@@ -1252,11 +1252,19 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   each call it restricts is checked first: a file access is granted by a
   rule on the file or a directory above it, matched by host identity up
   the file's host path (`EACCES`); a move between directories needs
-  `REFER` in both (`EXDEV`); `ftruncate` is decided at open; TCP `bind`
-  and `connect` need a rule for the port; a signal or a connection to an
-  abstract socket leaving a scoping layer's domain is `EPERM` (each layer
-  has an id, and a restricted process publishes its chain beside the
-  process records); so is tracing a process outside the domain. The LSM
+  `REFER` in both (`EXDEV`); truncation of a regular file and `ioctl` on
+  a device (but for the requests Linux leaves to any holder) are decided
+  at open, and a refusal is marked on the open file description
+  (`host::mark_landlock_denied`, its no-`SIGPIPE` flag, which neither
+  kind uses), so it holds for every descriptor of it in any process; TCP
+  `bind` and `connect` need a rule for the port; `mount`, `umount2`,
+  `pivot_root` and `move_mount` are refused in a domain that restricts
+  files (`EPERM`); a signal (to each member of a process group, or each
+  process `kill(-1)` reaches), a connection or a datagram (`sendto`,
+  `sendmsg`, each of `sendmmsg`'s) to an abstract socket leaving a
+  scoping layer's domain is `EPERM` (each layer has an id, and a
+  restricted process publishes its chain beside the process records); so
+  is tracing a process outside the domain. The LSM
   calls report Linux's capabilities, Landlock and Yama as the security
   modules (`/sys/kernel/security/lsm`), none keeping attributes of a
   process.
@@ -1367,7 +1375,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A Landlock domain is the process's, not the thread's that made it (the
   process's other threads are restricted with it), and its file rules
   follow a file's host path, so a bind mount's files are under the rules
-  of the directory they are bound from.
+  of the directory they are bound from. A device fwe makes of a host
+  socket or pipe, opened without `IOCTL_DEV`, keeps no mark: its `ioctl`
+  is not refused.
 - An I/O priority set for another process (`ioprio_set`) is checked and
   accepted but not kept: `ioprio_get` reports that process's as (none,
   0).

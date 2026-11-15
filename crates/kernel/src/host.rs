@@ -434,6 +434,49 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     ret(unsafe { libc::kill(pid, sig) })
 }
 
+/// Mark the open file description of `fd` as opened without a right a
+/// Landlock domain withheld for its kind ([`crate::landlock`]): truncating
+/// a regular file, `ioctl` on a device. The mark is the description's
+/// no-`SIGPIPE` flag (`F_SETNOSIGPIPE`), kept with the description and so
+/// with every descriptor of it in any process, and unused by a regular
+/// file or a device, which raise no `SIGPIPE`; a descriptor of another
+/// kind on the host (a socket fwe makes for a device) is not marked.
+#[cfg(target_os = "macos")]
+pub fn mark_landlock_denied(fd: i32) {
+    if markable(fd) {
+        // SAFETY: plain host call on the guest's descriptor.
+        unsafe { libc::fcntl(fd, libc::F_SETNOSIGPIPE, 1) };
+    }
+}
+
+/// Whether the open file description of `fd` carries the mark of
+/// [`mark_landlock_denied`].
+#[cfg(target_os = "macos")]
+pub fn landlock_denied(fd: i32) -> bool {
+    // SAFETY: plain host call on the guest's descriptor.
+    markable(fd) && unsafe { libc::fcntl(fd, libc::F_GETNOSIGPIPE) } == 1
+}
+
+/// Another host keeps no such mark: guests run on macOS only.
+#[cfg(not(target_os = "macos"))]
+pub fn mark_landlock_denied(_fd: i32) {}
+
+/// Another host keeps no such mark: guests run on macOS only.
+#[cfg(not(target_os = "macos"))]
+pub fn landlock_denied(_fd: i32) -> bool {
+    false
+}
+
+/// Whether `fd` is a regular file or a device on the host.
+#[cfg(target_os = "macos")]
+fn markable(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) == 0 };
+    ok && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFCHR | libc::S_IFBLK)
+}
+
 /// `kill` of one host process `pid`: a pid that is not one (0, or
 /// negative, which the host takes for a group or every process) is refused
 /// (`ESRCH`), so a number from a guest or a record never signals more.

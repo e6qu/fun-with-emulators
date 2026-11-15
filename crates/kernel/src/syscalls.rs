@@ -260,20 +260,23 @@ impl<P: Platform> Kernel<P> {
             return e;
         }
         // What a Landlock domain does not allow ([`crate::landlock`]).
-        let no_truncate = if crate::landlock::active() {
+        let withheld = if crate::landlock::active() {
             match self.landlock_before(n, &a) {
                 Ok(t) => t,
                 Err(e) => return err(e),
             }
         } else {
-            false
+            crate::landlock::Withheld::default()
         };
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
         let security = changes_security(n).then(|| self.cred_marks());
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
-        if no_truncate && r >= 0 && matches!(n, nr::OPENAT | nr::OPENAT2) {
-            crate::landlock::opened_without_truncate(r as i32);
+        if withheld != crate::landlock::Withheld::default()
+            && r >= 0
+            && matches!(n, nr::OPENAT | nr::OPENAT2)
+        {
+            crate::landlock::opened(r as i32, withheld);
         }
         crate::creds::publish(&self.creds);
         if let Some(before) = security {
@@ -342,7 +345,6 @@ impl<P: Platform> Kernel<P> {
                 crate::nsfd::closed(fd);
                 crate::inotify::closed(fd);
                 crate::dnotify::closed(fd);
-                crate::landlock::closed(fd);
                 crate::loopdev::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
@@ -1521,6 +1523,9 @@ impl<P: Platform> Kernel<P> {
         // The request is 32 bits (an `unsigned int`); a C library passing
         // an `int` sign-extends it.
         let req = req as u32 as u64;
+        if let Err(e) = crate::landlock::may_ioctl(fd, req) {
+            return err(e);
+        }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
             return r;
         }

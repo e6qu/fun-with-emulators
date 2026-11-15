@@ -149,7 +149,6 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &bpf::FILTERS,
         &bpf::PROG_MAPS,
         &landlock::DOMAIN,
-        &landlock::NO_TRUNCATE,
         &landlock::RULESETS,
         &mountapi::CONTEXTS,
         &mountapi::TREES,

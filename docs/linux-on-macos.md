@@ -1408,7 +1408,7 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 |---|---|---|
 | `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Who may trace whom as Linux's `ptrace_may_access`, Yama's `kernel.yama.ptrace_scope` and Landlock decide. Only fwe's processes can be traced. | `__ulock_wait2`/`__ulock_wake` on pages of the process store, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
-| `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path, TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); the domain is the process's, carried by `fork` and `execve` | none |
+| `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path (truncation and device `ioctl` decided as a file is opened, for every descriptor of it), TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); mounts refused in a domain that restricts files; the domain is the process's, carried by `fork` and `execve` | the open file description's no-`SIGPIPE` flag (`F_SETNOSIGPIPE`) marks a refused truncation or `ioctl` |
 | `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
 
 **`ptrace`**: each traced thread has a mailbox, a page of fwe's shared
@@ -2217,7 +2217,7 @@ process restrict itself. macOS's own (the sandbox, SIP) apply to the
 | Module | What fwe does | What a program sees |
 |---|---|---|
 | capabilities | Linux's five sets and securebits, enforced by fwe ([Credentials and capabilities](#credentials-and-capabilities)) | as on Linux |
-| Landlock | ABI 6: file rights by path, TCP ports, abstract sockets and signals, enforced by fwe (`landlock.rs`, `landlockops.rs`) | as on Linux, with the limits in [architecture.md](architecture.md#known-limitations) |
+| Landlock | ABI 6: file rights by path (device `ioctl` too), TCP ports, abstract sockets and signals, mounts and tracing, enforced by fwe (`landlock.rs`, `landlockops.rs`) | as on Linux, with the limits in [architecture.md](architecture.md#known-limitations) |
 | SELinux | none | no `/sys/fs/selinux`: SELinux is off, as on a distribution that does not use it |
 | AppArmor | none | no `/sys/kernel/security/apparmor`: AppArmor is absent |
 | Yama | `kernel.yama.ptrace_scope` (1 by default) and `PR_SET_PTRACER`, enforced by fwe on every attach (`ptrace.rs`) | as on Linux |

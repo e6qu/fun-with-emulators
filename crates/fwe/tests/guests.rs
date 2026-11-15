@@ -6568,6 +6568,26 @@ fn ptrace_access_follows_linux_and_yama() {
     );
 }
 
+/// What a Landlock domain withholds beyond the calls it checks: a file
+/// opened without the right to truncate cannot be truncated through any
+/// descriptor of it, a dup, `F_DUPFD`, or one passed to a process outside
+/// the domain; a device opened without `IOCTL_DEV` takes only the requests
+/// any holder may make; a domain restricting files may not mount; a
+/// signal to a process group or to every process spares those outside a
+/// signal-scoped domain; a datagram to an abstract socket bound outside an
+/// abstract-scoped domain is refused.
+#[test]
+fn landlock_follows_open_files_signals_mounts_and_datagrams() {
+    assert_eq!(
+        containers("landlock-gaps"),
+        "restricted: ok\nftruncate: EACCES dup EACCES F_DUPFD EACCES\n\
+         a device's ioctl: EACCES, FIOCLEX ok\nmount: EPERM\n\
+         ftruncate where it was passed: EACCES\nftruncate of its own: ok\n\
+         kill(0): ok, kill(-1): ok, the one outside untouched\n\
+         abstract datagram: sendto EPERM, sendmsg EPERM\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.

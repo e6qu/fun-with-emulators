@@ -7,7 +7,7 @@
 
 use crate::landlock::{self as ll};
 use crate::{Kernel, Platform, uaccess};
-use fwe_abi::{fcntl, nr};
+use fwe_abi::{errno, fcntl, nr};
 use std::os::fd::AsRawFd;
 
 /// `MAKE_*` for a file of mode `mode`'s kind.
@@ -94,6 +94,59 @@ pub fn check_connect(fd: i32, addr: u64, len: u64) -> Result<(), i32> {
     }
 }
 
+/// Whether a datagram to the guest's address `addr` (of `len` bytes)
+/// leaves the domain's abstract-socket scope (`EPERM`), as Linux's
+/// `unix_may_send` hook checks every send with an address.
+fn check_dest(addr: u64, len: u64) -> Result<(), i32> {
+    if addr == 0 {
+        return Ok(());
+    }
+    let Some((family, _, rest)) = sockaddr(addr, len) else { return Ok(()) };
+    match crate::net::abstract_owner(rest.get(1..).unwrap_or_default()) {
+        Some(owner) if family == AF_UNIX && rest.first() == Some(&0) => {
+            ll::may_connect_abstract(owner)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// The address a guest `msghdr` at `hdr` names (pointer and length).
+fn msg_name(hdr: u64) -> (u64, u64) {
+    let name = uaccess::read::<u64>(hdr).unwrap_or(0);
+    let len = uaccess::read::<u32>(hdr + 8).unwrap_or(0);
+    (name, u64::from(len))
+}
+
+/// `sendto` (`addr`, `len`), `sendmsg` (`msg`, the message) or
+/// `sendmmsg` (`vlen` of them at `msg`): refused if the first (or only)
+/// message goes to an abstract socket outside the domain's scope
+/// (`sendmmsg` past its first message: [`sendable_messages`]).
+pub fn check_send(nr: u64, msg: u64, vlen: u64, addr: u64, len: u64) -> Result<(), i32> {
+    match nr {
+        nr::SENDTO => check_dest(addr, len),
+        nr::SENDMSG => {
+            let (a, l) = msg_name(msg);
+            check_dest(a, l)
+        }
+        _ if vlen > 0 => {
+            let (a, l) = msg_name(msg);
+            check_dest(a, l)
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `sendmmsg` of `vlen` messages at `vec`: how many may be sent before
+/// the first that goes out of the domain's abstract-socket scope (`None`
+/// for all of them).
+pub fn sendable_messages(vec: u64, vlen: u64) -> Option<u64> {
+    // `struct mmsghdr`: a `msghdr` and the length sent, 64 bytes.
+    (0..vlen.min(1024)).find(|&i| {
+        let (a, l) = msg_name(vec + i * 64);
+        check_dest(a, l).is_err()
+    })
+}
+
 impl<P: Platform> Kernel<P> {
     /// The host paths of what `path` from `dirfd` names and of the
     /// directory it is in.
@@ -105,24 +158,25 @@ impl<P: Platform> Kernel<P> {
         Some((dir, obj))
     }
 
-    /// The checks of call `n` with `a`: whether a descriptor it opens is
-    /// one that may not truncate its file.
-    pub(crate) fn landlock_before(&self, n: u64, a: &[u64; 6]) -> Result<bool, i32> {
+    /// The checks of call `n` with `a`: what a descriptor it opens is
+    /// withheld.
+    pub(crate) fn landlock_before(&self, n: u64, a: &[u64; 6]) -> Result<ll::Withheld, i32> {
+        let none = ll::Withheld::default();
         match n {
             nr::OPENAT | nr::OPENAT2 => {
                 let flags =
                     if n == nr::OPENAT2 { uaccess::read::<u64>(a[2]).unwrap_or(0) } else { a[2] };
                 if flags & fcntl::O_PATH != 0 {
-                    return Ok(false);
+                    return Ok(none);
                 }
                 let follow = flags & fcntl::O_NOFOLLOW == 0;
-                let Some((dir, obj)) = self.ll_target(a[0], a[1], follow) else { return Ok(false) };
+                let Some((dir, obj)) = self.ll_target(a[0], a[1], follow) else { return Ok(none) };
                 let acc = flags & fcntl::O_ACCMODE;
                 let (read, write) = (acc != fcntl::O_WRONLY, acc != fcntl::O_RDONLY);
                 match host_mode(&obj, follow) {
                     Some(m) if m & libc::S_IFMT as u32 == libc::S_IFDIR as u32 => {
                         ll::check_path(&obj, if read { ll::READ_DIR } else { 0 }, true)?;
-                        Ok(false)
+                        Ok(none)
                     }
                     Some(_) => {
                         let mut need = 0;
@@ -136,13 +190,13 @@ impl<P: Platform> Kernel<P> {
                             need |= ll::TRUNCATE;
                         }
                         ll::check_path(&obj, need, true)?;
-                        Ok(write && ll::truncate_denied(&obj))
+                        Ok(ll::withheld(&obj, write))
                     }
                     None if flags & fcntl::O_CREAT != 0 => {
                         ll::check_path(&dir, ll::MAKE_REG, false)?;
-                        Ok(write && ll::truncate_denied(&dir))
+                        Ok(ll::withheld(&dir, write))
                     }
-                    None => Ok(false),
+                    None => Ok(none),
                 }
             }
             nr::MKDIRAT | nr::MKNODAT | nr::SYMLINKAT => {
@@ -154,7 +208,7 @@ impl<P: Platform> Kernel<P> {
                 if let Some((dir, _)) = self.ll_target(dirfd, path, false) {
                     ll::check_path(&dir, right, false)?;
                 }
-                Ok(false)
+                Ok(none)
             }
             nr::UNLINKAT => {
                 const AT_REMOVEDIR: u64 = 0x200;
@@ -163,19 +217,19 @@ impl<P: Platform> Kernel<P> {
                         if a[2] & AT_REMOVEDIR != 0 { ll::REMOVE_DIR } else { ll::REMOVE_FILE };
                     ll::check_path(&dir, right, false)?;
                 }
-                Ok(false)
+                Ok(none)
             }
             nr::LINKAT => {
                 let follow = a[4] & fcntl::AT_SYMLINK_FOLLOW != 0;
                 let (Some((from_dir, from)), Some((to_dir, _))) =
                     (self.ll_target(a[0], a[1], follow), self.ll_target(a[2], a[3], false))
                 else {
-                    return Ok(false);
+                    return Ok(none);
                 };
                 ll::check_refer(&from_dir, &to_dir)?;
                 let kind = host_mode(&from, follow).unwrap_or(libc::S_IFREG as u32);
                 ll::check_path(&to_dir, make_right(kind), false)?;
-                Ok(false)
+                Ok(none)
             }
             nr::RENAMEAT | nr::RENAMEAT2 => {
                 const RENAME_EXCHANGE: u64 = 2;
@@ -183,7 +237,7 @@ impl<P: Platform> Kernel<P> {
                 let (Some((from_dir, from)), Some((to_dir, to))) =
                     (self.ll_target(a[0], a[1], false), self.ll_target(a[2], a[3], false))
                 else {
-                    return Ok(false);
+                    return Ok(none);
                 };
                 ll::check_refer(&from_dir, &to_dir)?;
                 let kind = host_mode(&from, false).unwrap_or(libc::S_IFREG as u32);
@@ -195,15 +249,14 @@ impl<P: Platform> Kernel<P> {
                         ll::check_path(&from_dir, make_right(over), false)?;
                     }
                 }
-                Ok(false)
+                Ok(none)
             }
             nr::TRUNCATE => {
                 if let Some((_, obj)) = self.ll_target(fcntl::AT_FDCWD as u64, a[0], true) {
                     ll::check_path(&obj, ll::TRUNCATE, true)?;
                 }
-                Ok(false)
+                Ok(none)
             }
-            nr::FTRUNCATE => ll::may_ftruncate(a[0] as i32).map(|()| false),
             nr::BIND => {
                 if let Some((family, port, rest)) = sockaddr(a[1], a[2]) {
                     match family {
@@ -222,7 +275,7 @@ impl<P: Platform> Kernel<P> {
                         _ => {}
                     }
                 }
-                Ok(false)
+                Ok(none)
             }
             nr::KILL | nr::RT_SIGQUEUEINFO | nr::TGKILL | nr::RT_TGSIGQUEUEINFO => {
                 let pid = a[0] as i32;
@@ -231,7 +284,7 @@ impl<P: Platform> Kernel<P> {
                 {
                     ll::may_signal(host)?;
                 }
-                Ok(false)
+                Ok(none)
             }
             nr::TKILL => {
                 let tid = a[0] as i32;
@@ -240,15 +293,21 @@ impl<P: Platform> Kernel<P> {
                 } else if let Some(host) = crate::pidns::to_host(tid) {
                     ll::may_signal(host)?;
                 }
-                Ok(false)
+                Ok(none)
+            }
+            // A domain that restricts the file system may not change what
+            // its paths reach (Linux's `sb_mount`, `move_mount`,
+            // `sb_umount` and `sb_pivotroot` hooks).
+            nr::MOUNT | nr::UMOUNT2 | nr::PIVOT_ROOT | nr::MOVE_MOUNT if ll::handles_fs() => {
+                Err(errno::EPERM)
             }
             nr::PIDFD_SEND_SIGNAL => {
                 if let Some(t) = crate::pidfd::of(a[0] as i32) {
                     ll::may_signal(t.host)?;
                 }
-                Ok(false)
+                Ok(none)
             }
-            _ => Ok(false),
+            _ => Ok(none),
         }
     }
 

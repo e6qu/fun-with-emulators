@@ -989,9 +989,14 @@ impl<P: Platform> Kernel<P> {
     /// Whether the caller may send `sig` to host process `target` (Linux's
     /// `check_kill_permission`): when its real or effective user id is the
     /// target's real or saved one, with `CAP_KILL` in the target's user
-    /// namespace, or `SIGCONT` within its session. A process fwe has no
-    /// record of counts as root's, in the initial user namespace.
+    /// namespace, or `SIGCONT` within its session; and, in a Landlock
+    /// domain that scopes signals, only to a process inside it. A process
+    /// fwe has no record of counts as root's, in the initial user
+    /// namespace.
     pub(crate) fn may_signal(&self, target: i32, sig: u64) -> bool {
+        if crate::landlock::active() && crate::landlock::may_signal(target).is_err() {
+            return false;
+        }
         let ids = crate::procreg::ids(target);
         if [self.creds.uid, self.creds.euid].iter().any(|&u| u == ids[0] || u == ids[2]) {
             return true;
@@ -999,7 +1004,6 @@ impl<P: Platform> Kernel<P> {
         if self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_KILL) {
             return true;
         }
-
         // SAFETY: plain host calls.
         sig == signal::SIGCONT && unsafe { libc::getsid(target) == libc::getsid(0) }
     }

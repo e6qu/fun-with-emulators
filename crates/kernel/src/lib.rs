@@ -2240,6 +2240,23 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 r
             }
         }
+        // Datagrams to an abstract socket outside a Landlock domain that
+        // scopes them are refused, as connecting is.
+        n::SENDTO | n::SENDMSG | n::SENDMMSG
+            if landlock::active()
+                && let Err(e) = landlockops::check_send(nr, a[1], a[2], a[4], a[5]) =>
+        {
+            fwe_abi::err(e)
+        }
+        n::SENDMMSG
+            if landlock::active()
+                && let Some(k) = landlockops::sendable_messages(a[1], a[2])
+                && k < a[2] =>
+        {
+            // The messages before the first refused one are sent.
+            // SAFETY: caller guarantees the message vector.
+            unsafe { net::sendmmsg(a[0], a[1], k, a[3]) }
+        }
         // SAFETY: caller guarantees the buffer and sockaddr.
         n::SENDTO => netns::as_socket(a[0] as i32, || unsafe {
             net::sendto(a[0], a[1], a[2], a[3], a[4], a[5])

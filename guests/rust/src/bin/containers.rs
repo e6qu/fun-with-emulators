@@ -499,6 +499,153 @@ fn main() {
                 waitpid(-1, std::ptr::null_mut(), 0);
                 println!("ptrace_scope: {}", text("/proc/sys/kernel/yama/ptrace_scope").trim());
             }
+            // What a Landlock domain withholds beyond the calls it checks:
+            // truncation of a file opened without the right, through any
+            // descriptor of it, in any process; `ioctl` on a device opened
+            // without `IOCTL_DEV`; mounts; a signal to a process group or
+            // every process, for each target outside the domain; and a
+            // datagram to an abstract socket bound outside it.
+            Some("landlock-gaps") => {
+                // A ruleset handling `handled` file rights and `scoped`,
+                // granting `rules` (path, rights), applied to this process.
+                let restrict = |handled: u64, scoped: u64, rules: &[(&str, u64)]| {
+                    prctl(38, 1, 0, 0, 0);
+                    let attr = [handled, 0, scoped];
+                    let rs = syscall(444, attr.as_ptr(), 24, 0);
+                    for &(path, rights) in rules {
+                        let fd = open(c(path).as_ptr(), O_PATH);
+                        let mut rule = [0u8; 12];
+                        rule[..8].copy_from_slice(&rights.to_ne_bytes());
+                        rule[8..].copy_from_slice(&fd.to_ne_bytes());
+                        syscall(445, rs, 1, rule.as_ptr(), 0);
+                        close(fd);
+                    }
+                    syscall(446, rs, 0)
+                };
+                const WRITE: u64 = 2;
+                const READ: u64 = 4;
+                const TRUNCATE: u64 = 1 << 14;
+                const IOCTL_DEV: u64 = 1 << 15;
+                std::fs::write("/tmp/t", "content").unwrap();
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    let handled = READ | WRITE | TRUNCATE | IOCTL_DEV;
+                    let r = restrict(handled, 0, &[("/tmp", READ | WRITE), ("/dev/null", READ | WRITE)]);
+                    println!("restricted: {}", res(r));
+                    let fd = open(c("/tmp/t").as_ptr(), O_WRONLY);
+                    let dup = syscall(23, fd);
+                    let dupfd = fcntl(fd, 0, 100);
+                    println!(
+                        "ftruncate: {} dup {} F_DUPFD {}",
+                        res(syscall(46, fd, 0)),
+                        res(syscall(46, dup, 0)),
+                        res(syscall(46, dupfd as i64, 0))
+                    );
+                    // Passed to a process outside the domain.
+                    let mut control = [0u8; 24];
+                    control[..8].copy_from_slice(&20u64.to_ne_bytes());
+                    control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+                    control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+                    control[16..20].copy_from_slice(&fd.to_ne_bytes());
+                    let mut byte = *b"f";
+                    let mut iov = Iovec { base: byte.as_mut_ptr(), len: 1 };
+                    let m = Msghdr {
+                        name: std::ptr::null_mut(),
+                        namelen: 0,
+                        iov: &mut iov,
+                        iovlen: 1,
+                        control: control.as_mut_ptr(),
+                        controllen: 24,
+                        flags: 0,
+                    };
+                    sendmsg(sv[0], &m, 0);
+                    let null = open(c("/dev/null").as_ptr(), O_RDWR);
+                    let mut n = 0i32;
+                    let fionread = res(syscall(29, null, 0x541b, &mut n as *mut i32));
+                    let fioclex = res(syscall(29, null, 0x5451, 0));
+                    println!("a device's ioctl: {fionread}, FIOCLEX {fioclex}");
+                    let tmpfs = c("tmpfs");
+                    let r = mount(tmpfs.as_ptr(), c("/tmp").as_ptr(), tmpfs.as_ptr(), 0, std::ptr::null());
+                    println!("mount: {}", res(r as i64));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                let mut cbuf = [0u8; 64];
+                let mut b = 0u8;
+                let mut iov = Iovec { base: &mut b, len: 1 };
+                let mut m = Msghdr {
+                    name: std::ptr::null_mut(),
+                    namelen: 0,
+                    iov: &mut iov,
+                    iovlen: 1,
+                    control: cbuf.as_mut_ptr(),
+                    controllen: 64,
+                    flags: 0,
+                };
+                recvmsg(sv[1], &mut m, 0);
+                let got = i32::from_ne_bytes(cbuf[16..20].try_into().unwrap());
+                println!("ftruncate where it was passed: {}", res(syscall(46, got, 0)));
+                let own = open(c("/tmp/t").as_ptr(), O_WRONLY);
+                println!("ftruncate of its own: {}", res(syscall(46, own, 0)));
+                // Signals: a group with a member outside the domain.
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    syscall(154, 0, 0);
+                    signal(10, on_alarm);
+                    let mut ready = [0i32; 2];
+                    pipe2(ready.as_mut_ptr(), 0);
+                    let outside = fork();
+                    if outside == 0 {
+                        // Ended by the signal's default action if it comes.
+                        signal(10, std::mem::transmute::<usize, extern "C" fn(i32)>(0));
+                        write(ready[1], b"r".as_ptr(), 1);
+                        usleep(500_000);
+                        _exit(0);
+                    }
+                    read(ready[0], &mut b, 1);
+                    restrict(0, 2, &[]);
+                    let group = syscall(129, 0, 10);
+                    let every = syscall(129, -1, 10);
+                    let mut status = 0;
+                    waitpid(outside, &mut status, 0);
+                    println!(
+                        "kill(0): {}, kill(-1): {}, the one outside {}",
+                        res(group),
+                        res(every),
+                        if status == 0 { "untouched" } else { "signalled" }
+                    );
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                // A datagram to an abstract socket bound outside.
+                let s = socket(AF_UNIX, 2, 0);
+                let mut addr = SockaddrUn { family: AF_UNIX as u16, path: [0; 108] };
+                addr.path[1..12].copy_from_slice(b"fwe-ll-dgrm");
+                bind(s, &addr, 2 + 12);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    restrict(0, 1, &[]);
+                    let d = socket(AF_UNIX, 2, 0);
+                    let r = syscall(206, d, b"x".as_ptr(), 1, 0, &addr as *const SockaddrUn, 14);
+                    let mut byte = *b"y";
+                    let mut iov = Iovec { base: byte.as_mut_ptr(), len: 1 };
+                    let m = Msghdr {
+                        name: &addr as *const SockaddrUn as *mut u8,
+                        namelen: 14,
+                        iov: &mut iov,
+                        iovlen: 1,
+                        control: std::ptr::null_mut(),
+                        controllen: 0,
+                        flags: 0,
+                    };
+                    let r2 = sendmsg(d, &m, 0);
+                    println!("abstract datagram: sendto {}, sendmsg {}", res(r), res(r2 as i64));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+            }
             // A program only the VM runs, on a host without one: the exec
 
             // fails and the caller goes on, as podman's pause process does

@@ -2628,6 +2628,11 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = crate::memfd::truncate_frozen(fd as i32, len as i64) {
             return r;
         }
+        // Opened in a Landlock domain that let it not truncate the file,
+        // whoever holds it now.
+        if let Err(e) = crate::landlock::may_ftruncate(fd as i32) {
+            return err(e);
+        }
         // SAFETY: plain host call on a guest fd.
         let r = ret(unsafe { libc::ftruncate(fd as i32, len as libc::off_t) });
         // A set-ID file cut or grown loses its bits, as one written does.

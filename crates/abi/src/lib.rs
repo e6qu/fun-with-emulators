@@ -577,6 +577,19 @@ pub mod ioctl {
     pub const FIOCLEX: u64 = 0x5451;
     pub const FIONCLEX: u64 = 0x5450;
     pub const FIOASYNC: u64 = 0x5452;
+    /// The requests Landlock's `LANDLOCK_ACCESS_FS_IOCTL_DEV` leaves to
+    /// any holder of a device's descriptor (`is_masked_device_ioctl`):
+    /// the descriptor's own flags and the file system's requests.
+    pub const FIOQSIZE: u64 = 0x5460;
+    pub const FIFREEZE: u64 = 0xc004_5877;
+    pub const FITHAW: u64 = 0xc004_5878;
+    pub const FS_IOC_FIEMAP: u64 = 0xc020_660b;
+    pub const FIGETBSZ: u64 = 2;
+    pub const FICLONE: u64 = 0x4004_9409;
+    pub const FICLONERANGE: u64 = 0x4020_940d;
+    pub const FIDEDUPERANGE: u64 = 0xc018_9436;
+    pub const FS_IOC_GETFSUUID: u64 = 0x8011_1500;
+    pub const FS_IOC_GETFSSYSFSPATH: u64 = 0x8081_1501;
     /// Network interface requests on a socket (`struct ifreq`).
     pub const SIOCGIFNAME: u64 = 0x8910;
     pub const SIOCGIFCONF: u64 = 0x8912;
