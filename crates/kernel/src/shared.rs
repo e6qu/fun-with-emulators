@@ -222,21 +222,39 @@ impl<T: Data> Record<T> {
     /// never written here.
     pub fn join(dir: &[u8], id: u64) -> Result<Record<T>, i32> {
         let r = Record::open(dir.to_vec(), id, false)?;
-        r.read_file().map_err(|_| errno::ENOENT)?;
+        let (whole, t) = r.read_file().map_err(|_| errno::ENOENT)?;
+        r.keep_current(whole, t);
         Ok(r)
     }
 
     fn open_or_make(dir: Vec<u8>, id: u64, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
         let r = Record::open(dir, id, true)?;
         r.with_lock(|| {
-            if r.read_file().is_err() {
-                let at = r.generation() + 1;
-                r.write_file(at, &initial())?;
-                r.advance(at);
+            match r.read_file() {
+                Ok((whole, t)) => r.keep_current(whole, t),
+                Err(_) => {
+                    let at = r.generation() + 1;
+                    let t = initial();
+                    r.write_file(at, &t)?;
+                    r.advance(at);
+                    r.keep_current(at, t);
+                }
             }
             Ok(())
         })?;
         Ok(r)
+    }
+
+    /// The data read whole, `t` at generation `whole`, brought up to date
+    /// from the journal and kept for [`Record::get`] if it is the data as
+    /// it is now: the first look reads nothing again.
+    fn keep_current(&self, whole: u64, t: T) {
+        let now = self.generation();
+        if let Ok((at, t)) = self.apply_after(whole, &t)
+            && at == now
+        {
+            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = (at, Arc::new(t));
+        }
     }
 
     /// The record at `dir`, made if `make`, with its generation mapped.

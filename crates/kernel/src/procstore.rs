@@ -107,6 +107,9 @@ pub enum Count {
 
 /// The store's layout: where each part starts in the file.
 const COUNTS_AT: usize = 0;
+/// The CPU's features as `AT_HWCAP` and `AT_HWCAP2` report them
+/// ([`hwcap`]), then whether they are set, past the counts.
+const HWCAP_AT: usize = 32;
 /// The user's temporary directory as the host named it ([`user_temp`]):
 /// its length, then its bytes.
 const USER_TEMP_AT: usize = 64;
@@ -285,6 +288,24 @@ pub fn set_user_temp(dir: &[u8]) {
         s.at::<AtomicU64>(USER_TEMP_AT + 8 + i * 8).store(u64::from_le_bytes(w), SeqCst);
     }
     s.at::<AtomicU64>(USER_TEMP_AT).store(dir.len() as u64, SeqCst);
+}
+
+/// The CPU's features as a process found them ([`set_hwcap`]): asking the
+/// host costs a call for each.
+pub fn hwcap() -> Option<(u64, u64)> {
+    let s = store();
+    (s.at::<AtomicU64>(HWCAP_AT + 16).load(SeqCst) != 0).then(|| {
+        (s.at::<AtomicU64>(HWCAP_AT).load(SeqCst), s.at::<AtomicU64>(HWCAP_AT + 8).load(SeqCst))
+    })
+}
+
+/// Keep the CPU's features for [`hwcap`]; marked set last, so a reader
+/// finds both words or none.
+pub fn set_hwcap(hwcap: u64, hwcap2: u64) {
+    let s = store();
+    s.at::<AtomicU64>(HWCAP_AT).store(hwcap, SeqCst);
+    s.at::<AtomicU64>(HWCAP_AT + 8).store(hwcap2, SeqCst);
+    s.at::<AtomicU64>(HWCAP_AT + 16).store(1, SeqCst);
 }
 
 impl Store {
