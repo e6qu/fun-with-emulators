@@ -2501,6 +2501,15 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             && st.st_mode & libc::S_IFMT == libc::S_IFDIR
             && !access.permits(&st, 1)
         {
+            if crate::trace::file().is_some() {
+                crate::trace::note_to_file(&format!(
+                    "refused search of a directory {}:{} mode {:o} on the way to {}, for {access:?}",
+                    st.st_uid,
+                    st.st_gid,
+                    st.st_mode & 0o7777,
+                    String::from_utf8_lossy(path)
+                ));
+            }
             return Err(errno::EACCES);
         }
         if comp == b".." {

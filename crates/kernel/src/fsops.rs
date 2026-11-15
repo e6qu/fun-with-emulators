@@ -3715,17 +3715,46 @@ impl<P: Platform> Kernel<P> {
         if crate::fs::is_empty_dir(&st) {
             // What a name an overlay does not show is resolved in: nothing
             // is ever made there.
+            self.note_refused("an overlay's hidden name", &st);
             return err(errno::EACCES);
         }
         let perm = crate::modes::perm_of(&st);
         if !self.passes_dac(&st, 2) {
             if !self.permits(&st, 2 | 1) {
+                self.note_refused("the directory's bits", &st);
                 return err(errno::EACCES);
             }
             return op();
         }
         let r = op();
-        if r == err(errno::EACCES) && crate::modes::keep_fd(dir, perm).is_ok() { op() } else { r }
+        if r == err(errno::EACCES) && crate::modes::keep_fd(dir, perm).is_ok() {
+            op()
+        } else {
+            if r == err(errno::EACCES) {
+                self.note_refused("the host, past the capability", &st);
+            }
+            r
+        }
+    }
+
+    /// Under `--strace` to a file: why a change of a directory was refused
+    /// (`EACCES`), with what it was judged on, for a refusal to be traced.
+    fn note_refused(&self, by: &str, st: &libc::stat) {
+        if crate::trace::file().is_none() {
+            return;
+        }
+        let c = &self.creds;
+        crate::trace::note_to_file(&format!(
+            "refused by {by}: directory {}:{} mode {:o}; caller fsuid {} fsgid {} groups {:?} \
+             user namespace nested {}",
+            st.st_uid,
+            st.st_gid,
+            st.st_mode & 0o7777,
+            c.fsuid,
+            c.fsgid,
+            c.groups(),
+            crate::userns::nested()
+        ));
     }
 
     /// `linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH)`: give the file
