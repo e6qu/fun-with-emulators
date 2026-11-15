@@ -109,6 +109,11 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
     }
     use std::os::fd::AsRawFd;
     let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
+    // An abstract name's file is fwe's, of no guest permissions.
+    use std::os::unix::ffi::OsStrExt;
+    if a.dir.is_none() && hb[2..end].starts_with(abstract_dir().as_os_str().as_bytes()) {
+        return Ok(());
+    }
     let Ok(name) = std::ffi::CString::new(&hb[2..end]) else { return Ok(()) };
     let dir = a.dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
     // SAFETY: an all-zero `stat` is a valid out-parameter.
