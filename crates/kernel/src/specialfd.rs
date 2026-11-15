@@ -194,6 +194,29 @@ pub unsafe fn timerfd_settime(fd: u64, flags: u64, new_value: u64, old_value: u6
     }
 }
 
+/// `TFD_IOC_SET_TICKS` (`_IOW('T', 0, u64)`), the one request Linux's
+/// timerfd takes (with `CONFIG_CHECKPOINT_RESTORE`).
+pub const TFD_IOC_SET_TICKS: u64 = 0x4008_5400;
+
+/// An `ioctl` of request `req` on `fd`, if `fd` is a timerfd: for
+/// `TFD_IOC_SET_TICKS`, the count of expiries the next read returns, at
+/// `arg`; any other request `ENOTTY`, as Linux's `timerfd_ioctl`.
+pub fn timer_ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (fd, req, arg);
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        timer_nonblock(fd)?;
+        if req != TFD_IOC_SET_TICKS {
+            return Some(fwe_abi::err(fwe_abi::errno::ENOTTY));
+        }
+        imp::set_ticks(fd, arg)
+    }
+}
+
 /// `timerfd_gettime(fd, curr_value)`.
 ///
 /// # Safety
@@ -404,6 +427,9 @@ mod imp {
         first_at_ns: Option<i64>,
         period_ns: i64,
         taken: u64,
+        /// Expiries `TFD_IOC_SET_TICKS` set as unread, beyond the
+        /// schedule's.
+        extra: u64,
     }
 
     impl TimerFd {
@@ -426,6 +452,8 @@ mod imp {
         /// negated errno.
         fn arm(&self, now: i64) -> i64 {
             let next = match self.first_at_ns {
+                // Set expiries are due at once.
+                _ if self.extra > 0 => Some(now),
                 Some(first) if self.period_ns > 0 => {
                     Some(first.saturating_add(self.period_ns.saturating_mul(self.taken as i64)))
                 }
@@ -447,6 +475,31 @@ mod imp {
             // Deleting a timer that is not armed is no failure.
             if r < 0 && next.is_some() { last_error() } else { 0 }
         }
+    }
+
+    /// `TFD_IOC_SET_TICKS` on timerfd `fd`: the expiries a read returns
+    /// are `ticks` (0: `EINVAL`), those of the schedule so far taken, and
+    /// the descriptor readable at once. `None` for another descriptor.
+    pub fn set_ticks(fd: i32, arg: u64) -> Option<i64> {
+        if !with_reg(|m| matches!(m.get(&fd), Some(Special::Timer(_)))) {
+            return None;
+        }
+        let ticks: u64 = match uaccess::read(arg) {
+            Ok(t) => t,
+            Err(e) => return Some(err(e)),
+        };
+        if ticks == 0 {
+            return Some(err(errno::EINVAL));
+        }
+        Some(with_reg(|m| match m.get_mut(&fd) {
+            Some(Special::Timer(t)) => {
+                let now = now_ns();
+                t.taken = t.taken.max(t.expired(now));
+                t.extra = ticks;
+                t.arm(now)
+            }
+            _ => err(errno::EBADF),
+        }))
     }
 
     fn now_ns() -> i64 {
@@ -483,6 +536,7 @@ mod imp {
                     e.i64(t.first_at_ns.unwrap_or(0));
                     e.i64(t.period_ns);
                     e.u64(t.taken);
+                    e.u64(t.extra);
                 }
             })
         }
@@ -525,6 +579,7 @@ mod imp {
                     },
                     period_ns: d.i64(),
                     taken: d.u64(),
+                    extra: d.u64(),
                 })
             }
         });
@@ -574,6 +629,7 @@ mod imp {
                     e.i64(t.first_at_ns.unwrap_or(0));
                     e.i64(t.period_ns);
                     e.u64(t.taken);
+                    e.u64(t.extra);
                     Export {
                         kind: kind::TIMERFD,
                         state: e.into_bytes(),
@@ -642,6 +698,7 @@ mod imp {
             },
             period_ns: d.i64(),
             taken: d.u64(),
+            extra: d.u64(),
         };
         t.arm(now_ns());
         with_reg(|m| m.insert(fd, Special::Timer(t)));
@@ -775,6 +832,7 @@ mod imp {
                     first_at_ns: None,
                     period_ns: 0,
                     taken: 0,
+                    extra: 0,
                 }),
             )
         });
@@ -1010,8 +1068,9 @@ mod imp {
                     let due = with_reg(|m| match m.get_mut(&fd) {
                         Some(Special::Timer(t)) => {
                             let total = t.expired(now);
-                            let due = total.saturating_sub(t.taken);
+                            let due = total.saturating_sub(t.taken).saturating_add(t.extra);
                             t.taken = t.taken.max(total);
+                            t.extra = 0;
                             t.arm(now);
                             due
                         }
@@ -1246,6 +1305,32 @@ mod tests {
         assert_eq!(read_into(fd, &mut v), 8);
         assert_eq!(v, 1);
         assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        assert_eq!(close_fd(fd), 0);
+    }
+
+    /// `TFD_IOC_SET_TICKS` sets what the next read returns, readable at
+    /// once, whether or not the timer is armed; 0 is `EINVAL` and another
+    /// request `ENOTTY`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn timerfd_ticks_are_set() {
+        // SAFETY: no pointers.
+        let fd = unsafe { timerfd_create(1, 0o4000) } as i32;
+        assert!(fd >= 0);
+        assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        let ticks = 7u64;
+        let at = &ticks as *const u64 as u64;
+        assert_eq!(timer_ioctl(fd, TFD_IOC_SET_TICKS, at), Some(0));
+        let mut v = 0u64;
+        assert_eq!(read_into(fd, &mut v), 8);
+        assert_eq!(v, 7);
+        assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        let zero = 0u64;
+        let at = &zero as *const u64 as u64;
+        let r = timer_ioctl(fd, TFD_IOC_SET_TICKS, at);
+        assert_eq!(r, Some(fwe_abi::err(fwe_abi::errno::EINVAL)));
+        assert_eq!(timer_ioctl(fd, 0x5401, 0), Some(fwe_abi::err(fwe_abi::errno::ENOTTY)));
+        assert_eq!(timer_ioctl(-1, TFD_IOC_SET_TICKS, at), None);
         assert_eq!(close_fd(fd), 0);
     }
 

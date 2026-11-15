@@ -7368,3 +7368,26 @@ fn fifo_opens_wait_without_the_lock() {
 fn device_nodes_open_as_devices_to_read() {
     assert_eq!(fsrules("devnode"), "mknod: ok\n/tmp/zero: 4 [0, 0, 0, 0]\nzero: 4 [0, 0, 0, 0]\n");
 }
+
+/// What checkpoint/restore tools ask of the kernel: `PR_GET_TID_ADDRESS`,
+/// `TFD_IOC_SET_TICKS`, `kernel.ns_last_pid` (the host's in the initial
+/// pid namespace, fwe's to set in its own, with `CAP_SYS_ADMIN` or
+/// `CAP_CHECKPOINT_RESTORE`), and `PR_SET_MM` with Linux's checks.
+#[test]
+fn checkpoint_restore_interfaces() {
+    let out = run_c_guest("restore", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "PR_GET_TID_ADDRESS: 0, the word set 1\n\
+         TFD_IOC_SET_TICKS: 0, read 8 of 5, then -11; 0 ticks -22\n\
+         host's ns_last_pid read: 1\n\
+         set in the host's namespace: -1\n\
+         in a new namespace: last 1, set 0, then 41, next pid 42 1, -1 -22, a user -1\n\
+         PR_SET_MM_MAP_SIZE: 0, 104\n\
+         arguments moved: 0 0, cmdline \"renamed\" \"by prctl\" (17 bytes)\n\
+         below mmap_min_addr -22, extra argument -22, program file mapped -16, auxv too big \
+         -22, auxv set 0: 32 bytes, AT_PAGESZ 4096\n\
+         a user's PR_SET_MM: -1\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

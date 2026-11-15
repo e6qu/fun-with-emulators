@@ -320,8 +320,8 @@ so programs that probe for them fall back.
   (M8).
 - **Chosen pids in the initial pid namespace** (`clone3`'s `set_tid`
   there): pids are the host's, which macOS assigns; `set_tid` chooses
-  them in fwe's own pid namespaces. `/proc/sys/kernel/ns_last_pid` is
-  absent in every pid namespace.
+  them in fwe's own pid namespaces, as `/proc/sys/kernel/ns_last_pid`
+  does, which in the initial namespace is only read.
 - **`fanotify`:** its permission events would hold every process's file
   calls on another's answer; programs fall back to inotify.
 - **A shared descriptor table without shared memory** (`CLONE_FILES`

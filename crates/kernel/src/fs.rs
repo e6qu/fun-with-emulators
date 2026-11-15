@@ -588,6 +588,7 @@ impl Fs {
         let exe_fd = self.proc.exe_fd;
         let auxv = std::mem::take(&mut self.proc.auxv);
         crate::procreg::own_program(&exe, &cmdline);
+        crate::prmm::reset();
         crate::syscalls::publish_limits();
         // The program's file, for `/proc/self/maps`: through the descriptor
         // it was run by, if it has no path.
@@ -606,6 +607,29 @@ impl Fs {
         }
         crate::maps::publish();
         self.proc = crate::procfs::ProcInfo { exe, cmdline, ncpu, hostname, exe_fd, auxv };
+    }
+
+    /// The command line `/proc/self/cmdline` shows.
+    pub fn proc_cmdline(&self) -> &[u8] {
+        &self.proc.cmdline
+    }
+
+    /// The command line is `cmdline` from now on (`PR_SET_MM`'s argument
+    /// range), for other processes' `/proc/<pid>/cmdline` too.
+    pub fn set_proc_cmdline(&mut self, cmdline: Vec<u8>) {
+        crate::procreg::own_cmdline(&cmdline);
+        self.proc.cmdline = cmdline;
+    }
+
+    /// The program file is the one at guest path `exe` from now on
+    /// (`PR_SET_MM_EXE_FILE`), as `/proc/<pid>/exe` and the maps name it.
+    pub fn set_proc_exe(&mut self, exe: Vec<u8>) {
+        crate::procreg::own_exe(&exe);
+        let id = self.file_id(&exe).unwrap_or((0, 0));
+        crate::maps::record().set_exe(exe.clone(), id);
+        crate::maps::publish();
+        self.proc.exe = exe;
+        self.proc.exe_fd = None;
     }
 
     /// The auxiliary vector the running program started with.

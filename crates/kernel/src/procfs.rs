@@ -399,11 +399,19 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
         // The process's own memory, as it holds the strings now.
-        b"/proc/self/environ" => {
-            Entry::File(crate::procpid::environ(&info.auxv, &info.cmdline, |addr, buf| {
+        b"/proc/self/environ" => Entry::File(match crate::prmm::env_moved() {
+            // Where `PR_SET_MM` put it.
+            Some((start, end)) => {
+                let mut b = vec![0u8; end.saturating_sub(start).min(4 << 20) as usize];
+                if crate::uaccess::read_into(start, &mut b).is_err() {
+                    b.clear();
+                }
+                b
+            }
+            None => crate::procpid::environ(&info.auxv, &info.cmdline, |addr, buf| {
                 crate::uaccess::read_into(addr, buf).is_ok()
-            }))
-        }
+            }),
+        }),
         b"/proc/self/statm" => Entry::File(crate::procpid::statm(crate::host::pid())),
         b"/proc/self/io" => Entry::File(crate::procpid::io(crate::host::pid())),
         b"/proc/self/limits" => Entry::File(crate::procpid::limits(

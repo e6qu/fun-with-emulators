@@ -35,6 +35,9 @@ enum Space {
     User,
     /// The rest: fwe's own, every process's ([`Globals`]).
     Global,
+    /// The caller's pid namespace's (`kernel.ns_last_pid`), kept in its
+    /// record ([`crate::pidns::PidNs`]).
+    Pid,
 }
 
 /// The sysctls of no namespace set from their defaults, by name: a record
@@ -127,6 +130,8 @@ const INT_MAX: i64 = i32::MAX as i64;
 const YAMA_SCOPE: &[u8] = b"kernel/yama/ptrace_scope";
 /// `kernel.unprivileged_bpf_disabled`, likewise BPF's.
 const BPF_DISABLED: &[u8] = b"kernel/unprivileged_bpf_disabled";
+/// `kernel.ns_last_pid`, whose writes are checked as it is written.
+const NS_LAST_PID: &[u8] = b"kernel/ns_last_pid";
 /// `IPCMNI`: the most objects of a kind a namespace may have.
 const IPCMNI: i64 = 32768;
 
@@ -350,6 +355,9 @@ const SYSCTLS: &[Sysctl] = &[
     },
     // Pids are below it (fwe's namespaces number below it; the host's
     // own pids are the host's).
+    // The pid the caller's pid namespace gave last; the next is the one
+    // after it that is free.
+    Sysctl { path: NS_LAST_PID, default: "0", kind: Kind::Int(0, 4_194_304), space: Space::Pid },
     Sysctl {
         path: b"kernel/pid_max",
         default: "4194304",
@@ -505,6 +513,12 @@ fn value(i: usize) -> String {
             None => globals().and_then(|r| r.get().0.get(&name).cloned()),
         },
         Space::Ipc => crate::sysvipc::current().and_then(|r| r.get().sysctls.get(&name).cloned()),
+        Space::Pid => {
+            return match crate::pidns::current().first() {
+                Some(ns) => (ns.get().next - 1).max(0).to_string(),
+                None => crate::host::last_pid().to_string(),
+            };
+        }
         Space::Global => globals().and_then(|r| r.get().0.get(&name).cloned()),
         Space::User => match crate::userns::chain().first() {
             Some(u) => {
@@ -631,6 +645,8 @@ pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result
         // `CAP_SYS_RESOURCE` in the caller's own user namespace, whose
         // limits these are, as Linux checks it.
         Space::User => creds.has_own(crate::caps::CAP_SYS_RESOURCE),
+        // Anyone's to open (mode 0666); the write is checked.
+        Space::Pid => true,
     };
 
     Some(if allowed { Ok(Mark::Sysctl(i as u8)) } else { Err(errno::EACCES) })
@@ -701,6 +717,13 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
         }
     };
     let name = String::from_utf8_lossy(s.path).into_owned();
+    if s.space == Space::Pid {
+        let v: i32 = kept.parse().unwrap_or(0);
+        return Some(match set_last_pid(v) {
+            Ok(()) => len as i64,
+            Err(e) => fwe_abi::err(e),
+        });
+    }
     let r = match s.space {
         Space::Net if crate::netns::current().is_some() => {
             let net = crate::netns::current()?;
@@ -728,6 +751,7 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
                 Ok(())
             })
         }
+        Space::Pid => Err(errno::EINVAL),
         // The initial network namespace's, with those of no namespace.
         Space::Global | Space::Net | Space::User => {
             let Some(r) = globals() else {
@@ -742,6 +766,30 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     Some(match r {
         Ok(()) => len as i64,
         Err(e) => fwe_abi::err(e),
+    })
+}
+
+/// `kernel.ns_last_pid` written with `v`: the caller's pid namespace
+/// numbers its next process from `v + 1`, as Linux's `pid_ns_ctl_handler`
+/// sets it, if the caller has `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`
+/// in the user namespace owning it (its capabilities as its record holds
+/// them), else `EPERM`. The initial namespace's numbers are the host's, not
+/// fwe's to choose (`EPERM`).
+fn set_last_pid(v: i32) -> Result<(), i32> {
+    use crate::caps::{CAP_CHECKPOINT_RESTORE, CAP_SYS_ADMIN};
+    let Some(ns) = crate::pidns::current().first().cloned() else { return Err(errno::EPERM) };
+    let me = crate::host::pid();
+    let effective = crate::procreg::security(me).unwrap_or_default().caps[0];
+    let euid = crate::procreg::ids(me)[1];
+    let owner = crate::ns::owner_dir(ns.dir());
+    let own = crate::userns::own_dir();
+    let may = |cap: u32| crate::userns::capable_of(&own, &owner, euid, effective & 1 << cap != 0);
+    if !may(CAP_CHECKPOINT_RESTORE) && !may(CAP_SYS_ADMIN) {
+        return Err(errno::EPERM);
+    }
+    ns.update(|n| {
+        n.next = v + 1;
+        Ok(())
     })
 }
 
@@ -762,6 +810,17 @@ pub fn somaxconn() -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In the initial pid namespace `kernel.ns_last_pid` reads the host's
+    /// latest pid, at least the caller's own, and is not fwe's to set.
+    #[test]
+    fn the_initial_namespaces_last_pid_is_the_hosts() {
+        let text = read(b"/proc/sys/kernel/ns_last_pid").unwrap();
+        let last: i32 = String::from_utf8(text).unwrap().trim().parse().unwrap();
+        assert!(last >= crate::host::pid());
+        assert_eq!(set_last_pid(100), Err(errno::EPERM));
+        assert!(children(b"/proc/sys/kernel").iter().any(|(n, _)| n == b"ns_last_pid"));
+    }
 
     #[test]
     fn sysctls_and_their_directories() {

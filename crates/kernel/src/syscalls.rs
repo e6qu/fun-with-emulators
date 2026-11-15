@@ -1572,6 +1572,9 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
             return r;
         }
+        if let Some(r) = crate::specialfd::timer_ioctl(fd, req, arg) {
+            return r;
+        }
         // `FICLONE`, `FICLONERANGE` and `FIDEDUPERANGE` between files: no
         // file system fwe mounts shares extents (`EOPNOTSUPP`, as Linux's
         // tmpfs and ext4 answer).
@@ -1861,6 +1864,12 @@ impl<P: Platform> Kernel<P> {
             PR_SET_PDEATHSIG => err(errno::EINVAL),
             PR_GET_PDEATHSIG => {
                 guest!(uaccess::write(arg2, crate::pdeath::get() as i32));
+                0
+            }
+            crate::prmm::PR_SET_MM => self.prctl_set_mm(arg2, arg3, arg4, arg5),
+            // The thread's `set_tid_address` (`CLONE_CHILD_CLEARTID`) word.
+            PR_GET_TID_ADDRESS => {
+                guest!(uaccess::write(arg2, thread::clear_child_tid()));
                 0
             }
             _ => err(errno::EINVAL),

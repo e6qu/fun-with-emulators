@@ -318,6 +318,39 @@ fn exe_of(pid: libc::pid_t) -> Option<Vec<u8>> {
     })
 }
 
+/// The host's latest pid, as near as the host tells it: on macOS, which
+/// keeps no count of it, the highest pid in use; on Linux, the initial pid
+/// namespace's `ns_last_pid`.
+#[cfg(target_os = "macos")]
+pub fn last_pid() -> i32 {
+    // <sys/proc_info.h>: PROC_ALL_PIDS.
+    // SAFETY: sizing, then filling, a buffer of pids.
+    unsafe {
+        let n = libc::proc_listpids(1, 0, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return 0;
+        }
+        let mut pids = vec![0 as libc::pid_t; n as usize / size_of::<libc::pid_t>() + 64];
+        let n = libc::proc_listpids(
+            1,
+            0,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * size_of::<libc::pid_t>()) as i32,
+        );
+        pids.truncate(n.max(0) as usize / size_of::<libc::pid_t>());
+        pids.into_iter().max().unwrap_or(0)
+    }
+}
+
+/// The host's latest pid: on Linux, its `ns_last_pid`.
+#[cfg(not(target_os = "macos"))]
+pub fn last_pid() -> i32 {
+    std::fs::read_to_string("/proc/sys/kernel/ns_last_pid")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// The pids of process group `pgid` (none for a number that is not one).
 #[cfg(target_os = "macos")]
 fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {

@@ -267,6 +267,7 @@ pub mod prctl {
     pub const PR_GET_CHILD_SUBREAPER: u64 = 37;
     pub const PR_CAP_AMBIENT: u64 = 47;
     pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    pub const PR_GET_TID_ADDRESS: u64 = 40;
     pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
     /// Reset pointer-authentication keys (arm64): which, a mask of
     /// `PR_PAC_AP*KEY`, or 0 for all.

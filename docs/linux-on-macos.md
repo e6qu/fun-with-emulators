@@ -960,7 +960,7 @@ and `futex_waitv` run without the kernel lock.
 | `futex_waitv` | Up to 128 32-bit futexes, private and shared, on `CLOCK_MONOTONIC` or `CLOCK_REALTIME`. | as `futex` |
 | `futex_wake`, `futex_wait`, `futex_requeue` | As `FUTEX_WAKE_BITSET`, `FUTEX_WAIT_BITSET` (an absolute timeout on the clock given) and `FUTEX_CMP_REQUEUE`, on 32-bit futexes (another size or NUMA `EINVAL`); a requeue's two futexes are both private or both shared (`EINVAL` otherwise). | as `futex` |
 | `kcmp` | Memory, descriptor table, filesystem view, handlers, I/O context and undo list are shared only by a process's threads; two descriptors are one open file if they name the same socket or pipe, or the same file and (in the caller) share their status flags; `KCMP_EPOLL_TFD` for the caller's own epoll descriptors (`ENOENT` for another's); a caller that may not trace either process `EPERM`. | `proc_pidinfo`, `proc_pidfdinfo`, `fcntl` |
-| `prctl` | Name, capabilities, keepcaps, securebits, child subreaper, `no_new_privs`, THP choice, speculation (reported unaffected), seccomp, timer slack, dumpable, Yama's `PR_SET_PTRACER`, parent-death signal, anonymous memory's names (`PR_SET_VMA_ANON_NAME`, shown in `maps`); `PR_PAC_RESET_KEYS` in the VM only; others `EINVAL`. | none |
+| `prctl` | Name, capabilities, keepcaps, securebits, child subreaper, `no_new_privs`, THP choice, speculation (reported unaffected), seccomp, timer slack, dumpable, Yama's `PR_SET_PTRACER`, parent-death signal, anonymous memory's names (`PR_SET_VMA_ANON_NAME`, shown in `maps`), `PR_GET_TID_ADDRESS`, `PR_SET_MM` (the memory layout with Linux's checks and capabilities; a new argument range is what `cmdline` shows, as the memory holds it then, a new environment range what `/proc/self/environ` reads; the auxiliary vector and the program file, `EBUSY` while the old one is mapped; the break's start and end kept, the break staying where `brk` has it); `PR_PAC_RESET_KEYS` in the VM only; others `EINVAL`. | none |
 | `process_madvise` | The caller's own ranges as `madvise` takes them; another process's (with `CAP_SYS_NICE`, for a caller that may trace it) checked to be mapped, the hint given nothing to act on; only `MADV_WILLNEED`, `MADV_COLD`, `MADV_PAGEOUT` and `MADV_COLLAPSE` (`EINVAL` otherwise). | `madvise` for the caller's own |
 | `sched_setscheduler`, `sched_setparam`, `sched_getscheduler`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`/`min`, `sched_rr_get_interval` | Kept per process in its record with Linux's checks, inherited; the host schedules as before. | none |
 | `sched_setaffinity`, `sched_getaffinity`, `getcpu` | The mask is checked (another user's process needs `CAP_SYS_NICE`) and kept in the process record of the process named (a thread names its process), where it and any other process read it, and a fork child inherits it; `getcpu` reports its first CPU, node 0 (macOS tells no thread the CPU it runs on). | `sysconf` (online CPUs) |
@@ -1077,7 +1077,7 @@ no vDSO, so every clock read is a system call
 | `times` | ticks at 100 Hz from the process's and children's usage; returns the ticks since boot | `getrusage` |
 | `getitimer`, `setitimer` | the host's timers; a value over 100,000,000 s clamped and read back as asked | `getitimer`, `setitimer` |
 | `timer_create`, `timer_settime`, `timer_gettime`, `timer_getoverrun`, `timer_delete` | a timer thread of fwe's per process raises each timer's signal (`SI_TIMER`) | `clock_gettime`, `poll`, `nanosleep` in that thread |
-| `timerfd_create`, `timerfd_settime`, `timerfd_gettime` | a kqueue holding one timer; reads return the expiry count | `kqueue`, `kevent` (`EVFILT_TIMER`, `NOTE_NSECONDS \| NOTE_CRITICAL`) |
+| `timerfd_create`, `timerfd_settime`, `timerfd_gettime` | a kqueue holding one timer; reads return the expiry count; `TFD_IOC_SET_TICKS` sets the count the next read returns, readable at once | `kqueue`, `kevent` (`EVFILT_TIMER`, `NOTE_NSECONDS \| NOTE_CRITICAL`) |
 
 **`clock_nanosleep`** (and `nanosleep`, which is `clock_nanosleep` on
 `CLOCK_MONOTONIC`): a `TIMER_ABSTIME` time already past returns 0. The
@@ -2390,7 +2390,7 @@ where fwe falls short of Linux in detail is in
 | Pids in the initial pid namespace | **host** | the host's pids; thread ids from a counter fwe's processes share, from 100000, never a host pid |
 | Pid namespaces | **emulated** | records numbering processes and threads from 1, nested, every pid translated; init takes only the signals it handles and its end kills the rest ([Namespaces](#namespaces)) |
 | `clone3` `set_tid` | **emulated**; initial namespace **refused** | chooses pids in fwe's namespaces (`CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`); `EPERM` in the initial one, whose pids are macOS's |
-| `kernel.ns_last_pid` | **refused** | `ENOENT` in every pid namespace |
+| `kernel.ns_last_pid` | **enforced** | in fwe's pid namespaces the last pid given, and written (with `CAP_SYS_ADMIN` or `CAP_CHECKPOINT_RESTORE` over the namespace) where the next number starts; in the initial one the host's highest pid in use, not fwe's to set (`EPERM`) |
 | `kernel.pid_max` | **enforced** | for fwe's pid namespaces; host pids are macOS's |
 | uids, gids (real, effective, saved, fs), groups | **emulated** | virtual, root by default, Linux's `set*id` and `setgroups` rules and capability changes; per process, not per thread; the host process never changes ([Credential and namespace calls](#credential-and-namespace-calls)) |
 | The host user underneath | **host** | every guest user is the macOS user running fwe, with that user's rights ([Isolation and security](#isolation-and-security)) |
@@ -2439,7 +2439,7 @@ where fwe falls short of Linux in detail is in
 | Timer slack | **kept** | sleeps wake within tens of microseconds whatever it is |
 | `sysinfo` | **host** | uptime, load and memory; `procs` the caller's pid namespace's tasks |
 | `personality` | **kept**; `UNAME26`, `STICKY_TIMEOUTS` **emulated** | `PER_LINUX32` `EINVAL` |
-| `prctl` | **enforced** | the options it knows act or are kept as above; `PR_PAC_RESET_KEYS` only in the VM (natively `EINVAL`); speculation reads not affected (setting `ENXIO`); others `EINVAL` |
+| `prctl` | **enforced** | the options it knows act or are kept as above (`PR_SET_MM`: the break's start and end only kept); `PR_PAC_RESET_KEYS` only in the VM (natively `EINVAL`); speculation reads not affected (setting `ENXIO`); others `EINVAL` |
 | Parent-death signal, child subreaper | **emulated** | the signal when the parent process ends (not thread); orphans adopted by fwe ([Orphans and reapers](#orphans-and-reapers)) |
 | Process accounting (`acct`) | **emulated** | `acct_v3` records, per pid namespace |
 | Core dumps | **emulated** | fwe writes the ELF core (the dying thread's registers only), named by `kernel.core_pattern`; a pipe pattern dumps nothing; `coredump_filter` fixed |

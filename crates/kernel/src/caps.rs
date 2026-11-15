@@ -42,6 +42,7 @@ pub const CAP_SYS_BOOT: u32 = 22;
 pub const CAP_BPF: u32 = 39;
 pub const CAP_SYSLOG: u32 = 34;
 pub const CAP_WAKE_ALARM: u32 = 35;
+pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
 /// The highest capability (`CAP_CHECKPOINT_RESTORE`).
 pub const CAP_LAST_CAP: u32 = 40;
 /// Every capability.

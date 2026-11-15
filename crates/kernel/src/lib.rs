@@ -74,6 +74,7 @@ pub mod pidns;
 pub mod pipelock;
 pub mod posixtimer;
 pub mod prepcache;
+pub mod prmm;
 pub mod procfs;
 pub mod procmem;
 pub mod procnet;
@@ -1504,7 +1505,7 @@ fn is_regular(fd: i32) -> bool {
 /// the bytes copied, or an errno when none were.
 /// Whether the file of host status `st` is open for writing.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
-fn host_file_busy(st: &libc::stat) -> bool {
+pub(crate) fn host_file_busy(st: &libc::stat) -> bool {
     textbusy::is_being_written(st.st_dev as u64, st.st_ino as u64)
 }
 

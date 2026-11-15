@@ -789,6 +789,18 @@ pub fn own_program(exe: &[u8], cmdline: &[u8]) {
     });
 }
 
+/// This process's command line is `cmdline` (`PR_SET_MM`).
+pub fn own_cmdline(cmdline: &[u8]) {
+    let cmdline = cmdline.to_vec();
+    change_own(move |r| r.cmdline = cmdline.clone());
+}
+
+/// This process's program file is `exe` (`PR_SET_MM_EXE_FILE`).
+pub fn own_exe(exe: &[u8]) {
+    let exe = exe.to_vec();
+    change_own(move |r| r.exe = exe.clone());
+}
+
 /// This process's program started with auxiliary vector `auxv`.
 pub fn own_auxv(auxv: &[u8]) {
     let auxv = auxv.to_vec();
