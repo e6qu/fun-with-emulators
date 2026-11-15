@@ -601,13 +601,14 @@ def git_commands(ours, theirs, fresh, root):
               file=sys.stderr)
 
 
-def pcs(name, cmd, share=False):
+def pcs(name, cmd, share=False, execname="fwe"):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
     there (as `vmmap` lists it in the first process while it runs) and the
     offset into it: `sample` walks frames, which guest code without frame
     records leaves it short of. And the time the processes spend in each
-    host system call.
+    host system call. `execname` is the processes' name: fwe's, or a native
+    program's to compare with.
 
     With `share`, it returns the samples in the program's own code and all
     of them. A sample is fwe's in fwe itself, the host's libraries fwe
@@ -625,8 +626,8 @@ def pcs(name, cmd, share=False):
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
-    script = ('profile-997 /execname == "fwe"/ { @pc[arg1] = count(); } '
-              'syscall:::entry /execname == "fwe"/ { self->t = timestamp; } '
+    script = (f'profile-997 /execname == "{execname}"/ {{ @pc[arg1] = count(); }} '
+              f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
               'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); }')
@@ -879,6 +880,8 @@ def workloads(a, fwe, guest_env, lua_src, results):
     loop = ("cd /tmp/w && i=0; while [ $i -lt 20 ]; do echo $i >> src/lua.c; "
             "/usr/bin/git commit -q -am $i; i=$((i+1)); done")
     pcs("git commit", under("/bin/sh", "-c", loop))
+    pcs("git commit natively", ["/bin/sh", "-c", loop.replace("/tmp/w", theirs_w).replace(
+        "/usr/bin/git", brew["git"])], execname="git")
     # Its history with patches, one process: where git's own code goes.
     pcs("git log -p", under("/usr/bin/git", "-C", "/tmp/w", "log", "-p"))
     # One git process's start, where the workload's seventy go.
@@ -913,9 +916,10 @@ def workloads(a, fwe, guest_env, lua_src, results):
     # And xz alone, on the data that left (its code named by its library's
     # offsets, not its shell's): its two runs, each one process, are the
     # workload's share of fwe's.
-    # (Decompressing ten times over: once is over before `vmmap` looks.)
+    # (Decompressing sixty times over: once is over before `vmmap` has
+    # looked.)
     mine = [pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"), True),
-            pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", *["/tmp/w/data.xz"] * 10),
+            pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", *["/tmp/w/data.xz"] * 60),
                 True)]
     if all(mine):
         results.setdefault(SHARE, {})["xz (s)"] = (
