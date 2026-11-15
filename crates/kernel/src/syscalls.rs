@@ -934,7 +934,6 @@ impl<P: Platform> Kernel<P> {
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
                 let who = match a[0] as i32 as i64 {
-                    // The host has no per-thread usage; report the process's.
                     ru::RUSAGE_SELF | ru::RUSAGE_THREAD => libc::RUSAGE_SELF,
                     ru::RUSAGE_CHILDREN => libc::RUSAGE_CHILDREN,
                     _ => return err(errno::EINVAL),
@@ -944,6 +943,28 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: `usage` is a valid out-parameter.
                 if unsafe { libc::getrusage(who, &mut usage) } != 0 {
                     return last_error();
+                }
+                if a[0] as i32 as i64 == ru::RUSAGE_THREAD {
+                    // The calling thread's own times, as the host keeps
+                    // them per thread; the counts it keeps only per
+                    // process (faults, switches, blocks) are not this
+                    // thread's, and are left 0. The largest resident size
+                    // is the process's, as on Linux.
+                    // SAFETY: plain host call.
+                    let Some((user, system, _)) =
+                        host::thread_state(unsafe { libc::pthread_self() })
+                    else {
+                        return err(errno::EINVAL);
+                    };
+                    let tv = |ns: u64| libc::timeval {
+                        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+                        tv_usec: ((ns % 1_000_000_000) / 1000) as libc::suseconds_t,
+                    };
+                    let maxrss = usage.ru_maxrss;
+                    // SAFETY: an all-zero rusage is a valid value.
+                    usage = unsafe { std::mem::zeroed() };
+                    (usage.ru_utime, usage.ru_stime, usage.ru_maxrss) =
+                        (tv(user), tv(system), maxrss);
                 }
                 guest!(host::write_rusage(a[1], &usage));
                 0
@@ -4277,6 +4298,34 @@ mod tests {
         assert!(child.try_wait().unwrap().is_none(), "the host process lives");
         child.kill().unwrap();
         child.wait().unwrap();
+    }
+
+    /// `getrusage(RUSAGE_THREAD)` is the calling thread's own time: a
+    /// thread just started has run next to nothing, whatever the process
+    /// has.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn thread_usage_is_the_threads_own() {
+        let user_ms = |w: &[i64; 18]| w[0] * 1000 + w[1] / 1000;
+        let start = std::time::Instant::now();
+        let mut x = 0u64;
+        while start.elapsed() < std::time::Duration::from_millis(60) {
+            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+        }
+        let mut process = [0i64; 18];
+        let mut k = kernel();
+        k.syscall(nr::GETRUSAGE, [0, process.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        let fresh = std::thread::spawn(|| {
+            let mut own = [0i64; 18];
+            let mut k = kernel();
+            let r = k.syscall(nr::GETRUSAGE, [1, own.as_mut_ptr() as u64, 0, 0, 0, 0]);
+            (r, own)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(fresh.0, 0);
+        assert!(user_ms(&process) >= 40, "the process ran: {}", user_ms(&process));
+        assert!(user_ms(&fresh.1) < 20, "a new thread's own: {}", user_ms(&fresh.1));
     }
 
     /// A signal to a process group goes to each member the caller may
