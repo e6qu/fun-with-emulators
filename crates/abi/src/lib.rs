@@ -1194,6 +1194,11 @@ pub mod epoll {
     pub const EPOLLOUT: u32 = 0x004;
     pub const EPOLLERR: u32 = 0x008;
     pub const EPOLLHUP: u32 = 0x010;
+    pub const EPOLLRDNORM: u32 = 0x040;
+    pub const EPOLLRDBAND: u32 = 0x080;
+    pub const EPOLLWRNORM: u32 = 0x100;
+    pub const EPOLLWRBAND: u32 = 0x200;
+    pub const EPOLLMSG: u32 = 0x400;
     pub const EPOLLRDHUP: u32 = 0x2000;
     pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
     pub const EPOLLWAKEUP: u32 = 1 << 29;

@@ -27,6 +27,24 @@ int accept(int fd, void *addr, socklen_t *len);
 long read(int fd, void *buf, size_t n);
 int close(int fd);
 int socketpair(int domain, int type, int protocol, int sv[2]);
+int pipe(int fds[2]);
+long write(int fd, const void *buf, size_t n);
+int shutdown(int fd, int how);
+int epoll_create1(int flags);
+int epoll_ctl(int ep, int op, int fd, void *event);
+int epoll_wait(int ep, void *events, int max, int timeout);
+
+struct pollfd {
+    int fd;
+    short events, revents;
+};
+int poll(struct pollfd *fds, unsigned long n, int timeout);
+
+struct epoll_event {
+    unsigned events;
+    unsigned pad;
+    unsigned long long data;
+};
 int *__errno_location(void);
 int strcmp(const char *a, const char *b);
 int printf(const char *format, ...);
@@ -126,9 +144,32 @@ static int protocol(void) {
     return 0;
 }
 
+/* poll and epoll events by Linux's numbers: a pipe's write end is
+ * POLLWRNORM, a socket's POLLWRBAND too, POLLMSG never; a stream whose peer
+ * shut its writing is POLLRDHUP; epoll's EPOLLRDNORM is a read. */
+static int events(void) {
+    int p[2], sv[2], other[2];
+    pipe(p);
+    socketpair(1, SOCK_STREAM, 0, sv);
+    socketpair(1, SOCK_STREAM, 0, other);
+    struct pollfd fds[3] = {{p[1], 0x100 | 0x400, 0}, {other[0], 0x200, 0}, {sv[1], 0x2001, 0}};
+    shutdown(sv[0], 1);
+    int n = poll(fds, 3, 1000);
+    printf("poll %d: %#x %#x %#x\n", n, fds[0].revents, fds[1].revents, fds[2].revents & 0x2001);
+    write(p[1], "x", 1);
+    int ep = epoll_create1(0);
+    struct epoll_event ev = {0x40, 0, 7}, out;
+    epoll_ctl(ep, 1, p[0], &ev);
+    n = epoll_wait(ep, &out, 1, 1000);
+    printf("epoll %d: %#x\n", n, out.events);
+    return 0;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2)
         return 2;
+    if (!strcmp(argv[1], "events"))
+        return events();
     if (!strcmp(argv[1], "protocol"))
         return protocol();
     if (!strcmp(argv[1], "fastopen"))

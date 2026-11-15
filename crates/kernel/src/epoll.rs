@@ -449,8 +449,10 @@ unsafe fn pwait_ns(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
 unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) -> i64 {
     use fwe_abi::epoll::*;
 
-    let want_read = events & EPOLLIN != 0;
-    let want_write = events & EPOLLOUT != 0;
+    // Normal data is all the host reads and writes: `EPOLLRDNORM` is
+    // `EPOLLIN`'s filter, `EPOLLWRNORM` and `EPOLLWRBAND` `EPOLLOUT`'s.
+    let want_read = events & (EPOLLIN | EPOLLRDNORM) != 0;
+    let want_write = events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND) != 0;
     // A socket watched only for its reading side's shutting
     // (`EPOLLRDHUP`): the read filter, at a low-water mark no read reaches,
     // so it fires only at the end of the stream.
@@ -527,7 +529,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     let fifos: Vec<(i32, u64, u32)> = interest(|m| {
         m.get(&ep).map_or_else(Vec::new, |l| {
             l.iter()
-                .filter(|(_, (ev, _))| ev & EPOLLIN != 0)
+                .filter(|(_, (ev, _))| ev & READ != 0)
                 .map(|(&fd, &(ev, d))| (fd, d, ev))
                 .collect()
         })
@@ -591,7 +593,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             if !armed(ep, fd) {
                 continue;
             }
-            let mut bits = ev & EPOLLIN;
+            let mut bits = ev & READ;
             if bpf_watched(ep, fd) {
                 bits = EPOLLERR;
             } else if crate::mountwatch::changed(fd) == Some(true) {
@@ -826,7 +828,7 @@ fn armed(epfd: i32, fd: i32) -> bool {
     interest(|m| {
         m.get(&epfd)
             .and_then(|l| l.get(&fd))
-            .is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI) != 0)
+            .is_some_and(|&(ev, _)| ev & (READ | WRITE | EPOLLWRBAND | EPOLLRDHUP | EPOLLPRI) != 0)
     })
 }
 
@@ -837,7 +839,7 @@ fn disarm(epfd: i32, fd: i32) {
     use fwe_abi::epoll::*;
     let data = interest(|m| {
         let e = m.get_mut(&epfd)?.get_mut(&fd)?;
-        e.0 &= !(EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI);
+        e.0 &= !(READ | WRITE | EPOLLWRBAND | EPOLLRDHUP | EPOLLPRI);
         Some(e.1)
     });
     let Some(data) = data else { return };
@@ -937,6 +939,13 @@ fn kevent_once(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
     Ok((ready, reported))
 }
 
+/// What a readable descriptor reports (of what it was asked), and a
+/// writable one: normal data is all there is.
+#[cfg(not(target_os = "linux"))]
+const READ: u32 = fwe_abi::epoll::EPOLLIN | fwe_abi::epoll::EPOLLRDNORM;
+#[cfg(not(target_os = "linux"))]
+const WRITE: u32 = fwe_abi::epoll::EPOLLOUT | fwe_abi::epoll::EPOLLWRNORM;
+
 /// One `kevent` wait of [`kevent_once`].
 #[cfg(not(target_os = "linux"))]
 fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
@@ -992,23 +1001,24 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             // A Unix socket's peer has gone altogether (Linux shuts both
             // ways of it), so it has hung up too.
             libc::EVFILT_READ if eof && is_socket(fd) => {
-                bits |= EPOLLIN | EPOLLRDHUP | if is_unix(fd) { EPOLLHUP } else { 0 }
+                bits |= READ | EPOLLRDHUP | if is_unix(fd) { EPOLLHUP } else { 0 }
             }
-            libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { EPOLLIN } else { 0 },
+            libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { READ } else { 0 },
             // Edge-triggered, a pipe is readable anew only once written to.
             libc::EVFILT_READ
                 if ev.flags & libc::EV_CLEAR != 0
                     && is_pipe(fd)
                     && !pipe_grew(epfd, fd, ev.data as i64) => {}
-            libc::EVFILT_READ => bits |= EPOLLIN,
+            libc::EVFILT_READ => bits |= READ,
             // A pipe whose readers have gone is an error to write to; a
             // socket whose writing side is shut stays writable (a write
             // fails at once).
-            libc::EVFILT_WRITE if eof && !is_socket(fd) => bits |= EPOLLOUT | EPOLLERR,
+            libc::EVFILT_WRITE if eof && !is_socket(fd) => bits |= WRITE | EPOLLERR,
             // A pipe given less than the host's capacity is not writable
             // while full, which the host does not know.
             libc::EVFILT_WRITE if crate::fdstate::pipe_full(fd) => {}
-            libc::EVFILT_WRITE => bits |= EPOLLOUT,
+            // A socket's priority band is writable as its normal data is.
+            libc::EVFILT_WRITE => bits |= WRITE | if is_socket(fd) { EPOLLWRBAND } else { 0 },
             _ => {}
         }
         if ev.flags & libc::EV_ERROR != 0 {

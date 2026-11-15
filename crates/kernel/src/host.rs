@@ -1835,9 +1835,70 @@ pub fn socket_protocol(fd: i32) -> Option<i32> {
     }
 }
 
+/// `poll` events Linux and the host number alike: `POLLIN`, `POLLPRI`,
+/// `POLLOUT`, `POLLERR`, `POLLHUP`, `POLLNVAL`, `POLLRDNORM`, `POLLRDBAND`.
+const POLL_SHARED: i16 = 0xff;
+/// Linux's `POLLWRNORM`, `POLLWRBAND` (macOS's `POLLWRBAND` is 0x100, its
+/// `POLLWRNORM` its `POLLOUT`), `POLLMSG` and `POLLRDHUP`, which the host
+/// has not.
+pub const POLLWRNORM: i16 = 0x100;
+pub const POLLWRBAND: i16 = 0x200;
+pub const POLLMSG: i16 = 0x400;
+pub const POLLRDHUP: i16 = 0x2000;
+
+/// Linux `poll` events `linux` as the host's: those numbered alike as
+/// they are, `POLLWRNORM` and `POLLWRBAND` as the host numbers them, and
+/// what the host has not (`POLLMSG`, `POLLRDHUP`, which fwe looks for
+/// itself) left out.
+pub fn poll_events_to_host(linux: i16) -> i16 {
+    let mut h = linux & POLL_SHARED;
+    if linux & POLLWRNORM != 0 {
+        h |= libc::POLLWRNORM;
+    }
+    if linux & POLLWRBAND != 0 {
+        h |= libc::POLLWRBAND;
+    }
+    h
+}
+
+/// The host's `revents` `host` for a descriptor the guest asked `asked`
+/// (Linux events) of, as Linux reports them: each ready event the guest
+/// asked for under its Linux number, and an error, hang-up or invalid
+/// descriptor always.
+pub fn poll_revents_to_linux(host: i16, asked: i16) -> i16 {
+    let mut l = host & POLL_SHARED;
+    if host & libc::POLLOUT != 0 {
+        l |= POLLWRNORM;
+    }
+    if host & libc::POLLWRBAND != 0 {
+        l |= POLLWRBAND;
+    }
+    l & (asked | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Linux's write events reach the host by its numbers, never as
+    /// others (`POLLWRBAND` 0x200 is macOS's `POLLEXTEND`, `POLLMSG` its
+    /// `POLLATTRIB`), and come back by Linux's, only as asked.
+    #[test]
+    fn poll_events_are_translated() {
+        assert_eq!(poll_events_to_host(POLLWRNORM), libc::POLLWRNORM);
+        assert_eq!(poll_events_to_host(POLLWRBAND), libc::POLLWRBAND);
+        assert_eq!(poll_events_to_host(POLLMSG | POLLRDHUP), 0);
+        assert_eq!(
+            poll_events_to_host(libc::POLLIN | libc::POLLRDNORM),
+            libc::POLLIN | libc::POLLRDNORM
+        );
+        assert_eq!(poll_revents_to_linux(libc::POLLOUT, POLLWRNORM), POLLWRNORM);
+        assert_eq!(poll_revents_to_linux(libc::POLLWRBAND, POLLWRBAND), POLLWRBAND);
+        assert_eq!(
+            poll_revents_to_linux(libc::POLLOUT | libc::POLLHUP, libc::POLLIN),
+            libc::POLLHUP
+        );
+    }
 
     #[test]
     fn errno_translation() {

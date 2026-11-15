@@ -1132,6 +1132,20 @@ The masked waits (`ppoll`, `pselect6`, `epoll_pwait`, `epoll_pwait2`) run
 under the mask they are given, which stays replaced until a signal that
 ended the wait is delivered, as with `rt_sigsuspend`.
 
+**`poll` events**: Linux and macOS share the numbers of `POLLIN`,
+`POLLPRI`, `POLLOUT`, `POLLERR`, `POLLHUP`, `POLLNVAL`, `POLLRDNORM` and
+`POLLRDBAND`, not the rest: Linux's `POLLWRNORM` (0x100) is macOS's
+`POLLWRBAND`, its `POLLWRBAND` (0x200) macOS's `POLLEXTEND`, its `POLLMSG`
+(0x400) macOS's `POLLATTRIB`. fwe gives the host `POLLWRNORM` and
+`POLLWRBAND` by its numbers and leaves `POLLMSG` and `POLLRDHUP` out, then
+reports what is ready by Linux's numbers, only as asked (an error, hang-up
+or invalid descriptor always). `POLLRDHUP` is fwe's: a stream socket
+the host reports readable with nothing left to read (a peek of a byte
+returns 0) has had its peer's writing side shut, so it is reported only
+with `POLLIN` asked too. `epoll` takes `EPOLLRDNORM` as `EPOLLIN`,
+`EPOLLWRNORM` and `EPOLLWRBAND` as `EPOLLOUT`, and reports them so (a
+socket's `EPOLLWRBAND` when writable, as Linux's).
+
 **`epoll_ctl` and the waits** (`crates/kernel/src/epoll.rs`; the mapping of
 flags is under [Waiting and events](#waiting-and-events)): a socket
 watched only for `EPOLLRDHUP` gets a read filter with a low-water mark no

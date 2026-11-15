@@ -2980,7 +2980,7 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     } else {
         Vec::new()
     };
-    // `struct pollfd` and the POLL* bits match the host's.
+    // `struct pollfd` is laid out as the host's; its events are translated below.
     let mut set = vec![libc::pollfd { fd: 0, events: 0, revents: 0 }; nfds as usize];
     // SAFETY: a `pollfd` is plain data, as many bytes as the guest's.
     let bytes = unsafe {
@@ -2990,6 +2990,11 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         )
     };
     guest!(uaccess::read_into(fds, bytes));
+    // The events as the guest numbers them, and as the host does.
+    let asked: Vec<i16> = set.iter().map(|p| p.events).collect();
+    for p in &mut set {
+        p.events = host::poll_events_to_host(p.events);
+    }
     let deadline =
         (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
     let mut first = true;
@@ -3009,30 +3014,56 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
             })
         };
         first = false;
-        let mut ready = match poll_linux(&mut set, wait) {
-            Ok(n) => i64::from(n),
-            Err(e) => return err(e),
-        };
+        if let Err(e) = poll_linux(&mut set, wait) {
+            return err(e);
+        }
         for &i in &fifos {
             let p = &mut set[i];
             if p.revents & libc::POLLHUP == 0
                 && matches!(crate::fifo::probe(p.fd), crate::fifo::Probe::HungUp)
             {
-                if p.revents == 0 {
-                    ready += 1;
-                }
                 p.revents |= libc::POLLHUP;
             }
         }
+        let revents: Vec<i16> = set
+            .iter()
+            .zip(&asked)
+            .map(|(p, &a)| read_hangup(p.fd, a, host::poll_revents_to_linux(p.revents, a)))
+            .collect();
+        let ready = revents.iter().filter(|&&r| r != 0).count() as i64;
         if ready > 0 || fifos.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d)
         {
-            for (i, p) in set.iter().enumerate() {
+            for (i, r) in revents.iter().enumerate() {
                 let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
-                guest!(uaccess::write(at, p.revents));
+                guest!(uaccess::write(at, *r));
             }
             return ready;
         }
     }
+}
+
+/// `revents` (Linux's) of `fd`, asked `asked`, with `POLLRDHUP` when it
+/// was asked and `fd` is a stream socket whose peer has shut its writing
+/// side: readable, with nothing left to read (the host has no such
+/// event; it is looked for once the socket is readable, so with `POLLIN`
+/// asked too).
+fn read_hangup(fd: i32, asked: i16, revents: i16) -> i16 {
+    if asked & host::POLLRDHUP == 0 || revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+        return revents;
+    }
+    let mut ty: libc::c_int = 0;
+    let mut tl = size_of::<libc::c_int>() as libc::socklen_t;
+    let mut b = 0u8;
+    // SAFETY: valid out-parameters; a peek of at most a byte, not waited
+    // for.
+    let ended = unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&mut ty as *mut i32).cast(), &mut tl)
+            == 0
+            && ty == libc::SOCK_STREAM
+            && libc::recv(fd, (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+                == 0
+    };
+    if ended { revents | host::POLLRDHUP } else { revents }
 }
 
 /// The host's interfaces' IPv4 addresses, as (name as Linux has it, its

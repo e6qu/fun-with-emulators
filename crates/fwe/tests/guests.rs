@@ -1166,10 +1166,18 @@ fn a_signal_is_read_once_across_signalfds() {
 /// ping socket), and a Unix socket's error queue reads as empty.
 #[test]
 fn socket_protocol_and_error_queue_are_linuxs() {
+    c_guest_prints("sockopts", &["protocol"], "ping protocol 1, unix error queue -1 errno 11\n");
+}
+
+/// `poll` and `epoll` take and report events by Linux's numbers:
+/// `POLLWRNORM`, `POLLWRBAND` and `POLLRDHUP` as Linux reports them,
+/// `POLLMSG` never, `EPOLLRDNORM` for a read.
+#[test]
+fn poll_events_are_linuxs() {
     c_guest_prints(
         "sockopts",
-        &["protocol"],
-        "ping protocol 1, unix error queue -1 errno 11\n",
+        &["events"],
+        "poll 3: 0x100 0x200 0x2001\nepoll 1: 0x40\n",
     );
 }
 
