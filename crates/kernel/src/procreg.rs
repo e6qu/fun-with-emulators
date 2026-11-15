@@ -1479,6 +1479,8 @@ pub fn exiting(status: i32) {
     crate::inotify::exiting();
     // The program it runs no longer; no tracer waits on it.
     crate::textbusy::exiting();
+    // Its `O_TMPFILE` files' hidden names, as their descriptors close.
+    crate::tmpfile::exiting();
     crate::ptrace::exiting(status);
     crate::thread::process_ending();
     // Its System V IPC attachments and undo adjustments, as it ends.

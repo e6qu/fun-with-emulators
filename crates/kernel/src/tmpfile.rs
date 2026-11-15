@@ -1,8 +1,10 @@
 //! `O_TMPFILE`: a file with no name in a directory, which `linkat` with
 //! `AT_EMPTY_PATH` may give one. The host has no such file, so fwe makes
-//! it under a hidden name in the directory (one `getdents` leaves out),
-//! and removes the name when the descriptor is closed; one made with
-//! `O_EXCL`, which can never be given a name, loses it at once.
+//! it under a hidden name in the directory (one `getdents` leaves out, and
+//! a link count does not count), and removes the name when the last of
+//! the process's descriptors of it is closed, or the process ends; one
+//! made with `O_EXCL`, which can never be given a name, loses it at once.
+//! The name is its maker's: a fork child's descriptors leave it.
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -10,10 +12,41 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 /// The prefix of the hidden names.
 pub const PREFIX: &[u8] = b".fwe-tmpfile-";
 
-/// Each descriptor's hidden file: its host path.
-pub(crate) static NAMES: Mutex<Vec<(i32, std::ffi::CString)>> = Mutex::new(Vec::new());
+/// A hidden file: the descriptor it is held by, its host path and its
+/// host identity (device, inode).
+type Hidden = (i32, std::ffi::CString, (u64, u64));
+
+/// Each hidden file ([`Hidden`]).
+pub(crate) static NAMES: Mutex<Vec<Hidden>> = Mutex::new(Vec::new());
 /// Whether any is held (until then a close looks no further).
 static ANY: AtomicBool = AtomicBool::new(false);
+
+fn names() -> std::sync::MutexGuard<'static, Vec<Hidden>> {
+    NAMES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Whether the file of host identity `id` has a hidden name, which its
+/// link count leaves out.
+pub fn hidden(id: (u64, u64)) -> bool {
+    ANY.load(Ordering::Relaxed) && names().iter().any(|(_, _, i)| *i == id)
+}
+
+/// The process ends: its hidden names go.
+pub fn exiting() {
+    if !ANY.load(Ordering::Relaxed) {
+        return;
+    }
+    for (_, path, _) in names().drain(..) {
+        // SAFETY: a NUL-terminated host path of a file fwe made.
+        unsafe { libc::unlink(path.as_ptr()) };
+    }
+}
+
+/// In a fork child: the hidden names are the parent's to remove.
+pub fn forked_child() {
+    names().clear();
+    ANY.store(false, Ordering::Relaxed);
+}
 
 /// A hidden name for a new file.
 pub fn fresh_name() -> Vec<u8> {
@@ -35,20 +68,31 @@ pub fn made(fd: i32, now: bool) {
         unsafe { libc::unlink(path.as_ptr()) };
         return;
     }
-    NAMES.lock().unwrap_or_else(|e| e.into_inner()).push((fd, path));
+    let Some(id) = crate::fsops::host_identity(fd) else { return };
+    names().push((fd, path, id));
     ANY.store(true, Ordering::Relaxed);
 }
 
-/// Descriptor `fd` was closed: its hidden name goes.
+/// Descriptor `fd` is about to be closed: its hidden name goes, unless
+/// another descriptor of the process has the file open (a duplicate),
+/// which holds it from then on.
 pub fn closed(fd: i32) {
     if !ANY.load(Ordering::Relaxed) {
         return;
     }
-    let mut names = NAMES.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(i) = names.iter().position(|(f, _)| *f == fd) {
-        let (_, path) = names.swap_remove(i);
-        // SAFETY: a NUL-terminated host path of a file fwe made.
-        unsafe { libc::unlink(path.as_ptr()) };
+    let mut names = names();
+    let Some(i) = names.iter().position(|(f, _, _)| *f == fd) else { return };
+    let id = names[i].2;
+    let other = crate::fdtable::open_fds()
+        .into_iter()
+        .find(|&o| o != fd && crate::fsops::host_identity(o) == Some(id));
+    match other {
+        Some(o) => names[i].0 = o,
+        None => {
+            let (_, path, _) = names.swap_remove(i);
+            // SAFETY: a NUL-terminated host path of a file fwe made.
+            unsafe { libc::unlink(path.as_ptr()) };
+        }
     }
 }
 

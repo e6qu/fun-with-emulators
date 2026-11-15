@@ -6977,6 +6977,11 @@ fn fsrules(scenario: &str) -> String {
 
 /// [`fsrules`] with more arguments.
 fn fsrules_with(scenario: &str, args: &[&str]) -> String {
+    fsrules_then(scenario, args, |_| {})
+}
+
+/// [`fsrules_with`], then `check` of the root filesystem it ran in.
+fn fsrules_then(scenario: &str, args: &[&str], check: impl FnOnce(&Path)) -> String {
     let root = std::env::temp_dir().join(format!("fwe-fsr-{}-{scenario}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(root.join("tmp")).unwrap();
@@ -6986,6 +6991,7 @@ fn fsrules_with(scenario: &str, args: &[&str]) -> String {
     cmd.args(args);
     let out = run_bounded(cmd);
     eprintln!("--- fsrules {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    check(&root);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
     stdout(&out)
@@ -7148,6 +7154,22 @@ fn set_id_bits_go_with_any_change() {
         "dup: 775\nftruncate: 775\ntruncate: 775\nfallocate: 775\ncopy_file_range: 775\n\
          mmap: 775\n"
     );
+}
+
+/// An `O_TMPFILE` file has no link until given one, which any duplicate
+/// of its descriptor may do; a fork child's close leaves it to its maker;
+/// one still open as its process ends leaves no hidden file behind.
+#[test]
+fn o_tmpfile_files_have_no_name_until_linked() {
+    let mut left = Vec::new();
+    let out = fsrules_then("tmpfile", &[], |root| {
+        left = std::fs::read_dir(root.join("tmp/left"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+    });
+    assert_eq!(out, "links: 0\nlinked through a duplicate: ok links: 1\n");
+    assert!(left.is_empty(), "{left:?}");
 }
 
 /// A device node made outside `/dev` opens as its device when opened only

@@ -15,7 +15,7 @@ const O_TRUNC: i32 = 0o1000;
 const O_NONBLOCK: i32 = 0o4000;
 const O_DIRECTORY: i32 = 0o40000;
 const O_PATH: i32 = 0o10000000;
-const O_TMPFILE: i32 = 0o20200000;
+const O_TMPFILE: i32 = 0o20040000;
 const R_OK: i32 = 4;
 const W_OK: i32 = 2;
 const X_OK: i32 = 1;
@@ -947,9 +947,53 @@ fn setid_scenario() {
     });
 }
 
+/// The link count of the file open as `fd`.
+fn nlink_of(fd: i32) -> u32 {
+    let mut st = [0u64; 16];
+    // SAFETY: a buffer as big as a `struct stat`.
+    unsafe { fstat(fd, st.as_mut_ptr().cast()) };
+    (st[2] >> 32) as u32
+}
+
+/// An `O_TMPFILE` file has no link until one is given it, through any
+/// duplicate of its descriptor; a fork child's close leaves it to its
+/// maker; one the process still holds as it ends leaves nothing behind.
+fn tmpfile_scenario() {
+    const SYS_LINKAT: i64 = 37;
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/t").as_ptr(), 0o755);
+        mkdir(c("/tmp/left").as_ptr(), 0o755);
+    }
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/t").as_ptr(), O_TMPFILE | O_RDWR, 0o600) };
+    println!("links: {}", nlink_of(fd));
+    // SAFETY: plain calls on the descriptor.
+    let d = unsafe {
+        let d = dup(fd);
+        close(fd);
+        d
+    };
+    in_child(|| {
+        // SAFETY: the child's copy of the descriptor.
+        unsafe { close(d) };
+    });
+    let empty = c("");
+    // SAFETY: NUL-terminated paths.
+    let r = unsafe {
+        syscall(SYS_LINKAT, d, empty.as_ptr(), AT_FDCWD, c("/tmp/t/named").as_ptr(), AT_EMPTY_PATH)
+    };
+    println!("linked through a duplicate: {} links: {}", res(r), nlink_of(d));
+    in_child(|| {
+        // SAFETY: a NUL-terminated path; left open as the child ends.
+        unsafe { open(c("/tmp/left").as_ptr(), O_TMPFILE | O_RDWR, 0o600) };
+    });
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "tmpfile" => tmpfile_scenario(),
         "setid" => setid_scenario(),
         "atime" => atime_scenario(),
         "telldir" => telldir_scenario(),

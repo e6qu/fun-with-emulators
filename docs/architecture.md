@@ -855,9 +855,11 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   does.
 - **`O_TMPFILE`** (`crates/kernel/src/tmpfile.rs`): the file is made under
   a hidden name in its directory (`getdents` leaves it out; `rmdir` of a
-  directory holding only such names removes them), removed when the
-  descriptor is closed, or at once with `O_EXCL`; `linkat` gives it a
-  name through `/proc/self/fd`.
+  directory holding only such names removes them; its link count leaves
+  it out), removed when the last of its maker's descriptors of it is
+  closed or the maker ends (a fork child's close leaves it), or at once
+  with `O_EXCL`; `linkat` gives it a name through `/proc/self/fd` or
+  `AT_EMPTY_PATH`.
 - **File handles** (`crates/kernel/src/handles.rs`): a handle names the
   host file system and inode, which the host turns back into a path
   (`fsgetpath`) for `open_by_handle_at`, so it survives a rename and goes

@@ -15,6 +15,14 @@ fn linux_mode(mode: u32) -> u32 {
     if mode & S_IFMT == S_IFLNK { S_IFLNK | 0o777 } else { mode }
 }
 
+/// The link count of the file of host status `s`: an `O_TMPFILE` file's
+/// hidden name is no link of Linux's ([`crate::tmpfile`]).
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+fn nlink(s: &libc::stat) -> u32 {
+    let n = s.st_nlink as u32;
+    if crate::tmpfile::hidden((s.st_dev as u64, s.st_ino as u64)) { n.saturating_sub(1) } else { n }
+}
+
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 fn stat_to_linux(s: &libc::stat) -> Stat {
     // A host device has the numbers Linux gives it.
@@ -24,7 +32,7 @@ fn stat_to_linux(s: &libc::stat) -> Stat {
         st_dev: s.st_dev as u64,
         st_ino: s.st_ino as u64,
         st_mode: linux_mode(s.st_mode as u32),
-        st_nlink: s.st_nlink as u32,
+        st_nlink: nlink(s),
         st_uid: crate::userns::to_ns(s.st_uid, false),
         st_gid: crate::userns::to_ns(s.st_gid, true),
         st_rdev: rdev,
@@ -93,7 +101,7 @@ fn statx_from(s: &libc::stat) -> Statx {
             | if btime.is_some() { statx_mask::STATX_BTIME } else { 0 },
         stx_blksize: s.st_blksize as u32,
         stx_attributes: statx_attributes(s, false),
-        stx_nlink: s.st_nlink as u32,
+        stx_nlink: nlink(s),
         stx_uid: crate::userns::to_ns(s.st_uid, false),
         stx_gid: crate::userns::to_ns(s.st_gid, true),
         stx_mode: linux_mode(s.st_mode as u32) as u16,
