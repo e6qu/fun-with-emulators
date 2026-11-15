@@ -763,7 +763,8 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   group or a set-group-ID directory's), and `chown` changes the record
   under Linux's rules.
 - **Permission checks** are fwe's (`creds::Access::permits`): opening a
-  file, changing a directory's entries (with the sticky bit's
+  file, `faccessat` (by the real ids unless `AT_EACCESS`, the walk too),
+  changing a directory's entries (with the sticky bit's
   restriction), searching each directory of a path, `chdir`, `chmod`,
   `utimensat`, extended attributes, `execve` (root too needs an execute
   bit) and `O_NOATIME` (owner only), by the owner's, group's or others'

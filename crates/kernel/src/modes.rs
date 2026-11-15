@@ -247,6 +247,15 @@ pub fn guest_perm_at(dir: i32, name: &CStr, st: &libc::stat) -> u32 {
     mode_once(st, || read_at(dir, name)).unwrap_or(host)
 }
 
+/// [`guest_perm_fd`] for the file at host path `path` (not followed).
+pub fn guest_perm_path(path: &CStr, st: &libc::stat) -> u32 {
+    let host = crate::modes::perm_of(st);
+    if !marked(st) {
+        return host;
+    }
+    mode_once(st, || read_path(path)).unwrap_or(host)
+}
+
 /// Put the guest's permission bits in `st`.
 pub fn apply(st: &mut libc::stat, perm: u32) {
     st.st_mode = (st.st_mode & !0o7777) | perm as libc::mode_t;

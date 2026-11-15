@@ -88,8 +88,27 @@ fn permitted(ids: (u32, u32, &[u32]), caps: (bool, bool), st: &libc::stat, want:
 pub(crate) static ACCESS: crate::forklock::ForkRwLock<Option<Access>> =
     crate::forklock::ForkRwLock::new(None);
 
-/// The process's [`Access`] (root's before any is published).
+thread_local! {
+    /// The access this thread's lookups check in place of the process's
+    /// ([`walking_as`]).
+    static WALK_AS: std::cell::RefCell<Option<Access>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run `f` with this thread's lookups checking `a` instead of the
+/// process's access: `faccessat` walks as the real ids it checks with.
+pub fn walking_as<T>(a: Access, f: impl FnOnce() -> T) -> T {
+    let old = WALK_AS.with(|w| w.replace(Some(a)));
+    let r = f();
+    WALK_AS.with(|w| *w.borrow_mut() = old);
+    r
+}
+
+/// The process's [`Access`] (root's before any is published), or the one
+/// this thread walks as ([`walking_as`]).
 pub fn access() -> Access {
+    if let Some(a) = WALK_AS.with(|w| w.borrow().clone()) {
+        return a;
+    }
     ACCESS.read().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(Access {
         fsuid: 0,
         fsgid: 0,

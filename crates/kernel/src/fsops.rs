@@ -294,7 +294,9 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
         if unsafe { libc::lstat(c.as_ptr(), &mut out) } < 0 {
             return Err(host::errno_to_linux(host::last_errno()));
         }
+        let perm = crate::modes::guest_perm_path(&c, &out);
         let owner = crate::owners::of_path(&c, &out);
+        crate::modes::apply(&mut out, perm);
         crate::owners::apply(&mut out, owner);
         return Ok(out);
     }
@@ -1130,7 +1132,9 @@ impl<P: Platform> Kernel<P> {
 
     /// Whether `path` (from `dirfd`; followed if `follow`) allows the access
     /// `mode` asks (`R_OK`, `W_OK`, `X_OK`): 0, or the error, as `faccessat`
-    /// (with `eaccess`, `AT_EACCESS`) reports it.
+    /// (with `eaccess`, `AT_EACCESS`) reports it. The walk and the file are
+    /// checked as `open` checks them, by the guest's metadata (kept mode
+    /// and owner), with the ids [`access_creds`](Self::access_creds) gives.
     pub(crate) fn access_path(
         &self,
         dirfd: i32,
@@ -1142,51 +1146,80 @@ impl<P: Platform> Kernel<P> {
         if self.fs().synthetic(dirfd, path).is_some() {
             return self.access_synthetic(dirfd, path, mode, follow, eaccess);
         }
-        let r = match self.fs().resolve(dirfd, path, follow) {
+        let a = self.access_creds(eaccess);
+        let resolved =
+            crate::creds::walking_as(a.clone(), || self.fs().resolve(dirfd, path, follow));
+        let r = match resolved {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        const W_OK: u64 = 2;
-        if mode & W_OK != 0 && r.writable().is_err() {
-            return err(errno::EROFS);
-        }
-        let (dir, name) = match r.name_c() {
-            Ok(n) => (r.dir, n),
+        let name = match r.name_c() {
+            Ok(n) => n,
             Err(e) => return err(e),
         };
-        // With CAP_DAC_OVERRIDE (root's) the permission bits are bypassed, as
-        // on Linux: any existing file is accessible, and X_OK needs only one
-        // execute bit set.
-        const X_OK: u64 = 1;
-        let st = match stat_at(dir.as_raw_fd(), &name) {
+        let st = match stat_at(r.dir.as_raw_fd(), &name) {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        if self.creds.has(crate::caps::CAP_DAC_OVERRIDE) {
-            if mode & X_OK != 0 && (st.st_mode & 0o111) == 0 {
-                return err(errno::EACCES);
-            }
-            return 0;
+        let special = crate::devnodes::marked(&st);
+        self.access_result(&st, mode, &a, special, r.writable().is_err())
+    }
+
+    /// The access `faccessat` checks with: by default the caller's real
+    /// user and group, with the capabilities Linux gives them (the
+    /// permitted set for a real root, none for another, unless
+    /// `SECBIT_NO_SETUID_FIXUP`); with `eaccess` (`AT_EACCESS`), the ids
+    /// and capabilities it acts on files with.
+    fn access_creds(&self, eaccess: bool) -> crate::creds::Access {
+        let c = &self.creds;
+        let mut a = crate::creds::Access::of(c);
+        if eaccess {
+            return a;
         }
-        if crate::modes::marked(&st) {
-            // A kept mode: the owner's bits of it, which are the caller's.
-            let perm = crate::modes::perm_of(&st);
-            return if crate::modes::owner_allows(perm, mode as u32 & 7) {
-                0
-            } else {
-                err(errno::EACCES)
-            };
+        a.fsuid = c.uid;
+        a.fsgid = c.gid;
+        if c.caps.securebits & crate::caps::SECBIT_NO_SETUID_FIXUP == 0 {
+            let caps = if crate::userns::to_ns(c.uid, false) == 0 { c.caps.permitted } else { 0 };
+            a.dac_override = caps & 1 << crate::caps::CAP_DAC_OVERRIDE != 0;
+            a.dac_read_search = caps & 1 << crate::caps::CAP_DAC_READ_SEARCH != 0;
         }
-        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
-        ret(unsafe { libc::faccessat(dir.as_raw_fd(), name.as_ptr(), mode as i32, 0) })
+        a
+    }
+
+    /// The `faccessat` answer for the file of guest metadata `st`, asked
+    /// `mode` by a caller of access `a`: the permission bits first, as
+    /// Linux checks them, then `EROFS` (on a `read_only` mount) for asking
+    /// to write a file that is not a device (`special`), FIFO or socket. A
+    /// symbolic link's own bits are all set.
+    fn access_result(
+        &self,
+        st: &libc::stat,
+        mode: u64,
+        a: &crate::creds::Access,
+        special: bool,
+        read_only: bool,
+    ) -> i64 {
+        const W_OK: u64 = 2;
+        let kind = st.st_mode & libc::S_IFMT;
+        // Without a root filesystem, the host's own files (root's, with no
+        // owner kept) are the host user's to allow ([`Self::permits`]).
+        let host_own =
+            st.st_uid == 0 && st.st_gid == 0 && self.fs_opt().is_some_and(|f| f.root_is_host());
+        if kind != libc::S_IFLNK && !host_own && !a.permits(st, mode as u32 & 7) {
+            return err(errno::EACCES);
+        }
+        let special = special
+            || [libc::S_IFIFO, libc::S_IFSOCK, libc::S_IFCHR, libc::S_IFBLK].contains(&kind);
+        if mode & W_OK != 0 && read_only && !special {
+            return err(errno::EROFS);
+        }
+        0
     }
 
     /// `faccessat` of a file of fwe's `/proc` or `/sys`: whether it exists,
-    /// and the caller's access by the mode `stat` shows for it, as Linux
-    /// checks it (root's `CAP_DAC_OVERRIDE` bypassing all but a missing
-    /// execute bit on a file). A process's `oom_score_adj` is writable as
-    /// opening it to write is. The caller's real ids are checked, or with
-    /// `eaccess` (`AT_EACCESS`) those it acts on files with.
+    /// and the caller's access by the mode `stat` shows for it, as
+    /// [`access_result`](Self::access_result) checks it. A process's
+    /// `oom_score_adj` is writable as opening it to write is.
     fn access_synthetic(
         &self,
         dirfd: i32,
@@ -1196,7 +1229,6 @@ impl<P: Platform> Kernel<P> {
         eaccess: bool,
     ) -> i64 {
         const W_OK: u64 = 2;
-        const X_OK: u64 = 1;
         let st = match self.linux_stat(dirfd, path, follow, 0) {
             Ok(s) => s,
             Err(e) => return err(e),
@@ -1215,76 +1247,35 @@ impl<P: Platform> Kernel<P> {
                 (Ok(_), rest) => self.access_synthetic(dirfd, path, rest, follow, eaccess),
             };
         }
-        if self.creds.has(crate::caps::CAP_DAC_OVERRIDE) {
-            let dir = kind == fwe_abi::stat::S_IFDIR;
-            return if mode & X_OK != 0 && !dir && st.st_mode & 0o111 == 0 {
-                err(errno::EACCES)
-            } else {
-                0
-            };
-        }
-        let c = &self.creds;
-        let (uid, gid) = if eaccess { (c.fsuid, c.fsgid) } else { (c.uid, c.gid) };
-        let shift = if st.st_uid == uid {
-            6
-        } else if st.st_gid == gid || c.groups.contains(&st.st_gid) {
-            3
-        } else {
-            0
-        };
-        let bits = (st.st_mode >> shift) & 7;
-        if bits & mode as u32 == mode as u32 { 0 } else { err(errno::EACCES) }
+        let mut host = zeroed_stat();
+        let kind = if kind == fwe_abi::stat::S_IFDIR { libc::S_IFDIR } else { libc::S_IFREG };
+        host.st_mode = kind | (st.st_mode & 0o7777) as libc::mode_t;
+        host.st_uid = st.st_uid;
+        host.st_gid = st.st_gid;
+        self.access_result(&host, mode, &self.access_creds(eaccess), false, false)
     }
 
     /// `faccessat2(fd, "", mode, AT_EMPTY_PATH)`: the access the caller has
-    /// to the file `fd` is open on (or, for an `O_PATH` stand-in, names).
+    /// to the file `fd` is open on (or, for an `O_PATH` stand-in, names),
+    /// by its guest metadata, as [`access_path`](Self::access_path) checks.
+    /// A pipe or socket of no path is its maker's, as Linux's are.
     fn access_fd(&self, fd: i32, mode: u64) -> i64 {
-        let st = match stat_fd(fd) {
+        let mut st = match stat_fd(fd) {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        const W_OK: u64 = 2;
-        const X_OK: u64 = 1;
-        if mode & W_OK != 0
-            && crate::fdmarks::origin(fd).is_some_and(|o| o.flags & crate::mounts::ms::RDONLY != 0)
+        let a = self.access_creds(false);
+        let kind = st.st_mode & libc::S_IFMT;
+        if (kind == libc::S_IFIFO || kind == libc::S_IFSOCK)
+            && crate::fdmarks::stand_in(fd).is_none()
+            && crate::fs::host_path_of(fd).is_none()
         {
-            return err(errno::EROFS);
+            st.st_uid = a.fsuid;
+            st.st_gid = a.fsgid;
         }
-        if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
-            // A symbolic link's own bits are all set.
-            return 0;
-        }
-        if self.creds.has(crate::caps::CAP_DAC_OVERRIDE) {
-            if mode & X_OK != 0 && (st.st_mode & 0o111) == 0 {
-                return err(errno::EACCES);
-            }
-            return 0;
-        }
-        if crate::modes::marked(&st) {
-            let perm = crate::modes::perm_of(&st);
-            return if crate::modes::owner_allows(perm, mode as u32 & 7) {
-                0
-            } else {
-                err(errno::EACCES)
-            };
-        }
-        if let Some(path) = crate::fs::host_path_of(fd).filter(|p| p.starts_with(b"/"))
-            && let Ok(c) = CString::new(path)
-        {
-            // SAFETY: a NUL-terminated path.
-            return ret(unsafe { libc::access(c.as_ptr(), mode as i32) });
-        }
-        // A file with no path (a pipe, a socket): its bits for the caller.
-        let (uid, gid) = (host::euid(), host::egid());
-        let shift = if st.st_uid == uid {
-            6
-        } else if st.st_gid == gid {
-            3
-        } else {
-            0
-        };
-        let bits = (st.st_mode as u32 >> shift) & 7;
-        if bits & mode as u32 == mode as u32 { 0 } else { err(errno::EACCES) }
+        let read_only =
+            crate::fdmarks::origin(fd).is_some_and(|o| o.flags & crate::mounts::ms::RDONLY != 0);
+        self.access_result(&st, mode, &a, crate::devnodes::marked(&st), read_only)
     }
 
     /// `statfs(path, buf)`: the filesystem of the directory holding `path`
@@ -4574,5 +4565,68 @@ mod tests {
         );
         assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
         assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
+    }
+
+    /// `faccessat` checks the guest's ids against the file's guest owner
+    /// and mode as `open` does: the real ids by default (without the
+    /// capabilities of an effective root), the effective ones with
+    /// `AT_EACCESS`; the walk searches as the same ids; root passes all but
+    /// running a file nobody may run, and searches a directory of no
+    /// execute bit.
+    #[test]
+    fn access_checks_the_guests_ids_as_open_does() {
+        use fwe_abi::fcntl::{AT_EACCESS, F_OK, O_CREAT, O_RDWR, R_OK, W_OK, X_OK};
+        let (mut k, _d) = rooted();
+        let f = cstr("/f");
+        let fd = open(&mut k, &f, O_CREAT | O_RDWR, 0o640);
+        assert!(fd >= 0);
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+        let dir = cstr("/d");
+        assert_eq!(k.syscall(nr::MKDIRAT, [AT_FDCWD, dir.as_ptr() as u64, 0o600, 0, 0, 0]), 0);
+        let inner = cstr("/d/g");
+        let fd = open(&mut k, &inner, O_CREAT | O_RDWR, 0o644);
+        assert!(fd >= 0);
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+        let access = |k: &Kernel<NoPlatform>, p: &CString, mode: u64, flags: u64| {
+            k.sys_faccessat(AT_FDCWD, p.as_ptr() as u64, mode, flags)
+        };
+        // Root: everything but executing a file of no execute bit; a
+        // directory of none is searched.
+        assert_eq!(access(&k, &f, R_OK | W_OK, 0), 0);
+        assert_eq!(access(&k, &f, X_OK, 0), err(errno::EACCES));
+        assert_eq!(access(&k, &dir, X_OK, 0), 0);
+        // Called directly, never published: other tests' walks are not
+        // this user's.
+        let c = &mut k.creds;
+        (c.uid, c.euid, c.suid, c.fsuid) = (1000, 1000, 1000, 1000);
+        (c.gid, c.egid, c.sgid, c.fsgid) = (1000, 1000, 1000, 1000);
+        c.groups = vec![1000];
+        c.caps.effective = 0;
+        c.caps.permitted = 0;
+        assert_eq!(access(&k, &f, F_OK, 0), 0);
+        assert_eq!(access(&k, &f, R_OK, 0), err(errno::EACCES), "others may not read");
+        // The group's bits for a member of the file's group.
+        k.creds.groups = vec![1000, 0];
+        assert_eq!(access(&k, &f, R_OK, 0), 0);
+        assert_eq!(access(&k, &f, W_OK, 0), err(errno::EACCES));
+        // A directory the caller may not search hides what is in it.
+        assert_eq!(access(&k, &inner, F_OK, 0), err(errno::EACCES));
+        // An effective root whose real user is not: the real ids, with no
+        // capabilities, unless asked for the effective ones.
+        k.creds.groups = vec![1000];
+        (k.creds.euid, k.creds.fsuid) = (0, 0);
+        k.creds.caps.effective = crate::caps::INITIAL;
+        k.creds.caps.permitted = crate::caps::INITIAL;
+        assert_eq!(access(&k, &f, R_OK, 0), err(errno::EACCES));
+        assert_eq!(access(&k, &inner, F_OK, 0), err(errno::EACCES));
+        assert_eq!(access(&k, &f, R_OK | W_OK, AT_EACCESS), 0);
+        assert_eq!(access(&k, &inner, R_OK, AT_EACCESS), 0);
+        // A real root that is not effective: its permitted capabilities.
+        (k.creds.uid, k.creds.euid, k.creds.fsuid) = (0, 1000, 1000);
+        k.creds.caps.effective = 0;
+        assert_eq!(access(&k, &f, R_OK | W_OK, 0), 0);
+        assert_eq!(access(&k, &f, R_OK, AT_EACCESS), err(errno::EACCES));
     }
 }

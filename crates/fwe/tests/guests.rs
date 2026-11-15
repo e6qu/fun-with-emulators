@@ -6968,3 +6968,32 @@ fn newer_system_calls() {
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// Run one scenario of the `fsrules` guest in a root filesystem of its own
+/// (`/tmp`) and return its output.
+fn fsrules(scenario: &str) -> String {
+    let root = std::env::temp_dir().join(format!("fwe-fsr-{}-{scenario}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("fsrules"), root.join("fsrules")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures").arg("--root").arg(&root).arg(root.join("fsrules")).arg(scenario);
+    let out = run_bounded(cmd);
+    eprintln!("--- fsrules {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
+    stdout(&out)
+}
+
+/// `access` answers as `open` checks: a user that is not root is held to
+/// the file's guest owner and mode, and to the search bits on the way; the
+/// real ids are checked unless `AT_EACCESS` asks for the effective ones;
+/// root searches a directory of no execute bit but runs no file of none.
+#[test]
+fn access_checks_the_guests_ids() {
+    assert_eq!(
+        fsrules("access"),
+        "root X_OK dir: ok file: EACCES\nuser R_OK: EACCES open: EACCES\n\
+         user W_OK: EACCES beyond a closed dir: EACCES\nreal: EACCES effective: ok\n"
+    );
+}
