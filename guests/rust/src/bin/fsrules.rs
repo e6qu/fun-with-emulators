@@ -1054,9 +1054,25 @@ fn tmpfs_size_scenario() {
     println!("remount: {} then a write of 64k: {n}", res(r.into()));
 }
 
+/// `/proc/self/mountinfo` gives the root filesystem the device numbers
+/// `stat` reports for its files.
+fn mountinfo_scenario() {
+    let mut st = [0u64; 16];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+    unsafe { stat(c("/tmp").as_ptr(), st.as_mut_ptr().cast()) };
+    let dev = st[0];
+    let major = ((dev >> 8) & 0xfff) | ((dev >> 32) & !0xfff);
+    let minor = (dev & 0xff) | ((dev >> 12) & !0xff);
+    let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let root = info.lines().find(|l| l.split(' ').nth(4) == Some("/")).unwrap();
+    let numbers = root.split(' ').nth(2).unwrap();
+    println!("root's numbers match stat: {}", numbers == format!("{major}:{minor}"));
+}
+
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "mountinfo" => mountinfo_scenario(),
         "tmpfs" => tmpfs_size_scenario(),
         "tmpfile" => tmpfile_scenario(),
         "setid" => setid_scenario(),

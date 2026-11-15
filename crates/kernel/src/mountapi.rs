@@ -1057,7 +1057,7 @@ impl<P: Platform> Kernel<P> {
             |sm: &mut Vec<u8>, at: usize, v: u64| sm[at..at + 8].copy_from_slice(&v.to_ne_bytes());
         let mut done = 0u64;
         if mask & STATMOUNT_SB_BASIC != 0 {
-            let (major, minor) = self.mount_device(&m);
+            let (major, minor) = m.device_numbers();
             put32(&mut sm, 16, major);
             put32(&mut sm, 20, minor);
             put64(&mut sm, 24, m.fstype.magic() as u64);
@@ -1116,29 +1116,6 @@ impl<P: Platform> Kernel<P> {
         }
         guest!(uaccess::write_from(buf, &sm[..head]));
         0
-    }
-
-    /// The device numbers of mount `m`'s filesystem, as `stat` of its root
-    /// reports them.
-    #[allow(clippy::unnecessary_cast)] // `dev_t` differs by host
-    fn mount_device(&self, m: &Mount) -> (u32, u32) {
-        // A tmpfs is a device of its own, as its files' `stat` gives it.
-        if m.fstype == crate::mounts::FsType::Tmpfs {
-            return (0, 20 + m.id);
-        }
-        let st = m.host_path(b"").and_then(|p| std::ffi::CString::new(p).ok()).and_then(|c| {
-            // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: a NUL-terminated path and a valid out-parameter.
-            (unsafe { libc::stat(c.as_ptr(), &mut st) } == 0).then_some(st)
-        });
-        match st {
-            Some(st) => {
-                let dev = st.st_dev as u64;
-                (crate::fsops::major(dev), crate::fsops::minor(dev))
-            }
-            None => (0, 20 + m.id),
-        }
     }
 
     /// `listmount(req, mnt_ids, nr_mnt_ids, flags)`: the unique ids of the

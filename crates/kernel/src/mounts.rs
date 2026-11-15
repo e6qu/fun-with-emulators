@@ -234,6 +234,32 @@ impl Mount {
     pub fn read_only(&self) -> bool {
         self.flags & ms::RDONLY != 0
     }
+
+    /// The device numbers (major, minor) `mountinfo` and `statmount` give
+    /// the mount, the ones its files' `stat` reports: a tmpfs is a device
+    /// of its own; a host directory, or an overlay's layers, the host
+    /// device it is on; anything else fwe makes up one of its own.
+    pub fn device_numbers(&self) -> (u32, u32) {
+        let own = (0, 20 + self.id);
+        if self.fstype == FsType::Tmpfs {
+            return own;
+        }
+        let dir = match &self.source {
+            Source::Host(_) => self.host_path(b""),
+            Source::Overlay(l) => l.paths().next().map(<[u8]>::to_vec),
+            _ => None,
+        };
+        let st = dir.and_then(|p| std::ffi::CString::new(p).ok()).and_then(|c| {
+            // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a valid out-parameter.
+            (unsafe { libc::stat(c.as_ptr(), &mut st) } == 0).then_some(st)
+        });
+        #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+        st.map_or(own, |st| {
+            (crate::fsops::major(st.st_dev as u64), crate::fsops::minor(st.st_dev as u64))
+        })
+    }
 }
 
 /// `a` and `b` joined with one `/` between them; `b` may be empty or start
@@ -1226,6 +1252,7 @@ impl Table {
             let point = if rel.is_empty() { b"/".to_vec() } else { rel.to_vec() };
             let parent = if m.parent == m.id { m.id } else { m.parent };
             let opts = m.mount_options();
+            let dev = m.device_numbers();
             let mut optional = Vec::new();
             if m.peer != 0 {
                 optional.extend_from_slice(format!(" shared:{}", m.peer).as_bytes());
@@ -1237,7 +1264,7 @@ impl Table {
                 optional.extend_from_slice(b" unbindable");
             }
             let line = [
-                format!("{} {} 0:{} ", m.id, parent, 20 + m.id).as_bytes(),
+                format!("{} {} {}:{} ", m.id, parent, dev.0, dev.1).as_bytes(),
                 &escape(&m.root),
                 b" ",
                 &escape(&point),

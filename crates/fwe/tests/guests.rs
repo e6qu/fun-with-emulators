@@ -7184,6 +7184,13 @@ fn tmpfs_size_holds_for_every_write() {
     );
 }
 
+/// `mountinfo` gives a host-backed mount the device numbers `stat`
+/// reports for its files, as tools matching the two need.
+#[test]
+fn mountinfo_device_numbers_match_stat() {
+    assert_eq!(fsrules("mountinfo"), "root's numbers match stat: true\n");
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).
