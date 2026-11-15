@@ -4275,6 +4275,21 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// `madvise` controls what a fork child is given (`MADV_DONTFORK`), makes
+/// guard pages, frees a shared file's pages (`MADV_REMOVE`) and discards
+/// locked memory (`MADV_DONTNEED_LOCKED`), as Linux does.
+#[test]
+fn madvise_controls_fork_guards_and_removal() {
+    assert_eq!(
+        identity(&["madvise"]),
+        "dontfork 0: child has it unmapped exit 1; dofork: child reads exit 7\n\
+         guard 0: access killed by 11, neighbours 2, after mprotect killed by 11; removed 0: reads 0\n\
+         locked: guard EINVAL, dontneed EINVAL, dontneed_locked 0 reads 0\n\
+         remove: private anonymous EINVAL, shared anonymous 0 reads 0, private file EACCES, \
+         shared file 0 file reads 0\n"
+    );
+}
+
 /// `RLIMIT_MEMLOCK` bounds locked mappings as it bounds `mlock`:
 /// `MAP_LOCKED` and mappings made after `mlockall(MCL_FUTURE)`.
 #[test]

@@ -219,8 +219,14 @@ pub mod mman {
     pub const MADV_WILLNEED: u64 = 3;
     pub const MADV_DONTNEED: u64 = 4;
     pub const MADV_FREE: u64 = 8;
+    pub const MADV_REMOVE: u64 = 9;
+    pub const MADV_DONTFORK: u64 = 10;
+    pub const MADV_DOFORK: u64 = 11;
     pub const MADV_DONTDUMP: u64 = 16;
     pub const MADV_DODUMP: u64 = 17;
+    pub const MADV_DONTNEED_LOCKED: u64 = 24;
+    pub const MADV_GUARD_INSTALL: u64 = 102;
+    pub const MADV_GUARD_REMOVE: u64 = 103;
 }
 
 /// File status flags (`asm-generic/fcntl.h`, arm64 overrides).

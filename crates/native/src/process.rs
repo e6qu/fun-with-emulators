@@ -311,6 +311,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             unsafe { libc::close(done[1]) };
             done[1] = -1;
         }
+        // Nor any of what was not to be inherited.
+        if pid == 0 && share.is_empty() {
+            kernel.as_mut().unwrap().unmap_dont_fork();
+        }
         if pid == 0 {
             // SAFETY: this is the child, its only thread the caller, which
             // holds the lock.

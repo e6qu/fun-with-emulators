@@ -34,6 +34,17 @@ const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
 const MAP_LOCKED: i32 = 0x2000;
 const MCL_FUTURE: i32 = 2;
 const SYS_MMAP: i64 = 222;
+const MAP_SHARED: i32 = 0x01;
+const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
+const MAP_PRIVATE: i32 = 0x02;
+const MADV_NORMAL: i32 = 0;
+const MADV_DONTNEED: i32 = 4;
+const MADV_REMOVE: i32 = 9;
+const MADV_DONTFORK: i32 = 10;
+const MADV_DOFORK: i32 = 11;
+const MADV_DONTNEED_LOCKED: i32 = 24;
+const MADV_GUARD_INSTALL: i32 = 102;
+const MADV_GUARD_REMOVE: i32 = 103;
 const SYS_TIMER_CREATE: i64 = 107;
 const SYS_TIMER_DELETE: i64 = 111;
 const CLOCK_MONOTONIC: i64 = 1;
@@ -81,6 +92,11 @@ unsafe extern "C" {
     fn mlock(addr: *const c_void, len: usize) -> i32;
     fn mlockall(flags: i32) -> i32;
     fn munlockall() -> i32;
+    fn madvise(addr: *mut c_void, len: usize, advice: i32) -> i32;
+    fn mprotect(addr: *mut c_void, len: usize, prot: i32) -> i32;
+    fn memfd_create(name: *const c_char, flags: u32) -> i32;
+    fn ftruncate(fd: i32, len: i64) -> i32;
+    fn pread(fd: i32, buf: *mut c_void, len: usize, off: i64) -> isize;
     fn waitid(idtype: i32, id: u32, info: *mut [u8; 128], options: i32) -> i32;
     fn __errno_location() -> *mut i32;
 }
@@ -331,6 +347,88 @@ fn map_anon(len: usize, flags: i32) -> String {
     outcome(r)
 }
 
+/// A child that runs `f` and exits with what it returns: how it ended,
+/// its exit status or `killed by <signal>`.
+fn in_child(f: impl FnOnce() -> i32) -> String {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let pid = fork();
+        if pid == 0 {
+            _exit(f());
+        }
+        let mut status = 0;
+        waitpid(pid, &mut status, 0);
+        if status & 0x7f != 0 { format!("killed by {}", status & 0x7f) } else { format!("exit {}", (status >> 8) & 0xff) }
+    }
+}
+
+/// `madvise`'s controls of what a fork child gets and what memory holds:
+/// `MADV_DONTFORK` (the child has nothing there) and `MADV_DOFORK`;
+/// guard pages (an access is a `SIGSEGV`, whatever `mprotect` says, until
+/// removed, then reading zero); `MADV_REMOVE` (a shared mapping's file
+/// reads zero; private memory refused); `MADV_DONTNEED_LOCKED`.
+fn madvise_controls() {
+    // SAFETY: plain calls into the C library on mappings made here.
+    unsafe {
+        let k = 16 << 10;
+        let anon = |len: usize, flags: i32| {
+            mmap(std::ptr::null_mut(), len, PROT_RW, flags, -1, 0) as *mut u8
+        };
+        let p = anon(k, MAP_PRIVATE_ANON);
+        *p = 7;
+        let dont = madvise(p.cast(), k, MADV_DONTFORK);
+        let without = in_child(|| i32::from(madvise(p.cast(), k, MADV_NORMAL) == -1 && errno() == 12));
+        madvise(p.cast(), k, MADV_DOFORK);
+        let with = in_child(|| i32::from(*p));
+        println!("dontfork {dont}: child has it unmapped {without}; dofork: child reads {with}");
+
+        let g = anon(3 * k, MAP_PRIVATE_ANON);
+        std::ptr::write_bytes(g, 1, 3 * k);
+        let installed = madvise(g.add(k).cast(), k, MADV_GUARD_INSTALL);
+        let touch = || in_child(|| i32::from(std::ptr::read_volatile(g.add(k))));
+        let first = touch();
+        let neighbours = *g + *g.add(2 * k);
+        mprotect(g.cast(), 3 * k, PROT_RW);
+        let after_mprotect = touch();
+        let removed = madvise(g.add(k).cast(), k, MADV_GUARD_REMOVE);
+        println!(
+            "guard {installed}: access {first}, neighbours {neighbours}, after mprotect {after_mprotect}; removed {removed}: reads {}",
+            *g.add(k)
+        );
+        let l = anon(k, MAP_PRIVATE_ANON);
+        mlock(l.cast(), k);
+        let guard_locked = madvise(l.cast(), k, MADV_GUARD_INSTALL);
+        let guard_locked = if guard_locked == -1 && errno() == 22 { "EINVAL".to_string() } else { guard_locked.to_string() };
+        *l = 3;
+        let dontneed = madvise(l.cast(), k, MADV_DONTNEED);
+        let dontneed = if dontneed == -1 && errno() == 22 { "EINVAL".to_string() } else { dontneed.to_string() };
+        let locked = madvise(l.cast(), k, MADV_DONTNEED_LOCKED);
+        println!("locked: guard {guard_locked}, dontneed {dontneed}, dontneed_locked {locked} reads {}", *l);
+
+        let errno_of = |r: i32| if r == 0 { "0".to_string() } else { match errno() { 13 => "EACCES".into(), 22 => "EINVAL".into(), e => format!("errno {e}") } };
+        let private = anon(k, MAP_PRIVATE_ANON);
+        let private_anon = errno_of(madvise(private.cast(), k, MADV_REMOVE));
+        let shared = anon(k, MAP_SHARED_ANON);
+        *shared = 5;
+        let shared_anon = errno_of(madvise(shared.cast(), k, MADV_REMOVE));
+        let shared_reads = *shared;
+        let name = CString::new("remove").unwrap();
+        let fd = memfd_create(name.as_ptr(), 0);
+        ftruncate(fd, k as i64);
+        let file_private = mmap(std::ptr::null_mut(), k, PROT_RW, MAP_PRIVATE, fd, 0);
+        let private_file = errno_of(madvise(file_private, k, MADV_REMOVE));
+        let file = mmap(std::ptr::null_mut(), k, PROT_RW, MAP_SHARED, fd, 0) as *mut u8;
+        *file = 9;
+        let shared_file = errno_of(madvise(file.cast(), k, MADV_REMOVE));
+        let mut b = 1u8;
+        pread(fd, (&mut b as *mut u8).cast(), 1, 0);
+        println!(
+            "remove: private anonymous {private_anon}, shared anonymous {shared_anon} reads {shared_reads}, \
+             private file {private_file}, shared file {shared_file} file reads {b}"
+        );
+    }
+}
+
 /// `RLIMIT_MEMLOCK` for a process without `CAP_IPC_LOCK` (uid 1000): a
 /// `MAP_LOCKED` mapping is refused with a limit of 0 (`EPERM`) and past
 /// the limit (`EAGAIN`), as is any mapping after `mlockall(MCL_FUTURE)`;
@@ -565,6 +663,7 @@ fn main() {
         "sigpending" => sigpending_limit(),
         "priorities" => priorities(),
         "memlock" => memlock(),
+        "madvise" => madvise_controls(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

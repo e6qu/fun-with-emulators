@@ -1322,9 +1322,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   part is not shared with processes that share the rest;
   `MADV_DONTNEED` on a private file mapping keeps modified pages where
   Linux restores the file's.
-- VM: a fork child keeps the memory `MADV_WIPEONFORK` was given; a
-  `MAP_GROWSDOWN` mapping does not grow, and `MADV_HWPOISON` poisons
-  nothing.
+- VM: a fork child keeps the memory `MADV_WIPEONFORK` and
+  `MADV_DONTFORK` were given; a `MAP_GROWSDOWN` mapping does not grow;
+  `MADV_HWPOISON` poisons nothing, `MADV_GUARD_INSTALL` guards nothing,
+  `MADV_REMOVE` frees nothing, and `MADV_FREE`, `MADV_DONTDUMP` are
+  ignored (the VM's `madvise` acts on `MADV_DONTNEED` and
+  `MADV_DONTNEED_LOCKED` only).
+- `MADV_REMOVE` zeroes the pages where Linux frees the file's blocks.
 - Another process's `/proc/<pid>/mem` reaches its memory as
   `process_vm_readv` does (or, for a stopped tracee of the reader's,
   through its ptrace mailbox), and `pagemap` is the caller's own only; a

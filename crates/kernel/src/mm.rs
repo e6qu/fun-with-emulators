@@ -61,6 +61,13 @@ pub(crate) struct Ranges {
     /// Guest ranges given `MADV_DONTDUMP` (until `MADV_DODUMP`): left out
     /// of a core dump ([`dont_dump`]).
     dont_dump: BTreeMap<u64, u64>,
+    /// Guest ranges given `MADV_DONTFORK` (until `MADV_DOFORK`): a fork
+    /// child has nothing mapped there ([`Kernel::unmap_dont_fork`]).
+    dont_fork: BTreeMap<u64, u64>,
+    /// Guard pages (`MADV_GUARD_INSTALL`, until `MADV_GUARD_REMOVE`), guest
+    /// addresses: inaccessible on the host whatever the mapping's
+    /// protection, so an access is a `SIGSEGV`.
+    guard: BTreeMap<u64, u64>,
 }
 
 impl Ranges {
@@ -72,6 +79,8 @@ impl Ranges {
         grows_down: BTreeMap::new(),
         poisoned: BTreeMap::new(),
         dont_dump: BTreeMap::new(),
+        dont_fork: BTreeMap::new(),
+        guard: BTreeMap::new(),
     };
 
     /// Forget unmapped memory, `len` bytes at host address `host` and guest
@@ -82,7 +91,13 @@ impl Ranges {
         {
             remove_range(set, host, len);
         }
-        for set in [&mut self.grows_down, &mut self.poisoned, &mut self.dont_dump] {
+        for set in [
+            &mut self.grows_down,
+            &mut self.poisoned,
+            &mut self.dont_dump,
+            &mut self.dont_fork,
+            &mut self.guard,
+        ] {
             remove_range(set, guest, len);
         }
     }
@@ -173,6 +188,14 @@ fn any_poisoned(start: u64, end: u64) -> bool {
     !r.poisoned.is_empty() && r.poisoned.range(..end).next_back().is_some_and(|(_, &e)| e > start)
 }
 
+/// The pieces of the ranges of `set` within `[start, end)`.
+fn pieces_of(set: &BTreeMap<u64, u64>, start: u64, end: u64) -> Vec<(u64, u64)> {
+    set.range(..end)
+        .filter(|&(_, &e)| e > start)
+        .map(|(&s, &e)| (s.max(start), e.min(end)))
+        .collect()
+}
+
 /// Whether guest address `addr` is in memory `MADV_HWPOISON` poisoned.
 pub fn poisoned(addr: u64) -> bool {
     lock_ranges().poisoned.range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
@@ -181,6 +204,40 @@ pub fn poisoned(addr: u64) -> bool {
 /// Whether guest address `addr` is in memory given `MADV_DONTDUMP`.
 pub fn dont_dump(addr: u64) -> bool {
     lock_ranges().dont_dump.range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
+}
+
+/// Zero guest memory `[start, start + len)` in place, made writable for
+/// the moment if it is not.
+fn zero_guest(start: u64, len: u64) {
+    let host = crate::uaccess::g2h(start);
+    let prot = region_prot(host);
+    // SAFETY: guest memory, made writable for the zeroing and given back
+    // its protection.
+    unsafe {
+        let p = host as *mut libc::c_void;
+        if prot & libc::PROT_WRITE == 0 {
+            libc::mprotect(p, len as usize, libc::PROT_READ | libc::PROT_WRITE);
+        }
+        std::ptr::write_bytes(host as *mut u8, 0, len as usize);
+        if prot & libc::PROT_WRITE == 0 {
+            libc::mprotect(p, len as usize, prot);
+        }
+    }
+}
+
+impl<P: Platform> Kernel<P> {
+    /// In a fork child (not one sharing the memory): the ranges given
+    /// `MADV_DONTFORK` are not its, as Linux maps nothing there in the
+    /// child. (The host's own `VM_INHERIT_NONE` would do the same, but
+    /// fwe reads a region's inheritance to tell private memory from
+    /// shared.)
+    pub fn unmap_dont_fork(&mut self) {
+        let ranges: Vec<(u64, u64)> =
+            lock_ranges().dont_fork.iter().map(|(&a, &e)| (a, e - a)).collect();
+        for (addr, len) in ranges {
+            self.sys_munmap(addr, len);
+        }
+    }
 }
 
 /// In a fork child: the ranges given `MADV_WIPEONFORK` are zero, as Linux
@@ -1471,6 +1528,22 @@ impl<P: Platform> Kernel<P> {
         }
         let r = self.mprotect_call(addr, len, prot);
         if r == 0 {
+            // Guard pages stay guards whatever the mapping's protection, as
+            // Linux keeps their markers.
+            let end = addr.saturating_add(self.page_up(len));
+            let guards = pieces_of(&lock_ranges().guard, addr, end);
+            for (s, e) in guards {
+                // SAFETY: guest memory the guest made guard pages of.
+                unsafe {
+                    libc::mprotect(
+                        crate::uaccess::g2h(s) as *mut libc::c_void,
+                        (e - s) as usize,
+                        libc::PROT_NONE,
+                    )
+                };
+            }
+        }
+        if r == 0 {
             let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
             crate::maps::record().protected(addr, self.page_up(len), prot);
         }
@@ -2438,18 +2511,25 @@ impl<P: Platform> Kernel<P> {
             hole |= p.start > at;
             at = p.end;
             let a = &p.value;
-            use crate::maps::Name;
             let anonymous = a.private_anonymous();
-            let file = matches!(a.object.name, Name::Path(_) | Name::Exe);
             let bad = match advice {
-                // MADV_DONTNEED, MADV_FREE, MADV_REMOVE: not locked memory.
+                // MADV_DONTNEED, MADV_FREE, MADV_REMOVE, MADV_GUARD_INSTALL:
+                // not locked memory.
                 4 | 8 | 9 if a.locked => true,
+                mman::MADV_GUARD_INSTALL if a.locked => true,
                 8 | 18 => !anonymous,
-                9 => !(file && a.shared),
+                // MADV_REMOVE: a file's pages (shared anonymous memory is
+                // one too, as Linux's shmem).
+                9 => anonymous,
                 _ => false,
             };
             if bad {
                 return Err(errno::EINVAL);
+            }
+            // MADV_REMOVE frees the file's blocks: only through a shared
+            // mapping that may write it.
+            if advice == mman::MADV_REMOVE && !(a.shared && !a.nowrite) {
+                return Err(errno::EACCES);
             }
         }
         Ok(Some(Checked { hole: hole || at < end, areas }))
@@ -2509,6 +2589,61 @@ impl<P: Platform> Kernel<P> {
                 }));
                 self.platform.remapped_guest(addr, len);
                 r
+            }
+            // As MADV_DONTNEED, locked memory too.
+            mman::MADV_DONTNEED_LOCKED => self.madvise_apply(addr, len, mman::MADV_DONTNEED, areas),
+            // MADV_REMOVE: the file's (or shared memory's) pages read as
+            // zeros, in every mapping of it, as when Linux frees them.
+            mman::MADV_REMOVE => {
+                for p in areas {
+                    let (start, end) = (p.start.max(addr), p.end.min(addr + len));
+                    zero_guest(start, end - start);
+                }
+                0
+            }
+            // What a fork child has mapped.
+            mman::MADV_DONTFORK => {
+                add_range(&mut lock_ranges().dont_fork, addr, len);
+                0
+            }
+            mman::MADV_DOFORK => {
+                remove_range(&mut lock_ranges().dont_fork, addr, len);
+                0
+            }
+            // The pages' contents let go (private memory reads as zero
+            // again once the guard goes), and an access a SIGSEGV.
+            mman::MADV_GUARD_INSTALL => {
+                let private: Vec<Piece<Area>> =
+                    areas.iter().filter(|p| p.value.private_anonymous()).cloned().collect();
+                for p in &private {
+                    let (start, end) = (p.start.max(addr), p.end.min(addr + len));
+                    let r = self.madvise_apply(
+                        start,
+                        end - start,
+                        mman::MADV_DONTNEED,
+                        std::slice::from_ref(p),
+                    );
+                    if r < 0 {
+                        return r;
+                    }
+                }
+                add_range(&mut lock_ranges().guard, addr, len);
+                // SAFETY: guest memory the guest makes guard pages of.
+                ret(unsafe {
+                    libc::mprotect(host as *mut libc::c_void, len as usize, libc::PROT_NONE)
+                })
+            }
+            // Accessible again, as the mapping is.
+            mman::MADV_GUARD_REMOVE => {
+                remove_range(&mut lock_ranges().guard, addr, len);
+                for p in areas {
+                    let (start, end) = (p.start.max(addr), p.end.min(addr + len));
+                    let r = self.mprotect_call(start, end - start, p.value.prot);
+                    if r < 0 {
+                        return r;
+                    }
+                }
+                0
             }
             mman::MADV_FREE => {
                 // SAFETY: advisory call on guest memory.
