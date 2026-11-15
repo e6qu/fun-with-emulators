@@ -3715,13 +3715,13 @@ impl<P: Platform> Kernel<P> {
         if crate::fs::is_empty_dir(&st) {
             // What a name an overlay does not show is resolved in: nothing
             // is ever made there.
-            self.note_refused("an overlay's hidden name", &st);
+            self.note_refused("an overlay's hidden name", dir, &st);
             return err(errno::EACCES);
         }
         let perm = crate::modes::perm_of(&st);
         if !self.passes_dac(&st, 2) {
             if !self.permits(&st, 2 | 1) {
-                self.note_refused("the directory's bits", &st);
+                self.note_refused("the directory's bits", dir, &st);
                 return err(errno::EACCES);
             }
             return op();
@@ -3731,7 +3731,7 @@ impl<P: Platform> Kernel<P> {
             op()
         } else {
             if r == err(errno::EACCES) {
-                self.note_refused("the host, past the capability", &st);
+                self.note_refused("the host, past the capability", dir, &st);
             }
             r
         }
@@ -3739,14 +3739,26 @@ impl<P: Platform> Kernel<P> {
 
     /// Under `--strace` to a file: why a change of a directory was refused
     /// (`EACCES`), with what it was judged on, for a refusal to be traced.
-    fn note_refused(&self, by: &str, st: &libc::stat) {
+    fn note_refused(&self, by: &str, dir: i32, st: &libc::stat) {
         if crate::trace::file().is_none() {
             return;
         }
         let c = &self.creds;
+        let mut host = zeroed_stat();
+        // SAFETY: plain host call with a valid out-parameter.
+        unsafe { libc::fstat(dir, &mut host) };
+        let path = crate::fs::host_path_of(dir).unwrap_or_default();
+        #[cfg(target_os = "macos")]
+        let flags = host.st_flags;
+        #[cfg(not(target_os = "macos"))]
+        let flags = 0;
         crate::trace::note_to_file(&format!(
-            "refused by {by}: directory {}:{} mode {:o}; caller fsuid {} fsgid {} groups {:?} \
-             user namespace nested {}",
+            "refused by {by}: directory {} (host mode {:o}, flags {:#x}, kept mode {}) {}:{} \
+             mode {:o}; caller fsuid {} fsgid {} groups {:?} user namespace nested {}",
+            String::from_utf8_lossy(&path),
+            host.st_mode & 0o7777,
+            flags,
+            crate::modes::marked(&host),
             st.st_uid,
             st.st_gid,
             st.st_mode & 0o7777,
