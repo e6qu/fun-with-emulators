@@ -4275,6 +4275,19 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// `RLIMIT_MEMLOCK` bounds locked mappings as it bounds `mlock`:
+/// `MAP_LOCKED` and mappings made after `mlockall(MCL_FUTURE)`.
+#[test]
+fn locked_mappings_are_bounded_by_rlimit_memlock() {
+    assert_eq!(
+        identity(&["memlock"]),
+        "limit 0: MAP_LOCKED EPERM\n\
+         limit 64 KiB: MAP_LOCKED 32 KiB ok, then 48 KiB EAGAIN\n\
+         mlockall(MCL_FUTURE) 0: 48 KiB EAGAIN, 16 KiB ok\n\
+         unlocked: 48 KiB mapped true, mlock of 16 KiB 0\n"
+    );
+}
+
 /// Nice values: per thread, as Linux keeps them, and the process's given
 /// to the host process (which lets it be raised, not lowered);
 /// `PRIO_USER` names a user of the caller's user namespace.

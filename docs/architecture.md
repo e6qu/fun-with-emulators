@@ -352,8 +352,11 @@ records Linux would:
 - **`vm.max_map_count`** (65530 by default): an `mmap`, or an `munmap`
   that splits a mapping, past it fails with `ENOMEM`.
 - **Locking** (`mlock`, `mlock2`, `mlockall`, `MAP_LOCKED`) brings memory
-  in and marks it locked for `smaps`, `VmLck` and the next lock's
-  `RLIMIT_MEMLOCK` check; nothing is wired.
+  in, marks it locked for `smaps`, `VmLck` and the next lock's
+  `RLIMIT_MEMLOCK` check, and wires it on the host with `mlock` (unlocking
+  unwires it) as far as the host lets a user process; a mapping made
+  locked (`MAP_LOCKED`, or after `MCL_FUTURE`) past `RLIMIT_MEMLOCK` fails
+  with `EAGAIN`, and `MAP_LOCKED` with a limit of 0 with `EPERM`.
 - **Sealing** (`mseal`): a flag on the mapping, carried across `fork`;
   `munmap`, `mprotect`, `mremap`, a `MAP_FIXED` `mmap` over it and a
   discarding `madvise` of read-only anonymous memory fail with `EPERM`.

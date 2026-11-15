@@ -2,7 +2,8 @@
 //!
 //! - those the host has no counterpart of (`RLIMIT_NICE`, `RLIMIT_RTPRIO`,
 //!   `RLIMIT_MSGQUEUE` and the like);
-//! - `RLIMIT_MEMLOCK`, since fwe wires no memory for the guest (see
+//! - `RLIMIT_MEMLOCK`, since Linux's root may lock more than the host
+//!   lets fwe wire, and fwe counts the guest's locked memory itself (see
 //!   `Kernel::sys_mlock`);
 //! - `RLIMIT_CORE`, since fwe writes the guest's core dumps (the host's
 //!   limit is kept at 0);

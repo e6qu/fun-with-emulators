@@ -918,6 +918,20 @@ mod tests {
         assert_eq!(here(tracked()), vec![]);
     }
 
+    /// Locked memory is wired on the host, and unwired again.
+    #[test]
+    fn locked_memory_is_wired_on_the_host() {
+        let len = 1 << 16;
+        let at = map(len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE);
+        let rw = mman::PROT_READ | mman::PROT_WRITE;
+        crate::maps::record().mapped(at, len as u64, rw, false, None);
+        assert!(wire(at, len as u64, true), "wired");
+        assert!(wire(at, len as u64, false), "unwired");
+        // SAFETY: unmapping the test's own mapping.
+        unsafe { libc::munmap(at as *mut _, len) };
+        crate::maps::record().unmapped(at, len as u64);
+    }
+
     /// Private memory set to be shared on fork is written by the child for
     /// the parent to see (what a `vfork` child does), and goes back to
     /// being copied; `private_parts` leaves `MAP_SHARED` memory out.
@@ -1196,6 +1210,21 @@ impl<P: Platform> Kernel<P> {
         if too_many_maps(0) {
             return err(errno::ENOMEM);
         }
+        // A mapping made locked (`MAP_LOCKED`, or after `MCL_FUTURE`) must
+        // fit `RLIMIT_MEMLOCK` with what is locked already (`EAGAIN`);
+        // `MAP_LOCKED` with a limit of 0 is refused outright (`EPERM`).
+        let map_locked = flags & mman::MAP_LOCKED != 0;
+        if (map_locked || crate::maps::record().locks_future())
+            && !self.creds.has(crate::caps::CAP_IPC_LOCK)
+        {
+            let soft = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
+            if map_locked && soft == 0 {
+                return err(errno::EPERM);
+            }
+            if crate::maps::record().locked_bytes().saturating_add(self.page_up(len)) > soft {
+                return err(errno::EAGAIN);
+            }
+        }
         // Nothing of a mount that runs nothing is mapped to run, then or
         // later.
         let noexec = flags & mman::MAP_ANONYMOUS == 0
@@ -1270,8 +1299,10 @@ impl<P: Platform> Kernel<P> {
         if flags & mman::MAP_LOCKED != 0 {
             crate::maps::record().lock(r as u64, len, true);
             populate(r as u64, len, self.page_size);
+            wire(r as u64, len, true);
         } else if locked {
             populate(r as u64, len, self.page_size);
+            wire(r as u64, len, true);
         }
         if r >= 0 {
             crate::maps::publish();
@@ -1506,6 +1537,9 @@ impl<P: Platform> Kernel<P> {
             crate::maps::record().lock(start, len, lock);
             if lock && flags & mman::MLOCK_ONFAULT == 0 {
                 populate(start, len, self.page_size);
+                wire(start, len, true);
+            } else if !lock {
+                wire(start, len, false);
             }
         }
         if r >= 0 {
@@ -1651,10 +1685,17 @@ impl<P: Platform> Kernel<P> {
                         let all = crate::maps::record().areas();
                         for p in all {
                             populate(p.start, p.end - p.start, self.page_size);
+                            wire(p.start, p.end - p.start, true);
                         }
                     }
                 }
-                None => crate::maps::record().lock_all(None),
+                None => {
+                    let all = crate::maps::record().areas();
+                    for p in all.iter().filter(|p| p.value.locked) {
+                        wire(p.start, p.end - p.start, false);
+                    }
+                    crate::maps::record().lock_all(None);
+                }
             }
         }
         if r >= 0 {
@@ -1662,6 +1703,33 @@ impl<P: Platform> Kernel<P> {
         }
         r
     }
+}
+
+/// Wire (`on`) or unwire the host's memory behind the accessible mappings
+/// of guest memory `[start, start + len)`, as Linux's locked memory is
+/// kept in: as far as the host lets a user process (its
+/// `vm.user_wire_limit`). Linux's result is the guest's whatever the
+/// host's: root may lock more than the host lets fwe wire. Whether the
+/// host wired (or unwired) all of it.
+fn wire(start: u64, len: u64, on: bool) -> bool {
+    let mut all = true;
+    for p in crate::maps::record().areas_in(start, start + len) {
+        if p.value.prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC) == 0 {
+            continue;
+        }
+        let (s, n) = (p.start, p.end - p.start);
+        if crate::uaccess::crosses(s, n) {
+            all = false;
+            continue;
+        }
+        let host = crate::uaccess::g2h(s) as *const libc::c_void;
+        // SAFETY: guest memory, mapped; wiring changes no contents.
+        let r = unsafe {
+            if on { libc::mlock(host, n as usize) } else { libc::munlock(host, n as usize) }
+        };
+        all &= r == 0;
+    }
+    all
 }
 
 /// Bring the accessible pages of guest memory `[start, start + len)` in,
@@ -2267,9 +2335,9 @@ impl<P: Platform> Kernel<P> {
     /// `mlock`, `mlock2` (`flags`) and `munlock` (`lock` false): the range,
     /// widened to whole pages, must be mapped, and a caller without
     /// `CAP_IPC_LOCK` may lock no more than its `RLIMIT_MEMLOCK` (none at
-    /// all if that is 0). The host is not asked to wire the pages: Linux's
-    /// root may lock far more than the host lets a user process, and what
-    /// a program sees of a locked page is the same.
+    /// all if that is 0). The host wires the pages as far as it lets a
+    /// user process ([`wire`]); Linux's root may lock far more, and what a
+    /// program sees of a locked page is the same.
     fn mlock_call(&mut self, addr: u64, len: u64, flags: u64, lock: bool) -> i64 {
         if lock && flags & !mman::MLOCK_ONFAULT != 0 {
             return err(errno::EINVAL);
@@ -2299,7 +2367,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `mlockall(flags)` and `munlockall` (`flags` `None`): checked as Linux
-    /// checks them, nothing wired (see [`Kernel::sys_mlock`]).
+    /// checks them (see [`Kernel::sys_mlock`]).
     fn mlockall_call(&mut self, flags: Option<u64>) -> i64 {
         let Some(flags) = flags else { return 0 };
         let all = mman::MCL_CURRENT | mman::MCL_FUTURE | mman::MCL_ONFAULT;

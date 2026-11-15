@@ -489,6 +489,11 @@ impl Record {
         self.lock_future = future;
     }
 
+    /// Whether mappings made from now on are locked (`MCL_FUTURE`).
+    pub fn locks_future(&self) -> bool {
+        self.lock_future
+    }
+
     /// How many bytes of the mappings are locked.
     pub fn locked_bytes(&self) -> u64 {
         self.areas.iter().filter(|p| p.value.locked).map(|p| p.end - p.start).sum()

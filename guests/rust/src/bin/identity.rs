@@ -28,6 +28,12 @@ const SI_USER: i32 = 0;
 const SYS_RT_SIGQUEUEINFO: i64 = 138;
 const P_PID: i32 = 1;
 const RLIMIT_SIGPENDING: i32 = 11;
+const RLIMIT_MEMLOCK: i32 = 8;
+const PROT_RW: i32 = 3;
+const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
+const MAP_LOCKED: i32 = 0x2000;
+const MCL_FUTURE: i32 = 2;
+const SYS_MMAP: i64 = 222;
 const SYS_TIMER_CREATE: i64 = 107;
 const SYS_TIMER_DELETE: i64 = 111;
 const CLOCK_MONOTONIC: i64 = 1;
@@ -70,6 +76,11 @@ unsafe extern "C" {
     fn getpriority(which: i32, who: u32) -> i32;
     fn setpriority(which: i32, who: u32, prio: i32) -> i32;
     fn gettid() -> i32;
+    fn mmap(addr: *mut c_void, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut c_void;
+    fn munmap(addr: *mut c_void, len: usize) -> i32;
+    fn mlock(addr: *const c_void, len: usize) -> i32;
+    fn mlockall(flags: i32) -> i32;
+    fn munlockall() -> i32;
     fn waitid(idtype: i32, id: u32, info: *mut [u8; 128], options: i32) -> i32;
     fn __errno_location() -> *mut i32;
 }
@@ -311,6 +322,51 @@ fn sigpending_limit() {
     }
 }
 
+/// An anonymous mapping of `len` bytes with `flags` added: `ok` or the
+/// errno's name.
+fn map_anon(len: usize, flags: i32) -> String {
+    // The system call itself: musl turns its EPERM into ENOMEM.
+    // SAFETY: a fresh mapping, left mapped.
+    let r = unsafe { syscall(SYS_MMAP, 0i64, len, PROT_RW, MAP_PRIVATE_ANON | flags, -1i64, 0i64) };
+    outcome(r)
+}
+
+/// `RLIMIT_MEMLOCK` for a process without `CAP_IPC_LOCK` (uid 1000): a
+/// `MAP_LOCKED` mapping is refused with a limit of 0 (`EPERM`) and past
+/// the limit (`EAGAIN`), as is any mapping after `mlockall(MCL_FUTURE)`;
+/// `mlock` within it works.
+fn memlock() {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let child = fork();
+        if child == 0 {
+            setuid(1000);
+            let k = 16 << 10;
+            let hard = 8 << 20;
+            setrlimit(RLIMIT_MEMLOCK, &Rlimit { cur: 0, max: hard });
+            println!("limit 0: MAP_LOCKED {}", map_anon(k, MAP_LOCKED));
+            setrlimit(RLIMIT_MEMLOCK, &Rlimit { cur: 4 * k as u64, max: hard });
+            println!(
+                "limit 64 KiB: MAP_LOCKED 32 KiB {}, then 48 KiB {}",
+                map_anon(2 * k, MAP_LOCKED),
+                map_anon(3 * k, MAP_LOCKED)
+            );
+            let f = mlockall(MCL_FUTURE);
+            println!(
+                "mlockall(MCL_FUTURE) {f}: 48 KiB {}, 16 KiB {}",
+                map_anon(3 * k, 0),
+                map_anon(k, 0)
+            );
+            munlockall();
+            let p = mmap(std::ptr::null_mut(), 3 * k, PROT_RW, MAP_PRIVATE_ANON, -1, 0);
+            println!("unlocked: 48 KiB mapped {}, mlock of 16 KiB {}", p as isize != -1, mlock(p, k));
+            munmap(p, 3 * k);
+            _exit(0);
+        }
+        reap(child);
+    }
+}
+
 /// Nice values: the process's (its main thread's) and another thread's
 /// own, a thread starting with its creator's; the host process given the
 /// process's as far as the host lets (the test reads it while this waits
@@ -508,6 +564,7 @@ fn main() {
         "sender-ids" => sender_ids(),
         "sigpending" => sigpending_limit(),
         "priorities" => priorities(),
+        "memlock" => memlock(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);
