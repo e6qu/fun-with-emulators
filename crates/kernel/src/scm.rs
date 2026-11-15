@@ -18,7 +18,8 @@
 //! netlink socket's other end). The host passes no kqueue, so a timerfd or
 //! process descriptor goes as a placeholder (the bundle again) and the
 //! receiver makes its own: a timerfd with the same schedule, a process
-//! descriptor of the same process; a signalfd is made anew in the
+//! descriptor of the same process; a socket made in a network namespace of
+//! fwe's stays in it; a signalfd is made anew in the
 //! receiver with the same mask, reading the receiver's signals as Linux's
 //! does. The receiver recognises the bundle by its buffer size and the
 //! manifest's magic number, takes what it describes, and closes it, so the
@@ -48,6 +49,7 @@ pub(crate) mod kind {
     pub const SIGNALFD: u8 = 3;
     pub const NETLINK: u8 = 4;
     pub const PIDFD: u8 = 5;
+    pub const NETNS: u8 = 6;
 }
 
 /// What a descriptor fwe stands in for takes to another process: its kind,
@@ -251,6 +253,7 @@ fn export(fd: i32) -> Option<Export> {
         .or_else(|| crate::signalfd::export(fd))
         .or_else(|| crate::netlink::export(fd))
         .or_else(|| crate::pidfd::export(fd))
+        .or_else(|| crate::netns::export(fd))
 }
 
 /// Take what a bundle describes for received descriptor `fd`: whether it
@@ -262,6 +265,7 @@ fn import(kind: u8, fd: i32, state: &[u8], companions: Vec<i32>) -> bool {
         kind::SIGNALFD => crate::signalfd::import(fd, &mut d),
         kind::NETLINK => crate::netlink::import(fd, &mut d, companions),
         kind::PIDFD => crate::pidfd::import(fd, &mut d),
+        kind::NETNS => crate::netns::import(fd, &mut d),
         _ => false,
     }
 }
@@ -514,7 +518,8 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
     }
     close_all(fds.drain(kept..));
     for (i, &fd) in fds.iter().enumerate() {
-        if !taken[i] {
+        // A socket of a namespace may be a SOCK_SEQPACKET one too.
+        if !taken[i] || crate::netns::of(fd).is_some() {
             crate::seqpacket::adopt(fd);
         }
     }

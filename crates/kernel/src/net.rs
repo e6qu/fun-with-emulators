@@ -718,6 +718,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     if seqpacket {
         crate::seqpacket::make(fd);
     }
+    crate::netns::made(fd);
     fd as i64
 }
 
@@ -755,6 +756,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
         crate::seqpacket::make(fds[0]);
         crate::seqpacket::make(fds[1]);
     }
+    crate::netns::made(fds[0]);
+    crate::netns::made(fds[1]);
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -985,6 +988,8 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     if r < 0 {
         return last_error();
     }
+    // A connection is in its listener's namespace.
+    crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.

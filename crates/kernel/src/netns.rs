@@ -21,6 +21,12 @@
 //! socket, and see it, by its number; a program that is not fwe's finds
 //! nothing there.
 //!
+//! A socket belongs to the namespace it was made in, whichever namespace
+//! the process is in when it uses it ([`made`], recorded with the
+//! descriptor in [`crate::fdmarks`]): each socket call runs as its socket's
+//! namespace ([`as_socket`]), so its ports and abstract names are that
+//! namespace's.
+//!
 //! The functions here act on host socket addresses (macOS layout: a length
 //! and a family byte, the port, then the address).
 
@@ -36,6 +42,10 @@ thread_local! {
     /// ([`crate::threadfs`]): `Some(None)` for the initial one.
     static THREAD: std::cell::RefCell<Option<Option<Arc<Record<Net>>>>> =
         const { std::cell::RefCell::new(None) };
+    /// The namespace of the socket a call on this thread acts on, while it
+    /// does ([`as_socket`]).
+    static SOCKET: std::cell::RefCell<Option<Option<Arc<Record<Net>>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// This host thread starts another guest thread ([`crate::thread_reused`]).
@@ -43,12 +53,58 @@ pub(crate) fn thread_reused() {
     THREAD.with(|t| t.borrow_mut().take());
 }
 
-/// The calling thread's network namespace, if it is one of fwe's.
+/// The calling thread's network namespace, if it is one of fwe's: in a
+/// socket call, the socket's.
 pub fn current() -> Option<Arc<Record<Net>>> {
+    if let Some(sock) = SOCKET.with(|t| t.borrow().clone()) {
+        return sock;
+    }
     if let Some(own) = THREAD.with(|t| t.borrow().clone()) {
         return own;
     }
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Socket `fd` was just made: it belongs to the caller's namespace.
+pub fn made(fd: i32) {
+    crate::fdmarks::pin_net(fd, current());
+}
+
+/// The network namespace socket `fd` belongs to, if one of fwe's.
+pub fn of(fd: i32) -> Option<Arc<Record<Net>>> {
+    crate::fdmarks::net_of(fd)
+}
+
+/// Run `f`, a call on socket `fd`, as the socket's namespace.
+pub fn as_socket<R>(fd: i32, f: impl FnOnce() -> R) -> R {
+    let net = of(fd);
+    let prev = SOCKET.with(|t| t.borrow_mut().replace(net));
+    let r = f();
+    SOCKET.with(|t| *t.borrow_mut() = prev);
+    r
+}
+
+/// What socket `fd` of a namespace of fwe's takes to another process it is
+/// passed to ([`crate::scm`]): its namespace.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    let net = of(fd)?;
+    let mut e = crate::snapshot::Enc::new();
+    crate::shared::save_opt(&mut e, &Some(net));
+    Some(crate::scm::Export {
+        kind: crate::scm::kind::NETNS,
+        state: e.into_bytes(),
+        companions: Vec::new(),
+        placeholder: false,
+    })
+}
+
+/// Received socket `fd` belongs to the namespace an [`export`] named.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
+    let Ok(Some(net)) = crate::shared::load_opt(d) else { return false };
+    crate::fdmarks::pin_net(fd, Some(net));
+    true
 }
 
 /// Make `net` this thread's own (`Some`), or the process's again (`None`).
@@ -403,4 +459,37 @@ pub fn closed(mark: Option<crate::fdmarks::Mark>) {
         n.ports.remove(&(key, port));
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket made in a namespace belongs to it whichever namespace the
+    /// thread is in when it uses the socket.
+    #[test]
+    fn a_socket_keeps_the_namespace_it_was_made_in() {
+        let Ok(net) = Record::fresh("net", Net::default()) else { return };
+        let net = Arc::new(net);
+        set_thread(Some(Some(net.clone())));
+        // SAFETY: plain host call.
+        let inside = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        made(inside);
+        set_thread(Some(None));
+        // SAFETY: plain host call.
+        let outside = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        made(outside);
+        assert!(of(inside).is_some_and(|n| n.dir() == net.dir()));
+        assert!(of(outside).is_none());
+        // Used from the initial namespace, the first is its namespace's.
+        assert!(as_socket(inside, current).is_some_and(|n| n.dir() == net.dir()));
+        set_thread(Some(Some(net.clone())));
+        assert!(as_socket(outside, current).is_none());
+        set_thread(None);
+        for fd in [inside, outside] {
+            crate::fdmarks::closed(fd);
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd) };
+        }
+    }
 }

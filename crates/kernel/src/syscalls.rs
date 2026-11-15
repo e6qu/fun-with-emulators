@@ -266,7 +266,7 @@ impl<P: Platform> Kernel<P> {
                 if matches!(mark, Some(crate::fdmarks::Mark::NetBound { .. }))
                     && !crate::fdmarks::shared_elsewhere(fd)
                 {
-                    crate::netns::closed(mark);
+                    crate::netns::as_socket(fd, || crate::netns::closed(mark));
                 }
                 crate::netlink::closed(fd);
                 crate::net::closed(fd);
@@ -348,16 +348,14 @@ impl<P: Platform> Kernel<P> {
             nr::BIND if crate::netlink::is(a[0] as i32) => {
                 crate::netlink::bind(a[0] as i32, a[1], a[2])
             }
-            // SAFETY: the sockaddr pointer is validated by the host/impl.
-            nr::BIND => unsafe {
-                crate::net::bind(
-                    a[0],
-                    a[1],
-                    a[2],
-                    self.creds.has(crate::caps::CAP_NET_BIND_SERVICE),
-                    self.fs().umask(),
-                )
-            },
+            nr::BIND => {
+                let (may_low, umask) =
+                    (self.creds.has(crate::caps::CAP_NET_BIND_SERVICE), self.fs().umask());
+                crate::netns::as_socket(a[0] as i32, || {
+                    // SAFETY: the sockaddr pointer is validated by the host/impl.
+                    unsafe { crate::net::bind(a[0], a[1], a[2], may_low, umask) }
+                })
+            }
             // SAFETY: no pointers.
             nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
             nr::GETSOCKNAME if crate::netlink::is(a[0] as i32) => {
@@ -367,9 +365,13 @@ impl<P: Platform> Kernel<P> {
                 crate::netlink::getname(a[0] as i32, a[1], a[2], true)
             }
             // SAFETY: the out pointers are validated by the host/impl.
-            nr::GETSOCKNAME => unsafe { crate::net::getname(a[0], a[1], a[2], false) },
+            nr::GETSOCKNAME => crate::netns::as_socket(a[0] as i32, || unsafe {
+                crate::net::getname(a[0], a[1], a[2], false)
+            }),
             // SAFETY: the out pointers are validated by the host/impl.
-            nr::GETPEERNAME => unsafe { crate::net::getname(a[0], a[1], a[2], true) },
+            nr::GETPEERNAME => crate::netns::as_socket(a[0] as i32, || unsafe {
+                crate::net::getname(a[0], a[1], a[2], true)
+            }),
             // A netlink socket's own options change nothing fwe does.
             nr::SETSOCKOPT
                 if a[1] == crate::netlink::SOL_NETLINK && crate::netlink::is(a[0] as i32) =>
@@ -1802,7 +1804,8 @@ impl<P: Platform> Kernel<P> {
         if req == SIOCATMARK {
             return crate::net::at_mark(fd, arg);
         }
-        let net = self.fs().ns.net.clone();
+        // The socket's namespace, whichever the caller is in.
+        let net = crate::netns::of(fd);
         if req == SIOCGIFCONF {
             let addrs = match &net {
                 Some(n) if n.get().lo_up => vec![(b"lo".to_vec(), [127, 0, 0, 1], [255, 0, 0, 0])],

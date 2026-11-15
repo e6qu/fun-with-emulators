@@ -2071,17 +2071,19 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         // Socket calls that can block run without the kernel lock, so a thread
         // waiting in accept/recv does not stall the threads meant to feed it.
         // SAFETY: caller guarantees the sockaddr pointer.
-        n::CONNECT => {
+        // Each as its socket's network namespace.
+        n::CONNECT => netns::as_socket(a[0] as i32, || {
             match landlock::active().then(|| landlockops::check_connect(a[0] as i32, a[1], a[2])) {
                 Some(Err(e)) => fwe_abi::err(e),
                 // SAFETY: the backend's guarantee for the guest pointers.
                 _ => unsafe { net::connect(a[0], a[1], a[2]) },
             }
-        }
+        }),
         n::ACCEPT | n::ACCEPT4 => {
             let flags = if nr == n::ACCEPT4 { a[3] } else { 0 };
             // SAFETY: caller guarantees the out pointers.
-            let r = unsafe { net::accept4(a[0], a[1], a[2], flags) };
+            let r =
+                netns::as_socket(a[0] as i32, || unsafe { net::accept4(a[0], a[1], a[2], flags) });
             let made = fdtable::made(nr, &a, r);
             if fdtable::over_limit(&made) {
                 // A socket: nothing of fwe's to drop with it.
@@ -2093,17 +2095,25 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
         }
         // SAFETY: caller guarantees the buffer and sockaddr.
-        n::SENDTO => unsafe { net::sendto(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        n::SENDTO => netns::as_socket(a[0] as i32, || unsafe {
+            net::sendto(a[0], a[1], a[2], a[3], a[4], a[5])
+        }),
         // SAFETY: caller guarantees the buffer and out pointers.
-        n::RECVFROM => unsafe { net::recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        n::RECVFROM => netns::as_socket(a[0] as i32, || unsafe {
+            net::recvfrom(a[0], a[1], a[2], a[3], a[4], a[5])
+        }),
         // SAFETY: caller guarantees the msghdr.
-        n::SENDMSG => unsafe { net::sendmsg(a[0], a[1], a[2]) },
+        n::SENDMSG => netns::as_socket(a[0] as i32, || unsafe { net::sendmsg(a[0], a[1], a[2]) }),
         // SAFETY: caller guarantees the msghdr.
-        n::RECVMSG => unsafe { net::recvmsg(a[0], a[1], a[2]) },
-        // SAFETY: caller guarantees the message vector.
-        n::SENDMMSG => unsafe { net::sendmmsg(a[0], a[1], a[2], a[3]) },
-        // SAFETY: caller guarantees the message vector and timeout.
-        n::RECVMMSG => unsafe { net::recvmmsg(a[0], a[1], a[2], a[3], a[4]) },
+        n::RECVMSG => netns::as_socket(a[0] as i32, || unsafe { net::recvmsg(a[0], a[1], a[2]) }),
+        n::SENDMMSG => netns::as_socket(a[0] as i32, || {
+            // SAFETY: caller guarantees the message vector.
+            unsafe { net::sendmmsg(a[0], a[1], a[2], a[3]) }
+        }),
+        n::RECVMMSG => netns::as_socket(a[0] as i32, || {
+            // SAFETY: caller guarantees the message vector and timeout.
+            unsafe { net::recvmmsg(a[0], a[1], a[2], a[3], a[4]) }
+        }),
         _ => return None,
     })
 }

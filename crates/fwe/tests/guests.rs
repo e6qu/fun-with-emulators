@@ -1076,6 +1076,18 @@ fn emulated_descriptors_work_where_they_are_passed() {
     );
 }
 
+/// A socket belongs to the network namespace it was made in: one made
+/// before `unshare(CLONE_NEWNET)` binds the initial namespace's loopback
+/// and abstract names, one made after the new namespace's (its `lo` down).
+#[test]
+fn a_socket_stays_in_its_network_namespace() {
+    c_guest_prints(
+        "netns",
+        &["pinned"],
+        "early inet 0, late inet -1 errno 99, abstract name in each 0 0\n",
+    );
+}
+
 /// A timerfd's absolute time is on its own clock, and a periodic timer
 /// first expires at its value.
 #[test]
