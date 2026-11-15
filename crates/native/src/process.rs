@@ -460,8 +460,11 @@ fn reaped_signal(pid: i32, wstatus: i32) {
         sig if wstatus & 0x80 != 0 => (w::CLD_DUMPED, sig),
         sig => (w::CLD_KILLED, sig),
     };
-    // SAFETY: getuid cannot fail; a child of fwe's is this user's.
-    let uid = host::uid_to_initial(unsafe { libc::getuid() });
+    // The child's real user, as its record keeps it until the reap is
+    // done; a child fwe did not start is the host user's.
+    // SAFETY: getuid cannot fail.
+    let host_user = host::uid_to_initial(unsafe { libc::getuid() });
+    let uid = fwe_kernel::procreg::kept_uid(pid).unwrap_or(host_user);
     let info = thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
     reaper::reaped_child_signal(pid, info);
 }
@@ -902,8 +905,12 @@ pub fn do_waitid(regs: &Regs) -> i64 {
             words[0] = fwe_abi::signal::SIGCHLD as i32;
             words[2] = code;
             words[4] = reaper::guest_pid(e);
+            // The child's real user, as its record keeps it.
             // SAFETY: getuid cannot fail.
-            words[5] = host::uid_to_linux(unsafe { libc::getuid() }) as i32;
+            let host_user = host::uid_to_linux(unsafe { libc::getuid() });
+            words[5] = fwe_kernel::procreg::kept_uid(e.pid)
+                .map_or(host_user, |u| fwe_kernel::userns::to_ns(u, false))
+                as i32;
             words[6] = status;
             if infop != 0 && fwe_kernel::uaccess::write(infop, words).is_err() {
                 return err(errno::EFAULT);
@@ -957,8 +964,11 @@ fn waitid_host(
     }
     let mut words = [0i32; 32]; // a 128-byte siginfo_t
     // SAFETY: `si` was filled by the host.
-    let (pid, uid, status) =
-        unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
+    let (pid, host_uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+    // The child's real user, as its record keeps it (the host names the
+    // host user).
+    let uid = fwe_kernel::procreg::kept_uid(pid)
+        .map_or_else(|| host::uid_to_linux(host_uid), |u| fwe_kernel::userns::to_ns(u, false));
     if pid != 0 {
         // It ended of a Linux signal, as it recorded (see `linux_wstatus`).
         let ended = matches!(si.si_code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)

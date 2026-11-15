@@ -10,7 +10,8 @@
 //! itself in the target's mailbox, in the memory every fwe process maps
 //! ([`crate::procstore::mailbox`], given to the target by its first
 //! sender): a few slots per host signal (several processes may send one at
-//! once, which the host merges), each with the sender's pid and user, when
+//! once, which the host merges), each with the sender's pid and user (its
+//! guest real uid, an initial-namespace id, [`crate::creds::real_uid`]), when
 //! it was written, and for a signal that carries more than its sender (one
 //! a message queue raises, `SI_MESGQ`) its Linux `si_code` and value. A
 //! handler given a signal with no sender takes the note for it, if a
@@ -120,16 +121,15 @@ pub fn unnote(target: i32, sig: libc::c_int) {
 /// This process is about to send host signal `sig` to host process
 /// `target`: leave a note of itself there.
 pub fn note(target: i32, sig: libc::c_int) {
-    note_with(target, sig, 0, 0);
+    note_with(target, sig, 0, 0, crate::creds::real_uid());
 }
 
 /// As [`note`], for a signal the target is to take with Linux `si_code`
-/// `code` and value `value` (a message queue's notification).
-pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64) {
+/// `code` and value `value` (a message queue's notification), from user
+/// `uid` (an initial-namespace id).
+pub fn note_with(target: i32, sig: libc::c_int, code: i32, value: u64, uid: u32) {
     let Some(mb) = crate::procstore::mailbox(target, true) else { return };
     let Some(slots) = slots(mb, sig) else { return };
-    // SAFETY: plain host call.
-    let uid = unsafe { libc::getuid() };
     let me = crate::host::pid() as u64;
     // A free slot of the signal's, or the oldest note's.
     for _ in 0..64 {
@@ -219,6 +219,19 @@ const ENTRY: usize = 4;
 /// target.
 pub fn queue(target: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
     put(target, 0, sig, code, value)
+}
+
+/// [`queue`] with the sender the signal names: host pid `pid` and user
+/// `uid` (an initial-namespace id), as `rt_sigqueueinfo`'s caller gives
+/// them, or a message queue's sender.
+pub fn queue_from(
+    target: i32,
+    sig: u64,
+    code: i32,
+    value: u64,
+    (pid, uid): (i32, u32),
+) -> Result<(), i32> {
+    put_from(target, 0, sig, code, value, (pid as u32, uid))
 }
 
 /// [`queue`] for thread `tid` of host process `target`.
@@ -378,11 +391,21 @@ fn answer_mem(caller: i32, token: u64) {
 }
 
 fn put(target: i32, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
+    let me = (crate::host::pid() as u32, crate::creds::real_uid());
+    put_from(target, tid, sig, code, value, me)
+}
+
+/// [`put`] naming host pid `me` and user `uid` as the sender.
+fn put_from(
+    target: i32,
+    tid: i32,
+    sig: u64,
+    code: i32,
+    value: u64,
+    (me, uid): (u32, u32),
+) -> Result<(), i32> {
     let mb = crate::procstore::mailbox(target, true).ok_or(fwe_abi::errno::ESRCH)?;
     let q = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY).ok_or(fwe_abi::errno::ESRCH)?;
-    // SAFETY: plain host call.
-    let uid = unsafe { libc::getuid() };
-    let me = crate::host::pid() as u32;
     let sig_of = |e: &[crate::procstore::Word]| e[0].load(SeqCst) & 0xffff_ffff;
     // A standard signal already queued for the process is not queued
     // again, as Linux keeps one.
@@ -459,7 +482,7 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
 }
 
 /// In the host handler, for host signal `sig` that came with no sender: the
-/// sender (host pid, host uid) a recent note names, and what it carries,
+/// sender (host pid, guest uid) a recent note names, and what it carries,
 /// the note taken. Async-signal-safe.
 pub fn take(sig: libc::c_int) -> Option<Note> {
     let (note, when) = read_note(sig, Some(0))?;
@@ -725,7 +748,7 @@ mod tests {
         note(me, sig);
         assert_eq!(take(sig).map(|n| n.pid), Some(me));
         assert!(take(sig).is_none());
-        note_with(me, sig, -3, 9);
+        note_with(me, sig, -3, 9, 0);
         assert!(take_from(sig, me + 1).is_none());
         assert_eq!(take_from(sig, me).map(|n| (n.code, n.value)), Some((-3, 9)));
     }

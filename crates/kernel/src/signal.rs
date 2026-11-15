@@ -151,7 +151,7 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
         // signal from the kernel names no sender.
         if info.code != signal::SI_KERNEL {
             buf.put32(SI_PID_OFF, guest_pid(info.pid));
-            buf.put32(SI_UID_OFF, crate::userns::to_ns(info.uid, false) as i32);
+            buf.put32(SI_UID_OFF, crate::userns::to_ns(sender_uid(sig, &info), false) as i32);
         }
         if queued(info.code) {
             // `si_value`, where a child's status is for `SIGCHLD`.
@@ -279,10 +279,22 @@ pub fn relayed(sig: u64) -> bool {
 /// mailbox, and the process woken to take it ([`crate::signote::queue`]).
 /// A process that is not fwe's cannot take it (`EINVAL`).
 pub(crate) fn send_unhosted(host: i32, sig: u64, code: i32, value: u64) -> i64 {
+    send_unhosted_from(host, sig, code, value, (host::pid(), crate::creds::real_uid()))
+}
+
+/// [`send_unhosted`] naming `sender` (host pid, initial-namespace uid) as
+/// the signal's sender.
+pub(crate) fn send_unhosted_from(
+    host: i32,
+    sig: u64,
+    code: i32,
+    value: u64,
+    sender: (i32, u32),
+) -> i64 {
     if !host::is_fwe(host) {
         return err(errno::EINVAL);
     }
-    if let Err(e) = crate::signote::queue(host, sig, code, value) {
+    if let Err(e) = crate::signote::queue_from(host, sig, code, value, sender) {
         return err(e);
     }
     host::kill_process(host, host::WAKE_SIGNAL)
@@ -386,13 +398,21 @@ pub fn drain_to_signalfd() {
                 sig as u32,
                 info.code,
                 guest_pid(info.pid),
-                crate::userns::to_ns(info.uid, false),
+                crate::userns::to_ns(sender_uid(sig, &info), false),
                 info.status,
                 info.value,
             );
             crate::signalfd::deliver(sig, record);
         }
     }
+}
+
+/// The user `info` names as its sender (an initial-namespace id): for a
+/// child's `SIGCHLD`, the child's real user, which the host does not know
+/// (it names the host user), read from the child's record.
+fn sender_uid(sig: u64, info: &SigInfo) -> u32 {
+    let child = sig == signal::SIGCHLD && (1..=6).contains(&info.code) && info.pid > 0;
+    child.then(|| crate::procreg::kept_uid(info.pid)).flatten().unwrap_or(info.uid)
 }
 
 /// A sender's or child's host pid as the guest sees it.
@@ -423,10 +443,9 @@ pub(crate) fn raise_self(sig: u64) {
     thread::post_self(sig, own_info(signal::SI_KERNEL));
 }
 
+/// A signal this process sends itself: its own pid and guest user.
 fn own_info(code: i32) -> SigInfo {
-    // SAFETY: plain host calls.
-    let pid = crate::host::pid();
-    SigInfo { code, pid, ..SigInfo::default() }
+    SigInfo { code, pid: host::pid(), uid: crate::creds::real_uid(), ..SigInfo::default() }
 }
 
 impl<P: Platform> Kernel<P> {

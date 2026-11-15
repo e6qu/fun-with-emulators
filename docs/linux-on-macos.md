@@ -1021,7 +1021,12 @@ signals the host lacks never reach the host's table.
 **`kill`, `tgkill`, `rt_sigqueueinfo`**: [Sending a signal](#sending-a-signal)
 lists what each sends where. `rt_sigqueueinfo` to another process may not
 claim a kernel code (`si_code >= 0`) or `SI_TKILL` (`EPERM`), and reaches
-only that process's main thread.
+only that process's main thread. It delivers the caller's own `si_uid`
+(taken in the caller's user namespace, shown in the receiver's) and,
+to the caller itself or as a signal the host lacks, its `si_pid` (the
+process it names in the caller's pid namespace, 0 for none); a host
+signal to another process names the caller's own pid, which the host
+gives with it.
 
 **`rt_sigsuspend`, `rt_sigtimedwait`**: `rt_sigsuspend` blocks every
 relayed host signal while it checks for a deliverable one, then calls the
@@ -2309,8 +2314,9 @@ gives and fills the gaps from notes fwe processes leave each other:
 |---|---|---|
 | `si_code` of a sent signal (`SI_USER` = `0x10001`, `SI_QUEUE`, `SI_TIMER`, `SI_ASYNCIO`, `SI_MESGQ`) | translated (`host::si_code_to_linux`); the `SIGCHLD` and fault codes are the same on both | Linux's `si_code` (`SI_USER` = 0 …) |
 | `si_pid` of the sender, a host pid | mapped into the guest's pid namespace | the sender's pid there, 0 for one outside it |
-| `si_uid` of the sender | fwe's own host user → 0, any other → 65534, then through the user namespace | the sender's uid as the guest's ids go |
-| an fwe process sent it | the sender first wrote a note (pid, uid, and for `SI_MESGQ` the code and value) into the target's mailbox, which the handler reads | the sender, even when macOS gave none |
+| `si_uid` of the sender | from an fwe process (this one too), its guest real uid, which it writes in its note; from any other, fwe's own host user → 0, any other → 65534; then through the receiver's user namespace | the sender's real uid as the receiver's user namespace has it |
+| `si_uid` of a child's `SIGCHLD` (and `waitid`) | the child's guest real uid, read from its record, which is kept until it is reaped | the child's real uid |
+| an fwe process sent it | the sender first wrote a note (pid, its guest uid, and for `SI_MESGQ` the code and value) into the target's mailbox, which the handler reads | the sender, even when macOS gave none |
 | a `siginfo` macOS emptied (a signal that arrived while an fwe handler ran) | the note, if an fwe process sent it; for `SIGCHLD`, a `waitid(WNOHANG \| WNOWAIT)` finds the child and how it changed | the sender or child, as Linux tells it; none for a non-fwe sender |
 | a `SIGIO` the host raised for a descriptor's readiness | no sender: `SI_KERNEL` | see [Network events](#network-events) |
 | a fault | the fault address | `si_addr` |

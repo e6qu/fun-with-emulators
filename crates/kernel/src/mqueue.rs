@@ -422,7 +422,7 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
             } else if let Some(h) = crate::host::signal_to_host(sig) {
                 // Another process: a host signal, with a note of what it
                 // carries.
-                crate::signote::note_with(n.owner.0, h, info.code, info.value);
+                crate::signote::note_with(n.owner.0, h, info.code, info.value, by.uid);
                 if crate::host::kill_process(n.owner.0, h) != 0 {
                     crate::signote::unnote(n.owner.0, h);
                 }
@@ -430,7 +430,13 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
                 // One the host lacks (a real-time signal): queued in the
                 // owner's mailbox. A notification that cannot be delivered
                 // is lost, as Linux's is when its receiver has gone.
-                crate::signal::send_unhosted(n.owner.0, sig, info.code, info.value);
+                crate::signal::send_unhosted_from(
+                    n.owner.0,
+                    sig,
+                    info.code,
+                    info.value,
+                    (by.pid, by.uid),
+                );
             }
         }
         _ => {}
@@ -441,8 +447,7 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
 /// lock: who it is.
 fn sender(creds: &Creds) -> Sender {
     let pid = crate::host::pid();
-    let uid = crate::userns::from_ns(creds.uid, false).unwrap_or(crate::userns::OVERFLOW);
-    Sender { pid, uid }
+    Sender { pid, uid: creds.uid }
 }
 
 /// `mq_timedsend(fd, msg, len, prio, abs_timeout)`.

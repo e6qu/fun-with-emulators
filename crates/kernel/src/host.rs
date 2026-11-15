@@ -667,9 +667,12 @@ pub unsafe fn signal_info(
         set_errno(saved);
     }
     // A signal sent by another fwe process left a note of its sender, for
-    // when it comes with none, and of what it carries ([`crate::signote`]).
+    // when it comes with none, and of what it carries ([`crate::signote`]),
+    // with the sender's guest user id.
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut value = 0;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut guest_uid = None;
     #[cfg(target_os = "macos")]
     {
         /// macOS's `SI_USER`.
@@ -696,7 +699,7 @@ pub unsafe fn signal_info(
             return crate::thread::SigInfo { code: signal::SI_KERNEL, ..Default::default() };
         }
         if let Some(n) = note {
-            (code, pid, uid) = (SENT, n.pid, n.uid);
+            (code, pid, guest_uid) = (SENT, n.pid, Some(n.uid));
             if n.code != 0 {
                 // A lease break carries the leased descriptor.
                 let poll = (n.code == crate::leases::POLL_MSG && sig != libc::SIGCHLD)
@@ -704,7 +707,7 @@ pub unsafe fn signal_info(
                 return crate::thread::SigInfo {
                     code: n.code,
                     pid,
-                    uid: uid_to_initial(uid),
+                    uid: n.uid,
                     status: 0,
                     value: if poll.is_some() { 0 } else { n.value },
                     poll,
@@ -733,7 +736,12 @@ pub unsafe fn signal_info(
         // that had stopped it).
         status = signal::SIGCONT as i32;
     }
-    crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value, poll: None }
+    // One this process sent itself carries its own guest user; one from a
+    // process that is not fwe's, the host user's.
+    let uid = guest_uid.unwrap_or_else(|| {
+        if pid != 0 && pid == pid_now() { crate::creds::real_uid() } else { uid_to_initial(uid) }
+    });
+    crate::thread::SigInfo { code, pid, uid, status, value, poll: None }
 }
 
 /// The code and sender the host last gave each host signal, as
@@ -758,7 +766,7 @@ pub fn sent_info(note: crate::signote::Note) -> crate::thread::SigInfo {
     crate::thread::SigInfo {
         code,
         pid: note.pid,
-        uid: uid_to_initial(note.uid),
+        uid: note.uid,
         status: 0,
         value: note.value,
         poll: None,

@@ -917,6 +917,14 @@ pub fn ids(pid: i32) -> [u32; 8] {
     read(pid).map_or([0; 8], |r| r.ids)
 }
 
+/// The real user id of process `pid` as its record keeps it, which it
+/// does while the process lives, while it is a zombie and until whoever
+/// reaps it is done: what its `SIGCHLD` names as its sender's (`si_uid`).
+/// `None` for a process fwe has no record of.
+pub fn kept_uid(pid: i32) -> Option<u32> {
+    read_any(pid).map(|r| r.ids[0])
+}
+
 /// This process's ids are now `ids` ([`ProcRecord::ids`]).
 pub fn set_own_ids(ids: [u32; 8]) {
     let _ = change(me(), |r| r.ids = ids);

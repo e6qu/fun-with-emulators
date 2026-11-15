@@ -653,8 +653,11 @@ impl<P: Platform> Kernel<P> {
         if s == 0 {
             return 0;
         }
-        // SAFETY: getpid and getuid cannot fail.
-        let (pid, uid) = unsafe { (libc::getpid(), libc::getuid()) };
+        // The caller's own `si_pid` and `si_uid`, as Linux delivers them:
+        // the pid as the process it names in the caller's namespace (0 for
+        // none), the user as the caller's user namespace has it.
+        let pid = crate::pidns::to_host(word(16)).unwrap_or(0);
+        let uid = crate::userns::from_ns(word(20) as u32, false).unwrap_or(crate::userns::OVERFLOW);
         let info = thread::SigInfo { code, pid, uid, value, ..Default::default() };
         if tgid == me {
             if !thread::may_queue(s) {
@@ -679,9 +682,10 @@ impl<P: Platform> Kernel<P> {
         // the target's next system-call trap): through the mailbox.
         let h = crate::host::signal_to_host(s).filter(|_| s != fwe_abi::signal::SIGTRAP);
         let Some(h) = h else {
-            return crate::signal::send_unhosted(host, s, code, value);
+            return crate::signal::send_unhosted_from(host, s, code, value, (pid, uid));
         };
-        crate::signote::note_with(host, h, code, value);
+        // A host signal names its sender's pid itself.
+        crate::signote::note_with(host, h, code, value, uid);
         let r = crate::host::kill_process(host, h);
         if r != 0 {
             crate::signote::unnote(host, h);

@@ -104,9 +104,20 @@ pub fn dac_override() -> bool {
     ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_none_or(|a| a.dac_override)
 }
 
+/// The process's real user id (an initial-namespace id), as last
+/// published: what the signals it sends carry as their sender's
+/// (`si_uid`, which each receiver sees in its own user namespace).
+static REAL_UID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The process's real user id ([`REAL_UID`]). Async-signal-safe.
+pub fn real_uid() -> u32 {
+    REAL_UID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Publish the access `c` gives, after a system call that may have
-/// changed it (written only when it did).
+/// changed it (written only when it did), and its real user id.
 pub fn publish(c: &Creds) {
+    REAL_UID.store(c.uid, std::sync::atomic::Ordering::Relaxed);
     // Compared where it is, as most calls change nothing: made anew only
     // when it changed.
     let same = ACCESS.read().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|a| {

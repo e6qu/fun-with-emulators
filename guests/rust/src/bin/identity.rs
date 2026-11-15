@@ -17,6 +17,13 @@ const SIGTERM: i32 = 15;
 const SIGTSTP: i32 = 20;
 const CLONE_NEWPID: i32 = 0x2000_0000;
 const SIGRT1: i32 = 35;
+const SIGRT2: i32 = 36;
+const SIGCHLD: i32 = 17;
+const SI_QUEUE: i32 = -1;
+const SI_USER: i32 = 0;
+const SYS_RT_SIGQUEUEINFO: i64 = 138;
+const P_PID: i32 = 1;
+const WEXITED: i32 = 4;
 const O_RDONLY: i32 = 0;
 const SIG_BLOCK: i32 = 0;
 
@@ -45,6 +52,7 @@ unsafe extern "C" {
     fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     fn write(fd: i32, buf: *const c_void, len: usize) -> isize;
     fn usleep(us: u32) -> i32;
+    fn waitid(idtype: i32, id: u32, info: *mut [u8; 128], options: i32) -> i32;
     fn __errno_location() -> *mut i32;
 }
 
@@ -198,6 +206,94 @@ fn init_signals() {
     }
 }
 
+/// `si_pid` and `si_uid` of a `siginfo`.
+fn sender(info: &[u8; 128]) -> (i32, u32) {
+    (
+        i32::from_ne_bytes(info[16..20].try_into().unwrap()),
+        u32::from_ne_bytes(info[20..24].try_into().unwrap()),
+    )
+}
+
+/// A `siginfo` for `rt_sigqueueinfo`: `sig` with `code`, naming `pid` and
+/// `uid` as its sender.
+fn queued_info(sig: i32, code: i32, pid: i32, uid: u32) -> [u8; 128] {
+    let mut info = [0u8; 128];
+    info[0..4].copy_from_slice(&sig.to_ne_bytes());
+    info[8..12].copy_from_slice(&code.to_ne_bytes());
+    info[16..20].copy_from_slice(&pid.to_ne_bytes());
+    info[20..24].copy_from_slice(&uid.to_ne_bytes());
+    info
+}
+
+/// The sender's ids each signal carries: its pid and its guest user
+/// (not the host's), as `kill` from a process of uid 1000 to another
+/// gives them, with a host signal and with one the host lacks;
+/// `rt_sigqueueinfo` delivers the caller's own, to itself and to another;
+/// a child's `SIGCHLD` and `waitid` name the child's user.
+fn sender_ids() {
+    // SAFETY: plain calls into the C library and the kernel.
+    unsafe {
+        let all = sigset(SIGUSR1) | sigset(SIGRT1) | sigset(SIGRT2) | sigset(SIGCHLD);
+        sigprocmask(SIG_BLOCK, &all, std::ptr::null_mut());
+        let me = getpid();
+        kill(me, SIGUSR1);
+        let own = wait_for(SIGUSR1, 1000).map(|i| sender(&i));
+        println!("own kill: {}", own == Some((me, 0)));
+        let info = queued_info(SIGRT1, SI_QUEUE, 4242, 77);
+        syscall(SYS_RT_SIGQUEUEINFO, i64::from(me), i64::from(SIGRT1), info.as_ptr());
+        println!("own sigqueueinfo: {:?}", wait_for(SIGRT1, 1000).map(|i| sender(&i)));
+        let (mut ready, mut report) = ([0i32; 2], [0i32; 2]);
+        pipe(ready.as_mut_ptr());
+        pipe(report.as_mut_ptr());
+        let receiver = fork();
+        if receiver == 0 {
+            setuid(1000);
+            write(ready[1], b"r".as_ptr().cast(), 1);
+            let mut line = String::new();
+            for sig in [SIGUSR1, SIGRT1, SIGRT2] {
+                let got = wait_for(sig, 5000).map(|i| sender(&i));
+                line.push_str(&format!("{got:?} "));
+            }
+            write(report[1], line.as_ptr().cast(), line.len());
+            _exit(0);
+        }
+        let mut b = 0u8;
+        read(ready[0], (&mut b as *mut u8).cast(), 1);
+        let from = fork();
+        if from == 0 {
+            setuid(1000);
+            kill(receiver, SIGUSR1);
+            kill(receiver, SIGRT1);
+            let info = queued_info(SIGRT2, SI_QUEUE, getpid(), 1000);
+            syscall(SYS_RT_SIGQUEUEINFO, i64::from(receiver), i64::from(SIGRT2), info.as_ptr());
+            let info = queued_info(SIGRT2, SI_USER, getpid(), 1000);
+            let r = syscall(SYS_RT_SIGQUEUEINFO, i64::from(receiver), i64::from(SIGRT2), info.as_ptr());
+            _exit(i32::from(r == -1 && errno() == 1));
+        }
+        let refused = reap(from);
+        reap(receiver);
+        // SIGCHLD of the sender, the receiver: drained.
+        while wait_for(SIGCHLD, 0).is_some() {}
+        let mut buf = [0u8; 256];
+        let n = read(report[0], buf.as_mut_ptr().cast(), buf.len());
+        let text = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+        let want = format!("Some(({from}, 1000)) ").repeat(3);
+        println!("from uid 1000: {}, si_code 0 to another refused {}", text == want, refused == 1);
+        if text != want {
+            println!("  got {text}, wanted {want}");
+        }
+        let c = fork();
+        if c == 0 {
+            setuid(1000);
+            _exit(3);
+        }
+        let chld = wait_for(SIGCHLD, 5000).map(|i| sender(&i));
+        let mut info = [0u8; 128];
+        waitid(P_PID, c as u32, &mut info, WEXITED);
+        println!("child's SIGCHLD: {}, waitid: {}", chld == Some((c, 1000)), sender(&info) == (c, 1000));
+    }
+}
+
 /// `kill(0)` and `kill(-pgid)` from a process of uid 1000, in a group
 /// with root's processes and one of uid 1000: each member it may signal
 /// takes the signal, the others do not, and a group of root's only gives
@@ -246,6 +342,7 @@ fn main() {
         "host-process" => host_process(arg(2).parse().unwrap()),
         "group-kill" => group_kill(),
         "init-signals" => init_signals(),
+        "sender-ids" => sender_ids(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

@@ -4275,6 +4275,18 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// Each signal names its sender's pid and guest user, as Linux's
+/// `siginfo` does; `rt_sigqueueinfo` delivers the caller's own.
+#[test]
+fn signals_name_their_senders_guest_ids() {
+    assert_eq!(
+        identity(&["sender-ids"]),
+        "own kill: true\nown sigqueueinfo: Some((4242, 77))\n\
+         from uid 1000: true, si_code 0 to another refused true\n\
+         child's SIGCHLD: true, waitid: true\n"
+    );
+}
+
 /// A pid namespace's init takes only the signals it handles, from
 /// inside its namespace or its parent's; `SIGKILL` from outside ends it.
 #[test]
