@@ -230,14 +230,23 @@ their budgets; and what still needs the VM is listed with the reason.
 Linux programs with windows on the Mac's screen, Windows programs through
 Wine with theirs, and a Linux program inside gVisor, all on fwe.
 
-- [ ] **Graphical Linux programs:** X11 clients (`xterm`, `xeyes`, a GTK
-  and a Qt program) drawn by an X server on the Mac (XQuartz), reached
-  through the socket `DISPLAY` names, with shared memory (`MIT-SHM`)
-  where the server offers it; Wayland clients through a compositor that
-  speaks to the Mac, if one proves practical.
-- [ ] **Graphical Wine:** a Windows program with a window (Notepad, a
-  Direct3D-free game or demo) through Wine's X11 driver, natively (M6's
-  Wine item).
+- [ ] **A display for Linux programs:** X11 clients drawn by an X server
+  on the Mac (XQuartz), reached through the socket `DISPLAY` names, with
+  shared memory (`MIT-SHM`) where the server offers it; OpenGL and Vulkan
+  rendered in software by Mesa (llvmpipe, lavapipe); Wayland clients
+  through a compositor that speaks to the Mac, if one proves practical.
+- [ ] **Demo programs:** `xterm`, `xeyes`, `xclock`, `glxgears`, `vkcube`,
+  GTK's and Qt's demo programs.
+- [ ] **Browsers:** Chrome (Google's Linux arm64 build, or Chromium where
+  none is published) and Firefox, with their sandboxes on and their
+  content, GPU and network processes, browsing local pages and playing
+  video.
+- [ ] **Application frameworks:** an Electron app (Electron's quick-start
+  and Visual Studio Code); Zed, the editor (Vulkan); a Tauri app (Rust,
+  WebKitGTK); a Wails app (Go, WebKitGTK); a tkinter app (Python, Tk).
+- [ ] **Graphical Wine:** Windows programs with windows through Wine's
+  X11 driver, natively (M6's Wine item): Wine's own (Notepad,
+  Minesweeper, `regedit`) and a Direct3D demo through WineD3D on OpenGL.
 - [ ] **gVisor on fwe:** `runsc` running a Linux program on its `systrap`
   platform (`seccomp`'s `SECCOMP_RET_TRAP`, `SIGSYS` and memory shared
   between its sentry and stub processes) or its `ptrace` platform, as
@@ -247,10 +256,11 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
   `runsc` on fwe against the same workload under `runsc` on Linux, its
   output compared.
 
-**Done when:** CI starts an X server and runs an X11 program, a GTK
-program and a Windows program with a window under fwe, checking what they
-draw (a screenshot of the server compared), and runs the JDK workload
-through `runsc` on fwe, its benchmark beside `runsc` on Linux.
+**Done when:** CI starts an X server and runs every program above under
+fwe, each driven by synthetic input (keys, clicks, a page loaded, a file
+edited) and checked by what it draws (the server's screenshot compared);
+and runs the JDK workload through `runsc` on fwe, its benchmark beside
+`runsc` on Linux.
 
 ## After 1.0
 
