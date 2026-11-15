@@ -543,23 +543,16 @@ def pcs(name, cmd):
     lists it while the program runs) and the offset into it: `sample` walks
     frames, which guest code without frame records leaves it short of."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
+    # Started first, on every fwe process (one runs at a time here): DTrace
+    # grabbing a running process by its pid fails while it starts.
+    script = 'profile-997 /execname == "fwe"/ { @[arg1] = count(); }'
+    tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
+                               "-o", out],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              errors="replace")
+    time.sleep(2)
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    time.sleep(0.05)  # (Past its exec, as for `sample`.)
-    script = "profile-997 /pid == $target/ { @[arg1] = count(); }"
-
-    def trace():
-        return subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p",
-                                 str(proc.pid), "-n", script, "-o", out],
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                errors="replace")
-
-    tracer = trace()
-    time.sleep(0.2)
-    # Grabbed mid-`exec` (the host's own loading of fwe), DTrace lets go at
-    # once: once more, the process past it.
-    if tracer.poll() is not None and proc.poll() is None:
-        tracer = trace()
-        time.sleep(0.1)
+    time.sleep(0.25)
     regions = []
     vm = subprocess.run(["vmmap", "-wide", str(proc.pid)], capture_output=True, text=True,
                         errors="replace").stdout
@@ -567,8 +560,10 @@ def pcs(name, cmd):
         m = re.search(r"([0-9a-f]+)-([0-9a-f]+)\s+\[.*?\]\s+\S+\s+SM=\S+\s*(.*)$", line)
         if m:
             regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip()))
-    said = tracer.communicate()[0]
     proc.wait()
+    # (sudo passes the interrupt on; DTrace then writes what it gathered.)
+    subprocess.run(["sudo", "-n", "kill", "-INT", str(tracer.pid)], capture_output=True)
+    said = tracer.communicate()[0]
     counts = []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
