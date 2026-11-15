@@ -1296,16 +1296,21 @@ impl Table {
             .filter(|d| *d != n.id && !in_n.contains(d))
             .collect();
         let r_is_top = r.parent == r.id;
+        // The old root's lock to what it covers goes to the new root, as
+        // Linux moves it: the old root, now at `put_old`, may be detached.
+        let r_locked = r.locked & LOCKED;
         for m in self.mounts.iter_mut() {
             if m.id == n.id {
                 // Where the old root was (the namespace's root, if it was).
                 m.parent = if r_is_top { n.id } else { r.parent };
                 m.point = root.to_vec();
+                m.locked |= r_locked;
             } else if in_n.contains(&m.id) {
                 m.point = join(root, under(&m.point, &n.point).unwrap_or(b""));
             } else if m.id == r.id {
                 m.parent = holder;
                 m.point = new_put.clone();
+                m.locked &= !LOCKED;
             } else if in_r.contains(&m.id) {
                 m.point = join(&new_put, under(&m.point, root).unwrap_or(b""));
             }
@@ -2129,6 +2134,23 @@ mod tests {
         let (m, rest) = t.locate(b"/old/etc");
         assert_eq!(m.host_path(&rest).unwrap(), b"/host/root/etc");
         assert_eq!(t.locate(b"/old/proc/self").0.fstype, FsType::Proc);
+        t.umount(b"/old").unwrap();
+        assert_eq!(t.mounts.len(), 1);
+    }
+
+    /// In a namespace copied into a less privileged user namespace (every
+    /// mount locked), `pivot_root` moves the old root's lock to the new
+    /// root, so the old root can be unmounted from `put_old`, as rootless
+    /// container tools do; the new root cannot be.
+    #[test]
+    fn pivot_root_moves_the_roots_lock() {
+        let mut t = table();
+        for m in t.mounts.iter_mut() {
+            lock(m);
+        }
+        tmpfs(&mut t, b"/new");
+        t.pivot_root(b"/", b"/new", b"/new/old").unwrap();
+        assert_ne!(t.locate(b"/").0.locked & LOCKED, 0);
         t.umount(b"/old").unwrap();
         assert_eq!(t.mounts.len(), 1);
     }
