@@ -34,6 +34,9 @@ const MAP_PRIVATE_ANON: i32 = 0x02 | 0x20;
 const MAP_LOCKED: i32 = 0x2000;
 const MCL_FUTURE: i32 = 2;
 const SYS_MMAP: i64 = 222;
+const SYS_SCHED_SETAFFINITY: i64 = 122;
+const SYS_SCHED_GETAFFINITY: i64 = 123;
+const SYS_GETCPU: i64 = 168;
 const MAP_SHARED: i32 = 0x01;
 const MAP_SHARED_ANON: i32 = 0x01 | 0x20;
 const MAP_PRIVATE: i32 = 0x02;
@@ -345,6 +348,66 @@ fn map_anon(len: usize, flags: i32) -> String {
     // SAFETY: a fresh mapping, left mapped.
     let r = unsafe { syscall(SYS_MMAP, 0i64, len, PROT_RW, MAP_PRIVATE_ANON | flags, -1i64, 0i64) };
     outcome(r)
+}
+
+/// `sched_getaffinity(pid)`'s first word (0 on failure).
+fn affinity_of(pid: i32) -> u64 {
+    let mut mask = [0u64; 16];
+    // SAFETY: a buffer of the size given.
+    let r = unsafe { syscall(SYS_SCHED_GETAFFINITY, i64::from(pid), 128i64, mask.as_mut_ptr()) };
+    if r > 0 { mask[0] } else { 0 }
+}
+
+/// `sched_setaffinity(pid)` to the CPUs of `word`.
+fn set_affinity(pid: i32, word: u64) -> i64 {
+    let mask = [word, 0, 0, 0, 0, 0, 0, 0];
+    // SAFETY: a buffer of the size given.
+    unsafe { syscall(SYS_SCHED_SETAFFINITY, i64::from(pid), 64i64, mask.as_ptr()) }
+}
+
+/// The CPU `getcpu` reports.
+fn cpu() -> u32 {
+    let mut c = u32::MAX;
+    // SAFETY: an out-parameter; no node or cache asked for.
+    unsafe { syscall(SYS_GETCPU, &mut c as *mut u32, 0i64, 0i64) };
+    c
+}
+
+/// CPU affinity is kept per process: set on another process, it is what
+/// that process and others read; a fork child inherits it; `getcpu`
+/// reports a CPU of it.
+fn affinity() {
+    // SAFETY: plain calls into the C library.
+    unsafe {
+        let all = affinity_of(0);
+        let (mut ready, mut go, mut report) = ([0i32; 2], [0i32; 2], [0i32; 2]);
+        pipe(ready.as_mut_ptr());
+        pipe(go.as_mut_ptr());
+        pipe(report.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            close(go[1]);
+            write(ready[1], b"r".as_ptr().cast(), 1);
+            let mut b = 0u8;
+            read(go[0], (&mut b as *mut u8).cast(), 1);
+            let line = format!("child reads its own {:#x}, getcpu {}\n", affinity_of(0), cpu());
+            write(report[1], line.as_ptr().cast(), line.len());
+            _exit(0);
+        }
+        close(go[0]);
+        let mut b = 0u8;
+        read(ready[0], (&mut b as *mut u8).cast(), 1);
+        let set = set_affinity(child, 0b10);
+        println!("set another's {set}: it reads {:#x}, own unchanged {}", affinity_of(child), affinity_of(0) == all);
+        close(go[1]);
+        reap(child);
+        let mut buf = [0u8; 128];
+        let n = read(report[0], buf.as_mut_ptr().cast(), buf.len());
+        print!("{}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+        set_affinity(0, 0b100);
+        let inherited = in_child(|| affinity_of(0) as i32);
+        println!("own {:#x}, getcpu {}, a fork child's {inherited}", affinity_of(0), cpu());
+    }
 }
 
 /// A child that runs `f` and exits with what it returns: how it ended,
@@ -664,6 +727,7 @@ fn main() {
         "priorities" => priorities(),
         "memlock" => memlock(),
         "madvise" => madvise_controls(),
+        "affinity" => affinity(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

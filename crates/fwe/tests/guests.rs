@@ -4275,6 +4275,18 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// CPU affinity is per process and reaches across processes: one set on
+/// another process is what it reads; a fork child inherits it.
+#[test]
+fn affinity_is_kept_per_process() {
+    assert_eq!(
+        identity(&["affinity"]),
+        "set another's 0: it reads 0x2, own unchanged true\n\
+         child reads its own 0x2, getcpu 1\n\
+         own 0x4, getcpu 2, a fork child's exit 4\n"
+    );
+}
+
 /// `madvise` controls what a fork child is given (`MADV_DONTFORK`), makes
 /// guard pages, frees a shared file's pages (`MADV_REMOVE`) and discards
 /// locked memory (`MADV_DONTNEED_LOCKED`), as Linux does.

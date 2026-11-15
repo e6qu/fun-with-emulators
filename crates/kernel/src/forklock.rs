@@ -154,7 +154,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &posixtimer::NOTIFY,
         &ptrace::PENDING,
         &ptrace::THREADS,
-        &syscalls::AFFINITY,
+        &procreg::OWN_AFFINITY,
         &fdtable::LIMIT,
         &keys::INHERIT,
         &fs::PREOPENED,

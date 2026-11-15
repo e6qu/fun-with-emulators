@@ -89,6 +89,10 @@ pub struct ProcRecord {
     /// it was made with `CLONE_PARENT`, so its parent waits for it as a
     /// reaper waits for one it adopted ([`crate::reaper`]).
     pub foster: bool,
+    /// Its CPU affinity (`sched_setaffinity`), a mask of 64-bit words;
+    /// empty for every CPU. Its children inherit it; another process sets
+    /// and reads it here.
+    pub affinity: Vec<u64>,
 }
 
 /// A host process, as its pid and its start time.
@@ -230,6 +234,10 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
         e.bytes(d);
     }
     e.bool(r.foster);
+    e.u64(r.affinity.len() as u64);
+    for &w in &r.affinity {
+        e.u64(w);
+    }
     e.into_bytes()
 }
 
@@ -331,6 +339,8 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     let n = d.count(8);
     let held = (0..n).map(|_| d.bytes()).collect();
     let foster = d.bool();
+    let n = d.count(8);
+    let affinity = (0..n).map(|_| d.u64()).collect();
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -358,6 +368,7 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
         auxv,
         held,
         foster,
+        affinity,
     })
 }
 
@@ -587,6 +598,7 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
         auxv: Vec::new(),
         held: Vec::new(),
         foster: false,
+        affinity: Vec::new(),
     }
 }
 
@@ -721,6 +733,8 @@ pub struct Inherit {
     slack: u64,
     /// The child is made with `CLONE_PARENT` ([`ProcRecord::foster`]).
     pub foster: bool,
+    /// The CPU affinity ([`ProcRecord::affinity`]).
+    affinity: Vec<u64>,
 }
 
 /// What a child forked now inherits ([`Inherit`]): a child of a process
@@ -749,6 +763,7 @@ pub fn inherit() -> Inherit {
         sched,
         slack,
         foster: false,
+        affinity: r.affinity,
     }
 }
 
@@ -763,6 +778,10 @@ pub fn save_inherit(e: &mut Enc, i: &Inherit) {
     i.sched.encode(e);
     e.u64(i.slack);
     e.bool(i.foster);
+    e.u64(i.affinity.len() as u64);
+    for &w in &i.affinity {
+        e.u64(w);
+    }
 }
 
 /// What [`save_inherit`] wrote.
@@ -776,7 +795,9 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let sched = Sched::decode(d);
     let slack = d.u64();
     let foster = d.bool();
-    Inherit { ids, oom, nice, sched, slack, foster }
+    let n = d.count(8);
+    let affinity = (0..n).map(|_| d.u64()).collect();
+    Inherit { ids, oom, nice, sched, slack, foster, affinity }
 }
 
 /// Set `r`'s inherited part.
@@ -795,6 +816,7 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
         r.slack = (i.slack, i.slack);
     }
     r.foster = i.foster;
+    r.affinity = i.affinity.clone();
 }
 
 /// A child `child` of this process starts in this process's cgroup (or in
@@ -883,6 +905,42 @@ pub fn set_nice(pid: i32, nice: i32) -> Result<(), i32> {
     change(pid, |r| r.nice = nice)?;
     crate::host::set_nice(pid, nice);
     Ok(())
+}
+
+/// Host process `pid`'s CPU affinity, `None` for a process fwe has no
+/// record of (empty: every CPU).
+pub fn affinity(pid: i32) -> Option<Vec<u64>> {
+    read(pid).map(|r| r.affinity)
+}
+
+/// Host process `pid`'s CPU affinity is now `mask`.
+pub fn set_affinity(pid: i32, mask: Vec<u64>) -> Result<(), i32> {
+    change(pid, |r| r.affinity = mask)
+}
+
+/// This process's CPU affinity as last read, with its pid and record's
+/// version then.
+pub(crate) static OWN_AFFINITY: std::sync::Mutex<Option<(i32, u32, Vec<u64>)>> =
+    std::sync::Mutex::new(None);
+
+/// This process's CPU affinity, read again only once its record changed
+/// (by it or by another process): for `getcpu`, often called.
+pub fn own_affinity() -> Vec<u64> {
+    let me = me();
+    let version = crate::procstore::version(me);
+    let mut c = OWN_AFFINITY.lock().unwrap_or_else(|e| e.into_inner());
+    if let (Some((pid, v, mask)), Some(now)) = (c.as_ref(), version)
+        && *pid == me
+        && *v == now
+        && now % 2 == 0
+    {
+        return mask.clone();
+    }
+    let mask = affinity(me).unwrap_or_default();
+    if let Some(v) = version {
+        *c = Some((me, v, mask.clone()));
+    }
+    mask
 }
 
 /// Host process `pid`'s `oom_score_adj` (0 for one fwe has no record of).

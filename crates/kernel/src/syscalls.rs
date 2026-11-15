@@ -2093,19 +2093,43 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    fn sys_sched_getaffinity(&self, pid: u64, len: u64, mask: u64) -> i64 {
-        // The caller, the process, or one of its threads: glibc's
-        // `pthread_getattr_np` asks with the thread's own id.
+    /// The host process whose affinity `sched_*affinity`'s `pid` names: the
+    /// caller's for 0 or one of its threads (glibc's `pthread_getattr_np`
+    /// asks with the thread's own id), the process of another's thread,
+    /// or a process (`ESRCH` for none).
+    fn affinity_target(&self, pid: u64) -> Result<i32, i32> {
         let id = pid as i32;
-        if id != 0 && id != thread::tgid() && thread::host_thread(id).is_none() {
-            return err(errno::ESRCH);
+        if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
+            return Ok(host::pid());
         }
+        if let Some(owner) = thread::owner_of_tid(id).filter(|&o| host::is_fwe(o)) {
+            return Ok(owner);
+        }
+        match crate::pidns::host_arg(id) {
+            Ok(h) if host::process_exists(h) => Ok(h),
+            _ => Err(errno::ESRCH),
+        }
+    }
+
+    /// `sched_getaffinity(pid, len, mask)`: the affinity of the process
+    /// named, as its record keeps it; a process fwe did not start runs on
+    /// every CPU.
+    fn sys_sched_getaffinity(&self, pid: u64, len: u64, mask: u64) -> i64 {
+        let target = match self.affinity_target(pid) {
+            Ok(h) => h,
+            Err(e) => return err(e),
+        };
         let online = online_cpus();
         let size = online.len() as u64 * 8;
         if len < size || !len.is_multiple_of(8) {
             return err(errno::EINVAL);
         }
-        let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(online);
+        let set = if target == host::pid() {
+            crate::procreg::own_affinity()
+        } else {
+            crate::procreg::affinity(target).unwrap_or_default()
+        };
+        let set = if set.is_empty() { online } else { set };
         for (word, value) in set.iter().enumerate() {
             guest!(uaccess::write(mask + word as u64 * 8, *value));
         }
@@ -2113,9 +2137,11 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `sched_setaffinity(pid, len, mask)`: checked as Linux checks it (the
-    /// mask must name an online CPU) and remembered for the caller, which
-    /// `sched_getaffinity` then reports. The host has no affinity to set:
-    /// threads still run on any CPU, and another process's is not kept.
+    /// mask must name an online CPU; another user's process needs
+    /// `CAP_SYS_NICE`) and kept in the record of the process named, which
+    /// `sched_getaffinity` then reports, in it or any other. The host has
+    /// no affinity to set: threads still run on any CPU, and a process fwe
+    /// did not start keeps running on every one.
     fn sys_sched_setaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
         let online = online_cpus();
         let mut want = vec![0u64; online.len()];
@@ -2131,24 +2157,25 @@ impl<P: Platform> Kernel<P> {
         if want.iter().all(|&w| w == 0) {
             return err(errno::EINVAL);
         }
-        let id = pid as i32;
-        if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
-            *AFFINITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
-            return 0;
-        }
-        match crate::pidns::host_arg(id) {
-            // SAFETY: a signal 0 only checks that the process exists.
-            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => {
-                // Another user's process, without CAP_SYS_NICE: refused.
-                let owner = crate::procreg::ids(h);
-                if !self.creds.has(crate::caps::CAP_SYS_NICE)
-                    && ![owner[0], owner[1]].contains(&self.creds.euid)
-                {
-                    return err(errno::EPERM);
-                }
-                0
+        let target = match self.affinity_target(pid) {
+            Ok(h) => h,
+            Err(e) => return err(e),
+        };
+        if target != host::pid() {
+            // Another user's process, without CAP_SYS_NICE: refused.
+            let owner = crate::procreg::ids(target);
+            if !self.creds.has(crate::caps::CAP_SYS_NICE)
+                && ![owner[0], owner[1]].contains(&self.creds.euid)
+            {
+                return err(errno::EPERM);
             }
-            _ => err(errno::ESRCH),
+            if !host::is_fwe(target) {
+                return 0;
+            }
+        }
+        match crate::procreg::set_affinity(target, want) {
+            Ok(()) => 0,
+            Err(e) => err(e),
         }
     }
 
@@ -3490,21 +3517,16 @@ fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
     r
 }
 
-/// The affinity `sched_setaffinity` set for this process, if it did.
-pub(crate) static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
-
-/// The CPU the caller is taken to run on: the first of its affinity (the
-/// host's scheduler places it where it will).
+/// The CPU the caller is taken to run on: the first of its affinity.
+/// macOS offers no supported way to learn the CPU a thread runs on (its
+/// scheduler places it where it will), so this is where Linux would keep
+/// a thread bound to its affinity's first CPU.
 pub(crate) fn own_cpu() -> usize {
-    let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    set.and_then(|words| {
-        words
-            .iter()
-            .enumerate()
-            .find(|(_, w)| **w != 0)
-            .map(|(i, w)| i * 64 + w.trailing_zeros() as usize)
-    })
-    .unwrap_or(0)
+    crate::procreg::own_affinity()
+        .iter()
+        .enumerate()
+        .find(|(_, w)| **w != 0)
+        .map_or(0, |(i, w)| i * 64 + w.trailing_zeros() as usize)
 }
 
 /// The online CPUs, as a mask of 64-bit words.

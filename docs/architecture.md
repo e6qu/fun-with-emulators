@@ -1308,9 +1308,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   host process keeps the highest value it had. Another thread's nice
   value is kept for it, and only the process's reaches the host; a thread
   of another process cannot be named by its tid (`ESRCH`).
-- `sched_setaffinity` is checked and remembered, but threads run on any
-  CPU; scheduling policies are per process, not per thread, and do not
-  change how the host schedules.
+- A CPU affinity is checked and kept per process (a thread's is its
+  process's), but threads run on any CPU: macOS has no affinity a
+  process may set. `getcpu` reports the affinity's first CPU, macOS
+  telling no thread the CPU it runs on. A process fwe did not start is
+  reported to run on every CPU, and setting its affinity changes
+  nothing. Scheduling policies are per process, not per thread, and do
+  not change how the host schedules.
 
 **Memory**
 - Native: a not-yet-written page of a private mapping of a file with no
