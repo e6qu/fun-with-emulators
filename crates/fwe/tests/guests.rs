@@ -1775,7 +1775,13 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
         return root;
     }
     let files = fetched_alpine(manifest_name);
-    let _ = std::fs::remove_dir_all(&root);
+    // What is there goes whole: unpacking over it keeps its directories'
+    // modes, and its read-only ones (`/proc`, `/sys`) stop a removal
+    // halfway unless made writable first.
+    if root.exists() {
+        run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&root));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     std::fs::create_dir_all(&root).unwrap();
     for f in &files {
         run_checked(
