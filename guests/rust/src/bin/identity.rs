@@ -23,6 +23,16 @@ const SI_QUEUE: i32 = -1;
 const SI_USER: i32 = 0;
 const SYS_RT_SIGQUEUEINFO: i64 = 138;
 const P_PID: i32 = 1;
+const RLIMIT_SIGPENDING: i32 = 11;
+const SYS_TIMER_CREATE: i64 = 107;
+const SYS_TIMER_DELETE: i64 = 111;
+const CLOCK_MONOTONIC: i64 = 1;
+
+#[repr(C)]
+struct Rlimit {
+    cur: u64,
+    max: u64,
+}
 const WEXITED: i32 = 4;
 const O_RDONLY: i32 = 0;
 const SIG_BLOCK: i32 = 0;
@@ -52,6 +62,7 @@ unsafe extern "C" {
     fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
     fn write(fd: i32, buf: *const c_void, len: usize) -> isize;
     fn usleep(us: u32) -> i32;
+    fn setrlimit(res: i32, lim: *const Rlimit) -> i32;
     fn waitid(idtype: i32, id: u32, info: *mut [u8; 128], options: i32) -> i32;
     fn __errno_location() -> *mut i32;
 }
@@ -206,6 +217,93 @@ fn init_signals() {
     }
 }
 
+/// `rt_sigqueueinfo(pid, sig)` with `value`, as `sigqueue` sends it: 0 or
+/// the errno.
+fn sigqueue(pid: i32, sig: i32, value: i32) -> i32 {
+    // SAFETY: plain calls into the C library and the kernel.
+    unsafe {
+        let mut info = queued_info(sig, SI_QUEUE, getpid(), 0);
+        info[24..28].copy_from_slice(&value.to_ne_bytes());
+        if syscall(SYS_RT_SIGQUEUEINFO, i64::from(pid), i64::from(sig), info.as_ptr()) == 0 { 0 } else { errno() }
+    }
+}
+
+/// The values of the queued `sig` taken, in order, waiting up to `ms`
+/// for each.
+fn take_all(sig: i32, ms: i64) -> Vec<i32> {
+    std::iter::from_fn(|| wait_for(sig, ms)).map(|i| i32::from_ne_bytes(i[24..28].try_into().unwrap())).collect()
+}
+
+/// `RLIMIT_SIGPENDING` counts each signal queued: past it, `sigqueue`
+/// and `timer_create` fail with `EAGAIN`, while `kill` merges its signal
+/// into the one pending; to another process, what waits for room is kept
+/// for it, never lost.
+fn sigpending_limit() {
+    // SAFETY: plain calls into the C library and the kernel.
+    unsafe {
+        let rt = sigset(SIGRT1);
+        sigprocmask(SIG_BLOCK, &rt, std::ptr::null_mut());
+        let ten = Rlimit { cur: 10, max: 10 };
+        setrlimit(RLIMIT_SIGPENDING, &ten);
+        let me = getpid();
+        let mut sent = 0;
+        let refused = loop {
+            match sigqueue(me, SIGRT1, sent) {
+                0 if sent < 100 => sent += 1,
+                e => break e,
+            }
+        };
+        let mut timer = 0i32;
+        let t = syscall(SYS_TIMER_CREATE, CLOCK_MONOTONIC, 0i64, &mut timer as *mut i32);
+        let timer_refused = t == -1 && errno() == 11;
+        let killed = kill(me, SIGRT1);
+        let taken = take_all(SIGRT1, 0);
+        let in_order = taken.iter().copied().eq(0..sent);
+        println!(
+            "own: queued {sent}, then {}, timer refused {timer_refused}, kill {killed}, taken {} in order {in_order}",
+            if refused == 11 { "EAGAIN" } else { "?" },
+            taken.len()
+        );
+        let t = syscall(SYS_TIMER_CREATE, CLOCK_MONOTONIC, 0i64, &mut timer as *mut i32);
+        println!("timer once there is room: {}", t == 0);
+        syscall(SYS_TIMER_DELETE, i64::from(timer));
+
+        let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
+        pipe(ready.as_mut_ptr());
+        pipe(go.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            close(go[1]);
+            let five = Rlimit { cur: 5, max: 5 };
+            setrlimit(RLIMIT_SIGPENDING, &five);
+            write(ready[1], b"r".as_ptr().cast(), 1);
+            let mut b = 0u8;
+            read(go[0], (&mut b as *mut u8).cast(), 1);
+            let got = take_all(SIGRT1, 500);
+            let in_order = got.iter().copied().eq(0..got.len() as i32);
+            _exit(if in_order { got.len() as i32 } else { 255 });
+        }
+        close(go[0]);
+        let mut b = 0u8;
+        read(ready[0], (&mut b as *mut u8).cast(), 1);
+        let mut sent = 0;
+        let refused = loop {
+            match sigqueue(child, SIGRT1, sent) {
+                0 if sent < 200 => sent += 1,
+                e => break e,
+            }
+        };
+        close(go[1]);
+        let got = reap(child);
+        println!(
+            "another: then {}, past its limit {}, all taken in order {}",
+            if refused == 11 { "EAGAIN" } else { "?" },
+            sent >= 5,
+            got == sent
+        );
+    }
+}
+
 /// `si_pid` and `si_uid` of a `siginfo`.
 fn sender(info: &[u8; 128]) -> (i32, u32) {
     (
@@ -343,6 +441,7 @@ fn main() {
         "group-kill" => group_kill(),
         "init-signals" => init_signals(),
         "sender-ids" => sender_ids(),
+        "sigpending" => sigpending_limit(),
         other => {
             eprintln!("unknown check {other:?}");
             std::process::exit(2);

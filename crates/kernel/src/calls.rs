@@ -660,7 +660,7 @@ impl<P: Platform> Kernel<P> {
         let uid = crate::userns::from_ns(word(20) as u32, false).unwrap_or(crate::userns::OVERFLOW);
         let info = thread::SigInfo { code, pid, uid, value, ..Default::default() };
         if tgid == me {
-            if !thread::may_queue(s) {
+            if !thread::may_queue(s, code) {
                 return err(errno::EAGAIN);
             }
             match tid {

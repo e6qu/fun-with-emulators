@@ -13,7 +13,9 @@
 
 use fwe_abi::{Stack, signal};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex};
 
 /// The process (thread-group) id, shared by all threads. Set once at startup.
@@ -355,6 +357,13 @@ fn wait_timer() -> i32 {
 pub fn forked() {
     PROCESS.clear();
     with_own(Pending::clear);
+    // The parent's other threads' sets are not the child's.
+    for q in &POOL {
+        q.state.store(0, Ordering::Release);
+    }
+    POOL_USED.store(0, Ordering::Relaxed);
+    COUNT.store(0, Ordering::Relaxed);
+    HELD.store(false, Ordering::Relaxed);
     crate::acct::forked_child();
     crate::aio::forget_all();
     // A restricted process's child is in its domain: it says so.
@@ -662,68 +671,103 @@ impl SigSlot {
     }
 }
 
-/// A real-time signal queued behind the one pending of its number.
+/// A real-time signal queued behind the one pending of its number, in
+/// the process's [`POOL`].
 struct Queued {
     /// 0: free; [`CLAIMED`] while it is written or read; else the order it
     /// was queued in, from 2 up.
     state: AtomicU64,
+    /// The set it is queued in (its address).
+    owner: AtomicUsize,
     sig: AtomicU64,
     info: SigSlot,
 }
 
 const CLAIMED: u64 = 1;
 
-/// How many real-time signals a set queues beyond one of each number.
-const QUEUED: usize = 64;
+/// How many real-time signals the process queues behind the one pending
+/// of each number, in all its sets: where `RLIMIT_SIGPENDING` is higher,
+/// this is the process's limit.
+pub const QUEUE_MAX: usize = 4096;
+
+/// The real-time signals queued behind the one pending of each number, in
+/// every set of the process. Shared, so a set may queue as many as the
+/// process may.
+static POOL: [Queued; QUEUE_MAX] = [const {
+    Queued {
+        state: AtomicU64::new(0),
+        owner: AtomicUsize::new(0),
+        sig: AtomicU64::new(0),
+        info: SigSlot::new(),
+    }
+}; QUEUE_MAX];
+
+/// The order the next queued signal takes.
+static ORDER: AtomicU64 = AtomicU64::new(2);
+
+/// How many entries of [`POOL`] are in use.
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
+/// How many signals are pending in the process, in all its sets: each
+/// number pending, and each queued behind it. What `RLIMIT_SIGPENDING`
+/// bounds ([`may_queue`]).
+static COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The wake handler left signals another process queued in the mailbox,
+/// the process being at its limit ([`admits`]): it takes them once one is
+/// taken.
+static HELD: AtomicBool = AtomicBool::new(false);
 
 /// A set of pending signals with the `siginfo` each was raised with: one
 /// of each standard signal, and the real-time signals queued, as Linux
-/// queues them (one of each number in `info`, the rest behind it in
-/// `queue`, oldest first).
+/// queues them (one of each number in `info`, the rest behind it in the
+/// process's [`POOL`], oldest first). The pool names a set by its
+/// address, so a set never moves once it holds signals: it lives in a
+/// static or an `Arc`.
 pub struct Pending {
     bits: AtomicU64,
     info: [SigSlot; signal::NSIG as usize],
-    queue: [Queued; QUEUED],
-    /// The order the next queued signal takes.
-    order: AtomicU64,
 }
 
 impl Pending {
     pub const fn new() -> Pending {
-        Pending {
-            bits: AtomicU64::new(0),
-            info: [const { SigSlot::new() }; signal::NSIG as usize],
-            queue: [const {
-                Queued { state: AtomicU64::new(0), sig: AtomicU64::new(0), info: SigSlot::new() }
-            }; QUEUED],
-            order: AtomicU64::new(2),
-        }
+        Pending { bits: AtomicU64::new(0), info: [const { SigSlot::new() }; signal::NSIG as usize] }
     }
 
-    /// Queue real-time `sig` with `info` behind the one pending (dropped
-    /// when the queue is full). Async-signal-safe.
-    fn enqueue(&self, sig: u64, info: &SigInfo) {
-        for q in &self.queue {
+    fn id(&self) -> usize {
+        self as *const Pending as usize
+    }
+
+    /// Queue real-time `sig` with `info` behind the one pending: false
+    /// when the pool is full. Async-signal-safe.
+    fn enqueue(&self, sig: u64, info: &SigInfo) -> bool {
+        for q in &POOL {
             if q.state.compare_exchange(0, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                q.owner.store(self.id(), Ordering::Relaxed);
                 q.sig.store(sig, Ordering::Relaxed);
                 store_slot(&q.info, info);
-                let order = self.order.fetch_add(1, Ordering::Relaxed);
+                POOL_USED.fetch_add(1, Ordering::Relaxed);
+                COUNT.fetch_add(1, Ordering::Relaxed);
+                let order = ORDER.fetch_add(1, Ordering::Relaxed);
                 q.state.store(order, Ordering::Release);
-                return;
+                return true;
             }
         }
+        false
     }
 
     /// The oldest signal queued of number `sig`, taken off the queue.
     fn dequeue(&self, sig: u64) -> Option<SigInfo> {
+        let me = self.id();
         loop {
-            let oldest = self
-                .queue
+            let oldest = POOL
                 .iter()
-                .filter(|q| q.sig.load(Ordering::Relaxed) == sig)
                 .filter_map(|q| {
                     let s = q.state.load(Ordering::Acquire);
-                    (s > CLAIMED).then_some((s, q))
+                    (s > CLAIMED
+                        && q.owner.load(Ordering::Relaxed) == me
+                        && q.sig.load(Ordering::Relaxed) == sig)
+                        .then_some((s, q))
                 })
                 .min_by_key(|&(s, _)| s);
             let (s, q) = oldest?;
@@ -732,7 +776,16 @@ impl Pending {
             }
             let info = load_slot(&q.info);
             q.state.store(0, Ordering::Release);
+            POOL_USED.fetch_sub(1, Ordering::Relaxed);
+            uncount(1);
             return Some(info);
+        }
+    }
+
+    /// Mark `bit` pending, counted if it was not.
+    fn set_bit(&self, bit: u64) {
+        if self.bits.fetch_or(bit, Ordering::Release) & bit == 0 {
+            COUNT.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -759,13 +812,18 @@ impl Pending {
         {
             return;
         }
-        // A real-time signal already pending: this one waits behind it.
+        // A real-time signal already pending: this one waits behind it
+        // (a sender checked there was room, [`may_queue`]). A `kill`'s,
+        // past `RLIMIT_SIGPENDING`, is merged into the one pending, as
+        // Linux merges it.
         if sig >= signal::SIGRTMIN && pending {
-            self.enqueue(sig, &info);
+            if info.code != signal::SI_USER || room(0) {
+                self.enqueue(sig, &info);
+            }
             return;
         }
         store_slot(slot, &info);
-        self.bits.fetch_or(1 << (sig - 1), Ordering::Release);
+        self.set_bit(1 << (sig - 1));
     }
 
     fn take(&self, sig: u64) -> Option<SigInfo> {
@@ -784,12 +842,13 @@ impl Pending {
             if self.bits.fetch_and(!bit, Ordering::Acquire) & bit == 0 {
                 return None;
             }
+            uncount(1);
             // One queued as the bit was cleared.
             if sig >= signal::SIGRTMIN
                 && let Some(next) = self.dequeue(sig)
             {
                 store_slot(slot, &next);
-                self.bits.fetch_or(bit, Ordering::Release);
+                self.set_bit(bit);
             }
         }
         // A POSIX timer's signal: its overrun as it is taken.
@@ -804,10 +863,40 @@ impl Pending {
     }
 
     fn clear(&self) {
-        self.bits.store(0, Ordering::Release);
-        for q in &self.queue {
-            q.state.store(0, Ordering::Release);
+        uncount(u64::from(self.bits.swap(0, Ordering::AcqRel).count_ones()));
+        let me = self.id();
+        for q in &POOL {
+            let s = q.state.load(Ordering::Acquire);
+            if s > CLAIMED
+                && q.owner.load(Ordering::Relaxed) == me
+                && q.state.compare_exchange(s, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            {
+                POOL_USED.fetch_sub(1, Ordering::Relaxed);
+                uncount(1);
+            }
         }
+    }
+}
+
+impl Drop for Pending {
+    /// A thread's set goes with the thread, and the signals queued in it.
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// `n` signals pending are taken: and if the wake handler left signals in
+/// the mailbox for want of room, it is woken to take them now.
+/// Async-signal-safe.
+fn uncount(n: u64) {
+    if n == 0 {
+        return;
+    }
+    COUNT.fetch_sub(n, Ordering::Relaxed);
+    if HELD.swap(false, Ordering::AcqRel) {
+        // SAFETY: signalling this thread itself; the handler drains the
+        // mailbox.
+        unsafe { libc::pthread_kill(libc::pthread_self(), crate::host::WAKE_SIGNAL) };
     }
 }
 
@@ -1253,17 +1342,42 @@ pub fn host_state(tid: i32) -> Option<(u64, u64, bool)> {
     crate::host::thread_state(host)
 }
 
-/// Whether real-time signal `sig` may be queued: Linux refuses one
-/// (`EAGAIN`) once as many signals are pending as `RLIMIT_SIGPENDING`
-/// allows (those of this process are counted).
-pub fn may_queue(sig: u64) -> bool {
-    if sig < signal::SIGRTMIN {
+/// Whether one more signal may be queued with `extra` more already on
+/// their way: fewer are pending in the process, with its POSIX timers'
+/// (each holds one, as Linux allocates it), than `RLIMIT_SIGPENDING`
+/// allows and the pool holds. Linux counts those of the user's processes;
+/// those of this process are counted here. Async-signal-safe.
+fn room(extra: u64) -> bool {
+    let used = COUNT.load(Ordering::Relaxed) + crate::posixtimer::count() as u64 + extra;
+    used < crate::rlimits::sigpending()
+        && POOL_USED.load(Ordering::Relaxed) + extra < QUEUE_MAX as u64
+}
+
+/// Whether signal `sig` sent with `si_code` `code` may be queued: Linux
+/// refuses a real-time one (`EAGAIN`) past `RLIMIT_SIGPENDING`, unless a
+/// `kill` sent it (`SI_USER`), which is merged into the one pending
+/// instead; a standard signal is always taken, one of each number.
+pub fn may_queue(sig: u64, code: i32) -> bool {
+    sig < signal::SIGRTMIN || code == signal::SI_USER || room(0)
+}
+
+/// Whether a POSIX timer may be made: it holds a signal of the limit's
+/// from the start, as Linux allocates it then.
+pub fn may_add_timer() -> bool {
+    room(0)
+}
+
+/// In the wake handler, for signal `sig` with `code` another process
+/// queued in the mailbox, `taken` taken in this drain already: whether it
+/// may be taken now ([`may_queue`]). One that may not stays in the
+/// mailbox, and is taken once a signal pending is ([`uncount`]): the
+/// sender found room in the mailbox, so it is not lost. Async-signal-safe.
+pub fn admits(sig: u64, code: i32, taken: u64) -> bool {
+    if sig < signal::SIGRTMIN || code == signal::SI_USER || room(taken) {
         return true;
     }
-    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let count = threads.iter().map(|r| r.pending.bits().count_ones()).sum::<u32>()
-        + PROCESS.bits().count_ones();
-    u64::from(count) < crate::rlimits::get(fwe_abi::resource::RLIMIT_SIGPENDING).0
+    HELD.store(true, Ordering::Release);
+    false
 }
 
 /// Signals pending against the calling thread or the process.
@@ -1352,6 +1466,33 @@ mod tests {
         set_mask(u64::MAX);
         assert_eq!(mask() & UNBLOCKABLE, 0);
         set_mask(0);
+    }
+
+    /// A set queues as many real-time signals as the process's pool
+    /// holds, not a fixed few, and a set that goes frees what it queued.
+    #[test]
+    fn real_time_signals_queue_past_a_few() {
+        let rt = signal::SIGRTMIN + 2;
+        let p = Pending::new();
+        for v in 0..300 {
+            p.post(rt, valued(v));
+        }
+        let taken: Vec<u64> = std::iter::from_fn(|| p.take(rt)).map(|i| i.value).collect();
+        assert_eq!(taken, (0..300).collect::<Vec<_>>());
+        let q = Arc::new(Pending::new());
+        for v in 0..10 {
+            q.post(rt, valued(v));
+        }
+        let mine = |id: usize| {
+            POOL.iter()
+                .filter(|e| e.state.load(Ordering::Acquire) > CLAIMED)
+                .filter(|e| e.owner.load(Ordering::Relaxed) == id)
+                .count()
+        };
+        let id = q.id();
+        assert_eq!(mine(id), 9);
+        drop(q);
+        assert_eq!(mine(id), 0);
     }
 
     fn valued(value: u64) -> SigInfo {

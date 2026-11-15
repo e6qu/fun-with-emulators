@@ -4275,6 +4275,18 @@ fn host_processes_never_get_fwes_internal_signals() {
     assert!(alive, "the host process was ended");
 }
 
+/// `RLIMIT_SIGPENDING` bounds the signals queued: a `sigqueue` past it
+/// fails with `EAGAIN`, as does `timer_create`, and none is dropped.
+#[test]
+fn queued_signals_are_bounded_by_rlimit_sigpending() {
+    assert_eq!(
+        identity(&["sigpending"]),
+        "own: queued 10, then EAGAIN, timer refused true, kill 0, taken 10 in order true\n\
+         timer once there is room: true\n\
+         another: then EAGAIN, past its limit true, all taken in order true\n"
+    );
+}
+
 /// Each signal names its sender's pid and guest user, as Linux's
 /// `siginfo` does; `rt_sigqueueinfo` delivers the caller's own.
 #[test]

@@ -1806,7 +1806,7 @@ and `SIGINFO` its *kill relay*
 |---|---|---|---|
 | Dispositions | per process | per process, macOS numbers | in the kernel crate, each passed to the host as catch, default or ignore ([which](#who-acts-on-a-signal)) |
 | Mask, alternate stack | per thread | per thread | per thread, in host thread-locals; the host thread's own mask blocks only what the host must hold back |
-| Pending instances | one per standard signal; real-time signals queued | one per signal, `siginfo` lost while blocked | one per signal number; a standard signal keeps its first `siginfo`, a real-time one its latest; from another process, signals the host lacks wait in a queue of 64 in the target's mailbox |
+| Pending instances | one per standard signal; real-time signals queued | one per signal, `siginfo` lost while blocked | one per signal number; a standard signal keeps its first `siginfo`; real-time ones queued behind it, each with its own, up to `RLIMIT_SIGPENDING` counted per process (at most 4096); from another process, signals the host lacks wait in a queue of 64 in the target's mailbox, and stay there while it is at its limit |
 | Signal frame | `rt_sigframe` with `ucontext`, `fpsimd_context` | Darwin `ucontext`, `mcontext64` | Linux's layout, on the guest stack or alternate stack; return through `sa_restorer` or fwe's `rt_sigreturn` trampoline |
 
 A signal ignored when fwe starts (`nohup`, a shell's background job)

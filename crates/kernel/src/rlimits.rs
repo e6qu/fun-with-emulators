@@ -51,7 +51,7 @@ fn default_of(res: u64) -> (u64, u64) {
         return (crate::host::rlim_to_linux(l.rlim_cur), crate::host::rlim_to_linux(l.rlim_max));
     }
     let v = match res {
-        r::RLIMIT_SIGPENDING => 63_432,
+        r::RLIMIT_SIGPENDING => SIGPENDING_DEFAULT,
         r::RLIMIT_MSGQUEUE => 819_200,
         r::RLIMIT_NICE | r::RLIMIT_RTPRIO => 0,
         // 8 MiB, Linux's since 5.16.
@@ -59,6 +59,20 @@ fn default_of(res: u64) -> (u64, u64) {
         _ => r::RLIM_INFINITY,
     };
     (v, v)
+}
+
+/// Linux's usual `RLIMIT_SIGPENDING`.
+const SIGPENDING_DEFAULT: u64 = 63_432;
+
+/// The soft `RLIMIT_SIGPENDING`, for a signal handler to read without the
+/// lock.
+static SIGPENDING: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(SIGPENDING_DEFAULT);
+
+/// The soft `RLIMIT_SIGPENDING`: how many signals may be pending
+/// ([`crate::thread::may_queue`]). Async-signal-safe.
+pub fn sigpending() -> u64 {
+    SIGPENDING.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 fn with<R>(f: impl FnOnce(&mut [(u64, u64); COUNT]) -> R) -> R {
@@ -107,6 +121,9 @@ pub fn set(res: u64, soft: u64, hard: u64, privileged: bool) -> Result<(), i32> 
     })?;
     if res == r::RLIMIT_CPU {
         cpu_to_host(soft, hard);
+    }
+    if res == r::RLIMIT_SIGPENDING {
+        SIGPENDING.store(soft, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(())
 }
@@ -179,6 +196,7 @@ pub fn load(d: &mut Dec) {
     *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(l);
     let (soft, hard) = l[r::RLIMIT_CPU as usize];
     cpu_to_host(soft, hard);
+    SIGPENDING.store(l[r::RLIMIT_SIGPENDING as usize].0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]

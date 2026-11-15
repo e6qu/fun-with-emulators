@@ -301,11 +301,9 @@ pub(crate) fn send_unhosted_from(
 }
 
 /// `kill` of this process with `sig` it takes itself (one the host lacks,
-/// or one fwe keeps).
+/// or one fwe keeps). Past `RLIMIT_SIGPENDING` a real-time one is merged
+/// into the one pending, as Linux merges a `kill`'s.
 fn post_own(sig: u64) -> i64 {
-    if !thread::may_queue(sig) {
-        return err(errno::EAGAIN);
-    }
     thread::post_process(sig, own_info(signal::SI_USER));
     // Any thread may take it: interrupt the others' waits so one that does
     // not block it notices.
@@ -1056,7 +1054,7 @@ impl<P: Platform> Kernel<P> {
             // It ends the whole process, whichever thread it names.
             return self.sys_kill(me, sig);
         }
-        if !thread::may_queue(sig) {
+        if !thread::may_queue(sig, signal::SI_TKILL) {
             return err(errno::EAGAIN);
         }
         // A signal the backend's handler catches is posted to the thread

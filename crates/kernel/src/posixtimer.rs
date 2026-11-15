@@ -286,6 +286,13 @@ pub fn forked_child() {
     }
 }
 
+/// How many timers the process has: each holds a signal of
+/// `RLIMIT_SIGPENDING`'s ([`crate::thread::may_add_timer`]).
+/// Async-signal-safe.
+pub fn count() -> usize {
+    SLOTS.iter().filter(|s| s.used.load(Ordering::Acquire)).count()
+}
+
 /// At `execve`: the timers are deleted (the thread, idle, stays).
 pub fn exec() {
     for s in &SLOTS {
@@ -404,6 +411,11 @@ impl<P: crate::Platform> crate::Kernel<P> {
                 }
                 _ => return err(errno::EINVAL),
             }
+        }
+        // Its signal, allocated now as Linux allocates it, counts against
+        // `RLIMIT_SIGPENDING`.
+        if !crate::thread::may_add_timer() {
+            return err(errno::EAGAIN);
         }
         // The lowest free id.
         let mut notes = notify();

@@ -525,7 +525,15 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 - **Pending sets** are atomics in host thread-locals (the host handler
   records into them), registered by tid so another thread can target one.
   A real-time signal already pending is queued behind it, with its own
-  `siginfo`, in a lock-free table of the set, oldest first.
+  `siginfo`, in a lock-free pool the process's sets share (4096 entries),
+  oldest first.
+- **`RLIMIT_SIGPENDING`** bounds a count of the signals pending in the
+  process (each number pending and each queued, with one for each POSIX
+  timer, as Linux allocates its signal with it): past it a real-time
+  signal sent with a code other than `SI_USER` (`sigqueue`, `tgkill`) and
+  `timer_create` fail with `EAGAIN`, and a `kill`'s is merged into the one
+  pending. One another process queued in the mailbox is left there while
+  the process is at its limit, and taken once a pending signal is.
 - **fwe's handlers** start and end with every signal blocked, so the
   backend always knows whether it interrupted guest code or its own. Each
   thread otherwise runs under a host mask that blocks only the
@@ -1437,10 +1445,12 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   (`SECCOMP_RET_USER_NOTIF` and `SECCOMP_RET_TRACE` fail with `ENOSYS`).
 
 **Signals**
-- A thread's and a process's pending sets queue up to 64 real-time
-  signals beyond one of each number and drop more (Linux queues up to
-  `RLIMIT_SIGPENDING`, then `sigqueue` fails with `EAGAIN`); a signal the
-  host lacks reaches only fwe's processes (`EINVAL` to any other).
+- `RLIMIT_SIGPENDING` counts the signals pending in each process, not in
+  all of a user's processes as Linux does, and a process queues at most
+  4096 real-time signals whatever its limit. A process at its limit
+  leaves another's signals in its mailbox, so that sender gets `EAGAIN`
+  only once 64 more wait there; a signal the host lacks reaches only
+  fwe's processes (`EINVAL` to any other).
 - A blocked signal whose action the host applies (ignored, or a default
   that ignores or continues) loses its sender, which matters only if a
   handler is installed before it is unblocked; a signal from outside fwe

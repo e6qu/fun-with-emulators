@@ -436,28 +436,52 @@ fn put_from(
 }
 
 /// In the wake signal's handler: take every queued signal for this
-/// process, each with its sender's note, in the order queued.
-/// Async-signal-safe (it allocates nothing).
+/// process, each with its sender's note, in the order queued. One the
+/// process has no room for under `RLIMIT_SIGPENDING`
+/// ([`crate::thread::admits`]) stays queued, with those of its number
+/// after it, until it has. Async-signal-safe (it allocates nothing).
 pub fn drain(mut post: impl FnMut(u64, Note)) {
     let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
     let Some(q) = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY) else { return };
-    // Taken in ticket order: the lowest left, each round.
-    let mut taken = [(0u64, 0u64, 0u64, 0u64, 0u64); QUEUE_LEN];
+    // In ticket order.
+    let mut queued = [(0u64, 0usize); QUEUE_LEN];
     let mut n = 0;
-    for e in q.chunks(ENTRY) {
+    for (i, e) in q.chunks(ENTRY).enumerate() {
+        let state = e[0].load(SeqCst);
+        let sig = state & 0xffff_ffff;
+        if sig != 0 && sig != BUSY {
+            queued[n] = (state >> 32, i);
+            n += 1;
+        }
+    }
+    let queued = &mut queued[..n];
+    queued.sort_unstable_by_key(|t| t.0);
+    let mut taken = [(0u64, 0u64, 0u64, 0u64, 0u64); QUEUE_LEN];
+    let (mut n, mut admitted, mut held) = (0, 0u64, 0u64);
+    for &(_, i) in queued.iter() {
+        let e = &q[i * ENTRY..(i + 1) * ENTRY];
         let state = e[0].load(SeqCst);
         let sig = state & 0xffff_ffff;
         if sig == 0 || sig == BUSY {
             continue;
         }
         let (a, b, c) = (e[1].load(SeqCst), e[2].load(SeqCst), e[3].load(SeqCst));
+        if sig <= fwe_abi::signal::NSIG {
+            let bit = 1u64 << (sig - 1);
+            if held & bit != 0 || !crate::thread::admits(sig, b as u32 as i32, admitted) {
+                held |= bit;
+                continue;
+            }
+        }
         if e[0].compare_exchange(state, state & !0xffff_ffff, SeqCst, SeqCst).is_ok() {
             taken[n] = (state >> 32, sig, a, b, c);
             n += 1;
+            if (fwe_abi::signal::SIGRTMIN..=fwe_abi::signal::NSIG).contains(&sig) {
+                admitted += 1;
+            }
         }
     }
-    let taken = &mut taken[..n];
-    taken.sort_unstable_by_key(|t| t.0);
+    let taken = &taken[..n];
     for &(_, sig, ids, code_tid, value) in taken.iter() {
         let pid = ids as u32 as i32;
         if sig == FOSTER_NOTE {
