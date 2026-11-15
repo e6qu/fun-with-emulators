@@ -1481,13 +1481,26 @@ impl<P: Platform> Kernel<P> {
     /// `/proc/<pid>`: by the process's effective user and group (root's,
     /// for a process that is not dumpable).
     fn proc_owned(&self, dirfd: i32, path: &[u8], mut st: Stat) -> Stat {
-        let owner = match self.fs().proc_target(dirfd, path) {
-            Some((None, _))
-                if !crate::coredump::UNDUMPABLE.load(std::sync::atomic::Ordering::Relaxed) =>
-            {
-                Some((self.creds.euid, self.creds.egid))
+        // A dumpable process's files are its effective user's and group's;
+        // another's are root's of its user namespace (Linux's
+        // `task_dump_owner`).
+        let owner_of = |dumpable: u8, ids: (u32, u32), ns: &[u8]| {
+            if dumpable == crate::coredump::SUID_DUMP_USER {
+                ids
+            } else {
+                crate::userns::root_of(ns)
             }
-            Some((Some(Some(host)), _)) => crate::procreg::read(host).map(|r| (r.ids[1], r.ids[5])),
+        };
+        let owner = match self.fs().proc_target(dirfd, path) {
+            Some((None, _)) => Some(owner_of(
+                crate::coredump::dumpable(),
+                (self.creds.euid, self.creds.egid),
+                &crate::userns::own_dir(),
+            )),
+            Some((Some(Some(host)), _)) => crate::procreg::read(host).map(|r| {
+                let ns = crate::nsfd::dir_among(b"user", &r.ns).unwrap_or_default();
+                owner_of(r.sec.dumpable, (r.ids[1], r.ids[5]), &ns)
+            }),
             _ => None,
         };
         if let Some((uid, gid)) = owner {
@@ -2973,7 +2986,8 @@ impl<P: Platform> Kernel<P> {
     /// ([`crate::procpid::TRACER_ONLY`]): `EACCES` then.
     pub(crate) fn proc_refused(&self, dirfd: i32, path: &[u8]) -> Option<i32> {
         let (Some(Some(host)), sub) = self.fs().proc_target(dirfd, path)? else { return None };
-        if !crate::procpid::TRACER_ONLY.contains(&&sub[..]) || self.may_trace(host) {
+        // Linux's `PTRACE_MODE_READ_FSCREDS`.
+        if !crate::procpid::TRACER_ONLY.contains(&&sub[..]) || self.may_access(host, false, true) {
             return None;
         }
         Some(errno::EACCES)
@@ -3059,7 +3073,7 @@ impl<P: Platform> Kernel<P> {
         if !crate::host::is_fwe(host) {
             return Some(Err(errno::EACCES));
         }
-        Some(if crate::ptrace::traces(id) || self.may_trace(host) {
+        Some(if crate::ptrace::traces(id) || self.may_access(host, true, true) {
             Ok(id)
         } else {
             Err(errno::EACCES)

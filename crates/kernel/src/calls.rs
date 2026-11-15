@@ -78,10 +78,10 @@ const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 1;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
 const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 4;
 
-/// The security modules fwe has: Linux's capabilities and Landlock
-/// (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`), which keep no attributes of a
-/// process.
-const LSM_IDS: [u64; 2] = [100, 110];
+/// The security modules fwe has: Linux's capabilities, Landlock and Yama
+/// (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`, `LSM_ID_YAMA`), which keep no
+/// attributes of a process.
+const LSM_IDS: [u64; 3] = [100, 110, 111];
 
 /// `struct lsm_ctx`'s header: `id`, `flags`, `len` and `ctx_len`.
 const LSM_CTX_HEADER: u64 = 32;
@@ -234,7 +234,8 @@ impl<P: Platform> Kernel<P> {
             (Err(e), _) | (_, Err(e)) => return err(e),
         };
         let me = crate::host::pid();
-        if [a, b].iter().any(|&h| h != me && !self.may_trace(h)) {
+        // Linux's `PTRACE_MODE_READ_REALCREDS`.
+        if [a, b].iter().any(|&h| h != me && !self.may_access(h, false, false)) {
             return err(errno::EPERM);
         }
         match ty {
@@ -320,7 +321,8 @@ impl<P: Platform> Kernel<P> {
             }
             return done as i64;
         }
-        if !self.may_trace(t.host) || !self.creds.has(crate::caps::CAP_SYS_NICE) {
+        // Linux's `PTRACE_MODE_READ_FSCREDS`, and `CAP_SYS_NICE`.
+        if !self.may_access(t.host, false, true) || !self.creds.has(crate::caps::CAP_SYS_NICE) {
             return err(errno::EPERM);
         }
         let Some(view) = crate::mm::MapsView::of(t.host) else { return err(errno::ESRCH) };

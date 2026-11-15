@@ -251,6 +251,11 @@ pub fn mode() -> u8 {
     MODE.load(Ordering::Relaxed)
 }
 
+/// How many filters the process has (`Seccomp_filters:`).
+pub fn filter_count() -> u32 {
+    STATE.read().unwrap_or_else(|e| e.into_inner()).filters.len() as u32
+}
+
 /// The action for call `nr` with `args` at `pc`.
 pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
     match MODE.load(Ordering::Relaxed) {

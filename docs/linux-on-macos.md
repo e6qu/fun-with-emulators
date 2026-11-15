@@ -957,7 +957,7 @@ and `futex_waitv` run without the kernel lock.
 | `futex_waitv` | Up to 128 32-bit futexes, private and shared, on `CLOCK_MONOTONIC` or `CLOCK_REALTIME`. | as `futex` |
 | `futex_wake`, `futex_wait`, `futex_requeue` | As `FUTEX_WAKE_BITSET`, `FUTEX_WAIT_BITSET` (an absolute timeout on the clock given) and `FUTEX_CMP_REQUEUE`, on 32-bit futexes (another size or NUMA `EINVAL`); a requeue's two futexes are both private or both shared (`EINVAL` otherwise). | as `futex` |
 | `kcmp` | Memory, descriptor table, filesystem view, handlers, I/O context and undo list are shared only by a process's threads; two descriptors are one open file if they name the same socket or pipe, or the same file and (in the caller) share their status flags; `KCMP_EPOLL_TFD` for the caller's own epoll descriptors (`ENOENT` for another's); a caller that may not trace either process `EPERM`. | `proc_pidinfo`, `proc_pidfdinfo`, `fcntl` |
-| `prctl` | Name, capabilities, keepcaps, securebits, child subreaper, `no_new_privs`, THP choice, speculation (reported unaffected), seccomp, timer slack, dumpable, parent-death signal, anonymous memory's names (`PR_SET_VMA_ANON_NAME`, shown in `maps`); `PR_PAC_RESET_KEYS` in the VM only; others `EINVAL`. | none |
+| `prctl` | Name, capabilities, keepcaps, securebits, child subreaper, `no_new_privs`, THP choice, speculation (reported unaffected), seccomp, timer slack, dumpable, Yama's `PR_SET_PTRACER`, parent-death signal, anonymous memory's names (`PR_SET_VMA_ANON_NAME`, shown in `maps`); `PR_PAC_RESET_KEYS` in the VM only; others `EINVAL`. | none |
 | `process_madvise` | The caller's own ranges as `madvise` takes them; another process's (with `CAP_SYS_NICE`, for a caller that may trace it) checked to be mapped, the hint given nothing to act on; only `MADV_WILLNEED`, `MADV_COLD`, `MADV_PAGEOUT` and `MADV_COLLAPSE` (`EINVAL` otherwise). | `madvise` for the caller's own |
 | `sched_setscheduler`, `sched_setparam`, `sched_getscheduler`, `sched_getparam`, `sched_setattr`, `sched_getattr`, `sched_get_priority_max`/`min`, `sched_rr_get_interval` | Kept per process in its record with Linux's checks, inherited; the host schedules as before. | none |
 | `sched_setaffinity`, `sched_getaffinity`, `getcpu` | The mask is checked (another user's process needs `CAP_SYS_NICE`) and kept in the process record of the process named (a thread names its process), where it and any other process read it, and a fork child inherits it; `getcpu` reports its first CPU, node 0 (macOS tells no thread the CPU it runs on). | `sysconf` (online CPUs) |
@@ -1390,7 +1390,7 @@ otherwise.
 | `getrandom` | flags checked (`GRND_RANDOM` with `GRND_INSECURE` is `EINVAL`); never waits; at most 32 MiB a call | `arc4random_buf` |
 | `reboot` | `CAP_SYS_BOOT` in the user namespace owning the pid namespace, and the magic numbers checked; Ctrl-Alt-Del on/off accepted; restart, halt, power off, suspend and kexec `EPERM` | none |
 | `vhangup` | `CAP_SYS_TTY_CONFIG`, then nothing | none |
-| `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities and Landlock are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`; `/sys/kernel/security/lsm` reads `capability,landlock`); neither keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
+| `lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr` | Linux's capabilities, Landlock and Yama are the modules (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`, `LSM_ID_YAMA`; `/sys/kernel/security/lsm` reads `capability,landlock,yama`); none keeps attributes of a process, so the attribute calls check their arguments and fail with `EOPNOTSUPP` | none |
 
 **`uname`**: the release is fixed (`RELEASE` in
 `crates/kernel/src/syscalls.rs`); `UNAME26` replaces its version numbers
@@ -1406,7 +1406,7 @@ programs run on fwe's interpreters, and a tracee does its tracer's work.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Only fwe's processes can be traced. | `__ulock_wait2`/`__ulock_wake` on pages of the process store, `kill` |
+| `ptrace` | `TRACEME`, `ATTACH`, `SEIZE` (without stopping the tracee), `INTERRUPT`, `LISTEN`, `PEEK`/`POKE` of text and data, `GETREGSET`/`SETREGSET` (`NT_PRSTATUS`, `NT_PRFPREG`, `NT_ARM_SYSTEM_CALL`, `NT_ARM_TLS`; no hardware breakpoints), `GET`/`SETSIGINFO`, `GET`/`SETSIGMASK`, `GET_SYSCALL_INFO`, `SETOPTIONS`, `GETEVENTMSG`, `CONT`, `SYSCALL`, `SINGLESTEP`, `DETACH`, `KILL`; a seized tracee's group-stops and interrupts are `PTRACE_EVENT_STOP`; `PEEKUSR`/`POKEUSR` and others fail with `EIO`. Who may trace whom as Linux's `ptrace_may_access`, Yama's `kernel.yama.ptrace_scope` and Landlock decide. Only fwe's processes can be traced. | `__ulock_wait2`/`__ulock_wake` on pages of the process store, `kill` |
 | `seccomp` | Strict mode and filters, `GET_ACTION_AVAIL`, `GET_NOTIF_SIZES`; no listener (`SECCOMP_FILTER_FLAG_NEW_LISTENER` fails with `EINVAL`). | none |
 | `landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self` | ABI 6: filesystem rights by path, TCP port rules, and the abstract-socket and signal scopes, checked by fwe before each call it restricts (see [architecture.md](architecture.md)); the domain is the process's, carried by `fork` and `execve` | none |
 | `bpf` | Needs `CAP_BPF` or `CAP_SYS_ADMIN`. Program load, attach, detach, query and get-by-id for cgroup device programs; socket filters, a map access at a known offset outside the value refused as they load (`EACCES`, with the verifier's log); array and hash maps and their element commands; other commands `EINVAL`. | a file per program and per map |
@@ -1424,6 +1424,14 @@ of fwe's own queue that no guest sees. The tracee is never stopped on the
 host, so the tracer's `wait4`/`waitid` take a stop from the inbox before
 asking the host. Single-stepping plants `brk #0x4c59` where the
 instruction may go next ([architecture.md](architecture.md#ptrace)).
+
+Who may attach is decided as on Linux: the same ids, a dumpable target
+holding no capability the caller lacks, else `CAP_SYS_PTRACE` in the
+target's user namespace; Yama's `kernel.yama.ptrace_scope` (1 by default:
+only descendants, and the process a target names with `PR_SET_PTRACER`);
+and Landlock (a domain traces only within itself). `PR_SET_DUMPABLE`,
+`execve` and changes of ids set the dumpable flag Linux's way, and
+`/proc/<pid>/status` shows the tracer (`TracerPid`).
 
 ### The CPU
 
@@ -2212,7 +2220,8 @@ process restrict itself. macOS's own (the sandbox, SIP) apply to the
 | Landlock | ABI 6: file rights by path, TCP ports, abstract sockets and signals, enforced by fwe (`landlock.rs`, `landlockops.rs`) | as on Linux, with the limits in [architecture.md](architecture.md#known-limitations) |
 | SELinux | none | no `/sys/fs/selinux`: SELinux is off, as on a distribution that does not use it |
 | AppArmor | none | no `/sys/kernel/security/apparmor`: AppArmor is absent |
-| the list | `/sys/kernel/security/lsm` and `lsm_list_modules` name `capability,landlock` | only the modules that act |
+| Yama | `kernel.yama.ptrace_scope` (1 by default) and `PR_SET_PTRACER`, enforced by fwe on every attach (`ptrace.rs`) | as on Linux |
+| the list | `/sys/kernel/security/lsm` and `lsm_list_modules` name `capability,landlock,yama` | only the modules that act |
 
 podman, crun, runc and Docker apply an AppArmor profile or an SELinux
 label only where the host has the module, so here they run without one

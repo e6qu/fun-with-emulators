@@ -320,6 +320,40 @@ pub fn may_signal(target: i32) -> Result<(), i32> {
     if !active() || within(target, SCOPE_SIGNAL) { Ok(()) } else { Err(errno::EPERM) }
 }
 
+/// Tracing (or reading as a tracer does) host process `target`: only one
+/// in this process's domain or one nested in it (`EPERM` for a process
+/// less restricted, as Linux's Landlock has it for every layer).
+pub fn may_trace(target: i32) -> Result<(), i32> {
+    if !active() {
+        return Ok(());
+    }
+    // SAFETY: getpid cannot fail.
+    if target == unsafe { libc::getpid() } {
+        return Ok(());
+    }
+    let theirs = chain_of(target);
+    if chain().iter().enumerate().all(|(i, id)| theirs.get(i) == Some(id)) {
+        Ok(())
+    } else {
+        Err(errno::EPERM)
+    }
+}
+
+/// `PTRACE_TRACEME` with host process `parent` as tracer: the parent's
+/// domain must be this process's or one this one's is nested in.
+pub fn may_be_traced_by(parent: i32) -> Result<(), i32> {
+    let theirs = chain_of(parent);
+    if theirs.is_empty() {
+        return Ok(());
+    }
+    let mine = chain();
+    if theirs.iter().enumerate().all(|(i, id)| mine.get(i) == Some(id)) {
+        Ok(())
+    } else {
+        Err(errno::EPERM)
+    }
+}
+
 /// A connection to an abstract socket bound by host process `owner`.
 pub fn may_connect_abstract(owner: i32) -> Result<(), i32> {
     if !active() || within(owner, SCOPE_ABSTRACT_UNIX_SOCKET) { Ok(()) } else { Err(errno::EPERM) }

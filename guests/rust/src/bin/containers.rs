@@ -407,6 +407,98 @@ fn main() {
                     waitpid(-1, std::ptr::null_mut(), 0);
                 }
             }
+            // Who a user without capabilities may trace (Linux's
+            // `ptrace_may_access` with Yama's scope 1 and Landlock): its
+            // child, shown as its tracer; not one that made itself
+            // undumpable; not a sibling, unless that names it with
+            // `PR_SET_PTRACER`; nothing while it is in a Landlock domain
+            // its target is not.
+            Some("ptrace-access") => {
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    setuid(1000);
+                    prctl(4, 1, 0, 0, 0);
+                    let sleeper = |setup: &dyn Fn()| {
+                        let mut ready = [0i32; 2];
+                        pipe2(ready.as_mut_ptr(), 0);
+                        let pid = fork();
+                        if pid == 0 {
+                            setup();
+                            write(ready[1], b"r".as_ptr(), 1);
+                            loop {
+                                usleep(100_000);
+                            }
+                        }
+                        let mut b = 0u8;
+                        read(ready[0], &mut b, 1);
+                        pid
+                    };
+                    let attach = |pid: i32| {
+                        let r = syscall(117, 16, pid, 0, 0);
+                        let mut tracer = String::new();
+                        if r == 0 {
+                            waitpid(pid, std::ptr::null_mut(), 0x4000_0000);
+                            tracer = text(&format!("/proc/{pid}/status"))
+                                .lines()
+                                .find(|l| l.starts_with("TracerPid:"))
+                                .unwrap_or("")
+                                .to_string();
+                            syscall(117, 17, pid, 0, 0);
+                        }
+                        (res(r), tracer)
+                    };
+                    let kill = |pid: i32| {
+                        syscall(129, pid, 9);
+                        waitpid(pid, std::ptr::null_mut(), 0);
+                    };
+                    let child = sleeper(&|| {});
+                    let (r, tracer) = attach(child);
+                    let mine = format!("TracerPid:\t{}", getpid());
+                    println!("its child: {r}, shown as its tracer {}", tracer == mine);
+                    kill(child);
+                    let undumpable = sleeper(&|| {
+                        prctl(4, 0, 0, 0, 0);
+                    });
+                    println!("an undumpable child: {}", attach(undumpable).0);
+                    kill(undumpable);
+                    // Siblings: the second tries the first.
+                    for named in [false, true] {
+                        let mut go = [0i32; 2];
+                        pipe2(go.as_mut_ptr(), 0);
+                        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                        let tracer = fork();
+                        if tracer == 0 {
+                            let mut pid = [0u8; 4];
+                            read(go[0], pid.as_mut_ptr(), 4);
+                            let label = if named { "named by it" } else { "unnamed" };
+                            println!("a sibling, {label}: {}", attach(i32::from_ne_bytes(pid)).0);
+                            _exit(0);
+                        }
+                        let target = sleeper(&|| {
+                            if named {
+                                prctl(0x5961_6d61, tracer as u64, 0, 0, 0);
+                            }
+                        });
+                        write(go[1], target.to_ne_bytes().as_ptr(), 4);
+                        waitpid(tracer, std::ptr::null_mut(), 0);
+                        kill(target);
+                    }
+                    let w = std::fs::write("/proc/sys/kernel/yama/ptrace_scope", "0");
+                    println!("ptrace_scope by a user: {}", io(w));
+                    // Restricted by Landlock, its unrestricted child is
+                    // out of reach.
+                    let child = sleeper(&|| {});
+                    prctl(38, 1, 0, 0, 0);
+                    let attr = [1u64 << 2];
+                    let rs = syscall(444, attr.as_ptr(), 8, 0);
+                    syscall(446, rs, 0);
+                    println!("from a Landlock domain: {}", attach(child).0);
+                    kill(child);
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                println!("ptrace_scope: {}", text("/proc/sys/kernel/yama/ptrace_scope").trim());
+            }
             // A program only the VM runs, on a host without one: the exec
 
             // fails and the caller goes on, as podman's pause process does
@@ -472,6 +564,10 @@ fn main() {
                 let child = fork();
                 if child == 0 {
                     setuid(1000);
+                    // A change of ids leaves the process undumpable (its
+                    // `/proc` files root's) until it says otherwise.
+                    println!("dumpable after setuid: {}", prctl(3, 0, 0, 0, 0));
+                    prctl(4, 1, 0, 0, 0);
                     // A user may make a whiteout (as rootless overlay
                     // storage does), not a device.
                     let wh = mknod(c("/tmp/wh").as_ptr(), 0o20000 | 0o644, 0);

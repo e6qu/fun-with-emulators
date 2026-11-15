@@ -362,7 +362,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
-        e.bool(coredump::UNDUMPABLE.load(std::sync::atomic::Ordering::Relaxed));
+        e.u8(coredump::dumpable());
         rlimits::save(e);
         match self.fs_opt() {
             Some(fs) => {
@@ -438,7 +438,7 @@ impl<P: Platform> Kernel<P> {
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
         syscalls::THP_DISABLE.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
-        coredump::UNDUMPABLE.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
+        coredump::set_dumpable(d.u8());
         rlimits::load(d);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
@@ -569,11 +569,13 @@ impl<P: Platform> Kernel<P> {
         // A set-ID program's owner and group, then the saved IDs the
         // effective ones, and the capabilities, as Linux's execve sets them.
         let saved = (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid);
-        let secure = apply_exec_privs(&mut self.creds, take_exec_privs());
+        let permitted = self.creds.caps.permitted;
+        let privs = take_exec_privs();
+        let secure = apply_exec_privs(&mut self.creds, privs);
         if saved != (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid) {
             self.ids_changed(0);
         }
-        self.exec_secured(secure);
+        self.after_exec(secure, privs.unreadable, permitted);
     }
 
     /// For the program an `execve` in place is about to load: what its
@@ -585,16 +587,29 @@ impl<P: Platform> Kernel<P> {
         AuxIds::of(&c, secure)
     }
 
-    /// After an exec raised privilege (`secure`): what Linux undoes for
-    /// such a program, the personality flags it must not inherit
-    /// (`PER_CLEAR_ON_SETID`) and the parent-death signal.
-    fn exec_secured(&mut self, secure: bool) {
-        if !secure {
-            return;
+    /// After an exec: whether the process is dumpable, as Linux's
+    /// `begin_new_exec` sets it (dumpable again, unless the program runs
+    /// with effective ids other than the real ones, gained capabilities
+    /// over the `permitted` set it had, or could not be read by its caller
+    /// (`unreadable`): then as `fs.suid_dumpable` says); and for an exec
+    /// that raised privilege (`secure`), the personality flags it must not
+    /// inherit (`PER_CLEAR_ON_SETID`) and the parent-death signal gone.
+    /// Others see the result ([`crate::procreg::Security`]).
+    fn after_exec(&mut self, secure: bool, unreadable: bool, permitted: u64) {
+        let c = &self.creds;
+        let changed = c.euid != c.uid || c.egid != c.gid || c.caps.permitted & !permitted != 0;
+        if changed || unreadable {
+            coredump::lose_dumpable();
+        } else {
+            coredump::set_dumpable(coredump::SUID_DUMP_USER);
         }
-        const PER_CLEAR_ON_SETID: u32 = 0x0040_0000 | 0x0004_0000 | 0x0020_0000 | 0x0010_0000;
-        syscalls::PERSONALITY.fetch_and(!PER_CLEAR_ON_SETID, std::sync::atomic::Ordering::Relaxed);
-        pdeath::set(0);
+        if secure {
+            const PER_CLEAR_ON_SETID: u32 = 0x0040_0000 | 0x0004_0000 | 0x0020_0000 | 0x0010_0000;
+            syscalls::PERSONALITY
+                .fetch_and(!PER_CLEAR_ON_SETID, std::sync::atomic::Ordering::Relaxed);
+            pdeath::set(0);
+        }
+        procreg::publish_security(self.security());
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
@@ -749,15 +764,21 @@ impl<P: Platform> Kernel<P> {
         let gains = r.mount_flags & mounts::ms::NOSUID == 0
             && !syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
             && !ptrace::traced();
-        if gains {
-            let privs = ExecPrivs {
+        // A program its caller may not read leaves it undumpable (its
+        // memory would show the program).
+        let unreadable = !self.permits(st, 4);
+        let privs = if gains {
+            ExecPrivs {
                 uid: (st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
                 gid: (st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
                     .then_some(st.st_gid),
                 caps: file_caps(r.dir.as_raw_fd(), name),
-            };
-            EXEC_PRIVS.with(|p| p.set(privs));
-        }
+                unreadable,
+            }
+        } else {
+            ExecPrivs { unreadable, ..ExecPrivs::default() }
+        };
+        EXEC_PRIVS.with(|p| p.set(privs));
         Ok(())
     }
 
@@ -860,6 +881,8 @@ impl<P: Platform> Kernel<P> {
         let (tracer, syscalls) = ptrace::exec_state();
         e.u32(tracer as u32);
         e.bool(syscalls);
+        // Yama's named tracer, which an exec keeps.
+        e.i32(ptrace::ptracer());
         // Its Landlock domain, which a program run keeps.
         landlock::save(&mut e);
         // Its foster children, still its own to follow.
@@ -897,19 +920,22 @@ impl<P: Platform> Kernel<P> {
         let persona = d.u32();
         let thp = d.bool();
         let (tracer, syscalls) = (d.u32() as i32, d.bool());
+        let ptracer = d.i32();
         landlock::load(&mut d);
         let fostering = d.bool();
         d.finish()?;
         reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
+        ptrace::set_ptracer(ptracer);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
+        let permitted = creds.caps.permitted;
         let secure = apply_exec_privs(&mut creds, privs);
         self.creds = creds;
-        self.exec_secured(secure);
+        self.after_exec(secure, privs.unreadable, permitted);
         creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
@@ -1100,12 +1126,14 @@ pub fn release_robust_lists() {
 }
 
 /// What running a program grants ([`Kernel::may_exec`] notes it): the
-/// owner and group of a set-ID program, and its file capabilities.
+/// owner and group of a set-ID program, and its file capabilities; and
+/// whether its caller may not read it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecPrivs {
     uid: Option<u32>,
     gid: Option<u32>,
     caps: Option<caps::FileCaps>,
+    unreadable: bool,
 }
 
 impl ExecPrivs {
@@ -1119,6 +1147,7 @@ impl ExecPrivs {
         e.u64(c.permitted);
         e.u64(c.inheritable);
         e.bool(c.effective);
+        e.bool(self.unreadable);
     }
 
     fn load(d: &mut snapshot::Dec) -> ExecPrivs {
@@ -1129,7 +1158,7 @@ impl ExecPrivs {
         let (uid, gid) = (id(), id());
         let has = d.bool();
         let c = caps::FileCaps { permitted: d.u64(), inheritable: d.u64(), effective: d.bool() };
-        ExecPrivs { uid, gid, caps: has.then_some(c) }
+        ExecPrivs { uid, gid, caps: has.then_some(c), unreadable: d.bool() }
     }
 }
 
@@ -1147,7 +1176,7 @@ thread_local! {
 thread_local! {
     /// What the program this thread is about to run grants.
     static EXEC_PRIVS: std::cell::Cell<ExecPrivs> = const {
-        std::cell::Cell::new(ExecPrivs { uid: None, gid: None, caps: None })
+        std::cell::Cell::new(ExecPrivs { uid: None, gid: None, caps: None, unreadable: false })
     };
 }
 
@@ -1244,6 +1273,8 @@ impl AuxIds {
         if d.u64() != EXEC_STATE_MAGIC {
             return Err("the exec state is not fwe's".into());
         }
+        // The stack limit, then the view.
+        d.u64();
         if d.bool() {
             fs::Fs::skip_view(&mut d);
         }

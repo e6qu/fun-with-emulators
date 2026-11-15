@@ -239,6 +239,10 @@ pub mod prctl {
     pub const PR_GET_PDEATHSIG: u64 = 2;
     pub const PR_GET_DUMPABLE: u64 = 3;
     pub const PR_SET_DUMPABLE: u64 = 4;
+    /// Yama's `PR_SET_PTRACER` ("Yama"), and `PR_SET_PTRACER_ANY` as its
+    /// argument.
+    pub const PR_SET_PTRACER: u64 = 0x5961_6d61;
+    pub const PR_SET_PTRACER_ANY: u64 = u64::MAX;
     pub const PR_SET_NAME: u64 = 15;
     pub const PR_GET_NAME: u64 = 16;
     pub const PR_GET_TIMERSLACK: u64 = 30;

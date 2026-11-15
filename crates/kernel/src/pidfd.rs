@@ -435,23 +435,10 @@ impl<P: Platform> Kernel<P> {
         }
         // Only an fwe process can be asked for its descriptors; any other is
         // one the caller may not attach to, as `ptrace` has it.
-        if !crate::host::is_fwe(t.host) || !self.may_attach(t.host) {
+        if !crate::host::is_fwe(t.host) || !self.may_trace(t.host) {
             return Err(err(errno::EPERM));
         }
         Ok(GetFd { host: t.host, fd: target_fd, pidfd: fd })
-    }
-
-    /// Whether the caller may act on host process `target` as a tracer
-    /// may (Linux's `PTRACE_MODE_ATTACH_REALCREDS`): with
-    /// `CAP_SYS_PTRACE`, or when its real user and group ids are each of
-    /// the target's.
-    fn may_attach(&self, target: i32) -> bool {
-        if self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_PTRACE) {
-            return true;
-        }
-        let ids = crate::procreg::ids(target);
-        let c = &self.creds;
-        ids[..3].iter().all(|&u| u == c.uid) && ids[4..7].iter().all(|&g| g == c.gid)
     }
 
     /// `ioctl` on a process descriptor: `PIDFD_GET_INFO` and the
@@ -542,7 +529,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::ESRCH);
         }
         let me = crate::host::pid();
-        if t.host != me && !self.may_attach(t.host) {
+        if t.host != me && !self.may_access(t.host, false, true) {
             return err(errno::EPERM);
         }
         let dirs = if t.host == me {

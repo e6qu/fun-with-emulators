@@ -230,6 +230,12 @@ pub fn capable_in(target: &[u8], euid: u32, effective: bool) -> bool {
 }
 
 /// [`capable_in`] for a process in the user namespace whose record is
+/// `own` (another process's, `PTRACE_TRACEME` asks of its parent).
+pub fn capable_of(own: &[u8], target: &[u8], euid: u32, effective: bool) -> bool {
+    capable_from(own, target, euid, effective)
+}
+
+/// [`capable_in`] for a process in the user namespace whose record is
 /// `own`.
 fn capable_from(own: &[u8], target: &[u8], euid: u32, effective: bool) -> bool {
     let mut at = target.to_vec();
@@ -251,6 +257,28 @@ fn capable_from(own: &[u8], target: &[u8], euid: u32, effective: bool) -> bool {
         at = parent;
     }
     false
+}
+
+/// The initial namespace's ids of root (uid and gid 0) of the user
+/// namespace whose record is `dir`, or the initial root's where it maps
+/// none (Linux's `task_dump_owner`).
+pub fn root_of(dir: &[u8]) -> (u32, u32) {
+    if dir.is_empty() {
+        return (0, 0);
+    }
+    let chain = chain_from(joined(dir));
+    let up_through = |gid: bool| {
+        let mut v = 0;
+        for ns in chain.iter() {
+            let n = ns.get();
+            v = up(if gid { &n.gid_map } else { &n.uid_map }, v)?;
+        }
+        Some(v)
+    };
+    match (up_through(false), up_through(true)) {
+        (Some(u), Some(g)) => (u, g),
+        _ => (0, 0),
+    }
 }
 
 /// Whether `setgroups` is allowed in the process's namespaces.

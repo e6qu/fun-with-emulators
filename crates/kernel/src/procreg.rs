@@ -96,6 +96,79 @@ pub struct ProcRecord {
     /// empty for every CPU. Its children inherit it; another process sets
     /// and reads it here.
     pub affinity: Vec<u64>,
+    /// What another process's access to it, and its `/proc/<pid>/status`,
+    /// depend on.
+    pub sec: Security,
+}
+
+/// What of a process's security state others look at: its capability
+/// sets (`capget`, `/proc/<pid>/status`, whether a tracer holds at least
+/// its permitted set), whether it is dumpable, who it lets trace it
+/// (`PR_SET_PTRACER`), and its `no_new_privs` and seccomp state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Security {
+    /// Effective, permitted, inheritable, bounding and ambient sets.
+    pub caps: [u64; 5],
+    /// Its dumpable value ([`crate::coredump::dumpable`]).
+    pub dumpable: u8,
+    /// The host pid of the process that may trace it besides its
+    /// ancestors (`PR_SET_PTRACER`), -1 for any, 0 for none.
+    pub ptracer: i32,
+    pub no_new_privs: bool,
+    /// Its seccomp mode (0, 1 strict, 2 filtering) and number of filters.
+    pub seccomp: u8,
+    pub filters: u32,
+}
+
+impl Default for Security {
+    /// A process fwe knows nothing more of: root's, dumpable.
+    fn default() -> Self {
+        let c = crate::caps::Caps::default();
+        Security {
+            caps: [c.effective, c.permitted, c.inheritable, c.bounding, c.ambient],
+            dumpable: crate::coredump::SUID_DUMP_USER,
+            ptracer: 0,
+            no_new_privs: false,
+            seccomp: 0,
+            filters: 0,
+        }
+    }
+}
+
+impl Security {
+    fn encode(&self, e: &mut Enc) {
+        for c in self.caps {
+            e.u64(c);
+        }
+        e.u8(self.dumpable);
+        e.i32(self.ptracer);
+        e.bool(self.no_new_privs);
+        e.u8(self.seccomp);
+        e.u32(self.filters);
+    }
+
+    fn decode(d: &mut Dec) -> Security {
+        let caps = [d.u64(), d.u64(), d.u64(), d.u64(), d.u64()];
+        let (dumpable, ptracer, no_new_privs) = (d.u8(), d.i32(), d.bool());
+        Security { caps, dumpable, ptracer, no_new_privs, seccomp: d.u8(), filters: d.u32() }
+    }
+}
+
+/// The security state this process last published ([`publish_security`]).
+static PUBLISHED: std::sync::Mutex<Option<Security>> = std::sync::Mutex::new(None);
+
+/// This process's security state is `s`: written to its record when it
+/// changed.
+pub fn publish_security(s: Security) {
+    let mut p = PUBLISHED.lock().unwrap_or_else(|e| e.into_inner());
+    if *p != Some(s) && change(me(), |r| r.sec = s).is_ok() {
+        *p = Some(s);
+    }
+}
+
+/// Host process `pid`'s security state, if fwe has its record.
+pub fn security(pid: i32) -> Option<Security> {
+    read(pid).map(|r| r.sec)
 }
 
 /// A host process, as its pid and its start time.
@@ -247,6 +320,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
         e.u64(soft);
         e.u64(hard);
     }
+    r.sec.encode(&mut e);
     e.into_bytes()
 }
 
@@ -352,6 +426,7 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     let affinity = (0..n).map(|_| d.u64()).collect();
     let n = d.count(20);
     let rlimits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
+    let sec = Security::decode(&mut d);
     d.finish().ok()?;
     Some(ProcRecord {
         start,
@@ -381,6 +456,7 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
         foster,
         affinity,
         rlimits,
+        sec,
     })
 }
 
@@ -612,6 +688,7 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
         foster: false,
         affinity: Vec::new(),
         rlimits: Vec::new(),
+        sec: Security::default(),
     }
 }
 
@@ -735,10 +812,14 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 }
 
 /// What a fork child takes of this process's record, as it is when it
-/// forks: its ids, OOM adjustments, nice value and scheduling.
+/// forks: its ids, OOM adjustments, nice value and scheduling, and its
+/// security state (which the forking process sets, [`Inherit::sec`]).
 #[derive(Clone, Debug, Default)]
 pub struct Inherit {
     ids: [u32; 8],
+    /// The child's security state: the forking process's, with the
+    /// capabilities the child has (every one, in a new user namespace).
+    pub sec: Security,
     oom: (i32, i32),
     nice: i32,
     sched: Sched,
@@ -773,6 +854,7 @@ pub fn inherit() -> Inherit {
     let slack = crate::thread::slack();
     Inherit {
         ids: r.ids,
+        sec: r.sec,
         oom: (r.oom_score_adj, r.oom_score_adj_min),
         nice,
         sched,
@@ -804,6 +886,7 @@ pub fn save_inherit(e: &mut Enc, i: &Inherit) {
         e.u64(soft);
         e.u64(hard);
     }
+    i.sec.encode(e);
 }
 
 /// What [`save_inherit`] wrote.
@@ -821,7 +904,8 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let affinity = (0..n).map(|_| d.u64()).collect();
     let n = d.count(20);
     let rlimits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
-    Inherit { ids, oom, nice, sched, slack, foster, affinity, rlimits }
+    let sec = Security::decode(d);
+    Inherit { ids, sec, oom, nice, sched, slack, foster, affinity, rlimits }
 }
 
 /// Set `r`'s inherited part.
@@ -842,6 +926,7 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
     r.foster = i.foster;
     r.affinity = i.affinity.clone();
     r.rlimits = i.rlimits.clone();
+    r.sec = i.sec;
 }
 
 /// A child `child` of this process starts in this process's cgroup (or in
@@ -1558,6 +1643,22 @@ fn forget_children(parent: i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A record carries what others check of the process's security.
+    #[test]
+    fn records_carry_the_security_state() {
+        let mut r = fresh(1, 2);
+        assert_eq!(r.sec.dumpable, crate::coredump::SUID_DUMP_USER);
+        r.sec = Security {
+            caps: [1, 2, 3, 4, 5],
+            dumpable: 0,
+            ptracer: -1,
+            no_new_privs: true,
+            seccomp: 2,
+            filters: 3,
+        };
+        assert_eq!(decode(&encode(&r)), Some(r));
+    }
 
     #[test]
     fn a_batch_writes_once_and_its_changes_are_read_meanwhile() {

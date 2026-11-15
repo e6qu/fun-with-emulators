@@ -9,7 +9,7 @@
 //! or recorded for one it lacks. A parent that had ended already when the
 //! signal was set sends none, as on Linux. A fork child starts without one
 //! ([`forked`]); an `execve` keeps it ([`save`], [`restore`]) unless it
-//! raises privilege, as on Linux.
+//! raises privilege, and a change of credentials clears it, as on Linux.
 //!
 //! Linux sends it when the parent *thread* that made the child ends; here
 //! it is sent when the parent process ends.

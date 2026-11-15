@@ -653,6 +653,25 @@ memory or threads, so a tracee does its tracer's work itself:
 - **Attaching** makes the target's mailbox and sends it `SIGSTOP` as
   fwe's; the target starts being traced as it takes it. Only a process of
   fwe's can be traced.
+- **Access** (`Kernel::may_access`, Linux's `__ptrace_may_access`): to
+  attach (`ptrace`, `/proc/<pid>/mem`, `process_vm_readv`/`writev`,
+  `pidfd_getfd`) or read (`get_robust_list`, a pidfd's namespaces), the
+  target's real, effective and saved ids must all be the caller's (its
+  file-system ids for a `/proc` file), the target dumpable, and its
+  permitted capabilities within the caller's, each else `CAP_SYS_PTRACE`
+  in the target's user namespace; to attach, Yama's
+  `kernel.yama.ptrace_scope` too (1, the default: a descendant, or the
+  process the target named with `PR_SET_PTRACER`; 2: `CAP_SYS_PTRACE`; 3:
+  none); and the target in the caller's Landlock domain or one nested in
+  it. Each process's record carries what others check of it
+  (`procreg::Security`: capabilities, dumpable, named tracer,
+  `no_new_privs`, seccomp), written when one of the calls that change it
+  changed it. Dumpable is set again by `execve` (to 1, or to
+  `fs.suid_dumpable` after an exec that changed the ids, gained
+  capabilities or ran a program its caller may not read) and lost to
+  `fs.suid_dumpable` by a change of effective or file-system ids; an
+  undumpable process's `/proc/<pid>` files are root's of its user
+  namespace. `/proc/<pid>/status` shows `TracerPid` from the mailbox.
 
 ## Files
 
@@ -1237,9 +1256,10 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   and `connect` need a rule for the port; a signal or a connection to an
   abstract socket leaving a scoping layer's domain is `EPERM` (each layer
   has an id, and a restricted process publishes its chain beside the
-  process records). The LSM calls report Linux's capabilities and
-  Landlock as the security modules (`/sys/kernel/security/lsm`), neither
-  keeping attributes of a process.
+  process records); so is tracing a process outside the domain. The LSM
+  calls report Linux's capabilities, Landlock and Yama as the security
+  modules (`/sys/kernel/security/lsm`), none keeping attributes of a
+  process.
 
 ## Other calls
 
@@ -1257,7 +1277,7 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   in fwe's record, `[anon:name]` in `maps`), capability bounding and
   ambient sets, keepcaps,
   securebits, child subreaper, `no_new_privs`, seccomp, dumpability,
-  parent-death signal, timer slack, transparent huge pages and speculation
+  Yama's named tracer, parent-death signal, timer slack, transparent huge pages and speculation
   control (reported as not affected); others fail with `EINVAL`.
 - `getcpu`, `vhangup`, `readahead`, `sync_file_range`,
   `syslog` (an empty kernel log) and `membarrier` check their arguments

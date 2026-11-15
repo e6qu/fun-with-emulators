@@ -324,6 +324,30 @@ fn begin(tracer: i32) -> Result<(), i32> {
     Ok(())
 }
 
+/// The process Yama lets trace this one besides its ancestors
+/// (`PR_SET_PTRACER`): a host pid, -1 for any, 0 for none. A fork child
+/// starts with none.
+static PTRACER: AtomicI32 = AtomicI32::new(0);
+
+/// `PR_SET_PTRACER`.
+pub fn set_ptracer(pid: i32) {
+    PTRACER.store(pid, Ordering::Relaxed);
+}
+
+/// What `PR_SET_PTRACER` set.
+pub fn ptracer() -> i32 {
+    PTRACER.load(Ordering::Relaxed)
+}
+
+/// The host pid of the process tracing tracee `id` (a process's pid or a
+/// thread's tid), 0 for none: `TracerPid` in `/proc/<pid>/status`.
+pub fn tracer_of(id: i32) -> i32 {
+    open(mailbox_tag(id), None)
+        .map(|mb| mb.word(W_TRACER).load(Ordering::Acquire) as i32)
+        .filter(|&t| t > 0 && alive(t))
+        .unwrap_or(0)
+}
+
 /// `PTRACE_TRACEME`: traced by the parent, host process `parent`.
 pub fn traceme(parent: i32) -> Result<(), i32> {
     if traced() {
@@ -339,9 +363,11 @@ fn end() {
     crate::procstore::free_page(mailbox_tag(self_id()));
 }
 
-/// In a fork child: not traced (its parent's tracer does not trace it).
+/// In a fork child: not traced (its parent's tracer does not trace it),
+/// and no tracer named by `PR_SET_PTRACER`.
 pub fn forked_child() {
     let follow = FOLLOW.swap(0, Ordering::AcqRel);
+    PTRACER.store(0, Ordering::Relaxed);
     TRACED.with(|t| t.set(false));
     SYSCALLS.with(|t| t.set(false));
     ANY.store(0, Ordering::Release);
@@ -1632,20 +1658,101 @@ impl<P: crate::Platform> crate::Kernel<P> {
         }
     }
 
-    /// Whether the caller may trace host process `target` (Linux's
-    /// `ptrace_may_access` for attaching): `CAP_SYS_PTRACE`, or the same
-    /// real, effective and saved ids as the target's, and the target
-    /// dumpable.
+    /// Whether the caller may attach to host process `target` as a tracer
+    /// (`PTRACE_MODE_ATTACH_REALCREDS`: `ptrace`, `process_vm_readv`,
+    /// `pidfd_getfd`).
     pub(crate) fn may_trace(&self, target: i32) -> bool {
-        if self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_PTRACE) {
-            return true;
-        }
-        let ids = crate::procreg::ids(target);
+        self.may_access(target, true, false)
+    }
+
+    /// Linux's `__ptrace_may_access` of host process `target`, to attach
+    /// (`attach`) or only read, with the caller's file-system ids
+    /// (`fscreds`, for `/proc/<pid>` files) or real ones:
+    /// - its ids: the target's real, effective and saved user ids each the
+    ///   caller's, and its group ids likewise; else `CAP_SYS_PTRACE` in
+    ///   the target's user namespace;
+    /// - the target dumpable, else `CAP_SYS_PTRACE` there;
+    /// - the target's permitted capabilities within the caller's (its
+    ///   effective set with `fscreds`, else its permitted one) in the same
+    ///   user namespace, else `CAP_SYS_PTRACE` there;
+    /// - to attach, Yama's `kernel.yama.ptrace_scope`: 1, only a
+    ///   descendant, or one the target named with `PR_SET_PTRACER`; 2,
+    ///   only with `CAP_SYS_PTRACE` there; 3, none;
+    /// - Landlock: the target in the caller's domain or one nested in it.
+    pub(crate) fn may_access(&self, target: i32, attach: bool, fscreds: bool) -> bool {
+        let ns = crate::procreg::user_ns(target);
+        let cap = || self.creds.has_in(&ns, crate::caps::CAP_SYS_PTRACE);
         let c = &self.creds;
-        let uid = [c.uid, c.euid, c.suid];
-        let gid = [c.gid, c.egid, c.sgid];
-        ids[..3].iter().all(|u| uid.iter().all(|x| x == u))
-            && ids[4..7].iter().all(|g| gid.iter().all(|x| x == g))
+        let (uid, gid) = if fscreds { (c.fsuid, c.fsgid) } else { (c.uid, c.gid) };
+        let ids = crate::procreg::ids(target);
+        let same = ids[..3].iter().all(|&u| u == uid) && ids[4..7].iter().all(|&g| g == gid);
+        if !same && !cap() {
+            return false;
+        }
+        let sec = crate::procreg::security(target).unwrap_or_default();
+        if sec.dumpable != crate::coredump::SUID_DUMP_USER && !cap() {
+            return false;
+        }
+        let held = if fscreds { c.caps.effective } else { c.caps.permitted };
+        let within = crate::userns::own_dir() == ns && sec.caps[1] & !held == 0;
+        if !within && !cap() {
+            return false;
+        }
+        if attach && !self.yama_allows(target, &sec, cap) {
+            return false;
+        }
+        crate::landlock::may_trace(target).is_ok()
+    }
+
+    /// Yama's rule for attaching to host process `target` (whose security
+    /// state is `sec`), `cap` telling whether the caller has
+    /// `CAP_SYS_PTRACE` in its user namespace.
+    fn yama_allows(
+        &self,
+        target: i32,
+        sec: &crate::procreg::Security,
+        cap: impl Fn() -> bool,
+    ) -> bool {
+        match crate::sysctl::number(b"kernel/yama/ptrace_scope").unwrap_or(1) {
+            0 => true,
+            1 => {
+                let line =
+                    |pid: i32| crate::procreg::read(pid).map(|r| r.lineage).unwrap_or_default();
+                // A descendant; or the target named the caller, or a
+                // process the caller descends from, or any.
+                line(target).iter().any(|&(p, _)| p == me())
+                    || sec.ptracer == -1
+                    || (sec.ptracer > 0
+                        && (sec.ptracer == me()
+                            || line(me()).iter().any(|&(p, _)| p == sec.ptracer)))
+                    || cap()
+            }
+            2 => cap(),
+            _ => false,
+        }
+    }
+
+    /// Whether the caller may be traced by its parent, host process
+    /// `parent` (`PTRACE_TRACEME`): Yama refuses it at scope 3, and at
+    /// scope 2 unless the parent has `CAP_SYS_PTRACE` over the caller;
+    /// Landlock unless the parent's domain holds the caller's.
+    fn may_be_traced_by(&self, parent: i32) -> bool {
+        let allowed = match crate::sysctl::number(b"kernel/yama/ptrace_scope").unwrap_or(1) {
+            0 | 1 => true,
+            2 => {
+                let sec = crate::procreg::security(parent).unwrap_or_default();
+                let euid = crate::procreg::ids(parent)[1];
+                let effective = sec.caps[0] & 1 << crate::caps::CAP_SYS_PTRACE != 0;
+                crate::userns::capable_of(
+                    &crate::procreg::user_ns(parent),
+                    &crate::userns::own_dir(),
+                    euid,
+                    effective,
+                )
+            }
+            _ => false,
+        };
+        allowed && crate::landlock::may_be_traced_by(parent).is_ok()
     }
 
     /// `ptrace(request, pid, addr, data)`.
@@ -1655,6 +1762,9 @@ impl<P: crate::Platform> crate::Kernel<P> {
         if request == PTRACE_TRACEME {
             // SAFETY: getppid cannot fail.
             let parent = unsafe { libc::getppid() };
+            if !traced() && !self.may_be_traced_by(parent) {
+                return err(errno::EPERM);
+            }
             return match traceme(parent) {
                 Ok(()) => {
                     self.resync_for_tracing();

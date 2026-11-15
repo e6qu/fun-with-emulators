@@ -4926,7 +4926,7 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     dnotify: 2 signals, parent's true, inner's true\n\
     real-time queue: [1, 2, 3]\n\
     file attributes: set 0, get 0, no-dump true\n\
-    lsm: 2 modules, ids 100 110, size 16\n\
+    lsm: 3 modules, ids 100 110, size 24\n\
     sync: 0, syncfs 0, file/ ENOTDIR\n\
     msg_next_id: id true, then -1\n\
     process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n\
@@ -6552,6 +6552,22 @@ fn capabilities_in_a_user_namespace_cover_what_it_owns() {
     );
 }
 
+/// Who may trace whom, as Linux's `ptrace_may_access` with Yama (scope 1,
+/// the default) and Landlock decide it for a user without capabilities:
+/// its own child (`TracerPid` then names it), not an undumpable one, not a
+/// sibling unless the sibling names it (`PR_SET_PTRACER`), and nothing
+/// from inside a Landlock domain its target is outside. Yama's scope is
+/// root's to set.
+#[test]
+fn ptrace_access_follows_linux_and_yama() {
+    assert_eq!(
+        containers("ptrace-access"),
+        "its child: ok, shown as its tracer true\nan undumpable child: EPERM\n\
+         a sibling, unnamed: EPERM\na sibling, named by it: ok\nptrace_scope by a user: EPERM\n\
+         from a Landlock domain: EPERM\nptrace_scope: 1\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.
@@ -6572,6 +6588,7 @@ fn programs_grant_file_capabilities_and_set_ids() {
          set-uid: euid 0 CapEff:\t000001fffdffffff\n\
          capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
          set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         dumpable after setuid: 0\n\
          a user's mknod: whiteout ok, device EPERM\n\
          /proc owners: theirs Ok(1000), opened Ok(1000), own Ok(0)\n"
     );

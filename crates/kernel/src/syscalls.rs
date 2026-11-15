@@ -179,7 +179,64 @@ pub(crate) fn plain_memory(n: u64, a: &[u64; 6]) -> bool {
         || n == nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS != 0
 }
 
+/// Whether call `nr` may change what [`crate::procreg::Security`] holds,
+/// or the credentials Linux's `commit_creds` watches.
+fn changes_security(nr: u64) -> bool {
+    matches!(
+        nr,
+        nr::SETUID
+            | nr::SETREUID
+            | nr::SETRESUID
+            | nr::SETFSUID
+            | nr::SETGID
+            | nr::SETREGID
+            | nr::SETRESGID
+            | nr::SETFSGID
+            | nr::CAPSET
+            | nr::PRCTL
+            | nr::SECCOMP
+            | nr::UNSHARE
+            | nr::SETNS
+    )
+}
+
 impl<P: Platform> Kernel<P> {
+    /// What of the credentials Linux's `commit_creds` compares: the
+    /// effective and filesystem ids, and the permitted capabilities.
+    fn cred_marks(&self) -> ([u32; 4], u64) {
+        let c = &self.creds;
+        ([c.euid, c.egid, c.fsuid, c.fsgid], c.caps.permitted)
+    }
+
+    /// After call `nr`, which may have changed the security state, from
+    /// `before` ([`Kernel::cred_marks`]): a change of the ids, or a gain of
+    /// capabilities (other than a new user namespace's, which Linux's
+    /// `commit_creds` counts as none), makes the process dumpable only as
+    /// `fs.suid_dumpable` says and drops its parent-death signal; then the
+    /// state is published for other processes.
+    pub(crate) fn security_changed(&mut self, nr: u64, before: ([u32; 4], u64)) {
+        let (ids, permitted) = self.cred_marks();
+        let new_ns = matches!(nr, nr::UNSHARE | nr::SETNS);
+        if ids != before.0 || (!new_ns && permitted & !before.1 != 0) {
+            crate::coredump::lose_dumpable();
+        }
+        crate::procreg::publish_security(self.security());
+    }
+
+    /// The process's security state as others see it
+    /// ([`crate::procreg::Security`]).
+    pub(crate) fn security(&self) -> crate::procreg::Security {
+        let c = &self.creds.caps;
+        crate::procreg::Security {
+            caps: [c.effective, c.permitted, c.inheritable, c.bounding, c.ambient],
+            dumpable: crate::coredump::dumpable(),
+            ptracer: crate::ptrace::ptracer(),
+            no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
+            seccomp: crate::seccomp::mode(),
+            filters: crate::seccomp::filter_count(),
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
         // Limits another process set for this one take effect now.
         if crate::procreg::take_limits_left() {
@@ -213,11 +270,15 @@ impl<P: Platform> Kernel<P> {
         };
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
+        let security = changes_security(n).then(|| self.cred_marks());
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
         if no_truncate && r >= 0 && matches!(n, nr::OPENAT | nr::OPENAT2) {
             crate::landlock::opened_without_truncate(r as i32);
         }
         crate::creds::publish(&self.creds);
+        if let Some(before) = security {
+            self.security_changed(n, before);
+        }
         crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
@@ -652,7 +713,7 @@ impl<P: Platform> Kernel<P> {
                     let Some((owner, tid)) = target else {
                         return err(errno::ESRCH);
                     };
-                    if !self.may_trace(owner) {
+                    if !self.may_access(owner, false, false) {
                         return err(errno::EPERM);
                     }
                     thread::published_robust(owner, tid).unwrap_or(0)
@@ -1726,11 +1787,31 @@ impl<P: Platform> Kernel<P> {
             }
             PR_GET_TIMERSLACK => thread::slack() as i64,
             PR_SET_DUMPABLE if arg2 <= 1 => {
-                crate::coredump::UNDUMPABLE.store(arg2 == 0, Relaxed);
+                crate::coredump::set_dumpable(arg2 as u8);
                 0
             }
             PR_SET_DUMPABLE => err(errno::EINVAL),
-            PR_GET_DUMPABLE => i64::from(!crate::coredump::UNDUMPABLE.load(Relaxed)),
+            PR_GET_DUMPABLE => i64::from(crate::coredump::dumpable()),
+            // Yama: the process (and those below it) that may trace this
+            // one where `kernel.yama.ptrace_scope` is 1; any with
+            // `PR_SET_PTRACER_ANY` (-1); none with 0.
+            PR_SET_PTRACER => match arg2 {
+                0 => {
+                    crate::ptrace::set_ptracer(0);
+                    0
+                }
+                PR_SET_PTRACER_ANY => {
+                    crate::ptrace::set_ptracer(-1);
+                    0
+                }
+                pid => match crate::pidns::to_host(pid as i32) {
+                    Some(h) if pid <= i32::MAX as u64 && host::process_exists(h) => {
+                        crate::ptrace::set_ptracer(h);
+                        0
+                    }
+                    _ => err(errno::EINVAL),
+                },
+            },
             PR_SET_PDEATHSIG if arg2 <= signal::NSIG => {
                 crate::pdeath::set(arg2);
                 0
@@ -2123,6 +2204,10 @@ impl<P: Platform> Kernel<P> {
             seccomp: crate::seccomp::mode(),
             umask: self.fs().umask(),
             locked: crate::maps::record().locked_bytes(),
+            tracer: match crate::ptrace::tracer_of(host) {
+                0 => 0,
+                t => crate::pidns::to_guest(t),
+            },
         };
         crate::procpid::status(thread::tgid(), &comm, &h, &creds)
     }
@@ -3864,7 +3949,7 @@ mod tests {
     fn exec_state_carries_what_the_program_grants() {
         let mut k = kernel();
         assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
-        crate::EXEC_PRIVS.with(|p| p.set(crate::ExecPrivs { uid: Some(0), gid: None, caps: None }));
+        crate::EXEC_PRIVS.with(|p| p.set(crate::ExecPrivs { uid: Some(0), ..Default::default() }));
         let state = k.exec_state();
         let ids = crate::AuxIds::at_start(Some(&state)).unwrap();
         assert_eq!((ids.uid, ids.euid, ids.secure), (1000, 0, true));

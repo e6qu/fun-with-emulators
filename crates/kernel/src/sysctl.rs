@@ -121,6 +121,8 @@ enum Kind {
 }
 
 const INT_MAX: i64 = i32::MAX as i64;
+/// Yama's `ptrace_scope`, whose writes are Yama's to check.
+const YAMA_SCOPE: &[u8] = b"kernel/yama/ptrace_scope";
 /// `IPCMNI`: the most objects of a kind a namespace may have.
 const IPCMNI: i64 = 32768;
 
@@ -257,6 +259,19 @@ const SYSCTLS: &[Sysctl] = &[
         path: b"fs/protected_hardlinks",
         default: "0",
         kind: Kind::Int(0, 1),
+        space: Space::Global,
+    },
+    // Whether a process that raised privilege, or changed its credentials,
+    // stays dumpable: 0 no, 1 yes, 2 for root only (`PR_GET_DUMPABLE` 2).
+    Sysctl { path: b"fs/suid_dumpable", default: "0", kind: Kind::Int(0, 2), space: Space::Global },
+    // Yama: who may attach to a process (`ptrace`, `/proc/<pid>/mem`,
+    // `process_vm_readv`): 0 any process of the same ids, 1 only its
+    // ancestors and the one it names, 2 only with `CAP_SYS_PTRACE`, 3 none.
+    // Setting it takes `CAP_SYS_PTRACE`, and 3 cannot be undone.
+    Sysctl {
+        path: b"kernel/yama/ptrace_scope",
+        default: "1",
+        kind: Kind::Int(0, 3),
         space: Space::Global,
     },
     Sysctl {
@@ -588,6 +603,9 @@ pub fn is_dir(path: &[u8]) -> bool {
 pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result<Mark, i32>> {
     use crate::caps::{CAP_DAC_OVERRIDE, CAP_NET_ADMIN};
     let i = index(path)?;
+    if SYSCTLS[i].path == YAMA_SCOPE && !creds.has(crate::caps::CAP_SYS_PTRACE) {
+        return Some(Err(errno::EPERM));
+    }
     let allowed = match SYSCTLS[i].space {
         Space::Net => creds.has_in(&crate::netns::owner(), CAP_NET_ADMIN),
         Space::Ipc => creds.has_in(&crate::sysvipc::owner(), CAP_DAC_OVERRIDE),
@@ -632,6 +650,12 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
             Err(_) => return Some(fwe_abi::err(errno::EINVAL)),
         };
         match (s.kind, &words[..]) {
+            // Yama's scope 3 is for good.
+            (Kind::Int(..), [v])
+                if s.path == YAMA_SCOPE && *v != 3 && number(YAMA_SCOPE) == Some(3) =>
+            {
+                return Some(fwe_abi::err(errno::EINVAL));
+            }
             (Kind::Int(lo, hi), [v]) if (lo..=hi).contains(v) => v.to_string(),
             // A range of valid ids; a backwards one is taken as none
             // (`1 0`), as Linux takes it.

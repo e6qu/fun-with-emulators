@@ -430,6 +430,9 @@ impl<P: Platform> Kernel<P> {
         let dirs = fs.ns_dirs();
         let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
         let mut inherit = crate::procreg::inherit();
+        // Its security state: this process's, with its own capabilities,
+        // and no tracer named for it.
+        inherit.sec = crate::procreg::Security { ptracer: 0, ..self.security() };
         // Its parent is this process's, not this one (a foster child).
         inherit.foster = flags & fwe_abi::clone::CLONE_PARENT != 0;
         let clear_sighand = flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0;
