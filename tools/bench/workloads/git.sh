@@ -9,6 +9,10 @@ cp "$1"/*.c "$1"/*.h src/
 "$git" init -q
 "$git" config user.name bench
 "$git" config user.email bench@example.invalid
+# Only the repack below: a commit can start one of its own in the
+# background (git's count of loose objects is an estimate), which would
+# race that one.
+"$git" config gc.auto 0
 "$git" add -A
 "$git" commit -q -m initial
 i=0
