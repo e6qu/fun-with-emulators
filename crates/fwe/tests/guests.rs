@@ -7113,6 +7113,18 @@ fn overlay_sticky_directories_restrict_removal() {
     );
 }
 
+/// A trailing slash names a directory in every path call: a lookup
+/// follows a final link and finds a file `ENOTDIR`; a file is not removed
+/// or renamed by such a name, nor made (`ENOENT`); a directory is.
+#[test]
+fn trailing_slashes_name_directories() {
+    assert_eq!(
+        fsrules("slash"),
+        "stat file/: ENOTDIR\nlstat link/: ok\nchmod file/: ENOTDIR\nunlink file/: ENOTDIR\n\
+         rename file/: ENOTDIR\nmkfifo new/: ENOENT\nmkdir new/: ok\nlink/ is a directory: true\n"
+    );
+}
+
 /// A device node made outside `/dev` opens as its device when opened only
 /// to read by an absolute path or from the working directory (which fwe
 /// opens in one host call when the file is a plain one).

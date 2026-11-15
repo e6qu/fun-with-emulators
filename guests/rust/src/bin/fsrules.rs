@@ -157,9 +157,13 @@ fn access_scenario() {
     }
     make("/tmp/d/g", 0o644);
     // SAFETY: NUL-terminated paths.
-    let (dir_x, file_x) =
-        unsafe { (access(c("/tmp/nox").as_ptr(), X_OK), access(c("/tmp/a").as_ptr(), X_OK)) };
-    println!("root X_OK dir: {} file: {}", res(dir_x.into()), res(file_x.into()));
+    let (dir_x, file_x) = unsafe {
+        (
+            res(access(c("/tmp/nox").as_ptr(), X_OK).into()),
+            res(access(c("/tmp/a").as_ptr(), X_OK).into()),
+        )
+    };
+    println!("root X_OK dir: {dir_x} file: {file_x}");
     in_child(|| {
         // SAFETY: plain id changes.
         unsafe {
@@ -170,14 +174,14 @@ fn access_scenario() {
         // SAFETY: NUL-terminated paths.
         let (r, o, w, s) = unsafe {
             (
-                access(c("/tmp/a").as_ptr(), R_OK),
-                open(c("/tmp/a").as_ptr(), O_RDONLY),
-                access(c("/tmp/a").as_ptr(), W_OK),
-                access(c("/tmp/d/g").as_ptr(), 0),
+                res(access(c("/tmp/a").as_ptr(), R_OK).into()),
+                res(open(c("/tmp/a").as_ptr(), O_RDONLY).into()),
+                res(access(c("/tmp/a").as_ptr(), W_OK).into()),
+                res(access(c("/tmp/d/g").as_ptr(), 0).into()),
             )
         };
-        println!("user R_OK: {} open: {}", res(r.into()), res(o.into()));
-        println!("user W_OK: {} beyond a closed dir: {}", res(w.into()), res(s.into()));
+        println!("user R_OK: {r} open: {o}");
+        println!("user W_OK: {w} beyond a closed dir: {s}");
     });
     in_child(|| {
         // Real user 1000, effective root.
@@ -645,8 +649,8 @@ fn opath_scenario() {
         // SAFETY: an empty path with `AT_EMPTY_PATH`.
         let (own, mode) = unsafe {
             (
-                syscall(SYS_FCHOWNAT, fd, empty.as_ptr(), 1000, 1000, AT_EMPTY_PATH),
-                syscall(SYS_FCHMODAT2, fd, empty.as_ptr(), 0o600, AT_EMPTY_PATH),
+                res(syscall(SYS_FCHOWNAT, fd, empty.as_ptr(), 1000, 1000, AT_EMPTY_PATH)),
+                res(syscall(SYS_FCHMODAT2, fd, empty.as_ptr(), 0o600, AT_EMPTY_PATH)),
             )
         };
         let mut st = [0u64; 16];
@@ -655,8 +659,8 @@ fn opath_scenario() {
         let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
         println!(
             "{p}: chown {} chmod {} -> {}:{} {:o}",
-            res(own),
-            res(mode),
+            own,
+            mode,
             word(6),
             word(7),
             word(4) & 0o7777
@@ -702,19 +706,15 @@ fn unix_permissions_scenario() {
             // SAFETY: plain calls; socket addresses of their length.
             let (conn, sent, made) = unsafe {
                 let c = socket(1, SOCK_STREAM, 0);
-                let conn = connect(c, unix_addr("/tmp/s").as_ptr(), 110);
+                let conn = res(connect(c, unix_addr("/tmp/s").as_ptr(), 110).into());
                 let u = socket(1, SOCK_DGRAM, 0);
                 let sent = sendto(u, b"x".as_ptr(), 1, 0, unix_addr("/tmp/d").as_ptr(), 110);
+                let sent = res(sent as i64);
                 let b = socket(1, SOCK_DGRAM, 0);
-                let made = bind_socket(b, unix_addr("/tmp/closed/b").as_ptr(), 110);
-                (conn, sent as i32, made)
+                let made = res(bind_socket(b, unix_addr("/tmp/closed/b").as_ptr(), 110).into());
+                (conn, sent, made)
             };
-            println!(
-                "connect {} sendto {} bind {}",
-                res(conn.into()),
-                res(sent.into()),
-                res(made.into())
-            );
+            println!("connect {conn} sendto {sent} bind {made}");
         });
     };
     try_all();
@@ -761,23 +761,48 @@ fn overlay_sticky_scenario() {
         // SAFETY: NUL-terminated paths.
         let (unlinked, renamed, own) = unsafe {
             (
-                unlink(c("/tmp/m/t/root").as_ptr()),
-                rename(c("/tmp/m/t/root").as_ptr(), c("/tmp/m/t/mine").as_ptr()),
-                unlink(c("/tmp/m/t/user").as_ptr()),
+                res(unlink(c("/tmp/m/t/root").as_ptr()).into()),
+                res(rename(c("/tmp/m/t/root").as_ptr(), c("/tmp/m/t/mine").as_ptr()).into()),
+                res(unlink(c("/tmp/m/t/user").as_ptr()).into()),
             )
         };
-        println!(
-            "unlink another's: {} rename it: {} unlink own: {}",
-            res(unlinked.into()),
-            res(renamed.into()),
-            res(own.into())
-        );
+        println!("unlink another's: {unlinked} rename it: {renamed} unlink own: {own}");
     });
+}
+
+/// A trailing slash names a directory in every path call.
+fn trailing_slash_scenario() {
+    make("/tmp/f", 0o644);
+    // SAFETY: NUL-terminated paths.
+    unsafe {
+        mkdir(c("/tmp/d").as_ptr(), 0o755);
+        symlink(c("/tmp/d").as_ptr(), c("/tmp/l").as_ptr());
+    }
+    let mut st = [0u64; 16];
+    // SAFETY: (each) NUL-terminated paths and a buffer as big as a `struct
+    // stat`.
+    let out = unsafe {
+        [
+            ("stat file/", res(stat(c("/tmp/f/").as_ptr(), st.as_mut_ptr().cast()).into())),
+            ("lstat link/", res(lstat(c("/tmp/l/").as_ptr(), st.as_mut_ptr().cast()).into())),
+            ("chmod file/", res(chmod(c("/tmp/f/").as_ptr(), 0o600).into())),
+            ("unlink file/", res(unlink(c("/tmp/f/").as_ptr()).into())),
+            ("rename file/", res(rename(c("/tmp/f/").as_ptr(), c("/tmp/g").as_ptr()).into())),
+            ("mkfifo new/", res(mkfifo(c("/tmp/new/").as_ptr(), 0o644).into())),
+            ("mkdir new/", res(mkdir(c("/tmp/new/").as_ptr(), 0o755).into())),
+        ]
+    };
+    for (what, r) in out {
+        println!("{what}: {r}");
+    }
+    let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
+    println!("link/ is a directory: {}", word(4) & 0o170000 == 0o40000);
 }
 
 fn main() {
     let scenario = std::env::args().nth(1).unwrap_or_default();
     match scenario.as_str() {
+        "slash" => trailing_slash_scenario(),
         "ovlsticky" => overlay_sticky_scenario(),
         "unixperm" => unix_permissions_scenario(),
         "opath" => opath_scenario(),

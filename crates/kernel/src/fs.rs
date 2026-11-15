@@ -165,6 +165,11 @@ fn at_or_under_joined(path: &[u8], dir: &[u8], name: &[u8]) -> bool {
         .is_some_and(|r| r.is_empty() || r.first() == Some(&b'/'))
 }
 
+/// Whether `path` ends in a slash after a name: it names a directory.
+pub fn trailing_slash(path: &[u8]) -> bool {
+    path.ends_with(b"/") && path.iter().any(|&b| b != b'/')
+}
+
 fn components(path: &[u8]) -> Vec<Vec<u8>> {
     path.split(|&b| b == b'/').filter(|c| !c.is_empty() && c != b".").map(<[u8]>::to_vec).collect()
 }
@@ -1550,6 +1555,25 @@ impl Fs {
     /// standard device nodes ([`DEVICES`]) resolve to the host's, and
     /// `/dev/shm` to fwe's own directory for it ([`shm`]).
     pub fn resolve(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
+        // A trailing slash names a directory, as on Linux: a final link is
+        // followed, and anything but a directory found is `ENOTDIR`.
+        let slash = trailing_slash(path);
+        let r = self.resolve_once(dirfd, path, follow_final || slash)?;
+        if slash && r.lstat().is_some_and(|st| st.st_mode & libc::S_IFMT != libc::S_IFDIR) {
+            return Err(errno::ENOTDIR);
+        }
+        Ok(r)
+    }
+
+    /// [`resolve`](Self::resolve) for a call that makes, removes or renames
+    /// the final name itself, which is never followed: a trailing slash is
+    /// the caller's to judge ([`trailing_slash`]), as what Linux answers
+    /// differs by call.
+    pub fn resolve_entry(&self, dirfd: i32, path: &[u8]) -> Result<Resolved, i32> {
+        self.resolve_once(dirfd, path, false)
+    }
+
+    fn resolve_once(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
         if path.is_empty() {
             // An empty path names nothing, as on Linux; a call that takes
             // `AT_EMPTY_PATH` acts on its descriptor before resolving.

@@ -1926,7 +1926,9 @@ impl<P: Platform> Kernel<P> {
                 _ => errno::EEXIST,
             });
         }
-        let mut r = match self.fs().resolve(dirfd as i32, &path, false) {
+        // The name made, never followed (a trailing slash asks for the
+        // directory this makes).
+        let mut r = match self.fs().resolve_entry(dirfd as i32, &path) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -1991,6 +1993,9 @@ impl<P: Platform> Kernel<P> {
             Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
+        if let Err(e) = made_not_dir(&r, &path) {
+            return err(e);
+        }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let d = r.dir.as_raw_fd();
         let host_perm = crate::modes::host_perm(perm, false);
@@ -2099,6 +2104,9 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        if let Err(e) = removed_dir_only(&r, crate::fs::trailing_slash(&path)) {
+            return err(e);
+        }
         if let Some(o) = &r.ovl {
             if let Err(e) = self.may_remove_in_overlay(o, &r.name) {
                 return err(e);
@@ -2161,6 +2169,9 @@ impl<P: Platform> Kernel<P> {
             Err(errno::EBUSY) => return err(errno::EEXIST),
             Err(e) => return err(e),
         };
+        if let Err(e) = made_not_dir(&r, &path) {
+            return err(e);
+        }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let d = r.dir.as_raw_fd();
         let made = self.change_in(d, || {
@@ -2208,10 +2219,13 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        let new = match self.fs().resolve(newdirfd as i32, &newpath, false) {
+        let new = match self.fs().resolve_entry(newdirfd as i32, &newpath) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        if let Err(e) = made_not_dir(&new, &newpath) {
+            return err(e);
+        }
         if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
@@ -2322,6 +2336,11 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // A trailing slash on either asks for a directory to move.
+        let slash = crate::fs::trailing_slash(&oldpath) || crate::fs::trailing_slash(&newpath);
+        if let Err(e) = removed_dir_only(&old, slash) {
+            return err(e);
+        }
         if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
@@ -3791,7 +3810,12 @@ impl<P: Platform> Kernel<P> {
         mount_root_ok: bool,
         how: Change,
     ) -> Result<Resolved, i32> {
-        let mut r = self.fs().resolve(dirfd as i32, path, follow)?;
+        // A name made or removed is never followed; a trailing slash on it
+        // is the caller's to judge ([`crate::fs::Fs::resolve_entry`]).
+        let mut r = match how {
+            Change::Create | Change::Remove => self.fs().resolve_entry(dirfd as i32, path)?,
+            Change::Modify => self.fs().resolve(dirfd as i32, path, follow)?,
+        };
         // A mount's root is busy whatever the mount: the change is the
         // directory's above it (a read-only mount's root too).
         if r.mount_root && !mount_root_ok {
@@ -4255,6 +4279,32 @@ fn drop_cached(fd: i32, offset: u64, len: u64, size: u64) {
             libc::fsync(fd);
         },
     }
+}
+
+/// For a call that makes a file not a directory at `path`, resolved as `r`
+/// ([`crate::fs::Fs::resolve_entry`]): a trailing slash asks for a
+/// directory, so a name that is missing is `ENOENT`, as Linux says (one
+/// that is there is the call's own `EEXIST`).
+fn made_not_dir(r: &crate::fs::Resolved, path: &[u8]) -> Result<(), i32> {
+    let missing = match &r.ovl {
+        Some(o) => matches!(o.found, crate::overlay::Found::Missing),
+        None => r.lstat().is_none(),
+    };
+    if crate::fs::trailing_slash(path) && missing { Err(errno::ENOENT) } else { Ok(()) }
+}
+
+/// For a call that removes or renames the name resolved as `r`
+/// ([`crate::fs::Fs::resolve_entry`]): with a trailing slash (`slash`),
+/// the name must be a directory (not a link to one), else `ENOTDIR`.
+fn removed_dir_only(r: &crate::fs::Resolved, slash: bool) -> Result<(), i32> {
+    if !slash {
+        return Ok(());
+    }
+    let other = match &r.ovl {
+        Some(o) => matches!(o.found, crate::overlay::Found::Other { .. }),
+        None => r.lstat().is_some_and(|st| st.st_mode & libc::S_IFMT != libc::S_IFDIR),
+    };
+    if other { Err(errno::ENOTDIR) } else { Ok(()) }
 }
 
 /// For an `O_PATH` stand-in descriptor (`fd` is host `/dev/null`, see
@@ -4791,6 +4841,67 @@ mod tests {
         );
         assert_eq!(stbuf.st_mode & st::S_IFMT, st::S_IFREG);
         assert_eq!(open(&mut k, &cstr("/proc/nonexistent"), 0, 0), err(errno::ENOENT));
+    }
+
+    /// A trailing slash names a directory in every call, as on Linux: a
+    /// lookup follows a final link and finds anything else `ENOTDIR`; a
+    /// call that removes or renames the name needs a directory there (a
+    /// link to one is not); one that makes a file finds no directory to
+    /// make (`ENOENT`), or the name taken (`EEXIST`).
+    #[test]
+    fn a_trailing_slash_names_a_directory() {
+        use fwe_abi::fcntl::{AT_REMOVEDIR, AT_SYMLINK_NOFOLLOW, O_CREAT, O_RDWR};
+        let (mut k, _d) = rooted();
+        let fd = open(&mut k, &cstr("/f"), O_CREAT | O_RDWR, 0o644);
+        assert!(fd >= 0);
+        // SAFETY: closing a test fd.
+        unsafe { libc::close(fd as i32) };
+        let call = |k: &mut Kernel<NoPlatform>, n: u64, a: [u64; 5]| {
+            k.syscall(n, [a[0], a[1], a[2], a[3], a[4], 0])
+        };
+        let p = |s: &str| cstr(s);
+        let at = AT_FDCWD;
+        assert_eq!(call(&mut k, nr::MKDIRAT, [at, p("/d").as_ptr() as u64, 0o755, 0, 0]), 0);
+        for (t, l) in [("/d", "/l"), ("/f", "/lf")] {
+            let r =
+                call(&mut k, nr::SYMLINKAT, [p(t).as_ptr() as u64, at, p(l).as_ptr() as u64, 0, 0]);
+            assert_eq!(r, 0);
+        }
+        let stat = |k: &mut Kernel<NoPlatform>, s: &str, flags: u64| {
+            let mut st = Stat::default();
+            let path = p(s);
+            let r = k.syscall(
+                nr::NEWFSTATAT,
+                [at, path.as_ptr() as u64, &mut st as *mut _ as u64, flags, 0, 0],
+            );
+            if r < 0 { Err(r) } else { Ok(st.st_mode & fwe_abi::stat::S_IFMT) }
+        };
+        let nofollow = AT_SYMLINK_NOFOLLOW;
+        assert_eq!(stat(&mut k, "/f/", 0), Err(err(errno::ENOTDIR)));
+        assert_eq!(stat(&mut k, "/d/", 0), Ok(fwe_abi::stat::S_IFDIR));
+        assert_eq!(stat(&mut k, "/l/", nofollow), Ok(fwe_abi::stat::S_IFDIR));
+        assert_eq!(stat(&mut k, "/lf/", nofollow), Err(err(errno::ENOTDIR)));
+        let path_call = |k: &mut Kernel<NoPlatform>, n: u64, s: &str, b: u64, c: u64| {
+            let path = p(s);
+            k.syscall(n, [at, path.as_ptr() as u64, b, c, 0, 0])
+        };
+        assert_eq!(path_call(&mut k, nr::FCHMODAT, "/f/", 0o600, 0), err(errno::ENOTDIR));
+        assert_eq!(path_call(&mut k, nr::UNLINKAT, "/f/", 0, 0), err(errno::ENOTDIR));
+        assert_eq!(path_call(&mut k, nr::UNLINKAT, "/d/", 0, 0), err(errno::EISDIR));
+        assert_eq!(path_call(&mut k, nr::UNLINKAT, "/l/", AT_REMOVEDIR, 0), err(errno::ENOTDIR));
+        let node = u64::from(libc::S_IFREG) | 0o644;
+        assert_eq!(path_call(&mut k, nr::MKNODAT, "/new/", node, 0), err(errno::ENOENT));
+        assert_eq!(path_call(&mut k, nr::MKNODAT, "/f/", node, 0), err(errno::EEXIST));
+        assert_eq!(path_call(&mut k, nr::MKDIRAT, "/f/", 0o755, 0), err(errno::EEXIST));
+        assert_eq!(path_call(&mut k, nr::MKDIRAT, "/n/", 0o755, 0), 0);
+        let rename = |k: &mut Kernel<NoPlatform>, a: &str, b: &str| {
+            let (a, b) = (p(a), p(b));
+            k.syscall(nr::RENAMEAT2, [at, a.as_ptr() as u64, at, b.as_ptr() as u64, 0, 0])
+        };
+        assert_eq!(rename(&mut k, "/f/", "/g"), err(errno::ENOTDIR));
+        assert_eq!(rename(&mut k, "/f", "/g/"), err(errno::ENOTDIR));
+        assert_eq!(rename(&mut k, "/n/", "/m/"), 0);
+        assert_eq!(path_call(&mut k, nr::UNLINKAT, "/m/", AT_REMOVEDIR, 0), 0);
     }
 
     /// `mkdir` keeps the permission and sticky bits of its mode: a set-ID

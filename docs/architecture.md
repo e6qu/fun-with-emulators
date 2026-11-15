@@ -665,7 +665,10 @@ guest's reach, and translates what comes back.
 - `crates/kernel/src/fs.rs` resolves each path component by component:
   symlinks followed by fwe (absolute targets re-rooted), mounts entered,
   `..` clamped at the process's root. `*at` calls start from where their
-  descriptor was opened.
+  descriptor was opened. A trailing slash names a directory, as on Linux:
+  a lookup follows a final link and finds anything else `ENOTDIR`; a call
+  that removes or renames the name needs a directory there itself, and
+  one that makes a file there finds `ENOENT` (or `EEXIST`).
 - Fast paths:
   - a run of plain names that crosses no mount is looked up in one host
     `openat` (`O_NOFOLLOW_ANY`, opened to search, not to read);
