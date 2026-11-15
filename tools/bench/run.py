@@ -44,6 +44,9 @@ import tempfile
 import time
 
 ROUNDS = 9
+# The micro-benchmarks', each a fraction of a second: more rounds, so a
+# runner's passing load spoils none of the best of them.
+MICRO_ROUNDS = 21
 
 REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "../.."))
 
@@ -239,7 +242,7 @@ def micro_pair(fwe, guest, native):
     """The micro-benchmarks under fwe (`fwe` its command, `guest` the Linux
     build) and natively (`native`), their rounds taken in turn: a runner's
     load comes and goes, and so it falls on both alike."""
-    def pair(f, g, rounds=ROUNDS):
+    def pair(f, g, rounds=MICRO_ROUNDS):
         a, b = [], []
         for _ in range(rounds):
             a.append(f())
