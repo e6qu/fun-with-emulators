@@ -2,21 +2,23 @@
 
 ## Summary
 
-fwe runs a non-position-independent executable linked below 4 GiB, such
-as Debian's `python3.11`, GCC and clang at `0x400000` or static Go
-programs at `0x10000`, in a small Hypervisor.framework VM, and picks this
-backend for it automatically. macOS reserves the low 4 GiB of every arm64
-process (`__PAGEZERO`, which Apple's loader will not let a program shrink
-on Apple Silicon), and such a program has no relocations to run anywhere
-else; in the VM the guest has an address space of its own.
+fwe runs a non-position-independent executable linked below 4 GiB that
+it cannot move, such as Debian's `python3.11`, GCC and clang and Alpine's
+`sbcl` at `0x400000` or static Go programs at `0x10000`, in a small
+Hypervisor.framework VM, and picks this backend for it automatically.
+macOS reserves the low 4 GiB of every arm64 process (`__PAGEZERO`, which
+Apple's loader will not let a program shrink on Apple Silicon), and such
+a program cannot be moved above it (which ones can:
+[linux-on-macos.md](linux-on-macos.md#the-low-4-gib)); in the VM the
+guest has an address space of its own.
 
 The VM holds only the guest's CPU and memory, no Linux kernel: every
 system call leaves the VM for the same kernel crate the native backend
 uses, so a program in the VM has the same processes, namespaces, cgroups,
-mounts and files as a native one. How the VM is used (vCPUs, fwe's exception vector, the two stages
-of translation, system calls, timers, signals, memory, fork and execve)
-is in [linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used);
-where the backend differs from Linux, in
+mounts and files as a native one. How the VM is used (vCPUs, fwe's
+exception vector, the two stages of translation, system calls, timers,
+signals, memory, fork and execve) is in
+[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used); where the backend differs from Linux, in
 [architecture.md](architecture.md#known-limitations). This document
 holds the rules the implementation keeps, why misusing the framework is
 dangerous, how the backend is tested on a [stand-in](#the-stand-in) and
@@ -290,8 +292,8 @@ target/release/fwe ./program-linked-low
 
 ## Tests and CI
 
-The end-to-end tests named `hv_*` run low-linked programs in the VM
-backend:
+The end-to-end tests named `hv_*` run programs in the VM backend
+(low-linked ones, and others under `--vm`):
 
 - By default they run on the stand-in with the unsigned `fwe`, which
   could not create a real VM even by mistake (the tests check it carries

@@ -463,8 +463,9 @@ being exploited from user space. Above that, a Linux process owns its
 whole lower address space, which is why Linux toolchains link
 fixed-address executables at `0x400000` or `0x10000`, addresses inside
 macOS's `__PAGEZERO`. A Linux program loaded at such an address cannot
-share a process with macOS code, which is what sends those programs to a
-VM under fwe ([linux-on-macos.md](linux-on-macos.md#the-low-4-gib)).
+share a process with macOS code where it was linked: under fwe it is
+moved, if its link kept its relocations, or run in a VM
+([linux-on-macos.md](linux-on-macos.md#the-low-4-gib)).
 
 ## The address space and ASLR
 
@@ -575,8 +576,9 @@ binary.
 A Linux arm64 program's instructions run on a Mac's CPU unchanged, but
 its file and its expectations are Linux's: an ELF image, possibly at a
 fixed address inside macOS's `__PAGEZERO`, its own dynamic linker, its
-own system calls, the thread pointer in `TPIDR_EL0`, perhaps `x18`, and
-pages of 4 KiB. How fwe loads such programs, which ones it runs natively
-and which in a VM, and what it rewrites, is in
+own system calls, the thread pointer in `TPIDR_EL0`, perhaps `x18`,
+perhaps code it writes as it runs, and pages of 4 KiB. How fwe loads such
+programs, which ones it runs natively and which in a VM, and what it
+rewrites, is in
 [linux-on-macos.md](linux-on-macos.md); how each part is built is in
 [architecture.md](architecture.md).

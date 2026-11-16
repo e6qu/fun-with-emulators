@@ -37,7 +37,7 @@ the VM for the same userspace kernel.
 
 | | Code runs | System calls answered by | A Linux kernel? | One Linux process is one host process | Host files |
 |---|---|---|---|---|---|
-| **fwe** (native) | natively, in-process, a few instructions rewritten | fwe's userspace kernel, in the same process | no | yes | directly |
+| **fwe** (native) | natively, in-process, a few instructions rewritten; JIT code from a code cache | fwe's userspace kernel, in the same process | no | yes | directly |
 | **fwe** (VM) | natively, in a VM per process | fwe's userspace kernel, on VM exits | no | yes | directly |
 | Wine | natively, in-process | Wine's DLLs and `wineserver` | — (Windows) | yes | directly |
 | Lima, Colima, Docker Desktop, OrbStack | natively, in one Linux VM | Linux | yes | no | shared into the VM |
@@ -75,10 +75,11 @@ files and memory every fwe process maps, so there is no server process.
 
 **In common.** Both run code natively in-process, make one host process
 per guest process, and contend with macOS for low addresses: Wine
-reserves them with a preloader before macOS takes them; fwe runs a
-program linked below 4 GiB in its VM backend. fwe also runs Linux's Wine
-itself, in the VM backend (CI's `wine` job), so Windows programs run on
-fwe through Wine as they do on Linux.
+reserves them with a preloader before macOS takes them; fwe moves a
+static program linked below 4 GiB whose link kept its relocations, and
+runs any other in its VM backend. fwe also runs Linux's Wine itself, in
+the VM backend (CI's `wine` job), so Windows programs run on fwe through
+Wine as they do on Linux.
 
 ## Linux in a virtual machine
 
@@ -113,10 +114,10 @@ behaviour that is hard to match.
 **For fwe.** WSL1's mechanism is fwe's model, and its weakness is the
 risk this design carries: fidelity in the long tail. fwe measures it
 with LTP and with real programs in CI (Debian's bash, git, apt, Node.js
-and rustc; Podman, containerd, Docker; Wine). Its file operations are
-the host's own calls on APFS, with no translation layer of the kind WSL1
-had over NTFS, though fwe still resolves each path (mounts, overlays, the
-root).
+and rustc; OpenJDK; Podman, containerd, Docker; Wine). Its file
+operations are the host's own calls on APFS, with no translation layer
+of the kind WSL1 had over NTFS, though fwe still resolves each path
+(mounts, overlays, the root).
 
 ### QEMU and KVM
 
@@ -201,12 +202,14 @@ into the cache, instrumented, and run there, so every instruction the
 program executes is seen, including code made at run time. Pin and
 Valgrind work alike.
 
-**For fwe.** This would find every system call with certainty, in code
-fwe's scanner cannot tell from data and in JIT code, at the cost of
-running everything from a cache (typically tens of percent slower, and a
-large engine). fwe rewrites code in place instead, guided by the
-program's unwind tables and symbols, and traps where it cannot rewrite
-(see
+**For fwe.** Running everything from a cache would find every system
+call with certainty, at the cost of a large engine and typically tens of
+percent of speed. fwe does it only for code a program makes at run time
+(a JIT compiler's): when the program jumps there, the block is translated
+into fwe's code cache and run from there, and the program's memory stays
+as it wrote it. Code loaded from files it rewrites in place instead,
+guided by the program's unwind tables and symbols, and traps where it
+cannot rewrite (see
 [linux-on-macos.md](linux-on-macos.md#which-instructions-get-translated-and-how)).
 
 ### FEX and Box64
@@ -271,10 +274,11 @@ fwe builds:
 
 Homebrew and Nix build programs for macOS from source (or install builds
 made so), so they run as macOS programs with no translation at all: the
-fastest way to run what has been ported. What has not been ported (anything that needs namespaces,
-cgroups, `/proc`, Linux's system calls: container runtimes, much server
-software, Linux-only tools) cannot be had this way, and neither can a
-given binary, such as a vendor's build or a container image. Nix builds
+fastest way to run what has been ported. What has not been ported
+(anything that needs namespaces, cgroups, `/proc`, Linux's system calls:
+container runtimes, much server software, Linux-only tools) cannot be
+had this way, and neither can a given binary, such as a vendor's build
+or a container image. Nix builds
 Linux packages on a Mac with a Linux VM (its `linux-builder`).
 
 **For fwe.** fwe is for the other case: running the Linux build itself.
@@ -292,6 +296,7 @@ fwe is installed (`Formula/fwe.rb`).
   system calls by patching the instruction into a jump.
 - From **Noah** and **KVM** users: a VM with no kernel for what cannot run
   in-process.
+- From **DynamoRIO**: a code cache for code made at run time.
 - From **Rosetta 2**: prepared code kept between runs.
 - From **WSL1**'s successor: the warning to measure fidelity, not assume
   it.
