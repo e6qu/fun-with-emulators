@@ -979,6 +979,26 @@ fn jit_code_runs_as_the_program_wrote_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// `x18` in JIT code (guests/c/jitx18.c): one sequence of instructions
+/// working in `x18`, and the same in `x9`, compute the same, quietly and
+/// with signals landing anywhere in them.
+#[test]
+fn jit_code_using_x18_computes_as_with_another_register() {
+    let prog = build_c("jitx18", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitx18");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitx18 stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "x18 forms: same in 1000 of 1000\n\
+         x18 forms with signals: same in 100000 of 100000, signals landed\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code interrupted everywhere (guests/c/jitstorm.c): signals, faults
 /// and writes to its page landing while worker threads run every kind of
 /// instruction a translation expands leave each round's result as a quiet

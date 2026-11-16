@@ -747,10 +747,17 @@ fn finish(regs: &mut Regs) {
             regs.x[30] = unsafe { (regs.sp as *const u64).read() };
             regs.sp += 32;
         } else if w & 0xffc0_0000 == rewrite::STR_UIMM {
-            // `str xT, [xN, #imm]`: storing `x18`'s new value in its slot.
+            // `str xT, [xN, #imm]`: storing `x18`'s new value in its slot,
+            // or the thread pointer's in its own.
             let (t, n, imm) = (w & 0x1f, (w >> 5) & 0x1f, ((w >> 10) & 0xfff) as u64 * 8);
+            let value = regs.x[t as usize];
             // SAFETY: the thread's own TSD slot the expansion stores to.
-            unsafe { ((regs.x[n as usize] + imm) as *mut u64).write(regs.x[t as usize]) };
+            unsafe { ((regs.x[n as usize] + imm) as *mut u64).write(value) };
+            // `regs` carry the guest's `x18` (written back to its slot as
+            // the thread goes on): it is the new value too.
+            if imm == u64::from(crate::x18_slot()) {
+                regs.x[18] = value;
+            }
         } else {
             // A branch on, or the next instruction's translation.
             return;
