@@ -225,11 +225,6 @@ pub trait Platform {
         false
     }
 
-    /// `regs` as the guest's own, before a signal frame is written from
-    /// them: where they stopped in code fwe runs in the guest's stead (a
-    /// translation), as at the guest's instruction.
-    fn resume_point(&self, _regs: &mut Regs) {}
-
     /// Map the prepared image kept under `key` ([`prepcache::image_key`])
     /// over the mapping of a file's code at `[addr, addr + len)`, with
     /// protections `prot` (the host's), and its stubs where they were: the

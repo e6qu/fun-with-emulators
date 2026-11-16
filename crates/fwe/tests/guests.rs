@@ -951,7 +951,8 @@ fn dynamic_loader_hands_off_to_interpreter() {
 /// What a JIT does with the code it writes (guests/c/jitlab.c): calls,
 /// returns and indirect calls into static code and back, PC-relative
 /// loads with data among the code, x18 kept across system calls, a system
-/// call, a null check's fault seen at its instruction and resumed at a
+/// call, a blocking call interrupted by a handler with `SA_RESTART`, a signal
+/// landing in the code, a tracer's view of a call made from it, a null check's fault seen at its instruction and resumed at a
 /// continuation, code patched and run, code copied and run, return
 /// addresses that are the code's own, threads running code another thread
 /// patches, threads writing data in a page of code they run, W^X toggling, a fork child running and changing code; and the
@@ -967,6 +968,9 @@ fn jit_code_runs_as_the_program_wrote_it() {
     assert_eq!(
         stdout(&out),
         "calls: 90\nindirect: 21\npcrel: 30583\nx18: kept\ngetpid: matches\n\
+         restart: 1 j, the handler saw the call\n\
+         signal: seen in the code\n\
+         tracer: pc in the code\n\
          fault: seen at the load, 77\npatch: 1000 of 1000\ncopy: 90 30583\n\
          return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nmemory: as written\n\
          fork: child ok, parent 1\n"

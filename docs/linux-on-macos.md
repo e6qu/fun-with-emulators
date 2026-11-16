@@ -613,7 +613,10 @@ code generated at run time:
 - **What the program sees stays its own.** Its memory reads back exactly
   as it wrote it. A fault or signal in a translation is delivered at the
   program's instruction, with its registers: an expansion stopped before
-  its instruction ran is undone, one stopped after is finished.
+  its instruction ran is undone, one stopped after is finished. A system
+  call made from a translation is the program's `svc`'s: a tracer stops
+  there, a handler's frame holds it, and a restarted call is made again
+  from it.
 - **Code that changes.** A page code was translated from is kept from
   being written: a write faults, drops the page's translations (and the
   branches linked into them), and is retried; the code is translated

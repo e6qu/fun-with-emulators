@@ -184,13 +184,6 @@ impl Platform for NativePlatform {
         }
     }
 
-    fn resume_point(&self, regs: &mut fwe_kernel::Regs) {
-        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        jit::to_guest(regs);
-        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-        let _ = regs;
-    }
-
     fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {
         prepare::map_image(key, addr, len, prot, (self.tp_slot, self.x18_slot))
             .map_err(fwe_kernel::host::errno_to_linux)

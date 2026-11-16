@@ -240,8 +240,7 @@ The pieces:
   mapped (`mprotect` adding `PROT_EXEC`, or mapped writable and
   executable) is handed to the backend instead (`Platform::jit_code`,
   `jit_changed` when it is unmapped, mapped over, remapped or given other
-  protections), and a signal frame is written from the guest's own state
-  (`Platform::resume_point`).
+  protections).
 - `crates/native/src/jit.rs` runs such memory by translation, never
   changing it or letting the host execute it: a fetch from it faults
   (`trap.rs`), and the block there is translated into the code cache

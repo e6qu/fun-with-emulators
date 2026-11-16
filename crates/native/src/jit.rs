@@ -57,6 +57,20 @@ pub const EXIT: u32 = 0xd420_0000 | (EXIT_IMM << 5);
 const UDF: u32 = 0;
 /// Most instructions a block holds before it ends and goes on to the next.
 const BLOCK_INSNS: usize = 64;
+/// The most chunks the code cache has (8 GiB of translations).
+const MAX_CHUNKS: usize = 64;
+
+/// The chunks' executable views, for [`in_cache`] to read without the
+/// translator's lock: the first [`CHUNK_COUNT`] are set.
+static CHUNK_RX: [AtomicU64; MAX_CHUNKS] = [const { AtomicU64::new(0) }; MAX_CHUNKS];
+static CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Whether `pc` is in fwe's code cache, cheaply (every system call asks).
+pub fn in_cache(pc: u64) -> bool {
+    let n = CHUNK_COUNT.load(Ordering::Acquire) as usize;
+    CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < CACHE_SIZE)
+}
+
 /// A code cache chunk's size: what a branch reaches, so blocks in one chunk
 /// can be linked to each other. A full chunk is followed by another.
 const CACHE_SIZE: u64 = 128 << 20;
@@ -511,6 +525,22 @@ fn test_taken(insn: u32, v: u64) -> bool {
     }
 }
 
+/// The program's address of the instruction a word of a translation at
+/// `pc` stands for, if `pc` is in one: a system call made from a
+/// translation is the program's `svc`'s, for the kernel (which restarts it
+/// there, writes a signal frame from it, and shows it to a tracer).
+pub fn guest_pc(pc: u64) -> Option<u64> {
+    match word_at(&state(), pc)? {
+        Word::At(g)
+        | Word::Out { g, .. }
+        | Word::Undo { g, .. }
+        | Word::Finish { g }
+        | Word::Lookup { g, .. } => Some(g),
+        Word::Entry(g) => Some(g),
+        Word::Static(_) => None,
+    }
+}
+
 /// `regs` stopped in fwe's code cache (a fault, a signal): as the
 /// program's state at the instruction it stands for. `false` if `regs.pc`
 /// is not in the cache.
@@ -754,6 +784,10 @@ fn new_chunk() -> Chunk {
             0
         );
     }
+    let n = CHUNK_COUNT.load(Ordering::Relaxed) as usize;
+    assert!(n < MAX_CHUNKS, "fwe's code cache is full");
+    CHUNK_RX[n].store(rx, Ordering::Relaxed);
+    CHUNK_COUNT.store(n as u64 + 1, Ordering::Release);
     Chunk { rw, rx, used: 0 }
 }
 

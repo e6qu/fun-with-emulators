@@ -323,7 +323,9 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         b.slot = crate::quiesce::mine_addr();
     }
     crate::quiesce::leave_at(b.slot);
+    // A call from a translation is the program's `svc`'s.
     let site = crate::gate::site_of(b.ret);
+    let site = guest_site(site);
     b.regs.pc = site;
     b.regs.x[18] = guest_x18();
     b.ran = 0;
@@ -413,6 +415,16 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         crate::quiesce::enter_at(b.slot);
     }
     u64::from(!plain_return)
+}
+
+/// A system call's site: the program's `svc` where the call was made from a
+/// translation of code made executable at run time.
+fn guest_site(site: u64) -> u64 {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::jit::in_cache(site) {
+        return crate::jit::guest_pc(site).expect("a system call's site in a translation");
+    }
+    site
 }
 
 /// The TSD key of the guest `x18` slot (see [`crate::x18_slot`]).
@@ -630,6 +642,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         return;
     }
     let mut regs = regs_from(mc);
+    regs.pc = guest_site(regs.pc);
     if kernel().is_none() {
         report("fwe: system call before the kernel was initialized\n");
         // SAFETY: terminating the process.
@@ -862,6 +875,12 @@ fn take_async(
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     let mut regs = regs_from(mc);
     finish_sp_stub(&mut regs);
+    // In a translation: the guest's state as at the instruction it stands
+    // for, which is what a tracer, a handler's frame or a core sees.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::jit::in_cache(regs.pc) {
+        crate::jit::to_guest(&mut regs);
+    }
     k.deliver_pending(&mut regs);
     drop(guard);
     settle(&mut regs);

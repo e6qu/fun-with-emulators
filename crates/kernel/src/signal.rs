@@ -637,8 +637,6 @@ impl<P: Platform> Kernel<P> {
         if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN {
             return false;
         }
-        // The frame holds the guest's own state.
-        self.platform.resume_point(regs);
         if self.tracer.enabled && !self.tracer.failures_only {
             // As strace shows a delivery, with what the host gave the
             // signal it came as.

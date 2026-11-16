@@ -9,6 +9,13 @@
  *   including a word that reads as an instruction naming x18;
  * - x18 kept across system calls (Linux lets code use it);
  * - a system call made from it;
+ * - a blocking call from it interrupted by a signal whose handler has
+ *   SA_RESTART: the handler sees the call's own address, and the call is
+ *   made again;
+ * - a signal from another thread landing while it runs: the handler sees
+ *   an address in it;
+ * - a tracer stopping a child at a system call made from it: the pc it
+ *   reads is in the code;
  * - a load through a null pointer faulting at its own instruction, the
  *   handler sending it on to a continuation (a JIT's null check);
  * - code patched in place, then run;
@@ -44,6 +51,17 @@ struct sigaction {
 };
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
 int fork(void);
+int pipe(int fd[2]);
+long write(int fd, const void *buf, size_t n);
+int pthread_kill(unsigned long t, int sig);
+unsigned long pthread_self(void);
+int usleep(unsigned us);
+long ptrace(int req, int pid, void *addr, void *data);
+int kill(int pid, int sig);
+struct iovec {
+    void *base;
+    size_t len;
+};
 int waitpid(int pid, int *status, int options);
 void _exit(int code);
 #define PROT_READ 1
@@ -54,6 +72,15 @@ void _exit(int code);
 #define MAP_FAILED ((void *)-1)
 #define SIGSEGV 11
 #define SA_SIGINFO 4
+#define SA_RESTART 0x10000000
+#define SIGUSR1 10
+#define SIGUSR2 12
+#define SIGSTOP 19
+#define PTRACE_TRACEME 0
+#define PTRACE_CONT 7
+#define PTRACE_SYSCALL 24
+#define PTRACE_GETREGSET 0x4204
+#define NT_PRSTATUS 1
 /* The interrupted pc in an arm64 signal frame's ucontext. */
 #define UC_PC(ctx) (*(uint64_t *)((char *)(ctx) + 440))
 
@@ -136,6 +163,19 @@ __asm__(
     "7: mov x0, x18\n"
     "  ret\n"
 
+    /* long read_jit(int fd, void *buf, long n) */
+    "jl_read:\n"
+    "  mov x8, #63\n"
+    "jl_read_svc:\n"
+    "  svc #0\n"
+    "  ret\n"
+
+    /* void spin(int *flag): until *flag is set. */
+    "jl_spin:\n"
+    "8: ldr w1, [x0]\n"
+    "  cbz w1, 8b\n"
+    "  ret\n"
+
     /* long getpid_jit(void) */
     "jl_getpid:\n"
     "  mov x8, #172\n"
@@ -180,7 +220,7 @@ __asm__(
 
 extern const char jl_begin[], jl_end[], jl_sum[], jl_indirect[], jl_pcrel[], jl_x18[],
     jl_getpid[], jl_fault[], jl_fault_load[], jl_fault_cont[], jl_ret1[], jl_retaddr[],
-    jl_retaddr_after[], jl_slots[];
+    jl_retaddr_after[], jl_slots[], jl_read[], jl_read_svc[], jl_spin[];
 
 static size_t template_len(void) { return (size_t)(jl_end - jl_begin); }
 
@@ -217,6 +257,47 @@ static void on_segv(int sig, void *si, void *ctx) {
         atomic_store(&fault_seen, 1);
     }
     UC_PC(ctx) = (uint64_t)at(code, jl_fault_cont);
+}
+
+static atomic_uint_least64_t usr1_pc;
+
+static void on_usr1(int sig, void *si, void *ctx) {
+    (void)sig;
+    (void)si;
+    atomic_store(&usr1_pc, UC_PC(ctx));
+}
+
+/* The main thread, which the signals below interrupt. */
+static unsigned long restart_reader;
+
+static atomic_int spin_flag;
+static atomic_uint_least64_t usr2_pc;
+
+static void on_usr2(int sig, void *si, void *ctx) {
+    (void)sig;
+    (void)si;
+    atomic_store(&usr2_pc, UC_PC(ctx));
+    atomic_store(&spin_flag, 1);
+}
+
+/* Lands a signal on the spinning thread. */
+static void *nudger(void *arg) {
+    (void)arg;
+    usleep(50000);
+    pthread_kill(restart_reader, SIGUSR2);
+    return 0;
+}
+
+static int restart_pipe[2];
+
+/* Interrupts the reader's call, then gives it something to read. */
+static void *interrupter(void *arg) {
+    (void)arg;
+    usleep(100000);
+    pthread_kill(restart_reader, SIGUSR1);
+    usleep(100000);
+    write(restart_pipe[1], "j", 1);
+    return 0;
 }
 
 static atomic_int stop;
@@ -289,6 +370,65 @@ int main(void) {
 
     long (*getpid_jit)(void) = (long (*)(void))at(code, jl_getpid);
     printf("getpid: %s\n", getpid_jit() == getpid() ? "matches" : "differs");
+
+    struct sigaction usr1 = {0};
+    usr1.sa_sigaction = on_usr1;
+    usr1.sa_flags = SA_SIGINFO | SA_RESTART;
+    sigaction(SIGUSR1, &usr1, 0);
+    pipe(restart_pipe);
+    restart_reader = pthread_self();
+    unsigned long irq;
+    pthread_create(&irq, 0, interrupter, 0);
+    char got = 0;
+    long n = ((long (*)(int, void *, long))at(code, jl_read))(restart_pipe[0], &got, 1);
+    pthread_join(irq, 0);
+    uint64_t seen = atomic_load(&usr1_pc);
+    printf("restart: %ld %c, the handler saw %s\n", n, got,
+           seen == (uint64_t)at(code, jl_read_svc)       ? "the call"
+           : seen == (uint64_t)at(code, jl_read_svc) + 4 ? "past the call"
+                                                         : "elsewhere");
+
+    struct sigaction usr2 = {0};
+    usr2.sa_sigaction = on_usr2;
+    usr2.sa_flags = SA_SIGINFO;
+    sigaction(SIGUSR2, &usr2, 0);
+    pthread_create(&irq, 0, nudger, 0);
+    ((void (*)(atomic_int *))at(code, jl_spin))(&spin_flag);
+    pthread_join(irq, 0);
+    uint64_t spun = atomic_load(&usr2_pc);
+    printf("signal: seen %s\n",
+           spun >= (uint64_t)at(code, jl_spin) && spun < (uint64_t)at(code, jl_spin) + 12
+               ? "in the code"
+               : "elsewhere");
+
+    /* A tracer reads the pc of a child's call made from the code. */
+    int traced = fork();
+    if (traced == 0) {
+        ptrace(PTRACE_TRACEME, 0, 0, 0);
+        kill(getpid(), SIGSTOP);
+        getpid_jit();
+        _exit(0);
+    }
+    int st = 0;
+    waitpid(traced, &st, 0);
+    uint64_t stop_pc = 0;
+    for (int i = 0; i < 16 && stop_pc == 0; i++) {
+        ptrace(PTRACE_SYSCALL, traced, 0, 0);
+        if (waitpid(traced, &st, 0) != traced || (st & 0x7f) == 0) {
+            break;
+        }
+        uint64_t ur[34];
+        struct iovec iov = {ur, sizeof ur};
+        if (ptrace(PTRACE_GETREGSET, traced, (void *)NT_PRSTATUS, &iov) == 0 && ur[8] == 172) {
+            stop_pc = ur[32];
+        }
+    }
+    ptrace(PTRACE_CONT, traced, 0, 0);
+    waitpid(traced, &st, 0);
+    printf("tracer: pc %s\n",
+           stop_pc >= (uint64_t)at(code, jl_getpid) && stop_pc < (uint64_t)at(code, jl_getpid) + 12
+               ? "in the code"
+               : "elsewhere");
 
     struct sigaction sa = {0};
     sa.sa_sigaction = on_segv;
