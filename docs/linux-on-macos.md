@@ -618,7 +618,9 @@ code generated at run time:
   being written: a write faults, drops the page's translations (and the
   branches linked into them), and is retried; the code is translated
   again when it next runs. The page is protected before it is read, so a
-  write from another thread cannot slip in between.
+  write from another thread cannot slip in between. Threads writing the
+  page at once all fault; the first handled lifts the protection, and the
+  others' writes are tried again.
 - **The code cache** is made of 128 MiB chunks (what a branch reaches),
   each one memory mapped twice, writable for fwe and executable for the
   threads that run it; a full chunk is followed by a new one, and a

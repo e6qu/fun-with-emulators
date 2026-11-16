@@ -171,8 +171,19 @@ pub struct State {
     /// The program's pages kept from being written, with the protections
     /// they had (written, they get them back and their translations go).
     guarded: BTreeMap<u64, libc::c_int>,
+    /// Pages -> how many times their guard was lifted. A write that faulted
+    /// on a guard another thread lifted before this one's fault was handled
+    /// finds the page unguarded: it is tried again while the page's guard
+    /// changes between its tries ([`written`]).
+    lifted: BTreeMap<u64, u64>,
+    /// Host threads -> the address and the page's lift count of the write
+    /// each last tried again with its page unguarded.
+    retried: BTreeMap<u64, (u64, u64)>,
     /// Program pages -> the blocks made from them.
     pages: BTreeMap<u64, Vec<usize>>,
+    /// Program addresses the table sends through the stub into code not
+    /// translated.
+    outside: std::collections::BTreeSet<u64>,
     cache: Option<Cache>,
 }
 
@@ -182,7 +193,10 @@ static STATE: Mutex<State> = Mutex::new(State {
     by_t: BTreeMap::new(),
     blocks: Vec::new(),
     guarded: BTreeMap::new(),
+    lifted: BTreeMap::new(),
+    retried: BTreeMap::new(),
     pages: BTreeMap::new(),
+    outside: std::collections::BTreeSet::new(),
     cache: None,
 });
 
@@ -267,6 +281,7 @@ impl State {
                 // SAFETY: a page of the program's memory fwe kept from
                 // writes; it gets the protections it had back.
                 unsafe { libc::mprotect(p as *mut libc::c_void, page as usize, prot) };
+                *self.lifted.entry(p).or_default() += 1;
             }
             for i in self.pages.remove(&p).unwrap_or_default() {
                 let (g, t) = (self.blocks[i].g, self.blocks[i].t);
@@ -292,13 +307,11 @@ pub fn code(addr: u64, len: u64) {
     remove(&mut s.regions, addr, len);
     s.regions.insert(addr, addr + len);
     // Lookups that sent its addresses to code not translated go again.
-    if s.cache.is_some() {
-        for i in 0..1u64 << TABLE_BITS {
-            let e = entry(i << 2);
-            let k = e[0].load(Ordering::Acquire);
-            if k >= addr && k < addr + len {
-                e[0].store(0, Ordering::Release);
-            }
+    if let Some(stub) = s.cache.as_ref().map(|c| c.stub) {
+        let gone: Vec<u64> = s.outside.range(addr..addr.saturating_add(len)).copied().collect();
+        for g in gone {
+            s.outside.remove(&g);
+            unpublish(g, stub);
         }
     }
 }
@@ -312,6 +325,10 @@ pub fn changed(addr: u64, len: u64) -> bool {
     let held = s.regions.range(..end).any(|(_, &e)| e > addr);
     s.drop_range(addr, len);
     remove(&mut s.regions, addr, len);
+    let gone: Vec<u64> = s.lifted.range(addr & !(page_size() - 1)..end).map(|(&p, _)| p).collect();
+    for p in gone {
+        s.lifted.remove(&p);
+    }
     held
 }
 
@@ -323,12 +340,21 @@ pub fn reset() {
         s.drop_range(a, e - a);
     }
     s.regions.clear();
-    s.by_g.clear();
-    if s.cache.is_some() {
-        for i in 0..1u64 << TABLE_BITS {
-            entry(i << 2)[0].store(0, Ordering::Release);
+    if let Some(stub) = s.cache.as_ref().map(|c| c.stub) {
+        let entries: Vec<(u64, u64)> = s
+            .by_g
+            .iter()
+            .map(|(&g, &i)| (g, s.blocks[i].t))
+            .chain(s.outside.iter().map(|&g| (g, stub)))
+            .collect();
+        for (g, t) in entries {
+            unpublish(g, t);
         }
     }
+    s.by_g.clear();
+    s.outside.clear();
+    s.lifted.clear();
+    s.retried.clear();
 }
 
 /// Held across a `fork`, so that the child's copy of the translations is
@@ -405,14 +431,29 @@ pub fn enter(pc: u64) -> Option<u64> {
 /// A write to the program's memory at `addr` that faulted: if the page was
 /// kept from writes because code was translated from it, the translations
 /// go and it is writable again (the write is to be tried again).
+///
+/// Threads that write a guarded page at once all fault; the first one
+/// handled lifts the guard, and the others find the page unguarded. Their
+/// writes are tried again: once, and again only while the page's guard has
+/// changed since, so a write that faults for another reason is not tried
+/// forever.
 pub fn written(addr: u64) -> bool {
     let mut s = state();
     let page = addr & !(page_size() - 1);
-    if !s.guarded.contains_key(&page) {
+    // SAFETY: no preconditions.
+    let thread = unsafe { libc::pthread_self() } as u64;
+    if s.guarded.contains_key(&page) {
+        s.retried.remove(&thread);
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        s.drop_range(page, page_size());
+        return true;
+    }
+    let Some(&lifts) = s.lifted.get(&page) else { return false };
+    if !s.in_region(addr) || s.retried.get(&thread) == Some(&(addr, lifts)) {
+        s.retried.remove(&thread);
         return false;
     }
-    DROPPED.fetch_add(1, Ordering::Relaxed);
-    s.drop_range(page, page_size());
+    s.retried.insert(thread, (addr, lifts));
     true
 }
 
@@ -440,8 +481,9 @@ pub fn exit(regs: &mut Regs) -> bool {
     };
     if !s.in_region(to) {
         // Code not translated: its lookups go through the stub.
-        if let Some(c) = s.cache.as_ref() {
-            publish(to, c.stub);
+        if let Some(stub) = s.cache.as_ref().map(|c| c.stub) {
+            publish(to, stub);
+            s.outside.insert(to);
         }
         regs.pc = to;
         return true;

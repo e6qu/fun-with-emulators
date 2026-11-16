@@ -15,6 +15,7 @@
  * - code copied elsewhere and run there;
  * - the return address a call leaves being the code's own address;
  * - threads running code while another thread patches it;
+ * - threads running code while writing data in its page, at once;
  * - code made executable with mprotect after it was written (W^X);
  * - a fork child running code translated before, and code it changes;
  * - and the memory reading back exactly as the program wrote it.
@@ -167,6 +168,11 @@ __asm__(
     "  ldp x29, x30, [sp], #16\n"
     "  ret\n"
 
+    /* Data the writers below keep beside the code, one word each. */
+    "  .balign 64\n"
+    "jl_slots:\n"
+    "  .fill 8, 8, 0\n"
+
     ".globl jl_end\n"
     "jl_end:\n"
     ".balign 4096\n"
@@ -174,7 +180,7 @@ __asm__(
 
 extern const char jl_begin[], jl_end[], jl_sum[], jl_indirect[], jl_pcrel[], jl_x18[],
     jl_getpid[], jl_fault[], jl_fault_load[], jl_fault_cont[], jl_ret1[], jl_retaddr[],
-    jl_retaddr_after[];
+    jl_retaddr_after[], jl_slots[];
 
 static size_t template_len(void) { return (size_t)(jl_end - jl_begin); }
 
@@ -226,6 +232,27 @@ static void *runner(void *arg) {
             atomic_fetch_add(&bad, 1);
         }
         if (sum(10) != 90) {
+            atomic_fetch_add(&bad, 1);
+        }
+    }
+    return 0;
+}
+
+#define WRITERS 4
+#define WRITES 2000
+
+/* Runs the code, then writes its own word in the code's page: the writers
+ * write the page at once, each write after code there ran. */
+static void *writer(void *arg) {
+    long i = (long)arg;
+    long (*sum)(long) = (long (*)(long))at(code, jl_sum);
+    volatile long *slot = (volatile long *)at(code, jl_slots) + i;
+    for (long k = 1; k <= WRITES; k++) {
+        if (sum(10) != 90) {
+            atomic_fetch_add(&bad, 1);
+        }
+        *slot = k;
+        if (*slot != k) {
             atomic_fetch_add(&bad, 1);
         }
     }
@@ -314,6 +341,22 @@ int main(void) {
     }
     memcpy(at(expect, jl_ret1), &one, 4);
     printf("threads: %s\n", atomic_load(&bad) ? "wrong results" : "ok");
+
+    /* Any fault now is one the writers should not take. */
+    sa.sa_sigaction = 0;
+    sa.sa_flags = 0;
+    sigaction(SIGSEGV, &sa, 0);
+    for (long i = 0; i < WRITERS; i++) {
+        pthread_create(&t[i], 0, writer, (void *)i);
+    }
+    for (int i = 0; i < WRITERS; i++) {
+        pthread_join(t[i], 0);
+    }
+    for (int i = 0; i < WRITERS; i++) {
+        long last = WRITES;
+        memcpy((long *)at(expect, jl_slots) + i, &last, sizeof last);
+    }
+    printf("writers: %s\n", atomic_load(&bad) ? "wrong results" : "ok");
 
     /* Written, then made executable (and back), as a W^X JIT does. */
     char *wx = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
