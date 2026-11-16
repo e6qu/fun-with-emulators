@@ -975,9 +975,11 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   does not keep are 0), `net`, `task/<tid>/{stat,status,comm}`. Writing
   `comm` names the thread as `PR_SET_NAME` does (another process's:
   `EINVAL`). The state in `stat` is the main
-  thread's: `S` while it waits in a system call, never while it waits for
-  one of fwe's own locks (as a Linux task waiting on a kernel lock is not
-  asleep).
+  thread's: `S` while it waits in a system call, `D` while the host
+  brings in a page for it, and `R` while it does fwe's own work, waiting
+  for one of fwe's locks or the host's reading and writing of fwe's
+  records (a mark in the process store, `procstore::Busy`), as a Linux
+  task doing its kernel's work is not asleep.
 - `/proc` globals: `cpuinfo` (Linux's arm64 format: BogoMIPS from the
   host's timer, the features of the hwcaps the program was given, the
   implementer and, for a chip Linux knows, the part from `hw.cpufamily`;

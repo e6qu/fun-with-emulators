@@ -364,6 +364,7 @@ fn wait_timer() -> i32 {
 /// which a child does not inherit, are dropped. Async-signal-safe.
 pub fn forked() {
     PROCESS.clear();
+    crate::procstore::not_busy();
     with_own(Pending::clear);
     // The parent's other threads' sets are not the child's. Only entries
     // ever taken are looked at, and only those in use written: a write to

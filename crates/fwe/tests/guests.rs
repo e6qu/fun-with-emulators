@@ -1143,6 +1143,13 @@ fn a_connect_is_made_once_however_signals_land() {
     );
 }
 
+/// A process `/proc` shows sleeping in a semaphore wait is counted as
+/// waiting: fwe's own work on the way there is not shown as a sleep.
+#[test]
+fn a_process_shown_sleeping_in_a_semaphore_wait_is_counted() {
+    c_guest_prints("semwaiters", &[], "workers failed: 0, sleeping waiters not counted: 0\n");
+}
+
 /// A signal for a process whose main thread blocks it is taken by another
 /// thread that does not, whether that one waits in `pause` or sleeps.
 #[test]

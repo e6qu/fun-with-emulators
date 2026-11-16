@@ -392,6 +392,8 @@ impl<T: Data> Record<T> {
     /// holds every change since, else read whole. What a change made
     /// meanwhile tore is read again.
     fn read_current(&self, seen: u64, cached: &Arc<T>) -> Result<(u64, Arc<T>), i32> {
+        // Files read: fwe's work, not a wait of the guest's.
+        let _busy = crate::procstore::Busy::new();
         let mut last = Err(errno::EIO);
         for _ in 0..100 {
             let now = self.generation.load(Ordering::SeqCst);
@@ -498,6 +500,9 @@ impl<T: Data> Record<T> {
 
     /// Run `f` holding the record's lock.
     fn with_lock<R>(&self, f: impl FnOnce() -> Result<R, i32>) -> Result<R, i32> {
+        // Files opened, locked, read and written: fwe's work, not a wait
+        // of the guest's.
+        let _busy = crate::procstore::Busy::new();
         let lock = c(&[&self.dir[..], b"/lock"].concat())?;
         // SAFETY: a NUL-terminated path in the record's directory.
         let fd = unsafe {
