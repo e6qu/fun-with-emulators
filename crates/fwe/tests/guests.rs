@@ -1143,6 +1143,14 @@ fn a_connect_is_made_once_however_signals_land() {
     );
 }
 
+/// Tracers side by side: each continues its own tracee, stopped; none's
+/// requests reach another's, as their mailboxes' pages are freed and made
+/// again.
+#[test]
+fn tracers_side_by_side_continue_only_their_own_tracees() {
+    c_guest_prints("tracestorm", &[], "workers broken: 0, tracees not stopped or continued: 0\n");
+}
+
 /// A process `/proc` shows sleeping in a semaphore wait is counted as
 /// waiting: fwe's own work on the way there is not shown as a sleep.
 #[test]

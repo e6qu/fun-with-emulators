@@ -630,7 +630,9 @@ memory or threads, so a tracee does its tracer's work itself:
 
 - **Mailbox:** a page per traced thread in the process store (named by
   the pid for a main thread, the tid for another), kept while its tracer
-  lives. It names the thread's process and holds the stop's wait status,
+  lives: a tracee detached or ended marks it so, and its tracer frees it
+  as it next looks, so no tracer's request lands in a page made again
+  for another tracee. It names the thread's process and holds the stop's wait status,
   the general and FP registers, the `siginfo`, the options, and one
   request at a time with its result, handed over through shared host
   address waits.
