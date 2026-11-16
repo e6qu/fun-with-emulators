@@ -1199,14 +1199,14 @@ fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
 }
 
 /// Whether any page of a private file view waits to be written (see
-/// [`FILE_VIEWS`]).
+/// [`Ranges::file_views`]).
 pub fn any_views() -> bool {
     ANY_VIEWS.load(std::sync::atomic::Ordering::SeqCst) && !lock_ranges().file_views.is_empty()
 }
 
 /// fwe is about to write guest range `[addr, addr + len)` for the guest:
 /// pages of a file view in it become copies of themselves first (see
-/// [`FILE_VIEWS`]), as the guest's own write would make them. Cheap where
+/// [`Ranges::file_views`]), as the guest's own write would make them. Cheap where
 /// there are none.
 pub fn views_written(addr: u64, len: u64) {
     if len == 0 || !any_views() {
@@ -1277,7 +1277,8 @@ fn host_prot(prot: u64) -> libc::c_int {
 }
 
 /// The host protections guest protections `prot` end up as: writable and
-/// executable memory is only writable (see [`WRITE_EXEC`]).
+/// executable memory is only writable (the native backend runs it by
+/// translation, the VM as it is).
 fn final_prot(prot: u64) -> libc::c_int {
     let p = host_prot(prot);
     if wants_write_exec(prot) { p & !libc::PROT_EXEC } else { p }
@@ -2104,7 +2105,7 @@ impl<P: Platform> Kernel<P> {
         // mappings are made private for this, since the code is modified.
         let exec = prot & mman::PROT_EXEC != 0;
         // A private mapping of a file with no name: shared on the host,
-        // never writable there (see [`FILE_VIEWS`]).
+        // never writable there (see [`Ranges::file_views`]).
         let view = !anonymous
             && !exec
             && hflags & libc::MAP_PRIVATE != 0
@@ -2383,7 +2384,7 @@ impl<P: Platform> Kernel<P> {
         }
         let a = crate::uaccess::g2h(addr) as *mut libc::c_void;
         // Not yet written pages of a file view stay unwritable on the host
-        // (see [`FILE_VIEWS`]); made executable, a copy (code is prepared in
+        // (see [`Ranges::file_views`]); made executable, a copy (code is prepared in
         // place).
         let views: Vec<(u64, u64)> = {
             let len = self.page_up(len);
@@ -2484,7 +2485,7 @@ impl<P: Platform> Kernel<P> {
     /// writable — and report it handled, so the access is retried.
     /// A write the guest made at host address `addr` faulted: if it is a
     /// page of a file view not yet written that the guest may write, the
-    /// page becomes a copy of itself (see [`FILE_VIEWS`]), and the write is
+    /// page becomes a copy of itself (see [`Ranges::file_views`]), and the write is
     /// tried again.
     pub fn view_fault(&mut self, addr: u64) -> bool {
         let page = addr & !(self.page_size - 1);
