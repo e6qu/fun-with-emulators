@@ -4081,13 +4081,13 @@ mod tests {
             len: u64,
             _known: Option<&[(u64, u64)]>,
             _cache: Option<&[u8]>,
-        ) -> Result<(), crate::PrepareFailed> {
+        ) -> Result<usize, crate::PrepareFailed> {
             if self.refuse > 0 {
                 self.refuse -= 1;
                 return Err(crate::PrepareFailed { errno: errno::ENOMEM, why: "no room".into() });
             }
             self.exec.push((addr, len));
-            Ok(())
+            Ok(0)
         }
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")

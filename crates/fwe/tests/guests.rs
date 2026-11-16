@@ -3113,6 +3113,95 @@ fn alpine_wine_runs_windows_programs() {
     );
 }
 
+/// How many JIT pages had instructions naming `x18` given stubs, and how
+/// many such instructions, from the notes of a `--strace-file` trace.
+fn jit_x18_summary(what: &str, trace: &Path) {
+    let text = std::fs::read_to_string(trace).unwrap_or_default();
+    let (mut pages, mut uses) = (0, 0);
+    for l in text.lines().filter(|l| l.contains("x18 uses given stubs")) {
+        pages += 1;
+        uses += l
+            .rsplit(": ")
+            .next()
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
+    }
+    eprintln!("{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses");
+}
+
+/// Alpine's OpenJDK 25 (fetched: `guests/alpine/fetch/jdk.txt`): `javac`
+/// compiles the benchmark's multi-threaded application
+/// (`tools/bench/workloads/jdk`), and `java` runs it: parallel streams and
+/// regular expressions, a thread pool, fork/join, locks and the garbage
+/// collector, with HotSpot's JIT compilers at work. It runs only where
+/// `FWE_JDK_TESTS` is set (CI's `jdk` job).
+#[test]
+fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
+    if !fetched_program_tests("FWE_JDK_TESTS") {
+        return;
+    }
+    let cached = alpine_root("jdk");
+    let root = std::env::temp_dir().join(format!("fwe-jdk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
+    let src = repo().join("tools/bench/workloads/jdk");
+    let mut sources: Vec<String> = std::fs::read_dir(&src)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".java"))
+        .collect();
+    sources.sort();
+    std::fs::create_dir_all(root.join("tmp/src")).unwrap();
+    for n in &sources {
+        std::fs::copy(src.join(n), root.join("tmp/src").join(n)).unwrap();
+    }
+    let _workload = workload();
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("jdk-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    let bin = "/usr/lib/jvm/java-25-openjdk/bin";
+    let run = |name: &str, args: &[String]| {
+        let trace = kept.join(format!("{name}.trace"));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace")
+            .arg(format!("--strace-file={}", trace.display()))
+            .arg("--root")
+            .arg(&root)
+            .arg(root.join(format!("{bin}/{name}").trim_start_matches('/')))
+            .args(args)
+            .env_clear()
+            .env("PATH", format!("{bin}:/usr/bin:/bin"))
+            .env("HOME", "/tmp")
+            .stdin(Stdio::null());
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(600));
+        eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+        jit_x18_summary(name, &trace);
+        if !out.status.success() {
+            print_last_calls(&trace);
+            let text = std::fs::read_to_string(&trace).unwrap_or_default();
+            for l in text.lines().filter(|l| l.contains("--- signal") || l.contains("fault")) {
+                eprintln!("{l}");
+            }
+        }
+        out
+    };
+    let mut javac = vec!["-d".to_string(), "/tmp/out".to_string()];
+    javac.extend(sources.iter().map(|n| format!("/tmp/src/{n}")));
+    let out = run("javac", &javac);
+    assert!(out.status.success(), "javac failed");
+    let out = run("java", &["-cp".into(), "/tmp/out".into(), "Main".into(), "1".into()]);
+    assert_eq!(
+        stdout(&out),
+        "words: 1280000 in 1884 kinds, most sa=35916 vi=35899 ar=35637 ka=35613 qu=35596\n\
+         primes below 20000000: 1270607, sum 12272577818052\n\
+         matrix 160x160 x2: checksum 669356318\n\
+         bank: 100 accounts, 8 threads, total 100000, money moved\n\
+         done\n"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
 /// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
 /// constant tables among its code, which must not be rewritten), zlib, the
@@ -3185,6 +3274,7 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    jit_x18_summary("node", &trace);
     if !out.status.success() {
         print_last_calls(&trace);
         // Each signal, with where it was raised.

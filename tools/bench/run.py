@@ -150,6 +150,9 @@ BUDGETS = {
     # repository), as a call is.
     "SQLite (s)": 1.5,
     "git (s)": 1.5,
+    # A JIT runtime at work (compiling, then running, a multi-threaded
+    # application), against the same release of OpenJDK built for macOS.
+    "JDK (s)": 1.5,
 }
 
 # How much longer than its own code fwe may make a program that computes
@@ -185,6 +188,7 @@ BREW = {
     "sqlite": "opt/sqlite/bin/sqlite3",
     "git": "opt/git/bin/git",
     "xz": "opt/xz/bin/xz",
+    "jdk": "opt/openjdk@25/bin",
 }
 
 
@@ -533,6 +537,7 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    jdk(a, fwe, guest_env, results)
     shutil.rmtree(native, ignore_errors=True)
 
 
@@ -827,6 +832,39 @@ def profile(name, cmd, theirs, fresh, share=False):
     marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines() if "timing: " in l]
     print(f"{name}: fwe's marks: " + "; ".join(marks), file=sys.stderr)
     return mine
+
+
+# The JDK workload's sources: a multi-threaded application, and the scale
+# of its run.
+JDK_SRC = os.path.join(WORKLOADS, "jdk")
+JDK_SCALE = "4"
+
+
+def jdk(a, fwe, guest_env, results):
+    """OpenJDK 25 at work: `javac` compiling the application in
+    tools/bench/workloads/jdk, then `java` running it, under fwe in its
+    Alpine root, and natively with Homebrew's build of the same release."""
+    root = alpine_root("jdk", a.cache)
+    tmp = os.path.join(root, "tmp")
+    src = os.path.join(tmp, "jdksrc")
+    shutil.rmtree(src, ignore_errors=True)
+    shutil.copytree(JDK_SRC, src)
+    sources = sorted(f for f in os.listdir(JDK_SRC) if f.endswith(".java"))
+    bin_ours = "/usr/lib/jvm/java-25-openjdk/bin"
+    bin_theirs = os.path.join(a.brew, BREW["jdk"])
+    native = tempfile.mkdtemp()
+    ours_out, theirs_out = os.path.join(tmp, "jdkout"), os.path.join(native, "jdkout")
+
+    def both(bindir, srcdir, out):
+        files = " ".join(os.path.join(srcdir, f) for f in sources)
+        return (f"{bindir}/javac -d {out} {files} && "
+                f"{bindir}/java -cp {out} Main {JDK_SCALE}")
+
+    ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
+                              both(bin_ours, "/tmp/jdksrc", "/tmp/jdkout")]
+    theirs = ["/bin/sh", "-c", both(bin_theirs, JDK_SRC, theirs_out)]
+    workload(results, "JDK (s)", ours, theirs, (ours_out, theirs_out), len(guest_env) + 1)
+    shutil.rmtree(native, ignore_errors=True)
 
 
 def workloads(a, fwe, guest_env, lua_src, results):

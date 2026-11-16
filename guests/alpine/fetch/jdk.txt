@@ -1,0 +1,10 @@
+# Alpine Linux 3.24 aarch64 files the JDK test and benchmark fetch from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and OpenJDK 25
+# (the headless runtime, whose module image holds the compiler too, and
+# the JDK's tools: `javac`), which need only musl and zlib from the
+# minirootfs. Each line is a path under that URL and the file's SHA-256.
+# 3.24 is supported: a rebuild of a package replaces its file, and the
+# checksum then fails rather than the test changing.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/community/aarch64/openjdk25-jre-headless-25.0.5.0.3_p1-r0.apk 1aa7c93cbd1a5f20d8968e59745df0b64b50b1953f40a1966b69f1e9cbcbd436
+v3.24/community/aarch64/openjdk25-jdk-25.0.5.0.3_p1-r0.apk 696723b1aa4daccc949336d6fda04dfdce24dea9b07f34e2c3b8880168288adb

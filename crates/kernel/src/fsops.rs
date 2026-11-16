@@ -4788,8 +4788,8 @@ mod tests {
             _len: u64,
             _known: Option<&[(u64, u64)]>,
             _cache: Option<&[u8]>,
-        ) -> Result<(), crate::PrepareFailed> {
-            Ok(())
+        ) -> Result<usize, crate::PrepareFailed> {
+            Ok(0)
         }
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")

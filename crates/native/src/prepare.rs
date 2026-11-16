@@ -23,6 +23,8 @@ pub struct Prepared {
     /// (the forms [`crate::decode`] does not cover). Non-zero means the code
     /// can misbehave under preemption; reported under `--strace`.
     pub x18_deferred: usize,
+    /// Instructions naming `x18` given stubs.
+    pub x18_sites: usize,
 }
 
 /// No stub region could be placed within branch range of some sites.
@@ -252,8 +254,13 @@ pub unsafe fn prepare(
             _ => Some((off, site)),
         })
         .collect();
-    let mut stats =
-        Prepared { syscalls: patched.syscalls, stubs: 0, x18_deferred: patched.x18_deferred };
+    let x18_sites = all.iter().filter(|(_, site)| matches!(site, Site::X18 { .. })).count();
+    let mut stats = Prepared {
+        syscalls: patched.syscalls,
+        stubs: 0,
+        x18_deferred: patched.x18_deferred,
+        x18_sites,
+    };
 
     let mut sites = all.as_slice();
     while let Some(&(first, _)) = sites.first() {
@@ -872,7 +879,7 @@ mod tests {
         // The system call has a stub where there is a gate to call.
         let gate = crate::syscall_gate();
         let stubs = if gate == 0 { 2 } else { 3 };
-        assert_eq!(stats, Prepared { syscalls: 1, stubs, x18_deferred: 0 });
+        assert_eq!(stats, Prepared { syscalls: 1, stubs, x18_deferred: 0, x18_sites: 0 });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };
         let stub_of = |site: u64| {

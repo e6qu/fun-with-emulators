@@ -1,8 +1,9 @@
 # Alpine Linux test fixtures
 
-The container, debugger, Wine and benchmark tests use Alpine Linux, whose
-`aarch64` builds are position-independent and so run in fwe's native
-backend (Debian's podman, containerd and runc are not, and need the VM).
+The container, debugger, Wine, JDK and benchmark tests use Alpine Linux,
+whose `aarch64` programs are built position-independent (GCC's own
+compilers aside) and so run in fwe's native backend (Debian's podman,
+containerd and runc are not, and need the VM).
 Nothing is vendored here.
 
 ## Fetched, not vendored
@@ -24,6 +25,7 @@ package there fails its checksum.
 | `fetch/podman-further.txt` | What `podman.txt` lists, distribution's registry 2.8.3 (`docker-registry`), and shadow's `newuidmap`/`newgidmap` with their libraries (shadow-libs, libbsd, libmd, linux-pam, skalibs, utmps) | 31 MB |
 | `fetch/wine.txt` | The 3.24.4 minirootfs (the test's root) and Wine 11.0, its Windows modules ARM64 PE (and its x86 and ARM64EC parts, unused) | 76 MB |
 | `fetch/clang.txt` | The 3.24.4 minirootfs and clang 22 with LLVM's libraries, binutils 2.45, musl's headers, make 4.4 and GCC 15.2 (whose start files and libgcc clang links with; GCC's own compilers are not position-independent and are not run), and their libraries (gmp, mpfr, mpc, isl, jansson, libstdc++, libgcc, libatomic, libgomp, libffi, libxml2, xz, zlib, zstd), for the benchmarks' C build (`tools/bench/run.py`, which also fetches Lua 5.4.7's source from lua.org, MIT) | 170 MB |
+| `fetch/jdk.txt` | The 3.24.4 minirootfs and OpenJDK 25.0.5: the headless runtime (HotSpot, and the module image, the compiler's module among them) and the JDK's tools (`javac`), for the JDK test and the benchmarks' JDK workload (`tools/bench/workloads/jdk`) | 88 MB |
 | `fetch/workloads.txt` | The 3.24.4 minirootfs with SQLite 3.53, git 2.54, xz 5.8 and Python 3.14, and their libraries (libcurl, OpenSSL, nghttp2, c-ares, brotli, libidn2, libunistring, libpsl, pcre2, zlib, zstd, expat, bzip2, libffi, gdbm, mpdecimal, readline, ncurses, libgcc, libstdc++, ca-certificates), for the benchmarks' workloads (`tools/bench/run.py`) | 25 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
 
@@ -36,7 +38,7 @@ podman, conmon, netavark, containers-common, containerd, ctr, runc,
 dockerd, the docker CLI, buildx, Compose and the registry Apache-2.0;
 shadow, libbsd and linux-pam BSD-3-Clause; libmd BSD-3-Clause,
 BSD-2-Clause, ISC, Beerware and public domain; skalibs and utmps ISC;
-tini MIT; Wine LGPL-2.1-or-later; GCC, libgcc, libstdc++, libatomic and
+tini MIT; Wine LGPL-2.1-or-later; OpenJDK GPL-2.0 with the Classpath exception; GCC, libgcc, libstdc++, libatomic and
 libgomp GPL-3.0-or-later with the GCC Runtime Library Exception; binutils and
 make GPL-3.0-or-later; mpc LGPL-3.0-or-later; isl and jansson MIT; clang and
 LLVM Apache-2.0 with LLVM exceptions; libffi and libxml2 MIT; xz public

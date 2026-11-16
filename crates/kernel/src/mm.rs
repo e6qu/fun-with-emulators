@@ -2347,10 +2347,11 @@ impl<P: Platform> Kernel<P> {
             // Only what the file has (a page past its end has nothing to
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
-            if backed > 0
-                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE, None)
-            {
-                return self.prepare_failed(e);
+            if backed > 0 {
+                match self.platform.prepare_exec(a as u64, backed, JIT_CODE, None) {
+                    Ok(n) => self.jit_x18_note(a as u64, backed, n),
+                    Err(e) => return self.prepare_failed(e),
+                }
             }
         }
         // SAFETY: guest-requested protection change of guest memory.
@@ -2474,15 +2475,26 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
+    /// Under `--strace`: how many instructions naming `x18` were given
+    /// stubs in JIT code just prepared.
+    fn jit_x18_note(&self, addr: u64, len: u64, n: usize) {
+        if n > 0 {
+            self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs"));
+        }
+    }
+
     pub fn write_exec_fault(&mut self, addr: u64, exec: bool) -> bool {
         if !write_exec_writable(addr, self.page_size) {
             return false;
         }
         if exec {
             let page = addr & !(self.page_size - 1);
-            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
-                self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
-                return false;
+            match self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
+                Ok(n) => self.jit_x18_note(page, self.page_size, n),
+                Err(e) => {
+                    self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
+                    return false;
+                }
             }
             let rx = libc::PROT_READ | libc::PROT_EXEC;
             // SAFETY: a page of guest memory the guest mapped writable and

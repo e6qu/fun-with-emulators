@@ -149,8 +149,8 @@ impl Platform for NativePlatform {
         len: u64,
         known: Option<&[(u64, u64)]>,
         cache: Option<&[u8]>,
-    ) -> Result<(), fwe_kernel::PrepareFailed> {
-        self.prepare(addr, len, None, known, cache).map(|_| ()).map_err(|e| {
+    ) -> Result<usize, fwe_kernel::PrepareFailed> {
+        self.prepare(addr, len, None, known, cache).map(|p| p.x18_sites).map_err(|e| {
             // A mapping being kept as an image is not, failed.
             prepare::image_abandon();
             fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
