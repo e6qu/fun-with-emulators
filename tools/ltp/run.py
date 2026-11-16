@@ -195,6 +195,13 @@ def stacks(sid, work):
     return "\n" + "\n".join(out) + "\n"
 
 
+# Tests run with fwe's notes kept ([`run_one`]): open12, whose O_NOATIME
+# read now and then finds the file's access time changed in CI, and never
+# here; the notes give the file's times before and after the read, as
+# fwe sets it back, and at the close.
+TRACED = re.compile(r"^open12$")
+
+
 def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """Run one test; (name, outcome, seconds, output tail)."""
     bindir = "/opt/ltp/testcases/bin"
@@ -242,6 +249,11 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     if IPC_TESTS.match(name):
         busybox = os.path.join(root, "bin", "busybox")
         command = [fwe, "--root", root, busybox, "unshare", "-i", "--", prog, *argv[1:]]
+    # A test whose failure fwe's notes explain is traced to a file (no
+    # system call, the notes only), shown if it does not pass.
+    trace = os.path.join(tmp, "fwe-notes") if TRACED.match(name) else None
+    if trace:
+        command.insert(1, f"--strace-file={trace}")
     with tempfile.TemporaryFile(dir=work) as log:
         proc = subprocess.Popen(
             # (At most the host's hard limit, when that is lower.)
@@ -270,9 +282,12 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             pass
         log.seek(0)
         out = log.read()
+    if trace and outcome != "pass" and os.path.exists(trace):
+        with open(trace, "rb") as f:
+            out += b"\n--- fwe's notes:\n" + f.read()[-20000:]
     shutil.rmtree(tmp, ignore_errors=True)
     # (A timer test's every measurement, for `host_timers_late`.)
-    keep = 400 if outcome == "timeout" or b"slept for too long" in out else 40
+    keep = 400 if outcome == "timeout" or b"slept for too long" in out or b"--- fwe's notes" in out else 40
     tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
     if outcome == "conf" and VIRT and SKIPS_ON_VM in out:
         outcome = "conf-vm"
@@ -393,6 +408,12 @@ def main():
     # macOS runners start jobs at -10) gives it up, which any process may.
     if os.getpriority(os.PRIO_PROCESS, 0) < 0:
         os.setpriority(os.PRIO_PROCESS, 0, 0)
+
+    # Whether Spotlight indexes the volume the tests' files are on (a
+    # reader of theirs fwe does not see; open12's access times).
+    if shutil.which("mdutil"):
+        indexing = subprocess.run(["mdutil", "-s", tempfile.gettempdir()], capture_output=True, text=True)
+        print("Spotlight: " + " ".join((indexing.stdout + indexing.stderr).split()), flush=True)
 
     fwe = os.path.abspath(args.fwe)
     root = os.path.abspath(args.root)

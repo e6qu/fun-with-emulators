@@ -48,6 +48,9 @@ pub fn opened_noatime(fd: i32) {
 /// `fd` was closed.
 pub fn closed(fd: i32) {
     if NOATIME_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        if noatime_fd(fd) {
+            note(fd, "closing");
+        }
         NOATIME_FDS.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
     }
 }
@@ -83,6 +86,7 @@ pub fn before(n: u64, a: &[u64; 6]) -> Option<Before> {
         flags & ms::STRICTATIME == 0 && at > mt && at > ct && now - at < 86_400
     };
     let atime = libc::timespec { tv_sec: st.st_atime, tv_nsec: st.st_atime_nsec };
+    note(fd, if keep { "before a read that keeps it" } else { "before a read that sets it" });
     Some(Before { fd, atime, keep })
 }
 
@@ -100,6 +104,7 @@ pub fn after(b: Option<Before>, r: i64) {
         return;
     }
     let now = (st.st_atime, st.st_atime_nsec);
+    note(b.fd, "after the read");
     let atime = if b.keep {
         if now == (b.atime.tv_sec, b.atime.tv_nsec) {
             return;
@@ -116,6 +121,32 @@ pub fn after(b: Option<Before>, r: i64) {
         now
     };
     set_access_time(b.fd, atime);
+    note(b.fd, &format!("set back to {}.{:09} after the host's read", atime.tv_sec, atime.tv_nsec));
+}
+
+/// Note, in the trace file (`--strace-file`), the access, change and
+/// modification times of the file open as `fd`, at `when`: what a guest
+/// that finds an access time it did not expect can be traced by.
+fn note(fd: i32, when: &str) {
+    if crate::trace::file().is_none() {
+        return;
+    }
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return;
+    }
+    crate::trace::note_to_file(&format!(
+        "access time of fd {fd} (inode {}) {when}: atime {}.{:09} mtime {}.{:09} ctime {}.{:09}",
+        st.st_ino,
+        st.st_atime,
+        st.st_atime_nsec,
+        st.st_mtime,
+        st.st_mtime_nsec,
+        st.st_ctime,
+        st.st_ctime_nsec
+    ));
 }
 
 /// Give the file open as `fd` the access time `t`, its change time left

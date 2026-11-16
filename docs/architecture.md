@@ -147,7 +147,10 @@ byte ranges):
 - `--strace=failures` prints only failing calls and the notes, cheap
   enough to keep a run's timing.
 - `--strace-file=PATH` appends the trace of every process of the run to
-  `PATH`, each line naming its process.
+  `PATH`, each line naming its process. With it alone (no `--strace`) it
+  holds fwe's notes only, among them a file's times around each read
+  whose access time fwe keeps or sets, and at the close of one opened
+  with `O_NOATIME`.
 - `FWE_TIMING=1` prints how long each phase of a start, an `execve` and a
   `fork` took, to standard error.
 - All are passed on across `execve` and `fork`. A failed code preparation
