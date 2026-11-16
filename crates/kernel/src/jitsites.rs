@@ -33,9 +33,14 @@ use std::sync::Mutex;
 /// Changed words of JIT code: address -> (the JIT's word, fwe's word).
 static SITES: Mutex<BTreeMap<u64, (u32, u32)>> = Mutex::new(BTreeMap::new());
 
-/// Each word fwe wrote in JIT code -> the JIT's word it stands for, or
-/// `None` where it has stood for more than one.
-static WORDS: Mutex<Option<HashMap<u32, Option<u32>>>> = Mutex::new(None);
+/// Each word fwe wrote in JIT code -> where it wrote it and the JIT's
+/// word it stood for there. One word can stand for different words at
+/// different places (stub regions sit at the same distance from code with
+/// the same layout), told apart by where a copy was made from.
+static WORDS: Mutex<Option<Written>> = Mutex::new(None);
+
+/// fwe's word -> each place it was written, and the JIT's word there.
+type Written = HashMap<u32, Vec<(u64, u32)>>;
 
 fn sites() -> std::sync::MutexGuard<'static, BTreeMap<u64, (u32, u32)>> {
     SITES.lock().unwrap_or_else(|e| e.into_inner())
@@ -45,15 +50,17 @@ fn sites() -> std::sync::MutexGuard<'static, BTreeMap<u64, (u32, u32)>> {
 pub fn record(addr: u64, was: u32, now: u32) {
     sites().insert(addr, (was, now));
     let mut words = WORDS.lock().unwrap_or_else(|e| e.into_inner());
-    words
-        .get_or_insert_with(HashMap::new)
-        .entry(now)
-        .and_modify(|w| {
-            if *w != Some(was) {
-                *w = None;
-            }
-        })
-        .or_insert(Some(was));
+    let at = words.get_or_insert_with(HashMap::new).entry(now).or_default();
+    if !at.contains(&(addr, was)) {
+        at.push((addr, was));
+    }
+}
+
+/// fwe's word for the site at `addr`, if the JIT's word there is `was` as
+/// it was when fwe changed it last: its stub is there still, for the same
+/// instruction at the same place.
+pub fn reusable(addr: u64, was: u32) -> Option<u32> {
+    sites().get(&addr).filter(|&&(w, _)| w == was).map(|&(_, now)| now)
 }
 
 /// Whether `w` decodes in one of the instruction classes a program's code
@@ -89,41 +96,64 @@ fn branch_target(at: u64, w: u32) -> Option<u64> {
 /// branch fwe did not write here, with the bits of one it did, among
 /// instructions ([`among_instructions`]: not the low half of a pointer),
 /// that leads where `code` says there is no code (a JIT's own branches
-/// lead to its code). How many were put back.
-pub fn repair_copies(addr: u64, len: u64, code: impl Fn(u64) -> bool) -> usize {
+/// lead to its code). A copy moves all it copies by one distance: where a
+/// word stood for different words at different places, the place it was
+/// copied from is the one at the distance the other copies here moved.
+/// How many were put back, and how many could not be told.
+pub fn repair_copies(addr: u64, len: u64, code: impl Fn(u64) -> bool) -> (usize, usize) {
     let words = WORDS.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(words) = words.as_ref() else { return 0 };
+    let Some(words) = words.as_ref() else { return (0, 0) };
     let sites = sites();
     // SAFETY: the caller's range, readable.
     let here: Vec<u32> =
         unsafe { std::slice::from_raw_parts(addr as *const u32, (len / 4) as usize) }.to_vec();
-    let mut repaired = 0;
+    // The copies here: each with where its word was written, and what it
+    // stood for there.
+    let mut copies: Vec<(u64, &Vec<(u64, u32)>)> = Vec::new();
     for (i, &w) in here.iter().enumerate() {
         let at = addr + 4 * i as u64;
-        let p = at as *mut u32;
         let Some(to) = branch_target(at, w) else { continue };
-        if !among_instructions(&here, i) {
+        if sites.get(&at).is_some_and(|&(_, now)| now == w) || !among_instructions(&here, i) {
             continue;
         }
-        if sites.get(&at).is_some_and(|&(_, now)| now == w) {
-            continue;
-        }
-        if let Some(&Some(was)) = words.get(&w)
+        if let Some(from) = words.get(&w)
+            && !from.is_empty()
             && !code(to)
         {
-            // SAFETY: as above.
-            unsafe { p.write_volatile(was) };
-            repaired += 1;
+            copies.push((at, from));
         }
     }
-    repaired
-}
-
-/// fwe's word for the site at `addr`, if the JIT's word there is `was` as
-/// it was when fwe changed it last: its stub is there still, for the same
-/// instruction at the same place.
-pub fn reusable(addr: u64, was: u32) -> Option<u32> {
-    sites().get(&addr).filter(|&&(w, _)| w == was).map(|&(_, now)| now)
+    // The distances the copies moved, from those that stood for one word.
+    let mut moved: HashMap<u64, usize> = HashMap::new();
+    for &(at, from) in &copies {
+        if from.iter().all(|&(_, was)| was == from[0].1) {
+            for &(p, _) in from {
+                *moved.entry(at.wrapping_sub(p)).or_default() += 1;
+            }
+        }
+    }
+    let (mut repaired, mut untold) = (0, 0);
+    for &(at, from) in &copies {
+        let one = from.iter().all(|&(_, was)| was == from[0].1);
+        let was = if one {
+            Some(from[0].1)
+        } else {
+            // The place at the distance most copies here moved.
+            from.iter()
+                .filter_map(|&(p, was)| moved.get(&at.wrapping_sub(p)).map(|&n| (n, was)))
+                .max_by_key(|&(n, _)| n)
+                .map(|(_, was)| was)
+        };
+        match was {
+            Some(was) => {
+                // SAFETY: a word of the caller's range, writable.
+                unsafe { (at as *mut u32).write_volatile(was) };
+                repaired += 1;
+            }
+            None => untold += 1,
+        }
+    }
+    (repaired, untold)
 }
 
 /// Put back the JIT's words in `[addr, addr + len)`, which is writable:
@@ -170,9 +200,29 @@ mod tests {
         record(base, was, now);
         // The copy at 8 leads to code; the one at 5 does not.
         let to8 = base + 32 + 0x10_0000;
-        assert_eq!(repair_copies(base, 44, |t| t == to8), 1);
+        assert_eq!(repair_copies(base, 44, |t| t == to8), (1, 0));
         assert_eq!((code[0], code[1], code[5], code[8]), (now, now, was, now));
         forget(base, 44);
+    }
+
+    /// A word that stood for different words at different places: the copy
+    /// takes the one copied from the place at the distance the other copy
+    /// beside it moved.
+    #[test]
+    fn a_shared_word_is_told_by_how_far_its_copy_moved() {
+        const NOP: u32 = 0xd503_201f;
+        let (was_a, was_b, was_c) = (0xf940_0641, 0xf940_0642, 0xf940_0643);
+        let (shared, single) = (0x1408_0000, 0x1408_0004);
+        record(0x1000_0000, was_a, shared);
+        record(0x2000_0000, was_b, shared);
+        record(0x1000_0010, was_c, single);
+        // Code copied from 0x1000_0000 to q + 4: `shared` from there at
+        // q + 4 and `single` from 0x1000_0010 at q + 20, both moved by
+        // q + 4 - 0x1000_0000.
+        let mut code = vec![NOP, shared, NOP, NOP, NOP, single, NOP, NOP, NOP];
+        let q = code.as_mut_ptr() as u64;
+        assert_eq!(repair_copies(q, 36, |_| false), (2, 0));
+        assert_eq!((code[1], code[5]), (was_a, was_c));
     }
 
     /// A word fwe changed goes back when its page is writable again, unless

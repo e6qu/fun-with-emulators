@@ -2503,9 +2503,11 @@ impl<P: Platform> Kernel<P> {
                 .iter()
                 .any(|p| p.value.prot & mman::PROT_EXEC != 0)
         };
-        let n = crate::jitsites::repair_copies(addr, len, code);
-        if n > 0 {
-            self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} copied sites put back"));
+        let (n, untold) = crate::jitsites::repair_copies(addr, len, code);
+        if n + untold > 0 {
+            self.tracer.note(&format!(
+                "JIT code at {addr:#x}+{len:#x}: {n} copied sites put back, {untold} not told"
+            ));
         }
     }
 

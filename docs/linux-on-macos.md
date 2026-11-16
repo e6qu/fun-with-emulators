@@ -611,7 +611,11 @@ it stands for; before JIT code is prepared, a branch there that fwe did
 not write, with the bits of one it did, among instructions (as a
 pointer's low half is not) and leading where there is no code (a
 program's own branches lead to its code), gets the program's word back,
-and is then prepared as any other.
+and is then prepared as any other. One branch word can stand for
+different instructions at different places (stub regions sit at the same
+distance from code, with the same layout); a copy moves everything it
+copies by one distance, so the place a copy came from is the one at the
+distance the other copies beside it moved.
 
 ### CTR_EL0: emulated when it traps
 
