@@ -35,12 +35,13 @@ static NEXT: AtomicI32 = AtomicI32::new(0);
 /// The guest's default soft limit, Linux's.
 const DEFAULT_SOFT: u64 = 1024;
 
-/// The most descriptors the guest may have open at once, Linux's default
-/// hard limit. A host `fork` copies the descriptor table as far as its
-/// highest descriptor, fwe's reserved range just above this: from 16384,
-/// a fork and wait of a small process took 17% longer than with a small
-/// table (from 69120, the host's, far more); from 4096, 5%.
-pub const GUEST_CAP: i32 = 4096;
+/// The most descriptors the guest may have open at once: as many as
+/// programs a Linux distribution runs count on (LTP's `pipe15` opens
+/// 8195). A host `fork` copies the descriptor table as far as its highest
+/// descriptor, fwe's reserved range just above this: a fork, exit and
+/// wait takes about 6% longer than with the range from 4096 (from 69120,
+/// the host's, far more).
+pub const GUEST_CAP: i32 = 16384;
 
 #[cfg(target_os = "macos")]
 fn max_files_per_proc() -> u64 {

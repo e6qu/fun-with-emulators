@@ -58,17 +58,17 @@ pub(crate) const POP: u32 = 0xf841_07e0;
 /// `add xD, sp, #48`: the `sp` a three-register stub was entered with.
 const ADD_SP_48: u32 = 0x9100_c3e0;
 /// `sub sp, sp, #imm12`; `| (imm << 10)`.
-const SUB_SP: u32 = 0xd100_03ff;
+pub(crate) const SUB_SP: u32 = 0xd100_03ff;
 /// `add sp, sp, #imm12`; `| (imm << 10)`.
-const ADD_SP: u32 = 0x9100_03ff;
+pub(crate) const ADD_SP: u32 = 0x9100_03ff;
 /// `add xD, sp, #imm12`; `| (imm << 10) | d`.
 const ADD_FROM_SP: u32 = 0x9100_03e0;
 /// `mov sp, xN` (`add sp, xN, #0`); `| (n << 5)`.
-const MOV_TO_SP: u32 = 0x9100_001f;
+pub(crate) const MOV_TO_SP: u32 = 0x9100_001f;
 /// `stp xA, xB, [sp]`; `| (b << 10) | a`.
-const STP_SP: u32 = 0xa900_03e0;
+pub(crate) const STP_SP: u32 = 0xa900_03e0;
 /// `ldp xA, xB, [sp]`; `| (b << 10) | a`.
-const LDP_SP: u32 = 0xa940_03e0;
+pub(crate) const LDP_SP: u32 = 0xa940_03e0;
 /// `stp xA, xB, [sp, #-16]!`; `| (b << 10) | a`.
 pub(crate) const PUSH_PAIR: u32 = 0xa9bf_03e0;
 /// `ldp xA, xB, [sp], #16`; `| (b << 10) | a`.
@@ -76,9 +76,9 @@ pub(crate) const POP_PAIR: u32 = 0xa8c1_03e0;
 /// `ldur xT, [xN, #imm9]`; `| ((imm & 0x1ff) << 12) | (n << 5) | t`.
 pub const LDUR: u32 = 0xf840_0000;
 /// `mov xD, xM` (`orr xD, xzr, xM`); `| (m << 16) | d`.
-const MOV: u32 = 0xaa00_03e0;
+pub(crate) const MOV: u32 = 0xaa00_03e0;
 /// `add xD, xN, xM`; `| (m << 16) | (n << 5) | d`.
-const ADD_REG: u32 = 0x8b00_0000;
+pub(crate) const ADD_REG: u32 = 0x8b00_0000;
 /// `b <label>`
 pub(crate) const B: u32 = 0x1400_0000;
 /// `movz xN, #imm16` base; `| (hw << 21) | (imm16 << 5) | n`.
@@ -445,9 +445,9 @@ pub(crate) fn stub_body(site: Site, tp_slot: u32, x18_slot: u32, pc: u64) -> Vec
 
 /// A fault in a stub, as if at its site: the stub's words from its start
 /// up to the faulting one (`ran`), and its branch back among the rest
-/// give the site; each register the stub pushed before the fault and has
-/// not popped yet is read back (`stack(offset from sp)`), and `sp` is as
-/// at the site. `None` if the words are no stub's.
+/// give the site; each register the stub saved below `sp` before the
+/// fault and has not taken back yet is read back (`stack(offset from sp)`),
+/// and `sp` is as at the site. `None` if the words are no stub's.
 pub struct Rewound {
     pub site: u64,
     pub restored: Vec<(u32, u64)>,
@@ -472,24 +472,32 @@ pub fn rewind(
             .then(|| at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4)))?;
         (to < stub || to >= end).then(|| to.wrapping_sub(4))
     })?;
-    // The registers pushed and not popped before `pc`, in push order.
-    let mut pushed: Vec<Vec<u32>> = Vec::new();
+    // What was saved below `sp` and not yet taken back before `pc`, frame
+    // by frame: the registers and their offsets, and the frame's size.
+    let mut pushed: Vec<(Vec<(u32, u64)>, u64)> = Vec::new();
     for &w in words.get(..ran)? {
         if w & !0x1f == PUSH {
-            pushed.push(vec![w & 0x1f]);
+            pushed.push((vec![(w & 0x1f, 0)], 16));
         } else if w & !0x7c1f == PUSH_PAIR {
-            pushed.push(vec![w & 0x1f, (w >> 10) & 0x1f]);
+            pushed.push((vec![(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)], 16));
+        } else if w & 0xffc0_03ff == SUB_SP {
+            // A frame made at once, filled by the stores below.
+            pushed.push((Vec::new(), u64::from((w >> 10) & 0xfff)));
+        } else if w & !0x7c1f == STP_SP {
+            pushed.last_mut()?.0.extend([(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)]);
+        } else if w & 0xffc0_03e0 == STR_UIMM | 31 << 5 {
+            pushed.last_mut()?.0.push((w & 0x1f, u64::from((w >> 10) & 0xfff) * 8));
         } else if w & !0x1f == POP || w & !0x7c1f == POP_PAIR {
             pushed.pop()?;
         }
     }
     let mut restored = Vec::new();
     let mut at = sp;
-    for regs in pushed.iter().rev() {
-        for (k, &r) in regs.iter().enumerate() {
-            restored.push((r, stack(at - sp + 8 * k as u64)?));
+    for (regs, size) in pushed.iter().rev() {
+        for &(r, off) in regs {
+            restored.push((r, stack(at - sp + off)?));
         }
-        at += 16;
+        at += size;
     }
     Some(Rewound { site, restored, sp: at })
 }
@@ -860,6 +868,28 @@ pub(crate) fn x18_stub_main(insn: u32) -> usize {
     let reads = ops.iter().any(|f| (insn >> f.shift) & 0x1f == 18 && f.read);
     let sp_base = crate::decode::sp_scratch_field(insn).is_some();
     2 + if sp_base { 2 } else { 0 } + 2 + usize::from(reads)
+}
+
+/// Where in the stub for an `x18`-naming `casp`, load or store written
+/// back onto `sp`, or instruction writing `sp` the instruction itself is
+/// ([`x18_stub_main`] for the others): before it the stub saves registers
+/// and loads `x18`'s value, after it stores `x18` back, restores them and
+/// moves `sp`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn x18_special_main(insn: u32) -> Option<usize> {
+    if crate::decode::x18_casp(insn) {
+        let (rs, rt, rn) = ((insn >> 16) & 0x1f, insn & 0x1f, (insn >> 5) & 0x1f);
+        let pair = rs == 18 || rt == 18;
+        Some(3 + if pair { 3 } else { 0 } + usize::from(rn == 18))
+    } else if crate::decode::x18_sp_writeback(insn) {
+        let pair = insn & 0x3a00_0000 == 0x2800_0000;
+        let load = if pair { (insn >> 22) & 1 == 1 } else { (insn >> 22) & 3 != 0 };
+        Some(6 + usize::from(!load))
+    } else if crate::decode::x18_writes_sp(insn) {
+        Some(6)
+    } else {
+        None
+    }
 }
 
 fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
@@ -1357,6 +1387,30 @@ mod tests {
         // Pushed first, so deepest: the first push's register at sp + 16.
         let (s1, s2) = (words[0] & 0x1f, words[1] & 0x1f);
         assert_eq!(r.restored, vec![(s2, 0xaa00), (s1, 0xaa10)]);
+    }
+
+    /// A fault at the access of the stub for an `x18` store written back
+    /// onto `sp` is a fault at the site: the frame the stub made at once
+    /// below `sp` is taken back, its three scratch registers with it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn a_fault_in_an_sp_writeback_stub_rewinds_its_frame() {
+        let (stub_at, site) = (0x10_0000u64, 0x20_0000u64);
+        // `str x18, [sp, #-16]!`
+        let insn = 0xf81f_0ff2;
+        let words = stub(Site::X18 { insn }, 8, 16, stub_at, site + 4);
+        let at = x18_special_main(insn).unwrap();
+        // The access: a store with an unsigned offset, after the address.
+        assert_eq!(words[at] & 0x3b00_0000, 0x3900_0000);
+        assert_eq!(words[at - 1] & 0xffc0_03e0, ADD_FROM_SP);
+        let sp = 0x7000u64;
+        let r =
+            rewind(&words, stub_at, stub_at + 4 * at as u64, sp, |off| Some(0xaa00 + off)).unwrap();
+        assert_eq!(r.site, site);
+        assert_eq!(words[0], SUB_SP | 48 << 10);
+        assert_eq!(r.sp, sp + 48);
+        let (s1, s2, s3) = (words[1] & 0x1f, (words[1] >> 10) & 0x1f, words[2] & 0x1f);
+        assert_eq!(r.restored, vec![(s1, 0xaa00), (s2, 0xaa08), (s3, 0xaa10)]);
     }
 
     /// Outside the known code (what the unwind table covers), a word that

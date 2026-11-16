@@ -367,10 +367,6 @@ fn region_prot(addr: u64) -> libc::c_int {
 /// takes no lock to look for one.
 static ANY_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// If host address `addr` is in writable and executable guest memory, make
-/// its page (of `page_size` bytes) writable, and report whether it was. Takes
-/// no kernel lock, so fwe's own code may use it when a write it makes for the
-/// guest faults.
 /// Both `PROT_WRITE` and `PROT_EXEC`.
 fn wants_write_exec(prot: u64) -> bool {
     prot & (mman::PROT_WRITE | mman::PROT_EXEC) == mman::PROT_WRITE | mman::PROT_EXEC
@@ -1210,6 +1206,48 @@ fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
     ranges
 }
 
+/// What the backend does before the host writes guest memory itself, for
+/// pages it keeps from the guest's writes (the native backend's pages code
+/// was translated from), set as it starts.
+static HOST_WRITES: std::sync::OnceLock<fn(u64, u64)> = std::sync::OnceLock::new();
+
+/// Whether the backend keeps any page from writes yet: until it does, a
+/// write by the host takes no lock to look for one.
+static ANY_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Have `f` called with the host range the host is about to write for the
+/// guest, once [`keeping_pages`] has been called.
+pub fn on_host_writes(f: fn(u64, u64)) {
+    let _ = HOST_WRITES.set(f);
+}
+
+/// The backend now keeps pages from writes (see [`on_host_writes`]).
+pub fn keeping_pages() {
+    ANY_KEPT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a write the host makes for the guest has anything to do first
+/// ([`host_writes`]).
+pub fn host_writes_watched() -> bool {
+    ANY_KEPT.load(std::sync::atomic::Ordering::SeqCst) || any_views()
+}
+
+/// The host is about to write guest `[addr, addr + len)` itself (a `read`
+/// into it, a result fwe copies): pages there it could not write become
+/// writable first, as the guest's own write would make them (file views,
+/// pages the backend keeps from writes).
+pub fn host_writes(addr: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    views_written(addr, len);
+    if ANY_KEPT.load(std::sync::atomic::Ordering::SeqCst)
+        && let Some(f) = HOST_WRITES.get()
+    {
+        f(crate::uaccess::g2h(addr), len);
+    }
+}
+
 /// Whether any page of a private file view waits to be written (see
 /// [`Ranges::file_views`]).
 pub fn any_views() -> bool {
@@ -1470,6 +1508,9 @@ impl<P: Platform> Kernel<P> {
         if nowrite {
             crate::maps::record().no_write(r as u64, len);
         }
+        if shared && self.platform.translates_jit() {
+            self.platform.jit_mapped(crate::uaccess::g2h(r as u64), len);
+        }
         // Writes through a shared writable mapping are not seen one by one:
         // a set-ID file mapped so loses its bits as it is mapped, as one
         // written does.
@@ -1678,6 +1719,9 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
             crate::maps::record().protected(addr, self.page_up(len), prot);
+            if self.platform.translates_jit() {
+                self.platform.jit_mapped(crate::uaccess::g2h(addr), self.page_up(len));
+            }
         }
         if r >= 0 {
             crate::maps::publish();
@@ -1738,6 +1782,7 @@ impl<P: Platform> Kernel<P> {
                 if moved {
                     self.platform.jit_code(host, self.page_up(new_len));
                 }
+                self.platform.jit_mapped(host, self.page_up(new_len));
             }
         }
         r
@@ -2125,7 +2170,21 @@ impl<P: Platform> Kernel<P> {
         if view {
             hflags = (hflags & !libc::MAP_PRIVATE) | libc::MAP_SHARED;
         }
-        let initial_prot = if exec {
+        // Code in a file shared and open for writing (a JIT's code mapped
+        // twice through a memfd, writable and executable): it changes
+        // through the file's other mappings, so it is mapped shared as it
+        // is, never executable on the host, and runs by translation where
+        // the backend translates.
+        let changing = exec
+            && !anonymous
+            && hflags & libc::MAP_SHARED != 0
+            && self.platform.translates_jit()
+            // SAFETY: F_GETFL only queries the descriptor.
+            && unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDWR;
+        let exec = exec && !changing;
+        let initial_prot = if changing {
+            (host_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ
+        } else if exec {
             if hflags & libc::MAP_SHARED != 0 && !anonymous {
                 hflags = (hflags & !libc::MAP_SHARED) | libc::MAP_PRIVATE;
             }
@@ -2139,8 +2198,11 @@ impl<P: Platform> Kernel<P> {
         let host_fd = if anonymous { -1 } else { fd as i32 };
         if flags & mman::MAP_FIXED != 0 {
             // A fixed mapping replaces what is there: the VM lets go of it
-            // before the host frees it.
+            // before the host frees it, and translations of code there go
+            // (their pages' protections given back before the mapping
+            // sets its own).
             self.platform.unmap_guest(addr, self.page_up(len));
+            let _ = self.platform.jit_changed(haddr, self.page_up(len));
         }
         let mut retried = false;
         let guest = 'map: loop {
@@ -2176,7 +2238,6 @@ impl<P: Platform> Kernel<P> {
             let guest = if p == haddr && fixed { addr } else { p };
             // What was owed to the pages replaced goes with them.
             crate::lazycode::unmapped(p, self.page_up(len));
-            let _ = self.platform.jit_changed(p, self.page_up(len));
             {
                 let mut r = lock_ranges_as_they_are();
                 r.mapped(p, self.page_up(len));
@@ -2189,7 +2250,7 @@ impl<P: Platform> Kernel<P> {
             }
             // Writable and executable: a JIT's code, run by translation
             // where the backend translates it.
-            if wants_write_exec(prot) && self.platform.translates_jit() {
+            if (wants_write_exec(prot) || changing) && self.platform.translates_jit() {
                 self.platform.jit_code(p, self.page_up(len));
             }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
@@ -2422,8 +2483,9 @@ impl<P: Platform> Kernel<P> {
         if translated {
             let _ = self.platform.jit_changed(a as u64, self.page_up(len));
         }
+        // (Readable: fwe reads the code to translate it.)
         let host = if translated && prot & mman::PROT_EXEC != 0 {
-            final_prot(prot) & !libc::PROT_EXEC
+            (final_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ
         } else {
             final_prot(prot)
         };
@@ -2490,11 +2552,6 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
-    /// A fault the guest took at host address `addr`, fetching an
-    /// instruction (`exec`) or writing: if `addr` is in memory the guest
-    /// mapped writable and executable, switch its page to what the access
-    /// needs — executable, with its code prepared as any guest code is, or
-    /// writable — and report it handled, so the access is retried.
     /// A write the guest made at host address `addr` faulted: if it is a
     /// page of a file view not yet written that the guest may write, the
     /// page becomes a copy of itself (see [`Ranges::file_views`]), and the write is

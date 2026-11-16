@@ -276,10 +276,11 @@ for a well-known property only.
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code run by translation, its memory untouched; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
 | native, JIT | Alpine's Node.js 24 with a current V8 (tested) | the same workload as Node.js 18's: V8's tiers, its compiled regular expressions and WebAssembly, deoptimization, run by translation |
 | native, JIT | Alpine's LuaJIT 2.1 (tested) | its trace compiler's code run by translation; compiled code calling C through its FFI, and C (`qsort`) calling back into Lua |
-| native, compiling as they run | Alpine's SBCL 2.6, Racket 9 (Chez Scheme), GNU Guile 3.0 (tested) | each compiles to machine code as it runs (`compile`, `eval`, redefinitions, CLOS dispatch, Guile's JIT), run by translation |
+| native, compiling as they run | Alpine's Racket 9 (Chez Scheme), GNU Guile 3.0 (tested) | each compiles to machine code as it runs (`eval`, compiled from text, Guile's JIT), run by translation; Racket's heap holds data on the pages of its code, which `read` writes into |
 | native, interpreter making code | Alpine's Python 3.14 (tested) | `eval`, `exec` and `compile` make bytecode from text as it runs; no machine code is made |
 | native, programs that change themselves | self-modifying code, code on the stack, a program changing and running a copy of its executable, quines, IOCCC winners (tested) | code made executable at run time runs by translation, a translation ending at each `isb`; the IOCCC's entries are fetched from the contest's repository and built as old C |
 | native, JIT | Alpine's OpenJDK 25 with HotSpot (tested) | its compilers' code run by translation, `x18` included, its code cache untouched; see [Java](#java-and-the-jvm) |
+| VM, compiling as it runs | Alpine's SBCL 2.6 (tested) | non-PIE at `0x400000`; compiles each form to machine code as it runs (`compile`, redefinitions, CLOS dispatch), which the VM runs as it is |
 | VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
 | VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
 | VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
@@ -634,7 +635,14 @@ code generated at run time:
   again when it next runs. The page is protected before it is read, so a
   write from another thread cannot slip in between. Threads writing the
   page at once all fault; the first handled lifts the protection, and the
-  others' writes are tried again. A translation ends at each `isb`, the
+  others' writes are tried again. A write the host makes there for the
+  program (a `read` into a buffer on the page, a result fwe copies out)
+  drops the translations first, as the program's own write would. Code
+  in a file mapped shared and open for writing (a memfd a JIT maps
+  twice, writable and executable) is mapped shared as it is and runs by
+  translation; the file's other mappings of a page translated from, made
+  before or after, are kept from writes too, so a write through either
+  view drops the translations. A translation ends at each `isb`, the
   point from which the architecture has a program run what it wrote to
   its code, so code that rewrites instructions just ahead of itself runs
   the new ones.
@@ -2119,7 +2127,7 @@ to the host.
 | Linux | macOS | fwe |
 |---|---|---|
 | a process's root (`chroot`) and mount table | one host filesystem | guest paths resolved component by component (`crates/kernel/src/fs.rs`): symlinks followed by fwe, mounts entered, `..` clamped at the process's root, as `openat2(RESOLVE_IN_ROOT)` would; the final host `openat` has `O_NOFOLLOW` added |
-| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 4096 at most), out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
+| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 16384 at most), out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
 | record locks (`F_SETLK`) | POSIX locks, different `struct flock`; any close of a file by the process drops its locks on it | translated; the host's, so they hold against host processes too; fwe reaches a guest's file by path for its own ends, but for the few it reads through a descriptor of its own, whose close drops them ([known limitations](architecture.md#known-limitations)) |
 | OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
 | leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits, up to `fs.lease-break-time` |

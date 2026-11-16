@@ -104,6 +104,18 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
     "  add x11, x11, " R "\n"                                              \
     "  mov " R ", sp\n"                                                    \
     "  mov sp, " R "\n"                                                    \
+    /* sp moved through it, and written back by its loads and stores */   \
+    "  sub " R ", sp, #64\n"                                               \
+    "  mov sp, " R "\n"                                                    \
+    "  add " R ", sp, #64\n"                                               \
+    "  mov sp, " R "\n"                                                    \
+    "  add " R ", x11, #5\n"                                               \
+    "  str " R ", [sp, #-16]!\n"                                           \
+    "  ldr " R ", [sp], #16\n"                                             \
+    "  add x11, x11, " R "\n"                                              \
+    "  stp " R ", x5, [sp, #-32]!\n"                                       \
+    "  ldp " R ", x6, [sp], #32\n"                                         \
+    "  eor x11, x11, " R "\n"                                              \
     /* pc-relative: the difference cancels the copy's place */             \
     "  adr " R ", 2f\n"                                                    \
     "  adr x10, 2f\n"                                                      \
@@ -134,12 +146,31 @@ __asm__(".arch_extension lse\n"
         ".balign 4096\n"
         ".globl jx_begin\n"
         "jx_begin:\n"
-        "jx_x18:\n" BODY("x18", "w18") "jx_x9:\n" BODY("x9", "w9") ".globl jx_end\n"
+        "jx_x18:\n" BODY("x18", "w18") "jx_x9:\n" BODY("x9", "w9")
+        /* long casp_count(long *pair, long n): adds 1 to pair[0] n times
+         * with casp on x18 and x19, retrying each until it succeeds. */
+        "jx_casp:\n"
+        "  stp x19, x20, [sp, #-32]!\n"
+        "  str x21, [sp, #16]\n"
+        "1: ldp x18, x19, [x0]\n"
+        "  mov x4, x18\n"
+        "  add x20, x18, #1\n"
+        "  mov x21, x19\n"
+        "  casp x18, x19, x20, x21, [x0]\n"
+        "  cmp x18, x4\n"
+        "  b.ne 1b\n"
+        "  subs x1, x1, #1\n"
+        "  b.ne 1b\n"
+        "  ldr x0, [x0]\n"
+        "  ldr x21, [sp, #16]\n"
+        "  ldp x19, x20, [sp], #32\n"
+        "  ret\n"
+        ".globl jx_end\n"
         "jx_end:\n"
         ".balign 4096\n"
         ".text\n");
 
-extern const char jx_begin[], jx_end[], jx_x18[], jx_x9[];
+extern const char jx_begin[], jx_end[], jx_x18[], jx_x9[], jx_casp[];
 
 /* Make code just written visible to instruction fetch, as Linux's
  * __clear_cache does, by the cache lines CTR_EL0 gives. */
@@ -244,9 +275,12 @@ int main(void) {
     unsigned long t;
     pthread_create(&t, 0, signaller, 0);
     int same = agree(100000);
+    static _Alignas(16) long pair[2];
+    long counted = ((long (*)(long *, long))(code + (jx_casp - jx_begin)))(pair, 2000000);
     atomic_store(&stop, 1);
     pthread_join(t, 0);
     printf("x18 forms with signals: same in %d of 100000, signals %s\n", same,
            atomic_load(&signals) ? "landed" : "none");
+    printf("casp on x18 with signals: %ld of 2000000\n", counted);
     return 0;
 }

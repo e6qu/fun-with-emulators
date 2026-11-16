@@ -256,8 +256,13 @@ The pieces:
   `x16`/`x17` and branches through the program's own register. Each translated word records what
   guest state it stands for (`Word`), so a fault or signal there is
   delivered as at the guest's instruction (`jit::to_guest`). A page
-  translated from is write-protected before it is read; a write drops
-  its translations and the links into them. A full code cache is emptied
+  translated from is write-protected before it is read, with the
+  pages of other shared mappings of the same file page (`jit::guard`,
+  `jit::mapped`); a write drops its translations and the links into
+  them, and the host's writes for the guest do the same first
+  (`mm::host_writes`). A signal in an expansion is undone or finished
+  word by word (`jit::undo`, `jit::step`), frames it made below `sp`
+  included. A full code cache is emptied
   with every other thread stopped (`quiesce::stop_others`): the blocks
   that a thread's registers, the stack its `sp` is in, or a gate block
   point into are retired (kept, found by no lookup, their branches
@@ -836,9 +841,9 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   guest's up to the host's limit (`crates/kernel/src/fdtable.rs`).
 - At startup fwe raises its host soft limit as far as macOS allows and
   gives the guest a virtual `RLIMIT_NOFILE`: soft 1024, hard leaving fwe a
-  quarter of the host's descriptors, at least 64 and at most 4096, Linux's
-  default hard limit (the host's table grows to the highest descriptor,
-  and a host `fork` copies it all).
+  quarter of the host's descriptors, at least 64 and at most 16384 (the
+  host's table grows to the highest descriptor, and a host `fork` copies
+  it all).
 - The guest never reaches the range: `close_range(3, ~0)`, closing up to
   the limit and listing `/proc/self/fd` stop below it; a call naming one
   fails with `EBADF`, as does `dup2` onto one. Root may raise the limit
@@ -1471,6 +1476,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   link kept its relocations, runs only in the VM backend, which needs
   `fwe` signed with the hypervisor entitlement and a bare-metal Apple
   Silicon Mac.
+- Native: the program shares its address space with fwe, so a `MAP_FIXED`
+  mapping over memory fwe keeps for itself (its own code, heap and
+  stacks, the stubs, the code cache, the translation table at 32 TiB)
+  replaces it, and fwe fails. Mappings left to fwe never land there.
 - The memory-tagging instructions with an `sp` operand, `casp` on `sp`,
   an authenticated load written back onto `sp` and `blraa x18, x30` are
   left unrewritten when they name `x18` (`--strace` counts them). In code
@@ -1480,8 +1489,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   inline jump table in code the unwind table covers could be patched.
 
 **Processes**
-- A process may hold descriptors below 4096 only: root may raise
-  `RLIMIT_NOFILE` past it, as Linux allows, but an `open` past the 4096th
+- A process may hold descriptors below 16384 only: root may raise
+  `RLIMIT_NOFILE` past it, as Linux allows, but an `open` past the 16384th
   descriptor fails with `EMFILE`.
 - A `vfork` child shares the guest's memory but not its mappings (an
   `mmap`, `munmap` or `mprotect` in it stays in the child).

@@ -979,7 +979,7 @@ fn jit_code_runs_as_the_program_wrote_it() {
          tracer: pc in the code\n\
          fault: seen at the load, 77\npatch: 1000 of 1000\ncopy: 90 30583\n\
          x16 and x17 across a call: changed in 0 of 1000\n\
-         return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nmemory: as written\n\
+         return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nread into code's page: 5 6 hello, then 5\ntwo views: 1 2 3\nexecute only: 4\nmemory: as written\n\
          fork: child ok, parent 1\n"
     );
     assert_eq!(out.status.code(), Some(0));
@@ -1030,7 +1030,8 @@ fn jit_code_using_x18_computes_as_with_another_register() {
     assert_eq!(
         stdout(&out),
         "x18 forms: same in 1000 of 1000\n\
-         x18 forms with signals: same in 100000 of 100000, signals landed\n"
+         x18 forms with signals: same in 100000 of 100000, signals landed\n\
+         casp on x18 with signals: 2000000 of 2000000\n"
     );
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
@@ -3704,6 +3705,9 @@ fn alpine_luajit_runs_jit_code() {
         .arg(root.join("usr/bin/luajit"))
         .arg(&script)
         .env_clear()
+        // Its marks on stderr: at exit, how often translated code left
+        // through fwe.
+        .env("FWE_TIMING", "1")
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null());
     let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
@@ -3737,6 +3741,7 @@ fn alpine_luajit_runs_jit_code() {
 /// `expected`, what Linux prints. Its calls are kept, and their last shown
 /// should it fail.
 fn alpine_runtime_runs(
+    vm: bool,
     manifest: &str,
     program: &str,
     args: &[&str],
@@ -3749,7 +3754,12 @@ fn alpine_runtime_runs(
     std::fs::write(root.join(path.trim_start_matches('/')), script).unwrap();
     let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{manifest}.trace"));
     let _ = std::fs::remove_file(&trace);
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    let mut cmd = if vm {
+        let Some(cmd) = hv_command() else { return };
+        cmd
+    } else {
+        Command::new(env!("CARGO_BIN_EXE_fwe"))
+    };
     cmd.arg("--strace")
         .arg(format!("--strace-file={}", trace.display()))
         .arg("--root")
@@ -3761,7 +3771,12 @@ fn alpine_runtime_runs(
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
-    let out = run_bounded_for(cmd, &[], Duration::from_secs(180));
+    let out = if vm {
+        // The stand-in on a loaded CI runner takes several times as long.
+        run_hv_for(cmd, manifest, Duration::from_secs(600))
+    } else {
+        run_bounded_for(cmd, &[], Duration::from_secs(180))
+    };
     eprintln!("--- {manifest} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     if !out.status.success() {
         print_last_calls(&trace);
@@ -3783,11 +3798,20 @@ const RUNTIME_RESULTS: &str = "fib 75025\n\
          hash 1000\n";
 
 /// Steel Bank Common Lisp compiles each form to machine code as it runs:
-/// `compile` at run time, a function redefined, CLOS dispatch.
+/// `compile` at run time, a function redefined, CLOS dispatch. Alpine's
+/// `sbcl` is linked at `0x400000` and not movable, so the VM runs it.
 #[test]
-fn alpine_sbcl_compiles_lisp_as_it_runs() {
+fn hv_alpine_sbcl_compiles_lisp_as_it_runs() {
     let expected = format!("{RUNTIME_RESULTS}redefined 11 1000\n");
-    alpine_runtime_runs("sbcl", "/usr/bin/sbcl", &["--script"], "fwe.lisp", SBCL_SCRIPT, &expected);
+    alpine_runtime_runs(
+        true,
+        "sbcl",
+        "/usr/bin/sbcl",
+        &["--script"],
+        "fwe.lisp",
+        SBCL_SCRIPT,
+        &expected,
+    );
 }
 
 /// Racket (Racket CS, through Chez Scheme) compiles to machine code, `eval`
@@ -3795,6 +3819,7 @@ fn alpine_sbcl_compiles_lisp_as_it_runs() {
 #[test]
 fn alpine_racket_compiles_as_it_runs() {
     alpine_runtime_runs(
+        false,
         "racket",
         "/usr/bin/racket",
         &[],
@@ -3808,7 +3833,15 @@ fn alpine_racket_compiles_as_it_runs() {
 /// machine code; `eval` and `compile` at run time.
 #[test]
 fn alpine_guile_compiles_as_it_runs() {
-    alpine_runtime_runs("guile", "/usr/bin/guile", &[], "fwe.scm", GUILE_SCRIPT, RUNTIME_RESULTS);
+    alpine_runtime_runs(
+        false,
+        "guile",
+        "/usr/bin/guile",
+        &[],
+        "fwe.scm",
+        GUILE_SCRIPT,
+        RUNTIME_RESULTS,
+    );
 }
 
 /// Python's `eval`, `exec` and `compile` make code from text as it runs,
@@ -3816,6 +3849,7 @@ fn alpine_guile_compiles_as_it_runs() {
 #[test]
 fn alpine_python_evaluates_code_it_makes() {
     alpine_runtime_runs(
+        false,
         "python",
         "/usr/bin/python3",
         &[],

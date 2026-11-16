@@ -225,6 +225,11 @@ pub trait Platform {
         false
     }
 
+    /// `[addr, addr + len)` (host addresses) was just mapped or given
+    /// other protections, and the record of mappings says so: a mapping
+    /// of a file's pages code was translated from is watched as theirs.
+    fn jit_mapped(&mut self, _addr: u64, _len: u64) {}
+
     /// Map the prepared image kept under `key` ([`prepcache::image_key`])
     /// over the mapping of a file's code at `[addr, addr + len)`, with
     /// protections `prot` (the host's), and its stubs where they were: the
@@ -2038,11 +2043,11 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
     }
-    // The host writes these buffers itself: pages of a private file view
-    // in them become the guest's own first (see `mm::views_written`).
-    if mm::any_views() {
+    // The host writes these buffers itself: pages in them it could not
+    // write become writable first (see `mm::host_writes`).
+    if mm::host_writes_watched() {
         match nr {
-            n::READ | n::PREAD64 => mm::views_written(a[1], a[2]),
+            n::READ | n::PREAD64 | n::RECVFROM => mm::host_writes(a[1], a[2]),
             n::READV | n::PREADV | n::PREADV2 => {
                 for v in uaccess::read_bytes(a[1], (a[2].min(uaccess::UIO_MAXIOV) * 16) as usize)
                     .unwrap_or_default()
@@ -2052,7 +2057,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 {
                     let base = u64::from_ne_bytes(v[0..8].try_into().unwrap());
                     let len = u64::from_ne_bytes(v[8..16].try_into().unwrap());
-                    mm::views_written(base, len);
+                    mm::host_writes(base, len);
                 }
             }
             _ => {}

@@ -56,6 +56,10 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
 int fork(void);
 int pipe(int fd[2]);
 long write(int fd, const void *buf, size_t n);
+long read(int fd, void *buf, size_t n);
+int memfd_create(const char *name, unsigned flags);
+int ftruncate(int fd, long len);
+int munmap(void *addr, size_t len);
 int pthread_kill(unsigned long t, int sig);
 unsigned long pthread_self(void);
 int usleep(unsigned us);
@@ -70,6 +74,7 @@ void _exit(int code);
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define PROT_EXEC 4
+#define MAP_SHARED 1
 #define MAP_PRIVATE 2
 #define MAP_ANONYMOUS 0x20
 #define MAP_FAILED ((void *)-1)
@@ -558,6 +563,50 @@ int main(void) {
     memcpy(at(wx_expect, jl_ret1), &two, 4);
     mprotect(wx, len, PROT_READ | PROT_EXEC);
     printf("w^x: %ld %ld\n", first, ((long (*)(void))at(wx, jl_ret1))());
+
+    /* A read into the page of code that ran: Linux writes it as the
+     * program's own store would. */
+    uint32_t *page = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS,
+                          -1, 0);
+    page[0] = movz_x0(5);
+    page[1] = 0xd65f03c0; /* ret */
+    flush(page, 8);
+    long ran = ((long (*)(void))page)();
+    int fds[2];
+    pipe(fds);
+    write(fds[1], "hello", 6);
+    long nread = read(fds[0], (char *)page + 64, 6);
+    printf("read into code's page: %ld %ld %s, then %ld\n", ran, nread, (char *)page + 64,
+           ((long (*)(void))page)());
+
+    /* Code mapped twice through a memfd, as a W^X JIT keeps it: written
+     * through the writable view, run through the executable one, the
+     * writable view replaced by a new one after the code ran. */
+    int mfd = memfd_create("jit", 0);
+    ftruncate(mfd, 16384);
+    uint32_t *rw = mmap(0, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    uint32_t *rx = mmap(0, 16384, PROT_READ | PROT_EXEC, MAP_SHARED, mfd, 0);
+    long (*view)(void) = (long (*)(void))rx;
+    rw[0] = movz_x0(1);
+    rw[1] = 0xd65f03c0; /* ret */
+    flush(rx, 8);
+    long v1 = view();
+    rw[0] = movz_x0(2);
+    flush(rx, 4);
+    long v2 = view();
+    munmap(rw, 16384);
+    rw = mmap(0, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);
+    rw[0] = movz_x0(3);
+    flush(rx, 4);
+    printf("two views: %ld %ld %ld\n", v1, v2, view());
+
+    /* Made executable only (no PROT_READ), as Linux runs it. */
+    uint32_t *xo = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    xo[0] = movz_x0(4);
+    xo[1] = 0xd65f03c0; /* ret */
+    flush(xo, 8);
+    mprotect(xo, 4096, PROT_EXEC);
+    printf("execute only: %ld\n", ((long (*)(void))xo)());
 
     int same = memcmp(code, expect, len) == 0 && memcmp(copy, copy_expect, len) == 0 &&
                memcmp(wx, wx_expect, len) == 0;

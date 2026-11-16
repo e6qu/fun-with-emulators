@@ -911,7 +911,7 @@ fn take_async(
 /// The `T` at host address `addr`, or `None` where nothing readable is,
 /// read through the host's copy of this task's memory, which reports a hole
 /// rather than fault. Async-signal-safe.
-fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
+pub(crate) fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
