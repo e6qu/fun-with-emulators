@@ -109,14 +109,18 @@ impl Table {
             return Some(s);
         }
         // A new slot, or when all are in use, one with no write left to
-        // take (one freed, or a pipe long gone most likely; one still
-        // watched wakes every set again, as without a slot).
+        // take (one freed, or a pipe long gone most likely), else each in
+        // turn: writes no one took are left by pipes gone as well, and
+        // fill the page for good otherwise. A pipe still watched whose
+        // slot goes wakes every set again, as without a slot (Linux wakes
+        // one or more).
         let s = if used < SLOTS {
             self.slot(used)
         } else {
             (0..SLOTS)
                 .map(|i| self.slot(i))
-                .find(|s| s[3].load(Ordering::Acquire) >= s[2].load(Ordering::Acquire))?
+                .find(|s| s[3].load(Ordering::Acquire) >= s[2].load(Ordering::Acquire))
+                .unwrap_or_else(|| self.slot(NEXT_TAKEN.fetch_add(1, Ordering::Relaxed) % SLOTS))
         };
         s[0].store(lo, Ordering::Release);
         s[1].store(hi, Ordering::Release);
@@ -128,6 +132,10 @@ impl Table {
         Some(s)
     }
 }
+
+/// Which slot this process takes next when every one holds writes no
+/// one took.
+static NEXT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The lock that makes slots.
 struct Lock(i32);
