@@ -8,7 +8,7 @@ use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
 use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The program break: a reserved region after the executable image that
 /// `brk` commits and releases.
@@ -320,10 +320,17 @@ fn is_write_exec(addr: u64) -> bool {
 /// its page (of `page_size` bytes) writable, and report whether it was. Takes
 /// no kernel lock, so fwe's own code may use it when a write it makes for the
 /// guest faults.
+/// For `FWE_TIMING`: pages of write+exec memory made writable, and JIT
+/// code prepared, with the nanoseconds preparing took.
+pub static JIT_WRITABLE: AtomicU64 = AtomicU64::new(0);
+pub static JIT_PREPARED: AtomicU64 = AtomicU64::new(0);
+pub static JIT_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
+
 pub fn write_exec_writable(addr: u64, page_size: u64) -> bool {
     if !is_write_exec(addr) {
         return false;
     }
+    JIT_WRITABLE.fetch_add(1, Ordering::Relaxed);
     let page = addr & !(page_size - 1);
     let rw = libc::PROT_READ | libc::PROT_WRITE;
     // SAFETY: a page of guest memory the guest mapped writable and
@@ -2516,8 +2523,14 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
+            let t = crate::timing::on().then(std::time::Instant::now);
             self.repair_jit_copies(page, self.page_size);
-            match self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
+            let prepared = self.platform.prepare_exec(page, self.page_size, JIT_CODE, None);
+            if let Some(t) = t {
+                JIT_PREPARED.fetch_add(1, Ordering::Relaxed);
+                JIT_PREPARE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            }
+            match prepared {
                 Ok(n) => self.jit_x18_note(page, self.page_size, n),
                 Err(e) => {
                     self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));

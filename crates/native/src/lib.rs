@@ -35,6 +35,15 @@ fn mark_exit() {
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();
         fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
+        use fwe_kernel::mm::{JIT_PREPARE_NS, JIT_PREPARED, JIT_WRITABLE};
+        use std::sync::atomic::Ordering::Relaxed;
+        let (w, p) = (JIT_WRITABLE.load(Relaxed), JIT_PREPARED.load(Relaxed));
+        if w + p > 0 {
+            fwe_kernel::timing::mark(&format!(
+                "exit: JIT pages made writable {w} times, prepared {p} times in {} ms",
+                JIT_PREPARE_NS.load(Relaxed) / 1_000_000
+            ));
+        }
     }
 }
 

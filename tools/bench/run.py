@@ -864,6 +864,13 @@ def jdk(a, fwe, guest_env, results):
                               both(bin_ours, "/tmp/jdksrc", "/tmp/jdkout")]
     theirs = ["/bin/sh", "-c", both(bin_theirs, JDK_SRC, theirs_out)]
     workload(results, "JDK (s)", ours, theirs, (ours_out, theirs_out), len(guest_env) + 1)
+    # Where its time goes: fwe's marks for each process (JIT code made
+    # writable and prepared again, and how long that took).
+    timed = ours[:2] + ["FWE_TIMING=1"] + ours[2:]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
+    marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines()
+             if "timing: " in l and ("JIT" in l or "timing: exit +" in l)]
+    print("JDK: fwe's marks: " + "; ".join(marks), file=sys.stderr)
     shutil.rmtree(native, ignore_errors=True)
 
 
