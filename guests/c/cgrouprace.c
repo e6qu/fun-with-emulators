@@ -30,8 +30,8 @@ int *__errno_location(void);
 #define EEXIST 17
 #define ENOENT 2
 #define EBUSY 16
-#define WORKERS 12
-#define ROUNDS 150
+#define WORKERS 24
+#define ROUNDS 30
 
 static int put(const char *path, const char *text) {
     int fd = open(path, 1);
