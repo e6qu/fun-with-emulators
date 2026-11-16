@@ -1188,7 +1188,7 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     if let Err(e) = may_write_socket(&hb, &a) {
         return err(e);
     }
-    let r = ret(bind_or_connect(fd as i32, &hb, &a, false) as i64);
+    let r = connect_host(fd as i32, &hb, &a);
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, false, &a.guest);
     }
@@ -1196,6 +1196,81 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         crate::netns::used(fd as i32);
     }
     r
+}
+
+/// Sockets, by descriptor and inode, whose connection the host is still
+/// making: their connect was interrupted (`EINTR`) or did not wait
+/// (`EINPROGRESS`). Linux's socket is then `SS_CONNECTING`.
+static CONNECTING: std::sync::Mutex<Vec<(i32, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// Mark or unmark socket `fd` as [`CONNECTING`]; whether it was.
+fn connecting(fd: i32, mark: bool) -> bool {
+    let Some(ino) = inode(fd) else { return false };
+    let mut c = CONNECTING.lock().unwrap_or_else(|e| e.into_inner());
+    // Those of sockets gone: none is open here with its number now.
+    if mark && c.len() >= 64 && c.len().is_power_of_two() {
+        let open: std::collections::HashSet<u64> =
+            crate::fdtable::open_fds().into_iter().filter_map(inode).collect();
+        c.retain(|e| open.contains(&e.1));
+    }
+    let was = c.contains(&(fd, ino));
+    c.retain(|&e| e.0 != fd);
+    if mark {
+        c.push((fd, ino));
+    }
+    was
+}
+
+/// The host's connect of `fd` to `hb`, as Linux's connect answers. The
+/// host's connection goes on after an interrupted connect, as Linux's
+/// does, and a connect is not to be made twice: a later connect of the
+/// socket (the same call run again after a signal the guest does not see,
+/// or after its handler) finishes the one under way, waiting for it if
+/// the socket blocks, and returns its outcome, where the host would say
+/// `EALREADY` or `EISCONN`. Once that is told, the socket is connected
+/// (`EISCONN`), on Linux as on the host.
+fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
+    if bind_or_connect(fd, hb, a, false) == 0 {
+        connecting(fd, false);
+        return 0;
+    }
+    let e = crate::host::last_errno();
+    match e {
+        libc::EINTR | libc::EINPROGRESS => {
+            connecting(fd, true);
+            return err(crate::host::errno_to_linux(e));
+        }
+        libc::EALREADY | libc::EISCONN if connecting(fd, false) => {}
+        _ => {
+            // (A connection under way that failed is told so once.)
+            connecting(fd, false);
+            return err(crate::host::errno_to_linux(e));
+        }
+    }
+    if e == libc::EALREADY {
+        // SAFETY: plain host call on the guest's socket.
+        if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
+            connecting(fd, true);
+            return err(errno::EALREADY);
+        }
+        let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        // SAFETY: one valid pollfd.
+        if unsafe { libc::poll(&mut p, 1, -1) } < 0 {
+            let e = crate::host::last_errno();
+            connecting(fd, true);
+            return err(crate::host::errno_to_linux(e));
+        }
+    }
+    let mut so_error: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid out-parameter of its length.
+    let r = unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, (&raw mut so_error).cast(), &mut len)
+    };
+    if r != 0 {
+        return crate::host::last_error();
+    }
+    if so_error != 0 { err(crate::host::errno_to_linux(so_error)) } else { 0 }
 }
 
 /// Unix sockets bound (`local`) or connected to a path the host knows only

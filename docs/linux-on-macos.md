@@ -2122,6 +2122,7 @@ names macOS does not support:
 | a level a socket has no layer for | taken or `EINVAL` | `EOPNOTSUPP` to get, `ENOPROTOOPT` to set (`EOPNOTSUPP` on a Unix socket) |
 | multicast membership on a TCP socket | refused | kept by fwe (no multicast reaches one) |
 | `MSG_MORE` | none | a TCP or UDP send's data held back and sent with the next send without it, as one segment or datagram |
+| a later `connect` of a socket whose connect was interrupted or left in progress (`EINPROGRESS`) waits for the connection under way, then returns 0 (or its error); after that, `EISCONN` | it says `EALREADY` while the connection is made and `EISCONN` once it is | fwe marks the socket connecting and answers a later `connect` (its own rerun after a signal the guest does not see too) as Linux does, waiting for the host's connection if the socket blocks |
 | `connect` to `AF_UNSPEC` | dissolves a datagram socket's peer, reporting an error | a datagram socket's peer forgotten; a TCP socket's connection reset and a fresh host socket put in its place |
 | `IPV6_ADDRFORM` | none | an IPv6 socket with an IPv4-mapped peer reports its names as IPv4, and a reset makes it an IPv4 socket |
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
