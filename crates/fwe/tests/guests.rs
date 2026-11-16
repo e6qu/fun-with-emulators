@@ -650,6 +650,61 @@ fn build_c_now(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> Pat
     bin
 }
 
+/// `guests/c/lowlinked.c`, a static executable linked at lld's default
+/// address below 4 GiB (code built with `-mcmodel=large`, so it holds
+/// addresses in `movz`/`movk` too), with its relocations kept
+/// (`--emit-relocs`) or not.
+fn build_lowlinked(relocs: bool) -> PathBuf {
+    static BUILT: std::sync::Mutex<Vec<(bool, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, p)) = built.iter().find(|(r, _)| *r == relocs) {
+        return p.clone();
+    }
+    let out = out_dir().join("c");
+    std::fs::create_dir_all(&out).unwrap();
+    let obj = out.join("lowlinked.o");
+    run_checked(
+        Command::new("clang")
+            .args([
+                "-O2",
+                "--target=aarch64-linux-gnu",
+                "-fno-stack-protector",
+                "-fno-pic",
+                "-ffreestanding",
+                "-mcmodel=large",
+                "-c",
+                "-o",
+            ])
+            .arg(&obj)
+            .arg(repo().join("guests/c/lowlinked.c")),
+    );
+    let bin = out.join(if relocs { "lowlinked-relocs" } else { "lowlinked" });
+    let mut cmd = Command::new(rust_lld());
+    cmd.args(["-flavor", "gnu", "-static"]);
+    if relocs {
+        cmd.arg("--emit-relocs");
+    }
+    cmd.arg("-o").arg(&bin).arg(&obj);
+    run_checked(&mut cmd);
+    built.push((relocs, bin.clone()));
+    bin
+}
+
+/// An executable linked below 4 GiB whose link kept its relocations runs
+/// natively, moved above 4 GiB: its pointers in data, its constructor
+/// table and the addresses its code builds all follow it. (Run with the
+/// stand-in first, so a program that went to the VM after all would find
+/// no real one.)
+#[test]
+fn a_low_linked_executable_with_its_relocations_runs_moved() {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--hv-standin").arg("--strace").arg(build_lowlinked(true));
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "one two alpha beta target ctor ran above\n", "{err}");
+    assert!(!err.contains("runs in the VM"), "{err}");
+}
+
 fn name_suffix(libc: Libc) -> &'static str {
     match libc {
         Libc::Musl => "musl",
@@ -5587,6 +5642,24 @@ fn hv_runs_low_assembly_guests() {
     }
     let out = fwe_hv(&asm_guest("hello-low"), &[]).unwrap();
     assert_eq!(stdout(&out), "hello from linux\n");
+}
+
+/// An executable linked below 4 GiB whose link kept no relocations runs in
+/// the VM, and `--strace` says why it could not be moved.
+#[test]
+fn hv_runs_a_low_linked_executable_without_relocations_and_says_why() {
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--strace").arg(build_lowlinked(false));
+    let out = run_vm_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "one two alpha beta target ctor ran below\n", "{err}");
+    assert!(
+        err.contains(
+            "runs in the VM: linked at 0x200000, below 4 GiB, which macOS reserves, \
+                      and not movable: it keeps no relocations for its own addresses"
+        ),
+        "{err}"
+    );
 }
 
 /// Rust programs linked at the default low address (std's runtime, heap,

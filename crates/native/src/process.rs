@@ -82,7 +82,11 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         None => fs.read_identified(&path).map_err(err)?,
     };
     fwe_kernel::timing::mark("exec: read");
-    let vm = crate::needs_vm(&file);
+    let vm_reason = crate::vm_reason(&file);
+    if let Some(why) = &vm_reason {
+        k.tracer.note(&format!("runs in the VM: {why}"));
+    }
+    let vm = vm_reason.is_some();
     // A program only the VM can run, where there is none: the exec fails
     // while the caller is intact (podman's pause process then waits in a
     // loop of its own, say), rather than once it has gone.

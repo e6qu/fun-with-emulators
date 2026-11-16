@@ -55,7 +55,9 @@ flowchart TD
   4 GiB.
 - The **hypervisor backend** runs the guest at EL0 in a
   Hypervisor.framework VM. fwe picks it for a non-PIE executable linked
-  below 4 GiB, which the native backend cannot map.
+  below 4 GiB that the native backend cannot map or move above it
+  (`loader::moved`: a static one whose link kept its relocations is
+  moved 1 TiB higher, its absolute addresses changed to match).
 - **Root filesystems:** `fwe --pull IMAGE DIR` (`crates/fwe/src/pull.rs`)
   fetches an image's linux/arm64 variant from its registry (`curl`, with
   an anonymous token where asked), checks each layer's SHA-256 digest and
@@ -1397,9 +1399,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - ptrace has no hardware breakpoint or watchpoint (their register sets say there are none), and
   no `PTRACE_PEEKSIGINFO` (`EIO`). A single step over an exclusive load
   and store loops, as a breakpoint between them clears the monitor.
-- A non-PIE executable linked below 4 GiB runs only in the VM backend,
-  which needs `fwe` signed with the hypervisor entitlement and a
-  bare-metal Apple Silicon Mac.
+- A non-PIE executable linked below 4 GiB, unless it is static and its
+  link kept its relocations, runs only in the VM backend, which needs
+  `fwe` signed with the hypervisor entitlement and a bare-metal Apple
+  Silicon Mac.
 - The memory-tagging instructions with an `sp` operand, `casp` on `sp`,
   an authenticated load written back onto `sp` and `blraa x18, x30` are
   left unrewritten when they name `x18` (`--strace` counts them), as is

@@ -642,12 +642,12 @@ fn start(
     // there, the host delivers signals only to the vCPU threads, whose masks
     // follow the guest's. The mask fwe started with is the guest's own.
     let inherited_mask = host::blocked_signals();
+    let why = crate::vm_reason(data).unwrap_or_default();
     let unsupported = |e: String| {
         Error::Unsupported(format!(
-            "this program is linked below 4 GiB, which needs the hypervisor backend, \
-             and creating the VM failed ({e}); fwe must be signed with the \
-             com.apple.security.hypervisor entitlement (see docs/hypervisor.md) \
-             on a Mac with hypervisor support"
+            "this program needs the hypervisor backend ({why}), and creating the VM failed \
+             ({e}); fwe must be signed with the com.apple.security.hypervisor entitlement \
+             (see docs/hypervisor.md) on a Mac with hypervisor support"
         ))
     };
     // Asking the framework anything needs the entitlement too.

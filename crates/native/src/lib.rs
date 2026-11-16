@@ -931,15 +931,27 @@ pub struct Loadout {
     pub auxv: Vec<u8>,
 }
 
-/// Whether `file` is a program the hypervisor backend runs: a non-PIE
-/// executable linked into the low 4 GiB, which only it can run, or under
-/// `--vm` any program.
+/// Whether `file` is a program the hypervisor backend runs
+/// ([`vm_reason`]).
 pub fn needs_vm(file: &[u8]) -> bool {
-    Elf::parse(file).is_ok_and(|elf| {
-        hv::vm_always()
-            || !elf.is_pie()
-                && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
-    })
+    vm_reason(file).is_some()
+}
+
+/// Why `file` is a program the hypervisor backend runs, if it is: under
+/// `--vm` any program; otherwise an executable linked into the low 4 GiB
+/// that cannot be moved above it ([`loader::moved`]).
+pub fn vm_reason(file: &[u8]) -> Option<String> {
+    let elf = Elf::parse(file).ok()?;
+    if hv::vm_always() {
+        return Some("every program runs in the VM (--vm)".into());
+    }
+    let start = fwe_elf::LoadPlan::new(&elf, page_size()).start;
+    match loader::moved(&elf, page_size())? {
+        Ok(_) => None,
+        Err(why) => Some(format!(
+            "linked at {start:#x}, below 4 GiB, which macOS reserves, and not movable: {why}"
+        )),
+    }
 }
 
 /// Check that `file` is a program [`load_image`] can start, before `execve`
@@ -949,8 +961,7 @@ pub fn needs_vm(file: &[u8]) -> bool {
 pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
     use fwe_abi::errno;
     let elf = Elf::parse(file).map_err(|_| errno::ENOEXEC)?;
-    if !elf.is_pie() && fwe_elf::LoadPlan::new(&elf, page_size()).start < loader::host_min_address()
-    {
+    if loader::moved(&elf, page_size()).is_some_and(|m| m.is_err()) {
         return Err(errno::ENOEXEC);
     }
     if let Some(ip) = elf.interpreter().map_err(|_| errno::ENOEXEC)? {
@@ -1144,7 +1155,8 @@ fn start(
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if needs_vm(&data) {
+    if let Some(why) = vm_reason(&data) {
+        options.strace.note(&format!("runs in the VM: {why}"));
         fwe_kernel::timing::mark("backend: vm");
         drop(fs);
         return Err(hv::run(path, &data, args, env, options));

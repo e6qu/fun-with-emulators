@@ -73,7 +73,7 @@ and share the rest:
 
 | | Native backend | VM backend |
 |---|---|---|
-| Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB, and under `--vm` every program of the run |
+| Runs | every position-independent program, `ET_EXEC` images linked at or above 4 GiB, and static ones linked below it whose link kept its relocations (moved) | other non-PIE executables linked below 4 GiB, and under `--vm` every program of the run |
 | Guest code | in the `fwe` process, after rewriting | at EL0 in a Hypervisor.framework VM, unmodified |
 | Page size the guest sees | 16 KiB (the host's) | 4 KiB |
 | Guest addresses | host addresses | host addresses, except fixed-address ranges outside the memory set aside for the VM (the *slab*), such as a low-linked image, which are translated |
@@ -94,16 +94,29 @@ address: the usual toolchains use `0x400000` (4 MiB), Go uses `0x10000`
 mandatory 4 GiB `__PAGEZERO` at address 0, which Apple's loader will not
 shrink. The native backend runs the guest at the guest's own addresses
 inside the fwe process, so a program linked below 4 GiB has nowhere to
-go there. A position-independent program (`ET_DYN`, a PIE) goes wherever
-macOS has room, and an `ET_EXEC` program linked at or above 4 GiB at its
-own address.
+go there as linked (a smaller `__PAGEZERO` is killed at exec). A
+position-independent program (`ET_DYN`, a PIE) goes wherever macOS has
+room, and an `ET_EXEC` program linked at or above 4 GiB at its own
+address.
+
+A static `ET_EXEC` program linked below 4 GiB can still run natively,
+moved 1 TiB higher (`loader::MOVE`, a multiple of 4 GiB), when its link
+kept its relocations (`--emit-relocs`): arm64 code reaches its own code
+and data PC-relatively, so a whole image moved by a multiple of 4 GiB
+keeps its code right, and the relocations list every absolute address it
+holds, each changed to match (`fwe_elf::moves`: 64-bit pointers in data,
+addresses built in code from `movz`/`movk`, static glibc's ifunc table).
+A program whose link kept none, a dynamic one (its dynamic linker
+relocates it at its link address), or one holding an address no
+relocation follows (a 32-bit absolute address, one reached through a GOT)
+is not moved.
 
 ### How fwe decides
 
-`needs_vm` (`crates/native/src/lib.rs`) asks one question: is this a
-non-PIE executable whose lowest loaded page lies below 4 GiB? If so it
-runs in the VM, otherwise natively. Static or dynamic, glibc or musl, C,
-Rust or Go make no difference. `fwe --vm` runs every program of the run
+`vm_reason` (`crates/native/src/lib.rs`) asks: is this a non-PIE
+executable whose lowest loaded page lies below 4 GiB, and that cannot be
+moved above it? If so it runs in the VM, and `--strace` says why;
+otherwise natively. `fwe --vm` runs every program of the run
 in the VM (each fwe it starts gets `--vm` too), for programs that need
 4 KiB pages, such as Wine; a PIE is then placed in the slab. Where there
 is no VM to run such a program (fwe without the hypervisor entitlement,
@@ -117,7 +130,9 @@ flowchart TD
     elf -- "ET_DYN (PIE)" --> native["native backend: placed where macOS has room"]
     elf -- "ET_EXEC" --> where{"lowest page below 4 GiB?"}
     where -- no --> native2["native backend: placed at its link address"]
-    where -- yes --> vm["VM backend: Hypervisor.framework"]
+    where -- yes --> moves{"static, relocations kept?"}
+    moves -- yes --> native3["native backend: moved 1 TiB higher"]
+    moves -- no --> vm["VM backend: Hypervisor.framework"]
 ```
 
 | Binary | Example | Backend |
@@ -125,11 +140,12 @@ flowchart TD
 | dynamic PIE | Debian's `bash`, `git`, coreutils, Node.js | native |
 | static PIE | `musl-gcc -static-pie`, Rust's `+crt-static` with PIE | native |
 | static non-PIE linked at or above 4 GiB | fwe's test guests, linked at 1 TiB (`--image-base=0x10000000000`) | native |
+| static non-PIE linked below 4 GiB, relocations kept (`--emit-relocs`) | fwe's `lowlinked` test guest, at `0x200000` | native, moved |
 | non-PIE linked below 4 GiB, dynamic | Debian's `python3.11`, GCC and clang, at `0x400000` | VM |
-| non-PIE linked below 4 GiB, static | static Go programs at `0x10000`; fwe's `rust-low` test guests | VM |
+| non-PIE linked below 4 GiB, static, no relocations kept | static Go programs at `0x10000`; fwe's `rust-low` test guests | VM |
 
 "Low-linked" in this documentation and the tests means the last two
-rows. The test suite builds its Rust guests twice: at 1 TiB to run
+rows: the programs that run in the VM. The test suite builds its Rust guests twice: at 1 TiB to run
 natively, and at the toolchain's default address
 (`target/guests/rust-low`) to run in the VM. A low-linked program started
 without the hypervisor entitlement or on a Mac without hardware

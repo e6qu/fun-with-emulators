@@ -11,7 +11,10 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::fmt;
 
+mod moves;
 mod unwind;
+
+pub use moves::{Patch, moves};
 
 pub const ET_EXEC: u16 = 2;
 pub const ET_DYN: u16 = 3;

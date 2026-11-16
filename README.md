@@ -21,8 +21,10 @@ backends:
   program, which is most of what a distribution ships. `fwe` rewrites the
   few instructions macOS does not let a Linux program run unchanged.
 - **Hypervisor**, for a program linked at a fixed address below 4 GiB,
-  which macOS reserves: it runs unmodified in a small Hypervisor.framework
-  VM, its system calls served by the same code. This needs `fwe` signed
+  which macOS reserves, that fwe cannot move above it (one whose link
+  kept its relocations is moved and runs natively): it runs unmodified in
+  a small Hypervisor.framework VM, its system calls served by the same
+  code. This needs `fwe` signed
   with the hypervisor entitlement ([docs/hypervisor.md](docs/hypervisor.md)).
 
 [docs/linux-on-macos.md](docs/linux-on-macos.md) explains this in detail.
