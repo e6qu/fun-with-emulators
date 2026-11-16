@@ -948,6 +948,33 @@ fn dynamic_loader_hands_off_to_interpreter() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// What a JIT does with the code it writes (guests/c/jitlab.c): calls,
+/// returns and indirect calls into static code and back, PC-relative
+/// loads with data among the code, x18 kept across system calls, a system
+/// call, a null check's fault seen at its instruction and resumed at a
+/// continuation, code patched and run, code copied and run, return
+/// addresses that are the code's own, threads running code another thread
+/// patches, W^X toggling, a fork child running and changing code; and the
+/// program's memory reads back as it wrote it.
+#[test]
+fn jit_code_runs_as_the_program_wrote_it() {
+    let prog = build_c("jitlab", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitlab");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitlab stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "calls: 90\nindirect: 21\npcrel: 30583\nx18: kept\ngetpid: matches\n\
+         fault: seen at the load, 77\npatch: 1000 of 1000\ncopy: 90 30583\n\
+         return address: the code's own\nthreads: ok\nw^x: 90 2\nmemory: as written\n\
+         fork: child ok, parent 1\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Real dynamic linking, minimal case: a PIE with its own `_start` that calls
 /// `write` and `_exit` resolved from a genuine musl shared libc. This drives
 /// the real musl dynamic linker end to end — it maps and self-relocates,
@@ -3115,27 +3142,6 @@ fn alpine_wine_runs_windows_programs() {
     );
 }
 
-/// How many JIT pages had instructions naming `x18` given stubs, and how
-/// many such instructions, from the notes of a `--strace-file` trace.
-fn jit_x18_summary(what: &str, trace: &Path) {
-    let text = std::fs::read_to_string(trace).unwrap_or_default();
-    let (mut pages, mut uses) = (0, 0);
-    for l in text.lines().filter(|l| l.contains("x18 uses given stubs")) {
-        pages += 1;
-        uses += l
-            .rsplit(": ")
-            .next()
-            .and_then(|r| r.split(' ').next())
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or(0);
-    }
-    let left = text.lines().filter(|l| l.contains("taken for data")).count();
-    eprintln!(
-        "{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses; \
-         {left} lookalikes taken for data"
-    );
-}
-
 /// Alpine's OpenJDK 25 (fetched: `guests/alpine/fetch/jdk.txt`): `javac`
 /// compiles the benchmark's multi-threaded application
 /// (`tools/bench/workloads/jdk`), and `java` runs it: parallel streams and
@@ -3184,7 +3190,6 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             .stdin(Stdio::null());
         let out = run_bounded_for(cmd, &[], Duration::from_secs(600));
         eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
-        jit_x18_summary(name, &trace);
         if !out.status.success() {
             // HotSpot's report of a fatal error: on standard output, and in
             // full in its error file.
@@ -3297,7 +3302,6 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
-    jit_x18_summary("node", &trace);
     if !out.status.success() {
         print_last_calls(&trace);
         // Each signal, with where it was raised.

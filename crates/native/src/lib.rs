@@ -6,6 +6,8 @@ pub mod decode;
 mod gate;
 pub mod hv;
 pub mod hwcap;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod jit;
 pub mod loader;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod pool;
@@ -35,14 +37,9 @@ fn mark_exit() {
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();
         fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
-        use fwe_kernel::mm::{JIT_PREPARE_NS, JIT_PREPARED, JIT_WRITABLE};
-        use std::sync::atomic::Ordering::Relaxed;
-        let (w, p) = (JIT_WRITABLE.load(Relaxed), JIT_PREPARED.load(Relaxed));
-        if w + p > 0 {
-            fwe_kernel::timing::mark(&format!(
-                "exit: JIT pages made writable {w} times, prepared {p} times in {} ms",
-                JIT_PREPARE_NS.load(Relaxed) / 1_000_000
-            ));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(counts) = jit::counts() {
+            fwe_kernel::timing::mark(&format!("exit: {counts}"));
         }
     }
 }
@@ -158,15 +155,40 @@ impl Platform for NativePlatform {
         len: u64,
         known: Option<&[(u64, u64)]>,
         cache: Option<&[u8]>,
-    ) -> Result<fwe_kernel::PreparedCode, fwe_kernel::PrepareFailed> {
-        let prepared = self.prepare(addr, len, None, known, cache);
-        prepared
-            .map(|p| fwe_kernel::PreparedCode { x18_sites: p.x18_sites, x18_left: p.x18_left })
-            .map_err(|e| {
-                // A mapping being kept as an image is not, failed.
-                prepare::image_abandon();
-                fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
-            })
+    ) -> Result<(), fwe_kernel::PrepareFailed> {
+        self.prepare(addr, len, None, known, cache).map(|_| ()).map_err(|e| {
+            // A mapping being kept as an image is not, failed.
+            prepare::image_abandon();
+            fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
+        })
+    }
+
+    fn translates_jit(&self) -> bool {
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    }
+
+    fn jit_code(&mut self, addr: u64, len: u64) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        jit::code(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = (addr, len);
+    }
+
+    fn jit_changed(&mut self, addr: u64, len: u64) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return jit::changed(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (addr, len);
+            false
+        }
+    }
+
+    fn resume_point(&self, regs: &mut fwe_kernel::Regs) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        jit::to_guest(regs);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = regs;
     }
 
     fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {

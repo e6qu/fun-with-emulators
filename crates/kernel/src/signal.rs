@@ -637,6 +637,8 @@ impl<P: Platform> Kernel<P> {
         if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN {
             return false;
         }
+        // The frame holds the guest's own state.
+        self.platform.resume_point(regs);
         if self.tracer.enabled && !self.tracer.failures_only {
             // As strace shows a delivery, with what the host gave the
             // signal it came as.
@@ -1338,8 +1340,8 @@ mod tests {
             _l: u64,
             _k: Option<&[(u64, u64)]>,
             _c: Option<&[u8]>,
-        ) -> Result<crate::PreparedCode, crate::PrepareFailed> {
-            Ok(crate::PreparedCode::default())
+        ) -> Result<(), crate::PrepareFailed> {
+            Ok(())
         }
         fn exit(&mut self, code: i32) -> ! {
             panic!("exit({code})")

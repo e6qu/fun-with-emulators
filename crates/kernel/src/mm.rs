@@ -6,9 +6,8 @@ use crate::vmas::Piece;
 use crate::{Kernel, MemCall, Platform};
 use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The program break: a reserved region after the executable image that
 /// `brk` commits and releases.
@@ -30,14 +29,6 @@ pub(crate) struct Ranges {
     /// Linux discards the old address space; fwe's own memory is never in
     /// the set.
     guest: BTreeMap<u64, u64>,
-    /// Guest memory the guest mapped both writable and executable, host
-    /// addresses. macOS never maps memory so, so the host keeps these
-    /// writable only: in the hypervisor backend the VM alone executes them,
-    /// and the native backend makes a page executable when the guest runs
-    /// code in it and writable again when it writes there
-    /// ([`Kernel::write_exec_fault`]), as a JIT compiler expects of such
-    /// memory.
-    write_exec: BTreeMap<u64, u64>,
     /// Pages of private mappings of files with no name (a memfd, or a file
     /// unlinked once opened: memory shared through it) not yet written,
     /// host addresses. Linux shows such a page what is written to the file
@@ -73,7 +64,6 @@ pub(crate) struct Ranges {
 impl Ranges {
     const NONE: Ranges = Ranges {
         guest: BTreeMap::new(),
-        write_exec: BTreeMap::new(),
         file_views: BTreeMap::new(),
         wipe_on_fork: BTreeMap::new(),
         grows_down: BTreeMap::new(),
@@ -104,7 +94,7 @@ impl Ranges {
     /// Forget host range `[host, host + len)` of a mapping just made that
     /// failed (`mmap_call`), as its making added it.
     fn forget_host(&mut self, host: u64, len: u64) {
-        for set in [&mut self.guest, &mut self.write_exec, &mut self.file_views] {
+        for set in [&mut self.guest, &mut self.file_views] {
             remove_range(set, host, len);
         }
     }
@@ -311,38 +301,10 @@ fn region_prot(addr: u64) -> libc::c_int {
 /// takes no lock to look for one.
 static ANY_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Whether host address `addr` is in writable and executable guest memory.
-fn is_write_exec(addr: u64) -> bool {
-    lock_ranges().write_exec.range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
-}
-
 /// If host address `addr` is in writable and executable guest memory, make
 /// its page (of `page_size` bytes) writable, and report whether it was. Takes
 /// no kernel lock, so fwe's own code may use it when a write it makes for the
 /// guest faults.
-/// For `FWE_TIMING`: pages of write+exec memory made writable, and JIT
-/// code prepared, with the nanoseconds preparing took.
-pub static JIT_WRITABLE: AtomicU64 = AtomicU64::new(0);
-pub static JIT_PREPARED: AtomicU64 = AtomicU64::new(0);
-pub static JIT_PREPARE_NS: AtomicU64 = AtomicU64::new(0);
-
-pub fn write_exec_writable(addr: u64, page_size: u64) -> bool {
-    if !is_write_exec(addr) {
-        return false;
-    }
-    JIT_WRITABLE.fetch_add(1, Ordering::Relaxed);
-    let page = addr & !(page_size - 1);
-    let rw = libc::PROT_READ | libc::PROT_WRITE;
-    // SAFETY: a page of guest memory the guest mapped writable and
-    // executable; only its host protections change.
-    if unsafe { libc::mprotect(page as *mut libc::c_void, page_size as usize, rw) } != 0 {
-        return false;
-    }
-    // Writable, it is the code as the program wrote it.
-    crate::jitsites::restore(page, page_size);
-    true
-}
-
 /// Both `PROT_WRITE` and `PROT_EXEC`.
 fn wants_write_exec(prot: u64) -> bool {
     prot & (mman::PROT_WRITE | mman::PROT_EXEC) == mman::PROT_WRITE | mman::PROT_EXEC
@@ -1091,14 +1053,6 @@ mod tests {
     }
 }
 
-/// The known-code ranges given for memory a guest makes executable after
-/// mapping it (JIT code): none, as nothing says where a JIT's code is. Its
-/// `x18` uses get stubs where they sit among instructions (HotSpot's
-/// compilers use `x18` on Linux), and the data a JIT keeps among its code
-/// (HotSpot's code blob headers, V8's metadata) is left alone, however it
-/// reads (`fwe_native`'s `rewrite::patch_jit`).
-const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
-
 /// The executable sections of the ELF file open at `fd`, as file-offset
 /// ranges (its executable segments' without section headers), or `None` if
 /// it is not a readable regular ELF (then the caller translates the whole
@@ -1673,6 +1627,16 @@ impl<P: Platform> Kernel<P> {
         }
         if r >= 0 {
             crate::maps::publish();
+            // Code a JIT moved: translated anew from where it is now.
+            if self.platform.translates_jit() {
+                let moved =
+                    self.platform.jit_changed(crate::uaccess::g2h(old), self.page_up(old_len));
+                let host = crate::uaccess::g2h(r as u64);
+                let _ = self.platform.jit_changed(host, self.page_up(new_len));
+                if moved {
+                    self.platform.jit_code(host, self.page_up(new_len));
+                }
+            }
         }
         r
     }
@@ -2110,7 +2074,7 @@ impl<P: Platform> Kernel<P> {
             let guest = if p == haddr && fixed { addr } else { p };
             // What was owed to the pages replaced goes with them.
             crate::lazycode::unmapped(p, self.page_up(len));
-            crate::jitsites::forget(p, self.page_up(len));
+            let _ = self.platform.jit_changed(p, self.page_up(len));
             {
                 let mut r = lock_ranges();
                 add_range(&mut r.guest, p, self.page_up(len));
@@ -2120,11 +2084,11 @@ impl<P: Platform> Kernel<P> {
                 } else {
                     remove_range(&mut r.file_views, p, self.page_up(len));
                 }
-                if wants_write_exec(prot) {
-                    add_range(&mut r.write_exec, p, self.page_up(len));
-                } else {
-                    remove_range(&mut r.write_exec, p, self.page_up(len));
-                }
+            }
+            // Writable and executable: a JIT's code, run by translation
+            // where the backend translates it.
+            if wants_write_exec(prot) && self.platform.translates_jit() {
+                self.platform.jit_code(p, self.page_up(len));
             }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
                 // SAFETY: unmapping the mapping just created.
@@ -2256,8 +2220,8 @@ impl<P: Platform> Kernel<P> {
     /// Unmap guest host memory, or have the backend take it back
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
+        let _ = self.platform.jit_changed(addr, self.page_up(len));
         crate::lazycode::unmapped(addr, self.page_up(len));
-        crate::jitsites::forget(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
         }
@@ -2350,34 +2314,25 @@ impl<P: Platform> Kernel<P> {
                 remove_range(&mut lock_ranges().file_views, s, e - s);
             }
         }
-        if prot & mman::PROT_EXEC != 0 {
-            // SAFETY: guest-requested protection change of guest memory.
-            if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-                return last_error();
-            }
-            // Code made executable after it was mapped is a JIT's, with no
-            // unwind table to tell its code from the data in it (see
-            // [`JIT_CODE`]).
-            // Only what the file has (a page past its end has nothing to
-            // read, and faults).
-            let backed = self.backed_len(addr, self.page_up(len));
-            if backed > 0 {
-                self.repair_jit_copies(a as u64, backed);
-                match self.platform.prepare_exec(a as u64, backed, JIT_CODE, None) {
-                    Ok(p) => self.jit_x18_note(a as u64, backed, &p),
-                    Err(e) => return self.prepare_failed(e),
-                }
-            }
+        // Code a JIT makes executable runs by translation where the backend
+        // translates it: never executable on the host, nothing written.
+        let translated = self.platform.translates_jit();
+        if translated {
+            let _ = self.platform.jit_changed(a as u64, self.page_up(len));
         }
+        let host = if translated && prot & mman::PROT_EXEC != 0 {
+            final_prot(prot) & !libc::PROT_EXEC
+        } else {
+            final_prot(prot)
+        };
         // SAFETY: guest-requested protection change of guest memory.
-        let r = ret(unsafe { libc::mprotect(a, len as usize, final_prot(prot)) });
+        let r = ret(unsafe { libc::mprotect(a, len as usize, host) });
+        if r == 0 && translated && prot & mman::PROT_EXEC != 0 {
+            self.platform.jit_code(a as u64, self.page_up(len));
+        }
         if r == 0 {
             // Code with writes owed: made writable, they are made first.
             crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
-            // A JIT's code made writable is its code as it wrote it.
-            if final_prot(prot) & libc::PROT_WRITE != 0 {
-                crate::jitsites::restore(a as u64, self.page_up(len));
-            }
         }
         if r == 0 && prot & mman::PROT_EXEC == 0 {
             for &(s, e) in &views {
@@ -2392,33 +2347,9 @@ impl<P: Platform> Kernel<P> {
             }
         }
         if r == 0 {
-            let mut r = lock_ranges();
-            if wants_write_exec(prot) {
-                add_range(&mut r.write_exec, a as u64, self.page_up(len));
-            } else {
-                remove_range(&mut r.write_exec, a as u64, self.page_up(len));
-            }
-            drop(r);
             self.platform.protect_guest(addr, self.page_up(len), prot);
         }
         r
-    }
-
-    /// How much of guest range `[addr, addr + len)`, from its start, has
-    /// something behind it: all of it, but for a file mapping the pages up
-    /// to the file's end.
-    fn backed_len(&self, addr: u64, len: u64) -> u64 {
-        use crate::vmas::Mapping;
-        let Some(p) = crate::maps::record().areas_in(addr, addr + len).into_iter().next() else {
-            return len;
-        };
-        let area = p.value.at(addr.saturating_sub(p.start));
-        if !matches!(area.object.name, crate::maps::Name::Path(_) | crate::maps::Name::Exe) {
-            return len;
-        }
-        let Some(path) = region_file(crate::uaccess::g2h(addr)) else { return len };
-        let Ok(meta) = std::fs::metadata(std::ffi::OsStr::from_bytes(&path)) else { return len };
-        self.page_up(meta.len().saturating_sub(area.object.offset)).min(len)
     }
 
     /// A fault the guest took at host address `addr`: if it is below a
@@ -2491,75 +2422,6 @@ impl<P: Platform> Kernel<P> {
             )
         };
         remove_range(&mut lock_ranges().file_views, page, self.page_size);
-        true
-    }
-
-    /// Before JIT code is prepared, the copies there of branches fwe wrote
-    /// elsewhere get the JIT's words back ([`crate::jitsites`]).
-    fn repair_jit_copies(&self, addr: u64, len: u64) {
-        let code = |t: u64| {
-            crate::maps::record()
-                .areas_in(t, t + 4)
-                .iter()
-                .any(|p| p.value.prot & mman::PROT_EXEC != 0)
-        };
-        let (n, untold) = crate::jitsites::repair_copies(addr, len, code);
-        if n + untold > 0 {
-            self.tracer.note(&format!(
-                "JIT code at {addr:#x}+{len:#x}: {n} copied sites put back, {untold} not told"
-            ));
-        }
-    }
-
-    /// Under `--strace`: how many instructions naming `x18` were given
-    /// stubs in JIT code just prepared, and each word that read as one but
-    /// was taken for data, with the words around it.
-    fn jit_x18_note(&self, addr: u64, len: u64, p: &crate::PreparedCode) {
-        if !self.tracer.enabled {
-            return;
-        }
-        let n = p.x18_sites;
-        if n > 0 {
-            self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs"));
-        }
-        for &at in &p.x18_left {
-            let words: Vec<String> = (at.saturating_sub(8).max(addr)..(at + 12).min(addr + len))
-                .step_by(4)
-                .map(|w| {
-                    // SAFETY: a word of the range just prepared, readable.
-                    let v = unsafe { (w as *const u32).read() };
-                    if w == at { format!("*{v:08x}") } else { format!("{v:08x}") }
-                })
-                .collect();
-            self.tracer.note(&format!("JIT code at {at:#x}: taken for data: {}", words.join(" ")));
-        }
-    }
-
-    pub fn write_exec_fault(&mut self, addr: u64, exec: bool) -> bool {
-        if !write_exec_writable(addr, self.page_size) {
-            return false;
-        }
-        if exec {
-            let page = addr & !(self.page_size - 1);
-            let t = crate::timing::on().then(std::time::Instant::now);
-            self.repair_jit_copies(page, self.page_size);
-            let prepared = self.platform.prepare_exec(page, self.page_size, JIT_CODE, None);
-            if let Some(t) = t {
-                JIT_PREPARED.fetch_add(1, Ordering::Relaxed);
-                JIT_PREPARE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
-            }
-            match prepared {
-                Ok(p) => self.jit_x18_note(page, self.page_size, &p),
-                Err(e) => {
-                    self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
-                    return false;
-                }
-            }
-            let rx = libc::PROT_READ | libc::PROT_EXEC;
-            // SAFETY: a page of guest memory the guest mapped writable and
-            // executable; only its host protections change.
-            unsafe { libc::mprotect(page as *mut libc::c_void, self.page_size as usize, rx) };
-        }
         true
     }
 
@@ -2973,7 +2835,6 @@ impl<P: Platform> Kernel<P> {
                 self.platform.unmap_guest(old + new_len, old_len - new_len);
                 self.unmap_host(tail, old_len - new_len);
                 untrack(tail, old_len - new_len);
-                remove_range(&mut lock_ranges().write_exec, tail, old_len - new_len);
             }
             return old as i64;
         }

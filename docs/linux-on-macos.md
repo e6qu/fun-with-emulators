@@ -244,7 +244,7 @@ stops running its own code:
 | code using `x18` | a stub branch per use (a few Linux toolchains allocate it) | the hardware register |
 | reading `CTR_EL0` | a trap per read (C libraries read it once) | read by the guest |
 | reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
-| JIT, write+exec pages | a fault per switch between writing and running ([Write+exec memory](#writeexec-memory)) | no faults |
+| JIT code | a fault the first time each block runs (it is translated), a trap the first time each branch out of it is taken (then linked) and when a lookup misses, a fault for a write to a page translated from ([Code made executable at run time](#code-made-executable-at-run-time-translated)) | no faults |
 | `mmap`/`munmap` heavy | host calls | page-table edits; a TLB invalidation on every vCPU when access is taken away |
 | `fork` heavy | host `fork`, copy-on-write, after pausing the other guest threads ([fork](#fork)) | a new fwe process sent every page of guest memory that exists |
 | `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | a new process fetching pages as touched, then a re-exec |
@@ -273,15 +273,15 @@ for a well-known property only.
 | native, Go built as PIE | Alpine's podman (building, pushing, pulling, rootless), containerd and Docker with BuildKit and Compose (tested) | Alpine builds its Go programs as PIEs ([How distributions build their programs](#how-distributions-build-their-programs)); Debian's podman, containerd and runc are non-PIE and need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries, each page's rewrites written only when it first runs |
-| native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
-| native, JIT | Alpine's OpenJDK 25 with HotSpot (tested) | its compilers' code prepared as JIT code, `x18` included; its own words put back whenever it writes them; see [Java](#java-and-the-jvm) |
+| native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code run by translation, its memory untouched; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
+| native, JIT | Alpine's OpenJDK 25 with HotSpot (tested) | its compilers' code run by translation, `x18` included, its code cache untouched; see [Java](#java-and-the-jvm) |
 | VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
 | VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
 | VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
 | VM, container engine | Debian's podman 4.3 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
 | fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a call into fwe's gate natively, a VM exit in the VM |
-| uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub (in JIT code, each use among instructions: [x18 in JIT code](#x18-in-jit-code)); in the VM `x18` is the guest's own |
+| uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub (in code made executable at run time, its translation's expansion); in the VM `x18` is the guest's own |
 
 ## Languages and runtimes
 
@@ -352,11 +352,10 @@ natively, as bash does.
 Debian's Node.js 18 is a dynamic PIE and runs natively (tested: V8's JIT
 on a hot function, ICU, OpenSSL digests, zlib, timers and promises, a
 child process, an HTTP server and client, and a worker thread). Each
-time a page of V8's generated code becomes executable, fwe prepares it as
-JIT code: system calls and thread-pointer accesses are rewritten. V8
-never uses `x18`; the words of its code pages that read as `x18`
-instructions are its data (compressed pointers and metadata), which the
-rule for JIT code leaves alone ([x18 in JIT code](#x18-in-jit-code)).
+time V8 runs code it generated, fwe runs a translation of it, and V8's
+code pages, with the metadata and compressed pointers it keeps among its
+code, stay as V8 wrote them ([Code made executable at run
+time](#code-made-executable-at-run-time-translated)).
 
 ### Java and the JVM
 
@@ -367,17 +366,14 @@ interpreter and both of its compilers at work):
 
 - **Backend:** the `java` and `javac` launchers are PIEs; the JVM itself
   is a shared library (`libjvm.so`).
-- **JIT code:** HotSpot maps its code cache writable and executable, so
-  each page is prepared when it first runs and again after each write
-  ([Write+exec memory](#writeexec-memory)). Its compilers allocate `x18`
-  like any register on Linux (they keep it free only on macOS and
-  Windows), so the uses in its code get stubs, while its code blob
-  headers and trampolines' addresses, kept in the same pages, are left
-  alone ([x18 in JIT code](#x18-in-jit-code)).
-- **Code that moves:** HotSpot builds a method's code in a buffer in its
-  code cache, then copies it into the method, and patches calls and
-  constants in place; whenever it can write a page, the page holds its
-  own words again, not fwe's branches.
+- **JIT code:** HotSpot's code cache runs by translation ([Code made
+  executable at run time](#code-made-executable-at-run-time-translated)).
+  Its compilers allocate `x18` like any register on Linux (they keep it
+  free only on macOS and Windows); the translations keep its value. Its
+  code cache stays as HotSpot wrote it: the code blob headers and
+  trampolines' addresses it keeps among its code, the buffer it builds a
+  method in and then copies, the calls and constants it patches in
+  place, and the return addresses its stack walks read, all its own.
 - **Safepoints and null checks** rely on `SIGSEGV` from protected pages,
   which fwe delivers with Linux's frame, turning the `SIGBUS` macOS
   reports for some protection faults into `SIGSEGV`
@@ -416,8 +412,9 @@ taken by a vectored handler, and starts itself as a child process.
   data.
 - **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`. In
   the VM `x18` is the guest's own. Natively, Windows code Wine makes
-  executable is prepared as JIT code, its `x18` uses given stubs where
-  they sit among instructions ([x18 in JIT code](#x18-in-jit-code)).
+  executable runs by translation, `x18` kept in its translations
+  ([Code made executable at run
+  time](#code-made-executable-at-run-time-translated)).
 - **wineserver** talks to Wine processes over Unix sockets, passing
   descriptors with `SCM_RIGHTS` (received descriptors are not held to
   `RLIMIT_NOFILE`), and suspends threads with ordinary signals. It stays
@@ -580,47 +577,53 @@ the program's own instruction for its pc, the registers the stub pushed
 back as they were, and `sp` as the site had it, so a handler that looks
 up the faulting instruction, or skips it, finds it where it wrote it.
 
-### x18 in JIT code
+### Code made executable at run time: translated
 
-Code a program writes and then runs comes with nothing saying where its
-code is, and JITs keep data in the same pages: HotSpot its code blobs'
-headers and its trampolines' 64-bit addresses, V8 its metadata and
-compressed pointers. A data word can read as an instruction naming
-`x18`, and rewriting it would change the data. So in JIT code an `x18`
-instruction gets a stub only where it sits among instructions: the two
-words on each side of it (those within the range being prepared) all
-decode in one of the instruction classes. A pointer above 4 GiB has a
-small number for its high half and a small number decodes as no
-instruction (`udf`), so a pointer whose low half reads as an `x18`
-instruction is left alone. HotSpot's compilers use `x18` on Linux, and
-every such use in its code passes; V8's lookalikes are all data, and none
-does (`rewrite::patch_jit`, `jitsites::among_instructions`).
+A JIT compiler writes code and runs it, and keeps data in the same
+pages: headers, constants, addresses (HotSpot its code blobs' headers and
+trampolines' addresses, V8 its metadata and compressed pointers). It
+reads that memory back, patches it, copies code from one place to
+another, and walks stacks of return addresses into it. macOS has no
+memory that can be run but not read, so any change fwe made there would
+be seen. So fwe changes nothing there, and never lets the host run it:
+memory the guest made executable after mapping it (`mprotect` adding
+`PROT_EXEC`, or mapped writable and executable at once) runs by
+translation (`crates/native/src/jit.rs`), as Rosetta 2 and DynamoRIO run
+code generated at run time:
 
-A JIT also writes its code again: it patches calls and constants in
-place, and HotSpot builds a method in a buffer in its code cache and
-then copies it. Each word fwe changes in JIT code (an `x18` use, a
-system call or a thread-pointer access, now a branch to a stub) is
-recorded with what it was. Whenever the page becomes writable again (a
-write to write+exec memory, or `mprotect` adding `PROT_WRITE`), each
-word still as fwe made it goes back to the program's own, so the
-program reads, patches and copies the code it wrote. When the page next
-runs it is prepared again, and a site that is what it was gets its old
-stub back (`fwe_kernel::jitsites`).
-
-A JIT can also copy code out of a page that is executable, as macOS has
-no execute-only memory: HotSpot's buffer shares pages with code that
-runs, so it may have been prepared since its last write. A copied branch
-to a stub keeps its distance and leads nowhere. A branch's word is its
-distance alone, so every word fwe writes is kept with the program's word
-it stands for; before JIT code is prepared, a branch there that fwe did
-not write, with the bits of one it did, among instructions (as a
-pointer's low half is not) and leading where there is no code (a
-program's own branches lead to its code), gets the program's word back,
-and is then prepared as any other. One branch word can stand for
-different instructions at different places (stub regions sit at the same
-distance from code, with the same layout); a copy moves everything it
-copies by one distance, so the place a copy came from is the one at the
-distance the other copies beside it moved.
+- **The fetch faults.** The page is never executable on the host; a jump
+  there faults, and fwe translates the block of code at that address
+  into its code cache and goes on there. Only code that runs is decoded,
+  following the program's control flow, so nothing has to tell code from
+  data.
+- **The translation** holds the program's instructions as they are,
+  except `adr`, `adrp` and literal loads (computed from the program's
+  address), the uses of `x18`, system calls and thread-pointer accesses
+  (expanded as their stubs are, inline), and branches out of the block.
+- **Branches.** A direct branch traps the first time and is then linked:
+  a branch straight to its target's translation. A call puts the
+  program's own return address in `x30`, so the stack holds only the
+  program's addresses. An indirect branch or a return looks its target
+  up in a table of translations by program address, `x16` and `x17`
+  saved for the lookup and restored by the translation's first word; a
+  miss traps once and fills the table. Code that is not translated (a
+  library's, prepared in place) is entered through one stub that leaves
+  the target address in `x16`, as the arm64 procedure call standard lets
+  a call or return clobber `x16` and `x17`.
+- **What the program sees stays its own.** Its memory reads back exactly
+  as it wrote it. A fault or signal in a translation is delivered at the
+  program's instruction, with its registers: an expansion stopped before
+  its instruction ran is undone, one stopped after is finished.
+- **Code that changes.** A page code was translated from is kept from
+  being written: a write faults, drops the page's translations (and the
+  branches linked into them), and is retried; the code is translated
+  again when it next runs. The page is protected before it is read, so a
+  write from another thread cannot slip in between.
+- **The code cache** is made of 128 MiB chunks (what a branch reaches),
+  each one memory mapped twice, writable for fwe and executable for the
+  threads that run it; a full chunk is followed by a new one, and a
+  branch between chunks is not linked. A fork child maps its executable
+  views again from its own copies of the writable ones.
 
 ### CTR_EL0: emulated when it traps
 
@@ -641,9 +644,9 @@ while it is still writable and before any thread can run it
   writable memory, executable sections prepared, final protections set;
 - **`mmap` with `PROT_EXEC`**: for a file, only the sections its section
   headers mark executable;
-- **`mprotect` adding `PROT_EXEC`**: code written first, as a JIT does;
-- **the first instruction fetch from write+exec memory**
-  ([Write+exec memory](#writeexec-memory)).
+- code made executable after it was mapped (a JIT's) is not prepared but
+  translated ([Code made executable at run
+  time](#code-made-executable-at-run-time-translated)).
 
 Preparing is done once per file, not once per start, as Rosetta 2 keeps
 its translations. What a file's scan found (its code ranges from the
@@ -692,9 +695,8 @@ one of these instructions, so:
   the unwind table is found through `PT_GNU_EH_FRAME`, whose
   `.eh_frame_hdr` points at it; without a usable unwind table, every
   scanned word is taken as code;
-- code made executable after mapping (a JIT's) has only system calls and
-  thread-pointer accesses rewritten: Linux arm64 JITs leave `x18` alone
-  (V8 reserves it) and their pages hold data.
+- code made executable after mapping (a JIT's) is not scanned but
+  translated as it runs.
 
 ### Where the stubs go
 
@@ -711,10 +713,10 @@ can be found the preparation fails: the guest's `mmap` or `mprotect` gets
   of `x18` written back onto `sp`, and `blraa x18, x30` (whose stub would
   set the link register before the branch reads it as the modifier),
   counted per image under `--strace` ("x18 uses left unrewritten").
-- In JIT code, an `x18` use within two words of a word that decodes as
-  no instruction (data, or the end of the code), and a word of data
-  among instructions that reads as an `x18` instruction (taken for one):
-  [x18 in JIT code](#x18-in-jit-code).
+- In code made executable at run time, an authenticated branch
+  (`braa`, `retaa` and their kind, which fwe does not offer) and an
+  `x18` form without a stub become `udf` in the translation: `SIGILL`
+  at the program's instruction.
 - Pointer authentication is not offered natively (`AT_HWCAP` has no
   `PACA`/`PACG`), since the host owns the keys; programs use the
   instructions' no-op forms.
@@ -1794,13 +1796,11 @@ Every successful memory call is also recorded as Linux lists it
 
 Linux maps `PROT_WRITE | PROT_EXEC` memory freely. macOS refuses it
 without `MAP_JIT`, whose memory is switched per thread
-(`pthread_jit_write_protect_np`), which Linux code never calls. fwe keeps
-such memory writable on the host and records it
-(`crates/kernel/src/mm.rs`):
+(`pthread_jit_write_protect_np`), which Linux code never calls.
 
-- **native:** the first instruction fetch from a page faults; fwe prepares
-  its code and makes it read-execute. A later write, the guest's or one
-  fwe makes for it, makes it read-write again.
+- **native:** the host maps it writable, never executable: its code runs
+  by translation ([Code made executable at run
+  time](#code-made-executable-at-run-time-translated)).
 - **VM:** stage 1 maps it writable and executable; nothing faults.
 
 #### Shared memory and memfd
@@ -2932,7 +2932,9 @@ fwe's own traps rather than faults the guest should see:
 | `SIGTRAP` at any other `brk` | the guest's own breakpoint | `SIGTRAP`, `si_addr` the `brk` |
 | `SIGTRAP` where the pc holds no `brk` | sent by another process | a relayed `SIGTRAP` |
 | `SIGILL` at `mrs <Xt>, ctr_el0` | emulated | the value, as Linux lets EL0 read it |
-| `SIGSEGV`/`SIGBUS` on write+exec memory | the page switched between writable and executable, the access retried | nothing |
+| `SIGSEGV`/`SIGBUS` fetching code made executable at run time | the block translated, run there | nothing |
+| `SIGSEGV`/`SIGBUS` writing a page code was translated from | its translations dropped, the write retried | nothing |
+| `SIGTRAP` at a translation's way out (told by the syndrome's `brk` immediate) | on at the target's translation, the branch linked | nothing |
 | `SIGBUS` for an access the page's protection forbids (macOS reports some so) | turned into Linux's signal for it | `SIGSEGV` |
 | `SIGBUS` for an access the protection allows (past a mapped file's end) | kept | `SIGBUS` |
 | a fault signal with a note from another fwe process | a sent signal, not a fault | that signal, with its sender |

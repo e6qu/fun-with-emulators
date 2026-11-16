@@ -463,9 +463,8 @@ fn regs_to(mc: &mut Mcontext, regs: &Regs) {
 
 /// Under `--strace`, an instruction fetch that faulted, with what led
 /// there: the registers (the guest's `x18` among them), the code before
-/// the return address, and, where that is a call, the code it called. Each
-/// word is marked where fwe changed it (`fwe:was>now`). Code is read only
-/// where the guest's mappings say it is readable.
+/// the return address, and, where that is a call, the code it called. Code
+/// is read only where the guest's mappings say it is readable.
 fn fetch_fault_report(regs: &Regs) {
     if !kernel().as_ref().is_some_and(|k| k.tracer.enabled) {
         return;
@@ -483,12 +482,9 @@ fn fetch_fault_report(regs: &Regs) {
     let dump = |from: u64, n: u64| -> String {
         (0..n)
             .map(|i| from + 4 * i)
-            .map(|a| match (word(a), fwe_kernel::jitsites::at(a)) {
-                (Some(w), Some((was, now))) if w == now => {
-                    format!("{a:#x}:{w:08x}(fwe:{was:08x}>{now:08x})")
-                }
-                (Some(w), _) => format!("{a:#x}:{w:08x}"),
-                (None, _) => format!("{a:#x}:-"),
+            .map(|a| match word(a) {
+                Some(w) => format!("{a:#x}:{w:08x}"),
+                None => format!("{a:#x}:-"),
             })
             .collect::<Vec<_>>()
             .join(" ")
@@ -541,6 +537,27 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     let in_guest = IN_GUEST.with(Cell::get);
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let pc = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).ss.pc };
+    // A translated block's way out, told by what the hardware says
+    // trapped: another thread may have linked the word since (made it a
+    // branch). On at where it leads; in fwe's code from here, signals
+    // held, so a signal delivered meanwhile cannot take the translator's
+    // lock this thread holds.
+    if in_guest {
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+        let esr = mc.es.esr;
+        if (esr >> 26) & 0x3f == ESR_EC_BRK && esr & 0xffff == crate::jit::EXIT_IMM {
+            let _host = HostCode::enter_blocked();
+            let mut regs = regs_from(mc);
+            if crate::jit::exit(&mut regs) {
+                settle(&mut regs);
+                regs_to(mc, &regs);
+                // SAFETY: `ctx` is this handler's ucontext.
+                unsafe { return_with_guest_mask(ctx) };
+                return;
+            }
+        }
+    }
     // macOS's siginfo does not tell a trap from a sent SIGTRAP (both have
     // code 0), so look at the instruction: anything but a `brk` means the
     // signal was sent by another process, a signal for the guest.
@@ -1003,6 +1020,9 @@ fn linux_fault_signal(host: libc::c_int, addr: u64, esr: u32) -> u64 {
 
 /// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
 const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
+/// The exception class of a `brk` instruction (its immediate in the low 16
+/// bits of the syndrome).
+const ESR_EC_BRK: u32 = 0x3c;
 
 /// The pid of a process forking, from before its host `fork` until its
 /// child is set up (in the child) or the fork has returned (in the
@@ -1108,9 +1128,9 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let addr = unsafe { (*info).si_addr() } as u64;
-        if fwe_kernel::mm::write_exec_writable(addr, crate::page_size()) {
-            // fwe writing for the guest into a page of its writable and
-            // executable memory that was last executed: retry the write.
+        if crate::jit::written(addr) {
+            // fwe writing for the guest into a page code was translated
+            // from: its translations go, and the write is retried.
             return;
         }
         if let Some(resume) = fwe_kernel::uaccess::fixup(ss.pc) {
@@ -1149,10 +1169,16 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         return;
     }
 
-    // Memory the guest mapped writable and executable: the page becomes
-    // what this access needs, and the access is retried.
+    // Code the guest made executable after mapping it runs by translation:
+    // a fetch from it goes on at its translation; a write to a page code
+    // was translated from drops those translations and is tried again.
     let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
-    if kernel().as_mut().is_some_and(|k| k.write_exec_fault(addr, exec)) {
+    if exec {
+        if let Some(t) = crate::jit::enter(addr) {
+            mc.ss.pc = t;
+            return;
+        }
+    } else if crate::jit::written(addr) {
         return;
     }
     // A page of a private mapping of a file with no name, first written:
@@ -1181,6 +1207,9 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         }
         regs.sp = r.sp;
         regs.pc = r.site;
+    } else {
+        // In a translation: the guest's instruction it stands for.
+        crate::jit::to_guest(&mut regs);
     }
     // Memory `MADV_HWPOISON` poisoned fails with a bus error.
     let lsig = if fwe_kernel::mm::poisoned(addr) {

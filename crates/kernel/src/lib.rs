@@ -39,7 +39,6 @@ mod handles;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
-pub mod jitsites;
 mod kept;
 pub mod keycrypto;
 pub mod keys;
@@ -181,16 +180,6 @@ pub struct PrepareFailed {
     pub why: String,
 }
 
-/// What preparing code did that the trace reports.
-#[derive(Debug, Default)]
-pub struct PreparedCode {
-    /// Instructions naming `x18` given stubs.
-    pub x18_sites: usize,
-    /// In JIT code, the addresses of words that read as `x18` uses but
-    /// were taken for data.
-    pub x18_left: Vec<u64>,
-}
-
 pub trait Platform {
     /// Carry out a memory system call, for a backend whose guest has an
     /// address space of its own that it manages (the hypervisor backend);
@@ -215,7 +204,31 @@ pub trait Platform {
         len: u64,
         known: Option<&[(u64, u64)]>,
         cache: Option<&[u8]>,
-    ) -> Result<PreparedCode, PrepareFailed>;
+    ) -> Result<(), PrepareFailed>;
+
+    /// Whether code the guest makes executable after mapping it (a JIT's)
+    /// runs by translation, the guest's memory never executable on the
+    /// host (the native backend): then such memory is handed over with
+    /// [`Platform::jit_code`] rather than prepared in place.
+    fn translates_jit(&self) -> bool {
+        false
+    }
+
+    /// `[addr, addr + len)` (host addresses) now holds code the guest made
+    /// executable after mapping it.
+    fn jit_code(&mut self, _addr: u64, _len: u64) {}
+
+    /// `[addr, addr + len)` (host addresses) was unmapped, mapped anew or
+    /// given other protections: what was translated from it goes. Whether
+    /// any of it held code the guest made executable after mapping it.
+    fn jit_changed(&mut self, _addr: u64, _len: u64) -> bool {
+        false
+    }
+
+    /// `regs` as the guest's own, before a signal frame is written from
+    /// them: where they stopped in code fwe runs in the guest's stead (a
+    /// translation), as at the guest's instruction.
+    fn resume_point(&self, _regs: &mut Regs) {}
 
     /// Map the prepared image kept under `key` ([`prepcache::image_key`])
     /// over the mapping of a file's code at `[addr, addr + len)`, with

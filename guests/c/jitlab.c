@@ -1,0 +1,348 @@
+/* What a JIT does with the code it writes, as a contract for any way of
+ * running code made executable at run time. The code is assembled below
+ * into a page-aligned template (data, in .rodata), copied into memory
+ * mapped writable and executable, and run from there:
+ *
+ * - calls (bl) and returns, loops, conditional branches;
+ * - indirect calls (blr) into static code that calls back into it;
+ * - adr, adrp and a literal load, with data placed among the code,
+ *   including a word that reads as an instruction naming x18;
+ * - x18 kept across system calls (Linux lets code use it);
+ * - a system call made from it;
+ * - a load through a null pointer faulting at its own instruction, the
+ *   handler sending it on to a continuation (a JIT's null check);
+ * - code patched in place, then run;
+ * - code copied elsewhere and run there;
+ * - the return address a call leaves being the code's own address;
+ * - threads running code while another thread patches it;
+ * - code made executable with mprotect after it was written (W^X);
+ * - a fork child running code translated before, and code it changes;
+ * - and the memory reading back exactly as the program wrote it.
+ *
+ * Every line printed is what Linux prints. */
+#include <stdatomic.h>
+#include <stddef.h>
+#include <stdint.h>
+
+/* Declared here, so the guest builds with no libc headers on the host
+ * (musl's layouts). */
+int printf(const char *fmt, ...);
+void perror(const char *s);
+void *memcpy(void *d, const void *s, size_t n);
+int memcmp(const void *a, const void *b, size_t n);
+void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off);
+int mprotect(void *addr, size_t len, int prot);
+int getpid(void);
+int pthread_create(unsigned long *t, const void *attr, void *(*fn)(void *), void *arg);
+int pthread_join(unsigned long t, void **ret);
+struct sigaction {
+    void (*sa_sigaction)(int, void *, void *);
+    unsigned long sa_mask[16];
+    int sa_flags;
+    void (*sa_restorer)(void);
+};
+int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
+int fork(void);
+int waitpid(int pid, int *status, int options);
+void _exit(int code);
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define PROT_EXEC 4
+#define MAP_PRIVATE 2
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED ((void *)-1)
+#define SIGSEGV 11
+#define SA_SIGINFO 4
+/* The interrupted pc in an arm64 signal frame's ucontext. */
+#define UC_PC(ctx) (*(uint64_t *)((char *)(ctx) + 440))
+
+__asm__(
+    ".section .rodata\n"
+    ".balign 4096\n"
+    ".globl jl_begin\n"
+    "jl_begin:\n"
+
+    /* long sum(long n): the sum of double(i) for i < n, double called. */
+    "jl_sum:\n"
+    "  stp x29, x30, [sp, #-32]!\n"
+    "  mov x29, sp\n"
+    "  stp x19, x20, [sp, #16]\n"
+    "  mov x19, x0\n"
+    "  mov x20, #0\n"
+    "1: cbz x19, 2f\n"
+    "  sub x19, x19, #1\n"
+    "  mov x0, x19\n"
+    "  bl jl_double\n"
+    "  add x20, x20, x0\n"
+    "  b 1b\n"
+    "2: mov x0, x20\n"
+    "  ldp x19, x20, [sp, #16]\n"
+    "  ldp x29, x30, [sp], #32\n"
+    "  ret\n"
+    "jl_double:\n"
+    "  lsl x0, x0, #1\n"
+    "  ret\n"
+
+    /* long indirect(long (*f)(long, long), long a, long b):
+     * f(f(a, b), double(3)), double reached through a register. */
+    "jl_indirect:\n"
+    "  stp x29, x30, [sp, #-32]!\n"
+    "  mov x29, sp\n"
+    "  str x19, [sp, #16]\n"
+    "  mov x19, x0\n"
+    "  mov x0, x1\n"
+    "  mov x1, x2\n"
+    "  blr x19\n"
+    "  str x0, [sp, #24]\n"
+    "  mov x0, #3\n"
+    "  adr x9, jl_double\n"
+    "  blr x9\n"
+    "  mov x1, x0\n"
+    "  ldr x0, [sp, #24]\n"
+    "  blr x19\n"
+    "  ldr x19, [sp, #16]\n"
+    "  ldp x29, x30, [sp], #32\n"
+    "  ret\n"
+
+    /* long pcrel(void): 0x1111 + 0x2222 + 0x4444, by adr, a literal load
+     * and adrp. */
+    "jl_pcrel:\n"
+    "  adr x0, 3f\n"
+    "  ldr x0, [x0]\n"
+    "  ldr x1, 4f\n"
+    "  add x0, x0, x1\n"
+    "  adrp x2, 5f\n"
+    "  add x2, x2, :lo12:5f\n"
+    "  ldr x2, [x2]\n"
+    "  add x0, x0, x2\n"
+    "  ret\n"
+    "  .balign 8\n"
+    "3: .quad 0x1111\n"
+    "4: .quad 0x2222\n"
+    "5: .quad 0x4444\n"
+    /* Data among the code that reads as `ldr x0, [x18, #8]`. */
+    "  .word 0xf9400640, 0x00000200\n"
+
+    /* long x18(long v, long rounds): x18 = v across `rounds` system calls. */
+    "jl_x18:\n"
+    "  mov x18, x0\n"
+    "  mov x9, x1\n"
+    "6: cbz x9, 7f\n"
+    "  mov x8, #124\n" /* sched_yield */
+    "  svc #0\n"
+    "  sub x9, x9, #1\n"
+    "  b 6b\n"
+    "7: mov x0, x18\n"
+    "  ret\n"
+
+    /* long getpid_jit(void) */
+    "jl_getpid:\n"
+    "  mov x8, #172\n"
+    "  svc #0\n"
+    "  ret\n"
+
+    /* long fault(long *p): a load through p, by way of x18. */
+    "jl_fault:\n"
+    "  mov x18, x0\n"
+    "jl_fault_load:\n"
+    "  ldr x0, [x18, #16]\n"
+    "  ret\n"
+    "jl_fault_cont:\n"
+    "  mov x0, #77\n"
+    "  ret\n"
+
+    /* long ret1(void): patched to return other numbers. */
+    "jl_ret1:\n"
+    "  mov x0, #1\n"
+    "  ret\n"
+
+    /* long retaddr(void): the return address its call left. */
+    "jl_retaddr_callee:\n"
+    "  mov x0, x30\n"
+    "  ret\n"
+    "jl_retaddr:\n"
+    "  stp x29, x30, [sp, #-16]!\n"
+    "  bl jl_retaddr_callee\n"
+    "jl_retaddr_after:\n"
+    "  ldp x29, x30, [sp], #16\n"
+    "  ret\n"
+
+    ".globl jl_end\n"
+    "jl_end:\n"
+    ".balign 4096\n"
+    ".text\n");
+
+extern const char jl_begin[], jl_end[], jl_sum[], jl_indirect[], jl_pcrel[], jl_x18[],
+    jl_getpid[], jl_fault[], jl_fault_load[], jl_fault_cont[], jl_ret1[], jl_retaddr[],
+    jl_retaddr_after[];
+
+static size_t template_len(void) { return (size_t)(jl_end - jl_begin); }
+
+/* The address of template symbol `sym` in a copy at `base`. */
+static void *at(char *base, const char *sym) { return base + (sym - jl_begin); }
+
+/* Make code just written visible to instruction fetch, as Linux's
+ * __clear_cache does: clean the data cache to the point of unification,
+ * invalidate the instruction cache, by the lines CTR_EL0 gives. */
+static void flush(void *p, size_t n) {
+    uint64_t ctr;
+    __asm__ volatile("mrs %0, ctr_el0" : "=r"(ctr));
+    uint64_t dline = 4ull << ((ctr >> 16) & 15), iline = 4ull << (ctr & 15);
+    uint64_t start = (uint64_t)p, end = start + n;
+    for (uint64_t a = start & ~(dline - 1); a < end; a += dline) {
+        __asm__ volatile("dc cvau, %0" ::"r"(a) : "memory");
+    }
+    __asm__ volatile("dsb ish" ::: "memory");
+    for (uint64_t a = start & ~(iline - 1); a < end; a += iline) {
+        __asm__ volatile("ic ivau, %0" ::"r"(a) : "memory");
+    }
+    __asm__ volatile("dsb ish\n isb" ::: "memory");
+}
+
+static long host_add(long a, long b) { return a + b; }
+
+static char *code;
+static atomic_int fault_seen;
+
+static void on_segv(int sig, void *si, void *ctx) {
+    (void)sig;
+    (void)si;
+    if (UC_PC(ctx) == (uint64_t)at(code, jl_fault_load)) {
+        atomic_store(&fault_seen, 1);
+    }
+    UC_PC(ctx) = (uint64_t)at(code, jl_fault_cont);
+}
+
+static atomic_int stop;
+static atomic_long bad;
+
+static void *runner(void *arg) {
+    long (*ret1)(void) = (long (*)(void))at(code, jl_ret1);
+    long (*sum)(long) = (long (*)(long))at(code, jl_sum);
+    (void)arg;
+    while (!atomic_load(&stop)) {
+        long r = ret1();
+        if (r != 1 && r != 2) {
+            atomic_fetch_add(&bad, 1);
+        }
+        if (sum(10) != 90) {
+            atomic_fetch_add(&bad, 1);
+        }
+    }
+    return 0;
+}
+
+static uint32_t movz_x0(unsigned imm) { return 0xd2800000u | (imm << 5); }
+
+int main(void) {
+    size_t len = template_len();
+    code = mmap(0, len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (code == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+    /* What the program's memory must read back as. */
+    static char expect[1 << 16];
+    memcpy(code, jl_begin, len);
+    memcpy(expect, jl_begin, len);
+    flush(code, len);
+
+    long (*sum)(long) = (long (*)(long))at(code, jl_sum);
+    printf("calls: %ld\n", sum(10));
+
+    long (*indirect)(long (*)(long, long), long, long) =
+        (long (*)(long (*)(long, long), long, long))at(code, jl_indirect);
+    printf("indirect: %ld\n", indirect(host_add, 5, 10));
+
+    long (*pcrel)(void) = (long (*)(void))at(code, jl_pcrel);
+    printf("pcrel: %ld\n", pcrel());
+
+    long (*x18)(long, long) = (long (*)(long, long))at(code, jl_x18);
+    printf("x18: %s\n", x18(0x1818abcd, 2000) == 0x1818abcd ? "kept" : "lost");
+
+    long (*getpid_jit)(void) = (long (*)(void))at(code, jl_getpid);
+    printf("getpid: %s\n", getpid_jit() == getpid() ? "matches" : "differs");
+
+    struct sigaction sa = {0};
+    sa.sa_sigaction = on_segv;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, 0);
+    long (*fault)(long *) = (long (*)(long *))at(code, jl_fault);
+    long r = fault(0);
+    printf("fault: %s, %ld\n", atomic_load(&fault_seen) ? "seen at the load" : "seen elsewhere", r);
+
+    long (*ret1)(void) = (long (*)(void))at(code, jl_ret1);
+    int patched = 0;
+    for (unsigned i = 0; i < 1000; i++) {
+        uint32_t w = movz_x0(i % 7);
+        memcpy(at(code, jl_ret1), &w, 4);
+        memcpy(at(expect, jl_ret1), &w, 4);
+        flush(at(code, jl_ret1), 4);
+        patched += ret1() == (long)(i % 7);
+    }
+    printf("patch: %d of 1000\n", patched);
+
+    /* A copy elsewhere, at the same offset in its page (adrp is relative to
+     * the page). */
+    char *copy = mmap(0, len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(copy, code, len);
+    static char copy_expect[1 << 16];
+    memcpy(copy_expect, copy, len);
+    flush(copy, len);
+    printf("copy: %ld %ld\n", ((long (*)(long))at(copy, jl_sum))(10),
+           ((long (*)(void))at(copy, jl_pcrel))());
+
+    long (*retaddr)(void) = (long (*)(void))at(code, jl_retaddr);
+    printf("return address: %s\n",
+           retaddr() == (long)at(code, jl_retaddr_after) ? "the code's own" : "elsewhere");
+
+    /* Threads run while this one patches, between returning 1 and 2. */
+    uint32_t one = movz_x0(1), two = movz_x0(2);
+    memcpy(at(code, jl_ret1), &one, 4);
+    flush(at(code, jl_ret1), 4);
+    unsigned long t[4];
+    for (int i = 0; i < 4; i++) {
+        pthread_create(&t[i], 0, runner, 0);
+    }
+    for (int i = 0; i < 20000; i++) {
+        memcpy(at(code, jl_ret1), (i & 1) ? &one : &two, 4);
+        flush(at(code, jl_ret1), 4);
+    }
+    atomic_store(&stop, 1);
+    for (int i = 0; i < 4; i++) {
+        pthread_join(t[i], 0);
+    }
+    memcpy(at(expect, jl_ret1), &one, 4);
+    printf("threads: %s\n", atomic_load(&bad) ? "wrong results" : "ok");
+
+    /* Written, then made executable (and back), as a W^X JIT does. */
+    char *wx = mmap(0, len, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(wx, jl_begin, len);
+    static char wx_expect[1 << 16];
+    memcpy(wx_expect, jl_begin, len);
+    mprotect(wx, len, PROT_READ | PROT_EXEC);
+    long first = ((long (*)(long))at(wx, jl_sum))(10);
+    mprotect(wx, len, PROT_READ | PROT_WRITE);
+    memcpy(at(wx, jl_ret1), &two, 4);
+    memcpy(at(wx_expect, jl_ret1), &two, 4);
+    mprotect(wx, len, PROT_READ | PROT_EXEC);
+    printf("w^x: %ld %ld\n", first, ((long (*)(void))at(wx, jl_ret1))());
+
+    int same = memcmp(code, expect, len) == 0 && memcmp(copy, copy_expect, len) == 0 &&
+               memcmp(wx, wx_expect, len) == 0;
+    printf("memory: %s\n", same ? "as written" : "changed");
+
+    /* A child runs what ran before the fork, and code it changes. */
+    int pid = fork();
+    if (pid == 0) {
+        uint32_t three = movz_x0(3);
+        long before = sum(10);
+        memcpy(at(code, jl_ret1), &three, 4);
+        flush(at(code, jl_ret1), 4);
+        _exit(before == 90 && ret1() == 3 ? 7 : 1);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    printf("fork: child %s, parent %ld\n", (status >> 8) == 7 ? "ok" : "wrong", ret1());
+    return 0;
+}

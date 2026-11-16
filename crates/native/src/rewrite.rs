@@ -37,24 +37,24 @@ pub const TRAP_IMM: u32 = 0x4c58;
 /// `brk #TRAP_IMM`.
 pub const TRAP: u32 = 0xd420_0000 | (TRAP_IMM << 5);
 
-const NOP: u32 = 0xd503_201f;
-const RT_MASK: u32 = 0x1f;
+pub(crate) const NOP: u32 = 0xd503_201f;
+pub(crate) const RT_MASK: u32 = 0x1f;
 /// `mrs xN, tpidr_el0`
-const MRS_TPIDR: u32 = 0xd53b_d040;
+pub(crate) const MRS_TPIDR: u32 = 0xd53b_d040;
 /// `msr tpidr_el0, xN`
-const MSR_TPIDR: u32 = 0xd51b_d040;
+pub(crate) const MSR_TPIDR: u32 = 0xd51b_d040;
 /// `mrs xN, tpidrro_el0`
-const MRS_TPIDRRO: u32 = 0xd53b_d060;
+pub(crate) const MRS_TPIDRRO: u32 = 0xd53b_d060;
 /// `and xD, xN, #~7`
-const AND_NOT7: u32 = 0x927d_f000;
+pub(crate) const AND_NOT7: u32 = 0x927d_f000;
 /// `ldr xT, [xN, #imm]` (unsigned offset, imm/8 in bits 10..22)
-const LDR_UIMM: u32 = 0xf940_0000;
+pub(crate) const LDR_UIMM: u32 = 0xf940_0000;
 /// `str xT, [xN, #imm]` (unsigned offset)
-const STR_UIMM: u32 = 0xf900_0000;
+pub(crate) const STR_UIMM: u32 = 0xf900_0000;
 /// `str xT, [sp, #-16]!`
-const PUSH: u32 = 0xf81f_0fe0;
+pub(crate) const PUSH: u32 = 0xf81f_0fe0;
 /// `ldr xT, [sp], #16`
-const POP: u32 = 0xf841_07e0;
+pub(crate) const POP: u32 = 0xf841_07e0;
 /// `add xD, sp, #48`: the `sp` a three-register stub was entered with.
 const ADD_SP_48: u32 = 0x9100_c3e0;
 /// `sub sp, sp, #imm12`; `| (imm << 10)`.
@@ -70,9 +70,9 @@ const STP_SP: u32 = 0xa900_03e0;
 /// `ldp xA, xB, [sp]`; `| (b << 10) | a`.
 const LDP_SP: u32 = 0xa940_03e0;
 /// `stp xA, xB, [sp, #-16]!`; `| (b << 10) | a`.
-const PUSH_PAIR: u32 = 0xa9bf_03e0;
+pub(crate) const PUSH_PAIR: u32 = 0xa9bf_03e0;
 /// `ldp xA, xB, [sp], #16`; `| (b << 10) | a`.
-const POP_PAIR: u32 = 0xa8c1_03e0;
+pub(crate) const POP_PAIR: u32 = 0xa8c1_03e0;
 /// `ldur xT, [xN, #imm9]`; `| ((imm & 0x1ff) << 12) | (n << 5) | t`.
 pub const LDUR: u32 = 0xf840_0000;
 /// `mov xD, xM` (`orr xD, xzr, xM`); `| (m << 16) | d`.
@@ -80,11 +80,11 @@ const MOV: u32 = 0xaa00_03e0;
 /// `add xD, xN, xM`; `| (m << 16) | (n << 5) | d`.
 const ADD_REG: u32 = 0x8b00_0000;
 /// `b <label>`
-const B: u32 = 0x1400_0000;
+pub(crate) const B: u32 = 0x1400_0000;
 /// `movz xN, #imm16` base; `| (hw << 21) | (imm16 << 5) | n`.
-const MOVZ: u32 = 0xd280_0000;
+pub(crate) const MOVZ: u32 = 0xd280_0000;
 /// `movk xN, #imm16` base.
-const MOVK: u32 = 0xf280_0000;
+pub(crate) const MOVK: u32 = 0xf280_0000;
 
 /// Largest stub, in instructions. The `x18` branch stub and the stub for a
 /// load or store written back onto `sp` are the biggest.
@@ -116,7 +116,7 @@ fn rewritable_x18(insn: u32) -> bool {
 
 /// Whether `insn` is any instruction naming `x18` that this pass rewrites —
 /// operand substitution, a PC-relative form, a branch, or an indirect branch.
-fn x18_site(insn: u32) -> bool {
+pub(crate) fn x18_site(insn: u32) -> bool {
     // Most words name no x18, which the quick check tells.
     crate::decode::may_name_x18(insn) && x18_form(insn)
 }
@@ -145,9 +145,6 @@ pub struct Patched {
     /// writeback and `sp` register-offset load/store forms, and data-processing
     /// forms with an `sp` operand). Diagnostic only.
     pub x18_deferred: usize,
-    /// In JIT code, the offsets of words that read as an `x18` site but were
-    /// taken for data (not among instructions).
-    pub x18_left: Vec<u64>,
     /// Each word that was changed in place or is a site: its offset, what
     /// it was, and whether it was taken for code and known to be code,
     /// which is all [`replay`] needs to do the same again.
@@ -251,29 +248,9 @@ pub fn replay(code: &mut [u8], noted: &[Noted], x18_deferred: usize) -> Option<P
 /// an `x18` instruction is data in practice — a constant table hand-written
 /// assembly keeps among its code — and is left alone.
 pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
-    patch_with(code, known, false)
-}
-
-/// [`patch`] for code a JIT wrote, which comes with nothing saying where
-/// its code is and keeps data among it (HotSpot's code blob headers and
-/// trampolines' addresses, V8's metadata): an `x18` instruction is taken
-/// for one only among instructions ([`among_instructions`]). A pointer or
-/// a small number beside it decodes as no instruction (a pointer's high
-/// half above 4 GiB is a small number), so data that happens to read as
-/// an `x18` instruction is left alone, and code is not.
-pub fn patch_jit(code: &mut [u8]) -> Patched {
-    patch_with(code, None, true)
-}
-
-fn patch_with(code: &mut [u8], known: Option<&[(u64, u64)]>, jit: bool) -> Patched {
     let mut out = Patched::default();
     let words = code.len() / 4;
     let is_code: Vec<bool> = match known {
-        None if jit => {
-            let w: Vec<u32> =
-                code.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-            (0..words).map(|i| fwe_kernel::jitsites::among_instructions(&w, i)).collect()
-        }
         None => vec![true; words],
         Some(ranges) => {
             let mut v = vec![false; words];
@@ -299,9 +276,6 @@ fn patch_with(code: &mut [u8], known: Option<&[(u64, u64)]>, jit: bool) -> Patch
         }
         let insn = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         let w = classify(insn, is_code[i], known_code(i));
-        if jit && !is_code[i] && x18_site(insn) {
-            out.x18_left.push(i as u64 * 4);
-        }
         if w.syscall {
             out.syscalls += 1;
         }
@@ -377,6 +351,31 @@ pub fn branch(from: u64, to: u64) -> Option<u32> {
 /// `x18_slot` are the byte offsets of the guest thread pointer and of the guest
 /// `x18` in the host TSD.
 pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec<u32> {
+    let imm = |slot: u32| (slot / 8) << 10;
+    match site {
+        // Indirect and compare/test branches through x18, and system calls:
+        // complete stubs of their own, with their own ways out.
+        Site::X18 { insn } if crate::decode::x18_indirect(insn).is_some() => {
+            return x18_indirect_stub(insn, imm(x18_slot), ret);
+        }
+        Site::X18 { insn } if crate::decode::x18_branch(insn) => {
+            return x18_branch_stub(insn, imm(x18_slot), stub, ret);
+        }
+        Site::Syscall { gate } => return syscall_stub(gate, stub, ret),
+        _ => {}
+    }
+    let mut words = stub_body(site, tp_slot, x18_slot, ret - 4);
+    let at = stub + 4 * words.len() as u64;
+    words.push(branch(at, ret).expect("stub placed within branch range of its site"));
+    assert!(words.len() <= STUB_WORDS, "a stub longer than its slot");
+    words
+}
+
+/// The words of the stub for `site` (a thread-pointer access, or an
+/// instruction naming `x18` other than a branch), for the instruction at
+/// `pc`, without the branch back: they run on into what follows them.
+pub(crate) fn stub_body(site: Site, tp_slot: u32, x18_slot: u32, pc: u64) -> Vec<u32> {
+    let ret = pc + 4;
     let imm = |slot: u32| {
         assert!(
             slot.is_multiple_of(8) && slot / 8 < 4096,
@@ -384,7 +383,7 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
         );
         (slot / 8) << 10
     };
-    let mut words = match site {
+    match site {
         // Through `x18`: from one slot to the other.
         Site::ReadThreadPointer { rt: 18 } | Site::WriteThreadPointer { rt: 18 } => {
             let (from, to) = match site {
@@ -420,15 +419,10 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
                 POP | s,
             ]
         }
-        // An indirect branch through x18 builds a complete, self-terminating
-        // stub (it ends in `br`), so it is returned directly.
-        Site::X18 { insn } if crate::decode::x18_indirect(insn).is_some() => {
-            return x18_indirect_stub(insn, imm(x18_slot), ret);
-        }
-        // A compare/test branch that reads x18 also builds its own complete
-        // stub, including its outgoing branches.
-        Site::X18 { insn } if crate::decode::x18_branch(insn) => {
-            return x18_branch_stub(insn, imm(x18_slot), stub, ret);
+        Site::X18 { insn }
+            if crate::decode::x18_indirect(insn).is_some() || crate::decode::x18_branch(insn) =>
+        {
+            panic!("a branch through x18 has a stub of its own")
         }
         // PC-relative forms materialize the value computed from the original pc.
         Site::X18 { insn } if crate::decode::x18_adr(insn).is_some() => {
@@ -445,12 +439,8 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
             x18_writes_sp_stub(insn, imm(x18_slot))
         }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
-        Site::Syscall { gate } => return syscall_stub(gate, stub, ret),
-    };
-    let at = stub + 4 * words.len() as u64;
-    words.push(branch(at, ret).expect("stub placed within branch range of its site"));
-    assert!(words.len() <= STUB_WORDS, "a stub longer than its slot");
-    words
+        Site::Syscall { .. } => panic!("a system call has a stub of its own"),
+    }
 }
 
 /// A fault in a stub, as if at its site: the stub's words from its start
@@ -859,6 +849,19 @@ fn x18_writes_sp_stub(insn: u32, imm: u32) -> Vec<u32> {
 
 /// Body of the stub for an `x18`-naming instruction (without the final branch
 /// back). `x18` lives in the TSD slot whose `ldr`/`str` immediate is `imm`.
+/// Where in [`x18_stub`]'s words for `insn` the instruction itself is: the
+/// words before it only save registers and load `x18`'s value, so a
+/// signal there can undo them; the words after it store `x18` back and
+/// restore the registers, so a signal there must finish them, the
+/// instruction having run (it may be an atomic one).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn x18_stub_main(insn: u32) -> usize {
+    let ops = crate::decode::operands(insn).expect("x18 site must decode");
+    let reads = ops.iter().any(|f| (insn >> f.shift) & 0x1f == 18 && f.read);
+    let sp_base = crate::decode::sp_scratch_field(insn).is_some();
+    2 + if sp_base { 2 } else { 0 } + 2 + usize::from(reads)
+}
+
 fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let ops = crate::decode::operands(insn).expect("x18 site must decode");
     let field_reg = |f: &crate::decode::Field| (insn >> f.shift) & 0x1f;
@@ -1354,32 +1357,6 @@ mod tests {
         // Pushed first, so deepest: the first push's register at sp + 16.
         let (s1, s2) = (words[0] & 0x1f, words[1] & 0x1f);
         assert_eq!(r.restored, vec![(s2, 0xaa00), (s1, 0xaa10)]);
-    }
-
-    /// In a JIT's code, an `x18` instruction among instructions is one;
-    /// the same word as the low half of a pointer, its high half beside it
-    /// (a small number), is data. Words past the range's ends do not count.
-    #[test]
-    fn jit_code_x18_sites_are_told_from_data_by_their_neighbours() {
-        fn le(ws: &[u32]) -> Vec<u8> {
-            ws.iter().flat_map(|w| w.to_le_bytes()).collect()
-        }
-        const NOP: u32 = 0xd503_201f;
-        // `ldr x0, [x18, #8]`
-        const LDR_X18: u32 = 0xf940_0640;
-        let mut code = le(&[NOP, NOP, LDR_X18, NOP, NOP]);
-        let p = patch_jit(&mut code);
-        assert_eq!(p.sites.len(), 1, "an x18 instruction among instructions");
-        // HotSpot's trampoline: `ldr x8, #8; br x8`, then the address.
-        let mut code = le(&[0x5800_0048, 0xd61f_0100, LDR_X18, 0x0000_0200, NOP, NOP]);
-        let p = patch_jit(&mut code);
-        assert!(p.sites.is_empty(), "a pointer's low half");
-        assert_eq!(&code[8..12], &LDR_X18.to_le_bytes(), "left as it was");
-        // At the start of the range: only what follows counts.
-        let mut code = le(&[LDR_X18, NOP, NOP]);
-        assert_eq!(patch_jit(&mut code).sites.len(), 1, "at the range's start");
-        let mut code = le(&[NOP, NOP, LDR_X18]);
-        assert_eq!(patch_jit(&mut code).sites.len(), 1, "at the range's end");
     }
 
     /// Outside the known code (what the unwind table covers), a word that

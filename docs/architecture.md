@@ -233,27 +233,29 @@ The pieces:
     mappings are one host region, and a host fork's cost grows with the
     regions.
 - The kernel crate asks for preparation through `Platform::prepare_exec`
-  whenever guest memory becomes executable (`mmap`, `mprotect`, a
-  write+exec fault, in `crates/kernel/src/mm.rs`), passing the code ranges
-  it knows from the file's sections and unwind table; a failure is traced
-  (see [Tracing](#tracing)). Memory made executable after it was mapped
-  is a JIT's, with no ranges: `rewrite::patch_jit` gives an `x18` use a
-  stub only among instructions (`jitsites::among_instructions`), so the data a JIT keeps in its code pages
-  stays as it is, and `--strace` notes the uses given stubs per page
-  ([x18 in JIT code](linux-on-macos.md#x18-in-jit-code)).
-- `crates/kernel/src/jitsites.rs` records each word preparation changes
-  in JIT code, with what it was. `mm::write_exec_writable` (a write to
-  write+exec memory, by the guest or by fwe for it) and `mprotect` adding
-  `PROT_WRITE` put back every such word still as fwe made it, so a JIT
-  patches and copies the code it wrote; the page's next preparation gives
-  a site that is what it was its old branch and stub again. Unmapping or
-  mapping over a range forgets its records. Each word fwe writes is also
-  kept with the word it stands for, and before JIT code is prepared,
-  `jitsites::repair_copies` puts back the program's word for each copy
-  there of a branch fwe wrote elsewhere (one fwe did not write there,
-  among instructions, leading where the guest has no executable memory).
-  `jitsites::among_instructions` is the rule both use to tell a JIT's
-  code from its data.
+  whenever a file's code or anonymous memory is mapped executable
+  (`mmap`, the loader, in `crates/kernel/src/mm.rs`), passing the code
+  ranges it knows from the file's sections and unwind table; a failure is
+  traced (see [Tracing](#tracing)). Memory made executable after it was
+  mapped (`mprotect` adding `PROT_EXEC`, or mapped writable and
+  executable) is handed to the backend instead (`Platform::jit_code`,
+  `jit_changed` when it is unmapped, mapped over, remapped or given other
+  protections), and a signal frame is written from the guest's own state
+  (`Platform::resume_point`).
+- `crates/native/src/jit.rs` runs such memory by translation, never
+  changing it or letting the host execute it: a fetch from it faults
+  (`trap.rs`), and the block there is translated into the code cache
+  (chunks of 128 MiB, each mapped twice, writable for fwe and executable
+  for guest threads). A block's way out is `brk #0x4a54`, told by the
+  syndrome register; a direct branch is then linked, an indirect branch
+  or return looks up a table of translations by guest address at 2^45
+  (`x16`/`x17` saved, restored by the translation's first word), and a
+  stub enters code not translated. Each translated word records what
+  guest state it stands for (`Word`), so a fault or signal there is
+  delivered as at the guest's instruction (`jit::to_guest`). A page
+  translated from is write-protected before it is read; a write drops
+  its translations and the links into them. `fork` holds the
+  translator's lock, and the child maps its executable views again.
 - `crates/kernel/src/prepcache.rs` keeps, in fwe's private directory and
   by a file's identity (device, inode, size, modification time), its
   sections' and unwind table's code ranges and, for each mapped code range
@@ -317,8 +319,9 @@ costs two host calls, one of which could hang.
 
 Natively, every trap guest code takes arrives as a host signal. The fault
 handlers (`on_fault` and `on_sigtrap` in `crates/native/src/trap.rs`) sort
-each into a system call, an emulated instruction, a write+exec page
-switch, a recovered checked copy, a signal another process sent, a signal
+each into a system call, an emulated instruction, a fetch from code run
+by translation or a translation's way out, a write to a page code was
+translated from, a recovered checked copy, a signal another process sent, a signal
 for the guest, or a fatal fault in fwe's own code; what each becomes for
 the guest is in [linux-on-macos.md](linux-on-macos.md#faults-in-guest-code).
 
@@ -415,8 +418,8 @@ records Linux would:
   page asked for, as Linux, which has no non-linear mappings, does.
 - `POSIX_FADV_DONTNEED` writes a range's changes back and drops its pages
   from the host's cache (a shared mapping of it, synced and invalidated).
-- Write+exec memory is recorded in `crates/kernel/src/mm.rs` and handled
-  per backend.
+- Code made executable after it was mapped runs by translation natively
+  (`crates/native/src/jit.rs`) and as it is in the VM.
 
 ## Processes
 
@@ -1427,10 +1430,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   Silicon Mac.
 - The memory-tagging instructions with an `sp` operand, `casp` on `sp`,
   an authenticated load written back onto `sp` and `blraa x18, x30` are
-  left unrewritten when they name `x18` (`--strace` counts them). In JIT
-  code an `x18` use next to data is left unrewritten too, and a data
-  word among instructions that reads as an `x18` instruction is taken
-  for one. A binary with neither section headers nor an
+  left unrewritten when they name `x18` (`--strace` counts them). In code
+  made executable at run time, an authenticated branch and those `x18`
+  forms fault (`SIGILL`). A binary with neither section headers nor an
   unwind table has its whole executable segment taken as code, and an
   inline jump table in code the unwind table covers could be patched.
 
@@ -1537,10 +1539,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `pagemap` entry tells whether a page is in memory, its frame number 0,
   as Linux shows it to a process without `CAP_SYS_ADMIN`.
   `coredump_filter` is the default and cannot be changed.
-- Native: write+exec memory takes a fault each time a page switches
-  between being written and being run, slow for code that does both to
-  one page often; a host call writing into such a page while it is
-  executable (a `read` into it) fails with `EFAULT`.
+- Native: code made executable at run time costs a fault the first time
+  each block runs, and a write to a page it was translated from drops its
+  translations, which are made again as the code runs: slow for code that
+  writes and runs one page often. Translations are not freed; the code
+  cache grows by chunks.
 - VM: a private file mapping is a copy of the file when mapped, so later
   writes to the file do not show; a shared segment cannot grow with
   `mremap`, and `MREMAP_FIXED`/`MREMAP_DONTUNMAP` are refused (`EINVAL`).

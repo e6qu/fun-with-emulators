@@ -124,6 +124,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     fwe_kernel::release_robust_lists();
     fwe_kernel::timing::mark("exec: checked");
     fwe_kernel::mm::release_guest_memory();
+    crate::jit::reset();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
         // SAFETY: closing the pipe end this child holds for its parent.
@@ -262,6 +263,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // A fault signal sent to the child before it is set up is kept
         // for it (`trap::post_early`).
         trap::FORKING.store(host::pid(), Ordering::SeqCst);
+        // The translations whole in the child.
+        let mut jit = crate::jit::hold();
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
@@ -283,6 +286,11 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             set_shared(false);
             pid
         });
+        // The child's code cache's views, its own.
+        if pid == 0 {
+            crate::jit::forked(&mut jit);
+        }
+        drop(jit);
         if pid != 0 {
             trap::FORKING.store(0, Ordering::SeqCst);
         }
