@@ -14,14 +14,16 @@ run at once, but those that change a machine-wide setting or measure time
 (see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
-`--update` rewrites it from the run. A regression is run again alone. A
-timer test (see TIMER) runs with every processor kept busy at the lowest
-priority (`hosttimer spin`), so that none idles: on a virtual machine, as
-a CI runner is, an idle processor's next timer is the VM host's to deliver,
-and there the host's own timers end up to half the wait late (10 ms at
-most). A timer test
-that fails again only by sleeping too long is measured against the host's
-own timers (hosttimer.c), as busy, and named, not failed, if they, with
+`--update` rewrites it from the run. On a virtual machine (a CI runner:
+the host's `kern.hv_vmm_present`) the tests are told so, as
+`systemd-detect-virt`, which the root lacks, would tell them on a Linux
+one (`LTP_VIRT_OVERRIDE`): LTP's timer tests then check no upper bound,
+which a virtual machine cannot keep (there the host's own timers end up to
+half the wait late, 10 ms at most), clock_gettime04 allows ten times the
+gap, and a test that does not run on one skips (named, not failed). A
+regression is run again alone; a
+timer test that then fails only by sleeping too long is measured against
+the host's own timers (hosttimer.c), and named, not failed, if they, with
 fwe's least cost per sleep, miss the same threshold; once the host has so
 missed in a run, its other timer tests that only slept too long are named
 with it. The pass rate is printed either way.
@@ -32,7 +34,6 @@ and is not among them is named (what fwe still lacks).
 
 import argparse
 import concurrent.futures
-import contextlib
 import os
 import re
 import shlex
@@ -79,6 +80,19 @@ def process_limit():
 
 
 PROCESS_LIMIT = process_limit()
+
+
+def virtual_machine():
+    """Whether the host is a virtual machine."""
+    found = subprocess.run(["sysctl", "-n", "kern.hv_vmm_present"], capture_output=True, text=True)
+    return found.stdout.strip() == "1"
+
+
+# What `systemd-detect-virt` names Apple's virtual machines, for
+# `LTP_VIRT_OVERRIDE` (lib/tst_virt.c), on one; else nothing.
+VIRT = "apple" if virtual_machine() else None
+# What a test says as it skips on a virtual machine.
+SKIPS_ON_VM = b"not supported on a virtual machine"
 
 
 def prepare(root):
@@ -181,44 +195,8 @@ def stacks(sid, work):
     return "\n" + "\n".join(out) + "\n"
 
 
-# The timer tests (LTP's tst_timer_test: how late a sleep or a timeout
-# ends), run with every processor kept busy.
-TIMER = re.compile(
-    r"^(select02|poll02|pselect01|epoll_pwait03|epoll_wait02"
-    r"|clock_nanosleep02|nanosleep01|futex_wait05|prctl09)(_64)?$"
-)
-
-
-def hosttimer(work):
-    """hosttimer.c, built in `work` once."""
-    probe = os.path.join(work, "hosttimer")
-    if not os.path.exists(probe):
-        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosttimer.c")
-        subprocess.run(["cc", "-O2", "-o", probe, source], check=True)
-    return probe
-
-
-@contextlib.contextmanager
-def processors_busy(work):
-    """Every processor kept busy at the lowest priority (`hosttimer spin`)
-    while the block runs: an idle processor of a virtual machine takes its
-    next timer late, as the VM host delivers it."""
-    spinner = subprocess.Popen([hosttimer(work), "spin"])
-    try:
-        yield
-    finally:
-        spinner.kill()
-        spinner.wait()
-
-
 def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """Run one test; (name, outcome, seconds, output tail)."""
-    with processors_busy(work) if TIMER.match(name) else contextlib.nullcontext():
-        return run_one_now(fwe, root, work, name, argv, hard_limit)
-
-
-def run_one_now(fwe, root, work, name, argv, hard_limit):
-    """`run_one` as the processors are."""
     bindir = "/opt/ltp/testcases/bin"
     prog = argv[0] if "/" in argv[0] else f"{bindir}/{argv[0]}"
     host_prog = os.path.join(root, prog.lstrip("/"))
@@ -252,6 +230,8 @@ def run_one_now(fwe, root, work, name, argv, hard_limit):
         "HOME": guest_tmp,
         "LANG": "C",
     }
+    if VIRT:
+        env["LTP_VIRT_OVERRIDE"] = VIRT
     start = time.monotonic()
     # Output to a file, not a pipe: a process the test leaves behind, in a
     # process group of its own, would hold a pipe open and the read would
@@ -294,6 +274,8 @@ def run_one_now(fwe, root, work, name, argv, hard_limit):
     # (A timer test's every measurement, for `host_timers_late`.)
     keep = 400 if outcome == "timeout" or b"slept for too long" in out else 40
     tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
+    if outcome == "conf" and VIRT and SKIPS_ON_VM in out:
+        outcome = "conf-vm"
     return name, outcome, time.monotonic() - start, tail
 
 
@@ -312,8 +294,7 @@ def host_timers_late(work, tail):
     """For a timer test (LTP's tst_timer_test) whose only failures are
     sleeps that ended too late: evidence, as lines, that the host made each
     late sleep late itself, or none. The host's own sleeps of the same
-    length are measured (hosttimer.c, up to three rounds, with the
-    processors busy as for the test); fwe's least cost
+    length are measured (hosttimer.c, up to three rounds); fwe's least cost
     per sleep is what its shortest sleep took past the host's shortest.
     The host made the sleep late when its mean, with that cost, is past
     LTP's threshold already."""
@@ -330,13 +311,15 @@ def host_timers_late(work, tail):
                 late_sets.append((usec, n, threshold, int(res[1])))
     if not late_sets:
         return []
-    probe = hosttimer(work)
+    probe = os.path.join(work, "hosttimer")
+    if not os.path.exists(probe):
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosttimer.c")
+        if subprocess.run(["cc", "-O2", "-o", probe, source]).returncode != 0:
+            return []
     found = []
     for usec, n, threshold, fwe_min in late_sets:
         for _ in range(3):
-            # As the timer tests run.
-            with processors_busy(work):
-                r = subprocess.run([probe, str(usec), str(n)], capture_output=True, text=True)
+            r = subprocess.run([probe, str(usec), str(n)], capture_output=True, text=True)
             try:
                 host_min, host_mean, host_max = (float(x) for x in r.stdout.split())
             except ValueError:
@@ -446,7 +429,7 @@ def main():
             done += 1
             results[name] = outcome
             print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
-            if args.show and outcome not in ("pass", "conf", "script", "missing"):
+            if args.show and outcome not in ("pass", "conf", "conf-vm", "script", "missing"):
                 print("    " + tail.replace("\n", "\n    "), flush=True)
 
         parallel = [(n, a) for n, a in tests if not SERIAL.match(n)]
@@ -480,26 +463,34 @@ def main():
         counts[outcome] = counts.get(outcome, 0) + 1
     passed = counts.get("pass", 0)
     run = len(results) - counts.get("script", 0) - counts.get("missing", 0)
-    applicable = run - counts.get("conf", 0) - counts.get("exception", 0)
+    applicable = run - counts.get("conf", 0) - counts.get("conf-vm", 0) - counts.get("exception", 0)
     print("\noutcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     print(f"passed {passed} of {run} run ({100 * passed / max(run, 1):.1f}%), "
           f"{passed} of {applicable} applicable ({100 * passed / max(applicable, 1):.1f}%)")
 
     if args.update:
+        # (One that skipped on a virtual machine stays as it was.)
+        with open(args.baseline) as f:
+            was = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+        keep = {n for n, o in results.items() if o == "pass" or o == "conf-vm" and n in was}
         with open(args.baseline, "w") as f:
             f.write("# LTP system-call tests that pass under fwe (tools/ltp/run.py --update).\n")
-            for name in sorted(n for n, o in results.items() if o == "pass"):
+            for name in sorted(keep):
                 f.write(name + "\n")
         print(f"baseline: {passed} tests written to {args.baseline}")
         return 0
 
     with open(args.baseline) as f:
         baseline = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    regressed = [n for n in baseline if n in results and results[n] != "pass"]
+    # A test that skips on a virtual machine has not regressed there.
+    regressed = [n for n in baseline if n in results and results[n] not in ("pass", "conf-vm")]
     newly = sorted(n for n, o in results.items() if o == "pass" and n not in set(baseline))
     if newly:
         print(f"passing, not in the baseline ({len(newly)}): " + " ".join(newly))
     skipped = sorted(n for n, o in results.items() if o == "conf")
+    on_vm = sorted(n for n, o in results.items() if o == "conf-vm")
+    if on_vm:
+        print(f"skipped on a virtual machine ({len(on_vm)}): " + " ".join(on_vm))
     if skipped:
         print(f"skipped, not in the exceptions ({len(skipped)}): " + " ".join(skipped))
     if regressed:

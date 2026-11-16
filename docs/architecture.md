@@ -1718,10 +1718,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A sleep or timeout ends tens of microseconds late (the host's timer
   wake and fwe's return to the guest), and on a loaded host it, or the
   gap between two successive calls, can stretch to milliseconds. On a
-  virtual Mac (a CI runner) whose processors idle, the host's own
-  `NOTE_CRITICAL` timers, and so fwe's, end up to half the wait late (10
-  ms at most): more than LTP's timer tests and `clock_gettime04` allow,
-  so tools/ltp/run.py keeps every processor busy as they run.
+  virtual Mac (a CI runner) the host's own `NOTE_CRITICAL` timers, and so
+  fwe's, end up to half the wait late (10 ms at most), as LTP expects of
+  a virtual machine: tools/ltp/run.py tells its tests they run in one
+  (`LTP_VIRT_OVERRIDE`), as `systemd-detect-virt` would on Linux, and its
+  timer tests then check no upper bound.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in
