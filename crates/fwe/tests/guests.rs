@@ -3161,8 +3161,10 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
     let _ = std::fs::remove_dir_all(&kept);
     std::fs::create_dir_all(&kept).unwrap();
     let bin = "/usr/lib/jvm/java-25-openjdk/bin";
+    let step = std::cell::Cell::new(0);
     let run = |name: &str, args: &[String]| {
-        let trace = kept.join(format!("{name}.trace"));
+        step.set(step.get() + 1);
+        let trace = kept.join(format!("{}-{name}.trace", step.get()));
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--strace")
             .arg(format!("--strace-file={}", trace.display()))
@@ -3178,6 +3180,19 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
         eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
         jit_x18_summary(name, &trace);
         if !out.status.success() {
+            // HotSpot's report of a fatal error: on standard output, and in
+            // full in its error file.
+            eprintln!("--- {name} stdout:\n{}", stdout(&out));
+            for e in std::fs::read_dir(root.join("tmp")).unwrap().flatten() {
+                let n = e.file_name().into_string().unwrap_or_default();
+                if n.starts_with("hs_err") {
+                    let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    let _ = std::fs::write(kept.join(&n), &text);
+                    let head: Vec<&str> = text.lines().take(150).collect();
+                    eprintln!("--- {n}:\n{}", head.join("\n"));
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
             print_last_calls(&trace);
             let text = std::fs::read_to_string(&trace).unwrap_or_default();
             for l in text.lines().filter(|l| l.contains("--- signal") || l.contains("fault")) {
@@ -3186,11 +3201,28 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
         }
         out
     };
-    let mut javac = vec!["-d".to_string(), "/tmp/out".to_string()];
+    let errors = "-XX:ErrorFile=/tmp/hs_err_%p.log";
+    // Which of HotSpot's execution modes work: the interpreter alone, the
+    // first-tier compiler (C1), then everything.
+    for (what, extra) in [("interpreter", "-Xint"), ("C1", "-XX:TieredStopAtLevel=1")] {
+        let out = run("java", &[errors.into(), extra.into(), "-version".into()]);
+        eprintln!("java -version with the {what}: {}", out.status);
+        let mut javac = vec![
+            format!("-J{errors}"),
+            format!("-J{extra}"),
+            "-d".into(),
+            format!("/tmp/out-{what}"),
+        ];
+        javac.extend(sources.iter().map(|n| format!("/tmp/src/{n}")));
+        let out = run("javac", &javac);
+        eprintln!("javac with the {what}: {}", out.status);
+    }
+    let mut javac = vec![format!("-J{errors}"), "-d".to_string(), "/tmp/out".to_string()];
     javac.extend(sources.iter().map(|n| format!("/tmp/src/{n}")));
     let out = run("javac", &javac);
     assert!(out.status.success(), "javac failed");
-    let out = run("java", &["-cp".into(), "/tmp/out".into(), "Main".into(), "1".into()]);
+    let out =
+        run("java", &[errors.into(), "-cp".into(), "/tmp/out".into(), "Main".into(), "1".into()]);
     assert_eq!(
         stdout(&out),
         "words: 1280000 in 1884 kinds, most sa=35916 vi=35899 ar=35637 ka=35613 qu=35596\n\
