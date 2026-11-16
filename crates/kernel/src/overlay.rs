@@ -1117,6 +1117,10 @@ fn cursors<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Cursor>) -> R) 
 }
 
 /// Run `f` holding the cursors' lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = CURSORS.lock();
     f()

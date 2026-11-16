@@ -81,6 +81,10 @@ fn key() -> libc::pthread_key_t {
 }
 
 /// This thread's block, if it has one. Async-signal-safe.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn block() -> Option<&'static Block> {
     // SAFETY: reading this thread's value of fwe's key.
     let p = unsafe { libc::pthread_getspecific(key()) } as *const Block;

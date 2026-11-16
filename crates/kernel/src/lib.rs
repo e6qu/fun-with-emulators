@@ -1066,6 +1066,10 @@ impl<P: Platform> Kernel<P> {
     /// call runs again; if the handler has `SA_RESTART` and the call is one
     /// Linux restarts, it runs again after the handler returns; otherwise the
     /// guest gets `EINTR` once the handler returns.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.tracer.syscall(nr, args, result);
         // (`restart_syscall`'s own `EINTR` is its answer, not a host's.)
@@ -1167,6 +1171,10 @@ pub fn thread_reused() {
 /// Release every thread's robust futexes (`set_robust_list`) as the
 /// process ends or runs another program, its memory still there: Linux
 /// releases each thread's as the thread ends.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn release_robust_lists() {
     futex::release_robust(thread::take_robust_list(), thread::tid());
     for (tid, head) in thread::take_others_robust() {
@@ -1401,7 +1409,11 @@ pub fn forbid_fork() {
 /// the kernel's own registries use held, so that in a multithreaded guest
 /// the child cannot inherit one locked by a thread that does not exist in
 /// it. The caller holds the kernel lock itself. The locks are released in
-/// both processes.
+/// both processes. A process with no other thread takes none.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     if NO_FORK.load(std::sync::atomic::Ordering::SeqCst) {
         // SAFETY: setting this thread's errno.
@@ -1415,6 +1427,12 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
             *libc::__errno_location() = libc::ENOSYS
         };
         return -1;
+    }
+    // With no other thread in the process, none holds a lock the child
+    // would find held: the locks are not taken, which would touch (and
+    // copy, in both processes) the pages of every one of them.
+    if host::only_thread() {
+        return fork();
     }
     reaper::hold(|| {
         signalfd::hold(|| {
@@ -1481,6 +1499,10 @@ pub fn wake_futex(addr: u64, count: u32) {
 ///
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     // None of the calls run on the shared side waits, nor does a memory
     // call.
@@ -1520,6 +1542,10 @@ pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
 /// differs: a write refused to a sealed memfd, a socket that stands in for
 /// another kind, a read of an unconnected Unix socket, and the `SIGPIPE` a
 /// socket write to a closed peer raises.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     inotify::after_io(nr, a, r);
     if r > 0 && matches!(nr, fwe_abi::nr::WRITE | fwe_abi::nr::WRITEV) {
@@ -2003,6 +2029,10 @@ fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
 ///
 /// # Safety
 /// As for [`blocking_syscall`].
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {

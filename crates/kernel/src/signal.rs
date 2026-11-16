@@ -535,6 +535,10 @@ impl<P: Platform> Kernel<P> {
     /// ignored ones are dropped, default actions are taken, and the first
     /// one with a handler enters it. Ends a finished `rt_sigsuspend` by
     /// restoring the mask it replaced, if no handler did.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn deliver_pending(&mut self, regs: &mut Regs) {
         // Most often nothing is pending: the thread's state in one look.
         if self.settle_shared() {

@@ -6,12 +6,14 @@
 //!
 //! - **Entries**, one for each host pid: a lock, a sequence number (odd
 //!   while the record changes), where the record's bytes are and how many,
-//!   and the Linux wait status the process left as it ended of a signal.
-//!   A bit for each pid with a record lets a listing skip the rest.
+//!   and the Linux wait status the process left as it ended of a signal;
+//!   one of each kind (its record, thread list, mappings...), a pid's side
+//!   by side. A bit for each pid with a record lets a listing skip the
+//!   rest.
 //! - **Blocks** of 4 KiB hold the bytes, chained, taken from and given back
 //!   to a bitmap of free ones.
 //! - **Ended accounts** (how a process ended, for its reaper): a table of
-//!   their own, each taken whole by one reaper.
+//!   their own, each taken whole by one reaper, and a count of them.
 //! - **Thread numbers** outside a pid namespace ([`crate::thread`]): a
 //!   counter blocks of them are taken from, and each block's process.
 //! - **Signal mailboxes** ([`crate::signote`]): a pool of them, each given
@@ -124,6 +126,9 @@ const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 const UNWRITTEN_AT: usize = USED_AT + PIDS / 8;
 const ENDED_AT: usize = UNWRITTEN_AT + PIDS / 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
+/// How many ended accounts are kept or being kept or taken
+/// ([`Store::ended_kept`]), in the free hint's line.
+const ENDED_KEPT_AT: usize = FREE_HINT_AT + 8;
 /// Thread-number blocks: the next block's first number, then each
 /// block's process.
 pub const TID_BLOCKS: usize = 1 << 16;
@@ -322,9 +327,11 @@ impl Store {
         self.entry_of(Kind::Record, pid)
     }
 
+    /// A pid's entries side by side, one of each kind: a process just
+    /// forked, which writes several of its own, finds them on one page.
     fn entry_of(&self, kind: Kind, pid: i32) -> Option<&Entry> {
         let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
-        Some(self.at(ENTRIES_AT + (kind as usize * PIDS + i) * size_of::<Entry>()))
+        Some(self.at(ENTRIES_AT + (i * KINDS + kind as usize) * size_of::<Entry>()))
     }
 
     fn unwritten(&self, word: usize) -> &AtomicU64 {
@@ -346,6 +353,14 @@ impl Store {
     /// The lowest word of the block bitmap that may have a free block.
     fn free_hint(&self) -> &AtomicU32 {
         self.at(FREE_HINT_AT)
+    }
+
+    /// How many ended-account slots are not free: counted up before one is
+    /// filled and down once it is free again, so that none is in use while
+    /// it reads 0, and a look for an account, most often when there is
+    /// none (a parent reaping its child), reads one word, not the table.
+    fn ended_kept(&self) -> &AtomicU32 {
+        self.at(ENDED_KEPT_AT)
     }
 
     /// Block `b` (from 1): its link to the next (0 for none) and its room.
@@ -397,6 +412,10 @@ impl Store {
 
     /// Write `bytes` into new blocks: the first. With no room (256 MiB of
     /// records), the process ends saying so.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn write_chain(&self, bytes: &[u8]) -> u32 {
         let mut chunks: Vec<&[u8]> = bytes.chunks(ROOM).collect();
         if chunks.is_empty() {
@@ -563,6 +582,10 @@ pub fn free_cell(tag: u64) {
 /// The page tagged `tag` (not 0), or with `make` (`Some(owner)`) a new
 /// one, zeroed, kept until [`free_page`], or until host process `owner`
 /// is gone and the pages run short (`None`: none so tagged).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn page(tag: u64, make: Option<i32>) -> Option<&'static [Word; PAGE_WORDS]> {
     let s = store();
     let tags = |i: usize| -> &'static [Word; 2] { s.at(PAGE_TAGS_AT + i * 16) };
@@ -651,6 +674,10 @@ pub fn get(pid: i32) -> Option<Vec<u8>> {
 }
 
 /// What host pid `pid`'s entry of `kind` holds, if anything.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
     let s = store();
     let e = s.entry_of(kind, pid)?;
@@ -691,12 +718,20 @@ impl Drop for Held {
 }
 
 /// Hold host pid `pid`'s record lock while the result lives.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn lock(pid: i32) -> Option<Held> {
     Some(hold(&store().entry(pid)?.lock))
 }
 
 /// Hold the lock `word` (its holder's host pid, 0: free) while the result
 /// lives. A lock its holder left as it died is taken over.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn hold(word: &'static AtomicU32) -> Held {
     let me = crate::host::pid() as u32;
     loop {
@@ -717,6 +752,10 @@ fn hold(word: &'static AtomicU32) -> Held {
 }
 
 /// Write `bytes` as host pid `pid`'s record, under its lock (`_held`).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn put(_held: &Held, pid: i32, bytes: &[u8]) {
     let s = store();
     let Some(e) = s.entry(pid) else { return };
@@ -770,6 +809,10 @@ pub fn remove(_held: &Held, pid: i32) {
 
 /// Write `bytes` as this process's entry of `kind` (one it alone writes,
 /// its threads taking turns): `None` for none.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn put_own(kind: Kind, bytes: Option<&[u8]>) {
     let s = store();
     let Some(e) = s.entry_of(kind, crate::host::pid()) else { return };
@@ -840,9 +883,12 @@ pub fn put_ended(pid: i32, start: u64, bytes: &[u8]) {
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
-        if st(cur) != FREE
-            || slot.state.compare_exchange(cur, next(cur, FILLING), SeqCst, SeqCst).is_err()
-        {
+        if st(cur) != FREE {
+            continue;
+        }
+        s.ended_kept().fetch_add(1, SeqCst);
+        if slot.state.compare_exchange(cur, next(cur, FILLING), SeqCst, SeqCst).is_err() {
+            s.ended_kept().fetch_sub(1, SeqCst);
             continue;
         }
         slot.pid.store(pid as u32, SeqCst);
@@ -859,6 +905,9 @@ pub fn put_ended(pid: i32, start: u64, bytes: &[u8]) {
 pub fn ended(wanted: impl Fn(i32) -> bool) -> Vec<Vec<u8>> {
     let s = store();
     let mut out = Vec::new();
+    if s.ended_kept().load(SeqCst) == 0 {
+        return out;
+    }
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
@@ -881,6 +930,9 @@ pub fn ended(wanted: impl Fn(i32) -> bool) -> Vec<Vec<u8>> {
 /// whether this caller took it (one caller does).
 pub fn take_ended(pid: i32, start: u64) -> bool {
     let s = store();
+    if s.ended_kept().load(SeqCst) == 0 {
+        return false;
+    }
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
@@ -894,6 +946,7 @@ pub fn take_ended(pid: i32, start: u64) -> bool {
         let (head, len) = (slot.head.load(SeqCst), slot.len.load(SeqCst) as usize);
         s.free_chain(head, len);
         slot.state.store(next(next(cur, TAKING), FREE), SeqCst);
+        s.ended_kept().fetch_sub(1, SeqCst);
         return true;
     }
     false
@@ -903,12 +956,13 @@ pub fn take_ended(pid: i32, start: u64) -> bool {
 /// is kept.
 pub fn has_ended(pid: i32, start: u64) -> bool {
     let s = store();
-    (0..ENDED).any(|i| {
-        let slot = s.ended(i);
-        st(slot.state.load(SeqCst)) == FULL
-            && slot.pid.load(SeqCst) == pid as u32
-            && slot.start.load(SeqCst) == start
-    })
+    s.ended_kept().load(SeqCst) != 0
+        && (0..ENDED).any(|i| {
+            let slot = s.ended(i);
+            st(slot.state.load(SeqCst)) == FULL
+                && slot.pid.load(SeqCst) == pid as u32
+                && slot.start.load(SeqCst) == start
+        })
 }
 
 /// Wait while `word` is `value`, `timeout_ns` at most, for another process

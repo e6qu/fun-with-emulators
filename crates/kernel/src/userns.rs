@@ -86,6 +86,10 @@ pub(crate) static CURRENT: Mutex<Option<Arc<Chain>>> = Mutex::new(None);
 static NESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// The chain from `ns` up.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {
     let mut out = Vec::new();
     let mut at = ns;
@@ -98,6 +102,10 @@ pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {
 }
 
 /// Make `ns` (and those above it) the process's.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn set_current(ns: Option<Arc<Record<UserNs>>>) {
     let chain = Arc::new(chain_from(ns));
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());

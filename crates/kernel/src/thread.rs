@@ -49,6 +49,10 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
 /// child as soon as the parent's `fork` returns), is kept: the parent's,
 /// which the child does not inherit, are dropped as the fork returns
 /// ([`forked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn init_main(pid: i32) {
     TGID.store(pid, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
@@ -489,6 +493,10 @@ static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): from
 /// when it first has more than its main thread, in its entry of the
 /// process store ([`crate::procstore`]), which only it writes.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn publish_tids(tids: &[i32]) {
     if TIDS_ENDED.load(Ordering::SeqCst) {
         return;
@@ -953,6 +961,10 @@ impl Pending {
         }
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn take(&self, sig: u64) -> Option<SigInfo> {
         let i = (sig - 1) as usize;
         let bit = 1 << i;
@@ -993,6 +1005,10 @@ impl Pending {
         self.bits.load(Ordering::Acquire)
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn clear(&self) {
         uncount(u64::from(self.bits.swap(0, Ordering::AcqRel).count_ones()));
         // (In a fork child, a slot another thread of the parent held.)
@@ -1086,6 +1102,10 @@ struct Registered {
 static THREADS: Mutex<Vec<Registered>> = Mutex::new(Vec::new());
 
 /// The guest's threads, by tid, the main thread's (the process's) first.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn tids() -> Vec<i32> {
     let me = tgid();
     let mut out = vec![me];
@@ -1175,6 +1195,10 @@ fn own_bits(own: *const Pending) -> u64 {
 }
 
 /// Run `f` holding the thread registry lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     f()
@@ -1193,6 +1217,10 @@ pub fn register_current() {
 /// sent to it the moment `clone` returns is kept for it. The new thread
 /// [`adopt`]s the returned set; its creator calls [`set_host_thread`] once
 /// the host thread exists.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn register(tid: i32) -> Arc<Pending> {
     if tid != tgid() {
         let s = slack();
@@ -1237,6 +1265,10 @@ pub fn adopt(pending: &Arc<Pending>) {
 
 /// Record the host thread of the registration owning `pending`. Does
 /// nothing if that thread has already exited.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn set_host_thread(pending: &Arc<Pending>, host: libc::pthread_t) {
     let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = threads.iter_mut().find(|r| Arc::ptr_eq(&r.pending, pending)) {

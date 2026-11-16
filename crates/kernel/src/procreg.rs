@@ -149,6 +149,10 @@ impl Security {
         e.u32(self.filters);
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn decode(d: &mut Dec) -> Security {
         let caps = [d.u64(), d.u64(), d.u64(), d.u64(), d.u64()];
         let (dumpable, ptracer, no_new_privs) = (d.u8(), d.i32(), d.bool());
@@ -208,6 +212,10 @@ impl Sched {
         }
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn decode(d: &mut Dec) -> Sched {
         let (policy, priority, reset_on_fork) = (d.u32(), d.u32(), d.bool());
         let (runtime, deadline, period) = (d.u64(), d.u64(), d.u64());
@@ -228,6 +236,10 @@ fn put_procs(e: &mut Enc, ps: &[Proc]) {
     }
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn get_procs(d: &mut Dec) -> Vec<Proc> {
     let n = d.count(12);
     (0..n).map(|_| (d.i32(), d.u64())).collect()
@@ -267,6 +279,10 @@ pub fn host_parent(pid: i32) -> Option<i32> {
 }
 
 /// When host process `pid` started, if it exists.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn start_time(pid: i32) -> Option<u64> {
     host_info(pid).map(|(start, _, _)| start)
 }
@@ -327,6 +343,10 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
 }
 
 /// The record of live host process `pid`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn read(pid: i32) -> Option<ProcRecord> {
     if pid == crate::host::pid() {
         return with_held(pid, read_own(pid));
@@ -396,8 +416,27 @@ fn read_own(me: i32) -> Option<ProcRecord> {
 }
 
 /// The record kept for host pid `pid`, whether or not its process lives.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn read_any(pid: i32) -> Option<ProcRecord> {
     decode(&crate::procstore::get(pid)?)
+}
+
+/// The head of a record [`encode`] wrote: when its process started, its
+/// namespaces and its parent (the first of its line).
+fn decode_head(bytes: &[u8]) -> Option<(u64, Vec<Vec<u8>>, Option<i32>)> {
+    let mut d = Dec::new(bytes);
+    let start = d.u64();
+    d.bytes();
+    let n = d.count(8);
+    let ns = (0..n).map(|_| d.bytes()).collect();
+    for _ in 0..3 {
+        d.bytes();
+    }
+    let parent = get_procs(&mut d).first().map(|&(p, _)| p);
+    d.whole().then_some((start, ns, parent))
 }
 
 fn decode(bytes: &[u8]) -> Option<ProcRecord> {
@@ -794,6 +833,10 @@ fn change_own(f: impl Fn(&mut ProcRecord) + Send + 'static) {
 }
 
 /// This process's record with the changes [`batch`] holds back.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn with_held(pid: i32, r: Option<ProcRecord>) -> Option<ProcRecord> {
     if !BATCHING.load(std::sync::atomic::Ordering::SeqCst) {
         return r;
@@ -1300,23 +1343,81 @@ pub fn own_whole(
     auxv: &[u8],
     from: &FromParent,
 ) {
-    let _ = change(me(), |r| {
-        if r.lineage.is_empty() {
-            apply(r, inherit);
-            r.ns = ns;
-        }
-        if r.cgroup.is_empty() {
-            r.cgroup = from.cgroup.clone();
-        }
-        if r.exe.is_empty() {
-            (r.comm, r.cmdline, r.exe) =
-                (from.comm.clone(), from.cmdline.clone(), from.exe.clone());
-        }
-        (r.lineage, r.bound) = line.clone();
-        r.autoreap = from.autoreap;
-        r.maps = maps;
-        r.auxv = auxv.to_vec();
-    });
+    let _ = change(me(), |r| fill_child(r, line, inherit, ns, maps, auxv, from));
+}
+
+/// What [`own_whole`] writes into a child's record `r`.
+fn fill_child(
+    r: &mut ProcRecord,
+    line: &(Vec<Proc>, Option<Proc>),
+    inherit: &Inherit,
+    ns: Vec<Vec<u8>>,
+    maps: Vec<u8>,
+    auxv: &[u8],
+    from: &FromParent,
+) {
+    if r.lineage.is_empty() {
+        apply(r, inherit);
+        r.ns = ns;
+    }
+    if r.cgroup.is_empty() {
+        r.cgroup = from.cgroup.clone();
+    }
+    if r.exe.is_empty() {
+        (r.comm, r.cmdline, r.exe) = (from.comm.clone(), from.cmdline.clone(), from.exe.clone());
+    }
+    (r.lineage, r.bound) = line.clone();
+    r.autoreap = from.autoreap;
+    r.maps = maps;
+    r.auxv = auxv.to_vec();
+}
+
+/// A fork child's whole record, made by its parent before the fork, as
+/// the child would make it ([`own_whole`] on a record of its own, with the
+/// limits [`crate::syscalls::publish_limits`] adds): the child, which
+/// starts with the parent's memory, writes it whole ([`own_prepared`])
+/// instead of making it, which would take it through the code and memory
+/// the making needs, every page of them a fault in a process just forked.
+/// Its start time, which only the child knows, is left 0.
+#[derive(Clone, Debug)]
+pub struct Prepared(Vec<u8>);
+
+impl Prepared {
+    pub fn of(
+        line: &(Vec<Proc>, Option<Proc>),
+        inherit: &Inherit,
+        ns: Vec<Vec<u8>>,
+        maps: Vec<u8>,
+        auxv: &[u8],
+        from: &FromParent,
+        rlimits: Vec<(u32, u64, u64)>,
+    ) -> Prepared {
+        // Its process group and nice value are this process's, which it
+        // inherits.
+        let mut r = fresh(me(), 0);
+        fill_child(&mut r, line, inherit, ns, maps, auxv, from);
+        r.rlimits = rlimits;
+        Prepared(encode(&r))
+    }
+}
+
+/// In a fork child: write the record its parent made for it ([`Prepared`])
+/// as its own, with its start time. False, writing nothing, when a record
+/// of it is there already (another process changed it since the fork):
+/// its record is then made into that one ([`own_whole`]).
+pub fn own_prepared(prepared: &Prepared) -> bool {
+    let me = me();
+    let Some(start) = start_time(me) else { return false };
+    let Some(held) = crate::procstore::lock(me) else { return false };
+    let start = start.to_le_bytes();
+    // (A record begins with its start time, [`encode`].)
+    if crate::procstore::get(me).is_some_and(|b| b.get(..8) == Some(&start[..])) {
+        return false;
+    }
+    let mut bytes = prepared.0.clone();
+    bytes[..8].copy_from_slice(&start);
+    crate::procstore::put(&held, me, &bytes);
+    true
 }
 
 /// Make this process a child subreaper, or not, with the orphans below it
@@ -1593,14 +1694,31 @@ pub fn take_adopted_end(e: &Ended) -> bool {
 pub fn reaped(pid: i32) {
     forget_end(pid);
     crate::reaper::forget_exit_signal(pid);
-    if read(pid).is_none()
-        && let Some(held) = crate::procstore::lock(pid)
-        && let Some(r) = read_any(pid)
-        && r.lineage.first().is_some_and(|&(p, _)| p == me())
-    {
-        // An init killed outright: its namespace goes with it.
-        crate::pidns::init_gone(&r.ns, pid);
-        remove(&held, pid);
+    // The record goes, unless a process that has the pid since wrote it:
+    // one look at its head, under its lock.
+    if let Some(held) = crate::procstore::lock(pid) {
+        match crate::procstore::get(pid).and_then(|b| decode_head(&b)) {
+            Some((start, ns, parent)) if parent == Some(me()) => {
+                let now = start_time(pid);
+                if now != Some(start) {
+                    // An init killed outright: its namespace goes with it.
+                    crate::pidns::init_gone(&ns, pid);
+                    crate::procstore::remove(&held, pid);
+                    // Its mailbox, unless a process has the pid now.
+                    if now.is_none() {
+                        crate::signote::remove(pid);
+                    }
+                }
+            }
+            Some(_) => {}
+            // It ended before it wrote one: it writes none.
+            None if crate::procstore::unwritten(pid)
+                && !host_info(pid).is_some_and(|(_, _, zombie)| !zombie) =>
+            {
+                crate::procstore::forget_unwritten(pid);
+            }
+            None => {}
+        }
     }
     for e in ended_of(pid) {
         // Only the one the parent reaped: an older process with its pid
@@ -1613,6 +1731,10 @@ pub fn reaped(pid: i32) {
 
 /// This process is ending with Linux wait status `status`: leave a record
 /// of how it ended if a reaper might take it.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn exiting(status: i32) {
     // The robust futexes its threads hold.
     crate::release_robust_lists();

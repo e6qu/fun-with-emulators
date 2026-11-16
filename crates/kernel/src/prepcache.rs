@@ -91,7 +91,7 @@ pub fn code_key(id: FileId, offset: u64, len: u64, known: Option<&[(u64, u64)]>)
 /// The entry kept under `key`, if there is one.
 pub fn load(key: &[u8]) -> Option<Vec<u8>> {
     let path = path_of(key)?;
-    let data = std::fs::read(std::ffi::OsStr::from_bytes(&path)).ok()?;
+    let data = crate::fs::read_all_path(&path).ok()?;
     let mut d = Dec::new(&data);
     let (k, v) = (d.bytes(), d.bytes());
     (d.finish().is_ok() && k == key).then_some(v)

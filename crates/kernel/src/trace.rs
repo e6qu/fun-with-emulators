@@ -54,6 +54,10 @@ pub struct Tracer {
 }
 
 impl Tracer {
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn syscall(&self, nr: u64, args: &[u64; 6], result: i64) {
         if !self.enabled || self.failures_only && !(-4095..0).contains(&result) {
             return;

@@ -142,6 +142,10 @@ pub fn crosses(addr: u64, len: u64) -> bool {
 
 /// The host address of guest address `addr`, and how many bytes from it
 /// on share its translation (`u64::MAX` for an untranslated run).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn run(addr: u64) -> (u64, u64) {
     if TRANSLATED.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return (addr, u64::MAX);
@@ -377,6 +381,10 @@ fn check(ok: bool) -> Result<()> {
 ///
 /// # Safety
 /// `buf` must be valid for `len` bytes.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Result<()> {
     let addr = guest_of(addr);
     // Past a user address space (48 bits), or wrapping: never the guest's,

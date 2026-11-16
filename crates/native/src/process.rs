@@ -211,6 +211,10 @@ pub(crate) fn reserve_pair(fds: [i32; 2]) -> Result<[i32; 2], i32> {
 /// the child has called `execve` or exited, as Linux suspends it; what the
 /// child writes before then (glibc's `posix_spawn` reporting an exec
 /// failure, say) the parent sees.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
@@ -246,7 +250,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             }
         };
         // The child writes its whole record as it starts.
-        fwe_kernel::Kernel::<NativePlatform>::fork_child_writes(&mut token);
+        k.fork_child_writes(&mut token);
         let kqueues = fwe_kernel::kqueue_state();
         // A child of CLONE_VM shares the guest's memory: its private parts
         // are shared for the fork, then copied again by any later one (in
@@ -411,6 +415,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
 /// The child goes on only once the parent has unblocked them: a signal the
 /// child sends its parent sooner would be left pending, and macOS empties
 /// the `siginfo` of a signal it holds blocked, so its sender would be lost.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn fork_with_signals_held(
     fork: impl FnOnce() -> libc::pid_t,
     in_parent: impl FnOnce(libc::pid_t),

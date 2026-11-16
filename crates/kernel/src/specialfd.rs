@@ -286,6 +286,10 @@ pub(crate) fn import(
 }
 
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_os = "linux")]
     {
@@ -306,6 +310,10 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 /// Rebuild the registry in a fork child from [`save`]'s record: eventfd pipes
 /// are inherited as they are; each timerfd gets a fresh kqueue at its number,
 /// armed for what was left of its time.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     #[cfg(target_os = "linux")]
     let _ = d.count(1);
@@ -750,6 +758,10 @@ mod imp {
         })
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub(super) fn hold<R>(f: impl FnOnce() -> R) -> R {
         let _g = REG.lock();
         f()

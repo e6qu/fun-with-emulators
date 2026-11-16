@@ -62,6 +62,10 @@ fn publish_held() {
 
 /// Run `f` (a host `fork`) with the registry's lock held, released in both
 /// processes (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
     f()
@@ -166,6 +170,10 @@ pub fn started(tid: i32) {
 }
 
 /// A new thread picks up the view [`started`] left for it.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn enter(tid: i32) {
     let p = owners(|o| o.get_mut(&tid).map(|w| &mut *w.fs as *mut Fs));
     if let Some(p) = p {
@@ -199,6 +207,10 @@ pub fn thread_exit() {
 
 /// In the child of a `fork`, whose one thread is this one: its own view,
 /// if it has one, which becomes the process's; the other threads' go.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn take_for_child() -> Option<Fs> {
     let me = crate::thread::tid();
     CURRENT.with(|c| c.set(std::ptr::null_mut()));

@@ -139,6 +139,10 @@ static ANY_GROWS_DOWN: AtomicBool = AtomicBool::new(false);
 static RANGES: Mutex<Ranges> = Mutex::new(Ranges::NONE);
 
 /// The ranges, the latest mapping among them.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn lock_ranges() -> std::sync::MutexGuard<'static, Ranges> {
     let mut r = lock_ranges_as_they_are();
     r.settle();
@@ -295,6 +299,10 @@ impl<P: Platform> Kernel<P> {
 /// gives the child new memory there. They are zeroed in place, the
 /// mappings left as they are (a backend may map the memory itself),
 /// writable for the moment if they are not.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn forked_child() {
     // Kept as start and end.
     let ranges: Vec<(u64, u64)> =
@@ -579,6 +587,10 @@ pub(crate) fn resident(start: u64, end: u64) -> u64 {
 }
 
 /// Run `f` holding the tracking lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = lock_ranges();
     f()

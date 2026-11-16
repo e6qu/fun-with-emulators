@@ -54,6 +54,10 @@ pub fn closed(fd: i32) {
 
 /// Before call `n`: what its read of a file of a `noatime`, `nodiratime`
 /// or `strictatime` mount needs afterwards.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn before(n: u64, a: &[u64; 6]) -> Option<Before> {
     let fd = read_fd(n, a)?;
     // Opened with `O_NOATIME`: as a `noatime` mount's file.
@@ -88,6 +92,10 @@ pub fn before(n: u64, a: &[u64; 6]) -> Option<Before> {
 
 /// After the call noted `b` returned `r`: the access time as the mount has
 /// it.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn after(b: Option<Before>, r: i64) {
     let Some(b) = b else { return };
     if r < 0 {

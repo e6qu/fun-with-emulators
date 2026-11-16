@@ -245,6 +245,10 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 /// re-executed (true): a new kqueue at the number of each process
 /// descriptor, as the host passes none on (across an exec, of those not
 /// close-on-exec).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
     let n = d.count(8);
     let exits: HashMap<i32, i32> = (0..n).map(|_| (d.i32(), d.i32())).collect();

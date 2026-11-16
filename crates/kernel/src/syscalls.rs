@@ -132,6 +132,10 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
 
 /// Whether call `n` with `a` runs on the kernel lock's shared side
 /// ([`Kernel::dispatch_shared`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn shares(n: u64) -> bool {
     matches!(
         n,
@@ -284,6 +288,10 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn dispatch_counted(&mut self, n: u64, a: [u64; 6]) -> i64 {
         // Limits another process set for this one take effect now.
         if crate::procreg::take_limits_left() {
@@ -344,6 +352,10 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn dispatch_call(&mut self, n: u64, a: [u64; 6]) -> i64 {
         if shares(n) {
             return self.shared_call(n, a);
@@ -1019,6 +1031,10 @@ impl<P: Platform> Kernel<P> {
     /// The calls [`shares`] names: each reads what the kernel keeps for the
     /// process, changes only the calling thread's own state, or makes a
     /// host call that stands alone.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn shared_call(&self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             nr::LSEEK => {
@@ -3906,10 +3922,15 @@ mod itimer {
 /// process's `prlimit` reads them: as its program starts, as a fork child
 /// starts, and when they change.
 pub(crate) fn publish_limits() {
-    let all = (0..resource::RLIM_NLIMITS)
+    crate::procreg::set_own_rlimits(own_limits());
+}
+
+/// The caller's limits, (resource, soft, hard), as [`publish_limits`]
+/// publishes them.
+pub(crate) fn own_limits() -> Vec<(u32, u64, u64)> {
+    (0..resource::RLIM_NLIMITS)
         .filter_map(|res| own_limit(res).ok().map(|(soft, hard)| (res as u32, soft, hard)))
-        .collect();
-    crate::procreg::set_own_rlimits(all);
+        .collect()
 }
 
 /// The caller's soft limit of resource `res`.
@@ -4077,6 +4098,10 @@ fn is_dir_fd(fd: i32) -> bool {
 }
 
 /// Whether call `n` may change which memory is mapped, or how.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn changes_mappings(n: u64) -> bool {
     matches!(
         n,

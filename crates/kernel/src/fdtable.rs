@@ -35,10 +35,12 @@ static NEXT: AtomicI32 = AtomicI32::new(0);
 /// The guest's default soft limit, Linux's.
 const DEFAULT_SOFT: u64 = 1024;
 
-/// The most descriptors the guest may have open at once: a range ending
-/// at 69120 (a quarter of the host's left to fwe) makes each host `fork`
-/// copy that much table, 70% more than a fork of a small one.
-pub const GUEST_CAP: i32 = 16384;
+/// The most descriptors the guest may have open at once, Linux's default
+/// hard limit. A host `fork` copies the descriptor table as far as its
+/// highest descriptor, fwe's reserved range just above this: from 16384,
+/// a fork and wait of a small process took 17% longer than with a small
+/// table (from 69120, the host's, far more); from 4096, 5%.
+pub const GUEST_CAP: i32 = 4096;
 
 #[cfg(target_os = "macos")]
 fn max_files_per_proc() -> u64 {
@@ -310,6 +312,10 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
 }
 
 /// `EBADF` if a call would name one of fwe's own descriptors.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
     let bad = |fd: u64| !guest_visible(fd as i32);
     if (first_arg_is_fd(nr) && bad(a[0]))
@@ -348,6 +354,10 @@ pub fn check_limit(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
 }
 
 /// The descriptors call `nr` (arguments `a`) made, given its `result`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn made(nr: u64, a: &[u64; 6], result: i64) -> Vec<i32> {
     use fwe_abi::{fcntl, nr as n};
     if result < 0 {

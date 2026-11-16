@@ -125,6 +125,10 @@ pub(crate) static CURRENT: std::sync::Mutex<Option<std::sync::Arc<Chain>>> =
     std::sync::Mutex::new(None);
 
 /// The chain the process is in now.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn current() -> std::sync::Arc<Chain> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
@@ -134,6 +138,10 @@ pub fn current() -> std::sync::Arc<Chain> {
 static NESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Make `chain` the process's ([`crate::ns::Namespaces::pid`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn set_current(chain: Chain) {
     let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
     NESTED.store(!chain.is_empty(), std::sync::atomic::Ordering::Release);
@@ -205,6 +213,10 @@ pub fn alloc_chosen(
 
 /// Record the host pid behind the numbers [`alloc`] gave a process before
 /// it existed.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn set_host(chain: &Chain, nums: &[i32], host: i32) {
     for (r, n) in chain.iter().zip(nums) {
         let _ = r.update(|ns| {
