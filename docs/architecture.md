@@ -231,7 +231,18 @@ The pieces:
   whenever guest memory becomes executable (`mmap`, `mprotect`, a
   write+exec fault, in `crates/kernel/src/mm.rs`), passing the code ranges
   it knows from the file's sections and unwind table; a failure is traced
-  (see [Tracing](#tracing)).
+  (see [Tracing](#tracing)). Memory made executable after it was mapped
+  is a JIT's, with no ranges: `rewrite::patch_jit` gives an `x18` use a
+  stub only among instructions, so the data a JIT keeps in its code pages
+  stays as it is, and `--strace` notes the uses given stubs per page
+  ([x18 in JIT code](linux-on-macos.md#x18-in-jit-code)).
+- `crates/kernel/src/jitsites.rs` records each word preparation changes
+  in JIT code, with what it was. `mm::write_exec_writable` (a write to
+  write+exec memory, by the guest or by fwe for it) and `mprotect` adding
+  `PROT_WRITE` put back every such word still as fwe made it, so a JIT
+  patches and copies the code it wrote; the page's next preparation gives
+  a site that is what it was its old branch and stub again. Unmapping or
+  mapping over a range forgets its records.
 - `crates/kernel/src/prepcache.rs` keeps, in fwe's private directory and
   by a file's identity (device, inode, size, modification time), its
   sections' and unwind table's code ranges and, for each mapped code range
@@ -1405,8 +1416,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   Silicon Mac.
 - The memory-tagging instructions with an `sp` operand, `casp` on `sp`,
   an authenticated load written back onto `sp` and `blraa x18, x30` are
-  left unrewritten when they name `x18` (`--strace` counts them), as is
-  any `x18` use in JIT code. A binary with neither section headers nor an
+  left unrewritten when they name `x18` (`--strace` counts them). In JIT
+  code an `x18` use next to data is left unrewritten too, and a data
+  word among instructions that reads as an `x18` instruction is taken
+  for one. A binary with neither section headers nor an
   unwind table has its whole executable segment taken as code, and an
   inline jump table in code the unwind table covers could be patched.
 

@@ -3117,23 +3117,17 @@ fn alpine_wine_runs_windows_programs() {
 /// many such instructions, from the notes of a `--strace-file` trace.
 fn jit_x18_summary(what: &str, trace: &Path) {
     let text = std::fs::read_to_string(trace).unwrap_or_default();
-    let (mut pages, mut uses, mut out) = (0, 0, 0);
+    let (mut pages, mut uses) = (0, 0);
     for l in text.lines().filter(|l| l.contains("x18 uses given stubs")) {
         pages += 1;
-        let counts: Vec<usize> = l
+        uses += l
             .rsplit(": ")
             .next()
-            .unwrap_or("")
-            .split(", ")
-            .filter_map(|c| c.split(' ').next()?.parse().ok())
-            .collect();
-        uses += counts.first().copied().unwrap_or(0);
-        out += counts.get(1).copied().unwrap_or(0);
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok())
+            .unwrap_or(0);
     }
-    eprintln!(
-        "{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses, \
-         {out} branches out of code"
-    );
+    eprintln!("{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses");
 }
 
 /// Alpine's OpenJDK 25 (fetched: `guests/alpine/fetch/jdk.txt`): `javac`
@@ -3182,11 +3176,6 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             .env("PATH", format!("{bin}:/usr/bin:/bin"))
             .env("HOME", "/tmp")
             .stdin(Stdio::null());
-        if let Some(d) = std::env::var_os("FWE_JIT_DUMP") {
-            let d = Path::new(&d).join(format!("{}-{name}", step.get()));
-            std::fs::create_dir_all(&d).unwrap();
-            cmd.env("FWE_JIT_DUMP", d);
-        }
         let out = run_bounded_for(cmd, &[], Duration::from_secs(600));
         eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
         jit_x18_summary(name, &trace);
@@ -3213,21 +3202,6 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
         out
     };
     let errors = "-XX:ErrorFile=/tmp/hs_err_%p.log";
-    // Which of HotSpot's execution modes work: the interpreter alone, the
-    // first-tier compiler (C1), then everything.
-    for (what, extra) in [("interpreter", "-Xint"), ("C1", "-XX:TieredStopAtLevel=1")] {
-        let out = run("java", &[errors.into(), extra.into(), "-version".into()]);
-        eprintln!("java -version with the {what}: {}", out.status);
-        let mut javac = vec![
-            format!("-J{errors}"),
-            format!("-J{extra}"),
-            "-d".into(),
-            format!("/tmp/out-{what}"),
-        ];
-        javac.extend(sources.iter().map(|n| format!("/tmp/src/{n}")));
-        let out = run("javac", &javac);
-        eprintln!("javac with the {what}: {}", out.status);
-    }
     let mut javac = vec![format!("-J{errors}"), "-d".to_string(), "/tmp/out".to_string()];
     javac.extend(sources.iter().map(|n| format!("/tmp/src/{n}")));
     let out = run("javac", &javac);
@@ -3314,11 +3288,6 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
-    if let Some(d) = std::env::var_os("FWE_JIT_DUMP") {
-        let d = Path::new(&d).join("node");
-        std::fs::create_dir_all(&d).unwrap();
-        cmd.env("FWE_JIT_DUMP", d);
-    }
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));

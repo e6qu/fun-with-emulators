@@ -274,14 +274,14 @@ for a well-known property only.
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries, each page's rewrites written only when it first runs |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
-| native, JIT | the JVM (not tested by fwe) | a large code cache and many threads; see [Java](#java-and-the-jvm) |
+| native, JIT | Alpine's OpenJDK 25 with HotSpot (tested) | its compilers' code prepared as JIT code, `x18` included; its own words put back whenever it writes them; see [Java](#java-and-the-jvm) |
 | VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
 | VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
 | VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
 | VM, container engine | Debian's podman 4.3 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
 | fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a call into fwe's gate natively, a VM exit in the VM |
-| uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub, and JIT code's uses are not rewritten; in the VM `x18` is the guest's own |
+| uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub (in JIT code, each use among instructions: [x18 in JIT code](#x18-in-jit-code)); in the VM `x18` is the guest's own |
 
 ## Languages and runtimes
 
@@ -353,21 +353,31 @@ Debian's Node.js 18 is a dynamic PIE and runs natively (tested: V8's JIT
 on a hot function, ICU, OpenSSL digests, zlib, timers and promises, a
 child process, an HTTP server and client, and a worker thread). Each
 time a page of V8's generated code becomes executable, fwe prepares it as
-JIT code: system calls and thread-pointer accesses are rewritten, `x18`
-is not, which suits V8, since it reserves `x18`.
+JIT code: system calls and thread-pointer accesses are rewritten. V8
+never uses `x18`; the words of its code pages that read as `x18`
+instructions are its data (compressed pointers and metadata), which the
+rule for JIT code leaves alone ([x18 in JIT code](#x18-in-jit-code)).
 
 ### Java and the JVM
 
-Not tested by fwe; inferred from how HotSpot is built and from fwe's
-mechanisms:
+Alpine's OpenJDK 25 runs natively (tested: `javac` compiles a
+multi-threaded application and `java` runs it, with parallel streams,
+a thread pool, fork/join, locks and the G1 collector, HotSpot's
+interpreter and both of its compilers at work):
 
-- **Backend:** a `java` launcher built as a PIE, as Debian builds it,
-  runs natively; the JVM itself is a shared library (`libjvm.so`).
-- **JIT code:** each page of the code cache is prepared as JIT code when
-  it becomes executable. HotSpot reserves `x18` only where the platform
-  does, which Linux does not; if generated code uses it, those uses are
-  not rewritten and lose their value whenever macOS clears `x18`: the
-  largest risk.
+- **Backend:** the `java` and `javac` launchers are PIEs; the JVM itself
+  is a shared library (`libjvm.so`).
+- **JIT code:** HotSpot maps its code cache writable and executable, so
+  each page is prepared when it first runs and again after each write
+  ([Write+exec memory](#writeexec-memory)). Its compilers allocate `x18`
+  like any register on Linux (they keep it free only on macOS and
+  Windows), so the uses in its code get stubs, while its code blob
+  headers and trampolines' addresses, kept in the same pages, are left
+  alone ([x18 in JIT code](#x18-in-jit-code)).
+- **Code that moves:** HotSpot builds a method's code in a buffer in its
+  code cache, then copies it into the method, and patches calls and
+  constants in place; whenever it can write a page, the page holds its
+  own words again, not fwe's branches.
 - **Safepoints and null checks** rely on `SIGSEGV` from protected pages,
   which fwe delivers with Linux's frame, turning the `SIGBUS` macOS
   reports for some protection faults into `SIGSEGV`
@@ -406,8 +416,8 @@ taken by a vectored handler, and starts itself as a child process.
   data.
 - **`x18`:** the Windows ARM64 ABI keeps the thread's TEB in `x18`. In
   the VM `x18` is the guest's own. Natively, Windows code Wine makes
-  executable would be treated as JIT code, its `x18` uses unrewritten:
-  another reason Wine belongs in the VM.
+  executable is prepared as JIT code, its `x18` uses given stubs where
+  they sit among instructions ([x18 in JIT code](#x18-in-jit-code)).
 - **wineserver** talks to Wine processes over Unix sockets, passing
   descriptors with `SCM_RIGHTS` (received descriptors are not held to
   `RLIMIT_NOFILE`), and suspends threads with ordinary signals. It stays
@@ -565,6 +575,33 @@ their own:
 A system call or signal frame sees the guest's real `x18`, `rt_sigreturn`
 restores it, and a new thread starts with its creator's.
 
+### x18 in JIT code
+
+Code a program writes and then runs comes with nothing saying where its
+code is, and JITs keep data in the same pages: HotSpot its code blobs'
+headers and its trampolines' 64-bit addresses, V8 its metadata and
+compressed pointers. A data word can read as an instruction naming
+`x18`, and rewriting it would change the data. So in JIT code an `x18`
+instruction gets a stub only where it sits among instructions: the two
+words on each side of it (those within the range being prepared) all
+decode in one of the instruction classes. A pointer above 4 GiB has a
+small number for its high half and a small number decodes as no
+instruction (`udf`), so a pointer whose low half reads as an `x18`
+instruction is left alone. HotSpot's compilers use `x18` on Linux, and
+every such use in its code passes; V8's lookalikes are all data, and none
+does (`rewrite::patch_jit`).
+
+A JIT also writes its code again: it patches calls and constants in
+place, and HotSpot builds a method in a buffer in its code cache and
+then copies it. Each word fwe changes in JIT code (an `x18` use, a
+system call or a thread-pointer access, now a branch to a stub) is
+recorded with what it was. Whenever the page becomes writable again (a
+write to write+exec memory, or `mprotect` adding `PROT_WRITE`), each
+word still as fwe made it goes back to the program's own, so the
+program reads, patches and copies the code it wrote. When the page next
+runs it is prepared again, and a site that is what it was gets its old
+stub back (`fwe_kernel::jitsites`).
+
 ### CTR_EL0: emulated when it traps
 
 Linux lets user code read `CTR_EL0`, the cache-type register, to learn
@@ -654,7 +691,10 @@ can be found the preparation fails: the guest's `mmap` or `mprotect` gets
   of `x18` written back onto `sp`, and `blraa x18, x30` (whose stub would
   set the link register before the branch reads it as the modifier),
   counted per image under `--strace` ("x18 uses left unrewritten").
-- `x18` uses in JIT code.
+- In JIT code, an `x18` use within two words of a word that decodes as
+  no instruction (data, or the end of the code), and a word of data
+  among instructions that reads as an `x18` instruction (taken for one):
+  [x18 in JIT code](#x18-in-jit-code).
 - Pointer authentication is not offered natively (`AT_HWCAP` has no
   `PACA`/`PACG`), since the host owns the keys; programs use the
   instructions' no-op forms.

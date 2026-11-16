@@ -1084,21 +1084,6 @@ mod tests {
     }
 }
 
-/// TEMPORARY diagnostic: with `FWE_JIT_DUMP` naming a directory, the
-/// first 2000 JIT pages a process prepares are written there as they were
-/// before preparing (`<pid>-<address>.bin`).
-fn jit_dump(addr: u64, len: u64) {
-    static DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let Some(dir) = std::env::var_os("FWE_JIT_DUMP") else { return };
-    if DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2000 {
-        return;
-    }
-    // SAFETY: memory being prepared: mapped and readable.
-    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
-    let path = std::path::Path::new(&dir).join(format!("{}-{addr:x}.bin", crate::host::pid()));
-    let _ = std::fs::write(path, bytes);
-}
-
 /// The known-code ranges given for memory a guest makes executable after
 /// mapping it (JIT code): none, as nothing says where a JIT's code is. Its
 /// `x18` uses get stubs where they sit among instructions (HotSpot's
@@ -2370,7 +2355,6 @@ impl<P: Platform> Kernel<P> {
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
             if backed > 0 {
-                jit_dump(a as u64, backed);
                 match self.platform.prepare_exec(a as u64, backed, JIT_CODE, None) {
                     Ok(n) => self.jit_x18_note(a as u64, backed, n),
                     Err(e) => return self.prepare_failed(e),
@@ -2503,31 +2487,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Under `--strace`: how many instructions naming `x18` were given
-    /// stubs in JIT code just prepared, and how many branches (not fwe's)
-    /// there lead out of the guest's executable memory.
+    /// stubs in JIT code just prepared.
     fn jit_x18_note(&self, addr: u64, len: u64, n: usize) {
-        if !self.tracer.enabled {
-            return;
-        }
-        let mut out = 0;
-        for at in (addr..addr + len).step_by(4) {
-            // SAFETY: a word of the range just prepared, readable.
-            let w = unsafe { (at as *const u32).read() };
-            if w >> 26 != 0b000101 || crate::jitsites::written(at) == Some(w) {
-                continue;
-            }
-            let imm = (((w & 0x03ff_ffff) << 6) as i32 >> 4) as i64;
-            let to = at.wrapping_add_signed(imm);
-            let code = crate::maps::record()
-                .areas_in(to, to + 4)
-                .iter()
-                .any(|p| p.value.prot & mman::PROT_EXEC != 0);
-            out += usize::from(!code);
-        }
-        if n > 0 || out > 0 {
-            self.tracer.note(&format!(
-                "JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs, {out} branches out of code"
-            ));
+        if n > 0 {
+            self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs"));
         }
     }
 
@@ -2537,7 +2500,6 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
-            jit_dump(page, self.page_size);
             match self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
                 Ok(n) => self.jit_x18_note(page, self.page_size, n),
                 Err(e) => {

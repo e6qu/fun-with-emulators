@@ -65,11 +65,6 @@ pub fn forget(addr: u64, len: u64) {
     }
 }
 
-/// fwe's word at `addr`, if it changed the JIT's word there.
-pub fn written(addr: u64) -> Option<u32> {
-    sites().get(&addr).map(|&(_, now)| now)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
