@@ -1158,6 +1158,14 @@ fn a_process_shown_sleeping_in_a_semaphore_wait_is_counted() {
     c_guest_prints("semwaiters", &[], "workers failed: 0, sleeping waiters not counted: 0\n");
 }
 
+/// cgroups made, joined, left and removed side by side under one shared
+/// parent: a removal of the parent that finds a child is `EBUSY`, never
+/// taking the child or its files with it.
+#[test]
+fn cgroups_made_and_removed_side_by_side() {
+    c_guest_prints("cgrouprace", &[], "failed steps: 0\n");
+}
+
 /// A signal for a process whose main thread blocks it is taken by another
 /// thread that does not, whether that one waits in `pause` or sleeps.
 #[test]

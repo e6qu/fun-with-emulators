@@ -12,7 +12,9 @@
 //!   enables, within `cgroup.max.depth` and `cgroup.max.descendants` up
 //!   the tree, its files its creator's (a controller's files are whoever
 //!   enables the controller); `rmdir` removes an empty one (`EBUSY`
-//!   while it has processes or children).
+//!   while it has processes or children). Making, removing and moving into
+//!   one take the hierarchy's lock ([`TreeLock`]), so they happen one at a
+//!   time across processes, as under Linux's `cgroup_mutex`.
 //! - Writing a pid to `cgroup.procs` moves the process, by Linux's
 //!   delegation rules (write access to the common ancestor's
 //!   `cgroup.procs`, within the writer's cgroup namespace); the file lists
@@ -172,6 +174,33 @@ pub fn tree_dir() -> Result<Vec<u8>, i32> {
     Ok(dir)
 }
 
+/// The hierarchy's lock, held while a cgroup is made or removed or a
+/// process moved, as Linux's `cgroup_mutex` holds them apart: a removal's
+/// look for children and members stands until it is done, so no `mkdir`
+/// below it or move into it comes between (a file beside the hierarchy,
+/// which no guest sees). Every fwe process of the user takes it.
+pub struct TreeLock {
+    _fd: std::os::fd::OwnedFd,
+}
+
+/// Take the hierarchy's lock ([`TreeLock`]).
+pub fn lock_tree() -> Result<TreeLock, i32> {
+    use std::os::fd::FromRawFd;
+    let mut path = tree_dir()?;
+    path.extend_from_slice(b".lock\0");
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe {
+        libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
+    };
+    if fd < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    crate::shared::lock_exclusive(fd);
+    // SAFETY: the descriptor just opened, owned here; closing it lets the
+    // lock go.
+    Ok(TreeLock { _fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) } })
+}
+
 /// The host directory of cgroup `cg` (a path from the root).
 pub fn host_dir(cg: &[u8]) -> Result<Vec<u8>, i32> {
     Ok(crate::mounts::join(&tree_dir()?, cg))
@@ -260,6 +289,11 @@ pub fn remove(dir: &[u8]) -> Result<(), i32> {
     let Some((cg, None)) = locate(dir) else { return Err(errno::ENOTDIR) };
     if cg == b"/" {
         return Err(errno::EBUSY);
+    }
+    let _held = lock_tree()?;
+    if !std::path::Path::new(os(dir)).is_dir() {
+        // Removed meanwhile, by another.
+        return Err(errno::ENOENT);
     }
     if !children(dir).is_empty() || !members(&cg, false).is_empty() {
         return Err(errno::EBUSY);
@@ -399,6 +433,11 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
     match name {
         b"cgroup.procs" | b"cgroup.threads" => {
             let threads = name == b"cgroup.threads";
+            // (Not into a cgroup being removed.)
+            let _held = lock_tree()?;
+            if !std::path::Path::new(os(dir)).is_dir() {
+                return Err(errno::ENODEV);
+            }
             for word in text.split_whitespace() {
                 let id: i32 = word.parse().map_err(|_| errno::EINVAL)?;
                 let host = if threads { thread_process(id)? } else { process(id)? };
