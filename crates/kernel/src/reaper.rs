@@ -910,13 +910,18 @@ mod watch {
         /// and that is not followed yet: one adopted before this watcher
         /// started (a reaper that started again with `execve`), or one
         /// whose parent ended before its fork was seen, so it was no
-        /// longer that parent's child on the host.
-        fn follow_recorded(&mut self, me: i32) {
-            for (pid, r) in procreg::all() {
+        /// longer that parent's child on the host. Returns whether a
+        /// process just forked has not written its record yet: it may be
+        /// one of those, and is looked for again soon (nothing else tells
+        /// this watcher of it once its parent has gone).
+        fn follow_recorded(&mut self, me: i32) -> bool {
+            let (all, unwritten) = procreg::all_written();
+            for (pid, r) in all {
                 if !self.watched.contains(&pid) && r.lineage.iter().any(|&(p, _)| p == me) {
                     self.follow(pid);
                 }
             }
+            unwritten
         }
     }
 
@@ -978,13 +983,16 @@ mod watch {
         unsafe { libc::kevent(kq, own.as_ptr(), 3, std::ptr::null_mut(), 0, std::ptr::null()) };
         WATCH_KQ.store(kq, SeqCst);
         w.watched.insert(me);
-        busy(|| {
+        // A process just forked that has not written its record yet, which
+        // may be one to follow: looked for again until it has.
+        let mut unwritten = busy(|| {
             for c in children(me) {
                 w.follow(c);
             }
-            w.follow_recorded(me);
+            let unwritten = w.follow_recorded(me);
             notify();
             wake_waiters();
+            unwritten
         });
         // SAFETY: a zeroed kevent is a valid out-parameter.
         let mut evs: [libc::kevent; 32] = unsafe { std::mem::zeroed() };
@@ -1000,10 +1008,11 @@ mod watch {
         let soon = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
         let later = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
         loop {
-            let idle = ending.is_empty() && signalled.is_empty();
+            let idle = ending.is_empty() && signalled.is_empty() && !unwritten;
             // Often at first, where a stop usually is; less so after.
-            let fresh =
-                !ending.is_empty() || signalled.values().any(|sent| sent.elapsed() < SIGNAL_SOON);
+            let fresh = !ending.is_empty()
+                || unwritten
+                || signalled.values().any(|sent| sent.elapsed() < SIGNAL_SOON);
             let timeout = if idle {
                 std::ptr::null()
             } else if fresh {
@@ -1023,7 +1032,7 @@ mod watch {
                 RUNNING.store(false, SeqCst);
                 return;
             }
-            busy(|| {
+            unwritten = busy(|| {
                 for ev in &evs[..n as usize] {
                     if ev.filter != libc::EVFILT_PROC {
                         continue;
@@ -1096,9 +1105,10 @@ mod watch {
                     }
                     !done
                 });
-                w.follow_recorded(me);
+                let unwritten = w.follow_recorded(me);
                 notify();
                 wake_waiters();
+                unwritten
             });
         }
     }

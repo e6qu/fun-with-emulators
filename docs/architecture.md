@@ -484,8 +484,10 @@ and replace processes, and the per-process state it keeps:
   its whole record as it starts, from what its parent knows (program,
   cgroup, whether the host reaps). The parent marks it as still to write
   before its `fork` returns: until then every listing has it, and a look
-  at its record waits for it (so a reaper's watcher finds the orphan of a
-  parent that ended at once).
+  at its record waits for it. A reaper's watcher, which the host does not
+  tell of the orphan of a parent that ended at once, does not wait: while
+  a record listed is still to be written it looks again every 5 ms, and
+  follows the orphan once its record names the reaper an ancestor.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events)).
@@ -587,6 +589,13 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 
 - **Pending sets** are atomics in host thread-locals (the host handler
   records into them), registered by tid so another thread can target one.
+  Each signal's slot in a set is claimed by a compare-and-swap of its
+  state, empty, written, full or being taken, so posts and takes from many
+  threads and handlers at once (every thread takes from the process's set)
+  take each signal once, with the `siginfo` it was posted with. A take
+  blocks its thread's host signals while it holds a slot, so a post that
+  finds the slot being taken waits only on another running thread; a post
+  that finds a standard signal pending, or being written, is one with it.
   A real-time signal already pending is queued behind it, with its own
   `siginfo`, in a lock-free pool the process's sets share (4096 entries),
   oldest first.

@@ -531,8 +531,32 @@ pub fn collect_leftovers(young: std::time::Duration) {
 /// Every live process fwe has a record of, forgetting those that ended
 /// (zombies too).
 pub fn all() -> Vec<(i32, ProcRecord)> {
+    listed(true).0
+}
+
+/// [`all`], without waiting for the processes just forked that are still
+/// to write their records ([`crate::procstore::mark_unwritten`]): whether
+/// there are live ones, beside.
+pub fn all_written() -> (Vec<(i32, ProcRecord)>, bool) {
+    listed(false)
+}
+
+fn listed(wait: bool) -> (Vec<(i32, ProcRecord)>, bool) {
     let mut out = Vec::new();
+    let mut unwritten = false;
     for pid in crate::procstore::pids() {
+        if !wait
+            && crate::procstore::unwritten(pid)
+            && read_any(pid).filter(|r| start_time(pid) == Some(r.start)).is_none()
+        {
+            if host_info(pid).is_some_and(|(_, _, zombie)| !zombie) {
+                unwritten = true;
+            } else {
+                // Gone before it wrote one.
+                crate::procstore::forget_unwritten(pid);
+            }
+            continue;
+        }
         // A zombie has ended (Linux lists it in no cgroup either): its
         // record goes, and how it ended is kept for whoever reaps it.
         // Read again once before it is taken for gone: another process may
@@ -543,7 +567,7 @@ pub fn all() -> Vec<(i32, ProcRecord)> {
             None => gone(pid),
         }
     }
-    out
+    (out, unwritten)
 }
 
 /// The first fwe process of the run that host process `pid` (with record

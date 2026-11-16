@@ -740,20 +740,67 @@ static COUNT: AtomicU64 = AtomicU64::new(0);
 /// taken.
 static HELD: AtomicBool = AtomicBool::new(false);
 
+/// A slot of a [`Pending`] set holds no signal.
+const EMPTY: u32 = 0;
+/// A post is writing the slot's `siginfo` (its bit set before it is full).
+const WRITING: u32 = 1;
+/// The slot holds a pending signal, its bit set.
+const FULL: u32 = 2;
+/// A take is reading the slot's `siginfo`, with every host signal blocked
+/// on its thread: no handler of that thread waits for it.
+const TAKING: u32 = 3;
+
 /// A set of pending signals with the `siginfo` each was raised with: one
 /// of each standard signal, and the real-time signals queued, as Linux
 /// queues them (one of each number in `info`, the rest behind it in the
 /// process's [`POOL`], oldest first). The pool names a set by its
 /// address, so a set never moves once it holds signals: it lives in a
 /// static or an `Arc`.
+///
+/// Posts and takes come from many threads and signal handlers at once
+/// (every thread takes from the process's set). Each slot's `state` hands
+/// it between them: a post writes only a slot it claimed [`EMPTY`] (or,
+/// replacing a `SIGCHLD`, [`FULL`]), and a take reads only a slot it
+/// claimed full, so each signal is taken once, with the `siginfo` it was
+/// posted with. `bits` mirrors the full slots, for a look without them.
 pub struct Pending {
     bits: AtomicU64,
+    state: [AtomicU32; signal::NSIG as usize],
     info: [SigSlot; signal::NSIG as usize],
+}
+
+/// Every host signal blocked on the calling thread for the life of the
+/// value, its mask put back as it goes. Async-signal-safe.
+struct AllBlocked(libc::sigset_t);
+
+impl AllBlocked {
+    fn new() -> AllBlocked {
+        // SAFETY: zeroed bytes are a valid `sigset_t`, filled and passed as
+        // the host asks; only this thread's mask changes.
+        unsafe {
+            let mut all: libc::sigset_t = std::mem::zeroed();
+            libc::sigfillset(&mut all);
+            let mut old: libc::sigset_t = std::mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+            AllBlocked(old)
+        }
+    }
+}
+
+impl Drop for AllBlocked {
+    fn drop(&mut self) {
+        // SAFETY: the mask this thread had, as `new` read it.
+        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
+    }
 }
 
 impl Pending {
     pub const fn new() -> Pending {
-        Pending { bits: AtomicU64::new(0), info: [const { SigSlot::new() }; signal::NSIG as usize] }
+        Pending {
+            bits: AtomicU64::new(0),
+            state: [const { AtomicU32::new(EMPTY) }; signal::NSIG as usize],
+            info: [const { SigSlot::new() }; signal::NSIG as usize],
+        }
     }
 
     fn id(&self) -> usize {
@@ -823,55 +870,116 @@ impl Pending {
         if !(1..=signal::NSIG).contains(&sig) {
             return;
         }
-        let slot = &self.info[(sig - 1) as usize];
         if sig == signal::SIGCHLD && crate::reaper::superseded(info.pid) {
             return;
         }
-        let pending = self.bits.load(Ordering::Acquire) & (1 << (sig - 1)) != 0;
-        if sig < signal::SIGRTMIN
-            && pending
-            && !(sig == signal::SIGCHLD
-                && crate::reaper::precedes(info.pid, slot.pid.load(Ordering::Relaxed)))
-        {
-            return;
-        }
-        // A real-time signal already pending: this one waits behind it
-        // (a sender checked there was room, [`may_queue`]). A `kill`'s,
-        // past `RLIMIT_SIGPENDING`, is merged into the one pending, as
-        // Linux merges it.
-        if sig >= signal::SIGRTMIN && pending {
-            if info.code != signal::SI_USER || room(0) {
-                self.enqueue(sig, &info);
+        let i = (sig - 1) as usize;
+        let (state, slot) = (&self.state[i], &self.info[i]);
+        let realtime = sig >= signal::SIGRTMIN;
+        loop {
+            match state.load(Ordering::SeqCst) {
+                EMPTY => {
+                    if state
+                        .compare_exchange(EMPTY, WRITING, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        store_slot(slot, &info);
+                        // The bit before the state: no take empties a slot
+                        // whose bit is still to be set.
+                        self.set_bit(1 << i);
+                        state.store(FULL, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                // Being taken, by another thread (a take blocks its own
+                // thread's handlers), which finishes without waiting: this
+                // one is pending after it.
+                TAKING => std::hint::spin_loop(),
+                // Pending, or being written by another post (perhaps one
+                // this handler interrupted): a standard signal is one with
+                // it, as Linux keeps one of each; the exception is an
+                // adopted process's `SIGCHLD`, which takes the place of
+                // its former parent's.
+                pending if !realtime => {
+                    let replaces =
+                        || crate::reaper::precedes(info.pid, slot.pid.load(Ordering::SeqCst));
+                    if !(sig == signal::SIGCHLD && pending == FULL && replaces()) {
+                        return;
+                    }
+                    if state
+                        .compare_exchange(FULL, WRITING, Ordering::SeqCst, Ordering::SeqCst)
+                        .is_ok()
+                    {
+                        // Still the one it replaces, now that it is claimed.
+                        if replaces() {
+                            store_slot(slot, &info);
+                        }
+                        state.store(FULL, Ordering::SeqCst);
+                        return;
+                    }
+                }
+                // A real-time signal pending, or being written: this one
+                // waits behind it (a sender checked there was room,
+                // [`may_queue`]). A `kill`'s, past `RLIMIT_SIGPENDING`, is
+                // merged into the one pending, as Linux merges it.
+                _ => {
+                    if (info.code != signal::SI_USER || room(0)) && self.enqueue(sig, &info) {
+                        self.promote(sig);
+                    }
+                    return;
+                }
             }
+        }
+    }
+
+    /// Real-time `sig` was queued as the one pending of its number may
+    /// have been taken, its slot emptied: the oldest queued takes the slot.
+    /// Async-signal-safe.
+    fn promote(&self, sig: u64) {
+        let i = (sig - 1) as usize;
+        let (state, slot) = (&self.state[i], &self.info[i]);
+        // Pending still, or a post or take is there (a take brings the
+        // oldest queued in as it ends).
+        if state.compare_exchange(EMPTY, WRITING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return;
         }
-        store_slot(slot, &info);
-        self.set_bit(1 << (sig - 1));
+        match self.dequeue(sig) {
+            Some(next) => {
+                store_slot(slot, &next);
+                self.set_bit(1 << i);
+                state.store(FULL, Ordering::SeqCst);
+            }
+            None => state.store(EMPTY, Ordering::SeqCst),
+        }
     }
 
     fn take(&self, sig: u64) -> Option<SigInfo> {
-        let bit = 1 << (sig - 1);
-        let slot = &self.info[(sig - 1) as usize];
-        if self.bits.load(Ordering::Acquire) & bit == 0 {
+        let i = (sig - 1) as usize;
+        let bit = 1 << i;
+        let (state, slot) = (&self.state[i], &self.info[i]);
+        if self.bits.load(Ordering::SeqCst) & bit == 0 {
+            return None;
+        }
+        // No handler of this thread runs while the slot is claimed: a post
+        // to it would wait for this take.
+        let _blocked = AllBlocked::new();
+        // Not pending, or being written, or taken by another thread.
+        if state.compare_exchange(FULL, TAKING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return None;
         }
         let mut info = load_slot(slot);
         // The next of a queued real-time signal takes its place.
-        if sig >= signal::SIGRTMIN
-            && let Some(next) = self.dequeue(sig)
-        {
+        let next = if sig >= signal::SIGRTMIN { self.dequeue(sig) } else { None };
+        if let Some(next) = next {
             store_slot(slot, &next);
+            state.store(FULL, Ordering::SeqCst);
         } else {
-            if self.bits.fetch_and(!bit, Ordering::Acquire) & bit == 0 {
-                return None;
-            }
+            self.bits.fetch_and(!bit, Ordering::SeqCst);
+            state.store(EMPTY, Ordering::SeqCst);
             uncount(1);
-            // One queued as the bit was cleared.
-            if sig >= signal::SIGRTMIN
-                && let Some(next) = self.dequeue(sig)
-            {
-                store_slot(slot, &next);
-                self.set_bit(bit);
+            // One queued as the slot was emptied.
+            if sig >= signal::SIGRTMIN {
+                self.promote(sig);
             }
         }
         // A POSIX timer's signal: its overrun as it is taken.
@@ -887,6 +995,10 @@ impl Pending {
 
     fn clear(&self) {
         uncount(u64::from(self.bits.swap(0, Ordering::AcqRel).count_ones()));
+        // (In a fork child, a slot another thread of the parent held.)
+        for state in &self.state {
+            state.store(EMPTY, Ordering::SeqCst);
+        }
         let me = self.id();
         for q in used_pool() {
             let s = q.state.load(Ordering::Acquire);
@@ -1573,5 +1685,93 @@ mod tests {
         p.post(rt, valued(10));
         p.clear();
         assert!(p.take(rt).is_none());
+    }
+
+    /// Threads taking from one set (the process's, which every thread
+    /// takes from) while another posts: each signal posted is taken once,
+    /// with its own `siginfo`, whatever the posts and takes interleave.
+    #[test]
+    fn concurrent_takes_take_each_signal_once() {
+        let _held = signals_held();
+        const POSTS: u64 = 20_000;
+        let p = Pending::new();
+        let bit = 1 << (signal::SIGUSR1 - 1);
+        let done = AtomicBool::new(false);
+        let mut taken: Vec<u64> = std::thread::scope(|s| {
+            let takers: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut got = Vec::new();
+                        while !done.load(Ordering::SeqCst) || p.bits() & bit != 0 {
+                            if let Some(i) = p.take(signal::SIGUSR1) {
+                                got.push(i.value);
+                            }
+                        }
+                        got
+                    })
+                })
+                .collect();
+            for v in 0..POSTS {
+                // The next once the last is taken (or merged into a take):
+                // each is then a signal of its own, none pending to merge with.
+                while p.bits() & bit != 0 {
+                    std::hint::spin_loop();
+                }
+                p.post(signal::SIGUSR1, valued(v));
+            }
+            done.store(true, Ordering::SeqCst);
+            takers.into_iter().flat_map(|t| t.join().unwrap()).collect()
+        });
+        taken.sort_unstable();
+        let twice = taken.windows(2).filter(|w| w[0] == w[1]).count();
+        taken.dedup();
+        assert_eq!((twice, taken.len() as u64), (0, POSTS), "taken twice, and how many taken");
+    }
+
+    /// Real-time signals posted while threads take them: each is taken
+    /// once, and each thread takes them oldest first.
+    #[test]
+    fn concurrent_takes_of_queued_signals_keep_each_and_their_order() {
+        let _held = signals_held();
+        const POSTS: u64 = 20_000;
+        let rt = signal::SIGRTMIN + 3;
+        let p = Pending::new();
+        let (done, count) = (AtomicBool::new(false), AtomicU64::new(0));
+        let mut taken: Vec<u64> = std::thread::scope(|s| {
+            let takers: Vec<_> = (0..3)
+                .map(|_| {
+                    s.spawn(|| {
+                        let mut got = Vec::new();
+                        while !done.load(Ordering::SeqCst) || p.bits() != 0 {
+                            if let Some(i) = p.take(rt) {
+                                got.push(i.value);
+                                count.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                        got
+                    })
+                })
+                .collect();
+            for v in 0..POSTS {
+                // A few queued at a time, well within the pool.
+                while v - count.load(Ordering::SeqCst) > 64 {
+                    std::hint::spin_loop();
+                }
+                p.post(rt, valued(v));
+            }
+            done.store(true, Ordering::SeqCst);
+            takers
+                .into_iter()
+                .flat_map(|t| {
+                    let got = t.join().unwrap();
+                    assert!(got.windows(2).all(|w| w[0] < w[1]), "a thread took one out of order");
+                    got
+                })
+                .collect()
+        });
+        taken.sort_unstable();
+        let twice = taken.windows(2).filter(|w| w[0] == w[1]).count();
+        taken.dedup();
+        assert_eq!((twice, taken.len() as u64), (0, POSTS), "taken twice, and how many taken");
     }
 }
