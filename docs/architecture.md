@@ -456,8 +456,10 @@ and replace processes, and the per-process state it keeps:
   its whole record as it starts, from what its parent knows (program,
   cgroup, whether the host reaps). The parent marks it as still to write
   before its `fork` returns: until then every listing has it, and a look
-  at its record waits for it (so a reaper's watcher finds the orphan of a
-  parent that ended at once).
+  at its record waits for it. A reaper's watcher, which the host does not
+  tell of the orphan of a parent that ended at once, does not wait: while
+  a record listed is still to be written it looks again every 5 ms, and
+  follows the orphan once its record names the reaper an ancestor.
 - **Process descriptors** (`crates/kernel/src/pidfd.rs`): a kqueue
   watching the process's exit, marked with what it names (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events)).
