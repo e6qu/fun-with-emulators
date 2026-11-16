@@ -1111,6 +1111,16 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
+    // A fault in a stub is the program's own instruction's, at its site
+    // (a JIT's null checks fault on purpose, and its handler looks for
+    // the instruction it wrote).
+    if let Some(r) = crate::prepare::rewind_fault(regs.pc, regs.sp) {
+        for (reg, value) in r.restored {
+            regs.x[reg as usize] = value;
+        }
+        regs.sp = r.sp;
+        regs.pc = r.site;
+    }
     // Memory `MADV_HWPOISON` poisoned fails with a bus error.
     let lsig = if fwe_kernel::mm::poisoned(addr) {
         fwe_abi::signal::SIGBUS

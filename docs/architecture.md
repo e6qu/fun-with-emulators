@@ -208,6 +208,11 @@ The pieces:
   stub can substitute a scratch register, adjust an `sp` offset or rebuild
   a PC-relative or branch form, and finds the forms with stubs of their
   own (`casp`, writeback onto `sp`, `sp` written from `x18`).
+- A guest fault in a stub region is rewound to its site before it is
+  delivered (`prepare::rewind_fault`, `rewrite::rewind`): the stub's
+  slot (each stub has one of `STUB_WORDS` words from its region's start)
+  gives the site by its branch back, and the registers it pushed before
+  the faulting instruction are read back from the stack.
 - `crates/native/src/prepare.rs` groups sites so one stub region reaches
   each group (at most a quarter of the branch range apart), takes the
   region from the loader's arena or reserves one near the code, maps it

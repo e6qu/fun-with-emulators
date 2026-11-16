@@ -447,6 +447,57 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
     words
 }
 
+/// A fault in a stub, as if at its site: the stub's words from its start
+/// up to the faulting one (`ran`), and its branch back among the rest
+/// give the site; each register the stub pushed before the fault and has
+/// not popped yet is read back (`stack(offset from sp)`), and `sp` is as
+/// at the site. `None` if the words are no stub's.
+pub struct Rewound {
+    pub site: u64,
+    pub restored: Vec<(u32, u64)>,
+    pub sp: u64,
+}
+
+/// See [`Rewound`]. `words` is the stub's slot from its start (`stub`),
+/// `pc` the faulting instruction in it.
+pub fn rewind(
+    words: &[u32],
+    stub: u64,
+    pc: u64,
+    sp: u64,
+    stack: impl Fn(u64) -> Option<u64>,
+) -> Option<Rewound> {
+    let ran = ((pc.checked_sub(stub)?) / 4) as usize;
+    // The branch back: the first plain branch leading out of the slot.
+    let end = stub + 4 * words.len() as u64;
+    let site = words.iter().enumerate().find_map(|(i, &w)| {
+        let at = stub + 4 * i as u64;
+        let to = (w & 0xfc00_0000 == B)
+            .then(|| at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4)))?;
+        (to < stub || to >= end).then(|| to.wrapping_sub(4))
+    })?;
+    // The registers pushed and not popped before `pc`, in push order.
+    let mut pushed: Vec<Vec<u32>> = Vec::new();
+    for &w in words.get(..ran)? {
+        if w & !0x1f == PUSH {
+            pushed.push(vec![w & 0x1f]);
+        } else if w & !0x7c1f == PUSH_PAIR {
+            pushed.push(vec![w & 0x1f, (w >> 10) & 0x1f]);
+        } else if w & !0x1f == POP || w & !0x7c1f == POP_PAIR {
+            pushed.pop()?;
+        }
+    }
+    let mut restored = Vec::new();
+    let mut at = sp;
+    for regs in pushed.iter().rev() {
+        for (k, &r) in regs.iter().enumerate() {
+            restored.push((r, stack(at - sp + 8 * k as u64)?));
+        }
+        at += 16;
+    }
+    Some(Rewound { site, restored, sp: at })
+}
+
 /// `stp x30, x0, [sp, #-32]!`: a system-call stub's first word, its only
 /// one that can fault (the guest's `sp` need not be usable at a system
 /// call: musl's thread exit unmaps its own stack before `exit`).
@@ -1278,6 +1329,25 @@ mod tests {
         assert_eq!(p.x18_deferred, 0);
         // The data word is untouched.
         assert_eq!(&code[8..12], &0xd283_0312u32.to_le_bytes());
+    }
+
+    /// A fault in an `x18` stub at its moved instruction is a fault at the
+    /// site: the two registers it pushed come back from the stack, and `sp`
+    /// is as the site had it.
+    #[test]
+    fn a_fault_in_a_stub_rewinds_to_its_site() {
+        let (stub_at, site) = (0x10_0000u64, 0x20_0000u64);
+        // `ldr x0, [x18, #8]`
+        let words = stub(Site::X18 { insn: 0xf940_0640 }, 8, 16, stub_at, site + 4);
+        let at = words.iter().position(|&w| w & 0xffff_fc1f == 0xf940_0400).unwrap();
+        let sp = 0x7000u64;
+        let r =
+            rewind(&words, stub_at, stub_at + 4 * at as u64, sp, |off| Some(0xaa00 + off)).unwrap();
+        assert_eq!(r.site, site);
+        assert_eq!(r.sp, sp + 32);
+        // Pushed first, so deepest: the first push's register at sp + 16.
+        let (s1, s2) = (words[0] & 0x1f, words[1] & 0x1f);
+        assert_eq!(r.restored, vec![(s2, 0xaa00), (s1, 0xaa10)]);
     }
 
     /// In a JIT's code, an `x18` instruction among instructions is one;

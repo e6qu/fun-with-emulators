@@ -292,6 +292,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18dp",
     "x18ldst",
     "x18pair",
+    "x18fault",
     "x18br",
     "x18fp",
     "x18pc",
@@ -3857,6 +3858,15 @@ fn asm_x18_survives_load_store_addressing() {
 fn asm_x18_pairs_off_sp_keep_every_register() {
     let code = fwe(&asm_guest("x18pair-pie"), &[]).status.code();
     assert_eq!(code, Some(0), "register {} lost", code.unwrap_or(0) - 1);
+}
+
+/// A load through x18 that faults, as a JIT's implicit null check does: its
+/// handler sees the fault at the load, with every register and sp as they
+/// were, and skips it.
+#[test]
+fn asm_x18_fault_is_seen_at_its_instruction() {
+    let code = fwe(&asm_guest("x18fault-pie"), &[]).status.code();
+    assert_eq!(code, Some(0), "exit {code:?}: 1 + a register, 40 pc, 41 sp, 42 no handler");
 }
 
 /// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz), across preemption:

@@ -89,6 +89,37 @@ fn note_sp_stub_region(start: u64, end: u64) {
     SP_STUB_COUNT.store(i + 1, SeqCst);
 }
 
+/// Every stub region: start -> end. Stubs sit in slots of
+/// [`STUB_WORDS`] words from their region's start.
+static STUB_REGIONS: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn note_stub_region(start: u64, end: u64) {
+    STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(start, end);
+}
+
+/// A fault at `pc` with the stack at `sp`, as if at the site of the stub
+/// `pc` is in, if it is in one ([`rewrite::rewind`]): the program's own
+/// instruction faulted, and its handler sees it there, with its registers.
+pub fn rewind_fault(pc: u64, sp: u64) -> Option<rewrite::Rewound> {
+    let (start, end) = {
+        let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let (&start, &end) = regions.range(..=pc).next_back()?;
+        (start, end)
+    };
+    if pc >= end {
+        return None;
+    }
+    let slot = (STUB_WORDS * 4) as u64;
+    let stub = start + (pc - start) / slot * slot;
+    // SAFETY: a slot of a stub region, mapped and readable.
+    let words = unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) };
+    rewrite::rewind(words, stub, pc, sp, |off| {
+        // SAFETY: the stack the stub pushed to, below which it faulted.
+        Some(unsafe { ((sp + off) as *const u64).read() })
+    })
+}
+
 /// Whether `pc` may be in a stub for an instruction that writes `sp` from
 /// `x18`. Async-signal-safe.
 pub fn in_sp_stub_region(pc: u64) -> bool {
@@ -454,6 +485,7 @@ unsafe fn redirect(
         let last_error = std::io::Error::last_os_error().to_string();
         return Err(NoStubSpace { near: first, last_error });
     }
+    note_stub_region(region, region + size);
     let mut cursor = region;
     for &(offset, site) in group {
         let at = base + offset;
@@ -611,6 +643,7 @@ fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> b
         unsafe { libc::munmap(p, r.size as usize) };
         return false;
     }
+    note_stub_region(r.at, r.at + r.size);
     let mut cursor = r.at;
     for &(at, site) in &r.sites {
         for (i, w) in rewrite::stub(site, slot, x18_slot, cursor, at + 4).iter().enumerate() {

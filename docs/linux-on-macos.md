@@ -573,7 +573,12 @@ their own:
   below the new `sp` and could cover them.
 
 A system call or signal frame sees the guest's real `x18`, `rt_sigreturn`
-restores it, and a new thread starts with its creator's.
+restores it, and a new thread starts with its creator's. A fault in a
+stub (a load or store through `x18` that faults, as a JIT's implicit null
+checks do on purpose) is delivered as at its site: the signal frame has
+the program's own instruction for its pc, the registers the stub pushed
+back as they were, and `sp` as the site had it, so a handler that looks
+up the faulting instruction, or skips it, finds it where it wrote it.
 
 ### x18 in JIT code
 
