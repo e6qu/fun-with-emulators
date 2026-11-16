@@ -2,8 +2,9 @@
 
 The concepts behind a program file and its start: object files,
 relocations, linking statically and dynamically, position independence,
-ASLR, thread-local storage, and how a kernel and a loader start a
-program, each on Linux and on macOS, both on arm64. What fwe does with
+what the code of each kind looks like, virtual memory, ASLR,
+thread-local storage, and how a kernel and a loader start a program,
+each on Linux and on macOS, both on arm64. What fwe does with
 them is in [linux-on-macos.md](linux-on-macos.md); this document is the
 background it assumes.
 
@@ -164,6 +165,272 @@ at `0x10000` (64 KiB). macOS's linker produces only position-independent
 arm64 executables, and every arm64 process keeps its lowest 4 GiB
 unmapped ([`__PAGEZERO`](#__pagezero-the-unmapped-bottom-of-a-macos-process)).
 
+## What the code looks like: fixed-address, PIE and static PIE
+
+One small program, compiled and linked three ways, then disassembled.
+The output below is real, cut to the lines that matter.
+
+```c
+/* demo.c */
+extern int other_value;            /* defined in another file or library */
+extern int other_func(int);
+int counter = 1;                   /* defined here */
+const char *names[] = {"a", "b"};  /* pointers stored in data */
+
+int main(void) {
+    counter++;
+    return other_func(counter + other_value) + names[1][0];
+}
+
+/* other.c */
+int other_value = 41;
+int other_func(int x) { return x + 1; }
+```
+
+Built with clang for `aarch64-linux-musl`, linked with lld against musl's
+start-up files and `libc.a` (the dynamic case against a shared
+`libother.so` built from `other.c` with `-fPIC -shared`):
+
+| Build | Compile | Link | `file` says |
+|---|---|---|---|
+| fixed-address, static | `-fno-pic` | `-static` with `crt1.o` | `executable, statically linked` (`ET_EXEC`, at `0x200000`) |
+| static PIE | `-fPIE` | `-static -pie --no-dynamic-linker` with `rcrt1.o` | `pie executable, static-pie linked` (`ET_DYN`, linked at 0) |
+| dynamic PIE | `-fPIE` | `-pie --dynamic-linker=/lib/ld-musl-aarch64.so.1` | `pie executable, dynamically linked, interpreter …` |
+
+### What the compiler emits
+
+The compiler decides how each address is reached; the object file
+records what it still needs as relocations. `main` from `-fPIE`,
+`llvm-objdump -dr`:
+
+```
+ 4:  adrp  x8, 0x0                    R_AARCH64_ADR_PREL_PG_HI21   counter
+ 8:  adrp  x10, 0x0                   R_AARCH64_ADR_GOT_PAGE       other_value
+10:  ldr   w9, [x8]                   R_AARCH64_LDST32_ABS_LO12_NC counter
+14:  ldr   x10, [x10]                 R_AARCH64_LD64_GOT_LO12_NC   other_value
+18:  ldr   w10, [x10]
+28:  bl    0x28                       R_AARCH64_CALL26             other_func
+2c:  adrp  x8, 0x0                    R_AARCH64_ADR_PREL_PG_HI21   names+0x8
+30:  ldr   x8, [x8]                   R_AARCH64_LDST64_ABS_LO12_NC names+0x8
+34:  ldrb  w8, [x8]
+```
+
+- `counter`, defined in this file, is reached PC-relatively: `adrp` to
+  its 4 KiB page, then a load at the low 12 bits.
+- `other_value` may live in a shared library, at an address no one knows
+  until the program runs, so `-fPIE` reaches it through a GOT slot: the
+  first `ldr` fetches its address, the second its value. With
+  `-fno-pic` the compiler reaches it directly instead, as it does
+  `counter` (were it then in a shared library, the linker would copy it
+  into the executable: a *copy relocation*).
+- `other_func` is a plain `bl`; the linker decides whether it lands on
+  the function or on a PLT stub.
+- `names[1]` is loaded from data: a pointer stored in the image.
+
+### `main` after linking
+
+```
+fixed-address (0x200000)           static PIE (linked at 0)            dynamic PIE (linked at 0)
+adrp x8,  0x230000                 adrp x8,  0x31000                   adrp x8,  0x30000
+adrp x10, 0x230000                 adrp x10, 0x21000      ; GOT page   adrp x10, 0x20000      ; GOT page
+ldr  w9,  [x8, #0xcf8]  ; counter  ldr  w9,  [x8, #0x258] ; counter    ldr  w9,  [x8, #0x508] ; counter
+ldr  w10, [x10, #0xd10] ; value    ldr  x10, [x10, #0x208]; address    ldr  x10, [x10, #0x500]; address
+                                   ldr  w10, [x10]        ; value      ldr  w10, [x10]        ; value
+bl   other_func                    bl   other_func                     bl   other_func@plt
+adrp x8,  0x230000                 adrp x8,  0x31000                   adrp x8,  0x30000
+ldr  x8,  [x8, #0xd08]  ; names[1] ldr  x8,  [x8, #0x268] ; names[1]   ldr  x8,  [x8, #0x518] ; names[1]
+```
+
+The three are the same code. Every address is reached PC-relatively
+(`adrp` prints the page it will reach when the image runs where it was
+linked), so none of these instructions changes when the image is loaded
+elsewhere. What differs:
+
+- **`other_value`.** The fixed-address build loads it directly, one load.
+  Both PIEs go through the GOT, two loads.
+- **`other_func`.** In the static builds the call lands on the function
+  itself. In the dynamic PIE it lands on a PLT stub, which jumps through
+  a GOT slot the dynamic linker fills (`x16` and `x17` are the
+  registers the arm64 ABI sets aside for such stubs):
+
+  ```
+  other_func@plt:
+      adrp x16, 0x30000
+      ldr  x17, [x16, #0x538]     ; the slot: other_func's address, once bound
+      add  x16, x16, #0x538
+      br   x17
+  ```
+
+### The data, and what the loader must fix
+
+| | `names` holds, in the file | Dynamic relocations |
+|---|---|---|
+| fixed-address | `0x2001c8`, `0x2001ca`: the strings' final addresses | none |
+| static PIE | zeros | 18 `R_AARCH64_RELATIVE` (`names`, the GOT, the C library's own tables) |
+| dynamic PIE | zeros | `R_AARCH64_RELATIVE` ×2 (addends `0x360`, `0x362`: the strings), `R_AARCH64_GLOB_DAT other_value` (its GOT slot), `R_AARCH64_JUMP_SLOT other_func` (the PLT's slot) |
+
+A fixed-address image is finished at link time: its pointers are final
+and nothing runs before `_start`. A PIE's pointers are written at load
+time: each `R_AARCH64_RELATIVE` says "store the load address plus this
+addend here" (the addend is in the relocation, `RELA`, so the slot in
+the file stays zero).
+
+### Who applies them
+
+In the **dynamic PIE**, the dynamic linker does: it is mapped by the
+kernel, relocates itself, maps `libother.so`, applies the `RELATIVE`
+entries, finds `other_value` and `other_func` in the library for the
+`GLOB_DAT` and `JUMP_SLOT` slots, and jumps to the program's entry.
+
+In the **static PIE**, the program does it itself. Its `_start` (from
+`rcrt1.o`) finds its own dynamic section PC-relatively and hands it to
+the start-up code, before any other code runs:
+
+```
+_start:
+    mov  x29, #0
+    mov  x30, #0
+    mov  x0, sp                 ; argc, argv, envp, auxv
+    adr  x1, _DYNAMIC           ; where this image's dynamic section is now
+    and  sp, x0, #-16
+    b    _start_c
+```
+
+which then, in outline:
+
+```c
+base = address of _DYNAMIC now - its link-time address;
+for each entry in .rela.dyn:
+    if type == R_AARCH64_RELATIVE:
+        *(uint64_t *)(base + entry.offset) = base + entry.addend;
+/* then start the C library and call main, as a non-PIE would */
+```
+
+The relocating code itself uses no pointer stored in data, only
+PC-relative addressing, because none has been fixed yet.
+
+### The same function on macOS
+
+clang for `arm64-apple-macos`, the object file:
+
+```
+ 8:  adrp  x8, 0x0                    ARM64_RELOC_PAGE21          _counter
+ c:  ldr   w9, [x8]                   ARM64_RELOC_PAGEOFF12       _counter
+18:  adrp  x8, 0x0                    ARM64_RELOC_GOT_LOAD_PAGE21 _other_value
+1c:  ldr   x8, [x8]                   ARM64_RELOC_GOT_LOAD_PAGEOFF12 _other_value
+20:  ldr   w8, [x8]
+28:  bl    0x28                       ARM64_RELOC_BRANCH26        _other_func
+2c:  adrp  x8, 0x0                    ARM64_RELOC_PAGE21          _names (+8)
+30:  ldr   x8, [x8]                   ARM64_RELOC_PAGEOFF12       _names (+8)
+34:  ldrsb w8, [x8]
+```
+
+The same instructions under other names: Mach-O's relocations are
+`PAGE21`/`PAGEOFF12` for `adrp` and its low 12 bits, `GOT_LOAD_*` for a
+GOT slot, symbols carry a leading underscore, and in assembly source the
+forms are written `_counter@PAGE`, `_counter@PAGEOFF` and
+`_other_value@GOTPAGE`. One ABI difference shows: `char` is signed on
+Apple's platforms (`ldrsb`) and unsigned on Linux arm64 (`ldrb`).
+
+### Why this matters for moving a program
+
+All three builds reach their own code and data PC-relatively, so the
+instructions are right wherever the image goes, as long as code and
+data move together. Only the pointers stored in data, and any address
+built with `movz`/`movk`, depend on where the image is. A PIE lists
+those places in its dynamic relocations; a fixed-address executable
+throws the list away at link time, unless it was linked with
+`--emit-relocs`.
+
+## Virtual memory on arm64
+
+Every address a program uses is *virtual*: the CPU's memory management
+unit (MMU) translates it to a physical address through page tables the
+kernel builds. The hardware is the same under both kernels; how each
+kernel fills in the tables, and what it lets programs ask for, differs.
+
+### Translation
+
+```mermaid
+flowchart LR
+    va["virtual address from a load, store or fetch"] --> tlb{"in the TLB?"}
+    tlb -- yes --> pa["physical address, with permissions checked"]
+    tlb -- no --> walk["hardware walks the page tables from TTBR0 (user) or TTBR1 (kernel)"]
+    walk -- "entry valid" --> fill["entry cached in the TLB"] --> pa
+    walk -- "no entry, or not permitted" --> fault["exception to the kernel: a page fault"]
+    fault --> fix["kernel maps the page (demand paging, copy-on-write) and retries"]
+    fault --> sig["or delivers SIGSEGV / SIGBUS"]
+```
+
+- **Two halves.** arm64 splits the address space: the lower half
+  (addresses starting `0x0000…`) is translated through `TTBR0_EL1`, the
+  upper half (`0xffff…`) through `TTBR1_EL1`. Linux and XNU both put user
+  space in the lower half, one table per process, and the kernel in the
+  upper half, shared by all. A context switch changes `TTBR0` only.
+- **Page tables** are trees: each level's entry points to the next
+  level's table, the last to a page. An entry may also stop early and
+  map a whole *block* at once.
+- **The TLB** caches translations. Entries are tagged with an ASID
+  (address space ID), so a switch between processes need not flush it;
+  when the kernel changes a mapping it invalidates the stale entries
+  (`tlbi`).
+- **Permissions** live in each entry: readable, writable, executable for
+  user code (`UXN`) and for the kernel (`PXN`). The kernel is barred
+  from touching user memory except through its explicit copy routines
+  (`PAN`), and from executing it at all.
+- **A fault** on a missing or forbidden page traps to the kernel, which
+  either supplies the page and retries the instruction, or sends the
+  process a signal.
+
+### Page sizes
+
+The *granule* sets the page size and the shape of the tree:
+
+| Granule | Entries per table | Levels for a 48-bit space | Block mappings | Contiguous hint | Used by |
+|---|---|---|---|---|---|
+| 4 KiB | 512 | 4 | 2 MiB, 1 GiB | 16 pages (64 KiB) | most Linux kernels |
+| 16 KiB | 2048 | 4 (3 for 47 bits) | 32 MiB | 128 pages (2 MiB) | macOS; Linux on Apple Silicon (Asahi) and some servers |
+| 64 KiB | 8192 | 3 | 512 MiB | 32 pages (2 MiB) | some Linux server distributions |
+
+The page size is a kernel choice, fixed for each process. Apple's CPUs
+offer the 4 KiB granule as well as 16 KiB, and macOS runs Rosetta 2's
+x86 processes with it; its own arm64 processes always have 16 KiB pages.
+A Linux program asks for the page size (`sysconf(_SC_PAGESIZE)`,
+`AT_PAGESZ`) rather than assuming 4 KiB, and ELF segments are aligned
+to 64 KiB by default (`p_align`, from GNU ld and lld on arm64), so most
+binaries load under any of the three; the exceptions are programs that
+assumed 4 KiB pages when built (some memory allocators, for one).
+
+### What each kernel provides
+
+| | Linux | macOS (XNU) |
+|---|---|---|
+| Calls | `mmap`, `munmap`, `mprotect`, `madvise`, `mremap`, `brk`, `mlock`, `msync`, `userfaultfd`, `memfd_create` | `mmap`, `munmap`, `mprotect`, `madvise`, `mlock`, `msync` (BSD layer), and the Mach VM calls beneath them: `mach_vm_allocate`, `mach_vm_protect`, `mach_vm_remap`, memory entries (`mach_make_memory_entry`) |
+| Kinds of mapping | anonymous or file-backed, private (copy-on-write) or shared | the same, built on Mach VM objects |
+| Pages appear | on first touch (demand paging); a private page is copied on its first write | the same |
+| `fork` | copies the page tables, marks private pages copy-on-write | the same, through Mach's copy-on-write objects |
+| Growing a mapping in place | `mremap`, which can also move it | no `mremap`; `mach_vm_remap` maps the same pages elsewhere |
+| Heap | `brk` grows a data segment; `malloc` uses it and `mmap` | no `brk`; `malloc` uses `mach_vm_allocate` |
+| Giving pages back | `madvise(MADV_DONTNEED)` drops the pages at once: private anonymous ones read back as zero | `MADV_DONTNEED` and `MADV_FREE` are hints that let the kernel reclaim the pages later; until it does they may keep their contents |
+| Shared memory without a file | `memfd_create`, `shm_open`, a shared anonymous mapping across `fork` | `shm_open`, Mach memory entries passed over Mach ports |
+| Large pages | transparent huge pages (2 MiB with 4 KiB pages), `hugetlbfs` | no user-visible large pages |
+| Code | any mapping may be executable, even writable and executable at once, unless a security module forbids it | every executable page must be covered by a code signature (an ad-hoc one will do; the linker adds it) |
+| Code written at run time (JIT) | `mmap` writable, then `mprotect` executable, or both at once | `MAP_JIT` memory, switched per thread between writable and executable (`pthread_jit_write_protect_np`); the hardened runtime asks for an entitlement |
+| More memory promised than exists | overcommitted by default (`vm.overcommit_memory`); when memory runs out the OOM killer ends a process | overcommitted too |
+| When memory is short | pages written to swap (`zswap` can compress them first), file pages dropped | pages compressed in memory by the compressor, then written to swap files |
+| Seeing a process's mappings | `/proc/<pid>/maps`, `/proc/<pid>/smaps` | `vmmap <pid>` |
+
+### Two stages: virtual machines
+
+A virtual machine adds a second translation. The guest's own page
+tables translate its virtual addresses to what it believes are physical
+addresses (*intermediate physical addresses*, IPAs, stage 1); the
+hypervisor's tables translate those to real physical memory (stage 2),
+which the guest cannot see or change. The TLB caches the combined
+result. On a Mac, Hypervisor.framework manages stage 2: `hv_vm_map` maps
+a range of the host process's memory at an IPA in the VM, so a guest's
+"physical" memory is ordinary memory of the process that runs the VM.
+
 ## `__PAGEZERO`: the unmapped bottom of a macOS process
 
 Every macOS executable starts with a segment named `__PAGEZERO`: no file
@@ -292,15 +559,6 @@ with the call number in `x8`, the same in every release, so a static
 program runs on any later kernel. macOS's boundary is `libSystem`: its
 kernel calls (`svc #0x80`, number in `x16`) change between releases and
 are not for programs to make themselves.
-
-## Pages, segments and memory protections
-
-| | Linux arm64 | macOS arm64 |
-|---|---|---|
-| Page size | 4 KiB on most kernels; 16 KiB (Asahi, some servers) and 64 KiB exist | 16 KiB |
-| Segment alignment | ELF `p_align`: 64 KiB by default from GNU ld and lld on arm64, so a binary loads on any of those page sizes | 16 KiB |
-| Executable code | any mapping may be executable, writable and executable at once unless a security module forbids it | every executable page must be covered by a code signature (an ad-hoc one will do; the linker adds it) |
-| Code written at run time (JIT) | `mmap` writable, then `mprotect` executable, or both at once | `MAP_JIT` memory, switched per thread between writable and executable (`pthread_jit_write_protect_np`); the hardened runtime asks for an entitlement |
 
 ## Unwinding and debug information
 

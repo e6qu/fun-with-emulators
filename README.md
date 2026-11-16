@@ -54,7 +54,7 @@ Native speed, graphical programs and gVisor are the work left to 1.0;
 | [PLAN.md](PLAN.md) | Goal, approach, scope, principles and the 1.0 finish line |
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
 | [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run where, which instructions are rewritten, how the VM is used, and how each Linux concept maps onto macOS |
-| [docs/linking.md](docs/linking.md) | How programs are built and loaded, Linux and macOS on arm64: ELF and Mach-O, relocations, static and dynamic linking, PIE and static PIE, ASLR, thread-local storage, program start |
+| [docs/linking.md](docs/linking.md) | How programs are built and loaded, Linux and macOS on arm64: ELF and Mach-O, relocations, static and dynamic linking, PIE and static PIE and their code, virtual memory, ASLR, thread-local storage, program start |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/comparisons.md](docs/comparisons.md) | fwe beside Wine, WSL, Linux VMs, gVisor, QEMU, Rosetta, FreeBSD's Linuxulator and others |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
