@@ -161,9 +161,43 @@ packages still opt out; how distributions build theirs is in
 **Link addresses.** A fixed-address executable goes where its linker put
 it: GNU ld at `0x400000` (4 MiB), LLVM's lld at `0x200000`, Go's linker
 at `0x10000` (64 KiB). macOS's linker produces only position-independent
-arm64 executables, and every arm64 process has a `__PAGEZERO` segment
-covering the lowest 4 GiB, which keeps null and truncated 32-bit
-pointers from reaching anything.
+arm64 executables, and every arm64 process keeps its lowest 4 GiB
+unmapped ([`__PAGEZERO`](#__pagezero-the-unmapped-bottom-of-a-macos-process)).
+
+## `__PAGEZERO`: the unmapped bottom of a macOS process
+
+Every macOS executable starts with a segment named `__PAGEZERO`: no file
+contents and no access at all (its protections are none), covering the
+lowest addresses of the process. The kernel maps it like any segment, so
+nothing else can be placed there, and any load, store or jump into it
+faults (`SIGSEGV`, or `EXC_BAD_ACCESS` in a crash report).
+
+On arm64 it spans the whole lowest 4 GiB, `0` to `0x1_0000_0000`, and
+the kernel refuses to run an executable whose `__PAGEZERO` is smaller:
+it kills the process at `exec`. What that buys:
+
+- **Null pointers fault.** Dereferencing `NULL`, or a field or array
+  element a long way past it (`p->x` with `p == NULL`, `a[i]` with a
+  huge `i`), lands in unmapped memory and crashes at once, instead of
+  reading or writing whatever happened to be mapped low.
+- **Truncated pointers fault.** A 64-bit pointer squeezed through a
+  32-bit integer and back keeps only its low 32 bits, an address below
+  4 GiB. With nothing ever mapped there, such a bug crashes at its first
+  use rather than silently touching other memory: a whole class of
+  porting bugs from 32-bit code shows up at once.
+- **Exploits lose a foothold.** An attacker who can make code follow a
+  null or truncated pointer cannot first map their own data at that low
+  address, because nothing can be mapped there.
+
+Linux has a smaller version of the same guard: `vm.mmap_min_addr`
+(usually 32 or 64 KiB) keeps the lowest pages from being mapped by
+unprivileged programs, mainly to stop null-pointer bugs in the kernel
+being exploited from user space. Above that, a Linux process owns its
+whole lower address space, which is why Linux toolchains link
+fixed-address executables at `0x400000` or `0x10000`, addresses inside
+macOS's `__PAGEZERO`. A Linux program loaded at such an address cannot
+share a process with macOS code, which is what sends those programs to a
+VM under fwe ([linux-on-macos.md](linux-on-macos.md#the-low-4-gib)).
 
 ## The address space and ASLR
 
@@ -212,24 +246,33 @@ as plain `arm64`.
 
 ## Starting a program
 
+On Linux:
+
 ```mermaid
 sequenceDiagram
-    participant K as kernel
-    participant L as loader
+    participant K as Linux kernel
+    participant L as dynamic linker (ld-linux)
     participant P as program
-    Note over K,P: Linux
-    K->>K: execve: map the PT_LOAD segments; for a PIE, at a random base
-    K->>K: map the interpreter named in PT_INTERP, if any
-    K->>K: build the stack: argc, argv, envp, the auxiliary vector
-    K->>L: start at the interpreter's entry (or the program's, if static)
-    L->>L: load DT_NEEDED libraries, apply relocations, set up TLS
-    L->>P: run .init_array constructors, then _start → __libc_start_main → main
-    Note over K,P: macOS
-    K->>K: execve/posix_spawn: map the Mach-O segments, slid
-    K->>K: map /usr/lib/dyld and the shared cache
-    K->>L: start dyld with the program's header and an "apple" string array
-    L->>L: load the dylibs, apply chained fixups, run initializers
-    L->>P: call main (LC_MAIN)
+    K->>K: execve maps the PT_LOAD segments (a PIE at a random base)
+    K->>K: maps the interpreter named in PT_INTERP, if there is one
+    K->>K: builds the stack with argc, argv, envp and the auxiliary vector
+    K->>L: starts at the interpreter's entry (a static program starts at its own)
+    L->>L: loads the DT_NEEDED libraries, applies relocations, sets up TLS
+    L->>P: runs the .init_array constructors, then _start, __libc_start_main, main
+```
+
+On macOS:
+
+```mermaid
+sequenceDiagram
+    participant K as XNU kernel
+    participant D as dyld
+    participant P as program
+    K->>K: execve or posix_spawn maps the Mach-O segments at a random slide
+    K->>K: maps /usr/lib/dyld and the dyld shared cache
+    K->>D: starts dyld with the program's header and the apple strings
+    D->>D: loads the dylibs, applies the chained fixups, runs initializers
+    D->>P: calls main (LC_MAIN)
 ```
 
 **The auxiliary vector** is how a Linux kernel tells the loader and the
