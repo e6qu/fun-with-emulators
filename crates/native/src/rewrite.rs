@@ -5,7 +5,7 @@
 //!
 //! - `svc #0` (a Linux system call) would enter the macOS kernel. It becomes
 //!   a branch to a stub that calls fwe's system-call gate directly (see
-//!   `trap`'s gate), which runs the Linux system call and returns past the
+//!   [`crate::gate`]), which runs the Linux system call and returns past the
 //!   site. Where no stub can be placed it becomes a `brk` with a distinctive
 //!   immediate instead, whose trap fwe's handler services the same way.
 //! - `mrs`/`msr` of `TPIDR_EL0` (the Linux thread pointer): macOS does not

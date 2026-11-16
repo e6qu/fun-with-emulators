@@ -600,6 +600,21 @@ int main(void) {
     flush(rx, 4);
     printf("two views: %ld %ld %ld\n", v1, v2, view());
 
+    /* A file's code mapped private, writable and executable: it runs, and
+     * reads back as the file holds it. */
+    static const uint32_t getpid_code[] = {
+        0xd2801588, /* mov x8, #172 (getpid) */
+        0xd4000001, /* svc #0 */
+        0xd65f03c0, /* ret */
+    };
+    int cfd = memfd_create("code", 0);
+    write(cfd, getpid_code, sizeof getpid_code);
+    ftruncate(cfd, 16384);
+    uint32_t *fc = mmap(0, 16384, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE, cfd, 0);
+    long fpid = ((long (*)(void))fc)();
+    printf("file code: getpid %s, memory %s\n", fpid == getpid() ? "matches" : "differs",
+           memcmp(fc, getpid_code, sizeof getpid_code) == 0 ? "as written" : "changed");
+
     /* Made executable only (no PROT_READ), as Linux runs it. */
     uint32_t *xo = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     xo[0] = movz_x0(4);

@@ -2181,8 +2181,11 @@ impl<P: Platform> Kernel<P> {
             && self.platform.translates_jit()
             // SAFETY: F_GETFL only queries the descriptor.
             && unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDWR;
-        let exec = exec && !changing;
-        let initial_prot = if changing {
+        // It, and memory mapped writable and executable (a JIT's), runs by
+        // translation: never prepared, its words as the program wrote them.
+        let translated = changing || (wants_write_exec(prot) && self.platform.translates_jit());
+        let exec = exec && !translated;
+        let initial_prot = if translated {
             (host_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ
         } else if exec {
             if hflags & libc::MAP_SHARED != 0 && !anonymous {
@@ -2250,7 +2253,7 @@ impl<P: Platform> Kernel<P> {
             }
             // Writable and executable: a JIT's code, run by translation
             // where the backend translates it.
-            if (wants_write_exec(prot) || changing) && self.platform.translates_jit() {
+            if translated {
                 self.platform.jit_code(p, self.page_up(len));
             }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
