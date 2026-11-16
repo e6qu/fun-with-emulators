@@ -7,6 +7,11 @@
 //! record, checks the words it names, and changes only the pages that hold
 //! them.
 //!
+//! A mapping of a file's code also keeps its pages as preparation left
+//! them, an image, which a later mapping of the same range maps in their
+//! place ([`store_image`]): its pages then come from the host's file
+//! cache, shared by every process, and none is written or copied.
+//!
 //! An entry is a file in fwe's private directory named by a hash of its
 //! key, and holds the key itself, so a hash shared by two keys finds
 //! nothing. A file changed in place keeps its identity only if its size
@@ -30,6 +35,11 @@ impl FileId {
         if fd < 0 || unsafe { libc::fstat(fd, &mut st) } != 0 {
             return None;
         }
+        FileId::of_stat(&st)
+    }
+
+    /// The identity of the regular file whose metadata is `st`.
+    fn of_stat(st: &libc::stat) -> Option<FileId> {
         if st.st_mode & libc::S_IFMT != libc::S_IFREG {
             return None;
         }
@@ -41,6 +51,11 @@ impl FileId {
             st.st_mtime as u64,
             st.st_mtime_nsec as u64,
         ]))
+    }
+
+    /// The file's size.
+    pub fn size(&self) -> u64 {
+        self.0[2]
     }
 
     fn encode(&self, e: &mut Enc) {
@@ -98,6 +113,48 @@ pub fn store(key: &[u8], value: &[u8]) {
     }
 }
 
+/// The key of the prepared image of the mapping of `len` bytes at file
+/// offset `offset` of file `id` ([`store_image`]).
+pub fn image_key(id: FileId, offset: u64, len: u64) -> Vec<u8> {
+    let mut e = Enc::new();
+    e.bytes(b"image");
+    id.encode(&mut e);
+    e.u64(offset);
+    e.u64(len);
+    e.into_bytes()
+}
+
+/// Keep `image`, a mapping's pages as preparation left them, and `layout`
+/// (where its stubs go, see the backend) under `key`: the image in a file
+/// of its own beside the entry, which a later mapping maps in place of the
+/// program's file, its pages shared through the host's cache. The image
+/// is written first, so an entry found has its image whole.
+pub fn store_image(key: &[u8], layout: &[u8], image: &[u8]) {
+    let Some(path) = image_path(key) else { return };
+    let tmp = [&path[..], format!(".{}", crate::host::pid()).as_bytes()].concat();
+    let (tmp, path) = (std::ffi::OsStr::from_bytes(&tmp), std::ffi::OsStr::from_bytes(&path));
+    if std::fs::write(tmp, image).is_err() || std::fs::rename(tmp, path).is_err() {
+        let _ = std::fs::remove_file(tmp);
+        return;
+    }
+    store(key, layout);
+}
+
+/// The layout and image kept under `key`, the image open for mapping, if
+/// both are there and the image is `len` bytes.
+pub fn open_image(key: &[u8], len: u64) -> Option<(Vec<u8>, std::fs::File)> {
+    let layout = load(key)?;
+    let path = image_path(key)?;
+    let f = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)).ok()?;
+    (f.metadata().ok()?.len() == len).then_some((layout, f))
+}
+
+fn image_path(key: &[u8]) -> Option<Vec<u8>> {
+    let mut p = path_of(key)?;
+    p.extend_from_slice(b".img");
+    Some(p)
+}
+
 /// The directory of the entries.
 pub fn dir() -> Option<Vec<u8>> {
     let mut d = crate::fs::shm::user_dir().ok()?;
@@ -120,21 +177,84 @@ fn path_of(key: &[u8]) -> Option<Vec<u8>> {
     Some([&d[..], name.as_bytes()].concat())
 }
 
-/// Remove the entries made more than `age` ago: their files may be gone
-/// or changed (one still in use is made again).
+/// Remove the entries made more than `age` ago (their files may be gone
+/// or changed; one still in use is made again), and at once each image
+/// whose file is gone or changed: an image is as large as the code it
+/// holds, and a fresh copy of a library (a test's root, a container's
+/// layer) is a file of its own.
 pub fn collect(age: std::time::Duration) {
     let Some(d) = dir() else { return };
     let Ok(entries) = std::fs::read_dir(std::ffi::OsStr::from_bytes(&d)) else { return };
     for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "img") {
+            // With its entry.
+            continue;
+        }
         let old = e
             .metadata()
             .and_then(|m| m.modified())
             .ok()
             .and_then(|t| t.elapsed().ok())
             .is_none_or(|a| a > age);
-        if old {
-            let _ = std::fs::remove_file(e.path());
+        let image = std::fs::read(&path).ok().and_then(|data| image_source(&data));
+        if old || image.is_some_and(|id| !id.exists()) {
+            let _ = std::fs::remove_file(&path);
+            let _ = std::fs::remove_file(path.with_extension("img"));
         }
+    }
+    // Images whose entry is gone.
+    let Ok(entries) = std::fs::read_dir(std::ffi::OsStr::from_bytes(&d)) else { return };
+    for e in entries.flatten() {
+        let path = e.path();
+        if path.extension().is_some_and(|x| x == "img") && !path.with_extension("").exists() {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// The file an image entry (as [`store`] wrote it) was made from, if the
+/// entry is an image's.
+fn image_source(entry: &[u8]) -> Option<FileId> {
+    let mut d = Dec::new(entry);
+    let key = d.bytes();
+    let mut k = Dec::new(&key);
+    if k.bytes() != b"image" {
+        return None;
+    }
+    Some(FileId([k.u64(), k.u64(), k.u64(), k.u64(), k.u64()]))
+}
+
+impl FileId {
+    /// Whether the file is still there, unchanged: found by its device and
+    /// inode (`/.vol` on macOS), with the same size and modification time.
+    fn exists(&self) -> bool {
+        #[cfg(target_os = "macos")]
+        {
+            let [dev, ino, ..] = self.0;
+            let Ok(c) = std::ffi::CString::new(format!("/.vol/{}/{ino}", dev as i32)) else {
+                return true;
+            };
+            match FileId::of_path(&c) {
+                Some(now) => now == *self,
+                None => false,
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        true
+    }
+
+    /// The identity of the regular file at `path` (not opened: fwe opens
+    /// no guest file for its own ends).
+    #[cfg(target_os = "macos")]
+    fn of_path(path: &std::ffi::CStr) -> Option<FileId> {
+        // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: a NUL-terminated path and a valid out-parameter.
+        if unsafe { libc::stat(path.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        FileId::of_stat(&st)
     }
 }
 
@@ -227,4 +347,32 @@ pub fn decode_ranges(v: &[u8]) -> Option<Option<Vec<(u64, u64)>>> {
     };
     d.finish().ok()?;
     Some(out)
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+
+    /// An image is found while its file is there unchanged, and the
+    /// collector removes it, image and entry, once the file is gone.
+    #[test]
+    fn an_image_goes_with_its_file() {
+        let src = std::env::temp_dir().join(format!("fwe-image-src-{}", std::process::id()));
+        std::fs::write(&src, [7u8; 4096]).unwrap();
+        let f = std::fs::File::open(&src).unwrap();
+        let id = FileId::of_fd(std::os::fd::AsRawFd::as_raw_fd(&f)).unwrap();
+        let key = image_key(id, 0, 4096);
+        store_image(&key, b"layout", &[1u8; 4096]);
+        assert_eq!(open_image(&key, 4096).map(|(l, _)| l), Some(b"layout".to_vec()));
+        let day = std::time::Duration::from_secs(86400);
+        collect(day);
+        assert!(open_image(&key, 4096).is_some());
+        drop(f);
+        std::fs::remove_file(&src).unwrap();
+        collect(day);
+        assert!(open_image(&key, 4096).is_none());
+        assert!(
+            !std::path::Path::new(std::ffi::OsStr::from_bytes(&image_path(&key).unwrap())).exists()
+        );
+    }
 }

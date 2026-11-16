@@ -151,8 +151,24 @@ impl Platform for NativePlatform {
         cache: Option<&[u8]>,
     ) -> Result<(), fwe_kernel::PrepareFailed> {
         self.prepare(addr, len, None, known, cache).map(|_| ()).map_err(|e| {
+            // A mapping being kept as an image is not, failed.
+            prepare::image_abandon();
             fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
         })
+    }
+
+    fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {
+        prepare::map_image(key, addr, len, prot, (self.tp_slot, self.x18_slot))
+            .map_err(fwe_kernel::host::errno_to_linux)
+    }
+
+    fn image_begin(&mut self, _key: &[u8]) {
+        prepare::image_begin();
+    }
+
+    fn keep_image(&mut self, key: &[u8], addr: u64, len: u64) {
+        // SAFETY: the kernel's mapping, readable and just prepared.
+        unsafe { prepare::keep_image(key, addr, len) };
     }
 
     fn exit(&mut self, code: i32) -> ! {
@@ -968,8 +984,9 @@ pub fn load_image(
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
+    let slots = (platform.tp_slot, platform.x18_slot);
     let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
-        loader::load(elf, page, id, |a, l, known, arena, cache| {
+        let loaded = loader::load(elf, page, id, slots, |a, l, known, arena, cache| {
             let stats =
                 platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
@@ -981,7 +998,11 @@ pub fn load_image(
             }
             Ok(())
         })
-        .map_err(Error::Load)
+        .map_err(Error::Load)?;
+        if strace && loaded.from_image {
+            tracer.note(&format!("{what} from its prepared image"));
+        }
+        Ok(loaded)
     };
 
     let loaded = load_object(&elf, file_id, "exe")?;

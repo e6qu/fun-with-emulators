@@ -2117,6 +2117,42 @@ impl<P: Platform> Kernel<P> {
                 lock_ranges().forget_host(p, self.page_up(len));
                 return err(e);
             }
+            // A file's code prepared before: its image in place of the
+            // file's pages ([`crate::prepcache::store_image`]).
+            let file =
+                if exec && !anonymous { crate::prepcache::FileId::of_fd(host_fd) } else { None };
+            // (Of the pages the file holds: past its end, the mapping's
+            // pages are not to be read, and stay as mapped.)
+            let image_len = file.map_or(0, |id| {
+                self.page_up(len).min(self.page_up(id.size().saturating_sub(offset)))
+            });
+            let image = file
+                .filter(|_| image_len > 0)
+                .map(|id| crate::prepcache::image_key(id, offset, image_len));
+            let mapped = match &image {
+                Some(key) => self.platform.map_image(key, p, image_len, final_prot(prot)),
+                None => Ok(false),
+            };
+            if let Err(e) = mapped {
+                // SAFETY: unmapping the mapping just created.
+                self.unmap_host(p, len);
+                lock_ranges().forget_host(p, self.page_up(len));
+                return err(e);
+            }
+            if mapped == Ok(true) {
+                self.tracer.note(&format!("code at {p:#x}+{image_len:#x} from its prepared image"));
+                if image_len < self.page_up(len) {
+                    // SAFETY: the mapping's pages past the image, just made.
+                    unsafe {
+                        libc::mprotect(
+                            (p + image_len) as *mut libc::c_void,
+                            (self.page_up(len) - image_len) as usize,
+                            final_prot(prot),
+                        )
+                    };
+                }
+                break guest;
+            }
             if exec {
                 // Translate the code. For a file-backed mapping, confine the
                 // rewrite to the file's executable sections, so data mapped into
@@ -2135,7 +2171,9 @@ impl<P: Platform> Kernel<P> {
                         })
                         .collect()
                 };
-                let file = if anonymous { None } else { crate::prepcache::FileId::of_fd(host_fd) };
+                if let Some(key) = &image {
+                    self.platform.image_begin(key);
+                }
                 let (prep, known) =
                     match if anonymous { None } else { exec_file_ranges(host_fd, file) } {
                         Some((sections, code)) => (in_mapping(sections), code.map(in_mapping)),
@@ -2178,6 +2216,9 @@ impl<P: Platform> Kernel<P> {
                         }
                         return self.prepare_failed(e);
                     }
+                }
+                if let Some(key) = &image {
+                    self.platform.keep_image(key, p, image_len);
                 }
                 // SAFETY: changing protections of the mapping just created.
                 if unsafe { libc::mprotect(p as *mut libc::c_void, len as usize, final_prot(prot)) }

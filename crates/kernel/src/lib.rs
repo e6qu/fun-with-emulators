@@ -206,6 +206,27 @@ pub trait Platform {
         cache: Option<&[u8]>,
     ) -> Result<(), PrepareFailed>;
 
+    /// Map the prepared image kept under `key` ([`prepcache::image_key`])
+    /// over the mapping of a file's code at `[addr, addr + len)`, with
+    /// protections `prot` (the host's), and its stubs where they were: the
+    /// mapping is then ready, nothing written. `Ok(false)`, the mapping
+    /// left as it was, if there is no such image or its stubs' places are
+    /// taken; a Linux errno if the image replaced the mapping but could not
+    /// be made ready (the mapping is then to be undone).
+    fn map_image(&mut self, _key: &[u8], _addr: u64, _len: u64, _prot: i32) -> Result<bool, i32> {
+        Ok(false)
+    }
+
+    /// The mapping of a file's code about to be prepared ([`Self::prepare_exec`],
+    /// once for each of its code ranges) is to be kept as an image under
+    /// `key` once it is ([`Self::keep_image`]): each word is written now, none
+    /// owed, and where its stubs go is noted.
+    fn image_begin(&mut self, _key: &[u8]) {}
+
+    /// The mapping [`Self::image_begin`] began, `[addr, addr + len)`, is
+    /// prepared: its pages and stubs' places are kept under `key`.
+    fn keep_image(&mut self, _key: &[u8], _addr: u64, _len: u64) {}
+
     /// Terminate the whole process with `code` as its exit status
     /// (`exit_group`).
     fn exit(&mut self, code: i32) -> !;

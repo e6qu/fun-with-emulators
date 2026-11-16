@@ -152,14 +152,14 @@ natively wherever fwe can make them fit the Mac.
   | start-up | 3× macOS |
   | SQLite on disk, git | 1.5× macOS |
   | building a C project (Lua), a Lua script, a Python script, xz | fwe's share 1.2× |
-- [ ] **Prepared images kept:** the code fwe prepares in a program (its
-  system calls, thread-pointer accesses and `x18` uses rewritten, and
-  relocated where the next item needs it) is kept on disk by the file's
-  identity and reused, as Rosetta 2 keeps its translations, so a program
-  is prepared once rather than at every start, and a large one
-  (libLLVM, a JIT runtime) starts as fast as a small one. In place: the
-  record of what preparation found, kept and replayed, with pages written
-  as they first run ([architecture](docs/architecture.md)).
+- [x] **Prepared images kept:** the code fwe prepares in a program (its
+  system calls, thread-pointer accesses and `x18` uses rewritten) is kept
+  on disk whole, by the file's identity, and mapped from there the next
+  time, as Rosetta 2 keeps its translations: the program and its dynamic
+  linker as fwe loads them, and each library's code as the dynamic linker
+  maps it. A program is prepared once rather than at every start, and its
+  code pages are the host's cached ones, shared and never copied
+  ([architecture](docs/architecture.md)).
 - [ ] **Executables linked below 4 GiB, natively:** static Go programs and
   Debian's non-PIE executables (`python3`, GCC, clang) moved above 4 GiB.
   arm64 code reaches its own code and data PC-relative (`adrp`, `adr`,
