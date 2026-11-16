@@ -884,7 +884,19 @@ impl Pending {
                         .compare_exchange(EMPTY, WRITING, Ordering::SeqCst, Ordering::SeqCst)
                         .is_ok()
                     {
-                        store_slot(slot, &info);
+                        // A real-time signal queued before the slot was
+                        // emptied, and not yet brought in by the take that
+                        // emptied it ([`Pending::promote`]), comes first:
+                        // this one waits behind it.
+                        match self.dequeue_if(realtime, sig) {
+                            Some(older) => {
+                                store_slot(slot, &older);
+                                if info.code != signal::SI_USER || room(0) {
+                                    self.enqueue(sig, &info);
+                                }
+                            }
+                            None => store_slot(slot, &info),
+                        }
                         // The bit before the state: no take empties a slot
                         // whose bit is still to be set.
                         self.set_bit(1 << i);
@@ -931,6 +943,11 @@ impl Pending {
                 }
             }
         }
+    }
+
+    /// [`Pending::dequeue`], for a real-time signal only.
+    fn dequeue_if(&self, realtime: bool, sig: u64) -> Option<SigInfo> {
+        if realtime { self.dequeue(sig) } else { None }
     }
 
     /// Real-time `sig` was queued as the one pending of its number may
