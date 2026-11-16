@@ -1080,7 +1080,7 @@ and the per-call differences are in [Address-space layout](#address-space-layout
 | `mlock`, `mlock2`, `munlock`, `mlockall`, `munlockall` | Range and `RLIMIT_MEMLOCK` checked (for `MAP_LOCKED` and `MCL_FUTURE` mappings too), pages read in and wired on the host (not with `MLOCK_ONFAULT`, which the host cannot do), marked locked; the host's wiring is as far as it lets a user process, the guest's result Linux's. | `mlock`, `munlock` |
 | `mseal` | The mappings marked sealed in fwe's record; later changes to them fail with `EPERM`. | none |
 | `remap_file_pages` | The range of one shared file mapping mapped again at page `pgoff` of its file. | `open`, then `mmap` as above |
-| `membarrier` | Every command but the RSEQ ones; a barrier is an `mprotect` of a page of fwe's, which makes the host interrupt the process's other CPUs. | `mprotect` |
+| `membarrier` | Every command but the RSEQ ones; a barrier reads each other thread's registers, which makes the host stop it and orders its memory accesses (arm64 invalidates translations without interrupting other CPUs, so a change of protection is none). | `task_threads`, `thread_get_register_pointer_values` |
 
 #### Process and thread calls
 

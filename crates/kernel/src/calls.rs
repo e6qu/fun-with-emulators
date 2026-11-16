@@ -732,36 +732,61 @@ impl<P: Platform> Kernel<P> {
     }
 }
 
-/// A memory barrier on every thread of the process: a change of a page's
-/// protection makes the host interrupt every CPU running one, as Linux's
-/// expedited barriers do.
+/// A memory barrier on every thread of the process, as Linux's expedited
+/// barriers make one (they interrupt every CPU running the process). A
+/// change of a page's protection does not on arm64, which invalidates
+/// other CPUs' translations without interrupting them; reading each other
+/// thread's registers does: the host stops the thread for it, which orders
+/// its memory accesses (how the .NET runtime and HotSpot flush other
+/// threads' writes on macOS).
+#[cfg(target_os = "macos")]
 fn process_barrier() {
-    use std::sync::OnceLock;
-    static PAGE: OnceLock<usize> = OnceLock::new();
-    let page = *PAGE.get_or_init(|| {
-        // SAFETY: a fresh anonymous page of fwe's own.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                16384,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED { 0 } else { p as usize }
-    });
-    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
-    if page != 0 {
-        // SAFETY: fwe's own page; touched so it is mapped, then its
-        // protection changed and restored.
-        unsafe {
-            (page as *mut u8).write_volatile(0);
-            libc::mprotect(page as *mut libc::c_void, 16384, libc::PROT_READ);
-            libc::mprotect(page as *mut libc::c_void, 16384, libc::PROT_READ | libc::PROT_WRITE);
-        }
+    unsafe extern "C" {
+        static mach_task_self_: u32;
+        fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
+        fn thread_get_register_pointer_values(
+            thread: u32,
+            sp: *mut usize,
+            length: *mut usize,
+            values: *mut usize,
+        ) -> i32;
+        fn mach_thread_self() -> u32;
+        fn mach_port_deallocate(task: u32, name: u32) -> i32;
+        fn vm_deallocate(task: u32, addr: usize, size: usize) -> i32;
     }
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    // SAFETY: Mach calls on this task's own threads; every right and the
+    // list they return are given back.
+    unsafe {
+        let task = mach_task_self_;
+        let (mut list, mut count) = (std::ptr::null_mut(), 0u32);
+        if task_threads(task, &mut list, &mut count) != 0 {
+            return;
+        }
+        let me = mach_thread_self();
+        for i in 0..count as usize {
+            let t = *list.add(i);
+            if t != me {
+                // The registers that may hold pointers: none are wanted,
+                // only the stop that reading them makes.
+                let (mut sp, mut len) = (0usize, 128usize);
+                let mut values = [0usize; 128];
+                thread_get_register_pointer_values(t, &mut sp, &mut len, values.as_mut_ptr());
+            }
+            mach_port_deallocate(task, t);
+        }
+        mach_port_deallocate(task, me);
+        vm_deallocate(task, list as usize, count as usize * std::mem::size_of::<u32>());
+    }
+}
+
+/// A memory barrier on every thread of the process: the host's own
+/// (a Linux host, where the kernel crate's tests run).
+#[cfg(not(target_os = "macos"))]
+fn process_barrier() {
+    const MEMBARRIER_CMD_GLOBAL: libc::c_long = 1;
+    // SAFETY: a system call taking no pointers.
+    unsafe { libc::syscall(libc::SYS_membarrier, MEMBARRIER_CMD_GLOBAL, 0) };
 }
 
 /// The console's level before `syslog` turned it off (-1: not off).
