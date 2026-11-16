@@ -29,6 +29,12 @@ pub(crate) struct Ranges {
     /// Linux discards the old address space; fwe's own memory is never in
     /// the set.
     guest: BTreeMap<u64, u64>,
+    /// The host range of the latest mapping the guest made, not yet in
+    /// [`Ranges::guest`]: kept apart until anything else changes or reads
+    /// the set ([`lock_ranges`] puts it in first), so that a mapping
+    /// unmapped at once, as an allocator's often is, costs the set one look
+    /// instead of an insertion and a removal.
+    latest: Option<(u64, u64)>,
     /// Pages of private mappings of files with no name (a memfd, or a file
     /// unlinked once opened: memory shared through it) not yet written,
     /// host addresses. Linux shows such a page what is written to the file
@@ -64,6 +70,7 @@ pub(crate) struct Ranges {
 impl Ranges {
     const NONE: Ranges = Ranges {
         guest: BTreeMap::new(),
+        latest: None,
         file_views: BTreeMap::new(),
         wipe_on_fork: BTreeMap::new(),
         grows_down: BTreeMap::new(),
@@ -73,9 +80,31 @@ impl Ranges {
         guard: BTreeMap::new(),
     };
 
+    /// Put the latest mapping ([`Ranges::latest`]) in the guest's set.
+    fn settle(&mut self) {
+        if let Some((addr, len)) = self.latest.take() {
+            add_range(&mut self.guest, addr, len);
+        }
+    }
+
+    /// The guest mapped host range `[addr, addr + len)`: the latest
+    /// mapping, the one before it put in the set.
+    fn mapped(&mut self, addr: u64, len: u64) {
+        self.settle();
+        self.latest = Some((addr, len));
+    }
+
     /// Forget unmapped memory, `len` bytes at host address `host` and guest
     /// address `guest`, in every set.
     fn forget(&mut self, host: u64, guest: u64, len: u64) {
+        // The latest mapping, unmapped whole, never goes in: the set loses
+        // what it would have replaced, as it would with it put in and taken
+        // out.
+        if self.latest == Some((host, len)) {
+            self.latest = None;
+        } else {
+            self.settle();
+        }
         self.forget_host(host, len);
         remove_range(&mut self.wipe_on_fork, host, len);
         for set in [
@@ -109,7 +138,16 @@ static ANY_GROWS_DOWN: AtomicBool = AtomicBool::new(false);
 /// ([`hold`]).
 static RANGES: Mutex<Ranges> = Mutex::new(Ranges::NONE);
 
+/// The ranges, the latest mapping among them.
 fn lock_ranges() -> std::sync::MutexGuard<'static, Ranges> {
+    let mut r = lock_ranges_as_they_are();
+    r.settle();
+    r
+}
+
+/// The ranges, the latest mapping still apart ([`Ranges::latest`]), for
+/// [`Ranges::mapped`] and [`Ranges::forget`].
+fn lock_ranges_as_they_are() -> std::sync::MutexGuard<'static, Ranges> {
     RANGES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -153,13 +191,17 @@ fn remove_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
         return;
     }
     let end = addr.saturating_add(len);
-    // Most often the range is one of the set, whole (a mapping unmapped as
-    // it was made): no other overlaps it.
-    if let std::collections::btree_map::Entry::Occupied(o) = maps.entry(addr)
-        && *o.get() == end
-    {
-        o.remove();
-        return;
+    // Most often nothing overlaps the range, or it is one of the set,
+    // whole (a mapping unmapped as it was made): one look, at the last
+    // range that starts before its end.
+    match maps.range(..end).next_back() {
+        Some((&s, &e)) if e > addr => {
+            if (s, e) == (addr, end) {
+                maps.remove(&s);
+                return;
+            }
+        }
+        _ => return,
     }
     // From the last range that overlaps down to the first: what is put
     // back of one is outside the range, and not taken again.
@@ -982,6 +1024,37 @@ mod tests {
         );
         untrack(base, 0x20000);
         assert_eq!(here(tracked()), vec![]);
+    }
+
+    /// The latest mapping is kept apart and put in the set when anything
+    /// else comes; unmapped at once it never goes in, and what it replaced
+    /// goes all the same.
+    #[test]
+    fn latest_mapping_goes_in_unless_unmapped_at_once() {
+        let mut r = Ranges::NONE;
+        r.mapped(0x10000, 0x8000);
+        assert!(r.guest.is_empty());
+        r.mapped(0x20000, 0x4000);
+        assert_eq!(r.guest.iter().collect::<Vec<_>>(), vec![(&0x10000, &0x18000)]);
+        r.forget(0x20000, 0x20000, 0x4000);
+        assert_eq!(r.latest, None);
+        assert_eq!(r.guest.iter().collect::<Vec<_>>(), vec![(&0x10000, &0x18000)]);
+        // Fixed over the middle of the first, then unmapped: the middle
+        // goes.
+        r.mapped(0x12000, 0x2000);
+        r.forget(0x12000, 0x12000, 0x2000);
+        assert_eq!(
+            r.guest.iter().collect::<Vec<_>>(),
+            vec![(&0x10000, &0x12000), (&0x14000, &0x18000)]
+        );
+        // Unmapped other than whole: it went in first.
+        r.mapped(0x30000, 0x4000);
+        r.forget(0x30000, 0x30000, 0x2000);
+        r.settle();
+        assert_eq!(
+            r.guest.iter().collect::<Vec<_>>(),
+            vec![(&0x10000, &0x12000), (&0x14000, &0x18000), (&0x32000, &0x34000)]
+        );
     }
 
     /// Locked memory is wired on the host, and unwired again.
@@ -2092,8 +2165,8 @@ impl<P: Platform> Kernel<P> {
             crate::lazycode::unmapped(p, self.page_up(len));
             let _ = self.platform.jit_changed(p, self.page_up(len));
             {
-                let mut r = lock_ranges();
-                add_range(&mut r.guest, p, self.page_up(len));
+                let mut r = lock_ranges_as_they_are();
+                r.mapped(p, self.page_up(len));
                 if view {
                     ANY_VIEWS.store(true, std::sync::atomic::Ordering::SeqCst);
                     add_range(&mut r.file_views, p, self.page_up(len));
@@ -2258,7 +2331,7 @@ impl<P: Platform> Kernel<P> {
         self.platform.unmap_guest(addr, self.page_up(len));
         let r = self.unmap_host(host as u64, len);
         if r == 0 {
-            lock_ranges().forget(host as u64, addr, self.page_up(len));
+            lock_ranges_as_they_are().forget(host as u64, addr, self.page_up(len));
         }
         r
     }

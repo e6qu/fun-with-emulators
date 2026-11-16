@@ -32,12 +32,15 @@ best is the least disturbed.
 """
 
 import argparse
+import bisect
 import collections
+import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import tempfile
@@ -628,23 +631,84 @@ def git_commands(ours, theirs, fresh, root):
               file=sys.stderr)
 
 
+# A process's regions, as `vmmap` lists them but in milliseconds, not the
+# half second `vmmap` takes (longer than some of the programs measured
+# run): `proc_pidinfo`'s `PROC_PIDREGIONPATHINFO`, a `struct
+# proc_regionwithpathinfo` (the protection at 0, the user tag at 32, the
+# address and size at 80, the file's path at 248).
+REGION_INFO = 8
+REGION_SIZE = 96 + 152 + 1024
+# The user tags of the host's shared library cache, one region in the
+# listing (`VM_MEMORY_SHARED_PMAP`), and of fwe's stubs (`STUB_TAG` in
+# crates/native/src/prepare.rs, "Memory Tag 241" in `vmmap`).
+SHARED_CACHE_TAG = 32
+STUB_TAG = 241
+
+
+def host_regions(pid):
+    """Process `pid`'s regions in address order, (start, end, path or "",
+    user tag, protection): empty once it has ended."""
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+    buf = ctypes.create_string_buffer(REGION_SIZE)
+    out = []
+    at = 0
+    while lib.proc_pidinfo(pid, REGION_INFO, ctypes.c_uint64(at), buf, REGION_SIZE) > 0:
+        raw = buf.raw
+        prot = struct.unpack_from("<I", raw, 0)[0]
+        tag = struct.unpack_from("<I", raw, 32)[0]
+        start, size = struct.unpack_from("<QQ", raw, 80)
+        path = raw[248:].split(b"\0", 1)[0].decode(errors="replace")
+        out.append((start, start + size, path, tag, prot))
+        at = start + size
+    return out
+
+
+def proc_name(pid):
+    """The name of process `pid`'s program: "" once it has ended."""
+    buf = ctypes.create_string_buffer(256)
+    n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_name(pid, buf, len(buf))
+    return buf.raw[:max(n, 0)].decode(errors="replace")
+
+
+def shared_cache_name(pc):
+    """The library of the host's shared cache at `pc`, and the offset into
+    it: the cache is at one address in every process, so this one's
+    loader names it."""
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p),
+                    ("sname", ctypes.c_char_p), ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    if ctypes.CDLL(None).dladdr(ctypes.c_void_p(pc), ctypes.byref(info)) and info.fname:
+        return f"{os.path.basename(info.fname.decode())}+{pc - info.fbase:#x}"
+    return f"shared cache+{pc:#x}"
+
+
 def pcs(name, cmd, share=False, execname="fwe"):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
-    there (as `vmmap` lists it in the first process while it runs) and the
-    offset into it: `sample` walks frames, which guest code without frame
-    records leaves it short of. And the time the processes spend in each
-    host system call. `execname` is the processes' name: fwe's, or a native
-    program's to compare with.
+    there and the offset into it: `sample` walks frames, which guest code
+    without frame records leaves it short of. And the time the processes
+    spend in each host system call. `execname` is the processes' name:
+    fwe's, or a native program's to compare with.
+
+    What is mapped where is the first process's ([`host_regions`]), looked
+    at again and again from when it runs `execname` to its end; a sample is
+    named by the latest look that saw its address mapped. One look at one
+    moment would miss what is mapped after it, and a look slower than the
+    program (`vmmap`'s, half a second, against a compile's third) would
+    see nothing.
 
     With `share`, it returns the samples in the program's own code and all
-    of them. A sample is fwe's in fwe itself, the host's libraries fwe
-    calls, fwe's stubs (the regions they carry its memory tag in,
-    "Memory Tag 241") and anything `vmmap` did not see mapped; it is the
-    program's anywhere else: its images and libraries, mapped or loaded
-    into memory, the code it makes, and the kernel (the host's work for its
-    system calls and faults, as Linux's would be). `cmd` is then one
-    process: a forked one's mappings are not the first's."""
+    of them (none when no look saw the process). A sample is fwe's in fwe
+    itself, the host's libraries fwe calls (the shared cache, and anything
+    under `/usr/lib` or `/System`), fwe's stubs (the regions they carry its
+    memory tag in) and anything no look saw mapped; it is the program's
+    anywhere else: its images and libraries, mapped or loaded into memory,
+    the code it makes, and the kernel (the host's work for its system calls
+    and faults, as Linux's would be). `cmd` is then one process: a forked
+    one's mappings are not the first's."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
@@ -664,15 +728,16 @@ def pcs(name, cmd, share=False, execname="fwe"):
                               errors="replace")
     time.sleep(2)
     proc.stdin.close()
-    time.sleep(0.25)
-    regions = []
-    vm = subprocess.run(["vmmap", "-wide", str(proc.pid)], capture_output=True, text=True,
-                        errors="replace").stdout
-    for line in vm.splitlines():
-        m = re.search(r"([0-9a-f]+)-([0-9a-f]+)\s+\[.*?\]\s+\S+\s+SM=\S+\s*(.*)$", line)
-        if m:
-            regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip(),
-                            " ".join(line.split())))
+    # Its regions from when it runs `execname` to its end, each look kept
+    # when it differs from the last.
+    looks = []
+    while proc.poll() is None:
+        if proc_name(proc.pid) == execname:
+            regions = host_regions(proc.pid)
+            # (A look its end cut short is not kept.)
+            if regions and proc.poll() is None and (not looks or looks[-1] != regions):
+                looks.append(regions)
+        time.sleep(0.01)
     proc.wait(timeout=300)
     # DTrace itself, sudo's child: sudo passes on no signal from a process
     # of its own process group, as this one is.
@@ -702,19 +767,36 @@ def pcs(name, cmd, share=False, execname="fwe"):
     if not counts:
         print(f"{name}: no program counters: {said.strip()[-500:]}", file=sys.stderr)
         return None
+    print(f"{name}: its regions looked at as they changed: {len(looks)} times",
+          file=sys.stderr)
     # A file's offset from the lowest address it is mapped at.
     base = {}
-    for lo, _, what, _ in regions:
-        if what:
-            base[what] = min(base.get(what, lo), lo)
+    for regions in looks:
+        for lo, _, path, _, _ in regions:
+            if path:
+                base[path] = min(base.get(path, lo), lo)
+    starts = [[r[0] for r in regions] for regions in looks]
+
+    def region(pc):
+        """The region at `pc` in the latest look that saw one there."""
+        for regions, lows in zip(reversed(looks), reversed(starts)):
+            i = bisect.bisect_right(lows, pc) - 1
+            if i >= 0 and pc < regions[i][1]:
+                return regions[i]
+        return None
 
     def where(pc):
         if pc == 0:
             return "kernel"  # (No user program counter: in a system call.)
-        for lo, hi, what, _ in regions:
-            if lo <= pc < hi:
-                return f"{os.path.basename(what)}+{pc - base[what]:#x}" if what else f"anonymous {lo:#x}+{pc - lo:#x}"
-        return "unmapped"
+        r = region(pc)
+        if r is None:
+            return "unmapped"
+        lo, _, path, tag, _ = r
+        if path:
+            return f"{os.path.basename(path)}+{pc - base[path]:#x}"
+        if tag == SHARED_CACHE_TAG:
+            return shared_cache_name(pc)
+        return f"anonymous {lo:#x}+{pc - lo:#x}"
 
     total = sum(n for _, n in counts)
     by = collections.Counter()
@@ -725,22 +807,30 @@ def pcs(name, cmd, share=False, execname="fwe"):
                     for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
-    # What vmmap says of the unnamed regions most samples are in.
-    for w, _ in by.most_common(8):
-        for lo, _, what, line in regions:
-            if not what and w == f"anonymous {lo:#x}":
-                print(f"{name}: {w}: {line}", file=sys.stderr)
+    # The unnamed regions most samples are in: their tag and protection.
+    hot = {w for w, _ in by.most_common(8)}
+    for regions in looks:
+        for lo, hi, path, tag, prot in regions:
+            w = f"anonymous {lo:#x}"
+            if not path and w in hot:
+                hot.discard(w)
+                rwx = "".join(c if prot & b else "-" for c, b in (("r", 1), ("w", 2), ("x", 4)))
+                print(f"{name}: {w}: {lo:x}-{hi:x} tag {tag} {rwx}", file=sys.stderr)
     if not share:
         return None
+    if not looks:
+        print(f"{name}: no look saw the process's regions: no share", file=sys.stderr)
+        return None
 
-    def fwes(what, line):
-        return (line.startswith("Memory Tag 241")
-                or what.startswith(("/usr/lib/", "/System/"))
-                or os.path.basename(what) == "fwe")
+    def fwes(r):
+        _, _, path, tag, _ = r
+        return (tag in (STUB_TAG, SHARED_CACHE_TAG)
+                or path.startswith(("/usr/lib/", "/System/"))
+                or os.path.basename(path) == "fwe")
 
     def owns(pc):
-        return pc == 0 or any(lo <= pc < hi and not fwes(what, line)
-                              for lo, hi, what, line in regions)
+        r = region(pc)
+        return pc == 0 or (r is not None and not fwes(r))
 
     mine = sum(n for pc, n in counts if owns(pc))
     kernel = sum(n for pc, n in counts if pc == 0)
@@ -985,8 +1075,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
     # And xz alone, on the data that left (its code named by its library's
     # offsets, not its shell's): its two runs, each one process, are the
     # workload's share of fwe's.
-    # (Decompressing sixty times over: once is over before `vmmap` has
-    # looked.)
+    # (Decompressing sixty times over: once is over in a few samples.)
     mine = [pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"), True),
             pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", *["/tmp/w/data.xz"] * 60),
                 True)]

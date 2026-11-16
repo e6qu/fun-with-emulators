@@ -536,6 +536,10 @@ impl<P: Platform> Kernel<P> {
     /// one with a handler enters it. Ends a finished `rt_sigsuspend` by
     /// restoring the mask it replaced, if no handler did.
     pub fn deliver_pending(&mut self, regs: &mut Regs) {
+        // Most often nothing is pending: the thread's state in one look.
+        if self.settle_shared() {
+            return;
+        }
         thread::wake_others_if_asked(host::WAKE_SIGNAL);
         drain_to_signalfd();
         loop {
