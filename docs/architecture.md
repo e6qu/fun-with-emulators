@@ -669,7 +669,9 @@ memory or threads, so a tracee does its tracer's work itself:
 
 - **Mailbox:** a page per traced thread in the process store (named by
   the pid for a main thread, the tid for another), kept while its tracer
-  lives. It names the thread's process and holds the stop's wait status,
+  lives: a tracee detached or ended marks it so, and its tracer frees it
+  as it next looks, so no tracer's request lands in a page made again
+  for another tracee. It names the thread's process and holds the stop's wait status,
   the general and FP registers, the `siginfo`, the options, and one
   request at a time with its result, handed over through shared host
   address waits.
@@ -1014,9 +1016,11 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   does not keep are 0), `net`, `task/<tid>/{stat,status,comm}`. Writing
   `comm` names the thread as `PR_SET_NAME` does (another process's:
   `EINVAL`). The state in `stat` is the main
-  thread's: `S` while it waits in a system call, never while it waits for
-  one of fwe's own locks (as a Linux task waiting on a kernel lock is not
-  asleep).
+  thread's: `S` while it waits in a system call, `D` while the host
+  brings in a page for it, and `R` while it does fwe's own work, waiting
+  for one of fwe's locks or the host's reading and writing of fwe's
+  records (a mark in the process store, `procstore::Busy`), as a Linux
+  task doing its kernel's work is not asleep.
 - `/proc` globals: `cpuinfo` (Linux's arm64 format: BogoMIPS from the
   host's timer, the features of the hwcaps the program was given, the
   implementer and, for a chip Linux knows, the part from `hw.cpufamily`;
@@ -1151,7 +1155,9 @@ records ([linux-on-macos.md](linux-on-macos.md#ipc)):
 - **System V** (`crates/kernel/src/sysvipc.rs`, `ipcops.rs`): the record
   holds keys, owners, permissions, times, semaphore values and undo
   adjustments, messages, and the namespace's limits (`kernel.shmmax`,
-  `kernel.sem`, `kernel.msgmni`…, which root may change). `shmat` honours
+  `kernel.sem`, `kernel.msgmni`…, which root may change). The initial
+  namespace's record is the host boot's: no process names it, and the
+  collector keeps it until the host restarts. `shmat` honours
   `SHMLBA` with `SHM_RND` and maps over existing memory only with
   `SHM_REMAP`; a fork child counts its parent's attachments; `execve` and
   exit detach. A wait ends with `EINTR` for a signal, `EIDRM` if the
@@ -1754,10 +1760,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A sleep or timeout ends tens of microseconds late (the host's timer
   wake and fwe's return to the guest), and on a loaded host it, or the
   gap between two successive calls, can stretch to milliseconds. On a
-  virtual Mac (a CI runner) whose processors idle, the host's own
-  `NOTE_CRITICAL` timers, and so fwe's, end up to half the wait late (10
-  ms at most): more than LTP's timer tests and `clock_gettime04` allow,
-  so tools/ltp/run.py keeps every processor busy as they run.
+  virtual Mac (a CI runner) the host's own `NOTE_CRITICAL` timers, and so
+  fwe's, end up to half the wait late (10 ms at most), as LTP expects of
+  a virtual machine: tools/ltp/run.py tells its tests they run in one
+  (`LTP_VIRT_OVERRIDE`), as `systemd-detect-virt` would on Linux, and its
+  timer tests then check no upper bound.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in

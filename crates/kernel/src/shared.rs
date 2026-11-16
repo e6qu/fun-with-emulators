@@ -392,6 +392,8 @@ impl<T: Data> Record<T> {
     /// holds every change since, else read whole. What a change made
     /// meanwhile tore is read again.
     fn read_current(&self, seen: u64, cached: &Arc<T>) -> Result<(u64, Arc<T>), i32> {
+        // Files read: fwe's work, not a wait of the guest's.
+        let _busy = crate::procstore::Busy::new();
         let mut last = Err(errno::EIO);
         for _ in 0..100 {
             let now = self.generation.load(Ordering::SeqCst);
@@ -498,6 +500,9 @@ impl<T: Data> Record<T> {
 
     /// Run `f` holding the record's lock.
     fn with_lock<R>(&self, f: impl FnOnce() -> Result<R, i32>) -> Result<R, i32> {
+        // Files opened, locked, read and written: fwe's work, not a wait
+        // of the guest's.
+        let _busy = crate::procstore::Busy::new();
         let lock = c(&[&self.dir[..], b"/lock"].concat())?;
         // SAFETY: a NUL-terminated path in the record's directory.
         let fd = unsafe {
@@ -699,6 +704,15 @@ fn detach_descriptors() {
     }
 }
 
+/// Whether `name` (past `v<FORMAT>-`) is the initial IPC namespace's
+/// record of an earlier boot of the host: this boot's lasts until the host
+/// restarts, as Linux's initial namespace's objects last until the machine
+/// does ([`crate::sysvipc::initial`]).
+fn earlier_boot_ipc(name: &[u8]) -> bool {
+    name.strip_prefix(b"ipc-initial-")
+        .is_some_and(|boot| boot != crate::host::boot_time().to_string().as_bytes())
+}
+
 /// [`collect`]'s work, in fwe's private directory `base`.
 fn collect_in(base: &[u8]) {
     use std::collections::HashSet;
@@ -814,6 +828,10 @@ fn collect_in(base: &[u8]) {
                                 .and_then(|m| m.host_path(b""))
                         });
                         root.is_none_or(|r| !std::path::Path::new(&os(&r)).is_dir())
+                    } else if rest.starts_with(b"ipc-initial-") {
+                        // No process names it (it is everyone's who made
+                        // no other): kept while the host runs.
+                        earlier_boot_ipc(rest)
                     } else {
                         kind != b"cgroup" || rest.starts_with(b"cgroup-")
                     }
@@ -844,5 +862,20 @@ fn collect_in(base: &[u8]) {
                 let _ = std::fs::remove_file(os(&path));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod collect_tests {
+    use super::*;
+
+    /// The initial IPC namespace's record is this boot's to keep, however
+    /// long since it changed; an earlier boot's goes.
+    #[test]
+    fn the_initial_ipc_namespace_lasts_while_the_host_runs() {
+        let now = format!("ipc-initial-{}", crate::host::boot_time());
+        assert!(!earlier_boot_ipc(now.as_bytes()));
+        assert!(earlier_boot_ipc(b"ipc-initial-1"));
+        assert!(!earlier_boot_ipc(b"ipc-1234-5678-0"));
     }
 }

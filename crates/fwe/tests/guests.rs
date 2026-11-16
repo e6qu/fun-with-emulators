@@ -1198,6 +1198,42 @@ fn a_forked_child_starts_in_its_parents_cgroup() {
     c_guest_prints("cgroupfork", &[], "children elsewhere: 0\n");
 }
 
+/// A connect is made once: one a signal the guest ignores lands in
+/// succeeds, and a non-blocking one in progress is finished by the next
+/// connect (0), after which the socket is connected (`EISCONN`), as on
+/// Linux.
+#[test]
+fn a_connect_is_made_once_however_signals_land() {
+    c_guest_prints(
+        "connectsig",
+        &[],
+        "blocking connects failed: 0\nnon-blocking: 115, then 0, then 106\n",
+    );
+}
+
+/// Tracers side by side: each continues its own tracee, stopped; none's
+/// requests reach another's, as their mailboxes' pages are freed and made
+/// again.
+#[test]
+fn tracers_side_by_side_continue_only_their_own_tracees() {
+    c_guest_prints("tracestorm", &[], "workers broken: 0, tracees not stopped or continued: 0\n");
+}
+
+/// A process `/proc` shows sleeping in a semaphore wait is counted as
+/// waiting: fwe's own work on the way there is not shown as a sleep.
+#[test]
+fn a_process_shown_sleeping_in_a_semaphore_wait_is_counted() {
+    c_guest_prints("semwaiters", &[], "workers failed: 0, sleeping waiters not counted: 0\n");
+}
+
+/// cgroups made, joined, left and removed side by side under one shared
+/// parent: a removal of the parent that finds a child is `EBUSY`, never
+/// taking the child or its files with it.
+#[test]
+fn cgroups_made_and_removed_side_by_side() {
+    c_guest_prints("cgrouprace", &[], "failed steps: 0\n");
+}
+
 /// A signal for a process whose main thread blocks it is taken by another
 /// thread that does not, whether that one waits in `pause` or sleeps.
 #[test]

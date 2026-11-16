@@ -5,20 +5,11 @@
  * use (a kqueue EVFILT_TIMER with NOTE_CRITICAL), drops the longest 5%
  * (at least one), and prints the shortest sleep, the mean of the rest and
  * the longest, in microseconds. run.py runs it when a timer test fails.
- *
- * `hosttimer spin` keeps every processor busy at the lowest priority until
- * it is killed: run.py runs the timer tests, and this measurement, beside
- * it, so that none idles: on a virtual machine (a CI runner) an idle
- * processor's next timer is the VM host's to deliver, with the VM host's
- * leeway.
  */
 #include <poll.h>
-#include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/event.h>
-#include <sys/resource.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -35,36 +26,8 @@ static int longest_first(const void *a, const void *b)
 	return x < y ? 1 : x > y ? -1 : 0;
 }
 
-static void *spin_thread(void *arg)
-{
-	for (;;)
-		__asm__ volatile("" ::: "memory");
-	return arg;
-}
-
-/* A thread a processor, each at the lowest priority: any other work, a
- * timer test's woken thread first, takes the processor from it. Ends with
- * its parent, should that end without killing it. */
-static int spin(void)
-{
-	pid_t parent = getppid();
-	if (setpriority(PRIO_PROCESS, 0, PRIO_MAX) != 0)
-		return 2;
-	long n = sysconf(_SC_NPROCESSORS_ONLN);
-	for (long i = 0; i < n; i++) {
-		pthread_t t;
-		if (pthread_create(&t, NULL, spin_thread, NULL) != 0)
-			return 2;
-	}
-	while (getppid() == parent)
-		sleep(1);
-	return 0;
-}
-
 int main(int argc, char **argv)
 {
-	if (argc == 2 && strcmp(argv[1], "spin") == 0)
-		return spin();
 	if (argc != 3)
 		return 2;
 	long long usec = atoll(argv[1]);

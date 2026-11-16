@@ -1353,7 +1353,8 @@ type or a short `ucred` is `EINVAL`, a descriptor not open `EBADF`;
 other levels are passed over) and sends every `SCM_RIGHTS` message's
 descriptors, up to Linux's 253 (`EINVAL` past them; the host takes 254),
 as one host message, with `SCM_CREDENTIALS` (see below). On a socket that
-is not a Unix one, descriptors and credentials are `EINVAL`. A receive writes as many descriptors as the
+is not a Unix one, descriptors and credentials are let by and the data
+sent, as Linux's `__sock_cmsg_send` lets them by. A receive writes as many descriptors as the
 guest's buffer holds and closes the others, setting `MSG_CTRUNC`, as
 Linux does (the host installs them all whatever the buffer);
 `MSG_CMSG_CLOEXEC` makes them close-on-exec. A received
@@ -2195,6 +2196,7 @@ names macOS does not support:
 | a level a socket has no layer for | taken or `EINVAL` | `EOPNOTSUPP` to get, `ENOPROTOOPT` to set (`EOPNOTSUPP` on a Unix socket) |
 | multicast membership on a TCP socket | refused | kept by fwe (no multicast reaches one) |
 | `MSG_MORE` | none | a TCP or UDP send's data held back and sent with the next send without it, as one segment or datagram |
+| a later `connect` of a socket whose connect was interrupted or left in progress (`EINPROGRESS`) waits for the connection under way, then returns 0 (or its error); after that, `EISCONN` | it says `EALREADY` while the connection is made and `EISCONN` once it is | fwe marks the socket connecting and answers a later `connect` (its own rerun after a signal the guest does not see too) as Linux does, waiting for the host's connection if the socket blocks |
 | `connect` to `AF_UNSPEC` | dissolves a datagram socket's peer, reporting an error | a datagram socket's peer forgotten; a TCP socket's connection reset and a fresh host socket put in its place |
 | `IPV6_ADDRFORM` | none | an IPv6 socket with an IPv4-mapped peer reports its names as IPv4, and a reset makes it an IPv4 socket |
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
@@ -2263,7 +2265,7 @@ is a host process, native or running the VM alike.
 
 | File | What fwe does | On the host |
 |---|---|---|
-| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree, a write to `cgroup.subtree_control` naming a controller Linux lacks `EINVAL` (one the cgroup may not use `ENOENT`) before anything changes; a new cgroup's files are its creator's, a controller's whoever enables it; lists read as they are when opened (`cgroup.threads` lists every thread) | the directories, the process records |
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree, a write to `cgroup.subtree_control` naming a controller Linux lacks `EINVAL` (one the cgroup may not use `ENOENT`) before anything changes; a new cgroup's files are its creator's, a controller's whoever enables it; lists read as they are when opened (`cgroup.threads` lists every thread); making, removing and moving into a cgroup one at a time across processes, as under Linux's `cgroup_mutex` | the directories, a lock file beside them, the process records |
 | moving a process (`cgroup.procs`, `CLONE_INTO_CGROUP`) | Linux's delegation: write access to `cgroup.procs` of the cgroup the source and destination are both in (`EACCES`), both inside the writer's cgroup namespace (`ENOENT`; the hierarchy is mounted `nsdelegate`) | none |
 | `cgroup.type`, `cgroup.threads` | only domain cgroups: `threaded` is `EOPNOTSUPP`, and a thread moves only to the cgroup it is in | none |
 | `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
