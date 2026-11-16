@@ -560,8 +560,12 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
             times[side].append(time.perf_counter() - start)
             if r.returncode != 0:
+                # The head of the output holds a crash report's summary (a
+                # JVM's), its end what led to the failure.
+                out = r.stdout if len(r.stdout) <= 12000 else (
+                    f"{r.stdout[:6000]}\n[...]\n{r.stdout[-6000:]}")
                 sys.exit(f"{name} {side} failed ({r.returncode}): {r.stderr[-3000:]}\n"
-                         f"its output: {r.stdout[-6000:]}")
+                         f"its output: {out}")
             outs[side] = r.stdout
     if outs["fwe"] != outs["macOS"]:
         sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
