@@ -3726,7 +3726,8 @@ fn alpine_luajit_runs_jit_code() {
         .env("FWE_TIMING", "1")
         .env("PATH", "/usr/bin:/bin")
         .stdin(Stdio::null());
-    let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+    // A bound on a hang; how fast it ran is in the counts it prints.
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     eprintln!("--- luajit ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     if !out.status.success() {

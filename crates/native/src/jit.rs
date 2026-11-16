@@ -298,6 +298,9 @@ static ENTERED: AtomicU64 = AtomicU64::new(0);
 static EXITS_DIRECT_OUT: AtomicU64 = AtomicU64::new(0);
 static EXITS_INDIRECT_OUT: AtomicU64 = AtomicU64::new(0);
 static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
+/// Of [`ENTERED`]: calls (`blr`) from code not translated, counted only
+/// for `FWE_TIMING` (it reads the caller's code).
+static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
@@ -308,13 +311,14 @@ pub fn counts() -> Option<String> {
     (t > 0).then(|| {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
-             indirect to code not translated), {} entries by fetch ({} returns), \
+             indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated), \
              {} pages' translations dropped by writes, the code cache emptied {} times",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
             ENTERED.load(Ordering::Relaxed),
             ENTERED_RETURNS.load(Ordering::Relaxed),
+            ENTERED_CALLS.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed)
         )
@@ -559,16 +563,25 @@ fn remove(set: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 /// holds code that runs by translation.
 pub fn enter(pc: u64, lr: u64) -> Option<u64> {
     let mut s = state();
-    // Code it cannot read (its page's protections taken away without
-    // fwe) is no code to run: the fetch's fault is the program's. (Read
-    // as the host copies, which reports a hole rather than fault with the
-    // lock held.)
-    if !s.in_region(pc) || crate::trap::read_host::<u32>(pc).is_none() {
+    if !s.in_region(pc) {
+        return None;
+    }
+    // Code not translated yet that it cannot read (its page's protections
+    // taken away without fwe) is no code to run: the fetch's fault is the
+    // program's. (Read as the host copies, which reports a hole rather
+    // than fault with the lock held.)
+    if !s.by_g.contains_key(&pc) && crate::trap::read_host::<u32>(pc).is_none() {
         return None;
     }
     ENTERED.fetch_add(1, Ordering::Relaxed);
     if lr == pc {
         ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
+    } else if fwe_kernel::timing::on()
+        && !s.in_region(lr.wrapping_sub(4))
+        && crate::trap::read_host::<u32>(lr.wrapping_sub(4))
+            .is_some_and(|w| w & 0xffff_fc1f == 0xd63f_0000)
+    {
+        ENTERED_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     let i = translation(&mut s, pc);
     Some(body(&s, i))
