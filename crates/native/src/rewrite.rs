@@ -266,7 +266,7 @@ pub fn patch_jit(code: &mut [u8]) -> Patched {
 /// is made of: not the reserved class (`udf`, and any small number), the
 /// unallocated ones, or SVE's (which Apple's cores do not have).
 fn instruction_class(w: u32) -> bool {
-    !matches!((w >> 25) & 0xf, 0b0000 | 0b0001 | 0b0010 | 0b0011)
+    !matches!((w >> 25) & 0xf, 0b0000..=0b0011)
 }
 
 /// Whether word `i` of `words` sits among instructions: the two words on
