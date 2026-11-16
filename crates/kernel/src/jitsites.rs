@@ -56,6 +56,28 @@ pub fn record(addr: u64, was: u32, now: u32) {
         .or_insert(Some(was));
 }
 
+/// Whether `w` decodes in one of the instruction classes a program's code
+/// is made of: not the reserved class (`udf`, and any small number), the
+/// unallocated ones, or SVE's (which Apple's cores do not have).
+fn instruction_class(w: u32) -> bool {
+    !matches!((w >> 25) & 0xf, 0b0000..=0b0011)
+}
+
+/// Whether word `i` of `words` sits among instructions: the two words on
+/// each side of it that the range holds all decode in an instruction
+/// class. Words past either end of the range are not held against it (the
+/// code goes on in a page not being prepared). Code a JIT writes keeps
+/// data among it, mostly pointers and small numbers, and a pointer above
+/// 4 GiB has a small number for its high half, which decodes as no
+/// instruction: so a word of data that happens to read as an instruction
+/// fwe would change is told from one by its neighbours.
+pub fn among_instructions(words: &[u32], i: usize) -> bool {
+    (1..=2).all(|n| {
+        (i < n || instruction_class(words[i - n]))
+            && words.get(i + n).is_none_or(|&w| instruction_class(w))
+    })
+}
+
 /// Whether `w` is an unconditional branch (`b`), and where it leads from
 /// `at`.
 fn branch_target(at: u64, w: u32) -> Option<u64> {
@@ -64,19 +86,25 @@ fn branch_target(at: u64, w: u32) -> Option<u64> {
 
 /// In `[addr, addr + len)`, code a JIT wrote and is writable: put back the
 /// JIT's word for each copy of a branch fwe wrote elsewhere, found as a
-/// branch fwe did not write here, with the bits of one it did, that leads
-/// where `code` says there is no code (a JIT's own branches lead to its
-/// code). How many were put back.
+/// branch fwe did not write here, with the bits of one it did, among
+/// instructions ([`among_instructions`]: not the low half of a pointer),
+/// that leads where `code` says there is no code (a JIT's own branches
+/// lead to its code). How many were put back.
 pub fn repair_copies(addr: u64, len: u64, code: impl Fn(u64) -> bool) -> usize {
     let words = WORDS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(words) = words.as_ref() else { return 0 };
     let sites = sites();
+    // SAFETY: the caller's range, readable.
+    let here: Vec<u32> =
+        unsafe { std::slice::from_raw_parts(addr as *const u32, (len / 4) as usize) }.to_vec();
     let mut repaired = 0;
-    for at in (addr..addr.saturating_add(len)).step_by(4) {
+    for (i, &w) in here.iter().enumerate() {
+        let at = addr + 4 * i as u64;
         let p = at as *mut u32;
-        // SAFETY: a word of the caller's range, writable.
-        let w = unsafe { p.read_volatile() };
         let Some(to) = branch_target(at, w) else { continue };
+        if !among_instructions(&here, i) {
+            continue;
+        }
         if sites.get(&at).is_some_and(|&(_, now)| now == w) {
             continue;
         }
@@ -132,19 +160,19 @@ mod tests {
     /// when its target is no code; one whose target is code is the JIT's.
     #[test]
     fn copied_branches_get_the_jits_word_back() {
-        let mut code = vec![0u32; 8];
-        let base = code.as_mut_ptr() as u64;
+        const NOP: u32 = 0xd503_201f;
         // `b .+0x100000`, standing for `ldr x0, [x18, #8]` at base.
         let (was, now) = (0xf940_0640, 0x1404_0000);
-        code[0] = now;
+        // fwe's own at 0; the same bits as a pointer's low half at 1 (its
+        // high half beside it); copies among instructions at 5 and 8.
+        let mut code = vec![now, now, 0x0000_0200, NOP, NOP, now, NOP, NOP, now, NOP, NOP];
+        let base = code.as_mut_ptr() as u64;
         record(base, was, now);
-        // Copied to base + 16 and base + 24.
-        code[4] = now;
-        code[6] = now;
-        let to6 = base + 24 + 0x10_0000;
-        assert_eq!(repair_copies(base, 32, |t| t == to6), 1);
-        assert_eq!((code[0], code[4], code[6]), (now, was, now));
-        forget(base, 32);
+        // The copy at 8 leads to code; the one at 5 does not.
+        let to8 = base + 32 + 0x10_0000;
+        assert_eq!(repair_copies(base, 44, |t| t == to8), 1);
+        assert_eq!((code[0], code[1], code[5], code[8]), (now, now, was, now));
+        forget(base, 44);
     }
 
     /// A word fwe changed goes back when its page is writable again, unless

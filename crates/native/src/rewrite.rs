@@ -262,24 +262,6 @@ pub fn patch_jit(code: &mut [u8]) -> Patched {
     patch_with(code, None, true)
 }
 
-/// Whether `w` decodes in one of the instruction classes a program's code
-/// is made of: not the reserved class (`udf`, and any small number), the
-/// unallocated ones, or SVE's (which Apple's cores do not have).
-fn instruction_class(w: u32) -> bool {
-    !matches!((w >> 25) & 0xf, 0b0000..=0b0011)
-}
-
-/// Whether word `i` of `words` sits among instructions: the two words on
-/// each side of it that the range holds all decode in an instruction
-/// class. Words past either end of the range are not held against it (the
-/// code goes on in a page not being prepared).
-fn among_instructions(words: &[u32], i: usize) -> bool {
-    (1..=2).all(|n| {
-        (i < n || instruction_class(words[i - n]))
-            && words.get(i + n).is_none_or(|&w| instruction_class(w))
-    })
-}
-
 fn patch_with(code: &mut [u8], known: Option<&[(u64, u64)]>, jit: bool) -> Patched {
     let mut out = Patched::default();
     let words = code.len() / 4;
@@ -287,7 +269,7 @@ fn patch_with(code: &mut [u8], known: Option<&[(u64, u64)]>, jit: bool) -> Patch
         None if jit => {
             let w: Vec<u32> =
                 code.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
-            (0..words).map(|i| among_instructions(&w, i)).collect()
+            (0..words).map(|i| fwe_kernel::jitsites::among_instructions(&w, i)).collect()
         }
         None => vec![true; words],
         Some(ranges) => {

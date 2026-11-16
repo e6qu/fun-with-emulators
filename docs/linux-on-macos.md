@@ -589,7 +589,7 @@ small number for its high half and a small number decodes as no
 instruction (`udf`), so a pointer whose low half reads as an `x18`
 instruction is left alone. HotSpot's compilers use `x18` on Linux, and
 every such use in its code passes; V8's lookalikes are all data, and none
-does (`rewrite::patch_jit`).
+does (`rewrite::patch_jit`, `jitsites::among_instructions`).
 
 A JIT also writes its code again: it patches calls and constants in
 place, and HotSpot builds a method in a buffer in its code cache and
@@ -608,9 +608,10 @@ runs, so it may have been prepared since its last write. A copied branch
 to a stub keeps its distance and leads nowhere. A branch's word is its
 distance alone, so every word fwe writes is kept with the program's word
 it stands for; before JIT code is prepared, a branch there that fwe did
-not write, with the bits of one it did, leading where there is no code
-(a program's own branches lead to its code), gets the program's word
-back, and is then prepared as any other.
+not write, with the bits of one it did, among instructions (as a
+pointer's low half is not) and leading where there is no code (a
+program's own branches lead to its code), gets the program's word back,
+and is then prepared as any other.
 
 ### CTR_EL0: emulated when it traps
 

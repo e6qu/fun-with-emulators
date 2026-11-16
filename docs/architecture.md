@@ -233,7 +233,7 @@ The pieces:
   it knows from the file's sections and unwind table; a failure is traced
   (see [Tracing](#tracing)). Memory made executable after it was mapped
   is a JIT's, with no ranges: `rewrite::patch_jit` gives an `x18` use a
-  stub only among instructions, so the data a JIT keeps in its code pages
+  stub only among instructions (`jitsites::among_instructions`), so the data a JIT keeps in its code pages
   stays as it is, and `--strace` notes the uses given stubs per page
   ([x18 in JIT code](linux-on-macos.md#x18-in-jit-code)).
 - `crates/kernel/src/jitsites.rs` records each word preparation changes
@@ -246,7 +246,9 @@ The pieces:
   kept with the word it stands for, and before JIT code is prepared,
   `jitsites::repair_copies` puts back the program's word for each copy
   there of a branch fwe wrote elsewhere (one fwe did not write there,
-  leading where the guest has no executable memory).
+  among instructions, leading where the guest has no executable memory).
+  `jitsites::among_instructions` is the rule both use to tell a JIT's
+  code from its data.
 - `crates/kernel/src/prepcache.rs` keeps, in fwe's private directory and
   by a file's identity (device, inode, size, modification time), its
   sections' and unwind table's code ranges and, for each mapped code range

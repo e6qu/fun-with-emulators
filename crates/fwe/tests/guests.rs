@@ -291,6 +291,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18mem",
     "x18dp",
     "x18ldst",
+    "x18pair",
     "x18br",
     "x18fp",
     "x18pc",
@@ -3847,6 +3848,15 @@ fn asm_x18_survives_data_processing() {
 #[test]
 fn asm_x18_survives_load_store_addressing() {
     assert_eq!(fwe(&asm_guest("x18ldst-pie"), &[]).status.code(), Some(0));
+}
+
+/// HotSpot's register saves and restores with x18 in a pair off sp (`stp
+/// x18, xzr, [sp, #128]`, `ldp x18, x19, [sp], #96`) keep every register,
+/// across preemption and system calls.
+#[test]
+fn asm_x18_pairs_off_sp_keep_every_register() {
+    let code = fwe(&asm_guest("x18pair-pie"), &[]).status.code();
+    assert_eq!(code, Some(0), "register {} lost", code.unwrap_or(0) - 1);
 }
 
 /// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz), across preemption:
