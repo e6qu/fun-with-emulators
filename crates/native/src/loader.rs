@@ -1,7 +1,7 @@
 //! Mapping an ELF image into the host process at its guest addresses.
 
 use crate::prepare::{StubArena, stub_space};
-use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X};
+use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X, Patch};
 use std::fmt;
 
 /// A loaded image.
@@ -33,9 +33,10 @@ pub enum LoadError {
         reason: fwe_kernel::host::ReserveError,
     },
     /// The image is linked below 4 GiB, which macOS reserves in every arm64
-    /// process (`__PAGEZERO`).
+    /// process (`__PAGEZERO`), and cannot be moved ([`moved`]): why.
     BelowHostMinimum {
         start: u64,
+        why: String,
     },
     Map(std::io::Error),
     Prepare {
@@ -59,11 +60,10 @@ impl fmt::Display for LoadError {
                  ({reason})",
                 start + len
             ),
-            LoadError::BelowHostMinimum { start } => write!(
+            LoadError::BelowHostMinimum { start, why } => write!(
                 f,
-                "executable is linked at {start:#x}, below 4 GiB, which macOS reserves; \
-                 position-independent executables run, and executables linked at low \
-                 addresses need the hypervisor backend (not available yet)"
+                "executable is linked at {start:#x}, below 4 GiB, which macOS reserves, and \
+                 cannot be moved: {why}"
             ),
             LoadError::Map(e) => write!(f, "mapping the image failed: {e}"),
             LoadError::Prepare { start, reason } => {
@@ -105,6 +105,20 @@ pub fn host_min_address() -> u64 {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 1 << 32 } else { 0 }
 }
 
+/// How far an executable linked below 4 GiB is moved: 1 TiB, a multiple
+/// of 4 GiB (so the low 32 bits of every address, and with them all
+/// PC-relative page arithmetic, stay as linked), clear of fwe's own image
+/// just above 4 GiB and below the 2 TiB its mappings start at.
+pub const MOVE: u64 = 1 << 40;
+
+/// For an executable linked below 4 GiB: the patches that move it
+/// [`MOVE`] higher, or why it cannot be (see [`fwe_elf::moves`]).
+/// `None` for one the host can map where it is linked.
+pub fn moved(elf: &Elf<'_>, page_size: u64) -> Option<Result<Vec<(u64, Patch)>, String>> {
+    (!elf.is_pie() && LoadPlan::new(elf, page_size).start < host_min_address())
+        .then(|| fwe_elf::moves(elf, MOVE))
+}
+
 /// Map `elf` for host pages of `page_size` bytes. `prepare_exec` is called
 /// on every executable range while it is still writable.
 /// [`load`]'s preparation of code: `(address, length, known code, stub
@@ -129,9 +143,13 @@ pub fn load(
 ) -> Result<Loaded, LoadError> {
     use fwe_kernel::prepcache as cache;
     let plan = LoadPlan::new(elf, page_size);
-    if !elf.is_pie() && plan.start < host_min_address() {
-        return Err(LoadError::BelowHostMinimum { start: plan.start });
-    }
+    // An executable linked below 4 GiB, loaded `MOVE` higher with its
+    // absolute addresses changed to match.
+    let patches = match moved(elf, page_size) {
+        Some(Ok(p)) => Some(p),
+        Some(Err(why)) => return Err(LoadError::BelowHostMinimum { start: plan.start, why }),
+        None => None,
+    };
 
     // Space for code stubs right after the image, so they are within branch
     // range of the code that needs them.
@@ -181,10 +199,10 @@ pub fn load(
         }
         p as u64
     } else {
-        fwe_kernel::host::reserve_fixed(plan.start, total).map_err(|reason| {
-            LoadError::AddressUnavailable { start: plan.start, len: total, reason }
-        })?;
-        plan.start
+        let at = plan.start + if patches.is_some() { MOVE } else { 0 };
+        fwe_kernel::host::reserve_fixed(at, total)
+            .map_err(|reason| LoadError::AddressUnavailable { start: at, len: total, reason })?;
+        at
     };
     fwe_kernel::mm::track(base, total);
     let bias = base - plan.start;
@@ -228,6 +246,17 @@ pub fn load(
         unsafe {
             std::ptr::copy_nonoverlapping(src.as_ptr(), (ph.vaddr + bias) as *mut u8, src.len())
         };
+    }
+
+    // A moved executable's absolute addresses, before its code is looked at.
+    for &(at, patch) in patches.iter().flatten() {
+        // SAFETY: a place of the image, in a run mapped read-write above.
+        unsafe {
+            match patch {
+                Patch::Word(w) => ((at + bias) as *mut u64).write_unaligned(w),
+                Patch::Insn(i) => ((at + bias) as *mut u32).write_unaligned(i),
+            }
+        }
     }
 
     // Translate only the executable code, not every byte of an executable

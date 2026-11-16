@@ -21,8 +21,10 @@ backends:
   program, which is most of what a distribution ships. `fwe` rewrites the
   few instructions macOS does not let a Linux program run unchanged.
 - **Hypervisor**, for a program linked at a fixed address below 4 GiB,
-  which macOS reserves: it runs unmodified in a small Hypervisor.framework
-  VM, its system calls served by the same code. This needs `fwe` signed
+  which macOS reserves, that fwe cannot move above it (one whose link
+  kept its relocations is moved and runs natively): it runs unmodified in
+  a small Hypervisor.framework VM, its system calls served by the same
+  code. This needs `fwe` signed
   with the hypervisor entitlement ([docs/hypervisor.md](docs/hypervisor.md)).
 
 [docs/linux-on-macos.md](docs/linux-on-macos.md) explains this in detail.
@@ -52,6 +54,7 @@ Native speed, graphical programs and gVisor are the work left to 1.0;
 | [PLAN.md](PLAN.md) | Goal, approach, scope, principles and the 1.0 finish line |
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
 | [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run where, which instructions are rewritten, how the VM is used, and how each Linux concept maps onto macOS |
+| [docs/linking.md](docs/linking.md) | How programs are built and loaded, Linux and macOS on arm64: ELF and Mach-O, relocations, static and dynamic linking, PIE and static PIE and their code, virtual memory, ASLR, thread-local storage, program start |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/comparisons.md](docs/comparisons.md) | fwe beside Wine, WSL, Linux VMs, gVisor, QEMU, Rosetta, FreeBSD's Linuxulator and others |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
@@ -83,7 +86,7 @@ The [user guide](docs/user-guide.md) covers the rest.
 | `tools/gen-abi.py` | Generates the ABI tables from Linux's UAPI headers |
 | `tools/ltp` | Builds LTP and runs its system-call tests against the baseline |
 | `tools/bench` | The benchmarks and their budgets (`run.py`, run in CI), and `vm.sh`, which runs them beside a Linux VM on your Mac |
-| `docs/` | The user guide, Linux on macOS, the architecture, comparisons and the hypervisor backend |
+| `docs/` | The user guide, Linux on macOS, how programs are linked and loaded, the architecture, comparisons and the hypervisor backend |
 
 ## Testing
 

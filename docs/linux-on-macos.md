@@ -73,7 +73,7 @@ and share the rest:
 
 | | Native backend | VM backend |
 |---|---|---|
-| Runs | every position-independent program, and `ET_EXEC` images linked at or above 4 GiB | non-PIE executables linked below 4 GiB, and under `--vm` every program of the run |
+| Runs | every position-independent program, `ET_EXEC` images linked at or above 4 GiB, and static ones linked below it whose link kept its relocations (moved) | other non-PIE executables linked below 4 GiB, and under `--vm` every program of the run |
 | Guest code | in the `fwe` process, after rewriting | at EL0 in a Hypervisor.framework VM, unmodified |
 | Page size the guest sees | 16 KiB (the host's) | 4 KiB |
 | Guest addresses | host addresses | host addresses, except fixed-address ranges outside the memory set aside for the VM (the *slab*), such as a low-linked image, which are translated |
@@ -94,16 +94,29 @@ address: the usual toolchains use `0x400000` (4 MiB), Go uses `0x10000`
 mandatory 4 GiB `__PAGEZERO` at address 0, which Apple's loader will not
 shrink. The native backend runs the guest at the guest's own addresses
 inside the fwe process, so a program linked below 4 GiB has nowhere to
-go there. A position-independent program (`ET_DYN`, a PIE) goes wherever
-macOS has room, and an `ET_EXEC` program linked at or above 4 GiB at its
-own address.
+go there as linked (a smaller `__PAGEZERO` is killed at exec). A
+position-independent program (`ET_DYN`, a PIE) goes wherever macOS has
+room, and an `ET_EXEC` program linked at or above 4 GiB at its own
+address.
+
+A static `ET_EXEC` program linked below 4 GiB can still run natively,
+moved 1 TiB higher (`loader::MOVE`, a multiple of 4 GiB), when its link
+kept its relocations (`--emit-relocs`): arm64 code reaches its own code
+and data PC-relatively, so a whole image moved by a multiple of 4 GiB
+keeps its code right, and the relocations list every absolute address it
+holds, each changed to match (`fwe_elf::moves`: 64-bit pointers in data,
+addresses built in code from `movz`/`movk`, static glibc's ifunc table).
+A program whose link kept none, a dynamic one (its dynamic linker
+relocates it at its link address), or one holding an address no
+relocation follows (a 32-bit absolute address, one reached through a GOT)
+is not moved.
 
 ### How fwe decides
 
-`needs_vm` (`crates/native/src/lib.rs`) asks one question: is this a
-non-PIE executable whose lowest loaded page lies below 4 GiB? If so it
-runs in the VM, otherwise natively. Static or dynamic, glibc or musl, C,
-Rust or Go make no difference. `fwe --vm` runs every program of the run
+`vm_reason` (`crates/native/src/lib.rs`) asks: is this a non-PIE
+executable whose lowest loaded page lies below 4 GiB, and that cannot be
+moved above it? If so it runs in the VM, and `--strace` says why;
+otherwise natively. `fwe --vm` runs every program of the run
 in the VM (each fwe it starts gets `--vm` too), for programs that need
 4 KiB pages, such as Wine; a PIE is then placed in the slab. Where there
 is no VM to run such a program (fwe without the hypervisor entitlement,
@@ -117,7 +130,9 @@ flowchart TD
     elf -- "ET_DYN (PIE)" --> native["native backend: placed where macOS has room"]
     elf -- "ET_EXEC" --> where{"lowest page below 4 GiB?"}
     where -- no --> native2["native backend: placed at its link address"]
-    where -- yes --> vm["VM backend: Hypervisor.framework"]
+    where -- yes --> moves{"static, relocations kept?"}
+    moves -- yes --> native3["native backend: moved 1 TiB higher"]
+    moves -- no --> vm["VM backend: Hypervisor.framework"]
 ```
 
 | Binary | Example | Backend |
@@ -125,16 +140,73 @@ flowchart TD
 | dynamic PIE | Debian's `bash`, `git`, coreutils, Node.js | native |
 | static PIE | `musl-gcc -static-pie`, Rust's `+crt-static` with PIE | native |
 | static non-PIE linked at or above 4 GiB | fwe's test guests, linked at 1 TiB (`--image-base=0x10000000000`) | native |
+| static non-PIE linked below 4 GiB, relocations kept (`--emit-relocs`) | fwe's `lowlinked` test guest, at `0x200000` | native, moved |
 | non-PIE linked below 4 GiB, dynamic | Debian's `python3.11`, GCC and clang, at `0x400000` | VM |
-| non-PIE linked below 4 GiB, static | static Go programs at `0x10000`; fwe's `rust-low` test guests | VM |
+| non-PIE linked below 4 GiB, static, no relocations kept | static Go programs at `0x10000`; fwe's `rust-low` test guests | VM |
 
 "Low-linked" in this documentation and the tests means the last two
-rows. The test suite builds its Rust guests twice: at 1 TiB to run
-natively, and at the toolchain's default address
-(`target/guests/rust-low`) to run in the VM. A low-linked program started
+rows: the programs that run in the VM. The test suite builds its Rust
+guests twice: at 1 TiB to run natively, and at the toolchain's default
+address (`target/guests/rust-low`) to run in the VM. A low-linked program started
 without the hypervisor entitlement or on a Mac without hardware
 virtualization fails with a message saying so and status 126
 ([hypervisor.md](hypervisor.md#running-it-apple-silicon-no-root)).
+
+### How distributions build their programs
+
+(What PIE, static PIE and fixed-address executables are, and how
+linking works on each system: [linking.md](linking.md).)
+
+Most of what a distribution ships is PIE: its C compiler builds PIEs by
+default, and its packaging passes hardening flags that ask for them. The
+exceptions are programs whose build bypasses those flags or opts out,
+and they are the same few kinds everywhere. The arm64 packages of the
+current releases, by ELF header (`readelf -h -l`):
+
+| Program | Debian 13 | Ubuntu 26.04 | Fedora 45 | CentOS Stream 10 (RHEL 10) | Arch Linux ARM | Alpine 3.24 |
+|---|---|---|---|---|---|---|
+| Python | non-PIE | non-PIE | PIE | PIE | PIE | PIE |
+| GCC (`gcc`, `cc1`, `collect2`) | non-PIE | non-PIE | non-PIE | PIE | non-PIE | non-PIE |
+| clang | PIE | PIE | PIE | PIE | PIE | PIE |
+| rustc, cargo | PIE | PIE | PIE | PIE | PIE | PIE |
+| git | PIE | PIE | PIE | PIE | PIE | PIE |
+| the Go toolchain (`go`, `compile`, `link`) | non-PIE, static | non-PIE, static | non-PIE, static | non-PIE, static | non-PIE, static | PIE |
+| podman | non-PIE | non-PIE | PIE | PIE | PIE | PIE |
+| containerd | non-PIE | PIE (its shim non-PIE) | PIE | not packaged | non-PIE | PIE |
+| runc | non-PIE | non-PIE | PIE | not packaged (crun instead) | PIE | PIE |
+| catatonit (static) | non-PIE | non-PIE | non-PIE | static PIE | non-PIE | static PIE |
+| static busybox | non-PIE | non-PIE | non-PIE | not packaged | non-PIE | static PIE |
+
+Every non-PIE executable among them is linked below 4 GiB (C at
+`0x400000`, Go at `0x10000`) and none kept its relocations, so each
+runs in the VM. Why each kind is built so:
+
+- **Go.** Go's linker builds non-PIE executables on Linux unless asked
+  for `-buildmode=pie`, and Go builds bypass the C compiler's hardening
+  flags. A distribution gets PIEs only by passing the flag in its Go
+  packaging: Alpine does for everything, Fedora and CentOS for the
+  programs they package but not for the toolchain itself, Arch for most
+  (its containerd is the exception), Debian and Ubuntu not at all.
+- **GCC.** GCC builds its own programs position-dependent unless
+  configured with `--enable-host-pie` (or `--enable-host-shared`), so a
+  distribution's GCC is non-PIE even where it builds PIEs by default;
+  CentOS Stream 10 builds it as PIE.
+- **Python.** Debian and Ubuntu build the interpreter without PIE and
+  with `libpython` linked into it, for speed in the interpreter's loop:
+  a gain on x86, where position-independent code costs an indirection,
+  and next to none on arm64, which addresses its own data PC-relatively
+  either way.
+- **Static programs.** GCC's `-static` builds a non-PIE executable
+  unless asked for `-static-pie`; Alpine and CentOS build their static
+  programs as static PIEs. Rust's `+crt-static` musl builds (rustc 1.100,
+  linking its own start-up files) come out non-PIE at `0x200000`.
+
+The distributions built to run on Apple Silicon (Fedora Asahi Remix,
+Asahi's Arch Linux ARM, Ubuntu Asahi, and Omarchy on Apple Silicon, which
+builds on Arch Linux ARM and Asahi's repositories) take their programs
+from the arm64 packages above, adding their own kernel, firmware and
+graphics stack. Their kernels use 16 KiB pages, as the Mac's do, so what
+they ship already runs with the page size fwe's native backend gives.
 
 ### The dynamic linker
 
@@ -198,7 +270,7 @@ for a well-known property only.
 | Category | Software | Why it is there |
 |---|---|---|
 | native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once, then prepared from fwe's record; the rewrites are system calls and thread-pointer accesses |
-| native, Go built as PIE | Alpine's podman (building, pushing, pulling, rootless), containerd and Docker with BuildKit and Compose (tested) | Alpine builds its packages as PIEs, Go included; Debian's podman, containerd and runc are non-PIE and need the VM |
+| native, Go built as PIE | Alpine's podman (building, pushing, pulling, rootless), containerd and Docker with BuildKit and Compose (tested) | Alpine builds its Go programs as PIEs ([How distributions build their programs](#how-distributions-build-their-programs)); Debian's podman, containerd and runc are non-PIE and need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries, each page's rewrites written only when it first runs |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code prepared as JIT code each time it becomes executable; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |

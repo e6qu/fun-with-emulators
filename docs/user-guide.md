@@ -127,7 +127,9 @@ unpacked into a directory serves.
 macOS keeps the lowest 4 GiB of a process's address space for itself, so
 a program linked to load there (a non-PIE executable, such as Debian's
 Python, GCC, clang and Go) runs in a small VM instead, through
-Hypervisor.framework; `fwe` chooses the VM by itself. This needs
+Hypervisor.framework; `fwe` chooses the VM by itself, and `fwe --strace`
+says why. A static program linked there with its relocations kept
+(`-Wl,--emit-relocs`) runs natively instead, moved above 4 GiB. This needs
 `fwe` signed with the hypervisor entitlement (Homebrew's and the
 releases' are) on a Mac that offers the hypervisor
 (`sysctl kern.hv_support` prints `1`); otherwise `fwe` says the program

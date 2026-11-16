@@ -160,27 +160,24 @@ natively wherever fwe can make them fit the Mac.
   maps it. A program is prepared once rather than at every start, and its
   code pages are the host's cached ones, shared and never copied
   ([architecture](docs/architecture.md)).
-- [ ] **Executables linked below 4 GiB, natively:** static Go programs and
-  Debian's non-PIE executables (`python3`, GCC, clang) moved above 4 GiB.
-  arm64 code reaches its own code and data PC-relative (`adrp`, `adr`,
-  branches), so moving the whole image by a multiple of the page keeps
-  its code right; the absolute addresses are in its data (the GOT, init
-  and fini arrays, pointer tables, Go's module data). They are found from
-  the relocations a binary keeps and from the structures that hold them
-  (the GOT and arrays the dynamic section names, Go's `moduledata` and
-  `pclntab`), checked before the move; a binary whose pointers cannot all
-  be accounted for runs in the VM, and why is recorded.
+- [x] **Executables linked below 4 GiB:** macOS keeps the low 4 GiB from
+  every arm64 process (a smaller `__PAGEZERO` is killed at exec), so such
+  an executable runs natively only moved above it. arm64 code reaches its
+  own code and data PC-relatively, so moving a whole static image by a
+  multiple of 4 GiB keeps its code right; what changes is each absolute
+  address it holds, which a link that kept its relocations
+  (`--emit-relocs`) lists: those executables are moved and run natively.
+  One linked without them, as every non-PIE program the distributions
+  ship is (most GCC builds, Go toolchains, Debian's and Ubuntu's Python
+  and Go programs: [which ones](docs/linux-on-macos.md#how-distributions-build-their-programs)),
+  linked dynamically (its dynamic linker relocates it at its link
+  address), or holding an address no relocation follows, runs in the
+  VM, and `--strace` says why.
 - [ ] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes
   and runs, many threads, a garbage collector) runs natively under fwe,
   and the benchmarks run a realistic workload on it (compiling and running
   a multi-threaded application) against Homebrew's OpenJDK of the same
   release on the same runner, their output compared, within 1.5×.
-- [ ] **Programs GCC builds, natively:** what GCC links below 4 GiB
-  (`-static`, `-no-pie`, and toolchains whose default is not PIE) runs
-  natively: moved above 4 GiB as the item above moves a binary, or, where
-  its pointers cannot all be found, loaded at its own addresses in the low
-  4 GiB, which fwe keeps free of its own mappings for it. CI builds such
-  programs with GCC and runs them without `fwe --vm`.
 - [ ] **4 KiB pages natively:** `mmap`, `mprotect` and `munmap` at 4 KiB
   granularity on the Mac's 16 KiB pages: file contents at 4 KiB offsets
   copied in, each host page given the union of its parts' protections and
@@ -198,10 +195,10 @@ natively wherever fwe can make them fit the Mac.
   Alpine's Wine on fwe, against the same sources built natively for macOS
   on the same runner, their output compared, within 1.5×.
 
-**Done when:** the budgets hold in CI; static Go programs, Debian's
-low-linked toolchain, programs GCC links non-PIE or static, and Wine's
-test program run natively in CI; the JDK's and Wine's benchmarks hold
-their budgets; and what still needs the VM is listed with the reason.
+**Done when:** the budgets hold in CI; a low-linked executable whose link
+kept its relocations, and Wine's test program, run natively in CI; the
+JDK's and Wine's benchmarks hold their budgets; and what still needs the
+VM is listed with the reason.
 
 ### M7 — Graphical programs and sandboxes
 
