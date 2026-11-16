@@ -136,6 +136,10 @@ fn caught(sig: libc::c_int) -> bool {
 /// other threads are woken to take it. A signal with the default action
 /// or ignored stays where it is: unblocking it would apply that action to
 /// a signal Linux keeps pending.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn reroute_parked(blocked: u64) {
     if blocked == 0 {
         return;
@@ -289,6 +293,10 @@ impl Drop for HostCode {
 /// Prepare this thread to jump into guest code (a new program, a forked
 /// child, a new thread): it runs guest code from here, under its guest
 /// mask.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn prepare_guest_entry() {
     crate::gate::ensure_block();
     block_async_signals();
@@ -312,6 +320,10 @@ fn guest_interrupted(ctx: *mut libc::c_void) -> bool {
 /// and nothing is to be delivered (the gate returns to the guest); 1: the
 /// trap is to finish it (`b.ran` says whether it ran).
 #[unsafe(no_mangle)]
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     use fwe_abi::nr::*;
     use std::sync::atomic::Ordering::SeqCst;
@@ -1427,6 +1439,10 @@ fn install(
 /// Give the calling thread a signal stack if it has none. A forked child's
 /// thread does not inherit the parent thread's: without one, its handlers
 /// would run on the guest stack, which `execve` unmaps.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn ensure_thread_altstack() {
     // SAFETY: querying this thread's signal stack into a zeroed stack_t.
     let disabled = unsafe {

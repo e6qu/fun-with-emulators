@@ -106,6 +106,10 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 
 /// Rebuild every epoll descriptor in a fork child: a fresh kqueue at its
 /// number, with its interest list registered again.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     #[cfg(target_os = "linux")]
     let _ = d.count(1);

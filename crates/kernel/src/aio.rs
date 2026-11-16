@@ -71,6 +71,10 @@ fn ctxs<R>(f: impl FnOnce(&mut Vec<Ctx>) -> R) -> R {
 }
 
 /// A fork child has none of its parent's contexts, nor has a new program.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn forget_all() {
     ctxs(Vec::clear);
     RESERVED.store(0, Ordering::Relaxed);

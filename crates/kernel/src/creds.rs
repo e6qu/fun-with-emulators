@@ -205,6 +205,10 @@ pub fn identity() -> Identity {
 
 /// Publish the access `c` gives, after a system call that may have
 /// changed it (written only when it did), and its real user id.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn publish(c: &Creds) {
     REAL_UID.store(c.uid, std::sync::atomic::Ordering::Relaxed);
     let id = Identity::of(c);

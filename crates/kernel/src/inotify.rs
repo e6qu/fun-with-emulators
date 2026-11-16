@@ -163,6 +163,10 @@ fn registry_dir() -> Option<Vec<u8>> {
 /// build shares) is looked for again only once another is made. It is
 /// joined, not made, so a call made while the registry's lock is held
 /// (a watch being added) never waits for that lock.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn registry() -> Option<&'static Record<Registry>> {
     use crate::procstore::{Count, count};
     if let Some(r) = REGISTRY.get() {
@@ -937,6 +941,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Before file call `nr`: what [`after`](Self::inotify_after) needs.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub(crate) fn inotify_before(&self, n: u64, a: &[u64; 6]) -> Option<Plan> {
         if !watching() {
             return None;
@@ -990,6 +998,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// After file call `nr` (with `a`) returned `r`: raise its events.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub(crate) fn inotify_after(&self, n: u64, a: &[u64; 6], r: i64, plan: Option<Plan>) {
         if r < 0 || !watching() {
             return;

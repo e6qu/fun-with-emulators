@@ -272,6 +272,10 @@ fn chain_file(pid: i32) -> Option<std::path::PathBuf> {
 /// Publish this process's chain for others ([`within`]); called as it is
 /// restricted and as a restricted process starts (a fork child, a program
 /// run).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn publish() {
     if !active() {
         return;

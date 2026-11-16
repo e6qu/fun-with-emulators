@@ -60,6 +60,10 @@ fn slots() -> std::sync::MutexGuard<'static, Vec<&'static Slot>> {
 }
 
 /// This thread's slot, registered on first use.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn mine() -> &'static Slot {
     if let Some(slot) = MINE.get() {
         return slot;
@@ -114,6 +118,10 @@ pub fn mine_addr() -> u64 {
 }
 
 /// [`enter`], for this thread's slot at `slot` ([`mine_addr`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn enter_at(slot: u64) {
     // SAFETY: a slot is never freed (a thread that ends frees it for reuse).
     let slot = unsafe { &*(slot as *const Slot) };
@@ -213,6 +221,10 @@ pub fn stop_others(visit: &mut dyn FnMut(&[u64; 34])) -> Stopped {
 /// Run `fork` (a host `fork`) with every other thread that is running guest
 /// code stopped. In the child, which has only this thread, the other slots
 /// are freed.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn fork_stopped(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     let me = mine();
     let slots = slots();

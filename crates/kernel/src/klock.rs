@@ -123,6 +123,10 @@ impl<T> Lock<T> {
 
     /// The value, for this thread alone. The thread must hold no [`Shared`]
     /// of this lock.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn lock(&self) -> Exclusive<'_, T> {
         // Readers that wait come in first: a thread making one exclusive
         // call after another would otherwise take the mutex back each time
@@ -155,6 +159,10 @@ impl<T> Lock<T> {
     /// The value, shared with other threads' readers. The thread must hold
     /// no other [`Shared`] or [`Exclusive`] of this lock: a writer waiting
     /// between the two would wait for it.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn shared(&self) -> Shared<'_, T> {
         let mut shard = SHARD.with(Cell::get);
         if shard == 0 {
@@ -196,6 +204,10 @@ impl<T> Lock<T> {
 impl<P: Platform> KernelLock<P> {
     /// Run the system call named in `regs` as [`Kernel::enter_syscall`]
     /// does: on the shared side if it is one that may, else exclusively.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn syscall(&self, regs: &mut Regs) {
         let nr = regs.x[8];
         let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
@@ -228,6 +240,10 @@ impl<P: Platform> KernelLock<P> {
         self.finish_holding(self.shared(), regs, nr, args, result);
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn finish_holding(
         &self,
         shared: Shared<'_, Option<Kernel<P>>>,

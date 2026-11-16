@@ -406,6 +406,10 @@ fn end() {
 
 /// In a fork child: not traced (its parent's tracer does not trace it),
 /// and no tracer named by `PR_SET_PTRACER`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn forked_child() {
     let follow = FOLLOW.swap(0, Ordering::AcqRel);
     PTRACER.store(0, Ordering::Relaxed);
@@ -1659,6 +1663,10 @@ impl<P: crate::Platform> crate::Kernel<P> {
 
     /// The exit event's stop (`PTRACE_O_TRACEEXIT`), as the process ends
     /// with wait status `status`.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn ptrace_exit_stop(&mut self, status: i32) {
         if traced() && options() & PTRACE_O_TRACEEXIT != 0 {
             let mut regs = crate::Regs::default();

@@ -30,6 +30,10 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 /// `FWE_TIMING`'s mark as the process ends, with how many code pages were
 /// written as they first ran.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn mark_exit() {
     fwe_kernel::timing::mark("exit");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -198,6 +202,10 @@ impl Platform for NativePlatform {
         unsafe { prepare::keep_image(key, addr, len) };
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn exit(&mut self, code: i32) -> ! {
         mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
@@ -374,11 +382,10 @@ fn read_program(
     } else if let Some(guest) = guest_path_in_root(path, options) {
         in_guest(&guest)
     } else {
-        use std::io::Read;
         use std::os::fd::AsRawFd;
-        let mut f = std::fs::File::open(path).map_err(Error::Read)?;
-        let mut data = Vec::new();
-        f.read_to_end(&mut data).map_err(Error::Read)?;
+        let f = std::fs::File::open(path).map_err(Error::Read)?;
+        let data = fwe_kernel::fs::read_all_fd(f.as_raw_fd())
+            .map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))?;
         Ok((data, fwe_kernel::prepcache::FileId::of_fd(f.as_raw_fd())))
     }
 }

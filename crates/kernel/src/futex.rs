@@ -566,6 +566,10 @@ pub fn process_started() {
 /// waiter woken, so the next to lock it learns its owner died
 /// (`EOWNERDEAD`). The entry being added or removed (`list_op_pending`)
 /// last; the walk stops at a fault, the list's end, or 2048 entries.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn release_robust(head: u64, tid: i32) {
     use crate::uaccess::read;
     if head == 0 {
@@ -689,6 +693,10 @@ fn wait_deadline_abs(timeout: u64, realtime: bool) -> crate::uaccess::Result<Opt
 }
 
 /// Run `f` holding the wait-queue lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = table().queues.lock().unwrap_or_else(|e| e.into_inner());
     f()

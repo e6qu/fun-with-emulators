@@ -445,7 +445,19 @@ and replace processes, and the per-process state it keeps:
     so inherits none held by a thread it lacks; it clears the kernel
     lock's reader counters. A `RwLock` among them is replaced in the child
     rather than unlocked, since on macOS unlocking one walks a queue of
-    waiting threads the child lacks.
+    waiting threads the child lacks. A process with no other host thread
+    takes none of them: none can be held, and taking and letting go of
+    them would touch, and copy in both processes, the pages they are on.
+  - A fork's cost is the pages each process then touches, each a fault in
+    the child: the code a child runs as it starts and ends (the fork
+    itself, its records, `init_main`, the system calls it makes, its end)
+    is laid out together, in a section of its own (`__TEXT,__fwe_fork`,
+    by `link_section` on each function), where it was spread over some 50
+    pages of fwe's code. The host's own fork costs more for every page of
+    `malloc`'s regions written, and for a high descriptor (see
+    [Descriptors](#descriptors)): fwe maps its blocks of 32 KiB and more
+    (a program's bytes, read into memory sized for them) on their own
+    (`crates/fwe/src/alloc.rs`), which a fork leaves to copy as written.
   - The fork refuses (`ENOSYS`) once the process has a VM.
   - Threads running guest code are suspended
     (`crates/native/src/quiesce.rs`); one in fwe's code (which may hold
@@ -478,16 +490,23 @@ and replace processes, and the per-process state it keeps:
   dirty pages would be written back to disk as each process holding them
   ends). It holds an entry per pid (a lock naming its holder's pid, taken
   over from one that died holding it; a sequence number, odd while the
-  record changes; where its bytes are; the end status), the records'
+  record changes; where its bytes are; the end status), one of each kind
+  (record, threads, mappings...), a pid's side by side, the records'
   bytes in chained 4 KiB blocks, a bitmap of pids with a record, a table
-  of how processes ended, the CPU's features (asked of the host by the
+  of how processes ended with a count of those kept (most looks, a
+  parent reaping its child, then read no table), the CPU's features (asked of the host by the
   first process after boot), and the thread-number blocks, signal
   mailboxes, ptrace pages and shared cells described below. A writer holds
   the entry's lock, writes new blocks, links them and frees the old ones;
   a reader takes no lock and rereads if the sequence number changed.
   A program's start writes its record once. A native fork's child writes
-  its whole record as it starts, from what its parent knows (program,
-  cgroup, whether the host reaps). The parent marks it as still to write
+  its whole record as it starts: its parent makes it before the fork (and
+  the child's view of its filesystem and limits), as the child would, for
+  the child to write as it is with its start time, unless something
+  changed the child's record first, which the child then changes as
+  before; a process just forked pays a fault for every page it first
+  touches, and making the record would touch the code and memory of
+  making it. The parent marks it as still to write
   before its `fork` returns: until then every listing has it, and a look
   at its record waits for it. A reaper's watcher, which the host does not
   tell of the orphan of a parent that ended at once, does not wait: while
@@ -816,9 +835,9 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   guest's up to the host's limit (`crates/kernel/src/fdtable.rs`).
 - At startup fwe raises its host soft limit as far as macOS allows and
   gives the guest a virtual `RLIMIT_NOFILE`: soft 1024, hard leaving fwe a
-  quarter of the host's descriptors, at least 64 and at most 16384 (the
-  host's table grows to the highest descriptor, and a host `fork` copies
-  it all).
+  quarter of the host's descriptors, at least 64 and at most 4096, Linux's
+  default hard limit (the host's table grows to the highest descriptor,
+  and a host `fork` copies it all).
 - The guest never reaches the range: `close_range(3, ~0)`, closing up to
   the limit and listing `/proc/self/fd` stop below it; a call naming one
   fails with `EBADF`, as does `dup2` onto one. Root may raise the limit

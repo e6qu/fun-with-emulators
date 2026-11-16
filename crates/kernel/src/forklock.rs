@@ -171,6 +171,10 @@ fn locks() -> Vec<&'static dyn ForkLock> {
 }
 
 /// Run `fork` holding every lock of [`locks`], taken all at once.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(fork: impl FnOnce() -> R) -> R {
     let all = locks();
     loop {

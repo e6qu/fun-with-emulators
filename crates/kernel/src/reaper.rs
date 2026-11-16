@@ -75,6 +75,10 @@ fn adopts(p: Proc, bound: Option<Proc>, who: Proc) -> bool {
 /// Who adopts process `who`, with line of ancestors `lineage` and bound
 /// `bound`, once its parent has gone: the host pid of its first living
 /// ancestor past the parent that is a subreaper (for it) or the bound.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn adopter(who: Proc, lineage: &[Proc], bound: Option<Proc>) -> Option<i32> {
     candidates(lineage, bound).find(|&p| adopts(p, bound, who)).map(|p| p.0)
 }
@@ -89,6 +93,10 @@ pub fn might_adopt(who: Proc, lineage: &[Proc], bound: Option<Proc>) -> bool {
 /// Whether how process `who` ends is to be recorded for someone other
 /// than its host parent to take: a reaper might adopt it, or it is a
 /// foster child (`foster`) of a living parent.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn takes_end(who: Proc, lineage: &[Proc], bound: Option<Proc>, foster: bool) -> bool {
     foster && lineage.first().is_some_and(|&p| procreg::alive(p))
         || might_adopt(who, lineage, bound)
@@ -462,6 +470,10 @@ static BUSY: Mutex<()> = Mutex::new(());
 
 /// Run `f` (a host `fork`) with the reaper's locks held, released in both
 /// processes (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
     let _waiters = WAITERS.lock().unwrap_or_else(|e| e.into_inner());

@@ -1720,20 +1720,7 @@ impl Fs {
         // SAFETY: `fd` is a fresh owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let id = crate::prepcache::FileId::of_fd(fd.as_raw_fd());
-        let mut data = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
-            // SAFETY: reading into a valid local buffer.
-            let n = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-            if n < 0 {
-                return Err(e());
-            }
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&chunk[..n as usize]);
-        }
-        Ok((data, id))
+        Ok((read_all(fd.as_raw_fd())?, id))
     }
 
     /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
@@ -1831,6 +1818,11 @@ impl Fs {
     /// namespace, root and working directory (namespace paths), and the
     /// process's resource limits ([`OtherView`]).
     pub fn share(&self) {
+        crate::procstore::put_own(crate::procstore::Kind::View, Some(&self.shared()));
+    }
+
+    /// What [`Fs::share`] lets other processes see.
+    pub fn shared(&self) -> Vec<u8> {
         let mut e = crate::snapshot::Enc::new();
         e.bytes(self.mnt.dir());
         e.bytes(&self.proc_root);
@@ -1841,7 +1833,7 @@ impl Fs {
             e.u64(soft);
             e.u64(hard);
         }
-        crate::procstore::put_own(crate::procstore::Kind::View, Some(&e.into_bytes()));
+        e.into_bytes()
     }
 
     /// Translate a host path to the guest path it is reached by, through
@@ -3006,6 +2998,10 @@ pub(crate) fn unpublish() {
 }
 
 /// Run `f` holding the published view's lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = published();
     f()
@@ -3612,14 +3608,34 @@ pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever
-/// its offset.
-/// All of the file open as `fd`, from where it is.
-pub(crate) fn read_all_fd(fd: i32) -> Result<Vec<u8>, i32> {
+/// its offset ([`read_all`]).
+pub fn read_all_fd(fd: i32) -> Result<Vec<u8>, i32> {
     read_all(fd)
 }
 
+/// The whole contents of host file `path` ([`read_all`]).
+pub fn read_all_path(path: &[u8]) -> Result<Vec<u8>, i32> {
+    let path = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(e());
+    }
+    // SAFETY: a fresh descriptor this owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    read_all(fd.as_raw_fd())
+}
+
+/// The whole of the file open on `fd`, into memory sized for it at once (a
+/// program's bytes, grown as they were read, were copied at every
+/// doubling).
 fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
-    let mut data = Vec::new();
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    let size =
+        if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size.max(0) as usize } else { 0 };
+    let mut data = Vec::with_capacity(size);
     let mut chunk = [0u8; 65536];
     loop {
         // SAFETY: reading into a valid local buffer.

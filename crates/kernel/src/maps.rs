@@ -704,6 +704,10 @@ pub fn clear() {
 }
 
 /// Run `f` holding the record's lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = record();
     f()
@@ -801,6 +805,10 @@ pub fn publish() {
 
 /// Before system call `nr`: publish the mappings if they changed, unless
 /// `nr` is a memory call (one that only changes them again).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn flush_before(nr: u64) {
     use fwe_abi::nr as n;
     if !matches!(
