@@ -154,6 +154,9 @@ virtualization fails with a message saying so and status 126
 
 ### How distributions build their programs
 
+(What PIE, static PIE and fixed-address executables are, and how
+linking works on each system: [linking.md](linking.md).)
+
 Most of what a distribution ships is PIE: its C compiler builds PIEs by
 default, and its packaging passes hardening flags that ask for them. The
 exceptions are programs whose build bypasses those flags or opts out,
