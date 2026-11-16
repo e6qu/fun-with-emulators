@@ -2355,6 +2355,7 @@ impl<P: Platform> Kernel<P> {
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
             if backed > 0 {
+                self.repair_jit_copies(a as u64, backed);
                 match self.platform.prepare_exec(a as u64, backed, JIT_CODE, None) {
                     Ok(n) => self.jit_x18_note(a as u64, backed, n),
                     Err(e) => return self.prepare_failed(e),
@@ -2486,6 +2487,21 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
+    /// Before JIT code is prepared, the copies there of branches fwe wrote
+    /// elsewhere get the JIT's words back ([`crate::jitsites`]).
+    fn repair_jit_copies(&self, addr: u64, len: u64) {
+        let code = |t: u64| {
+            crate::maps::record()
+                .areas_in(t, t + 4)
+                .iter()
+                .any(|p| p.value.prot & mman::PROT_EXEC != 0)
+        };
+        let n = crate::jitsites::repair_copies(addr, len, code);
+        if n > 0 {
+            self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} copied sites put back"));
+        }
+    }
+
     /// Under `--strace`: how many instructions naming `x18` were given
     /// stubs in JIT code just prepared.
     fn jit_x18_note(&self, addr: u64, len: u64, n: usize) {
@@ -2500,6 +2516,7 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
+            self.repair_jit_copies(page, self.page_size);
             match self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
                 Ok(n) => self.jit_x18_note(page, self.page_size, n),
                 Err(e) => {

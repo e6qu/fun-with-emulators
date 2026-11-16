@@ -602,6 +602,16 @@ program reads, patches and copies the code it wrote. When the page next
 runs it is prepared again, and a site that is what it was gets its old
 stub back (`fwe_kernel::jitsites`).
 
+A JIT can also copy code out of a page that is executable, as macOS has
+no execute-only memory: HotSpot's buffer shares pages with code that
+runs, so it may have been prepared since its last write. A copied branch
+to a stub keeps its distance and leads nowhere. A branch's word is its
+distance alone, so every word fwe writes is kept with the program's word
+it stands for; before JIT code is prepared, a branch there that fwe did
+not write, with the bits of one it did, leading where there is no code
+(a program's own branches lead to its code), gets the program's word
+back, and is then prepared as any other.
+
 ### CTR_EL0: emulated when it traps
 
 Linux lets user code read `CTR_EL0`, the cache-type register, to learn

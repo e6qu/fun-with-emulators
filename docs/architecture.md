@@ -242,7 +242,11 @@ The pieces:
   `PROT_WRITE` put back every such word still as fwe made it, so a JIT
   patches and copies the code it wrote; the page's next preparation gives
   a site that is what it was its old branch and stub again. Unmapping or
-  mapping over a range forgets its records.
+  mapping over a range forgets its records. Each word fwe writes is also
+  kept with the word it stands for, and before JIT code is prepared,
+  `jitsites::repair_copies` puts back the program's word for each copy
+  there of a branch fwe wrote elsewhere (one fwe did not write there,
+  leading where the guest has no executable memory).
 - `crates/kernel/src/prepcache.rs` keeps, in fwe's private directory and
   by a file's identity (device, inode, size, modification time), its
   sections' and unwind table's code ranges and, for each mapped code range
