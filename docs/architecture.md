@@ -559,6 +559,13 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 
 - **Pending sets** are atomics in host thread-locals (the host handler
   records into them), registered by tid so another thread can target one.
+  Each signal's slot in a set is claimed by a compare-and-swap of its
+  state, empty, written, full or being taken, so posts and takes from many
+  threads and handlers at once (every thread takes from the process's set)
+  take each signal once, with the `siginfo` it was posted with. A take
+  blocks its thread's host signals while it holds a slot, so a post that
+  finds the slot being taken waits only on another running thread; a post
+  that finds a standard signal pending, or being written, is one with it.
   A real-time signal already pending is queued behind it, with its own
   `siginfo`, in a lock-free pool the process's sets share (4096 entries),
   oldest first.
