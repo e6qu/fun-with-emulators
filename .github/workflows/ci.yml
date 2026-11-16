@@ -240,10 +240,23 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== round $i"; cargo test -p fwe --test guests -- alpine_jdk --nocapture || exit 1; done
+      - name: The JDK under HotSpot options that narrow a failure down
+        run: |
+          set +e
+          failed=0
+          for opts in "" "-Xint" "-XX:TieredStopAtLevel=1" "-XX:-TieredCompilation" "-XX:+UseSerialGC" "-XX:+UnlockDiagnosticVMOptions -XX:+VerifyBeforeGC -XX:+VerifyAfterGC" "" ""; do
+            echo "=== options: '$opts'"
+            FWE_JDK_JAVA_OPTIONS="$opts" cargo test -p fwe --test guests -- alpine_jdk --nocapture > jdk.out 2>&1
+            r=$?
+            grep -E "SIGSEGV \(|SIGBUS \(|Problematic|^# +[VJjvC] |test result|Verif|verif|guarantee|assert" jdk.out | head -40
+            echo "=== options: '$opts' -> exit $r"
+            [ $r -ne 0 ] && failed=1
+          done
+          exit $failed
         env:
           FWE_JDK_TESTS: "1"
-      - run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== node round $i"; cargo test -p fwe --test guests -- debian_node --nocapture || exit 1; done
+      - if: always()
+        run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== node round $i"; cargo test -p fwe --test guests -- debian_node --nocapture || exit 1; done
       # The calls of each step.
       - if: failure()
         uses: actions/upload-artifact@v4

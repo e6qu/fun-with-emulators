@@ -3263,6 +3263,11 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             .env("PATH", format!("{bin}:/usr/bin:/bin"))
             .env("HOME", "/tmp")
             .stdin(Stdio::null());
+        // HotSpot options for every JVM the test starts, to narrow a failure
+        // down (`-Xint`, a GC's verification).
+        if let Ok(opts) = std::env::var("FWE_JDK_JAVA_OPTIONS") {
+            cmd.env("JAVA_TOOL_OPTIONS", opts);
+        }
         let out = run_bounded_for(cmd, &[], Duration::from_secs(600));
         eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
         if !out.status.success() {
