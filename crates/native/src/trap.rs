@@ -1253,7 +1253,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // was translated from drops those translations and is tried again.
     let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
     if exec {
-        if let Some(t) = crate::jit::enter(addr) {
+        if let Some(t) = crate::jit::enter(addr, mc.ss.lr) {
             mc.ss.pc = t;
             return;
         }

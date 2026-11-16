@@ -3489,6 +3489,9 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             .env_clear()
             .env("PATH", format!("{bin}:/usr/bin:/bin"))
             .env("HOME", "/tmp")
+            // Its marks on stderr: at exit, how translated code crossed
+            // into code not translated and back.
+            .env("FWE_TIMING", "1")
             .stdin(Stdio::null());
         // HotSpot options for every JVM the test starts, to narrow a failure
         // down (`-Xint`, a GC's verification).
@@ -3730,7 +3733,7 @@ fn alpine_luajit_runs_jit_code() {
          ffi strlen 18\n\
          abs 2500000000\n\
          qsort 0 999 332001\n\
-         jit true\n"
+         jit\ttrue\n"
     );
     assert_eq!(out.status.code(), Some(0));
 }

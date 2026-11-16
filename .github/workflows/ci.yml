@@ -253,7 +253,7 @@ jobs:
             FWE_JDK_JAVA_OPTIONS="$opts" cargo test -p fwe --test guests -- alpine_jdk --nocapture > jdk.out 2>&1
             r=$?
             grep -q "alpine_jdk_compiles_and_runs_a_multithreaded_application ... " jdk.out || { echo "the JDK test did not run"; exit 1; }
-            grep -E "SIGSEGV \(|SIGBUS \(|Problematic|^# +[VJjvC] |test result|guarantee|assert" jdk.out | head -20
+            grep -E "SIGSEGV \(|SIGBUS \(|Problematic|^# +[VJjvC] |test result|guarantee|assert|JIT code:" jdk.out | head -20
             echo "=== options: '$opts' -> exit $r"
             [ -d target/tmp/jdk-traces ] && mv target/tmp/jdk-traces "target/tmp/jdk-run-$n" && cp jdk.out "target/tmp/jdk-run-$n/test.out"
             [ $r -ne 0 ] && failed=1
