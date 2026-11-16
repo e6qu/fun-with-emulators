@@ -1116,7 +1116,9 @@ records ([linux-on-macos.md](linux-on-macos.md#ipc)):
 - **System V** (`crates/kernel/src/sysvipc.rs`, `ipcops.rs`): the record
   holds keys, owners, permissions, times, semaphore values and undo
   adjustments, messages, and the namespace's limits (`kernel.shmmax`,
-  `kernel.sem`, `kernel.msgmni`…, which root may change). `shmat` honours
+  `kernel.sem`, `kernel.msgmni`…, which root may change). The initial
+  namespace's record is the host boot's: no process names it, and the
+  collector keeps it until the host restarts. `shmat` honours
   `SHMLBA` with `SHM_RND` and maps over existing memory only with
   `SHM_REMAP`; a fork child counts its parent's attachments; `execve` and
   exit detach. A wait ends with `EINTR` for a signal, `EIDRM` if the
