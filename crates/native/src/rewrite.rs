@@ -145,6 +145,9 @@ pub struct Patched {
     /// writeback and `sp` register-offset load/store forms, and data-processing
     /// forms with an `sp` operand). Diagnostic only.
     pub x18_deferred: usize,
+    /// In JIT code, the offsets of words that read as an `x18` site but were
+    /// taken for data (not among instructions).
+    pub x18_left: Vec<u64>,
     /// Each word that was changed in place or is a site: its offset, what
     /// it was, and whether it was taken for code and known to be code,
     /// which is all [`replay`] needs to do the same again.
@@ -296,6 +299,9 @@ fn patch_with(code: &mut [u8], known: Option<&[(u64, u64)]>, jit: bool) -> Patch
         }
         let insn = u32::from_le_bytes([word[0], word[1], word[2], word[3]]);
         let w = classify(insn, is_code[i], known_code(i));
+        if jit && !is_code[i] && x18_site(insn) {
+            out.x18_left.push(i as u64 * 4);
+        }
         if w.syscall {
             out.syscalls += 1;
         }

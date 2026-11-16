@@ -2364,7 +2364,7 @@ impl<P: Platform> Kernel<P> {
             if backed > 0 {
                 self.repair_jit_copies(a as u64, backed);
                 match self.platform.prepare_exec(a as u64, backed, JIT_CODE, None) {
-                    Ok(n) => self.jit_x18_note(a as u64, backed, n),
+                    Ok(p) => self.jit_x18_note(a as u64, backed, &p),
                     Err(e) => return self.prepare_failed(e),
                 }
             }
@@ -2512,10 +2512,26 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Under `--strace`: how many instructions naming `x18` were given
-    /// stubs in JIT code just prepared.
-    fn jit_x18_note(&self, addr: u64, len: u64, n: usize) {
+    /// stubs in JIT code just prepared, and each word that read as one but
+    /// was taken for data, with the words around it.
+    fn jit_x18_note(&self, addr: u64, len: u64, p: &crate::PreparedCode) {
+        if !self.tracer.enabled {
+            return;
+        }
+        let n = p.x18_sites;
         if n > 0 {
             self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs"));
+        }
+        for &at in &p.x18_left {
+            let words: Vec<String> = (at.saturating_sub(8).max(addr)..(at + 12).min(addr + len))
+                .step_by(4)
+                .map(|w| {
+                    // SAFETY: a word of the range just prepared, readable.
+                    let v = unsafe { (w as *const u32).read() };
+                    if w == at { format!("*{v:08x}") } else { format!("{v:08x}") }
+                })
+                .collect();
+            self.tracer.note(&format!("JIT code at {at:#x}: taken for data: {}", words.join(" ")));
         }
     }
 
@@ -2533,7 +2549,7 @@ impl<P: Platform> Kernel<P> {
                 JIT_PREPARE_NS.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
             }
             match prepared {
-                Ok(n) => self.jit_x18_note(page, self.page_size, n),
+                Ok(p) => self.jit_x18_note(page, self.page_size, &p),
                 Err(e) => {
                     self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
                     return false;

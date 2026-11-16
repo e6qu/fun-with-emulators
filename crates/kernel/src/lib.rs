@@ -181,6 +181,16 @@ pub struct PrepareFailed {
     pub why: String,
 }
 
+/// What preparing code did that the trace reports.
+#[derive(Debug, Default)]
+pub struct PreparedCode {
+    /// Instructions naming `x18` given stubs.
+    pub x18_sites: usize,
+    /// In JIT code, the addresses of words that read as `x18` uses but
+    /// were taken for data.
+    pub x18_left: Vec<u64>,
+}
+
 pub trait Platform {
     /// Carry out a memory system call, for a backend whose guest has an
     /// address space of its own that it manages (the hypervisor backend);
@@ -198,15 +208,14 @@ pub trait Platform {
     /// applies the final protections afterwards. A failure carries the
     /// Linux errno for the guest and why, for the trace.
     /// `cache`, when given, is the key ([`prepcache::code_key`]) under
-    /// which what the preparation finds is kept and found again. On
-    /// success, how many instructions naming `x18` were given stubs.
+    /// which what the preparation finds is kept and found again.
     fn prepare_exec(
         &mut self,
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
         cache: Option<&[u8]>,
-    ) -> Result<usize, PrepareFailed>;
+    ) -> Result<PreparedCode, PrepareFailed>;
 
     /// Map the prepared image kept under `key` ([`prepcache::image_key`])
     /// over the mapping of a file's code at `[addr, addr + len)`, with

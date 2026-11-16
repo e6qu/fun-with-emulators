@@ -51,9 +51,9 @@ impl Platform for HvPlatform {
         _len: u64,
         _known: Option<&[(u64, u64)]>,
         _cache: Option<&[u8]>,
-    ) -> Result<usize, fwe_kernel::PrepareFailed> {
+    ) -> Result<fwe_kernel::PreparedCode, fwe_kernel::PrepareFailed> {
         // The guest's code runs as it is.
-        Ok(0)
+        Ok(fwe_kernel::PreparedCode::default())
     }
 
     fn exit(&mut self, code: i32) -> ! {

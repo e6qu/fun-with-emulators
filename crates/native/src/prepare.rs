@@ -15,7 +15,7 @@ const STUB_TAG: i32 = 241 << 24;
 const STUB_TAG: i32 = -1;
 
 /// Statistics of one preparation.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Prepared {
     pub syscalls: usize,
     pub stubs: usize,
@@ -25,6 +25,9 @@ pub struct Prepared {
     pub x18_deferred: usize,
     /// Instructions naming `x18` given stubs.
     pub x18_sites: usize,
+    /// In JIT code, the addresses of words that read as `x18` sites but
+    /// were taken for data.
+    pub x18_left: Vec<u64>,
 }
 
 /// No stub region could be placed within branch range of some sites.
@@ -311,6 +314,7 @@ pub unsafe fn prepare(
         stubs: 0,
         x18_deferred: patched.x18_deferred,
         x18_sites,
+        x18_left: patched.x18_left.iter().map(|&off| start + off).collect(),
     };
 
     let mut sites = all.as_slice();
@@ -943,7 +947,7 @@ mod tests {
         // The system call has a stub where there is a gate to call.
         let gate = crate::syscall_gate();
         let stubs = if gate == 0 { 2 } else { 3 };
-        assert_eq!(stats, Prepared { syscalls: 1, stubs, x18_deferred: 0, x18_sites: 0 });
+        assert_eq!(stats, Prepared { syscalls: 1, stubs, ..Prepared::default() });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };
         let stub_of = |site: u64| {

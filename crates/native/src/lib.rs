@@ -158,12 +158,15 @@ impl Platform for NativePlatform {
         len: u64,
         known: Option<&[(u64, u64)]>,
         cache: Option<&[u8]>,
-    ) -> Result<usize, fwe_kernel::PrepareFailed> {
-        self.prepare(addr, len, None, known, cache).map(|p| p.x18_sites).map_err(|e| {
-            // A mapping being kept as an image is not, failed.
-            prepare::image_abandon();
-            fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
-        })
+    ) -> Result<fwe_kernel::PreparedCode, fwe_kernel::PrepareFailed> {
+        let prepared = self.prepare(addr, len, None, known, cache);
+        prepared
+            .map(|p| fwe_kernel::PreparedCode { x18_sites: p.x18_sites, x18_left: p.x18_left })
+            .map_err(|e| {
+                // A mapping being kept as an image is not, failed.
+                prepare::image_abandon();
+                fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
+            })
     }
 
     fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {

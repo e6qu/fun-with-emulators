@@ -3129,7 +3129,11 @@ fn jit_x18_summary(what: &str, trace: &Path) {
             .and_then(|n| n.parse::<usize>().ok())
             .unwrap_or(0);
     }
-    eprintln!("{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses");
+    let left = text.lines().filter(|l| l.contains("taken for data")).count();
+    eprintln!(
+        "{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses; \
+         {left} lookalikes taken for data"
+    );
 }
 
 /// Alpine's OpenJDK 25 (fetched: `guests/alpine/fetch/jdk.txt`): `javac`
