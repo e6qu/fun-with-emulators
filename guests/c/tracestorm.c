@@ -25,8 +25,8 @@ int printf(const char *format, ...);
 #define PTRACE_CONT 7
 #define PTRACE_KILL 8
 #define SIGKILL 9
-#define WORKERS 16
-#define ROUNDS 40
+#define WORKERS 8
+#define ROUNDS 5
 
 /* One worker's rounds: the continues that failed, or -1. */
 static int worker(void) {

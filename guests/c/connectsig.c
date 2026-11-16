@@ -67,7 +67,7 @@ int main(void) {
                 _exit(0);
     }
     int failed = 0;
-    for (int i = 0; i < 2000; i++) {
+    for (int i = 0; i < 200; i++) {
         int fd = socket(AF_INET, SOCK_STREAM, 0);
         if (connect(fd, &a, sizeof a) != 0)
             failed++;

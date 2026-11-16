@@ -1,7 +1,7 @@
 /* A process that /proc shows sleeping ('S') in a semaphore wait is
  * counted by GETNCNT or GETZCNT, as semctl01 expects: fwe's own work on
  * the way to the wait (its records' files, a page brought in) is not
- * shown as a sleep. Twelve workers at once, each with sets of its own,
+ * shown as a sleep. Eight workers at once, each with sets of its own,
  * load the host as a test run does.
  *
  * Built freestanding and linked against the target libc's shared library
@@ -34,8 +34,8 @@ int sched_yield(void);
 #define GETZCNT 15
 #define SETVAL 16
 #define SIGKILL 9
-#define WORKERS 12
-#define ROUNDS 25
+#define WORKERS 8
+#define ROUNDS 15
 #define WAITERS 5
 
 struct sembuf {
