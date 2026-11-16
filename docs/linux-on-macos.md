@@ -274,6 +274,11 @@ for a well-known property only.
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
 | native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries, each page's rewrites written only when it first runs |
 | native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code run by translation, its memory untouched; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
+| native, JIT | Alpine's Node.js 24 with a current V8 (tested) | the same workload as Node.js 18's: V8's tiers, its compiled regular expressions and WebAssembly, deoptimization, run by translation |
+| native, JIT | Alpine's LuaJIT 2.1 (tested) | its trace compiler's code run by translation; compiled code calling C through its FFI, and C (`qsort`) calling back into Lua |
+| native, compiling as they run | Alpine's SBCL 2.6, Racket 9 (Chez Scheme), GNU Guile 3.0 (tested) | each compiles to machine code as it runs (`compile`, `eval`, redefinitions, CLOS dispatch, Guile's JIT), run by translation |
+| native, interpreter making code | Alpine's Python 3.14 (tested) | `eval`, `exec` and `compile` make bytecode from text as it runs; no machine code is made |
+| native, programs that change themselves | self-modifying code, code on the stack, a program changing and running a copy of its executable, quines, IOCCC winners (tested) | code made executable at run time runs by translation, a translation ending at each `isb`; the IOCCC's entries are fetched from the contest's repository and built as old C |
 | native, JIT | Alpine's OpenJDK 25 with HotSpot (tested) | its compilers' code run by translation, `x18` included, its code cache untouched; see [Java](#java-and-the-jvm) |
 | VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
 | VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
@@ -629,7 +634,10 @@ code generated at run time:
   again when it next runs. The page is protected before it is read, so a
   write from another thread cannot slip in between. Threads writing the
   page at once all fault; the first handled lifts the protection, and the
-  others' writes are tried again.
+  others' writes are tried again. A translation ends at each `isb`, the
+  point from which the architecture has a program run what it wrote to
+  its code, so code that rewrites instructions just ahead of itself runs
+  the new ones.
 - **The code cache** is made of 128 MiB chunks (what a branch reaches),
   each one memory mapped twice, writable for fwe and executable for the
   threads that run it; a branch between chunks is not linked. When a

@@ -1,0 +1,8 @@
+# Alpine Linux 3.24 aarch64 files the sbcl test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and Steel Bank Common Lisp 2.6, which compiles Lisp to machine code as it runs (`compile`,
+# redefinitions, CLOS dispatch),
+# with what it needs. Each line is a path under that URL and the file's
+# SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/community/aarch64/sbcl-2.6.5-r0.apk a6b5ee2d032c1633243965b1722ec832e8fc61ee7bea87bdf213f6fd331efd9b
+v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818

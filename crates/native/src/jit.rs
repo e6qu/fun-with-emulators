@@ -133,6 +133,8 @@ const MISS: u32 = 0xb500_0011;
 const VALUE: u32 = 0xf940_0631;
 /// `br x17`
 const GO: u32 = 0xd61f_0220;
+/// `isb`.
+const ISB: u32 = 0xd503_3fdf;
 /// `cbz x17, <outside>`: a table entry for a target not translated.
 const OUTSIDE: u32 = 0xb400_0011;
 
@@ -1273,6 +1275,16 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
         }
         info.extend((at..out.len()).map(|_| Word::At(pc)));
         return false;
+    }
+    // `isb`: from here the program runs what it wrote to code before it
+    // (the architecture's rule for self-modifying code). The block ends:
+    // its way out goes on at the next instruction's translation, made again
+    // if a write dropped it (and unlinked the way there).
+    if w == ISB {
+        out.push(w);
+        info.push(Word::At(pc));
+        jump(out, info, pc + 4);
+        return true;
     }
     // A system call (Linux ignores `svc`'s immediate).
     if w & 0xffe0_001f == 0xd400_0001 {

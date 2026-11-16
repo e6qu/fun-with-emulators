@@ -260,7 +260,7 @@ jobs:
           done
           exit $failed
       - if: always()
-        run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== node round $i"; cargo test -p fwe --test guests -- debian_node --nocapture || exit 1; done
+        run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== JIT runtimes round $i"; cargo test -p fwe --test guests -- node_runs luajit sbcl racket guile python_evaluates --nocapture || exit 1; done
       # The calls of each step.
       - if: failure()
         uses: actions/upload-artifact@v4
