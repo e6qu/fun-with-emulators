@@ -461,6 +461,64 @@ fn regs_to(mc: &mut Mcontext, regs: &Regs) {
     mc.ns.fpcr = regs.fp.fpcr;
 }
 
+/// Under `--strace`, an instruction fetch that faulted, with what led
+/// there: the registers (the guest's `x18` among them), the code before
+/// the return address, and, where that is a call, the code it called. Each
+/// word is marked where fwe changed it (`fwe:was>now`). Code is read only
+/// where the guest's mappings say it is readable.
+fn fetch_fault_report(regs: &Regs) {
+    if !kernel().as_ref().is_some_and(|k| k.tracer.enabled) {
+        return;
+    }
+    let readable = |a: u64| {
+        fwe_kernel::maps::record()
+            .areas_in(a, a + 4)
+            .iter()
+            .any(|p| p.value.prot & fwe_abi::mman::PROT_READ != 0)
+    };
+    let word = |a: u64| -> Option<u32> {
+        // SAFETY: an address the guest's mappings say is readable.
+        readable(a).then(|| unsafe { (a as *const u32).read() })
+    };
+    let dump = |from: u64, n: u64| -> String {
+        (0..n)
+            .map(|i| from + 4 * i)
+            .map(|a| match (word(a), fwe_kernel::jitsites::at(a)) {
+                (Some(w), Some((was, now))) if w == now => {
+                    format!("{a:#x}:{w:08x}(fwe:{was:08x}>{now:08x})")
+                }
+                (Some(w), _) => format!("{a:#x}:{w:08x}"),
+                (None, _) => format!("{a:#x}:-"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut r = format!(
+        "fetch fault at {:#x} (stub region {:?}); sp {:#x}; x18 {:#x}; regs",
+        regs.pc,
+        crate::prepare::stub_region(regs.pc),
+        regs.sp,
+        regs.x[18]
+    );
+    for (i, x) in regs.x.iter().enumerate() {
+        r.push_str(&format!(" x{i}={x:#x}"));
+    }
+    let lr = regs.x[30];
+    r.push_str(&format!("; before lr: {}", dump(lr.wrapping_sub(32), 10)));
+    if let Some(w) = word(lr.wrapping_sub(4)) {
+        if w & 0xfc00_0000 == 0x9400_0000 {
+            let to = lr.wrapping_sub(4).wrapping_add_signed(i64::from(((w << 6) as i32) >> 4));
+            r.push_str(&format!("; called {to:#x}: {}", dump(to, 48)));
+        } else if w & 0xffff_fc1f == 0xd63f_0000 {
+            let n = ((w >> 5) & 31) as usize;
+            r.push_str(&format!("; called through x{n} = {:#x}", regs.x[n]));
+        }
+    }
+    if let Some(k) = kernel().as_ref() {
+        k.tracer.note(&r);
+    }
+}
+
 /// Whether `word` is a `brk` instruction (any immediate).
 fn is_brk(word: u32) -> bool {
     word & 0xffe0_001f == 0xd420_0000
@@ -1111,6 +1169,9 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
+    if exec {
+        fetch_fault_report(&regs);
+    }
     // A fault in a stub is the program's own instruction's, at its site
     // (a JIT's null checks fault on purpose, and its handler looks for
     // the instruction it wrote).

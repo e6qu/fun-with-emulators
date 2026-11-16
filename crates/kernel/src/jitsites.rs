@@ -63,6 +63,11 @@ pub fn reusable(addr: u64, was: u32) -> Option<u32> {
     sites().get(&addr).filter(|&&(w, _)| w == was).map(|&(_, now)| now)
 }
 
+/// The JIT's word and fwe's at `addr`, if fwe changed the word there.
+pub fn at(addr: u64) -> Option<(u32, u32)> {
+    sites().get(&addr).copied()
+}
+
 /// Whether `w` decodes in one of the instruction classes a program's code
 /// is made of: not the reserved class (`udf`, and any small number), the
 /// unallocated ones, or SVE's (which Apple's cores do not have).

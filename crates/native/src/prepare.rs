@@ -101,6 +101,13 @@ fn note_stub_region(start: u64, end: u64) {
     STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(start, end);
 }
 
+/// The stub region holding `pc`, if any: (start, end).
+pub fn stub_region(pc: u64) -> Option<(u64, u64)> {
+    let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let (&start, &end) = regions.range(..=pc).next_back()?;
+    (pc < end).then_some((start, end))
+}
+
 /// A fault at `pc` with the stack at `sp`, as if at the site of the stub
 /// `pc` is in, if it is in one ([`rewrite::rewind`]): the program's own
 /// instruction faulted, and its handler sees it there, with its registers.
