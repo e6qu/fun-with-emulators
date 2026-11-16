@@ -137,8 +137,7 @@ pub fn uid_to_linux(uid: u32) -> u32 {
 /// handler may compute (it takes no lock), translated when the guest is
 /// given it.
 pub fn uid_to_initial(uid: u32) -> u32 {
-    // SAFETY: plain host call.
-    if uid == unsafe { libc::geteuid() } { 0 } else { OVERFLOW_ID }
+    if uid == euid() { 0 } else { OVERFLOW_ID }
 }
 
 /// [`uid_to_linux`] for group ids: fwe's own group is the guest's root
@@ -149,8 +148,7 @@ pub fn gid_to_linux(gid: u32) -> u32 {
 
 /// [`gid_to_linux`] in the initial user namespace's terms.
 pub fn gid_to_initial(gid: u32) -> u32 {
-    // SAFETY: plain host call.
-    if gid == unsafe { libc::getegid() } { 0 } else { OVERFLOW_ID }
+    if gid == egid() { 0 } else { OVERFLOW_ID }
 }
 
 /// Host clock for a Linux clock id.
@@ -320,6 +318,39 @@ fn exe_of(pid: libc::pid_t) -> Option<Vec<u8>> {
     })
 }
 
+/// The host's latest pid, as near as the host tells it: on macOS, which
+/// keeps no count of it, the highest pid in use; on Linux, the initial pid
+/// namespace's `ns_last_pid`.
+#[cfg(target_os = "macos")]
+pub fn last_pid() -> i32 {
+    // <sys/proc_info.h>: PROC_ALL_PIDS.
+    // SAFETY: sizing, then filling, a buffer of pids.
+    unsafe {
+        let n = libc::proc_listpids(1, 0, std::ptr::null_mut(), 0);
+        if n <= 0 {
+            return 0;
+        }
+        let mut pids = vec![0 as libc::pid_t; n as usize / size_of::<libc::pid_t>() + 64];
+        let n = libc::proc_listpids(
+            1,
+            0,
+            pids.as_mut_ptr().cast(),
+            (pids.len() * size_of::<libc::pid_t>()) as i32,
+        );
+        pids.truncate(n.max(0) as usize / size_of::<libc::pid_t>());
+        pids.into_iter().max().unwrap_or(0)
+    }
+}
+
+/// The host's latest pid: on Linux, its `ns_last_pid`.
+#[cfg(not(target_os = "macos"))]
+pub fn last_pid() -> i32 {
+    std::fs::read_to_string("/proc/sys/kernel/ns_last_pid")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// The pids of process group `pgid` (none for a number that is not one).
 #[cfg(target_os = "macos")]
 fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
@@ -347,16 +378,29 @@ fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
     }
 }
 
-/// The processes of host process group `pgid` that are fwe's.
+/// The pids of process group `pgid`, read from `/proc`.
+#[cfg(not(target_os = "macos"))]
+fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
+    let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
+    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+        .filter(|&p| {
+            // The group is the fifth field, after the name in parentheses.
+            std::fs::read_to_string(format!("/proc/{p}/stat")).ok().is_some_and(|st| {
+                st.rsplit_once(')')
+                    .and_then(|(_, rest)| rest.split_whitespace().nth(2)?.parse().ok())
+                    == Some(pgid)
+            })
+        })
+        .collect()
+}
+
+/// The processes of host process group `pgid` (none for a number that is
+/// not one), fwe's and others.
 pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    #[cfg(target_os = "macos")]
-    let all = pids_of(pgid);
-    #[cfg(not(target_os = "macos"))]
-    let all: Vec<libc::pid_t> = {
-        let _ = pgid;
-        Vec::new()
-    };
-    all.into_iter().filter(|&p| crate::procreg::read(p).is_some()).collect()
+    if pgid <= 0 {
+        return Vec::new();
+    }
+    pids_of(pgid)
 }
 
 /// Whether host descriptor `fd` is of a file with no name left (a memfd's,
@@ -376,8 +420,15 @@ pub fn unlinked(fd: i32) -> bool {
 /// -1 is refused (`ESRCH`): on the host it is every process of the user, so
 /// a guest's -1 is resolved to fwe's own processes before it gets here
 /// ([`kill_process`] sends to each).
+///
+/// [`WAKE_SIGNAL`] goes only to one live fwe process (`ESRCH` otherwise):
+/// any other process takes the host's default action for it, which ends
+/// it.
 pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     if pid == -1 {
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
+    if sig == WAKE_SIGNAL && (pid <= 0 || !is_fwe(pid)) {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     #[cfg(target_os = "macos")]
@@ -416,6 +467,49 @@ pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     ret(unsafe { libc::kill(pid, sig) })
 }
 
+/// Mark the open file description of `fd` as opened without a right a
+/// Landlock domain withheld for its kind ([`crate::landlock`]): truncating
+/// a regular file, `ioctl` on a device. The mark is the description's
+/// no-`SIGPIPE` flag (`F_SETNOSIGPIPE`), kept with the description and so
+/// with every descriptor of it in any process, and unused by a regular
+/// file or a device, which raise no `SIGPIPE`; a descriptor of another
+/// kind on the host (a socket fwe makes for a device) is not marked.
+#[cfg(target_os = "macos")]
+pub fn mark_landlock_denied(fd: i32) {
+    if markable(fd) {
+        // SAFETY: plain host call on the guest's descriptor.
+        unsafe { libc::fcntl(fd, libc::F_SETNOSIGPIPE, 1) };
+    }
+}
+
+/// Whether the open file description of `fd` carries the mark of
+/// [`mark_landlock_denied`].
+#[cfg(target_os = "macos")]
+pub fn landlock_denied(fd: i32) -> bool {
+    // SAFETY: plain host call on the guest's descriptor.
+    markable(fd) && unsafe { libc::fcntl(fd, libc::F_GETNOSIGPIPE) } == 1
+}
+
+/// Another host keeps no such mark: guests run on macOS only.
+#[cfg(not(target_os = "macos"))]
+pub fn mark_landlock_denied(_fd: i32) {}
+
+/// Another host keeps no such mark: guests run on macOS only.
+#[cfg(not(target_os = "macos"))]
+pub fn landlock_denied(_fd: i32) -> bool {
+    false
+}
+
+/// Whether `fd` is a regular file or a device on the host.
+#[cfg(target_os = "macos")]
+fn markable(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) == 0 };
+    ok && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFCHR | libc::S_IFBLK)
+}
+
 /// `kill` of one host process `pid`: a pid that is not one (0, or
 /// negative, which the host takes for a group or every process) is refused
 /// (`ESRCH`), so a number from a guest or a record never signals more.
@@ -424,6 +518,35 @@ pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     kill(pid, sig)
+}
+
+/// Host process `pid`'s nice value as the host has it (0 for one that
+/// is not there).
+pub fn nice_of(pid: libc::pid_t) -> i32 {
+    // SAFETY: plain host call; -1 is a valid value, so errno is not
+    // consulted (an absent process reads as 0).
+    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    v.clamp(-20, 19)
+}
+
+/// Give host process `pid` (one of fwe's) nice value `nice`, which the
+/// host scheduler then applies. The host lets a user raise a process's
+/// nice value but not lower it (only its root may), so a guest's lowering
+/// stands in fwe's record while the host process keeps the value it had:
+/// Linux's result is the guest's, the host's limit is the host's.
+pub fn set_nice(pid: libc::pid_t, nice: i32) {
+    if pid <= 0 {
+        return;
+    }
+    // SAFETY: plain host call on one process of this user's.
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
+}
+
+/// Whether host process `pid` is a live fwe process (one with a record):
+/// the only kind that takes fwe's internal signals ([`WAKE_SIGNAL`]) and
+/// serves requests left in its mailbox.
+pub fn is_fwe(pid: libc::pid_t) -> bool {
+    pid > 0 && crate::procreg::read(pid).is_some()
 }
 
 /// Whether host process `pid` exists (a zombie does), whether or not this
@@ -642,9 +765,12 @@ pub unsafe fn signal_info(
         set_errno(saved);
     }
     // A signal sent by another fwe process left a note of its sender, for
-    // when it comes with none, and of what it carries ([`crate::signote`]).
+    // when it comes with none, and of what it carries ([`crate::signote`]),
+    // with the sender's guest user id.
     #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
     let mut value = 0;
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut guest_uid = None;
     #[cfg(target_os = "macos")]
     {
         /// macOS's `SI_USER`.
@@ -671,7 +797,7 @@ pub unsafe fn signal_info(
             return crate::thread::SigInfo { code: signal::SI_KERNEL, ..Default::default() };
         }
         if let Some(n) = note {
-            (code, pid, uid) = (SENT, n.pid, n.uid);
+            (code, pid, guest_uid) = (SENT, n.pid, Some(n.uid));
             if n.code != 0 {
                 // A lease break carries the leased descriptor.
                 let poll = (n.code == crate::leases::POLL_MSG && sig != libc::SIGCHLD)
@@ -679,7 +805,7 @@ pub unsafe fn signal_info(
                 return crate::thread::SigInfo {
                     code: n.code,
                     pid,
-                    uid: uid_to_initial(uid),
+                    uid: n.uid,
                     status: 0,
                     value: if poll.is_some() { 0 } else { n.value },
                     poll,
@@ -708,7 +834,12 @@ pub unsafe fn signal_info(
         // that had stopped it).
         status = signal::SIGCONT as i32;
     }
-    crate::thread::SigInfo { code, pid, uid: uid_to_initial(uid), status, value, poll: None }
+    // One this process sent itself carries its own guest user; one from a
+    // process that is not fwe's, the host user's.
+    let uid = guest_uid.unwrap_or_else(|| {
+        if pid != 0 && pid == pid_now() { crate::creds::real_uid() } else { uid_to_initial(uid) }
+    });
+    crate::thread::SigInfo { code, pid, uid, status, value, poll: None }
 }
 
 /// The code and sender the host last gave each host signal, as
@@ -733,7 +864,7 @@ pub fn sent_info(note: crate::signote::Note) -> crate::thread::SigInfo {
     crate::thread::SigInfo {
         code,
         pid: note.pid,
-        uid: uid_to_initial(note.uid),
+        uid: note.uid,
         status: 0,
         value: note.value,
         poll: None,
@@ -1033,6 +1164,176 @@ pub fn boot_time() -> u64 {
     }
 }
 
+/// The host's memory, in bytes: what `/proc/meminfo` and `sysinfo`
+/// report of it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Memory {
+    pub total: u64,
+    /// Not in use at all.
+    pub free: u64,
+    /// What could be had without swapping: free, inactive and purgeable
+    /// pages.
+    pub available: u64,
+    /// File-backed pages (the page cache).
+    pub cached: u64,
+    pub active: u64,
+    pub inactive: u64,
+    /// Wired (Linux's unevictable) pages.
+    pub wired: u64,
+    pub swap_total: u64,
+    pub swap_free: u64,
+}
+
+/// The integer sysctl `name` (of up to 8 bytes), if the host has it.
+#[cfg(target_os = "macos")]
+pub fn sysctl_u64(name: &std::ffi::CStr) -> Option<u64> {
+    let mut v = [0u8; 8];
+    let mut len = v.len();
+    // SAFETY: a valid out-buffer of the size given.
+    let r = unsafe {
+        libc::sysctlbyname(name.as_ptr(), v.as_mut_ptr().cast(), &mut len, std::ptr::null_mut(), 0)
+    };
+    match (r, len) {
+        (0, 4) => Some(u64::from(u32::from_ne_bytes(v[..4].try_into().ok()?))),
+        (0, 8) => Some(u64::from_ne_bytes(v)),
+        _ => None,
+    }
+}
+
+/// The host's memory now (`hw.memsize`, the VM statistics, `vm.swapusage`).
+pub fn memory() -> Memory {
+    #[cfg(target_os = "macos")]
+    {
+        let total = sysctl_u64(c"hw.memsize").unwrap_or(0);
+        // SAFETY: plain host call.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(4096) as u64;
+        // SAFETY: zeroed bytes are a valid `vm_statistics64`, which the
+        // call fills up to the count it is given.
+        let mut s: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut count = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: a valid out-buffer of `count` words; the host port is
+        // this task's send right, kept for its life.
+        #[allow(deprecated)]
+        let r = unsafe {
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                (&mut s as *mut libc::vm_statistics64).cast(),
+                &mut count,
+            )
+        };
+        let mut m = Memory { total, ..Default::default() };
+        if r == 0 {
+            let p = |n: u32| u64::from(n) * page;
+            m.free = p(s.free_count.saturating_sub(s.speculative_count));
+            m.available = (p(s.free_count) + p(s.inactive_count) + p(s.purgeable_count)).min(total);
+            m.cached = p(s.external_page_count);
+            m.active = p(s.active_count);
+            m.inactive = p(s.inactive_count);
+            m.wired = p(s.wire_count);
+        }
+        // SAFETY: zeroed bytes are a valid `xsw_usage`.
+        let mut sw: libc::xsw_usage = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::xsw_usage>();
+        // SAFETY: a valid out-parameter of the size given.
+        let r = unsafe {
+            libc::sysctlbyname(
+                c"vm.swapusage".as_ptr(),
+                (&mut sw as *mut libc::xsw_usage).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if r == 0 {
+            m.swap_total = sw.xsu_total;
+            m.swap_free = sw.xsu_avail;
+        }
+        m
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Memory::default()
+    }
+}
+
+/// What `/proc/cpuinfo` says of each CPU: BogoMIPS (twice the timer's
+/// frequency in MHz, as Linux computes it on arm64), and the implementer,
+/// variant, part and revision of the `MIDR_EL1` of the efficiency and
+/// the performance cores, and how many efficiency cores there are (Linux
+/// numbers them first on Apple's chips), where the host's chip is one
+/// Linux knows.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct CpuIdentity {
+    pub bogomips: f64,
+    pub implementer: u32,
+    pub variant: u32,
+    pub parts: (u32, u32),
+    pub revision: u32,
+    pub efficiency_cores: u32,
+}
+
+/// The host CPU's identity ([`CpuIdentity`]).
+pub fn cpu_identity() -> CpuIdentity {
+    #[cfg(target_os = "macos")]
+    {
+        let tb = sysctl_u64(c"hw.tbfrequency").unwrap_or(24_000_000);
+        let family = sysctl_u64(c"hw.cpufamily").unwrap_or(0) as u32;
+        let sub = sysctl_u64(c"hw.cpusubfamily").unwrap_or(0) as u32;
+        // `CPUFAMILY_ARM_*` and `CPUSUBFAMILY_ARM_*` (`mach/machine.h`), and
+        // the parts Linux's `cputype.h` gives Apple's cores.
+        let base = match family {
+            0x1b58_8bb3 => Some(0x022),
+            0xda33_d83d => Some(0x032),
+            _ => None,
+        };
+        let parts = base.map(|b: u32| {
+            let b = match sub {
+                4 => b + 2,
+                5 => b + 6,
+                _ => b,
+            };
+            (b, b + 1)
+        });
+        CpuIdentity {
+            bogomips: tb as f64 * 2.0 / 1e6,
+            implementer: 0x61,
+            variant: 0,
+            parts: parts.unwrap_or((0, 0)),
+            revision: 0,
+            efficiency_cores: sysctl_u64(c"hw.perflevel1.logicalcpu").unwrap_or(0) as u32,
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        CpuIdentity { bogomips: 48.0, implementer: 0x61, ..Default::default() }
+    }
+}
+
+/// The bytes host process `pid` had read from and written to storage.
+pub fn disk_io(pid: i32) -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: zeroed bytes are a valid `rusage_info_v2`, which the call
+        // fills.
+        let mut r: libc::rusage_info_v2 = unsafe { std::mem::zeroed() };
+        // SAFETY: a valid out-buffer of the flavour's size.
+        let ok = unsafe {
+            libc::proc_pid_rusage(
+                pid,
+                libc::RUSAGE_INFO_V2,
+                (&mut r as *mut libc::rusage_info_v2).cast(),
+            )
+        } == 0;
+        if ok { (r.ri_diskio_bytesread, r.ri_diskio_byteswritten) } else { (0, 0) }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        (0, 0)
+    }
+}
+
 pub fn uptime() -> f64 {
     let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `ts` is a valid out parameter.
@@ -1265,19 +1566,6 @@ pub fn getppid() -> i64 {
     unsafe { libc::getppid() as i64 }
 }
 
-/// (uid, euid, gid, egid) of the host process.
-pub fn ids() -> (i64, i64, i64, i64) {
-    // SAFETY: plain host calls.
-    unsafe {
-        (
-            libc::getuid() as i64,
-            libc::geteuid() as i64,
-            libc::getgid() as i64,
-            libc::getegid() as i64,
-        )
-    }
-}
-
 /// `fallocate(fd, mode, offset, len)` on the host, returning a Linux errno
 /// on failure. Mode 0 reserves the space and extends the file to cover the
 /// range, `FALLOC_FL_KEEP_SIZE` only reserves it, and with
@@ -1417,9 +1705,392 @@ fn write_zeros(fd: i32, mut from: i64, to: i64) -> Result<(), i32> {
     Ok(())
 }
 
+/// A host network interface as Linux describes one: its name (the host's
+/// `lo0` is `lo`), index, `IFF_*` flags, MTU, hardware type (`ARPHRD_*`)
+/// and address, and its IP addresses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Interface {
+    pub name: Vec<u8>,
+    pub index: u32,
+    pub flags: u32,
+    pub mtu: u32,
+    pub hw_type: u16,
+    pub hw_addr: Vec<u8>,
+    pub addrs: Vec<IfAddr>,
+}
+
+/// An IP address of an interface: 4 bytes for IPv4, 16 for IPv6, its
+/// prefix length, and an IPv4 broadcast address.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IfAddr {
+    pub addr: Vec<u8>,
+    pub prefix: u8,
+    pub broadcast: Option<[u8; 4]>,
+}
+
+/// `ARPHRD_ETHER`, `ARPHRD_LOOPBACK` and `ARPHRD_NONE` (a tunnel or
+/// another kind Linux would name otherwise).
+#[cfg(target_os = "macos")]
+const ARPHRD_ETHER: u16 = 1;
+const ARPHRD_LOOPBACK: u16 = 772;
+const ARPHRD_NONE: u16 = 0xfffe;
+
+/// `IFF_LOWER_UP`, Linux's alone: an interface whose carrier is up.
+const IFF_LOWER_UP: u32 = 0x1_0000;
+
+/// Linux's interface flags for the host's `flags`: those the two number
+/// alike (up to `IFF_ALLMULTI`, 0x200), `IFF_MULTICAST` moved from the
+/// BSD's 0x8000 to Linux's 0x1000 (where the BSD's is Linux's
+/// `IFF_DYNAMIC`), and `IFF_LOWER_UP` while the interface runs. A loopback
+/// interface is Linux's `lo`, which takes no multicast. The BSD's own
+/// (`IFF_OACTIVE`, `IFF_SIMPLEX`, `IFF_LINK*`) have no Linux meaning.
+#[cfg(target_os = "macos")]
+pub fn iface_flags_to_linux(flags: u32) -> u32 {
+    const LINUX_MULTICAST: u32 = 0x1000;
+    let mut out = flags & 0x3ff;
+    let loopback = flags & libc::IFF_LOOPBACK as u32 != 0;
+    if flags & libc::IFF_MULTICAST as u32 != 0 && !loopback {
+        out |= LINUX_MULTICAST;
+    }
+    if flags & libc::IFF_RUNNING as u32 != 0 {
+        out |= IFF_LOWER_UP;
+    }
+    out
+}
+
+/// On a Linux host the flags are Linux's already, but for the carrier,
+/// which `getifaddrs` leaves out.
+#[cfg(not(target_os = "macos"))]
+pub fn iface_flags_to_linux(flags: u32) -> u32 {
+    if flags & libc::IFF_RUNNING as u32 != 0 { flags | IFF_LOWER_UP } else { flags }
+}
+
+/// The prefix length of netmask `mask`.
+fn prefix_of(mask: &[u8]) -> u8 {
+    mask.iter().map(|b| b.count_ones() as u8).sum()
+}
+
+/// The host's network interfaces, in index order, as the guest sees the
+/// initial network namespace's (`getifaddrs`).
+pub fn interfaces() -> Vec<Interface> {
+    let mut out: Vec<Interface> = Vec::new();
+    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+    // SAFETY: `getifaddrs` fills the list, freed below; each entry's
+    // pointers are valid until then, and an address is read as its own
+    // family's structure.
+    unsafe {
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let i = &*at;
+            at = i.ifa_next;
+            let host_name = std::ffi::CStr::from_ptr(i.ifa_name);
+            let name = match host_name.to_bytes() {
+                b"lo0" => b"lo".to_vec(),
+                n => n.to_vec(),
+            };
+            let pos = match out.iter().position(|f| f.name == name) {
+                Some(p) => p,
+                None => {
+                    let flags = iface_flags_to_linux(i.ifa_flags);
+                    let loopback = flags & libc::IFF_LOOPBACK as u32 != 0;
+                    out.push(Interface {
+                        name,
+                        index: libc::if_nametoindex(host_name.as_ptr()),
+                        flags,
+                        mtu: if loopback { 16384 } else { 1500 },
+                        hw_type: if loopback { ARPHRD_LOOPBACK } else { ARPHRD_NONE },
+                        hw_addr: vec![0; 6],
+                        addrs: Vec::new(),
+                    });
+                    out.len() - 1
+                }
+            };
+            if i.ifa_addr.is_null() {
+                continue;
+            }
+            let f = &mut out[pos];
+            let mask = |len: usize, off: usize| -> Vec<u8> {
+                if i.ifa_netmask.is_null() {
+                    return vec![0xff; len];
+                }
+                std::slice::from_raw_parts((i.ifa_netmask as *const u8).add(off), len).to_vec()
+            };
+            match i32::from((*i.ifa_addr).sa_family) {
+                libc::AF_INET => {
+                    let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
+                    // The broadcast address (the destination address's
+                    // field, which the hosts name apart).
+                    #[cfg(target_os = "linux")]
+                    let other = i.ifa_ifu;
+                    #[cfg(not(target_os = "linux"))]
+                    let other = i.ifa_dstaddr;
+                    let broadcast = (f.flags & libc::IFF_BROADCAST as u32 != 0 && !other.is_null())
+                        .then(|| {
+                            (*(other as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes()
+                        });
+                    f.addrs.push(IfAddr {
+                        addr: sin.sin_addr.s_addr.to_ne_bytes().to_vec(),
+                        prefix: prefix_of(&mask(4, 4)),
+                        broadcast,
+                    });
+                }
+                libc::AF_INET6 => {
+                    let sin6 = &*(i.ifa_addr as *const libc::sockaddr_in6);
+                    let mut addr = sin6.sin6_addr.s6_addr;
+                    // The host keeps a link-local address's scope in its
+                    // third and fourth bytes, which Linux shows as zero.
+                    if addr[0] == 0xfe && addr[1] & 0xc0 == 0x80 {
+                        addr[2] = 0;
+                        addr[3] = 0;
+                    }
+                    f.addrs.push(IfAddr {
+                        addr: addr.to_vec(),
+                        prefix: prefix_of(&mask(16, 8)),
+                        broadcast: None,
+                    });
+                }
+                #[cfg(target_os = "macos")]
+                libc::AF_LINK => {
+                    let dl = &*(i.ifa_addr as *const libc::sockaddr_dl);
+                    if !i.ifa_data.is_null() {
+                        let data = &*(i.ifa_data as *const libc::if_data);
+                        f.mtu = data.ifi_mtu;
+                        // IFT_ETHER: an Ethernet (or Wi-Fi) interface.
+                        if data.ifi_type == 6 {
+                            f.hw_type = ARPHRD_ETHER;
+                        }
+                    }
+                    if f.hw_type == ARPHRD_ETHER && dl.sdl_alen == 6 {
+                        let base = dl.sdl_data.as_ptr() as *const u8;
+                        let mac = std::slice::from_raw_parts(base.add(dl.sdl_nlen as usize), 6);
+                        f.hw_addr = mac.to_vec();
+                    }
+                }
+                _ => {}
+            }
+        }
+        libc::freeifaddrs(list);
+    }
+    out.sort_by_key(|f| f.index);
+    out
+}
+
+/// The protocol socket `fd` was made with, as the host knows it (the one
+/// it chose for 0: TCP or UDP), if it is a socket.
+pub fn socket_protocol(fd: i32) -> Option<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        // `PROC_PIDFDSOCKETINFO`'s `struct socket_fdinfo` (792 bytes): the
+        // socket's protocol at 180, as `<sys/proc_info.h>` lays it out.
+        const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+        const SIZE: usize = 792;
+        const PROTOCOL: usize = 180;
+        let mut info = [0u8; SIZE];
+        // SAFETY: a buffer of the size the call fills, for this process.
+        let n = unsafe {
+            libc::proc_pidfdinfo(
+                libc::getpid(),
+                fd,
+                PROC_PIDFDSOCKETINFO,
+                info.as_mut_ptr().cast(),
+                SIZE as libc::c_int,
+            )
+        };
+        (n as usize == SIZE)
+            .then(|| i32::from_ne_bytes(info[PROTOCOL..PROTOCOL + 4].try_into().unwrap()))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut v: libc::c_int = 0;
+        let mut l = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: valid out-parameters.
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_PROTOCOL,
+                (&mut v as *mut i32).cast(),
+                &mut l,
+            )
+        };
+        (r == 0).then_some(v)
+    }
+}
+
+/// `poll` events Linux and the host number alike: `POLLIN`, `POLLPRI`,
+/// `POLLOUT`, `POLLERR`, `POLLHUP`, `POLLNVAL`, `POLLRDNORM`, `POLLRDBAND`.
+const POLL_SHARED: i16 = 0xff;
+/// Linux's `POLLWRNORM`, `POLLWRBAND` (macOS's `POLLWRBAND` is 0x100, its
+/// `POLLWRNORM` its `POLLOUT`), `POLLMSG` and `POLLRDHUP`, which the host
+/// has not.
+pub const POLLWRNORM: i16 = 0x100;
+pub const POLLWRBAND: i16 = 0x200;
+pub const POLLMSG: i16 = 0x400;
+pub const POLLRDHUP: i16 = 0x2000;
+
+/// Linux `poll` events `linux` as the host's: those numbered alike as
+/// they are, `POLLWRNORM` and `POLLWRBAND` as the host numbers them, and
+/// what the host has not (`POLLMSG`, `POLLRDHUP`, which fwe looks for
+/// itself) left out.
+pub fn poll_events_to_host(linux: i16) -> i16 {
+    let mut h = linux & POLL_SHARED;
+    if linux & POLLWRNORM != 0 {
+        h |= libc::POLLWRNORM;
+    }
+    if linux & POLLWRBAND != 0 {
+        h |= libc::POLLWRBAND;
+    }
+    h
+}
+
+/// The host's `revents` `host` for a descriptor the guest asked `asked`
+/// (Linux events) of, as Linux reports them: each ready event the guest
+/// asked for under its Linux number, and an error, hang-up or invalid
+/// descriptor always.
+pub fn poll_revents_to_linux(host: i16, asked: i16) -> i16 {
+    let mut l = host & POLL_SHARED;
+    if host & libc::POLLOUT != 0 {
+        l |= POLLWRNORM;
+    }
+    if host & libc::POLLWRBAND != 0 {
+        l |= POLLWRBAND;
+    }
+    l & (asked | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+}
+
+/// Run `call`, a host call that takes only a path (the attribute calls,
+/// `truncate`, `chflags`), on `name` in directory `dir`, without opening
+/// the file: macOS drops every record lock a process holds on a file when
+/// it closes any descriptor of it, so fwe never opens a guest's file for
+/// its own ends. `call` gets the file's full path, or where that is too
+/// long for the host, `name` itself from the thread's working directory
+/// set to `dir` for the call (`pthread_fchdir_np`); with `dir` the working
+/// directory (`AT_FDCWD`), `name` itself. Linux hosts (the unit tests)
+/// reach it through `/proc/self/fd`.
+pub fn at_path<T>(
+    dir: i32,
+    name: &std::ffi::CStr,
+    call: impl FnOnce(&std::ffi::CStr) -> T,
+) -> Result<T, i32> {
+    // From the working directory, or absolute: the name is the path.
+    if dir == libc::AT_FDCWD {
+        return Ok(call(name));
+    }
+    let full = crate::fs::fd_path(dir).and_then(|mut p| {
+        p.push(b'/');
+        p.extend_from_slice(name.to_bytes());
+        (p.len() < libc::PATH_MAX as usize).then(|| std::ffi::CString::new(p).ok()).flatten()
+    });
+    if let Some(full) = full {
+        return Ok(call(&full));
+    }
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn pthread_fchdir_np(fd: libc::c_int) -> libc::c_int;
+        }
+        // SAFETY: sets only this thread's working directory, to a live
+        // directory descriptor.
+        if unsafe { pthread_fchdir_np(dir) } != 0 {
+            return Err(errno_to_linux(last_errno()));
+        }
+        let r = call(name);
+        let e = last_errno();
+        // SAFETY: back to the process's working directory.
+        unsafe { pthread_fchdir_np(-1) };
+        // SAFETY: the call's errno, kept for its caller to read.
+        unsafe { *libc::__error() = e };
+        Ok(r)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mut p = format!("/proc/self/fd/{dir}/").into_bytes();
+        p.extend_from_slice(name.to_bytes());
+        let p = std::ffi::CString::new(p).map_err(|_| le::EINVAL)?;
+        Ok(call(&p))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The BSD's interface flags as Linux's: the loopback `lo` with its
+    /// carrier up and no multicast; another interface's multicast moved.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn interface_flags_are_linuxs() {
+        // lo0: UP, LOOPBACK, RUNNING, MULTICAST (0x8049).
+        assert_eq!(iface_flags_to_linux(0x8049), 0x10049);
+        // en0: UP, BROADCAST, SMART, RUNNING, SIMPLEX, MULTICAST (0x8863).
+        assert_eq!(iface_flags_to_linux(0x8863), 0x11063);
+    }
+
+    /// Linux's write events reach the host by its numbers, never as
+    /// others (`POLLWRBAND` 0x200 is macOS's `POLLEXTEND`, `POLLMSG` its
+    /// `POLLATTRIB`), and come back by Linux's, only as asked.
+    #[test]
+    fn poll_events_are_translated() {
+        assert_eq!(poll_events_to_host(POLLWRNORM), libc::POLLWRNORM);
+        assert_eq!(poll_events_to_host(POLLWRBAND), libc::POLLWRBAND);
+        assert_eq!(poll_events_to_host(POLLMSG | POLLRDHUP), 0);
+        assert_eq!(
+            poll_events_to_host(libc::POLLIN | libc::POLLRDNORM),
+            libc::POLLIN | libc::POLLRDNORM
+        );
+        assert_eq!(poll_revents_to_linux(libc::POLLOUT, POLLWRNORM), POLLWRNORM);
+        assert_eq!(poll_revents_to_linux(libc::POLLWRBAND, POLLWRBAND), POLLWRBAND);
+        assert_eq!(
+            poll_revents_to_linux(libc::POLLOUT | libc::POLLHUP, libc::POLLIN),
+            libc::POLLHUP
+        );
+    }
+
+    /// A path call reaches a name in a directory, also where the whole path
+    /// is longer than the host takes, and the thread's working directory
+    /// is the process's again after.
+    #[test]
+    fn a_path_call_reaches_a_name_past_the_hosts_length() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        let base = std::env::temp_dir().join(format!("fwe-at-path-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let mut dir: OwnedFd = std::fs::File::open(&base).unwrap().into();
+        // Made a name at a time: the whole path is past the host's limit.
+        let name = c"directory-with-a-name-of-many-bytes-to-make-a-long-path-of";
+        for _ in 0..20 {
+            // SAFETY: a NUL-terminated name in a live directory; the new
+            // descriptor is owned.
+            dir = unsafe {
+                libc::mkdirat(dir.as_raw_fd(), name.as_ptr(), 0o755);
+                let fd = libc::openat(dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY);
+                assert!(fd >= 0);
+                OwnedFd::from_raw_fd(fd)
+            };
+        }
+        let dir = dir.as_raw_fd();
+        assert!(crate::fs::fd_path(dir).is_none_or(|p| p.len() >= 1024));
+        // SAFETY: a NUL-terminated name in a live directory.
+        let fd = unsafe { libc::openat(dir, c"f".as_ptr(), libc::O_CREAT | libc::O_WRONLY, 0o644) };
+        assert!(fd >= 0);
+        // SAFETY: the descriptor just opened.
+        unsafe { libc::close(fd) };
+        let cut = |p: &std::ffi::CStr| {
+            // SAFETY: a NUL-terminated path.
+            unsafe { libc::truncate(p.as_ptr(), 7) }
+        };
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(at_path(dir, c"f", cut), Ok(0));
+        assert_eq!(std::env::current_dir().unwrap(), cwd);
+        // SAFETY: zeroed bytes are a valid `stat`; a NUL-terminated name.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above.
+        assert_eq!(unsafe { libc::fstatat(dir, c"f".as_ptr(), &mut st, 0) }, 0);
+        assert_eq!(st.st_size, 7);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 
     #[test]
     fn errno_translation() {
@@ -1579,6 +2250,37 @@ pub fn clone_at(src: i32, dst_dir: i32, dst: &std::ffi::CStr) -> Result<(), i32>
     }
 }
 
+/// [`clone_at`] of the regular file `src` in directory `src_dir` (not
+/// followed), never opened ([`crate::reclocks`]).
+pub fn clone_name_at(
+    src_dir: i32,
+    src: &std::ffi::CStr,
+    dst_dir: i32,
+    dst: &std::ffi::CStr,
+) -> Result<(), i32> {
+    #[cfg(target_os = "macos")]
+    {
+        /// `<sys/clonefile.h>`'s: a link itself, not what it leads to.
+        const CLONE_NOFOLLOW: u32 = 1;
+        // SAFETY: NUL-terminated names in the caller's directories.
+        let r = unsafe {
+            libc::clonefileat(src_dir, src.as_ptr(), dst_dir, dst.as_ptr(), CLONE_NOFOLLOW)
+        };
+        if r == 0 {
+            return Ok(());
+        }
+        match last_errno() {
+            libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
+            e => Err(errno_to_linux(e)),
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (src_dir, src, dst_dir, dst);
+        Err(le::EOPNOTSUPP)
+    }
+}
+
 /// Run `f` with every signal blocked on the calling thread, its mask put
 /// back after. A thread `f` creates starts with them all blocked: one of
 /// fwe's own keeps them so (a guest's signal is a guest thread's to take),
@@ -1600,4 +2302,99 @@ pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
     // SAFETY: the mask saved above.
     unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
     r
+}
+
+/// This process's host pid as the kernel has it now, asked each time: in
+/// a signal handler, which may run in a fork child before its
+/// `pthread_atfork` handlers have forgotten the parent's [`pid`] (or
+/// libc its own copy). Async-signal-safe.
+pub fn pid_now() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        // SAFETY: the `getpid` system call (20), which cannot fail.
+        #[allow(deprecated)]
+        unsafe {
+            libc::syscall(20)
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // SAFETY: plain host call.
+        unsafe { libc::getpid() }
+    }
+}
+
+/// This process's host pid, kept: asked of the host once, and again in a
+/// fork child (a `pthread_atfork` handler forgets it).
+pub fn pid() -> i32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let p = PID.load(Relaxed);
+    if p != 0 {
+        return p;
+    }
+    static FORGET: std::sync::Once = std::sync::Once::new();
+    FORGET.call_once(|| {
+        extern "C" fn forget() {
+            PID.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+        // SAFETY: registering a handler that only stores to an atomic.
+        unsafe { libc::pthread_atfork(None, None, Some(forget)) };
+    });
+    // SAFETY: getpid cannot fail.
+    let p = unsafe { libc::getpid() };
+    PID.store(p, Relaxed);
+    p
+}
+
+static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// fwe's effective user id on the host, kept: fwe never changes it. Safe in
+/// a signal handler.
+pub fn euid() -> u32 {
+    kept_id(&EUID, || {
+        // SAFETY: geteuid cannot fail.
+        unsafe { libc::geteuid() }
+    })
+}
+
+/// fwe's effective group id on the host, as [`euid`].
+pub fn egid() -> u32 {
+    kept_id(&EGID, || {
+        // SAFETY: getegid cannot fail.
+        unsafe { libc::getegid() }
+    })
+}
+
+static EUID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+static EGID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+fn kept_id(slot: &std::sync::atomic::AtomicU64, ask: impl FnOnce() -> u32) -> u32 {
+    use std::sync::atomic::Ordering::Relaxed;
+    let v = slot.load(Relaxed);
+    if v != u64::MAX {
+        return v as u32;
+    }
+    let id = ask();
+    slot.store(u64::from(id), Relaxed);
+    id
+}
+
+/// Milliseconds on a monotonic clock that is cheap to read and coarse:
+/// for checks made at most so often on every call, where reading the
+/// precise clock costs more than the check (it does in a virtual machine).
+pub fn coarse_ms() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn clock_gettime_nsec_np(clock: libc::clockid_t) -> u64;
+        }
+        // SAFETY: plain host call; the approximate clock is read from
+        // memory the kernel keeps current.
+        unsafe { clock_gettime_nsec_np(libc::CLOCK_MONOTONIC_RAW_APPROX) / 1_000_000 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+        START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+    }
 }

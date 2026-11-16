@@ -12,7 +12,8 @@
 //! and inode), and its mask. An instance's descriptor is a host datagram
 //! socket bound to a path in fwe's private directory, so a process that
 //! raises an event sends it there, one datagram an event, and reading,
-//! `poll` and `epoll` are the host's own. Beside it, three shared words
+//! `poll` and `epoll` are the host's own. Beside it, three shared words (a
+//! cell of the process store, [`crate::procstore::cell`])
 //! count the events queued (up to `fs.inotify.max_queued_events`, past
 //! which events are dropped and the reader is given `IN_Q_OVERFLOW` once
 //! it has read the rest), note an overflow, and keep the last event sent,
@@ -41,9 +42,10 @@ pub struct Watch {
     pub ino: u64,
     /// The events asked for, with `IN_ONESHOT` and `IN_EXCL_UNLINK`.
     pub mask: u32,
-    /// Where the file was in the mount namespace's view (for
-    /// `IN_UNMOUNT`).
+    /// Where the file was in the mount namespace's view, and that
+    /// namespace's record (for `IN_UNMOUNT`).
     pub ns_path: Vec<u8>,
+    pub mnt: Vec<u8>,
 }
 
 /// An instance.
@@ -82,6 +84,7 @@ impl Data for Registry {
             e.u64(w.ino);
             e.u32(w.mask);
             e.bytes(&w.ns_path);
+            e.bytes(&w.mnt);
         }
     }
 
@@ -95,7 +98,7 @@ impl Data for Registry {
                 next_wd: d.i32(),
             })
             .collect();
-        let n = d.count(40);
+        let n = d.count(48);
         let watches = (0..n)
             .map(|_| Watch {
                 inst: d.bytes(),
@@ -104,6 +107,7 @@ impl Data for Registry {
                 ino: d.u64(),
                 mask: d.u32(),
                 ns_path: d.bytes(),
+                mnt: d.bytes(),
             })
             .collect();
         Registry { instances, watches }
@@ -140,13 +144,11 @@ fn alive(p: Proc) -> bool {
 }
 
 static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
-/// When this process last found no registry (monotonic milliseconds).
-static MISSED: AtomicU64 = AtomicU64::new(0);
 
-fn now_ms() -> u64 {
-    static START: OnceLock<std::time::Instant> = OnceLock::new();
-    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64 + 1
-}
+/// The count of registries made ([`make_registry`]) this process last
+/// looked for one at and found none: it looks again only once the count
+/// moves.
+static MISSED_AT: AtomicU64 = AtomicU64::new(0);
 
 fn registry_dir() -> Option<Vec<u8>> {
     let mut d = crate::fs::shm::user_dir().ok()?;
@@ -155,36 +157,39 @@ fn registry_dir() -> Option<Vec<u8>> {
 }
 
 /// The registry, every process's, if any process has made it (it lasts,
-/// once made). A process that finds none looks again a second later at
-/// the soonest, so a file call costs nothing while nothing is watched.
+/// once made): a count in the process store says how many times one was
+/// made, so a file call costs a word read while none is, and a registry
+/// looked for and not there (the count can outlive it: a store another fwe
+/// build shares) is looked for again only once another is made. It is
+/// joined, not made, so a call made while the registry's lock is held
+/// (a watch being added) never waits for that lock.
 pub fn registry() -> Option<&'static Record<Registry>> {
+    use crate::procstore::{Count, count};
     if let Some(r) = REGISTRY.get() {
         return Some(r);
     }
-    let missed = MISSED.load(Ordering::Relaxed);
-    let now = now_ms();
-    if missed != 0 && now.saturating_sub(missed) < 1000 {
+    let made = count(Count::Watches).load(Ordering::SeqCst);
+    if made == 0 || MISSED_AT.load(Ordering::Relaxed) == made {
         return None;
     }
-    match registry_dir().and_then(|d| Record::join(&d, 0).ok()) {
-        Some(r) => {
-            let _ = REGISTRY.set(r);
-            REGISTRY.get()
-        }
-        None => {
-            MISSED.store(now, Ordering::Relaxed);
-            None
-        }
-    }
+    let Some(r) = registry_dir().and_then(|d| Record::join(&d, 0).ok()) else {
+        MISSED_AT.store(made, Ordering::Relaxed);
+        return None;
+    };
+    let _ = REGISTRY.set(r);
+    REGISTRY.get()
 }
 
 /// The registry, made if no process has made it yet.
-fn make_registry() -> Option<&'static Record<Registry>> {
+pub(crate) fn make_registry() -> Option<&'static Record<Registry>> {
+    use crate::procstore::{Count, count};
     if let Some(r) = registry() {
         return Some(r);
     }
     let r = Record::named("inotify", 0, Registry::default).ok()?;
     let _ = REGISTRY.set(r);
+    // Every process looks for it from now on, those that missed one too.
+    count(Count::Watches).fetch_add(1, Ordering::SeqCst);
     REGISTRY.get()
 }
 
@@ -224,55 +229,25 @@ pub fn instance_of(fd: i32) -> Option<Vec<u8>> {
     }
 }
 
-/// The three shared words beside instance `path`: events queued, an
-/// overflow, the last event sent (a hash).
+/// The three shared words of instance `path`: events queued, an
+/// overflow, the last event sent (a hash). They are a cell of the process
+/// store's ([`crate::procstore::cell`]), tagged with a hash of the path:
+/// memory, where a file's mapped words would be written back to its disk.
 fn queue_words(path: &[u8]) -> Option<&'static [AtomicU64; 3]> {
-    static MAPS: Mutex<Option<HashMap<Vec<u8>, usize>>> = Mutex::new(None);
-    let mut g = MAPS.lock().unwrap_or_else(|e| e.into_inner());
-    let m = g.get_or_insert_with(HashMap::new);
-    if let Some(&p) = m.get(path) {
-        // SAFETY: a mapping made below, never unmapped.
-        return Some(unsafe { &*(p as *const [AtomicU64; 3]) });
-    }
-    let c = std::ffi::CString::new([path, b".q"].concat()).ok()?;
-    // SAFETY: a NUL-terminated path in fwe's private directory; the
-    // mapping holds the file, the descriptor is closed again.
-    let p = unsafe {
-        let fd = libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let p = libc::mmap(
-            std::ptr::null_mut(),
-            24,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        libc::close(fd);
-        if p == libc::MAP_FAILED {
-            return None;
-        }
-        p
-    };
-    m.insert(path.to_vec(), p as usize);
-    // SAFETY: a shared mapping of 24 bytes, aligned, kept for good.
-    Some(unsafe { &*(p as *const [AtomicU64; 3]) })
+    crate::procstore::cell(crate::shared::hash(path), false)
 }
 
-/// Remove instance `path`'s files.
+/// Remove instance `path`'s socket and words.
 fn remove_files(path: &[u8]) {
-    // A dnotify watch has no files.
+    // A dnotify watch has none.
     if crate::dnotify::is_dnotify(path) {
         return;
     }
-    for p in [path.to_vec(), [path, b".q"].concat()] {
-        if let Ok(c) = std::ffi::CString::new(p) {
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            unsafe { libc::unlink(c.as_ptr()) };
-        }
+    if let Ok(c) = std::ffi::CString::new(path) {
+        // SAFETY: a NUL-terminated path in fwe's private directory.
+        unsafe { libc::unlink(c.as_ptr()) };
     }
+    crate::procstore::free_cell(crate::shared::hash(path));
 }
 
 /// `struct inotify_event` for `wd`, `mask`, `cookie` and `name`, its name
@@ -370,8 +345,7 @@ fn forget(inst: &[u8]) {
 fn sender(f: impl FnOnce(i32) -> Result<i32, i32>) -> Result<i32, i32> {
     static S: Mutex<(i32, i32)> = Mutex::new((-1, 0));
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if g.0 < 0 || g.1 != me {
         // SAFETY: plain host call; the socket is fwe's own.
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -437,22 +411,22 @@ fn overlay_ident(fd: i32, dev: u64) -> Option<(u64, u64)> {
 
 /// `s`, `name` in host directory `dir`, as seen through overlay `l`.
 fn through_overlay(mut s: Subject, dir: i32, name: &[u8], l: &crate::overlay::Layers) -> Subject {
-    use std::os::fd::{AsRawFd, FromRawFd};
     let dev = overlay_dev(l);
+    // By its path, never opened ([`crate::reclocks`]).
     let file = std::ffi::CString::new(name).ok().and_then(|c| {
-        // SAFETY: a live directory and a NUL-terminated name; the
-        // descriptor is owned below.
-        let fd = unsafe {
-            libc::openat(
-                dir,
-                c.as_ptr(),
-                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        // SAFETY: a fresh descriptor this owns.
-        (fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+        crate::host::at_path(dir, &c, |p| {
+            let ino = crate::overlay::origin_at(p).map(|(_, i)| i).or_else(|| {
+                // SAFETY: zeroed bytes are a valid `stat`; `lstat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: a NUL-terminated path; a valid out-parameter.
+                (unsafe { libc::lstat(p.as_ptr(), &mut st) } == 0).then(|| identity(&st).1)
+            })?;
+            Some((dev, ino))
+        })
+        .ok()
+        .flatten()
     });
-    match file.and_then(|f| overlay_ident(f.as_raw_fd(), dev)) {
+    match file {
         Some((d, i)) => (s.dev, s.ino) = (d, i),
         None => s.dev = dev,
     }
@@ -655,20 +629,20 @@ pub fn deleted(s: &Subject) {
     drop_watches(|w| w.dev == s.dev && w.ino == s.ino, 0);
 }
 
-/// The mount at namespace path `point` is gone: the watches of what was
-/// in it hear `IN_UNMOUNT` and go.
-pub fn unmounted(point: &[u8]) {
+/// The mount at path `point` of the mount namespace whose record is `mnt`
+/// is gone: the watches of what was in it there hear `IN_UNMOUNT` and go
+/// (another namespace's mounts there are its own).
+pub fn unmounted(mnt: &[u8], point: &[u8]) {
     if !watching() {
         return;
     }
-    drop_watches(|w| crate::mounts::under(&w.ns_path, point).is_some(), IN_UNMOUNT);
+    drop_watches(|w| w.mnt == mnt && crate::mounts::under(&w.ns_path, point).is_some(), IN_UNMOUNT);
 }
 
 /// A cookie tying a move's two events together.
 pub fn cookie() -> u32 {
     static N: AtomicU32 = AtomicU32::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = crate::host::pid() as u32;
     (pid << 12) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 
@@ -1215,23 +1189,9 @@ impl<P: Platform> Kernel<P> {
             err(e)
         };
         // The queue's words, then the socket.
-        let Ok(q) = std::ffi::CString::new([&path[..], b".q"].concat()) else {
-            return fail(errno::EINVAL);
-        };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let qfd = unsafe {
-            libc::open(
-                q.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        // SAFETY: the descriptor just opened.
-        if qfd < 0 || unsafe { libc::ftruncate(qfd, 24) } != 0 {
+        if crate::procstore::cell(crate::shared::hash(&path), true).is_none() {
             return fail(errno::ENOMEM);
         }
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(qfd) };
         // SAFETY: plain host call; the socket is the guest's descriptor.
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
         if s < 0 {
@@ -1306,6 +1266,7 @@ impl<P: Platform> Kernel<P> {
             return r;
         }
         let ns_path = resolved.ns_path.clone().unwrap_or_default();
+        let mnt = self.fs().mount_ns().dir().to_vec();
         let kept = mask & (IN_ALL_EVENTS | IN_ONESHOT | IN_EXCL_UNLINK);
         let uid = self.creds.uid;
         let Some(r) = registry() else { return err(errno::ENOMEM) };
@@ -1335,6 +1296,7 @@ impl<P: Platform> Kernel<P> {
                 ino: s.ino,
                 mask: kept,
                 ns_path,
+                mnt,
             });
             Ok(wd)
         });
@@ -1451,6 +1413,7 @@ mod tests {
             ino: 5,
             mask: IN_OPEN,
             ns_path: b"/x".to_vec(),
+            mnt: b"/ns".to_vec(),
         });
         let mut e = Enc::new();
         r.encode(&mut e);

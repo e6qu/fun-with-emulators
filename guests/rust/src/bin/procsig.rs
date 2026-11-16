@@ -102,8 +102,10 @@ fn main() {
         let none = Rlimit { cur: 0, max: u64::MAX };
         setrlimit(RLIMIT_CORE, &none);
 
-        // A queued signal for pid -1 names no process.
-        let info = [0u8; 128];
+        // A queued signal for pid -1 names no process (with `SI_QUEUE`: a
+        // code only the kernel gives is refused first, `EPERM`).
+        let mut info = [0u8; 128];
+        info[8..12].copy_from_slice(&(-1i32).to_ne_bytes());
         let r = syscall(SYS_RT_SIGQUEUEINFO, -1i64, 10i64, info.as_ptr());
         println!("queued to -1: {}", r == -1 && errno() == ESRCH);
 

@@ -10,14 +10,27 @@
 //!   length byte then a family byte. The payload that follows is identical.
 //! - **socket type flags:** `SOCK_NONBLOCK`/`SOCK_CLOEXEC` are stripped from the
 //!   `type` argument and applied with `fcntl`.
-//! - **`setsockopt` names and `send`/`recv` flags:** mapped individually;
-//!   `MSG_NOSIGNAL` becomes `SO_NOSIGPIPE` on the socket.
-//! - **`SCM_RIGHTS`:** the control-message layout differs (`cmsg_len` is 64-bit
-//!   on Linux, 32-bit on macOS), so file-descriptor passing is re-encoded.
+//! - **`setsockopt` names and `send`/`recv` flags:** mapped individually
+//!   ([`crate::sockopt`]); an option the host lacks is kept by fwe (the
+//!   UDP level's, `UDP_CORK` and `UDP_SEGMENT` acted on) or refused, never
+//!   passed on under its Linux number; `MSG_NOSIGNAL` becomes
+//!   `SO_NOSIGPIPE` on the socket.
+//! - **control messages:** the layout differs (`cmsg_len` is 64-bit on
+//!   Linux, 32-bit on macOS), so descriptors and credentials are
+//!   re-encoded, and what fwe keeps of a descriptor goes with it
+//!   ([`crate::scm`]).
 //!
 //! `AF_UNIX` paths are rooted under the rootfs; abstract-namespace names (a
 //! leading NUL) are mapped to files under a per-host temporary directory, since
-//! macOS has no abstract namespace.
+//! macOS has no abstract namespace. A Unix socket bound with its family
+//! alone, or passing credentials and connecting or sending unbound, is
+//! given an abstract name as Linux's autobind gives one; a Unix `SOCK_RAW`
+//! socket is a datagram one, as Linux makes it.
+//!
+//! A ping socket (ICMP datagrams) receives on macOS with the IP header
+//! first, which Linux's does not give: fwe marks one as it is made
+//! ([`crate::fdmarks::Mark::Ping`]) and strips the header from what it
+//! receives.
 //!
 //! The calls that can block — `connect`, `accept`, `recvfrom`, `recvmsg`,
 //! `sendto`, `sendmsg` — run outside the kernel lock via `blocking_syscall`.
@@ -89,25 +102,44 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
 }
 
 /// Whether the caller may write to the Unix socket file host address `hb`
-/// names (`a`'s), which connecting or sending to it needs: `EACCES` if the
-/// mode fwe keeps for it denies its owner that, to a caller without
-/// `CAP_DAC_OVERRIDE` ([`crate::modes`]; the host checks any other mode).
+/// names (`a`'s), which connecting or sending to it needs: as `open`
+/// checks, the caller's file-system ids against the node's guest owner
+/// and mode ([`crate::owners`], [`crate::modes`]), `EACCES` where they
+/// deny it. Without a root filesystem, the host's own nodes (root's, no
+/// owner kept) are left to the host's checks.
 fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
-    if family(hb) != libc::AF_UNIX || hb[2] == 0 || crate::creds::dac_override() {
+    if family(hb) != libc::AF_UNIX || hb[2] == 0 {
+        return Ok(());
+    }
+    let access = crate::creds::access();
+    // `CAP_DAC_OVERRIDE` passes every node, but in a user namespace of
+    // fwe's only a node mapped there ([`crate::creds::Access::permits`]).
+    if access.dac_override && !access.scoped {
         return Ok(());
     }
     use std::os::fd::AsRawFd;
     let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
+    // An abstract name's file is fwe's, of no guest permissions.
+    use std::os::unix::ffi::OsStrExt;
+    if a.dir.is_none() && hb[2..end].starts_with(abstract_dir().as_os_str().as_bytes()) {
+        return Ok(());
+    }
     let Ok(name) = std::ffi::CString::new(&hb[2..end]) else { return Ok(()) };
     let dir = a.dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
     // SAFETY: an all-zero `stat` is a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a NUL-terminated name, relative to a live directory.
-    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, 0) } != 0 || !crate::modes::marked(&st) {
+    if unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Ok(());
     }
     let perm = crate::modes::guest_perm_at(dir, &name, &st);
-    if crate::modes::owner_allows(perm, 2) { Ok(()) } else { Err(errno::EACCES) }
+    let owner = crate::owners::of_at(dir, &name, &st);
+    crate::modes::apply(&mut st, perm);
+    crate::owners::apply(&mut st, owner);
+    if owner == (0, 0) && crate::fs::root_is_host() {
+        return Ok(());
+    }
+    if access.permits(&st, 2) { Ok(()) } else { Err(errno::EACCES) }
 }
 
 /// The file abstract name `name` (without its leading NUL) stands as.
@@ -657,7 +689,7 @@ fn buffer_size(fd: i32, optname: u64, optval: u64, optlen: u64, admin: bool) -> 
 /// range, the type and its flags, the family, then the type and protocol
 /// the family has (a raw IP socket names its protocol; a Unix socket's is
 /// 0 or `PF_UNIX`).
-fn check_socket(domain: u64, type_: u64, protocol: u64) -> Result<libc::c_int, i64> {
+pub(crate) fn check_socket(domain: u64, type_: u64, protocol: u64) -> Result<libc::c_int, i64> {
     // NPROTO and SOCK_MAX.
     if domain >= 46 {
         return Err(err(errno::EAFNOSUPPORT));
@@ -700,6 +732,11 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
         Err(e) => return e,
     };
     let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    // A Unix `SOCK_RAW` socket is a datagram one, as Linux's `unix_create`
+    // makes it.
+    if dom == libc::AF_UNIX && base == SOCK_RAW as i32 {
+        base = libc::SOCK_DGRAM;
+    }
     // macOS has no SOCK_SEQPACKET Unix sockets: a stream socket with its
     // messages framed (see `seqpacket`).
     let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
@@ -716,7 +753,98 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     if seqpacket {
         crate::seqpacket::make(fd);
     }
+    #[cfg(target_os = "macos")]
+    if dom == libc::AF_INET && base == libc::SOCK_DGRAM && protocol == 1 {
+        crate::fdmarks::mark(fd, crate::fdmarks::Mark::Ping);
+    }
+    crate::netns::made(fd);
+    fresh(fd);
+    socket_made(fd, Some(own_ids()));
     fd as i64
+}
+
+/// A descriptor received from another process (`SCM_RIGHTS`,
+/// `pidfd_getfd`): a socket standing in for a kind the host lacks is
+/// marked as one here too.
+pub fn adopt(fd: i32) {
+    if kind(fd).is_some() {
+        socket_made(fd, None);
+    }
+    // A SOCK_SEQPACKET socket of fwe's.
+    crate::seqpacket::adopt(fd);
+    // A ping socket, whose receives come with the IP header on macOS.
+    #[cfg(target_os = "macos")]
+    if kind(fd) == Some((libc::AF_INET, libc::SOCK_DGRAM))
+        && crate::host::socket_protocol(fd) == Some(1)
+    {
+        crate::fdmarks::mark(fd, crate::fdmarks::Mark::Ping);
+    }
+}
+
+/// The length of the IP header ICMP datagram `d` received on a macOS ping
+/// socket starts with (0 if it has none: an IPv4 header's version and
+/// length, in its first byte, say).
+fn ip_header_len(d: &[u8]) -> usize {
+    match d.first() {
+        Some(&b) if b >> 4 == 4 && usize::from(b & 0xf) * 4 >= 20 => {
+            (usize::from(b & 0xf) * 4).min(d.len())
+        }
+        _ => 0,
+    }
+}
+
+/// A receive on ping socket `fd` into the host message `hmsg` (the host
+/// flags `hflags`), as Linux delivers it: the ICMP message, without the IP
+/// header macOS puts before it, cut to the buffers (`MSG_TRUNC` set when
+/// it is), its whole length returned when the guest asked with `MSG_TRUNC`
+/// (`whole`). Received whole into a buffer of fwe's, then copied to the
+/// message's buffers (translated guest buffers: a fault there is `EFAULT`).
+///
+/// # Safety
+/// `hmsg`'s name and control buffers must be valid for writing, and its
+/// `msg_iov` must point to `msg_iovlen` iovecs.
+unsafe fn ping_recvmsg(fd: i32, hmsg: &mut libc::msghdr, hflags: i32, whole: bool) -> i64 {
+    // The largest IP datagram.
+    let mut d = vec![0u8; 65536];
+    let mut iov = libc::iovec { iov_base: d.as_mut_ptr().cast(), iov_len: d.len() };
+    let (to, count) = (hmsg.msg_iov, hmsg.msg_iovlen);
+    hmsg.msg_iov = &mut iov;
+    hmsg.msg_iovlen = 1;
+    // SAFETY: the caller's guarantee for name and control; a local buffer.
+    let n = unsafe { libc::recvmsg(fd, hmsg, hflags & !libc::MSG_TRUNC) };
+    hmsg.msg_iov = to;
+    hmsg.msg_iovlen = count;
+    if n < 0 {
+        return last_error();
+    }
+    let got = &d[..n as usize];
+    let icmp = &got[ip_header_len(got)..];
+    #[allow(clippy::unnecessary_cast)] // `msg_iovlen` is an `int` on macOS
+    // SAFETY: the caller's guarantee: `count` iovecs at `to`.
+    let bufs = unsafe { std::slice::from_raw_parts(to, count as usize) };
+    let mut done = 0;
+    for b in bufs {
+        let k = b.iov_len.min(icmp.len() - done);
+        if let Err(e) = uaccess::write_host(b.iov_base as u64, &icmp[done..done + k]) {
+            return err(e);
+        }
+        done += k;
+    }
+    if done < icmp.len() {
+        hmsg.msg_flags |= libc::MSG_TRUNC;
+    }
+    if whole { icmp.len() as i64 } else { done as i64 }
+}
+
+/// `read` or `readv` of ping socket `fd` ([`crate::fdmarks::is_ping`])
+/// into translated guest buffers `iov` ([`ping_recvmsg`]).
+pub fn ping_read(fd: i32, iov: &[libc::iovec]) -> i64 {
+    // SAFETY: an all-zero `msghdr` is valid: no name, no control.
+    let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
+    m.msg_iov = iov.as_ptr().cast_mut();
+    m.msg_iovlen = iov.len() as _;
+    // SAFETY: no name or control; the iovecs given.
+    unsafe { ping_recvmsg(fd, &mut m, 0, false) }
 }
 
 /// `socketpair(domain, type, protocol, sv)`.
@@ -733,6 +861,11 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
         return err(errno::EOPNOTSUPP);
     }
     let mut base = (type_ & !(SOCK_NONBLOCK | SOCK_CLOEXEC)) as i32;
+    // A Unix `SOCK_RAW` socket is a datagram one, as Linux's `unix_create`
+    // makes it.
+    if dom == libc::AF_UNIX && base == SOCK_RAW as i32 {
+        base = libc::SOCK_DGRAM;
+    }
     // macOS has no SOCK_SEQPACKET Unix sockets: a stream pair with its
     // messages framed (see `seqpacket`).
     let seqpacket = dom == libc::AF_UNIX && base == SOCK_SEQPACKET as i32;
@@ -753,6 +886,12 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
         crate::seqpacket::make(fds[0]);
         crate::seqpacket::make(fds[1]);
     }
+    crate::netns::made(fds[0]);
+    crate::netns::made(fds[1]);
+    fresh(fds[0]);
+    fresh(fds[1]);
+    socket_made(fds[0], Some(own_ids()));
+    socket_made(fds[1], Some(own_ids()));
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -775,6 +914,74 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
         Ok(s) => s,
         Err(e) => return e,
     };
+    // A Unix socket given its family alone takes a name of the kernel's
+    // choosing, as Linux's `unix_bind` has it.
+    if src.len() == 2 && src[..2] == (AF_UNIX as u16).to_ne_bytes() && is_unix(fd as i32) {
+        return autobind(fd as i32);
+    }
+    bind_name(fd, src, may_low, umask)
+}
+
+/// Unix socket `fd` bound, unless it is bound already, to an abstract name
+/// of five hexadecimal digits, as Linux's `unix_autobind` names one: from a
+/// random start, the next free one; `ENOSPC` when none is.
+fn autobind(fd: i32) -> i64 {
+    if unix_bound(fd) {
+        return 0;
+    }
+    let mut start = [0u8; 4];
+    crate::host::fill_random(&mut start);
+    let mut n = u32::from_ne_bytes(start) & 0xfffff;
+    for _ in 0..=0xfffff {
+        let mut src = (AF_UNIX as u16).to_ne_bytes().to_vec();
+        src.push(0);
+        src.extend_from_slice(autobind_name(n).as_bytes());
+        let r = bind_name(fd as u64, src, false, 0);
+        if r != err(errno::EADDRINUSE) {
+            return r;
+        }
+        n = (n + 1) & 0xfffff;
+    }
+    err(errno::ENOSPC)
+}
+
+/// The abstract name (after its leading NUL) [`autobind`] gives for `n`.
+fn autobind_name(n: u32) -> String {
+    format!("{n:05x}")
+}
+
+/// Whether Unix socket `fd` has a name.
+fn unix_bound(fd: i32) -> bool {
+    let mut hb = empty_sockaddr();
+    let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    let r = unsafe { libc::getsockname(fd, hb.as_mut_ptr().cast(), &mut hl) };
+    r == 0 && hl as usize > 2 && hb[2] != 0
+}
+
+/// A Unix socket that passes credentials (`SO_PASSCRED`) and has no name
+/// is given one before it connects, or before a datagram one sends
+/// (`datagram`), as Linux's `unix_stream_connect`, `unix_dgram_connect`
+/// and `unix_dgram_sendmsg` give it, so that its peer can tell who sent.
+fn autobind_to_pass_creds(fd: i32, datagram: bool) -> Result<(), i64> {
+    if kept_value(fd, SO_PASSCRED) == 0 {
+        return Ok(());
+    }
+    let unix = match kind(fd) {
+        Some((libc::AF_UNIX, ty)) => !datagram || ty == libc::SOCK_DGRAM,
+        _ => false,
+    };
+    if !unix || crate::netlink::is(fd) {
+        return Ok(());
+    }
+    match autobind(fd) {
+        r if r < 0 => Err(r),
+        _ => Ok(()),
+    }
+}
+
+/// [`bind`] of socket `fd` to Linux socket address `src`.
+fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     let mut hb = empty_sockaddr();
     let a = match bytes_to_host(&src, &mut hb, false) {
         Ok(a) => a,
@@ -782,8 +989,10 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     };
     // A port below `net.ipv4.ip_unprivileged_port_start` is the
     // privileged's (the host lets anyone have one on the wildcard address;
-    // on a loopback one, `netns` maps it).
+    // on a loopback one, `netns` maps it); a ping socket's is its ICMP
+    // identifier, anyone's.
     if !may_low
+        && !crate::fdmarks::is_ping(fd as i32)
         && matches!(family(&hb), libc::AF_INET | libc::AF_INET6)
         && (1..crate::sysctl::unprivileged_port_start())
             .contains(&u16::from_be_bytes([hb[2], hb[3]]))
@@ -809,8 +1018,7 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     }
     // Who bound an abstract name, beside its file.
     if r == 0 && src[..2] == 1u16.to_ne_bytes() && src.get(2) == Some(&0) {
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let _ = std::fs::write(abstract_file(&src[3..]).with_extension("owner"), me.to_ne_bytes());
     }
     if r == 0
@@ -818,10 +1026,14 @@ pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) 
     {
         crate::netns::bind_done(fd as i32, plan);
     }
+    #[cfg(not(target_os = "linux"))]
+    if r == 0 && kept_value(fd as i32, SO_PASSCRED) != 0 {
+        passcred_bound(fd as i32, true);
+    }
     if r == 0 && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
         // The node takes the socket's mode (its `fchmod`, or every bit),
         // less the umask, as on Linux.
-        let mode = take_socket_mode(fd as i32).unwrap_or(0o777) & !umask;
+        let mode = socket_inode(fd as i32).map_or(0o777, |s| s.perm) & !umask;
         let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
         if let Ok(name) = std::ffi::CString::new(&hb[2..end]) {
             use std::os::fd::AsRawFd;
@@ -861,9 +1073,22 @@ fn family(hb: &[u8]) -> i32 {
     }
 }
 
-/// Modes given unbound sockets with `fchmod`, by descriptor and the
-/// socket's inode: what a node bound for one is made with.
-pub(crate) static SOCKET_MODES: std::sync::Mutex<Vec<(i32, u64, u32)>> =
+/// What Linux keeps on a socket's own inode that the host keeps nowhere:
+/// its owner and its mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SocketInode {
+    /// The file-system ids of the process that made it (initial-namespace
+    /// ids), or none for one this process did not make (received).
+    pub owner: Option<(u32, u32)>,
+    /// Its permission bits: every one until an `fchmod`, which a node
+    /// bound for it is made with (less the umask).
+    pub perm: u32,
+}
+
+/// [`SocketInode`]s by the host socket's inode number, which every
+/// descriptor of the socket shares; a socket made, accepted or received
+/// with a number another had starts afresh.
+pub(crate) static SOCKETS: std::sync::Mutex<Vec<(u64, SocketInode)>> =
     std::sync::Mutex::new(Vec::new());
 
 fn inode(fd: i32) -> Option<u64> {
@@ -873,20 +1098,44 @@ fn inode(fd: i32) -> Option<u64> {
     (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino as u64)
 }
 
-/// `fchmod` of socket `fd` to `perm`: the mode a node bound for it gets
-/// (the host has no mode for a socket itself).
-pub fn set_socket_mode(fd: i32, perm: u32) {
+/// Socket `fd` was made or accepted by this process, as its file-system
+/// ids are now: its owner. A received one (`owner` none) has the host's.
+fn socket_made(fd: i32, owner: Option<(u32, u32)>) {
     let Some(ino) = inode(fd) else { return };
-    let mut m = SOCKET_MODES.lock().unwrap_or_else(|e| e.into_inner());
-    m.retain(|&(f, _, _)| f != fd);
-    m.push((fd, ino, perm & 0o7777));
+    let mut m = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    // Those of sockets gone: none is open here with its number now.
+    if m.len() >= 64 && m.len().is_power_of_two() {
+        let open: std::collections::HashSet<u64> =
+            crate::fdtable::open_fds().into_iter().filter_map(inode).collect();
+        m.retain(|(n, _)| open.contains(n));
+    }
+    m.retain(|&(n, _)| n != ino);
+    m.push((ino, SocketInode { owner, perm: 0o777 }));
 }
 
-fn take_socket_mode(fd: i32) -> Option<u32> {
+/// The owner and mode Linux would show for socket `fd`, if this process
+/// knows them.
+pub fn socket_inode(fd: i32) -> Option<SocketInode> {
     let ino = inode(fd)?;
-    let mut m = SOCKET_MODES.lock().unwrap_or_else(|e| e.into_inner());
-    let i = m.iter().position(|&(f, n, _)| f == fd && n == ino)?;
-    Some(m.swap_remove(i).2)
+    let m = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    m.iter().find(|&&(n, _)| n == ino).map(|&(_, s)| s)
+}
+
+/// The caller's file-system ids, as a socket it makes is owned by.
+fn own_ids() -> (u32, u32) {
+    let a = crate::creds::access();
+    (a.fsuid, a.fsgid)
+}
+
+/// `fchmod` of socket `fd` to `perm` (the host has no mode for a socket
+/// itself).
+pub fn set_socket_mode(fd: i32, perm: u32) {
+    let Some(ino) = inode(fd) else { return };
+    let mut m = SOCKETS.lock().unwrap_or_else(|e| e.into_inner());
+    match m.iter_mut().find(|(n, _)| *n == ino) {
+        Some((_, s)) => s.perm = perm & 0o7777,
+        None => m.push((ino, SocketInode { owner: None, perm: perm & 0o7777 })),
+    }
 }
 
 /// `listen(fd, backlog)`. Linux queues one connection more than the
@@ -896,9 +1145,9 @@ fn take_socket_mode(fd: i32) -> Option<u32> {
 /// # Safety
 /// No pointer arguments.
 pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
-    const SOMAXCONN: i32 = 4096;
+    let max = crate::sysctl::somaxconn();
     let b = backlog as i32;
-    let b = if (0..=SOMAXCONN).contains(&b) { b } else { SOMAXCONN };
+    let b = if (0..=max).contains(&b) { b } else { max };
     // SAFETY: plain host call.
     ret(unsafe { libc::listen(fd as i32, b + 1) } as i64)
 }
@@ -930,6 +1179,9 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         Ok(a) => a,
         Err(e) => return e,
     };
+    if let Err(e) = autobind_to_pass_creds(fd as i32, false) {
+        return e;
+    }
     if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
         return err(e);
     }
@@ -939,6 +1191,9 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     let r = ret(bind_or_connect(fd as i32, &hb, &a, false) as i64);
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, false, &a.guest);
+    }
+    if r == 0 {
+        crate::netns::used(fd as i32);
     }
     r
 }
@@ -970,6 +1225,9 @@ fn remembered_name(fd: i32, local: bool) -> Option<Vec<u8>> {
 /// # Safety
 /// `addr`/`addrlen`, if non-null, must be writable.
 pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
+    if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
+        return err(errno::EINVAL);
+    }
     let mut hb = empty_sockaddr();
     let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
     let want = addr != 0;
@@ -984,6 +1242,10 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     if r < 0 {
         return last_error();
     }
+    // A connection is in its listener's namespace.
+    crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
+    fresh(r);
+    socket_made(r, Some(own_ids()));
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.
@@ -1093,7 +1355,13 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     // What the receiving socket's filter lets in: none, the data dropped as
     // if sent, or the first part.
     let sent = len;
-    let len = match crate::bpf::filter_send(fd as i32, len) {
+    let filtered = if crate::bpf::filtering() {
+        let data = guest!(uaccess::read_bytes(buf, len as usize));
+        crate::bpf::filter_send(fd as i32, &data)
+    } else {
+        None
+    };
+    let len = match filtered {
         Some(0) => return sent as i64,
         Some(keep) => keep,
         None => len,
@@ -1114,6 +1382,13 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         }
         guest!(uaccess::read_bytes(addr, l as usize));
     }
+    if let Err(e) = autobind_to_pass_creds(fd as i32, true) {
+        return e;
+    }
+    // TCP fast open: connected first, then sent to the peer.
+    if let Err(e) = fastopen(fd as i32, flags, addr, addrlen) {
+        return e;
+    }
     // TCP sends to its peer, whatever address it is given.
     let named = addr != 0 && addrlen != 0 && !ip_stream(fd as i32);
     let hflags = msg_flags_to_host(flags);
@@ -1125,6 +1400,10 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         match unsafe { to_host(addr, addrlen, &mut hb, true) } {
             Ok(a) => {
                 if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
+                    return err(e);
+                }
+                // Sending to a Unix socket's node needs write permission on it.
+                if let Err(e) = may_write_socket(&hb, &a) {
                     return err(e);
                 }
                 dir = a.dir;
@@ -1140,13 +1419,26 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         return crate::seqpacket::send(fd as i32, &[v], (std::ptr::null_mut(), 0), hflags);
     }
     let mut iov = [guest!(uaccess::host_buffer(buf, len, false))];
+    // A datagram to a socket that asked for credentials carries them.
+    #[cfg(not(target_os = "linux"))]
+    let prepared = match send_control(fd as i32, 0, 0, named.then(|| &hb[..alen as usize])) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (ctl_ptr, ctl_len) = match &prepared {
+        Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len() as _),
+        None => (std::ptr::null_mut(), 0),
+    };
+    #[cfg(target_os = "linux")]
+    let (ctl_ptr, ctl_len) = (std::ptr::null_mut(), 0);
     let mut hmsg = libc::msghdr {
         msg_name: aptr as *mut libc::c_void,
         msg_namelen: alen,
         msg_iov: iov.as_mut_ptr(),
         msg_iovlen: 1,
-        msg_control: std::ptr::null_mut(),
-        msg_controllen: 0,
+        msg_control: ctl_ptr,
+        msg_controllen: ctl_len,
         msg_flags: 0,
     };
     // ENAMETOOLONG where the host cannot send from a directory.
@@ -1156,15 +1448,57 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
         r = unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) };
         0
     });
+    #[cfg(not(target_os = "linux"))]
+    if r < 0
+        && let Some(p) = prepared
+    {
+        p.unsent();
+    }
+    if r >= 0 {
+        crate::netns::used(fd as i32);
+    }
     r
 }
 
-/// Bytes `MSG_MORE` held back, by IP socket.
-pub(crate) static CORKED: std::sync::Mutex<Option<std::collections::HashMap<i32, Vec<u8>>>> =
+/// Bytes `MSG_MORE` (or `UDP_CORK`) held back, by IP socket.
+pub(crate) static CORKED: std::sync::Mutex<Option<std::collections::HashMap<i32, Held>>> =
     std::sync::Mutex::new(None);
+
+/// What a socket holds back: the bytes, and for a datagram the host
+/// address the first of them was sent to (empty for none), where they go.
+#[derive(Default)]
+pub(crate) struct Held {
+    data: Vec<u8>,
+    name: Vec<u8>,
+}
 
 /// Whether any socket has bytes held back.
 static ANY_CORKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A send with `MSG_FASTOPEN` on TCP socket `fd`: connect to `addr`
+/// (`addrlen` bytes) first, as Linux does when it sends the data with the
+/// connection's opening (the host has no client fast open, so the data
+/// follows the handshake). Whether it connected; `EISCONN` for a socket
+/// connected already, `EINVAL` with no address, and the connection's
+/// error (`EINPROGRESS` for a non-blocking socket, which sends nothing
+/// then, as Linux sends nothing without a fast-open cookie).
+fn fastopen(fd: i32, flags: u64, addr: u64, addrlen: u64) -> Result<bool, i64> {
+    if flags & MSG_FASTOPEN == 0 || !ip_stream(fd) {
+        return Ok(false);
+    }
+    let mut hb = empty_sockaddr();
+    let mut hl = SOCKADDR_MAX as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    if unsafe { libc::getpeername(fd, hb.as_mut_ptr().cast(), &mut hl) } == 0 {
+        return Err(err(errno::EISCONN));
+    }
+    if addr == 0 || addrlen == 0 {
+        return Err(err(errno::EINVAL));
+    }
+    // SAFETY: the caller guarantees the address spans its length.
+    let r = unsafe { connect(fd as u64, addr, addrlen) };
+    if r < 0 { Err(r) } else { Ok(true) }
+}
 
 /// Whether `fd` has bytes `MSG_MORE` held back.
 pub fn corked(fd: i32) -> bool {
@@ -1177,7 +1511,7 @@ pub fn corked(fd: i32) -> bool {
 }
 
 /// The bytes held back for `fd`, taken.
-fn take_corked(fd: i32) -> Option<Vec<u8>> {
+fn take_corked(fd: i32) -> Option<Held> {
     if !ANY_CORKED.load(std::sync::atomic::Ordering::Relaxed) {
         return None;
     }
@@ -1186,8 +1520,8 @@ fn take_corked(fd: i32) -> Option<Vec<u8>> {
 
 /// The multicast groups TCP sockets joined: (socket, group and
 /// interface as the host lays them out).
-pub(crate) static MEMBERSHIPS: std::sync::Mutex<Vec<(i32, Vec<u8>)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static MEMBERSHIPS: crate::kept::Kept<Vec<(i32, Vec<u8>)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// A multicast group joined or left on a TCP socket, which Linux allows
 /// (no multicast reaches one) and the host refuses: kept by fwe. Joining
@@ -1208,7 +1542,7 @@ fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) ->
     // MCAST_JOIN_SOURCE_GROUP; the leaves; the rest need the group joined.
     let join = matches!(name, 35 | 39 | 42 | 46);
     let leave = matches!(name, 36 | 40 | 45 | 47);
-    let mut m = MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut m = MEMBERSHIPS.lock();
     let at = m.iter().position(|(f, g)| *f == fd && *g == group);
     Some(match (at, join, leave) {
         (Some(_), true, _) => err(errno::EADDRINUSE),
@@ -1228,13 +1562,121 @@ fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) ->
 /// Socket `fd` was closed: what it held back goes out, as Linux sends it,
 /// and the groups it joined are left.
 pub fn closed(fd: i32) {
-    MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(f, _)| *f != fd);
-    KEPT_VALUES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd);
-    V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
-    if let Some(held) = take_corked(fd) {
-        // SAFETY: a local buffer of its length; the send does not wait.
-        unsafe { libc::send(fd, held.as_ptr().cast(), held.len(), libc::MSG_DONTWAIT) };
+    #[cfg(not(target_os = "linux"))]
+    if kept_value(fd, SO_PASSCRED) != 0 {
+        passcred_bound(fd, false);
     }
+    if let Some(mut m) = MEMBERSHIPS.if_used() {
+        m.retain(|(f, _)| *f != fd);
+    }
+    if let Some(mut k) = KEPT_VALUES.if_used() {
+        k.retain(|k| k.0 != fd);
+    }
+    if let Some(mut v) = V4_VIEW.if_used() {
+        v.retain(|&f| f != fd);
+    }
+    flush_corked(fd);
+}
+
+/// A new socket is descriptor `fd` (made, accepted or received): what fwe
+/// keeps per descriptor starts empty, whatever a socket that had the
+/// number left (one closed out of fwe's sight).
+pub(crate) fn fresh(fd: i32) {
+    if let Some(mut m) = MEMBERSHIPS.if_used() {
+        m.retain(|(f, _)| *f != fd);
+    }
+    if let Some(mut k) = KEPT_VALUES.if_used() {
+        k.retain(|k| k.0 != fd);
+    }
+    if let Some(mut v) = V4_VIEW.if_used() {
+        v.retain(|&f| f != fd);
+    }
+    take_corked(fd);
+}
+
+/// Send what socket `fd` held back, without waiting.
+fn flush_corked(fd: i32) {
+    let Some(held) = take_corked(fd) else { return };
+    let (name, len) = if held.name.is_empty() {
+        (std::ptr::null(), 0)
+    } else {
+        (held.name.as_ptr().cast(), held.name.len() as libc::socklen_t)
+    };
+    // SAFETY: local buffers of their lengths; the send does not wait.
+    unsafe {
+        libc::sendto(fd, held.data.as_ptr().cast(), held.data.len(), libc::MSG_DONTWAIT, name, len)
+    };
+}
+
+/// Whether `fd` is a UDP socket (an IP datagram one).
+fn udp(fd: i32) -> bool {
+    matches!(kind(fd), Some((libc::AF_INET | libc::AF_INET6, libc::SOCK_DGRAM)))
+}
+
+/// The value of option `optname` of the UDP level fwe keeps for `fd`.
+fn udp_option(fd: i32, optname: u64) -> i32 {
+    kept_value(fd, SOL_UDP << 32 | optname)
+}
+
+/// The value fwe keeps for `fd` under `key` ([`kept_key`]), 0 if none.
+fn kept_value(fd: i32, key: u64) -> i32 {
+    let kept = KEPT_VALUES.if_used();
+    kept.and_then(|k| k.iter().find(|v| (v.0, v.1) == (fd, key)).map(|v| v.2)).unwrap_or(0)
+}
+
+/// The host path of Unix datagram socket `fd`'s own address (`peer`: its
+/// peer's), if it has one.
+#[cfg(not(target_os = "linux"))]
+fn dgram_path(fd: i32, peer: bool) -> Option<Vec<u8>> {
+    if kind(fd) != Some((libc::AF_UNIX, libc::SOCK_DGRAM)) {
+        return None;
+    }
+    let mut hb = empty_sockaddr();
+    let mut hl = SOCKADDR_MAX as libc::socklen_t;
+    let a = hb.as_mut_ptr().cast();
+    // SAFETY: valid out-parameters of their lengths.
+    let r = unsafe {
+        if peer { libc::getpeername(fd, a, &mut hl) } else { libc::getsockname(fd, a, &mut hl) }
+    };
+    if r != 0 {
+        return None;
+    }
+    host_unix_path(&hb[..hl as usize])
+}
+
+/// The path of host Unix address `hb` (macOS layout), if it has one.
+#[cfg(not(target_os = "linux"))]
+fn host_unix_path(hb: &[u8]) -> Option<Vec<u8>> {
+    if hb.len() <= 2 || i32::from(hb[1]) != libc::AF_UNIX {
+        return None;
+    }
+    let path = &hb[2..];
+    let end = path.iter().position(|&b| b == 0).unwrap_or(path.len());
+    (end > 0).then(|| path[..end].to_vec())
+}
+
+/// Datagram socket `fd`, bound, asks for credentials (`on`) or no longer
+/// does: senders that are fwe's are told by its address ([`crate::scm`]).
+#[cfg(not(target_os = "linux"))]
+fn passcred_bound(fd: i32, on: bool) {
+    if let Some(path) = dgram_path(fd, false) {
+        crate::scm::wants_creds(&path, on);
+    }
+}
+
+/// The credentials a datagram from Unix socket `fd` to host address `to`
+/// (its peer's when `None`) carries unasked: the sender's, when the
+/// receiving socket asked for them ([`crate::scm::wants_creds`]).
+#[cfg(not(target_os = "linux"))]
+fn creds_for(fd: i32, to: Option<&[u8]>) -> Option<crate::scm::Creds> {
+    if !crate::scm::any_wanted() {
+        return None;
+    }
+    let path = match to {
+        Some(hb) => host_unix_path(hb)?,
+        None => dgram_path(fd, true)?,
+    };
+    crate::scm::creds_wanted(&path).then(crate::scm::own_creds)
 }
 
 /// Send `msg` on `fd` with the guest's `flags` (the host's `hflags`), as
@@ -1248,12 +1690,12 @@ unsafe fn send_corked(fd: i32, msg: &mut libc::msghdr, flags: u64, hflags: i32) 
     #[allow(clippy::unnecessary_cast)] // `msg_iovlen` is an `int` on macOS
     // SAFETY: the caller's guarantee.
     let iov = unsafe { std::slice::from_raw_parts(msg.msg_iov, msg.msg_iovlen as usize) };
-    if flags & MSG_MORE != 0
-        && matches!(
-            kind(fd),
-            Some((libc::AF_INET | libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_DGRAM))
-        )
-    {
+    let ip = matches!(
+        kind(fd),
+        Some((libc::AF_INET | libc::AF_INET6, libc::SOCK_STREAM | libc::SOCK_DGRAM))
+    );
+    let udp = ip && udp(fd);
+    if ip && (flags & MSG_MORE != 0 || udp && udp_option(fd, UDP_CORK) != 0) {
         let mut more = Vec::new();
         for v in iov {
             // SAFETY: the iovecs are checked host buffers.
@@ -1263,29 +1705,90 @@ unsafe fn send_corked(fd: i32, msg: &mut libc::msghdr, flags: u64, hflags: i32) 
         }
         let n = more.len() as i64;
         let mut m = CORKED.lock().unwrap_or_else(|e| e.into_inner());
-        m.get_or_insert_with(Default::default).entry(fd).or_default().extend(more);
+        let held = m.get_or_insert_with(Default::default).entry(fd).or_default();
+        if held.name.is_empty() && !msg.msg_name.is_null() {
+            // SAFETY: the caller's name buffer of its length.
+            let name = unsafe {
+                std::slice::from_raw_parts(msg.msg_name.cast::<u8>(), msg.msg_namelen as usize)
+            };
+            held.name = name.to_vec();
+        }
+        held.data.extend(more);
         ANY_CORKED.store(true, std::sync::atomic::Ordering::Relaxed);
         return n;
     }
-    let Some(held) = take_corked(fd) else {
+    let held = take_corked(fd).unwrap_or_default();
+    // A datagram held back goes where its first part was sent.
+    if msg.msg_name.is_null() && !held.name.is_empty() {
+        msg.msg_name = held.name.as_ptr() as *mut _;
+        msg.msg_namelen = held.name.len() as _;
+    }
+    let segment = if udp { udp_option(fd, UDP_SEGMENT) as usize } else { 0 };
+    let total = held.data.len() + iov.iter().map(|v| v.iov_len).sum::<usize>();
+    if segment > 0 && total > segment {
+        // SAFETY: the caller's buffers.
+        return unsafe { send_segments(fd, msg, &held.data, iov, segment, hflags) };
+    }
+    if held.data.is_empty() {
         // SAFETY: the caller's guarantee.
         return ret(unsafe { libc::sendmsg(fd, msg, hflags) } as i64);
-    };
-    let mut all = vec![libc::iovec { iov_base: held.as_ptr() as *mut _, iov_len: held.len() }];
+    }
+    let mut all =
+        vec![libc::iovec { iov_base: held.data.as_ptr() as *mut _, iov_len: held.data.len() }];
     all.extend_from_slice(iov);
     msg.msg_iov = all.as_mut_ptr();
     msg.msg_iovlen = all.len() as _;
     // SAFETY: the caller's buffers, and the held bytes.
     let r = ret(unsafe { libc::sendmsg(fd, msg, hflags) } as i64);
-    let h = held.len() as i64;
+    let h = held.data.len() as i64;
     if r < h {
         // What did not go is held still.
         let sent = r.max(0) as usize;
         let mut m = CORKED.lock().unwrap_or_else(|e| e.into_inner());
-        m.get_or_insert_with(Default::default).insert(fd, held[sent..].to_vec());
+        let rest = Held { data: held.data[sent..].to_vec(), name: held.name.clone() };
+        m.get_or_insert_with(Default::default).insert(fd, rest);
         return if r < 0 { r } else { 0 };
     }
     r - h
+}
+
+/// A UDP send of `held` then `iov` with `UDP_SEGMENT` of `segment` bytes,
+/// as Linux's segmentation offload sends it: a datagram of each `segment`
+/// bytes and one of the rest, at most [`UDP_MAX_SEGMENTS`] (`EINVAL` past
+/// them). Returns the guest's bytes sent, or the first datagram's error.
+///
+/// # Safety
+/// `msg` names valid buffers, `iov` the guest's.
+unsafe fn send_segments(
+    fd: i32,
+    msg: &mut libc::msghdr,
+    held: &[u8],
+    iov: &[libc::iovec],
+    segment: usize,
+    hflags: i32,
+) -> i64 {
+    let mut all = held.to_vec();
+    for v in iov {
+        // SAFETY: the iovecs are checked host buffers.
+        all.extend_from_slice(unsafe { std::slice::from_raw_parts(v.iov_base.cast(), v.iov_len) });
+    }
+    if all.len().div_ceil(segment) > UDP_MAX_SEGMENTS {
+        return err(errno::EINVAL);
+    }
+    for (i, part) in all.chunks(segment).enumerate() {
+        let mut one = libc::iovec { iov_base: part.as_ptr() as *mut _, iov_len: part.len() };
+        msg.msg_iov = &mut one;
+        msg.msg_iovlen = 1;
+        // SAFETY: a local buffer and the caller's name and control.
+        let r = ret(unsafe { libc::sendmsg(fd, msg, hflags) } as i64);
+        if r < 0 && i == 0 {
+            return r;
+        }
+        // Control data (descriptors) goes with the first only.
+        msg.msg_control = std::ptr::null_mut();
+        msg.msg_controllen = 0;
+    }
+    (all.len() - held.len()) as i64
 }
 
 /// `recvfrom(fd, buf, len, flags, addr, addrlen)`.
@@ -1324,6 +1827,65 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
         return crate::seqpacket::recv(fd as i32, &[v], (std::ptr::null_mut(), 0), flags, hflags)
             .result;
     }
+    if crate::fdmarks::is_ping(fd as i32) {
+        let mut v = [guest!(uaccess::host_buffer(buf, len, true))];
+        let mut hb = empty_sockaddr();
+        // SAFETY: an all-zero `msghdr` is valid: no name, no control.
+        let mut m: libc::msghdr = unsafe { std::mem::zeroed() };
+        m.msg_iov = v.as_mut_ptr();
+        m.msg_iovlen = 1;
+        if addr != 0 {
+            m.msg_name = hb.as_mut_ptr().cast();
+            m.msg_namelen = SOCKADDR_MAX as libc::socklen_t;
+        }
+        // SAFETY: a local name buffer and the translated guest buffer.
+        let r = unsafe { ping_recvmsg(fd as i32, &mut m, hflags, flags & MSG_TRUNC != 0) };
+        if r >= 0 && addr != 0 && addrlen != 0 {
+            crate::netns::to_guest(fd as i32, &mut hb, false);
+            guest!(name_to_guest(&hb, m.msg_namelen, addr, addrlen));
+        }
+        return r;
+    }
+    let whole = match datagram_whole(fd as i32, flags) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    let r = recvfrom_host(fd, buf, len, hflags, addr, addrlen);
+    match whole {
+        Some(w) if r >= 0 => w as i64,
+        _ => r,
+    }
+}
+
+/// The length of the datagram a receive with `MSG_TRUNC` on datagram
+/// socket `fd` takes, which Linux returns (the host takes the flag as an
+/// output only): waited for as the receive would wait, then measured
+/// (`SO_NREAD`). `None` for another socket or without the flag.
+fn datagram_whole(fd: i32, flags: u64) -> Result<Option<usize>, i64> {
+    if flags & MSG_TRUNC == 0 || kind(fd).map(|k| k.1) != Some(libc::SOCK_DGRAM) {
+        return Ok(None);
+    }
+    let wait = msg_flags_to_host(flags & (MSG_DONTWAIT | MSG_OOB)) | libc::MSG_PEEK;
+    let mut b = 0u8;
+    // A peek of a byte, which waits (one of none returns at once).
+    // SAFETY: a one-byte local buffer.
+    if unsafe { libc::recv(fd, (&mut b as *mut u8).cast(), 1, wait) } < 0 {
+        return Err(last_error());
+    }
+    Ok(crate::netlink::next_len(fd))
+}
+
+/// Whether host address `hb` of `len` bytes, a received datagram's
+/// sender's, is a Unix socket with no name, which Linux reports as no
+/// address at all (a length of 0), not as the family alone.
+fn unnamed_unix(hb: &[u8; SOCKADDR_MAX], len: libc::socklen_t) -> bool {
+    let len = (len as usize).min(SOCKADDR_MAX);
+    family(hb) == libc::AF_UNIX && hb[2..len.max(2)].first().is_none_or(|&b| b == 0)
+}
+
+/// [`recvfrom`] of a host socket: the bytes, the sender's address
+/// translated back.
+fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u64) -> i64 {
     if addr != 0 {
         let mut hb = empty_sockaddr();
         let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
@@ -1343,7 +1905,11 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
         }
         crate::netns::to_guest(fd as i32, &mut hb, false);
         if addrlen != 0 {
-            guest!(name_to_guest(&hb, hl, addr, addrlen));
+            if unnamed_unix(&hb, hl) {
+                guest!(uaccess::write(addrlen, 0u32));
+            } else {
+                guest!(name_to_guest(&hb, hl, addr, addrlen));
+            }
         }
         r as i64
     } else {
@@ -1363,7 +1929,6 @@ pub unsafe fn recvfrom(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrl
 
 // --- options --------------------------------------------------------------
 
-/// Map a Linux `(level, optname)` to the host pair.
 /// Socket `fd`'s host family and type (`None` if it is not a socket).
 fn kind(fd: i32) -> Option<(i32, i32)> {
     let mut hb = empty_sockaddr();
@@ -1476,11 +2041,7 @@ fn disconnect(fd: i32) -> Option<i64> {
         return None;
     }
     // One IPv6 socket that `IPV6_ADDRFORM` made IPv4 is IPv4 from now on.
-    let fam = if V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd) {
-        libc::AF_INET
-    } else {
-        fam
-    };
+    let fam = if V4_VIEW.lock().contains(&fd) { libc::AF_INET } else { fam };
     // SAFETY: plain host calls; `new` is a fresh socket this owns until it
     // takes `fd`'s place.
     unsafe {
@@ -1509,15 +2070,15 @@ fn disconnect(fd: i32) -> Option<i64> {
         libc::fcntl(fd, libc::F_SETFD, fdfl);
         libc::close(new);
     }
-    V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+    V4_VIEW.lock().retain(|&f| f != fd);
     take_corked(fd);
-    MEMBERSHIPS.lock().unwrap_or_else(|e| e.into_inner()).retain(|(f, _)| *f != fd);
+    MEMBERSHIPS.lock().retain(|(f, _)| *f != fd);
     Some(0)
 }
 
-/// Socket options Linux has and the host has not, which change nothing
-/// fwe does: kept, and read back as set (`SO_NO_CHECK`, `SO_PRIORITY`,
-/// `SO_PASSCRED`).
+/// Socket options Linux has and the host has not: kept, and read back as
+/// set (`SO_NO_CHECK`, `SO_PRIORITY`, which change nothing fwe does;
+/// `SO_PASSCRED`, which a receive acts on, see [`crate::scm`]).
 const KEPT: [u64; 3] = [11, 12, 16];
 
 /// Options of the IP levels Linux has and the host has not, kept as
@@ -1525,13 +2086,30 @@ const KEPT: [u64; 3] = [11, 12, 16];
 /// sets on its socket and gives up without. Linux's error queue holds the
 /// ICMP errors a socket's datagrams met; the host keeps none, so it stays
 /// empty, as on a network that returns no such errors.
-const KEPT_IP: [(u64, u64); 2] = [(0, 11), (41, 25)];
+const KEPT_IP: [(u64, u64); 3] = [(0, 11), (41, 25), (SOL_RAW, ICMP_FILTER)];
+
+/// `SOL_RAW` and its `ICMP_FILTER`, which filters a raw ICMP socket's
+/// types on Linux. The host has none, so it is kept as [`KEPT`] is, and
+/// every type arrives (which `ping` copes with).
+const SOL_RAW: u64 = 255;
+const ICMP_FILTER: u64 = 1;
+
+/// The UDP level's options (`SOL_UDP`, which `SOL_UDPLITE` shares). The
+/// host has none of them (its `UDP_NOCKSUM` has `UDP_CORK`'s number), so
+/// fwe keeps them: `UDP_CORK` holds sends back as `MSG_MORE` does until it
+/// is cleared, which sends them as one datagram; `UDP_SEGMENT` cuts each
+/// send into datagrams of its size, as segmentation offload does;
+/// `UDP_GRO` joins nothing (Linux too delivers datagrams it did not join
+/// one by one); the IPv6 checksum options leave checksums to the host.
+const KEPT_UDP: [u64; 5] = [UDP_CORK, UDP_NO_CHECK6_TX, UDP_NO_CHECK6_RX, UDP_SEGMENT, UDP_GRO];
 
 /// The key [`KEPT_VALUES`] holds option `optname` of `level` under, if it
 /// is one fwe keeps.
 fn kept_key(level: u64, optname: u64) -> Option<u64> {
     if level == SOL_SOCKET && KEPT.contains(&optname) {
         Some(optname)
+    } else if matches!(level, SOL_UDP | SOL_UDPLITE) && KEPT_UDP.contains(&optname) {
+        Some(SOL_UDP << 32 | optname)
     } else if KEPT_IP.contains(&(level, optname)) {
         Some(level << 32 | optname)
     } else {
@@ -1540,12 +2118,12 @@ fn kept_key(level: u64, optname: u64) -> Option<u64> {
 }
 
 /// The values of kept options set: (socket, [`kept_key`], value).
-pub(crate) static KEPT_VALUES: std::sync::Mutex<Vec<(i32, u64, i32)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static KEPT_VALUES: crate::kept::Kept<Vec<(i32, u64, i32)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// IPv6 sockets `IPV6_ADDRFORM` made IPv4: the host's socket stays IPv6,
 /// its names are reported as the IPv4 ones they map.
-static V4_VIEW: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
+static V4_VIEW: crate::kept::Kept<Vec<i32>> = crate::kept::Kept::new(Vec::new());
 
 /// `IPV6_ADDRFORM` (`optval` `AF_INET`) of socket `fd`, as Linux allows
 /// it: a TCP or UDP IPv6 socket whose peer is IPv4 (an IPv4-mapped address)
@@ -1578,16 +2156,14 @@ fn addrform(fd: i32, optval: u64, optlen: u64) -> i64 {
     if hb[8..18] != [0; 10] || hb[18..20] != [0xff, 0xff] {
         return err(errno::EADDRNOTAVAIL);
     }
-    V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+    V4_VIEW.lock().push(fd);
     0
 }
 
 /// The host name `hb` (of `hl` bytes) of an IPv6 socket `IPV6_ADDRFORM`
 /// made IPv4, as that: the IPv4 address its IPv4-mapped one stands for.
 fn v4_view(fd: i32, hb: &mut [u8; SOCKADDR_MAX], hl: &mut libc::socklen_t) {
-    if family(hb) != libc::AF_INET6
-        || !V4_VIEW.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)
-    {
+    if family(hb) != libc::AF_INET6 || !V4_VIEW.lock().contains(&fd) {
         return;
     }
     let mut v4 = empty_sockaddr();
@@ -1654,7 +2230,9 @@ fn opt_to_host(level: u64, optname: u64) -> Result<(i32, i32, Form), i64> {
                 SO_RCVBUF => libc::SO_RCVBUF,
                 SO_KEEPALIVE => libc::SO_KEEPALIVE,
                 SO_OOBINLINE => libc::SO_OOBINLINE,
-                SO_LINGER => libc::SO_LINGER,
+                // Seconds, as Linux's: the host's SO_LINGER is in clock
+                // ticks.
+                SO_LINGER => libc::SO_LINGER_SEC,
                 SO_REUSEPORT => libc::SO_REUSEPORT,
                 SO_RCVTIMEO => libc::SO_RCVTIMEO,
                 SO_SNDTIMEO => libc::SO_SNDTIMEO,
@@ -1719,7 +2297,7 @@ pub unsafe fn setsockopt(
         if let Err(e) = socket_fd(fd as i32) {
             return e;
         }
-        let mut k = KEPT_VALUES.lock().unwrap_or_else(|e| e.into_inner());
+        let mut k = KEPT_VALUES.lock();
         k.retain(|&(f, o, _)| (f, o) != (fd as i32, key));
         k.push((fd as i32, key, v));
         0
@@ -1727,10 +2305,37 @@ pub unsafe fn setsockopt(
     if level == SOL_SOCKET
         && let Some(key) = kept_key(level, optname)
     {
-        return keep(key);
+        // SO_PRIORITY past 6 is CAP_NET_ADMIN's to set.
+        if optname == SO_PRIORITY && optlen >= 4 {
+            let v: i32 = guest!(uaccess::read(optval));
+            if !(0..=6).contains(&v) && !admin {
+                return err(errno::EPERM);
+            }
+        }
+        let r = keep(key);
+        #[cfg(not(target_os = "linux"))]
+        if r == 0 && optname == SO_PASSCRED {
+            passcred_bound(fd as i32, kept_value(fd as i32, SO_PASSCRED) != 0);
+        }
+        return r;
     }
     if let Some(e) = level_refused(fd as i32, level, false) {
         return e;
+    }
+    if matches!(level, SOL_UDP | SOL_UDPLITE) && kept_key(level, optname).is_some() {
+        if optlen < 4 {
+            return err(errno::EINVAL);
+        }
+        let v: i32 = guest!(uaccess::read(optval));
+        if optname == UDP_SEGMENT && !(0..=0xffff).contains(&v) {
+            return err(errno::EINVAL);
+        }
+        let r = keep(SOL_UDP << 32 | optname);
+        if r == 0 && optname == UDP_CORK && v == 0 {
+            // Uncorked: what was held goes, as one datagram.
+            flush_corked(fd as i32);
+        }
+        return r;
     }
     if let Some(key) = kept_key(level, optname) {
         return keep(key);
@@ -1789,16 +2394,14 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
     }
     let kept = kept_key(level, optname);
     if kept.is_some() || level == SOL_SOCKET && matches!(optname, 38 | 39) {
-        let Some((fam, ty)) = kind(fd as i32) else {
+        let Some((fam, _)) = kind(fd as i32) else {
             return socket_fd(fd as i32).err().unwrap_or(err(errno::ENOTSOCK));
         };
         let v = match optname {
-            // SO_PROTOCOL: what the socket was made with, as Linux names it.
-            38 => match (fam, ty) {
-                (libc::AF_INET | libc::AF_INET6, libc::SOCK_STREAM) => 6,
-                (libc::AF_INET | libc::AF_INET6, libc::SOCK_DGRAM) => 17,
-                _ => 0,
-            },
+            // SO_PROTOCOL: what the socket was made with (TCP or UDP for
+            // 0), as the host knows it; a netlink one's is NETLINK_ROUTE.
+            38 if crate::netlink::is(fd as i32) => 0,
+            38 => crate::host::socket_protocol(fd as i32).unwrap_or(0),
             // SO_DOMAIN
             39 => match fam {
                 libc::AF_INET6 => AF_INET6 as i32,
@@ -1806,7 +2409,6 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
             },
             _ => KEPT_VALUES
                 .lock()
-                .unwrap_or_else(|e| e.into_inner())
                 .iter()
                 .find(|&&(f, o, _)| Some((f, o)) == kept.map(|k| (fd as i32, k)))
                 .map_or(0, |k| k.2),
@@ -1868,15 +2470,41 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
 /// The pid is the peer's in the caller's pid namespace; its ids are the
 /// host's, as the guest sees them.
 fn peercred(fd: i32, optval: u64, optlen: u64) -> i64 {
-    let Ok(len) = uaccess::read::<u32>(optlen) else { return err(errno::EFAULT) };
-    let (pid, uid, gid) = match host_peercred(fd) {
-        Ok(v) => v,
-        Err(e) => return err(e),
-    };
-    let pid = crate::pidns::to_guest(pid);
-    let cred = [pid as u32, crate::host::uid_to_linux(uid), crate::host::gid_to_linux(gid)];
-    let _ = len;
-    write_ucred(optval, optlen, cred)
+    match peer_ucred(fd) {
+        Ok(cred) => write_ucred(optval, optlen, cred),
+        Err(e) => err(e),
+    }
+}
+
+/// The `ucred` of the process at the other end of Unix socket `fd`, as the
+/// caller sees it: its pid in the caller's pid namespace, its effective
+/// user and group ids (fwe's for it, as `SO_PEERCRED` gives them) in the
+/// caller's user namespace. A process fwe did not start has its host ids
+/// as the guest sees them.
+fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
+    let (pid, uid, gid) = host_peercred(fd)?;
+    Ok(ucred_of(pid).unwrap_or([
+        crate::pidns::to_guest(pid) as u32,
+        crate::host::uid_to_linux(uid),
+        crate::host::gid_to_linux(gid),
+    ]))
+}
+
+/// The `ucred` of fwe's process `pid` (a host pid) as the caller sees it:
+/// its effective ids, if fwe has a record of it.
+fn ucred_of(pid: i32) -> Option<[u32; 3]> {
+    let ids = crate::procreg::read(pid)?.ids;
+    Some(guest_ucred(pid, ids[1], ids[5]))
+}
+
+/// Credentials as the caller sees them: the pid in its pid namespace, the
+/// ids in its user namespace.
+fn guest_ucred(host_pid: i32, uid: u32, gid: u32) -> [u32; 3] {
+    [
+        crate::pidns::to_guest(host_pid) as u32,
+        crate::userns::to_ns(uid, false),
+        crate::userns::to_ns(gid, true),
+    ]
 }
 
 /// Write `struct ucred` `cred` to `optval`, its room at `optlen`.
@@ -1993,8 +2621,9 @@ fn msg_iovecs(iov: u64, count: u64, write: bool) -> uaccess::Result<Vec<libc::io
     uaccess::host_iovecs(iov, count, write)
 }
 
-/// A read of an IP socket's error queue (`MSG_ERRQUEUE`), which fwe never
-/// fills (the host has none): empty, `EAGAIN`, as Linux reports one.
+/// A read of a socket's error queue (`MSG_ERRQUEUE`), which fwe never
+/// fills (the host has none): empty, `EAGAIN`, as Linux reports one, for
+/// an IP or a Unix socket.
 fn errqueue_empty(fd: i32, flags: u64) -> Option<i64> {
     if flags & MSG_ERRQUEUE == 0 {
         return None;
@@ -2003,7 +2632,9 @@ fn errqueue_empty(fd: i32, flags: u64) -> Option<i64> {
     let mut hl = SOCKADDR_MAX as libc::socklen_t;
     // SAFETY: valid out-parameters of their lengths.
     let named = unsafe { libc::getsockname(fd, hb.as_mut_ptr().cast(), &mut hl) } == 0;
-    (named && matches!(family(&hb), libc::AF_INET | libc::AF_INET6)).then(|| err(errno::EAGAIN))
+    let fam = family(&hb);
+    (named && matches!(fam, libc::AF_INET | libc::AF_INET6 | libc::AF_UNIX))
+        .then(|| err(errno::EAGAIN))
 }
 
 /// Guest `msghdr` fields (64-bit Linux layout): name, namelen, iov,
@@ -2050,6 +2681,28 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         }
         return crate::netlink::send(fd as i32, &data);
     }
+    if let Err(e) = autobind_to_pass_creds(fd as i32, true) {
+        return e;
+    }
+    // TCP fast open: connected first, then sent to the peer.
+    let (name, namelen) = match fastopen(fd as i32, flags, name, namelen as u64) {
+        Ok(true) => (0, 0),
+        Ok(false) => (name, namelen),
+        Err(e) => return e,
+    };
+    // A socket whose peer filters what arrives: what it lets in is sent,
+    // the rest dropped as if sent.
+    let total: u64 = hiov.iter().map(|v| v.iov_len as u64).sum();
+    let mut dropped = 0;
+    if crate::bpf::filtering()
+        && let Some(keep) = crate::bpf::filter_send(fd as i32, &crate::iovecs_bytes(&hiov))
+    {
+        if keep == 0 {
+            return total as i64;
+        }
+        dropped = total - keep;
+        hiov = crate::iovecs_part(&hiov, 0, keep);
+    }
     let mut hb = empty_sockaddr();
     // A Unix path too long for the host is sent to from its directory.
     let mut dir = None;
@@ -2058,6 +2711,10 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         match unsafe { to_host(name, namelen as u64, &mut hb, true) } {
             Ok(a) => {
                 if let Err(e) = crate::netns::connect_prepare(fd as i32, &mut hb) {
+                    return err(e);
+                }
+                // Sending to a Unix socket's node needs write permission on it.
+                if let Err(e) = may_write_socket(&hb, &a) {
                     return err(e);
                 }
                 dir = a.dir;
@@ -2070,20 +2727,20 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     };
 
     // Ancillary data: on Linux the guest layout is the host's, so it passes
-    // through; on macOS re-encode SCM_RIGHTS.
+    // through; on macOS it is re-encoded ([`crate::scm`]).
     #[cfg(target_os = "linux")]
     let (ctl_ptr, ctl_len) = (control as *mut libc::c_void, controllen as _);
     #[cfg(not(target_os = "linux"))]
-    let mut macbuf = [0u8; 256];
+    let to = (!name_ptr.is_null()).then(|| &hb[..name_len as usize]);
     #[cfg(not(target_os = "linux"))]
-    let (ctl_ptr, ctl_len) = if controllen != 0 {
-        match scm_linux_to_host(control, controllen as usize, &mut macbuf) {
-            Ok(0) => (std::ptr::null_mut(), 0),
-            Ok(n) => (macbuf.as_mut_ptr() as *mut libc::c_void, n as libc::socklen_t),
-            Err(e) => return e,
-        }
-    } else {
-        (std::ptr::null_mut(), 0)
+    let prepared = match send_control(fd as i32, control, controllen, to) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (ctl_ptr, ctl_len) = match &prepared {
+        Some(p) if !p.buf.is_empty() => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len() as _),
+        _ => (std::ptr::null_mut(), 0),
     };
 
     let hmsg = libc::msghdr {
@@ -2095,23 +2752,35 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_len,
         msg_flags: 0,
     };
-    if crate::seqpacket::is(fd as i32) {
-        return crate::seqpacket::send(
+    let r = if crate::seqpacket::is(fd as i32) {
+        crate::seqpacket::send(
             fd as i32,
             &hiov,
             (hmsg.msg_control, hmsg.msg_controllen as usize),
             msg_flags_to_host(flags),
-        );
+        )
+    } else {
+        let mut hmsg = hmsg;
+        // ENAMETOOLONG where the host cannot send from a directory.
+        let mut r = err(errno::ENAMETOOLONG);
+        in_dir(dir.as_ref(), || {
+            // SAFETY: `hmsg` references guest iov and local name/control buffers.
+            r = unsafe { send_corked(fd as i32, &mut hmsg, flags, msg_flags_to_host(flags)) };
+            0
+        });
+        r
+    };
+    #[cfg(not(target_os = "linux"))]
+    if r < 0
+        && let Some(p) = prepared
+    {
+        p.unsent();
     }
-    let mut hmsg = hmsg;
-    // ENAMETOOLONG where the host cannot send from a directory.
-    let mut r = err(errno::ENAMETOOLONG);
-    in_dir(dir.as_ref(), || {
-        // SAFETY: `hmsg` references guest iov and local name/control buffers.
-        r = unsafe { send_corked(fd as i32, &mut hmsg, flags, msg_flags_to_host(flags)) };
-        0
-    });
-    r
+    if r >= 0 {
+        crate::netns::used(fd as i32);
+    }
+    // What the filter dropped counts as sent.
+    if r >= 0 && r as u64 + dropped == total { total as i64 } else { r }
 }
 
 /// A `struct mmsghdr`: a `msghdr` and the length sent or received.
@@ -2253,8 +2922,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
 
     #[cfg(target_os = "linux")]
     let (ctl_ptr, ctl_cap) = (control as *mut libc::c_void, controllen as _);
+    // Room for the most descriptors the host passes in one message.
     #[cfg(not(target_os = "linux"))]
-    let mut macbuf = [0u8; 256];
+    let mut macbuf = vec![0u8; if controllen != 0 { HOST_CONTROL } else { 0 }];
     #[cfg(not(target_os = "linux"))]
     let (ctl_ptr, ctl_cap) = if controllen != 0 {
         (macbuf.as_mut_ptr() as *mut libc::c_void, macbuf.len() as libc::socklen_t)
@@ -2275,10 +2945,18 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         msg_controllen: ctl_cap,
         msg_flags: 0,
     };
+    let ping = crate::fdmarks::is_ping(fd as i32);
     // A netlink message's whole length, asked for with MSG_TRUNC.
-    let nl_whole = (crate::netlink::is(fd as i32) && flags & MSG_TRUNC != 0)
-        .then(|| crate::netlink::next_len(fd as i32))
-        .flatten();
+    let nl_whole = if crate::netlink::is(fd as i32) {
+        (flags & MSG_TRUNC != 0).then(|| crate::netlink::next_len(fd as i32)).flatten()
+    } else if crate::seqpacket::is(fd as i32) || ping {
+        None
+    } else {
+        match datagram_whole(fd as i32, flags) {
+            Ok(w) => w,
+            Err(e) => return e,
+        }
+    };
     let r = if crate::seqpacket::is(fd as i32) {
         let got = crate::seqpacket::recv(
             fd as i32,
@@ -2294,6 +2972,15 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         hmsg.msg_controllen = got.controllen as _;
         hmsg.msg_flags = got.flags;
         got.result as isize
+    } else if ping {
+        // SAFETY: `hmsg` references guest iov and local name/control buffers.
+        let r = unsafe {
+            ping_recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags), flags & MSG_TRUNC != 0)
+        };
+        if r < 0 {
+            return r;
+        }
+        r as isize
     } else {
         // SAFETY: `hmsg` references guest iov and local name/control buffers.
         let r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
@@ -2311,6 +2998,8 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         };
         guest!(uaccess::write_from(name, &b[..(namelen as usize).min(12)]));
         guest!(uaccess::write(msg + 8, 12u32));
+    } else if want_name && unnamed_unix(&hb, hmsg.msg_namelen) {
+        guest!(uaccess::write(msg + 8, 0u32));
     } else if want_name {
         crate::netns::to_guest(fd as i32, &mut hb, false);
         let full = guest!(to_guest(&hb, hmsg.msg_namelen, name, namelen));
@@ -2326,109 +3015,81 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let (clen, ctrunc) = if controllen != 0 && hmsg.msg_controllen != 0 {
-            guest!(scm_host_to_linux(
-                &macbuf,
-                hmsg.msg_controllen as usize,
-                control,
-                controllen as usize,
-            ))
-        } else {
-            (0u64, false)
-        };
+        let cap = controllen as usize;
+        let got = (hmsg.msg_controllen as usize).min(macbuf.len());
+        // Credentials, asked for with `SO_PASSCRED`, come first: those the
+        // sender gave, else the peer's (the kernel's, 0, for netlink).
+        let passcred = kept_value(fd as i32, SO_PASSCRED) != 0;
+        let room = cap.saturating_sub(if passcred { 32 } else { 0 });
+        let inc = crate::scm::receive(
+            &macbuf[..got],
+            room.saturating_sub(CMSG_HDR) / 4,
+            flags & MSG_PEEK != 0,
+        );
+        let creds = passcred.then(|| match inc.creds {
+            Some(c) => guest_ucred(c.host_pid, c.uid, c.gid),
+            None if crate::netlink::is(fd as i32) => [0, 0, 0],
+            // No process to name (a datagram from a program fwe did not
+            // start): the overflow ids, as Linux gives an id it cannot map.
+            None => peer_ucred(fd as i32).unwrap_or([0, 65534, 65534]),
+        });
+        let (bytes, ctrunc) =
+            crate::scm::linux_control(cap, creds, &inc.fds, flags & MSG_CMSG_CLOEXEC != 0);
         let mut lflags = msg_flags_from_host(hmsg.msg_flags);
-        if ctrunc {
+        if ctrunc || inc.dropped {
             lflags |= MSG_CTRUNC as i32;
         }
-        guest!(uaccess::write(msg + 40, clen));
+        if uaccess::write_from(control, &bytes).is_err() {
+            for &fd in &inc.fds {
+                // SAFETY: descriptors received for this call, not delivered.
+                unsafe { libc::close(fd) };
+            }
+            return err(errno::EFAULT);
+        }
+        guest!(uaccess::write(msg + 40, bytes.len() as u64));
         guest!(uaccess::write(msg + 48, lflags));
     }
     r as i64
 }
 
-/// Re-encode a guest Linux `SCM_RIGHTS` control buffer into macOS layout in
-/// `out`; returns the macOS control length (0 if no SCM_RIGHTS present).
+/// The host control buffer a receive gives: the host's most descriptors
+/// in one message (254), with room to spare.
 #[cfg(not(target_os = "linux"))]
-fn scm_linux_to_host(control: u64, len: usize, out: &mut [u8; 256]) -> Result<usize, i64> {
-    // Linux cmsghdr: { u64 cmsg_len; i32 level; i32 type; } then data @16, 8-aligned.
-    let ctl = uaccess::read_bytes(control, len.min(64 * 1024)).map_err(err)?;
-    let len = ctl.len();
-    let u64_at = |o: usize| u64::from_ne_bytes(ctl[o..o + 8].try_into().unwrap());
-    let i32_at = |o: usize| i32::from_ne_bytes(ctl[o..o + 4].try_into().unwrap());
-    let mut off = 0usize;
-    while off + 16 <= len {
-        let (clen, level, ctype) = (u64_at(off) as usize, i32_at(off + 8), i32_at(off + 12));
-        if clen < 16 || off + clen > len {
-            break;
-        }
-        if level == SOL_SOCKET as i32 && ctype == 1
-        /* SCM_RIGHTS */
-        {
-            let nfds = (clen - 16) / 4;
-            // macOS cmsghdr: { u32 cmsg_len; i32 level; i32 type; } data @12, 4-aligned.
-            let maclen = 12 + nfds * 4;
-            if maclen > out.len() {
-                return Err(err(errno::EINVAL));
-            }
-            out[0..4].copy_from_slice(&(maclen as u32).to_ne_bytes());
-            out[4..8].copy_from_slice(&(libc::SOL_SOCKET).to_ne_bytes());
-            out[8..12].copy_from_slice(&libc::SCM_RIGHTS.to_ne_bytes());
-            for i in 0..nfds {
-                let fd = i32_at(off + 16 + i * 4);
-                out[12 + i * 4..16 + i * 4].copy_from_slice(&fd.to_ne_bytes());
-            }
-            return Ok(maclen);
-        }
-        off += (clen + 7) & !7; // CMSG_ALIGN to 8
-    }
-    Ok(0)
-}
+const HOST_CONTROL: usize = 12 + 4 * 256 + 64;
 
-/// Re-encode macOS `SCM_RIGHTS` control data from `host` into the guest Linux
-/// control buffer; returns `(linux_controllen, truncated)`.
+/// The host control data for the guest's control buffer of a send on
+/// `fd` ([`crate::scm`]). A socket that is not a Unix one takes neither
+/// descriptors nor credentials (`EINVAL`), and passes the rest over.
 ///
-/// `host` holds `host_len` bytes; `dst` is the guest's buffer of `dst_cap`
-/// bytes.
+/// Credentials it gives are checked ([`crate::scm::check_creds`]); a
+/// datagram to a socket that asked for them carries the sender's anyway,
+/// as Linux attaches them (`to`: the host address it is sent to, if any).
 #[cfg(not(target_os = "linux"))]
-fn scm_host_to_linux(
-    host: &[u8; 256],
-    host_len: usize,
-    dst: u64,
-    dst_cap: usize,
-) -> uaccess::Result<(u64, bool)> {
-    let mut off = 0usize;
-    while off + 12 <= host_len {
-        let clen =
-            u32::from_ne_bytes([host[off], host[off + 1], host[off + 2], host[off + 3]]) as usize;
-        let level =
-            i32::from_ne_bytes([host[off + 4], host[off + 5], host[off + 6], host[off + 7]]);
-        let ctype =
-            i32::from_ne_bytes([host[off + 8], host[off + 9], host[off + 10], host[off + 11]]);
-        if clen < 12 || off + clen > host_len {
-            break;
-        }
-        if level == libc::SOL_SOCKET && ctype == libc::SCM_RIGHTS {
-            let nfds = (clen - 12) / 4;
-            let linux_len = 16 + nfds * 4;
-            if linux_len > dst_cap {
-                return Ok((0, true));
-            }
-            let mut out = vec![0u8; linux_len];
-            out[0..8].copy_from_slice(&(linux_len as u64).to_ne_bytes());
-            out[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
-            out[12..16].copy_from_slice(&1i32.to_ne_bytes()); // SCM_RIGHTS
-            for i in 0..nfds {
-                let fd = &host[off + 12 + i * 4..off + 16 + i * 4];
-                out[16 + i * 4..20 + i * 4].copy_from_slice(fd);
-                // A SOCK_SEQPACKET socket of fwe's is one here too.
-                crate::seqpacket::adopt(i32::from_ne_bytes(fd.try_into().unwrap()));
-            }
-            uaccess::write_from(dst, &out)?;
-            return Ok((linux_len as u64, false));
-        }
-        off += (clen + 3) & !3; // CMSG_ALIGN to 4 on macOS
+fn send_control(
+    fd: i32,
+    control: u64,
+    len: u64,
+    to: Option<&[u8]>,
+) -> Result<Option<crate::scm::Prepared>, i32> {
+    if len == 0 {
+        return creds_for(fd, to).map_or(Ok(None), |c| crate::scm::prepare(&[], Some(c)).map(Some));
     }
-    Ok((0, false))
+    let ctl = uaccess::read_bytes(control, (len as usize).min(64 * 1024))?;
+    if !is_unix(fd) {
+        return match crate::scm::parse(&ctl) {
+            Ok(o) if !o.fds.is_empty() || o.creds.is_some() => Err(errno::EINVAL),
+            _ => Ok(None),
+        };
+    }
+    let out = crate::scm::parse(&ctl)?;
+    let creds = match out.creds {
+        Some(c) => Some(crate::scm::check_creds(c)?),
+        None => creds_for(fd, to),
+    };
+    if out.fds.is_empty() && creds.is_none() {
+        return Ok(None);
+    }
+    crate::scm::prepare(&out.fds, creds).map(Some)
 }
 
 #[cfg(test)]
@@ -2842,5 +3503,725 @@ mod tests {
             libc::close(sv[0]);
             libc::close(sv[1]);
         }
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod scm_tests {
+    use super::*;
+
+    /// A connected Unix socket pair of `ty`.
+    pub(crate) fn pair(ty: u64) -> [i32; 2] {
+        let mut sv = [0i32; 2];
+        // SAFETY: valid array.
+        assert_eq!(unsafe { socketpair(AF_UNIX, ty, 0, sv.as_mut_ptr() as u64) }, 0);
+        sv
+    }
+
+    /// Send one byte on `s` with `control` (Linux layout): the result.
+    pub(crate) fn send_control(s: i32, control: &[u8]) -> i64 {
+        let byte = *b"x";
+        let iov = libc::iovec { iov_base: byte.as_ptr() as *mut _, iov_len: 1 };
+        let mut mhdr = [0u64; 7];
+        mhdr[2] = &iov as *const _ as u64;
+        mhdr[3] = 1;
+        mhdr[4] = control.as_ptr() as u64;
+        mhdr[5] = control.len() as u64;
+        // SAFETY: a valid msghdr pointing at a valid iovec and control.
+        unsafe { sendmsg(s as u64, mhdr.as_ptr() as u64, 0) }
+    }
+
+    /// An `SCM_RIGHTS` message (Linux layout) of `fds`.
+    pub(crate) fn rights(fds: &[i32]) -> Vec<u8> {
+        let len = CMSG_HDR + 4 * fds.len();
+        let mut c = vec![0u8; (len + 7) & !7];
+        c[0..8].copy_from_slice(&(len as u64).to_ne_bytes());
+        c[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        c[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+        for (i, fd) in fds.iter().enumerate() {
+            c[16 + 4 * i..20 + 4 * i].copy_from_slice(&fd.to_ne_bytes());
+        }
+        c
+    }
+
+    /// Receive one message on `s` into a control buffer of `cap` bytes:
+    /// the result, the control bytes written and the message flags.
+    pub(crate) fn recv_control(s: i32, cap: usize, flags: u64) -> (i64, Vec<u8>, i32) {
+        let mut byte = [0u8; 1];
+        let iov = libc::iovec { iov_base: byte.as_mut_ptr() as *mut _, iov_len: 1 };
+        let mut control = vec![0u8; cap];
+        let mut mhdr = [0u64; 7];
+        mhdr[2] = &iov as *const _ as u64;
+        mhdr[3] = 1;
+        mhdr[4] = control.as_mut_ptr() as u64;
+        mhdr[5] = cap as u64;
+        // SAFETY: a valid msghdr with a writable iovec and control.
+        let r = unsafe { recvmsg(s as u64, mhdr.as_mut_ptr() as u64, flags) };
+        control.truncate(mhdr[5] as usize);
+        (r, control, mhdr[6] as i32)
+    }
+
+    /// The descriptors of the `SCM_RIGHTS` messages in `control`.
+    pub(crate) fn fds_in(control: &[u8]) -> Vec<i32> {
+        let mut out = Vec::new();
+        let mut at = 0;
+        while at + CMSG_HDR <= control.len() {
+            let len = u64::from_ne_bytes(control[at..at + 8].try_into().unwrap()) as usize;
+            let ty = i32::from_ne_bytes(control[at + 12..at + 16].try_into().unwrap());
+            if ty == SCM_RIGHTS {
+                for o in (at + CMSG_HDR..(at + len).min(control.len())).step_by(4) {
+                    out.push(i32::from_ne_bytes(control[o..o + 4].try_into().unwrap()));
+                }
+            }
+            at += (len.max(CMSG_HDR) + 7) & !7;
+        }
+        out
+    }
+
+    pub(crate) fn cloexec(fd: i32) -> bool {
+        // SAFETY: F_GETFD only queries.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0 }
+    }
+
+    pub(crate) fn close_all(fds: &[i32]) {
+        for &fd in fds {
+            // SAFETY: descriptors of this test's.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    #[test]
+    fn cmsg_cloexec_marks_received_descriptors() {
+        let _g = serial();
+        let sv = pair(SOCK_STREAM);
+        for (flags, want) in [(0, false), (MSG_CMSG_CLOEXEC, true)] {
+            assert_eq!(send_control(sv[0], &rights(&[0, 1])), 1);
+            let (r, control, _) = recv_control(sv[1], 64, flags);
+            assert_eq!(r, 1);
+            let fds = fds_in(&control);
+            assert_eq!(fds.len(), 2);
+            assert!(fds.iter().all(|&fd| cloexec(fd) == want), "flags {flags:#x}");
+            close_all(&fds);
+        }
+        close_all(&sv);
+    }
+
+    /// The descriptor-passing tests, one at a time: they take descriptor
+    /// numbers the host hands out and registries keyed by them.
+    pub(crate) fn serial() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Pass `fds` from one end of a socket pair to the other: what came.
+    fn pass(fds: &[i32]) -> Vec<i32> {
+        let sv = pair(SOCK_STREAM);
+        assert_eq!(send_control(sv[0], &rights(fds)), 1);
+        let (r, control, flags) = recv_control(sv[1], 4096, 0);
+        assert_eq!((r, flags & MSG_CTRUNC as i32), (1, 0));
+        close_all(&sv);
+        fds_in(&control)
+    }
+
+    #[test]
+    fn the_most_descriptors_linux_passes_go_in_one_message() {
+        let _g = serial();
+        let fds = vec![0; SCM_MAX_FD];
+        let got = pass(&fds);
+        assert_eq!(got.len(), SCM_MAX_FD);
+        close_all(&got);
+        let sv = pair(SOCK_STREAM);
+        assert_eq!(send_control(sv[0], &rights(&[0; SCM_MAX_FD + 1])), err(errno::EINVAL));
+        close_all(&sv);
+    }
+
+    #[test]
+    fn descriptors_that_do_not_fit_are_closed() {
+        let _g = serial();
+        let mut p = [0i32; 2];
+        // SAFETY: a valid out-array.
+        assert_eq!(unsafe { libc::pipe(p.as_mut_ptr()) }, 0);
+        let sv = pair(SOCK_STREAM);
+        // Four of the pipe's write end; room for two.
+        assert_eq!(send_control(sv[0], &rights(&[p[1]; 4])), 1);
+        let (r, control, flags) = recv_control(sv[1], CMSG_HDR + 8, 0);
+        assert_eq!(r, 1);
+        assert_ne!(flags & MSG_CTRUNC as i32, 0);
+        let got = fds_in(&control);
+        assert_eq!(got.len(), 2);
+        // Once those and the original are closed, no write end is left.
+        close_all(&got);
+        close_all(&[p[1]]);
+        close_all(&sv);
+        let mut b = 0u8;
+        // SAFETY: a valid one-byte buffer; the read end does not block
+        // once no writer is left.
+        assert_eq!(unsafe { libc::read(p[0], (&mut b as *mut u8).cast(), 1) }, 0);
+        close_all(&[p[0]]);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_passed_eventfd_shares_its_count() {
+        let _g = serial();
+        // SAFETY: no pointers.
+        let fd = unsafe { crate::specialfd::eventfd2(0, fwe_abi::eventfd::EFD_NONBLOCK) } as i32;
+        let got = pass(&[fd]);
+        assert_eq!(got.len(), 1);
+        assert_eq!(crate::specialfd::anon_name(got[0]), Some("[eventfd]"));
+        let seven = 7u64;
+        // SAFETY: 8 readable bytes.
+        let wrote = unsafe { crate::specialfd::try_write(fd, &seven as *const u64 as u64, 8) };
+        assert_eq!(wrote, Some(8));
+        let mut v = 0u64;
+        // SAFETY: 8 writable bytes.
+        let read = unsafe { crate::specialfd::try_read(got[0], &mut v as *mut u64 as u64, 8) };
+        assert_eq!(read, Some(8));
+        assert_eq!(v, 7);
+        // SAFETY: as above: the original sees it read.
+        let r = unsafe { crate::specialfd::try_read(fd, &mut v as *mut u64 as u64, 8) };
+        assert_eq!(r, Some(err(errno::EAGAIN)));
+        assert_eq!(crate::specialfd::try_close(got[0]), Some(0));
+        assert_eq!(crate::specialfd::try_close(fd), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_passed_timerfd_keeps_its_schedule() {
+        let _g = serial();
+        use fwe_abi::timerfd::TFD_NONBLOCK;
+        // SAFETY: no pointers.
+        let fd = unsafe { crate::specialfd::timerfd_create(1, TFD_NONBLOCK) } as i32;
+        let spec: [i64; 4] = [0, 0, 0, 40_000_000];
+        // SAFETY: a valid itimerspec.
+        let r = unsafe { crate::specialfd::timerfd_settime(fd as u64, 0, spec.as_ptr() as u64, 0) };
+        assert_eq!(r, 0);
+        let got = pass(&[fd]);
+        assert_eq!(crate::specialfd::anon_name(got[0]), Some("[timerfd]"));
+        let mut cur = [0i64; 4];
+        // SAFETY: a writable itimerspec.
+        let r =
+            unsafe { crate::specialfd::timerfd_gettime(got[0] as u64, cur.as_mut_ptr() as u64) };
+        assert_eq!(r, 0);
+        assert!(cur[3] > 0 && cur[3] <= 40_000_000, "{cur:?}");
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let mut v = 0u64;
+        // SAFETY: 8 writable bytes.
+        let r = unsafe { crate::specialfd::try_read(got[0], &mut v as *mut u64 as u64, 8) };
+        assert_eq!((r, v), (Some(8), 1));
+        crate::specialfd::try_close(got[0]);
+        crate::specialfd::try_close(fd);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_passed_signalfd_is_one() {
+        let _held = crate::thread::signals_held();
+        let _g = serial();
+        let fd = crate::signalfd::signalfd4(-1, 1 << 9, fwe_abi::fcntl::O_NONBLOCK);
+        let got = pass(&[fd as i32]);
+        assert!(crate::signalfd::is_signalfd(got[0]));
+        crate::signalfd::try_close(got[0]);
+        crate::signalfd::try_close(fd as i32);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_passed_netlink_socket_answers() {
+        let _g = serial();
+        let fd = crate::netlink::socket(3, 0, false) as i32;
+        let got = pass(&[fd]);
+        assert!(crate::netlink::is(got[0]));
+        assert_eq!(crate::netlink::sock_type(got[0]), Some(3));
+        crate::netlink::closed(got[0]);
+        crate::fdmarks::closed(got[0]);
+        crate::netlink::closed(fd);
+        crate::fdmarks::closed(fd);
+        close_all(&[got[0], fd]);
+    }
+}
+
+#[cfg(test)]
+mod udp_option_tests {
+    use super::*;
+
+    /// A bound UDP receiver and a sender: their descriptors and the
+    /// receiver's address (Linux layout).
+    fn udp_pair() -> (i32, i32, [u8; 16]) {
+        let mut a = [0u8; 16];
+        a[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // SAFETY: no pointers.
+        let (rx, tx) = unsafe { (socket(AF_INET, SOCK_DGRAM, 0), socket(AF_INET, SOCK_DGRAM, 0)) };
+        // SAFETY: a valid sockaddr.
+        assert_eq!(unsafe { bind(rx as u64, a.as_ptr() as u64, 16, true, 0o022) }, 0);
+        let mut len: u32 = 16;
+        // SAFETY: a writable sockaddr and length.
+        let r =
+            unsafe { getname(rx as u64, a.as_mut_ptr() as u64, &mut len as *mut _ as u64, false) };
+        assert_eq!(r, 0);
+        (rx as i32, tx as i32, a)
+    }
+
+    fn set(fd: i32, level: u64, name: u64, v: i32) -> i64 {
+        // SAFETY: a 4-byte option value.
+        unsafe { setsockopt(fd as u64, level, name, &v as *const i32 as u64, 4, false) }
+    }
+
+    fn get(fd: i32, level: u64, name: u64) -> Result<i32, i64> {
+        let mut v = 0i32;
+        let mut len = 4u32;
+        // SAFETY: a 4-byte option buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                fd as u64,
+                level,
+                name,
+                &mut v as *mut i32 as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        if r < 0 { Err(r) } else { Ok(v) }
+    }
+
+    fn send(tx: i32, data: &[u8], to: &[u8; 16]) -> i64 {
+        // SAFETY: valid buffers.
+        unsafe {
+            sendto(tx as u64, data.as_ptr() as u64, data.len() as u64, 0, to.as_ptr() as u64, 16)
+        }
+    }
+
+    /// The next datagram waiting on `rx`, if one is.
+    fn next(rx: i32) -> Option<Vec<u8>> {
+        let mut b = [0u8; 64];
+        // SAFETY: a valid buffer.
+        let n = unsafe { recvfrom(rx as u64, b.as_mut_ptr() as u64, 64, MSG_DONTWAIT, 0, 0) };
+        (n >= 0).then(|| b[..n as usize].to_vec())
+    }
+
+    #[test]
+    fn udp_cork_sends_one_datagram_when_cleared() {
+        let (rx, tx, to) = udp_pair();
+        assert_eq!(set(tx, SOL_UDP, UDP_CORK, 1), 0);
+        assert_eq!(get(tx, SOL_UDP, UDP_CORK), Ok(1));
+        assert_eq!(send(tx, b"ab", &to), 2);
+        assert_eq!(send(tx, b"cd", &to), 2);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(next(rx), None);
+        assert_eq!(set(tx, SOL_UDP, UDP_CORK, 0), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(next(rx).as_deref(), Some(&b"abcd"[..]));
+        closed(tx);
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
+    }
+
+    #[test]
+    fn udp_segment_cuts_a_send_into_datagrams() {
+        let (rx, tx, to) = udp_pair();
+        assert_eq!(set(tx, SOL_UDP, UDP_SEGMENT, 4), 0);
+        assert_eq!(send(tx, b"0123456789", &to), 10);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let got: Vec<Vec<u8>> = std::iter::from_fn(|| next(rx)).collect();
+        assert_eq!(got, [b"0123".to_vec(), b"4567".to_vec(), b"89".to_vec()]);
+        assert_eq!(set(tx, SOL_UDP, UDP_SEGMENT, 70_000), err(errno::EINVAL));
+        closed(tx);
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
+    }
+
+    #[test]
+    fn other_options_never_reach_the_host() {
+        let (rx, tx, _) = udp_pair();
+        // An option of the UDP level Linux has but fwe does not
+        // (UDP_ENCAP), one it has not, and a level the socket has not.
+        assert_eq!(set(tx, SOL_UDP, UDP_ENCAP, 1), err(errno::ENOPROTOOPT));
+        assert_eq!(set(tx, SOL_UDP, 999, 1), err(errno::ENOPROTOOPT));
+        assert_eq!(get(tx, SOL_UDP, 999), Err(err(errno::ENOPROTOOPT)));
+        assert_eq!(set(tx, 6, 1, 1), err(errno::ENOPROTOOPT));
+        assert_eq!(set(tx, SOL_UDP, UDP_GRO, 1), 0);
+        assert_eq!(get(tx, SOL_UDPLITE, UDP_GRO), Ok(1));
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[cfg(test)]
+mod fastopen_tests {
+    use super::*;
+
+    /// `MSG_FASTOPEN` on an unconnected TCP socket connects and sends; on
+    /// a connected one it is `EISCONN`.
+    #[test]
+    fn fast_open_connects_and_sends() {
+        let mut a = [0u8; 16];
+        a[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        a[4..8].copy_from_slice(&[127, 0, 0, 1]);
+        // SAFETY: no pointers.
+        let (srv, cli) = unsafe {
+            (socket(AF_INET, SOCK_STREAM, 0) as i32, socket(AF_INET, SOCK_STREAM, 0) as i32)
+        };
+        // SAFETY: a valid sockaddr.
+        assert_eq!(unsafe { bind(srv as u64, a.as_ptr() as u64, 16, true, 0o022) }, 0);
+        let mut len: u32 = 16;
+        // SAFETY: a writable sockaddr and length.
+        let r =
+            unsafe { getname(srv as u64, a.as_mut_ptr() as u64, &mut len as *mut _ as u64, false) };
+        assert_eq!(r, 0);
+        // SAFETY: no pointers.
+        assert_eq!(unsafe { listen(srv as u64, 1) }, 0);
+        let data = b"hello";
+        let send = |addr: u64| {
+            // SAFETY: valid buffers.
+            unsafe { sendto(cli as u64, data.as_ptr() as u64, 5, MSG_FASTOPEN, addr, 16) }
+        };
+        assert_eq!(send(a.as_ptr() as u64), 5);
+        // SAFETY: no out pointers.
+        let conn = unsafe { accept4(srv as u64, 0, 0, 0) } as i32;
+        let mut b = [0u8; 8];
+        // SAFETY: a valid buffer.
+        assert_eq!(unsafe { libc::read(conn, b.as_mut_ptr().cast(), 8) }, 5);
+        assert_eq!(&b[..5], data);
+        assert_eq!(send(a.as_ptr() as u64), err(errno::EISCONN));
+        for fd in [srv, cli, conn] {
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod protocol_tests {
+    use super::*;
+
+    fn protocol(fd: i64) -> i32 {
+        let mut v = -1i32;
+        let mut len = 4u32;
+        // SAFETY: a 4-byte option buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                fd as u64,
+                SOL_SOCKET,
+                38,
+                &mut v as *mut i32 as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        assert_eq!(r, 0);
+        v
+    }
+
+    /// `SO_PROTOCOL` is the protocol the socket was made with: ICMP for a
+    /// ping socket, not 0.
+    #[test]
+    fn so_protocol_is_the_sockets() {
+        // SAFETY: no pointers.
+        let (tcp, udp, ping) = unsafe {
+            (
+                socket(AF_INET, SOCK_STREAM, 0),
+                socket(AF_INET, SOCK_DGRAM, 0),
+                socket(AF_INET, SOCK_DGRAM, 1),
+            )
+        };
+        assert_eq!((protocol(tcp), protocol(udp)), (6, 17));
+        if ping >= 0 {
+            assert_eq!(protocol(ping), 1);
+        }
+        for fd in [tcp, udp, ping] {
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd as i32) };
+        }
+    }
+
+    /// A Unix socket's error queue is empty, as an IP socket's is.
+    #[test]
+    fn unix_error_queue_is_empty() {
+        let mut sv = [0i32; 2];
+        // SAFETY: a valid array.
+        assert_eq!(unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, sv.as_mut_ptr() as u64) }, 0);
+        let mut b = [0u8; 4];
+        // SAFETY: a valid buffer; the socket's queue holds nothing.
+        let r = unsafe { recvfrom(sv[0] as u64, b.as_mut_ptr() as u64, 4, MSG_ERRQUEUE, 0, 0) };
+        assert_eq!(r, err(errno::EAGAIN));
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
+    }
+
+    /// The IP header before a received ICMP message is measured by its
+    /// first byte; a message with none (an ICMP type) has none measured.
+    #[test]
+    fn ip_header_is_measured() {
+        assert_eq!(ip_header_len(&[0x45; 28]), 20);
+        assert_eq!(ip_header_len(&[0x46; 28]), 24);
+        assert_eq!(ip_header_len(&[0, 0, 0, 0]), 0);
+        assert_eq!(ip_header_len(&[8, 0, 0, 0]), 0);
+        assert_eq!(ip_header_len(&[]), 0);
+    }
+
+    /// A ping socket's datagram is delivered as Linux delivers it, the
+    /// ICMP message alone (a datagram socket marked as one stands in for
+    /// macOS's, which gives the IP header first), cut to the buffer with
+    /// `MSG_TRUNC` giving its whole length.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn ping_replies_come_without_the_ip_header() {
+        let mut sv = [0i32; 2];
+        // SAFETY: a valid array.
+        let r = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) };
+        assert_eq!(r, 0);
+        crate::fdmarks::mark(sv[1], crate::fdmarks::Mark::Ping);
+        assert!(crate::fdmarks::is_ping(sv[1]));
+        let mut d = vec![0x45u8; 20];
+        d.extend_from_slice(&[0, 0, 0xab, 0xcd, 0x12, 0x34, 0, 1, b'h', b'i']);
+        for _ in 0..3 {
+            // SAFETY: a local buffer of its length.
+            assert_eq!(unsafe { libc::send(sv[0], d.as_ptr().cast(), d.len(), 0) }, 30);
+        }
+        let mut b = [0u8; 64];
+        // SAFETY: a valid buffer of its length.
+        let r = unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 64, 0, 0, 0) };
+        assert_eq!(r, 10);
+        assert_eq!(&b[..10], &d[20..]);
+        // SAFETY: as above.
+        let r = unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 4, MSG_TRUNC, 0, 0) };
+        assert_eq!((r, &b[..4]), (10, &d[20..24]));
+        let iov = [libc::iovec { iov_base: b.as_mut_ptr().cast(), iov_len: 64 }];
+        assert_eq!(ping_read(sv[1], &iov), 10);
+        crate::fdmarks::closed(sv[1]);
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
+    }
+
+    /// A Unix `SOCK_RAW` socket is a datagram one, as Linux makes it.
+    #[test]
+    fn unix_raw_is_a_datagram_socket() {
+        // SAFETY: no pointers.
+        let fd = unsafe { socket(AF_UNIX, SOCK_RAW, 0) };
+        assert!(fd >= 0, "{fd}");
+        let mut ty = -1i32;
+        let mut len = 4u32;
+        // SAFETY: a 4-byte option buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                fd as u64,
+                SOL_SOCKET,
+                3,
+                &mut ty as *mut i32 as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        assert_eq!((r, ty), (0, SOCK_DGRAM as i32));
+        // SAFETY: the socket made here.
+        unsafe { libc::close(fd as i32) };
+    }
+
+    /// A Unix socket bound with its family alone is named as Linux's
+    /// autobind names one, and binding it so again changes nothing.
+    #[test]
+    fn unix_autobind_names_five_hex_digits() {
+        // SAFETY: no pointers.
+        let fd = unsafe { socket(AF_UNIX, SOCK_DGRAM, 0) };
+        let fam = (AF_UNIX as u16).to_ne_bytes();
+        // SAFETY: a 2-byte address.
+        assert_eq!(unsafe { bind(fd as u64, fam.as_ptr() as u64, 2, false, 0) }, 0);
+        let name = |fd: i64| {
+            let mut b = [0u8; 110];
+            let mut len = b.len() as u32;
+            // SAFETY: a buffer and its length.
+            let r = unsafe {
+                getname(fd as u64, b.as_mut_ptr() as u64, &mut len as *mut u32 as u64, false)
+            };
+            assert_eq!(r, 0);
+            b[..len as usize].to_vec()
+        };
+        let first = name(fd);
+        assert_eq!(first.len(), 8, "{first:?}");
+        assert_eq!(&first[..3], &[fam[0], fam[1], 0]);
+        assert!(
+            first[3..].iter().all(u8::is_ascii_hexdigit)
+                && first[3..] == *first[3..].to_ascii_lowercase()
+        );
+        // SAFETY: as above.
+        assert_eq!(unsafe { bind(fd as u64, fam.as_ptr() as u64, 2, false, 0) }, 0);
+        assert_eq!(name(fd), first);
+        assert_eq!(autobind_name(0xabc), "00abc");
+        // SAFETY: the socket made here.
+        unsafe { libc::close(fd as i32) };
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod creds_tests {
+    use super::scm_tests::{close_all, pair, recv_control, send_control};
+    use super::*;
+
+    fn set_passcred(fd: i32) {
+        let one = 1i32;
+        // SAFETY: a 4-byte option value.
+        let r = unsafe {
+            setsockopt(fd as u64, SOL_SOCKET, SO_PASSCRED, &one as *const i32 as u64, 4, false)
+        };
+        assert_eq!(r, 0);
+    }
+
+    /// The `SCM_CREDENTIALS` message (Linux layout) of `creds`.
+    fn credentials(creds: [u32; 3]) -> Vec<u8> {
+        let mut c = vec![0u8; 32];
+        c[0..8].copy_from_slice(&28u64.to_ne_bytes());
+        c[8..12].copy_from_slice(&(SOL_SOCKET as i32).to_ne_bytes());
+        c[12..16].copy_from_slice(&crate::scm::SCM_CREDENTIALS.to_ne_bytes());
+        for (i, w) in creds.iter().enumerate() {
+            c[16 + 4 * i..20 + 4 * i].copy_from_slice(&w.to_ne_bytes());
+        }
+        c
+    }
+
+    /// The credentials the control data `c` starts with.
+    fn creds_in(c: &[u8]) -> Option<[u32; 3]> {
+        let ty = i32::from_ne_bytes(c.get(12..16)?.try_into().ok()?);
+        if ty != crate::scm::SCM_CREDENTIALS {
+            return None;
+        }
+        let w = |i: usize| u32::from_ne_bytes(c[16 + 4 * i..20 + 4 * i].try_into().unwrap());
+        Some([w(0), w(1), w(2)])
+    }
+
+    /// A socket that asked for credentials receives its peer's, or those
+    /// the sender gave when it may give them.
+    #[test]
+    fn credentials_come_when_asked() {
+        let _g = super::scm_tests::serial();
+        let sv = pair(SOCK_STREAM);
+        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        assert_eq!(send_control(sv[0], &[]), 1);
+        let (_, c, _) = recv_control(sv[1], 64, 0);
+        assert_eq!(creds_in(&c), None);
+        set_passcred(sv[1]);
+        assert_eq!(send_control(sv[0], &[]), 1);
+        let (_, c, _) = recv_control(sv[1], 64, 0);
+        assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
+        // Given: as given (the caller is root, as before any is published).
+        let tgid = crate::thread::tgid() as u32;
+        assert_eq!(send_control(sv[0], &credentials([tgid, 5, 6])), 1);
+        let (_, c, _) = recv_control(sv[1], 64, 0);
+        assert_eq!(creds_in(&c).map(|c| c[1..].to_vec()), Some(vec![5, 6]));
+        // A pid no process has, or an id nothing maps.
+        let bad = send_control(sv[0], &credentials([0x7fff_fff0, 0, 0]));
+        assert_eq!(bad, err(errno::ESRCH));
+        let bad = send_control(sv[0], &credentials([tgid, u32::MAX, 0]));
+        assert_eq!(bad, err(errno::EINVAL));
+        closed(sv[1]);
+        close_all(&sv);
+    }
+
+    /// A datagram to a bound socket that asked for credentials carries the
+    /// sender's.
+    #[test]
+    fn a_datagram_carries_credentials_when_asked() {
+        let _g = super::scm_tests::serial();
+        // An abstract name: a path would be rooted in whatever filesystem
+        // view another test publishes meanwhile.
+        let name = format!("fwe-passcred-{}", std::process::id());
+        let mut a = [0u8; 110];
+        a[0..2].copy_from_slice(&(AF_UNIX as u16).to_ne_bytes());
+        a[3..3 + name.len()].copy_from_slice(name.as_bytes());
+        let alen = (3 + name.len()) as u64;
+        // SAFETY: no pointers.
+        let (rx, tx) = unsafe {
+            (socket(AF_UNIX, SOCK_DGRAM, 0) as i32, socket(AF_UNIX, SOCK_DGRAM, 0) as i32)
+        };
+        // SAFETY: a valid address.
+        assert_eq!(unsafe { bind(rx as u64, a.as_ptr() as u64, alen, true, 0o022) }, 0);
+        set_passcred(rx);
+        let byte = *b"x";
+        // SAFETY: valid buffers.
+        let r = unsafe { sendto(tx as u64, byte.as_ptr() as u64, 1, 0, a.as_ptr() as u64, alen) };
+        assert_eq!(r, 1);
+        let (_, c, _) = recv_control(rx, 64, 0);
+        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
+        closed(rx);
+        close_all(&[rx, tx]);
+    }
+}
+
+#[cfg(test)]
+mod kept_option_tests {
+    use super::*;
+
+    fn set(fd: i64, name: u64, val: &[i32], admin: bool) -> i64 {
+        // SAFETY: an option value of its length.
+        unsafe {
+            setsockopt(
+                fd as u64,
+                SOL_SOCKET,
+                name,
+                val.as_ptr() as u64,
+                4 * val.len() as u64,
+                admin,
+            )
+        }
+    }
+
+    /// `SO_LINGER` is in seconds, as Linux's (the host's own is in ticks).
+    #[test]
+    fn linger_is_in_seconds() {
+        // SAFETY: no pointers.
+        let s = unsafe { socket(AF_INET, SOCK_STREAM, 0) };
+        assert_eq!(set(s, SO_LINGER, &[1, 7], false), 0);
+        let mut v = [0i32; 2];
+        let mut len = 8u32;
+        // SAFETY: an 8-byte buffer and its length.
+        let r = unsafe {
+            getsockopt(
+                s as u64,
+                SOL_SOCKET,
+                SO_LINGER,
+                v.as_mut_ptr() as u64,
+                &mut len as *mut u32 as u64,
+            )
+        };
+        assert_eq!((r, v[1] != 0, v[1]), (0, true, 7));
+        closed(s as i32);
+        // SAFETY: the socket made above.
+        unsafe { libc::close(s as i32) };
+    }
+
+    /// A priority past 6 needs `CAP_NET_ADMIN`; `accept4` takes Linux's
+    /// flags only.
+    #[test]
+    fn priority_and_accept_flags_are_checked() {
+        // SAFETY: no pointers.
+        let s = unsafe { socket(AF_INET, SOCK_DGRAM, 0) };
+        assert_eq!(set(s, SO_PRIORITY, &[7], false), err(errno::EPERM));
+        assert_eq!(set(s, SO_PRIORITY, &[7], true), 0);
+        assert_eq!(set(s, SO_PRIORITY, &[3], false), 0);
+        // SAFETY: no out pointers.
+        assert_eq!(unsafe { accept4(s as u64, 0, 0, 1) }, err(errno::EINVAL));
+        closed(s as i32);
+        // SAFETY: the socket made above.
+        unsafe { libc::close(s as i32) };
+    }
+
+    /// `MSG_TRUNC` on a datagram socket returns the datagram's whole
+    /// length, as Linux does.
+    #[test]
+    fn msg_trunc_gives_the_whole_datagram() {
+        let mut sv = [0i32; 2];
+        // SAFETY: a valid array.
+        assert_eq!(unsafe { socketpair(AF_UNIX, SOCK_DGRAM, 0, sv.as_mut_ptr() as u64) }, 0);
+        // SAFETY: a valid buffer.
+        assert_eq!(unsafe { libc::send(sv[0], b"0123456789".as_ptr().cast(), 10, 0) }, 10);
+        let mut b = [0u8; 4];
+        // SAFETY: a valid 4-byte buffer.
+        let peek =
+            unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 4, MSG_PEEK | MSG_TRUNC, 0, 0) };
+        assert_eq!(peek, 10);
+        // SAFETY: as above.
+        let r = unsafe { recvfrom(sv[1] as u64, b.as_mut_ptr() as u64, 4, MSG_TRUNC, 0, 0) };
+        assert_eq!((r, &b), (10, b"0123"));
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(sv[0]), libc::close(sv[1])) };
     }
 }

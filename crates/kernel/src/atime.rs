@@ -3,8 +3,8 @@
 //! read). The host updates a file's access time by its own rule, so a read
 //! of a file opened through such a mount has its access time noted before
 //! and, where the host left another, set after as Linux would have left
-//! it. Setting it changes the host's change time too, which is why it is
-//! set only then. A mount with none of them is `relatime`, Linux's
+//! it, by the host's `setattrlist` of the access time alone, which leaves
+//! the change time as a read leaves it. A mount with none of them is `relatime`, Linux's
 //! default, which is left to the host.
 
 use crate::mounts::ms;
@@ -110,9 +110,39 @@ pub fn after(b: Option<Before>, r: i64) {
         if now > (b.atime.tv_sec, b.atime.tv_nsec) {
             return;
         }
-        libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_NOW }
+        let mut now = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+        // SAFETY: a valid out-parameter.
+        unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut now) };
+        now
     };
-    let times = [atime, libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }];
+    set_access_time(b.fd, atime);
+}
+
+/// Give the file open as `fd` the access time `t`, its change time left
+/// as it is, as a read leaves it on Linux: the host's `setattrlist` of the
+/// access time alone moves no change time (`futimens` would).
+#[cfg(target_os = "macos")]
+fn set_access_time(fd: i32, t: libc::timespec) {
+    // SAFETY: zeroed bytes are a valid `attrlist`.
+    let mut list: libc::attrlist = unsafe { std::mem::zeroed() };
+    list.bitmapcount = libc::ATTR_BIT_MAP_COUNT;
+    list.commonattr = libc::ATTR_CMN_ACCTIME;
+    // SAFETY: a valid attribute list and a buffer of the one timespec it
+    // names; the descriptor is the guest's.
+    unsafe {
+        libc::fsetattrlist(
+            fd,
+            std::ptr::from_mut(&mut list).cast(),
+            std::ptr::from_ref(&t).cast_mut().cast(),
+            std::mem::size_of::<libc::timespec>(),
+            0,
+        )
+    };
+}
+
+#[cfg(not(target_os = "macos"))]
+fn set_access_time(fd: i32, t: libc::timespec) {
+    let times = [t, libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT }];
     // SAFETY: a valid times array; the descriptor is the guest's.
-    unsafe { libc::futimens(b.fd, times.as_ptr()) };
+    unsafe { libc::futimens(fd, times.as_ptr()) };
 }

@@ -7,6 +7,8 @@
 //! the overflow id 65534), and what it sets is mapped back up (`EINVAL` for
 //! one that has none). A new namespace's maps are empty until written,
 //! once, through `/proc/<pid>/uid_map` and `gid_map`, with Linux's rules.
+//! A capability held in a namespace reaches only it and the namespaces
+//! below it ([`capable_in`]).
 
 use crate::shared::{Data, Record};
 use crate::snapshot::{Dec, Enc};
@@ -79,6 +81,10 @@ pub type Chain = Vec<Arc<Record<UserNs>>>;
 
 pub(crate) static CURRENT: Mutex<Option<Arc<Chain>>> = Mutex::new(None);
 
+/// Whether [`CURRENT`] holds any namespace: most processes are in none,
+/// and a mapping of an id (every `stat` maps two) looks no further.
+static NESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// The chain from `ns` up.
 pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {
     let mut out = Vec::new();
@@ -94,16 +100,30 @@ pub fn chain_from(ns: Option<Arc<Record<UserNs>>>) -> Chain {
 /// Make `ns` (and those above it) the process's.
 pub fn set_current(ns: Option<Arc<Record<UserNs>>>) {
     let chain = Arc::new(chain_from(ns));
-    *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = Some(chain);
+    let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+    NESTED.store(!chain.is_empty(), std::sync::atomic::Ordering::SeqCst);
+    *current = Some(chain);
 }
 
 fn current() -> Arc<Chain> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
 }
 
+/// The process's user namespaces: its own first (none: the initial one).
+pub fn chain() -> Arc<Chain> {
+    current()
+}
+
 /// Whether the process is in a user namespace of fwe's.
 pub fn nested() -> bool {
-    !current().is_empty()
+    NESTED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Whether the process may make a user namespace below its own: not from
+/// inside a `chroot` (`chrooted`), which it could leave with the
+/// capabilities the new namespace gives (`EPERM`).
+pub fn may_make(chrooted: bool) -> Result<(), i32> {
+    if chrooted { Err(errno::EPERM) } else { Ok(()) }
 }
 
 fn down(map: &[Extent], outside: u32) -> Option<u32> {
@@ -119,6 +139,9 @@ fn up(map: &[Extent], inside: u32) -> Option<u32> {
 /// What the initial namespace's id `id` is in the process's namespace
 /// (`gid` for a group id).
 pub fn to_ns(id: u32, gid: bool) -> u32 {
+    if !nested() {
+        return id;
+    }
     let chain = current();
     let mut v = id;
     for ns in chain.iter().rev() {
@@ -135,6 +158,9 @@ pub fn to_ns(id: u32, gid: bool) -> u32 {
 /// The initial namespace's id for the process's namespace's id `id`, if it
 /// has one.
 pub fn from_ns(id: u32, gid: bool) -> Option<u32> {
+    if !nested() {
+        return Some(id);
+    }
     let chain = current();
     let mut v = id;
     for ns in chain.iter() {
@@ -143,6 +169,124 @@ pub fn from_ns(id: u32, gid: bool) -> Option<u32> {
         v = up(map, v)?;
     }
     Some(v)
+}
+
+/// Whether the initial namespace's id `id` has a mapping in the
+/// process's namespace (`gid` for a group id): Linux's `kuid_has_mapping`.
+pub fn mapped(id: u32, gid: bool) -> bool {
+    mapped_through(&current(), id, gid)
+}
+
+fn mapped_through(chain: &Chain, id: u32, gid: bool) -> bool {
+    let mut v = id;
+    for ns in chain.iter().rev() {
+        let n = ns.get();
+        match down(if gid { &n.gid_map } else { &n.uid_map }, v) {
+            Some(x) => v = x,
+            None => return false,
+        }
+    }
+    true
+}
+
+/// The directory of the process's user namespace's record (empty for the
+/// initial one).
+pub fn own_dir() -> Vec<u8> {
+    current().first().map_or_else(Vec::new, |r| r.dir().to_vec())
+}
+
+/// The user namespace whose record is `dir`, joined once per process (a
+/// joined record stays mapped for as long as the process lives).
+fn joined(dir: &[u8]) -> Option<Arc<Record<UserNs>>> {
+    static JOINED: Mutex<Vec<Arc<Record<UserNs>>>> = Mutex::new(Vec::new());
+    if let Some(r) = current().iter().find(|r| r.dir() == dir) {
+        return Some(r.clone());
+    }
+    let mut j = JOINED.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(r) = j.iter().find(|r| r.dir() == dir) {
+        return Some(r.clone());
+    }
+    let r = Arc::new(Record::join(dir, 0).ok()?);
+    j.push(r.clone());
+    Some(r)
+}
+
+/// The parent of the user namespace whose record is `dir` (empty: the
+/// initial one), `None` if there is no such namespace.
+pub fn parent_dir(dir: &[u8]) -> Option<Vec<u8>> {
+    let r = joined(dir)?;
+    Some(r.get().parent.as_ref().map_or_else(Vec::new, |p| p.0.clone()))
+}
+
+/// Whether a process of this one's user namespace, with effective uid
+/// `euid` (the initial namespace's) and `effective` holding the capability
+/// asked about, has it in the user namespace whose record is `target`
+/// (empty: the initial one): Linux's `cap_capable`. In its own namespace
+/// by its effective set; in a namespace below its own made by its
+/// effective user (its owner), every capability, and so in every namespace
+/// below that; in any other (its parents', a sibling's) none.
+pub fn capable_in(target: &[u8], euid: u32, effective: bool) -> bool {
+    capable_from(&own_dir(), target, euid, effective)
+}
+
+/// [`capable_in`] for a process in the user namespace whose record is
+/// `own` (another process's, `PTRACE_TRACEME` asks of its parent).
+pub fn capable_of(own: &[u8], target: &[u8], euid: u32, effective: bool) -> bool {
+    capable_from(own, target, euid, effective)
+}
+
+/// [`capable_in`] for a process in the user namespace whose record is
+/// `own`.
+fn capable_from(own: &[u8], target: &[u8], euid: u32, effective: bool) -> bool {
+    let mut at = target.to_vec();
+
+    // Namespaces nest at most 32 deep.
+    for _ in 0..40 {
+        if at == own {
+            return effective;
+        }
+        if at.is_empty() {
+            return false;
+        }
+        let Some(r) = joined(&at) else { return false };
+        let ns = r.get();
+        let parent = ns.parent.as_ref().map_or_else(Vec::new, |p| p.0.clone());
+        if parent == own && ns.owner == euid {
+            return true;
+        }
+        at = parent;
+    }
+    false
+}
+
+/// The initial namespace's ids of root (uid and gid 0) of the user
+/// namespace whose record is `dir`, or the initial root's where it maps
+/// none (Linux's `task_dump_owner`).
+pub fn root_of(dir: &[u8]) -> (u32, u32) {
+    if dir.is_empty() {
+        return (0, 0);
+    }
+    let chain = chain_from(joined(dir));
+    let up_through = |gid: bool| {
+        let mut v = 0;
+        for ns in chain.iter() {
+            let n = ns.get();
+            v = up(if gid { &n.gid_map } else { &n.uid_map }, v)?;
+        }
+        Some(v)
+    };
+    match (up_through(false), up_through(true)) {
+        (Some(u), Some(g)) => (u, g),
+        _ => (0, 0),
+    }
+}
+
+/// The initial namespace's uids of root of the process's user namespace
+/// and of each above it, the initial one's (0) last.
+pub fn roots_above() -> Vec<u32> {
+    let mut out: Vec<u32> = current().iter().map(|r| root_of(r.dir()).0).collect();
+    out.push(0);
+    out
 }
 
 /// Whether `setgroups` is allowed in the process's namespaces.
@@ -184,6 +328,17 @@ pub fn write_map(
     if map.is_empty() || map.len() > MAX_EXTENTS {
         return Err(errno::EINVAL);
     }
+    // Each extent's ids must be the parent namespace's, all within one
+    // extent of its map (Linux's `map_id_range_down` of the parent's map,
+    // for every writer): the initial namespace has them all.
+    if let Some((dir, _)) = &ns.get().parent {
+        let parent = joined(dir).ok_or(errno::EPERM)?;
+        let p = parent.get();
+        let pmap = if gid { &p.gid_map } else { &p.uid_map };
+        if !map.iter().all(|&(_, o, c)| within_one(pmap, o, c)) {
+            return Err(errno::EPERM);
+        }
+    }
     ns.update(|n| {
         let current = if gid { &n.gid_map } else { &n.uid_map };
         if !current.is_empty() {
@@ -201,6 +356,16 @@ pub fn write_map(
             n.uid_map = map;
         }
         Ok(())
+    })
+}
+
+/// Whether ids `first` to `first + count - 1` of a namespace are all inside
+/// one extent of its `map`.
+fn within_one(map: &[Extent], first: u32, count: u32) -> bool {
+    let (first, count) = (u64::from(first), u64::from(count));
+    map.iter().any(|&(i, _, c)| {
+        let (i, c) = (u64::from(i), u64::from(c));
+        first >= i && first + count <= i + c
     })
 }
 
@@ -293,5 +458,73 @@ mod tests {
         assert_eq!(up(&map, 65536), Some(165535));
         assert_eq!(up(&map, 65537), None);
         assert_eq!(show_map(&map[..1]), b"         0       1000          1\n");
+    }
+
+    /// A map written to a namespace inside another names only ids its
+    /// parent has, each extent within one of the parent's (`EPERM`), even
+    /// for a privileged writer; inside the initial namespace, any.
+    #[test]
+    fn a_map_is_checked_against_the_parents() {
+        let parent = Record::fresh(
+            "user",
+            UserNs {
+                owner: 1000,
+                uid_map: vec![(0, 1000, 1), (1, 100000, 10)],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let child = || {
+            let parent = Some((parent.dir().to_vec(), 0));
+            Record::fresh("user", UserNs { parent, owner: 1000, ..Default::default() }).unwrap()
+        };
+        // Within one of the parent's extents, or several each within one.
+        assert_eq!(write_map(&child(), false, b"0 0 1\n", true, 0), Ok(()));
+        assert_eq!(write_map(&child(), false, b"0 1 10\n", true, 0), Ok(()));
+        assert_eq!(write_map(&child(), false, b"0 0 1\n1 1 10\n", true, 0), Ok(()));
+        // Across two extents, past the end, or an id the parent lacks.
+        assert_eq!(write_map(&child(), false, b"0 0 2\n", true, 0), Err(errno::EPERM));
+        assert_eq!(write_map(&child(), false, b"0 5 10\n", true, 0), Err(errno::EPERM));
+        assert_eq!(write_map(&child(), false, b"0 1000 1\n", true, 0), Err(errno::EPERM));
+        // The parent has no gid map yet: no group of it can be named.
+        assert_eq!(write_map(&child(), true, b"0 0 1\n", true, 0), Err(errno::EPERM));
+        // Unprivileged, its own id unmapped in the parent's terms: refused.
+        assert_eq!(write_map(&child(), false, b"0 65534 1\n", false, 65534), Err(errno::EPERM));
+        // Inside the initial namespace: any ids.
+        let top = Record::fresh("user", UserNs { owner: 0, ..Default::default() }).unwrap();
+        assert_eq!(write_map(&top, false, b"0 100000 65536\n", true, 0), Ok(()));
+    }
+
+    #[test]
+    fn capabilities_reach_own_and_owned_namespaces_only() {
+        let fresh = |parent: &[u8], owner| {
+            let parent = (!parent.is_empty()).then(|| (parent.to_vec(), 0));
+            Record::fresh("user", UserNs { parent, owner, ..Default::default() }).unwrap()
+        };
+        // User 1000's namespace, one it made inside that, and user 2000's.
+        let a = fresh(b"", 1000);
+        let b = fresh(a.dir(), 1000);
+        let c = fresh(b"", 2000);
+        let init: &[u8] = b"";
+        // In the initial namespace: by the effective set there, and in
+        // every namespace below it.
+        assert!(capable_from(init, init, 0, true) && !capable_from(init, init, 0, false));
+        assert!(capable_from(init, c.dir(), 0, true));
+        // A user without the capability has every one in a namespace it
+        // made, and below it; not in another user's.
+        assert!(capable_from(init, a.dir(), 1000, false));
+        assert!(capable_from(init, b.dir(), 1000, false));
+        assert!(!capable_from(init, c.dir(), 1000, false));
+        // Inside its namespace: its effective set there, nothing in the
+        // initial namespace or a sibling, whatever its set holds.
+        assert!(capable_from(a.dir(), a.dir(), 1000, true));
+        assert!(!capable_from(a.dir(), a.dir(), 1000, false));
+        assert!(!capable_from(a.dir(), init, 1000, true));
+        assert!(!capable_from(a.dir(), c.dir(), 1000, true));
+        // A namespace below made by another user: by the set it has in
+        // its own namespace above it.
+        assert!(capable_from(a.dir(), b.dir(), 5000, true));
+        assert!(!capable_from(a.dir(), b.dir(), 5000, false));
+        assert!(capable_from(a.dir(), b.dir(), 1000, false));
     }
 }

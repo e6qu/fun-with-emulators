@@ -115,6 +115,45 @@ pub struct Namespaces {
     pub user: Option<Arc<Record<crate::userns::UserNs>>>,
 }
 
+/// Whether the record at `dir` is a namespace of kind `name` (`mnt`,
+/// `uts`...) that one of fwe's calls made, not an initial one.
+fn of_kind(dir: &[u8], name: &str) -> bool {
+    let base = dir.rsplit(|&b| b == b'/').next().unwrap_or_default();
+    let prefix = format!("v{}-{name}-", crate::shared::FORMAT);
+    base.starts_with(prefix.as_bytes()) && !base[prefix.len()..].starts_with(b"init-")
+}
+
+/// Record that the namespace whose record is at `dir` belongs to the user
+/// namespace `user` (`None`: the initial one), in a file beside its data:
+/// what `NS_GET_USERNS` gives and the namespace limits count it against.
+pub fn set_owner(dir: &[u8], user: Option<&Record<crate::userns::UserNs>>) {
+    use std::os::unix::ffi::OsStrExt;
+    let text =
+        user.map_or_else(Vec::new, |u| [u.dir(), format!("\n{}", u.id()).as_bytes()].concat());
+    let _ = std::fs::write(std::ffi::OsStr::from_bytes(&[dir, b"/owner"].concat()), text);
+}
+
+/// The user namespace that owns the namespace whose record is at `dir`:
+/// its record's directory and identity (`None`: the initial one).
+pub fn owner_of(dir: &[u8]) -> Option<(Vec<u8>, u64)> {
+    use std::os::unix::ffi::OsStrExt;
+    let text = std::fs::read(std::ffi::OsStr::from_bytes(&[dir, b"/owner"].concat())).ok()?;
+    let nl = text.iter().rposition(|&b| b == b'\n')?;
+    let id = std::str::from_utf8(&text[nl + 1..]).ok()?.parse().ok()?;
+    Some((text[..nl].to_vec(), id))
+}
+
+/// The process's UTS namespace, for a write to `/proc/sys/kernel/hostname`
+/// ([`set_current_name`]).
+static UTS: std::sync::Mutex<Option<Arc<Record<Uts>>>> = std::sync::Mutex::new(None);
+
+/// Set the host (`host`) or domain name of the process's UTS namespace,
+/// as `sethostname` does: `EPERM` in the initial one, the Mac's.
+pub fn set_current_name(host: bool, name: &[u8]) -> Result<(), i32> {
+    let uts = UTS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    Namespaces { uts, ..Default::default() }.set_name(host, name)
+}
+
 /// The longest host name Linux holds (`__NEW_UTS_LEN`).
 pub const HOST_NAME_MAX: usize = 64;
 
@@ -131,11 +170,47 @@ pub fn host_name() -> Vec<u8> {
     host[..end].to_vec()
 }
 
+/// The user namespace that owns the namespace whose record is `dir`, as
+/// the directory of its record (empty: the initial one, which owns every
+/// initial namespace, and a record that names none). Read once per
+/// process: it never changes.
+pub fn owner_dir(dir: &[u8]) -> Vec<u8> {
+    static OWNERS: std::sync::Mutex<Vec<(Vec<u8>, Vec<u8>)>> = std::sync::Mutex::new(Vec::new());
+    let mut known = OWNERS.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, o)) = known.iter().find(|(d, _)| d == dir) {
+        return o.clone();
+    }
+    let owner = owner_of(dir).map(|(d, _)| d).unwrap_or_default();
+    known.push((dir.to_vec(), owner.clone()));
+    owner
+}
+
+/// The owner of namespace record `r` (`None`: an initial namespace).
+fn owner_or_initial<T: Data>(r: &Option<Arc<Record<T>>>) -> Vec<u8> {
+    r.as_ref().map_or_else(Vec::new, |r| owner_dir(r.dir()))
+}
+
 impl Namespaces {
     /// The directory of the user namespace's record (empty for the initial
     /// one).
     pub fn user_dir(&self) -> Vec<u8> {
         self.user.as_ref().map_or_else(Vec::new, |u| u.dir().to_vec())
+    }
+
+    /// The user namespace that owns the process's namespace of
+    /// `CLONE_NEW*` type `kind` (UTS, IPC, network, cgroup or pid; the
+    /// mount namespace's table names its own), as its record's directory
+    /// (empty: the initial one): where a capability over what the
+    /// namespace holds is asked for.
+    pub fn owner(&self, kind: u64) -> Vec<u8> {
+        match kind {
+            CLONE_NEWUTS => owner_or_initial(&self.uts),
+            CLONE_NEWIPC => owner_or_initial(&self.ipc),
+            CLONE_NEWNET => owner_or_initial(&self.net),
+            CLONE_NEWCGROUP => owner_or_initial(&self.cgroup),
+            CLONE_NEWPID => owner_or_initial(&self.pid),
+            _ => Vec::new(),
+        }
     }
 
     /// The host name `uname` and `/proc/sys/kernel/hostname` report.
@@ -160,28 +235,120 @@ impl Namespaces {
     /// `euid` is the maker's effective uid (the initial namespace's), which
     /// owns a new user namespace.
     pub fn unshare(&mut self, flags: u64, euid: u32) -> Result<(), i32> {
+        self.may_make(flags)?;
         // The user namespace first: the others are made in it.
         if flags & CLONE_NEWUSER != 0 {
             let parent = self.user.as_ref().map(|r| (r.dir().to_vec(), r.id()));
             let owner = euid;
             let ns = crate::userns::UserNs { parent, owner, ..Default::default() };
-            self.user = Some(Arc::new(Record::fresh("user", ns)?));
+            let made = Arc::new(Record::fresh("user", ns)?);
+            set_owner(made.dir(), self.user.as_deref());
+            self.user = Some(made);
+        }
+        let user = self.user.clone();
+        fn owned<T: Data>(
+            r: Record<T>,
+            user: &Option<Arc<Record<crate::userns::UserNs>>>,
+        ) -> Arc<Record<T>> {
+            set_owner(r.dir(), user.as_deref());
+            Arc::new(r)
         }
         if flags & CLONE_NEWUTS != 0 {
             let uts = Uts { hostname: self.hostname(), domainname: self.domainname() };
-            self.uts = Some(Arc::new(Record::fresh("uts", uts)?));
+            self.uts = Some(owned(Record::fresh("uts", uts)?, &user));
         }
         if flags & CLONE_NEWIPC != 0 {
-            self.ipc = Some(Arc::new(Record::fresh("ipc", Ipc::default())?));
+            self.ipc = Some(owned(Record::fresh("ipc", Ipc::default())?, &user));
         }
         if flags & CLONE_NEWNET != 0 {
-            self.net = Some(Arc::new(Record::fresh("net", Net::default())?));
+            self.net = Some(owned(Record::fresh("net", Net::default())?, &user));
         }
         if flags & CLONE_NEWCGROUP != 0 {
             let root = crate::cgroupfs::current();
-            self.cgroup = Some(Arc::new(Record::fresh("cgroup", Cgroup { root })?));
+            self.cgroup = Some(owned(Record::fresh("cgroup", Cgroup { root })?, &user));
         }
         Ok(())
+    }
+
+    /// Whether the namespaces `flags` asks for may be made (`ENOSPC` if
+    /// not): a user namespace no deeper than Linux nests them (32 below
+    /// the initial one's child), and of each kind fewer than its
+    /// `user.max_<kind>_namespaces` sysctl allows, counting the ones fwe's
+    /// processes are in. The limits are those of the initial user
+    /// namespace, for every user and namespace.
+    pub fn may_make(&self, flags: u64) -> Result<(), i32> {
+        const KINDS: [(u64, &str); 7] = [
+            (CLONE_NEWUSER, "user"),
+            (CLONE_NEWNS, "mnt"),
+            (CLONE_NEWUTS, "uts"),
+            (CLONE_NEWIPC, "ipc"),
+            (CLONE_NEWNET, "net"),
+            (CLONE_NEWCGROUP, "cgroup"),
+            (CLONE_NEWPID, "pid"),
+        ];
+        if flags & CLONE_NEWUSER != 0 && self.user_level() > 32 {
+            return Err(errno::ENOSPC);
+        }
+        let wanted: Vec<&str> =
+            KINDS.iter().filter(|(k, _)| flags & k != 0).map(|(_, n)| *n).collect();
+        if wanted.is_empty() {
+            return Ok(());
+        }
+        let mut live = std::collections::HashSet::new();
+        for (_, r) in crate::procreg::all() {
+            live.extend(r.ns);
+            live.extend(r.held);
+        }
+        live.extend(self.dirs());
+        // The maker's user namespaces, its own first, then the initial one
+        // (`None`): a new namespace counts against each of them.
+        let mut levels: Vec<Option<Vec<u8>>> = crate::userns::chain_from(self.user.clone())
+            .iter()
+            .map(|u| Some(u.dir().to_vec()))
+            .collect();
+        levels.push(None);
+        for name in wanted {
+            let key = format!("user/max_{name}_namespaces");
+            // Each live one of the kind, by the user namespaces above it.
+            let owners: Vec<Vec<Vec<u8>>> = live
+                .iter()
+                .filter(|d| of_kind(d, name))
+                .map(|d| {
+                    crate::userns::chain_from(
+                        owner_of(d).and_then(|(d, id)| Record::join(&d, id).ok().map(Arc::new)),
+                    )
+                    .iter()
+                    .map(|u| u.dir().to_vec())
+                    .collect()
+                })
+                .collect();
+            for level in &levels {
+                let n = match level {
+                    Some(l) => owners.iter().filter(|o| o.contains(l)).count(),
+                    None => owners.len(),
+                };
+                if n as i64 >= crate::sysctl::user_limit(level.as_deref(), &key) {
+                    return Err(errno::ENOSPC);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// How deep the user namespace is: 0 for the initial one.
+    pub fn user_level(&self) -> usize {
+        let mut at = self.user.as_ref().map(|u| (u.dir().to_vec(), u.id()));
+        let mut level = 0;
+        while let Some((d, id)) = at {
+            level += 1;
+            if level > 64 {
+                break;
+            }
+            at = Record::<crate::userns::UserNs>::join(&d, id)
+                .ok()
+                .and_then(|r| r.get().parent.clone());
+        }
+        level
     }
 
     /// `sethostname`/`setdomainname`: in a UTS namespace of the process's
@@ -243,6 +410,10 @@ impl Namespaces {
         crate::netns::set_current(self.net.clone());
         crate::userns::set_current(self.user.clone());
         crate::sysvipc::activate(self.ipc.clone());
+        *UTS.lock().unwrap_or_else(|e| e.into_inner()) = self.uts.clone();
+        crate::cgroupfs::set_ns_root(
+            &self.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone()),
+        );
     }
 
     /// Make `own` the calling thread's own namespaces for its sockets and

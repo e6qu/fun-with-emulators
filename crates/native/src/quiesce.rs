@@ -105,6 +105,34 @@ pub fn enter() {
     }
 }
 
+/// This thread's slot's address, for [`enter_at`] and [`leave_at`] (the
+/// gate keeps it in its block).
+pub fn mine_addr() -> u64 {
+    std::ptr::from_ref(mine()) as u64
+}
+
+/// [`enter`], for this thread's slot at `slot` ([`mine_addr`]).
+pub fn enter_at(slot: u64) {
+    // SAFETY: a slot is never freed (a thread that ends frees it for reuse).
+    let slot = unsafe { &*(slot as *const Slot) };
+    loop {
+        slot.in_guest.store(true, SeqCst);
+        if !FORKING.load(SeqCst) {
+            return;
+        }
+        slot.in_guest.store(false, SeqCst);
+        while FORKING.load(SeqCst) {
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// [`leave`], for this thread's slot at `slot` ([`mine_addr`]).
+pub fn leave_at(slot: u64) {
+    // SAFETY: as in `enter_at`.
+    unsafe { &*(slot as *const Slot) }.in_guest.store(false, SeqCst);
+}
+
 /// This thread has left guest code for fwe's.
 pub fn leave() {
     if let Some(slot) = MINE.get() {

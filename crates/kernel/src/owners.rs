@@ -7,7 +7,9 @@
 //! attribute: a user id and a group id, little-endian. The file is flagged
 //! as [`crate::modes`] flags a kept mode (the same host flag marks either),
 //! so that a `stat` shows at once whether to look. A file whose owner is
-//! root again loses the attribute.
+//! root again loses the attribute. A Unix socket node, which takes no
+//! extended attribute on macOS, keeps its owner in
+//! [`crate::socketowners`].
 
 use std::ffi::CStr;
 
@@ -23,31 +25,35 @@ pub fn host_owner(st: &libc::stat) -> (u32, u32) {
 /// The owner, as initial-namespace ids, of the file open as `fd` whose
 /// host metadata is `st`.
 pub fn of_fd(fd: i32, st: &libc::stat) -> (u32, u32) {
+    kept_of_fd(fd, st).unwrap_or_else(|| host_owner(st))
+}
+
+/// The owner kept for the file open as `fd` whose host metadata is `st`,
+/// if one is: by its path where the descriptor reads no attribute (one
+/// opened only to search a directory).
+pub fn kept_of_fd(fd: i32, st: &libc::stat) -> Option<(u32, u32)> {
     if !crate::modes::marked(st) {
-        return host_owner(st);
+        return None;
     }
-    // By its path where the descriptor reads no attribute (one opened only
-    // to search a directory).
-    read_fd(fd)
-        .or_else(|| {
+    crate::modes::owner_once(st, || {
+        read_fd(fd).or_else(|| {
             let p = std::ffi::CString::new(crate::fs::fd_path(fd)?).ok()?;
             read_path(&p)
         })
-        .unwrap_or_else(|| host_owner(st))
+    })
 }
 
 /// [`of_fd`] for `name` in directory `dir` (not followed).
 pub fn of_at(dir: i32, name: &CStr, st: &libc::stat) -> (u32, u32) {
+    kept_of_at(dir, name, st).unwrap_or_else(|| host_owner(st))
+}
+
+/// [`kept_of_fd`] for `name` in directory `dir` (not followed).
+pub fn kept_of_at(dir: i32, name: &CStr, st: &libc::stat) -> Option<(u32, u32)> {
     if !crate::modes::marked(st) {
-        return host_owner(st);
+        return None;
     }
-    match path_of(dir, name) {
-        Some(p) => read_path(&p),
-        // A path too long for the host: through a descriptor of the file.
-        None => crate::modes::open_at(dir, name)
-            .and_then(|f| read_fd(std::os::fd::AsRawFd::as_raw_fd(&f))),
-    }
-    .unwrap_or_else(|| host_owner(st))
+    crate::modes::owner_once(st, || crate::host::at_path(dir, name, read_path).ok().flatten())
 }
 
 /// [`of_fd`] for the file at host path `path` (not followed).
@@ -55,7 +61,7 @@ pub fn of_path(path: &CStr, st: &libc::stat) -> (u32, u32) {
     if !crate::modes::marked(st) {
         return host_owner(st);
     }
-    read_path(path).unwrap_or_else(|| host_owner(st))
+    crate::modes::owner_once(st, || read_path(path)).unwrap_or_else(|| host_owner(st))
 }
 
 /// Put the owner `(uid, gid)` in `st`, in place of the host's ids.
@@ -66,23 +72,65 @@ pub fn apply(st: &mut libc::stat, owner: (u32, u32)) {
 
 /// Give the file open as `fd` the owner `owner`.
 pub fn keep_fd(fd: i32, owner: (u32, u32)) -> Result<(), i32> {
-    let st = fstat(fd)?;
+    let mut st = fstat(fd)?;
+    if root_group_by_host(owner, &st) {
+        // SAFETY: plain host call on the caller's descriptor.
+        if unsafe { libc::fchown(fd, u32::MAX, crate::host::egid()) } != 0 {
+            return Err(last());
+        }
+        st = fstat(fd)?;
+    }
     let record = (owner != host_owner(&st)).then_some(owner);
-    mark_fd(fd, &st, record)
+    match mark_fd(fd, &st, record) {
+        // A mode that denies the owner writing the attribute: kept apart
+        // first ([`crate::modes::own_fd`]).
+        Err(fwe_abi::errno::EACCES) if record.is_some() => {
+            crate::modes::own_fd(fd)?;
+            mark_fd(fd, &fstat(fd)?, record)
+        }
+        r => r,
+    }
+}
+
+/// Whether the host gives the file whose metadata is `st` another group
+/// than fwe's own while `owner`'s group is root's (fwe's own): a new file
+/// takes its directory's group on the host (`/tmp`'s is `wheel`), where
+/// Linux gives it its creator's. Given fwe's group, it needs no attribute
+/// to keep its owner, and a `stat` of it reads none.
+fn root_group_by_host(owner: (u32, u32), st: &libc::stat) -> bool {
+    owner.1 == 0 && st.st_gid != crate::host::egid()
 }
 
 /// [`keep_fd`] for `name` in directory `dir`, a symbolic link itself if it
 /// is one.
 pub fn keep_at(dir: i32, name: &CStr, owner: (u32, u32)) -> Result<(), i32> {
-    let st = fstatat(dir, name)?;
-    let record = (owner != host_owner(&st)).then_some(owner);
-    match path_of(dir, name) {
-        Some(path) => mark_path(&path, &st, record),
-        None => {
-            let fd = crate::modes::open_at(dir, name).ok_or(fwe_abi::errno::ENOENT)?;
-            mark_fd(std::os::fd::AsRawFd::as_raw_fd(&fd), &st, record)
+    let mut st = fstatat(dir, name)?;
+    if root_group_by_host(owner, &st) {
+        // SAFETY: a NUL-terminated name in the caller's directory, a link
+        // itself if it is one.
+        let r = unsafe {
+            libc::fchownat(
+                dir,
+                name.as_ptr(),
+                u32::MAX,
+                crate::host::egid(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if r != 0 {
+            return Err(last());
         }
+        st = fstatat(dir, name)?;
     }
+    let record = (owner != host_owner(&st)).then_some(owner);
+    crate::host::at_path(dir, name, |path| match mark_path(path, &st, record) {
+        // As [`keep_fd`]'s.
+        Err(fwe_abi::errno::EACCES) if record.is_some() => {
+            crate::modes::own_path(path)?;
+            mark_path(path, &fstatat(dir, name)?, record)
+        }
+        r => r,
+    })?
 }
 
 /// Whether the file open as `fd` has an owner kept.
@@ -112,18 +160,6 @@ fn fstatat(dir: i32, name: &CStr) -> Result<libc::stat, i32> {
     // SAFETY: `name` NUL-terminated; `dir` live; a valid out-parameter.
     let r = unsafe { libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) };
     if r != 0 { Err(last()) } else { Ok(st) }
-}
-
-/// The host path of `name` in directory `dir`, if the host takes one so
-/// long (a longer one is reached through a descriptor instead).
-fn path_of(dir: i32, name: &CStr) -> Option<std::ffi::CString> {
-    let mut p = crate::fs::fd_path(dir)?;
-    p.push(b'/');
-    p.extend_from_slice(name.to_bytes());
-    if p.len() >= libc::PATH_MAX as usize {
-        return None;
-    }
-    std::ffi::CString::new(p).ok()
 }
 
 #[cfg(target_os = "macos")]
@@ -166,7 +202,23 @@ fn read_path(path: &CStr) -> Option<(u32, u32)> {
             libc::XATTR_NOFOLLOW,
         )
     };
+    // A socket node takes no attribute (it has none): its owner is kept
+    // apart.
+    if n < 0 && crate::host::last_errno() == libc::ENOATTR {
+        return socket_node(path).and_then(|st| crate::socketowners::read(&st));
+    }
     decode(&buf, n)
+}
+
+/// The host metadata of the socket node at `path` (not followed), if it is
+/// one.
+#[cfg(target_os = "macos")]
+fn socket_node(path: &CStr) -> Option<libc::stat> {
+    // SAFETY: zeroed bytes are a valid `stat`; `lstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a valid out-parameter.
+    let r = unsafe { libc::lstat(path.as_ptr(), &mut st) };
+    (r == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK).then_some(st)
 }
 
 /// Keep `owner` for the file open as `fd` (or forget a kept one, for
@@ -186,7 +238,8 @@ fn mark_fd(fd: i32, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<(), i3
             }
             None if crate::modes::marked(st)
                 && libc::fremovexattr(fd, ATTR.as_ptr(), 0) == 0
-                && !crate::modes::kept_fd(fd) =>
+                && !crate::modes::kept_fd(fd)
+                && !crate::modes::flags_set_fd(fd) =>
             {
                 crate::modes::set_mark_fd(fd, st, false);
             }
@@ -204,22 +257,33 @@ fn mark_path(path: &CStr, st: &libc::stat, owner: Option<(u32, u32)>) -> Result<
         match owner {
             Some(o) => {
                 let v = encode(o);
-                let set = libc::setxattr(
+                let socket = st.st_mode & libc::S_IFMT == libc::S_IFSOCK;
+                if socket {
+                    // A socket node takes no attribute.
+                    crate::socketowners::write(st, Some(o))?;
+                } else if libc::setxattr(
                     path.as_ptr(),
                     ATTR.as_ptr(),
                     v.as_ptr().cast(),
                     8,
                     0,
                     libc::XATTR_NOFOLLOW,
-                );
-                if set != 0 {
+                ) != 0
+                {
                     return Err(last());
                 }
                 crate::modes::set_mark_path(path, st, true);
             }
+            None if crate::modes::marked(st) && st.st_mode & libc::S_IFMT == libc::S_IFSOCK => {
+                crate::socketowners::write(st, None)?;
+                if !crate::modes::kept_path(path) && !crate::modes::flags_set_path(path) {
+                    crate::modes::set_mark_path(path, st, false);
+                }
+            }
             None if crate::modes::marked(st)
                 && libc::removexattr(path.as_ptr(), ATTR.as_ptr(), libc::XATTR_NOFOLLOW) == 0
-                && !crate::modes::kept_path(path) =>
+                && !crate::modes::kept_path(path)
+                && !crate::modes::flags_set_path(path) =>
             {
                 crate::modes::set_mark_path(path, st, false);
             }

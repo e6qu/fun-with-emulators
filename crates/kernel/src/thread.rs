@@ -13,13 +13,13 @@
 
 use fwe_abi::{Stack, signal};
 use std::cell::Cell;
-use std::sync::atomic::{AtomicI32, AtomicI64, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{
+    AtomicBool, AtomicI32, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering,
+};
 use std::sync::{Arc, Mutex};
 
 /// The process (thread-group) id, shared by all threads. Set once at startup.
 static TGID: AtomicI32 = AtomicI32::new(0);
-/// Next thread id to hand out. Thread ids are unique within the process.
-static NEXT_TID: AtomicI32 = AtomicI32::new(TID_FIRST);
 
 thread_local! {
     static TID: Cell<i32> = const { Cell::new(0) };
@@ -51,13 +51,11 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
 /// ([`forked`]).
 pub fn init_main(pid: i32) {
     TGID.store(pid, Ordering::SeqCst);
-    // Without the shared counter: numbers past every host pid, this
-    // process's own.
-    NEXT_TID.store(TID_FIRST + (pid % 40) * 100_000, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
-    // An end status left by an earlier process of this number.
-    // SAFETY: getpid cannot fail.
-    crate::procreg::forget_end(unsafe { libc::getpid() });
+    // An end status and a thread list left by an earlier process of this
+    // number.
+    crate::procreg::forget_end(crate::host::pid());
+    forget_published();
     // The calling thread's own set goes with the registry: what landed in
     // it is moved to the process's, and a handler meanwhile posts there.
     let early: Vec<(u64, SigInfo)> = with_own(|p| {
@@ -65,7 +63,7 @@ pub fn init_main(pid: i32) {
             .flat_map(|s| std::iter::from_fn(move || p.take(s)).map(move |i| (s, i)))
             .collect()
     });
-    OWN.with(|o| o.set(std::ptr::null()));
+    HOT.with(|h| h.own.set(std::ptr::null()));
     for (s, i) in early {
         PROCESS.post(s, i);
     }
@@ -79,9 +77,10 @@ pub fn init_main(pid: i32) {
     forget_wait_pipes();
     crate::pdeath::forked();
     crate::futex::forked_child();
-    crate::signote::open_own();
     crate::sysvipc::forked_child();
     crate::textbusy::forked_child();
+    crate::reclocks::forked_child();
+    crate::tmpfile::forked_child();
     crate::posixtimer::forked_child();
     crate::ptrace::forked_child();
     register_current();
@@ -242,6 +241,10 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         let mut b = [0u8; 64];
         // SAFETY: the thread's own non-blocking pipe and a buffer of its length.
         while unsafe { libc::read(wake, b.as_mut_ptr().cast(), b.len()) } > 0 {}
+        // One that landed here for the process while this thread blocks
+        // it: another thread that does not is woken to take it, as this
+        // one waits on ([`post_landed`]).
+        wake_others_if_asked(crate::host::WAKE_SIGNAL);
         crate::signal::drain_to_signalfd();
         if deliverable() != 0 {
             return Err(fwe_abi::errno::EINTR);
@@ -314,6 +317,8 @@ pub fn nap_ns(ns: i64) {
     let mut b = [0u8; 64];
     // SAFETY: the thread's own non-blocking pipe and a buffer of its length.
     while unsafe { libc::read(wake, b.as_mut_ptr().cast(), b.len()) } > 0 {}
+    // As [`wait_ready_ns`]: one this thread blocks goes to another.
+    wake_others_if_asked(crate::host::WAKE_SIGNAL);
 }
 
 /// Set the thread's timer kqueue `kq` to fire once, `after` from now, on
@@ -360,6 +365,17 @@ fn wait_timer() -> i32 {
 pub fn forked() {
     PROCESS.clear();
     with_own(Pending::clear);
+    // The parent's other threads' sets are not the child's. Only entries
+    // ever taken are looked at, and only those in use written: a write to
+    // each of the pool's pages would copy every one into the child.
+    for q in used_pool() {
+        if q.state.load(Ordering::Relaxed) != 0 {
+            q.state.store(0, Ordering::Release);
+        }
+    }
+    POOL_USED.store(0, Ordering::Relaxed);
+    COUNT.store(0, Ordering::Relaxed);
+    HELD.store(false, Ordering::Relaxed);
     crate::acct::forked_child();
     crate::aio::forget_all();
     // A restricted process's child is in its domain: it says so.
@@ -384,8 +400,7 @@ static SLACK_HANDOFF: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 /// This thread's timer slack (`PR_GET_TIMERSLACK`).
 pub fn slack() -> u64 {
     if tid() == tgid() {
-        // SAFETY: getpid cannot fail.
-        crate::procreg::slack(unsafe { libc::getpid() }).0
+        crate::procreg::slack(crate::host::pid()).0
     } else {
         SLACK.with(Cell::get).0
     }
@@ -395,8 +410,7 @@ pub fn slack() -> u64 {
 /// default).
 pub fn set_slack(value: u64) {
     if tid() == tgid() {
-        // SAFETY: getpid cannot fail.
-        let _ = crate::procreg::set_slack(unsafe { libc::getpid() }, value);
+        let _ = crate::procreg::set_slack(crate::host::pid(), value);
     } else {
         SLACK.with(|s| {
             let (_, default) = s.get();
@@ -420,61 +434,31 @@ const TID_END: i32 = 4_194_304;
 /// A thread id outside a pid namespace of fwe's: the next of a counter
 /// every fwe process shares (a file beside the process records, taken in
 /// turn with `flock`), so no two live threads have the same one. They are
-/// taken [`TID_BLOCK`] at a time, each marked this process's, with no
-/// robust list, and given out from the block.
-fn shared_tid() -> Option<i32> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+/// taken [`TID_BLOCK`] at a time, the block marked this process's, and
+/// given out from the block (a slot of the robust lists' file is a thread's
+/// only once it is written after the process started).
+fn shared_tid() -> i32 {
+    let me = crate::host::pid();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
     // A fork child's block is its parent's.
     if block.0 == me && block.1 < block.2 {
         block.1 += 1;
-        return Some(block.1 - 1);
+        return block.1 - 1;
     }
-    let dir = crate::procreg::records_dir()?;
-    let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
-    // SAFETY: a NUL-terminated path in fwe's private directory; buffers of
-    // the sizes given; the descriptor is closed below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd < 0 {
-            return None;
-        }
-        crate::shared::lock_exclusive(fd);
-        let mut b = [0u8; 4];
-        let n = match libc::pread(fd, b.as_mut_ptr().cast(), 4, 0) {
-            4 => i32::from_ne_bytes(b),
-            _ => TID_FIRST,
-        };
-        // A block that fits before the end of the numbers.
-        let n = if (TID_FIRST..=TID_END - TID_BLOCK).contains(&n) { n } else { TID_FIRST };
-        let next = n + TID_BLOCK;
-        let next = if next >= TID_END { TID_FIRST } else { next };
-        libc::pwrite(fd, next.to_ne_bytes().as_ptr().cast(), 4, 0);
-        // Whose each is, for another process to find it by
-        // ([`owner_of_tid`]): the slot of each tid, after the counter.
-        let owners: Vec<u8> = (0..TID_BLOCK).flat_map(|_| me.to_ne_bytes()).collect();
-        libc::pwrite(fd, owners.as_ptr().cast(), owners.len(), owner_at(n));
-        // The numbers' robust lists are the new threads', none yet.
-        publish_robust_block(n, TID_BLOCK, me);
-        libc::flock(fd, libc::LOCK_UN);
-        libc::close(fd);
-        *block = (me, n + 1, n + TID_BLOCK);
-        Some(n)
-    }
+    // Whose each block is, for another process to find it by
+    // ([`owner_of_tid`]), beside the counter in the process store.
+    let n = crate::procstore::take_tid_block(TID_FIRST, TID_END, TID_BLOCK);
+    *block = (me, n + 1, n + TID_BLOCK);
+    n
 }
 
-/// How many thread ids [`shared_tid`] takes at once.
-const TID_BLOCK: i32 = 16;
+/// How many thread ids [`shared_tid`] takes at once: a change of the shared
+/// counter for each block, not each thread.
+const TID_BLOCK: i32 = 64;
 
 /// The block of thread ids being given out: its process, the next, and
 /// the end.
 pub(crate) static TID_BLOCK_LEFT: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0));
-
-/// Where in the counter's file thread `tid`'s process is.
-fn owner_at(tid: i32) -> libc::off_t {
-    (4 + 4 * i64::from(tid - TID_FIRST)) as libc::off_t
-}
 
 /// The host process thread `tid` (one of another process's) is in, if a
 /// live one.
@@ -482,84 +466,52 @@ pub fn owner_of_tid(tid: i32) -> Option<i32> {
     if !(TID_FIRST..TID_END).contains(&tid) {
         return None;
     }
-    let dir = crate::procreg::records_dir()?;
-    let path = std::ffi::CString::new([&dir[..], b"/tids"].concat()).ok()?;
-    let mut b = [0u8; 4];
-    // SAFETY: a NUL-terminated path; a 4-byte buffer; closed below.
-    let n = unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let n = libc::pread(fd, b.as_mut_ptr().cast(), 4, owner_at(tid));
-        libc::close(fd);
-        n
-    };
-    let pid = i32::from_ne_bytes(b);
-    (n == 4 && pid > 0 && crate::host::process_exists(pid) && published_tids(pid).contains(&tid))
+    let pid = crate::procstore::tid_block_owner(((tid - TID_FIRST) / TID_BLOCK) as usize);
+    (pid > 0 && crate::host::process_exists(pid) && published_tids(pid).contains(&tid))
         .then_some(pid)
 }
 
 /// The threads (tids, the main thread's the process's pid) another
 /// process published ([`publish_tids`]).
 pub fn published_tids(pid: i32) -> Vec<i32> {
-    let Some(dir) = crate::procreg::records_dir() else { return Vec::new() };
-    let Ok(b) = std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(
-        &tids_file(&dir, pid),
-    )) else {
-        return Vec::new();
-    };
-    let Some(count) = b.get(..4).map(|c| u32::from_ne_bytes(c.try_into().unwrap()) as usize) else {
-        return Vec::new();
-    };
-    b[4..].as_chunks::<4>().0.iter().take(count).map(|c| i32::from_ne_bytes(*c)).collect()
+    let b = crate::procstore::get_of(crate::procstore::Kind::Threads, pid).unwrap_or_default();
+    b.as_chunks::<4>().0.iter().map(|c| i32::from_ne_bytes(*c)).collect()
 }
 
-fn tids_file(dir: &[u8], pid: i32) -> Vec<u8> {
-    [dir, format!("/threads-{pid}").as_bytes()].concat()
-}
+/// Whether this process published its threads ([`publish_tids`]), and
+/// which process that was (a fork child's is its parent's).
+pub(crate) static PUBLISHED: Mutex<i32> = Mutex::new(0);
 
-/// This process's thread list file, open: its pid and descriptor.
-pub(crate) static TIDS_FD: Mutex<(i32, i32)> = Mutex::new((0, -1));
+/// The process is ending: its thread list is written no more.
+static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Publish this process's threads, for another process to list
 /// (`/proc/<pid>/task`) and name (a thread-directed signal, ptrace): from
-/// when it first has more than its main thread. The list is a count and the
-/// tids, written whole at once on a descriptor kept open, so a reader sees
-/// one list or the other.
+/// when it first has more than its main thread, in its entry of the
+/// process store ([`crate::procstore`]), which only it writes.
 fn publish_tids(tids: &[i32]) {
-    let Some(dir) = crate::procreg::records_dir() else { return };
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    let path = tids_file(&dir, me);
-    let mut kept = TIDS_FD.lock().unwrap_or_else(|e| e.into_inner());
-    if kept.0 != me && kept.1 >= 0 {
-        // A fork child's copy of its parent's descriptor.
-        // SAFETY: closing the descriptor this process inherited.
-        unsafe { libc::close(kept.1) };
-        *kept = (me, -1);
-    }
-    // A process that never had another thread has no list; one that had
-    // keeps its file, with the main thread alone in it again (making and
-    // removing it for each thread a program starts and joins cost more
-    // than the thread). The collector removes it once the process is gone.
-    if tids.len() <= 1 && kept.1 < 0 {
+    if TIDS_ENDED.load(Ordering::SeqCst) {
         return;
     }
-    if kept.1 < 0 {
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *kept = (me, fd);
+    let me = crate::host::pid();
+    // Its threads take turns.
+    let mut published = PUBLISHED.lock().unwrap_or_else(|e| e.into_inner());
+    // A process that never had another thread has no list; one that had
+    // keeps it, with the main thread alone in it again.
+    if tids.len() <= 1 && *published != me {
+        return;
     }
-    let mut b = Vec::with_capacity(4 + 4 * tids.len());
-    b.extend((tids.len() as u32).to_ne_bytes());
-    b.extend(tids.iter().flat_map(|t| t.to_ne_bytes()));
-    // SAFETY: a buffer of `b.len()` bytes, on the descriptor kept for it.
-    unsafe { libc::pwrite(kept.1, b.as_ptr().cast(), b.len(), 0) };
+    *published = me;
+    let b: Vec<u8> = tids.iter().flat_map(|t| t.to_ne_bytes()).collect();
+    crate::procstore::put_own(crate::procstore::Kind::Threads, Some(&b));
+}
+
+/// This process starts (or is a fork's child): a list its pid's earlier
+/// process left is not its own.
+pub(crate) fn forget_published() {
+    crate::procstore::put_own(crate::procstore::Kind::Threads, None);
+    crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
 /// Allocate a fresh thread id for a new thread: in a pid namespace of
@@ -567,14 +519,13 @@ fn publish_tids(tids: &[i32]) {
 /// outside one, a number no host process has ([`shared_tid`]).
 pub fn alloc_tid() -> i32 {
     if crate::pidns::nested() {
-        // SAFETY: getpid cannot fail.
-        let host = unsafe { libc::getpid() };
+        let host = crate::host::pid();
         if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
             crate::pidns::remember_thread(nums[0], nums.clone());
             return nums[0];
         }
     }
-    shared_tid().unwrap_or_else(|| NEXT_TID.fetch_add(1, Ordering::SeqCst))
+    shared_tid()
 }
 
 /// Record this host thread's guest thread id (called when a thread starts).
@@ -614,12 +565,11 @@ pub fn set_robust_list(head: u64, len: u64) {
         r.robust = head;
     }
     drop(threads);
-    // SAFETY: getpid cannot fail.
-    let host = unsafe { libc::getpid() };
+    let host = crate::host::pid();
     if me == tgid() {
-        publish_robust(host, host, head);
+        publish_robust(host, head);
     } else if !crate::pidns::nested() {
-        publish_robust(me, host, head);
+        publish_robust(me, head);
     }
 }
 
@@ -651,116 +601,44 @@ pub fn robust_list_of(tid: i32) -> Option<u64> {
     threads.iter().find(|r| r.tid == tid).map(|r| r.robust)
 }
 
-// Robust-list heads for other processes to read (`get_robust_list`), in a
-// file beside the process records: a slot per main thread (by host pid)
-// and per thread number of fwe's ([`shared_tid`]), holding the owner's
-// host pid, when it was written (microseconds since the epoch) and the
-// head. A main thread's slot written before its process started is a
-// former process's; a thread number's is cleared when it is given out.
+// Robust-list heads for other processes to read (`get_robust_list`): the
+// process's entry of them in the process store ([`crate::procstore`]),
+// which only it writes, as (id, head) pairs: the main thread's id its host
+// pid, another's its thread number of fwe's ([`shared_tid`]).
 
-const ROBUST_SLOT: i64 = 24;
+/// The heads this process published, by id.
+pub(crate) static ROBUST: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
-fn robust_path() -> Option<std::ffi::CString> {
-    let dir = crate::procreg::records_dir()?;
-    std::ffi::CString::new([&dir[..], b"/robust"].concat()).ok()
-}
-
-fn now_micros() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_micros() as u64)
-}
-
-/// Record slot `id`'s (a host pid or a thread number) robust-list head.
-fn publish_robust(id: i32, owner: i32, head: u64) {
-    if !(1..TID_END).contains(&id) {
-        return;
-    }
-    let Some(path) = robust_path() else { return };
-    let mut b = [0u8; ROBUST_SLOT as usize];
-    b[..4].copy_from_slice(&owner.to_ne_bytes());
-    b[8..16].copy_from_slice(&now_micros().to_ne_bytes());
-    b[16..].copy_from_slice(&head.to_ne_bytes());
-    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
-    // below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            libc::pwrite(
-                fd,
-                b.as_ptr().cast(),
-                b.len(),
-                (i64::from(id) * ROBUST_SLOT) as libc::off_t,
-            );
-            libc::close(fd);
+/// Record thread `id`'s (a host pid or a thread number) robust-list head
+/// (0: none).
+fn publish_robust(id: i32, head: u64) {
+    let mut heads = ROBUST.lock().unwrap_or_else(|e| e.into_inner());
+    let had = heads.iter().position(|&(i, _)| i == id);
+    match (had, head) {
+        (Some(i), 0) => {
+            heads.swap_remove(i);
         }
+        (Some(i), h) => heads[i].1 = h,
+        (None, 0) => return,
+        (None, h) => heads.push((id, h)),
     }
-}
-
-/// Mark slots `first..first + count` (thread numbers) `owner`'s, with no
-/// robust list, in one write.
-fn publish_robust_block(first: i32, count: i32, owner: i32) {
-    if first < 1 || first + count > TID_END {
-        return;
-    }
-    let Some(path) = robust_path() else { return };
-    let mut slot = [0u8; ROBUST_SLOT as usize];
-    slot[..4].copy_from_slice(&owner.to_ne_bytes());
-    slot[8..16].copy_from_slice(&now_micros().to_ne_bytes());
-    let b: Vec<u8> = (0..count).flat_map(|_| slot).collect();
-    // SAFETY: a NUL-terminated path; a buffer of `b.len()` bytes; closed
-    // below.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd >= 0 {
-            libc::pwrite(
-                fd,
-                b.as_ptr().cast(),
-                b.len(),
-                (i64::from(first) * ROBUST_SLOT) as libc::off_t,
-            );
-            libc::close(fd);
-        }
-    }
+    let b: Vec<u8> = heads
+        .iter()
+        .flat_map(|&(i, h)| (i as u64).to_ne_bytes().into_iter().chain(h.to_ne_bytes()))
+        .collect();
+    crate::procstore::put_own(crate::procstore::Kind::Robust, Some(&b));
 }
 
 /// Another process's thread's robust-list head: `host` the main thread of
 /// that host process, or `tid` one of its other threads (a number of
-/// fwe's, of process `host`). `None` if the slot is not that thread's,
-/// which then has no list.
+/// fwe's, of process `host`). `None` if it published none.
 pub fn published_robust(host: i32, tid: Option<i32>) -> Option<u64> {
     let id = tid.unwrap_or(host);
-    if !(1..TID_END).contains(&id) {
-        return None;
-    }
-    let path = robust_path()?;
-    let mut b = [0u8; ROBUST_SLOT as usize];
-    // SAFETY: a NUL-terminated path; a buffer of the slot's size; closed
-    // below.
-    let n = unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return None;
-        }
-        let n = libc::pread(
-            fd,
-            b.as_mut_ptr().cast(),
-            b.len(),
-            (i64::from(id) * ROBUST_SLOT) as libc::off_t,
-        );
-        libc::close(fd);
-        n
-    };
-    let owner = i32::from_ne_bytes(b[..4].try_into().unwrap());
-    let written = u64::from_ne_bytes(b[8..16].try_into().unwrap());
-    let head = u64::from_ne_bytes(b[16..].try_into().unwrap());
-    if n != ROBUST_SLOT as isize || owner != host {
-        return None;
-    }
-    if tid.is_none() && crate::procreg::start_time(host).is_none_or(|start| written < start) {
-        return None;
-    }
-    Some(head)
+    let b = crate::procstore::get_of(crate::procstore::Kind::Robust, host)?;
+    b.as_chunks::<16>().0.iter().find_map(|c| {
+        let i = u64::from_ne_bytes(c[..8].try_into().unwrap()) as i32;
+        (i == id).then(|| u64::from_ne_bytes(c[8..].try_into().unwrap()))
+    })
 }
 
 /// What a pending signal carries into the handler's `siginfo`.
@@ -805,68 +683,114 @@ impl SigSlot {
     }
 }
 
-/// A real-time signal queued behind the one pending of its number.
+/// A real-time signal queued behind the one pending of its number, in
+/// the process's [`POOL`].
 struct Queued {
     /// 0: free; [`CLAIMED`] while it is written or read; else the order it
     /// was queued in, from 2 up.
     state: AtomicU64,
+    /// The set it is queued in (its address).
+    owner: AtomicUsize,
     sig: AtomicU64,
     info: SigSlot,
 }
 
 const CLAIMED: u64 = 1;
 
-/// How many real-time signals a set queues beyond one of each number.
-const QUEUED: usize = 64;
+/// How many real-time signals the process queues behind the one pending
+/// of each number, in all its sets: where `RLIMIT_SIGPENDING` is higher,
+/// this is the process's limit.
+pub const QUEUE_MAX: usize = 4096;
+
+/// The real-time signals queued behind the one pending of each number, in
+/// every set of the process. Shared, so a set may queue as many as the
+/// process may.
+static POOL: [Queued; QUEUE_MAX] = [const {
+    Queued {
+        state: AtomicU64::new(0),
+        owner: AtomicUsize::new(0),
+        sig: AtomicU64::new(0),
+        info: SigSlot::new(),
+    }
+}; QUEUE_MAX];
+
+/// The order the next queued signal takes.
+static ORDER: AtomicU64 = AtomicU64::new(2);
+
+/// How many entries of [`POOL`] are in use.
+static POOL_USED: AtomicU64 = AtomicU64::new(0);
+
+/// How many entries of [`POOL`] from its start were ever taken: none past
+/// it was.
+static POOL_HIGH: AtomicU64 = AtomicU64::new(0);
+
+/// The entries of [`POOL`] ever taken: those past them hold nothing, and
+/// are never read (a fork child would map in their pages to read them).
+fn used_pool() -> &'static [Queued] {
+    &POOL[..(POOL_HIGH.load(Ordering::Acquire) as usize).min(QUEUE_MAX)]
+}
+
+/// How many signals are pending in the process, in all its sets: each
+/// number pending, and each queued behind it. What `RLIMIT_SIGPENDING`
+/// bounds ([`may_queue`]).
+static COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// The wake handler left signals another process queued in the mailbox,
+/// the process being at its limit ([`admits`]): it takes them once one is
+/// taken.
+static HELD: AtomicBool = AtomicBool::new(false);
 
 /// A set of pending signals with the `siginfo` each was raised with: one
 /// of each standard signal, and the real-time signals queued, as Linux
-/// queues them (one of each number in `info`, the rest behind it in
-/// `queue`, oldest first).
+/// queues them (one of each number in `info`, the rest behind it in the
+/// process's [`POOL`], oldest first). The pool names a set by its
+/// address, so a set never moves once it holds signals: it lives in a
+/// static or an `Arc`.
 pub struct Pending {
     bits: AtomicU64,
     info: [SigSlot; signal::NSIG as usize],
-    queue: [Queued; QUEUED],
-    /// The order the next queued signal takes.
-    order: AtomicU64,
 }
 
 impl Pending {
     pub const fn new() -> Pending {
-        Pending {
-            bits: AtomicU64::new(0),
-            info: [const { SigSlot::new() }; signal::NSIG as usize],
-            queue: [const {
-                Queued { state: AtomicU64::new(0), sig: AtomicU64::new(0), info: SigSlot::new() }
-            }; QUEUED],
-            order: AtomicU64::new(2),
-        }
+        Pending { bits: AtomicU64::new(0), info: [const { SigSlot::new() }; signal::NSIG as usize] }
     }
 
-    /// Queue real-time `sig` with `info` behind the one pending (dropped
-    /// when the queue is full). Async-signal-safe.
-    fn enqueue(&self, sig: u64, info: &SigInfo) {
-        for q in &self.queue {
+    fn id(&self) -> usize {
+        self as *const Pending as usize
+    }
+
+    /// Queue real-time `sig` with `info` behind the one pending: false
+    /// when the pool is full. Async-signal-safe.
+    fn enqueue(&self, sig: u64, info: &SigInfo) -> bool {
+        for (i, q) in POOL.iter().enumerate() {
             if q.state.compare_exchange(0, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                POOL_HIGH.fetch_max(i as u64 + 1, Ordering::AcqRel);
+                q.owner.store(self.id(), Ordering::Relaxed);
                 q.sig.store(sig, Ordering::Relaxed);
                 store_slot(&q.info, info);
-                let order = self.order.fetch_add(1, Ordering::Relaxed);
+                POOL_USED.fetch_add(1, Ordering::Relaxed);
+                COUNT.fetch_add(1, Ordering::Relaxed);
+                let order = ORDER.fetch_add(1, Ordering::Relaxed);
                 q.state.store(order, Ordering::Release);
-                return;
+                return true;
             }
         }
+        false
     }
 
     /// The oldest signal queued of number `sig`, taken off the queue.
     fn dequeue(&self, sig: u64) -> Option<SigInfo> {
+        let me = self.id();
         loop {
-            let oldest = self
-                .queue
+            let oldest = used_pool()
                 .iter()
-                .filter(|q| q.sig.load(Ordering::Relaxed) == sig)
                 .filter_map(|q| {
                     let s = q.state.load(Ordering::Acquire);
-                    (s > CLAIMED).then_some((s, q))
+                    (s > CLAIMED
+                        && q.owner.load(Ordering::Relaxed) == me
+                        && q.sig.load(Ordering::Relaxed) == sig)
+                        .then_some((s, q))
                 })
                 .min_by_key(|&(s, _)| s);
             let (s, q) = oldest?;
@@ -875,7 +799,16 @@ impl Pending {
             }
             let info = load_slot(&q.info);
             q.state.store(0, Ordering::Release);
+            POOL_USED.fetch_sub(1, Ordering::Relaxed);
+            uncount(1);
             return Some(info);
+        }
+    }
+
+    /// Mark `bit` pending, counted if it was not.
+    fn set_bit(&self, bit: u64) {
+        if self.bits.fetch_or(bit, Ordering::Release) & bit == 0 {
+            COUNT.fetch_add(1, Ordering::Relaxed);
         }
     }
 
@@ -902,13 +835,18 @@ impl Pending {
         {
             return;
         }
-        // A real-time signal already pending: this one waits behind it.
+        // A real-time signal already pending: this one waits behind it
+        // (a sender checked there was room, [`may_queue`]). A `kill`'s,
+        // past `RLIMIT_SIGPENDING`, is merged into the one pending, as
+        // Linux merges it.
         if sig >= signal::SIGRTMIN && pending {
-            self.enqueue(sig, &info);
+            if info.code != signal::SI_USER || room(0) {
+                self.enqueue(sig, &info);
+            }
             return;
         }
         store_slot(slot, &info);
-        self.bits.fetch_or(1 << (sig - 1), Ordering::Release);
+        self.set_bit(1 << (sig - 1));
     }
 
     fn take(&self, sig: u64) -> Option<SigInfo> {
@@ -927,12 +865,13 @@ impl Pending {
             if self.bits.fetch_and(!bit, Ordering::Acquire) & bit == 0 {
                 return None;
             }
+            uncount(1);
             // One queued as the bit was cleared.
             if sig >= signal::SIGRTMIN
                 && let Some(next) = self.dequeue(sig)
             {
                 store_slot(slot, &next);
-                self.bits.fetch_or(bit, Ordering::Release);
+                self.set_bit(bit);
             }
         }
         // A POSIX timer's signal: its overrun as it is taken.
@@ -947,10 +886,40 @@ impl Pending {
     }
 
     fn clear(&self) {
-        self.bits.store(0, Ordering::Release);
-        for q in &self.queue {
-            q.state.store(0, Ordering::Release);
+        uncount(u64::from(self.bits.swap(0, Ordering::AcqRel).count_ones()));
+        let me = self.id();
+        for q in used_pool() {
+            let s = q.state.load(Ordering::Acquire);
+            if s > CLAIMED
+                && q.owner.load(Ordering::Relaxed) == me
+                && q.state.compare_exchange(s, 0, Ordering::AcqRel, Ordering::Relaxed).is_ok()
+            {
+                POOL_USED.fetch_sub(1, Ordering::Relaxed);
+                uncount(1);
+            }
         }
+    }
+}
+
+impl Drop for Pending {
+    /// A thread's set goes with the thread, and the signals queued in it.
+    fn drop(&mut self) {
+        self.clear();
+    }
+}
+
+/// `n` signals pending are taken: and if the wake handler left signals in
+/// the mailbox for want of room, it is woken to take them now.
+/// Async-signal-safe.
+fn uncount(n: u64) {
+    if n == 0 {
+        return;
+    }
+    COUNT.fetch_sub(n, Ordering::Relaxed);
+    if HELD.swap(false, Ordering::AcqRel) {
+        // SAFETY: signalling this thread itself; the handler drains the
+        // mailbox.
+        unsafe { libc::pthread_kill(libc::pthread_self(), crate::host::WAKE_SIGNAL) };
     }
 }
 
@@ -996,6 +965,9 @@ struct Registered {
     host: libc::pthread_t,
     /// Its robust-futex list's head (`set_robust_list`).
     robust: u64,
+    /// Its nice value (`setpriority` of its tid), for a thread other than
+    /// the main one, whose nice value is the process's record's.
+    nice: i32,
 }
 
 /// Every live guest thread's pending set, by tid.
@@ -1017,18 +989,77 @@ pub fn live_threads() -> usize {
 
 const UNBLOCKABLE: u64 = (1 << (signal::SIGKILL - 1)) | (1 << (signal::SIGSTOP - 1));
 
-thread_local! {
-    static MASK: Cell<u64> = const { Cell::new(0) };
+/// The signal state every system call looks at, in one thread-local so
+/// that a call looks it up once (each lookup is a call into the host's
+/// dynamic linker).
+struct Hot {
+    mask: Cell<u64>,
     /// The mask `rt_sigsuspend` replaced, restored once the call ends.
-    static SAVED_MASK: Cell<Option<u64>> = const { Cell::new(None) };
+    saved_mask: Cell<Option<u64>>,
+    /// This thread's registered pending set (owned by [`THREADS`]).
+    own: Cell<*const Pending>,
+    /// A process signal landed here while this thread blocked it: the
+    /// other threads are to be woken to take it ([`post_landed`]).
+    wake_others: Cell<bool>,
+}
+
+thread_local! {
+    static HOT: Hot = const {
+        Hot {
+            mask: Cell::new(0),
+            saved_mask: Cell::new(None),
+            own: Cell::new(std::ptr::null()),
+            wake_others: Cell::new(false),
+        }
+    };
     static ALTSTACK: Cell<Stack> = const {
         Cell::new(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 })
     };
-    /// This thread's registered pending set (owned by [`THREADS`]).
-    static OWN: Cell<*const Pending> = const { Cell::new(std::ptr::null()) };
-    /// A process signal landed here while this thread blocked it: the
-    /// other threads are to be woken to take it ([`post_landed`]).
-    static WAKE_OTHERS: Cell<bool> = const { Cell::new(false) };
+}
+
+/// This host thread starts another guest thread ([`crate::thread_reused`]):
+/// its state is a new thread's.
+pub(crate) fn thread_reused() {
+    TID.with(|t| t.set(0));
+    CLEAR_CHILD_TID.with(|c| c.set(0));
+    ROBUST_LIST.with(|r| r.set((0, 0)));
+    NAME.with(|n| n.set(None));
+    SLACK.with(|s| s.set((DEFAULT_SLACK, DEFAULT_SLACK)));
+    HOT.with(|h| {
+        h.mask.set(0);
+        h.saved_mask.set(None);
+        h.own.set(std::ptr::null());
+        h.wake_others.set(false);
+    });
+    ALTSTACK.with(|a| a.set(Stack { ss_sp: 0, ss_flags: signal::SS_DISABLE, _pad: 0, ss_size: 0 }));
+}
+
+/// After a system call: wake the other threads if a signal for them landed
+/// here, and the calling thread's pending signals, mask and saved mask
+/// (see [`save_mask`]), in one look.
+pub fn after_call(sig: libc::c_int) -> (u64, u64, Option<u64>) {
+    let (wake, own, mask, saved) =
+        HOT.with(|h| (h.wake_others.replace(false), h.own.get(), h.mask.get(), h.saved_mask.get()));
+    if wake {
+        wake_others(sig);
+    }
+    (own_bits(own) | PROCESS.bits(), mask, saved)
+}
+
+/// The calling thread's pending signals and mask, in one look.
+pub fn state() -> (u64, u64) {
+    let (own, mask) = HOT.with(|h| (h.own.get(), h.mask.get()));
+    (own_bits(own) | PROCESS.bits(), mask)
+}
+
+/// The bits pending in `own` (the process's set when it is null).
+fn own_bits(own: *const Pending) -> u64 {
+    if own.is_null() {
+        PROCESS.bits()
+    } else {
+        // SAFETY: the pointer is cleared before the registry drops its Arc.
+        unsafe { &*own }.bits()
+    }
 }
 
 /// Run `f` holding the thread registry lock (see [`crate::fork_locked`]).
@@ -1059,17 +1090,36 @@ pub fn register(tid: i32) -> Arc<Pending> {
         // Its filesystem view and namespaces are its creator's.
         crate::threadfs::started(tid);
     }
+    // Its creator's nice value, as Linux's thread inherits it.
+    let nice = if tid != tgid() { nice_of(self::tid()) } else { 0 };
     let pending = Arc::new(Pending::new());
-    let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0 };
+    let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0, nice };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
     directed_add(tid, Arc::as_ptr(&pending));
     publish_tids(&tids());
     pending
 }
 
+/// Thread `tid` of this process's nice value: the main thread's is the
+/// process's, in its record ([`crate::procreg::nice`]).
+pub fn nice_of(tid: i32) -> i32 {
+    if tid == tgid() {
+        return crate::procreg::nice(crate::host::pid());
+    }
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter().find(|r| r.tid == tid).map_or(0, |r| r.nice)
+}
+
+/// Set the nice value of thread `tid` of this process, other than the
+/// main one: whether it is one.
+pub fn set_nice_of(tid: i32, nice: i32) -> bool {
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter_mut().find(|r| r.tid == tid).map(|r| r.nice = nice).is_some()
+}
+
 /// Make `pending` (from [`register`]) the calling thread's own set.
 pub fn adopt(pending: &Arc<Pending>) {
-    OWN.with(|o| o.set(Arc::as_ptr(pending)));
+    HOT.with(|h| h.own.set(Arc::as_ptr(pending)));
     crate::threadfs::enter(tid());
 }
 
@@ -1103,15 +1153,21 @@ pub fn unregister_current() {
     // Its process descriptors (`PIDFD_THREAD`) say it has ended.
     crate::pidfd::thread_gone(tid());
     drop_wait_pipe();
-    let own = OWN.with(|o| o.replace(std::ptr::null()));
+    let own = HOT.with(|h| h.own.replace(std::ptr::null()));
     directed_remove(tid());
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
     publish_tids(&tids());
+    if tid() != tgid() {
+        publish_robust(tid(), 0);
+    }
 }
 
-/// As the process ends: its published threads go.
+/// As the process ends: its published threads go, and are written no
+/// more.
 pub fn process_ending() {
-    publish_tids(&[]);
+    TIDS_ENDED.store(true, Ordering::SeqCst);
+    crate::procstore::put_own(crate::procstore::Kind::Threads, None);
+    crate::procstore::put_own(crate::procstore::Kind::Robust, None);
 }
 
 // --- signals for a named thread, from a handler ------------------------------------
@@ -1199,7 +1255,7 @@ pub fn post_directed(tid: i32, sig: u64, info: SigInfo) -> bool {
 }
 
 fn with_own<R>(f: impl FnOnce(&Pending) -> R) -> R {
-    let p = OWN.with(Cell::get);
+    let p = HOT.with(|h| h.own.get());
     if p.is_null() {
         f(&PROCESS)
     } else {
@@ -1251,7 +1307,7 @@ pub fn post_landed(sig: u64, info: SigInfo) {
         post_self(sig, info);
     } else {
         PROCESS.post(sig, info);
-        WAKE_OTHERS.with(|w| w.set(true));
+        HOT.with(|h| h.wake_others.set(true));
     }
 }
 
@@ -1259,7 +1315,7 @@ pub fn post_landed(sig: u64, info: SigInfo) {
 /// blocked it ([`post_landed`]). Takes the thread registry lock: called
 /// where this thread holds none of fwe's locks.
 pub fn wake_others_if_asked(sig: libc::c_int) {
-    if WAKE_OTHERS.with(|w| w.replace(false)) {
+    if HOT.with(|h| h.wake_others.replace(false)) {
         wake_others(sig);
     }
 }
@@ -1275,6 +1331,13 @@ pub fn post_process(sig: u64, info: SigInfo) {
 /// to the process would reach one thread the host picks, which may block
 /// `sig` and wait on, leaving the one that takes it asleep.
 pub fn post_process_waking(sig: u64, info: SigInfo) {
+    if sig == signal::SIGCHLD && crate::trace::file().is_some() {
+        crate::trace::note_to_file(&format!(
+            "signal: SIGCHLD from {} posted (pending {:#x})",
+            info.pid,
+            PROCESS.bits()
+        ));
+    }
     post_process(sig, info);
     wake_others(crate::host::WAKE_SIGNAL);
 }
@@ -1324,17 +1387,42 @@ pub fn host_state(tid: i32) -> Option<(u64, u64, bool)> {
     crate::host::thread_state(host)
 }
 
-/// Whether real-time signal `sig` may be queued: Linux refuses one
-/// (`EAGAIN`) once as many signals are pending as `RLIMIT_SIGPENDING`
-/// allows (those of this process are counted).
-pub fn may_queue(sig: u64) -> bool {
-    if sig < signal::SIGRTMIN {
+/// Whether one more signal may be queued with `extra` more already on
+/// their way: fewer are pending in the process, with its POSIX timers'
+/// (each holds one, as Linux allocates it), than `RLIMIT_SIGPENDING`
+/// allows and the pool holds. Linux counts those of the user's processes;
+/// those of this process are counted here. Async-signal-safe.
+fn room(extra: u64) -> bool {
+    let used = COUNT.load(Ordering::Relaxed) + crate::posixtimer::count() as u64 + extra;
+    used < crate::rlimits::sigpending()
+        && POOL_USED.load(Ordering::Relaxed) + extra < QUEUE_MAX as u64
+}
+
+/// Whether signal `sig` sent with `si_code` `code` may be queued: Linux
+/// refuses a real-time one (`EAGAIN`) past `RLIMIT_SIGPENDING`, unless a
+/// `kill` sent it (`SI_USER`), which is merged into the one pending
+/// instead; a standard signal is always taken, one of each number.
+pub fn may_queue(sig: u64, code: i32) -> bool {
+    sig < signal::SIGRTMIN || code == signal::SI_USER || room(0)
+}
+
+/// Whether a POSIX timer may be made: it holds a signal of the limit's
+/// from the start, as Linux allocates it then.
+pub fn may_add_timer() -> bool {
+    room(0)
+}
+
+/// In the wake handler, for signal `sig` with `code` another process
+/// queued in the mailbox, `taken` taken in this drain already: whether it
+/// may be taken now ([`may_queue`]). One that may not stays in the
+/// mailbox, and is taken once a signal pending is ([`uncount`]): the
+/// sender found room in the mailbox, so it is not lost. Async-signal-safe.
+pub fn admits(sig: u64, code: i32, taken: u64) -> bool {
+    if sig < signal::SIGRTMIN || code == signal::SI_USER || room(taken) {
         return true;
     }
-    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    let count = threads.iter().map(|r| r.pending.bits().count_ones()).sum::<u32>()
-        + PROCESS.bits().count_ones();
-    u64::from(count) < crate::rlimits::get(fwe_abi::resource::RLIMIT_SIGPENDING).0
+    HELD.store(true, Ordering::Release);
+    false
 }
 
 /// Signals pending against the calling thread or the process.
@@ -1355,23 +1443,23 @@ pub fn deliverable() -> u64 {
 
 /// The calling thread's blocked-signal mask.
 pub fn mask() -> u64 {
-    MASK.with(Cell::get)
+    HOT.with(|h| h.mask.get())
 }
 
 /// Replace the calling thread's mask; `SIGKILL` and `SIGSTOP` cannot be
 /// blocked.
 pub fn set_mask(mask: u64) {
-    MASK.with(|m| m.set(mask & !UNBLOCKABLE));
+    HOT.with(|h| h.mask.set(mask & !UNBLOCKABLE));
 }
 
 /// Remember the mask to restore when `rt_sigsuspend` ends.
 pub fn save_mask(mask: u64) {
-    SAVED_MASK.with(|m| m.set(Some(mask)));
+    HOT.with(|h| h.saved_mask.set(Some(mask)));
 }
 
 /// The mask saved by `rt_sigsuspend`, if the call is still in progress.
 pub fn take_saved_mask() -> Option<u64> {
-    SAVED_MASK.with(Cell::take)
+    HOT.with(|h| h.saved_mask.take())
 }
 
 /// The calling thread's alternate signal stack.
@@ -1381,6 +1469,14 @@ pub fn altstack() -> Stack {
 
 pub fn set_altstack(stack: Stack) {
     ALTSTACK.with(|a| a.set(stack));
+}
+
+/// Held by every unit test that touches the process's pending signals or
+/// signal queues, which all of a test process's threads share.
+#[cfg(test)]
+pub(crate) fn signals_held() -> std::sync::MutexGuard<'static, ()> {
+    static HELD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    HELD.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 #[cfg(test)]
@@ -1399,6 +1495,7 @@ mod tests {
 
     #[test]
     fn pending_is_per_thread_and_carries_info() {
+        let _held = crate::thread::signals_held();
         register_current();
         let info = SigInfo { code: -6, pid: 7, uid: 8, status: 0, value: 9, poll: None };
         post_self(signal::SIGUSR1, info);
@@ -1423,6 +1520,33 @@ mod tests {
         set_mask(u64::MAX);
         assert_eq!(mask() & UNBLOCKABLE, 0);
         set_mask(0);
+    }
+
+    /// A set queues as many real-time signals as the process's pool
+    /// holds, not a fixed few, and a set that goes frees what it queued.
+    #[test]
+    fn real_time_signals_queue_past_a_few() {
+        let rt = signal::SIGRTMIN + 2;
+        let p = Pending::new();
+        for v in 0..300 {
+            p.post(rt, valued(v));
+        }
+        let taken: Vec<u64> = std::iter::from_fn(|| p.take(rt)).map(|i| i.value).collect();
+        assert_eq!(taken, (0..300).collect::<Vec<_>>());
+        let q = Arc::new(Pending::new());
+        for v in 0..10 {
+            q.post(rt, valued(v));
+        }
+        let mine = |id: usize| {
+            POOL.iter()
+                .filter(|e| e.state.load(Ordering::Acquire) > CLAIMED)
+                .filter(|e| e.owner.load(Ordering::Relaxed) == id)
+                .count()
+        };
+        let id = q.id();
+        assert_eq!(mine(id), 9);
+        drop(q);
+        assert_eq!(mine(id), 0);
     }
 
     fn valued(value: u64) -> SigInfo {

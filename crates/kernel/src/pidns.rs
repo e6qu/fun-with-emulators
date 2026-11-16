@@ -158,9 +158,35 @@ pub fn chain_from(ns: Option<std::sync::Arc<crate::shared::Record<PidNs>>>) -> C
 /// host pid `host` (0 until known, see [`set_host`]). Returns the numbers,
 /// the chain's first namespace's first.
 pub fn alloc(chain: &Chain, host: i32, thread: bool) -> Result<Vec<i32>, i32> {
+    alloc_chosen(chain, host, thread, &[])
+}
+
+/// [`alloc`], with the numbers `chosen` (`clone3`'s `set_tid`) in the
+/// first namespaces of the chain: `EINVAL` for one out of range (or other
+/// than 1 in a namespace with no init yet), `EEXIST` for one taken.
+pub fn alloc_chosen(
+    chain: &Chain,
+    host: i32,
+    thread: bool,
+    chosen: &[i32],
+) -> Result<Vec<i32>, i32> {
+    use fwe_abi::errno;
     let mut nums = Vec::with_capacity(chain.len());
-    for r in chain.iter() {
-        match r.update(|ns| ns.alloc(Entry { host, thread }).ok_or(fwe_abi::errno::EAGAIN)) {
+    for (i, r) in chain.iter().enumerate() {
+        let take = |ns: &mut PidNs| match chosen.get(i) {
+            None => ns.alloc(Entry { host, thread }).ok_or(errno::EAGAIN),
+            Some(&n) => {
+                if n < 1 || n >= pid_max() || (n != 1 && !ns.pids.contains_key(&1)) {
+                    return Err(errno::EINVAL);
+                }
+                if ns.pids.contains_key(&n) {
+                    return Err(errno::EEXIST);
+                }
+                ns.pids.insert(n, Entry { host, thread });
+                Ok(n)
+            }
+        };
+        match r.update(take) {
             Ok(n) => nums.push(n),
             Err(e) => {
                 // Undo the ones made.
@@ -309,8 +335,7 @@ pub fn init_gone(dirs: &[Vec<u8>], host: i32) {
 /// This process is ending: if it is its pid namespace's init, the
 /// namespace ends with it.
 pub fn exiting() {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     if let Some(ns) = current().first()
         && ns.get().number_of(me) == Some(1)
     {
@@ -362,8 +387,7 @@ pub fn guest_ret(r: i64) -> i64 {
 /// what the namespace's record holds for this host process.
 pub fn adopt(ns: &crate::ns::Namespaces, known: i32) -> i32 {
     set_current(chain_from(ns.pid.clone()));
-    // SAFETY: getpid cannot fail.
-    let host = unsafe { libc::getpid() };
+    let host = crate::host::pid();
     if known > 0 {
         // Its number stands for it from now on, not only once the parent
         // gets to it.

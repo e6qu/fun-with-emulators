@@ -14,8 +14,9 @@
 //! kqueue, so it stays readable.
 //!
 //! The host passes no kqueue on to a fork child, nor over a Unix socket: a
-//! fork child gets a new one at each marked number ([`restore`]), and
-//! one sent with `SCM_RIGHTS` fails (`EINVAL`).
+//! fork child gets a new one at each marked number ([`restore`]), and a
+//! process a descriptor is sent to with `SCM_RIGHTS` makes its own
+//! ([`export`], [`import`], [`crate::scm`]).
 //!
 //! An ended process's wait status, which `PIDFD_GET_INFO` gives once it
 //! has been reaped, is what this process's `wait` reaped ([`reaped`]).
@@ -141,8 +142,7 @@ pub fn thread_gone(tid: i32) {
     if THREAD_FDS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     for (fd, m) in fdmarks::marks() {
         if m == (Mark::Pid { host: me, tid, nonblock: false })
             || m == (Mark::Pid { host: me, tid, nonblock: true })
@@ -158,8 +158,7 @@ pub fn thread_gone(tid: i32) {
 /// `NSpid`.
 pub fn fdinfo(fd: i32) -> Option<String> {
     let t = of(fd)?;
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let pid = if t.host == me {
         thread::tgid()
     } else if ended(fd) && !crate::host::process_exists(t.host) {
@@ -168,6 +167,37 @@ pub fn fdinfo(fd: i32) -> Option<String> {
         crate::pidns::to_guest(t.host)
     };
     Some(format!("Pid:\t{pid}\nNSpid:\t{pid}\n"))
+}
+
+/// What process descriptor `fd` takes to another process it is passed to
+/// ([`crate::scm`]): the process it names (a kqueue, which the host does
+/// not pass, so the receiver watches the process with one of its own).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    let t = of(fd)?;
+    let mut e = crate::snapshot::Enc::new();
+    e.i32(t.host);
+    e.bool(t.nonblock);
+    Some(crate::scm::Export {
+        kind: crate::scm::kind::PIDFD,
+        state: e.into_bytes(),
+        companions: Vec::new(),
+        placeholder: true,
+    })
+}
+
+/// Make received descriptor `fd` the process descriptor an [`export`]
+/// described (of the process, for a thread's of another process):
+/// whether it was.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
+    let t = Target { host: d.i32(), tid: 0, nonblock: d.bool() };
+    let Ok(kq) = watch(t) else { return false };
+    if !crate::scm::replace(fd, kq) {
+        return false;
+    }
+    fdmarks::mark(fd, Mark::Pid { host: t.host, tid: 0, nonblock: t.nonblock });
+    true
 }
 
 /// `PIDFD_NONBLOCK` set or cleared on `fd` (`F_SETFL`).
@@ -220,8 +250,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
     let exits: HashMap<i32, i32> = (0..n).map(|_| (d.i32(), d.i32())).collect();
     *EXITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(exits);
     let n = d.count(14);
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     for _ in 0..n {
         let (fd, host, tid, nonblock, cloexec) = (d.i32(), d.i32(), d.i32(), d.bool(), d.bool());
         if exec && cloexec {
@@ -261,19 +290,44 @@ pub fn wait_target(fd: i32) -> Result<(i32, bool), i32> {
     Ok((t.host, t.nonblock))
 }
 
+/// `process_mrelease(pidfd, flags)`: release the memory of a process being
+/// killed, as Linux's: no flags (`EINVAL`); a process descriptor
+/// (`EBADF`), of a process, not another thread (`ESRCH`), not yet reaped
+/// (`ESRCH`); one that has ended already has no memory left (0); else it
+/// must be on its way out, killed (a `SIGKILL` an fwe process sent it) or
+/// exiting (`EINVAL`). The host frees an ending process's memory itself,
+/// as it ends: nothing is left for fwe to free first.
+pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
+    if flags != 0 {
+        return err(errno::EINVAL);
+    }
+    let fd = fd as i32;
+    let t = match wait_target(fd) {
+        Ok(_) => of(fd).expect("a process descriptor"),
+        Err(e) => return err(e),
+    };
+    if t.tid != 0 {
+        return err(errno::ESRCH);
+    }
+    if ended(fd) {
+        let reaped = exit_status(t.host).is_some() || !crate::host::process_exists(t.host);
+        return if reaped { err(errno::ESRCH) } else { 0 };
+    }
+    let exiting = crate::procreg::kinfo(t.host).is_some_and(|k| k.exiting || k.state == 5);
+    if exiting || crate::signote::kill_noted(t.host) { 0 } else { err(errno::EINVAL) }
+}
+
 /// The host process a `/proc/<pid>` directory descriptor names (which
 /// `pidfd_send_signal` takes as Linux does), if `fd` is one.
 fn proc_dir_target(fd: i32) -> Option<i32> {
     let path = crate::synthdir::path_of(fd)?;
     let rest = path.strip_prefix(b"/proc/")?;
     if rest == b"self" || rest == b"thread-self" {
-        // SAFETY: getpid cannot fail.
-        return Some(unsafe { libc::getpid() });
+        return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(rest).ok()?.parse().ok()?;
     if pid == thread::tgid() {
-        // SAFETY: getpid cannot fail.
-        return Some(unsafe { libc::getpid() });
+        return Some(crate::host::pid());
     }
     crate::pidns::to_host(pid)
 }
@@ -286,8 +340,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let nonblock = flags & PIDFD_NONBLOCK != 0;
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let t = if thread::host_thread(pid).is_some() || pid == thread::tid() {
             // One of this process's threads: the main one names the
             // process; another only as a thread.
@@ -351,8 +404,7 @@ impl<P: Platform> Kernel<P> {
         if gone {
             return err(errno::ESRCH);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host) };
         if pid == 0 {
             // Not in the caller's pid namespace or one below it.
@@ -395,8 +447,7 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return Err(err(errno::ESRCH));
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         if t.host == me {
             if !crate::fdtable::guest_visible(target_fd) {
                 return Err(err(errno::EBADF));
@@ -409,23 +460,12 @@ impl<P: Platform> Kernel<P> {
             fdmarks::duplicated(target_fd, r);
             return Err(i64::from(r));
         }
-        if !self.may_attach(t.host) {
+        // Only an fwe process can be asked for its descriptors; any other is
+        // one the caller may not attach to, as `ptrace` has it.
+        if !crate::host::is_fwe(t.host) || !self.may_trace(t.host) {
             return Err(err(errno::EPERM));
         }
         Ok(GetFd { host: t.host, fd: target_fd, pidfd: fd })
-    }
-
-    /// Whether the caller may act on host process `target` as a tracer
-    /// may (Linux's `PTRACE_MODE_ATTACH_REALCREDS`): with
-    /// `CAP_SYS_PTRACE`, or when its real user and group ids are each of
-    /// the target's.
-    fn may_attach(&self, target: i32) -> bool {
-        if self.creds.has(crate::caps::CAP_SYS_PTRACE) {
-            return true;
-        }
-        let ids = crate::procreg::ids(target);
-        let c = &self.creds;
-        ids[..3].iter().all(|&u| u == c.uid) && ids[4..7].iter().all(|&g| g == c.gid)
     }
 
     /// `ioctl` on a process descriptor: `PIDFD_GET_INFO` and the
@@ -457,8 +497,7 @@ impl<P: Platform> Kernel<P> {
     fn pidfd_info(&self, fd: i32, t: Target, arg: u64, size: u64) -> i64 {
         let asked: u64 = guest!(uaccess::read(arg));
         // As the caller's pid namespace numbers it: none outside it.
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host) };
         if pid == 0 {
             return err(errno::ESRCH);
@@ -516,9 +555,8 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return err(errno::ESRCH);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
-        if t.host != me && !self.may_attach(t.host) {
+        let me = crate::host::pid();
+        if t.host != me && !self.may_access(t.host, false, true) {
             return err(errno::EPERM);
         }
         let dirs = if t.host == me {
@@ -553,8 +591,7 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return err(errno::ESRCH);
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let dirs = if t.host == me {
             self.fs().ns_dirs()
         } else {
@@ -584,12 +621,29 @@ impl<P: Platform> Kernel<P> {
             fds.push(r as i32);
             let _ = kind;
         }
+        // All or nothing: what one joined is undone if a later one fails.
+        let before = match self.fs().copy() {
+            Ok(fs) => fs,
+            Err(e) => {
+                close(&fds);
+                return err(e);
+            }
+        };
+        let caps = self.creds.caps;
         let mut r = 0;
         for (&f, (kind, _)) in fds.iter().zip(kinds.iter().filter(|(k, _)| flags & k != 0)) {
             r = self.sys_setns(f as u64, *kind);
             if r < 0 {
                 break;
             }
+        }
+        if r < 0 {
+            let fs = self.fs_mut();
+            fs.ns = before.ns.clone();
+            fs.set_mount_ns(before.mount_ns().clone());
+            fs.set_view(&before);
+            self.creds.caps = caps;
+            self.namespaces_changed();
         }
         close(&fds);
         r
@@ -733,7 +787,7 @@ mod imp {
         }
         // SAFETY: the descriptor received.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
-        crate::seqpacket::adopt(fd);
+        crate::net::adopt(fd);
         i64::from(fd)
     }
 }

@@ -45,6 +45,86 @@ pub enum Entry {
     Missing,
 }
 
+/// `hidepid=` of a `proc` mount: another's `/proc/<pid>` is open to all
+/// (`off`); its directory listed but nothing in it reached (`EPERM`) by
+/// one who may not trace it (`noaccess`); or not there at all to such a
+/// reader (`ENOENT`), whom `ptraceable` names as Linux's own check does
+/// and `invisible` likewise.
+pub const HIDEPID_OFF: u8 = 0;
+pub const HIDEPID_NO_ACCESS: u8 = 1;
+pub const HIDEPID_INVISIBLE: u8 = 2;
+pub const HIDEPID_NOT_PTRACEABLE: u8 = 4;
+
+/// The `hidepid=` value `v` names (a number or a name), if Linux takes it.
+pub fn hidepid(v: &[u8]) -> Option<u8> {
+    Some(match v {
+        b"0" | b"off" => HIDEPID_OFF,
+        b"1" | b"noaccess" => HIDEPID_NO_ACCESS,
+        b"2" | b"invisible" => HIDEPID_INVISIBLE,
+        b"4" | b"ptraceable" => HIDEPID_NOT_PTRACEABLE,
+        _ => return None,
+    })
+}
+
+/// What a `proc` mount's options hide: `hidepid=`, the group `gid=`
+/// exempts from it (an initial-namespace id), and `subset=pid` (only the
+/// processes' directories, `self` and `thread-self`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Hiding {
+    pub hidepid: u8,
+    pub gid: Option<u32>,
+    pub pids_only: bool,
+}
+
+impl Hiding {
+    /// What options `options` (as the mount keeps them) hide.
+    pub fn of(options: &[u8]) -> Hiding {
+        let mut h = Hiding::default();
+        for o in options.split(|&b| b == b',') {
+            if let Some(v) = o.strip_prefix(b"hidepid=") {
+                h.hidepid = hidepid(v).unwrap_or(HIDEPID_OFF);
+            } else if let Some(v) = o.strip_prefix(b"gid=") {
+                h.gid = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok());
+            } else if let Some(v) = o.strip_prefix(b"subset=") {
+                h.pids_only = v == b"pid";
+            }
+        }
+        h
+    }
+
+    /// Whether it hides anything.
+    pub fn any(&self) -> bool {
+        self.hidepid != HIDEPID_OFF || self.pids_only
+    }
+
+    /// What it refuses of `fs_path` (a path in the mount, `/123/status`),
+    /// `traceable` telling whether the reader may trace the process a
+    /// number names (its own always): `ENOENT` for what it hides, `EPERM`
+    /// for what `noaccess` keeps out of; `None` for the rest.
+    pub fn refuses(&self, fs_path: &[u8], traceable: impl FnOnce(i32) -> bool) -> Option<i32> {
+        let rel = fs_path.strip_prefix(b"/").unwrap_or(fs_path);
+        let (first, rest) = match rel.iter().position(|&b| b == b'/') {
+            Some(i) => (&rel[..i], &rel[i + 1..]),
+            None => (rel, &b""[..]),
+        };
+        if first.is_empty() {
+            return None;
+        }
+        let pid = std::str::from_utf8(first).ok().and_then(|s| s.parse::<i32>().ok());
+        let Some(pid) = pid.filter(|_| first.iter().all(u8::is_ascii_digit)) else {
+            let own = matches!(first, b"self" | b"thread-self");
+            return (self.pids_only && !own).then_some(fwe_abi::errno::ENOENT);
+        };
+        if self.hidepid == HIDEPID_OFF || traceable(pid) {
+            return None;
+        }
+        if self.hidepid >= HIDEPID_INVISIBLE {
+            return Some(fwe_abi::errno::ENOENT);
+        }
+        (!rest.is_empty()).then_some(fwe_abi::errno::EPERM)
+    }
+}
+
 /// Linux `d_type` values used in directory listings.
 pub const DT_DIR: u8 = 4;
 pub const DT_REG: u8 = 8;
@@ -56,8 +136,10 @@ type Child = (&'static [u8], u8);
 type DirDef = (&'static [u8], &'static [Child]);
 
 /// The kernel configuration fwe presents: what it implements, in the
-/// options' terms (an option not listed is not set), for the programs and
-/// test suites that read `/proc/config.gz` to tell what the kernel has.
+/// options' terms (an option not listed is not set; the ones programs ask
+/// about by name are said to be not set), for the programs and test suites
+/// that read `/proc/config.gz` to tell what the kernel has. The calls of
+/// an option not set fail as on a kernel built without it (`ENOSYS`).
 const CONFIG: &str = "\
 # Linux/arm64 Kernel Configuration, as fwe implements it
 CONFIG_ARM64=y
@@ -71,6 +153,17 @@ CONFIG_HZ_250=y
 CONFIG_HZ=250
 CONFIG_HIGH_RES_TIMERS=y
 CONFIG_POSIX_TIMERS=y
+CONFIG_SYSCTL=y
+CONFIG_PROC_SYSCTL=y
+CONFIG_FILE_LOCKING=y
+CONFIG_ADVISE_SYSCALLS=y
+CONFIG_MEMBARRIER=y
+CONFIG_FHANDLE=y
+CONFIG_KCMP=y
+CONFIG_CROSS_MEMORY_ATTACH=y
+CONFIG_CACHESTAT_SYSCALL=y
+CONFIG_POSIX_MQUEUE=y
+CONFIG_POSIX_MQUEUE_SYSCTL=y
 CONFIG_MULTIUSER=y
 CONFIG_PROC_FS=y
 CONFIG_SYSFS=y
@@ -84,9 +177,12 @@ CONFIG_EVENTFD=y
 CONFIG_AIO=y
 CONFIG_DNOTIFY=y
 CONFIG_INOTIFY_USER=y
+CONFIG_FSNOTIFY=y
 CONFIG_SHMEM=y
 CONFIG_TMPFS=y
 CONFIG_TMPFS_XATTR=y
+CONFIG_HUGETLBFS=y
+CONFIG_HUGETLB_PAGE=y
 CONFIG_BLOCK=y
 CONFIG_BLK_DEV=y
 CONFIG_BLK_DEV_LOOP=y
@@ -106,10 +202,20 @@ CONFIG_NET_NS=y
 CONFIG_CGROUPS=y
 CONFIG_CGROUP_BPF=y
 CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CPUSETS=y
+CONFIG_CGROUP_SCHED=y
+CONFIG_FAIR_GROUP_SCHED=y
+CONFIG_BLK_CGROUP=y
+CONFIG_MEMCG=y
+CONFIG_CGROUP_HUGETLB=y
+CONFIG_CGROUP_RDMA=y
+CONFIG_CGROUP_MISC=y
 CONFIG_SECURITY=y
 CONFIG_SECURITYFS=y
 CONFIG_SECURITY_LANDLOCK=y
-CONFIG_LSM=\"capability,landlock\"
+CONFIG_SECURITY_YAMA=y
+CONFIG_LSM=\"capability,landlock,yama\"
 CONFIG_SECCOMP=y
 CONFIG_SECCOMP_FILTER=y
 CONFIG_BPF=y
@@ -140,6 +246,13 @@ CONFIG_CRYPTO_SHA512=y
 CONFIG_CRYPTO_AES=y
 CONFIG_CRYPTO_CBC=y
 CONFIG_CRYPTO_HMAC=y
+# CONFIG_MODULES is not set
+# CONFIG_IO_URING is not set
+# CONFIG_PERF_EVENTS is not set
+# CONFIG_FANOTIFY is not set
+# CONFIG_USERFAULTFD is not set
+# CONFIG_TIME_NS is not set
+# CONFIG_RSEQ is not set
 ";
 
 /// [`CONFIG`], gzipped as `/proc/config.gz` is (in stored blocks: the
@@ -202,6 +315,7 @@ const DIRS: &[DirDef] = &[
             (b"partitions", DT_REG),
             (b"keys", DT_REG),
             (b"key-users", DT_REG),
+            (b"net", DT_LNK),
         ],
     ),
     (
@@ -234,6 +348,26 @@ const DIRS: &[DirDef] = &[
             (b"maps", DT_REG),
             (b"smaps", DT_REG),
             (b"personality", DT_REG),
+            (b"auxv", DT_REG),
+            (b"environ", DT_REG),
+            (b"limits", DT_REG),
+            (b"statm", DT_REG),
+            (b"io", DT_REG),
+            (b"net", DT_DIR),
+        ],
+    ),
+    (
+        b"/proc/self/net",
+        &[
+            (b"dev", DT_REG),
+            (b"if_inet6", DT_REG),
+            (b"route", DT_REG),
+            (b"snmp", DT_REG),
+            (b"tcp", DT_REG),
+            (b"tcp6", DT_REG),
+            (b"udp", DT_REG),
+            (b"udp6", DT_REG),
+            (b"unix", DT_REG),
         ],
     ),
     (
@@ -253,15 +387,8 @@ const DIRS: &[DirDef] = &[
     (b"/proc/self/fd", &[]),
     (b"/proc/sys", &[(b"kernel", DT_DIR), (b"vm", DT_DIR), (b"fs", DT_DIR)]),
     (b"/proc/sysvipc", &[(b"shm", DT_REG), (b"sem", DT_REG), (b"msg", DT_REG)]),
-    (
-        b"/proc/sys/fs",
-        &[
-            (b"nr_open", DT_REG),
-            (b"file-max", DT_REG),
-            (b"pipe-max-size", DT_REG),
-            (b"lease-break-time", DT_REG),
-        ],
-    ),
+    // With the sysctls fwe keeps there ([`crate::sysctl::children`]).
+    (b"/proc/sys/fs", &[(b"file-max", DT_REG)]),
     (
         b"/proc/sys/kernel",
         &[
@@ -276,6 +403,16 @@ const DIRS: &[DirDef] = &[
             (b"threads-max", DT_REG),
             (b"domainname", DT_REG),
             (b"tainted", DT_REG),
+            (b"random", DT_DIR),
+        ],
+    ),
+    (
+        b"/proc/sys/kernel/random",
+        &[
+            (b"entropy_avail", DT_REG),
+            (b"poolsize", DT_REG),
+            (b"uuid", DT_REG),
+            (b"boot_id", DT_REG),
         ],
     ),
     (b"/proc/sys/vm", &[(b"overcommit_memory", DT_REG), (b"mmap_min_addr", DT_REG)]),
@@ -341,6 +478,28 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         b"/proc/self/exe" if !info.exe.is_empty() => Entry::Symlink(info.exe.clone()),
         b"/proc/self/cmdline" => Entry::File(info.cmdline.clone()),
+        // The process's own memory, as it holds the strings now.
+        b"/proc/self/environ" => Entry::File(match crate::prmm::env_moved() {
+            // Where `PR_SET_MM` put it.
+            Some((start, end)) => {
+                let mut b = vec![0u8; end.saturating_sub(start).min(4 << 20) as usize];
+                if crate::uaccess::read_into(start, &mut b).is_err() {
+                    b.clear();
+                }
+                b
+            }
+            None => crate::procpid::environ(&info.auxv, &info.cmdline, |addr, buf| {
+                crate::uaccess::read_into(addr, buf).is_ok()
+            }),
+        }),
+        b"/proc/self/statm" => Entry::File(crate::procpid::statm(crate::host::pid())),
+        b"/proc/self/io" => Entry::File(crate::procpid::io(crate::host::pid())),
+        b"/proc/self/limits" => Entry::File(crate::procpid::limits(
+            &(0..fwe_abi::resource::RLIM_NLIMITS)
+                .map(|r| crate::syscalls::own_limit(r).unwrap_or((u64::MAX, u64::MAX)))
+                .collect::<Vec<_>>(),
+        )),
+        b"/proc/net" => Entry::Symlink(b"self/net".to_vec()),
         b"/proc/self/auxv" => Entry::File(info.auxv.clone()),
         b"/proc/self/personality" => Entry::File(
             format!(
@@ -355,7 +514,7 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
             Entry::File(b"         0          0 4294967295\n".to_vec())
         }
         b"/proc/self/setgroups" => Entry::File(b"allow\n".to_vec()),
-        b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu)),
+        b"/proc/cpuinfo" => Entry::File(cpuinfo(info.ncpu, &info.auxv)),
         // What `mount` takes, and the rootfs's own.
         b"/proc/filesystems" => Entry::File(
             b"nodev\tsysfs\nnodev\ttmpfs\nnodev\tproc\nnodev\tcgroup2\nnodev\tdevpts\n\
@@ -391,19 +550,22 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/sys/kernel/threads-max" => Entry::File(b"254828\n".to_vec()),
         // Nothing has tainted fwe's kernel.
         b"/proc/sys/kernel/tainted" => Entry::File(b"0\n".to_vec()),
-        b"/proc/sys/fs/lease-break-time" => Entry::File(b"45\n".to_vec()),
         // Linux's pool is full from boot.
         b"/proc/sys/kernel/random/entropy_avail" => Entry::File(b"256\n".to_vec()),
         b"/proc/sys/kernel/random/poolsize" => Entry::File(b"256\n".to_vec()),
+        // A new random UUID each read; one for as long as the host runs.
+        b"/proc/sys/kernel/random/uuid" => Entry::File(uuid_line(random_128())),
+        b"/proc/sys/kernel/random/boot_id" => Entry::File(uuid_line(boot_id())),
         // The kernel was given no command line.
         b"/proc/cmdline" => Entry::File(b"\n".to_vec()),
         b"/proc/config.gz" => Entry::File(config_gz()),
         b"/proc/sys/fs/file-max" => Entry::File(b"9223372036854775807\n".to_vec()),
-        b"/proc/sys/fs/pipe-max-size" => Entry::File(b"1048576\n".to_vec()),
         b"/proc/sys/vm/overcommit_memory" => Entry::File(b"0\n".to_vec()),
-        b"/proc/sys/vm/mmap_min_addr" => Entry::File(b"65536\n".to_vec()),
+        b"/proc/sys/vm/mmap_min_addr" => {
+            Entry::File(format!("{}\n", crate::mm::MMAP_MIN_ADDR).into_bytes())
+        }
         // No newline, as Linux writes it.
-        b"/sys/kernel/security/lsm" => Entry::File(b"capability,landlock".to_vec()),
+        b"/sys/kernel/security/lsm" => Entry::File(b"capability,landlock,yama".to_vec()),
         b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {
             Entry::File(cpu_range(info.ncpu))
         }
@@ -414,19 +576,130 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
     })
 }
 
+/// 128 random bits.
+fn random_128() -> u128 {
+    let mut b = [0u8; 16];
+    // SAFETY: `b` is a valid buffer of its length (at most 256 bytes).
+    unsafe { libc::getentropy(b.as_mut_ptr().cast(), b.len()) };
+    u128::from_ne_bytes(b)
+}
+
+/// The host's boot, as 128 bits: the same for every read until it
+/// restarts.
+fn boot_id() -> u128 {
+    let boot = crate::host::boot_time().to_le_bytes();
+    let a = crate::shared::hash(&[&boot[..], b"boot"].concat());
+    let b = crate::shared::hash(&[&boot[..], b"id"].concat());
+    u128::from(a) << 64 | u128::from(b)
+}
+
+/// `bits` as a version 4 UUID's text, with a newline.
+fn uuid_line(bits: u128) -> Vec<u8> {
+    let mut b = bits.to_be_bytes();
+    b[6] = b[6] & 0x0f | 0x40;
+    b[8] = b[8] & 0x3f | 0x80;
+    let h: String = b.iter().map(|x| format!("{x:02x}")).collect();
+    format!("{}-{}-{}-{}-{}\n", &h[..8], &h[8..12], &h[12..16], &h[16..20], &h[20..]).into_bytes()
+}
+
 fn line(bytes: &[u8]) -> Vec<u8> {
     let mut v = bytes.to_vec();
     v.push(b'\n');
     v
 }
 
-fn cpuinfo(ncpu: u32) -> Vec<u8> {
+/// The names Linux gives the `AT_HWCAP` bits, then the `AT_HWCAP2` ones,
+/// in bit order (`arch/arm64/kernel/cpuinfo.c`).
+const HWCAP_NAMES: [&str; 32] = [
+    "fp", "asimd", "evtstrm", "aes", "pmull", "sha1", "sha2", "crc32", "atomics", "fphp",
+    "asimdhp", "cpuid", "asimdrdm", "jscvt", "fcma", "lrcpc", "dcpop", "sha3", "sm3", "sm4",
+    "asimddp", "sha512", "sve", "asimdfhm", "dit", "uscat", "ilrcpc", "flagm", "ssbs", "sb",
+    "paca", "pacg",
+];
+const HWCAP2_NAMES: [&str; 45] = [
+    "dcpodp",
+    "sve2",
+    "sveaes",
+    "svepmull",
+    "svebitperm",
+    "svesha3",
+    "svesm4",
+    "flagm2",
+    "frint",
+    "svei8mm",
+    "svef32mm",
+    "svef64mm",
+    "svebf16",
+    "i8mm",
+    "bf16",
+    "dgh",
+    "rng",
+    "bti",
+    "mte",
+    "ecv",
+    "afp",
+    "rpres",
+    "mte3",
+    "sme",
+    "smei16i64",
+    "smef64f64",
+    "smei8i32",
+    "smef16f32",
+    "smeb16f32",
+    "smef32f32",
+    "smefa64",
+    "wfxt",
+    "ebf16",
+    "sveebf16",
+    "cssc",
+    "rprfm",
+    "sve2p1",
+    "sme2",
+    "sme2p1",
+    "smei16i32",
+    "smebi32i32",
+    "smeb16b16",
+    "smef16f16",
+    "mops",
+    "hbc",
+];
+
+/// The value of entry `key` of auxiliary vector `auxv` (words), if it is
+/// there.
+pub(crate) fn auxv_value(auxv: &[u8], key: u64) -> Option<u64> {
+    auxv.as_chunks::<16>().0.iter().find_map(|e| {
+        let k = u64::from_ne_bytes(e[..8].try_into().ok()?);
+        (k == key).then(|| u64::from_ne_bytes(e[8..].try_into().unwrap_or([0; 8])))
+    })
+}
+
+/// `/proc/cpuinfo` as Linux writes it on arm64: for each of `ncpu` CPUs,
+/// its BogoMIPS, the features of the hwcaps the program was given in
+/// `auxv`, and the host's identity of the core.
+fn cpuinfo(ncpu: u32, auxv: &[u8]) -> Vec<u8> {
+    let hwcap = auxv_value(auxv, fwe_abi::auxv::AT_HWCAP).unwrap_or(0);
+    let hwcap2 = auxv_value(auxv, fwe_abi::auxv::AT_HWCAP2).unwrap_or(0);
+    let features: Vec<&str> = HWCAP_NAMES
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| hwcap & (1 << i) != 0)
+        .chain(HWCAP2_NAMES.iter().enumerate().filter(|(i, _)| hwcap2 & (1 << i) != 0))
+        .map(|(_, n)| *n)
+        .collect();
+    let id = crate::host::cpu_identity();
     let mut out = Vec::new();
     for i in 0..ncpu.max(1) {
+        let part = if i < id.efficiency_cores { id.parts.0 } else { id.parts.1 };
         out.extend_from_slice(
             format!(
-                "processor\t: {i}\nBHID\t: 0x0\nCPU implementer\t: 0x61\n\
-                 CPU architecture: 8\nFeatures\t: fp asimd\n\n"
+                "processor\t: {i}\nBogoMIPS\t: {:.2}\nFeatures\t: {}\nCPU implementer\t: {:#x}\n\
+                 CPU architecture: 8\nCPU variant\t: {:#x}\nCPU part\t: {part:#05x}\n\
+                 CPU revision\t: {}\n\n",
+                id.bogomips,
+                features.join(" "),
+                id.implementer,
+                id.variant,
+                id.revision
             )
             .as_bytes(),
         );
@@ -434,21 +707,39 @@ fn cpuinfo(ncpu: u32) -> Vec<u8> {
     out
 }
 
-/// The memory reported to the guest, in kB: plausible fixed values (programs
-/// mostly read the total and what is available). `sysinfo` reports the same.
-pub(crate) const MEM_TOTAL_KB: u64 = 8_388_608;
-pub(crate) const MEM_FREE_KB: u64 = 4_194_304;
-const MEM_AVAILABLE_KB: u64 = 6_291_456;
-const MEM_CACHED_KB: u64 = 1_048_576;
-
+/// `/proc/meminfo`: the host's memory ([`crate::host::memory`]), in kB.
 fn meminfo() -> Vec<u8> {
-    format!(
-        "MemTotal:       {MEM_TOTAL_KB:8} kB\nMemFree:        {MEM_FREE_KB:8} kB\n\
-         MemAvailable:   {MEM_AVAILABLE_KB:8} kB\nBuffers:               0 kB\n\
-         Cached:         {MEM_CACHED_KB:8} kB\nSwapTotal:             0 kB\n\
-         SwapFree:              0 kB\n"
-    )
-    .into_bytes()
+    let m = crate::host::memory();
+    let kb = |b: u64| b / 1024;
+    let lines = [
+        ("MemTotal", kb(m.total)),
+        ("MemFree", kb(m.free)),
+        ("MemAvailable", kb(m.available)),
+        ("Buffers", 0),
+        ("Cached", kb(m.cached)),
+        ("SwapCached", 0),
+        ("Active", kb(m.active)),
+        ("Inactive", kb(m.inactive)),
+        ("Unevictable", kb(m.wired)),
+        ("Mlocked", 0),
+        ("SwapTotal", kb(m.swap_total)),
+        ("SwapFree", kb(m.swap_free)),
+        ("Dirty", 0),
+        ("Writeback", 0),
+        ("Shmem", 0),
+        ("HugePages_Total", 0),
+        ("HugePages_Free", 0),
+        ("HugePages_Rsvd", 0),
+        ("HugePages_Surp", 0),
+    ];
+    let mut out = String::new();
+    for (name, v) in lines {
+        let unit = if name.starts_with("HugePages") { "" } else { " kB" };
+        out.push_str(&format!("{:<16}{v:>8}{unit}\n", format!("{name}:")));
+    }
+    // The huge page pool: empty (`vm.nr_hugepages`).
+    out.push_str("Hugepagesize:       2048 kB\nHugetlb:               0 kB\n");
+    out.into_bytes()
 }
 
 /// `/proc/stat`: the host's CPU times (in `USER_HZ` ticks), each of the
@@ -502,6 +793,40 @@ mod tests {
         }
     }
 
+    /// The configuration names what fwe has: each cgroup controller it
+    /// offers, and the calls whose options programs look for.
+    #[test]
+    fn config_names_what_fwe_has() {
+        let set = |o: &str| CONFIG.contains(&format!("\nCONFIG_{o}=y\n"));
+        for c in crate::cgroupfs::CONTROLLERS {
+            let option = match *c {
+                "cpuset" => "CPUSETS",
+                "cpu" => "CGROUP_SCHED",
+                "io" => "BLK_CGROUP",
+                "memory" => "MEMCG",
+                "hugetlb" => "CGROUP_HUGETLB",
+                "pids" => "CGROUP_PIDS",
+                "rdma" => "CGROUP_RDMA",
+                "misc" => "CGROUP_MISC",
+                other => panic!("no option for controller {other}"),
+            };
+            assert!(set(option), "{option}");
+        }
+        for o in [
+            "POSIX_MQUEUE",
+            "FHANDLE",
+            "MEMBARRIER",
+            "CROSS_MEMORY_ATTACH",
+            "KCMP",
+            "SYSCTL",
+            "FILE_LOCKING",
+            "CHECKPOINT_RESTORE",
+        ] {
+            assert!(set(o), "{o}");
+        }
+        assert!(CONFIG.contains("\n# CONFIG_TIME_NS is not set\n"));
+    }
+
     /// `/proc/config.gz` is a gzip stream of the configuration: framed as
     /// gzip, the configuration in its stored blocks, the right CRC.
     #[test]
@@ -513,6 +838,7 @@ mod tests {
         assert_eq!(body[0], 1);
         let len = u16::from_le_bytes([body[1], body[2]]) as usize;
         assert_eq!(&body[5..5 + len], CONFIG.as_bytes());
+        assert!(CONFIG.contains("\n# CONFIG_MODULES is not set\n"));
         let tail = &gz[gz.len() - 8..];
         assert_eq!(u32::from_le_bytes(tail[..4].try_into().unwrap()), crc32(CONFIG.as_bytes()));
         assert_eq!(u32::from_le_bytes(tail[4..].try_into().unwrap()), CONFIG.len() as u32);
@@ -541,11 +867,87 @@ mod tests {
         );
     }
 
+    /// `/proc/sys/kernel/random` is a directory; `uuid` differs at each
+    /// read, `boot_id` does not.
+    #[test]
+    fn random_directory() {
+        let info = info();
+        assert!(matches!(lookup(b"/proc/sys/kernel/random", &info), Some(Entry::Dir)));
+        let names: Vec<_> =
+            children(b"/proc/sys/kernel/random").unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(names.contains(&b"boot_id".to_vec()) && names.contains(&b"uuid".to_vec()));
+        let read = |p: &[u8]| match lookup(p, &info) {
+            Some(Entry::File(c)) => c,
+            _ => panic!(),
+        };
+        let u = read(b"/proc/sys/kernel/random/uuid");
+        assert_eq!(u.len(), 37);
+        assert_eq!(u[14], b'4');
+        assert_ne!(u, read(b"/proc/sys/kernel/random/uuid"));
+        assert_eq!(
+            read(b"/proc/sys/kernel/random/boot_id"),
+            read(b"/proc/sys/kernel/random/boot_id")
+        );
+        let fs: Vec<_> = children(b"/proc/sys/fs").unwrap().into_iter().map(|(n, _)| n).collect();
+        assert!(fs.contains(&b"pipe-max-size".to_vec()) && fs.contains(&b"file-max".to_vec()));
+    }
+
+    /// `/proc/cpuinfo` names the features of the hwcaps given and nothing
+    /// Linux does not write; `/proc/meminfo` reports the host's memory.
+    #[test]
+    fn cpuinfo_and_meminfo() {
+        let mut auxv = Vec::new();
+        for (k, v) in [(fwe_abi::auxv::AT_HWCAP, 0b11 | 1 << 8), (fwe_abi::auxv::AT_HWCAP2, 1)] {
+            auxv.extend_from_slice(&k.to_ne_bytes());
+            auxv.extend_from_slice(&(v as u64).to_ne_bytes());
+        }
+        let text = String::from_utf8(cpuinfo(2, &auxv)).unwrap();
+        assert_eq!(text.matches("processor\t:").count(), 2);
+        assert!(text.contains("Features\t: fp asimd atomics dcpodp\n"), "{text}");
+        assert!(text.contains("CPU implementer\t: 0x61\n"));
+        assert!(!text.contains("BHID"));
+        let mem = String::from_utf8(meminfo()).unwrap();
+        let total: u64 =
+            mem.lines().next().unwrap()[9..].trim().trim_end_matches(" kB").parse().unwrap();
+        #[cfg(target_os = "macos")]
+        assert_eq!(total, crate::host::sysctl_u64(c"hw.memsize").unwrap() / 1024);
+        let _ = total;
+        assert!(mem.contains("\nMemAvailable:   "));
+    }
+
     #[test]
     fn unknown_proc_path_is_missing_and_others_fall_through() {
         let info = info();
         assert!(matches!(lookup(b"/proc/does/not/exist", &info), Some(Entry::Missing)));
         assert!(lookup(b"/etc/passwd", &info).is_none());
         assert!(lookup(b"/home", &info).is_none());
+    }
+
+    /// `hidepid=` and `subset=pid` as Linux's `proc` has them: another's
+    /// directory hidden (`invisible`, `ptraceable`) or kept out of
+    /// (`noaccess`) for a reader that may not trace it; with `subset=pid`
+    /// only the processes' directories and the reader's own links.
+    #[test]
+    fn hidepid_and_subset_hide_as_linux() {
+        assert_eq!(hidepid(b"invisible"), Some(HIDEPID_INVISIBLE));
+        assert_eq!(hidepid(b"3"), None);
+        let none = Hiding::of(b"rw");
+        assert!(!none.any());
+        assert_eq!(none.refuses(b"/42/status", |_| false), None);
+        let invisible = Hiding::of(b"hidepid=invisible,gid=10");
+        assert_eq!(invisible.gid, Some(10));
+        assert_eq!(invisible.refuses(b"/42", |_| false), Some(fwe_abi::errno::ENOENT));
+        assert_eq!(invisible.refuses(b"/42/status", |_| true), None);
+        assert_eq!(invisible.refuses(b"/meminfo", |_| false), None);
+        let noaccess = Hiding::of(b"hidepid=1");
+        assert_eq!(noaccess.refuses(b"/42", |_| false), None);
+        assert_eq!(noaccess.refuses(b"/42/status", |_| false), Some(fwe_abi::errno::EPERM));
+        let pids = Hiding::of(b"subset=pid");
+        assert!(pids.any());
+        assert_eq!(pids.refuses(b"/meminfo", |_| false), Some(fwe_abi::errno::ENOENT));
+        assert_eq!(pids.refuses(b"/sys/kernel", |_| false), Some(fwe_abi::errno::ENOENT));
+        assert_eq!(pids.refuses(b"/self/status", |_| false), None);
+        assert_eq!(pids.refuses(b"/42/status", |_| false), None);
+        assert_eq!(pids.refuses(b"/", |_| false), None);
     }
 }

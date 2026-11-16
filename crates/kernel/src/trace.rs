@@ -104,8 +104,7 @@ impl Tracer {
         let mut out = String::with_capacity(line.len() + 16);
         let fd = match FILE.get() {
             Some((_, fd)) => {
-                // SAFETY: getpid cannot fail.
-                let _ = write!(out, "[fwe {}] ", unsafe { libc::getpid() });
+                let _ = write!(out, "[fwe {}] ", crate::host::pid());
                 *fd
             }
             None => {

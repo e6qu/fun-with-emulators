@@ -27,10 +27,44 @@
 
 use crate::{Kernel, Platform, Regs};
 use fwe_abi::{fcntl, signal};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-/// `PR_SET_DUMPABLE` 0 was asked.
-pub static UNDUMPABLE: AtomicBool = AtomicBool::new(false);
+/// Linux's dumpable values: not dumpable, dumpable, and dumpable as root
+/// only (`fs.suid_dumpable` 2).
+pub const SUID_DUMP_DISABLE: u8 = 0;
+pub const SUID_DUMP_USER: u8 = 1;
+pub const SUID_DUMP_ROOT: u8 = 2;
+
+/// Whether the process is dumpable (`PR_SET_DUMPABLE`): what decides a
+/// core dump, who owns its `/proc/<pid>` files and who may trace it. An
+/// `execve` sets it back to [`SUID_DUMP_USER`], or to `fs.suid_dumpable`
+/// for a program that raised privilege or could not be read, and so does
+/// a change of credentials ([`lose_dumpable`]).
+static DUMPABLE: AtomicU8 = AtomicU8::new(SUID_DUMP_USER);
+
+/// The process's dumpable value.
+pub fn dumpable() -> u8 {
+    DUMPABLE.load(Ordering::Relaxed)
+}
+
+/// Set the process's dumpable value.
+pub fn set_dumpable(v: u8) {
+    DUMPABLE.store(v, Ordering::Relaxed);
+}
+
+/// The process's credentials changed as Linux's `commit_creds` notes (its
+/// effective or filesystem ids, or capabilities it gained): it becomes
+/// dumpable only as `fs.suid_dumpable` says, and loses its parent-death
+/// signal.
+pub fn lose_dumpable() {
+    set_dumpable(suid_dumpable());
+    crate::pdeath::set(0);
+}
+
+/// `fs.suid_dumpable` (0 by default).
+pub fn suid_dumpable() -> u8 {
+    crate::sysctl::number(b"fs/suid_dumpable").map_or(SUID_DUMP_DISABLE, |v| v.clamp(0, 2) as u8)
+}
 
 /// The guest's page: a mapping's contents are written in its units.
 const PAGE: u64 = 4096;
@@ -75,7 +109,7 @@ pub fn status_bit() -> i32 {
 /// `core_pattern` with its `%` specifiers filled in.
 fn core_name(pattern: &str, sig: u64, uid: u32, gid: u32, comm: &[u8], exe: &[u8]) -> Vec<u8> {
     // SAFETY: plain host calls.
-    let host_pid = unsafe { libc::getpid() };
+    let host_pid = crate::host::pid();
     let pid = crate::thread::tgid();
     let mut out = Vec::new();
     let mut has_pid = false;
@@ -158,8 +192,7 @@ struct Segment {
 /// What the core holds of each mapping, by `coredump_filter`'s default.
 fn segments() -> Vec<Segment> {
     use crate::maps::Name;
-    // SAFETY: getpid cannot fail.
-    let Some(view) = crate::mm::MapsView::of(unsafe { libc::getpid() }) else { return Vec::new() };
+    let Some(view) = crate::mm::MapsView::of(crate::host::pid()) else { return Vec::new() };
     view.areas
         .iter()
         .map(|p| {
@@ -234,7 +267,7 @@ impl<P: Platform> Kernel<P> {
     /// Dump core for `sig`, with the registers `regs` (or none), if Linux
     /// would: whether a core was dumped. Called as the process ends of it.
     pub fn dump_core(&mut self, sig: u64, regs: Option<&Regs>) -> bool {
-        if !dumps(sig) || UNDUMPABLE.load(Ordering::Relaxed) {
+        if !dumps(sig) || dumpable() == SUID_DUMP_DISABLE {
             return false;
         }
         let limit = crate::rlimits::get(fwe_abi::resource::RLIMIT_CORE).0;
@@ -245,8 +278,7 @@ impl<P: Platform> Kernel<P> {
         if pattern.is_empty() || pattern.starts_with('|') {
             return false;
         }
-        // SAFETY: getpid cannot fail.
-        let record = crate::procreg::read(unsafe { libc::getpid() });
+        let record = crate::procreg::read(crate::host::pid());
         let comm = crate::thread::name()
             .map(|n| n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())].to_vec())
             .or_else(|| record.as_ref().map(|r| r.comm.clone()))

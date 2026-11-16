@@ -1,8 +1,8 @@
 //! Writes to the files of fwe's whose writes act rather than store: a
 //! cgroup's interface files ([`crate::cgroupfs`]), the user-namespace maps
 //! of `/proc/<pid>` ([`crate::userns`]), a namespace's sysctls
-//! ([`crate::sysctl`]) and `/proc/<pid>/oom_score_adj`
-//! ([`crate::procpid`]). On Linux each takes one write's bytes, whichever
+//! ([`crate::sysctl`]), `/proc/<pid>/oom_score_adj` and `comm`, and the
+//! host and domain names of `/proc/sys/kernel` ([`crate::procpid`]). On Linux each takes one write's bytes, whichever
 //! call makes it (`write`, `writev`, `pwrite64`, `pwritev`, `pwritev2`; C
 //! libraries' buffered output uses `writev`), so every one of those comes
 //! here first.
@@ -33,6 +33,8 @@ pub fn is(fd: i32) -> bool {
                         | Mark::ProcMap { .. }
                         | Mark::OomScore { .. }
                         | Mark::TimerSlack { .. }
+                        | Mark::Comm { .. }
+                        | Mark::UtsName { .. }
                 )
             ))
 }

@@ -11,6 +11,8 @@
 use crate::mounts::{FsType, Source, ms};
 use crate::{Kernel, Platform, guest, uaccess};
 use fwe_abi::{err, errno};
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
 
 /// `umount2` flags.
 const MNT_FORCE: u64 = 1;
@@ -24,8 +26,7 @@ fn tmpfs_dir(mode: u32) -> Result<Vec<u8>, i32> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let mut dir = crate::fs::shm::user_dir()?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -49,14 +50,79 @@ pub(crate) fn default_atime(flags: u64) -> u64 {
     if flags & (ms::NOATIME | ms::STRICTATIME) == 0 { ms::RELATIME } else { 0 }
 }
 
-/// The `mode=` a filesystem's options give (octal), if any.
-fn mode_option(data: &[u8]) -> Option<u32> {
-    data.split(|&b| b == b',')
-        .find_map(|o| o.strip_prefix(b"mode="))
-        .and_then(|m| u32::from_str_radix(std::str::from_utf8(m).ok()?, 8).ok())
+/// The initial namespace's id for id `v` (text) of the caller's user
+/// namespace, as a mount option names it (`EINVAL` for one it does not
+/// map), Linux's `make_kuid` and `make_kgid`.
+fn kernel_id(v: &[u8], gid: bool) -> Result<u32, i32> {
+    let n = std::str::from_utf8(v).ok().and_then(|s| s.parse().ok()).ok_or(errno::EINVAL)?;
+    crate::userns::from_ns(n, gid).ok_or(errno::EINVAL)
 }
 
 impl<P: Platform> Kernel<P> {
+    /// Filesystem options `data` of a new `kind` filesystem (or a remount),
+    /// checked as Linux checks them (`EINVAL`), and as the mount keeps
+    /// them: a user or group id as the initial namespace has it, as
+    /// `mountinfo` shows it. A tmpfs's ([`crate::tmpfs::parse`]); a
+    /// `proc`'s `hidepid=` (`0` to `2`, `4`, or their names), `gid=` and
+    /// `subset=` (`pid`, or nothing).
+    pub(crate) fn fs_data(kind: FsType, data: &[u8]) -> Result<Vec<u8>, i32> {
+        if kind == FsType::Tmpfs {
+            crate::tmpfs::parse(data)?;
+        }
+        if !matches!(kind, FsType::Tmpfs | FsType::Proc) {
+            return Ok(data.to_vec());
+        }
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for o in data.split(|&b| b == b',').filter(|o| !o.is_empty()) {
+            let (key, value) = match o.iter().position(|&b| b == b'=') {
+                Some(i) => (&o[..i], &o[i + 1..]),
+                None => (o, &b""[..]),
+            };
+            out.push(match (kind, key) {
+                (_, b"uid") if kind == FsType::Tmpfs => {
+                    format!("uid={}", kernel_id(value, false)?).into_bytes()
+                }
+                (_, b"gid") => format!("gid={}", kernel_id(value, true)?).into_bytes(),
+                (FsType::Proc, b"hidepid") => {
+                    crate::procfs::hidepid(value).ok_or(errno::EINVAL)?;
+                    o.to_vec()
+                }
+                (FsType::Proc, b"subset") if !matches!(value, b"pid" | b"") => {
+                    return Err(errno::EINVAL);
+                }
+                _ => o.to_vec(),
+            });
+        }
+        Ok(out.join(&b","[..]))
+    }
+
+    /// Whether the caller may change its mount namespace's mounts:
+    /// `CAP_SYS_ADMIN` in the user namespace that owns the namespace
+    /// (Linux's `may_mount`).
+    pub(crate) fn may_mount(&self) -> bool {
+        let owner = self.fs().mount_ns().table().owner.clone();
+        self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN)
+    }
+
+    /// Whether the caller may make a new filesystem of `kind`: every kind
+    /// fwe has is one a user namespace may mount (`FS_USERNS_MOUNT`), with
+    /// `CAP_SYS_ADMIN` in the user namespace the filesystem belongs to:
+    /// the one owning the pid namespace for `proc`, the network namespace
+    /// for `sysfs`, the IPC namespace for `mqueue`, the cgroup namespace
+    /// for `cgroup2`, else the caller's own (Linux's `mount_capable`).
+    pub(crate) fn may_make_filesystem(&self, kind: FsType) -> bool {
+        use fwe_abi::clone::{CLONE_NEWCGROUP, CLONE_NEWIPC, CLONE_NEWNET, CLONE_NEWPID};
+        let ns = &self.fs().ns;
+        let owner = match kind {
+            FsType::Proc => ns.owner(CLONE_NEWPID),
+            FsType::Sysfs => ns.owner(CLONE_NEWNET),
+            FsType::Mqueue => ns.owner(CLONE_NEWIPC),
+            FsType::Cgroup2 => ns.owner(CLONE_NEWCGROUP),
+            _ => return self.creds.has_own(crate::caps::CAP_SYS_ADMIN),
+        };
+        self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN)
+    }
+
     /// The namespace path of `path`, which must exist; `follow` as for
     /// resolution, a link in `/proc` included (`/proc/self/exe` names the
     /// program's file, `/proc/self/fd/N` the open file's). Fails with
@@ -139,10 +205,25 @@ impl<P: Platform> Kernel<P> {
         let mut flags = 0;
         let src = match kind {
             FsType::Tmpfs => {
-                let dir = tmpfs_dir(mode_option(data).unwrap_or(0o1777))?;
-                // A size asked for is kept beside it ([`crate::tmpfs`]).
-                if let Some(limit) = crate::tmpfs::size_option(data) {
+                // Options as [`Self::fs_data`] keeps them: ids the initial
+                // namespace's.
+                let o = crate::tmpfs::parse(data)?;
+                let dir = tmpfs_dir(o.mode.unwrap_or(0o1777))?;
+                // Its root is its mounter's, or the owner asked for.
+                let owner = (o.uid.unwrap_or(self.creds.fsuid), o.gid.unwrap_or(self.creds.fsgid));
+                let kept = std::fs::File::open(std::ffi::OsStr::from_bytes(&dir))
+                    .map_err(|e| crate::host::errno_to_linux(e.raw_os_error().unwrap_or(0)))
+                    .and_then(|f| crate::owners::keep_fd(f.as_raw_fd(), owner));
+                if let Err(e) = kept {
+                    let _ = std::fs::remove_dir(std::ffi::OsStr::from_bytes(&dir));
+                    return Err(e);
+                }
+                // The limits asked for are kept beside it ([`crate::tmpfs`]).
+                if let Some(limit) = o.size {
                     crate::tmpfs::mounted(&dir, limit);
+                }
+                if let Some(n) = o.inodes {
+                    crate::tmpfs::mounted_inodes(&dir, n);
                 }
                 Source::Host(dir)
             }
@@ -252,7 +333,7 @@ impl<P: Platform> Kernel<P> {
         mut flags: u64,
         data: u64,
     ) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let target = guest!(uaccess::read_cstr(target, uaccess::PATH_MAX));
@@ -274,6 +355,28 @@ impl<P: Platform> Kernel<P> {
             // With no access-time mode named the mount keeps its own.
             let named = flags & (ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME);
             let flags = if named == 0 { flags } else { flags | default_atime(flags) };
+            // The options checked as a new filesystem's, of its type.
+            let kind = ns.table().locate(&point).0.fstype;
+            let opts = match opts.map(|d| Self::fs_data(kind, &d)).transpose() {
+                Ok(o) => o,
+                Err(e) => return err(e),
+            };
+            // A tmpfs given a new size or number of inodes holds to it from
+            // now on.
+            if flags & ms::BIND == 0
+                && let Ok(o) = crate::tmpfs::parse(&data)
+                && let (m, _) = ns.table().locate(&point)
+                && m.fstype == FsType::Tmpfs
+                && m.root == b"/"
+                && let Some(dir) = m.host_path(b"")
+            {
+                if let Some(limit) = o.size {
+                    crate::tmpfs::mounted(&dir, limit);
+                }
+                if let Some(n) = o.inodes {
+                    crate::tmpfs::mounted_inodes(&dir, n);
+                }
+            }
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0
             && let Some(found) = self.bound_namespace(&source)
@@ -312,7 +415,7 @@ impl<P: Platform> Kernel<P> {
             };
             match from {
                 Ok((from, _)) => {
-                    ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0, 0).map(|_| ()))
+                    ns.update(|t| t.bind(&from, &point, flags & ms::REC != 0).map(|_| ()))
                 }
                 Err(errno::EINVAL) => match device.or_else(|| self.host_source(&source)) {
                     Some(host) => ns.update(|t| {
@@ -351,13 +454,21 @@ impl<P: Platform> Kernel<P> {
             if fstype_ptr == 0 {
                 return err(errno::EINVAL);
             }
-            // `cgroup` names the v2 hierarchy when that is the one there is.
-            let name: &[u8] = if fstype == b"cgroup" { b"cgroup2" } else { &fstype };
-            let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
+            // Only the v2 hierarchy: `cgroup` (v1) is no type fwe knows, as
+            // on a kernel built without it.
+            let Some(kind) = FsType::from_name(&fstype) else { return err(errno::ENODEV) };
+            if !self.may_make_filesystem(kind) {
+                return err(errno::EPERM);
+            }
+            let data = match Self::fs_data(kind, &data) {
+                Ok(d) => d,
+                Err(e) => return err(e),
+            };
             let (src, root, more) = match self.new_filesystem(kind, &data) {
                 Ok(v) => v,
                 Err(e) => return err(e),
             };
+
             flags |= more | default_atime(flags);
             let device = if source.is_empty() { kind.name().as_bytes().to_vec() } else { source };
             ns.update(|t| {
@@ -372,11 +483,12 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `umount2(target, flags)`: a mount in use is refused (`EBUSY`, see
-    /// [`Self::mount_busy`]) unless detached (`MNT_DETACH`) or forced; with
+    /// [`Self::mount_busy`]) unless detached (`MNT_DETACH`), forced
+    /// (`MNT_FORCE`) or not, as Linux's own file systems refuse it; with
     /// `MNT_EXPIRE` an unused one is first marked (`EAGAIN`), and unmounted
     /// by the next such call if nothing used it in between.
     pub(crate) fn sys_umount2(&mut self, target: u64, flags: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !(MNT_FORCE | MNT_DETACH | MNT_EXPIRE | UMOUNT_NOFOLLOW) != 0
@@ -423,7 +535,7 @@ impl<P: Platform> Kernel<P> {
             t.umount(&point)
         }) {
             Ok(()) => {
-                crate::inotify::unmounted(&point);
+                crate::inotify::unmounted(ns.dir(), &point);
                 0
             }
             Err(e) => err(e),
@@ -487,8 +599,7 @@ impl<P: Platform> Kernel<P> {
             Some(d) => deepest(path, &others).is_none_or(|o| o < d),
             None => false,
         };
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let ns = fs.mount_ns().dir().to_vec();
         crate::procreg::all()
             .into_iter()
@@ -506,7 +617,7 @@ impl<P: Platform> Kernel<P> {
     /// whose root was the old one now has the new one; its working
     /// directory, if in the old tree, follows it there.
     pub(crate) fn sys_pivot_root(&mut self, new_root: u64, put_old: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let new_root = guest!(uaccess::read_cstr(new_root, uaccess::PATH_MAX));
@@ -562,7 +673,7 @@ impl<P: Platform> Kernel<P> {
     /// `chroot(path)`.
     pub(crate) fn sys_chroot(&mut self, path: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        if !self.creds.has_chroot() {
+        if !self.creds.has_own(crate::caps::CAP_SYS_CHROOT) {
             // Linux looks the directory up, and checks it may be entered,
             // before the privilege.
             const X_OK: u64 = 1;

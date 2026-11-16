@@ -77,7 +77,11 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // A script runs its interpreter.
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
-    let file = fs.read(&path).map_err(err)?;
+    let (file, file_id) = match k.take_exec_file(&path) {
+        Some(file) => file,
+        None => fs.read_identified(&path).map_err(err)?,
+    };
+    fwe_kernel::timing::mark("exec: read");
     let vm = crate::needs_vm(&file);
     // A program only the VM can run, where there is none: the exec fails
     // while the caller is intact (podman's pause process then waits in a
@@ -93,6 +97,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
     // The old image is untouched on failure, so the guest can handle it.
+    fwe_kernel::timing::mark("exec: checked for re-exec");
+    fwe_kernel::timing::mark("backend: native");
     crate::check_image(&file, fs).map_err(err)?;
     // A program with no path (a memfd) is held, for `/proc/self/exe`: the
     // descriptor it was run through may close on exec.
@@ -106,17 +112,31 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     };
     let arg_refs: Vec<&[u8]> = args.iter().map(Vec::as_slice).collect();
     let env_refs: Vec<&[u8]> = env.iter().map(Vec::as_slice).collect();
+    // The credentials the program starts with, as `exec_reset` makes them.
+    let ids = k.exec_aux_ids();
     // The point of no return: the old program's memory goes, and a vfork
     // parent may resume. The robust futexes its threads hold are released
     // first.
     fwe_kernel::release_robust_lists();
+    fwe_kernel::timing::mark("exec: checked");
     fwe_kernel::mm::release_guest_memory();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
         // SAFETY: closing the pipe end this child holds for its parent.
         unsafe { libc::close(done) };
     }
-    let out = match load_image(&file, &path, &arg_refs, &env_refs, fs, &platform, page, strace) {
+    let out = match load_image(
+        (&file, file_id),
+        &path,
+        &arg_refs,
+        &env_refs,
+        fs,
+        &platform,
+        page,
+        strace,
+        fwe_kernel::rlimits::get(fwe_abi::resource::RLIMIT_STACK).0,
+        ids,
+    ) {
         Ok(out) => out,
         Err(e) => {
             let msg = format!("fwe: execve {}: {e}\n", String::from_utf8_lossy(&path));
@@ -126,6 +146,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         }
     };
 
+    fwe_kernel::timing::mark("exec: loaded");
     k.close_on_exec();
     k.exec_reset();
     k.brk = out.brk;
@@ -139,6 +160,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
             fs.publish();
         });
     }
+    fwe_kernel::timing::mark("exec: published");
     // The new program starts with every register zero, as Linux leaves it;
     // the trap handler returns into it.
     Ok(Regs { sp: out.sp, pc: out.entry, ..Regs::default() })
@@ -208,7 +230,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         let k = kernel.as_mut().unwrap();
         // The child's namespaces, which it inherits from this view.
-        let token = match k.fork_begin(&a) {
+        let mut token = match k.fork_begin(&a) {
             Ok(t) => t,
             Err(e) => {
                 for fd in done.into_iter().filter(|&fd| fd >= 0) {
@@ -218,6 +240,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 return fwe_abi::err(e);
             }
         };
+        // The child writes its whole record as it starts.
+        fwe_kernel::Kernel::<NativePlatform>::fork_child_writes(&mut token);
         let kqueues = fwe_kernel::kqueue_state();
         // A child of CLONE_VM shares the guest's memory: its private parts
         // are shared for the fork, then copied again by any later one (in
@@ -230,6 +254,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 region::set_shared_on_fork(start, len, on);
             }
         };
+        fwe_kernel::timing::mark("fork: prepared");
+        // A fault signal sent to the child before it is set up is kept
+        // for it (`trap::post_early`).
+        trap::FORKING.store(host::pid(), Ordering::SeqCst);
         let pid = fwe_kernel::fork_locked(|| {
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
@@ -251,6 +279,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             set_shared(false);
             pid
         });
+        if pid != 0 {
+            trap::FORKING.store(0, Ordering::SeqCst);
+        }
+        fwe_kernel::timing::mark(if pid == 0 { "fork: child" } else { "fork: parent" });
         let e = fwe_kernel::host::last_error();
         // The child's pid: in the child, its own namespace's; in the
         // parent, as the parent sees it.
@@ -259,6 +291,14 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
             thread::forked();
+            // A signal sent to it as it was being made is its own.
+            trap::post_early();
+            // The code pages its parent wrote are the parent's to keep.
+            fwe_kernel::lazycode::forked();
+            // The parent's threads' stacks are none of the child's to reuse.
+            crate::stacks::forked();
+            // Nor are its waiting threads.
+            crate::pool::forked();
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);
@@ -274,6 +314,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // SAFETY: the child holds its own copy of the write end.
             unsafe { libc::close(done[1]) };
             done[1] = -1;
+        }
+        // Nor any of what was not to be inherited.
+        if pid == 0 && share.is_empty() {
+            kernel.as_mut().unwrap().unmap_dont_fork();
         }
         if pid == 0 {
             // SAFETY: this is the child, its only thread the caller, which
@@ -424,8 +468,11 @@ fn reaped_signal(pid: i32, wstatus: i32) {
         sig if wstatus & 0x80 != 0 => (w::CLD_DUMPED, sig),
         sig => (w::CLD_KILLED, sig),
     };
-    // SAFETY: getuid cannot fail; a child of fwe's is this user's.
-    let uid = host::uid_to_initial(unsafe { libc::getuid() });
+    // The child's real user, as its record keeps it until the reap is
+    // done; a child fwe did not start is the host user's.
+    // SAFETY: getuid cannot fail.
+    let host_user = host::uid_to_initial(unsafe { libc::getuid() });
+    let uid = fwe_kernel::procreg::kept_uid(pid).unwrap_or(host_user);
     let info = thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
     reaper::reaped_child_signal(pid, info);
 }
@@ -866,8 +913,12 @@ pub fn do_waitid(regs: &Regs) -> i64 {
             words[0] = fwe_abi::signal::SIGCHLD as i32;
             words[2] = code;
             words[4] = reaper::guest_pid(e);
+            // The child's real user, as its record keeps it.
             // SAFETY: getuid cannot fail.
-            words[5] = host::uid_to_linux(unsafe { libc::getuid() }) as i32;
+            let host_user = host::uid_to_linux(unsafe { libc::getuid() });
+            words[5] = fwe_kernel::procreg::kept_uid(e.pid)
+                .map_or(host_user, |u| fwe_kernel::userns::to_ns(u, false))
+                as i32;
             words[6] = status;
             if infop != 0 && fwe_kernel::uaccess::write(infop, words).is_err() {
                 return err(errno::EFAULT);
@@ -921,8 +972,11 @@ fn waitid_host(
     }
     let mut words = [0i32; 32]; // a 128-byte siginfo_t
     // SAFETY: `si` was filled by the host.
-    let (pid, uid, status) =
-        unsafe { (si.si_pid(), host::uid_to_linux(si.si_uid()), si.si_status()) };
+    let (pid, host_uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
+    // The child's real user, as its record keeps it (the host names the
+    // host user).
+    let uid = fwe_kernel::procreg::kept_uid(pid)
+        .map_or_else(|| host::uid_to_linux(host_uid), |u| fwe_kernel::userns::to_ns(u, false));
     if pid != 0 {
         // It ended of a Linux signal, as it recorded (see `linux_wstatus`).
         let ended = matches!(si.si_code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)

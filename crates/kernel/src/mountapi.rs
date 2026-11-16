@@ -17,7 +17,7 @@
 //!
 //! Mount ids for `statmount` and `listmount` are the unique ones
 //! ([`crate::mounts::UNIQUE_ID_BASE`]); a mount the caller cannot reach
-//! from its root is refused (`EPERM`) without `CAP_SYS_ADMIN`.
+//! from its root is refused (`EPERM`) without `CAP_SYS_ADMIN` in the initial user namespace.
 
 use crate::fdmarks::{self, Mark};
 use crate::mounts::{FsType, Mount, Source, join, ms, under};
@@ -118,13 +118,16 @@ pub(crate) fn detached_synthetic(fd: i32) -> Option<(crate::mounts::FsType, Vec<
 
 /// `fd` is closed: a context or tree it was the last descriptor of goes.
 pub fn closed(fd: i32) {
-    if fdmarks::shared_elsewhere(fd) {
+    // The mark first: most descriptors are neither, and finding another
+    // descriptor of the same file lists them all.
+    let (context, tree) = (context_key(fd), tree_key(fd));
+    if (context.is_none() && tree.is_none()) || fdmarks::shared_elsewhere(fd) {
         return;
     }
-    if let Some(k) = context_key(fd) {
+    if let Some(k) = context {
         with(&CONTEXTS, |m| m.remove(&k));
     }
-    if let Some(k) = tree_key(fd) {
+    if let Some(k) = tree {
         // Not while another descriptor of the tree is open: fwe's own of a
         // program run through it (`/proc/self/exe`) is one.
         let open = |o: i32| {
@@ -443,15 +446,14 @@ impl<P: Platform> Kernel<P> {
 
     /// `fsopen(fs_name, flags)`.
     pub(crate) fn sys_fsopen(&mut self, name: u64, flags: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !FSOPEN_CLOEXEC != 0 {
             return err(errno::EINVAL);
         }
         let name = guest!(user_string(name, 4096));
-        let name: &[u8] = if name == b"cgroup" { b"cgroup2" } else { &name };
-        let Some(kind) = FsType::from_name(name) else { return err(errno::ENODEV) };
+        let Some(kind) = FsType::from_name(&name) else { return err(errno::ENODEV) };
         let c = Context {
             kind,
             phase: Phase::Create,
@@ -469,7 +471,7 @@ impl<P: Platform> Kernel<P> {
     /// `fspick(dfd, path, flags)`: a context to reconfigure the filesystem
     /// mounted at `path`.
     pub(crate) fn sys_fspick(&mut self, dfd: u64, path: u64, flags: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let all =
@@ -597,11 +599,19 @@ impl<P: Platform> Kernel<P> {
             FSCONFIG_CMD_CREATE | FSCONFIG_CMD_CREATE_EXCL => {
                 if c.phase != Phase::Create {
                     Err(errno::EBUSY)
-                } else if !self.creds.has_admin() {
+                } else if !self.may_make_filesystem(c.kind) {
                     Err(errno::EPERM)
                 } else {
-                    let data = c.options.join(&b","[..]);
-                    match self.new_filesystem(c.kind, &data) {
+                    // The options as the mount keeps them.
+                    let data = Self::fs_data(c.kind, &c.options.join(&b","[..]));
+                    if let Ok(d) = &data {
+                        c.options = d
+                            .split(|&b| b == b',')
+                            .filter(|o| !o.is_empty())
+                            .map(<[u8]>::to_vec)
+                            .collect();
+                    }
+                    match data.and_then(|d| self.new_filesystem(c.kind, &d)) {
                         Ok(made) => {
                             c.made = Some(made);
                             c.phase = Phase::AwaitingMount;
@@ -617,7 +627,7 @@ impl<P: Platform> Kernel<P> {
             FSCONFIG_CMD_RECONFIGURE => {
                 if c.phase != Phase::Reconf {
                     Err(errno::EBUSY)
-                } else if !self.creds.has_admin() {
+                } else if !self.may_mount() {
                     Err(errno::EPERM)
                 } else {
                     self.reconfigure(&c)
@@ -637,7 +647,11 @@ impl<P: Platform> Kernel<P> {
     fn reconfigure(&mut self, c: &Context) -> Result<(), i32> {
         let id = c.picked.ok_or(errno::EINVAL)?;
         let (set, clear) = (c.set & ms::RDONLY, c.clear & ms::RDONLY);
-        let options = c.options.clone();
+        let mut options = Vec::new();
+        for o in &c.options {
+            options.push(Self::fs_data(c.kind, o)?);
+        }
+
         self.fs().mount_ns().clone().update(|t| {
             let m = t.mounts.iter_mut().find(|m| m.unique_id() == id).ok_or(errno::ENOENT)?;
             m.flags = (m.flags | set) & !clear;
@@ -660,7 +674,7 @@ impl<P: Platform> Kernel<P> {
     /// `fsmount(fd, flags, attr_flags)`: a detached mount of the context's
     /// new filesystem.
     pub(crate) fn sys_fsmount(&mut self, fd: u64, flags: u64, attr: u64) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !FSMOUNT_CLOEXEC != 0 {
@@ -711,6 +725,7 @@ impl<P: Platform> Kernel<P> {
             master: 0,
             device,
             options: c.options.join(&b","[..]),
+            locked: 0,
         };
         self.tree_descriptor(vec![m], flags & FSMOUNT_CLOEXEC != 0)
     }
@@ -729,7 +744,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let clone = flags & OPEN_TREE_CLONE != 0;
-        if clone && !self.creds.has_admin() {
+        if clone && !self.may_mount() {
             return err(errno::EPERM);
         }
         let cloexec = flags & OPEN_TREE_CLOEXEC != 0;
@@ -783,6 +798,7 @@ impl<P: Platform> Kernel<P> {
                 master: 0,
                 device: b"devtmpfs".to_vec(),
                 options: Vec::new(),
+                locked: 0,
             };
             return self.tree_descriptor(vec![m], cloexec);
         }
@@ -801,7 +817,7 @@ impl<P: Platform> Kernel<P> {
         to_path: u64,
         flags: u64,
     ) -> i64 {
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         if flags & !MOVE_MOUNT__MASK != 0
@@ -923,7 +939,7 @@ impl<P: Platform> Kernel<P> {
         if size < MOUNT_ATTR_SIZE_VER0 {
             return err(errno::EINVAL);
         }
-        if !self.creds.has_admin() {
+        if !self.may_mount() {
             return err(errno::EPERM);
         }
         let b = guest!(uaccess::read_bytes(attr, size as usize));
@@ -1008,6 +1024,11 @@ impl<P: Platform> Kernel<P> {
             if recursive {
                 ids.extend(t.mounts.iter().filter(|o| t.is_below(o.id, id)).map(|o| o.id));
             }
+            // All or none: not with a locked flag cleared on any.
+            let new = |m: &Mount| (m.flags & !remove) | add;
+            if t.mounts.iter().any(|m| ids.contains(&m.id) && !m.may_set_flags(new(m))) {
+                return Err(errno::EPERM);
+            }
             for m in t.mounts.iter_mut().filter(|m| ids.contains(&m.id)) {
                 apply(m);
             }
@@ -1044,7 +1065,7 @@ impl<P: Platform> Kernel<P> {
         }
         let table = ns.table();
         let Some(m) = table.by_unique(id).cloned() else { return err(errno::ENOENT) };
-        if !self.reachable(&m) && !self.creds.has_admin() {
+        if !self.reachable(&m) && !self.creds.has(crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         let mut sm = vec![0u8; STATMOUNT_SIZE];
@@ -1055,7 +1076,7 @@ impl<P: Platform> Kernel<P> {
             |sm: &mut Vec<u8>, at: usize, v: u64| sm[at..at + 8].copy_from_slice(&v.to_ne_bytes());
         let mut done = 0u64;
         if mask & STATMOUNT_SB_BASIC != 0 {
-            let (major, minor) = self.mount_device(&m);
+            let (major, minor) = m.device_numbers();
             put32(&mut sm, 16, major);
             put32(&mut sm, 20, minor);
             put64(&mut sm, 24, m.fstype.magic() as u64);
@@ -1116,29 +1137,6 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    /// The device numbers of mount `m`'s filesystem, as `stat` of its root
-    /// reports them.
-    #[allow(clippy::unnecessary_cast)] // `dev_t` differs by host
-    fn mount_device(&self, m: &Mount) -> (u32, u32) {
-        // A tmpfs is a device of its own, as its files' `stat` gives it.
-        if m.fstype == crate::mounts::FsType::Tmpfs {
-            return (0, 20 + m.id);
-        }
-        let st = m.host_path(b"").and_then(|p| std::ffi::CString::new(p).ok()).and_then(|c| {
-            // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: a NUL-terminated path and a valid out-parameter.
-            (unsafe { libc::stat(c.as_ptr(), &mut st) } == 0).then_some(st)
-        });
-        match st {
-            Some(st) => {
-                let dev = st.st_dev as u64;
-                (crate::fsops::major(dev), crate::fsops::minor(dev))
-            }
-            None => (0, 20 + m.id),
-        }
-    }
-
     /// `listmount(req, mnt_ids, nr_mnt_ids, flags)`: the unique ids of the
     /// mounts under the one asked (`LSMT_ROOT`: the caller's root), in
     /// order, after `param`'s.
@@ -1166,7 +1164,7 @@ impl<P: Platform> Kernel<P> {
         };
         let Some(parent) = parent else { return err(errno::ENOENT) };
         let from_root = id == LSMT_ROOT;
-        if !from_root && !self.reachable(&parent) && !self.creds.has_admin() {
+        if !from_root && !self.reachable(&parent) && !self.creds.has(crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         let mut found: Vec<u64> = table
@@ -1232,6 +1230,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 master: 0,
                 device: Vec::new(),
                 options: Vec::new(),
+                locked: 0,
             };
             as_table(vec![carrier]).encode(e);
             e.bool(c.made.is_some());

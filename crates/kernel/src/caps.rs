@@ -20,10 +20,13 @@ pub const CAP_SETUID: u32 = 7;
 pub const CAP_SETPCAP: u32 = 8;
 pub const CAP_LINUX_IMMUTABLE: u32 = 9;
 pub const CAP_NET_BIND_SERVICE: u32 = 10;
+pub const CAP_NET_BROADCAST: u32 = 11;
 pub const CAP_NET_ADMIN: u32 = 12;
+pub const CAP_NET_RAW: u32 = 13;
 pub const CAP_IPC_LOCK: u32 = 14;
 pub const CAP_IPC_OWNER: u32 = 15;
 pub const CAP_SYS_MODULE: u32 = 16;
+pub const CAP_SYS_RAWIO: u32 = 17;
 pub const CAP_SYS_CHROOT: u32 = 18;
 pub const CAP_SYS_PTRACE: u32 = 19;
 pub const CAP_SYS_PACCT: u32 = 20;
@@ -40,6 +43,7 @@ pub const CAP_SYS_BOOT: u32 = 22;
 pub const CAP_BPF: u32 = 39;
 pub const CAP_SYSLOG: u32 = 34;
 pub const CAP_WAKE_ALARM: u32 = 35;
+pub const CAP_CHECKPOINT_RESTORE: u32 = 40;
 /// The highest capability (`CAP_CHECKPOINT_RESTORE`).
 pub const CAP_LAST_CAP: u32 = 40;
 /// Every capability.

@@ -202,6 +202,8 @@ pub mod mman {
     pub const MAP_EXECUTABLE: u64 = 0x1000;
     pub const MAP_LOCKED: u64 = 0x2000;
     pub const MAP_NORESERVE: u64 = 0x4000;
+    /// Where a `MAP_HUGETLB` mapping's page size (its log2) starts.
+    pub const MAP_HUGE_SHIFT: u64 = 26;
     pub const MAP_POPULATE: u64 = 0x8000;
     pub const MAP_NONBLOCK: u64 = 0x10000;
     pub const MAP_STACK: u64 = 0x20000;
@@ -219,17 +221,30 @@ pub mod mman {
     pub const MADV_WILLNEED: u64 = 3;
     pub const MADV_DONTNEED: u64 = 4;
     pub const MADV_FREE: u64 = 8;
+    pub const MADV_REMOVE: u64 = 9;
+    pub const MADV_DONTFORK: u64 = 10;
+    pub const MADV_DOFORK: u64 = 11;
     pub const MADV_DONTDUMP: u64 = 16;
     pub const MADV_DODUMP: u64 = 17;
+    pub const MADV_DONTNEED_LOCKED: u64 = 24;
+    pub const MADV_GUARD_INSTALL: u64 = 102;
+    pub const MADV_GUARD_REMOVE: u64 = 103;
 }
 
 /// File status flags (`asm-generic/fcntl.h`, arm64 overrides).
 /// `prctl` options.
 pub mod prctl {
+    /// `PR_SET_VMA` ("SVMA") and its one option.
+    pub const PR_SET_VMA: u64 = 0x5356_4d41;
+    pub const PR_SET_VMA_ANON_NAME: u64 = 0;
     pub const PR_SET_PDEATHSIG: u64 = 1;
     pub const PR_GET_PDEATHSIG: u64 = 2;
     pub const PR_GET_DUMPABLE: u64 = 3;
     pub const PR_SET_DUMPABLE: u64 = 4;
+    /// Yama's `PR_SET_PTRACER` ("Yama"), and `PR_SET_PTRACER_ANY` as its
+    /// argument.
+    pub const PR_SET_PTRACER: u64 = 0x5961_6d61;
+    pub const PR_SET_PTRACER_ANY: u64 = u64::MAX;
     pub const PR_SET_NAME: u64 = 15;
     pub const PR_GET_NAME: u64 = 16;
     pub const PR_GET_TIMERSLACK: u64 = 30;
@@ -254,6 +269,7 @@ pub mod prctl {
     pub const PR_GET_CHILD_SUBREAPER: u64 = 37;
     pub const PR_CAP_AMBIENT: u64 = 47;
     pub const PR_SET_NO_NEW_PRIVS: u64 = 38;
+    pub const PR_GET_TID_ADDRESS: u64 = 40;
     pub const PR_GET_NO_NEW_PRIVS: u64 = 39;
     /// Reset pointer-authentication keys (arm64): which, a mask of
     /// `PR_PAC_AP*KEY`, or 0 for all.
@@ -421,6 +437,7 @@ pub mod statx_mask {
     pub const STATX_SIZE: u32 = 0x0200;
     pub const STATX_BLOCKS: u32 = 0x0400;
     pub const STATX_BASIC_STATS: u32 = 0x07ff;
+    pub const STATX_BTIME: u32 = 0x0800;
     pub const STATX_MNT_ID: u32 = 0x1000;
     pub const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
 }
@@ -563,6 +580,24 @@ pub mod ioctl {
     pub const FIOCLEX: u64 = 0x5451;
     pub const FIONCLEX: u64 = 0x5450;
     pub const FIOASYNC: u64 = 0x5452;
+    /// The requests Landlock's `LANDLOCK_ACCESS_FS_IOCTL_DEV` leaves to
+    /// any holder of a device's descriptor (`is_masked_device_ioctl`):
+    /// the descriptor's own flags and the file system's requests.
+    pub const FIOQSIZE: u64 = 0x5460;
+    pub const FIFREEZE: u64 = 0xc004_5877;
+    pub const FITHAW: u64 = 0xc004_5878;
+    pub const FS_IOC_FIEMAP: u64 = 0xc020_660b;
+    pub const FIGETBSZ: u64 = 2;
+    pub const FICLONE: u64 = 0x4004_9409;
+    pub const FICLONERANGE: u64 = 0x4020_940d;
+    pub const FIDEDUPERANGE: u64 = 0xc018_9436;
+    pub const FS_IOC_GETFSUUID: u64 = 0x8011_1500;
+    pub const FS_IOC_GETFSSYSFSPATH: u64 = 0x8081_1501;
+    /// A file's inode flags, and as XFS's extended flags (`struct fsxattr`).
+    pub const FS_IOC_GETFLAGS: u64 = 0x8008_6601;
+    pub const FS_IOC_SETFLAGS: u64 = 0x4008_6602;
+    pub const FS_IOC_FSGETXATTR: u64 = 0x801c_581f;
+    pub const FS_IOC_FSSETXATTR: u64 = 0x401c_5820;
     /// Network interface requests on a socket (`struct ifreq`).
     pub const SIOCGIFNAME: u64 = 0x8910;
     pub const SIOCGIFCONF: u64 = 0x8912;
@@ -1017,6 +1052,13 @@ pub mod term {
 
 /// Resource limits (`asm-generic/resource.h`).
 /// `getpriority`/`setpriority`'s `which`.
+/// Linux security modules' ids (`include/uapi/linux/lsm.h`).
+pub mod lsm {
+    pub const LSM_ID_CAPABILITY: u64 = 100;
+    pub const LSM_ID_YAMA: u64 = 105;
+    pub const LSM_ID_LANDLOCK: u64 = 110;
+}
+
 pub mod prio {
     pub const PROCESS: u64 = 0;
     pub const PGRP: u64 = 1;
@@ -1050,6 +1092,7 @@ pub mod futex {
     pub const FUTEX_WAKE: u64 = 1;
     pub const FUTEX_REQUEUE: u64 = 3;
     pub const FUTEX_CMP_REQUEUE: u64 = 4;
+    pub const FUTEX_WAKE_OP: u64 = 5;
     pub const FUTEX_WAIT_BITSET: u64 = 9;
     pub const FUTEX_WAKE_BITSET: u64 = 10;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
@@ -1062,6 +1105,22 @@ pub mod futex {
     pub const FUTEX_TID_MASK: u32 = 0x3fff_ffff;
     /// The most entries of a robust list released as a thread ends.
     pub const ROBUST_LIST_LIMIT: usize = 2048;
+    /// `FUTEX_WAKE_OP`'s encoded operation: the operation (bits 28-30,
+    /// with `FUTEX_OP_OPARG_SHIFT` at bit 31 making its argument a shift),
+    /// the comparison (bits 24-27), and the operation's and comparison's
+    /// 12-bit signed arguments (bits 12-23, 0-11).
+    pub const FUTEX_OP_SET: u32 = 0;
+    pub const FUTEX_OP_ADD: u32 = 1;
+    pub const FUTEX_OP_OR: u32 = 2;
+    pub const FUTEX_OP_ANDN: u32 = 3;
+    pub const FUTEX_OP_XOR: u32 = 4;
+    pub const FUTEX_OP_OPARG_SHIFT: u32 = 8;
+    pub const FUTEX_OP_CMP_EQ: u32 = 0;
+    pub const FUTEX_OP_CMP_NE: u32 = 1;
+    pub const FUTEX_OP_CMP_LT: u32 = 2;
+    pub const FUTEX_OP_CMP_LE: u32 = 3;
+    pub const FUTEX_OP_CMP_GT: u32 = 4;
+    pub const FUTEX_OP_CMP_GE: u32 = 5;
 }
 
 /// `wait4`/`waitid` options (`linux/wait.h`).
@@ -1185,6 +1244,11 @@ pub mod epoll {
     pub const EPOLLOUT: u32 = 0x004;
     pub const EPOLLERR: u32 = 0x008;
     pub const EPOLLHUP: u32 = 0x010;
+    pub const EPOLLRDNORM: u32 = 0x040;
+    pub const EPOLLRDBAND: u32 = 0x080;
+    pub const EPOLLWRNORM: u32 = 0x100;
+    pub const EPOLLWRBAND: u32 = 0x200;
+    pub const EPOLLMSG: u32 = 0x400;
     pub const EPOLLRDHUP: u32 = 0x2000;
     pub const EPOLLEXCLUSIVE: u32 = 1 << 28;
     pub const EPOLLWAKEUP: u32 = 1 << 29;
@@ -1224,7 +1288,9 @@ pub mod socket {
     pub const SO_RCVBUF: u64 = 8;
     pub const SO_KEEPALIVE: u64 = 9;
     pub const SO_OOBINLINE: u64 = 10;
+    pub const SO_PRIORITY: u64 = 12;
     pub const SO_LINGER: u64 = 13;
+    pub const SO_PASSCRED: u64 = 16;
     pub const SO_PEERCRED: u64 = 17;
     pub const SO_REUSEPORT: u64 = 15;
     pub const SO_RCVTIMEO: u64 = 20;
@@ -1244,6 +1310,29 @@ pub mod socket {
     pub const MSG_WAITFORONE: u64 = 0x10000;
     pub const MSG_NOSIGNAL: u64 = 0x4000;
     pub const MSG_MORE: u64 = 0x8000;
+    /// Received descriptors are close-on-exec.
+    pub const MSG_CMSG_CLOEXEC: u64 = 0x4000_0000;
+    /// Connect (with TCP fast open) and send.
+    pub const MSG_FASTOPEN: u64 = 0x2000_0000;
+
+    // Control messages (`SOL_SOCKET` level): a `cmsghdr` is a 64-bit
+    // length, the level and the type, its data 8-aligned after it.
+    pub const SCM_RIGHTS: i32 = 1;
+    /// The most descriptors one message carries (`SCM_MAX_FD`).
+    pub const SCM_MAX_FD: usize = 253;
+    pub const CMSG_HDR: usize = 16;
+
+    // `SOL_UDP` (`IPPROTO_UDP`) options, which `SOL_UDPLITE` shares.
+    pub const SOL_UDP: u64 = 17;
+    pub const SOL_UDPLITE: u64 = 136;
+    pub const UDP_CORK: u64 = 1;
+    pub const UDP_ENCAP: u64 = 100;
+    pub const UDP_NO_CHECK6_TX: u64 = 101;
+    pub const UDP_NO_CHECK6_RX: u64 = 102;
+    pub const UDP_SEGMENT: u64 = 103;
+    pub const UDP_GRO: u64 = 104;
+    /// The most datagrams one `UDP_SEGMENT` send is cut into.
+    pub const UDP_MAX_SEGMENTS: usize = 64;
 }
 
 /// `eventfd2` flags (`sys/eventfd.h`).

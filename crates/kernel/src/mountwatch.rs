@@ -12,15 +12,15 @@
 
 use crate::mounts::store::Ns;
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 /// Each watched descriptor's namespace, and the generation last seen.
 type Watches = HashMap<i32, (Arc<Ns>, u64)>;
 
-pub(crate) static WATCHES: Mutex<Option<Watches>> = Mutex::new(None);
+pub(crate) static WATCHES: crate::kept::Kept<Option<Watches>> = crate::kept::Kept::new(None);
 
 fn with<R>(f: impl FnOnce(&mut Watches) -> R) -> R {
-    f(WATCHES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+    f(WATCHES.lock().get_or_insert_with(HashMap::new))
 }
 
 /// `fd` was opened on a mounts file of namespace `ns`: changes after now
@@ -32,7 +32,11 @@ pub fn opened(fd: i32, ns: Arc<Ns>) {
 
 /// `fd` was closed.
 pub fn closed(fd: i32) {
-    with(|m| m.remove(&fd));
+    if let Some(mut g) = WATCHES.if_used()
+        && let Some(m) = g.as_mut()
+    {
+        m.remove(&fd);
+    }
 }
 
 /// Whether `fd` is a watched mounts file.

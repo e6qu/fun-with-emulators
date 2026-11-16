@@ -109,8 +109,8 @@ impl Table {
             return Some(s);
         }
         // A new slot, or when all are in use, one with no write left to
-        // take (a pipe long gone, most likely; one still watched wakes
-        // every set again, as without a slot).
+        // take (one freed, or a pipe long gone most likely; one still
+        // watched wakes every set again, as without a slot).
         let s = if used < SLOTS {
             self.slot(used)
         } else {
@@ -164,10 +164,15 @@ fn pipe_id(fd: i32) -> Option<(u64, u64)> {
     Some((end.min(peer), end.max(peer)))
 }
 
-/// The guest made a pipe, one end open as `fd`: a slot left by a pipe
-/// gone that had its identity (the host reuses them) starts again.
+/// A pipe the guest holds was made (by pipe2, eventfd or signalfd), one
+/// end open as `fd`: a slot left by a pipe gone that had its identity (the
+/// host reuses them) is freed, so that the new pipe counts no writes until
+/// a set watches it exclusively. A freed slot has no identity a pipe has
+/// and no write left to take, so it is made again first.
 pub fn made(fd: i32) {
     if let Some(s) = slot_of(fd) {
+        s[0].store(0, Ordering::Release);
+        s[1].store(0, Ordering::Release);
         s[2].store(0, Ordering::Release);
         s[3].store(0, Ordering::Release);
     }
@@ -237,5 +242,34 @@ pub fn wait_for_write(fd: i32, seen: u64, slice: std::time::Duration) {
     match slot_of(fd) {
         Some(s) => crate::shared::wait_word_for(&s[2], seen, slice),
         None => std::thread::sleep(slice),
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod tests {
+    #[test]
+    fn a_made_pipe_frees_a_slot_its_identity_had() {
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // A slot with no write left to take may go to another pipe when
+        // all are in use (the table is the user's, shared by other tests):
+        // until this one keeps its own.
+        let kept = (0..20).any(|_| {
+            super::watch(fds[0]);
+            super::wrote(fds[1]);
+            super::wrote(fds[1]);
+            super::writes(fds[0]) == Some(2)
+        });
+        assert!(kept);
+        // A new pipe with this identity (the host reuses them) counts
+        // nothing left by the old one.
+        super::made(fds[0]);
+        assert_eq!(super::writes(fds[0]), None);
+        // SAFETY: closing the descriptors made above.
+        unsafe {
+            libc::close(fds[0]);
+            libc::close(fds[1]);
+        }
     }
 }

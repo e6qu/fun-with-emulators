@@ -285,6 +285,17 @@ pub fn origin_of(fd: i32) -> Option<(u64, u64)> {
     })
 }
 
+/// [`origin_of`] the file at host path `path` (not followed).
+pub fn origin_at(path: &CStr) -> Option<(u64, u64)> {
+    let v = crate::xattr::get(&crate::xattr::Target::Path(path), ORIGIN).ok()?;
+    (v.len() == 16).then(|| {
+        (
+            u64::from_le_bytes(v[..8].try_into().unwrap()),
+            u64::from_le_bytes(v[8..].try_into().unwrap()),
+        )
+    })
+}
+
 /// The path in the overlay `l` of what descriptor `fd` (open on a file of
 /// one of its layers) is: where it is now in its layer, which a rename
 /// moves it with.
@@ -461,8 +472,7 @@ fn split(path: &[u8]) -> (Vec<u8>, Vec<u8>) {
 fn temp_name() -> CString {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     CString::new(format!("#fwe.{pid}.{}", N.fetch_add(1, Ordering::Relaxed))).expect("no NUL")
 }
 
@@ -622,8 +632,9 @@ fn copy_one(
             }
         }
         libc::S_IFREG => {
-            let src = open_at(src_dir, name, libc::O_RDONLY | libc::O_NOFOLLOW)?;
-            match crate::host::clone_at(src.as_raw_fd(), w, &tmp) {
+            // By name: a descriptor of the lower file, closed, would drop
+            // the record locks the caller holds on it ([`crate::reclocks`]).
+            match crate::host::clone_name_at(src_dir, name, w, &tmp) {
                 Ok(()) => {
                     // The clone has the attributes; the times are set again
                     // in case the host gave it its own.
@@ -635,7 +646,9 @@ fn copy_one(
                     // SAFETY: a valid times array; an open descriptor.
                     unsafe { libc::futimens(made.as_raw_fd(), times.as_ptr()) };
                 }
+                // Layers on two file systems: the bytes copied.
                 Err(errno::EOPNOTSUPP) => {
+                    let src = open_at(src_dir, name, libc::O_RDONLY | libc::O_NOFOLLOW)?;
                     let made = open_at(
                         w,
                         &tmp,
@@ -1095,17 +1108,17 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
     stat_fd(fd).ok().map(|st| (st.st_dev as u64, st.st_ino as u64))
 }
 
-static CURSORS: std::sync::Mutex<Option<std::collections::HashMap<i32, Cursor>>> =
-    std::sync::Mutex::new(None);
+static CURSORS: crate::kept::Kept<Option<std::collections::HashMap<i32, Cursor>>> =
+    crate::kept::Kept::new(None);
 
 fn cursors<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Cursor>) -> R) -> R {
-    let mut g = CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = CURSORS.lock();
     f(g.get_or_insert_with(Default::default))
 }
 
 /// Run `f` holding the cursors' lock (see [`crate::fork_locked`]).
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = CURSORS.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = CURSORS.lock();
     f()
 }
 
@@ -1212,10 +1225,11 @@ pub fn moved(fd: i32) {
 
 /// `fd` was closed (or replaced): its listing goes.
 pub fn closed(fd: i32) {
-    if CURSORS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.is_empty()) {
-        return;
+    if let Some(mut g) = CURSORS.if_used()
+        && let Some(m) = g.as_mut()
+    {
+        m.remove(&fd);
     }
-    cursors(|m| m.remove(&fd));
 }
 
 #[cfg(all(test, target_os = "macos"))]

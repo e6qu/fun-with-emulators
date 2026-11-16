@@ -6,7 +6,9 @@
 //! reports that mount's flags and `/proc/self/fd` its path, even once the
 //! mount is detached. A host descriptor knows nothing of fwe's mounts.
 //! macOS has no `SOCK_SEQPACKET` Unix sockets either, and fwe makes one of
-//! a stream socket ([`crate::seqpacket`]). So fwe records both against the
+//! a stream socket ([`crate::seqpacket`]); and a socket belongs to the
+//! network namespace it was made in ([`Net`]), which the host knows
+//! nothing of. So fwe records these against the
 //! descriptor, follows it through `dup` and
 //! `close`, `fork` and `exec`, and drops a record whose descriptor no
 //! longer names the same file.
@@ -64,6 +66,13 @@ pub enum Mark {
     /// `/proc/<pid>/timerslack_ns` of host process `host`, opened for
     /// writing.
     TimerSlack { host: i32 },
+    /// `/proc/<pid>/comm` (or a thread's), opened for writing: of thread
+    /// `tid` of this process (0: its main thread), or of another process
+    /// (-1), whose name a write may not change.
+    Comm { tid: i32 },
+    /// `/proc/sys/kernel/hostname` (or `domainname`, `domain`), opened for
+    /// writing.
+    UtsName { domain: bool },
     /// An `AF_NETLINK` socket ([`crate::netlink`]).
     Netlink,
     /// Loop device `N`'s node, open as the device ([`crate::loopdev`]).
@@ -102,6 +111,9 @@ pub enum Mark {
     /// `/proc/self/pagemap`: an entry per page of the process's memory
     /// ([`crate::procmem`]).
     Pagemap,
+    /// An ICMP datagram ("ping") socket whose host receives come with the
+    /// IP header, which Linux's do not ([`crate::net`]).
+    Ping,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -111,6 +123,27 @@ pub(crate) struct Record {
     ino: u64,
     origin: Option<Origin>,
     mark: Option<Mark>,
+    /// For a socket made in a network namespace of fwe's, that namespace.
+    net: Option<Net>,
+}
+
+/// The network namespace a socket was made in, which it stays in
+/// ([`crate::netns`]).
+#[derive(Clone)]
+pub struct Net(pub std::sync::Arc<crate::shared::Record<crate::ns::Net>>);
+
+impl PartialEq for Net {
+    fn eq(&self, other: &Net) -> bool {
+        self.0.dir() == other.0.dir()
+    }
+}
+
+impl Eq for Net {}
+
+impl std::fmt::Debug for Net {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Net({})", String::from_utf8_lossy(self.0.dir()))
+    }
 }
 
 pub(crate) static RECORDS: Mutex<BTreeMap<i32, Record>> = Mutex::new(BTreeMap::new());
@@ -166,6 +199,12 @@ fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
     // a VM fork or a re-execution ([`load`]).
     if rec.mark.is_some() {
         MARKS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    if rec.mark == Some(Mark::Ping) {
+        PINGS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+    if rec.net.is_some() {
+        NETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     count(Some(&rec), true);
     count(r.insert(fd, rec).as_ref(), false);
@@ -226,11 +265,26 @@ pub fn opened(
     fstype: FsType,
     ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 ) {
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some(id) = identity(fd) else { return };
+    opened_as(fd, id, ns_path, mount, flags, fstype, ovl);
+}
+
+/// [`opened`], for a descriptor whose file (`dev`, `ino`) the caller has
+/// looked at already.
+pub fn opened_as(
+    fd: i32,
+    (dev, ino): (u64, u64),
+    ns_path: Vec<u8>,
+    mount: u32,
+    flags: u64,
+    fstype: FsType,
+    ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
+) {
     let origin = Some(Origin { mount, flags, fstype, ns_path, ovl, stand_in: None });
     let mut r = records();
-    let mark = kept(&r, fd, dev, ino).and_then(|rec| rec.mark);
-    insert(&mut r, fd, Record { dev, ino, origin, mark });
+    let had = kept(&r, fd, dev, ino);
+    let (mark, net) = had.map_or((None, None), |rec| (rec.mark, rec.net));
+    insert(&mut r, fd, Record { dev, ino, origin, mark, net });
 }
 
 /// The record of `fd` that is of the file `dev`, `ino`, which a new
@@ -265,6 +319,16 @@ pub fn stand_in(fd: i32) -> Option<Vec<u8>> {
 /// How many marks were ever recorded, so that a call looks for one only
 /// once there have been any.
 static MARKS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// How many ping sockets were ever marked ([`Mark::Ping`]), so that a
+/// receive looks for one only once there have been any.
+static PINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether descriptor `fd` is a ping socket whose receives fwe strips of
+/// the IP header ([`Mark::Ping`]).
+pub fn is_ping(fd: i32) -> bool {
+    PINGS.load(std::sync::atomic::Ordering::SeqCst) > 0 && marked(fd) == Some(Mark::Ping)
+}
 
 /// Whether any descriptor was ever marked (so a write need not look).
 pub fn any_marks() -> bool {
@@ -354,7 +418,7 @@ pub fn opened_in_tree(fd: i32, mount: u32, flags: u64, fstype: FsType) {
     let Some((dev, ino)) = identity(fd) else { return };
     let origin =
         Some(Origin { mount, flags, fstype, ns_path: Vec::new(), ovl: None, stand_in: None });
-    insert(&mut records(), fd, Record { dev, ino, origin, mark: None });
+    insert(&mut records(), fd, Record { dev, ino, origin, mark: None, net: None });
 }
 
 /// The namespace paths descriptors were opened at, each made `moved(path)`
@@ -373,8 +437,35 @@ pub fn rebase(moved: impl Fn(&[u8]) -> Vec<u8>) {
 pub fn mark(fd: i32, mark: Mark) {
     let Some((dev, ino)) = identity(fd) else { return };
     let mut r = records();
-    let origin = kept(&r, fd, dev, ino).and_then(|rec| rec.origin);
-    insert(&mut r, fd, Record { dev, ino, origin, mark: Some(mark) });
+    let had = kept(&r, fd, dev, ino);
+    let (origin, net) = had.map_or((None, None), |rec| (rec.origin, rec.net));
+    insert(&mut r, fd, Record { dev, ino, origin, mark: Some(mark), net });
+}
+
+/// How many sockets were ever pinned to a network namespace of fwe's, so
+/// that a socket call looks for one only once there have been any.
+static NETS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Socket `fd` belongs to network namespace `net` (`None`: the initial
+/// one).
+pub fn pin_net(fd: i32, net: Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>) {
+    if net.is_none() && NETS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return;
+    }
+    let Some((dev, ino)) = identity(fd) else { return };
+    let mut r = records();
+    let had = kept(&r, fd, dev, ino);
+    let (origin, mark) = had.map_or((None, None), |rec| (rec.origin, rec.mark));
+    insert(&mut r, fd, Record { dev, ino, origin, mark, net: net.map(Net) });
+}
+
+/// The network namespace of fwe's socket `fd` belongs to (`None`: the
+/// initial one).
+pub fn net_of(fd: i32) -> Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>> {
+    if NETS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return None;
+    }
+    record(fd)?.net.map(|n| n.0)
 }
 
 /// Where `fd` was opened, if fwe recorded it.
@@ -398,7 +489,17 @@ pub fn proc_link(fd: i32) -> Option<Vec<u8>> {
 
 /// What `fd` stands in for, if anything.
 pub fn marked(fd: i32) -> Option<Mark> {
-    record(fd)?.mark
+    if !any_marks() {
+        return None;
+    }
+    // The mark first: most records have none, and the check that `fd`
+    // still names the file asks the host.
+    let (mark, dev, ino) = {
+        let r = records();
+        let rec = r.get(&fd)?;
+        (rec.mark?, rec.dev, rec.ino)
+    };
+    (identity(fd) == Some((dev, ino))).then_some(mark)
 }
 
 /// Every marked descriptor, with its mark (whether or not it is still
@@ -506,7 +607,16 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Mem) => 20,
             Some(Mark::Pagemap) => 21,
             Some(Mark::RemoteMem { .. }) => 22,
+            Some(Mark::Comm { .. }) => 23,
+            Some(Mark::UtsName { .. }) => 24,
+            Some(Mark::Ping) => 25,
         });
+        if let Some(Mark::Comm { tid }) = rec.mark {
+            e.i32(tid);
+        }
+        if let Some(Mark::UtsName { domain }) = rec.mark {
+            e.bool(domain);
+        }
         if let Some(Mark::Pid { host, tid, nonblock }) = rec.mark {
             e.i32(host);
             e.i32(tid);
@@ -542,6 +652,7 @@ pub fn save(e: &mut Enc) {
             e.bool(any);
             e.u8(key);
         }
+        crate::shared::save_opt(e, &rec.net.as_ref().map(|n| n.0.clone()));
     }
 }
 
@@ -592,9 +703,13 @@ pub fn load(d: &mut Dec) {
             20 => Some(Mark::Mem),
             21 => Some(Mark::Pagemap),
             22 => Some(Mark::RemoteMem { id: d.i32() }),
+            23 => Some(Mark::Comm { tid: d.i32() }),
+            24 => Some(Mark::UtsName { domain: d.bool() }),
+            25 => Some(Mark::Ping),
             _ => None,
         };
-        insert(&mut r, fd, Record { dev, ino, origin, mark });
+        let net = crate::shared::load_opt(d).ok().flatten().map(Net);
+        insert(&mut r, fd, Record { dev, ino, origin, mark, net });
     }
 }
 

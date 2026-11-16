@@ -16,6 +16,13 @@ use std::collections::BTreeMap;
 /// seen from its end.
 pub trait Mapping: Clone + PartialEq + std::fmt::Debug {
     fn at(&self, offset: u64) -> Self;
+
+    /// Whether `next` is this mapping seen from `offset` bytes into it
+    /// (`self.at(offset) == *next`), which a mapping may tell without
+    /// making the copy.
+    fn continues(&self, offset: u64, next: &Self) -> bool {
+        self.at(offset) == *next
+    }
 }
 
 /// A range `[start, end)` and what it maps.
@@ -91,8 +98,8 @@ impl<V: Mapping> Vmas<V> {
     /// Whether every page of `[start, end)` is mapped.
     pub fn covered(&self, start: u64, end: u64) -> bool {
         let mut at = start;
-        for p in self.pieces(start, end) {
-            if p.start != at {
+        for p in self.overlapping(start, end) {
+            if p.start > at {
                 return false;
             }
             at = p.end;
@@ -102,7 +109,7 @@ impl<V: Mapping> Vmas<V> {
 
     /// Whether any page of `[start, end)` is mapped.
     pub fn any(&self, start: u64, end: u64) -> bool {
-        !self.pieces(start, end).is_empty()
+        self.overlapping(start, end).next().is_some()
     }
 
     /// Unmap `[start, end)`, returning what was mapped there.
@@ -111,24 +118,73 @@ impl<V: Mapping> Vmas<V> {
             return Vec::new();
         }
         let removed = self.pieces(start, end);
-        self.cut(start);
-        self.cut(end);
-        let keys: Vec<u64> = self.map.range(start..end).map(|(&s, _)| s).collect();
-        for k in keys {
-            self.map.remove(&k);
-        }
+        self.clear(start, end);
         removed
     }
 
-    /// Map `[start, end)` to `value`, replacing what was there (as
-    /// `MAP_FIXED` does); returns what it replaced.
-    pub fn insert(&mut self, start: u64, end: u64, value: V) -> Vec<Piece<V>> {
-        let replaced = self.remove(start, end);
-        if start < end {
-            self.map.insert(start, (end, value));
-            self.merge_around(start, end);
+    /// Unmap `[start, end)`.
+    pub fn clear(&mut self, start: u64, end: u64) {
+        if start >= end {
+            return;
         }
-        replaced
+        // Most often the range is free, or inside one mapping: one look,
+        // at the last mapping that starts before its end.
+        let Some((&s, &(e, _))) = self.map.range(..end).next_back() else { return };
+        if e <= start {
+            return;
+        }
+        if s <= start {
+            if e > end {
+                let rest = self.map[&s].1.at(end - s);
+                self.map.insert(end, (e, rest));
+            }
+            if s < start {
+                self.map.get_mut(&s).expect("looked at").0 = start;
+            } else {
+                self.map.remove(&s);
+            }
+            return;
+        }
+        self.cut(start);
+        self.cut(end);
+        while let Some((&k, _)) = self.map.range(start..end).next() {
+            self.map.remove(&k);
+        }
+    }
+
+    /// Map `[start, end)` to `value`, replacing what was there (as
+    /// `MAP_FIXED` does).
+    pub fn insert(&mut self, start: u64, end: u64, value: V) {
+        if start >= end {
+            return;
+        }
+        self.clear(start, end);
+        // Merged with its neighbours where they continue each other.
+        let before = self
+            .map
+            .range(..start)
+            .next_back()
+            .filter(|&(&ps, (pe, pv))| *pe == start && pv.continues(start - ps, &value))
+            .map(|(&ps, _)| ps);
+        let after = self
+            .map
+            .range(end..)
+            .next()
+            .filter(|&(&ns, (_, nv))| ns == end && value.continues(end - start, nv))
+            .map(|(_, (ne, _))| *ne);
+        let last = match after {
+            Some(ne) => {
+                self.map.remove(&end);
+                ne
+            }
+            None => end,
+        };
+        match before {
+            Some(ps) => self.map.get_mut(&ps).expect("looked at").0 = last,
+            None => {
+                self.map.insert(start, (last, value));
+            }
+        }
     }
 
     /// Give every mapped part of `[start, end)` the value `f` makes of its
@@ -182,31 +238,39 @@ impl<V: Mapping> Vmas<V> {
 
     /// Split the mapping containing `addr` there, if it starts before it.
     fn cut(&mut self, addr: u64) {
-        let Some((&s, &(e, _))) = self.map.range(..addr).next_back() else { return };
-        if e <= addr {
+        let Some((&s, (e, v))) = self.map.range_mut(..addr).next_back() else { return };
+        if *e <= addr {
             return;
         }
-        let (_, v) = self.map.get(&s).unwrap().clone();
-        self.map.insert(s, (addr, v.clone()));
-        self.map.insert(addr, (e, v.at(addr - s)));
+        let rest = (*e, v.at(addr - s));
+        *e = addr;
+        self.map.insert(addr, rest);
     }
 
     /// Merge the mappings in and next to `[start, end)` that continue each
     /// other.
     fn merge_around(&mut self, start: u64, end: u64) {
-        let from = self.map.range(..start).next_back().map_or(start, |(&s, _)| s);
-        let keys: Vec<u64> = self.map.range(from..=end).map(|(&s, _)| s).collect();
-        let Some(&first) = keys.first() else { return };
-        let mut cur = first;
-        for &next in &keys[1..] {
-            let continues = {
-                let (ce, cv) = &self.map[&cur];
-                let (_, nv) = &self.map[&next];
-                *ce == next && cv.at(next - cur) == *nv
+        let Some(mut cur) = self
+            .map
+            .range(..start)
+            .next_back()
+            .or_else(|| self.map.range(start..).next())
+            .map(|(&s, _)| s)
+        else {
+            return;
+        };
+        loop {
+            // The mapping at `cur` and the one after it, if that starts by `end`.
+            let mut pair = self.map.range(cur..=end.max(cur));
+            let (Some((_, (ce, cv))), Some((&next, (ne, nv)))) = (pair.next(), pair.next()) else {
+                return;
             };
-            if continues {
-                let (ne, _) = self.map.remove(&next).unwrap();
-                self.map.get_mut(&cur).unwrap().0 = ne;
+            if *ce == next && cv.continues(next - cur, nv) {
+                let ne = *ne;
+                self.map.remove(&next);
+                if let Some((e, _)) = self.map.get_mut(&cur) {
+                    *e = ne;
+                }
             } else {
                 cur = next;
             }
@@ -235,6 +299,63 @@ mod tests {
         M { prot, off }
     }
 
+    /// Random mappings, unmappings and changes keep what a page-by-page
+    /// model keeps, with no two neighbours that continue each other left
+    /// apart.
+    #[test]
+    fn random_calls_keep_pages_and_merges() {
+        const PAGES: u64 = 48;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut v: Vmas<M> = Vmas::default();
+        let mut model: Vec<Option<(u8, u64)>> = vec![None; PAGES as usize];
+        for _ in 0..20_000 {
+            let start = next(PAGES);
+            let end = start + 1 + next(PAGES - start);
+            match next(3) {
+                0 => {
+                    let (prot, off) = (next(3) as u8, next(4) * 100);
+                    v.insert(start, end, m(prot, off));
+                    for p in start..end {
+                        model[p as usize] = Some((prot, off + (p - start)));
+                    }
+                }
+                1 => {
+                    v.clear(start, end);
+                    for p in start..end {
+                        model[p as usize] = None;
+                    }
+                }
+                _ => {
+                    let prot = next(3) as u8;
+                    v.update(start, end, |x| m(prot, x.off));
+                    for p in start..end {
+                        if let Some(x) = &mut model[p as usize] {
+                            x.0 = prot;
+                        }
+                    }
+                }
+            }
+            let mut pages: Vec<Option<(u8, u64)>> = vec![None; PAGES as usize];
+            let mut prev: Option<(u64, M)> = None;
+            for p in v.iter() {
+                for q in p.start..p.end {
+                    pages[q as usize] = Some((p.value.prot, p.value.off + (q - p.start)));
+                }
+                if let Some((pe, pv)) = &prev {
+                    assert!(!(*pe == p.start && *pv == *p.value), "left apart at {}", p.start);
+                }
+                prev = Some((p.end, p.value.at(p.end - p.start)));
+            }
+            assert_eq!(pages, model);
+        }
+    }
+
     fn list(v: &Vmas<M>) -> Vec<(u64, u64, u8, u64)> {
         v.iter().map(|p| (p.start, p.end, p.value.prot, p.value.off)).collect()
     }
@@ -243,8 +364,11 @@ mod tests {
     fn fixed_mappings_replace_and_split() {
         let mut v = Vmas::new();
         v.insert(0x1000, 0x9000, m(3, 0));
-        let replaced = v.insert(0x3000, 0x5000, m(1, 100));
-        assert_eq!(replaced, vec![Piece { start: 0x3000, end: 0x5000, value: m(3, 0x2000) }]);
+        assert_eq!(
+            v.pieces(0x3000, 0x5000),
+            vec![Piece { start: 0x3000, end: 0x5000, value: m(3, 0x2000) }]
+        );
+        v.insert(0x3000, 0x5000, m(1, 100));
         assert_eq!(
             list(&v),
             vec![(0x1000, 0x3000, 3, 0), (0x3000, 0x5000, 1, 100), (0x5000, 0x9000, 3, 0x4000)]

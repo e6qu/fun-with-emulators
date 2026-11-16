@@ -1,10 +1,12 @@
-//! Socket options at the IP, IPv6 and TCP levels, which Linux and macOS
-//! number apart, some with structures laid out apart.
+//! Socket options at the IP, IPv6, TCP and ICMPv6 levels, which Linux and
+//! macOS number apart, some with structures laid out apart.
 //!
 //! Each Linux option the host has is given its host level and name and how
 //! its value is laid out ([`Form`]); one the host has not is refused
-//! (`ENOPROTOOPT`), as Linux refuses an option it does not know. Levels
-//! other than these pass through. On a Linux host every option is its own.
+//! (`ENOPROTOOPT`), as Linux refuses an option it does not know, and so is
+//! every option of another level: no Linux number reaches the host as
+//! another option. (The UDP level is fwe's own, see [`crate::net`].) On a
+//! Linux host every option is its own.
 //!
 //! The layouts that differ: the multicast TTL and loop flag are an `int`
 //! or a byte to Linux and a byte to macOS; `ip_mreq_source` keeps its
@@ -35,6 +37,9 @@ pub enum Form {
     GroupReq,
     /// `group_source_req`.
     GroupSourceReq,
+    /// `icmp6_filter`: a bit set for each type Linux blocks, the host
+    /// passes.
+    Icmp6Filter,
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -43,10 +48,12 @@ const IPPROTO_IP: u64 = 0;
 const IPPROTO_TCP: u64 = 6;
 #[cfg(not(target_os = "linux"))]
 const IPPROTO_IPV6: u64 = 41;
+#[cfg(not(target_os = "linux"))]
+const IPPROTO_ICMPV6: u64 = 58;
 
 /// The host's level, name and value layout for Linux option `name` at
-/// `level`: `ENOPROTOOPT` for one the host has not at the IP, IPv6 or TCP
-/// level, the level and name as they are at any other.
+/// `level`: `ENOPROTOOPT` for one the host has not, and for any option of
+/// another level.
 pub fn to_host(level: u64, name: u64) -> Result<(i32, i32, Form), i32> {
     #[cfg(target_os = "linux")]
     {
@@ -93,6 +100,8 @@ pub fn to_host(level: u64, name: u64) -> Result<(i32, i32, Form), i32> {
                 20 => (libc::IPV6_JOIN_GROUP, Same),
                 21 => (libc::IPV6_LEAVE_GROUP, Same),
                 26 => (libc::IPV6_V6ONLY, Same),
+                // IPV6_CHECKSUM, for a raw socket.
+                7 => (26, Same),
                 // IPV6_RTHDR: a routing header, as RFC 3542 has it.
                 57 => (51, Same),
                 67 => (libc::IPV6_TCLASS, Same),
@@ -112,7 +121,9 @@ pub fn to_host(level: u64, name: u64) -> Result<(i32, i32, Form), i32> {
                 25 => (0x201, Same),
                 _ => return Err(errno::ENOPROTOOPT),
             },
-            _ => return Ok((level as i32, name as i32, Same)),
+            // ICMP6_FILTER
+            IPPROTO_ICMPV6 if name == 1 => (18, Icmp6Filter),
+            _ => return Err(errno::ENOPROTOOPT),
         };
         Ok((level as i32, host, form))
     }
@@ -175,6 +186,10 @@ pub fn value_to_host(form: Form, val: &[u8]) -> Result<Vec<u8>, i32> {
                 sockaddr_to_host(&val[8..136], &mut h[4..132])?;
                 h
             }
+            Form::Icmp6Filter => {
+                need(32)?;
+                val[..32].iter().map(|b| !b).collect()
+            }
             Form::GroupSourceReq => {
                 need(264)?;
                 let mut h = vec![0u8; 260];
@@ -195,6 +210,7 @@ pub fn value_to_linux(form: Form, host: &[u8], cap: usize) -> Vec<u8> {
         Form::Byte if cap >= 4 => {
             i32::from(host.first().copied().unwrap_or(0)).to_ne_bytes().to_vec()
         }
+        Form::Icmp6Filter => host.iter().map(|b| !b).collect(),
         _ => host.to_vec(),
     }
 }
@@ -220,6 +236,12 @@ mod tests {
 
     #[test]
     fn options_the_host_lacks_are_refused() {
+        // Another level never reaches the host: Linux's `UDP_CORK` is
+        // macOS's `UDP_NOCKSUM`, its `ICMP_FILTER` (`SOL_RAW`) nothing.
+        assert_eq!(to_host(17, 1), Err(errno::ENOPROTOOPT));
+        assert_eq!(to_host(255, 1), Err(errno::ENOPROTOOPT));
+        assert_eq!(to_host(58, 2), Err(errno::ENOPROTOOPT));
+        assert_eq!(to_host(58, 1).unwrap(), (58, 18, Form::Icmp6Filter));
         assert_eq!(to_host(0, u32::MAX as u64), Err(errno::ENOPROTOOPT));
         assert_eq!(to_host(6, 12), Err(errno::ENOPROTOOPT));
         assert_eq!(to_host(0, 1).unwrap().1, libc::IP_TOS);
@@ -233,5 +255,9 @@ mod tests {
         assert_eq!(h, [0, 1, 2, 3, 8, 9, 10, 11, 4, 5, 6, 7]);
         assert_eq!(value_to_host(Form::Byte, &5i32.to_ne_bytes()).unwrap(), [5]);
         assert_eq!(value_to_linux(Form::Byte, &[5], 4), 5i32.to_ne_bytes());
+        // Linux blocks the types whose bits are set; the host passes them.
+        let block_all = [0xffu8; 32];
+        assert_eq!(value_to_host(Form::Icmp6Filter, &block_all).unwrap(), [0u8; 32]);
+        assert_eq!(value_to_linux(Form::Icmp6Filter, &[0u8; 32], 32), block_all);
     }
 }

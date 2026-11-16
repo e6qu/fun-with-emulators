@@ -43,8 +43,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::SeqCst};
 
 /// The host pid of this process.
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 /// The processes that would adopt one with line of ancestors `lineage`
@@ -771,8 +770,10 @@ fn raise(e: &Ended) {
         REPORTED.store(e.pid, SeqCst);
     }
     let (code, status) = child_code(e.status);
+    // The child's real user, as its record kept it; a child's of fwe's.
     // SAFETY: getuid cannot fail.
-    let uid = crate::host::uid_to_initial(unsafe { libc::getuid() });
+    let host_user = crate::host::uid_to_initial(unsafe { libc::getuid() });
+    let uid = crate::procreg::kept_uid(e.pid).unwrap_or(host_user);
     let info = crate::thread::SigInfo { code, pid: e.pid, uid, status, value: 0, poll: None };
     crate::thread::post_process_waking(fwe_abi::signal::SIGCHLD, info);
 }

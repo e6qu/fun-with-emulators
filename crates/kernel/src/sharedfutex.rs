@@ -162,8 +162,7 @@ fn key_of(host: u64) -> Option<[u64; 2]> {
 }
 
 fn me() -> u32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() as u32 }
+    crate::host::pid() as u32
 }
 
 /// This process, as slots name their owner: (pid, start time).

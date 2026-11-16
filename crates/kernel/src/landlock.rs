@@ -10,14 +10,17 @@
 //!   layer grants it on the file or on a directory above it, by host
 //!   identity (device and inode) up the file's host path: opening to read
 //!   or write a file or read a directory, executing, making and removing
-//!   each kind of file in a directory, truncating (decided as a file is
-//!   opened, for `ftruncate`), and moving a file between directories
-//!   (`REFER` in both, or `EXDEV`). A denied access is `EACCES`.
+//!   each kind of file in a directory, truncating and a device's `ioctl`
+//!   (decided as a file is opened, and marked on its open file
+//!   description, [`opened`]), and moving a file between directories
+//!   (`REFER` in both, or `EXDEV`). A denied access is `EACCES`. A domain
+//!   that restricts files may not mount (`EPERM`).
 //! - **TCP ports:** `bind` and `connect` to a port a rule names.
-//! - **Scopes:** a signal, or a connection to an abstract socket, to a
-//!   process outside a scoping layer's domain is `EPERM`. Each layer has
-//!   an id, and a process restricted publishes its chain of ids (a file
-//!   beside the process records) for others to compare with theirs.
+//! - **Scopes:** a signal, or a connection or datagram to an abstract
+//!   socket, to a process outside a scoping layer's domain is `EPERM`, and
+//!   so is tracing one ([`may_trace`]). Each layer has an id, and a
+//!   process restricted publishes its chain of ids (a file beside the
+//!   process records) for others to compare with theirs.
 //!
 //! Nothing is looked at while the process has no domain: one flag.
 
@@ -82,12 +85,14 @@ pub(crate) static RULESETS: Mutex<Vec<((u64, u64), Ruleset)>> = Mutex::new(Vec::
 pub(crate) static DOMAIN: Mutex<Vec<(u64, Ruleset)>> = Mutex::new(Vec::new());
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 
-/// Descriptors opened without the right to truncate their file.
-pub(crate) static NO_TRUNCATE: Mutex<Vec<i32>> = Mutex::new(Vec::new());
-
 /// Whether the process is restricted at all.
 pub fn active() -> bool {
     ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Whether a layer of the domain restricts file-system access.
+pub fn handles_fs() -> bool {
+    active() && DOMAIN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|l| l.1.fs != 0)
 }
 
 #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
@@ -145,8 +150,7 @@ pub fn create_ruleset(attr: u64, size: u64, flags: u64) -> Result<i64, i32> {
 fn anon_file() -> Result<i32, i32> {
     static N: AtomicU64 = AtomicU64::new(0);
     let mut path = crate::procreg::records_dir().ok_or(errno::ENOMEM)?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     path.extend_from_slice(
         format!("/landlock-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
     );
@@ -272,8 +276,7 @@ pub fn publish() {
     if !active() {
         return;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let Some(p) = chain_file(me) else { return };
     let mut b = Vec::new();
     if let Some(start) = crate::procreg::start_time(me) {
@@ -308,8 +311,7 @@ fn within(target: i32, scope: u64) -> bool {
     }
     let mine: Vec<(u64, u64)> = d.iter().map(|l| (l.0, l.1.scoped)).collect();
     drop(d);
-    // SAFETY: getpid cannot fail.
-    if target == unsafe { libc::getpid() } {
+    if target == crate::host::pid() {
         return true;
     }
     let theirs = chain_of(target);
@@ -321,6 +323,40 @@ fn within(target: i32, scope: u64) -> bool {
 /// A signal to host process `target`: `EPERM` outside a scoping layer.
 pub fn may_signal(target: i32) -> Result<(), i32> {
     if !active() || within(target, SCOPE_SIGNAL) { Ok(()) } else { Err(errno::EPERM) }
+}
+
+/// Tracing (or reading as a tracer does) host process `target`: only one
+/// in this process's domain or one nested in it (`EPERM` for a process
+/// less restricted, as Linux's Landlock has it for every layer).
+pub fn may_trace(target: i32) -> Result<(), i32> {
+    if !active() {
+        return Ok(());
+    }
+    // SAFETY: getpid cannot fail.
+    if target == unsafe { libc::getpid() } {
+        return Ok(());
+    }
+    let theirs = chain_of(target);
+    if chain().iter().enumerate().all(|(i, id)| theirs.get(i) == Some(id)) {
+        Ok(())
+    } else {
+        Err(errno::EPERM)
+    }
+}
+
+/// `PTRACE_TRACEME` with host process `parent` as tracer: the parent's
+/// domain must be this process's or one this one's is nested in.
+pub fn may_be_traced_by(parent: i32) -> Result<(), i32> {
+    let theirs = chain_of(parent);
+    if theirs.is_empty() {
+        return Ok(());
+    }
+    let mine = chain();
+    if theirs.iter().enumerate().all(|(i, id)| mine.get(i) == Some(id)) {
+        Ok(())
+    } else {
+        Err(errno::EPERM)
+    }
 }
 
 /// A connection to an abstract socket bound by host process `owner`.
@@ -428,31 +464,86 @@ pub fn check_port(port: u16, connect: bool) -> Result<(), i32> {
     Ok(())
 }
 
-/// Descriptor `fd` was opened without the right to truncate its file.
-pub fn opened_without_truncate(fd: i32) {
-    NO_TRUNCATE.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
+/// What the domain withholds from a file as it is opened: truncating it
+/// (`TRUNCATE`), and for a device `ioctl` (`IOCTL_DEV`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Withheld {
+    pub truncate: bool,
+    pub ioctl: bool,
 }
 
-/// `ftruncate` of `fd`: `EACCES` if it was opened without the right.
+/// Descriptor `fd` was opened with `w` withheld: for a regular file the
+/// right to truncate it, for a device `ioctl`. The mark goes on its open
+/// file description (as Linux keeps it with the open file), so every
+/// descriptor of it, `dup`'d, inherited, passed over a socket or kept
+/// across `execve`, carries it ([`crate::host::mark_landlock_denied`]).
+pub fn opened(fd: i32, w: Withheld) {
+    let Ok(st) = crate::fsops::linux_fstat(fd) else { return };
+    let denied = match st.st_mode & fwe_abi::stat::S_IFMT {
+        fwe_abi::stat::S_IFREG => w.truncate,
+        fwe_abi::stat::S_IFCHR | fwe_abi::stat::S_IFBLK => w.ioctl,
+        _ => false,
+    };
+    if denied {
+        crate::host::mark_landlock_denied(fd);
+    }
+}
+
+/// The guest's kind of file `fd` is (`S_IFMT` bits), if it is marked
+/// ([`opened`]).
+fn denied_kind(fd: i32) -> Option<u32> {
+    if !crate::host::landlock_denied(fd) {
+        return None;
+    }
+    crate::fsops::linux_fstat(fd).ok().map(|st| st.st_mode & fwe_abi::stat::S_IFMT)
+}
+
+/// `ftruncate` of `fd`: `EACCES` if its file was opened without the right,
+/// whichever process holds it now.
 pub fn may_ftruncate(fd: i32) -> Result<(), i32> {
-    if active() && NO_TRUNCATE.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd) {
-        Err(errno::EACCES)
-    } else {
-        Ok(())
+    match denied_kind(fd) {
+        Some(fwe_abi::stat::S_IFREG) => Err(errno::EACCES),
+        _ => Ok(()),
     }
 }
 
-/// `fd` is closed.
-pub fn closed(fd: i32) {
-    if active() {
-        NO_TRUNCATE.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
+/// `ioctl(fd, req)`: `EACCES` for a device opened without `IOCTL_DEV`,
+/// but for the requests any holder may make (the descriptor's flags, the
+/// file system's), as Linux's `is_masked_device_ioctl` lists them.
+pub fn may_ioctl(fd: i32, req: u64) -> Result<(), i32> {
+    use fwe_abi::ioctl::*;
+    if matches!(
+        req,
+        FIOCLEX
+            | FIONCLEX
+            | FIONBIO
+            | FIOASYNC
+            | FIOQSIZE
+            | FIFREEZE
+            | FITHAW
+            | FS_IOC_FIEMAP
+            | FIGETBSZ
+            | FICLONE
+            | FICLONERANGE
+            | FIDEDUPERANGE
+            | FS_IOC_GETFSUUID
+            | FS_IOC_GETFSSYSFSPATH
+    ) {
+        return Ok(());
+    }
+    match denied_kind(fd) {
+        Some(fwe_abi::stat::S_IFCHR | fwe_abi::stat::S_IFBLK) => Err(errno::EACCES),
+        _ => Ok(()),
     }
 }
 
-/// Whether some layer handles truncation without granting it to what is
-/// at host path `path`.
-pub fn truncate_denied(path: &[u8]) -> bool {
-    check_path(path, TRUNCATE, true).is_err()
+/// What some layer handles without granting it to the file at host path
+/// `path`, opened for writing if `write` (truncation is a writer's).
+pub fn withheld(path: &[u8], write: bool) -> Withheld {
+    Withheld {
+        truncate: write && check_path(path, TRUNCATE, true).is_err(),
+        ioctl: check_path(path, IOCTL_DEV, true).is_err(),
+    }
 }
 
 /// The domain, for an exec state or fork snapshot.
@@ -510,5 +601,29 @@ mod tests {
         let ids = ancestry(b"/tmp");
         assert!(!ids.is_empty());
         assert_eq!(ancestry(b"/").len(), 1);
+    }
+
+    /// A file opened without the right to truncate it keeps that on its
+    /// open file description: every descriptor of it is refused, another
+    /// open of the file is not, and `ioctl` is a device's to refuse.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn withheld_rights_follow_the_open_file() {
+        let path = std::env::temp_dir().join(format!("fwe-ll-trunc-{}", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let open = || std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let (a, b) = (open(), open());
+        use std::os::fd::AsRawFd;
+        opened(a.as_raw_fd(), Withheld { truncate: true, ioctl: true });
+        // SAFETY: duplicating a descriptor of this test's.
+        let dup = unsafe { libc::dup(a.as_raw_fd()) };
+        assert_eq!(may_ftruncate(a.as_raw_fd()), Err(errno::EACCES));
+        assert_eq!(may_ftruncate(dup), Err(errno::EACCES));
+        assert_eq!(may_ftruncate(b.as_raw_fd()), Ok(()));
+        // A regular file's mark is not a device's.
+        assert_eq!(may_ioctl(a.as_raw_fd(), 0x541b), Ok(()));
+        // SAFETY: closing the duplicate.
+        unsafe { libc::close(dup) };
+        let _ = std::fs::remove_file(&path);
     }
 }

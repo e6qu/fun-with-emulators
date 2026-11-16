@@ -7,7 +7,8 @@
 //! namespace's record directory otherwise). An ending process's record
 //! goes to the nearest namespace, its own or one above it, with
 //! accounting on, as Linux's does: a failed `open` a namespace when none
-//! is.
+//! is. How many namespaces have it on is kept in the process store, so a
+//! process ends without looking for those files while none has.
 
 use fwe_abi::errno;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,16 +52,32 @@ fn target() -> Option<Vec<u8>> {
     })
 }
 
+fn namespaces_on() -> &'static std::sync::atomic::AtomicU64 {
+    crate::procstore::count(crate::procstore::Count::Accounting)
+}
+
 /// Turn accounting on, to the file at host path `host`, or off (`None`).
 pub fn set(host: Option<&[u8]>) -> Result<(), i32> {
     let path = setting().ok_or(errno::ENOMEM)?;
     let p = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path.as_bytes());
     match host {
         None => {
-            let _ = std::fs::remove_file(p);
+            if std::fs::remove_file(p).is_ok() {
+                let on = namespaces_on();
+                let mut n = on.load(Ordering::SeqCst);
+                while n > 0 {
+                    match on.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                        Ok(_) => break,
+                        Err(now) => n = now,
+                    }
+                }
+            }
             Ok(())
         }
         Some(h) => {
+            if !std::fs::exists(p).unwrap_or(false) {
+                namespaces_on().fetch_add(1, Ordering::SeqCst);
+            }
             let tmp = [path.as_bytes(), b".new"].concat();
             let t = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&tmp);
             std::fs::write(t, h).and_then(|()| std::fs::rename(t, p)).map_err(|_| errno::EIO)
@@ -105,6 +122,9 @@ fn ticks(tv: libc::timeval) -> u64 {
 /// This process ends with Linux wait status `status`: its record, if
 /// accounting is on.
 pub fn process_ending(status: i32) {
+    if namespaces_on().load(Ordering::SeqCst) == 0 {
+        return;
+    }
     let Some(file) = target() else { return };
     let Ok(target) = std::ffi::CString::new(file) else { return };
     let rec = record(status);

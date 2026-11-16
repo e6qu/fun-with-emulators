@@ -50,6 +50,7 @@ impl Platform for HvPlatform {
         _addr: u64,
         _len: u64,
         _known: Option<&[(u64, u64)]>,
+        _cache: Option<&[u8]>,
     ) -> Result<(), fwe_kernel::PrepareFailed> {
         // The guest's code runs as it is.
         Ok(())
@@ -725,7 +726,9 @@ fn start(
     if features.pacg {
         hwcap |= fwe_abi::hwcap::PACG;
     }
-    let (uid, euid, gid, egid) = host::ids();
+    // The credentials the program starts with, as its kernel will have
+    // them.
+    let ids = crate::start_aux_ids(options)?;
     let mut aux = vec![
         (auxv::AT_HWCAP, hwcap),
         (auxv::AT_PAGESZ, page),
@@ -735,11 +738,11 @@ fn start(
         (auxv::AT_BASE, interp.as_ref().map_or(0, |i| i.bias)),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, exe.entry),
-        (auxv::AT_UID, uid as u64),
-        (auxv::AT_EUID, euid as u64),
-        (auxv::AT_GID, gid as u64),
-        (auxv::AT_EGID, egid as u64),
-        (auxv::AT_SECURE, 0),
+        (auxv::AT_UID, u64::from(ids.uid)),
+        (auxv::AT_EUID, u64::from(ids.euid)),
+        (auxv::AT_GID, u64::from(ids.gid)),
+        (auxv::AT_EGID, u64::from(ids.egid)),
+        (auxv::AT_SECURE, u64::from(ids.secure)),
         (auxv::AT_HWCAP2, hwcap2),
         (auxv::AT_MINSIGSTKSZ, fwe_abi::signal::MINSIGSTKSZ),
     ];
@@ -1361,8 +1364,10 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         }
         return fork::fork(parent, a, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
     }
-    if flags & cl::CLONE_VM == 0 || stack == 0 {
-        return err(errno::EINVAL);
+    // The flags a thread may have, its stack and the task limits, as a
+    // native thread's.
+    if let Err(e) = a.thread_check() {
+        return err(e);
     }
     let tid = thread::alloc_tid();
     // Traced from its start if the tracer follows new threads.
@@ -1495,11 +1500,17 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(regs, true);
     }
-    let n = regs.x[8];
-    let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    let mut n = regs.x[8];
+    let mut args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
-        let action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        let mut action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        // A tracer's turn (`SECCOMP_RET_TRACE`): the call as it leaves it.
+        if let fwe_kernel::seccomp::Action::Trace(data) = action {
+            action = kernel().as_mut().unwrap().seccomp_trace(regs, data);
+            n = regs.x[8];
+            args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+        }
         if action == fwe_kernel::seccomp::Action::KillThread && thread::live_threads() > 1 {
             // The thread ends without the kernel lock, as `exit` does.
             let _ = vcpu;

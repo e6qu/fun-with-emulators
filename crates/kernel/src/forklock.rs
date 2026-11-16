@@ -109,6 +109,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &epoll::EDGES,
         &epoll::HELD,
         &epoll::WRITES,
+        &scm::PENDING,
     ]);
     v.extend([
         &fdstate::STATES as &'static dyn ForkLock,
@@ -129,23 +130,27 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &rlimits::LIMITS,
         &seccomp::STATE,
         &creds::ACCESS,
+        &creds::IDENTITY,
+        &netns::SUNK,
         &net::CORKED,
         &net::KEPT_VALUES,
         &net::MEMBERSHIPS,
         &net::NAMES,
-        &net::SOCKET_MODES,
+        &net::SOCKETS,
         &netlink::SOCKS,
         &nsfd::FDS,
         &memfd::READ_ONLY,
         &atime::NOATIME_FDS,
-        &modes::SETID_FDS,
+        &modes::SETID_FILES,
+        &modes::CAPS_FILES,
+        &modes::READ,
         &tmpfile::NAMES,
         &tmpfs::HELD,
+        &tmpfs::USED,
         &aio::CTXS,
         &bpf::FILTERS,
         &bpf::PROG_MAPS,
         &landlock::DOMAIN,
-        &landlock::NO_TRUNCATE,
         &landlock::RULESETS,
         &mountapi::CONTEXTS,
         &mountapi::TREES,
@@ -153,16 +158,13 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &posixtimer::NOTIFY,
         &ptrace::PENDING,
         &ptrace::THREADS,
-        &syscalls::AFFINITY,
+        &procreg::OWN_AFFINITY,
         &fdtable::LIMIT,
         &keys::INHERIT,
         &fs::PREOPENED,
         &maps::OUTBOX,
-        &mm::DONT_DUMP,
-        &mm::GROWS_DOWN,
-        &mm::POISONED,
-        &mm::WIPE_ON_FORK,
-        &thread::TIDS_FD,
+        &thread::PUBLISHED,
+        &thread::ROBUST,
         &thread::TID_BLOCK_LEFT,
     ]);
     v
@@ -180,11 +182,10 @@ pub(crate) fn hold<R>(fork: impl FnOnce() -> R) -> R {
             }
         }
         if held.len() == all.len() {
-            // SAFETY: getpid cannot fail.
-            let parent = unsafe { libc::getpid() };
+            let parent = crate::host::pid();
             let r = fork();
             // SAFETY: as above.
-            if unsafe { libc::getpid() } != parent {
+            if crate::host::pid() != parent {
                 for (&l, g) in all.iter().zip(held) {
                     l.release_in_child(g);
                 }

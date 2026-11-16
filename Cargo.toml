@@ -25,6 +25,8 @@ undocumented_unsafe_blocks = "warn"
 
 [profile.release]
 debug = 1
+lto = "fat"
+codegen-units = 1
 
 # Preparing guest code scans every word of a program's executable sections,
 # 100 MB and more for rustc's libraries, once per process: optimized even in

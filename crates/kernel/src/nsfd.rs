@@ -125,10 +125,12 @@ pub fn target(fd: i32) -> Option<Vec<u8>> {
 
 /// `fd` is closed: what it named goes with its last descriptor.
 pub fn closed(fd: i32) {
-    if fdmarks::shared_elsewhere(fd) {
+    // The mark first: finding another descriptor of the same file lists
+    // them all.
+    let Some(Mark::Ns(k)) = fdmarks::any_marks().then(|| fdmarks::marked(fd)).flatten() else {
         return;
-    }
-    if let Some(Mark::Ns(k)) = fdmarks::any_marks().then(|| fdmarks::marked(fd)).flatten() {
+    };
+    if !fdmarks::shared_elsewhere(fd) {
         with(|m| m.remove(&k));
     }
 }
@@ -264,12 +266,13 @@ impl<P: Platform> Kernel<P> {
                 let kind = if req == NS_GET_PARENT { n.kind } else { CLONE_NEWUSER };
                 // What is asked for: the parent (a user namespace's owner
                 // is its parent); for another kind's owner, the user
-                // namespace it was made in, which fwe takes as the
-                // caller's. `None`: there is none (an initial namespace's
-                // parent); `Some(None)`: the initial namespace.
+                // namespace it was made in ([`crate::ns::owner_of`]; the
+                // initial one for an initial namespace). `None`: there is
+                // none (an initial namespace's parent); `Some(None)`: the
+                // initial namespace.
                 let wanted: Option<Option<(Vec<u8>, u64)>> =
                     if req == NS_GET_USERNS && n.kind != CLONE_NEWUSER {
-                        Some(self.fs().ns.user.as_ref().map(|u| (u.dir().to_vec(), u.id())))
+                        Some(n.dir.as_deref().and_then(crate::ns::owner_of))
                     } else {
                         match &n.dir {
                             None => None,
@@ -296,33 +299,28 @@ impl<P: Platform> Kernel<P> {
         })
     }
 
-    /// Whether the caller has `CAP_SYS_ADMIN` in the user namespace whose
-    /// record is `dir` (`None`: the initial one), as Linux's `ns_capable`:
-    /// in its own namespace by its capabilities; in one below it, made by
-    /// its effective user, outright; in one further below, as in the one
-    /// of those it is in.
-    fn admin_in_user_ns(&self, dir: Option<&[u8]>, id: u64) -> bool {
-        let own = self.fs().ns.user.as_ref().map(|r| r.dir().to_vec());
-        let mut at = dir.map(|d| (d.to_vec(), id));
-        for _ in 0..64 {
-            let Some((d, id)) = at else {
-                // Reached the initial namespace: the caller's only if it is in it.
-                return own.is_none() && self.creds.has_admin();
-            };
-            if Some(&d) == own.as_ref() {
-                return self.creds.has_admin();
+    /// Whether the caller may join namespace `n`, as Linux's `setns` has
+    /// it: `CAP_SYS_ADMIN` in a user namespace it joins; for another kind,
+    /// `CAP_SYS_ADMIN` in the user namespace that owns it and in its own
+    /// (and for a mount namespace `CAP_SYS_CHROOT` in its own too).
+    fn may_join(&self, n: &NsRef) -> bool {
+        use crate::caps::{CAP_SYS_ADMIN, CAP_SYS_CHROOT};
+        let dir = n.dir.as_deref().unwrap_or_default();
+        let c = &self.creds;
+        match n.kind {
+            CLONE_NEWUSER => c.has_in(dir, CAP_SYS_ADMIN),
+            CLONE_NEWNS => {
+                let owner = crate::mounts::store::Ns::join(dir, n.id)
+                    .map_or_else(|_| Vec::new(), |m| m.table().owner.clone());
+                c.has_in(&owner, CAP_SYS_ADMIN)
+                    && c.has_own(CAP_SYS_CHROOT)
+                    && c.has_own(CAP_SYS_ADMIN)
             }
-            let Ok(r) = crate::shared::Record::<crate::userns::UserNs>::join(&d, id) else {
-                return false;
-            };
-            let ns = r.get();
-            let parent = ns.parent.clone();
-            if parent.as_ref().map(|p| &p.0) == own.as_ref() && ns.owner == self.creds.euid {
-                return true;
+            _ => {
+                let owner = if dir.is_empty() { Vec::new() } else { crate::ns::owner_dir(dir) };
+                c.has_in(&owner, CAP_SYS_ADMIN) && c.has_own(CAP_SYS_ADMIN)
             }
-            at = parent;
         }
-        false
     }
 
     /// Whether, from namespace `start` of `kind` (`None`: the initial one)
@@ -360,17 +358,22 @@ impl<P: Platform> Kernel<P> {
         if nstype != 0 && nstype != n.kind {
             return err(errno::EINVAL);
         }
-        // CAP_SYS_ADMIN where it counts: for a user namespace, in that one
-        // (a user has it in one of its own, made below its namespace).
-        let admin = if n.kind == CLONE_NEWUSER {
-            self.admin_in_user_ns(n.dir.as_deref(), n.id)
-        } else {
-            self.creds.has_admin()
-        };
-        if !admin {
+        // A user namespace is joined, as Linux's `userns_install` has it,
+        // only if it is not the caller's own and the caller is a single
+        // thread (`EINVAL`), before the capability is asked for.
+        if n.kind == CLONE_NEWUSER {
+            let own = self.fs().ns.user.as_ref().map(|r| r.dir().to_vec());
+            if own == n.dir || crate::thread::live_threads() > 1 {
+                return err(errno::EINVAL);
+            }
+        }
+        if !self.may_join(&n) {
             return err(errno::EPERM);
         }
-        if n.kind == CLONE_NEWUSER && crate::thread::live_threads() > 1 {
+        // A pid namespace (for the caller's children) is its own or one
+        // below it, as Linux's `pidns_install` allows (`EINVAL`).
+        if n.kind == CLONE_NEWPID && !self.reaches(CLONE_NEWPID, &n.dir.clone().map(|d| (d, n.id)))
+        {
             return err(errno::EINVAL);
         }
         // A mount namespace is joined by a thread that shares its root and

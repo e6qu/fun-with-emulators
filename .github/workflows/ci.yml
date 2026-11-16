@@ -88,26 +88,36 @@ jobs:
           /usr/bin/log show --last 60m --style compact --predicate \
             '(eventMessage CONTAINS[c] "unrecoverable" AND NOT eventMessage CONTAINS "CT signature") OR eventMessage CONTAINS[c] "EXC_GUARD" OR (eventMessage CONTAINS "fwe" AND eventMessage CONTAINS[c] "kill")' \
             | tail -200 || true
-      # Where fwe itself crashed: the newest crash reports, their faulting
-      # thread's registers and frames.
+      # Where fwe itself crashed: the crash reports, but those of a process
+      # that killed itself with the guest's fatal signal (one line each),
+      # with their faulting thread's registers and frames.
       - if: failure()
         run: |
-          for f in $(ls -t ~/Library/Logs/DiagnosticReports/fwe*.ips 2>/dev/null | head -3); do
-            echo "=== $f"
-            python3 -c "
-          import json,sys
-          t=open(sys.argv[1]).read().split('\\n',1)[1]
-          r=json.loads(t)
-          print(r.get('exception'),r.get('termination',{}).get('indicator'))
-          imgs=r['usedImages']
-          ft=r['faultingThread']
-          th=r['threads'][ft]
-          print('state', {k:v for k,v in th.get('threadState',{}).items() if k in ('pc','lr','sp','far','esr','x')})
-          for fr in th['frames'][:25]:
-            im=imgs[fr['imageIndex']]
-            print(im.get('name'), fr.get('symbol'), hex(fr.get('imageOffset',0)))
-          " "$f" || head -c 3000 "$f"
-          done
+          python3 - ~/Library/Logs/DiagnosticReports/fwe*.ips <<'PY' || true
+          import json, os, sys
+          shown = 0
+          for f in sorted(sys.argv[1:], key=os.path.getmtime, reverse=True):
+              try:
+                  r = json.loads(open(f).read().split("\n", 1)[1])
+              except (OSError, ValueError, IndexError):
+                  continue
+              imgs, th = r["usedImages"], r["threads"][r["faultingThread"]]
+              frames = [(imgs[fr["imageIndex"]].get("name"), fr.get("symbol"), fr.get("imageOffset", 0))
+                        for fr in th["frames"]]
+              ex = r.get("exception", {})
+              if any(s and "kill_self" in s for _, s, _ in frames):
+                  print(f"{f}: {ex.get('signal')}, the guest's (kill_self)")
+                  continue
+              if shown == 10:
+                  continue
+              shown += 1
+              print(f"=== {f} (parent {r.get('parentProc')} {r.get('parentPid')})")
+              print(ex, r.get("termination", {}).get("indicator"))
+              print("state", {k: v for k, v in th.get("threadState", {}).items()
+                              if k in ("pc", "lr", "sp", "far", "esr", "x")})
+              for name, sym, off in frames[:25]:
+                  print(name, sym, hex(off))
+          PY
       # The whole trace of a container engine's step that failed.
       - if: failure()
         uses: actions/upload-artifact@v4
@@ -276,17 +286,26 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/bench-cache
-          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'tools/bench/run.py') }}
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'tools/bench/run.py') }}
       - uses: actions/download-artifact@v4
         with:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
-      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --cache target/bench-cache --linux linux.json --out macos.json
-      - uses: actions/upload-artifact@v4
+      # The native side's programs: the clang release Alpine's root has, and
+      # the workloads' programs (tools/bench/run.py, BREW).
+      - run: brew install llvm@22 python@3.14 sqlite git xz
+      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --linux linux.json --out macos.json
+      - if: always()
+        uses: actions/upload-artifact@v4
         with:
           name: bench-results
-          path: macos.json
+          path: |
+            macos.json
+            bench-*.sample
+            bench-*.vmmap
+            bench-*.pcs
+            bench-*.trace
       - if: failure()
         run: |
           mkdir -p crash-reports

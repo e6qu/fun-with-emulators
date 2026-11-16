@@ -239,6 +239,14 @@ fn write_to(fd: i32, k: Kind, buf: &[u8], pos: Option<u64>) -> Result<usize, i32
         let r = crate::loopdev::write_at_pos(fd, buf, pos).unwrap_or(err(errno::EBADF));
         return if r < 0 { Err(-r as i32) } else { Ok(r as usize) };
     }
+    // A socket whose peer filters what arrives: what it lets in is
+    // written, the rest dropped as if sent.
+    let whole = buf.len();
+    let buf = match crate::bpf::filter_send(fd, buf) {
+        Some(0) => return Ok(whole),
+        Some(keep) => &buf[..keep as usize],
+        None => buf,
+    };
     let iov = libc::iovec { iov_base: buf.as_ptr() as *mut _, iov_len: buf.len() };
     let r = if let Some(r) =
         crate::specialwrite::write(fd, crate::specialwrite::Source::Host(&[iov]), buf.len() as u64)
@@ -259,7 +267,13 @@ fn write_to(fd: i32, k: Kind, buf: &[u8], pos: Option<u64>) -> Result<usize, i32
     // What Linux reports where the host differs: `/dev/full`, a sealed
     // memfd, a closed peer's `SIGPIPE`.
     let r = crate::linux_result(nr::WRITE, &[fd as u64, 0, buf.len() as u64, 0, 0, 0], r);
-    if r < 0 { Err(-r as i32) } else { Ok(r as usize) }
+    if r < 0 {
+        Err(-r as i32)
+    } else if r as usize == buf.len() {
+        Ok(whole)
+    } else {
+        Ok(r as usize)
+    }
 }
 
 /// The offset a guest pointer `ptr` holds, if it is not null (`EINVAL` if
@@ -329,6 +343,10 @@ fn splice_inner(
                 return Err(errno::EINVAL);
             }
             let socket_nonblock = flags & SPLICE_F_NONBLOCK != 0 && ko == Kind::Socket;
+            // A file of a tmpfs with a size: as much as fits, asked before
+            // the pipe is taken from.
+            let len =
+                if ko == Kind::File { crate::tmpfs::room(fd_out, pos_out, len)? } else { len };
             let w =
                 from_pipe(fd_in, nonblock_of(fl_in), fd_out, ko, socket_nonblock, pos_out, len)?;
             if let Some(p) = pos_out {

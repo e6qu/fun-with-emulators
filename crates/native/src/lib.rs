@@ -7,6 +7,8 @@ mod gate;
 pub mod hv;
 pub mod hwcap;
 pub mod loader;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod pool;
 pub mod prepare;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod process;
@@ -15,6 +17,8 @@ mod quiesce;
 pub mod rewrite;
 pub mod stack;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod stacks;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod threads;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod trap;
@@ -22,17 +26,44 @@ mod trap;
 /// Live guest threads, so the last one to exit ends the process.
 static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
 
+/// `FWE_TIMING`'s mark as the process ends, with how many code pages were
+/// written as they first ran.
+fn mark_exit() {
+    fwe_kernel::timing::mark("exit");
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    prepare::keep_hot();
+    if fwe_kernel::timing::on() {
+        let pages = fwe_kernel::lazycode::written();
+        fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
+    }
+}
+
 /// End the calling guest thread: the last thread ends the process, any other
-/// ends just its host thread. Must be called without the kernel lock held,
-/// since `pthread_exit` does not return and would never release it.
-pub(crate) fn exit_current_thread(code: i32) -> ! {
+/// ends just its host thread, or, from the system-call gate (`from_gate`),
+/// leaves it to run the next thread ([`threads::wait_for_next`]). Must be
+/// called without the kernel lock held, since neither returns and the lock
+/// would never be released.
+pub(crate) fn exit_current_thread(code: i32, from_gate: bool) -> ! {
+    #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+    let _ = from_gate;
     if LIVE_THREADS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst) == 1 {
+        mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
+        fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process.
         unsafe { libc::_exit(code) }
     }
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    quiesce::forget_current();
+    {
+        quiesce::forget_current();
+        if from_gate {
+            threads::wait_for_next();
+        }
+        // Its stacks, for a thread that starts once this one has gone.
+        if let (Some(gate), Some(alt)) = (gate::block_mapping(), trap::altstack_mapping()) {
+            stacks::give(gate, alt);
+        }
+    }
     // SAFETY: ends the calling host thread; the process keeps running.
     unsafe { libc::pthread_exit(std::ptr::null_mut()) }
 }
@@ -46,8 +77,27 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::Path;
 use std::sync::OnceLock;
 
-/// Size of the guest's main thread stack.
+/// Size of the guest's main thread stack in the hypervisor backend.
 pub const STACK_SIZE: u64 = 8 << 20;
+
+/// The size of a program's main thread stack for a soft `RLIMIT_STACK` of
+/// `limit`, in the native backend: the limit, which Linux lets the stack
+/// grow to, mapped at once (the host gives it pages only as they are
+/// used), from 128 KiB (Linux's least) up to 4 GiB for an unlimited one.
+fn stack_size(limit: u64, page: u64) -> u64 {
+    limit.clamp(128 << 10, 4 << 30).next_multiple_of(page)
+}
+
+/// The soft `RLIMIT_STACK` the program is started under: the one an
+/// `execve` carried, else the process's own.
+fn start_stack_limit(options: &Options) -> u64 {
+    options
+        .exec_state
+        .as_deref()
+        .and_then(unhex)
+        .and_then(|s| fwe_kernel::exec_state_stack_limit(&s))
+        .unwrap_or_else(|| fwe_kernel::rlimits::get(fwe_abi::resource::RLIMIT_STACK).0)
+}
 
 /// The kernel of the guest running in this process.
 #[allow(dead_code)]
@@ -69,12 +119,13 @@ impl NativePlatform {
         len: u64,
         arena: Option<&mut prepare::StubArena>,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
         unsafe {
             let (tp, x18, page) = (self.tp_slot, self.x18_slot, self.page_size);
-            prepare::prepare(addr, len, tp, x18, page, arena, known)
+            prepare::prepare(addr, len, (tp, x18), page, arena, known, cache)
         }
     }
 }
@@ -97,21 +148,23 @@ impl Platform for NativePlatform {
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<(), fwe_kernel::PrepareFailed> {
-        self.prepare(addr, len, None, known).map(|_| ()).map_err(|e| fwe_kernel::PrepareFailed {
-            errno: fwe_abi::errno::ENOMEM,
-            why: e.to_string(),
+        self.prepare(addr, len, None, known, cache).map(|_| ()).map_err(|e| {
+            fwe_kernel::PrepareFailed { errno: fwe_abi::errno::ENOMEM, why: e.to_string() }
         })
     }
 
     fn exit(&mut self, code: i32) -> ! {
+        mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
+        fwe_kernel::timing::mark("exit: recorded");
         // SAFETY: terminating the process; the guest owns all its state.
         unsafe { libc::_exit(code) }
     }
 
     fn exit_thread(&mut self, code: i32) -> ! {
-        exit_current_thread(code)
+        exit_current_thread(code, false)
     }
 
     fn kill_self(&mut self, sig: libc::c_int) -> ! {
@@ -185,6 +238,19 @@ fn unhex(text: &[u8]) -> Option<Vec<u8>> {
     text.chunks(2).map(|p| u8::from_str_radix(std::str::from_utf8(p).ok()?, 16).ok()).collect()
 }
 
+/// What the auxiliary vector of the program fwe starts says of its
+/// credentials: from [`Options::exec_state`] for one an `execve` re-executed
+/// fwe for, once the filesystem has its namespaces.
+fn start_aux_ids(options: &Options) -> Result<fwe_kernel::AuxIds, Error> {
+    let state = match &options.exec_state {
+        Some(text) => {
+            Some(unhex(text).ok_or_else(|| Error::Unsupported("malformed --exec-state".into()))?)
+        }
+        None => None,
+    };
+    fwe_kernel::AuxIds::at_start(state.as_deref()).map_err(Error::Unsupported)
+}
+
 /// Apply [`Options::exec_state`] to a new kernel. A program fwe was handed
 /// by descriptor (`--exe-fd`), run as `/dev/fd/N`, came through the mount
 /// the guest's descriptor `N` was opened in.
@@ -250,9 +316,14 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
 /// host path inside the rootfs is read as the guest's path, so that a
 /// symbolic link there resolves in the rootfs (Alpine's `/bin/sh` links to
 /// `/bin/busybox`, which on the host is no file).
-fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<Vec<u8>, Error> {
-    let in_guest =
-        |p: &[u8]| fs.read(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)));
+fn read_program(
+    path: &Path,
+    options: &Options,
+    fs: &fwe_kernel::Fs,
+) -> Result<fwe_kernel::ExecFile, Error> {
+    let in_guest = |p: &[u8]| {
+        fs.read_identified(p).map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))
+    };
     if options.exe_fd.is_some() {
         in_guest(b"/proc/self/exe")
     } else if options.guest_path {
@@ -260,7 +331,12 @@ fn read_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Result<V
     } else if let Some(guest) = guest_path_in_root(path, options) {
         in_guest(&guest)
     } else {
-        std::fs::read(path).map_err(Error::Read)
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        let mut f = std::fs::File::open(path).map_err(Error::Read)?;
+        let mut data = Vec::new();
+        f.read_to_end(&mut data).map_err(Error::Read)?;
+        Ok((data, fwe_kernel::prepcache::FileId::of_fd(f.as_raw_fd())))
     }
 }
 
@@ -701,7 +777,6 @@ fn x18_survives_kernel_entry() -> bool {
     x18_survives(true)
 }
 
-/// Diagnostic probes of host behaviour, run one per process with
 /// `fwe --probe <name>`. Prints the result; a crash identifies the step.
 pub fn probe(name: &str) -> Result<String, String> {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -873,11 +948,12 @@ pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
 }
 
 /// Load an ELF image (and its dynamic linker) and build the initial stack,
-/// returning where to start the guest. Shared by process startup and
-/// `execve`. Does not touch the kernel; the caller installs or updates it.
+/// returning where to start the guest, whose auxiliary vector carries
+/// `ids`. Shared by process startup and `execve`. Does not touch the
+/// kernel; the caller installs or updates it.
 #[allow(clippy::too_many_arguments)]
 pub fn load_image(
-    file: &[u8],
+    (file, file_id): (&[u8], Option<fwe_kernel::prepcache::FileId>),
     execfn: &[u8],
     args: &[&[u8]],
     env: &[&[u8]],
@@ -885,14 +961,17 @@ pub fn load_image(
     platform: &NativePlatform,
     page: u64,
     tracer: Tracer,
+    stack_limit: u64,
+    ids: fwe_kernel::AuxIds,
 ) -> Result<Loadout, Error> {
     let elf = Elf::parse(file).map_err(Error::Elf)?;
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
-    let load_object = |elf: &Elf, what: &str| -> Result<loader::Loaded, Error> {
-        loader::load(elf, page, |a, l, known, arena| {
-            let stats = platform.prepare(a, l, Some(arena), known).map_err(|e| e.to_string())?;
+    let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
+        loader::load(elf, page, id, |a, l, known, arena, cache| {
+            let stats =
+                platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
                 tracer.note(&format!(
                     "prepared {what} {a:#x}+{l:#x}: {} system calls, {} stubs, \
@@ -905,7 +984,7 @@ pub fn load_image(
         .map_err(Error::Load)
     };
 
-    let loaded = load_object(&elf, "exe")?;
+    let loaded = load_object(&elf, file_id, "exe")?;
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
@@ -921,7 +1000,7 @@ pub fn load_image(
     // libraries itself through our mmap and openat.
     let interp = match &interp_path {
         Some(ip) => {
-            let idata = fs.read(ip).map_err(|e| {
+            let (idata, iid) = fs.read_identified(ip).map_err(|e| {
                 Error::Unsupported(format!(
                     "loading the dynamic linker {}: errno {e}",
                     String::from_utf8_lossy(ip)
@@ -933,7 +1012,7 @@ pub fn load_image(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            let placed = load_object(&ielf, "interp")?;
+            let placed = load_object(&ielf, iid, "interp")?;
             let name = fwe_kernel::maps::Name::Path(ip.as_slice().into());
             fwe_kernel::maps::record().loaded(
                 &ielf,
@@ -949,12 +1028,14 @@ pub fn load_image(
     let entry = interp.map_or(loaded.entry, |i| i.entry);
     let interp_base = interp.map_or(0, |i| i.load_base);
 
-    // A fresh thread stack, with an inaccessible guard page below it.
+    // A fresh thread stack, as large as `RLIMIT_STACK` lets it grow, with
+    // an inaccessible guard page below it.
+    let stack = stack_size(stack_limit, page);
     // SAFETY: a fresh mapping owned by the guest.
     let stack_base = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            (STACK_SIZE + page) as usize,
+            (stack + page) as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
             -1,
@@ -964,15 +1045,14 @@ pub fn load_image(
     if stack_base == libc::MAP_FAILED {
         return Err(Error::Load(loader::LoadError::Map(std::io::Error::last_os_error())));
     }
-    fwe_kernel::mm::track(stack_base as u64, STACK_SIZE + page);
+    fwe_kernel::mm::track(stack_base as u64, stack + page);
     // SAFETY: protecting the lowest page of the mapping just made.
     unsafe { libc::mprotect(stack_base, page as usize, libc::PROT_NONE) };
-    let stack_top = stack_base as u64 + STACK_SIZE + page;
+    let stack_top = stack_base as u64 + stack + page;
     fwe_kernel::maps::record().set_stack(stack_base as u64 + page, stack_top);
     fwe_kernel::maps::record().set_heap(brk.start, brk.start, brk.limit);
 
     let (hwcap, hwcap2) = hwcap::detect();
-    let (uid, euid, gid, egid) = fwe_kernel::host::ids();
     let mut aux = vec![
         (auxv::AT_HWCAP, hwcap),
         (auxv::AT_PAGESZ, page),
@@ -982,11 +1062,11 @@ pub fn load_image(
         (auxv::AT_BASE, interp_base),
         (auxv::AT_FLAGS, 0),
         (auxv::AT_ENTRY, loaded.entry),
-        (auxv::AT_UID, uid as u64),
-        (auxv::AT_EUID, euid as u64),
-        (auxv::AT_GID, gid as u64),
-        (auxv::AT_EGID, egid as u64),
-        (auxv::AT_SECURE, 0),
+        (auxv::AT_UID, u64::from(ids.uid)),
+        (auxv::AT_EUID, u64::from(ids.euid)),
+        (auxv::AT_GID, u64::from(ids.gid)),
+        (auxv::AT_EGID, u64::from(ids.egid)),
+        (auxv::AT_SECURE, u64::from(ids.secure)),
         (auxv::AT_HWCAP2, hwcap2),
         (auxv::AT_MINSIGSTKSZ, fwe_abi::signal::MINSIGSTKSZ),
     ];
@@ -996,7 +1076,7 @@ pub fn load_image(
 
     let image =
         stack::InitialStack { args, env, execfn, auxv: &aux, random: random16() }.build(stack_top);
-    if stack_top - image.sp > STACK_SIZE / 2 {
+    if stack_top - image.sp > stack / 2 {
         return Err(Error::Unsupported("argument list too long".into()));
     }
     // SAFETY: the image fits in the stack mapping, ending at its top.
@@ -1027,22 +1107,28 @@ fn start(
     }
     // fwe's own descriptors go above the guest's range from here on.
     fwe_kernel::fdtable::init();
+    fwe_kernel::timing::mark("main");
     if options.exec_state.is_none() {
         // A fresh start: what earlier runs left behind and no process holds
         // goes (see `fwe_kernel::shared::collect`).
         fwe_kernel::shared::collect();
     }
     let args = &guest_args(args, options);
+    fwe_kernel::timing::mark("collect");
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
-    let data = read_program(path, options, &fs)?;
+    fwe_kernel::timing::mark("open_fs");
+    let (data, data_id) = read_program(path, options, &fs)?;
+    fwe_kernel::timing::mark("read_program");
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if needs_vm(&data) {
+        fwe_kernel::timing::mark("backend: vm");
         drop(fs);
         return Err(hv::run(path, &data, args, env, options));
     }
+    fwe_kernel::timing::mark("backend: native");
 
     let page = page_size();
     let tracer = options.strace;
@@ -1054,7 +1140,7 @@ fn start(
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
     let out = load_image(
-        &data,
+        (&data, data_id),
         &guest_execfn(path, options),
         &arg_bytes,
         &env_bytes,
@@ -1062,10 +1148,14 @@ fn start(
         &platform,
         page,
         options.strace,
+        start_stack_limit(options),
+        start_aux_ids(options)?,
     )?;
+    fwe_kernel::timing::mark("load_image");
     // A trampoline used as the return address for signal handlers that have
     // no sa_restorer: it issues the rt_sigreturn system call.
     let sigreturn_tramp = make_sigreturn_trampoline(page)?;
+    fwe_kernel::timing::mark("trampoline");
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
@@ -1077,6 +1167,7 @@ fn start(
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
     });
+    fwe_kernel::timing::mark("published");
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();
 
@@ -1084,6 +1175,7 @@ fn start(
     kernel.set_sigreturn_trampoline(sigreturn_tramp);
     apply_exec_state(&mut kernel, options, path)?;
     *KERNEL.lock() = Some(kernel);
+    fwe_kernel::timing::mark("kernel");
     enter(out.sp, out.entry)
 }
 

@@ -65,6 +65,8 @@ pub struct ForkNs {
     cgroup: Option<Vec<u8>>,
     /// Its handlers are reset (`CLONE_CLEAR_SIGHAND`).
     clear_sighand: bool,
+    /// It starts in a frozen cgroup: it stops itself before it runs.
+    frozen: bool,
     /// It shares its parent's descriptor table (`CLONE_FILES`).
     files: bool,
     /// The signal its end is told with.
@@ -72,14 +74,27 @@ pub struct ForkNs {
     /// `CLONE_PIDFD`: the descriptor made ready for the child, and where it
     /// goes.
     pidfd: Option<(i32, u64)>,
+    /// What the parent alone would know of the child's record, for a child
+    /// that writes its whole record itself ([`Kernel::fork_child_writes`]).
+    child_writes: Option<crate::procreg::FromParent>,
 }
 
 impl<P: Platform> Kernel<P> {
     /// `unshare(flags)`.
     pub(crate) fn sys_unshare(&mut self, flags: u64) -> i64 {
         // What a single-threaded process does not share anyway.
-        let unshared = CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_VM;
+        let unshared =
+            CLONE_FILES | CLONE_FS | CLONE_SYSVSEM | CLONE_SIGHAND | CLONE_VM | CLONE_THREAD;
         if flags & !(unshared | SUPPORTED) != 0 {
+            return err(errno::EINVAL);
+        }
+        // Its threads, signal handlers and memory are another thread's too
+        // while it has other threads: they cannot be made its own. (A
+        // process shares memory with no other process past a `vfork`,
+        // whose parent waits.)
+        if flags & (CLONE_THREAD | CLONE_SIGHAND | CLONE_VM) != 0
+            && crate::thread::live_threads() > 1
+        {
             return err(errno::EINVAL);
         }
         // A descriptor table shared with another process, or with other
@@ -111,7 +126,12 @@ impl<P: Platform> Kernel<P> {
         if new_user && crate::thread::live_threads() > 1 {
             return err(errno::EINVAL);
         }
-        if !new_user && !self.creds.has_admin() {
+        if new_user && let Err(e) = crate::userns::may_make(self.fs().proc_root() != b"/") {
+            return err(e);
+        }
+        // The others need CAP_SYS_ADMIN in the caller's user namespace
+        // (which a new one gives it), and are owned by that namespace.
+        if !new_user && !self.creds.has_own(crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         // With other threads, the namespaces become the caller's own.
@@ -126,7 +146,10 @@ impl<P: Platform> Kernel<P> {
         // Owned by the user namespace it is made in, a new one included.
         if flags & CLONE_NEWNS != 0 {
             match fs.mount_ns().copy(&fs.ns.user_dir()) {
-                Ok(copy) => fs.set_mount_ns(Arc::new(copy)),
+                Ok(copy) => {
+                    crate::ns::set_owner(copy.dir(), fs.ns.user.as_deref());
+                    fs.set_mount_ns(Arc::new(copy))
+                }
                 Err(e) => return err(e),
             }
         }
@@ -147,7 +170,10 @@ impl<P: Platform> Kernel<P> {
             // For the children: the process itself stays where it is.
             let parent = fs.ns.pid_children.as_ref().map(|r| (r.dir().to_vec(), r.id()));
             match Record::fresh("pid", PidNs::new(parent)) {
-                Ok(r) => fs.ns.pid_children = Some(Arc::new(r)),
+                Ok(r) => {
+                    crate::ns::set_owner(r.dir(), fs.ns.user.as_deref());
+                    fs.ns.pid_children = Some(Arc::new(r))
+                }
                 Err(e) => return err(e),
             }
         }
@@ -223,7 +249,9 @@ impl<P: Platform> Kernel<P> {
 
     /// `sethostname(name, len)`, or `setdomainname` when `!host`.
     pub(crate) fn sys_setname(&mut self, name: u64, len: u64, host: bool) -> i64 {
-        if !self.creds.has_admin() {
+        // CAP_SYS_ADMIN over the UTS namespace: in the user namespace that
+        // owns it.
+        if !self.creds.has_in(&self.fs().ns.owner(CLONE_NEWUTS), crate::caps::CAP_SYS_ADMIN) {
             return err(errno::EPERM);
         }
         if len > 64 {
@@ -271,20 +299,18 @@ impl<P: Platform> Kernel<P> {
         // Limits left for this process are its own before its child
         // inherits them.
         self.take_pending_limits();
-        // RLIMIT_NPROC: a user with as many processes as it allows has no
-        // more but as root or with CAP_SYS_RESOURCE or CAP_SYS_ADMIN, as on
-        // Linux (the host's limit, the user's on the host, applies too).
+        // RLIMIT_NPROC: a user with as many tasks (threads, in all its
+        // processes) as it allows has no more but as root or with
+        // CAP_SYS_RESOURCE or CAP_SYS_ADMIN, as on Linux (the host's limit,
+        // the user's on the host, applies too).
         let (nproc, _) = crate::rlimits::get(fwe_abi::resource::RLIMIT_NPROC);
         if nproc != fwe_abi::resource::RLIM_INFINITY
             && self.creds.uid != 0
             && !self.creds.has(crate::caps::CAP_SYS_RESOURCE)
-            && !self.creds.has_admin()
+            && !self.creds.has(crate::caps::CAP_SYS_ADMIN)
+            && crate::cgroupfs::user_tasks(self.creds.uid) >= nproc
         {
-            let uid = self.creds.uid;
-            let mine = crate::procreg::all().iter().filter(|(_, r)| r.ids[0] == uid).count();
-            if mine as u64 >= nproc {
-                return Err(errno::EAGAIN);
-            }
+            return Err(errno::EAGAIN);
         }
         // And so are its keyrings.
         crate::keys::before_fork();
@@ -293,16 +319,18 @@ impl<P: Platform> Kernel<P> {
         }
         let new = flags & SUPPORTED;
         let new_user = new & CLONE_NEWUSER != 0;
-        if new != 0 && !new_user && !self.creds.has_admin() {
+        if new_user {
+            crate::userns::may_make(self.fs().proc_root() != b"/")?;
+        }
+        if new != 0 && !new_user && !self.creds.has_own(crate::caps::CAP_SYS_ADMIN) {
             return Err(errno::EPERM);
         }
         // Taken while this process's own pid namespaces are current.
         let mut line = crate::procreg::child_line();
         if flags & fwe_abi::clone::CLONE_PARENT != 0
-            && crate::pidns::current().first().is_some_and(|ns| {
-                // SAFETY: getpid cannot fail.
-                ns.get().number_of(unsafe { libc::getpid() }) == Some(1)
-            })
+            && crate::pidns::current()
+                .first()
+                .is_some_and(|ns| ns.get().number_of(crate::host::pid()) == Some(1))
         {
             // A pid namespace's init has no parent in its namespace to give.
             return Err(errno::EINVAL);
@@ -321,6 +349,7 @@ impl<P: Platform> Kernel<P> {
                 let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
                 match crate::cgroupfs::locate(&host) {
                     Some((cg, None)) => {
+                        crate::cgroupfs::may_move(&crate::cgroupfs::current(), &cg)?;
                         crate::cgroupfs::may_join(&cg)?;
                         Some(cg)
                     }
@@ -328,34 +357,67 @@ impl<P: Platform> Kernel<P> {
                 }
             }
         };
-        // Within the cgroup's `pids.max`.
-        crate::cgroupfs::fork_allowed(&cgroup.clone().unwrap_or_else(crate::cgroupfs::current))?;
+        // Within the cgroup's `pids.max`; frozen with it.
+        let start = cgroup.clone().unwrap_or_else(crate::cgroupfs::current);
+        crate::cgroupfs::fork_allowed(&start)?;
+        let frozen = crate::cgroupfs::frozen(&start);
         CLEAR_SIGHAND.store(
             flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
             std::sync::atomic::Ordering::SeqCst,
         );
         let euid = self.creds.euid;
+        // `CAP_CHECKPOINT_RESTORE` (the last) or `CAP_SYS_ADMIN`, for
+        // `set_tid`, in the user namespace owning the pid namespace the
+        // number is chosen in.
+        let pid_owner = self
+            .fs()
+            .ns
+            .pid_children
+            .as_ref()
+            .map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()));
+        let restorer = self.creds.has_in(&pid_owner, crate::caps::CAP_LAST_CAP)
+            || self.creds.has_in(&pid_owner, crate::caps::CAP_SYS_ADMIN);
         let fs = self.fs_mut();
         let mut ns = fs.ns.clone();
         ns.unshare(new, euid)?;
         let base = fs.ns.pid_children.clone();
         let child_pid_ns = if new & CLONE_NEWPID != 0 {
             let parent = base.as_ref().map(|r| (r.dir().to_vec(), r.id()));
-            Some(Arc::new(Record::fresh("pid", PidNs::new(parent))?))
+            let r = Record::fresh("pid", PidNs::new(parent))?;
+            crate::ns::set_owner(r.dir(), ns.user.as_deref());
+            Some(Arc::new(r))
         } else {
             base
         };
         ns.pid = child_pid_ns.clone();
         ns.pid_children = child_pid_ns.clone();
         let mnt = if new & CLONE_NEWNS != 0 {
-            Some(Arc::new(fs.mount_ns().copy(&ns.user_dir())?))
+            let copy = fs.mount_ns().copy(&ns.user_dir())?;
+            crate::ns::set_owner(copy.dir(), ns.user.as_deref());
+            Some(Arc::new(copy))
         } else {
             None
         };
         // Numbered last, so that nothing after it can fail and leave the
         // numbers taken.
         let chain = pidns::chain_from(child_pid_ns);
-        let nums = if chain.is_empty() { Vec::new() } else { pidns::alloc(&chain, 0, false)? };
+        // `set_tid`: the child's numbers chosen, in fwe's namespaces (the
+        // host's own numbers are not fwe's to choose: `EPERM`), with
+        // `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`.
+        let chosen = &a.set_tid[..a.set_tid_size];
+        if !chosen.is_empty() {
+            if chosen.len() > chain.len() + 1 {
+                return Err(errno::EINVAL);
+            }
+            if chosen.len() > chain.len() || !restorer {
+                return Err(errno::EPERM);
+            }
+        }
+        let nums = if chain.is_empty() {
+            Vec::new()
+        } else {
+            pidns::alloc_chosen(&chain, 0, false, chosen)?
+        };
         let saved = if new != 0 || !nums.is_empty() {
             let old = (fs.mount_ns().clone(), std::mem::replace(&mut fs.ns, ns));
             if let Some(m) = mnt {
@@ -368,6 +430,9 @@ impl<P: Platform> Kernel<P> {
         let dirs = fs.ns_dirs();
         let caps = new_user.then(|| std::mem::replace(&mut self.creds.caps, caps_in_new_userns()));
         let mut inherit = crate::procreg::inherit();
+        // Its security state: this process's, with its own capabilities,
+        // and no tracer named for it.
+        inherit.sec = crate::procreg::Security { ptracer: 0, ..self.security() };
         // Its parent is this process's, not this one (a foster child).
         inherit.foster = flags & fwe_abi::clone::CLONE_PARENT != 0;
         let clear_sighand = flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0;
@@ -382,15 +447,25 @@ impl<P: Platform> Kernel<P> {
             inherit,
             cgroup,
             clear_sighand,
+            frozen,
             files: flags & fwe_abi::clone::CLONE_FILES != 0,
             exit_signal,
             pidfd: None,
+            child_writes: None,
         })
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
     /// pid, or negative if it failed): back to its own namespaces. Returns
     /// the child's pid as the parent sees it.
+    /// For a fork whose child runs [`Kernel::fork_child`]: the child writes
+    /// its whole record as it starts, with what this process knows of it,
+    /// and this process writes none (a look at the child's record waits
+    /// for it, [`crate::procreg::read`]).
+    pub fn fork_child_writes(t: &mut ForkNs) {
+        t.child_writes = Some(crate::procreg::FromParent::of(t.cgroup.as_deref()));
+    }
+
     pub fn fork_parent(&mut self, t: ForkNs, child: i32) -> i32 {
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(caps) = t.caps {
@@ -401,7 +476,7 @@ impl<P: Platform> Kernel<P> {
             fs.set_mount_ns(mnt);
             fs.ns = ns;
         }
-        if child > 0 {
+        if child > 0 && t.child_writes.is_none() {
             // It starts in this process's cgroup, in its namespaces.
             crate::procreg::forked(
                 child,
@@ -412,6 +487,11 @@ impl<P: Platform> Kernel<P> {
                 t.cgroup.as_deref(),
             );
             // It holds this process's session keyring.
+        }
+        if child > 0 && t.child_writes.is_some() {
+            crate::procreg::child_writes_own(child);
+        }
+        if child > 0 {
             crate::keys::forked(child);
             crate::reaper::set_exit_signal(child, t.exit_signal);
             if let Some((fd, at)) = t.pidfd {
@@ -444,12 +524,14 @@ impl<P: Platform> Kernel<P> {
     /// In the child after the host `fork`: its pid namespaces are the ones
     /// made for it. Returns its pid, for `thread::init_main`.
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
-        // Its view is the forking thread's.
+        // Its view is the forking thread's, which other processes see.
         self.adopt_thread_view();
+        if let Some(fs) = self.fs_opt() {
+            fs.share();
+        }
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
-        // SAFETY: getpid cannot fail.
-        pidns::set_host(&t.chain, &t.nums, unsafe { libc::getpid() });
+        pidns::set_host(&t.chain, &t.nums, crate::host::pid());
         pidns::set_current(t.chain);
         if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
@@ -458,25 +540,47 @@ impl<P: Platform> Kernel<P> {
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
         let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
-        crate::procreg::own_line(&t.line, &t.inherit, t.dirs.clone(), crate::maps::forked(), &auxv);
+        match &t.child_writes {
+            Some(from) => crate::procreg::own_whole(
+                &t.line,
+                &t.inherit,
+                t.dirs.clone(),
+                crate::maps::forked(),
+                &auxv,
+                from,
+            ),
+            None => crate::procreg::own_line(
+                &t.line,
+                &t.inherit,
+                t.dirs.clone(),
+                crate::maps::forked(),
+                &auxv,
+            ),
+        }
+        // Its limits, its parent's, for other processes to read.
+        crate::syscalls::publish_limits();
         if t.inherit.foster {
             crate::reaper::foster_started(&t.line.0);
         }
         if let Some(cg) = &t.cgroup {
             // Where it starts, should it look before the parent writes it.
-            // SAFETY: getpid cannot fail.
-            let _ = crate::procreg::set_cgroup(unsafe { libc::getpid() }, cg);
+            let _ = crate::procreg::set_cgroup(crate::host::pid(), cg);
         }
         if t.clear_sighand {
             self.clear_handlers();
+        }
+        crate::cgroupfs::forked();
+        if t.frozen {
+            // As a task forked into a frozen cgroup, it runs only once
+            // the cgroup thaws.
+            crate::host::kill_process(crate::host::pid(), libc::SIGSTOP);
         }
         FILES_SHARED.store(t.files, std::sync::atomic::Ordering::SeqCst);
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         crate::reaper::start_if_reaper();
-        // SAFETY: getpid cannot fail.
-        t.nums.first().copied().unwrap_or_else(|| unsafe { libc::getpid() })
+        t.nums.first().copied().unwrap_or_else(crate::host::pid)
     }
 
     /// `CLONE_CLEAR_SIGHAND`: every handler back to the default action (an

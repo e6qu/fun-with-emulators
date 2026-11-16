@@ -105,11 +105,26 @@ pub fn host_min_address() -> u64 {
 
 /// Map `elf` for host pages of `page_size` bytes. `prepare_exec` is called
 /// on every executable range while it is still writable.
+/// [`load`]'s preparation of code: `(address, length, known code, stub
+/// arena, cache key)`.
+pub trait PrepareFn:
+    FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena, Option<&[u8]>) -> Result<(), String>
+{
+}
+impl<F: FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena, Option<&[u8]>) -> Result<(), String>>
+    PrepareFn for F
+{
+}
+
+/// Load `elf`, read from file `file` (its identity, under which what is
+/// learned of its code is kept: [`fwe_kernel::prepcache`]).
 pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
-    mut prepare_exec: impl FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena) -> Result<(), String>,
+    file: Option<fwe_kernel::prepcache::FileId>,
+    mut prepare_exec: impl PrepareFn,
 ) -> Result<Loaded, LoadError> {
+    use fwe_kernel::prepcache as cache;
     let plan = LoadPlan::new(elf, page_size);
     if !elf.is_pie() && plan.start < host_min_address() {
         return Err(LoadError::BelowHostMinimum { start: plan.start });
@@ -117,13 +132,31 @@ pub fn load(
 
     // Space for code stubs right after the image, so they are within branch
     // range of the code that needs them.
-    let stub_len: u64 = elf
-        .loads()
-        .filter(|ph| ph.executable())
-        .map(|ph| {
-            stub_space(&elf.data[ph.offset as usize..(ph.offset + ph.filesz) as usize], page_size)
-        })
-        .sum();
+    let count = || -> u64 {
+        elf.loads()
+            .filter(|ph| ph.executable())
+            .map(|ph| {
+                stub_space(
+                    &elf.data[ph.offset as usize..(ph.offset + ph.filesz) as usize],
+                    page_size,
+                )
+            })
+            .sum()
+    };
+    let stub_len = match file {
+        Some(id) => {
+            let key = cache::about(id, format!("stubs-{page_size}").as_bytes());
+            match cache::load(&key).and_then(|v| Some(u64::from_le_bytes(v.try_into().ok()?))) {
+                Some(n) => n,
+                None => {
+                    let n = count();
+                    cache::store(&key, &n.to_le_bytes());
+                    n
+                }
+            }
+        }
+        None => count(),
+    };
     let total = plan.len + stub_len;
 
     // Reserve the whole range first so segments land at fixed offsets from
@@ -186,10 +219,37 @@ pub fn load(
     // code extents from the section headers when present.
     // The unwind table tells code from data placed among it (see
     // `fwe_elf::Elf::unwind_code_ranges`).
+    let unwind = match file {
+        Some(id) => {
+            let key = cache::about(id, b"unwind");
+            match cache::load(&key).and_then(|v| cache::decode_ranges(&v)) {
+                Some(r) => r,
+                None => {
+                    let r = elf.unwind_code_ranges();
+                    cache::store(&key, &cache::encode_ranges(r.as_deref()));
+                    r
+                }
+            }
+        }
+        None => elf.unwind_code_ranges(),
+    };
     let known: Option<Vec<(u64, u64)>> =
-        elf.unwind_code_ranges().map(|r| r.into_iter().map(|(a, l)| (a + bias, l)).collect());
+        unwind.as_ref().map(|r| r.iter().map(|&(a, l)| (a + bias, l)).collect());
     for (vaddr, size) in elf.exec_ranges() {
-        prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena)
+        // Kept by the file and the code's place in the image, with the
+        // known code as offsets from it.
+        let key = file.map(|id| {
+            let k = unwind.as_ref().map(|r| {
+                r.iter()
+                    .filter_map(|&(a, l)| {
+                        let (lo, hi) = (a.max(vaddr), (a + l).min(vaddr + size));
+                        (lo < hi).then(|| (lo - vaddr, hi - lo))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            cache::code_key(id, vaddr | 1 << 63, size, k.as_deref())
+        });
+        prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena, key.as_deref())
             .map_err(|reason| LoadError::Prepare { start: vaddr + bias, reason })?;
     }
 

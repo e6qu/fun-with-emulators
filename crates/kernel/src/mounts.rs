@@ -58,6 +58,10 @@ pub mod ms {
         | NODIRATIME
         | RELATIME
         | STRICTATIME;
+    /// The flags a less privileged namespace may not clear on a mount it
+    /// was given ([`super::lock`]).
+    pub const LOCKABLE: u64 = RDONLY | NOSUID | NODEV | NOEXEC;
+
     /// The propagation types.
     pub const PROPAGATION: u64 = UNBINDABLE | PRIVATE | SLAVE | SHARED;
 }
@@ -185,6 +189,24 @@ pub struct Mount {
     pub device: Vec<u8>,
     /// The filesystem's options (`mode=755` and the like).
     pub options: Vec<u8>,
+    /// What a less privileged namespace may not change of it ([`lock`]):
+    /// the flags of [`ms::LOCKABLE`] it may not clear, [`LOCK_ATIME`] (its
+    /// access-time mode is fixed) and [`LOCKED`] (it may not be unmounted
+    /// or moved apart from its parent, to show what it covers).
+    pub locked: u64,
+}
+
+/// A mount's access-time mode may not change ([`Mount::locked`]).
+pub const LOCK_ATIME: u64 = 1 << 62;
+/// A mount is locked to its parent ([`Mount::locked`]).
+pub const LOCKED: u64 = 1 << 63;
+
+/// Linux's `lock_mnt_tree`: what a mount copied into a namespace owned by
+/// a less privileged user namespace keeps. Its read-only, nosuid, nodev
+/// and noexec flags cannot be cleared there, its access-time mode cannot
+/// change, and it stays attached to its parent.
+pub fn lock(m: &mut Mount) {
+    m.locked |= (m.flags & ms::LOCKABLE) | LOCK_ATIME | LOCKED;
 }
 
 /// What unique mount ids (`STATX_MNT_ID_UNIQUE`, `statmount`) count up
@@ -196,6 +218,15 @@ impl Mount {
     /// never reuses an id).
     pub fn unique_id(&self) -> u64 {
         UNIQUE_ID_BASE + u64::from(self.id)
+    }
+
+    /// Whether its per-mount flags may become `flags`: not with a locked
+    /// flag cleared or a locked access-time mode changed
+    /// (`can_change_locked_flags`).
+    pub fn may_set_flags(&self, flags: u64) -> bool {
+        const ATIME: u64 = ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME;
+        self.locked & ms::LOCKABLE & !flags == 0
+            && (self.locked & LOCK_ATIME == 0 || (self.flags ^ flags) & ATIME == 0)
     }
 
     /// The host path of `rest` (a path inside the mount, starting with
@@ -233,6 +264,32 @@ impl Mount {
 
     pub fn read_only(&self) -> bool {
         self.flags & ms::RDONLY != 0
+    }
+
+    /// The device numbers (major, minor) `mountinfo` and `statmount` give
+    /// the mount, the ones its files' `stat` reports: a tmpfs is a device
+    /// of its own; a host directory, or an overlay's layers, the host
+    /// device it is on; anything else fwe makes up one of its own.
+    pub fn device_numbers(&self) -> (u32, u32) {
+        let own = (0, 20 + self.id);
+        if self.fstype == FsType::Tmpfs {
+            return own;
+        }
+        let dir = match &self.source {
+            Source::Host(_) => self.host_path(b""),
+            Source::Overlay(l) => l.paths().next().map(<[u8]>::to_vec),
+            _ => None,
+        };
+        let st = dir.and_then(|p| std::ffi::CString::new(p).ok()).and_then(|c| {
+            // SAFETY: zeroed bytes are a valid `stat`; `stat` fills it.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            // SAFETY: a NUL-terminated path and a valid out-parameter.
+            (unsafe { libc::stat(c.as_ptr(), &mut st) } == 0).then_some(st)
+        });
+        #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
+        st.map_or(own, |st| {
+            (crate::fsops::major(st.st_dev as u64), crate::fsops::minor(st.st_dev as u64))
+        })
     }
 }
 
@@ -343,6 +400,7 @@ impl Table {
             master: 0,
             device: b"/dev/root".to_vec(),
             options: b"rw".to_vec(),
+            locked: 0,
         });
         let add = |t: &mut Table, parent: u32, point: &[u8], fstype: FsType, opts: &[u8]| {
             let id = t.alloc();
@@ -359,6 +417,7 @@ impl Table {
                 master: 0,
                 device: fstype.name().as_bytes().to_vec(),
                 options: opts.to_vec(),
+                locked: 0,
             });
             id
         };
@@ -379,6 +438,7 @@ impl Table {
                 master: 0,
                 device: b"cgroup2".to_vec(),
                 options: b"rw,nsdelegate".to_vec(),
+                locked: 0,
             });
         }
         add(&mut t, root, b"/dev/pts", FsType::Devpts, b"rw,gid=5,mode=620,ptmxmode=000");
@@ -398,6 +458,7 @@ impl Table {
                 master: 0,
                 device: b"tmpfs".to_vec(),
                 options: b"rw".to_vec(),
+                locked: 0,
             });
         }
         t
@@ -525,6 +586,7 @@ impl Table {
             master: 0,
             device,
             options,
+            locked: 0,
         });
         id
     }
@@ -556,17 +618,17 @@ impl Table {
     }
 
     /// A bind mount of `from` (a path in the namespace's view) at `to`;
-    /// with `recursive`, the mounts under `from` come along.
-    pub fn bind(
-        &mut self,
-        from: &[u8],
-        to: &[u8],
-        recursive: bool,
-        flags: u64,
-    ) -> Result<u32, i32> {
+    /// with `recursive`, the mounts under `from` come along, but for an
+    /// unbindable one and what is under it. Each copy keeps its source's
+    /// per-mount flags (read-only, `nosuid` and the rest), as Linux's
+    /// clone of a mount does; a remount changes them.
+    pub fn bind(&mut self, from: &[u8], to: &[u8], recursive: bool) -> Result<u32, i32> {
         let (src, rest) = self.locate(from);
         let src = src.clone();
         if src.propagation & ms::UNBINDABLE != 0 {
+            return Err(errno::EINVAL);
+        }
+        if !recursive && self.covers_locked(src.id, from) {
             return Err(errno::EINVAL);
         }
         let id = self.mount_one(
@@ -574,10 +636,14 @@ impl Table {
             src.fstype,
             src.source.clone(),
             src.fs_path(&rest),
-            (src.flags & !ms::RDONLY) | (flags & ms::RDONLY),
+            src.flags,
             src.device.clone(),
             src.options.clone(),
         );
+        // The copy keeps the locks of its flags, not its place.
+        if let Some(m) = self.get_mut(id) {
+            m.locked = src.locked & !LOCKED;
+        }
         self.clone_propagation(id, &src);
         if recursive {
             // Each mount under `from`, attached to its copy's parent at the
@@ -588,6 +654,8 @@ impl Table {
                 .iter()
                 .filter(|m| m.id != id && under(&m.point, from).is_some_and(|r| !r.is_empty()))
                 .filter(|m| self.is_below(m.id, src.id))
+                // (What is under an unbindable one finds no parent copy.)
+                .filter(|m| m.propagation & ms::UNBINDABLE == 0)
                 .cloned()
                 .collect();
             for m in parent_first(src.id, below) {
@@ -619,7 +687,15 @@ impl Table {
         if src.propagation & ms::UNBINDABLE != 0 {
             return Err(errno::EINVAL);
         }
-        let mut tree = vec![Mount { point: Vec::new(), root: src.fs_path(&rest), ..src.clone() }];
+        if !recursive && self.covers_locked(src.id, from) {
+            return Err(errno::EINVAL);
+        }
+        let mut tree = vec![Mount {
+            point: Vec::new(),
+            root: src.fs_path(&rest),
+            locked: src.locked & !LOCKED,
+            ..src.clone()
+        }];
         if recursive {
             let below: Vec<Mount> = self
                 .mounts
@@ -679,6 +755,18 @@ impl Table {
         Ok(root)
     }
 
+    /// Whether a mount locked to its parent ([`LOCKED`]) is attached
+    /// within mount `id` at or below `path`: what a copy of the mount
+    /// without them would uncover (Linux's `has_locked_children`).
+    fn covers_locked(&self, id: u32, path: &[u8]) -> bool {
+        self.mounts.iter().any(|m| {
+            m.id != id
+                && m.locked & LOCKED != 0
+                && self.is_below(m.id, id)
+                && under(&m.point, path).is_some()
+        })
+    }
+
     /// Whether mount `id` is below mount `ancestor`.
     pub fn is_below(&self, mut id: u32, ancestor: u32) -> bool {
         while let Some(m) = self.get(id) {
@@ -698,7 +786,7 @@ impl Table {
     /// goes with it ([`Table::drop_copy`]).
     pub fn umount(&mut self, path: &[u8]) -> Result<(), i32> {
         let (m, rest) = self.locate(path);
-        if !rest.is_empty() || m.parent == m.id {
+        if !rest.is_empty() || m.parent == m.id || m.locked & LOCKED != 0 {
             return Err(errno::EINVAL);
         }
         let m = m.clone();
@@ -1007,7 +1095,7 @@ impl Table {
     /// Move the mount whose root is `from` to `to`.
     pub fn move_mount(&mut self, from: &[u8], to: &[u8]) -> Result<(), i32> {
         let (m, rest) = self.locate(from);
-        if !rest.is_empty() || m.parent == m.id {
+        if !rest.is_empty() || m.parent == m.id || m.locked & LOCKED != 0 {
             return Err(errno::EINVAL);
         }
         // Not out of a shared mount, as Linux has it.
@@ -1039,7 +1127,7 @@ impl Table {
     /// `to`: between that one and what it is attached to, keeping its id.
     pub fn move_beneath(&mut self, from: &[u8], to: &[u8]) -> Result<(), i32> {
         let (m, rest) = self.locate(from);
-        if !rest.is_empty() || m.parent == m.id {
+        if !rest.is_empty() || m.parent == m.id || m.locked & LOCKED != 0 {
             return Err(errno::EINVAL);
         }
         let (id, old_point) = (m.id, m.point.clone());
@@ -1087,7 +1175,11 @@ impl Table {
         // Naming no access-time mode keeps the mount's.
         const ATIME: u64 = ms::NOATIME | ms::NODIRATIME | ms::RELATIME | ms::STRICTATIME;
         let atime = if flags & ATIME == 0 { m.flags & ATIME } else { flags & ATIME };
-        m.flags = (flags & !ATIME | atime) & ms::PER_MOUNT;
+        let new = (flags & !ATIME | atime) & ms::PER_MOUNT;
+        if !m.may_set_flags(new) {
+            return Err(errno::EPERM);
+        }
+        m.flags = new;
         if let Some(d) = data {
             m.options = d;
         }
@@ -1174,6 +1266,11 @@ impl Table {
         if o.peer != 0 || shared(n.parent) || (r.parent != r.id && shared(r.parent)) {
             return Err(errno::EINVAL);
         }
+        // Not a mount locked to what it covers.
+        if n.locked & LOCKED != 0 {
+            return Err(errno::EINVAL);
+        }
+
         if n.id == r.id || o.id == r.id {
             return Err(errno::EBUSY);
         }
@@ -1199,16 +1296,21 @@ impl Table {
             .filter(|d| *d != n.id && !in_n.contains(d))
             .collect();
         let r_is_top = r.parent == r.id;
+        // The old root's lock to what it covers goes to the new root, as
+        // Linux moves it: the old root, now at `put_old`, may be detached.
+        let r_locked = r.locked & LOCKED;
         for m in self.mounts.iter_mut() {
             if m.id == n.id {
                 // Where the old root was (the namespace's root, if it was).
                 m.parent = if r_is_top { n.id } else { r.parent };
                 m.point = root.to_vec();
+                m.locked |= r_locked;
             } else if in_n.contains(&m.id) {
                 m.point = join(root, under(&m.point, &n.point).unwrap_or(b""));
             } else if m.id == r.id {
                 m.parent = holder;
                 m.point = new_put.clone();
+                m.locked &= !LOCKED;
             } else if in_r.contains(&m.id) {
                 m.point = join(&new_put, under(&m.point, root).unwrap_or(b""));
             }
@@ -1227,6 +1329,7 @@ impl Table {
             let point = if rel.is_empty() { b"/".to_vec() } else { rel.to_vec() };
             let parent = if m.parent == m.id { m.id } else { m.parent };
             let opts = m.mount_options();
+            let dev = m.device_numbers();
             let mut optional = Vec::new();
             if m.peer != 0 {
                 optional.extend_from_slice(format!(" shared:{}", m.peer).as_bytes());
@@ -1238,7 +1341,7 @@ impl Table {
                 optional.extend_from_slice(b" unbindable");
             }
             let line = [
-                format!("{} {} 0:{} ", m.id, parent, 20 + m.id).as_bytes(),
+                format!("{} {} {}:{} ", m.id, parent, dev.0, dev.1).as_bytes(),
                 &escape(&m.root),
                 b" ",
                 &escape(&point),
@@ -1323,6 +1426,7 @@ impl Table {
             e.u32(m.master);
             e.bytes(&m.device);
             e.bytes(&m.options);
+            e.u64(m.locked);
         }
         e.u64(self.expiring.len() as u64);
         for &id in &self.expiring {
@@ -1334,7 +1438,7 @@ impl Table {
     pub fn decode(d: &mut crate::snapshot::Dec) -> Table {
         let (next_id, next_group) = (d.u32(), d.u32());
         // Each mount takes at least its fixed-size fields.
-        let n = d.count(48);
+        let n = d.count(56);
         let mounts = (0..n)
             .map(|_| Mount {
                 id: d.u32(),
@@ -1358,6 +1462,7 @@ impl Table {
                 master: d.u32(),
                 device: d.bytes(),
                 options: d.bytes(),
+                locked: d.u64(),
             })
             .collect();
         let n = d.count(4);
@@ -1418,6 +1523,8 @@ pub mod store {
                     m.propagation = ms::SLAVE;
                 }
                 t.owner = owner.to_vec();
+                // Given to a less privileged namespace: locked as they are.
+                t.mounts.iter_mut().for_each(super::lock);
             }
             Record::fresh("mnt", t).map(Ns)
         }
@@ -1561,6 +1668,12 @@ pub mod store {
         static OWN: std::cell::RefCell<Option<Vec<u8>>> = const { std::cell::RefCell::new(None) };
     }
 
+    /// This host thread starts another guest thread
+    /// ([`crate::thread_reused`]).
+    pub(crate) fn thread_reused() {
+        OWN.with(|o| o.borrow_mut().take());
+    }
+
     /// The tables of the mount namespaces other than the one being changed
     /// (none outside a change): read, never locked, so a change reads them
     /// with its own namespace locked and no other.
@@ -1654,7 +1767,7 @@ mod tests {
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
         let group = t.get(a).unwrap().peer;
         assert_ne!(group, 0);
-        let b = t.bind(b"/a", b"/b", false, 0).unwrap();
+        let b = t.bind(b"/a", b"/b", false).unwrap();
         assert_eq!(t.get(b).unwrap().peer, group);
         t.set_propagation(b"/b", ms::SLAVE, false).unwrap();
         let bm = t.get(b).unwrap();
@@ -1725,7 +1838,7 @@ mod tests {
         let mut t = table();
         let a = tmpfs(&mut t, b"/a");
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
-        let b = t.bind(b"/a", b"/b", false, 0).unwrap();
+        let b = t.bind(b"/a", b"/b", false).unwrap();
         t.set_propagation(b"/b", ms::SLAVE, false).unwrap();
         assert_ne!(t.get(b).unwrap().master, 0);
         t.set_propagation(b"/a", ms::PRIVATE, false).unwrap();
@@ -1742,8 +1855,8 @@ mod tests {
         let mut t = table();
         tmpfs(&mut t, b"/a");
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
-        t.bind(b"/a", b"/b", false, 0).unwrap();
-        t.bind(b"/a", b"/s", false, 0).unwrap();
+        t.bind(b"/a", b"/b", false).unwrap();
+        t.bind(b"/a", b"/s", false).unwrap();
         t.set_propagation(b"/s", ms::SLAVE, false).unwrap();
         tmpfs(&mut t, b"/a/x");
         let x = t.locate(b"/a/x/f").0.clone();
@@ -1790,10 +1903,10 @@ mod tests {
         let mut a = table();
         tmpfs(&mut a, b"/m");
         a.set_propagation(b"/m", ms::SHARED, false).unwrap();
-        a.bind(b"/m", b"/n", false, 0).unwrap();
+        a.bind(b"/m", b"/n", false).unwrap();
         a.set_propagation(b"/n", ms::SLAVE, false).unwrap();
         a.set_propagation(b"/n", ms::SHARED, false).unwrap();
-        a.bind(b"/n", b"/o", false, 0).unwrap();
+        a.bind(b"/n", b"/o", false).unwrap();
         let mut b = a.clone();
         a.outbox.clear();
         tmpfs(&mut a, b"/m/x");
@@ -1819,7 +1932,7 @@ mod tests {
         let mut t = table();
         tmpfs(&mut t, b"/a");
         t.set_propagation(b"/a", ms::SHARED, false).unwrap();
-        t.bind(b"/a", b"/b", false, 0).unwrap();
+        t.bind(b"/a", b"/b", false).unwrap();
         tmpfs(&mut t, b"/a/x");
         tmpfs(&mut t, b"/a/x/y");
         assert_eq!(t.locate(b"/b/x/y/f").0.point, b"/b/x/y");
@@ -1855,6 +1968,53 @@ mod tests {
         }
     }
 
+    /// A namespace copied into a less privileged user namespace locks its
+    /// mounts: their flags cannot be cleared, nor their access-time mode
+    /// changed; they cannot be unmounted or moved from what they cover, nor
+    /// uncovered by a bind without them. What it mounts itself is its own.
+    #[test]
+    fn a_less_privileged_copy_is_locked() {
+        let root = format!("/fwe-test-root-locked-{}", std::process::id());
+        let a = store::Ns::initial(root.as_bytes(), None).unwrap();
+        a.update(|t| {
+            tmpfs(t, b"/mnt");
+            t.remount(b"/mnt", ms::NOSUID | ms::RELATIME, None)?;
+            tmpfs(t, b"/mnt/sub");
+            Ok(())
+        })
+        .unwrap();
+        let c = a.copy(b"/some/user/ns").unwrap();
+        let r = c.update(|t| t.remount(b"/mnt", ms::RELATIME, None));
+        assert_eq!(r, Err(errno::EPERM));
+        let r = c.update(|t| t.remount(b"/mnt", ms::NOSUID | ms::NOATIME, None));
+        assert_eq!(r, Err(errno::EPERM));
+        // Adding a flag is allowed.
+        c.update(|t| t.remount(b"/mnt", ms::NOSUID | ms::RDONLY | ms::RELATIME, None)).unwrap();
+        assert_eq!(c.update(|t| t.umount(b"/mnt/sub")), Err(errno::EINVAL));
+        assert_eq!(c.update(|t| t.move_mount(b"/mnt/sub", b"/tmp")), Err(errno::EINVAL));
+        let bind = |t: &mut Table| t.bind(b"/mnt", b"/srv", false).map(|_| ());
+        assert_eq!(c.update(bind), Err(errno::EINVAL));
+        // A recursive bind takes them along: its root is the binder's,
+        // still unable to clear nosuid.
+        c.update(|t| t.bind(b"/mnt", b"/srv", true).map(|_| ())).unwrap();
+        assert_eq!(c.update(|t| t.remount(b"/srv", ms::RELATIME, None)), Err(errno::EPERM));
+        assert_eq!(c.update(|t| t.umount(b"/srv/sub")), Err(errno::EINVAL));
+        c.update(|t| t.umount(b"/srv")).unwrap();
+        // Its own mount is its own.
+        c.update(|t| {
+            tmpfs(t, b"/own");
+            t.remount(b"/own", ms::NOSUID | ms::RELATIME, None)?;
+            t.remount(b"/own", ms::RELATIME, None)?;
+            t.umount(b"/own")
+        })
+        .unwrap();
+        // In the namespace it was copied from, nothing is locked.
+        a.update(|t| t.remount(b"/mnt", ms::RELATIME, None)).unwrap();
+        for d in [a.dir(), c.dir()] {
+            let _ = std::fs::remove_dir_all(String::from_utf8_lossy(d).as_ref());
+        }
+    }
+
     /// A bind of a shared mount onto itself doubles what is there, each
     /// copy going beneath the mount already there (Linux's tucking).
     #[test]
@@ -1863,7 +2023,7 @@ mod tests {
         tmpfs(&mut t, b"/r");
         t.set_propagation(b"/r", ms::SHARED, false).unwrap();
         for _ in 0..3 {
-            t.bind(b"/r", b"/r", false, 0).unwrap();
+            t.bind(b"/r", b"/r", false).unwrap();
         }
         assert_eq!(t.mounts.iter().filter(|m| m.point == b"/r").count(), 8);
     }
@@ -1902,17 +2062,29 @@ mod tests {
     fn bind_mounts() {
         let mut t = table();
         tmpfs(&mut t, b"/srv/data");
-        t.bind(b"/srv", b"/mnt", false, 0).unwrap();
+        t.bind(b"/srv", b"/mnt", false).unwrap();
         let (m, rest) = t.locate(b"/mnt/data/f");
         assert_eq!(m.host_path(&rest).unwrap(), b"/host/root/srv/data/f");
-        t.bind(b"/srv", b"/rec", true, ms::RDONLY).unwrap();
+        t.bind(b"/srv", b"/rec", true).unwrap();
         let (m, rest) = t.locate(b"/rec/data/f");
         assert_eq!(
             (m.fstype, m.host_path(&rest).unwrap()),
             (FsType::Tmpfs, b"/srv/data/f".to_vec())
         );
-        assert!(t.locate(b"/rec").0.read_only());
-        t.bind(b"/proc/sys", b"/proc/sys", false, 0).unwrap();
+        // A copy keeps its source's flags; a remount sets them.
+        assert!(!t.locate(b"/rec").0.read_only());
+        t.remount(b"/rec", ms::RDONLY | ms::NOSUID, None).unwrap();
+        t.bind(b"/rec", b"/again", true).unwrap();
+        assert_eq!(
+            t.locate(b"/again").0.flags & (ms::RDONLY | ms::NOSUID),
+            ms::RDONLY | ms::NOSUID
+        );
+        assert!(!t.locate(b"/again/data").0.read_only(), "a submount keeps its own");
+        // An unbindable submount stays behind.
+        t.set_propagation(b"/srv/data", ms::UNBINDABLE, false).unwrap();
+        t.bind(b"/srv", b"/norec", true).unwrap();
+        assert_eq!(t.locate(b"/norec/data/f").0.fstype, FsType::Ext4);
+        t.bind(b"/proc/sys", b"/proc/sys", false).unwrap();
         t.remount(b"/proc/sys", ms::RDONLY, None).unwrap();
         let (m, rest) = t.locate(b"/proc/sys/kernel");
         assert!(m.read_only() && m.fstype == FsType::Proc);
@@ -1925,7 +2097,7 @@ mod tests {
     #[test]
     fn pivot_root_into_a_container() {
         let mut t = table();
-        t.bind(b"/bundle/rootfs", b"/bundle/rootfs", false, 0).unwrap();
+        t.bind(b"/bundle/rootfs", b"/bundle/rootfs", false).unwrap();
         t.mount(
             b"/bundle/rootfs/proc",
             FsType::Proc,
@@ -1962,6 +2134,23 @@ mod tests {
         let (m, rest) = t.locate(b"/old/etc");
         assert_eq!(m.host_path(&rest).unwrap(), b"/host/root/etc");
         assert_eq!(t.locate(b"/old/proc/self").0.fstype, FsType::Proc);
+        t.umount(b"/old").unwrap();
+        assert_eq!(t.mounts.len(), 1);
+    }
+
+    /// In a namespace copied into a less privileged user namespace (every
+    /// mount locked), `pivot_root` moves the old root's lock to the new
+    /// root, so the old root can be unmounted from `put_old`, as rootless
+    /// container tools do; the new root cannot be.
+    #[test]
+    fn pivot_root_moves_the_roots_lock() {
+        let mut t = table();
+        for m in t.mounts.iter_mut() {
+            lock(m);
+        }
+        tmpfs(&mut t, b"/new");
+        t.pivot_root(b"/", b"/new", b"/new/old").unwrap();
+        assert_ne!(t.locate(b"/").0.locked & LOCKED, 0);
         t.umount(b"/old").unwrap();
         assert_eq!(t.mounts.len(), 1);
     }

@@ -215,8 +215,7 @@ fn make(m: Map) -> Result<i32, i32> {
     static N: AtomicU64 = AtomicU64::new(0);
     let last = || crate::host::errno_to_linux(crate::host::last_errno());
     let mut path = crate::fs::shm::user_dir()?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     path.extend_from_slice(
         format!("/bpf-map-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
     );

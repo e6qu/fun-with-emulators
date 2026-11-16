@@ -24,7 +24,8 @@
 //! A notification goes to the process that registered it, whoever sends
 //! the message that makes the queue non-empty: a signal (`SI_MESGQ`, with
 //! the sender and the registered value), which reaches another process as
-//! a host signal with a note of what it carries ([`crate::signote`]); or,
+//! a host signal with a note of what it carries ([`crate::signote`]), or,
+//! for a real-time signal the host lacks, queued in its mailbox; or,
 //! for `SIGEV_THREAD` (which the C library turns into a netlink socket and
 //! a cookie), the cookie, sent to the socket at the host address fwe gave
 //! it ([`crate::netlink::bind_for_notify`]).
@@ -32,8 +33,7 @@
 //! Not kept: `poll`, `select` and `epoll` see a queue's descriptor as
 //! always ready (its readiness is the queue's, not the host file's), a
 //! queue's file in the mqueue filesystem is read, not opened as the queue
-//! or removed, and a real-time signal is not sent to another process (see
-//! `docs/architecture.md`).
+//! or removed (see `docs/architecture.md`).
 
 use crate::creds::Creds;
 use crate::fdmarks::{self, Mark};
@@ -318,8 +318,8 @@ fn may(creds: &Creds, q: &Queue, want: u32) -> bool {
         0
     };
     (q.mode >> shift) & want == want
-        || creds.has(crate::caps::CAP_DAC_OVERRIDE)
-        || (want == 4 && creds.has(crate::caps::CAP_DAC_READ_SEARCH))
+        || creds.has_over(crate::caps::CAP_DAC_OVERRIDE, q.uid, q.gid)
+        || (want == 4 && creds.has_over(crate::caps::CAP_DAC_READ_SEARCH, q.uid, q.gid))
 }
 
 /// The guest's access mode of queue descriptor `fd`: (readable,
@@ -422,7 +422,7 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
             } else if let Some(h) = crate::host::signal_to_host(sig) {
                 // Another process: a host signal, with a note of what it
                 // carries.
-                crate::signote::note_with(n.owner.0, h, info.code, info.value);
+                crate::signote::note_with(n.owner.0, h, info.code, info.value, by.uid);
                 if crate::host::kill_process(n.owner.0, h) != 0 {
                     crate::signote::unnote(n.owner.0, h);
                 }
@@ -430,7 +430,13 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
                 // One the host lacks (a real-time signal): queued in the
                 // owner's mailbox. A notification that cannot be delivered
                 // is lost, as Linux's is when its receiver has gone.
-                crate::signal::send_unhosted(n.owner.0, sig, info.code, info.value);
+                crate::signal::send_unhosted_from(
+                    n.owner.0,
+                    sig,
+                    info.code,
+                    info.value,
+                    (by.pid, by.uid),
+                );
             }
         }
         _ => {}
@@ -440,10 +446,8 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
 /// What a send or receive needs of the caller, taken under the kernel
 /// lock: who it is.
 fn sender(creds: &Creds) -> Sender {
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
-    let uid = crate::userns::from_ns(creds.uid, false).unwrap_or(crate::userns::OVERFLOW);
-    Sender { pid, uid }
+    let pid = crate::host::pid();
+    Sender { pid, uid: creds.uid }
 }
 
 /// `mq_timedsend(fd, msg, len, prio, abs_timeout)`.
@@ -869,7 +873,10 @@ impl<P: Platform> Kernel<P> {
             let q = queue_at(&[&ns_dir[..], b"/", dir].concat())?.get();
             // The queues' directory is root's and sticky: only the queue's
             // owner removes it, or one with `CAP_FOWNER`.
-            if creds.fsuid != q.uid && creds.fsuid != 0 && !creds.has(crate::caps::CAP_FOWNER) {
+            if creds.fsuid != q.uid
+                && creds.fsuid != 0
+                && !creds.has_over(crate::caps::CAP_FOWNER, q.uid, q.gid)
+            {
                 return Err(errno::EPERM);
             }
             t.mq_names.remove(&name);
@@ -993,8 +1000,7 @@ impl<P: Platform> Kernel<P> {
 /// `SIGEV_THREAD` registration's socket is bound.
 fn notify_path(ns_dir: &[u8]) -> Vec<u8> {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     [ns_dir, format!("/{NOTIFY_PREFIX}{pid}-{n}").as_bytes()].concat()
 }

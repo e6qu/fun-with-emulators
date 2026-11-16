@@ -8,7 +8,9 @@ use fwe_abi::hwcap as h1;
 #[cfg(target_os = "macos")]
 use fwe_abi::hwcap2 as h2;
 
-/// (macOS `hw.optional.*` sysctl, `AT_HWCAP` bits, `AT_HWCAP2` bits)
+/// (macOS `hw.optional.*` sysctl, `AT_HWCAP` bits, `AT_HWCAP2` bits). What
+/// they make is kept in the process store ([`fwe_kernel::procstore::hwcap`]):
+/// a change here changes `fwe_kernel::shared::FORMAT`, and with it the store.
 #[cfg(target_os = "macos")]
 const FEATURES: &[(&str, u64, u64)] = &[
     ("hw.optional.arm.FEAT_AES", h1::AES, 0),
@@ -68,6 +70,11 @@ fn sysctl_flag(name: &str) -> bool {
 
 /// `(AT_HWCAP, AT_HWCAP2)` for this machine.
 pub fn detect() -> (u64, u64) {
+    // As the first process found them: a host call for each costs most of
+    // a start's time.
+    if let Some(caps) = fwe_kernel::procstore::hwcap() {
+        return caps;
+    }
     // Every Apple Silicon CPU has FP and Advanced SIMD.
     #[allow(unused_mut)]
     let (mut hwcap, mut hwcap2) = (h1::FP | h1::ASIMD, 0u64);
@@ -78,6 +85,7 @@ pub fn detect() -> (u64, u64) {
             hwcap2 |= b2;
         }
     }
+    fwe_kernel::procstore::set_hwcap(hwcap, hwcap2);
     (hwcap, hwcap2)
 }
 

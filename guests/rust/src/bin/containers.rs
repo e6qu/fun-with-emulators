@@ -102,6 +102,11 @@ unsafe extern "C" {
     fn setns(fd: i32, t: i32) -> i32;
     fn prctl(op: i32, a: u64, b: u64, c: u64, d: u64) -> i32;
     fn execv(p: *const std::ffi::c_char, argv: *const *const std::ffi::c_char) -> i32;
+    fn execve(
+        p: *const std::ffi::c_char,
+        argv: *const *const std::ffi::c_char,
+        envp: *const *const std::ffi::c_char,
+    ) -> i32;
     fn umask(m: u32) -> u32;
     fn chdir(p: *const std::ffi::c_char) -> i32;
     fn readlink(p: *const std::ffi::c_char, b: *mut u8, n: usize) -> isize;
@@ -174,6 +179,7 @@ fn name(e: i32) -> &'static str {
         ENXIO => "ENXIO",
         EAFNOSUPPORT => "EAFNOSUPPORT",
         8 => "ENOEXEC",
+        38 => "ENOSYS",
         _ => "?",
     }
 }
@@ -316,7 +322,568 @@ fn main() {
                 write(go[1], b"g".as_ptr(), 1);
                 waitpid(holder, std::ptr::null_mut(), 0);
             }
+            // A user's own user namespace holds every capability, over what
+            // the namespace owns only: not root's private file, root's
+            // process, the host name, a global sysctl, BPF; its own mount
+            // namespace's mounts, but those it was given stay locked; a
+            // UTS namespace of its own is its to name.
+            Some("userns-scope") => {
+                std::fs::write("/etc/secret", "s").unwrap();
+                chmod(c("/etc/secret").as_ptr(), 0o600);
+                let victim = fork();
+                if victim == 0 {
+                    loop {
+                        usleep(100_000);
+                    }
+                }
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    setuid(1000);
+                    let r = unshare(0x1000_0000 | 0x2_0000);
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", "0 1000 1").unwrap();
+                    std::fs::write("/proc/self/gid_map", "0 0 1").unwrap();
+                    println!("unshare: {} euid {}", res(r as i64), geteuid());
+                    println!("root's file: {}", io(std::fs::read("/etc/secret")));
+                    println!("root's process: {}", res(syscall(129, victim, 0)));
+                    println!("host name: {}", res(syscall(161, b"x".as_ptr(), 1)));
+                    // NS_GET_USERNS: the initial UTS namespace's owner is
+                    // above the caller's, not its to see.
+                    let uts = open(c("/proc/self/ns/uts").as_ptr(), O_RDONLY);
+                    println!("owner of the host's UTS: {}", res(syscall(29, uts, 0xb701)));
+                    close(uts);
+                    let w = std::fs::write("/proc/sys/fs/protected_symlinks", "0");
+                    println!("global sysctl: {}", io(w));
+                    let attr = [2u32, 4, 4, 1, 0, 0, 0, 0];
+                    println!("bpf: {}", res(syscall(280, 0, attr.as_ptr(), 32)));
+                    let tmpfs = c("tmpfs");
+                    let r = mount(tmpfs.as_ptr(), c("/tmp").as_ptr(), tmpfs.as_ptr(), 0, std::ptr::null());
+                    println!("mount: {}", res(r as i64));
+                    let r = mount(std::ptr::null(), c("/proc").as_ptr(), std::ptr::null(), 32, std::ptr::null());
+                    println!("remount clearing nosuid: {}", res(r as i64));
+                    println!("umount a given mount: {}", res(umount2(c("/proc").as_ptr(), 0) as i64));
+                    let r = unshare(0x0400_0000);
+                    println!("own UTS: {} host name: {}", res(r as i64), res(syscall(161, b"x".as_ptr(), 1)));
+                    let uts = open(c("/proc/self/ns/uts").as_ptr(), O_RDONLY);
+                    let owner = syscall(29, uts, 0xb701);
+                    let link = std::fs::read_link(format!("/proc/self/fd/{owner}")).ok();
+                    let own = std::fs::read_link("/proc/self/ns/user").ok();
+                    println!("its owner is its user namespace: {}", link.is_some() && link == own);
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                syscall(129, victim, 9);
+                waitpid(victim, std::ptr::null_mut(), 0);
+            }
+            // What a glibc program (`/secure`, guests/c/secure.c) is told
+            // as it starts, run by root and by a user: plainly, set-user-ID
+            // root, and with file capabilities, the last two in secure mode.
+            Some("secure-exec") => {
+                for (to, m) in [("/tmp/plain", 0o755), ("/tmp/suid", 0o4755), ("/tmp/capped", 0o755)] {
+                    std::fs::copy("/secure", to).unwrap();
+                    chmod(c(to).as_ptr(), m);
+                }
+                // Revision 2, effective, CAP_SETUID (7) permitted.
+                let mut v = 0x0200_0001u32.to_le_bytes().to_vec();
+                for w in [1u32 << 7, 0, 0, 0] {
+                    v.extend_from_slice(&w.to_le_bytes());
+                }
+                let cap = c("security.capability");
+                setxattr(c("/tmp/capped").as_ptr(), cap.as_ptr(), v.as_ptr(), v.len(), 0);
+                for (prog, label, uid) in [
+                    ("/tmp/plain", "root", 0),
+                    ("/tmp/plain", "user", 1000),
+                    ("/tmp/suid", "user, set-uid", 1000),
+                    ("/tmp/capped", "user, capped", 1000),
+                ] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    if fork() == 0 {
+                        setuid(uid);
+                        let (p, l, e) = (c(prog), c(label), c("LD_LIBRARY_PATH=/nowhere"));
+                        let argv = [p.as_ptr(), l.as_ptr(), std::ptr::null()];
+                        let envp = [e.as_ptr(), std::ptr::null()];
+                        execve(p.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                        _exit(9);
+                    }
+                    waitpid(-1, std::ptr::null_mut(), 0);
+                }
+            }
+            // Who a user without capabilities may trace (Linux's
+            // `ptrace_may_access` with Yama's scope 1 and Landlock): its
+            // child, shown as its tracer; not one that made itself
+            // undumpable; not a sibling, unless that names it with
+            // `PR_SET_PTRACER`; nothing while it is in a Landlock domain
+            // its target is not.
+            Some("ptrace-access") => {
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    setuid(1000);
+                    prctl(4, 1, 0, 0, 0);
+                    let sleeper = |setup: &dyn Fn()| {
+                        let mut ready = [0i32; 2];
+                        pipe2(ready.as_mut_ptr(), 0);
+                        let pid = fork();
+                        if pid == 0 {
+                            setup();
+                            write(ready[1], b"r".as_ptr(), 1);
+                            loop {
+                                usleep(100_000);
+                            }
+                        }
+                        let mut b = 0u8;
+                        read(ready[0], &mut b, 1);
+                        pid
+                    };
+                    let attach = |pid: i32| {
+                        let r = syscall(117, 16, pid, 0, 0);
+                        let mut tracer = String::new();
+                        if r == 0 {
+                            waitpid(pid, std::ptr::null_mut(), 0x4000_0000);
+                            tracer = text(&format!("/proc/{pid}/status"))
+                                .lines()
+                                .find(|l| l.starts_with("TracerPid:"))
+                                .unwrap_or("")
+                                .to_string();
+                            syscall(117, 17, pid, 0, 0);
+                        }
+                        (res(r), tracer)
+                    };
+                    let kill = |pid: i32| {
+                        syscall(129, pid, 9);
+                        waitpid(pid, std::ptr::null_mut(), 0);
+                    };
+                    let child = sleeper(&|| {});
+                    let (r, tracer) = attach(child);
+                    let mine = format!("TracerPid:\t{}", getpid());
+                    println!("its child: {r}, shown as its tracer {}", tracer == mine);
+                    kill(child);
+                    let undumpable = sleeper(&|| {
+                        prctl(4, 0, 0, 0, 0);
+                    });
+                    println!("an undumpable child: {}", attach(undumpable).0);
+                    kill(undumpable);
+                    // Siblings: the second tries the first.
+                    for named in [false, true] {
+                        let mut go = [0i32; 2];
+                        pipe2(go.as_mut_ptr(), 0);
+                        std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                        let tracer = fork();
+                        if tracer == 0 {
+                            let mut pid = [0u8; 4];
+                            read(go[0], pid.as_mut_ptr(), 4);
+                            let label = if named { "named by it" } else { "unnamed" };
+                            println!("a sibling, {label}: {}", attach(i32::from_ne_bytes(pid)).0);
+                            _exit(0);
+                        }
+                        let target = sleeper(&|| {
+                            if named {
+                                prctl(0x5961_6d61, tracer as u64, 0, 0, 0);
+                            }
+                        });
+                        write(go[1], target.to_ne_bytes().as_ptr(), 4);
+                        waitpid(tracer, std::ptr::null_mut(), 0);
+                        kill(target);
+                    }
+                    let w = std::fs::write("/proc/sys/kernel/yama/ptrace_scope", "0");
+                    println!("ptrace_scope by a user: {}", io(w));
+                    // Restricted by Landlock, its unrestricted child is
+                    // out of reach.
+                    let child = sleeper(&|| {});
+                    prctl(38, 1, 0, 0, 0);
+                    let attr = [1u64 << 2];
+                    let rs = syscall(444, attr.as_ptr(), 8, 0);
+                    syscall(446, rs, 0);
+                    println!("from a Landlock domain: {}", attach(child).0);
+                    kill(child);
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                println!("ptrace_scope: {}", text("/proc/sys/kernel/yama/ptrace_scope").trim());
+            }
+            // What a Landlock domain withholds beyond the calls it checks:
+            // truncation of a file opened without the right, through any
+            // descriptor of it, in any process; `ioctl` on a device opened
+            // without `IOCTL_DEV`; mounts; a signal to a process group or
+            // every process, for each target outside the domain; and a
+            // datagram to an abstract socket bound outside it.
+            Some("landlock-gaps") => {
+                // A ruleset handling `handled` file rights and `scoped`,
+                // granting `rules` (path, rights), applied to this process.
+                let restrict = |handled: u64, scoped: u64, rules: &[(&str, u64)]| {
+                    prctl(38, 1, 0, 0, 0);
+                    let attr = [handled, 0, scoped];
+                    let rs = syscall(444, attr.as_ptr(), 24, 0);
+                    for &(path, rights) in rules {
+                        let fd = open(c(path).as_ptr(), O_PATH);
+                        let mut rule = [0u8; 12];
+                        rule[..8].copy_from_slice(&rights.to_ne_bytes());
+                        rule[8..].copy_from_slice(&fd.to_ne_bytes());
+                        syscall(445, rs, 1, rule.as_ptr(), 0);
+                        close(fd);
+                    }
+                    syscall(446, rs, 0)
+                };
+                const WRITE: u64 = 2;
+                const READ: u64 = 4;
+                const TRUNCATE: u64 = 1 << 14;
+                const IOCTL_DEV: u64 = 1 << 15;
+                std::fs::write("/tmp/t", "content").unwrap();
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    let handled = READ | WRITE | TRUNCATE | IOCTL_DEV;
+                    let r = restrict(handled, 0, &[("/tmp", READ | WRITE), ("/dev/null", READ | WRITE)]);
+                    println!("restricted: {}", res(r));
+                    let fd = open(c("/tmp/t").as_ptr(), O_WRONLY);
+                    let dup = syscall(23, fd);
+                    let dupfd = fcntl(fd, 0, 100);
+                    println!(
+                        "ftruncate: {} dup {} F_DUPFD {}",
+                        res(syscall(46, fd, 0)),
+                        res(syscall(46, dup, 0)),
+                        res(syscall(46, dupfd as i64, 0))
+                    );
+                    // Passed to a process outside the domain.
+                    let mut control = [0u8; 24];
+                    control[..8].copy_from_slice(&20u64.to_ne_bytes());
+                    control[8..12].copy_from_slice(&SOL_SOCKET.to_ne_bytes());
+                    control[12..16].copy_from_slice(&SCM_RIGHTS.to_ne_bytes());
+                    control[16..20].copy_from_slice(&fd.to_ne_bytes());
+                    let mut byte = *b"f";
+                    let mut iov = Iovec { base: byte.as_mut_ptr(), len: 1 };
+                    let m = Msghdr {
+                        name: std::ptr::null_mut(),
+                        namelen: 0,
+                        iov: &mut iov,
+                        iovlen: 1,
+                        control: control.as_mut_ptr(),
+                        controllen: 24,
+                        flags: 0,
+                    };
+                    sendmsg(sv[0], &m, 0);
+                    let null = open(c("/dev/null").as_ptr(), O_RDWR);
+                    let mut n = 0i32;
+                    let fionread = res(syscall(29, null, 0x541b, &mut n as *mut i32));
+                    let fioclex = res(syscall(29, null, 0x5451, 0));
+                    println!("a device's ioctl: {fionread}, FIOCLEX {fioclex}");
+                    let tmpfs = c("tmpfs");
+                    let r = mount(tmpfs.as_ptr(), c("/tmp").as_ptr(), tmpfs.as_ptr(), 0, std::ptr::null());
+                    println!("mount: {}", res(r as i64));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                let mut cbuf = [0u8; 64];
+                let mut b = 0u8;
+                let mut iov = Iovec { base: &mut b, len: 1 };
+                let mut m = Msghdr {
+                    name: std::ptr::null_mut(),
+                    namelen: 0,
+                    iov: &mut iov,
+                    iovlen: 1,
+                    control: cbuf.as_mut_ptr(),
+                    controllen: 64,
+                    flags: 0,
+                };
+                recvmsg(sv[1], &mut m, 0);
+                let got = i32::from_ne_bytes(cbuf[16..20].try_into().unwrap());
+                println!("ftruncate where it was passed: {}", res(syscall(46, got, 0)));
+                let own = open(c("/tmp/t").as_ptr(), O_WRONLY);
+                println!("ftruncate of its own: {}", res(syscall(46, own, 0)));
+                // Signals: a group with a member outside the domain.
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    syscall(154, 0, 0);
+                    signal(10, on_alarm);
+                    let mut ready = [0i32; 2];
+                    pipe2(ready.as_mut_ptr(), 0);
+                    let outside = fork();
+                    if outside == 0 {
+                        // Ended by the signal's default action if it comes.
+                        signal(10, std::mem::transmute::<usize, extern "C" fn(i32)>(0));
+                        write(ready[1], b"r".as_ptr(), 1);
+                        usleep(500_000);
+                        _exit(0);
+                    }
+                    read(ready[0], &mut b, 1);
+                    restrict(0, 2, &[]);
+                    let group = syscall(129, 0, 10);
+                    let every = syscall(129, -1, 10);
+                    let mut status = 0;
+                    waitpid(outside, &mut status, 0);
+                    println!(
+                        "kill(0): {}, kill(-1): {}, the one outside {}",
+                        res(group),
+                        res(every),
+                        if status == 0 { "untouched" } else { "signalled" }
+                    );
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                // A datagram to an abstract socket bound outside.
+                let s = socket(AF_UNIX, 2, 0);
+                let mut addr = SockaddrUn { family: AF_UNIX as u16, path: [0; 108] };
+                addr.path[1..12].copy_from_slice(b"fwe-ll-dgrm");
+                bind(s, &addr, 2 + 12);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    restrict(0, 1, &[]);
+                    let d = socket(AF_UNIX, 2, 0);
+                    let r = syscall(206, d, b"x".as_ptr(), 1, 0, &addr as *const SockaddrUn, 14);
+                    let mut byte = *b"y";
+                    let mut iov = Iovec { base: byte.as_mut_ptr(), len: 1 };
+                    let m = Msghdr {
+                        name: &addr as *const SockaddrUn as *mut u8,
+                        namelen: 14,
+                        iov: &mut iov,
+                        iovlen: 1,
+                        control: std::ptr::null_mut(),
+                        controllen: 0,
+                        flags: 0,
+                    };
+                    let r2 = sendmsg(d, &m, 0);
+                    println!("abstract datagram: sendto {}, sendmsg {}", res(r), res(r2 as i64));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+            }
+            // File capabilities: checked as they are written, gone with a
+            // change of owner and with a write (whoever makes them), and
+            // kept for the root of the user namespace that wrote them.
+            Some("filecaps") => {
+                let cap = c("security.capability");
+                let v = |magic: u32, words: &[u32]| {
+                    let mut out = magic.to_le_bytes().to_vec();
+                    for w in words {
+                        out.extend_from_slice(&w.to_le_bytes());
+                    }
+                    out
+                };
+                let v2 = v(0x0200_0001, &[1 << 7, 0, 0, 0]);
+                let set = |p: &str, val: &[u8]| res(setxattr(c(p).as_ptr(), cap.as_ptr(), val.as_ptr(), val.len(), 0) as i64);
+                let has = |p: &str| {
+                    let mut buf = [0u8; 32];
+                    let n = getxattr(c(p).as_ptr(), cap.as_ptr(), buf.as_mut_ptr(), buf.len());
+                    if n < 0 {
+                        name(errno()).to_string()
+                    } else {
+                        format!("rev {} size {n}", buf[3])
+                    }
+                };
+                std::fs::write("/tmp/f", "x").unwrap();
+                println!("revision 1: {}", set("/tmp/f", &v(0x0100_0001, &[1 << 7, 0])));
+                println!("bad size: {}", set("/tmp/f", &v2[..16]));
+                println!("set: {} read: {}", set("/tmp/f", &v2), has("/tmp/f"));
+                fchownat(-100, c("/tmp/f").as_ptr(), 1000, 0, 0);
+                println!("after chown: {}", has("/tmp/f"));
+                set("/tmp/f", &v2);
+                let fd = open(c("/tmp/f").as_ptr(), O_WRONLY);
+                write(fd, b"y".as_ptr(), 1);
+                close(fd);
+                println!("after a write: {}", has("/tmp/f"));
+                chmod(c("/tmp").as_ptr(), 0o1777);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    setuid(1000);
+                    unshare(0x1000_0000);
+                    std::fs::write("/proc/self/setgroups", "deny").unwrap();
+                    std::fs::write("/proc/self/uid_map", "0 1000 1").unwrap();
+                    std::fs::write("/proc/self/gid_map", "0 0 1").unwrap();
+                    std::fs::write("/tmp/u", "x").unwrap();
+                    println!("in a user namespace: set {} read {}", set("/tmp/u", &v2), has("/tmp/u"));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                println!("outside it: {}", has("/tmp/u"));
+            }
+            // seccomp beyond allowing and refusing: the number of filters
+            // shown, a logged action in the kernel log, a traced action
+            // stopping a tracer that asked for it (and `ENOSYS` without
+            // one); another process's capabilities; who may make ping and
+            // raw sockets; the security sysctls.
+            Some("seccomp-more") => {
+                let prog = |insns: &[(u16, u8, u8, u32)]| {
+                    let raw: Vec<u8> = insns
+                        .iter()
+                        .flat_map(|&(c, t, f, k)| {
+                            let mut b = c.to_le_bytes().to_vec();
+                            b.extend([t, f]);
+                            b.extend(k.to_le_bytes());
+                            b
+                        })
+                        .collect();
+                    raw
+                };
+                let install = |raw: &[u8]| {
+                    let fprog = [(raw.len() / 8) as u64, raw.as_ptr() as u64];
+                    syscall(277, 1, 0, fprog.as_ptr())
+                };
+                let log_ppid = prog(&[(0x20, 0, 0, 0), (0x15, 0, 1, 173), (6, 0, 0, 0x7ffc_0000), (6, 0, 0, 0x7fff_0000)]);
+                let trace_pid = prog(&[(0x20, 0, 0, 0), (0x15, 0, 1, 172), (6, 0, 0, 0x7ff0_0000 | 42), (6, 0, 0, 0x7fff_0000)]);
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    prctl(38, 1, 0, 0, 0);
+                    install(&log_ppid);
+                    install(&trace_pid);
+                    let status = text("/proc/self/status");
+                    let line = status.lines().find(|l| l.starts_with("Seccomp_filters:")).unwrap_or("");
+                    println!("{line}");
+                    syscall(173);
+                    let mut buf = vec![0u8; 1 << 17];
+                    let n = syscall(116, 3, buf.as_mut_ptr(), buf.len());
+                    let log = String::from_utf8_lossy(&buf[..n.max(0) as usize]).into_owned();
+                    let logged = log.lines().any(|l| l.contains("type=1326") && l.contains("syscall=173"));
+                    println!("logged in the kernel log: {logged}");
+                    println!("traced, no tracer: {}", res(syscall(172)));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                // A tracer that asked for seccomp's stops.
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                let child = fork();
+                if child == 0 {
+                    syscall(117, 0, 0, 0, 0);
+                    syscall(129, getpid(), 19);
+                    prctl(38, 1, 0, 0, 0);
+                    install(&trace_pid);
+                    let r = syscall(172);
+                    println!("traced call returns: {}", r == getpid() as i64);
+                    _exit(0);
+                }
+                let mut st = 0;
+                waitpid(child, &mut st, 0);
+                syscall(117, 0x4200, child, 0, 0x80);
+                syscall(117, 7, child, 0, 0);
+                waitpid(child, &mut st, 0);
+                let mut msg = 0u64;
+                syscall(117, 0x4201, child, 0, &mut msg as *mut u64);
+                println!("seccomp stop: event {} signal {} data {msg}", (st >> 16) & 0xff, (st >> 8) & 0xff);
+                // On to its end, past any other stop.
+                loop {
+                    syscall(117, 7, child, 0, 0);
+                    waitpid(child, &mut st, 0);
+                    if st & 0x7f != 0x7f {
+                        break;
+                    }
+                }
+                // Another process's capabilities.
+                let mut ready = [0i32; 2];
+                pipe2(ready.as_mut_ptr(), 0);
+                let other = fork();
+                if other == 0 {
+                    let hdr = [0x2008_0522u32, 0];
+                    let data = [0u32; 6];
+                    syscall(91, hdr.as_ptr(), data.as_ptr());
+                    write(ready[1], b"r".as_ptr(), 1);
+                    loop {
+                        usleep(100_000);
+                    }
+                }
+                let mut b = 0u8;
+                read(ready[0], &mut b, 1);
+                let hdr = [0x2008_0522u32, other as u32];
+                let mut data = [0u32; 6];
+                let r = syscall(90, hdr.as_ptr(), data.as_mut_ptr());
+                println!("capget of another: {} effective {:#x}", res(r), data[0]);
+                syscall(129, other, 9);
+                waitpid(other, std::ptr::null_mut(), 0);
+                // Ping and raw sockets, in a network namespace of its own.
+                std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                if fork() == 0 {
+                    unshare(CLONE_NEWNET);
+                    let ping = |label: &str| {
+                        let s = socket(2, 2, 1);
+                        println!("{label}: {}", res(s as i64));
+                        if s >= 0 {
+                            close(s);
+                        }
+                    };
+                    ping("ping socket, default range");
+                    std::fs::write("/proc/sys/net/ipv4/ping_group_range", "0 2147483647").unwrap();
+                    ping("ping socket, every group");
+                    setuid(1000);
+                    println!("raw socket without CAP_NET_RAW: {}", res(socket(2, 3, 1) as i64));
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                for s in ["kernel/unprivileged_bpf_disabled", "kernel/yama/ptrace_scope", "fs/suid_dumpable"] {
+                    println!("{s}: {}", text(&format!("/proc/sys/{s}")).trim());
+                }
+            }
+            // A socket filter that reads the packet (`bpf_skb_load_bytes`)
+            // and drops what starts with `x`, on every way of sending.
+            Some("socket-filter") => {
+                let ins = |code: u8, dst: u8, src: u8, off: i16, imm: i32| -> u64 {
+                    u64::from(code)
+                        | u64::from(dst | src << 4) << 8
+                        | u64::from(off as u16) << 16
+                        | u64::from(imm as u32) << 32
+                };
+                let insns = [
+                    ins(0xbf, 6, 1, 0, 0),    // r6 = r1
+                    ins(0xb7, 2, 0, 0, 0),    // r2 = 0
+                    ins(0xbf, 3, 10, 0, 0),   // r3 = r10
+                    ins(0x07, 3, 0, 0, -8),   // r3 -= 8
+                    ins(0xb7, 4, 0, 0, 1),    // r4 = 1
+                    ins(0xbf, 1, 6, 0, 0),    // r1 = r6
+                    ins(0x85, 0, 0, 0, 26),   // skb_load_bytes
+                    ins(0x55, 0, 0, 4, 0),    // if r0 != 0 drop
+                    ins(0x71, 1, 10, -8, 0),  // r1 = first byte
+                    ins(0x15, 1, 0, 2, 0x78), // if 'x' drop
+                    ins(0xb7, 0, 0, 0, 0xffff),
+                    ins(0x95, 0, 0, 0, 0),
+                    ins(0xb7, 0, 0, 0, 0),
+                    ins(0x95, 0, 0, 0, 0),
+                ];
+                let lic = c("GPL");
+                let mut attr = [0u8; 128];
+                attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // SOCKET_FILTER
+                attr[4..8].copy_from_slice(&(insns.len() as u32).to_ne_bytes());
+                attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+                attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
+                let prog = syscall(280, 5, attr.as_ptr(), 128) as i32;
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, 2, 0, sv.as_mut_ptr());
+                let r = syscall(208, sv[1], 1, 50, &prog as *const i32, 4);
+                println!("loaded: {} attached: {}", prog >= 0, res(r));
+                let send_iov = |data: &[u8], how: &str| {
+                    let mut iov = Iovec { base: data.as_ptr() as *mut u8, len: data.len() };
+                    let n = match how {
+                        "write" => write(sv[0], data.as_ptr(), data.len()),
+                        "sendto" => syscall(206, sv[0], data.as_ptr(), data.len(), 0, 0, 0) as isize,
+                        "writev" => syscall(66, sv[0], &mut iov as *mut Iovec, 1) as isize,
+                        _ => {
+                            let m = Msghdr {
+                                name: std::ptr::null_mut(),
+                                namelen: 0,
+                                iov: &mut iov,
+                                iovlen: 1,
+                                control: std::ptr::null_mut(),
+                                controllen: 0,
+                                flags: 0,
+                            };
+                            sendmsg(sv[0], &m, 0)
+                        }
+                    };
+                    println!("{how} of {}: {n}", String::from_utf8_lossy(data));
+                };
+                for how in ["write", "sendto", "writev", "sendmsg"] {
+                    send_iov(format!("x-{how}").as_bytes(), how);
+                    send_iov(format!("k-{how}").as_bytes(), how);
+                }
+                let mut got = Vec::new();
+                loop {
+                    let mut buf = [0u8; 64];
+                    let n = recv(sv[1], buf.as_mut_ptr(), 64, MSG_DONTWAIT);
+                    if n <= 0 {
+                        break;
+                    }
+                    got.push(String::from_utf8_lossy(&buf[..n as usize]).into_owned());
+                }
+                println!("received: {}", got.join(" "));
+            }
             // A program only the VM runs, on a host without one: the exec
+
             // fails and the caller goes on, as podman's pause process does
             // when its catatonit cannot run.
             Some("exec-low") => {
@@ -371,6 +938,39 @@ fn main() {
                     }
                     waitpid(-1, std::ptr::null_mut(), 0);
                 }
+                // Traced (`PTRACE_TRACEME`, the tracer detaching at the
+                // exec's stop): a tracer with `CAP_SYS_PTRACE` lets the
+                // program grant what it grants, one without withholds it.
+                let (hdr, mut full) = ([0x2008_0522u32, 0], [0u32; 6]);
+                syscall(90, hdr.as_ptr(), full.as_mut_ptr());
+                for (prog, label, privileged) in [
+                    ("/tmp/setuid", "set-uid, traced by a privileged tracer", true),
+                    ("/tmp/setuid", "set-uid, traced by an unprivileged tracer", false),
+                    ("/tmp/capped", "capped, traced by an unprivileged tracer", false),
+                ] {
+                    std::io::Write::flush(&mut std::io::stdout()).unwrap();
+                    let mut less = full;
+                    if !privileged {
+                        // CAP_SYS_PTRACE (19) out of the effective set.
+                        less[0] &= !(1 << 19);
+                    }
+                    syscall(91, hdr.as_ptr(), less.as_ptr());
+                    let child = fork();
+                    if child == 0 {
+                        setuid(1000);
+                        syscall(117, 0, 0, 0, 0);
+                        let (p, r, l) = (c(prog), c("report"), c(label));
+                        let argv = [p.as_ptr(), r.as_ptr(), l.as_ptr(), std::ptr::null()];
+                        execv(p.as_ptr(), argv.as_ptr());
+                        _exit(9);
+                    }
+                    let mut st = 0;
+                    waitpid(child, &mut st, 0);
+                    // PTRACE_DETACH, at the exec's SIGTRAP stop.
+                    syscall(117, 17, child, 0, 0);
+                    waitpid(child, std::ptr::null_mut(), 0);
+                    syscall(91, hdr.as_ptr(), full.as_ptr());
+                }
                 // A process's /proc directory is its effective user's, as
                 // newuidmap checks of the process it maps.
                 let (mut ready, mut go) = ([0i32; 2], [0i32; 2]);
@@ -380,6 +980,10 @@ fn main() {
                 let child = fork();
                 if child == 0 {
                     setuid(1000);
+                    // A change of ids leaves the process undumpable (its
+                    // `/proc` files root's) until it says otherwise.
+                    println!("dumpable after setuid: {}", prctl(3, 0, 0, 0, 0));
+                    prctl(4, 1, 0, 0, 0);
                     // A user may make a whiteout (as rootless overlay
                     // storage does), not a device.
                     let wh = mknod(c("/tmp/wh").as_ptr(), 0o20000 | 0o644, 0);
@@ -982,7 +1586,8 @@ fn main() {
                 let f = open(c("/tmp/linked").as_ptr(), O_WRONLY | O_CREAT, 0o644);
                 println!("linkat AT_EMPTY_PATH: {}", r(linkat(f, c("").as_ptr(), -100, c("/tmp/again").as_ptr(), 0x1000) as i64));
                 println!("fchownat AT_EMPTY_PATH: {}", r(fchownat(f, c("").as_ptr(), 0, 0, 0x1000) as i64));
-                // BPF: a program of another type loads but does not attach.
+                // BPF: a program of another type loads, as programs
+                // probe for one, but is not attached.
                 let insns: [u64; 2] = [0x0000_0000_0000_00b7, 0x0000_0000_0000_0095];
                 let mut attr = [0u8; 128];
                 attr[0..4].copy_from_slice(&8u32.to_ne_bytes()); // CGROUP_SKB

@@ -11,7 +11,10 @@
 //! the guest's. Memory fwe maps for the guest that the guest did not ask
 //! for (the native backend's code stubs, a stack's guard page) is listed
 //! as anonymous memory with the host's protections, so a program looking
-//! for free address space in the list does not pick it.
+//! for free address space in the list does not pick it. The latest plain
+//! anonymous mapping waits beside the list until anything reads it
+//! ([`record`]): one unmapped whole before then, as a program's buffer
+//! often is, never costs the list a change.
 //!
 //! Each process publishes its record once it changed, before its next
 //! system call that is not a memory call and before a fork, in a shared
@@ -22,7 +25,7 @@
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;
-use std::os::unix::ffi::OsStrExt;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// What a mapping is named by in the listing.
@@ -74,6 +77,9 @@ pub struct Area {
     pub sealed: bool,
     /// What it maps; anonymous memory has offset 0 throughout.
     pub object: Object,
+    /// Anonymous memory's name (`PR_SET_VMA_ANON_NAME`), as the listing
+    /// shows it (`[anon:name]`).
+    pub label: Option<Arc<[u8]>>,
 }
 
 impl Mapping for Area {
@@ -83,6 +89,22 @@ impl Mapping for Area {
             a.object.offset += offset;
         }
         a
+    }
+
+    fn continues(&self, offset: u64, next: &Self) -> bool {
+        let (a, b) = (&self.object, &next.object);
+        let moved = if matches!(a.name, Name::Exe | Name::Path(_)) { offset } else { 0 };
+        self.prot == next.prot
+            && self.shared == next.shared
+            && self.locked == next.locked
+            && self.noexec == next.noexec
+            && self.nowrite == next.nowrite
+            && self.sealed == next.sealed
+            && a.dev == b.dev
+            && a.ino == b.ino
+            && a.offset.wrapping_add(moved) == b.offset
+            && a.name == b.name
+            && self.label == next.label
     }
 }
 
@@ -96,6 +118,13 @@ impl Area {
         }
     }
 
+    /// Private anonymous memory (the break and the stack too): what
+    /// `MADV_DONTNEED` zero-fills, and `MADV_FREE` and `MADV_WIPEONFORK`
+    /// take.
+    pub fn private_anonymous(&self) -> bool {
+        !self.shared && matches!(self.object.name, Name::Anonymous | Name::Heap | Name::Stack)
+    }
+
     fn anonymous(prot: u64, name: Name) -> Area {
         Area {
             prot,
@@ -105,6 +134,7 @@ impl Area {
             nowrite: false,
             sealed: false,
             object: Object { name, dev: 0, ino: 0, offset: 0 },
+            label: None,
         }
     }
 }
@@ -122,6 +152,13 @@ pub struct Record {
     /// device and inode.
     exe: Vec<u8>,
     exe_id: (u64, u64),
+    /// Some memory was sealed: until then no call looks for a seal.
+    any_sealed: bool,
+    /// The latest plain mapping (anonymous, unlocked: start, length,
+    /// protection, shared), not yet among the areas: one unmapped whole
+    /// before anything looks is never put there ([`mapped_plain`],
+    /// [`unmapped`]). [`record`] puts it there first.
+    pending: Option<(u64, u64, u64, bool)>,
 }
 
 impl Default for Record {
@@ -138,6 +175,15 @@ impl Record {
             lock_future: false,
             exe: Vec::new(),
             exe_id: (0, 0),
+            any_sealed: false,
+            pending: None,
+        }
+    }
+
+    /// Put the pending mapping among the areas.
+    fn settle(&mut self) {
+        if let Some((start, len, prot, shared)) = self.pending.take() {
+            self.mapped(start, len, prot, shared, None);
         }
     }
 
@@ -182,6 +228,7 @@ impl Record {
                     e.bytes(p);
                 }
             }
+            e.bytes(a.label.as_deref().unwrap_or_default());
         }
     }
 
@@ -206,7 +253,9 @@ impl Record {
                 _ => Name::Anonymous,
             };
             let object = Object { name, dev, ino, offset };
-            let area = Area { prot, shared, locked, noexec, nowrite, sealed, object };
+            let label = Some(d.bytes()).filter(|l| !l.is_empty()).map(Into::into);
+            let area = Area { prot, shared, locked, noexec, nowrite, sealed, object, label };
+            r.any_sealed |= sealed;
             r.areas.insert(start, end, area);
         }
         r
@@ -226,10 +275,41 @@ impl Record {
     ) -> bool {
         let locked = self.lock_future;
         let object = object.unwrap_or(Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 });
-        let area =
-            Area { prot, shared, locked, noexec: false, nowrite: false, sealed: false, object };
+        let area = Area {
+            prot,
+            shared,
+            locked,
+            noexec: false,
+            nowrite: false,
+            sealed: false,
+            object,
+            label: None,
+        };
         self.areas.insert(start, start + len, area);
         locked
+    }
+
+    /// Name the anonymous memory in `[start, end)` `name` (`None`: no
+    /// name), as `PR_SET_VMA_ANON_NAME` does: `EBADF` if a file is mapped
+    /// in it (nothing named then), `ENOMEM` past a hole (the rest named).
+    pub fn set_anon_name(&mut self, start: u64, end: u64, name: Option<&[u8]>) -> Result<(), i32> {
+        let pieces: Vec<_> = self.areas.overlapping(start, end).collect();
+        if pieces.iter().any(|p| matches!(p.value.object.name, Name::Exe | Name::Path(_))) {
+            return Err(fwe_abi::errno::EBADF);
+        }
+        let mut at = start;
+        let mut hole = false;
+        for p in &pieces {
+            hole |= p.start > at;
+            at = p.end;
+        }
+        hole |= at < end;
+        let label = |shared: bool| -> Option<Arc<[u8]>> {
+            let kind: &[u8] = if shared { b"[anon_shmem:" } else { b"[anon:" };
+            name.map(|n| [kind, n, b"]"].concat().into())
+        };
+        self.areas.update(start, end, |a| Area { label: label(a.shared), ..a.clone() });
+        if hole { Err(fwe_abi::errno::ENOMEM) } else { Ok(()) }
     }
 
     /// Name the mapping `[start, start + len)` as what it maps (a System V
@@ -252,29 +332,31 @@ impl Record {
             return Err(fwe_abi::errno::ENOMEM);
         }
         self.areas.update(start, end, |a| Area { sealed: true, ..a.clone() });
+        self.any_sealed = true;
         Ok(())
     }
 
     /// Whether any of `[start, end)` is sealed.
     pub fn any_sealed(&self, start: u64, end: u64) -> bool {
-        self.areas.overlapping(start, end).any(|p| p.value.sealed)
+        self.any_sealed && self.areas.overlapping(start, end).any(|p| p.value.sealed)
     }
 
     /// Whether any of `[start, end)` is sealed, private, anonymous and not
     /// writable: memory `madvise` may not discard.
     pub fn any_sealed_read_only(&self, start: u64, end: u64) -> bool {
-        self.areas.overlapping(start, end).any(|p| {
-            let a = p.value;
-            a.sealed
-                && !a.shared
-                && !matches!(a.object.name, Name::Exe | Name::Path(_))
-                && a.prot & fwe_abi::mman::PROT_WRITE == 0
-        })
+        self.any_sealed
+            && self.areas.overlapping(start, end).any(|p| {
+                let a = p.value;
+                a.sealed
+                    && !a.shared
+                    && !matches!(a.object.name, Name::Exe | Name::Path(_))
+                    && a.prot & fwe_abi::mman::PROT_WRITE == 0
+            })
     }
 
     /// The guest unmapped `[start, start + len)`.
     pub fn unmapped(&mut self, start: u64, len: u64) {
-        self.areas.remove(start, start + len);
+        self.areas.clear(start, start + len);
     }
 
     /// The guest changed the protections of `[start, start + len)` to
@@ -292,13 +374,13 @@ impl Record {
 
     /// Whether any of `[start, start + len)` may not be made writable.
     pub fn any_nowrite(&self, start: u64, len: u64) -> bool {
-        self.areas.pieces(start, start + len).iter().any(|p| p.value.nowrite)
+        self.areas.overlapping(start, start + len).any(|p| p.value.nowrite)
     }
 
     /// Whether any of `[start, start + len)` maps a file of a `noexec`
     /// mount.
     pub fn any_noexec(&self, start: u64, len: u64) -> bool {
-        self.areas.pieces(start, start + len).iter().any(|p| p.value.noexec)
+        self.areas.overlapping(start, start + len).any(|p| p.value.noexec)
     }
 
     pub fn protected(&mut self, start: u64, len: u64, prot: u64) {
@@ -340,7 +422,7 @@ impl Record {
             .map(|p| (p.start, p.end))
             .collect();
         for (a, b) in heap {
-            self.areas.remove(a, b);
+            self.areas.clear(a, b);
         }
         if end > start {
             let mut heap = Area::anonymous(mman::PROT_READ | mman::PROT_WRITE, Name::Heap);
@@ -397,6 +479,7 @@ impl Record {
                     nowrite: false,
                     sealed: false,
                     object,
+                    label: None,
                 };
                 self.areas.insert(start, file_end, area);
             }
@@ -420,6 +503,11 @@ impl Record {
             self.areas.update(0, u64::MAX, |a| Area { locked: on, ..a.clone() });
         }
         self.lock_future = future;
+    }
+
+    /// Whether mappings made from now on are locked (`MCL_FUTURE`).
+    pub fn locks_future(&self) -> bool {
+        self.lock_future
     }
 
     /// How many bytes of the mappings are locked.
@@ -453,7 +541,7 @@ impl Record {
 
     /// How many mappings there are (what `vm.max_map_count` limits).
     pub fn count(&self) -> usize {
-        self.areas.len()
+        self.areas.len() + usize::from(self.pending.is_some())
     }
 
     pub fn areas_in(&self, start: u64, end: u64) -> Vec<Piece<Area>> {
@@ -505,20 +593,109 @@ static PAGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(40
 
 /// The guest's pages are `page` bytes.
 pub fn set_page_size(page: u64) {
-    PAGE.store(page, std::sync::atomic::Ordering::Relaxed);
+    PAGE.store(page, Relaxed);
 }
 
 /// The guest's page size.
 pub fn page_size() -> u64 {
-    PAGE.load(std::sync::atomic::Ordering::Relaxed)
+    PAGE.load(Relaxed)
 }
 
 /// This process's record.
 static RECORD: Mutex<Record> = Mutex::new(Record::new());
 
+/// How many mappings the record holds, as its lock was last let go: read
+/// without the lock by every `mmap` ([`count`]).
+static COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether mappings made from now on are locked (`mlockall(MCL_FUTURE)`),
+/// as the record's lock was last let go: read without the lock by every
+/// `mmap` ([`locks_future`]).
+static LOCKS_FUTURE: AtomicBool = AtomicBool::new(false);
+
+/// Whether some memory was sealed, as the record's lock was last let go:
+/// until then no call looks for a seal ([`may_be_sealed`]).
+static ANY_SEALED: AtomicBool = AtomicBool::new(false);
+
+/// The record, locked; its count, whether it locks future mappings and
+/// whether any memory was sealed are published as the lock is let go.
+pub struct Held(MutexGuard<'static, Record>);
+
+impl std::ops::Deref for Held {
+    type Target = Record;
+
+    fn deref(&self) -> &Record {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut Record {
+        &mut self.0
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        COUNT.store(self.0.count(), Relaxed);
+        LOCKS_FUTURE.store(self.0.lock_future, Relaxed);
+        ANY_SEALED.store(self.0.any_sealed, Relaxed);
+    }
+}
+
 /// This process's record, to read or change.
-pub fn record() -> MutexGuard<'static, Record> {
-    RECORD.lock().unwrap_or_else(|e| e.into_inner())
+pub fn record() -> Held {
+    let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
+    h.0.settle();
+    h
+}
+
+/// The guest mapped `[start, start + len)` with `prot` (`shared` or
+/// private), nothing named: as [`Record::mapped`], but kept apart until
+/// something looks, so that one unmapped at once ([`unmapped`]) costs the
+/// areas nothing. Returns whether it is locked (`mlockall(MCL_FUTURE)`).
+pub fn mapped_plain(start: u64, len: u64, prot: u64, shared: bool) -> bool {
+    let mut h = record();
+    if h.lock_future {
+        return h.mapped(start, len, prot, shared, None);
+    }
+    h.0.pending = Some((start, len, prot, shared));
+    false
+}
+
+/// The guest unmapped `[start, start + len)`: the pending mapping if it is
+/// that one, else as [`Record::unmapped`].
+pub fn unmapped(start: u64, len: u64) {
+    let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
+    if h.0.pending.is_some_and(|(s, l, _, _)| (s, l) == (start, len)) {
+        // What it replaced goes too (one look where nothing was).
+        h.0.pending = None;
+        h.unmapped(start, len);
+        return;
+    }
+    h.0.settle();
+    h.unmapped(start, len);
+}
+
+/// How many mappings the record holds, without its lock: as of the last
+/// change, which a call racing with another thread's map may miss as it
+/// would with the lock.
+pub fn count() -> usize {
+    COUNT.load(Relaxed)
+}
+
+/// Whether mappings made from now on are locked, without the record's
+/// lock: as of the last change, which a call racing with another thread's
+/// `mlockall` may miss as it would with the lock.
+pub fn locks_future() -> bool {
+    LOCKS_FUTURE.load(Relaxed)
+}
+
+/// Whether any memory may be sealed, without the record's lock: false
+/// until some was (a seal is made under the kernel lock, which every call
+/// that looks for one holds).
+pub fn may_be_sealed() -> bool {
+    ANY_SEALED.load(Relaxed)
 }
 
 /// Forget every mapping (the old program's, at `execve`).
@@ -566,24 +743,21 @@ impl Published {
     }
 }
 
-/// The shared file this process publishes its mappings in: other
-/// processes read it for `/proc/<pid>/maps`. It holds a sequence word
-/// (odd while a change is written), the length of what follows, and the
-/// encoded [`Published`].
-pub(crate) struct Outbox {
-    pid: i32,
-    fd: i32,
-    map: *mut u8,
-    cap: usize,
+/// The process is ending: its mappings are published no more.
+static ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The process is ending: its published mappings go, and are published no
+/// more.
+pub fn close_for_exit() {
+    ENDED.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    crate::procstore::put_own(crate::procstore::Kind::Maps, None);
 }
 
-// SAFETY: the mapping is this process's own, used under `OUTBOX`'s lock.
-unsafe impl Send for Outbox {}
-
-pub(crate) static OUTBOX: Mutex<Option<Outbox>> = Mutex::new(None);
-
-/// The header before the encoded record: the sequence word and the length.
-const HEADER: usize = 16;
+/// Taken while this process publishes its mappings (its threads take
+/// turns): other processes read them from its entry in the process store
+/// ([`crate::procstore`]) for `/proc/<pid>/maps`.
+pub(crate) static OUTBOX: Mutex<()> = Mutex::new(());
 
 /// This process's mappings encoded as [`publish`] publishes them.
 pub fn snapshot() -> Vec<u8> {
@@ -607,27 +781,10 @@ pub fn snapshot() -> Vec<u8> {
     e.into_bytes()
 }
 
-/// Let go of the parent's file a fork child inherited.
-fn drop_inherited(out: &mut Option<Outbox>) {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    if let Some(o) = out.as_ref()
-        && o.pid != me
-    {
-        // SAFETY: the mapping and descriptor are this process's copies.
-        unsafe {
-            libc::munmap(o.map.cast(), o.cap);
-            libc::close(o.fd);
-        }
-        *out = None;
-    }
-}
-
 /// In a fork child: its mappings, which are its parent's, for the record
-/// it writes as it starts (see [`crate::procreg::own_line`]). It makes a
-/// file of its own only once they change, so a fork costs no file.
+/// it writes as it starts (see [`crate::procreg::own_line`]). It publishes
+/// its own only once they change.
 pub fn forked() -> Vec<u8> {
-    drop_inherited(&mut OUTBOX.lock().unwrap_or_else(|e| e.into_inner()));
     snapshot()
 }
 
@@ -639,7 +796,7 @@ static STALE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new
 /// of a mapping before then, and a run of mapping calls (a program making
 /// thousands) publishes them once, not once each.
 pub fn publish() {
-    STALE.store(true, std::sync::atomic::Ordering::Relaxed);
+    STALE.store(true, Relaxed);
 }
 
 /// Before system call `nr`: publish the mappings if they changed, unless
@@ -665,7 +822,7 @@ pub fn flush_before(nr: u64) {
 
 /// Publish the mappings if they changed since last published.
 pub fn flush() {
-    use std::sync::atomic::Ordering::Relaxed;
+    use Relaxed;
     // Read first: a swap would write the flag's line on every call, which
     // every thread's calls then contend for.
     if STALE.load(Relaxed) && STALE.swap(false, Relaxed) {
@@ -675,71 +832,17 @@ pub fn flush() {
 
 /// Publish this process's mappings for other processes to read now.
 pub fn publish_now() {
-    let body = snapshot();
-    let mut out = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
-    drop_inherited(&mut out);
-    if out.is_none() {
-        let Some(path) = crate::procreg::maps_path(me) else { return };
-        let Ok(c) = std::ffi::CString::new(path) else { return };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
-                0o600,
-            )
-        };
-        if fd < 0 {
-            return;
-        }
-        let Ok(fd) = crate::fdtable::reserve(fd) else { return };
-        *out = Some(Outbox { pid: me, fd, map: std::ptr::null_mut(), cap: 0 });
+    // After when the process started: a reader tells them from an earlier
+    // process's of the same pid that was killed before it could take its
+    // own away.
+    let me = crate::host::pid();
+    let mut body = crate::procreg::start_time(me).unwrap_or(0).to_le_bytes().to_vec();
+    body.extend(snapshot());
+    let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
+    if ENDED.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
     }
-    let Some(o) = out.as_mut() else { return };
-    let need = HEADER + body.len();
-    if need > o.cap {
-        let cap = need.next_power_of_two().max(1 << 16);
-        // SAFETY: fwe's own file; growing it keeps what it holds.
-        if unsafe { libc::ftruncate(o.fd, cap as libc::off_t) } != 0 {
-            return;
-        }
-        // SAFETY: a fresh shared mapping of the whole file.
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                cap,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                o.fd,
-                0,
-            )
-        };
-        if map == libc::MAP_FAILED {
-            return;
-        }
-        if !o.map.is_null() {
-            // SAFETY: the old mapping, replaced by the new one.
-            unsafe { libc::munmap(o.map.cast(), o.cap) };
-        }
-        o.map = map.cast();
-        o.cap = cap;
-    }
-    use std::sync::atomic::{AtomicU64, Ordering, fence};
-    // SAFETY: the mapping is `cap` bytes, at least `need`, page-aligned
-    // (so the words are aligned), and only this process writes it.
-    unsafe {
-        let seq = &*(o.map as *const AtomicU64);
-        let len = &*(o.map.add(8) as *const AtomicU64);
-        let s = seq.load(Ordering::Relaxed);
-        seq.store(s | 1, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        std::ptr::copy_nonoverlapping(body.as_ptr(), o.map.add(HEADER), body.len());
-        len.store(body.len() as u64, Ordering::Relaxed);
-        fence(Ordering::SeqCst);
-        seq.store((s | 1) + 1, Ordering::Release);
-    }
+    crate::procstore::put_own(crate::procstore::Kind::Maps, Some(&body));
 }
 
 /// What [`snapshot`] encoded.
@@ -758,31 +861,18 @@ fn decode_published(body: &[u8]) -> Option<Published> {
 /// The mappings host process `pid` published, if it is a process of
 /// fwe's that has.
 pub fn of_process(pid: i32) -> Option<Published> {
-    use std::os::unix::fs::FileExt;
-    let path = crate::procreg::maps_path(pid)?;
-    let Ok(file) = std::fs::File::open(std::ffi::OsStr::from_bytes(&path)) else {
-        // None published yet: what it was forked with.
-        let r = crate::procreg::read(pid)?;
-        return (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten();
-    };
-    let word = |at: u64| -> Option<u64> {
-        let mut b = [0u8; 8];
-        file.read_exact_at(&mut b, at).ok()?;
-        Some(u64::from_ne_bytes(b))
-    };
-    // A consistent copy: the same even sequence word before and after.
-    for _ in 0..1000 {
-        let before = word(0)?;
-        if before & 1 == 0 {
-            let len = word(8)? as usize;
-            let mut body = vec![0u8; len];
-            if file.read_exact_at(&mut body, HEADER as u64).is_ok() && word(0)? == before {
-                return decode_published(&body);
-            }
+    let published = crate::procstore::get_of(crate::procstore::Kind::Maps, pid).filter(|b| {
+        b.get(..8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
+            == crate::procreg::start_time(pid)
+    });
+    match published {
+        Some(body) => decode_published(&body[8..]),
+        None => {
+            // None published yet: what it was forked with.
+            let r = crate::procreg::read(pid)?;
+            (!r.maps.is_empty()).then(|| decode_published(&r.maps)).flatten()
         }
-        std::thread::yield_now();
     }
-    None
 }
 
 /// What the listing shows of each mapping beyond its line (`smaps`).
@@ -923,7 +1013,7 @@ pub fn query(areas: &[Piece<Area>], addr: u64, flags: u64) -> Option<&Piece<Area
 /// and its file's device and inode.
 pub fn name_of<'a>(a: &'a Area, exe: &Exe<'a>) -> (&'a [u8], (u64, u64)) {
     match &a.object.name {
-        Name::Anonymous => (b"", (0, 0)),
+        Name::Anonymous => (a.label.as_deref().unwrap_or_default(), (0, 0)),
         Name::Heap => (b"[heap]", (0, 0)),
         Name::Stack => (b"[stack]", (0, 0)),
         Name::Exe => (exe.path, exe.id),
@@ -935,8 +1025,114 @@ pub fn name_of<'a>(a: &'a Area, exe: &Exe<'a>) -> (&'a [u8], (u64, u64)) {
 mod tests {
     use super::*;
 
+    /// A plain mapping kept apart is in the record for anyone who looks,
+    /// counted meanwhile, and one unmapped whole at once leaves nothing.
+    #[test]
+    fn a_pending_mapping_is_seen_by_readers_and_dropped_by_its_unmap() {
+        let (a, b, len) = (0x7a00_0000_0000u64, 0x7b00_0000_0000u64, 0x4000u64);
+        let before = record().count();
+        mapped_plain(a, len, 3, false);
+        assert_eq!(count(), before + 1);
+        unmapped(a, len);
+        assert_eq!(record().span_at(a), None);
+        assert_eq!(record().count(), before);
+        mapped_plain(b, len, 3, false);
+        assert_eq!(record().span_at(b), Some((b, b + len)));
+        unmapped(b, len);
+        assert_eq!(record().span_at(b), None);
+        // One made over another (`MAP_FIXED`) and unmapped at once takes
+        // the one it replaced with it.
+        record().mapped(a, 4 * len, 1, false, None);
+        mapped_plain(a + len, len, 3, false);
+        unmapped(a + len, len);
+        assert_eq!(record().span_at(a + len), None);
+        assert_eq!(record().span_at(a), Some((a, a + len)));
+        unmapped(a, 4 * len);
+        assert_eq!(record().count(), before);
+    }
+
     fn file(path: &str, offset: u64) -> Option<Object> {
         Some(Object { name: Name::Path(path.as_bytes().into()), dev: 0x803, ino: 42, offset })
+    }
+
+    /// `continues` tells what comparing with `at` tells, for every field
+    /// that can differ.
+    #[test]
+    fn continuing_is_comparing_the_moved_mapping() {
+        use crate::vmas::Mapping;
+        let base = Area {
+            prot: mman::PROT_READ,
+            shared: false,
+            locked: false,
+            noexec: false,
+            nowrite: false,
+            sealed: false,
+            object: file("/lib/x.so", 0x1000).unwrap(),
+            label: None,
+        };
+        let anon = Area {
+            object: Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 },
+            ..base.clone()
+        };
+        let mut others = vec![base.at(0x4000), base.at(0x8000), anon.clone(), anon.at(0x4000)];
+        for change in [
+            |a: &mut Area| a.prot = mman::PROT_READ | mman::PROT_WRITE,
+            |a: &mut Area| a.shared = true,
+            |a: &mut Area| a.locked = true,
+            |a: &mut Area| a.noexec = true,
+            |a: &mut Area| a.nowrite = true,
+            |a: &mut Area| a.sealed = true,
+            |a: &mut Area| a.object.dev += 1,
+            |a: &mut Area| a.object.ino += 1,
+            |a: &mut Area| a.object.name = Name::Path(b"/lib/y.so"[..].into()),
+            |a: &mut Area| a.object.name = Name::Heap,
+            |a: &mut Area| a.label = Some(b"[anon:x]"[..].into()),
+        ] {
+            let mut a = base.at(0x4000);
+            change(&mut a);
+            others.push(a);
+        }
+        for first in [&base, &anon] {
+            for next in &others {
+                for offset in [0, 0x4000, 0x8000] {
+                    assert_eq!(
+                        first.continues(offset, next),
+                        first.at(offset) == *next,
+                        "{first:?} at {offset:#x} against {next:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Anonymous memory takes a name, which the listing shows and which
+    /// splits it from the rest; a file's mapping takes none (`EBADF`); a
+    /// hole is `ENOMEM` once the rest is named.
+    #[test]
+    fn anonymous_memory_is_named() {
+        let mut r = Record::new();
+        let rw = mman::PROT_READ | mman::PROT_WRITE;
+        r.mapped(0x10000, 0xc000, rw, false, None);
+        r.mapped(0x20000, 0x4000, rw, true, None);
+        r.mapped(0x30000, 0x4000, rw, false, file("/lib/a.so", 0));
+        assert_eq!(r.set_anon_name(0x14000, 0x18000, Some(b"buf")), Ok(()));
+        assert_eq!(r.set_anon_name(0x20000, 0x24000, Some(b"shm")), Ok(()));
+        assert_eq!(r.set_anon_name(0x2c000, 0x34000, Some(b"x")), Err(fwe_abi::errno::EBADF));
+        assert_eq!(r.set_anon_name(0x18000, 0x20000, Some(b"y")), Err(fwe_abi::errno::ENOMEM));
+        let text = String::from_utf8(render(
+            &r.areas(),
+            &Exe { path: b"/bin/x", id: (0, 0) },
+            0x4000,
+            None,
+        ))
+        .unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].starts_with("00010000-00014000 rw-p") && lines[0].ends_with(" 0 "));
+        assert!(lines[1].starts_with("00014000-00018000 ") && lines[1].ends_with("[anon:buf]"));
+        assert!(lines[2].starts_with("00018000-0001c000 ") && lines[2].ends_with("[anon:y]"));
+        assert!(lines[3].ends_with("[anon_shmem:shm]"), "{text}");
+        assert_eq!(r.set_anon_name(0x14000, 0x18000, None), Ok(()));
+        assert!(r.areas()[0].value.label.is_none());
     }
 
     #[test]

@@ -39,12 +39,15 @@ mod handles;
 pub mod host;
 pub mod inotify;
 pub mod ipcops;
+mod kept;
 pub mod keycrypto;
 pub mod keys;
 mod keytypes;
 pub mod klock;
+pub mod klog;
 pub mod landlock;
 mod landlockops;
+pub mod lazycode;
 pub mod leases;
 pub mod loopdev;
 pub mod maps;
@@ -70,16 +73,23 @@ pub mod pidfd;
 pub mod pidns;
 pub mod pipelock;
 pub mod posixtimer;
+pub mod prepcache;
+pub mod prmm;
 pub mod procfs;
 pub mod procmem;
+pub mod procnet;
 pub mod procpid;
 pub mod procreg;
+pub mod procstore;
 pub mod procvm;
 pub mod ptrace;
 pub mod pty;
 pub mod reaper;
+pub mod reclocks;
 pub mod rlimits;
 mod sched;
+#[cfg(not(target_os = "linux"))]
+pub mod scm;
 pub mod seccomp;
 pub mod seqpacket;
 pub mod shared;
@@ -89,6 +99,8 @@ pub mod signal;
 pub mod signalfd;
 pub mod signote;
 pub mod snapshot;
+#[cfg(target_os = "macos")]
+pub mod socketowners;
 pub mod sockopt;
 pub mod specialfd;
 pub mod specialwrite;
@@ -101,6 +113,7 @@ pub mod term;
 pub mod textbusy;
 pub mod thread;
 pub mod threadfs;
+pub mod timing;
 pub mod tmpfile;
 pub mod tmpfs;
 pub mod trace;
@@ -183,11 +196,14 @@ pub trait Platform {
     /// The memory is readable and writable when this is called; the kernel
     /// applies the final protections afterwards. A failure carries the
     /// Linux errno for the guest and why, for the trace.
+    /// `cache`, when given, is the key ([`prepcache::code_key`]) under
+    /// which what the preparation finds is kept and found again.
     fn prepare_exec(
         &mut self,
         addr: u64,
         len: u64,
         known: Option<&[(u64, u64)]>,
+        cache: Option<&[u8]>,
     ) -> Result<(), PrepareFailed>;
 
     /// Terminate the whole process with `code` as its exit status
@@ -306,6 +322,8 @@ impl<P: Platform> Kernel<P> {
         // one process making many kernels while others wait.)
         #[cfg(not(test))]
         futex::process_started();
+        // The process records, mapped before a signal handler reads them.
+        procstore::init();
         // The guest's umask is fwe's to apply: the host's would take more
         // bits off what the guest asked for.
         #[cfg(not(test))]
@@ -348,7 +366,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
-        e.bool(coredump::UNDUMPABLE.load(std::sync::atomic::Ordering::Relaxed));
+        e.u8(coredump::dumpable());
         rlimits::save(e);
         match self.fs_opt() {
             Some(fs) => {
@@ -424,7 +442,7 @@ impl<P: Platform> Kernel<P> {
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
         syscalls::THP_DISABLE.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
-        coredump::UNDUMPABLE.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
+        coredump::set_dumpable(d.u8());
         rlimits::load(d);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
@@ -476,6 +494,7 @@ impl<P: Platform> Kernel<P> {
         ptrace::load_fork(d);
         landlock::load(d);
         acct::forked_child();
+        reclocks::forked_child();
         aio::forget_all();
         // A thread's own view the forking thread had is in the state.
         drop(threadfs::take_for_child());
@@ -554,10 +573,47 @@ impl<P: Platform> Kernel<P> {
         // A set-ID program's owner and group, then the saved IDs the
         // effective ones, and the capabilities, as Linux's execve sets them.
         let saved = (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid);
-        apply_exec_privs(&mut self.creds, take_exec_privs());
+        let permitted = self.creds.caps.permitted;
+        let privs = take_exec_privs();
+        let secure = apply_exec_privs(&mut self.creds, privs);
         if saved != (self.creds.euid, self.creds.suid, self.creds.egid, self.creds.sgid) {
             self.ids_changed(0);
         }
+        self.after_exec(secure, privs.unreadable, permitted);
+    }
+
+    /// For the program an `execve` in place is about to load: what its
+    /// auxiliary vector says of its credentials, as [`Kernel::exec_reset`]
+    /// will make them.
+    pub fn exec_aux_ids(&self) -> AuxIds {
+        let mut c = self.creds.clone();
+        let secure = apply_exec_privs(&mut c, EXEC_PRIVS.with(|p| p.get()));
+        AuxIds::of(&c, secure)
+    }
+
+    /// After an exec: whether the process is dumpable, as Linux's
+    /// `begin_new_exec` sets it (dumpable again, unless the program runs
+    /// with effective ids other than the real ones, gained capabilities
+    /// over the `permitted` set it had, or could not be read by its caller
+    /// (`unreadable`): then as `fs.suid_dumpable` says); and for an exec
+    /// that raised privilege (`secure`), the personality flags it must not
+    /// inherit (`PER_CLEAR_ON_SETID`) and the parent-death signal gone.
+    /// Others see the result ([`crate::procreg::Security`]).
+    fn after_exec(&mut self, secure: bool, unreadable: bool, permitted: u64) {
+        let c = &self.creds;
+        let changed = c.euid != c.uid || c.egid != c.gid || c.caps.permitted & !permitted != 0;
+        if changed || unreadable {
+            coredump::lose_dumpable();
+        } else {
+            coredump::set_dumpable(coredump::SUID_DUMP_USER);
+        }
+        if secure {
+            const PER_CLEAR_ON_SETID: u32 = 0x0040_0000 | 0x0004_0000 | 0x0020_0000 | 0x0010_0000;
+            syscalls::PERSONALITY
+                .fetch_and(!PER_CLEAR_ON_SETID, std::sync::atomic::Ordering::Relaxed);
+            pdeath::set(0);
+        }
+        procreg::publish_security(self.security());
     }
 
     /// The guest path `execveat(dirfd, path, .., flags)` executes: `path`
@@ -623,9 +679,56 @@ impl<P: Platform> Kernel<P> {
     /// regular file whose bits let it (`EACCES`; root needs one execute
     /// bit set), and that no process has open for writing (`ETXTBSY`).
     /// What running it grants ([`ExecPrivs`]) is noted for the exec.
+    /// The program file at `path`, which the caller may run
+    /// ([`Kernel::may_exec`]): its contents, read through the one
+    /// descriptor its checks were made on (`None` with no filesystem).
+    fn exec_file(&self, path: &[u8]) -> Result<Option<ExecFile>, i32> {
+        use fwe_abi::{errno, fcntl};
+        use std::os::fd::FromRawFd;
+        let Some(fs) = self.fs_opt() else {
+            self.may_exec(path)?;
+            return Ok(None);
+        };
+        // fwe's own files (`/proc/self/exe`, `/dev/fd/N`): through them.
+        if fs.synthetic(fcntl::AT_FDCWD as i32, path).is_some() {
+            self.may_exec(path)?;
+            return fs.read_identified(path).map(Some);
+        }
+        EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
+        if landlock::active() {
+            self.landlock_exec(path)?;
+        }
+        let r = fs.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        let name = r.name_c()?;
+        // Not waiting for a writer, should it be a FIFO (refused below).
+        // SAFETY: a NUL-terminated name in a live directory; the result is
+        // checked and owned.
+        let fd = unsafe {
+            libc::openat(
+                r.dir.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        // SAFETY: a fresh descriptor this owns.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+        let st = fs::guest_stat(fd.as_raw_fd()).ok_or(errno::EACCES)?;
+        self.exec_checks(&st, &r, &name)?;
+        let id = prepcache::FileId::of_fd(fd.as_raw_fd());
+        fs::read_all_fd(fd.as_raw_fd()).map(|d| Some((d, id)))
+    }
+
+    /// The program the last [`Kernel::exec_target`] found at `path`, read.
+    pub fn take_exec_file(&self, path: &[u8]) -> Option<ExecFile> {
+        EXEC_FILE.with(|f| f.borrow_mut().take()).filter(|(p, _)| p == path).map(|(_, d)| d)
+    }
+
     pub fn may_exec(&self, path: &[u8]) -> Result<(), i32> {
         EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
-        use fwe_abi::{errno, fcntl};
+        use fwe_abi::fcntl;
         if landlock::active() {
             self.landlock_exec(path)?;
         }
@@ -634,33 +737,58 @@ impl<P: Platform> Kernel<P> {
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
         {
-            // Not a regular file, not to be run by the caller, or on a
-            // `noexec` mount, before any writer is looked for.
-            if st.st_mode & libc::S_IFMT != libc::S_IFREG
-                || !self.permits(&st, 1)
-                || r.mount_flags & mounts::ms::NOEXEC != 0
-            {
-                return Err(errno::EACCES);
-            }
-            // Not a file open for writing.
-            if host_file_busy(&st) {
-                return Err(errno::ETXTBSY);
-            }
-            // What it grants, unless a `nosuid` mount, `no_new_privs` or a
-            // tracer says it grants nothing, as on Linux.
-            let gains = r.mount_flags & mounts::ms::NOSUID == 0
-                && !syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-                && !ptrace::traced();
-            if gains {
-                let privs = ExecPrivs {
-                    uid: (st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
-                    gid: (st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
-                        .then_some(st.st_gid),
-                    caps: file_caps(r.dir.as_raw_fd(), &name),
-                };
-                EXEC_PRIVS.with(|p| p.set(privs));
-            }
+            self.exec_checks(&st, &r, &name)?;
         }
+        Ok(())
+    }
+
+    /// [`Kernel::may_exec`]'s checks of the file `name` in `r`'s directory,
+    /// whose guest status is `st`, noting what it grants.
+    fn exec_checks(
+        &self,
+        st: &libc::stat,
+        r: &fs::Resolved,
+        name: &std::ffi::CStr,
+    ) -> Result<(), i32> {
+        use fwe_abi::errno;
+        // Not a regular file, not to be run by the caller, or on a
+        // `noexec` mount, before any writer is looked for.
+        if st.st_mode & libc::S_IFMT != libc::S_IFREG
+            || !self.permits(st, 1)
+            || r.mount_flags & mounts::ms::NOEXEC != 0
+        {
+            return Err(errno::EACCES);
+        }
+        // Not a file open for writing.
+        if host_file_busy(st) {
+            return Err(errno::ETXTBSY);
+        }
+        // A program its caller may not read leaves it undumpable (its
+        // memory would show the program).
+        let unreadable = !self.permits(st, 4);
+        // A `nosuid` mount grants nothing, as Linux's `mnt_may_suid`.
+        if r.mount_flags & mounts::ms::NOSUID != 0 {
+            EXEC_PRIVS.with(|p| p.set(ExecPrivs { unreadable, ..ExecPrivs::default() }));
+            return Ok(());
+        }
+        // Under `no_new_privs`, or traced by a tracer without
+        // `CAP_SYS_PTRACE` over the caller, an exec is unsafe and Linux's
+        // `cap_bprm_creds_from_file` downgrades what it grants: the set-ID
+        // ids are kept only by a caller with `CAP_SETUID` not under
+        // `no_new_privs`, and the capabilities are no more than the
+        // caller's permitted ones.
+        let nnp = syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed);
+        let unsafe_exec = nnp || (ptrace::traced() && !ptrace::tracer_capable());
+        let ids = !unsafe_exec || (!nnp && self.creds.has_own(caps::CAP_SETUID));
+        let privs = ExecPrivs {
+            uid: (ids && st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
+            gid: (ids && st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
+                .then_some(st.st_gid),
+            caps: file_caps(r.dir.as_raw_fd(), name),
+            cap_limit: unsafe_exec.then_some(self.creds.caps.permitted),
+            unreadable,
+        };
+        EXEC_PRIVS.with(|p| p.set(privs));
         Ok(())
     }
 
@@ -677,11 +805,17 @@ impl<P: Platform> Kernel<P> {
         path: Vec<u8>,
         args: Vec<Vec<u8>>,
     ) -> Result<(Vec<u8>, Vec<Vec<u8>>), i32> {
+        // A `set*uid` past `RLIMIT_NPROC` fails here, before the program
+        // is looked at, as Linux's `execve` fails it.
+        crate::rlimits::exec_allowed(self.creds.uid)?;
         let (mut path, mut args) = (path, args);
+        EXEC_FILE.with(|f| f.borrow_mut().take());
         for _ in 0..5 {
-            self.may_exec(&path)?;
-            let Some(fs) = self.fs_opt() else { return Ok((path, args)) };
-            let Some((interp, arg)) = script_interpreter(&fs.read_head(&path, 256)?)? else {
+            let Some(data) = self.exec_file(&path)? else { return Ok((path, args)) };
+            let head = &data.0[..data.0.len().min(256)];
+            let Some((interp, arg)) = script_interpreter(head)? else {
+                // Kept for the loader ([`Kernel::take_exec_file`]).
+                EXEC_FILE.with(|f| *f.borrow_mut() = Some((path.clone(), data)));
                 return Ok((path, args));
             };
             let mut new = vec![interp.clone()];
@@ -703,6 +837,9 @@ impl<P: Platform> Kernel<P> {
     pub fn exec_state(&self) -> Vec<u8> {
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
+        // First, for the new process to size the program's stack by before
+        // it reads the rest ([`exec_state_stack_limit`]).
+        e.u64(rlimits::get(fwe_abi::resource::RLIMIT_STACK).0);
         match self.fs_opt() {
             Some(fs) => {
                 e.bool(true);
@@ -719,6 +856,9 @@ impl<P: Platform> Kernel<P> {
             e.u32(g);
         }
         c.caps.encode(&mut e);
+        // What the program it runs grants, with the credentials it acts on
+        // (read early by [`AuxIds::at_start`]).
+        take_exec_privs().save(&mut e);
         let (soft, hard) = fdtable::limit();
         e.u64(soft);
         e.u64(hard);
@@ -746,41 +886,33 @@ impl<P: Platform> Kernel<P> {
         // Kept across execve, as on Linux.
         seccomp::save(&mut e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
-        // Kept across execve, as on Linux (whose set-ID exec, which fwe
-        // has none of, would clear some of it).
+        // Kept across execve, as on Linux (less what an exec that raises
+        // privilege clears, [`Kernel::exec_secured`]).
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
         e.bool(syscalls::THP_DISABLE.load(std::sync::atomic::Ordering::Relaxed));
         // Traced on, by the same tracer ([`ptrace::restore`]).
         let (tracer, syscalls) = ptrace::exec_state();
         e.u32(tracer as u32);
         e.bool(syscalls);
+        // Yama's named tracer, which an exec keeps.
+        e.i32(ptrace::ptracer());
         // Its Landlock domain, which a program run keeps.
         landlock::save(&mut e);
         // Its foster children, still its own to follow.
         e.bool(reaper::fostering());
-        // What the program it runs grants.
-        take_exec_privs().save(&mut e);
         e.into_bytes()
     }
 
     /// Take the state [`Kernel::exec_state`] recorded in the process that
     /// exec'd this one. Fails, changing nothing, on a malformed record.
     pub fn restore_exec_state(&mut self, state: &[u8]) -> Result<(), String> {
-        let mut d = snapshot::Dec::new(state);
-        if d.u64() != EXEC_STATE_MAGIC {
-            return Err("the exec state is not fwe's".into());
-        }
+        let mut d = exec_state_body(state)?;
         // The view, which the filesystem took when it was opened.
         if d.bool() {
             fs::Fs::skip_view(&mut d);
         }
-        let mut ids = [0u32; 8];
-        for v in &mut ids {
-            *v = d.u32();
-        }
-        let n = d.count(4);
-        let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
-        let caps = caps::Caps::decode(&mut d);
+        let mut creds = exec_state_creds(&mut d);
+        let privs = ExecPrivs::load(&mut d);
         let (soft, hard) = (d.u64(), d.u64());
         let umask = d.u32();
         rlimits::load(&mut d);
@@ -796,22 +928,22 @@ impl<P: Platform> Kernel<P> {
         let persona = d.u32();
         let thp = d.bool();
         let (tracer, syscalls) = (d.u32() as i32, d.bool());
+        let ptracer = d.i32();
         landlock::load(&mut d);
         let fostering = d.bool();
-        let privs = ExecPrivs::load(&mut d);
         d.finish()?;
         reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
+        ptrace::set_ptracer(ptracer);
         syscalls::THP_DISABLE.store(thp, std::sync::atomic::Ordering::Relaxed);
         syscalls::NO_NEW_PRIVS.store(nnp, std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(persona, std::sync::atomic::Ordering::Relaxed);
         // The saved IDs become the effective ones, and the capabilities
         // what an exec makes of them, as across any execve.
-        let [uid, euid, suid, fsuid, gid, egid, sgid, fsgid] = ids;
-        let mut creds =
-            creds::Creds { uid, euid, suid, fsuid, gid, egid, sgid, fsgid, groups, caps };
-        apply_exec_privs(&mut creds, privs);
+        let permitted = creds.caps.permitted;
+        let secure = apply_exec_privs(&mut creds, privs);
         self.creds = creds;
+        self.after_exec(secure, privs.unreadable, permitted);
         creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
@@ -822,6 +954,8 @@ impl<P: Platform> Kernel<P> {
         // Limits another process left for this one (runc sets its
         // container's this way before it runs the program).
         self.take_pending_limits();
+        // The limits carried across, for other processes to read.
+        syscalls::publish_limits();
         self.ids_changed(0);
         Ok(())
     }
@@ -877,6 +1011,7 @@ impl<P: Platform> Kernel<P> {
         let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
         let nr = regs.x[8];
         let result = self.dispatch(nr, args);
+        self.note_creds();
         self.finish_syscall(regs, nr, &args, result);
     }
 
@@ -893,7 +1028,8 @@ impl<P: Platform> Kernel<P> {
     /// guest gets `EINTR` once the handler returns.
     pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.tracer.syscall(nr, args, result);
-        if result == fwe_abi::err(fwe_abi::errno::EINTR) {
+        // (`restart_syscall`'s own `EINTR` is its answer, not a host's.)
+        if result == fwe_abi::err(fwe_abi::errno::EINTR) && nr != fwe_abi::nr::RESTART_SYSCALL {
             signal::drain_to_signalfd();
             let rerun = match self.next_handler() {
                 None => true,
@@ -972,6 +1108,22 @@ pub fn thread_exit_cleanup() {
     }
 }
 
+/// The calling host thread, whose guest thread ended, is to run another
+/// one (the backend keeps host threads for reuse): every per-thread state
+/// of the kernel's is as a new host thread's.
+pub fn thread_reused() {
+    thread::thread_reused();
+    fs::thread_reused();
+    netns::thread_reused();
+    sysvipc::thread_reused();
+    threadfs::thread_reused();
+    ptrace::thread_reused();
+    uaccess::thread_reused();
+    mounts::store::thread_reused();
+    EXEC_FILE.with(|f| f.borrow_mut().take());
+    EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
+}
+
 /// Release every thread's robust futexes (`set_robust_list`) as the
 /// process ends or runs another program, its memory still there: Linux
 /// releases each thread's as the thread ends.
@@ -983,12 +1135,17 @@ pub fn release_robust_lists() {
 }
 
 /// What running a program grants ([`Kernel::may_exec`] notes it): the
-/// owner and group of a set-ID program, and its file capabilities.
+/// owner and group of a set-ID program, and its file capabilities; and
+/// whether its caller may not read it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecPrivs {
     uid: Option<u32>,
     gid: Option<u32>,
     caps: Option<caps::FileCaps>,
+    /// For an unsafe exec, the most capabilities it may leave: the
+    /// caller's permitted set.
+    cap_limit: Option<u64>,
+    unreadable: bool,
 }
 
 impl ExecPrivs {
@@ -1002,6 +1159,9 @@ impl ExecPrivs {
         e.u64(c.permitted);
         e.u64(c.inheritable);
         e.bool(c.effective);
+        e.bool(self.cap_limit.is_some());
+        e.u64(self.cap_limit.unwrap_or(0));
+        e.bool(self.unreadable);
     }
 
     fn load(d: &mut snapshot::Dec) -> ExecPrivs {
@@ -1012,14 +1172,38 @@ impl ExecPrivs {
         let (uid, gid) = (id(), id());
         let has = d.bool();
         let c = caps::FileCaps { permitted: d.u64(), inheritable: d.u64(), effective: d.bool() };
-        ExecPrivs { uid, gid, caps: has.then_some(c) }
+        let (limited, limit) = (d.bool(), d.u64());
+        ExecPrivs {
+            uid,
+            gid,
+            caps: has.then_some(c),
+            cap_limit: limited.then_some(limit),
+            unreadable: d.bool(),
+        }
     }
+}
+
+/// A program file read to be run, and its identity
+/// ([`prepcache::FileId`]).
+pub type ExecFile = (Vec<u8>, Option<prepcache::FileId>);
+
+thread_local! {
+    /// The program file [`Kernel::exec_target`] read, by its path, for the
+    /// loader to take.
+    static EXEC_FILE: std::cell::RefCell<Option<(Vec<u8>, ExecFile)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 thread_local! {
     /// What the program this thread is about to run grants.
     static EXEC_PRIVS: std::cell::Cell<ExecPrivs> = const {
-        std::cell::Cell::new(ExecPrivs { uid: None, gid: None, caps: None })
+        std::cell::Cell::new(ExecPrivs {
+            uid: None,
+            gid: None,
+            caps: None,
+            cap_limit: None,
+            unreadable: false,
+        })
     };
 }
 
@@ -1032,22 +1216,19 @@ fn take_exec_privs() -> ExecPrivs {
 /// only for the user namespace whose root it names.
 fn file_caps(dir: i32, name: &std::ffi::CStr) -> Option<caps::FileCaps> {
     let mut buf = [0u8; 24];
-    // SAFETY: a NUL-terminated name in a live directory; the descriptor is
-    // closed below; a buffer of its length.
-    let n = unsafe {
-        let fd =
-            libc::openat(dir, name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK);
-        if fd < 0 {
-            return None;
-        }
-        let name = c"security.capability".as_ptr();
+    // By its path, not a descriptor ([`crate::reclocks`]).
+    let n = host::at_path(dir, name, |path| {
+        let attr = c"security.capability".as_ptr();
+        // SAFETY: a NUL-terminated path and attribute name, a buffer of its
+        // length.
         #[cfg(target_os = "macos")]
-        let n = libc::fgetxattr(fd, name, buf.as_mut_ptr().cast(), buf.len(), 0, 0);
+        let n = unsafe { libc::getxattr(path.as_ptr(), attr, buf.as_mut_ptr().cast(), 24, 0, 0) };
+        // SAFETY: as above.
         #[cfg(not(target_os = "macos"))]
-        let n = libc::fgetxattr(fd, name, buf.as_mut_ptr().cast(), buf.len());
-        libc::close(fd);
+        let n = unsafe { libc::getxattr(path.as_ptr(), attr, buf.as_mut_ptr().cast(), 24) };
         n
-    };
+    })
+    .ok()?;
     let (f, rootid) = caps::parse_file_caps(&buf[..usize::try_from(n).ok()?])?;
     match rootid {
         Some(r) if r != 0 && userns::to_ns(r, false) != 0 => None,
@@ -1057,8 +1238,13 @@ fn file_caps(dir: i32, name: &std::ffi::CStr) -> Option<caps::FileCaps> {
 
 /// An exec's change to `c`: a set-ID program's owner and group as the
 /// effective (and filesystem) ids, the saved ids then the effective ones,
-/// and the capabilities as Linux computes them.
-fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
+/// and the capabilities as Linux computes them. Returns whether the exec
+/// raised privilege (Linux's `secureexec`, which `AT_SECURE` reports): the
+/// new effective uid or gid is not the real one, or a caller not root
+/// gained capabilities from the file (its effective bit, or a permitted
+/// set beyond the ambient one).
+fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) -> bool {
+    let (ruid, rgid) = (c.uid, c.gid);
     if let Some(u) = p.uid {
         (c.euid, c.fsuid) = (u, u);
     }
@@ -1072,10 +1258,94 @@ fn apply_exec_privs(c: &mut creds::Creds, p: ExecPrivs) {
     // initial namespace's).
     let ns = |id| userns::to_ns(id, false);
     c.caps.on_exec_file(ns(c.uid), ns(c.euid), p.caps, setid);
+    if let Some(limit) = p.cap_limit {
+        c.caps.permitted &= limit;
+        c.caps.effective &= limit;
+    }
+    let real_root = ns(c.uid) == 0;
+    let file_effective = p.caps.is_some_and(|f| f.effective);
+    c.euid != ruid
+        || c.egid != rgid
+        || (!real_root && (file_effective || c.caps.permitted & !c.caps.ambient != 0))
+}
+
+/// What a program's auxiliary vector says of its credentials: the real
+/// and effective ids as its user namespace shows them, and `AT_SECURE`
+/// (the exec raised privilege, so the C library ignores `LD_PRELOAD`,
+/// `LD_LIBRARY_PATH` and their like).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AuxIds {
+    pub uid: u32,
+    pub euid: u32,
+    pub gid: u32,
+    pub egid: u32,
+    pub secure: bool,
+}
+
+impl AuxIds {
+    fn of(c: &creds::Creds, secure: bool) -> AuxIds {
+        AuxIds {
+            uid: userns::to_ns(c.uid, false),
+            euid: userns::to_ns(c.euid, false),
+            gid: userns::to_ns(c.gid, true),
+            egid: userns::to_ns(c.egid, true),
+            secure,
+        }
+    }
+
+    /// For the program a process fwe starts runs: the first one (no
+    /// `state`), root's and not raised; or the one an `execve` re-executed
+    /// fwe for, from the exec state ([`Kernel::exec_state`]) its old
+    /// process recorded, once its namespaces are in place
+    /// ([`Fs::adopt_exec_view`]).
+    pub fn at_start(state: Option<&[u8]>) -> Result<AuxIds, String> {
+        let Some(state) = state else { return Ok(AuxIds::of(&creds::Creds::default(), false)) };
+        let mut d = exec_state_body(state)?;
+        if d.bool() {
+            fs::Fs::skip_view(&mut d);
+        }
+        let mut c = exec_state_creds(&mut d);
+        let privs = ExecPrivs::load(&mut d);
+        let secure = apply_exec_privs(&mut c, privs);
+        Ok(AuxIds::of(&c, secure))
+    }
+}
+
+/// The credentials an exec state records, after its view.
+fn exec_state_creds(d: &mut snapshot::Dec) -> creds::Creds {
+    let mut ids = [0u32; 8];
+    for v in &mut ids {
+        *v = d.u32();
+    }
+    let n = d.count(4);
+    let groups: Vec<u32> = (0..n).map(|_| d.u32()).collect();
+    let caps = caps::Caps::decode(d);
+    let [uid, euid, suid, fsuid, gid, egid, sgid, fsgid] = ids;
+    creds::Creds { uid, euid, suid, fsuid, gid, egid, sgid, fsgid, groups, caps }
 }
 
 /// Host `fork` is refused (see [`forbid_fork`]).
 static NO_FORK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The soft `RLIMIT_STACK` an exec state record ([`Kernel::exec_state`])
+/// carries: what the new process sizes the program's stack by, before it
+/// has a kernel to restore the record into.
+pub fn exec_state_stack_limit(state: &[u8]) -> Option<u64> {
+    let mut d = snapshot::Dec::new(state);
+    (d.u64() == EXEC_STATE_MAGIC).then(|| d.u64())
+}
+
+/// An exec state record ([`Kernel::exec_state`]) past its header (the
+/// magic and the stack limit, [`exec_state_stack_limit`]): where every
+/// reader of the record starts.
+pub(crate) fn exec_state_body(state: &[u8]) -> Result<snapshot::Dec<'_>, String> {
+    let mut d = snapshot::Dec::new(state);
+    if d.u64() != EXEC_STATE_MAGIC {
+        return Err("the exec state is not fwe's".into());
+    }
+    d.u64();
+    Ok(d)
+}
 
 /// Leads an exec state record ([`Kernel::exec_state`]).
 pub(crate) const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
@@ -1172,8 +1442,9 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
-    // None of the calls run on the shared side waits.
-    if syscalls::shares(nr) {
+    // None of the calls run on the shared side waits, nor does a memory
+    // call.
+    if syscalls::shares(nr) || syscalls::plain_memory(nr, &a) {
         return None;
     }
     // What other processes may look at, current before this one waits.
@@ -1189,14 +1460,19 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
 }
 
 /// After call `nr` with `a`, which returned `r`: a write to a set-ID
-/// file takes the bits away where Linux's would ([`modes::wrote`]).
+/// file (by any of the write calls, or copied or spliced into) takes the
+/// bits away where Linux's would ([`modes::wrote`]).
 pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
     use fwe_abi::nr as n;
-    if r > 0
-        && modes::setid_open()
-        && matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2)
-    {
-        modes::wrote(a[0] as i32);
+    if r <= 0 || !modes::setid_open() {
+        return;
+    }
+    match nr {
+        n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2 | n::SENDFILE => {
+            modes::wrote(a[0] as i32)
+        }
+        n::COPY_FILE_RANGE | n::SPLICE => modes::wrote(a[2] as i32),
+        _ => {}
     }
 }
 
@@ -1235,7 +1511,7 @@ fn is_regular(fd: i32) -> bool {
 /// the bytes copied, or an errno when none were.
 /// Whether the file of host status `st` is open for writing.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
-fn host_file_busy(st: &libc::stat) -> bool {
+pub(crate) fn host_file_busy(st: &libc::stat) -> bool {
     textbusy::is_being_written(st.st_dev as u64, st.st_ino as u64)
 }
 
@@ -1363,6 +1639,19 @@ fn copy_between(
     let mut failure = 0;
     while done < count {
         let want = (count - done).min(buf.len() as u64) as usize;
+        // A file of a tmpfs with a size: as much as fits, asked before it
+        // is read.
+        let want = if out_dev {
+            want
+        } else {
+            match tmpfs::room(output, opos.map(|p| p as u64), want as u64) {
+                Ok(fits) => fits as usize,
+                Err(e) => {
+                    failure = e;
+                    break;
+                }
+            }
+        };
         let n = if in_dev {
             match loopdev::read_into(input, &mut buf[..want], ipos.map(|p| p as u64)) {
                 Some(r) if r < 0 => {
@@ -1388,10 +1677,13 @@ fn copy_between(
         if n == 0 {
             break;
         }
+        // A socket whose peer filters what arrives: what it lets in is
+        // written, the rest dropped as if sent.
+        let limit = bpf::filter_send(output, &buf[..n as usize]).map_or(n as usize, |k| k as usize);
         let mut sent = 0usize;
-        while sent < n as usize {
+        while sent < limit {
             if out_dev {
-                match loopdev::write_at_pos(output, &buf[sent..n as usize], None) {
+                match loopdev::write_at_pos(output, &buf[sent..limit], None) {
                     Some(w) if w > 0 => {
                         sent += w as usize;
                         continue;
@@ -1411,10 +1703,10 @@ fn copy_between(
                     Some(p) => libc::pwrite(
                         output,
                         buf[sent..].as_ptr().cast(),
-                        n as usize - sent,
+                        limit - sent,
                         p + sent as i64,
                     ),
-                    None => libc::write(output, buf[sent..].as_ptr().cast(), n as usize - sent),
+                    None => libc::write(output, buf[sent..].as_ptr().cast(), limit - sent),
                 }
             };
             if w <= 0 {
@@ -1422,6 +1714,9 @@ fn copy_between(
                 break;
             }
             sent += w as usize;
+        }
+        if sent == limit {
+            sent = n as usize;
         }
         // What was read and not written goes back to the input.
         if sent < n as usize && ipos.is_none() {
@@ -1478,7 +1773,12 @@ fn vectored_at(
     if offset != -1 && (kind == libc::S_IFIFO || kind == libc::S_IFSOCK) {
         return err(errno::ESPIPE);
     }
-    if no_buffers(fd, write) != 0 {
+    // SAFETY: F_GETFL only queries the descriptor.
+    let status = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if status < 0 {
+        return host::last_error();
+    }
+    if !open_for(status, write) {
         return err(errno::EBADF);
     }
     let iov = match uaccess::host_iovecs(iov, count, !write) {
@@ -1508,8 +1808,23 @@ fn vectored_at(
             return err(errno::EAGAIN);
         }
     }
+    // A file of a tmpfs with a size: as much as fits.
+    let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
+    let iov = if write {
+        let total = specialwrite::total(&iov);
+        let at = (offset >= 0 && flags & rwf::APPEND == 0 && !appends).then_some(offset as u64);
+        match tmpfs::room(fd, at, total) {
+            Ok(fits) if fits < total => iovecs_part(&iov, 0, fits),
+            Ok(_) => iov,
+            Err(e) => return err(e),
+        }
+    } else {
+        iov
+    };
     let n = iov.len() as i32;
-    let r = if flags & rwf::APPEND != 0 {
+    // Linux appends to a file opened to append whatever the offset, as
+    // its `pwrite` does.
+    let r = if flags & rwf::APPEND != 0 || appends {
         append_vectored(fd, &iov, offset)
     } else if offset == -1 {
         // SAFETY: the iovecs are checked host buffers.
@@ -1540,7 +1855,19 @@ fn vectored_at(
 /// descriptor must be open for it, as on Linux (the host refuses the
 /// call outright).
 /// The `n` bytes from byte `at` of the buffers `iov`.
-fn iovecs_part(iov: &[libc::iovec], at: u64, n: u64) -> Vec<libc::iovec> {
+/// The bytes host buffers `iov` hold, in order.
+pub(crate) fn iovecs_bytes(iov: &[libc::iovec]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for v in iov {
+        // SAFETY: the iovecs are checked host buffers of their lengths.
+        out.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(v.iov_base.cast::<u8>(), v.iov_len)
+        });
+    }
+    out
+}
+
+pub(crate) fn iovecs_part(iov: &[libc::iovec], at: u64, n: u64) -> Vec<libc::iovec> {
     let (mut skip, mut left) = (at as usize, n as usize);
     let mut out = Vec::new();
     for v in iov {
@@ -1567,12 +1894,17 @@ fn no_buffers(fd: i32, write: bool) -> i64 {
     if fl < 0 {
         return host::last_error();
     }
-    let open_for = match fl & libc::O_ACCMODE {
+    if open_for(fl, write) { 0 } else { fwe_abi::err(fwe_abi::errno::EBADF) }
+}
+
+/// Whether a descriptor of host status flags `fl` is open to write
+/// (`write`) or to read.
+fn open_for(fl: i32, write: bool) -> bool {
+    match fl & libc::O_ACCMODE {
         libc::O_RDONLY => !write,
         libc::O_WRONLY => write,
         _ => true,
-    };
-    if open_for { 0 } else { fwe_abi::err(fwe_abi::errno::EBADF) }
+    }
 }
 
 /// `pwritev2` with `RWF_APPEND`: the data goes at the end of the file, as
@@ -1694,6 +2026,12 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::FUTEX => unsafe { futex::op_full(a[0], a[1], a[2] as u32, a[3], a[4], a[5] as u32) },
         // SAFETY: the guest pointers are checked as they are read.
         n::FUTEX_WAITV => unsafe { futex::waitv(a[0], a[1], a[2], a[3], a[4]) },
+        // SAFETY: as for `futex`.
+        n::FUTEX_WAKE => unsafe { futex::wake2(a[0], a[1], a[2], a[3]) },
+        // SAFETY: as for `futex`.
+        n::FUTEX_WAIT => unsafe { futex::wait2(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        // SAFETY: the guest pointers are checked as they are read.
+        n::FUTEX_REQUEUE => unsafe { futex::requeue2(a[0], a[1], a[2], a[3]) },
         // On macOS `nanosleep` reads and writes its arguments in the C
         // library, unchecked, so it goes through `clock_nanosleep`'s copies.
         // SAFETY: the arguments are checked guest pointers.
@@ -1735,6 +2073,13 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // A ping socket's datagram, without the IP header macOS gives.
+            if fdmarks::is_ping(fd) {
+                return Some(match uaccess::host_buffer(buf, len, true) {
+                    Ok(v) => net::ping_read(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             // SAFETY: the host validates the guest buffer.
             host::ret(unsafe { libc::read(fd, buf as *mut _, len as usize) } as i64)
         }
@@ -1764,15 +2109,25 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             }
             // A socket holding bytes back for `MSG_MORE`: they go first.
             if net::corked(fd) {
-                // SAFETY: the guest buffer spans the length.
-                return Some(unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) });
+                return Some(netns::as_socket(fd, || {
+                    // SAFETY: the guest buffer spans the length.
+                    unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) }
+                }));
             }
             if memfd::grow_refused(fd, None, len) {
                 return Some(fwe_abi::err(fwe_abi::errno::EPERM));
             }
             // A socket whose peer filters what arrives: none of it (dropped
             // as if sent), or its first part.
-            let (sent, len) = match bpf::filter_send(fd, len) {
+            let filtered = if bpf::filtering() {
+                match uaccess::read_bytes(buf, len as usize) {
+                    Ok(data) => bpf::filter_send(fd, &data),
+                    Err(e) => return Some(fwe_abi::err(e)),
+                }
+            } else {
+                None
+            };
+            let (sent, len) = match filtered {
                 Some(0) => return Some(len as i64),
                 Some(keep) => (len, keep),
                 None => (len, len),
@@ -1802,6 +2157,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
         n::READV => match uaccess::host_iovecs(a[1], a[2], true) {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::read(a[0] as i32, &iov),
+            Ok(iov) if fdmarks::is_ping(a[0] as i32) => net::ping_read(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, false),
             Ok(iov) => {
                 // SAFETY: the iovecs are translated host buffers; the host
@@ -1816,6 +2172,17 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
                 let total = specialwrite::total(&iov);
+                // A socket whose peer filters what arrives: what it lets in.
+                let (iov, total, dropped) = match bpf::filtering()
+                    .then(|| bpf::filter_send(a[0] as i32, &iovecs_bytes(&iov)))
+                    .flatten()
+                {
+                    Some(keep) => (iovecs_part(&iov, 0, keep), keep, total - keep),
+                    None => (iov, total, 0),
+                };
+                if total == 0 && dropped > 0 {
+                    return Some(dropped as i64);
+                }
                 // A file of a tmpfs with a size: as much as fits.
                 let fits = match tmpfs::room(a[0] as i32, None, total) {
                     Ok(n) => n,
@@ -1832,7 +2199,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                             as i64,
                     )
                 };
-                match specialwrite::write(a[0] as i32, special, total)
+                let r = match specialwrite::write(a[0] as i32, special, total)
                     .or_else(|| fdstate::capped_write(a[0] as i32, total, capped))
                 {
                     Some(r) => r,
@@ -1840,7 +2207,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     None => host::ret(unsafe {
                         libc::writev(a[0] as i32, iov.as_ptr(), iov.len() as i32)
                     } as i64),
-                }
+                };
+                // What the filter dropped counts as sent.
+                if r >= 0 && r as u64 == total { r + dropped as i64 } else { r }
             }
             Err(e) => fwe_abi::err(e),
         },
@@ -1933,17 +2302,19 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         // Socket calls that can block run without the kernel lock, so a thread
         // waiting in accept/recv does not stall the threads meant to feed it.
         // SAFETY: caller guarantees the sockaddr pointer.
-        n::CONNECT => {
+        // Each as its socket's network namespace.
+        n::CONNECT => netns::as_socket(a[0] as i32, || {
             match landlock::active().then(|| landlockops::check_connect(a[0] as i32, a[1], a[2])) {
                 Some(Err(e)) => fwe_abi::err(e),
                 // SAFETY: the backend's guarantee for the guest pointers.
                 _ => unsafe { net::connect(a[0], a[1], a[2]) },
             }
-        }
+        }),
         n::ACCEPT | n::ACCEPT4 => {
             let flags = if nr == n::ACCEPT4 { a[3] } else { 0 };
             // SAFETY: caller guarantees the out pointers.
-            let r = unsafe { net::accept4(a[0], a[1], a[2], flags) };
+            let r =
+                netns::as_socket(a[0] as i32, || unsafe { net::accept4(a[0], a[1], a[2], flags) });
             let made = fdtable::made(nr, &a, r);
             if fdtable::over_limit(&made) {
                 // A socket: nothing of fwe's to drop with it.
@@ -1954,20 +2325,111 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 r
             }
         }
+        // Datagrams to an abstract socket outside a Landlock domain that
+        // scopes them are refused, as connecting is.
+        n::SENDTO | n::SENDMSG | n::SENDMMSG
+            if landlock::active()
+                && let Err(e) = landlockops::check_send(nr, a[1], a[2], a[4], a[5]) =>
+        {
+            fwe_abi::err(e)
+        }
+        n::SENDMMSG
+            if landlock::active()
+                && let Some(k) = landlockops::sendable_messages(a[1], a[2])
+                && k < a[2] =>
+        {
+            // The messages before the first refused one are sent.
+            // SAFETY: caller guarantees the message vector.
+            unsafe { net::sendmmsg(a[0], a[1], k, a[3]) }
+        }
         // SAFETY: caller guarantees the buffer and sockaddr.
-        n::SENDTO => unsafe { net::sendto(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        n::SENDTO => netns::as_socket(a[0] as i32, || unsafe {
+            net::sendto(a[0], a[1], a[2], a[3], a[4], a[5])
+        }),
         // SAFETY: caller guarantees the buffer and out pointers.
-        n::RECVFROM => unsafe { net::recvfrom(a[0], a[1], a[2], a[3], a[4], a[5]) },
+        n::RECVFROM => netns::as_socket(a[0] as i32, || unsafe {
+            net::recvfrom(a[0], a[1], a[2], a[3], a[4], a[5])
+        }),
         // SAFETY: caller guarantees the msghdr.
-        n::SENDMSG => unsafe { net::sendmsg(a[0], a[1], a[2]) },
+        n::SENDMSG => netns::as_socket(a[0] as i32, || unsafe { net::sendmsg(a[0], a[1], a[2]) }),
         // SAFETY: caller guarantees the msghdr.
-        n::RECVMSG => unsafe { net::recvmsg(a[0], a[1], a[2]) },
-        // SAFETY: caller guarantees the message vector.
-        n::SENDMMSG => unsafe { net::sendmmsg(a[0], a[1], a[2], a[3]) },
-        // SAFETY: caller guarantees the message vector and timeout.
-        n::RECVMMSG => unsafe { net::recvmmsg(a[0], a[1], a[2], a[3], a[4]) },
+        n::RECVMSG => netns::as_socket(a[0] as i32, || unsafe { net::recvmsg(a[0], a[1], a[2]) }),
+        n::SENDMMSG => netns::as_socket(a[0] as i32, || {
+            // SAFETY: caller guarantees the message vector.
+            unsafe { net::sendmmsg(a[0], a[1], a[2], a[3]) }
+        }),
+        n::RECVMMSG => netns::as_socket(a[0] as i32, || {
+            // SAFETY: caller guarantees the message vector and timeout.
+            unsafe { net::recvmmsg(a[0], a[1], a[2], a[3], a[4]) }
+        }),
         _ => return None,
     })
+}
+
+#[cfg(test)]
+mod exec_tests {
+    use super::*;
+
+    fn user() -> creds::Creds {
+        let mut c = creds::Creds::default();
+        assert_eq!(c.setresuid(1000, 1000, 1000), 0);
+        c
+    }
+
+    /// An exec raises privilege (`AT_SECURE`) when it changes the effective
+    /// ids from the real ones, or gives a caller other than root
+    /// capabilities from the file; root running anything does not.
+    #[test]
+    fn privilege_raising_execs_are_secure() {
+        let plain = ExecPrivs::default();
+        let setuid = ExecPrivs { uid: Some(0), ..plain };
+        let setgid = ExecPrivs { gid: Some(50), ..plain };
+        let file = |effective| caps::FileCaps { permitted: 1 << 7, inheritable: 0, effective };
+        let capped = ExecPrivs { caps: Some(file(true)), ..plain };
+        let permitted_only = ExecPrivs { caps: Some(file(false)), ..plain };
+        let secure = |mut c: creds::Creds, p| {
+            let s = apply_exec_privs(&mut c, p);
+            (s, AuxIds::of(&c, s))
+        };
+        assert!(!secure(creds::Creds::default(), plain).0);
+        assert!(!secure(creds::Creds::default(), setuid).0);
+        assert!(!secure(creds::Creds::default(), capped).0);
+        assert!(!secure(user(), plain).0);
+        let (s, ids) = secure(user(), setuid);
+        assert!(s);
+        assert_eq!((ids.uid, ids.euid, ids.gid, ids.egid), (1000, 0, 0, 0));
+        assert!(secure(user(), setgid).0);
+        assert!(secure(user(), capped).0);
+        assert!(secure(user(), permitted_only).0);
+    }
+
+    /// An unsafe exec (under `no_new_privs`, or watched by a tracer
+    /// without `CAP_SYS_PTRACE`) leaves no capability the caller did not
+    /// hold; a set-user-ID root program run that way by root still makes
+    /// it root with root's capabilities.
+    #[test]
+    fn an_unsafe_exec_gains_no_capability() {
+        let file = caps::FileCaps { permitted: 1 << 7, inheritable: 0, effective: true };
+        let limited = ExecPrivs { caps: Some(file), cap_limit: Some(0), ..ExecPrivs::default() };
+        let mut c = user();
+        apply_exec_privs(&mut c, limited);
+        assert_eq!((c.caps.permitted, c.caps.effective), (0, 0));
+        let mut root = creds::Creds::default();
+        let held = root.caps.permitted;
+        let setuid = ExecPrivs { uid: Some(0), cap_limit: Some(held), ..ExecPrivs::default() };
+        apply_exec_privs(&mut root, setuid);
+        assert_eq!((root.euid, root.caps.permitted), (0, held));
+        // Untraced, the tracer's capability is not asked for.
+        assert!(ptrace::tracer_capable());
+    }
+
+    /// A re-executed fwe's program starts with the auxiliary vector its
+    /// exec state makes, the same as the in-place exec's.
+    #[test]
+    fn a_re_executed_program_is_told_its_credentials() {
+        assert_eq!(AuxIds::at_start(None), Ok(AuxIds::default()));
+        assert!(AuxIds::at_start(Some(b"garbage!")).is_err());
+    }
 }
 
 #[cfg(test)]
@@ -1989,5 +2451,36 @@ mod script_tests {
             Ok(Some((v("/bin/sh"), Some(v("-e")))))
         );
         assert_eq!(script_interpreter(b"#!  \n"), Err(fwe_abi::errno::ENOEXEC));
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use fwe_abi::nr as n;
+
+    /// `pwritev` to a file opened to append appends, whatever the offset,
+    /// as Linux's does, and leaves the file's position alone.
+    #[test]
+    fn a_vectored_write_at_an_offset_appends_to_a_file_opened_to_append() {
+        let dir = std::env::temp_dir().join(format!("fwe-pwritev-{}", std::process::id()));
+        std::fs::write(&dir, b"abc").unwrap();
+        let path = std::ffi::CString::new(dir.to_str().unwrap()).unwrap();
+        // SAFETY: plain host calls on a file of the test's own.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDWR | libc::O_APPEND) };
+        assert!(fd >= 0);
+        let data = *b"XY";
+        let iov = libc::iovec { iov_base: data.as_ptr() as *mut _, iov_len: 2 };
+        // SAFETY: the iovec and its buffer live across the call.
+        let r = unsafe {
+            super::blocking_call(n::PWRITEV, [fd as u64, &iov as *const _ as u64, 1, 0, 0, 0])
+        };
+        assert_eq!(r, Some(2));
+        // SAFETY: plain host calls.
+        unsafe {
+            assert_eq!(libc::lseek(fd, 0, libc::SEEK_CUR), 0);
+            libc::close(fd);
+        }
+        assert_eq!(std::fs::read(&dir).unwrap(), b"abcXY");
+        let _ = std::fs::remove_file(&dir);
     }
 }

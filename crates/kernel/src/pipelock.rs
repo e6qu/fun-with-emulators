@@ -104,8 +104,7 @@ fn ended(pid: u64) -> bool {
 /// if the table has no room (the write then goes as the host makes it), or
 /// `Err` for a signal for the guest while waiting.
 fn lock(t: &'static [AtomicU64], (lo, hi): (u64, u64)) -> Result<Option<usize>, i32> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() } as u64;
+    let me = crate::host::pid() as u64;
     let slot = |i: usize| &t[i * SLOT_WORDS..(i + 1) * SLOT_WORDS];
     // The pipe's slot, made if it has none: under the making lock, so two
     // writers of a pipe agree on one.

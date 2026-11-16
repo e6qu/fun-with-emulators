@@ -156,6 +156,13 @@ fn ready(fd: i32, events: i16) -> i16 {
     p.revents
 }
 
+/// The events of Linux `events` `fd` has ready now, as Linux numbers
+/// them (an error or hang-up always).
+fn poll_ready(fd: i32, events: i16) -> i16 {
+    let host = ready(fd, crate::host::poll_events_to_host(events) | libc::POLLERR | libc::POLLHUP);
+    crate::host::poll_revents_to_linux(host, events)
+}
+
 fn host_result(r: isize) -> i64 {
     if r < 0 { err(crate::host::errno_to_linux(crate::host::last_errno())) } else { r as i64 }
 }
@@ -240,7 +247,7 @@ fn run(ctx: u64, at: u64, b: &[u8; IOCB_SIZE]) -> Result<Option<i64>, i32> {
                 return Err(errno::EINVAL);
             }
             let events = buf as i16;
-            let got = ready(fd, events | libc::POLLERR | libc::POLLHUP);
+            let got = poll_ready(fd, events);
             if got == 0 {
                 let data = u64_at(0);
                 let poll = Poll { iocb: at, data, fd, events, resfd };
@@ -327,9 +334,13 @@ fn check_polls(ctx: u64) -> Vec<libc::pollfd> {
     });
     let mut left = Vec::new();
     for (at, data, fd, events, resfd) in waiting {
-        let got = ready(fd, events | libc::POLLERR | libc::POLLHUP);
+        let got = poll_ready(fd, events);
         if got == 0 {
-            left.push(libc::pollfd { fd, events, revents: 0 });
+            left.push(libc::pollfd {
+                fd,
+                events: crate::host::poll_events_to_host(events),
+                revents: 0,
+            });
             continue;
         }
         let taken = ctxs(|c| {

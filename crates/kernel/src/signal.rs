@@ -11,9 +11,13 @@
 //! action where that is ignoring it or continuing. A default action that
 //! ends or stops the process is fwe's to take. The host never blocks a
 //! caught signal ([`caught`]): fwe keeps it pending while the guest blocks
-//! it. Signals with no host equivalent (the real-time signals), and caught
-//! ones sent with `tgkill`, are recorded here directly; the real-time ones
-//! only travel within the process.
+//! it. Signals with no host equivalent (`SIGSTKFLT`, `SIGPWR`, the
+//! real-time signals), and caught ones sent with `tgkill`, are recorded
+//! here directly within the process; to another fwe process they travel
+//! through its mailbox ([`crate::signote::queue`]), with the sender, code
+//! and value, and the process is woken with [`host::WAKE_SIGNAL`] to take
+//! them ([`send_unhosted`]). A process that is not fwe's has no mailbox and
+//! is never sent the wake signal.
 //!
 //! A frame carries the general-purpose registers and the floating-point and
 //! SIMD state (an `fpsimd_context` record), as on Linux.
@@ -147,7 +151,7 @@ fn put_siginfo(buf: &mut Buf, sig: u64, info: SigInfo, fault_addr: u64) {
         // signal from the kernel names no sender.
         if info.code != signal::SI_KERNEL {
             buf.put32(SI_PID_OFF, guest_pid(info.pid));
-            buf.put32(SI_UID_OFF, crate::userns::to_ns(info.uid, false) as i32);
+            buf.put32(SI_UID_OFF, crate::userns::to_ns(sender_uid(sig, &info), false) as i32);
         }
         if queued(info.code) {
             // `si_value`, where a child's status is for `SIGCHLD`.
@@ -275,21 +279,31 @@ pub fn relayed(sig: u64) -> bool {
 /// mailbox, and the process woken to take it ([`crate::signote::queue`]).
 /// A process that is not fwe's cannot take it (`EINVAL`).
 pub(crate) fn send_unhosted(host: i32, sig: u64, code: i32, value: u64) -> i64 {
-    if host <= 0 || crate::procreg::read(host).is_none() {
+    send_unhosted_from(host, sig, code, value, (host::pid(), crate::creds::real_uid()))
+}
+
+/// [`send_unhosted`] naming `sender` (host pid, initial-namespace uid) as
+/// the signal's sender.
+pub(crate) fn send_unhosted_from(
+    host: i32,
+    sig: u64,
+    code: i32,
+    value: u64,
+    sender: (i32, u32),
+) -> i64 {
+    if !host::is_fwe(host) {
         return err(errno::EINVAL);
     }
-    if let Err(e) = crate::signote::queue(host, sig, code, value) {
+    if let Err(e) = crate::signote::queue_from(host, sig, code, value, sender) {
         return err(e);
     }
     host::kill_process(host, host::WAKE_SIGNAL)
 }
 
 /// `kill` of this process with `sig` it takes itself (one the host lacks,
-/// or one fwe keeps).
+/// or one fwe keeps). Past `RLIMIT_SIGPENDING` a real-time one is merged
+/// into the one pending, as Linux merges a `kill`'s.
 fn post_own(sig: u64) -> i64 {
-    if !thread::may_queue(sig) {
-        return err(errno::EAGAIN);
-    }
     thread::post_process(sig, own_info(signal::SI_USER));
     // Any thread may take it: interrupt the others' waits so one that does
     // not block it notices.
@@ -297,9 +311,33 @@ fn post_own(sig: u64) -> i64 {
     0
 }
 
+/// Whether this process is the init of a pid namespace of fwe's: as
+/// Linux's `SIGNAL_UNKILLABLE`, it takes no signal it has no handler for,
+/// from inside its namespace or above it. `SIGKILL` and `SIGSTOP`, which
+/// have no handler, are kept from it at their sender when sent from inside
+/// ([`Kernel::send_one`]); from an ancestor namespace they act.
+fn unkillable_init() -> bool {
+    crate::pidns::nested() && thread::tgid() == 1
+}
+
+/// Whether `sig` with `info` is a fault of the thread taking it (a code
+/// the kernel gave it, not a sender's), which Linux forces on even a
+/// namespace's init.
+fn forced_fault(sig: u64, info: &SigInfo) -> bool {
+    info.code > 0
+        && matches!(
+            sig,
+            signal::SIGSEGV
+                | signal::SIGBUS
+                | signal::SIGILL
+                | signal::SIGFPE
+                | signal::SIGTRAP
+                | signal::SIGSYS
+        )
+}
+
 fn me_host() -> i64 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() as i64 }
+    crate::host::pid() as i64
 }
 
 fn owned(sig: u64) -> bool {
@@ -358,13 +396,21 @@ pub fn drain_to_signalfd() {
                 sig as u32,
                 info.code,
                 guest_pid(info.pid),
-                crate::userns::to_ns(info.uid, false),
+                crate::userns::to_ns(sender_uid(sig, &info), false),
                 info.status,
                 info.value,
             );
             crate::signalfd::deliver(sig, record);
         }
     }
+}
+
+/// The user `info` names as its sender (an initial-namespace id): for a
+/// child's `SIGCHLD`, the child's real user, which the host does not know
+/// (it names the host user), read from the child's record.
+fn sender_uid(sig: u64, info: &SigInfo) -> u32 {
+    let child = sig == signal::SIGCHLD && (1..=6).contains(&info.code) && info.pid > 0;
+    child.then(|| crate::procreg::kept_uid(info.pid)).flatten().unwrap_or(info.uid)
 }
 
 /// A sender's or child's host pid as the guest sees it.
@@ -395,10 +441,9 @@ pub(crate) fn raise_self(sig: u64) {
     thread::post_self(sig, own_info(signal::SI_KERNEL));
 }
 
+/// A signal this process sends itself: its own pid and guest user.
 fn own_info(code: i32) -> SigInfo {
-    // SAFETY: plain host calls.
-    let pid = unsafe { libc::getpid() };
-    SigInfo { code, pid, ..SigInfo::default() }
+    SigInfo { code, pid: host::pid(), uid: crate::creds::real_uid(), ..SigInfo::default() }
 }
 
 impl<P: Platform> Kernel<P> {
@@ -500,6 +545,13 @@ impl<P: Platform> Kernel<P> {
             }
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(info) = thread::take_pending(sig) else { continue };
+            if sig == signal::SIGCHLD && crate::trace::file().is_some() {
+                crate::trace::note_to_file(&format!(
+                    "signal: SIGCHLD from {} delivered to {}",
+                    info.pid,
+                    thread::tid()
+                ));
+            }
             // fwe's nudge of a seized thread: no signal for the guest.
             if sig == signal::SIGSTOP && info.code == crate::ptrace::POKE_CODE {
                 self.ptrace_poked(regs);
@@ -520,6 +572,8 @@ impl<P: Platform> Kernel<P> {
             let action = self.sigactions[(sig - 1) as usize];
             match action.handler {
                 signal::SIG_IGN => {}
+                // A pid namespace's init takes only the signals it handles.
+                signal::SIG_DFL if unkillable_init() && !forced_fault(sig, &info) => {}
                 signal::SIG_DFL => match signal::default_action(sig) {
                     signal::Default::Terminate => self.terminate_with(sig, Some(regs)),
                     // A seized thread's group-stop is its tracer's to end.
@@ -747,13 +801,16 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
-    /// `kill(pid, sig)`. A relayed signal is sent as the host signal to
-    /// whatever `pid` names (a process, `0` for the caller's process group,
-    /// or `-pgid`); the host delivers it, to this process too. `-1` is every
+    /// `kill(pid, sig)`. A relayed signal is sent as the host signal to the
+    /// process `pid` names, this one too ([`Kernel::send_one`]); `0` (the
+    /// caller's process group) and `-pgid` send it to each process of the
+    /// group the caller may signal ([`Kernel::kill_group`]). `-1` is every
     /// other process of the caller's pid namespace, or outside one, of the
     /// caller's run of fwe ([`Kernel::kill_every`]): never the host's other
-    /// processes. A signal with no host equivalent can only be sent within
-    /// this process.
+    /// processes. A signal with no host equivalent is posted within this
+    /// process, or to another fwe process queued in its mailbox
+    /// ([`send_unhosted`]); a process that is not fwe's cannot take one
+    /// (`EINVAL`).
     pub(crate) fn sys_kill(&mut self, pid: i64, sig: u64) -> i64 {
         if sig > signal::NSIG {
             return err(errno::EINVAL);
@@ -765,13 +822,17 @@ impl<P: Platform> Kernel<P> {
             return err(errno::ESRCH);
         }
         let me = thread::tgid() as i64;
-        // Another thread's id names its process, as on Linux.
+        // Another thread's id names its process, as on Linux (whose `kill`
+        // finds the task and signals its thread group): this one's, or
+        // another process's.
         let pid = if pid > 0 && thread::host_thread(pid).is_some() { me } else { pid as i64 };
+        let thread_owner =
+            || if crate::pidns::nested() { None } else { thread::owner_of_tid(pid as i32) };
         // The host process (or group) `pid` names in the guest's pid
-        // namespace.
+        // namespace (a thread's number in one of fwe's names its process).
         let target = match pid {
             0 | -1 => pid,
-            p if p > 0 => match crate::pidns::to_host(p as i32) {
+            p if p > 0 => match thread_owner().or_else(|| crate::pidns::to_host(p as i32)) {
                 Some(h) => h as i64,
                 None => return err(errno::ESRCH),
             },
@@ -783,112 +844,117 @@ impl<P: Platform> Kernel<P> {
         if pid == -1 {
             return self.kill_every(sig);
         }
-        if target > 0 && target != me_host() && !self.may_signal(target as i32, sig) {
+        if target <= 0 {
+            // SAFETY: getpgrp cannot fail.
+            let pgid = if target == 0 { unsafe { libc::getpgrp() } } else { -target as i32 };
+            return self.kill_group(pgid, sig);
+        }
+        let target = target as i32;
+        if target != me_host() as i32 && !self.may_signal(target, sig) {
             // SAFETY: plain host call; signal 0 only checks the target.
-            let exists = unsafe { libc::kill(target as libc::pid_t, 0) } == 0
-                || host::last_errno() == libc::EPERM;
+            let exists = unsafe { libc::kill(target, 0) } == 0 || host::last_errno() == libc::EPERM;
             return err(if exists { errno::EPERM } else { errno::ESRCH });
         }
         if sig == 0 {
             // SAFETY: plain host call; signal 0 only checks the target.
-            return host::ret(unsafe { libc::kill(target as libc::pid_t, 0) });
+            return host::ret(unsafe { libc::kill(target, 0) });
         }
+        self.send_one(target, sig)
+    }
+
+    /// `kill(-pgid, sig)` (and `kill(0, sig)`): `sig` to each process of
+    /// host process group `pgid` the caller may signal, this one last, as
+    /// Linux's `kill_pgrp` sends it: 0 if any took it, else the last
+    /// error (`EPERM` when it may signal none; `ESRCH` for an empty
+    /// group). A signal the host lacks reaches only fwe's processes.
+    fn kill_group(&mut self, pgid: i32, sig: u64) -> i64 {
+        let me = me_host() as i32;
+        let mut members = host::group_members(pgid);
+        // This process last: a fatal signal ends it.
+        members.sort_by_key(|&p| p == me);
+        let (mut any, mut last) = (false, err(errno::ESRCH));
+        for m in members {
+            let r = if m != me && !self.may_signal(m, sig) {
+                err(errno::EPERM)
+            } else if sig == 0 {
+                0
+            } else if host::signal_to_host(sig).is_none() && m != me && !host::is_fwe(m) {
+                continue;
+            } else {
+                self.send_one(m, sig)
+            };
+            any |= r == 0;
+            last = r;
+        }
+        if any { 0 } else { last }
+    }
+
+    /// Send `sig` (not 0) to host process `target`, which the caller may
+    /// signal: this one, another of fwe's, or one fwe did not start.
+    fn send_one(&mut self, target: i32, sig: u64) -> i64 {
+        let to_self = target == me_host() as i32;
         // A pid namespace's init cannot be killed or stopped from inside it
         // (it has no handler for either), as on Linux.
         if matches!(sig, signal::SIGKILL | signal::SIGSTOP)
-            && target > 0
-            && crate::pidns::current()
-                .first()
-                .is_some_and(|ns| ns.get().host_of(1) == Some(target as i32))
+            && crate::pidns::current().first().is_some_and(|ns| ns.get().host_of(1) == Some(target))
         {
             return 0;
         }
-        let to_self = pid == me || pid == 0;
         // A traced process takes SIGSTOP as fwe's: the host's would stop it
         // where it cannot answer its tracer.
-        if sig == signal::SIGSTOP
-            && target > 0
-            && !to_self
-            && crate::ptrace::is_traced(target as i32)
-        {
-            return send_unhosted(target as i32, sig, signal::SI_USER, 0);
+        if sig == signal::SIGSTOP && !to_self && crate::ptrace::is_traced(target) {
+            return send_unhosted(target, sig, signal::SI_USER, 0);
         }
         // SIGTRAP to another of fwe's processes goes through its mailbox:
         // the host would merge it with the trap of that process's next
         // system call (fwe's `brk`, a SIGTRAP too), and it would be lost.
-        if sig == signal::SIGTRAP
-            && target > 0
-            && !to_self
-            && crate::procreg::read(target as i32).is_some()
-        {
-            return send_unhosted(target as i32, sig, signal::SI_USER, 0);
+        if sig == signal::SIGTRAP && !to_self && host::is_fwe(target) {
+            return send_unhosted(target, sig, signal::SI_USER, 0);
+        }
+        // One this thread sends itself and blocks is pending when `kill`
+        // returns, as on Linux: the host would hand a signal for the
+        // process to a thread that does not block it, which records it
+        // only once it runs (another thread that does not block it is
+        // woken to take it).
+        if to_self && thread::mask() & bit(sig) != 0 {
+            return post_own(sig);
         }
         if let Some(h) = host::signal_to_host(sig).filter(|_| !(to_self && owned(sig))) {
             // A namespace's init takes its namespace with it.
-            let led = (sig == signal::SIGKILL && target > 0)
-                .then(|| crate::pidns::led_by(target as i32))
-                .flatten();
+            let led = (sig == signal::SIGKILL).then(|| crate::pidns::led_by(target)).flatten();
             // A note of the sender for another process; and for this one's
             // own SIGIO, which without one is taken for the host's I/O signal.
-            let noted = target > 0 && (!to_self || sig == signal::SIGIO);
+            let noted = !to_self || sig == signal::SIGIO;
             if noted {
-                crate::signote::note(target as i32, h);
+                crate::signote::note(target, h);
             }
             // Before the signal: the watcher of a reaper takes the target's
             // stop for one it was sent from now on.
-            if target > 0
-                && matches!(
-                    sig,
-                    signal::SIGSTOP
-                        | signal::SIGTSTP
-                        | signal::SIGTTIN
-                        | signal::SIGTTOU
-                        | signal::SIGCONT
-                )
-            {
-                crate::reaper::stop_signal_sent(target as i32);
+            if matches!(
+                sig,
+                signal::SIGSTOP
+                    | signal::SIGTSTP
+                    | signal::SIGTTIN
+                    | signal::SIGTTOU
+                    | signal::SIGCONT
+            ) {
+                crate::reaper::stop_signal_sent(target);
             }
-            let r = host::kill(target as libc::pid_t, h);
+            let r = host::kill_process(target, h);
             if r != 0 && noted {
-                crate::signote::unnote(target as i32, h);
+                crate::signote::unnote(target, h);
             }
             if r == 0
                 && let Some(ns) = led
             {
-                crate::pidns::zap(&ns, target as i32);
+                crate::pidns::zap(&ns, target);
             }
             return r;
         }
-        if to_self && pid != 0 {
+        if to_self {
             return post_own(sig);
         }
-        if target > 0 {
-            return send_unhosted(target as i32, sig, signal::SI_USER, 0);
-        }
-        // A process group: each of its processes (this one too, when in it).
-        // SAFETY: getpgrp cannot fail.
-        let pgid = if target == 0 { unsafe { libc::getpgrp() } } else { -target as i32 };
-        let mut r = err(errno::ESRCH);
-        for member in host::group_members(pgid) {
-            let one = if i64::from(member) == me_host() {
-                post_own(sig)
-            } else if !self.may_signal(member, sig) {
-                err(errno::EPERM)
-            } else if let Some(h) = host::signal_to_host(sig) {
-                crate::signote::note(member, h);
-                let r = host::kill_process(member, h);
-                if r != 0 {
-                    crate::signote::unnote(member, h);
-                }
-                r
-            } else {
-                send_unhosted(member, sig, signal::SI_USER, 0)
-            };
-            if r != 0 {
-                r = one;
-            }
-        }
-        r
+        send_unhosted(target, sig, signal::SI_USER, 0)
     }
 
     /// `kill(-1, sig)`: every process the caller may signal but itself
@@ -916,18 +982,7 @@ impl<P: Platform> Kernel<P> {
             if !self.may_signal(host, sig) {
                 continue;
             }
-            let r = match (sig, host::signal_to_host(sig)) {
-                (0, _) => 0,
-                (_, Some(h)) => {
-                    crate::signote::note(host, h);
-                    let r = host::kill_process(host, h);
-                    if r != 0 {
-                        crate::signote::unnote(host, h);
-                    }
-                    r
-                }
-                (_, None) => send_unhosted(host, sig, signal::SI_USER, 0),
-            };
+            let r = if sig == 0 { 0 } else { self.send_one(host, sig) };
             if r != err(errno::EPERM) {
                 ret = r;
             }
@@ -936,15 +991,26 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Whether the caller may send `sig` to host process `target` (Linux's
-    /// `check_kill_permission`): with `CAP_KILL`, when its real or
-    /// effective user id is the target's real or saved one, or `SIGCONT`
-    /// within its session. A process fwe has no record of counts as root's.
+    /// `check_kill_permission`): when its real or effective user id is the
+    /// target's real or saved one, with `CAP_KILL` in the target's user
+    /// namespace, or `SIGCONT` within its session; and, in a Landlock
+    /// domain that scopes signals, only to a process inside it. A process
+    /// fwe has no record of counts as root's, in the initial user
+    /// namespace.
     pub(crate) fn may_signal(&self, target: i32, sig: u64) -> bool {
+        if crate::landlock::active() && crate::landlock::may_signal(target).is_err() {
+            return false;
+        }
+        // `CAP_KILL` in the initial user namespace reaches every namespace:
+        // no record to read.
         if self.creds.has(crate::caps::CAP_KILL) {
             return true;
         }
         let ids = crate::procreg::ids(target);
         if [self.creds.uid, self.creds.euid].iter().any(|&u| u == ids[0] || u == ids[2]) {
+            return true;
+        }
+        if self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_KILL) {
             return true;
         }
         // SAFETY: plain host calls.
@@ -959,12 +1025,20 @@ impl<P: Platform> Kernel<P> {
     /// process's queue, the process woken to give it to the thread
     /// ([`crate::signote::queue_thread`]); SIGKILL ends the process.
     fn signal_other_thread(&mut self, owner: i32, tid: i32, sig: u64) -> i64 {
+        // The table of threads may name a process that has gone, its pid
+        // since taken by one that is not fwe's.
+        if !host::is_fwe(owner) {
+            return err(errno::ESRCH);
+        }
         if !self.may_signal(owner, sig) {
             return err(errno::EPERM);
         }
         match sig {
             0 => 0,
-            signal::SIGKILL => host::kill_process(owner, libc::SIGKILL),
+            signal::SIGKILL => {
+                crate::signote::note(owner, libc::SIGKILL);
+                host::kill_process(owner, libc::SIGKILL)
+            }
             _ => match crate::signote::queue_thread(owner, tid, sig, signal::SI_TKILL, 0) {
                 Ok(()) => host::kill_process(owner, host::WAKE_SIGNAL),
                 Err(e) => err(e),
@@ -1006,7 +1080,7 @@ impl<P: Platform> Kernel<P> {
             // It ends the whole process, whichever thread it names.
             return self.sys_kill(me, sig);
         }
-        if !thread::may_queue(sig) {
+        if !thread::may_queue(sig, signal::SI_TKILL) {
             return err(errno::EAGAIN);
         }
         // A signal the backend's handler catches is posted to the thread
@@ -1224,9 +1298,25 @@ mod tests {
     use super::*;
     use crate::{Brk, Tracer};
 
+    /// A namespace's init still dies of its own faults, which carry the
+    /// kernel's code, but not of a fault signal a process sent it.
+    #[test]
+    fn only_own_faults_are_forced_on_an_init() {
+        let _held = crate::thread::signals_held();
+        let fault = SigInfo { code: 1, ..SigInfo::default() };
+        let sent = SigInfo { code: signal::SI_USER, ..SigInfo::default() };
+        assert!(forced_fault(signal::SIGSEGV, &fault));
+        assert!(forced_fault(signal::SIGSYS, &fault));
+        assert!(!forced_fault(signal::SIGSEGV, &sent));
+        assert!(!forced_fault(signal::SIGTERM, &fault));
+        let queued = SigInfo { code: signal::SI_QUEUE, ..SigInfo::default() };
+        assert!(!forced_fault(signal::SIGBUS, &queued));
+    }
+
     /// The computed frame offsets match the arm64 kernel layout.
     #[test]
     fn frame_offsets() {
+        let _held = crate::thread::signals_held();
         // `offsetof(struct rt_sigframe, uc.uc_mcontext)` and friends on arm64
         // Linux; glibc's `getcontext` stores `x18`/`x19` at
         // `uc_mcontext + 8 + 18 * 8` = 328 from `ucontext`, which is 456 here.
@@ -1247,6 +1337,7 @@ mod tests {
             _a: u64,
             _l: u64,
             _k: Option<&[(u64, u64)]>,
+            _c: Option<&[u8]>,
         ) -> Result<(), crate::PrepareFailed> {
             Ok(())
         }
@@ -1281,6 +1372,7 @@ mod tests {
 
     #[test]
     fn delivers_handler_and_restores_on_sigreturn() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let act = Sigaction { handler: HANDLER, flags: signal::SA_SIGINFO, restorer: 0, mask: 0 };
         k.sigactions[(signal::SIGUSR1 - 1) as usize] = act;
@@ -1323,6 +1415,7 @@ mod tests {
     /// builds its frame below the running handler's sp, not over it.
     #[test]
     fn nested_delivery_stays_below_live_altstack_frame() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let act = Sigaction { handler: HANDLER, flags: signal::SA_ONSTACK, restorer: 0, mask: 0 };
         k.sigactions[(signal::SIGUSR1 - 1) as usize] = act;
@@ -1354,6 +1447,7 @@ mod tests {
 
     #[test]
     fn ignored_signal_is_dropped() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = signal::SIG_IGN;
         let mut regs = Regs { sp: 0x9000, pc: 0x1000, ..Regs::default() };
@@ -1365,6 +1459,7 @@ mod tests {
 
     #[test]
     fn blocked_signal_stays_pending() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = HANDLER;
         thread::set_mask(1 << (signal::SIGUSR1 - 1));
@@ -1374,6 +1469,20 @@ mod tests {
         assert_eq!(regs.pc, 0x1000); // not delivered
         assert_eq!(thread::pending(), 1 << (signal::SIGUSR1 - 1)); // still pending
         thread::take_pending(signal::SIGUSR1);
+        thread::set_mask(0);
+    }
+
+    /// A signal the process sends itself while the thread blocks it is
+    /// pending when `kill` returns, as on Linux.
+    #[test]
+    fn a_blocked_signal_sent_to_oneself_is_pending_at_once() {
+        let _held = crate::thread::signals_held();
+        let mut k = kernel();
+        let urg = 1u64 << (signal::SIGURG - 1);
+        thread::set_mask(urg);
+        assert_eq!(k.sys_kill(thread::tgid() as i64, signal::SIGURG), 0);
+        assert_eq!(thread::pending() & urg, urg);
+        thread::take_pending(signal::SIGURG);
         thread::set_mask(0);
     }
 
@@ -1387,6 +1496,7 @@ mod tests {
     /// restored on `rt_sigreturn`, whatever the handler did to them.
     #[test]
     fn fp_state_survives_a_handler() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR2 - 1) as usize].handler = HANDLER;
         let (_stack, top) = stack();
@@ -1419,6 +1529,7 @@ mod tests {
     /// returns to the mask from before the call.
     #[test]
     fn sigsuspend_mask_is_restored_by_sigreturn() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         k.sigactions[(signal::SIGUSR1 - 1) as usize].handler = HANDLER;
         let (_stack, top) = stack();
@@ -1443,6 +1554,7 @@ mod tests {
     /// when no handler is waiting (the interruption was not the guest's).
     #[test]
     fn interrupted_calls_restart_as_on_linux() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
         let (_stack, top) = stack();
         let args = [7, 0, 0, 0, 0, 0];

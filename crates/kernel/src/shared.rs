@@ -136,13 +136,12 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 20;
+pub const FORMAT: u32 = 27;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
@@ -223,21 +222,39 @@ impl<T: Data> Record<T> {
     /// never written here.
     pub fn join(dir: &[u8], id: u64) -> Result<Record<T>, i32> {
         let r = Record::open(dir.to_vec(), id, false)?;
-        r.read_file().map_err(|_| errno::ENOENT)?;
+        let (whole, t) = r.read_file().map_err(|_| errno::ENOENT)?;
+        r.keep_current(whole, t);
         Ok(r)
     }
 
     fn open_or_make(dir: Vec<u8>, id: u64, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
         let r = Record::open(dir, id, true)?;
         r.with_lock(|| {
-            if r.read_file().is_err() {
-                let at = r.generation() + 1;
-                r.write_file(at, &initial())?;
-                r.advance(at);
+            match r.read_file() {
+                Ok((whole, t)) => r.keep_current(whole, t),
+                Err(_) => {
+                    let at = r.generation() + 1;
+                    let t = initial();
+                    r.write_file(at, &t)?;
+                    r.advance(at);
+                    r.keep_current(at, t);
+                }
             }
             Ok(())
         })?;
         Ok(r)
+    }
+
+    /// The data read whole, `t` at generation `whole`, brought up to date
+    /// from the journal and kept for [`Record::get`] if it is the data as
+    /// it is now: the first look reads nothing again.
+    fn keep_current(&self, whole: u64, t: T) {
+        let now = self.generation();
+        if let Ok((at, t)) = self.apply_after(whole, &t)
+            && at == now
+        {
+            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = (at, Arc::new(t));
+        }
     }
 
     /// The record at `dir`, made if `make`, with its generation mapped.
@@ -399,8 +416,7 @@ impl<T: Data> Record<T> {
         let mut enc = Enc::new();
         enc.u64(at);
         t.encode(&mut enc);
-        // SAFETY: getpid cannot fail.
-        let pid = unsafe { libc::getpid() };
+        let pid = crate::host::pid();
         let tmp = [&self.data_path()[..], format!(".{pid}").as_bytes()].concat();
         std::fs::write(std::ffi::OsStr::from_bytes(&tmp), enc.into_bytes())
             .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
@@ -606,7 +622,8 @@ const YOUNG: std::time::Duration = std::time::Duration::from_secs(60);
 /// when its last process leaves: namespaces nobody is in, tmpfs directories
 /// and rootfs `/dev/shm` directories no live mount table shows, records
 /// another fwe build wrote, the initial mount table of a rootfs that is
-/// gone, and the tracing mailboxes of processes that are gone.
+/// gone, the tracing mailboxes of processes that are gone, and the owners
+/// kept for socket nodes that are gone.
 ///
 /// It runs at most once a minute ([`YOUNG`], within which nothing would be
 /// removed anyway), as a fresh fwe starts, in a process of its own: a
@@ -689,6 +706,11 @@ fn collect_in(base: &[u8]) {
     let base = base.to_vec();
     let os = |p: &[u8]| std::ffi::OsStr::from_bytes(p).to_owned();
     crate::procreg::collect_leftovers(YOUNG);
+    // Prepared code no start has made for a month.
+    crate::prepcache::collect(std::time::Duration::from_secs(30 * 24 * 3600));
+    // The owners of socket nodes that are gone.
+    #[cfg(target_os = "macos")]
+    crate::socketowners::collect();
     let mut live: HashSet<Vec<u8>> = HashSet::new();
     for (_, r) in crate::procreg::all() {
         live.extend(r.ns);
@@ -807,7 +829,8 @@ fn collect_in(base: &[u8]) {
             // A tmpfs, or a rootfs's `/dev/shm`, that no table shows.
             !shown.contains(&path)
         } else if name.starts_with(b"ptrace-") {
-            crate::ptrace::leftover(&name)
+            // ptrace's pages are the process store's.
+            true
         } else {
             // Another fwe build's: `v<n>-` with another format.
             name.first() == Some(&b'v')

@@ -56,7 +56,15 @@ pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
     };
     let Some(hcmd) = host::lock_cmd(cmd) else { return err(errno::EINVAL) };
     // SAFETY: `lock` is a valid host `struct flock`.
-    ret(unsafe { libc::fcntl(fd, hcmd, &lock) })
+    let r = ret(unsafe { libc::fcntl(fd, hcmd, &lock) });
+    // A process's lock, which any close of the file drops
+    // ([`crate::reclocks`]); an open file description's is not.
+    #[allow(clippy::unnecessary_cast)] // the field's width differs by host
+    let unlock = lock.l_type as i32 == libc::F_UNLCK as i32;
+    if r == 0 && matches!(cmd, fcntl::F_SETLK | fcntl::F_SETLKW) && !unlock {
+        crate::reclocks::taken();
+    }
+    r
 }
 
 pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> i64 {
@@ -116,8 +124,7 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
     }
     let who = o.ns_path.strip_suffix(b"/maps")?.rsplit(|&b| b == b'/').next()?;
     if who == b"self" {
-        // SAFETY: getpid cannot fail.
-        return Some(unsafe { libc::getpid() });
+        return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(who).ok()?.parse().ok()?;
     crate::pidns::to_host(pid)
@@ -164,8 +171,110 @@ pub(crate) fn shares(n: u64) -> bool {
     )
 }
 
+/// A memory call that names no descriptor or path: it makes no descriptor,
+/// reads or writes no file, changes no credentials and never waits, so none
+/// of the checks and notes around the other calls applies.
+pub(crate) fn plain_memory(n: u64, a: &[u64; 6]) -> bool {
+    matches!(n, nr::MUNMAP | nr::MPROTECT | nr::MADVISE | nr::BRK | nr::MREMAP)
+        || n == nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS != 0
+}
+
+/// Whether call `nr` may change what [`crate::procreg::Security`] holds,
+/// or the credentials Linux's `commit_creds` watches.
+fn changes_security(nr: u64) -> bool {
+    matches!(
+        nr,
+        nr::SETUID
+            | nr::SETREUID
+            | nr::SETRESUID
+            | nr::SETFSUID
+            | nr::SETGID
+            | nr::SETREGID
+            | nr::SETRESGID
+            | nr::SETFSGID
+            | nr::CAPSET
+            | nr::PRCTL
+            | nr::SECCOMP
+            | nr::UNSHARE
+            | nr::SETNS
+    )
+}
+
 impl<P: Platform> Kernel<P> {
+    /// Whether the caller may make a socket of `domain`, `type_` and
+    /// `protocol` (one the host can make, checked after): a raw IP socket
+    /// takes `CAP_NET_RAW` in the user namespace owning the network
+    /// namespace (`EPERM`); an ICMP datagram ("ping") socket a group in
+    /// `net.ipv4.ping_group_range` (`EACCES`), as Linux's `ping_init_sock`.
+    fn may_open_socket(&self, domain: u64, type_: u64, protocol: u64) -> Result<(), i32> {
+        use fwe_abi::socket::{AF_INET, AF_INET6, SOCK_DGRAM, SOCK_RAW, SOCK_TYPE_MASK};
+        if !matches!(domain, AF_INET | AF_INET6)
+            || crate::net::check_socket(domain, type_, protocol).is_err()
+        {
+            return Ok(());
+        }
+        match type_ & SOCK_TYPE_MASK {
+            SOCK_RAW if !self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_RAW) => {
+                Err(errno::EPERM)
+            }
+            SOCK_DGRAM
+                if (domain, protocol) == (AF_INET, 1) || (domain, protocol) == (AF_INET6, 58) =>
+            {
+                let range = crate::sysctl::text(b"net/ipv4/ping_group_range").unwrap_or_default();
+                let mut w = range.split_whitespace().map(|v| v.parse::<u32>().unwrap_or(u32::MAX));
+                let (lo, hi) = (w.next().unwrap_or(1), w.next().unwrap_or(0));
+                let c = &self.creds;
+                let ns = |g| crate::userns::to_ns(g, true);
+                let ok = std::iter::once(c.egid)
+                    .chain(c.groups.iter().copied())
+                    .any(|g| (lo..=hi).contains(&ns(g)));
+                if ok { Ok(()) } else { Err(errno::EACCES) }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// What of the credentials Linux's `commit_creds` compares: the
+    /// effective and filesystem ids, and the permitted capabilities.
+    fn cred_marks(&self) -> ([u32; 4], u64) {
+        let c = &self.creds;
+        ([c.euid, c.egid, c.fsuid, c.fsgid], c.caps.permitted)
+    }
+
+    /// After call `nr`, which may have changed the security state, from
+    /// `before` ([`Kernel::cred_marks`]): a change of the ids, or a gain of
+    /// capabilities (other than a new user namespace's, which Linux's
+    /// `commit_creds` counts as none), makes the process dumpable only as
+    /// `fs.suid_dumpable` says and drops its parent-death signal; then the
+    /// state is published for other processes.
+    pub(crate) fn security_changed(&mut self, nr: u64, before: ([u32; 4], u64)) {
+        let (ids, permitted) = self.cred_marks();
+        let new_ns = matches!(nr, nr::UNSHARE | nr::SETNS);
+        if ids != before.0 || (!new_ns && permitted & !before.1 != 0) {
+            crate::coredump::lose_dumpable();
+        }
+        crate::procreg::publish_security(self.security());
+    }
+
+    /// The process's security state as others see it
+    /// ([`crate::procreg::Security`]).
+    pub(crate) fn security(&self) -> crate::procreg::Security {
+        let c = &self.creds.caps;
+        crate::procreg::Security {
+            caps: [c.effective, c.permitted, c.inheritable, c.bounding, c.ambient],
+            dumpable: crate::coredump::dumpable(),
+            ptracer: crate::ptrace::ptracer(),
+            no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
+            seccomp: crate::seccomp::mode(),
+            filters: crate::seccomp::filter_count(),
+        }
+    }
+
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        // Limits another process set for this one take effect now.
+        if crate::procreg::take_limits_left() {
+            self.take_pending_limits();
+        }
         // Told of a foster child: the watcher that follows it starts here,
         // under the kernel lock.
         if crate::reaper::watcher_wanted() {
@@ -174,6 +283,9 @@ impl<P: Platform> Kernel<P> {
         // Mappings changed by memory calls are published before any other
         // call ([`crate::maps::publish`]).
         crate::maps::flush_before(n);
+        if plain_memory(n, &a) {
+            return self.dispatch_call(n, a);
+        }
         if let Err(e) = crate::fdtable::check_args(n, &a) {
             return e;
         }
@@ -181,21 +293,28 @@ impl<P: Platform> Kernel<P> {
             return e;
         }
         // What a Landlock domain does not allow ([`crate::landlock`]).
-        let no_truncate = if crate::landlock::active() {
+        let withheld = if crate::landlock::active() {
             match self.landlock_before(n, &a) {
                 Ok(t) => t,
                 Err(e) => return err(e),
             }
         } else {
-            false
+            crate::landlock::Withheld::default()
         };
         let plan = self.inotify_before(n, &a);
         let noted = crate::atime::before(n, &a);
+        let security = changes_security(n).then(|| self.cred_marks());
         let r = crate::linux_result(n, &a, self.dispatch_call(n, a));
-        if no_truncate && r >= 0 && matches!(n, nr::OPENAT | nr::OPENAT2) {
-            crate::landlock::opened_without_truncate(r as i32);
+        if withheld != crate::landlock::Withheld::default()
+            && r >= 0
+            && matches!(n, nr::OPENAT | nr::OPENAT2)
+        {
+            crate::landlock::opened(r as i32, withheld);
         }
         crate::creds::publish(&self.creds);
+        if let Some(before) = security {
+            self.security_changed(n, before);
+        }
         crate::atime::after(noted, r);
         self.inotify_after(n, &a, r, plan);
         // Descriptors past the guest's soft limit are ones Linux would not
@@ -245,14 +364,13 @@ impl<P: Platform> Kernel<P> {
                 crate::atime::closed(fd);
                 crate::memfd::closed(fd);
                 crate::tmpfile::closed(fd);
-                crate::modes::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
                 let mark = crate::fdmarks::marked(fd);
                 if matches!(mark, Some(crate::fdmarks::Mark::NetBound { .. }))
                     && !crate::fdmarks::shared_elsewhere(fd)
                 {
-                    crate::netns::closed(mark);
+                    crate::netns::as_socket(fd, || crate::netns::closed(mark));
                 }
                 crate::netlink::closed(fd);
                 crate::net::closed(fd);
@@ -260,7 +378,6 @@ impl<P: Platform> Kernel<P> {
                 crate::nsfd::closed(fd);
                 crate::inotify::closed(fd);
                 crate::dnotify::closed(fd);
-                crate::landlock::closed(fd);
                 crate::loopdev::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 crate::fdmarks::closed(fd);
@@ -313,6 +430,17 @@ impl<P: Platform> Kernel<P> {
             nr::TIMER_GETTIME => self.sys_timer_gettime(a[0], a[1]),
             nr::TIMER_GETOVERRUN => self.sys_timer_getoverrun(a[0]),
             nr::TIMER_DELETE => self.sys_timer_delete(a[0]),
+            // An alarm clock's timer (one that would wake a suspended
+            // system) needs `CAP_WAKE_ALARM`, once the clock and flags are
+            // known good, as Linux checks it.
+            nr::TIMERFD_CREATE
+                if matches!(a[0], clock::CLOCK_REALTIME_ALARM | clock::CLOCK_BOOTTIME_ALARM)
+                    && a[1] & !(fwe_abi::timerfd::TFD_NONBLOCK | fwe_abi::timerfd::TFD_CLOEXEC)
+                        == 0
+                    && !self.creds.has(crate::caps::CAP_WAKE_ALARM) =>
+            {
+                err(errno::EPERM)
+            }
             // SAFETY: timerfd_create takes no pointers.
             nr::TIMERFD_CREATE => unsafe { crate::specialfd::timerfd_create(a[0], a[1]) },
             // SAFETY: the itimerspec pointers are validated by the host/impl.
@@ -324,9 +452,12 @@ impl<P: Platform> Kernel<P> {
 
             // Sockets. The blocking calls (connect, accept, send*, recv*) are
             // handled lock-free in `blocking_syscall`; these set up or query.
-            nr::SOCKET if a[0] == crate::netlink::AF_NETLINK => {
-                crate::netlink::socket(a[1], a[2], self.creds.has(crate::caps::CAP_NET_ADMIN))
-            }
+            nr::SOCKET if a[0] == crate::netlink::AF_NETLINK => crate::netlink::socket(
+                a[1],
+                a[2],
+                self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_ADMIN),
+            ),
+            nr::SOCKET if let Err(e) = self.may_open_socket(a[0], a[1], a[2]) => err(e),
             // SAFETY: socket takes no pointers.
             nr::SOCKET => unsafe { crate::net::socket(a[0], a[1], a[2]) },
             // SAFETY: the sv pointer is validated by the host/impl.
@@ -334,16 +465,16 @@ impl<P: Platform> Kernel<P> {
             nr::BIND if crate::netlink::is(a[0] as i32) => {
                 crate::netlink::bind(a[0] as i32, a[1], a[2])
             }
-            // SAFETY: the sockaddr pointer is validated by the host/impl.
-            nr::BIND => unsafe {
-                crate::net::bind(
-                    a[0],
-                    a[1],
-                    a[2],
-                    self.creds.has(crate::caps::CAP_NET_BIND_SERVICE),
+            nr::BIND => {
+                let (may_low, umask) = (
+                    self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_BIND_SERVICE),
                     self.fs().umask(),
-                )
-            },
+                );
+                crate::netns::as_socket(a[0] as i32, || {
+                    // SAFETY: the sockaddr pointer is validated by the host/impl.
+                    unsafe { crate::net::bind(a[0], a[1], a[2], may_low, umask) }
+                })
+            }
             // SAFETY: no pointers.
             nr::LISTEN => unsafe { crate::net::listen(a[0], a[1]) },
             nr::GETSOCKNAME if crate::netlink::is(a[0] as i32) => {
@@ -353,18 +484,31 @@ impl<P: Platform> Kernel<P> {
                 crate::netlink::getname(a[0] as i32, a[1], a[2], true)
             }
             // SAFETY: the out pointers are validated by the host/impl.
-            nr::GETSOCKNAME => unsafe { crate::net::getname(a[0], a[1], a[2], false) },
+            nr::GETSOCKNAME => crate::netns::as_socket(a[0] as i32, || unsafe {
+                crate::net::getname(a[0], a[1], a[2], false)
+            }),
             // SAFETY: the out pointers are validated by the host/impl.
-            nr::GETPEERNAME => unsafe { crate::net::getname(a[0], a[1], a[2], true) },
-            // A netlink socket's own options change nothing fwe does.
+            nr::GETPEERNAME => crate::netns::as_socket(a[0] as i32, || unsafe {
+                crate::net::getname(a[0], a[1], a[2], true)
+            }),
+            // A netlink socket's options of a level of its own.
             nr::SETSOCKOPT
-                if a[1] == crate::netlink::SOL_NETLINK && crate::netlink::is(a[0] as i32) =>
+                if a[1] != fwe_abi::socket::SOL_SOCKET
+                    && (a[4] as i32) >= 0
+                    && crate::netlink::is(a[0] as i32) =>
             {
-                0
+                let broadcast =
+                    self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_BROADCAST);
+                crate::netlink::setsockopt(a[0] as i32, a[1], a[2], a[3], a[4], broadcast)
+            }
+            nr::GETSOCKOPT
+                if a[1] != fwe_abi::socket::SOL_SOCKET && crate::netlink::is(a[0] as i32) =>
+            {
+                crate::netlink::getsockopt(a[0] as i32, a[1], a[2], a[3], a[4])
             }
             // SAFETY: the option buffer is validated by the host/impl.
             nr::SETSOCKOPT => unsafe {
-                let admin = self.creds.has(crate::caps::CAP_NET_ADMIN);
+                let admin = self.creds.has_in(&crate::netns::owner(), crate::caps::CAP_NET_ADMIN);
                 crate::net::setsockopt(a[0], a[1], a[2], a[3], a[4], admin)
             },
             // SAFETY: the out buffers are validated by the host/impl.
@@ -374,7 +518,11 @@ impl<P: Platform> Kernel<P> {
 
             // Files and directories.
             nr::OPENAT => self.sys_openat(a[0], a[1], a[2], a[3]),
-            nr::OPENAT2 => self.sys_openat2(a[0], a[1], a[2], a[3]),
+            nr::OPENAT2 => {
+                let r = self.sys_openat2(a[0], a[1], a[2], a[3]);
+                crate::fs::ahead::clear();
+                r
+            }
             nr::STATFS => self.sys_statfs(a[0], a[1]),
             nr::FSTATFS => self.sys_fstatfs(a[0], a[1]),
             nr::GETDENTS64 => self.sys_getdents64(a[0], a[1], a[2]),
@@ -390,18 +538,23 @@ impl<P: Platform> Kernel<P> {
             nr::LINKAT => self.sys_linkat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHMODAT => self.sys_fchmodat(a[0], a[1], a[2], 0),
             nr::FCHMODAT2 => self.sys_fchmodat2(a[0], a[1], a[2], a[3]),
-            nr::SETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], true),
-            nr::LSETXATTR => self.sys_setxattr(a[0], a[1], a[2], a[3], a[4], false),
+            nr::SETXATTR => self.sys_setxattr(CWD, a[0], a[1], a[2], a[3], a[4], true),
+            nr::LSETXATTR => self.sys_setxattr(CWD, a[0], a[1], a[2], a[3], a[4], false),
             nr::FSETXATTR => self.sys_fsetxattr(a[0], a[1], a[2], a[3], a[4]),
-            nr::GETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], true),
-            nr::LGETXATTR => self.sys_getxattr(None, a[0], a[1], a[2], a[3], false),
-            nr::FGETXATTR => self.sys_getxattr(Some(a[0] as i32), 0, a[1], a[2], a[3], true),
-            nr::LISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], true),
-            nr::LLISTXATTR => self.sys_listxattr(None, a[0], a[1], a[2], false),
-            nr::FLISTXATTR => self.sys_listxattr(Some(a[0] as i32), 0, a[1], a[2], true),
-            nr::REMOVEXATTR => self.sys_removexattr(None, a[0], a[1], true),
-            nr::LREMOVEXATTR => self.sys_removexattr(None, a[0], a[1], false),
-            nr::FREMOVEXATTR => self.sys_removexattr(Some(a[0] as i32), 0, a[1], true),
+            nr::GETXATTR => self.sys_getxattr(CWD, None, a[0], a[1], a[2], a[3], true),
+            nr::LGETXATTR => self.sys_getxattr(CWD, None, a[0], a[1], a[2], a[3], false),
+            nr::FGETXATTR => self.sys_getxattr(CWD, Some(a[0] as i32), 0, a[1], a[2], a[3], true),
+            nr::LISTXATTR => self.sys_listxattr(CWD, None, a[0], a[1], a[2], true),
+            nr::LLISTXATTR => self.sys_listxattr(CWD, None, a[0], a[1], a[2], false),
+            nr::FLISTXATTR => self.sys_listxattr(CWD, Some(a[0] as i32), 0, a[1], a[2], true),
+            nr::REMOVEXATTR => self.sys_removexattr(CWD, None, a[0], a[1], true),
+            nr::LREMOVEXATTR => self.sys_removexattr(CWD, None, a[0], a[1], false),
+            nr::FREMOVEXATTR => self.sys_removexattr(CWD, Some(a[0] as i32), 0, a[1], true),
+            nr::KCMP => self.sys_kcmp(a[0], a[1], a[2], a[3], a[4]),
+            nr::PROCESS_MADVISE => self.sys_process_madvise(a[0], a[1], a[2], a[3], a[4]),
+            nr::SETXATTRAT | nr::GETXATTRAT | nr::LISTXATTRAT | nr::REMOVEXATTRAT => {
+                self.sys_xattrat(n, a)
+            }
             nr::FCHMOD => self.sys_fchmod(a[0], a[1]),
             nr::FCHOWNAT => self.sys_fchownat(a[0], a[1], a[2], a[3], a[4]),
             nr::FCHOWN => self.sys_fchown(a[0], a[1], a[2]),
@@ -507,8 +660,7 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setpgid(pid, pgid) });
                 if r == 0 {
-                    // SAFETY: getpid cannot fail.
-                    let me = unsafe { libc::getpid() };
+                    let me = crate::host::pid();
                     crate::procreg::record_pgid(if pid == 0 { me } else { pid });
                 }
                 r
@@ -517,8 +669,7 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setsid() } as i64);
                 if r > 0 {
-                    // SAFETY: getpid cannot fail.
-                    crate::procreg::record_pgid(unsafe { libc::getpid() });
+                    crate::procreg::record_pgid(crate::host::pid());
                 }
                 crate::pidns::guest_ret(r)
             }
@@ -527,23 +678,26 @@ impl<P: Platform> Kernel<P> {
             // namespace's maps (see `userns`).
             nr::SETUID => match uid_in(a[0], false) {
                 Ok(u) => {
+                    let old = self.creds.uid;
                     let r = self.creds.setuid(u);
-                    self.ids_changed(r)
+                    self.uids_changed(old, r)
                 }
                 Err(e) => err(e),
             },
             nr::SETREUID => match (uid_in(a[0], false), uid_in(a[1], false)) {
                 (Ok(r), Ok(e)) => {
+                    let old = self.creds.uid;
                     let r = self.creds.setreuid(r, e);
-                    self.ids_changed(r)
+                    self.uids_changed(old, r)
                 }
                 (Err(x), _) | (_, Err(x)) => err(x),
             },
             nr::SETRESUID => {
                 match (uid_in(a[0], false), uid_in(a[1], false), uid_in(a[2], false)) {
                     (Ok(r), Ok(e), Ok(s)) => {
+                        let old = self.creds.uid;
                         let r = self.creds.setresuid(r, e, s);
-                        self.ids_changed(r)
+                        self.uids_changed(old, r)
                     }
                     (Err(x), _, _) | (_, Err(x), _) | (_, _, Err(x)) => err(x),
                 }
@@ -618,7 +772,7 @@ impl<P: Platform> Kernel<P> {
                     let Some((owner, tid)) = target else {
                         return err(errno::ESRCH);
                     };
-                    if !self.may_trace(owner) {
+                    if !self.may_access(owner, false, false) {
                         return err(errno::EPERM);
                     }
                     thread::published_robust(owner, tid).unwrap_or(0)
@@ -637,7 +791,7 @@ impl<P: Platform> Kernel<P> {
             }
             nr::LANDLOCK_RESTRICT_SELF => {
                 let privileged = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-                    || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+                    || self.creds.has_own(crate::caps::CAP_SYS_ADMIN);
                 crate::landlock::restrict_self(a[0] as i32, a[1], privileged).unwrap_or_else(err)
             }
             nr::PROCESS_VM_READV => self.sys_process_vm(false, a),
@@ -668,6 +822,11 @@ impl<P: Platform> Kernel<P> {
             },
             nr::PIDFD_OPEN => self.sys_pidfd_open(a[0], a[1]),
             nr::PIDFD_SEND_SIGNAL => self.sys_pidfd_send_signal(a[0], a[1], a[2], a[3]),
+            nr::PROCESS_MRELEASE => crate::pidfd::process_mrelease(a[0], a[1]),
+            // A call fwe interrupts is restarted (or not) as the signal is
+            // delivered, never left for this: there is nothing to restart,
+            // as on Linux after a handler ran (`do_no_restart_syscall`).
+            nr::RESTART_SYSCALL => err(errno::EINTR),
             // The backends finish it without the lock (it waits for the
             // target); the same, reached here.
             nr::PIDFD_GETFD => crate::pidfd::getfd(self.getfd_request(a[0], a[1], a[2])),
@@ -701,8 +860,14 @@ impl<P: Platform> Kernel<P> {
             nr::SETPRIORITY => self.sys_setpriority(a[0], a[1] as i32, a[2] as i32),
             nr::CAPGET => self.sys_capget(a[0], a[1]),
             nr::SECCOMP => self.sys_seccomp(a[0], a[1], a[2]),
-            // `CAP_BPF` or `CAP_SYS_ADMIN`, as Linux's `bpf_capable`.
-            nr::BPF if !self.creds.has_admin() && !self.creds.has(crate::caps::CAP_BPF) => {
+            // `CAP_BPF` or `CAP_SYS_ADMIN`, as Linux's `bpf_capable`, unless
+            // `kernel.unprivileged_bpf_disabled` is 0 and the command one
+            // Linux then leaves to anyone.
+            nr::BPF
+                if !self.creds.has(crate::caps::CAP_SYS_ADMIN)
+                    && !self.creds.has(crate::caps::CAP_BPF)
+                    && !crate::bpf::unprivileged_allows(a[0], a[1]) =>
+            {
                 err(errno::EPERM)
             }
             nr::BPF => crate::bpf::sys_bpf(a[0], a[1], a[2]),
@@ -710,7 +875,6 @@ impl<P: Platform> Kernel<P> {
             nr::VHANGUP => self.sys_vhangup(),
             nr::READAHEAD => self.sys_readahead(a[0]),
             nr::SYNC_FILE_RANGE => self.sys_sync_file_range(a[0], a[1], a[2], a[3]),
-            nr::DELETE_MODULE => self.sys_delete_module(a[0]),
             nr::SYSLOG => self.sys_syslog(a[0], a[1], a[2]),
             nr::MEMBARRIER => self.sys_membarrier(a[0], a[1]),
             nr::IOPRIO_GET => self.sys_ioprio_get(a[0], a[1]),
@@ -741,9 +905,17 @@ impl<P: Platform> Kernel<P> {
             nr::SCHED_GET_PRIORITY_MIN => crate::sched::priority_bound(a[0], false),
             nr::SCHED_RR_GET_INTERVAL => self.sys_sched_rr_get_interval(a[0], a[1]),
             nr::SCHED_SETAFFINITY => self.sys_sched_setaffinity(a[0], a[1], a[2]),
-            nr::PRLIMIT64 => self.sys_prlimit(a[0], a[1], a[2], a[3]),
+            nr::PRLIMIT64 | nr::SETRLIMIT => {
+                let (pid, res, new, old) =
+                    if n == nr::SETRLIMIT { (0, a[0], a[1], 0) } else { (a[0], a[1], a[2], a[3]) };
+                let r = self.sys_prlimit(pid, res, new, old);
+                // Other processes see the limits it now has.
+                if r == 0 && new != 0 && (pid == 0 || pid as i32 == thread::tgid()) {
+                    self.fs().share();
+                }
+                r
+            }
             nr::GETRLIMIT => self.sys_prlimit(0, a[0], 0, a[1]),
-            nr::SETRLIMIT => self.sys_prlimit(0, a[0], a[1], 0),
 
             // Time.
             nr::CLOCK_SETTIME => self.sys_clock_settime(a[0], a[1]),
@@ -800,6 +972,25 @@ impl<P: Platform> Kernel<P> {
             return None;
         }
         crate::maps::flush_before(n);
+        // A call that names no descriptor, path or buffer of data: none of
+        // the checks or notes around file calls applies to it.
+        if matches!(
+            n,
+            nr::GETPID
+                | nr::GETTID
+                | nr::GETPPID
+                | nr::GETUID
+                | nr::GETEUID
+                | nr::GETGID
+                | nr::GETEGID
+                | nr::GETPGID
+                | nr::GETSID
+                | nr::SCHED_YIELD
+                | nr::CLOCK_GETTIME
+                | nr::GETTIMEOFDAY
+        ) {
+            return Some(self.shared_call(n, a));
+        }
         if let Err(e) = crate::fdtable::check_args(n, &a) {
             return Some(e);
         }
@@ -826,6 +1017,11 @@ impl<P: Platform> Kernel<P> {
                     && is_dir_fd(a[0] as i32)
                 {
                     crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                } else if let Some(r) =
+                    crate::fsops::dir_lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    // A host directory listed: by its positions in the listing.
+                    r
                 } else {
                     // SEEK_SET, CUR and END match; Linux's SEEK_DATA and
                     // SEEK_HOLE are 3 and 4, the host's the other way round.
@@ -860,9 +1056,12 @@ impl<P: Platform> Kernel<P> {
             nr::GETTID => thread::tid() as i64,
             // A parent outside the namespace is 0, as Linux reports it.
             nr::GETPPID => {
-                // SAFETY: getpid cannot fail.
-                let me = unsafe { libc::getpid() };
-                let parent = crate::reaper::parent_of(me, host::getppid() as i32);
+                let me = crate::host::pid();
+                let host_ppid = crate::pdeath::parent().unwrap_or_else(|| {
+                    crate::pdeath::asked();
+                    host::getppid() as i32
+                });
+                let parent = crate::reaper::parent_of(me, host_ppid);
                 crate::pidns::guest_ret(i64::from(parent))
             }
             // Credentials, seen through the user namespace's maps.
@@ -884,7 +1083,6 @@ impl<P: Platform> Kernel<P> {
             nr::GETRUSAGE => {
                 use fwe_abi::resource_usage as ru;
                 let who = match a[0] as i32 as i64 {
-                    // The host has no per-thread usage; report the process's.
                     ru::RUSAGE_SELF | ru::RUSAGE_THREAD => libc::RUSAGE_SELF,
                     ru::RUSAGE_CHILDREN => libc::RUSAGE_CHILDREN,
                     _ => return err(errno::EINVAL),
@@ -894,6 +1092,28 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: `usage` is a valid out-parameter.
                 if unsafe { libc::getrusage(who, &mut usage) } != 0 {
                     return last_error();
+                }
+                if a[0] as i32 as i64 == ru::RUSAGE_THREAD {
+                    // The calling thread's own times, as the host keeps
+                    // them per thread; the counts it keeps only per
+                    // process (faults, switches, blocks) are not this
+                    // thread's, and are left 0. The largest resident size
+                    // is the process's, as on Linux.
+                    // SAFETY: plain host call.
+                    let Some((user, system, _)) =
+                        host::thread_state(unsafe { libc::pthread_self() })
+                    else {
+                        return err(errno::EINVAL);
+                    };
+                    let tv = |ns: u64| libc::timeval {
+                        tv_sec: (ns / 1_000_000_000) as libc::time_t,
+                        tv_usec: ((ns % 1_000_000_000) / 1000) as libc::suseconds_t,
+                    };
+                    let maxrss = usage.ru_maxrss;
+                    // SAFETY: an all-zero rusage is a valid value.
+                    usage = unsafe { std::mem::zeroed() };
+                    (usage.ru_utime, usage.ru_stime, usage.ru_maxrss) =
+                        (tv(user), tv(system), maxrss);
                 }
                 guest!(host::write_rusage(a[1], &usage));
                 0
@@ -1151,7 +1371,9 @@ impl<P: Platform> Kernel<P> {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
-                    } else if crate::memfd::write_refused(fd) {
+                    } else if r & libc::O_ACCMODE == libc::O_RDONLY
+                        && crate::memfd::write_refused(fd)
+                    {
                         // Read-only on the host since it was sealed (see
                         // `memfd`), but open for writing as far as Linux goes.
                         let r = (r & !libc::O_ACCMODE) | libc::O_RDWR;
@@ -1186,7 +1408,12 @@ impl<P: Platform> Kernel<P> {
                     }
                     // Nothing in the way: Linux changes only the type (the
                     // host makes the range absolute too).
-                    let found = host::flock_to_linux(&lock);
+                    let mut found = host::flock_to_linux(&lock);
+                    // The holder by its pid in the caller's namespace (0
+                    // where it is outside, as Linux reports one).
+                    if found.l_pid > 0 {
+                        found.l_pid = crate::pidns::guest_ret(i64::from(found.l_pid)) as i32;
+                    }
                     let answer = if found.l_type == fcntl::F_UNLCK {
                         fwe_abi::Flock { l_type: fcntl::F_UNLCK, ..asked }
                     } else {
@@ -1361,6 +1588,9 @@ impl<P: Platform> Kernel<P> {
         // The request is 32 bits (an `unsigned int`); a C library passing
         // an `int` sign-extends it.
         let req = req as u32 as u64;
+        if let Err(e) = crate::landlock::may_ioctl(fd, req) {
+            return err(e);
+        }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
             return r;
         }
@@ -1368,6 +1598,9 @@ impl<P: Platform> Kernel<P> {
             return r;
         }
         if let Some(r) = self.pidfd_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = crate::specialfd::timer_ioctl(fd, req, arg) {
             return r;
         }
         // `FICLONE`, `FICLONERANGE` and `FIDEDUPERANGE` between files: no
@@ -1379,9 +1612,16 @@ impl<P: Platform> Kernel<P> {
         // `FS_IOC_GETFLAGS` and `FS_IOC_SETFLAGS`: the immutable and
         // append-only flags, which the host has (and enforces) too.
         #[cfg(target_os = "macos")]
-        if req == 0x8008_6601 || req == 0x4008_6602 {
-            return self.inode_flags(fd, req == 0x4008_6602, arg);
+        if req == ioctl::FS_IOC_GETFLAGS || req == ioctl::FS_IOC_SETFLAGS {
+            return self.inode_flags(fd, req == ioctl::FS_IOC_SETFLAGS, arg);
         }
+        // `FS_IOC_FSGETXATTR` and `FS_IOC_FSSETXATTR`: the same, as XFS's
+        // extended flags.
+        #[cfg(target_os = "macos")]
+        if req == ioctl::FS_IOC_FSGETXATTR || req == ioctl::FS_IOC_FSSETXATTR {
+            return self.fs_xattr(fd, req == ioctl::FS_IOC_FSSETXATTR, arg);
+        }
+
         // `RNDGETENTCNT` on `/dev/random` or `/dev/urandom`: the entropy
         // count, full as Linux's is (`kernel.random.entropy_avail`).
         if req == 0x8004_5200 && is_random_device(fd) {
@@ -1520,6 +1760,8 @@ impl<P: Platform> Kernel<P> {
         use fwe_abi::prctl::*;
         use std::sync::atomic::Ordering::Relaxed;
         match option {
+            PR_SET_VMA if arg2 == PR_SET_VMA_ANON_NAME => self.set_vma_name(arg3, arg4, arg5),
+            PR_SET_VMA => err(errno::EINVAL),
             PR_SET_NAME => {
                 let mut name = [0u8; TASK_COMM_LEN];
                 let s = guest!(uaccess::read_cstr(arg2, 4096));
@@ -1625,11 +1867,31 @@ impl<P: Platform> Kernel<P> {
             }
             PR_GET_TIMERSLACK => thread::slack() as i64,
             PR_SET_DUMPABLE if arg2 <= 1 => {
-                crate::coredump::UNDUMPABLE.store(arg2 == 0, Relaxed);
+                crate::coredump::set_dumpable(arg2 as u8);
                 0
             }
             PR_SET_DUMPABLE => err(errno::EINVAL),
-            PR_GET_DUMPABLE => i64::from(!crate::coredump::UNDUMPABLE.load(Relaxed)),
+            PR_GET_DUMPABLE => i64::from(crate::coredump::dumpable()),
+            // Yama: the process (and those below it) that may trace this
+            // one where `kernel.yama.ptrace_scope` is 1; any with
+            // `PR_SET_PTRACER_ANY` (-1); none with 0.
+            PR_SET_PTRACER => match arg2 {
+                0 => {
+                    crate::ptrace::set_ptracer(0);
+                    0
+                }
+                PR_SET_PTRACER_ANY => {
+                    crate::ptrace::set_ptracer(-1);
+                    0
+                }
+                pid => match crate::pidns::to_host(pid as i32) {
+                    Some(h) if pid <= i32::MAX as u64 && host::process_exists(h) => {
+                        crate::ptrace::set_ptracer(h);
+                        0
+                    }
+                    _ => err(errno::EINVAL),
+                },
+            },
             PR_SET_PDEATHSIG if arg2 <= signal::NSIG => {
                 crate::pdeath::set(arg2);
                 0
@@ -1637,6 +1899,12 @@ impl<P: Platform> Kernel<P> {
             PR_SET_PDEATHSIG => err(errno::EINVAL),
             PR_GET_PDEATHSIG => {
                 guest!(uaccess::write(arg2, crate::pdeath::get() as i32));
+                0
+            }
+            crate::prmm::PR_SET_MM => self.prctl_set_mm(arg2, arg3, arg4, arg5),
+            // The thread's `set_tid_address` (`CLONE_CHILD_CLEARTID`) word.
+            PR_GET_TID_ADDRESS => {
+                guest!(uaccess::write(arg2, thread::clear_child_tid()));
                 0
             }
             _ => err(errno::EINVAL),
@@ -1658,8 +1926,8 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// `capget(hdr, data)`: the caller's capabilities (another process's
-    /// fwe does not hold: `ESRCH`).
+    /// `capget(hdr, data)`: the caller's capabilities, or another
+    /// process's as its record holds them.
     fn sys_capget(&mut self, hdr: u64, data: u64) -> i64 {
         let (words, pid) = match self.cap_words(hdr) {
             Ok(v) => v,
@@ -1668,19 +1936,28 @@ impl<P: Platform> Kernel<P> {
         if pid < 0 {
             return err(errno::EINVAL);
         }
-        if pid != 0 && pid != thread::tgid() {
-            return err(errno::ESRCH);
-        }
+        // Another process's sets are those its record holds (root's for
+        // one fwe has no record of); a thread's are its process's.
+        let own = pid == 0 || pid == thread::tgid() || thread::host_thread(pid).is_some();
+        let sets = if own {
+            let c = &self.creds.caps;
+            [c.effective, c.permitted, c.inheritable]
+        } else {
+            let Some(host) = crate::pidns::to_host(pid).filter(|&h| host::process_exists(h)) else {
+                return err(errno::ESRCH);
+            };
+            let s = crate::procreg::security(host).unwrap_or_default();
+            [s.caps[0], s.caps[1], s.caps[2]]
+        };
         if data == 0 {
             return 0;
         }
-        let c = &self.creds.caps;
         let mut out = [0u32; 6];
         for w in 0..words {
             let shift = 32 * w as u64;
-            out[w * 3] = (c.effective >> shift) as u32;
-            out[w * 3 + 1] = (c.permitted >> shift) as u32;
-            out[w * 3 + 2] = (c.inheritable >> shift) as u32;
+            for (i, set) in sets.iter().enumerate() {
+                out[w * 3 + i] = (set >> shift) as u32;
+            }
         }
         guest!(uaccess::write_from(data, &bytemuck_u32(&out[..words * 3])));
         0
@@ -1727,7 +2004,8 @@ impl<P: Platform> Kernel<P> {
         if req == SIOCATMARK {
             return crate::net::at_mark(fd, arg);
         }
-        let net = self.fs().ns.net.clone();
+        // The socket's namespace, whichever the caller is in.
+        let net = crate::netns::of(fd);
         if req == SIOCGIFCONF {
             let addrs = match &net {
                 Some(n) if n.get().lo_up => vec![(b"lo".to_vec(), [127, 0, 0, 1], [255, 0, 0, 0])],
@@ -1771,7 +2049,10 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 SIOCSIFFLAGS => {
-                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                    if !self
+                        .creds
+                        .has_in(&crate::ns::owner_dir(net.dir()), crate::caps::CAP_NET_ADMIN)
+                    {
                         return err(errno::EPERM);
                     }
                     let flags = u16::from_ne_bytes(ifr[16..18].try_into().unwrap());
@@ -1793,7 +2074,10 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 SIOCSIFMTU => {
-                    if !self.creds.has(crate::caps::CAP_NET_ADMIN) {
+                    if !self
+                        .creds
+                        .has_in(&crate::ns::owner_dir(net.dir()), crate::caps::CAP_NET_ADMIN)
+                    {
                         return err(errno::EPERM);
                     }
                     // At least an Ethernet frame's minimum (ETH_MIN_MTU).
@@ -1906,7 +2190,36 @@ impl<P: Platform> Kernel<P> {
             // kernel lock; the last one takes the process with it.
             Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
             Action::KillStrict => self.terminate_by(signal::SIGKILL),
+            // No tracer took it: the call fails as Linux fails it then.
+            Action::Trace(_) => self.finish_syscall(regs, nr, args, err(errno::ENOSYS)),
+            // The tracer skipped it: what it left in `x0` is the result.
+            Action::Skip => {
+                let x0 = regs.x[0] as i64;
+                self.finish_syscall(regs, nr, args, x0);
+            }
         }
+    }
+
+    /// `SECCOMP_RET_TRACE` with `data` for the call in `regs`: a tracer
+    /// that asked for it (`PTRACE_O_TRACESECCOMP`) stops the call with
+    /// `PTRACE_EVENT_SECCOMP` (its message `data`) and may change it; then
+    /// the filters run again on what it left, a call it set to -1 being
+    /// skipped, as Linux's `__seccomp_filter` has it. Without such a tracer,
+    /// [`crate::seccomp::Action::Trace`] stands (`ENOSYS`).
+    pub fn seccomp_trace(&mut self, regs: &mut crate::Regs, data: u16) -> crate::seccomp::Action {
+        use crate::seccomp::Action;
+        if !crate::ptrace::traced()
+            || crate::ptrace::options() & crate::ptrace::PTRACE_O_TRACESECCOMP == 0
+        {
+            return Action::Trace(data);
+        }
+        self.ptrace_event_stop(regs, crate::ptrace::PTRACE_EVENT_SECCOMP, u64::from(data));
+        let nr = regs.x[8];
+        if nr as i64 == -1 {
+            return Action::Skip;
+        }
+        let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+        crate::seccomp::recheck(nr, &args, regs.pc)
     }
 
     /// `reboot(magic, magic2, cmd)`, checked as Linux checks it: the
@@ -1921,7 +2234,10 @@ impl<P: Platform> Kernel<P> {
         const CAD_OFF: u32 = 0;
         const STOPS: [u32; 6] =
             [0x0123_4567, 0xcdef_0123, 0x4321_fedc, 0xa1b2_c3d4, 0xd000_fce2, 0x4558_4543];
-        if !self.creds.has(crate::caps::CAP_SYS_BOOT) {
+        // CAP_SYS_BOOT over the pid namespace: in the user namespace that
+        // owns it.
+        let owner = self.fs().ns.owner(fwe_abi::clone::CLONE_NEWPID);
+        if !self.creds.has_in(&owner, crate::caps::CAP_SYS_BOOT) {
             return err(errno::EPERM);
         }
         if magic as u32 != MAGIC1 || !MAGIC2.contains(&(magic2 as u32)) {
@@ -1939,7 +2255,7 @@ impl<P: Platform> Kernel<P> {
     fn sys_seccomp(&mut self, op: u64, flags: u64, args: u64) -> i64 {
         use crate::seccomp::*;
         let allowed = NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed)
-            || self.creds.has(crate::caps::CAP_SYS_ADMIN);
+            || self.creds.has_own(crate::caps::CAP_SYS_ADMIN);
         let r = match op {
             SET_MODE_STRICT if flags != 0 || args != 0 => Err(errno::EINVAL),
             SET_MODE_STRICT => set_strict(),
@@ -1960,6 +2276,17 @@ impl<P: Platform> Kernel<P> {
 
     /// A call that may have changed the caller's ids returned `r`: other
     /// processes see the ids it now has ([`crate::procreg::ProcRecord::ids`]).
+    /// [`Kernel::ids_changed`] after a `set*uid` (result `r`) of a process
+    /// whose real user was `old`: a new real user past `RLIMIT_NPROC`
+    /// fails the next `execve` ([`crate::rlimits::real_user_changed`]),
+    /// counted before this process is that user's.
+    fn uids_changed(&self, old: u32, r: i64) -> i64 {
+        if r >= 0 && self.creds.uid != old {
+            crate::rlimits::real_user_changed(self.creds.uid);
+        }
+        self.ids_changed(r)
+    }
+
     pub(crate) fn ids_changed(&self, r: i64) -> i64 {
         if r >= 0 {
             let c = &self.creds;
@@ -1992,8 +2319,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn self_status(&self) -> Vec<u8> {
-        // SAFETY: getpid cannot fail.
-        let host = unsafe { libc::getpid() };
+        let host = crate::host::pid();
         let comm = thread::name()
             .map(|n| n[..n.iter().position(|&b| b == 0).unwrap_or(n.len())].to_vec())
             .unwrap_or_else(|| {
@@ -2011,8 +2337,13 @@ impl<P: Platform> Kernel<P> {
             caps: Some(c.caps),
             no_new_privs: NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed),
             seccomp: crate::seccomp::mode(),
+            filters: crate::seccomp::filter_count(),
             umask: self.fs().umask(),
             locked: crate::maps::record().locked_bytes(),
+            tracer: match crate::ptrace::tracer_of(host) {
+                0 => 0,
+                t => crate::pidns::to_guest(t),
+            },
         };
         crate::procpid::status(thread::tgid(), &comm, &h, &creds)
     }
@@ -2021,12 +2352,22 @@ impl<P: Platform> Kernel<P> {
     /// reports.
     fn sys_sysinfo(&self, buf: u64) -> i64 {
         let scale = (1u64 << fwe_abi::SI_LOAD_SHIFT) as f64;
+        let m = host::memory();
+        // The tasks of the processes the caller's pid namespace holds.
+        let procs: u64 = crate::procpid::listed()
+            .into_iter()
+            .filter_map(crate::pidns::to_host)
+            .map(|h| crate::procpid::host_info(h).map_or(1, |i| i.threads.max(1)))
+            .sum();
         let info = fwe_abi::Sysinfo {
             uptime: host::uptime() as i64,
             loads: host::load_averages().map(|l| (l * scale) as u64),
-            totalram: crate::procfs::MEM_TOTAL_KB * 1024,
-            freeram: crate::procfs::MEM_FREE_KB * 1024,
-            procs: 1,
+            totalram: m.total,
+            freeram: m.free,
+            bufferram: 0,
+            totalswap: m.swap_total,
+            freeswap: m.swap_free,
+            procs: procs.min(u64::from(u16::MAX)) as u16,
             mem_unit: 1,
             ..Default::default()
         };
@@ -2034,19 +2375,43 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    fn sys_sched_getaffinity(&self, pid: u64, len: u64, mask: u64) -> i64 {
-        // The caller, the process, or one of its threads: glibc's
-        // `pthread_getattr_np` asks with the thread's own id.
+    /// The host process whose affinity `sched_*affinity`'s `pid` names: the
+    /// caller's for 0 or one of its threads (glibc's `pthread_getattr_np`
+    /// asks with the thread's own id), the process of another's thread,
+    /// or a process (`ESRCH` for none).
+    fn affinity_target(&self, pid: u64) -> Result<i32, i32> {
         let id = pid as i32;
-        if id != 0 && id != thread::tgid() && thread::host_thread(id).is_none() {
-            return err(errno::ESRCH);
+        if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
+            return Ok(host::pid());
         }
+        if let Some(owner) = thread::owner_of_tid(id).filter(|&o| host::is_fwe(o)) {
+            return Ok(owner);
+        }
+        match crate::pidns::host_arg(id) {
+            Ok(h) if host::process_exists(h) => Ok(h),
+            _ => Err(errno::ESRCH),
+        }
+    }
+
+    /// `sched_getaffinity(pid, len, mask)`: the affinity of the process
+    /// named, as its record keeps it; a process fwe did not start runs on
+    /// every CPU.
+    fn sys_sched_getaffinity(&self, pid: u64, len: u64, mask: u64) -> i64 {
+        let target = match self.affinity_target(pid) {
+            Ok(h) => h,
+            Err(e) => return err(e),
+        };
         let online = online_cpus();
         let size = online.len() as u64 * 8;
         if len < size || !len.is_multiple_of(8) {
             return err(errno::EINVAL);
         }
-        let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or(online);
+        let set = if target == host::pid() {
+            crate::procreg::own_affinity()
+        } else {
+            crate::procreg::affinity(target).unwrap_or_default()
+        };
+        let set = if set.is_empty() { online } else { set };
         for (word, value) in set.iter().enumerate() {
             guest!(uaccess::write(mask + word as u64 * 8, *value));
         }
@@ -2054,9 +2419,11 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `sched_setaffinity(pid, len, mask)`: checked as Linux checks it (the
-    /// mask must name an online CPU) and remembered for the caller, which
-    /// `sched_getaffinity` then reports. The host has no affinity to set:
-    /// threads still run on any CPU, and another process's is not kept.
+    /// mask must name an online CPU; another user's process needs
+    /// `CAP_SYS_NICE`) and kept in the record of the process named, which
+    /// `sched_getaffinity` then reports, in it or any other. The host has
+    /// no affinity to set: threads still run on any CPU, and a process fwe
+    /// did not start keeps running on every one.
     fn sys_sched_setaffinity(&mut self, pid: u64, len: u64, mask: u64) -> i64 {
         let online = online_cpus();
         let mut want = vec![0u64; online.len()];
@@ -2072,24 +2439,26 @@ impl<P: Platform> Kernel<P> {
         if want.iter().all(|&w| w == 0) {
             return err(errno::EINVAL);
         }
-        let id = pid as i32;
-        if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
-            *AFFINITY.lock().unwrap_or_else(|e| e.into_inner()) = Some(want);
-            return 0;
-        }
-        match crate::pidns::host_arg(id) {
-            // SAFETY: a signal 0 only checks that the process exists.
-            Ok(h) if unsafe { libc::kill(h, 0) } == 0 || host::last_errno() == libc::EPERM => {
-                // Another user's process, without CAP_SYS_NICE: refused.
-                let owner = crate::procreg::ids(h);
-                if !self.creds.has(crate::caps::CAP_SYS_NICE)
-                    && ![owner[0], owner[1]].contains(&self.creds.euid)
-                {
-                    return err(errno::EPERM);
-                }
-                0
+        let target = match self.affinity_target(pid) {
+            Ok(h) => h,
+            Err(e) => return err(e),
+        };
+        if target != host::pid() {
+            // Another user's process, without CAP_SYS_NICE in its user
+            // namespace: refused.
+            let owner = crate::procreg::ids(target);
+            if ![owner[0], owner[1]].contains(&self.creds.euid)
+                && !self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_NICE)
+            {
+                return err(errno::EPERM);
             }
-            _ => err(errno::ESRCH),
+            if !host::is_fwe(target) {
+                return 0;
+            }
+        }
+        match crate::procreg::set_affinity(target, want) {
+            Ok(()) => 0,
+            Err(e) => err(e),
         }
     }
 
@@ -2126,6 +2495,7 @@ impl<P: Platform> Kernel<P> {
                 if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
                     return err(e);
                 }
+                publish_limits();
             }
             return 0;
         }
@@ -2136,6 +2506,7 @@ impl<P: Platform> Kernel<P> {
                 if let Err(e) = crate::rlimits::set(res, n.rlim_cur, n.rlim_max, privileged) {
                     return err(e);
                 }
+                publish_limits();
             }
             return 0;
         }
@@ -2152,27 +2523,29 @@ impl<P: Platform> Kernel<P> {
             if unsafe { libc::setrlimit(hres as _, &r) } != 0 {
                 return last_error();
             }
+            publish_limits();
         }
         0
     }
 
-    /// `prlimit` of another process, host process `target`: the limit it
-    /// was left (or, none left, the caller's own, which a child inherits:
-    /// fwe cannot read another's), and a new one left for it to take up
-    /// ([`crate::procreg::push_limit`]), for a caller of its ids or with
-    /// `CAP_SYS_RESOURCE`.
+    /// `prlimit` of another process, host process `target`, for a caller of
+    /// its ids or with `CAP_SYS_RESOURCE` in its user namespace (raising a
+    /// hard limit takes it in the initial one): its limit as its record has it
+    /// (one left for it, else the one it published), and a new one left
+    /// there ([`crate::procreg::push_limit`]), the target woken to take it
+    /// up at once ([`crate::signote::limits_set`]).
     fn prlimit_other(&mut self, target: i32, res: u64, new: u64, old: u64) -> i64 {
         if crate::procreg::read(target).is_none() {
             return err(errno::ESRCH);
         }
         // As Linux: another process's limits are the caller's to see and
         // set if its real, effective and saved ids are all the caller's
-        // real ones, or with CAP_SYS_RESOURCE.
+        // real ones, or with CAP_SYS_RESOURCE over it.
         let privileged = self.creds.has(crate::caps::CAP_SYS_RESOURCE);
         let ids = crate::procreg::ids(target);
         let (uid, gid) = (self.creds.uid, self.creds.gid);
         if !(ids[..3].iter().all(|&u| u == uid) && ids[4..7].iter().all(|&g| g == gid))
-            && !privileged
+            && !self.creds.has_in(&crate::procreg::user_ns(target), crate::caps::CAP_SYS_RESOURCE)
         {
             return err(errno::EPERM);
         }
@@ -2184,16 +2557,16 @@ impl<P: Platform> Kernel<P> {
         }
         // Raising the hard limit takes CAP_SYS_RESOURCE (the other's limit
         // as fwe knows it: what was set for it, else the caller's own).
+        // Its limit, as it published it (from its start, or its parent's
+        // at its fork) or was left it.
+        let Some(Some(had)) = crate::procreg::limit_of(target, res as u32) else {
+            return err(errno::ESRCH);
+        };
         if let Some(n) = &n
             && !privileged
+            && n.rlim_max > had.1
         {
-            let hard = match crate::procreg::pending_limit(target, res as u32) {
-                Some((_, max)) => max,
-                None => own_limit(res).map_or(resource::RLIM_INFINITY, |(_, max)| max),
-            };
-            if n.rlim_max > hard {
-                return err(errno::EPERM);
-            }
+            return err(errno::EPERM);
         }
         // A descriptor limit past what fwe leaves the guest (every fwe
         // process the same range): refused now, as Linux refuses one past
@@ -2214,26 +2587,28 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         if old != 0 {
-            let had = match crate::procreg::pending_limit(target, res as u32) {
-                Some(l) => l,
-                None => match own_limit(res) {
-                    Ok(l) => l,
-                    Err(e) => return err(e),
-                },
-            };
             guest!(uaccess::write(old, Rlimit { rlim_cur: had.0, rlim_max: had.1 }));
         }
-        if let Some(n) = n
-            && let Err(e) = crate::procreg::push_limit(target, res as u32, n.rlim_cur, n.rlim_max)
-        {
-            return err(e);
+        if let Some(n) = n {
+            if let Err(e) = crate::procreg::push_limit(target, res as u32, n.rlim_cur, n.rlim_max) {
+                return err(e);
+            }
+            // Woken to take it up now (it has a mailbox, being fwe's).
+            if crate::signote::limits_set(target).is_ok() {
+                host::kill_process(target, host::WAKE_SIGNAL);
+            }
         }
         0
     }
 
-    /// Take up the resource limits another process set for this one.
+    /// Take up the resource limits another process set for this one, and
+    /// publish them.
     pub(crate) fn take_pending_limits(&mut self) {
-        for (res, soft, hard) in crate::procreg::take_limits() {
+        let taken = crate::procreg::take_limits();
+        if taken.is_empty() {
+            return;
+        }
+        for (res, soft, hard) in taken {
             let value = Rlimit { rlim_cur: soft, rlim_max: hard };
             if u64::from(res) == resource::RLIMIT_NOFILE {
                 let _ = crate::fdtable::set_limit(soft, hard);
@@ -2249,6 +2624,7 @@ impl<P: Platform> Kernel<P> {
                 unsafe { libc::setrlimit(hres as _, &r) };
             }
         }
+        publish_limits();
     }
 
     fn sys_clock_gettime(&self, id: u64, tp: u64) -> i64 {
@@ -2464,9 +2840,10 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     }
 }
 
-/// Linux's inode flags fwe keeps: immutable and append-only, as the
-/// host's user flags; `noatime` and `nodump`, which tmpfs takes, are
-/// accepted and not kept.
+/// Linux's inode flags fwe keeps, those tmpfs takes: immutable and
+/// append-only, as the host's user flags; `nodump` and `noatime` recorded
+/// beside the file ([`crate::modes::Flag`]), the file of `noatime` read
+/// as through `O_NOATIME`.
 #[cfg(target_os = "macos")]
 const FS_IMMUTABLE_FL: u32 = 0x10;
 #[cfg(target_os = "macos")]
@@ -2491,48 +2868,120 @@ impl<P: Platform> Kernel<P> {
             };
         }
         let f: u32 = guest!(uaccess::read(arg));
-        match self.set_inode_flags(fd, f) {
+        // A change of the file: not through a read-only mount (`EROFS`), an
+        // overlay's lower file copied up first.
+        if let Err(e) = self.fd_change(fd) {
+            return err(e);
+        }
+        match self.set_flags_of(FlagFile::Fd(fd), f, false) {
             Ok(()) => 0,
             Err(e) => err(e),
         }
     }
 
-    /// Set the inode flags `f` of the file open as `fd` (`ENOTTY` for one
-    /// that has none).
-    fn set_inode_flags(&mut self, fd: i32, f: u32) -> Result<(), i32> {
-        let st = file_kind_for_flags(fd)?;
-        let host = st.st_flags;
-        if f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
-            return Err(errno::EOPNOTSUPP);
+    /// `FS_IOC_FSGETXATTR` (`set` false) or `FS_IOC_FSSETXATTR` of the
+    /// file open as `fd`, a `struct fsxattr` at `arg`: the inode flags as
+    /// `fsx_xflags`, as `file_getattr` and `file_setattr` have them; what
+    /// only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set, as
+    /// on tmpfs.
+    fn fs_xattr(&mut self, fd: i32, set: bool, arg: u64) -> i64 {
+        if !set {
+            let f = match get_inode_flags(fd) {
+                Ok(f) => f,
+                Err(e) => return err(e),
+            };
+            let mut out = [0u8; FSXATTR_SIZE];
+            out[..4].copy_from_slice(&(flags_to_xflags(f) as u32).to_ne_bytes());
+            guest!(uaccess::write_from(arg, &out));
+            return 0;
         }
+        let given = guest!(uaccess::read_bytes(arg, FSXATTR_SIZE));
+        let word = |at: usize| u32::from_ne_bytes(given[at..at + 4].try_into().unwrap());
+        let xflags = u64::from(word(0));
+        if let Err(e) = self.fd_change(fd) {
+            return err(e);
+        }
+        // `fsx_nextents` (8) is only reported; the extent sizes (4, 16)
+        // and the project (12) are XFS's.
+        let extra = xflags_unsupported(xflags) || word(4) != 0 || word(12) != 0 || word(16) != 0;
+        match self.set_flags_of(FlagFile::Fd(fd), xflags_to_flags(xflags), extra) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        }
+    }
+
+    /// Set the inode flags `f` of `file` (`ENOTTY` for one that has none),
+    /// with Linux's checks in its order: the owner (or `CAP_FOWNER`), then
+    /// `CAP_LINUX_IMMUTABLE` to change the immutable or append-only flag,
+    /// then what the file system keeps (`EOPNOTSUPP`, as `extra`, more
+    /// than inode flags, is too).
+    fn set_flags_of(&mut self, file: FlagFile<'_>, f: u32, extra: bool) -> Result<(), i32> {
+        let st = file.stat()?;
+        let host = st.st_flags;
         // The file's owner's to change, and the immutable and append-only
         // flags only with `CAP_LINUX_IMMUTABLE`.
-        let owner = crate::owners::of_fd(fd, &st).0;
-        if owner != self.creds.fsuid && !self.creds.has(crate::caps::CAP_FOWNER) {
+        let (owner, group) = file.owner(&st);
+        if owner != self.creds.fsuid && !self.creds.has_over(crate::caps::CAP_FOWNER, owner, group)
+        {
             return Err(errno::EPERM);
         }
         let fixed = libc::UF_IMMUTABLE | libc::UF_APPEND;
-        let mut want = host & !(fixed | libc::UF_NODUMP);
+        let mut want_fixed = 0;
         if f & FS_IMMUTABLE_FL != 0 {
-            want |= libc::UF_IMMUTABLE;
+            want_fixed |= libc::UF_IMMUTABLE;
         }
         if f & FS_APPEND_FL != 0 {
-            want |= libc::UF_APPEND;
+            want_fixed |= libc::UF_APPEND;
         }
-        // The flag also marks a kept mode, which stays marked.
-        let kept = crate::modes::marked(&st) && !crate::modes::nodump_fd(fd, &st);
-        if f & FS_NODUMP_FL != 0 || kept {
-            want |= libc::UF_NODUMP;
-        }
-        if (want ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
+        if (want_fixed ^ host) & fixed != 0 && !self.creds.has(crate::caps::CAP_LINUX_IMMUTABLE) {
             return Err(errno::EPERM);
         }
-        if want == host {
-            return Ok(());
+        if extra || f & !(FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL) != 0 {
+            return Err(errno::EOPNOTSUPP);
         }
-        // SAFETY: plain host call on the guest's descriptor.
-        if unsafe { libc::fchflags(fd, want) } != 0 {
-            return Err(host::errno_to_linux(host::last_errno()));
+        // The guest's no-dump and no-access-time are recorded apart from
+        // the host's flag, which also marks a kept mode or owner
+        // ([`crate::modes::set_flag_fd`]).
+        use crate::modes::Flag;
+        let kept = [(Flag::NoDump, FS_NODUMP_FL), (Flag::NoAtime, FS_NOATIME_FL)];
+        let mut released = false;
+        for (flag, bit) in kept {
+            let on = f & bit != 0;
+            if on == file.flag_set(flag) {
+                continue;
+            }
+            // The record is an attribute, which the host refuses to change
+            // on a file it holds immutable or append-only: those are let go
+            // of while it is written.
+            if host & fixed != 0 && !released {
+                file.chflags(host & !fixed)?;
+                released = true;
+            }
+            let r = match file.set_flag(flag, on) {
+                // A mode that denies the owner writing attributes: kept
+                // apart first.
+                Err(errno::EACCES) => file.own().and_then(|()| file.set_flag(flag, on)),
+                r => r,
+            };
+            if let Err(e) = r {
+                let _ = file.chflags(host);
+                return Err(e);
+            }
+        }
+        // As the attribute step left them (a mode kept apart is marked).
+        let now = file.stat()?.st_flags;
+        let mut want = now & !(fixed | libc::UF_NODUMP) | want_fixed;
+        if f & (FS_NODUMP_FL | FS_NOATIME_FL) != 0 || file.kept() {
+            want |= libc::UF_NODUMP;
+        }
+        if let FlagFile::Fd(fd) = file
+            && f & FS_NOATIME_FL != 0
+        {
+            // Read from now on as the flag has it.
+            crate::atime::opened_noatime(fd);
+        }
+        if want != now {
+            file.chflags(want)?;
         }
         Ok(())
     }
@@ -2540,7 +2989,8 @@ impl<P: Platform> Kernel<P> {
     /// `file_getattr(dfd, path, attr, size, at_flags)` (`set` false) or
     /// `file_setattr`: a file's attributes as `struct file_attr` (24
     /// bytes), the inode flags as `fa_xflags`; what only XFS keeps
-    /// (extent sizes, projects) is `EOPNOTSUPP` to set.
+    /// (extent sizes, projects) is `EOPNOTSUPP` to set. A path's file is
+    /// reached by its path, never opened ([`crate::reclocks`]).
     fn sys_file_attr(&mut self, set: bool, a: [u64; 6]) -> i64 {
         const VER0: u64 = 24;
         let (dfd, path, attr, size, at) = (a[0] as i32, a[1], a[2], a[3], a[4]);
@@ -2566,17 +3016,10 @@ impl<P: Platform> Kernel<P> {
             if xflags & !0x1_ffff != 0 {
                 return err(errno::EINVAL);
             }
-            // Beyond what every file system with flags has (immutable,
-            // append-only, sync, no-atime, no-dump, DAX), XFS's.
-            if xflags & !(0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x8000) != 0
-                || word(8) != 0
-                || word(16) != 0
-                || word(20) != 0
-            {
-                Some(Err(errno::EOPNOTSUPP))
-            } else {
-                Some(Ok(xflags))
-            }
+            // The extent sizes (8, 20) and the project (16) are XFS's.
+            let extra =
+                xflags_unsupported(xflags) || word(8) != 0 || word(16) != 0 || word(20) != 0;
+            Some((xflags, extra))
         } else {
             None
         };
@@ -2587,98 +3030,208 @@ impl<P: Platform> Kernel<P> {
         } else {
             guest!(uaccess::read_cstr(path, uaccess::PATH_MAX))
         };
+        let resolved;
+        let cname;
+        // A change of the file: not through a read-only mount (`EROFS`), an
+        // overlay's lower file copied up first.
         let file = if name.is_empty() && at & fcntl::AT_EMPTY_PATH != 0 {
-            // SAFETY: plain host call on a guest descriptor.
-            let fd = unsafe { libc::fcntl(dfd, libc::F_DUPFD_CLOEXEC, 0) };
-            if fd < 0 {
-                return err(errno::EBADF);
+            if set && let Err(e) = self.fd_change(dfd) {
+                return err(e);
             }
-            fd
+            FlagFile::Fd(dfd)
         } else {
             let follow = at & fcntl::AT_SYMLINK_NOFOLLOW == 0;
-            let r = match self.fs().resolve(dfd, &name, follow) {
-                Ok(r) => r,
-                Err(e) => return err(e),
-            };
-            if set && r.mount_flags & crate::mounts::ms::RDONLY != 0 {
-                return err(errno::EROFS);
-            }
-            let Ok(c) = std::ffi::CString::new(r.name.clone()) else {
-                return err(errno::ENOENT);
-            };
-            let flags = libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC;
-            // SAFETY: a NUL-terminated name in a directory descriptor.
-            let fd =
-                unsafe { libc::openat(std::os::fd::AsRawFd::as_raw_fd(&r.dir), c.as_ptr(), flags) };
-            if fd < 0 {
-                // A symbolic link has no attributes.
-                return err(match host::last_errno() {
-                    libc::ELOOP => errno::EOPNOTSUPP,
-                    e => host::errno_to_linux(e),
-                });
-            }
-            fd
-        };
-        let r = (|| {
-            if let Some(w) = wanted {
-                let x = w?;
-                let mut f = 0;
-                for (xf, fl) in [
-                    (0x8, FS_IMMUTABLE_FL),
-                    (0x10, FS_APPEND_FL),
-                    (0x20, 0x8),
-                    (0x40, FS_NOATIME_FL),
-                    (0x80, FS_NODUMP_FL),
-                ] {
-                    if x & xf != 0 {
-                        f |= fl;
+            resolved = match self.fs().resolve(dfd, &name, follow) {
+                Ok(mut r) => {
+                    match if set { r.prepare(crate::fs::Change::Modify) } else { Ok(()) } {
+                        Ok(()) => r,
+                        Err(e) => return err(e),
                     }
                 }
-                return self.set_inode_flags(file, f).map(|()| 0);
+                Err(e) => return err(e),
+            };
+            cname = match resolved.name_c() {
+                Ok(c) => c,
+                Err(e) => return err(e),
+            };
+            FlagFile::At(std::os::fd::AsRawFd::as_raw_fd(&resolved.dir), &cname)
+        };
+        let r = (|| {
+            if let Some((x, extra)) = wanted {
+                return self.set_flags_of(file, xflags_to_flags(x), extra).map(|()| 0);
             }
-            let f = get_inode_flags(file)?;
-            let mut x = 0u64;
-            for (fl, xf) in [(FS_IMMUTABLE_FL, 0x8), (FS_APPEND_FL, 0x10), (FS_NODUMP_FL, 0x80)] {
-                if f & fl != 0 {
-                    x |= xf;
-                }
-            }
+            let x = flags_to_xflags(flags_of(file)?);
             let mut out = vec![0u8; size as usize];
             out[..8].copy_from_slice(&x.to_ne_bytes());
             uaccess::write_from(attr, &out)?;
             Ok(0)
         })();
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(file) };
         match r {
             Ok(v) => v,
+            // A file of no flags (a symbolic link, a device).
             Err(errno::ENOTTY) => err(errno::EOPNOTSUPP),
             Err(e) => err(e),
         }
     }
 }
 
-/// The host status of `fd` if its file has inode flags (a regular file or
-/// directory), else `ENOTTY`.
+/// `struct fsxattr`'s size.
 #[cfg(target_os = "macos")]
-fn file_kind_for_flags(fd: i32) -> Result<libc::stat, i32> {
-    // SAFETY: an all-zero `stat` is a valid out-parameter.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    if unsafe { libc::fstat(fd, &mut st) } != 0 {
-        return Err(host::errno_to_linux(host::last_errno()));
+const FSXATTR_SIZE: usize = 28;
+
+/// `FS_XFLAG_*` and the `FS_*_FL` inode flags they stand for, as Linux's
+/// `fileattr_fill_xflags` pairs them (sync, `FS_SYNC_FL`, is refused).
+#[cfg(target_os = "macos")]
+const XFLAGS: [(u64, u32); 5] = [
+    (0x8, FS_IMMUTABLE_FL),
+    (0x10, FS_APPEND_FL),
+    (0x20, 0x8),
+    (0x40, FS_NOATIME_FL),
+    (0x80, FS_NODUMP_FL),
+];
+
+/// The inode flags `FS_XFLAG_*` set `x` asks for.
+#[cfg(target_os = "macos")]
+fn xflags_to_flags(x: u64) -> u32 {
+    XFLAGS.iter().filter(|(xf, _)| x & xf != 0).fold(0, |f, (_, fl)| f | fl)
+}
+
+/// The `FS_XFLAG_*` set of inode flags `f`.
+#[cfg(target_os = "macos")]
+fn flags_to_xflags(f: u32) -> u64 {
+    XFLAGS.iter().filter(|(_, fl)| f & fl != 0).fold(0, |x, (xf, _)| x | xf)
+}
+
+/// Whether `FS_XFLAG_*` set `x` asks for more than every file system with
+/// flags has (immutable, append-only, sync, no-atime, no-dump, DAX:
+/// `FS_XFLAG_COMMON`): XFS's.
+#[cfg(target_os = "macos")]
+fn xflags_unsupported(x: u64) -> bool {
+    x & !(0x8 | 0x10 | 0x20 | 0x40 | 0x80 | 0x8000) != 0
+}
+
+/// The file an inode-flags call acts on: open as a descriptor, or a name
+/// in a directory, reached by its path ([`crate::host::at_path`]).
+#[cfg(target_os = "macos")]
+#[derive(Clone, Copy)]
+enum FlagFile<'a> {
+    Fd(i32),
+    At(i32, &'a std::ffi::CStr),
+}
+
+#[cfg(target_os = "macos")]
+impl FlagFile<'_> {
+    /// Its host status if it has inode flags (a regular file or a
+    /// directory), else `ENOTTY`.
+    fn stat(self) -> Result<libc::stat, i32> {
+        // SAFETY: an all-zero `stat` is a valid out-parameter.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // SAFETY: as above; a NUL-terminated name in a live directory.
+        let r = unsafe {
+            match self {
+                FlagFile::Fd(fd) => libc::fstat(fd, &mut st),
+                FlagFile::At(dir, name) => {
+                    libc::fstatat(dir, name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
+                }
+            }
+        };
+        if r != 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        let kind = st.st_mode & libc::S_IFMT;
+        if kind != libc::S_IFREG && kind != libc::S_IFDIR {
+            return Err(errno::ENOTTY);
+        }
+        Ok(st)
     }
-    let kind = st.st_mode & libc::S_IFMT;
-    if kind != libc::S_IFREG && kind != libc::S_IFDIR {
-        return Err(errno::ENOTTY);
+
+    /// Its guest owner (host status `st`).
+    fn owner(self, st: &libc::stat) -> (u32, u32) {
+        match self {
+            FlagFile::Fd(fd) => crate::owners::of_fd(fd, st),
+            FlagFile::At(dir, name) => crate::owners::of_at(dir, name, st),
+        }
     }
-    Ok(st)
+
+    /// Whether it has the guest's no-dump flag (host status `st`).
+    fn nodump(self, st: &libc::stat) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::nodump_fd(fd, st),
+            FlagFile::At(dir, name) => crate::modes::nodump_at(dir, name, st),
+        }
+    }
+
+    /// Whether it has the guest's no-access-time flag (host status `st`).
+    fn noatime(self, st: &libc::stat) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::marked(st) && crate::modes::noatime_fd(fd),
+            FlagFile::At(dir, name) => crate::modes::noatime_at(dir, name, st),
+        }
+    }
+
+    /// Whether the guest gave it the kept flag `flag`.
+    fn flag_set(self, flag: crate::modes::Flag) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::flag_set_fd(fd, flag),
+            FlagFile::At(dir, name) => {
+                host::at_path(dir, name, |p| crate::modes::flag_set_path(p, flag)).unwrap_or(false)
+            }
+        }
+    }
+
+    /// Record the guest's kept flag `flag` (`on`) or take it away.
+    fn set_flag(self, flag: crate::modes::Flag, on: bool) -> Result<(), i32> {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::set_flag_fd(fd, flag, on),
+            FlagFile::At(dir, name) => {
+                host::at_path(dir, name, |p| crate::modes::set_flag_path(p, flag, on))?
+            }
+        }
+    }
+
+    /// Keep its mode apart, as the host refused what fwe allowed.
+    fn own(self) -> Result<(), i32> {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::own_fd(fd),
+            FlagFile::At(dir, name) => host::at_path(dir, name, crate::modes::own_path)?,
+        }
+    }
+
+    /// Whether a mode or owner is kept for it.
+    fn kept(self) -> bool {
+        match self {
+            FlagFile::Fd(fd) => crate::modes::kept_fd(fd) || crate::owners::kept_fd(fd),
+            FlagFile::At(dir, name) => host::at_path(dir, name, |p| {
+                crate::modes::kept_path(p) || crate::owners::kept_path(p)
+            })
+            .unwrap_or(false),
+        }
+    }
+
+    /// Give it the host flags `flags`.
+    fn chflags(self, flags: u32) -> Result<(), i32> {
+        let r = match self {
+            // SAFETY: a plain host call on a descriptor.
+            FlagFile::Fd(fd) => unsafe { libc::fchflags(fd, flags) },
+            FlagFile::At(dir, name) => host::at_path(dir, name, |p| {
+                // SAFETY: a NUL-terminated path, the name itself.
+                unsafe { libc::lchflags(p.as_ptr(), flags) }
+            })?,
+        };
+        if r != 0 { Err(host::errno_to_linux(host::last_errno())) } else { Ok(()) }
+    }
 }
 
 /// The inode flags (`FS_IOC_GETFLAGS`) of the file open as `fd`.
 #[cfg(target_os = "macos")]
 fn get_inode_flags(fd: i32) -> Result<u32, i32> {
-    let st = file_kind_for_flags(fd)?;
+    flags_of(FlagFile::Fd(fd))
+}
+
+/// The inode flags of `file`.
+#[cfg(target_os = "macos")]
+fn flags_of(file: FlagFile<'_>) -> Result<u32, i32> {
+    let st = file.stat()?;
     let host = st.st_flags;
     let mut f = 0u32;
     if host & libc::UF_IMMUTABLE != 0 {
@@ -2687,9 +3240,13 @@ fn get_inode_flags(fd: i32) -> Result<u32, i32> {
     if host & libc::UF_APPEND != 0 {
         f |= FS_APPEND_FL;
     }
-    if crate::modes::nodump_fd(fd, &st) {
+    if file.nodump(&st) {
         f |= FS_NODUMP_FL;
     }
+    if file.noatime(&st) {
+        f |= FS_NOATIME_FL;
+    }
+
     Ok(f)
 }
 
@@ -2860,7 +3417,7 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     } else {
         Vec::new()
     };
-    // `struct pollfd` and the POLL* bits match the host's.
+    // `struct pollfd` is laid out as the host's; its events are translated below.
     let mut set = vec![libc::pollfd { fd: 0, events: 0, revents: 0 }; nfds as usize];
     // SAFETY: a `pollfd` is plain data, as many bytes as the guest's.
     let bytes = unsafe {
@@ -2870,6 +3427,11 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         )
     };
     guest!(uaccess::read_into(fds, bytes));
+    // The events as the guest numbers them, and as the host does.
+    let asked: Vec<i16> = set.iter().map(|p| p.events).collect();
+    for p in &mut set {
+        p.events = host::poll_events_to_host(p.events);
+    }
     let deadline =
         (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
     let mut first = true;
@@ -2889,60 +3451,68 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
             })
         };
         first = false;
-        let mut ready = match poll_linux(&mut set, wait) {
-            Ok(n) => i64::from(n),
-            Err(e) => return err(e),
-        };
+        if let Err(e) = poll_linux(&mut set, wait) {
+            return err(e);
+        }
         for &i in &fifos {
             let p = &mut set[i];
             if p.revents & libc::POLLHUP == 0
                 && matches!(crate::fifo::probe(p.fd), crate::fifo::Probe::HungUp)
             {
-                if p.revents == 0 {
-                    ready += 1;
-                }
                 p.revents |= libc::POLLHUP;
             }
         }
+        let revents: Vec<i16> = set
+            .iter()
+            .zip(&asked)
+            .map(|(p, &a)| read_hangup(p.fd, a, host::poll_revents_to_linux(p.revents, a)))
+            .collect();
+        let ready = revents.iter().filter(|&&r| r != 0).count() as i64;
         if ready > 0 || fifos.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d)
         {
-            for (i, p) in set.iter().enumerate() {
+            for (i, r) in revents.iter().enumerate() {
                 let at = fds + (i * size_of::<Pollfd>() + 6) as u64;
-                guest!(uaccess::write(at, p.revents));
+                guest!(uaccess::write(at, *r));
             }
             return ready;
         }
     }
 }
 
+/// `revents` (Linux's) of `fd`, asked `asked`, with `POLLRDHUP` when it
+/// was asked and `fd` is a stream socket whose peer has shut its writing
+/// side: readable, with nothing left to read (the host has no such
+/// event; it is looked for once the socket is readable, so with `POLLIN`
+/// asked too).
+fn read_hangup(fd: i32, asked: i16, revents: i16) -> i16 {
+    if asked & host::POLLRDHUP == 0 || revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+        return revents;
+    }
+    let mut ty: libc::c_int = 0;
+    let mut tl = size_of::<libc::c_int>() as libc::socklen_t;
+    let mut b = 0u8;
+    // SAFETY: valid out-parameters; a peek of at most a byte, not waited
+    // for.
+    let ended = unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&mut ty as *mut i32).cast(), &mut tl)
+            == 0
+            && ty == libc::SOCK_STREAM
+            && libc::recv(fd, (&mut b as *mut u8).cast(), 1, libc::MSG_PEEK | libc::MSG_DONTWAIT)
+                == 0
+    };
+    if ended { revents | host::POLLRDHUP } else { revents }
+}
+
 /// The host's interfaces' IPv4 addresses, as (name as Linux has it, its
 /// address, its mask): `lo0` is Linux's `lo`.
 fn host_ipv4_addrs() -> Vec<(Vec<u8>, [u8; 4], [u8; 4])> {
     let mut out = Vec::new();
-    let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-    // SAFETY: `getifaddrs` fills the list, freed below; each entry's
-    // pointers are valid until then.
-    unsafe {
-        if libc::getifaddrs(&mut list) != 0 {
-            return out;
+    for f in host::interfaces() {
+        for a in f.addrs.iter().filter(|a| a.addr.len() == 4) {
+            let mask = u32::MAX.checked_shl(32 - u32::from(a.prefix)).unwrap_or(0);
+            let addr = [a.addr[0], a.addr[1], a.addr[2], a.addr[3]];
+            out.push((f.name.clone(), addr, mask.to_be_bytes()));
         }
-        let mut at = list;
-        while !at.is_null() {
-            let i = &*at;
-            if !i.ifa_addr.is_null() && i32::from((*i.ifa_addr).sa_family) == libc::AF_INET {
-                let name = std::ffi::CStr::from_ptr(i.ifa_name).to_bytes();
-                let name = if name == b"lo0" { b"lo".to_vec() } else { name.to_vec() };
-                let sin = &*(i.ifa_addr as *const libc::sockaddr_in);
-                let mask = if i.ifa_netmask.is_null() {
-                    [0; 4]
-                } else {
-                    (*(i.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr.to_ne_bytes()
-                };
-                out.push((name, sin.sin_addr.s_addr.to_ne_bytes(), mask));
-            }
-            at = i.ifa_next;
-        }
-        libc::freeifaddrs(list);
     }
     out
 }
@@ -2983,25 +3553,36 @@ fn ifconf(arg: u64, addrs: &[(Vec<u8>, [u8; 4], [u8; 4])]) -> i64 {
 /// the descriptor limit fwe keeps, the host's, or for a limit the host does
 /// not have, Linux's default.
 impl<P: Platform> Kernel<P> {
-    /// The host processes `getpriority`/`setpriority`'s `which` and `who`
-    /// name, among those the caller sees: a process, a process group or a
-    /// user's processes (`who` 0: the caller's own).
-    fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<i32>, i32> {
+    /// What `getpriority`/`setpriority`'s `which` and `who` name, among
+    /// the processes the caller sees: a process or a thread of this one
+    /// (`who` 0: the calling thread, as on Linux), a process group or a
+    /// user's processes (`who` 0: the caller's own; a user as the caller's
+    /// user namespace numbers it).
+    fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<PrioTarget>, i32> {
         use fwe_abi::prio;
         // SAFETY: plain host calls.
         let (me, my_group) = unsafe { (libc::getpid(), libc::getpgrp()) };
+        let processes = |v: Vec<i32>| v.into_iter().map(PrioTarget::Process).collect();
         let seen = || {
             crate::procpid::listed()
                 .into_iter()
                 .filter_map(crate::pidns::to_host)
                 .collect::<Vec<_>>()
         };
+        // The main thread names the process; another of this process's
+        // threads names itself.
+        let own_thread = |tid: i32| {
+            if tid == thread::tgid() { PrioTarget::Process(me) } else { PrioTarget::Thread(tid) }
+        };
         Ok(match which {
-            prio::PROCESS if who == 0 => vec![me],
-            prio::PROCESS => crate::pidns::to_host(who)
-                .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
-                .into_iter()
-                .collect(),
+            prio::PROCESS if who == 0 => vec![own_thread(thread::tid())],
+            prio::PROCESS if thread::host_thread(who).is_some() => vec![own_thread(who)],
+            prio::PROCESS => processes(
+                crate::pidns::to_host(who)
+                    .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
+                    .into_iter()
+                    .collect(),
+            ),
             prio::PGRP => {
                 let group = if who == 0 {
                     my_group
@@ -3013,12 +3594,23 @@ impl<P: Platform> Kernel<P> {
                 };
                 // (A process gone meanwhile has no group: -1, never one's.)
                 // SAFETY: plain host call.
-                seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect()
+                processes(
+                    seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect(),
+                )
             }
             prio::USER => {
-                let uid = if who == 0 { self.creds.uid } else { who as u32 };
+                // The records hold initial-namespace ids; a user the
+                // caller's namespace does not map names none.
+                let uid = if who == 0 {
+                    self.creds.uid
+                } else {
+                    match crate::userns::from_ns(who as u32, false) {
+                        Some(u) => u,
+                        None => return Ok(Vec::new()),
+                    }
+                };
                 let own = |h: i32| if h == me { self.creds.uid } else { crate::procreg::ids(h)[0] };
-                seen().into_iter().filter(|&h| own(h) == uid).collect()
+                processes(seen().into_iter().filter(|&h| own(h) == uid).collect())
             }
             _ => return Err(errno::EINVAL),
         })
@@ -3031,7 +3623,10 @@ impl<P: Platform> Kernel<P> {
         match self.prio_targets(which, who) {
             Ok(t) => t
                 .iter()
-                .map(|&h| crate::procreg::nice(h))
+                .map(|t| match *t {
+                    PrioTarget::Process(h) => crate::procreg::nice(h),
+                    PrioTarget::Thread(tid) => thread::nice_of(tid),
+                })
                 .min()
                 .map_or(err(errno::ESRCH), |n| (20 - n) as i64),
             Err(e) => err(e),
@@ -3049,21 +3644,42 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         let nice = nice.clamp(-20, 19);
+        // Lowering a nice value past the limit takes CAP_SYS_NICE in the
+        // initial user namespace; another user's process, in its own.
         let privileged = self.creds.has(crate::caps::CAP_SYS_NICE);
+        let over =
+            |h: i32| self.creds.has_in(&crate::procreg::user_ns(h), crate::caps::CAP_SYS_NICE);
         // `RLIMIT_NICE` bounds the least nice value as 20 less it.
         let floor =
             20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let mut result = err(errno::ESRCH);
-        for h in targets {
+        for t in targets {
+            let h = match t {
+                PrioTarget::Process(h) => h,
+                PrioTarget::Thread(tid) => {
+                    // A thread of this process: its own value, kept for
+                    // it (the host process keeps the process's).
+                    let r = if nice < thread::nice_of(tid) && !privileged && nice < floor {
+                        err(errno::EACCES)
+                    } else if thread::set_nice_of(tid, nice) {
+                        0
+                    } else {
+                        err(errno::ESRCH)
+                    };
+                    if r != 0 || result == err(errno::ESRCH) {
+                        result = r;
+                    }
+                    continue;
+                }
+            };
             let ids = if h == me {
                 [self.creds.uid, self.creds.euid]
             } else {
                 let i = crate::procreg::ids(h);
                 [i[0], i[1]]
             };
-            let r = if !privileged && !ids.contains(&self.creds.euid) {
+            let r = if !ids.contains(&self.creds.euid) && !over(h) {
                 err(errno::EPERM)
             } else if nice < crate::procreg::nice(h) && !privileged && nice < floor {
                 err(errno::EACCES)
@@ -3082,6 +3698,14 @@ impl<P: Platform> Kernel<P> {
         }
         result
     }
+}
+
+/// What a `getpriority`/`setpriority` call acts on.
+enum PrioTarget {
+    /// A host process (for this one, its main thread).
+    Process(i32),
+    /// Another thread of this process, by tid.
+    Thread(i32),
 }
 
 /// For a clock id Linux's CPU-time clocks encode (negative: a pid or tid,
@@ -3107,8 +3731,7 @@ pub(crate) fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
         let tid = if who == 0 { thread::tid() } else { who };
         thread::host_state(tid).map(|(user, system, _)| (user, system))
     } else if who == 0 || who == me {
-        // SAFETY: getpid cannot fail.
-        crate::procpid::cpu_ns(unsafe { libc::getpid() })
+        crate::procpid::cpu_ns(crate::host::pid())
     } else {
         crate::pidns::to_host(who).and_then(crate::procpid::cpu_ns)
     };
@@ -3265,12 +3888,22 @@ mod itimer {
     }
 }
 
+/// Publish this process's resource limits in its record, where another
+/// process's `prlimit` reads them: as its program starts, as a fork child
+/// starts, and when they change.
+pub(crate) fn publish_limits() {
+    let all = (0..resource::RLIM_NLIMITS)
+        .filter_map(|res| own_limit(res).ok().map(|(soft, hard)| (res as u32, soft, hard)))
+        .collect();
+    crate::procreg::set_own_rlimits(all);
+}
+
 /// The caller's soft limit of resource `res`.
 pub(crate) fn own_limit_of(res: u64) -> u64 {
     own_limit(res).map_or(resource::RLIM_INFINITY, |(soft, _)| soft)
 }
 
-fn own_limit(res: u64) -> Result<(u64, u64), i32> {
+pub(crate) fn own_limit(res: u64) -> Result<(u64, u64), i32> {
     if res == resource::RLIMIT_NOFILE {
         // Virtual: the host's limit also covers fwe's own descriptors.
         return Ok(crate::fdtable::limit());
@@ -3309,6 +3942,9 @@ pub(crate) static THP_DISABLE: std::sync::atomic::AtomicBool =
 /// per process, which a program setting it before an `execve` (`setarch`)
 /// cannot tell apart.
 pub(crate) static PERSONALITY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// The working directory, as a directory descriptor.
+const CWD: i32 = fwe_abi::fcntl::AT_FDCWD as i32;
 
 /// Personality flags fwe acts on: `select`'s timeout left as given, and
 /// `uname` reporting a 2.6 release. The others (address-space layout,
@@ -3379,21 +4015,16 @@ fn with_remaining(timeout: u64, f: impl FnOnce() -> i64) -> i64 {
     r
 }
 
-/// The affinity `sched_setaffinity` set for this process, if it did.
-pub(crate) static AFFINITY: std::sync::Mutex<Option<Vec<u64>>> = std::sync::Mutex::new(None);
-
-/// The CPU the caller is taken to run on: the first of its affinity (the
-/// host's scheduler places it where it will).
+/// The CPU the caller is taken to run on: the first of its affinity.
+/// macOS offers no supported way to learn the CPU a thread runs on (its
+/// scheduler places it where it will), so this is where Linux would keep
+/// a thread bound to its affinity's first CPU.
 pub(crate) fn own_cpu() -> usize {
-    let set = AFFINITY.lock().unwrap_or_else(|e| e.into_inner()).clone();
-    set.and_then(|words| {
-        words
-            .iter()
-            .enumerate()
-            .find(|(_, w)| **w != 0)
-            .map(|(i, w)| i * 64 + w.trailing_zeros() as usize)
-    })
-    .unwrap_or(0)
+    crate::procreg::own_affinity()
+        .iter()
+        .enumerate()
+        .find(|(_, w)| **w != 0)
+        .map_or(0, |(i, w)| i * 64 + w.trailing_zeros() as usize)
 }
 
 /// The online CPUs, as a mask of 64-bit words.
@@ -3449,6 +4080,7 @@ mod tests {
             addr: u64,
             len: u64,
             _known: Option<&[(u64, u64)]>,
+            _cache: Option<&[u8]>,
         ) -> Result<(), crate::PrepareFailed> {
             if self.refuse > 0 {
                 self.refuse -= 1;
@@ -3490,6 +4122,28 @@ mod tests {
         )
     }
 
+    /// A fixed mapping below `vm.mmap_min_addr` is refused (`EPERM`) to a
+    /// caller without `CAP_SYS_RAWIO`, as is a move there; a hint there is
+    /// only a hint.
+    #[test]
+    fn fixed_mappings_below_mmap_min_addr_need_rawio() {
+        use fwe_abi::mman::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
+        let _g = mapping_lock();
+        let mut k = kernel();
+        k.creds.caps.effective &= !(1 << crate::caps::CAP_SYS_RAWIO);
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        for fixed in [MAP_FIXED, MAP_FIXED_NOREPLACE] {
+            let r = k.syscall(nr::MMAP, [0x8000, 0x4000, 3, anon | fixed, u64::MAX, 0]);
+            assert_eq!(r, err(errno::EPERM));
+        }
+        let p = k.syscall(nr::MMAP, [0, 0x4000, 3, anon, u64::MAX, 0]);
+        assert!(p > 0);
+        // MREMAP_MAYMOVE | MREMAP_FIXED.
+        let r = k.syscall(nr::MREMAP, [p as u64, 0x4000, 0x4000, 3, 0x8000, 0]);
+        assert_eq!(r, err(errno::EPERM));
+        assert_eq!(k.syscall(nr::MUNMAP, [p as u64, 0x4000, 0, 0, 0, 0]), 0);
+    }
+
     /// The credentials survive an `execve` that re-executes fwe, with the
     /// saved IDs becoming the effective ones, and a bad record is refused.
     #[test]
@@ -3509,6 +4163,42 @@ mod tests {
         assert!(bad.restore_exec_state(&state[..state.len() - 1]).is_err());
         assert!(bad.restore_exec_state(b"garbage!").is_err());
         assert_eq!(bad.creds.resuid(), kernel().creds.resuid());
+    }
+
+    /// A set-user-ID program run by re-executing fwe: its auxiliary vector,
+    /// read from the exec state before its kernel exists, and its kernel's
+    /// credentials agree, and the exec is a secure one.
+    #[test]
+    fn exec_state_carries_what_the_program_grants() {
+        let mut k = kernel();
+        assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
+        crate::EXEC_PRIVS.with(|p| p.set(crate::ExecPrivs { uid: Some(0), ..Default::default() }));
+        let state = k.exec_state();
+        let ids = crate::AuxIds::at_start(Some(&state)).unwrap();
+        assert_eq!((ids.uid, ids.euid, ids.secure), (1000, 0, true));
+        let mut new = kernel();
+        new.restore_exec_state(&state).unwrap();
+        assert_eq!(new.creds.resuid(), (1000, 0, 0));
+    }
+
+    /// An alarm clock's timerfd needs `CAP_WAKE_ALARM`, once its flags are
+    /// known good.
+    #[test]
+    fn alarm_timerfds_need_cap_wake_alarm() {
+        use fwe_abi::clock::{CLOCK_BOOTTIME_ALARM, CLOCK_REALTIME_ALARM};
+        let mut k = kernel();
+        // (Elsewhere the host's own timerfd needs the host's capability.)
+        #[cfg(target_os = "macos")]
+        {
+            let fd = k.syscall(nr::TIMERFD_CREATE, [CLOCK_REALTIME_ALARM, 0, 0, 0, 0, 0]);
+            assert!(fd >= 0, "{fd}");
+            assert_eq!(k.syscall(nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]), 0);
+        }
+        assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
+        for clock in [CLOCK_REALTIME_ALARM, CLOCK_BOOTTIME_ALARM] {
+            assert_eq!(k.syscall(nr::TIMERFD_CREATE, [clock, 0, 0, 0, 0, 0]), err(errno::EPERM));
+            assert_eq!(k.syscall(nr::TIMERFD_CREATE, [clock, 1, 0, 0, 0, 0]), err(errno::EINVAL));
+        }
     }
 
     #[test]
@@ -3919,7 +4609,8 @@ mod tests {
         let p = &mut info as *mut _ as u64;
         assert_eq!(kernel().syscall(nr::SYSINFO, [p, 0, 0, 0, 0, 0]), 0);
         assert!(info.uptime > 0);
-        assert_eq!(info.totalram, crate::procfs::MEM_TOTAL_KB * 1024);
+        assert_eq!(info.totalram, host::memory().total);
+        assert!(info.procs >= 1);
         assert!(info.freeram <= info.totalram);
         assert_eq!(info.mem_unit, 1);
     }
@@ -4005,8 +4696,15 @@ mod tests {
                 p as u64
             };
             k.brk = Brk::reserve(probe, size);
-            if k.brk.limit != k.brk.start {
+            // All of it: a range taken in part meanwhile is let go and
+            // tried again.
+            if k.brk.limit == probe + size {
                 break;
+            }
+            if k.brk.limit > probe {
+                crate::mm::untrack(probe, k.brk.limit - probe);
+                // SAFETY: the test's own reservation, released.
+                unsafe { libc::munmap(probe as *mut libc::c_void, (k.brk.limit - probe) as usize) };
             }
         }
         assert_eq!(k.brk.limit, probe + size);
@@ -4075,18 +4773,112 @@ mod tests {
     /// signal.
     #[test]
     fn no_guest_pid_signals_the_hosts_processes() {
+        let _held = crate::thread::signals_held();
         let mut k = kernel();
-        let info = [0u8; 128];
+        // `SI_QUEUE`: a code a process may send (with the kernel's own,
+        // `SI_USER`, Linux refuses any but the caller itself first).
+        let mut info = [0u8; 128];
+        info[8..12].copy_from_slice(&(-1i32).to_ne_bytes());
         for pid in [-1i64, 0, -5] {
             let r = k.syscall(nr::RT_SIGQUEUEINFO, [pid as u64, 10, info.as_ptr() as u64, 0, 0, 0]);
             assert_eq!(r, err(errno::ESRCH), "rt_sigqueueinfo to {pid}");
         }
+        let kernel_code = [0u8; 128];
+        let r = k
+            .syscall(nr::RT_SIGQUEUEINFO, [-1i64 as u64, 10, kernel_code.as_ptr() as u64, 0, 0, 0]);
+        assert_eq!(r, err(errno::EPERM));
         assert_eq!(host::kill(-1, libc::SIGUSR1), err(errno::ESRCH));
         for pid in [-1, 0, -5] {
             assert_eq!(host::kill_process(pid, libc::SIGUSR1), err(errno::ESRCH));
         }
         // tgkill's thread group must be a process.
         assert_eq!(k.syscall(nr::TGKILL, [-1i64 as u64, 1, 0, 0, 0, 0]), err(errno::EINVAL));
+    }
+
+    /// fwe's internal wake signal, whose host default action ends a
+    /// process, never reaches a process that is not fwe's (one this test
+    /// started), whatever asks: a signal the host lacks, a descriptor
+    /// (`pidfd_getfd`), its memory (`process_vm_readv`).
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn internal_signals_never_reach_other_processes() {
+        let _held = crate::thread::signals_held();
+        let mut k = kernel();
+        let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
+        let pid = child.id() as i32;
+        assert!(!host::is_fwe(pid));
+        assert_eq!(host::kill_process(pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        assert_eq!(host::kill(-pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        // A real-time signal, which only fwe's mailbox carries.
+        assert_eq!(k.syscall(nr::KILL, [pid as u64, 40, 0, 0, 0, 0]), err(errno::EINVAL));
+        let fd = k.syscall(nr::PIDFD_OPEN, [pid as u64, 0, 0, 0, 0, 0]);
+        assert!(fd >= 0, "pidfd_open of a host process: {fd}");
+        assert_eq!(k.syscall(nr::PIDFD_GETFD, [fd as u64, 0, 0, 0, 0, 0]), err(errno::EPERM));
+        let mut buf = [0u8; 8];
+        let iov = [buf.as_mut_ptr() as u64, 8];
+        let remote = [0x1000u64, 8];
+        let a = [pid as u64, iov.as_ptr() as u64, 1, remote.as_ptr() as u64, 1, 0];
+        assert_eq!(k.syscall(nr::PROCESS_VM_READV, a), err(errno::EPERM));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "the host process lives");
+        child.kill().unwrap();
+        child.wait().unwrap();
+    }
+
+    /// `getrusage(RUSAGE_THREAD)` is the calling thread's own time: a
+    /// thread just started has run next to nothing, whatever the process
+    /// has.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn thread_usage_is_the_threads_own() {
+        let user_ms = |w: &[i64; 18]| w[0] * 1000 + w[1] / 1000;
+        let start = std::time::Instant::now();
+        let mut x = 0u64;
+        while start.elapsed() < std::time::Duration::from_millis(60) {
+            x = std::hint::black_box(x.wrapping_mul(31).wrapping_add(7));
+        }
+        let mut process = [0i64; 18];
+        let mut k = kernel();
+        k.syscall(nr::GETRUSAGE, [0, process.as_mut_ptr() as u64, 0, 0, 0, 0]);
+        let fresh = std::thread::spawn(|| {
+            let mut own = [0i64; 18];
+            let mut k = kernel();
+            let r = k.syscall(nr::GETRUSAGE, [1, own.as_mut_ptr() as u64, 0, 0, 0, 0]);
+            (r, own)
+        })
+        .join()
+        .unwrap();
+        assert_eq!(fresh.0, 0);
+        assert!(user_ms(&process) >= 40, "the process ran: {}", user_ms(&process));
+        assert!(user_ms(&fresh.1) < 20, "a new thread's own: {}", user_ms(&fresh.1));
+    }
+
+    /// A signal to a process group goes to each member the caller may
+    /// signal: one whose only member it may not (a process fwe has no
+    /// record of counts as root's) gives `EPERM` and signals nothing, as
+    /// Linux's `kill_pgrp`.
+    #[test]
+    fn group_kill_checks_each_member() {
+        let _held = crate::thread::signals_held();
+        use std::os::unix::process::CommandExt;
+        let mut k = kernel();
+        let mut child =
+            std::process::Command::new("/bin/sleep").arg("30").process_group(0).spawn().unwrap();
+        let pgid = child.id() as i64;
+        k.creds.uid = 1000;
+        k.creds.euid = 1000;
+        k.creds.suid = 1000;
+        k.creds.caps.effective = 0;
+        assert_eq!(k.syscall(nr::KILL, [-pgid as u64, 15, 0, 0, 0, 0]), err(errno::EPERM));
+        assert_eq!(k.syscall(nr::KILL, [-pgid as u64, 0, 0, 0, 0, 0]), err(errno::EPERM));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert!(child.try_wait().unwrap().is_none(), "the member it may not signal lives");
+        // With the capability, it takes the signal.
+        k.creds.caps.effective = 1 << crate::caps::CAP_KILL;
+        assert_eq!(k.syscall(nr::KILL, [-pgid as u64, 15, 0, 0, 0, 0]), 0);
+        let status = child.wait().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(status.signal(), Some(libc::SIGTERM));
     }
 
     /// Code the host placed with no room for its stubs near it is mapped
@@ -4136,6 +4928,58 @@ mod tests {
         for p in [a, b, r] {
             assert_eq!(k.syscall(nr::MUNMAP, [p, len, 0, 0, 0, 0]), 0);
         }
+    }
+
+    /// Anonymous huge pages come from the pool, which is empty
+    /// (`ENOMEM`), unless the mapping reserves none; a size the hardware
+    /// lacks is `EINVAL`, and so is a file that is not hugetlbfs's.
+    #[test]
+    fn huge_pages_are_none_to_reserve() {
+        let _mapping = mapping_lock();
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let (anon, rw, len) = (MAP_PRIVATE | MAP_ANONYMOUS, PROT_READ | PROT_WRITE, 2u64 << 20);
+        let huge = anon | MAP_HUGETLB;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, huge, u64::MAX, 0]), err(errno::ENOMEM));
+        let shared = MAP_SHARED | MAP_ANONYMOUS | MAP_HUGETLB;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, shared, u64::MAX, 0]), err(errno::ENOMEM));
+        let sized = huge | 30 << MAP_HUGE_SHIFT;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, sized, u64::MAX, 0]), err(errno::ENOMEM));
+        let odd = huge | 20 << MAP_HUGE_SHIFT;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, rw, odd, u64::MAX, 0]), err(errno::EINVAL));
+        assert_eq!(k.syscall(nr::MMAP, [0, 0, rw, huge, u64::MAX, 0]), err(errno::EINVAL));
+        let p = k.syscall(nr::MMAP, [0, len, rw, huge | MAP_NORESERVE, u64::MAX, 0]);
+        assert!(p > 0, "{p}");
+        assert_eq!(k.syscall(nr::MUNMAP, [p as u64, len, 0, 0, 0, 0]), 0);
+        let f = std::fs::File::open("/dev/null").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f) as u64;
+        let file = MAP_PRIVATE | MAP_HUGETLB;
+        assert_eq!(k.syscall(nr::MMAP, [0, len, PROT_READ, file, fd, 0]), err(errno::EINVAL));
+    }
+
+    /// `MADV_COLD` and `MADV_PAGEOUT` refuse locked memory (`EINVAL`),
+    /// which stays resident, and take any other.
+    #[test]
+    fn locked_memory_is_not_paged_out() {
+        let _mapping = mapping_lock();
+        use fwe_abi::mman::*;
+        let mut k = kernel();
+        let page = k.page_size;
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let p = k.syscall(nr::MMAP, [0, 2 * page, PROT_READ | PROT_WRITE, anon, u64::MAX, 0]);
+        let p = p as u64;
+        for advice in [20, 21] {
+            assert_eq!(k.syscall(nr::MADVISE, [p, 2 * page, advice, 0, 0, 0]), 0);
+        }
+        assert_eq!(k.syscall(nr::MLOCK, [p + page, page, 0, 0, 0, 0]), 0);
+        for advice in [20, 21] {
+            assert_eq!(k.syscall(nr::MADVISE, [p, page, advice, 0, 0, 0]), 0);
+            let r = k.syscall(nr::MADVISE, [p, 2 * page, advice, 0, 0, 0]);
+            assert_eq!(r, err(errno::EINVAL));
+        }
+        assert_eq!(k.syscall(nr::MUNLOCK, [p + page, page, 0, 0, 0, 0]), 0);
+        assert_eq!(k.syscall(nr::MADVISE, [p, 2 * page, 21, 0, 0, 0]), 0);
+        assert_eq!(k.syscall(nr::MUNMAP, [p, 2 * page, 0, 0, 0, 0]), 0);
     }
 
     /// `mremap`: checked as Linux checks it; a range grows in place with
@@ -4203,8 +5047,15 @@ mod tests {
                 crate::pidfd::wait_target(fd as i32),
                 Ok((std::process::id() as i32, false))
             );
+            // This process is not on its way out; flags are refused first.
+            assert_eq!(call(nr::PROCESS_MRELEASE, [fd as u64, 0, 0, 0]), err(errno::EINVAL));
+            assert_eq!(call(nr::PROCESS_MRELEASE, [fd as u64, 1, 0, 0]), err(errno::EINVAL));
             assert_eq!(call(nr::CLOSE, [fd as u64, 0, 0, 0]), 0);
         }
+        assert_eq!(call(nr::PROCESS_MRELEASE, [0, 1, 0, 0]), err(errno::EINVAL));
+        assert_eq!(call(nr::PROCESS_MRELEASE, [0, 0, 0, 0]), err(errno::EBADF));
+        // Nothing is ever left to restart.
+        assert_eq!(call(nr::RESTART_SYSCALL, [0, 0, 0, 0]), err(errno::EINTR));
         let _ = PIDFD_NONBLOCK;
     }
 
@@ -4226,5 +5077,84 @@ mod tests {
         assert_eq!(call([PR_GET_SPECULATION_CTRL, 0, 1, 0, 0]), err(errno::EINVAL));
         assert_eq!(call([PR_GET_SPECULATION_CTRL, 9, 0, 0, 0]), err(errno::ENODEV));
         assert_eq!(call([PR_SET_SPECULATION_CTRL, 0, 0, 0, 0]), err(errno::ENXIO));
+    }
+
+    /// The no-dump flag the guest sets is its own, apart from the host flag
+    /// that marks a kept owner: a file with an owner kept does not read as
+    /// no-dump, clearing the flags keeps the owner, and the guest's
+    /// no-dump outlives the owner going back to root.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn nodump_is_the_guests_apart_from_kept_metadata() {
+        const FS_NODUMP_FL: u32 = 0x40;
+        let path = std::env::temp_dir().join(format!("fwe-nodump-{}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+        let mut k = kernel();
+        let mut flags = |set: Option<u32>| {
+            let mut v = set.unwrap_or(0);
+            let req = if set.is_some() { 0x4008_6602 } else { 0x8008_6601 };
+            let r = k.syscall(nr::IOCTL, [fd as u64, req, &mut v as *mut u32 as u64, 0, 0, 0]);
+            assert_eq!(r, 0);
+            v
+        };
+        let owner = || crate::owners::of_fd(fd, &super::FlagFile::Fd(fd).stat().unwrap());
+        crate::owners::keep_fd(fd, (1000, 100)).unwrap();
+        assert_eq!(flags(None), 0, "a kept owner is not no-dump");
+        flags(Some(0));
+        assert_eq!(owner(), (1000, 100), "clearing the flags keeps the owner");
+        flags(Some(FS_NODUMP_FL));
+        assert_eq!(flags(None), FS_NODUMP_FL);
+        assert_eq!(owner(), (1000, 100));
+        crate::owners::keep_fd(fd, (0, 0)).unwrap();
+        assert_eq!(flags(None), FS_NODUMP_FL, "the guest's no-dump stays");
+        flags(Some(0));
+        assert_eq!(flags(None), 0);
+        assert!(!crate::modes::marked(&super::FlagFile::Fd(fd).stat().unwrap()));
+        drop(f);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The no-access-time flag is kept, apart from no-dump and a kept
+    /// owner, and read back through `FS_IOC_GETFLAGS` and as
+    /// `FS_XFLAG_NOATIME` through `FS_IOC_FSGETXATTR`; `FS_IOC_FSSETXATTR`
+    /// sets the flags `FS_IOC_SETFLAGS` does, and refuses XFS's
+    /// (`EOPNOTSUPP`); a file of the flag reads as `O_NOATIME`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn noatime_is_kept_and_seen_through_both_requests() {
+        use fwe_abi::ioctl::*;
+        const FS_NODUMP_FL: u32 = 0x40;
+        const FS_NOATIME_FL: u32 = 0x80;
+        const XFLAG_NOATIME: u32 = 0x40;
+        const XFLAG_NODUMP: u32 = 0x80;
+        let path = std::env::temp_dir().join(format!("fwe-noatime-{}", std::process::id()));
+        let f = std::fs::File::create(&path).unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&f);
+        let mut k = kernel();
+        let mut ioctl =
+            |req: u64, arg: *mut u8| k.syscall(nr::IOCTL, [fd as u64, req, arg as u64, 0, 0, 0]);
+        let mut v = FS_NOATIME_FL;
+        assert_eq!(ioctl(FS_IOC_SETFLAGS, (&raw mut v).cast()), 0);
+        v = 0;
+        assert_eq!(ioctl(FS_IOC_GETFLAGS, (&raw mut v).cast()), 0);
+        assert_eq!(v, FS_NOATIME_FL, "no-access-time, and not no-dump");
+        assert!(crate::modes::noatime_fd(fd));
+        crate::owners::keep_fd(fd, (1000, 100)).unwrap();
+        assert_eq!(ioctl(FS_IOC_GETFLAGS, (&raw mut v).cast()), 0);
+        assert_eq!(v, FS_NOATIME_FL, "a kept owner is still not no-dump");
+        let mut fsx = [0u8; 28];
+        assert_eq!(ioctl(FS_IOC_FSGETXATTR, fsx.as_mut_ptr()), 0);
+        assert_eq!(u32::from_ne_bytes(fsx[..4].try_into().unwrap()), XFLAG_NOATIME);
+        fsx[..4].copy_from_slice(&XFLAG_NODUMP.to_ne_bytes());
+        assert_eq!(ioctl(FS_IOC_FSSETXATTR, fsx.as_mut_ptr()), 0);
+        assert_eq!(ioctl(FS_IOC_GETFLAGS, (&raw mut v).cast()), 0);
+        assert_eq!(v, FS_NODUMP_FL);
+        assert!(!crate::modes::noatime_fd(fd));
+        // An extent size, XFS's.
+        fsx[4..8].copy_from_slice(&4096u32.to_ne_bytes());
+        assert_eq!(ioctl(FS_IOC_FSSETXATTR, fsx.as_mut_ptr()), err(errno::EOPNOTSUPP));
+        drop(f);
+        let _ = std::fs::remove_file(&path);
     }
 }

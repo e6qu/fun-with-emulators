@@ -7,18 +7,24 @@
 //! the guest sends is answered at once: fwe writes each reply message to
 //! the other end, where the guest receives it, as the kernel queues
 //! replies on the socket. The namespace has one interface, `lo` (index
-//! 1), which `RTM_GETLINK` describes, `RTM_NEWLINK` brings up or down
-//! (with `CAP_NET_ADMIN`), and whose addresses `RTM_GETADDR` lists once it
-//! is up; any other request is answered with `EOPNOTSUPP`, as the kernel
-//! answers one it has no handler for.
+//! 1), which `RTM_GETLINK` describes (with the MTU `SIOCSIFMTU` gave it),
+//! `RTM_NEWLINK` brings up or down (with `CAP_NET_ADMIN`), and whose
+//! addresses `RTM_GETADDR` lists once it is up; any other request is
+//! answered with `EOPNOTSUPP`, as the kernel answers one it has no handler
+//! for.
 //!
 //! In the initial network namespace, whose interfaces are the host's, fwe
-//! describes the host's loopback as `lo`, always up, with its addresses:
-//! bringing it up changes nothing, taking it down is refused (`EPERM`).
-//! The host's other interfaces are not described. Such a socket also
+//! describes each of them ([`crate::host::interfaces`], the host's `lo0`
+//! as `lo`) with its addresses, as the interface requests (`SIOCGIFCONF`)
+//! do: bringing `lo` up changes nothing, and any other change is refused
+//! (`EPERM`). Such a socket also
 //! carries what the kernel itself sends it: a message queue's
 //! notification ([`crate::mqueue`]), for which [`bind_for_notify`] gives
 //! the socket a host address another process can send to.
+//!
+//! A socket's own options (`SOL_NETLINK`) are Linux's, checked as Linux
+//! checks them and kept, its groups too ([`setsockopt`], [`getsockopt`]);
+//! no group is sent to.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::{err, errno};
@@ -27,8 +33,22 @@ use std::sync::Mutex;
 
 pub const AF_NETLINK: u64 = 16;
 const NETLINK_ROUTE: u64 = 0;
-/// `SOL_NETLINK`, whose options are accepted and change nothing.
+/// `SOL_NETLINK`, the level of a netlink socket's own options.
 pub const SOL_NETLINK: u64 = 270;
+
+/// `SOL_NETLINK` options.
+const NETLINK_ADD_MEMBERSHIP: u64 = 1;
+const NETLINK_DROP_MEMBERSHIP: u64 = 2;
+const NETLINK_LISTEN_ALL_NSID: u64 = 8;
+const NETLINK_LIST_MEMBERSHIPS: u64 = 9;
+const NETLINK_CAP_ACK: u64 = 10;
+/// The options Linux keeps as a socket's flags, on or off:
+/// `NETLINK_PKTINFO`, `NETLINK_BROADCAST_ERROR`, `NETLINK_NO_ENOBUFS`,
+/// `NETLINK_LISTEN_ALL_NSID`, `NETLINK_CAP_ACK`, `NETLINK_EXT_ACK` and
+/// `NETLINK_GET_STRICT_CHK`.
+const FLAG_OPTIONS: [u64; 7] = [3, 4, 5, 8, 10, 11, 12];
+/// The multicast groups of `NETLINK_ROUTE` (`RTNLGRP_MAX` of Linux 6.12).
+const ROUTE_GROUPS: u32 = 36;
 
 const NLMSG_ERROR: u16 = 2;
 const NLMSG_DONE: u16 = 3;
@@ -47,6 +67,10 @@ const IFF_RUNNING: u32 = 0x40;
 const IFF_LOWER_UP: u32 = 0x10000;
 const ARPHRD_LOOPBACK: u16 = 772;
 
+use crate::host::{IfAddr, Interface};
+
+const ARPHRD_ETHER: u16 = 1;
+const IFA_BROADCAST: u16 = 4;
 const IFLA_ADDRESS: u16 = 1;
 const IFLA_BROADCAST: u16 = 2;
 const IFLA_IFNAME: u16 = 3;
@@ -77,6 +101,37 @@ pub(crate) struct Sock {
     /// process that bound it (which alone removes it: a fork child that
     /// closes its copy leaves it).
     bound: Option<(Vec<u8>, i32)>,
+    /// Its `SOL_NETLINK` options.
+    opts: Opts,
+}
+
+/// A netlink socket's own options, as Linux keeps them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Opts {
+    /// The flag options set: bit `n` for option `n` ([`FLAG_OPTIONS`]).
+    flags: u32,
+    /// The multicast groups joined, bit `n` for group `n + 1`; `None`
+    /// until the socket first names a group (by `bind` or
+    /// `NETLINK_ADD_MEMBERSHIP`), as Linux has no groups for it till then.
+    groups: Option<u64>,
+}
+
+impl Opts {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.u32(self.flags);
+        e.bool(self.groups.is_some());
+        e.u64(self.groups.unwrap_or(0));
+    }
+
+    fn decode(d: &mut crate::snapshot::Dec) -> Opts {
+        let flags = d.u32();
+        let (some, groups) = (d.bool(), d.u64());
+        Opts { flags, groups: some.then_some(groups) }
+    }
+
+    fn has(&self, opt: u64) -> bool {
+        self.flags & (1 << opt) != 0
+    }
 }
 
 /// The most a socket's queue holds, and the largest request: Linux's
@@ -147,7 +202,13 @@ pub fn socket(type_: u64, protocol: u64, admin: bool) -> i64 {
     }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     fdmarks::mark(fd, Mark::Netlink);
-    socks(|m| m.insert(ino, Sock { peer, port: 0, ty: base, admin, net, bound: None }));
+    crate::net::fresh(fd);
+    socks(|m| {
+        m.insert(
+            ino,
+            Sock { peer, port: 0, ty: base, admin, net, bound: None, opts: Opts::default() },
+        )
+    });
     fd as i64
 }
 
@@ -239,8 +300,7 @@ pub fn bind_for_notify(fd: i32, path: &[u8]) -> Result<Vec<u8>, i32> {
         if let Some(mut s) = m.remove(&ino) {
             close(s.peer);
             s.peer = peer;
-            // SAFETY: getpid cannot fail.
-            s.bound = Some((path.to_vec(), unsafe { libc::getpid() }));
+            s.bound = Some((path.to_vec(), crate::host::pid()));
             m.insert(new_ino, s);
         }
     });
@@ -306,11 +366,128 @@ pub fn bind(fd: i32, addr: u64, len: u64) -> i64 {
             Some(s) if s.port != 0 && s.port != port => err(errno::EINVAL),
             Some(s) => {
                 s.port = port;
+                // The groups named, the first 32 (those the family has),
+                // replace the socket's first 32.
+                let groups = u64::from(a[2]) & ((1 << ROUTE_GROUPS) - 1);
+                if groups != 0 || s.opts.groups.is_some_and(|g| g as u32 != 0) {
+                    let had = s.opts.groups.unwrap_or(0);
+                    s.opts.groups = Some(had & !0xffff_ffff | groups);
+                }
                 0
             }
             None => err(errno::EBADF),
         }
     })
+}
+
+/// `setsockopt(fd, level, name, optval, optlen)` of a level other than
+/// `SOL_SOCKET`, as Linux's `netlink_setsockopt` takes it: only
+/// `SOL_NETLINK`, and of it the options Linux has (`ENOPROTOOPT` for
+/// others, `NETLINK_RX_RING` and `NETLINK_TX_RING` among them). A flag
+/// option is kept on or off; a group is joined or left (one past the
+/// family's is `EINVAL`); `NETLINK_LISTEN_ALL_NSID` needs
+/// `CAP_NET_BROADCAST` (`broadcast`). Of what they change, fwe acts on
+/// `NETLINK_CAP_ACK` (an error's acknowledgement carries the request's
+/// header only); the kernel sends nothing to the groups fwe answers for.
+pub fn setsockopt(
+    fd: i32,
+    level: u64,
+    name: u64,
+    optval: u64,
+    optlen: u64,
+    broadcast: bool,
+) -> i64 {
+    if level != SOL_NETLINK {
+        return err(errno::ENOPROTOOPT);
+    }
+    let val = if optlen as u32 >= 4 {
+        match crate::uaccess::read::<u32>(optval) {
+            Ok(v) => v,
+            Err(_) => return err(errno::EFAULT),
+        }
+    } else {
+        0
+    };
+    let Some(ino) = inode(fd) else { return err(errno::EBADF) };
+    let change = |f: &mut dyn FnMut(&mut Opts)| {
+        socks(|m| match m.get_mut(&ino) {
+            Some(s) => {
+                f(&mut s.opts);
+                0
+            }
+            None => err(errno::EBADF),
+        })
+    };
+    match name {
+        NETLINK_ADD_MEMBERSHIP | NETLINK_DROP_MEMBERSHIP => {
+            if val == 0 || val > ROUTE_GROUPS {
+                return err(errno::EINVAL);
+            }
+            change(&mut |o| {
+                let g = o.groups.unwrap_or(0);
+                let bit = 1u64 << (val - 1);
+                o.groups = Some(if name == NETLINK_ADD_MEMBERSHIP { g | bit } else { g & !bit });
+            })
+        }
+        NETLINK_LISTEN_ALL_NSID if !broadcast => err(errno::EPERM),
+        n if FLAG_OPTIONS.contains(&n) => {
+            if (optlen as u32) < 4 {
+                return err(errno::EINVAL);
+            }
+            change(&mut |o| {
+                if val != 0 {
+                    o.flags |= 1 << n;
+                } else {
+                    o.flags &= !(1 << n);
+                }
+            })
+        }
+        _ => err(errno::ENOPROTOOPT),
+    }
+}
+
+/// `getsockopt(fd, level, name, optval, optlen)` of a level other than
+/// `SOL_SOCKET`, as Linux's `netlink_getsockopt` gives it: a flag option
+/// as 0 or 1; `NETLINK_LIST_MEMBERSHIPS` the groups joined, as many
+/// 32-bit words of them as there is room for, and the room they take
+/// (none before the socket first names a group).
+pub fn getsockopt(fd: i32, level: u64, name: u64, optval: u64, optlen: u64) -> i64 {
+    if level != SOL_NETLINK {
+        return err(errno::ENOPROTOOPT);
+    }
+    let Ok(len) = crate::uaccess::read::<i32>(optlen) else { return err(errno::EFAULT) };
+    if len < 0 {
+        return err(errno::EINVAL);
+    }
+    let Some(ino) = inode(fd) else { return err(errno::EBADF) };
+    let Some(opts) = socks(|m| m.get(&ino).map(|s| s.opts)) else { return err(errno::EBADF) };
+    let put = |at: u64, v: u32| crate::uaccess::write(at, v).map_err(|_| err(errno::EFAULT));
+    let r = match name {
+        n if FLAG_OPTIONS.contains(&n) => {
+            if len < 4 {
+                return err(errno::EINVAL);
+            }
+            put(optlen, 4).and_then(|()| put(optval, u32::from(opts.has(n))))
+        }
+        NETLINK_LIST_MEMBERSHIPS => {
+            let groups = opts.groups.map_or(0, |_| ROUTE_GROUPS);
+            let words = groups.div_ceil(32);
+            let g = opts.groups.unwrap_or(0);
+            let mut r = Ok(());
+            for w in 0..words {
+                if (len as u32) < (w + 1) * 4 {
+                    break;
+                }
+                r = r.and_then(|()| put(optval + u64::from(w) * 4, (g >> (32 * w)) as u32));
+            }
+            r.and_then(|()| put(optlen, groups.div_ceil(8).next_multiple_of(4)))
+        }
+        _ => return err(errno::ENOPROTOOPT),
+    };
+    match r {
+        Ok(()) => 0,
+        Err(e) => e,
+    }
 }
 
 /// `getsockname` (or `getpeername`, `peer`: the kernel, port 0) into the
@@ -401,6 +578,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
             let (path, by) = s.bound.clone().unwrap_or_default();
             e.bytes(&path);
             e.i32(by);
+            s.opts.encode(e);
         }
     });
 }
@@ -413,17 +591,75 @@ pub(crate) fn load(d: &mut crate::snapshot::Dec) {
     for _ in 0..n {
         let (ino, peer, port, ty, admin) = (d.u64(), d.i32(), d.u32(), d.i32(), d.bool());
         let (some, path, by) = (d.bool(), d.bytes(), d.i32());
-        read.push((ino, peer, port, ty, admin, some.then_some((path, by))));
+        let opts = Opts::decode(d);
+        read.push((ino, peer, port, ty, admin, some.then_some((path, by)), opts));
     }
     let net = crate::netns::current();
     socks(|m| {
-        for (ino, peer, port, ty, admin, bound) in read {
+        for (ino, peer, port, ty, admin, bound, opts) in read {
             // SAFETY: plain host call on fwe's own descriptor.
             if unsafe { libc::fcntl(peer, libc::F_SETFD, libc::FD_CLOEXEC) } == 0 {
-                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone(), bound });
+                m.insert(ino, Sock { peer, port, ty, admin, net: net.clone(), bound, opts });
             }
         }
     });
+}
+
+/// What netlink socket `fd` takes to another process it is passed to
+/// ([`crate::scm`]): its port, type, namespace and address, and fwe's end,
+/// through which the receiver answers it too.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    if !is(fd) {
+        return None;
+    }
+    let ino = inode(fd)?;
+    socks(|m| {
+        let s = m.get(&ino)?;
+        let mut e = crate::snapshot::Enc::new();
+        e.u32(s.port);
+        e.i32(s.ty);
+        e.bool(s.admin);
+        crate::shared::save_opt(&mut e, &s.net);
+        let (path, by) = s.bound.clone().unwrap_or_default();
+        e.bool(s.bound.is_some());
+        e.bytes(&path);
+        e.i32(by);
+        s.opts.encode(&mut e);
+        Some(crate::scm::Export {
+            kind: crate::scm::kind::NETLINK,
+            state: e.into_bytes(),
+            companions: vec![s.peer],
+            placeholder: false,
+        })
+    })
+}
+
+/// Make received descriptor `fd` the netlink socket an [`export`]
+/// described: whether it was.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec, companions: Vec<i32>) -> bool {
+    let [peer] = companions[..] else {
+        for c in companions {
+            // SAFETY: descriptors received for this socket.
+            unsafe { libc::close(c) };
+        }
+        return false;
+    };
+    let Ok(peer) = crate::fdtable::reserve(peer) else { return false };
+    let (port, ty, admin) = (d.u32(), d.i32(), d.bool());
+    let net = crate::shared::load_opt(d).ok().flatten();
+    let (some, path, by) = (d.bool(), d.bytes(), d.i32());
+    let opts = Opts::decode(d);
+    let Some(ino) = inode(fd) else {
+        // SAFETY: fwe's end, received above.
+        unsafe { libc::close(peer) };
+        return false;
+    };
+    fdmarks::mark(fd, Mark::Netlink);
+    let bound = some.then_some((path, by));
+    socks(|m| m.insert(ino, Sock { peer, port, ty, admin, net, bound, opts }));
+    true
 }
 
 /// `fd` is closed: its host end goes with the last of its descriptors.
@@ -437,8 +673,7 @@ pub fn closed(fd: i32) {
         unsafe { libc::close(s.peer) };
         // Its address (one no other socket is given) goes with it, in the
         // process that bound it.
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let path = s.bound.filter(|&(_, by)| by == me).map(|(p, _)| p);
         if let Some(c) = path.and_then(|p| std::ffi::CString::new(p).ok()) {
             // SAFETY: a NUL-terminated path in fwe's private directory.
@@ -486,46 +721,104 @@ fn attrs(b: &[u8], fixed: usize) -> Vec<(u16, &[u8])> {
     out
 }
 
-/// The `lo` interface's `RTM_NEWLINK` body: up or not.
-fn link_body(up: bool) -> Vec<u8> {
-    let flags = IFF_LOOPBACK | if up { IFF_UP | IFF_RUNNING | IFF_LOWER_UP } else { 0 };
+/// The interfaces a socket of namespace `net` sees: in one of fwe's, `lo`
+/// alone, up or not as the namespace has it, with the MTU `SIOCSIFMTU`
+/// gave it; in the initial one, the host's, as `SIOCGIFCONF` and the
+/// other interface requests see them.
+fn interfaces(
+    net: &Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
+) -> Vec<Interface> {
+    let Some(net) = net else { return crate::host::interfaces() };
+    let n = net.get();
+    vec![lo(n.lo_up, n.lo_mtu)]
+}
+
+/// A namespace's `lo`: up or not, its MTU (0: Linux's 65536).
+fn lo(up: bool, mtu: u32) -> Interface {
+    let addrs = if up {
+        let mut one = vec![0u8; 16];
+        one[15] = 1;
+        vec![
+            IfAddr { addr: vec![127, 0, 0, 1], prefix: 8, broadcast: None },
+            IfAddr { addr: one, prefix: 128, broadcast: None },
+        ]
+    } else {
+        Vec::new()
+    };
+    Interface {
+        name: b"lo".to_vec(),
+        index: 1,
+        flags: IFF_LOOPBACK | if up { IFF_UP | IFF_RUNNING | IFF_LOWER_UP } else { 0 },
+        mtu: if mtu == 0 { 65536 } else { mtu },
+        hw_type: ARPHRD_LOOPBACK,
+        hw_addr: vec![0; 6],
+        addrs,
+    }
+}
+
+/// An interface's `RTM_NEWLINK` body.
+fn link_body(f: &Interface) -> Vec<u8> {
     let mut b = Vec::new();
     b.push(0); // family
     b.push(0);
-    b.extend_from_slice(&ARPHRD_LOOPBACK.to_ne_bytes());
-    b.extend_from_slice(&1i32.to_ne_bytes()); // index
-    b.extend_from_slice(&flags.to_ne_bytes());
+    b.extend_from_slice(&f.hw_type.to_ne_bytes());
+    b.extend_from_slice(&f.index.to_ne_bytes());
+    b.extend_from_slice(&f.flags.to_ne_bytes());
     b.extend_from_slice(&0u32.to_ne_bytes()); // change
-    attr(&mut b, IFLA_IFNAME, b"lo\0");
-    attr(&mut b, IFLA_MTU, &65536u32.to_ne_bytes());
+    let mut name = f.name.clone();
+    name.push(0);
+    attr(&mut b, IFLA_IFNAME, &name);
+    attr(&mut b, IFLA_MTU, &f.mtu.to_ne_bytes());
     attr(&mut b, IFLA_TXQLEN, &1000u32.to_ne_bytes());
-    // IF_OPER_UNKNOWN as Linux reports for an up loopback, else DOWN.
-    attr(&mut b, IFLA_OPERSTATE, &[if up { 0 } else { 2 }]);
-    attr(&mut b, IFLA_ADDRESS, &[0; 6]);
-    attr(&mut b, IFLA_BROADCAST, &[0; 6]);
+    // IF_OPER_UNKNOWN as Linux reports for an up loopback, UP for another
+    // running, else DOWN.
+    let state =
+        match (f.flags & IFF_UP != 0, f.flags & IFF_LOOPBACK != 0, f.flags & IFF_RUNNING != 0) {
+            (true, true, _) => 0,
+            (true, false, true) => 6,
+            _ => 2,
+        };
+    attr(&mut b, IFLA_OPERSTATE, &[state]);
+    attr(&mut b, IFLA_ADDRESS, &f.hw_addr);
+    let ether = f.hw_type == ARPHRD_ETHER;
+    attr(&mut b, IFLA_BROADCAST, &vec![if ether { 0xff } else { 0 }; f.hw_addr.len()]);
     b
 }
 
-/// The `RTM_NEWADDR` bodies of `lo`'s addresses of `family` (0 for
-/// both).
-fn addr_bodies(family: u8) -> Vec<Vec<u8>> {
+/// The `RTM_NEWADDR` bodies of interface `f`'s addresses of `family` (0
+/// for both): an `ifaddrmsg` (family, prefix, `IFA_F_PERMANENT`, scope,
+/// index), then the address, for IPv4 also the local address, any
+/// broadcast address and the interface's name.
+fn addr_bodies(f: &Interface, family: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
-    // AF_INET: 127.0.0.1/8, host scope.
-    if family == 0 || family == 2 {
-        let mut b = vec![2, 8, 0x80, 254];
-        b.extend_from_slice(&1u32.to_ne_bytes());
-        attr(&mut b, IFA_ADDRESS, &[127, 0, 0, 1]);
-        attr(&mut b, IFA_LOCAL, &[127, 0, 0, 1]);
-        attr(&mut b, IFA_LABEL, b"lo\0");
-        out.push(b);
-    }
-    // AF_INET6: ::1/128.
-    if family == 0 || family == 10 {
-        let mut b = vec![10, 128, 0x80, 254];
-        b.extend_from_slice(&1u32.to_ne_bytes());
-        let mut one = [0u8; 16];
-        one[15] = 1;
-        attr(&mut b, IFA_ADDRESS, &one);
+    for a in &f.addrs {
+        let v4 = a.addr.len() == 4;
+        let fam = if v4 { 2 } else { 10 };
+        if family != 0 && family != fam {
+            continue;
+        }
+        let loopback = if v4 { a.addr[0] == 127 } else { a.addr[..15].iter().all(|&b| b == 0) };
+        let link = !v4 && a.addr[0] == 0xfe && a.addr[1] & 0xc0 == 0x80;
+        // RT_SCOPE_HOST, RT_SCOPE_LINK, RT_SCOPE_UNIVERSE.
+        let scope = if loopback {
+            254
+        } else if link {
+            253
+        } else {
+            0
+        };
+        let mut b = vec![fam, a.prefix, 0x80, scope];
+        b.extend_from_slice(&f.index.to_ne_bytes());
+        attr(&mut b, IFA_ADDRESS, &a.addr);
+        if v4 {
+            attr(&mut b, IFA_LOCAL, &a.addr);
+            if let Some(bc) = a.broadcast {
+                attr(&mut b, IFA_BROADCAST, &bc);
+            }
+            let mut name = f.name.clone();
+            name.push(0);
+            attr(&mut b, IFA_LABEL, &name);
+        }
         out.push(b);
     }
     out
@@ -539,7 +832,8 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
     }
     let Some(ino) = inode(fd) else { return err(errno::EBADF) };
     let port = port_of(fd);
-    let Some((peer, admin, net)) = socks(|m| m.get(&ino).map(|s| (s.peer, s.admin, s.net.clone())))
+    let Some((peer, admin, net, opts)) =
+        socks(|m| m.get(&ino).map(|s| (s.peer, s.admin, s.net.clone(), s.opts)))
     else {
         return err(errno::EBADF);
     };
@@ -556,11 +850,12 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
         let head = &data[at..at + HEADER];
         let body = &data[at + HEADER..at + len];
         // An acknowledgement (the request's header, capped) or an error
-        // (the whole request), as Linux sends them.
+        // (the whole request, unless `NETLINK_CAP_ACK` caps it too), as
+        // Linux sends them.
         let whole = &data[at..at + len];
         let ack = |code: i32| {
             let mut b = (-code).to_ne_bytes().to_vec();
-            let flags = if code == 0 {
+            let flags = if code == 0 || opts.has(NETLINK_CAP_ACK) {
                 b.extend_from_slice(head);
                 NLM_F_CAPPED
             } else {
@@ -570,26 +865,35 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             message(NLMSG_ERROR, flags, seq, port, &b)
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-        // The initial namespace's loopback is the host's, always up.
-        let up = net.as_ref().is_none_or(|n| n.get().lo_up);
+        let links = if matches!(ty, RTM_GETLINK | RTM_NEWLINK | RTM_GETADDR) {
+            interfaces(&net)
+        } else {
+            Vec::new()
+        };
+        let done = || message(NLMSG_DONE, NLM_F_MULTI, seq, port, &0i32.to_ne_bytes());
         let result: Result<Vec<Vec<u8>>, i32> = match ty {
-            RTM_GETLINK if flags & NLM_F_DUMP == NLM_F_DUMP => Ok(vec![
-                message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &link_body(up)),
-                message(NLMSG_DONE, NLM_F_MULTI, seq, port, &0i32.to_ne_bytes()),
-            ]),
-            RTM_GETLINK => {
-                if names_lo(body) {
-                    Ok(vec![message(RTM_NEWLINK, 0, seq, port, &link_body(up))])
-                } else {
-                    Err(errno::ENODEV)
-                }
+            RTM_GETLINK if dump => {
+                let mut out: Vec<Vec<u8>> = links
+                    .iter()
+                    .map(|f| message(RTM_NEWLINK, NLM_F_MULTI, seq, port, &link_body(f)))
+                    .collect();
+                out.push(done());
+                Ok(out)
             }
+            RTM_GETLINK => match named(&links, body) {
+                Some(f) => Ok(vec![message(RTM_NEWLINK, 0, seq, port, &link_body(f))]),
+                None => Err(errno::ENODEV),
+            },
             RTM_NEWLINK if body.len() >= 16 => {
                 let change = u32::from_ne_bytes(body[12..16].try_into().unwrap());
                 let want = u32::from_ne_bytes(body[8..12].try_into().unwrap());
-                if !names_lo(body) {
+                let target = named(&links, body);
+                if target.is_none() {
                     Err(errno::ENODEV)
                 } else if !admin {
+                    Err(errno::EPERM)
+                } else if target.is_some_and(|f| f.flags & IFF_LOOPBACK == 0) {
+                    // The host's interfaces are not the guest's to change.
                     Err(errno::EPERM)
                 } else if change & IFF_UP != 0 || change == 0 {
                     match &net {
@@ -609,15 +913,12 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             }
             RTM_GETADDR => {
                 let family = body.first().copied().unwrap_or(0);
-                let mut out: Vec<Vec<u8>> = if up {
-                    addr_bodies(family)
-                        .iter()
-                        .map(|b| message(RTM_NEWADDR, NLM_F_MULTI, seq, port, b))
-                        .collect()
-                } else {
-                    Vec::new()
-                };
-                out.push(message(NLMSG_DONE, NLM_F_MULTI, seq, port, &0i32.to_ne_bytes()));
+                let mut out: Vec<Vec<u8>> = links
+                    .iter()
+                    .flat_map(|f| addr_bodies(f, family))
+                    .map(|b| message(RTM_NEWADDR, NLM_F_MULTI, seq, port, &b))
+                    .collect();
+                out.push(done());
                 Ok(out)
             }
             _ => Err(errno::EOPNOTSUPP),
@@ -643,18 +944,17 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
 
 /// Whether an `ifinfomsg` request body names `lo`: its index 1, or the
 /// name `lo` with no index.
-fn names_lo(body: &[u8]) -> bool {
+fn named<'a>(links: &'a [Interface], body: &[u8]) -> Option<&'a Interface> {
     if body.len() < 16 {
-        return false;
+        return None;
     }
-    let index = i32::from_ne_bytes(body[4..8].try_into().unwrap());
+    let index = u32::from_ne_bytes(body[4..8].try_into().unwrap());
     if index != 0 {
-        return index == 1;
+        return links.iter().find(|f| f.index == index);
     }
-    attrs(body, 16)
-        .iter()
-        .find(|(t, _)| *t == IFLA_IFNAME)
-        .is_some_and(|(_, v)| v.split(|&b| b == 0).next() == Some(&b"lo"[..]))
+    let name = attrs(body, 16).into_iter().find(|(t, _)| *t == IFLA_IFNAME)?.1;
+    let name = name.split(|&b| b == 0).next()?;
+    links.iter().find(|f| f.name == name)
 }
 
 #[cfg(test)]
@@ -663,22 +963,80 @@ mod tests {
 
     #[test]
     fn finds_lo_by_index_or_name() {
+        let links = [lo(true, 0)];
         let mut body = vec![0u8; 16];
         body[4..8].copy_from_slice(&1i32.to_ne_bytes());
-        assert!(names_lo(&body));
+        assert!(named(&links, &body).is_some());
         let mut body = vec![0u8; 16];
         attr(&mut body, IFLA_IFNAME, b"lo\0");
-        assert!(names_lo(&body));
+        assert!(named(&links, &body).is_some());
         let mut body = vec![0u8; 16];
         attr(&mut body, IFLA_IFNAME, b"eth0\0");
-        assert!(!names_lo(&body));
+        assert!(named(&links, &body).is_none());
     }
 
     #[test]
     fn link_message_parses_back() {
-        let b = link_body(true);
+        let b = link_body(&lo(true, 1280));
         let a = attrs(&b, 16);
         assert!(a.iter().any(|(t, v)| *t == IFLA_IFNAME && *v == b"lo\0"));
+        // The MTU `SIOCSIFMTU` set.
+        assert!(a.iter().any(|(t, v)| *t == IFLA_MTU && *v == 1280u32.to_ne_bytes()));
         assert_eq!(u32::from_ne_bytes(b[8..12].try_into().unwrap()) & IFF_UP, IFF_UP);
+    }
+
+    /// In the initial namespace, the links and addresses netlink lists are
+    /// the host's, as `SIOCGIFCONF` lists them.
+    #[test]
+    fn the_initial_namespace_lists_the_hosts_interfaces() {
+        let links = interfaces(&None);
+        let host = crate::host::interfaces();
+        assert_eq!(links, host);
+        assert!(links.iter().any(|f| f.name == b"lo" && f.flags & IFF_LOOPBACK != 0));
+        let v4: usize = links.iter().map(|f| addr_bodies(f, 2).len()).sum();
+        let want = host.iter().flat_map(|f| &f.addrs).filter(|a| a.addr.len() == 4).count();
+        assert_eq!(v4, want);
+    }
+
+    /// A netlink socket's own options are Linux's: others are
+    /// `ENOPROTOOPT`, a flag is kept on or off, a group must be one the
+    /// family has, `NETLINK_LISTEN_ALL_NSID` needs `CAP_NET_BROADCAST`, and
+    /// the groups joined read back as Linux lists them.
+    #[test]
+    fn options_are_linuxs() {
+        let fd = socket(3, 0, true) as i32;
+        assert!(fd >= 0);
+        let set = |name: u64, v: u32, len: u64, broadcast: bool| {
+            setsockopt(fd, SOL_NETLINK, name, (&raw const v) as u64, len, broadcast)
+        };
+        let get = |name: u64, room: u32| {
+            let mut v = [0u32; 4];
+            let mut len = room;
+            let r = getsockopt(fd, SOL_NETLINK, name, v.as_mut_ptr() as u64, (&raw mut len) as u64);
+            (r, len, v)
+        };
+        assert_eq!(set(6, 1, 4, true), err(errno::ENOPROTOOPT));
+        assert_eq!(setsockopt(fd, 0, 1, 0, 0, true), err(errno::ENOPROTOOPT));
+        assert_eq!(get(13, 4).0, err(errno::ENOPROTOOPT));
+        assert_eq!(set(11, 1, 2, true), err(errno::EINVAL));
+        assert_eq!(set(8, 1, 4, false), err(errno::EPERM));
+        assert_eq!(get(9, 16), (0, 0, [0; 4]));
+        assert_eq!(set(11, 1, 4, true), 0);
+        assert_eq!(get(11, 4), (0, 4, [1, 0, 0, 0]));
+        assert_eq!(get(11, 2).0, err(errno::EINVAL));
+        assert_eq!(set(11, 0, 4, true), 0);
+        assert_eq!(get(11, 4).2[0], 0);
+        assert_eq!(set(1, 0, 4, true), err(errno::EINVAL));
+        assert_eq!(set(1, ROUTE_GROUPS + 1, 4, true), err(errno::EINVAL));
+        assert_eq!(set(1, ROUTE_GROUPS, 4, true), 0);
+        assert_eq!(set(1, 2, 4, true), 0);
+        assert_eq!(get(9, 16), (0, 8, [2, 1 << (ROUTE_GROUPS - 33), 0, 0]));
+        // Room for one word: the first, and the room all of them take.
+        assert_eq!(get(9, 4), (0, 8, [2, 0, 0, 0]));
+        assert_eq!(set(2, 2, 4, true), 0);
+        assert_eq!(get(9, 16).2[0], 0);
+        closed(fd);
+        // SAFETY: the socket made here.
+        unsafe { libc::close(fd) };
     }
 }

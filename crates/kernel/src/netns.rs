@@ -9,7 +9,13 @@
 //! and addresses are translated through it both ways, so two namespaces
 //! can each have their own port 80 and neither is reachable from the host
 //! or another namespace by its number. A bind to the wildcard address is a
-//! bind to the host's loopback.
+//! bind to the host's loopback. A datagram socket the host gave a port
+//! when it first sent ([`used`]) has that port recorded too, so that
+//! replies reach it. A stream to a port nobody bound in the namespace is
+//! refused; a datagram to one goes to a host port fwe holds and never
+//! reads ([`sink`]), connected to itself, so the host drops it and answers
+//! a connected sender with port unreachable (`ECONNREFUSED`), as Linux
+//! does: it never reaches a host program on that port.
 //!
 //! The host's own namespace keeps such a table for one thing the host
 //! refuses there: a port below 1024 on a loopback address, for a caller
@@ -20,6 +26,12 @@
 //! the pair recorded ([`host_low_ports`]), so fwe's processes reach the
 //! socket, and see it, by its number; a program that is not fwe's finds
 //! nothing there.
+//!
+//! A socket belongs to the namespace it was made in, whichever namespace
+//! the process is in when it uses it ([`made`], recorded with the
+//! descriptor in [`crate::fdmarks`]): each socket call runs as its socket's
+//! namespace ([`as_socket`]), so its ports and abstract names are that
+//! namespace's.
 //!
 //! The functions here act on host socket addresses (macOS layout: a length
 //! and a family byte, the port, then the address).
@@ -36,14 +48,77 @@ thread_local! {
     /// ([`crate::threadfs`]): `Some(None)` for the initial one.
     static THREAD: std::cell::RefCell<Option<Option<Arc<Record<Net>>>>> =
         const { std::cell::RefCell::new(None) };
+    /// The namespace of the socket a call on this thread acts on, while it
+    /// does ([`as_socket`]).
+    static SOCKET: std::cell::RefCell<Option<Option<Arc<Record<Net>>>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
-/// The calling thread's network namespace, if it is one of fwe's.
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    THREAD.with(|t| t.borrow_mut().take());
+}
+
+/// The calling thread's network namespace, if it is one of fwe's: in a
+/// socket call, the socket's.
 pub fn current() -> Option<Arc<Record<Net>>> {
+    if let Some(sock) = SOCKET.with(|t| t.borrow().clone()) {
+        return sock;
+    }
     if let Some(own) = THREAD.with(|t| t.borrow().clone()) {
         return own;
     }
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// Socket `fd` was just made: it belongs to the caller's namespace.
+pub fn made(fd: i32) {
+    crate::fdmarks::pin_net(fd, current());
+}
+
+/// The network namespace socket `fd` belongs to, if one of fwe's.
+pub fn of(fd: i32) -> Option<Arc<Record<Net>>> {
+    crate::fdmarks::net_of(fd)
+}
+
+/// Run `f`, a call on socket `fd`, as the socket's namespace.
+pub fn as_socket<R>(fd: i32, f: impl FnOnce() -> R) -> R {
+    let net = of(fd);
+    let prev = SOCKET.with(|t| t.borrow_mut().replace(net));
+    let r = f();
+    SOCKET.with(|t| *t.borrow_mut() = prev);
+    r
+}
+
+/// What socket `fd` of a namespace of fwe's takes to another process it is
+/// passed to ([`crate::scm`]): its namespace.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
+    let net = of(fd)?;
+    let mut e = crate::snapshot::Enc::new();
+    crate::shared::save_opt(&mut e, &Some(net));
+    Some(crate::scm::Export {
+        kind: crate::scm::kind::NETNS,
+        state: e.into_bytes(),
+        companions: Vec::new(),
+        placeholder: false,
+    })
+}
+
+/// Received socket `fd` belongs to the namespace an [`export`] named.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
+    let Ok(Some(net)) = crate::shared::load_opt(d) else { return false };
+    crate::fdmarks::pin_net(fd, Some(net));
+    true
+}
+
+/// The user namespace that owns the calling thread's network namespace
+/// (its record's directory; empty: the initial one), where a capability
+/// over the network (`CAP_NET_ADMIN`, `CAP_NET_RAW`,
+/// `CAP_NET_BIND_SERVICE`) is asked for.
+pub fn owner() -> Vec<u8> {
+    current().map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()))
 }
 
 /// Make `net` this thread's own (`Some`), or the process's again (`None`).
@@ -214,6 +289,9 @@ fn host_key(fd: i32, a: &Inet) -> u8 {
 /// [`bind_prepare`] in the host's namespace.
 fn host_bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan>, i32> {
     let Some(a) = parse(hb) else { return Ok(None) };
+    if crate::fdmarks::is_ping(fd) {
+        return Ok(None);
+    }
     // SAFETY: plain host call.
     let root = unsafe { libc::geteuid() } == 0;
     if a.port == 0 || a.port >= HOST_LOW || !a.loopback || a.any || !may_low || root {
@@ -247,6 +325,12 @@ pub fn bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan
     let Some(a) = parse(hb) else { return Ok(None) };
     if !(a.loopback || a.any) || a.loopback && !net.get().lo_up {
         return Err(errno::EADDRNOTAVAIL);
+    }
+    // A ping socket's "port" is its ICMP identifier: no port of the
+    // namespace's.
+    if crate::fdmarks::is_ping(fd) {
+        set_loopback(hb, a.v6);
+        return Ok(None);
     }
     let proto = proto(fd);
     if a.port != 0 {
@@ -324,13 +408,97 @@ pub fn connect_prepare(fd: i32, hb: &mut [u8]) -> Result<(), i32> {
     let proto = proto(fd);
     match host_port(&net, proto, a.port) {
         Some(h) => set_port(hb, h),
-        // A stream to a port nobody bound here is refused; a datagram to a
-        // socket's own host-chosen port (one never bound by number) goes
-        // there.
+        // A stream to a port nobody bound here is refused; a datagram goes
+        // where nobody reads it.
         None if proto == TCP => return Err(errno::ECONNREFUSED),
-        None => {}
+        None => {
+            set_loopback(hb, a.v6);
+            set_port(hb, sink(a.v6)?);
+            SUNK.lock().unwrap_or_else(|e| e.into_inner()).insert(fd, a.port);
+        }
     }
     Ok(())
+}
+
+/// The namespace port each socket last sent to, or connected to, where
+/// nobody was bound (its datagrams went to [`sink`]): what its peer's
+/// name reads as.
+pub(crate) static SUNK: Mutex<std::collections::BTreeMap<i32, u16>> =
+    Mutex::new(std::collections::BTreeMap::new());
+
+/// This process's host loopback port (of IPv6 if `v6`) that nobody reads:
+/// a datagram socket of fwe's bound to it and connected to itself, which
+/// the host gives no one else's datagrams (it answers them with port
+/// unreachable), held for as long as the process lives.
+fn sink(v6: bool) -> Result<u16, i32> {
+    static SINKS: [std::sync::OnceLock<Result<u16, i32>>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    *SINKS[v6 as usize].get_or_init(|| make_sink(v6))
+}
+
+fn make_sink(v6: bool) -> Result<u16, i32> {
+    let fail = || crate::host::errno_to_linux(crate::host::last_errno());
+    let fam = if v6 { libc::AF_INET6 } else { libc::AF_INET };
+    // SAFETY: plain host call.
+    let s = unsafe { libc::socket(fam, libc::SOCK_DGRAM, 0) };
+    if s < 0 {
+        return Err(fail());
+    }
+    let s = crate::fdtable::reserve(s)?;
+    let mut hb = [0u8; 28];
+    let len = if v6 { 28 } else { 16 };
+    #[cfg(target_os = "linux")]
+    hb[0..2].copy_from_slice(&(fam as u16).to_ne_bytes());
+    #[cfg(not(target_os = "linux"))]
+    {
+        hb[0] = len as u8;
+        hb[1] = fam as u8;
+    }
+    set_loopback(&mut hb, v6);
+    let mut hl = len as libc::socklen_t;
+    // SAFETY: plain host calls on the socket made above, with a valid
+    // address and out-parameters of the lengths given.
+    let ok = unsafe {
+        libc::bind(s, hb.as_ptr().cast(), len as libc::socklen_t) == 0
+            && libc::getsockname(s, hb.as_mut_ptr().cast(), &mut hl) == 0
+            && libc::connect(s, hb.as_ptr().cast(), hl) == 0
+    };
+    if !ok {
+        let e = fail();
+        // SAFETY: the socket made above.
+        unsafe { libc::close(s) };
+        return Err(e);
+    }
+    Ok(u16::from_be_bytes([hb[2], hb[3]]))
+}
+
+/// After datagram socket `fd` of a namespace sent or connected: a port the
+/// host gave it then (it was bound to none) is recorded as the namespace's
+/// too, as Linux binds one, so that what is sent back to it arrives.
+pub fn used(fd: i32) {
+    let Some(net) = current() else { return };
+    if proto(fd) != UDP
+        || crate::fdmarks::is_ping(fd)
+        || matches!(crate::fdmarks::marked(fd), Some(crate::fdmarks::Mark::NetBound { .. }))
+    {
+        return;
+    }
+    let mut hb = [0u8; 128];
+    let mut hl = hb.len() as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    if unsafe { libc::getsockname(fd, hb.as_mut_ptr().cast(), &mut hl) } != 0 {
+        return;
+    }
+    let Some(a) = parse(&hb) else { return };
+    if a.port == 0 {
+        return;
+    }
+    let _ = net.update(|n| {
+        n.ports.retain(|&(p, _), h| p != UDP || *h != a.port);
+        n.ports.insert((UDP, a.port), a.port);
+        Ok(())
+    });
+    crate::fdmarks::mark(fd, crate::fdmarks::Mark::NetBound { port: a.port, any: a.any, key: UDP });
 }
 
 /// A host address `hb` the guest is given back, as the namespace numbers
@@ -380,6 +548,13 @@ pub fn to_guest(fd: i32, hb: &mut [u8], local: bool) {
         .map(|((_, port), _)| *port);
     if let Some(port) = found {
         set_port(hb, port);
+    } else if !local
+        && proto == UDP
+        && sink(a.v6) == Ok(a.port)
+        && let Some(&port) = SUNK.lock().unwrap_or_else(|e| e.into_inner()).get(&fd)
+    {
+        // Connected where nobody was bound: the port it was given.
+        set_port(hb, port);
     }
 }
 
@@ -398,4 +573,77 @@ pub fn closed(mark: Option<crate::fdmarks::Mark>) {
         n.ports.remove(&(key, port));
         Ok(())
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A socket made in a namespace belongs to it whichever namespace the
+    /// thread is in when it uses the socket.
+    #[test]
+    fn a_socket_keeps_the_namespace_it_was_made_in() {
+        let Ok(net) = Record::fresh("net", Net::default()) else { return };
+        let net = Arc::new(net);
+        set_thread(Some(Some(net.clone())));
+        // SAFETY: plain host call.
+        let inside = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        made(inside);
+        set_thread(Some(None));
+        // SAFETY: plain host call.
+        let outside = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        made(outside);
+        assert!(of(inside).is_some_and(|n| n.dir() == net.dir()));
+        assert!(of(outside).is_none());
+        // Used from the initial namespace, the first is its namespace's.
+        assert!(as_socket(inside, current).is_some_and(|n| n.dir() == net.dir()));
+        set_thread(Some(Some(net.clone())));
+        assert!(as_socket(outside, current).is_none());
+        set_thread(None);
+        for fd in [inside, outside] {
+            crate::fdmarks::closed(fd);
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd) };
+        }
+    }
+    /// A host IPv4 loopback address of `port`, host layout.
+    fn loopback(port: u16) -> [u8; 16] {
+        let mut hb = [0u8; 16];
+        #[cfg(target_os = "linux")]
+        hb[0..2].copy_from_slice(&(libc::AF_INET as u16).to_ne_bytes());
+        #[cfg(not(target_os = "linux"))]
+        {
+            hb[0] = 16;
+            hb[1] = libc::AF_INET as u8;
+        }
+        set_loopback(&mut hb, false);
+        set_port(&mut hb, port);
+        hb
+    }
+
+    /// In a namespace, a datagram to a port nobody bound goes to the
+    /// process's sink, never the host's port of that number; a stream is
+    /// refused.
+    #[test]
+    fn nothing_sent_to_an_unbound_port_reaches_the_host() {
+        let Ok(net) = Record::fresh("net", Net { lo_up: true, ..Net::default() }) else { return };
+        set_thread(Some(Some(Arc::new(net))));
+        // SAFETY: plain host calls.
+        let (udp, tcp) = unsafe {
+            (
+                libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0),
+                libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0),
+            )
+        };
+        let mut hb = loopback(9999);
+        assert_eq!(connect_prepare(udp, &mut hb), Ok(()));
+        assert_eq!(u16::from_be_bytes([hb[2], hb[3]]), sink(false).unwrap());
+        let mut hb = loopback(9999);
+        assert_eq!(connect_prepare(tcp, &mut hb), Err(errno::ECONNREFUSED));
+        set_thread(None);
+        for fd in [udp, tcp] {
+            // SAFETY: the sockets made above.
+            unsafe { libc::close(fd) };
+        }
+    }
 }

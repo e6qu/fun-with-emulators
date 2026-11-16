@@ -13,7 +13,8 @@
 //!
 //! A socket filter (`BPF_PROG_TYPE_SOCKET_FILTER`) may also load maps
 //! ([`crate::bpfmap`]) and call their helpers (lookup, update, delete),
-//! reading and writing a value through the pointer a lookup returns.
+//! reading and writing a value through the pointer a lookup returns, and
+//! read the packet with `bpf_skb_load_bytes`.
 //! Attached to a socket (`SO_ATTACH_BPF`), it runs as data is sent to it
 //! by this process, found by the socket's connected peer: what it returns
 //! is how much of the data arrives (none: dropped).
@@ -27,7 +28,7 @@ pub const BPF_PROG_DETACH: u64 = 9;
 pub const BPF_PROG_GET_FD_BY_ID: u64 = 13;
 pub const BPF_PROG_QUERY: u64 = 16;
 
-/// The one program type fwe runs.
+/// The program types fwe runs: the device controller's and socket filters.
 pub const BPF_PROG_TYPE_CGROUP_DEVICE: u32 = 15;
 pub const BPF_PROG_TYPE_SOCKET_FILTER: u32 = 1;
 /// The highest program type Linux 6.x has (`BPF_PROG_TYPE_NETFILTER`).
@@ -107,11 +108,15 @@ pub fn load_filter(bytes: &[u8]) -> Result<Program, i32> {
     check(bytes, true)
 }
 
-/// The map helpers a socket filter may call: `bpf_map_lookup_elem`,
-/// `bpf_map_update_elem`, `bpf_map_delete_elem`.
+/// The helpers a socket filter may call: `bpf_map_lookup_elem`,
+/// `bpf_map_update_elem`, `bpf_map_delete_elem`, and
+/// `bpf_skb_load_bytes` ([`HELPER_SKB_LOAD_BYTES`]).
 const HELPER_LOOKUP: i32 = 1;
 const HELPER_UPDATE: i32 = 2;
 const HELPER_DELETE: i32 = 3;
+/// `bpf_skb_load_bytes(skb, offset, to, len)`: a socket filter reads the
+/// packet's bytes.
+const HELPER_SKB_LOAD_BYTES: i32 = 26;
 /// A 64-bit immediate load of a map's descriptor.
 const PSEUDO_MAP_FD: u8 = 1;
 
@@ -170,7 +175,10 @@ fn check(bytes: &[u8], filter: bool) -> Result<Program, i32> {
                     // A helper call: the map helpers, for a filter.
                     0x80 if filter
                         && class == CLASS_JMP
-                        && matches!(ins.imm, HELPER_LOOKUP | HELPER_UPDATE | HELPER_DELETE) => {}
+                        && matches!(
+                            ins.imm,
+                            HELPER_LOOKUP | HELPER_UPDATE | HELPER_DELETE | HELPER_SKB_LOAD_BYTES
+                        ) => {}
                     0x80 => return Err(errno::EINVAL),
                     0x90 => {} // exit
                     _ if op > 0xd0 => return Err(errno::EINVAL),
@@ -222,13 +230,18 @@ pub fn run(prog: &Program, access: u32, dev_type: u32, major: u32, minor: u32) -
     ctx[0..4].copy_from_slice(&((access << 16) | dev_type).to_le_bytes());
     ctx[4..8].copy_from_slice(&major.to_le_bytes());
     ctx[8..12].copy_from_slice(&minor.to_le_bytes());
-    exec(prog, &ctx, &[])
+    exec(prog, &ctx, &[], &[])
 }
 
-/// Run `prog` with context `ctx` (read only) and the maps it loads, by the
-/// index of the instruction that loads each: its return value, or `None`
-/// when it went wrong.
-fn exec(prog: &Program, ctx: &[u8], maps: &[(usize, crate::bpfmap::Map)]) -> Option<u64> {
+/// Run `prog` with context `ctx` (read only), the maps it loads, by the
+/// index of the instruction that loads each, and a socket filter's packet
+/// `packet`: its return value, or `None` when it went wrong.
+fn exec(
+    prog: &Program,
+    ctx: &[u8],
+    maps: &[(usize, crate::bpfmap::Map)],
+    packet: &[u8],
+) -> Option<u64> {
     let mut stack = [0u8; STACK];
     let mut r = [Val::Scalar(0); 11];
     r[1] = Val::Ctx(0);
@@ -280,6 +293,12 @@ fn exec(prog: &Program, ctx: &[u8], maps: &[(usize, crate::bpfmap::Map)]) -> Opt
                         map_write(map, file + rel as u64, bytes)?;
                     }
                     _ => return None,
+                }
+            }
+            CLASS_JMP if ins.code & 0xf0 == 0x80 && ins.imm == HELPER_SKB_LOAD_BYTES => {
+                r[0] = skb_load_bytes(&r, &mut stack, packet)?;
+                for reg in &mut r[1..=5] {
+                    *reg = Val::Scalar(0);
                 }
             }
             CLASS_JMP if ins.code & 0xf0 == 0x80 => {
@@ -490,6 +509,31 @@ fn stack_bytes(stack: &[u8; STACK], p: Val, len: usize) -> Option<Vec<u8>> {
     Some(stack[at as usize..at as usize + len].to_vec())
 }
 
+/// `bpf_skb_load_bytes` with the registers `r`: `len` bytes of `packet`
+/// from `offset` into the stack at `to`, 0; past the packet's end, the
+/// stack's bytes zeroed and `-EFAULT`, as Linux has it. A context other
+/// than the program's, or a destination off the stack, stops the program.
+fn skb_load_bytes(r: &[Val; 11], stack: &mut [u8; STACK], packet: &[u8]) -> Option<Val> {
+    let Val::Ctx(0) = r[1] else { return None };
+    let (off, len) = (r[2].scalar()?, r[4].scalar()? as usize);
+    let Val::Stack(base) = r[3] else { return None };
+    let at = (STACK as i64).checked_add(base)?;
+    if len == 0 || at < 0 || at as usize + len > STACK {
+        return None;
+    }
+    let dest = &mut stack[at as usize..at as usize + len];
+    match usize::try_from(off).ok().and_then(|o| packet.get(o..o.checked_add(len)?)) {
+        Some(src) => {
+            dest.copy_from_slice(src);
+            Some(Val::Scalar(0))
+        }
+        None => {
+            dest.fill(0);
+            Some(Val::Scalar((-(errno::EFAULT as i64)) as u64))
+        }
+    }
+}
+
 /// Call map helper `which` with the registers `r`.
 fn helper(
     which: i32,
@@ -536,8 +580,7 @@ fn prog_fd(bytes: &[u8], id: u32, ty: u32) -> Result<i32, i32> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static N: AtomicU64 = AtomicU64::new(0);
     let mut path = crate::fs::shm::user_dir()?;
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     path.extend_from_slice(format!("/bpf-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes());
     let p = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
     // SAFETY: a NUL-terminated path in fwe's private directory.
@@ -617,8 +660,7 @@ fn fresh_id() -> u32 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() } as u32;
+    let pid = crate::host::pid() as u32;
     ((now ^ pid.rotate_left(16) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_mul(2654435761))
         & 0x7fff_ffff)
         .max(1)
@@ -669,8 +711,7 @@ static ANY_FILTER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
 /// `setsockopt(fd, SOL_SOCKET, SO_ATTACH_BPF)` with program `prog`, or
 /// `SO_DETACH_BPF` (`prog` `None`).
 pub fn attach_socket(fd: i32, prog: Option<i32>) -> Result<(), i32> {
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let me = crate::host::pid();
     let so = crate::procpid::socket_id(me, fd).ok_or(errno::ENOTSOCK)?;
     let mut f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
     let Some(prog) = prog else {
@@ -697,21 +738,28 @@ pub fn attach_socket(fd: i32, prog: Option<i32>) -> Result<(), i32> {
     Ok(())
 }
 
-/// What of `len` bytes sent on socket `fd` the filter of the socket they
-/// reach lets in (`None`: no filter; `Some(0)`: none, the data dropped).
-pub fn filter_send(fd: i32, len: u64) -> Option<u64> {
-    if !ANY_FILTER.load(std::sync::atomic::Ordering::Acquire) {
+/// Whether any socket filter is attached (sends look for one only then).
+pub fn filtering() -> bool {
+    ANY_FILTER.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// What of the bytes `data` sent on socket `fd` the filter of the socket
+/// they reach lets in (`None`: no filter; `Some(0)`: none, the data
+/// dropped). The program sees their length in `__sk_buff` and reads them
+/// with `bpf_skb_load_bytes`.
+pub fn filter_send(fd: i32, data: &[u8]) -> Option<u64> {
+    if !filtering() {
         return None;
     }
-    // SAFETY: getpid cannot fail.
-    let me = unsafe { libc::getpid() };
+    let len = data.len() as u64;
+    let me = crate::host::pid();
     let peer = crate::procpid::socket_peer(me, fd)?;
     let f = FILTERS.lock().unwrap_or_else(|e| e.into_inner());
     let (_, prog, maps) = f.iter().find(|e| e.0 == peer)?;
     // The context: `struct __sk_buff`, its length first.
     let mut ctx = [0u8; 192];
     ctx[0..4].copy_from_slice(&(len as u32).to_le_bytes());
-    let keep = exec(prog, &ctx, maps).unwrap_or(0);
+    let keep = exec(prog, &ctx, maps, data).unwrap_or(0);
     Some(keep.min(len))
 }
 
@@ -732,15 +780,56 @@ fn dword(a: &[u8], at: usize) -> u64 {
     a.get(at..at + 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()))
 }
 
+/// Whether `bpf(cmd, attr)` is open to a caller without `CAP_BPF` or
+/// `CAP_SYS_ADMIN`: only with `kernel.unprivileged_bpf_disabled` at 0,
+/// and then, as Linux, a map's making and its elements' commands, and the
+/// loading of a socket filter.
+pub fn unprivileged_allows(cmd: u64, attr: u64) -> bool {
+    if crate::sysctl::number(b"kernel/unprivileged_bpf_disabled") != Some(0) {
+        return false;
+    }
+    match cmd {
+        0..=4 => true,
+        BPF_PROG_LOAD => crate::uaccess::read::<u32>(attr) == Ok(BPF_PROG_TYPE_SOCKET_FILTER),
+        _ => false,
+    }
+}
+
+/// The size of Linux 6.12's `union bpf_attr`: what fwe knows of an
+/// attribute.
+const ATTR_SIZE: usize = 152;
+
+/// Linux's `bpf_check_uarg_tail_zero` of an attribute of `size` bytes at
+/// `attr`: one larger than a page is `E2BIG`, and so is one larger than
+/// fwe knows with a byte past the known part that is not zero (a field of
+/// a newer kernel the caller relies on).
+fn tail_zero(attr: u64, size: u64) -> Result<(), i32> {
+    if size > 4096 {
+        return Err(errno::E2BIG);
+    }
+    if size as usize <= ATTR_SIZE {
+        return Ok(());
+    }
+    let tail = crate::uaccess::read_bytes(attr + ATTR_SIZE as u64, size as usize - ATTR_SIZE)?;
+    if tail.iter().any(|&b| b != 0) {
+        return Err(errno::E2BIG);
+    }
+    Ok(())
+}
+
 /// `bpf(cmd, attr, size)`: maps and their elements ([`crate::bpfmap`]);
 /// the device controller's programs: load, attach, detach, query, and a
 /// descriptor by identity; socket filters, loaded with the maps they use
-/// and attached with `SO_ATTACH_BPF`. A program of another type loads (as
-/// programs probe for features by loading one) but cannot be attached;
-/// other commands fail as on a kernel without them.
+/// and attached with `SO_ATTACH_BPF`. A program of another type Linux has
+/// loads (libraries such as cilium/ebpf, which runc uses, probe for what
+/// the kernel supports by loading one) but is never attached nor run
+/// (`EINVAL`); other commands fail as on a kernel without them.
 pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
     use fwe_abi::err;
-    let size = size.min(256) as usize;
+    if let Err(e) = tail_zero(attr, size) {
+        return err(e);
+    }
+    let size = size.min(ATTR_SIZE as u64) as usize;
     let mut a = vec![0u8; size];
     if let Err(e) = crate::uaccess::read_into(attr, &mut a) {
         return err(e);
@@ -757,7 +846,7 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
             }
             let bytes = crate::uaccess::read_bytes(dword(&a, 8), n * 8)?;
             // A device program or a socket filter is checked as fwe will
-            // run it; one of another type is kept but never attached.
+            // run it; another type is kept, never attached nor run.
             let maps = match ty {
                 BPF_PROG_TYPE_CGROUP_DEVICE => load(&bytes).map(|_| Vec::new())?,
                 BPF_PROG_TYPE_SOCKET_FILTER => {
@@ -876,6 +965,22 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
 mod tests {
     use super::*;
 
+    /// An attribute larger than fwe knows is taken if what lies past the
+    /// known part is zero, and is `E2BIG` if not, or if it is larger than
+    /// a page, as Linux's `bpf_check_uarg_tail_zero`.
+    #[test]
+    fn attribute_tails_must_be_zero() {
+        let mut a = [0u8; 200];
+        let at = a.as_ptr() as u64;
+        assert_eq!(tail_zero(at, 200), Ok(()));
+        assert_eq!(tail_zero(at, 100), Ok(()));
+        a[ATTR_SIZE + 3] = 1;
+        assert_eq!(tail_zero(a.as_ptr() as u64, 200), Err(errno::E2BIG));
+        assert_eq!(tail_zero(a.as_ptr() as u64, ATTR_SIZE as u64), Ok(()));
+        assert_eq!(tail_zero(a.as_ptr() as u64, 4097), Err(errno::E2BIG));
+        assert_eq!(fwe_abi::err(errno::E2BIG), sys_bpf(0, a.as_ptr() as u64, 200));
+    }
+
     fn ins(code: u8, dst: u8, src: u8, off: i16, imm: i32) -> [u8; 8] {
         let mut b = [0u8; 8];
         b[0] = code;
@@ -883,6 +988,31 @@ mod tests {
         b[2..4].copy_from_slice(&off.to_le_bytes());
         b[4..8].copy_from_slice(&imm.to_le_bytes());
         b
+    }
+
+    /// A socket filter reads the packet with `bpf_skb_load_bytes`: the
+    /// byte at 2 is the length kept; past the end the helper fails.
+    #[test]
+    fn socket_filters_read_the_packet() {
+        let bytes: Vec<u8> = [
+            ins(0xb7, 2, 0, 0, 2),   // r2 = 2
+            ins(0xbf, 3, 10, 0, 0),  // r3 = r10
+            ins(0x07, 3, 0, 0, -8),  // r3 -= 8
+            ins(0xb7, 4, 0, 0, 1),   // r4 = 1
+            ins(0x85, 0, 0, 0, 26),  // skb_load_bytes(ctx, 2, fp-8, 1)
+            ins(0x55, 0, 0, 2, 0),   // if r0 != 0 goto fail
+            ins(0x71, 0, 10, -8, 0), // r0 = the byte
+            ins(0x95, 0, 0, 0, 0),
+            ins(0xb7, 0, 0, 0, 99), // fail: r0 = 99
+            ins(0x95, 0, 0, 0, 0),
+        ]
+        .concat();
+        let prog = load_filter(&bytes).unwrap();
+        let ctx = [0u8; 192];
+        assert_eq!(exec(&prog, &ctx, &[], &[9, 9, 5, 9]), Some(5));
+        assert_eq!(exec(&prog, &ctx, &[], &[9]), Some(99));
+        // A device program may call no helper.
+        assert_eq!(load(&bytes).map(|_| ()), Err(errno::EINVAL));
     }
 
     /// A program of the shape crun generates: deny everything but reads and
@@ -973,7 +1103,7 @@ mod tests {
         .concat();
         assert_eq!(load(&prog), Err(errno::EINVAL));
         let p = load_filter(&prog).unwrap();
-        assert_eq!(exec(&p, &[0u8; 192], &[(0, m)]), Some(0));
+        assert_eq!(exec(&p, &[0u8; 192], &[(0, m)], &[]), Some(0));
         assert_eq!(m.lookup(&0u32.to_le_bytes()), Ok(1u64.to_le_bytes().to_vec()));
     }
 

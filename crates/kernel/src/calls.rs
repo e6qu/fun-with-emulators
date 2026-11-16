@@ -1,22 +1,90 @@
 //! Small system calls with little state of their own: `getcpu`,
-//! `vhangup`, `readahead`, `sync_file_range`, `delete_module`, `syslog`,
-//! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, and the LSM
-//! calls (`lsm_list_modules`, `lsm_get_self_attr`, `lsm_set_self_attr`),
-//! each checked as Linux checks its arguments.
+//! `vhangup`, `readahead`, `sync_file_range`, `syslog`,
+//! `membarrier`, `rt_sigqueueinfo` and `rt_tgsigqueueinfo`, `kcmp`,
+//! `process_madvise`, and the LSM calls (`lsm_list_modules`,
+//! `lsm_get_self_attr`, `lsm_set_self_attr`), each checked as Linux checks
+//! its arguments.
 
 use crate::{Kernel, Platform, guest, thread, uaccess};
 use fwe_abi::{err, errno, signal as sig};
 use std::sync::atomic::Ordering::SeqCst;
+
+/// `kcmp`'s kinds of resource.
+const KCMP_FILE: u64 = 0;
+const KCMP_VM: u64 = 1;
+const KCMP_SYSVSEM: u64 = 6;
+const KCMP_EPOLL_TFD: u64 = 7;
+
+/// `process_madvise`'s advice for another process: the hints that change
+/// nothing a program sees (`MADV_WILLNEED`, `MADV_COLD`, `MADV_PAGEOUT`,
+/// `MADV_COLLAPSE`).
+const REMOTE_ADVICE: [u64; 4] = [3, 20, 21, 25];
+
+/// What one of a process's descriptors is, for `kcmp`: the kind of thing
+/// and its identity, as far as fwe can tell (two descriptors of the same
+/// object have the same).
+type FileKey = (u8, u64, Vec<u8>);
+
+/// `kcmp`'s answer for two resources whose identities are `x` and `y`: 0
+/// if the same, else 1 or 2 by their order.
+fn order<T: Ord>(x: &T, y: &T) -> i64 {
+    match x.cmp(y) {
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Less => 1,
+        std::cmp::Ordering::Greater => 2,
+    }
+}
+
+/// The identity of descriptor `fd` of host process `host` ([`FileKey`]),
+/// if it has that descriptor.
+fn file_key(host: i32, fd: i32) -> Option<FileKey> {
+    use crate::procpid::FdTarget;
+    let (_, t) = crate::procpid::fds(host).into_iter().find(|(f, _)| *f == fd)?;
+    Some(match t {
+        FdTarget::Socket(id) => (1, id, Vec::new()),
+        FdTarget::Pipe(id) => (2, id, Vec::new()),
+        FdTarget::Path(p) => (3, 0, p),
+        FdTarget::Anon(name) => (4, 0, name.as_bytes().to_vec()),
+    })
+}
+
+/// Whether this process's descriptors `a` and `b` (of the same file) are
+/// one open file: a status flag changed through one shows through the
+/// other. `O_NONBLOCK` is turned and turned back, which changes nothing
+/// for a regular file or directory; another kind is taken to be one.
+fn same_description(a: i32, b: i32) -> bool {
+    // SAFETY: zeroed bytes are a valid `stat`; plain host calls on the
+    // caller's descriptors, each flag restored.
+    unsafe {
+        let mut st: libc::stat = std::mem::zeroed();
+        if libc::fstat(a, &mut st) != 0
+            || !matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFDIR)
+        {
+            return true;
+        }
+        let (fa, fb) = (libc::fcntl(a, libc::F_GETFL), libc::fcntl(b, libc::F_GETFL));
+        if fa < 0 || fb < 0 {
+            return true;
+        }
+        libc::fcntl(a, libc::F_SETFL, fa ^ libc::O_NONBLOCK);
+        let shared = libc::fcntl(b, libc::F_GETFL) != fb;
+        libc::fcntl(a, libc::F_SETFL, fa);
+        shared
+    }
+}
 
 /// `sync_file_range`'s flags.
 const SYNC_FILE_RANGE_WAIT_BEFORE: u64 = 1;
 const SYNC_FILE_RANGE_WRITE: u64 = 2;
 const SYNC_FILE_RANGE_WAIT_AFTER: u64 = 4;
 
-/// The security modules fwe has: Linux's capabilities and Landlock
-/// (`LSM_ID_CAPABILITY`, `LSM_ID_LANDLOCK`), which keep no attributes of a
-/// process.
-const LSM_IDS: [u64; 2] = [100, 110];
+/// The security modules fwe has, in the order `/sys/kernel/security/lsm`
+/// names them: Linux's capabilities, Landlock and Yama, which keep no
+/// attributes of a process.
+const LSM_IDS: [u64; 3] = {
+    use fwe_abi::lsm::*;
+    [LSM_ID_CAPABILITY, LSM_ID_LANDLOCK, LSM_ID_YAMA]
+};
 
 /// `struct lsm_ctx`'s header: `id`, `flags`, `len` and `ctx_len`.
 const LSM_CTX_HEADER: u64 = 32;
@@ -61,11 +129,6 @@ const SYSLOG_ACTION_CONSOLE_ON: u64 = 7;
 const SYSLOG_ACTION_CONSOLE_LEVEL: u64 = 8;
 const SYSLOG_ACTION_SIZE_UNREAD: u64 = 9;
 const SYSLOG_ACTION_SIZE_BUFFER: u64 = 10;
-/// The kernel log's size Linux reports (`CONFIG_LOG_BUF_SHIFT` of 17).
-const LOG_BUF_LEN: i64 = 1 << 17;
-
-/// The longest module name (`MODULE_NAME_LEN`).
-const MODULE_NAME_LEN: usize = 56;
 
 impl<P: Platform> Kernel<P> {
     /// `getcpu(cpu, node, cache)`: the CPU the caller runs on, as far as
@@ -140,22 +203,158 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
-    /// `delete_module(name, flags)`: no module is loaded, so any name is
-    /// not found (`ENOENT`), once `CAP_SYS_MODULE` is had and the name
-    /// read.
-    pub(crate) fn sys_delete_module(&mut self, name: u64) -> i64 {
-        if !self.creds.has(crate::caps::CAP_SYS_MODULE) {
+    /// `kcmp(pid1, pid2, type, idx1, idx2)`: whether the two processes (or
+    /// threads) share a resource: 0 if they do, else 1 or 2 by an order of
+    /// the two that stays the same. Both must be the caller's to read as a
+    /// tracer would (`EPERM`). A process shares its memory, descriptor
+    /// table, filesystem view, handlers, I/O context and semaphore undo
+    /// list only with its own threads (a fork child has copies); two
+    /// descriptors are the same open file if they name the same socket or
+    /// pipe, or the same file and, in the caller, share their status flags
+    /// (one is a copy of the other).
+    pub(crate) fn sys_kcmp(&mut self, pid1: u64, pid2: u64, ty: u64, i1: u64, i2: u64) -> i64 {
+        let host = |p: u64| -> Result<i32, i32> {
+            let p = p as i32;
+            if p <= 0 {
+                return Err(errno::ESRCH);
+            }
+            if p == thread::tgid() || thread::tids().contains(&p) {
+                return Ok(crate::host::pid());
+            }
+            if let Some(owner) = thread::owner_of_tid(p) {
+                return Ok(owner);
+            }
+            let h = crate::pidns::host_arg(p)?;
+            if crate::procreg::read(h).is_none() {
+                return Err(errno::ESRCH);
+            }
+            Ok(h)
+        };
+        let (a, b) = match (host(pid1), host(pid2)) {
+            (Ok(a), Ok(b)) => (a, b),
+            (Err(e), _) | (_, Err(e)) => return err(e),
+        };
+        let me = crate::host::pid();
+        // Linux's `PTRACE_MODE_READ_REALCREDS`.
+        if [a, b].iter().any(|&h| h != me && !self.may_access(h, false, false)) {
             return err(errno::EPERM);
         }
-        let n = guest!(uaccess::read_cstr(name, MODULE_NAME_LEN + 1));
-        if n.len() >= MODULE_NAME_LEN {
-            return err(errno::ENOENT);
+        match ty {
+            KCMP_FILE | KCMP_EPOLL_TFD => {
+                let (fd1, fd2) = if ty == KCMP_FILE {
+                    (i1 as i32, i2 as i32)
+                } else {
+                    // `struct kcmp_epoll_slot`: the epoll descriptor of the
+                    // second process, a descriptor in its interest list.
+                    let slot: [u32; 3] = guest!(uaccess::read(i2));
+                    let (efd, tfd) = (slot[0] as i32, slot[1] as i32);
+                    if b != me {
+                        // Another process's interest lists are its own.
+                        return err(errno::ENOENT);
+                    }
+                    match crate::epoll::watches(efd, tfd) {
+                        Some(true) => {}
+                        Some(false) => return err(errno::ENOENT),
+                        None => return err(errno::EINVAL),
+                    }
+                    (i1 as i32, tfd)
+                };
+                let (Some(k1), Some(k2)) = (file_key(a, fd1), file_key(b, fd2)) else {
+                    return err(errno::EBADF);
+                };
+                if k1 != k2 {
+                    return order(&k1, &k2);
+                }
+                if a == me && b == me && fd1 != fd2 && !same_description(fd1, fd2) {
+                    return if fd1 < fd2 { 1 } else { 2 };
+                }
+                0
+            }
+            KCMP_VM..=KCMP_SYSVSEM => order(&a, &b),
+            _ => err(errno::EINVAL),
         }
-        err(errno::ENOENT)
     }
 
-    /// `syslog(type, buf, len)` (`klogctl`): the kernel log, which is
-    /// empty. Reading it, clearing it and setting the console level need
+    /// `process_madvise(pidfd, iov, vlen, advice, flags)`: `madvise` of
+    /// each range on the process the descriptor names. The caller's own
+    /// takes any advice `madvise` takes; another process's only the hints
+    /// that change nothing it sees (`EINVAL` for the rest), with
+    /// `CAP_SYS_NICE` and the standing of a tracer (`EPERM`): fwe checks
+    /// its ranges are mapped and gives the host nothing to act on, as the
+    /// host's memory of another process is not fwe's to advise. The bytes
+    /// advised.
+    pub(crate) fn sys_process_madvise(
+        &mut self,
+        pidfd: u64,
+        iov: u64,
+        vlen: u64,
+        advice: u64,
+        flags: u64,
+    ) -> i64 {
+        if flags != 0 || vlen > uaccess::UIO_MAXIOV {
+            return err(errno::EINVAL);
+        }
+        let raw = guest!(uaccess::read_bytes(iov, vlen as usize * 16));
+        let ranges: Vec<(u64, u64)> = raw
+            .as_chunks::<16>()
+            .0
+            .iter()
+            .map(|v| {
+                let w = |o: usize| u64::from_ne_bytes(v[o..o + 8].try_into().unwrap_or([0; 8]));
+                (w(0), w(8))
+            })
+            .collect();
+        let Some(t) = crate::pidfd::of(pidfd as i32) else { return err(errno::EBADF) };
+        if crate::pidfd::ended(pidfd as i32) {
+            return err(errno::ESRCH);
+        }
+        if !REMOTE_ADVICE.contains(&advice) {
+            return err(errno::EINVAL);
+        }
+        let mut done = 0u64;
+        if t.host == crate::host::pid() {
+            for (addr, len) in ranges {
+                let r = self.sys_madvise(addr, len, advice);
+                if r < 0 {
+                    return if done > 0 { done as i64 } else { r };
+                }
+                done += len;
+            }
+            return done as i64;
+        }
+        // Linux's `PTRACE_MODE_READ_FSCREDS`, and `CAP_SYS_NICE`.
+        if !self.may_access(t.host, false, true) || !self.creds.has(crate::caps::CAP_SYS_NICE) {
+            return err(errno::EPERM);
+        }
+        let Some(view) = crate::mm::MapsView::of(t.host) else { return err(errno::ESRCH) };
+        let page = view.page.max(1);
+        for (addr, len) in ranges {
+            let end = addr.checked_add(len.div_ceil(page) * page);
+            let Some(end) = end.filter(|_| addr % page == 0) else {
+                return if done > 0 { done as i64 } else { err(errno::EINVAL) };
+            };
+            // Every page of the range mapped, else `ENOMEM` for it; none
+            // locked for `MADV_COLD` or `MADV_PAGEOUT` (`EINVAL`).
+            let mut at = addr;
+            let mut hole = false;
+            for p in view.areas.iter().filter(|p| p.end > addr && p.start < end) {
+                if p.value.locked && matches!(advice, 20 | 21) {
+                    return if done > 0 { done as i64 } else { err(errno::EINVAL) };
+                }
+                hole |= p.start > at;
+                at = at.max(p.end);
+            }
+            let at = if hole { addr } else { at };
+            if at < end {
+                return if done > 0 { done as i64 } else { err(errno::ENOMEM) };
+            }
+            done += len;
+        }
+        done as i64
+    }
+
+    /// `syslog(type, buf, len)` (`klogctl`): the kernel log
+    /// ([`crate::klog`]). Reading it, clearing it and setting the console level need
     /// `CAP_SYSLOG` (or `CAP_SYS_ADMIN`); the sizes need nothing.
     pub(crate) fn sys_syslog(&mut self, ty: u64, buf: u64, len: u64) -> i64 {
         let len = len as i32;
@@ -181,11 +380,19 @@ impl<P: Platform> Kernel<P> {
                 if !uaccess::valid(buf, len as u64, true) {
                     return err(errno::EFAULT);
                 }
-                // An empty log: a read of it waits for none, nothing to
-                // copy.
+                // A destructive read takes what is unread, at once (with
+                // nothing unread, nothing: it does not wait for more).
+                let text = match ty {
+                    SYSLOG_ACTION_READ => crate::klog::read_unread(len as usize),
+                    _ => crate::klog::read_all(len as usize, ty == SYSLOG_ACTION_READ_CLEAR),
+                };
+                guest!(uaccess::write_from(buf, &text));
+                text.len() as i64
+            }
+            SYSLOG_ACTION_CLEAR => {
+                crate::klog::clear();
                 0
             }
-            SYSLOG_ACTION_CLEAR => 0,
             // The console's level (`kernel.printk`'s first): off is the
             // least it may be, the level before kept for on.
             SYSLOG_ACTION_CONSOLE_OFF => {
@@ -214,8 +421,8 @@ impl<P: Platform> Kernel<P> {
                 SAVED_LEVEL.store(-1, SeqCst);
                 set_printk(p)
             }
-            SYSLOG_ACTION_SIZE_UNREAD => 0,
-            _ => LOG_BUF_LEN,
+            SYSLOG_ACTION_SIZE_UNREAD => crate::klog::unread() as i64,
+            _ => crate::klog::LOG_BUF_LEN as i64,
         }
     }
 
@@ -312,7 +519,10 @@ impl<P: Platform> Kernel<P> {
         let (class, level) = (prio >> 13, prio & 7);
         let high = prio & 0x1ff8;
         match class {
-            CLASS_RT if !self.creds.has(crate::caps::CAP_SYS_NICE) && !self.creds.has_admin() => {
+            CLASS_RT
+                if !self.creds.has(crate::caps::CAP_SYS_NICE)
+                    && !self.creds.has(crate::caps::CAP_SYS_ADMIN) =>
+            {
                 return err(errno::EPERM);
             }
             CLASS_RT | CLASS_BE if high != 0 => return err(errno::EINVAL),
@@ -441,19 +651,27 @@ impl<P: Platform> Kernel<P> {
         let code = word(8);
         let value = u64::from_ne_bytes(raw[24..32].try_into().unwrap());
         let me = thread::tgid();
+        // A code only the kernel or `tkill` gives only to the calling thread
+        // itself, by its own id, as Linux compares it.
+        if (code >= 0 || code == sig::SI_TKILL) && tid.unwrap_or(tgid) != thread::tid() {
+            return err(errno::EPERM);
+        }
         // Only a process: Linux finds none for 0 or a negative number.
         if tgid <= 0 {
             return err(errno::ESRCH);
         }
-        // Another thread's id names its process, as on Linux.
-        let tgid = if tid.is_none() && thread::host_thread(tgid).is_some() { me } else { tgid };
-        if (code >= 0 || code == sig::SI_TKILL) && tgid != me {
-            return err(errno::EPERM);
-        }
         if s > sig::NSIG {
             return err(errno::EINVAL);
         }
-        let Some(host) = crate::pidns::to_host(tgid) else { return err(errno::ESRCH) };
+        // Another thread's id names its process, as on Linux.
+        let tgid = if tid.is_none() && thread::host_thread(tgid).is_some() { me } else { tgid };
+        // Another process's thread, named alone, names its process too.
+        let owner = (tid.is_none() && tgid != me && !crate::pidns::nested())
+            .then(|| thread::owner_of_tid(tgid))
+            .flatten();
+        let Some(host) = owner.or_else(|| crate::pidns::to_host(tgid)) else {
+            return err(errno::ESRCH);
+        };
         // As `kill` is: only a process the caller may signal.
         if tgid != me && !self.may_signal(host, s) {
             return err(errno::EPERM);
@@ -461,11 +679,14 @@ impl<P: Platform> Kernel<P> {
         if s == 0 {
             return 0;
         }
-        // SAFETY: getpid and getuid cannot fail.
-        let (pid, uid) = unsafe { (libc::getpid(), libc::getuid()) };
+        // The caller's own `si_pid` and `si_uid`, as Linux delivers them:
+        // the pid as the process it names in the caller's namespace (0 for
+        // none), the user as the caller's user namespace has it.
+        let pid = crate::pidns::to_host(word(16)).unwrap_or(0);
+        let uid = crate::userns::from_ns(word(20) as u32, false).unwrap_or(crate::userns::OVERFLOW);
         let info = thread::SigInfo { code, pid, uid, value, ..Default::default() };
         if tgid == me {
-            if !thread::may_queue(s) {
+            if !thread::may_queue(s, code) {
                 return err(errno::EAGAIN);
             }
             match tid {
@@ -479,17 +700,30 @@ impl<P: Platform> Kernel<P> {
             thread::wake_others(crate::host::WAKE_SIGNAL);
             return 0;
         }
-        if tid.is_some_and(|t| t != tgid) {
-            // Another process's other thread: the host signals processes.
-            return err(errno::ESRCH);
+        if let Some(t) = tid.filter(|&t| t != tgid) {
+            // Another process's other thread: queued for it in the
+            // process's mailbox, the process woken to give it to the
+            // thread (SIGKILL ends the process).
+            if thread::owner_of_tid(t) != Some(host) || !crate::host::is_fwe(host) {
+                return err(errno::ESRCH);
+            }
+            if s == fwe_abi::signal::SIGKILL {
+                crate::signote::note(host, libc::SIGKILL);
+                return crate::host::kill_process(host, libc::SIGKILL);
+            }
+            if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
+                return err(e);
+            }
+            return crate::host::kill_process(host, crate::host::WAKE_SIGNAL);
         }
         // One the host lacks, or SIGTRAP (which the host would merge with
         // the target's next system-call trap): through the mailbox.
         let h = crate::host::signal_to_host(s).filter(|_| s != fwe_abi::signal::SIGTRAP);
         let Some(h) = h else {
-            return crate::signal::send_unhosted(host, s, code, value);
+            return crate::signal::send_unhosted_from(host, s, code, value, (pid, uid));
         };
-        crate::signote::note_with(host, h, code, value);
+        // A host signal names its sender's pid itself.
+        crate::signote::note_with(host, h, code, value, uid);
         let r = crate::host::kill_process(host, h);
         if r != 0 {
             crate::signote::unnote(host, h);

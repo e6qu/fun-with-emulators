@@ -134,8 +134,7 @@ fn ticks_since_boot(started: f64) -> u64 {
 fn threads_state(pid: i32) -> u8 {
     /// `PROC_PIDLISTTHREADS`: the process's thread handles.
     const PROC_PIDLISTTHREADS: i32 = 6;
-    // SAFETY: getpid cannot fail.
-    if pid == unsafe { libc::getpid() } {
+    if pid == crate::host::pid() {
         return match crate::thread::host_state(crate::thread::tgid()) {
             Some((_, _, true)) | None => b'R',
             Some((_, _, false)) => b'S',
@@ -240,10 +239,118 @@ pub const FILES: &[(&[u8], u8)] = &[
     (b"timerslack_ns", DT_REG),
     (b"mem", DT_REG),
     (b"auxv", DT_REG),
+    (b"environ", DT_REG),
+    (b"limits", DT_REG),
+    (b"statm", DT_REG),
+    (b"io", DT_REG),
+    (b"cwd", DT_LNK),
+    (b"root", DT_LNK),
+    (b"mountinfo", DT_REG),
+    (b"mounts", DT_REG),
+    (b"uid_map", DT_REG),
+    (b"gid_map", DT_REG),
+    (b"setgroups", DT_REG),
     (b"ns", DT_DIR),
+    (b"net", DT_DIR),
     (b"fd", DT_DIR),
     (b"task", DT_DIR),
 ];
+
+/// The files another process's `/proc/<pid>` shows only to a reader that
+/// may read it as a tracer would (`PTRACE_MODE_READ_FSCREDS`), as Linux
+/// has it: `EACCES` for anyone else.
+pub const TRACER_ONLY: &[&[u8]] = &[b"/maps", b"/smaps", b"/environ", b"/io", b"/cwd", b"/root"];
+
+/// `/proc/<pid>/environ` of a process whose program started with
+/// auxiliary vector `auxv` and command line `cmdline`, its memory read
+/// with `read`: the environment strings, which the initial stack holds
+/// after the arguments (from the platform's name on, `AT_PLATFORM`) and
+/// before the program's path (`AT_EXECFN`), as the program left them.
+pub fn environ(auxv: &[u8], cmdline: &[u8], read: impl Fn(u64, &mut [u8]) -> bool) -> Vec<u8> {
+    const MAX: u64 = 4 << 20;
+    let at = |k| crate::procfs::auxv_value(auxv, k);
+    let (Some(platform), Some(execfn)) =
+        (at(fwe_abi::auxv::AT_PLATFORM), at(fwe_abi::auxv::AT_EXECFN))
+    else {
+        return Vec::new();
+    };
+    // Past "aarch64" and its NUL.
+    let start = platform + 8;
+    if execfn <= start || execfn - start > MAX {
+        return Vec::new();
+    }
+    let mut b = vec![0u8; (execfn - start) as usize];
+    if !read(start, &mut b) {
+        return Vec::new();
+    }
+    // Past the arguments, as many strings as the command line has.
+    let argc = cmdline.iter().filter(|&&c| c == 0).count();
+    let mut skip = 0;
+    for _ in 0..argc {
+        match b[skip..].iter().position(|&c| c == 0) {
+            Some(i) => skip += i + 1,
+            None => return Vec::new(),
+        }
+    }
+    b.split_off(skip)
+}
+
+/// `/proc/<pid>/limits` of a process with resource limits `limits`
+/// (soft, hard), as Linux writes it.
+pub fn limits(limits: &[(u64, u64)]) -> Vec<u8> {
+    const NAMES: [(&str, &str); 16] = [
+        ("Max cpu time", "seconds"),
+        ("Max file size", "bytes"),
+        ("Max data size", "bytes"),
+        ("Max stack size", "bytes"),
+        ("Max core file size", "bytes"),
+        ("Max resident set", "bytes"),
+        ("Max processes", "processes"),
+        ("Max open files", "files"),
+        ("Max locked memory", "bytes"),
+        ("Max address space", "bytes"),
+        ("Max file locks", "locks"),
+        ("Max pending signals", "signals"),
+        ("Max msgqueue size", "bytes"),
+        ("Max nice priority", ""),
+        ("Max realtime priority", ""),
+        ("Max realtime timeout", "us"),
+    ];
+    let shown = |v: u64| {
+        if v == fwe_abi::resource::RLIM_INFINITY { "unlimited".to_string() } else { v.to_string() }
+    };
+    let mut out =
+        format!("{:<25} {:<20} {:<20} {:<10}\n", "Limit", "Soft Limit", "Hard Limit", "Units");
+    for ((name, unit), (soft, hard)) in NAMES.iter().zip(limits) {
+        out.push_str(&format!("{name:<25} {:<20} {:<20} ", shown(*soft), shown(*hard)));
+        if !unit.is_empty() {
+            out.push_str(&format!("{unit:<10}"));
+        }
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
+/// `/proc/<pid>/statm` of host process `host`, in pages: its size and
+/// resident set as the host has them (`/proc/<pid>/status` reports the
+/// same); the shared, text and data counts are not kept (0).
+pub fn statm(host: i32) -> Vec<u8> {
+    let h = host_info(host).unwrap_or_default();
+    let page = crate::maps::page_size().max(1);
+    format!("{} {} 0 0 0 0 0\n", h.vsize / page, h.rss_bytes / page).into_bytes()
+}
+
+/// `/proc/<pid>/io` of host process `host`: the bytes it had the host read
+/// from and write to storage; the counts of `read` and `write` calls and
+/// the bytes they moved are not kept (0).
+pub fn io(host: i32) -> Vec<u8> {
+    let (read, written) = crate::host::disk_io(host);
+    format!(
+        "rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: {read}\nwrite_bytes: {written}\n\
+         cancelled_write_bytes: 0\n"
+    )
+    .into_bytes()
+}
 
 /// `/proc/<pid>/stat` of process `pid` (as the reader sees it) named
 /// `comm`.
@@ -279,9 +386,13 @@ pub struct Creds {
     pub caps: Option<crate::caps::Caps>,
     pub no_new_privs: bool,
     pub seccomp: u8,
+    /// How many seccomp filters it has.
+    pub filters: u32,
     pub umask: u32,
     /// Bytes of memory locked (`mlock`).
     pub locked: u64,
+    /// Its tracer's pid in the reader's pid namespace (0: none).
+    pub tracer: i32,
 }
 
 /// `/proc/<pid>/status`.
@@ -306,13 +417,14 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
         |k| k.status(),
     );
     format!(
-        "Name:\t{}\nUmask:\t{:04o}\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t0\n\
+        "Name:\t{}\nUmask:\t{:04o}\nState:\t{state}\nTgid:\t{pid}\nNgid:\t0\nPid:\t{pid}\nPPid:\t{}\nTracerPid:\t{}\n\
          Uid:\t{}\nGid:\t{}\nFDSize:\t64\nGroups:\t{groups}\nNStgid:\t{pid}\nNSpid:\t{pid}\nNSpgid:\t{}\nNSsid:\t{}\n\
          VmSize:\t{} kB\nVmLck:\t{} kB\nVmRSS:\t{} kB\nVmSwap:\t0 kB\nThreads:\t{}\nSigQ:\t0/63448\n{caps}NoNewPrivs:\t{}\nSeccomp:\t{}\n\
          Seccomp_filters:\t{}\nCpus_allowed_list:\t0-{}\nvoluntary_ctxt_switches:\t0\nnonvoluntary_ctxt_switches:\t0\n",
         String::from_utf8_lossy(comm),
         c.umask,
         g(h.ppid),
+        c.tracer,
         ids(&c.uids),
         ids(&c.gids),
         g(h.pgid),
@@ -323,7 +435,7 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
         h.threads,
         u8::from(c.no_new_privs),
         c.seccomp,
-        u8::from(c.seccomp == 2),
+        c.filters,
         crate::procfs::ncpu_hint().saturating_sub(1),
     )
     .into_bytes()
@@ -413,10 +525,25 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
             let u = |id| crate::userns::to_ns(id, false);
             let g = |id| crate::userns::to_ns(id, true);
             let i = rec.ids;
+            let s = rec.sec;
+            let [effective, permitted, inheritable, bounding, ambient] = s.caps;
+            let tracer = crate::ptrace::tracer_of(host);
             Creds {
                 uids: [u(i[0]), u(i[1]), u(i[2]), u(i[3])],
                 gids: [g(i[4]), g(i[5]), g(i[6]), g(i[7])],
                 groups: Vec::new(),
+                caps: Some(crate::caps::Caps {
+                    effective,
+                    permitted,
+                    inheritable,
+                    bounding,
+                    ambient,
+                    securebits: 0,
+                }),
+                no_new_privs: s.no_new_privs,
+                seccomp: s.seccomp,
+                filters: s.filters,
+                tracer: if tracer == 0 { 0 } else { crate::pidns::to_guest(tracer) },
                 ..Creds::default()
             }
         })),
@@ -425,9 +552,19 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
             None => Entry::Missing,
         },
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
+        b"/environ" => Entry::File(environ(&rec.auxv, &rec.cmdline, |addr, buf| {
+            crate::procvm::remote(host, addr, buf, false).is_ok_and(|n| n == buf.len())
+        })),
+        b"/limits" => match crate::fs::OtherView::of(host) {
+            Some(v) => Entry::File(limits(&v.limits)),
+            None => Entry::Missing,
+        },
+        b"/statm" => Entry::File(statm(host)),
+        b"/io" => Entry::File(io(host)),
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),
-        b"/cgroup" => Entry::File([b"0::", &rec.cgroup[..], b"\n"].concat()),
+        // Relative to the reader's cgroup namespace (`Fs::synthetic_entry`).
+        b"/cgroup" => Entry::Missing,
         b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
             Entry::File(oom_file(sub, rec.oom_score_adj))
         }
@@ -492,6 +629,7 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
                 .iter()
                 .map(|n| (n.to_vec(), DT_LNK)),
         ),
+        b"/net" => out.extend(crate::procnet::FILES.iter().map(|n| (n.to_vec(), DT_REG))),
         b"/task" => {
             out.push((pid.to_string().into_bytes(), DT_DIR));
             let me = pid.to_string().into_bytes();
@@ -589,6 +727,17 @@ pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
         mark @ crate::fdmarks::Mark::OomScore { .. } => {
             Some(oom_write(mark, &data[..data.len().min(64)], len))
         }
+        crate::fdmarks::Mark::Comm { tid } => Some(comm_write(tid, data, len)),
+        crate::fdmarks::Mark::UtsName { domain } => {
+            use fwe_abi::err;
+            // The first line, as much of it as the name holds.
+            let line = data.split(|&b| b == b'\n').next().unwrap_or_default();
+            let name = &line[..line.len().min(crate::ns::HOST_NAME_MAX)];
+            Some(match crate::ns::set_current_name(!domain, name) {
+                Ok(()) => len as i64,
+                Err(e) => err(e),
+            })
+        }
         crate::fdmarks::Mark::TimerSlack { host } => {
             use fwe_abi::{err, errno};
             let text = String::from_utf8_lossy(&data[..data.len().min(64)]);
@@ -600,6 +749,28 @@ pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
         }
         _ => None,
     }
+}
+
+/// A write of `data` (`len` bytes in all) to the `comm` of thread `tid`
+/// of this process (0: the main thread; -1: another process's, `EINVAL`
+/// as Linux has it): its first 15 bytes are the thread's name, as
+/// `PR_SET_NAME` sets it.
+fn comm_write(tid: i32, data: &[u8], len: u64) -> i64 {
+    use fwe_abi::prctl::TASK_COMM_LEN;
+    use fwe_abi::{err, errno};
+    let n = data.len().min(TASK_COMM_LEN - 1);
+    let mut name = [0u8; TASK_COMM_LEN];
+    name[..n].copy_from_slice(&data[..n]);
+    let main = tid == 0 || tid == crate::thread::tgid();
+    if main {
+        crate::procreg::own_comm(&name[..n]);
+    }
+    if main && crate::thread::tid() == crate::thread::tgid() || tid == crate::thread::tid() {
+        crate::thread::set_name(name);
+    } else if !main {
+        return err(errno::EINVAL);
+    }
+    len as i64
 }
 
 /// What one of another process's descriptors is open on, as the host
@@ -717,6 +888,11 @@ pub fn socket_peer(host: i32, fd: i32) -> Option<u64> {
 
 /// `PROC_PIDFDSOCKETINFO` of descriptor `fd` of host process `host`.
 #[cfg(target_os = "macos")]
+pub(crate) fn socket_info_of(host: i32, fd: i32) -> Option<Vec<u8>> {
+    socket_info(host, fd)
+}
+
+#[cfg(target_os = "macos")]
 fn socket_info(host: i32, fd: i32) -> Option<Vec<u8>> {
     const SOCKET: i32 = 3;
     const SOCKET_SIZE: usize = 792;
@@ -740,8 +916,7 @@ fn peer_offset() -> Option<usize> {
         if unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, sv.as_mut_ptr()) } != 0 {
             return None;
         }
-        // SAFETY: getpid cannot fail.
-        let me = unsafe { libc::getpid() };
+        let me = crate::host::pid();
         let found = (|| {
             let a = socket_info(me, sv[0])?;
             let other = socket_id(me, sv[1])?;

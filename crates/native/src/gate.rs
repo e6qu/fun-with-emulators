@@ -52,6 +52,9 @@ pub struct Block {
     pub stack: u64,
     /// The call has run (the trap only delivers what is pending).
     pub ran: u64,
+    /// This thread's slot in [`crate::quiesce`], once looked up: the gate
+    /// marks itself in and out of guest code there without a thread-local.
+    pub slot: u64,
 }
 
 const _: () = assert!(std::mem::size_of::<Regs>() == 800);
@@ -110,6 +113,32 @@ pub fn ensure_block() {
         (*b).stack = p as u64 + size as u64;
         libc::pthread_setspecific(key(), p);
     }
+}
+
+/// Give this thread the block and gate stack at `p` (a mapping an ended
+/// thread gave back, [`crate::stacks`]), fresh.
+pub fn adopt_block(p: u64) {
+    let size = crate::page_size() as usize + STACK_SIZE;
+    // SAFETY: the mapping is this thread's alone now; the block starts it.
+    unsafe {
+        std::ptr::write_bytes(p as *mut Block, 0, 1);
+        let b = p as *mut Block;
+        (*b).stack = p + size as u64;
+        libc::pthread_setspecific(key(), p as *const libc::c_void);
+    }
+}
+
+/// Start this thread's block afresh, as [`adopt_block`] does a pooled one:
+/// its thread runs another guest thread.
+pub fn reset_block() {
+    if let Some(p) = block_mapping() {
+        adopt_block(p);
+    }
+}
+
+/// This thread's block's mapping, if it has one.
+pub fn block_mapping() -> Option<u64> {
+    block().map(|b| std::ptr::from_ref(b) as u64)
 }
 
 /// Whether `pc` is in the gate's own instructions. Async-signal-safe.
@@ -256,10 +285,20 @@ core::arch::global_asm!(
     "ldp q26, q27, [x2, #416]",
     "ldp q28, q29, [x2, #448]",
     "ldp q30, q31, [x2, #480]",
+    // The floating-point status and control as they were, written only
+    // where fwe's code changed them: writing `fpcr` stalls the core.
     "ldr w3, [x0, #784]",
-    "ldr w4, [x0, #788]",
+    "mrs x5, fpsr",
+    "cmp x3, x5",
+    "b.eq 2f",
     "msr fpsr, x3",
+    "2:",
+    "ldr w4, [x0, #788]",
+    "mrs x5, fpcr",
+    "cmp x4, x5",
+    "b.eq 3f",
     "msr fpcr, x4",
+    "3:",
     "ldr x3, [x0, #264]",
     "msr nzcv, x3",
     // Back on the guest's stack, its x30 still saved there for the stub.

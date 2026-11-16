@@ -16,7 +16,9 @@
 //!   is cloned, and every descriptor this process has of it is replaced by a
 //!   read-only one of the clone, at the same offset and with the same flags
 //!   and sharing. The host then refuses writes and writable shared mappings,
-//!   and the kernel reports those as `EPERM` ([`write_refused`]). Its size
+//!   and the kernel reports those as `EPERM` ([`write_refused`], which
+//!   looks at a file's seals only once some memfd was sealed so: a count in
+//!   the process store). Its size
 //!   still changes as the other seals allow, through a writable descriptor
 //!   of the clone fwe keeps; a writable shared mapping of it makes the seal
 //!   `EBUSY`.
@@ -203,7 +205,11 @@ pub fn chmod_sealed(fd: i32) -> bool {
 /// `EACCES` for a writable shared mapping) did so because `fd` is a memfd
 /// sealed against writing, which Linux reports as `EPERM`.
 pub fn write_refused(fd: i32) -> bool {
-    cfg!(target_os = "macos") && imp::seals(fd).is_some_and(|s| s & WRITE_SEALS != 0)
+    use crate::procstore::{Count, count};
+    // A memfd's seals are looked for only once one was sealed so.
+    cfg!(target_os = "macos")
+        && count(Count::WriteSeals).load(std::sync::atomic::Ordering::SeqCst) != 0
+        && imp::seals(fd).is_some_and(|s| s & WRITE_SEALS != 0)
 }
 
 /// The result of system call `nr` with arguments `a`, with a host refusal
@@ -286,8 +292,7 @@ mod imp {
     fn fresh_path(what: &str) -> Result<std::ffi::CString, i32> {
         static N: AtomicU64 = AtomicU64::new(0);
         let mut path = crate::fs::shm::user_dir()?;
-        // SAFETY: getpid cannot fail.
-        let pid = unsafe { libc::getpid() };
+        let pid = crate::host::pid();
         let n = N.fetch_add(1, Ordering::Relaxed);
         path.extend_from_slice(format!("/{what}-{pid}-{n}").as_bytes());
         std::ffi::CString::new(path).map_err(|_| errno::EINVAL)
@@ -372,6 +377,8 @@ mod imp {
             if file_id(fd).is_some_and(|(_, ino)| crate::maps::record().shared_writable(ino)) {
                 return Err(errno::EBUSY);
             }
+            crate::procstore::count(crate::procstore::Count::WriteSeals)
+                .fetch_add(1, Ordering::SeqCst);
             freeze(fd, new)?;
         }
         if new & fcntl::F_SEAL_GROW != 0 {

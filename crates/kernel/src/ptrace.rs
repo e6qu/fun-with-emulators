@@ -3,8 +3,9 @@
 //! read and change its memory and registers.
 //!
 //! macOS gives no process another's memory or threads, so a tracee does
-//! its tracer's work itself. Each traced process has a mailbox: a page in
-//! fwe's private directory (`ptrace-<pid>`) that it and its tracer map.
+//! its tracer's work itself. Each traced thread has a mailbox, and each
+//! tracer an inbox: pages of fwe's process store
+//! ([`crate::procstore::page`]), kept while the tracer lives.
 //! At a stop (a signal about to be delivered, a system call's entry or
 //! exit, an `execve`) the tracee writes its registers, the stop's wait
 //! status and the signal's `siginfo` there, tells its tracer (an entry in
@@ -57,10 +58,12 @@ pub const PTRACE_O_TRACECLONE: u64 = 0x8;
 pub const PTRACE_O_TRACEEXEC: u64 = 0x10;
 pub const PTRACE_O_TRACEVFORKDONE: u64 = 0x20;
 pub const PTRACE_O_TRACEEXIT: u64 = 0x40;
+pub const PTRACE_O_TRACESECCOMP: u64 = 0x80;
 pub const PTRACE_O_EXITKILL: u64 = 0x10_0000;
-/// The options fwe takes (not `PTRACE_O_TRACESECCOMP` or
-/// `PTRACE_O_SUSPEND_SECCOMP`, which need seccomp's tracer return).
+/// The options fwe takes (not `PTRACE_O_SUSPEND_SECCOMP`, checkpointing's
+/// switch that turns a tracee's seccomp off).
 const KNOWN_OPTIONS: u64 = PTRACE_O_TRACESYSGOOD
+    | PTRACE_O_TRACESECCOMP
     | PTRACE_O_TRACEFORK
     | PTRACE_O_TRACEVFORK
     | PTRACE_O_TRACECLONE
@@ -74,6 +77,7 @@ pub const PTRACE_EVENT_CLONE: i32 = 3;
 pub const PTRACE_EVENT_EXEC: i32 = 4;
 pub const PTRACE_EVENT_VFORK_DONE: i32 = 5;
 pub const PTRACE_EVENT_EXIT: i32 = 6;
+pub const PTRACE_EVENT_SECCOMP: i32 = 7;
 /// A seized tracee's stop that no signal or event made: an interrupt, a
 /// group-stop, the end of one.
 pub const PTRACE_EVENT_STOP: i32 = 128;
@@ -140,7 +144,7 @@ const FPREGS_AT: usize = 1024;
 /// `OP_WRITE`), a part at a time.
 const MEMBUF_AT: usize = 2048;
 const MEMBUF_LEN: usize = 2048;
-const PAGE: usize = 4096;
+const _: () = assert!(MEMBUF_AT + MEMBUF_LEN <= crate::procstore::PAGE_WORDS * 8);
 
 /// [`W_STATE`]: running, stopped and not yet reported by `wait`, stopped
 /// and reported.
@@ -166,7 +170,7 @@ const OP_LISTEN: u64 = 7;
 const OP_READ: u64 = 8;
 const OP_WRITE: u64 = 9;
 
-/// A mapped mailbox or inbox page.
+/// A mailbox or inbox page.
 struct Page(&'static [AtomicU64]);
 
 impl Page {
@@ -190,65 +194,23 @@ impl Page {
     }
 }
 
-impl Drop for Page {
-    fn drop(&mut self) {
-        // SAFETY: the page `open` mapped, no longer used.
-        unsafe { libc::munmap(self.0.as_ptr() as *mut libc::c_void, PAGE) };
-    }
+/// Tracee thread `id`'s mailbox, and tracer `pid`'s inbox, by their tags
+/// in the store.
+fn mailbox_tag(id: i32) -> u64 {
+    1 << 32 | u64::from(id as u32)
 }
 
-fn path(name: &str) -> Option<std::ffi::CString> {
-    let mut p = crate::fs::shm::user_dir().ok()?;
-    p.extend_from_slice(name.as_bytes());
-    std::ffi::CString::new(p).ok()
+fn inbox_tag(pid: i32) -> u64 {
+    2 << 32 | u64::from(pid as u32)
 }
 
-/// Map the page `name` in fwe's private directory, made if `create`.
-fn open(name: &str, create: bool) -> Option<Page> {
-    let c = path(name)?;
-    let flags = libc::O_RDWR | libc::O_CLOEXEC | if create { libc::O_CREAT } else { 0 };
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    let fd = unsafe { libc::open(c.as_ptr(), flags, 0o600) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: plain host calls on the descriptor just opened; a file
-    // shorter than a page is grown with zeros.
-    let map = unsafe {
-        let mut st: libc::stat = std::mem::zeroed();
-        if libc::fstat(fd, &mut st) == 0 && (st.st_size as usize) < PAGE {
-            libc::ftruncate(fd, PAGE as libc::off_t);
-        }
-        let m = libc::mmap(
-            std::ptr::null_mut(),
-            PAGE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        libc::close(fd);
-        m
-    };
-    if map == libc::MAP_FAILED {
-        return None;
-    }
-    // SAFETY: a page, shared, page-aligned, every access atomic; unmapped
-    // when the `Page` goes.
-    Some(Page(unsafe { std::slice::from_raw_parts(map as *const AtomicU64, PAGE / 8) }))
-}
-
-fn mailbox_name(pid: i32) -> String {
-    format!("/ptrace-{pid}")
-}
-
-fn inbox_name(pid: i32) -> String {
-    format!("/ptrace-inbox-{pid}")
+/// The page tagged `tag`, made if `make` names the tracer it is kept for.
+fn open(tag: u64, make: Option<i32>) -> Option<Page> {
+    crate::procstore::page(tag, make).map(|w| Page(&w[..]))
 }
 
 fn me() -> i32 {
-    // SAFETY: getpid cannot fail.
-    unsafe { libc::getpid() }
+    crate::host::pid()
 }
 
 fn alive(pid: i32) -> bool {
@@ -287,6 +249,26 @@ fn tracer() -> i32 {
     TRACER.with(std::cell::Cell::get)
 }
 
+/// Whether this thread's tracer (if it has one) has `CAP_SYS_PTRACE` in
+/// its user namespace, Linux's `ptracer_capable`: an exec it watches may
+/// then grant what the program grants. The tracer's capabilities are the
+/// ones its process record holds now.
+pub fn tracer_capable() -> bool {
+    let t = tracer();
+    if !traced() || t <= 0 {
+        return true;
+    }
+    let sec = crate::procreg::security(t).unwrap_or_default();
+    let euid = crate::procreg::ids(t)[1];
+    let effective = sec.caps[0] & 1 << crate::caps::CAP_SYS_PTRACE != 0;
+    crate::userns::capable_of(
+        &crate::procreg::user_ns(t),
+        &crate::userns::own_dir(),
+        euid,
+        effective,
+    )
+}
+
 /// The host's signal dispositions are to be set again: a thread began or
 /// ended being traced ([`crate::Kernel::resync_for_tracing`]).
 static RESYNC: AtomicBool = AtomicBool::new(false);
@@ -313,7 +295,8 @@ fn set_traced(on: bool) {
 
 /// Whether this thread stops at each system call's entry and exit.
 pub fn stops_at_syscalls() -> bool {
-    traced() && SYSCALLS.with(std::cell::Cell::get)
+    // Nothing traced in the process: no look at this thread's state.
+    any_traced() && traced() && SYSCALLS.with(std::cell::Cell::get)
 }
 
 /// What names this thread's mailbox: the process's host pid for its main
@@ -340,7 +323,7 @@ const FRESH: [usize; 10] = [
 /// This thread is traced by host process `tracer` from now on.
 fn begin(tracer: i32) -> Result<(), i32> {
     let id = self_id();
-    let mb = open(&mailbox_name(id), true).ok_or(errno::ENOMEM)?;
+    let mb = open(mailbox_tag(id), Some(tracer)).ok_or(errno::ENOMEM)?;
     for w in FRESH {
         mb.word(w).store(0, Ordering::Release);
     }
@@ -350,7 +333,7 @@ fn begin(tracer: i32) -> Result<(), i32> {
     SYSCALLS.with(|t| t.set(false));
     set_traced(true);
     // Its tracer looks for its stops in its inbox.
-    if let Some(inbox) = open(&inbox_name(tracer), true) {
+    if let Some(inbox) = open(inbox_tag(tracer), Some(tracer)) {
         let pid = id as u64;
         let slots = &inbox.0[1..];
         if !slots.iter().any(|s| s.load(Ordering::Acquire) == pid) {
@@ -362,6 +345,30 @@ fn begin(tracer: i32) -> Result<(), i32> {
         }
     }
     Ok(())
+}
+
+/// The process Yama lets trace this one besides its ancestors
+/// (`PR_SET_PTRACER`): a host pid, -1 for any, 0 for none. A fork child
+/// starts with none.
+static PTRACER: AtomicI32 = AtomicI32::new(0);
+
+/// `PR_SET_PTRACER`.
+pub fn set_ptracer(pid: i32) {
+    PTRACER.store(pid, Ordering::Relaxed);
+}
+
+/// What `PR_SET_PTRACER` set.
+pub fn ptracer() -> i32 {
+    PTRACER.load(Ordering::Relaxed)
+}
+
+/// The host pid of the process tracing tracee `id` (a process's pid or a
+/// thread's tid), 0 for none: `TracerPid` in `/proc/<pid>/status`.
+pub fn tracer_of(id: i32) -> i32 {
+    open(mailbox_tag(id), None)
+        .map(|mb| mb.word(W_TRACER).load(Ordering::Acquire) as i32)
+        .filter(|&t| t > 0 && alive(t))
+        .unwrap_or(0)
 }
 
 /// `PTRACE_TRACEME`: traced by the parent, host process `parent`.
@@ -376,15 +383,14 @@ pub fn traceme(parent: i32) -> Result<(), i32> {
 fn end() {
     set_traced(false);
     SYSCALLS.with(|t| t.set(false));
-    if let Some(c) = path(&mailbox_name(self_id())) {
-        // SAFETY: a NUL-terminated path of fwe's.
-        unsafe { libc::unlink(c.as_ptr()) };
-    }
+    crate::procstore::free_page(mailbox_tag(self_id()));
 }
 
-/// In a fork child: not traced (its parent's tracer does not trace it).
+/// In a fork child: not traced (its parent's tracer does not trace it),
+/// and no tracer named by `PR_SET_PTRACER`.
 pub fn forked_child() {
     let follow = FOLLOW.swap(0, Ordering::AcqRel);
+    PTRACER.store(0, Ordering::Relaxed);
     TRACED.with(|t| t.set(false));
     SYSCALLS.with(|t| t.set(false));
     ANY.store(0, Ordering::Release);
@@ -406,7 +412,7 @@ pub fn forked_child() {
 /// stops it with `PTRACE_EVENT_STOP`, as Linux starts each.
 fn first_stop(id: i32, opts: u64, seized: bool) -> (u64, crate::thread::SigInfo) {
     use crate::thread::SigInfo;
-    if let Some(mb) = open(&mailbox_name(id), false) {
+    if let Some(mb) = open(mailbox_tag(id), None) {
         mb.word(W_OPTIONS).store(opts, Ordering::Release);
         mb.word(W_SEIZED).store(u64::from(seized), Ordering::Release);
         mb.word(W_INTERRUPT).store(u64::from(seized), Ordering::Release);
@@ -418,7 +424,7 @@ fn first_stop(id: i32, opts: u64, seized: bool) -> (u64, crate::thread::SigInfo)
 /// Whether this thread was attached by `PTRACE_SEIZE`.
 pub fn seized() -> bool {
     traced()
-        && open(&mailbox_name(self_id()), false)
+        && open(mailbox_tag(self_id()), None)
             .is_some_and(|mb| mb.word(W_SEIZED).load(Ordering::Acquire) == 1)
 }
 
@@ -507,10 +513,10 @@ pub fn thread_exiting() {
 /// Tell `tracer` that tracee `id` ended with wait status `status`, through
 /// its mailbox, which the tracer then removes ([`take_stop`]).
 fn report_end(id: i32, tracer: i32, status: i32) {
-    let Some(mb) = open(&mailbox_name(id), false) else { return };
+    let Some(mb) = open(mailbox_tag(id), None) else { return };
     mb.word(W_STATUS).store(status as u32 as u64, Ordering::Release);
     mb.word(W_STATE).store(EXITED, Ordering::Release);
-    if let Some(inbox) = open(&inbox_name(tracer), false) {
+    if let Some(inbox) = open(inbox_tag(tracer), None) {
         inbox.word(0).fetch_add(1, Ordering::AcqRel);
         wake_word(inbox.word(0));
     }
@@ -565,9 +571,8 @@ pub fn exiting(status: i32) {
         if id == self_id() {
             continue;
         }
-        if let Some(mb) = open(&mailbox_name(id), false) {
+        if let Some(mb) = open(mailbox_tag(id), None) {
             let t = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
-            drop(mb);
             report_end(id, t, status);
         }
     }
@@ -586,24 +591,20 @@ pub fn exiting(status: i32) {
     }
     // A tracer that ends takes the tracees that asked it to with it
     // (`PTRACE_O_EXITKILL`).
-    if let Some(inbox) = open(&inbox_name(me()), false) {
+    if let Some(inbox) = open(inbox_tag(me()), None) {
         for slot in &inbox.0[1..] {
             let pid = slot.load(Ordering::Acquire) as i32;
             if pid <= 0 {
                 continue;
             }
-            if let Some(mb) = open(&mailbox_name(pid), false)
+            if let Some(mb) = open(mailbox_tag(pid), None)
                 && mb.word(W_TRACER).load(Ordering::Acquire) == me() as u64
                 && mb.word(W_OPTIONS).load(Ordering::Acquire) & PTRACE_O_EXITKILL != 0
             {
                 crate::host::kill_process(pid, libc::SIGKILL);
             }
         }
-        drop(inbox);
-        if let Some(c) = path(&inbox_name(me())) {
-            // SAFETY: a NUL-terminated path of fwe's.
-            unsafe { libc::unlink(c.as_ptr()) };
-        }
+        crate::procstore::free_page(inbox_tag(me()));
     }
 }
 
@@ -620,7 +621,7 @@ pub fn restore(tracer: i32, syscalls: bool) {
     if tracer <= 0 || !alive(tracer) {
         return;
     }
-    if open(&mailbox_name(self_id()), false).is_none() {
+    if open(mailbox_tag(self_id()), None).is_none() {
         let _ = begin(tracer);
     } else {
         TRACER.with(|t| t.set(tracer));
@@ -650,7 +651,7 @@ impl Resume {
 
 /// The options the tracer set.
 pub fn options() -> u64 {
-    open(&mailbox_name(self_id()), false).map_or(0, |mb| mb.word(W_OPTIONS).load(Ordering::Acquire))
+    open(mailbox_tag(self_id()), None).map_or(0, |mb| mb.word(W_OPTIONS).load(Ordering::Acquire))
 }
 
 /// Stop for the tracer with wait status `status` and `siginfo` (128
@@ -668,7 +669,7 @@ pub fn stop(
 ) -> Resume {
     let sig = ((status >> 8) & 0x7f) as u64;
     let passing = if status >> 16 == 0 && sig != libc::SIGTRAP as u64 { sig } else { 0 };
-    let Some(mb) = open(&mailbox_name(self_id()), false) else { return Resume::Cont(passing) };
+    let Some(mb) = open(mailbox_tag(self_id()), None) else { return Resume::Cont(passing) };
     let tracer = tracer();
     if !alive(tracer) {
         end();
@@ -727,7 +728,7 @@ fn report(
     mb.word(W_STATE).store(STOPPED, Ordering::Release);
     wake_word(mb.word(W_STATE));
     // Its tracer is told: its inbox's generation, and `SIGCHLD`.
-    if let Some(inbox) = open(&inbox_name(tracer), false) {
+    if let Some(inbox) = open(inbox_tag(tracer), None) {
         inbox.word(0).fetch_add(1, Ordering::AcqRel);
         wake_word(inbox.word(0));
     }
@@ -958,6 +959,16 @@ std::thread_local! {
         const { std::cell::RefCell::new(Vec::new()) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    TRACED.with(|t| t.set(false));
+    TRACER.with(|t| t.set(0));
+    SYSCALLS.with(|t| t.set(false));
+    NEW_THREAD.with(|t| t.set(None));
+    NOTED.with(|t| t.set(None));
+    STEPS.with(|s| s.borrow_mut().clear());
+}
+
 /// Where the instruction `insn` at `pc` may go next, with registers `x`.
 pub fn next_pcs(insn: u32, pc: u64, x: &[u64; 31]) -> Vec<u64> {
     let sext = |v: u32, bits: u32| ((v as i64) << (64 - bits)) >> (64 - bits);
@@ -1052,23 +1063,6 @@ pub fn stop_status(sig: u64, event: i32) -> i32 {
     0x7f | ((sig as i32) << 8) | (event << 16)
 }
 
-/// Whether `name`, a file in fwe's private directory, is a mailbox or
-/// inbox of a process that is gone (left when it was killed).
-pub(crate) fn leftover(name: &[u8]) -> bool {
-    let Some(name) = std::str::from_utf8(name).ok() else { return false };
-    if let Some(tracer) = name.strip_prefix("ptrace-inbox-") {
-        return tracer.parse().is_ok_and(|pid: i32| pid > 0 && !alive(pid));
-    }
-    let Some(id) = name.strip_prefix("ptrace-").and_then(|n| n.parse::<i32>().ok()) else {
-        return false;
-    };
-    // A thread's mailbox is named by its tid: the process it says it is in.
-    open(&mailbox_name(id), false).is_some_and(|mb| {
-        let pid = proc_of(&mb);
-        pid <= 0 || !alive(pid)
-    })
-}
-
 // --- the tracer ----------------------------------------------------------------
 
 /// The host process a tracee's mailbox says it is in.
@@ -1079,7 +1073,7 @@ fn proc_of(mb: &Page) -> i32 {
 /// Tracee `pid`'s mailbox (a process's pid, or a thread's tid), if this
 /// process traces it.
 fn tracee(pid: i32) -> Result<Page, i32> {
-    let mb = open(&mailbox_name(pid), false).ok_or(errno::ESRCH)?;
+    let mb = open(mailbox_tag(pid), None).ok_or(errno::ESRCH)?;
     if mb.word(W_TRACER).load(Ordering::Acquire) != me() as u64
         || mb.word(W_STATE).load(Ordering::Acquire) == EXITED
         || !alive(proc_of(&mb))
@@ -1092,7 +1086,7 @@ fn tracee(pid: i32) -> Result<Page, i32> {
 /// The tracee a tracer names by `pid` (a traced thread's tid, or a process's
 /// pid as the guest names it), as its mailbox is named.
 pub fn target_of(pid: i32) -> Option<i32> {
-    if pid > 0 && open(&mailbox_name(pid), false).is_some() {
+    if pid > 0 && open(mailbox_tag(pid), None).is_some() {
         return Some(pid);
     }
     crate::pidns::to_host(pid)
@@ -1100,7 +1094,7 @@ pub fn target_of(pid: i32) -> Option<i32> {
 
 /// The host process tracee `id` is in.
 pub fn process_of(id: i32) -> i32 {
-    open(&mailbox_name(id), false).map_or(id, |mb| proc_of(&mb))
+    open(mailbox_tag(id), None).map_or(id, |mb| proc_of(&mb))
 }
 
 /// The tracee host process `pid`'s mailbox, if this process traces it and
@@ -1151,7 +1145,7 @@ pub fn tracee_memory(pid: i32, addr: u64, buf: &mut [u8], write: bool) -> Result
 /// traced without stopping it; its nudge sent by the caller.
 fn seize(id: i32, proc: i32, options: u64) -> Result<(), i32> {
     attach_id(id, proc)?;
-    let mb = open(&mailbox_name(id), false).ok_or(errno::ESRCH)?;
+    let mb = open(mailbox_tag(id), None).ok_or(errno::ESRCH)?;
     mb.word(W_OPTIONS).store(options, Ordering::Release);
     mb.word(W_SEIZED).store(1, Ordering::Release);
     Ok(())
@@ -1256,20 +1250,18 @@ fn ask(mb: &Page, pid: i32, op: u64, addr: u64, data: u64) -> Result<i64, i32> {
 
 /// Whether this process traces any process.
 pub fn tracing() -> bool {
-    let Some(c) = path(&inbox_name(me())) else { return false };
-    // SAFETY: a NUL-terminated path; F_OK only checks it is there.
-    unsafe { libc::access(c.as_ptr(), libc::F_OK) == 0 }
+    open(inbox_tag(me()), None).is_some()
 }
 
 /// The inbox's generation, which every tracee's stop moves.
 pub fn inbox_generation() -> u64 {
-    open(&inbox_name(me()), false).map_or(0, |i| i.word(0).load(Ordering::Acquire))
+    open(inbox_tag(me()), None).map_or(0, |i| i.word(0).load(Ordering::Acquire))
 }
 
 /// Sleep until a tracee stops (the inbox's generation moves from `seen`)
 /// or `slice` passes.
 pub fn wait_for_stop(seen: u64, slice: Duration) {
-    if let Some(inbox) = open(&inbox_name(me()), false) {
+    if let Some(inbox) = open(inbox_tag(me()), None) {
         wait_word_for(inbox.word(0), seen, slice);
     } else {
         std::thread::sleep(slice);
@@ -1280,13 +1272,13 @@ pub fn wait_for_stop(seen: u64, slice: Duration) {
 /// not yet reported: its id, wait status and whether it is a thread,
 /// reported now unless `peek`.
 pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, bool)> {
-    let inbox = open(&inbox_name(me()), false)?;
+    let inbox = open(inbox_tag(me()), None)?;
     for slot in &inbox.0[1..] {
         let pid = slot.load(Ordering::Acquire) as i32;
         if pid <= 0 {
             continue;
         }
-        let Some(mb) = open(&mailbox_name(pid), false) else {
+        let Some(mb) = open(mailbox_tag(pid), None) else {
             // Its tracing ended: the slot is free.
             let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
             continue;
@@ -1299,11 +1291,7 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, 
         if state == EXITED {
             let status = mb.word(W_STATUS).load(Ordering::Acquire) as i32;
             if !peek {
-                drop(mb);
-                if let Some(c) = path(&mailbox_name(pid)) {
-                    // SAFETY: a NUL-terminated path of fwe's.
-                    unsafe { libc::unlink(c.as_ptr()) };
-                }
+                crate::procstore::free_page(mailbox_tag(pid));
                 let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
             }
             return Some((pid, status, thread));
@@ -1414,7 +1402,7 @@ pub fn event_msg(pid: i32) -> Result<u64, i32> {
 /// Whether host process `pid` is traced by any process.
 pub fn is_traced(pid: i32) -> bool {
     // (The process's main thread's mailbox.)
-    open(&mailbox_name(pid), false)
+    open(mailbox_tag(pid), None)
         .is_some_and(|mb| alive(mb.word(W_TRACER).load(Ordering::Acquire) as i32))
 }
 
@@ -1436,13 +1424,13 @@ fn attach_id(pid: i32, proc: i32) -> Result<(), i32> {
     if is_traced(pid) {
         return Err(errno::EPERM);
     }
-    let mb = open(&mailbox_name(pid), true).ok_or(errno::ENOMEM)?;
+    let mb = open(mailbox_tag(pid), Some(me())).ok_or(errno::ENOMEM)?;
     for w in FRESH {
         mb.word(w).store(0, Ordering::Release);
     }
     mb.word(W_TRACER).store(me() as u64, Ordering::Release);
     mb.word(W_PROC).store(proc as u64, Ordering::Release);
-    let inbox = open(&inbox_name(me()), true).ok_or(errno::ENOMEM)?;
+    let inbox = open(inbox_tag(me()), Some(me())).ok_or(errno::ENOMEM)?;
     let slots = &inbox.0[1..];
     if !slots.iter().any(|s| s.load(Ordering::Acquire) == pid as u64)
         && !slots
@@ -1464,7 +1452,7 @@ pub fn attached(sig: u64) -> bool {
     if sig != fwe_abi::signal::SIGSTOP {
         return begin_seized();
     }
-    let Some(mb) = open(&mailbox_name(self_id()), false) else { return false };
+    let Some(mb) = open(mailbox_tag(self_id()), None) else { return false };
     let tracer = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
     if tracer <= 0 || !alive(tracer) {
         return false;
@@ -1482,7 +1470,7 @@ pub fn attached(sig: u64) -> bool {
 /// A thread seized (`PTRACE_SEIZE`) but not yet traced is traced from now
 /// on: whether it was.
 fn begin_seized() -> bool {
-    let Some(mb) = open(&mailbox_name(self_id()), false) else { return false };
+    let Some(mb) = open(mailbox_tag(self_id()), None) else { return false };
     let tracer = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
     if mb.word(W_SEIZED).load(Ordering::Acquire) != 1
         || tracer <= 0
@@ -1615,11 +1603,10 @@ impl<P: crate::Platform> crate::Kernel<P> {
         if !traced() && !begin_seized() {
             return;
         }
-        let Some(mb) = open(&mailbox_name(self_id()), false) else { return };
+        let Some(mb) = open(mailbox_tag(self_id()), None) else { return };
         if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) != 1 {
             return;
         }
-        drop(mb);
         let (status, si, _, _) = trap_stop();
         let r = self.stop_with_tls(regs, status, &si, 0, 0);
         if r.signal() != 0 {
@@ -1694,20 +1681,101 @@ impl<P: crate::Platform> crate::Kernel<P> {
         }
     }
 
-    /// Whether the caller may trace host process `target` (Linux's
-    /// `ptrace_may_access` for attaching): `CAP_SYS_PTRACE`, or the same
-    /// real, effective and saved ids as the target's, and the target
-    /// dumpable.
+    /// Whether the caller may attach to host process `target` as a tracer
+    /// (`PTRACE_MODE_ATTACH_REALCREDS`: `ptrace`, `process_vm_readv`,
+    /// `pidfd_getfd`).
     pub(crate) fn may_trace(&self, target: i32) -> bool {
-        if self.creds.has(crate::caps::CAP_SYS_PTRACE) {
-            return true;
-        }
-        let ids = crate::procreg::ids(target);
+        self.may_access(target, true, false)
+    }
+
+    /// Linux's `__ptrace_may_access` of host process `target`, to attach
+    /// (`attach`) or only read, with the caller's file-system ids
+    /// (`fscreds`, for `/proc/<pid>` files) or real ones:
+    /// - its ids: the target's real, effective and saved user ids each the
+    ///   caller's, and its group ids likewise; else `CAP_SYS_PTRACE` in
+    ///   the target's user namespace;
+    /// - the target dumpable, else `CAP_SYS_PTRACE` there;
+    /// - the target's permitted capabilities within the caller's (its
+    ///   effective set with `fscreds`, else its permitted one) in the same
+    ///   user namespace, else `CAP_SYS_PTRACE` there;
+    /// - to attach, Yama's `kernel.yama.ptrace_scope`: 1, only a
+    ///   descendant, or one the target named with `PR_SET_PTRACER`; 2,
+    ///   only with `CAP_SYS_PTRACE` there; 3, none;
+    /// - Landlock: the target in the caller's domain or one nested in it.
+    pub(crate) fn may_access(&self, target: i32, attach: bool, fscreds: bool) -> bool {
+        let ns = crate::procreg::user_ns(target);
+        let cap = || self.creds.has_in(&ns, crate::caps::CAP_SYS_PTRACE);
         let c = &self.creds;
-        let uid = [c.uid, c.euid, c.suid];
-        let gid = [c.gid, c.egid, c.sgid];
-        ids[..3].iter().all(|u| uid.iter().all(|x| x == u))
-            && ids[4..7].iter().all(|g| gid.iter().all(|x| x == g))
+        let (uid, gid) = if fscreds { (c.fsuid, c.fsgid) } else { (c.uid, c.gid) };
+        let ids = crate::procreg::ids(target);
+        let same = ids[..3].iter().all(|&u| u == uid) && ids[4..7].iter().all(|&g| g == gid);
+        if !same && !cap() {
+            return false;
+        }
+        let sec = crate::procreg::security(target).unwrap_or_default();
+        if sec.dumpable != crate::coredump::SUID_DUMP_USER && !cap() {
+            return false;
+        }
+        let held = if fscreds { c.caps.effective } else { c.caps.permitted };
+        let within = crate::userns::own_dir() == ns && sec.caps[1] & !held == 0;
+        if !within && !cap() {
+            return false;
+        }
+        if attach && !self.yama_allows(target, &sec, cap) {
+            return false;
+        }
+        crate::landlock::may_trace(target).is_ok()
+    }
+
+    /// Yama's rule for attaching to host process `target` (whose security
+    /// state is `sec`), `cap` telling whether the caller has
+    /// `CAP_SYS_PTRACE` in its user namespace.
+    fn yama_allows(
+        &self,
+        target: i32,
+        sec: &crate::procreg::Security,
+        cap: impl Fn() -> bool,
+    ) -> bool {
+        match crate::sysctl::number(b"kernel/yama/ptrace_scope").unwrap_or(1) {
+            0 => true,
+            1 => {
+                let line =
+                    |pid: i32| crate::procreg::read(pid).map(|r| r.lineage).unwrap_or_default();
+                // A descendant; or the target named the caller, or a
+                // process the caller descends from, or any.
+                line(target).iter().any(|&(p, _)| p == me())
+                    || sec.ptracer == -1
+                    || (sec.ptracer > 0
+                        && (sec.ptracer == me()
+                            || line(me()).iter().any(|&(p, _)| p == sec.ptracer)))
+                    || cap()
+            }
+            2 => cap(),
+            _ => false,
+        }
+    }
+
+    /// Whether the caller may be traced by its parent, host process
+    /// `parent` (`PTRACE_TRACEME`): Yama refuses it at scope 3, and at
+    /// scope 2 unless the parent has `CAP_SYS_PTRACE` over the caller;
+    /// Landlock unless the parent's domain holds the caller's.
+    fn may_be_traced_by(&self, parent: i32) -> bool {
+        let allowed = match crate::sysctl::number(b"kernel/yama/ptrace_scope").unwrap_or(1) {
+            0 | 1 => true,
+            2 => {
+                let sec = crate::procreg::security(parent).unwrap_or_default();
+                let euid = crate::procreg::ids(parent)[1];
+                let effective = sec.caps[0] & 1 << crate::caps::CAP_SYS_PTRACE != 0;
+                crate::userns::capable_of(
+                    &crate::procreg::user_ns(parent),
+                    &crate::userns::own_dir(),
+                    euid,
+                    effective,
+                )
+            }
+            _ => false,
+        };
+        allowed && crate::landlock::may_be_traced_by(parent).is_ok()
     }
 
     /// `ptrace(request, pid, addr, data)`.
@@ -1717,6 +1785,9 @@ impl<P: crate::Platform> crate::Kernel<P> {
         if request == PTRACE_TRACEME {
             // SAFETY: getppid cannot fail.
             let parent = unsafe { libc::getppid() };
+            if !traced() && !self.may_be_traced_by(parent) {
+                return err(errno::EPERM);
+            }
             return match traceme(parent) {
                 Ok(()) => {
                     self.resync_for_tracing();
@@ -1877,36 +1948,13 @@ impl<P: crate::Platform> crate::Kernel<P> {
 
 /// The `siginfo` this process's tracer left in its mailbox.
 fn get_own_siginfo() -> Option<[u8; 128]> {
-    let mb = open(&mailbox_name(self_id()), false)?;
+    let mb = open(mailbox_tag(self_id()), None)?;
     mb.bytes(SIGINFO_AT, 128).try_into().ok()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_gone_process_leaves_its_mailboxes_to_be_collected() {
-        use std::os::unix::ffi::OsStrExt;
-        // A process that has ended (and been reaped).
-        let child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
-        let gone = child.id() as i32;
-        let mut child = child;
-        child.wait().unwrap();
-        assert!(leftover(format!("ptrace-inbox-{gone}").as_bytes()));
-        assert!(!leftover(format!("ptrace-inbox-{}", me()).as_bytes()));
-        // A thread's mailbox, by the process it says it is in.
-        let id = 0x7ff0_0000 + (me() & 0xffff);
-        let mb = open(&mailbox_name(id), true).unwrap();
-        mb.word(W_PROC).store(me() as u64, Ordering::Release);
-        assert!(!leftover(&mailbox_name(id).as_bytes()[1..]));
-        mb.word(W_PROC).store(gone as u64, Ordering::Release);
-        assert!(leftover(&mailbox_name(id).as_bytes()[1..]));
-        let _ = std::fs::remove_file(std::ffi::OsStr::from_bytes(
-            path(&mailbox_name(id)).unwrap().to_bytes(),
-        ));
-        assert!(!leftover(b"ptrace-x"));
-    }
 
     #[test]
     fn a_step_follows_every_kind_of_branch() {
@@ -1943,8 +1991,9 @@ mod tests {
 
     #[test]
     fn a_mailbox_keeps_registers_and_siginfo() {
-        let words: &'static [AtomicU64] =
-            Box::leak((0..PAGE / 8).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into());
+        let words: &'static [AtomicU64] = Box::leak(
+            (0..crate::procstore::PAGE_WORDS).map(|_| AtomicU64::new(0)).collect::<Vec<_>>().into(),
+        );
         let mb = std::mem::ManuallyDrop::new(Page(words));
         let mut regs = crate::Regs::default();
         for (i, x) in regs.x.iter_mut().enumerate() {

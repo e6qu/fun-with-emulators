@@ -8,7 +8,9 @@
 //! `udata`. `EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`.
 //! The host's edge-triggered read filter on a pipe fires after a read too,
 //! which Linux's does not: the read end is reported only once it holds more
-//! than when last seen. A pipe with a capacity smaller than the host's
+//! than when last seen; an eventfd's (whose pipe holds one byte while its
+//! count is not 0) once written to, every write being an edge to Linux,
+//! whatever the count was. A pipe with a capacity smaller than the host's
 //! ([`crate::fdstate::pipe_full`]) is not writable while full, which the
 //! host does not know: its `EVFILT_WRITE` events are dropped then.
 //!
@@ -25,13 +27,25 @@
 type Interest = std::collections::BTreeMap<i32, (u32, u64)>;
 
 #[cfg(not(target_os = "linux"))]
-pub(crate) static INTEREST: std::sync::Mutex<Option<std::collections::HashMap<i32, Interest>>> =
-    std::sync::Mutex::new(None);
+pub(crate) static INTEREST: crate::kept::Kept<Option<std::collections::HashMap<i32, Interest>>> =
+    crate::kept::Kept::new(None);
 
 #[cfg(not(target_os = "linux"))]
 fn interest<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Interest>) -> R) -> R {
-    let mut g = INTEREST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut g = INTEREST.lock();
     f(g.get_or_insert_with(Default::default))
+}
+
+/// Whether descriptor `tfd` is in the interest list of epoll descriptor
+/// `efd` (`None`: `efd` is no epoll descriptor of this process's).
+pub fn watches(efd: i32, tfd: i32) -> Option<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = (efd, tfd);
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    interest(|m| m.get(&efd).map(|list| list.contains_key(&tfd)))
 }
 
 /// Descriptor `fd` is being closed: it leaves every interest list (as the
@@ -41,16 +55,26 @@ pub fn closed(fd: i32) {
     let _ = fd;
     #[cfg(not(target_os = "linux"))]
     {
-        interest(|m| {
+        if let Some(mut g) = INTEREST.if_used()
+            && let Some(m) = g.as_mut()
+        {
             m.remove(&fd);
             for list in m.values_mut() {
                 list.remove(&fd);
             }
-        });
-        EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
-        HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
-        BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
-        WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut e) = EDGES.if_used() {
+            e.retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut h) = HELD.if_used() {
+            h.retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut w) = BPF_WATCHED.if_used() {
+            w.retain(|k| k.0 != fd && k.1 != fd);
+        }
+        if let Some(mut w) = WRITES.if_used() {
+            w.retain(|k| k.0 != fd && k.1 != fd);
+        }
     }
 }
 
@@ -59,7 +83,9 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     #[cfg(target_os = "linux")]
     e.u64(0);
     #[cfg(not(target_os = "linux"))]
-    interest(|m| {
+    {
+        let mut g = INTEREST.lock();
+        let m = g.get_or_insert_with(Default::default);
         let mut eps: Vec<&i32> = m.keys().collect();
         eps.sort();
         let ce: Vec<bool> = eps.iter().map(|&&fd| crate::snapshot::cloexec(fd)).collect();
@@ -75,7 +101,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 e.u64(data);
             }
         })
-    })
+    }
 }
 
 /// Rebuild every epoll descriptor in a fork child: a fresh kqueue at its
@@ -236,7 +262,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         }
         // A mounts file or a bpf object is fwe's to watch, not the host's.
         if bpf {
-            let mut w = BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner());
+            let mut w = BPF_WATCHED.lock();
             w.retain(|&(e, f)| (e, f) != (epfd as i32, fd as i32));
             if entry.is_some() {
                 w.push((epfd as i32, fd as i32));
@@ -277,13 +303,13 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
 /// The bpf objects each set watches (set, descriptor): always in error, as
 /// Linux polls a map without events of its own.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static BPF_WATCHED: std::sync::Mutex<Vec<(i32, i32)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static BPF_WATCHED: crate::kept::Kept<Vec<(i32, i32)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// Whether set `ep` watches bpf object `fd`.
 #[cfg(not(target_os = "linux"))]
 fn bpf_watched(ep: i32, fd: i32) -> bool {
-    BPF_WATCHED.lock().unwrap_or_else(|e| e.into_inner()).contains(&(ep, fd))
+    BPF_WATCHED.lock().contains(&(ep, fd))
 }
 
 /// Whether `fd` is an epoll descriptor.
@@ -425,8 +451,10 @@ unsafe fn pwait_ns(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
 unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) -> i64 {
     use fwe_abi::epoll::*;
 
-    let want_read = events & EPOLLIN != 0;
-    let want_write = events & EPOLLOUT != 0;
+    // Normal data is all the host reads and writes: `EPOLLRDNORM` is
+    // `EPOLLIN`'s filter, `EPOLLWRNORM` and `EPOLLWRBAND` `EPOLLOUT`'s.
+    let want_read = events & (EPOLLIN | EPOLLRDNORM) != 0;
+    let want_write = events & (EPOLLOUT | EPOLLWRNORM | EPOLLWRBAND) != 0;
     // A socket watched only for its reading side's shutting
     // (`EPOLLRDHUP`): the read filter, at a low-water mark no read reaches,
     // so it fires only at the end of the stream.
@@ -460,6 +488,23 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
     };
     push(libc::EVFILT_READ, want_read || hangup_only, hangup_only.then_some(i32::MAX as isize));
     push(libc::EVFILT_WRITE, want_write, None);
+    // A TCP socket's urgent data (`EPOLLPRI`): the host's exception filter
+    // for out-of-band data.
+    if tcp_socket(fd as i32) {
+        let flags = if op != EPOLL_CTL_DEL && events & EPOLLPRI != 0 {
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT | extra
+        } else {
+            libc::EV_DELETE | libc::EV_RECEIPT
+        };
+        changes.push(libc::kevent {
+            ident: fd as libc::uintptr_t,
+            filter: libc::EVFILT_EXCEPT,
+            flags,
+            fflags: libc::NOTE_OOB,
+            data: 0,
+            udata: data as *mut libc::c_void,
+        });
+    }
 
     let mut out = changes.clone();
     // SAFETY: both lists are valid for `changes.len()` entries; no timeout.
@@ -503,7 +548,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     let fifos: Vec<(i32, u64, u32)> = interest(|m| {
         m.get(&ep).map_or_else(Vec::new, |l| {
             l.iter()
-                .filter(|(_, (ev, _))| ev & EPOLLIN != 0)
+                .filter(|(_, (ev, _))| ev & READ != 0)
                 .map(|(&fd, &(ev, d))| (fd, d, ev))
                 .collect()
         })
@@ -567,7 +612,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             if !armed(ep, fd) {
                 continue;
             }
-            let mut bits = ev & EPOLLIN;
+            let mut bits = ev & READ;
             if bpf_watched(ep, fd) {
                 bits = EPOLLERR;
             } else if crate::mountwatch::changed(fd) == Some(true) {
@@ -711,12 +756,13 @@ fn write_events(events: u64, ready: &[(i32, u32, u64)]) -> i64 {
 /// report on (its writers' end, bytes a probe kept), by epoll descriptor and
 /// descriptor.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static EDGES: std::sync::Mutex<Vec<(i32, i32, u32)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static EDGES: crate::kept::Kept<Vec<(i32, i32, u32)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// Whether `bits` of `fd` are news to epoll set `epfd` (and note them).
 #[cfg(not(target_os = "linux"))]
 fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
-    let mut e = EDGES.lock().unwrap_or_else(|e| e.into_inner());
+    let mut e = EDGES.lock();
     match e.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
         Some(k) if k.2 == bits => false,
         Some(k) => {
@@ -732,31 +778,33 @@ fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
 
 #[cfg(not(target_os = "linux"))]
 fn edge_clear(epfd: i32, fd: i32) {
-    EDGES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
-    HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
-    WRITES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k| (k.0, k.1) != (epfd, fd));
+    EDGES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
+    HELD.lock().retain(|k| (k.0, k.1) != (epfd, fd));
+    WRITES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
 }
 
 /// What edge-triggered pipe read ends in epoll sets held when last
 /// reported: (set, descriptor, bytes).
 #[cfg(not(target_os = "linux"))]
-pub(crate) static HELD: std::sync::Mutex<Vec<(i32, i32, i64)>> = std::sync::Mutex::new(Vec::new());
+pub(crate) static HELD: crate::kept::Kept<Vec<(i32, i32, i64)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// The writes each set saw counted of each pipe watched exclusively it
 /// watches: `(epfd, fd, writes)`.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static WRITES: std::sync::Mutex<Vec<(i32, i32, u64)>> =
-    std::sync::Mutex::new(Vec::new());
+pub(crate) static WRITES: crate::kept::Kept<Vec<(i32, i32, u64)>> =
+    crate::kept::Kept::new(Vec::new());
 
 /// Whether a pipe read end `fd` holding `bytes` has had data written since
 /// set `epfd` last saw it, which is an edge to Linux (the host's
 /// edge-triggered read filter fires on reads too).
 #[cfg(not(target_os = "linux"))]
 fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
-    // A pipe whose writes are counted (one watched exclusively): written
-    // to since, whatever it holds now.
-    if let Some(w) = crate::exclusive::writes(fd) {
-        let mut seen = WRITES.lock().unwrap_or_else(|e| e.into_inner());
+    // A pipe whose writes are counted (an eventfd's, each of whose writes
+    // is an edge to Linux even when the count was not 0, or one watched
+    // exclusively): written to since, whatever it holds now.
+    if let Some(w) = crate::specialfd::eventfd_writes(fd).or_else(|| crate::exclusive::writes(fd)) {
+        let mut seen = WRITES.lock();
         return match seen.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
             Some(k) => {
                 let grew = w > k.2;
@@ -769,7 +817,7 @@ fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
             }
         };
     }
-    let mut h = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let mut h = HELD.lock();
     match h.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
         Some(k) => {
             let grew = bytes > k.2;
@@ -800,7 +848,7 @@ fn armed(epfd: i32, fd: i32) -> bool {
     interest(|m| {
         m.get(&epfd)
             .and_then(|l| l.get(&fd))
-            .is_some_and(|&(ev, _)| ev & (EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI) != 0)
+            .is_some_and(|&(ev, _)| ev & (READ | WRITE | EPOLLWRBAND | EPOLLRDHUP | EPOLLPRI) != 0)
     })
 }
 
@@ -811,7 +859,7 @@ fn disarm(epfd: i32, fd: i32) {
     use fwe_abi::epoll::*;
     let data = interest(|m| {
         let e = m.get_mut(&epfd)?.get_mut(&fd)?;
-        e.0 &= !(EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLPRI);
+        e.0 &= !(READ | WRITE | EPOLLWRBAND | EPOLLRDHUP | EPOLLPRI);
         Some(e.1)
     });
     let Some(data) = data else { return };
@@ -828,6 +876,26 @@ fn is_socket(fd: i32) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK }
+}
+
+/// Whether `fd` is a TCP socket (an IP stream one), whose urgent data the
+/// host reports.
+#[cfg(not(target_os = "linux"))]
+fn tcp_socket(fd: i32) -> bool {
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: valid out-parameters.
+    let stream = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut ty as *mut i32).cast(),
+            &mut len,
+        )
+    } == 0
+        && ty == libc::SOCK_STREAM;
+    stream && !is_unix(fd)
 }
 
 /// Whether socket `fd` is a Unix-domain one.
@@ -911,6 +979,13 @@ fn kevent_once(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
     Ok((ready, reported))
 }
 
+/// What a readable descriptor reports (of what it was asked), and a
+/// writable one: normal data is all there is.
+#[cfg(not(target_os = "linux"))]
+const READ: u32 = fwe_abi::epoll::EPOLLIN | fwe_abi::epoll::EPOLLRDNORM;
+#[cfg(not(target_os = "linux"))]
+const WRITE: u32 = fwe_abi::epoll::EPOLLOUT | fwe_abi::epoll::EPOLLWRNORM;
+
 /// One `kevent` wait of [`kevent_once`].
 #[cfg(not(target_os = "linux"))]
 fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
@@ -966,23 +1041,26 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             // A Unix socket's peer has gone altogether (Linux shuts both
             // ways of it), so it has hung up too.
             libc::EVFILT_READ if eof && is_socket(fd) => {
-                bits |= EPOLLIN | EPOLLRDHUP | if is_unix(fd) { EPOLLHUP } else { 0 }
+                bits |= READ | EPOLLRDHUP | if is_unix(fd) { EPOLLHUP } else { 0 }
             }
-            libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { EPOLLIN } else { 0 },
+            libc::EVFILT_READ if eof => bits |= EPOLLHUP | if ev.data > 0 { READ } else { 0 },
             // Edge-triggered, a pipe is readable anew only once written to.
             libc::EVFILT_READ
                 if ev.flags & libc::EV_CLEAR != 0
                     && is_pipe(fd)
                     && !pipe_grew(epfd, fd, ev.data as i64) => {}
-            libc::EVFILT_READ => bits |= EPOLLIN,
+            libc::EVFILT_READ => bits |= READ,
             // A pipe whose readers have gone is an error to write to; a
             // socket whose writing side is shut stays writable (a write
             // fails at once).
-            libc::EVFILT_WRITE if eof && !is_socket(fd) => bits |= EPOLLOUT | EPOLLERR,
+            libc::EVFILT_WRITE if eof && !is_socket(fd) => bits |= WRITE | EPOLLERR,
             // A pipe given less than the host's capacity is not writable
             // while full, which the host does not know.
             libc::EVFILT_WRITE if crate::fdstate::pipe_full(fd) => {}
-            libc::EVFILT_WRITE => bits |= EPOLLOUT,
+            // A socket's priority band is writable as its normal data is.
+            libc::EVFILT_WRITE => bits |= WRITE | if is_socket(fd) { EPOLLWRBAND } else { 0 },
+            // Urgent data waits.
+            libc::EVFILT_EXCEPT => bits |= EPOLLPRI,
             _ => {}
         }
         if ev.flags & libc::EV_ERROR != 0 {
@@ -1060,6 +1138,89 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     fn data(e: &Event) -> u64 {
         e.data
+    }
+
+    /// A TCP socket's urgent data is `EPOLLPRI`.
+    #[test]
+    fn urgent_data_is_epollpri() {
+        let _turn = turn();
+        // SAFETY: plain host calls on sockets made here, with valid
+        // addresses and lengths.
+        let (srv, cli, conn) = unsafe {
+            let srv = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            let mut a: libc::sockaddr_in = std::mem::zeroed();
+            #[cfg(not(target_os = "linux"))]
+            {
+                a.sin_len = 16;
+            }
+            a.sin_family = libc::AF_INET as libc::sa_family_t;
+            a.sin_addr.s_addr = u32::from_be_bytes([127, 0, 0, 1]).to_be();
+            let mut len = 16 as libc::socklen_t;
+            libc::bind(srv, (&a as *const libc::sockaddr_in).cast(), len);
+            libc::getsockname(srv, (&mut a as *mut libc::sockaddr_in).cast(), &mut len);
+            libc::listen(srv, 1);
+            let cli = libc::socket(libc::AF_INET, libc::SOCK_STREAM, 0);
+            libc::connect(cli, (&a as *const libc::sockaddr_in).cast(), len);
+            (srv, cli, libc::accept(srv, std::ptr::null_mut(), std::ptr::null_mut()))
+        };
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) };
+        let reg = event(EPOLLPRI, 5);
+        // SAFETY: a valid epoll_event.
+        let r = unsafe { ctl(ep as u64, EPOLL_CTL_ADD, conn as u64, &reg as *const _ as u64) };
+        assert_eq!(r, 0);
+        let mut got = [event(0, 0); 2];
+        // SAFETY: room for 2 events.
+        assert_eq!(unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, 0, 0, 0) }, 0);
+        // SAFETY: a one-byte local buffer.
+        assert_eq!(unsafe { libc::send(cli, b"!".as_ptr().cast(), 1, libc::MSG_OOB) }, 1);
+        // SAFETY: room for 2 events.
+        assert_eq!(unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, 1000, 0, 0) }, 1);
+        assert_eq!({ got[0].events } & EPOLLPRI, EPOLLPRI);
+        closed(ep as i32);
+        for fd in [srv, cli, conn, ep as i32] {
+            // SAFETY: the descriptors made here.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// An eventfd watched edge-triggered raises a new edge on every write,
+    /// whether or not its count was 0, as Linux's wakes its waiters on
+    /// each; with nothing written, none.
+    #[test]
+    fn eventfd_edge_on_every_write() {
+        let _turn = turn();
+        // SAFETY: no pointers.
+        let efd = unsafe { crate::specialfd::eventfd2(0, fwe_abi::eventfd::EFD_NONBLOCK) } as i32;
+        assert!(efd >= 0);
+        let write = |v: u64| {
+            // SAFETY: 8 readable bytes; a Linux host's eventfd is its own.
+            unsafe {
+                crate::specialfd::try_write(efd, (&raw const v) as u64, 8)
+                    .unwrap_or_else(|| libc::write(efd, (&raw const v).cast(), 8) as i64)
+            }
+        };
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) };
+        let reg = event(EPOLLIN | EPOLLET, 9);
+        // SAFETY: a valid epoll_event.
+        let r = unsafe { ctl(ep as u64, EPOLL_CTL_ADD, efd as u64, &reg as *const _ as u64) };
+        assert_eq!(r, 0);
+        let mut got = [event(0, 0); 2];
+        let mut wait = |ms: u64| {
+            // SAFETY: room for 2 events.
+            unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, ms, 0, 0) }
+        };
+        assert_eq!(wait(0), 0);
+        for round in 0..3 {
+            assert_eq!(write(1), 8);
+            assert_eq!(wait(1000), 1, "write {round}");
+            assert_eq!(wait(0), 0, "after write {round}");
+        }
+        closed(ep as i32);
+        assert_eq!(crate::specialfd::try_close(efd).unwrap_or(0), 0);
+        // SAFETY: the descriptor made here.
+        unsafe { libc::close(ep as i32) };
     }
 
     /// A pipe whose read end becomes readable once data is written, observed

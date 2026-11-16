@@ -1,10 +1,9 @@
 # Vendored musl runtime (test fixture)
 
-These files are an unmodified prebuilt [musl libc](https://musl.libc.org/)
-for `aarch64`, vendored so the end-to-end tests can exercise **real** dynamic
-linking — loading a genuine dynamic linker, resolving symbols against a shared
-libc, and applying relocations — rather than a hand-written stand-in. macOS has
-no musl, so the runtime is checked in rather than built from source here.
+An unmodified prebuilt [musl libc](https://musl.libc.org/) for `aarch64`,
+vendored so the end-to-end tests exercise real dynamic linking: a genuine
+dynamic linker loaded, symbols resolved against a shared libc, relocations
+applied. macOS has no musl to build it with.
 
 | File | Purpose |
 | --- | --- |

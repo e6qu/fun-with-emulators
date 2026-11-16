@@ -41,6 +41,10 @@ pub const SHM_INFO: u64 = 14;
 pub const SHM_STAT_ANY: u64 = 15;
 pub const SHM_RDONLY: u64 = 0o10000;
 pub const SHM_HUGETLB: u64 = 0o4000;
+/// Reserve no huge pages (with `SHM_HUGETLB`).
+pub const SHM_NORESERVE: u64 = 0o10000;
+/// Where a `SHM_HUGETLB` segment's page size (its log2) starts.
+pub const SHM_HUGE_SHIFT: u64 = 26;
 pub const SHM_RND: u64 = 0o20000;
 pub const SHM_REMAP: u64 = 0o40000;
 pub const SHM_EXEC: u64 = 0o100000;
@@ -89,8 +93,7 @@ pub type Proc = (i32, u64);
 /// This process.
 pub fn me() -> Proc {
     static ME: Mutex<Proc> = Mutex::new((0, 0));
-    // SAFETY: getpid cannot fail.
-    let pid = unsafe { libc::getpid() };
+    let pid = crate::host::pid();
     let mut m = ME.lock().unwrap_or_else(|e| e.into_inner());
     if m.0 != pid {
         *m = (pid, crate::procreg::start_time(pid).unwrap_or(0));
@@ -135,7 +138,10 @@ pub struct Shm {
     pub dtime: i64,
     /// Attachments, by process.
     pub attached: Vec<(Proc, u32)>,
-    pub locked: bool,
+    /// Locked (`SHM_LOCK`): the user (effective id) its pages are charged
+    /// to, against that user's `RLIMIT_MEMLOCK`, as Linux's
+    /// `user_shm_lock` charges them.
+    pub locked: Option<u32>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -370,7 +376,8 @@ fn put_obj(e: &mut Enc, id: i32, o: &Obj) {
             e.i32(s.lpid);
             e.u64(s.atime as u64);
             e.u64(s.dtime as u64);
-            e.bool(s.locked);
+            e.bool(s.locked.is_some());
+            e.u32(s.locked.unwrap_or(0));
             e.u64(s.attached.len() as u64);
             for &(p, n) in &s.attached {
                 put_proc(e, p);
@@ -421,8 +428,10 @@ fn get_obj(d: &mut Dec) -> (i32, Obj) {
     let (id, key, perm, ctime, removed) = (d.i32(), d.i32(), get_perm(d), d.u64() as i64, d.bool());
     let body = match d.u8() {
         0 => {
-            let (size, cpid, lpid, atime, dtime, locked) =
-                (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64, d.bool());
+            let (size, cpid, lpid, atime, dtime) =
+                (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64);
+            let locked = (d.bool(), d.u32());
+            let locked = locked.0.then_some(locked.1);
             let n = d.count(16);
             let attached = (0..n).map(|_| (get_proc(d), d.u32())).collect();
             Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked })
@@ -744,6 +753,11 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
+/// This host thread starts another guest thread ([`crate::thread_reused`]).
+pub(crate) fn thread_reused() {
+    THREAD.with(|t| t.borrow_mut().take());
+}
+
 /// Make `ipc` this thread's own (`Some`), or the process's again (`None`).
 pub fn set_thread(ipc: Option<Option<Arc<Record<Ipc>>>>) {
     THREAD.with(|t| *t.borrow_mut() = ipc);
@@ -935,11 +949,19 @@ fn apply_undo(s: &mut Sem, adj: &[(u16, i32)]) {
     }
 }
 
+/// The user namespace that owns the IPC namespace the caller is in (its
+/// record's directory; empty: the initial one), where a capability over
+/// its objects is asked for.
+pub fn owner() -> Vec<u8> {
+    current().map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()))
+}
+
 /// Whether `creds` may access an object with permission `perm` for `want`
-/// (`4` read, `2` write, both `6`): with `CAP_IPC_OWNER`, or by the owner's,
-/// the group's or others' bits, as `ipcperms` checks.
+/// (`4` read, `2` write, both `6`): with `CAP_IPC_OWNER` in the user
+/// namespace owning the IPC namespace, or by the owner's, the group's or
+/// others' bits, as `ipcperms` checks.
 pub fn permits(creds: &crate::creds::Creds, perm: &Perm, want: u32) -> bool {
-    if want == 0 || creds.has(crate::caps::CAP_IPC_OWNER) {
+    if want == 0 {
         return true;
     }
     let shift = if creds.euid == perm.uid || creds.euid == perm.cuid {
@@ -949,13 +971,16 @@ pub fn permits(creds: &crate::creds::Creds, perm: &Perm, want: u32) -> bool {
     } else {
         0
     };
-    (perm.mode >> shift) & want == want
+    (perm.mode >> shift) & want == want || creds.has_in(&owner(), crate::caps::CAP_IPC_OWNER)
 }
 
 /// Whether `creds` may change or remove an object (`IPC_SET`,
-/// `IPC_RMID`): its owner or creator, or with `CAP_SYS_ADMIN`.
+/// `IPC_RMID`): its owner or creator, or with `CAP_SYS_ADMIN` in the user
+/// namespace owning the IPC namespace.
 pub fn owns(creds: &crate::creds::Creds, perm: &Perm) -> bool {
-    creds.euid == perm.uid || creds.euid == perm.cuid || creds.has(crate::caps::CAP_SYS_ADMIN)
+    creds.euid == perm.uid
+        || creds.euid == perm.cuid
+        || creds.has_in(&owner(), crate::caps::CAP_SYS_ADMIN)
 }
 
 /// A command with `IPC_64` taken off.
@@ -997,7 +1022,7 @@ pub fn shmid_ds(o: &Obj, id: i32) -> Vec<u8> {
     if o.removed {
         perm.mode |= SHM_DEST;
     }
-    if s.locked {
+    if s.locked.is_some() {
         perm.mode |= SHM_LOCKED;
     }
     write_perm(&mut b, o.key, &perm, id);

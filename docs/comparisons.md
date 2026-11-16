@@ -1,8 +1,8 @@
 # fwe and other ways to run Linux programs
 
-There are many ways to run a program built for one system on another.
-This document places fwe among them: what each does, how it differs
-from fwe, and what fwe takes from it. How fwe itself works is in
+This document places fwe among the other ways to run a program built for
+one system on another: what each does, how it differs from fwe, and what
+fwe takes from it. How fwe itself works is in
 [architecture.md](architecture.md) and [linux-on-macos.md](linux-on-macos.md).
 
 ## The design space
@@ -31,9 +31,9 @@ Running a Linux program elsewhere comes down to two questions.
 
 fwe runs code natively and answers system calls with a userspace
 kernel. Its native backend runs the program inside the `fwe` process,
-diverting each `svc` to fwe's code; its VM backend runs the program in
-a Hypervisor.framework VM that has no kernel in it, so that each system
-call leaves the VM for the same userspace kernel.
+diverting each `svc` to fwe's code; its VM backend runs the program in a
+Hypervisor.framework VM with no kernel in it, so each system call leaves
+the VM for the same userspace kernel.
 
 | | Code runs | System calls answered by | A Linux kernel? | One Linux process is one host process | Host files |
 |---|---|---|---|---|---|
@@ -69,16 +69,16 @@ kept by `wineserver`, a separate process every Wine process talks to.
 **How fwe differs.** Linux's stable interface is the system-call
 instruction itself: static binaries, Go programs and musl make system
 calls directly, with no library in between. fwe therefore intercepts at
-the instruction (`svc`) and implements the kernel, not a library. fwe
-keeps what processes share in shared files and memory every fwe process
-maps (process records, the futex table, namespaces), so it needs no
-server process.
+the instruction (`svc`) and implements the kernel, not a library. What
+processes share (process records, the futex table, namespaces) lives in
+files and memory every fwe process maps, so there is no server process.
 
-**In common.** Both run code natively in-process, both make one host
-process per guest process, and both fight macOS for low addresses: Wine
+**In common.** Both run code natively in-process, make one host process
+per guest process, and contend with macOS for low addresses: Wine
 reserves them with a preloader before macOS takes them; fwe runs a
-program linked below 4 GiB in its VM backend. fwe runs Alpine's Wine
-itself, in the VM backend (CI's `wine` job).
+program linked below 4 GiB in its VM backend. fwe also runs Linux's Wine
+itself, in the VM backend (CI's `wine` job), so Windows programs run on
+fwe through Wine as they do on Linux.
 
 ## Linux in a virtual machine
 
@@ -92,30 +92,31 @@ running in the VM and its socket forwarded to macOS. Docker Desktop,
 Podman Machine and OrbStack follow the same pattern with their own VMs.
 
 **How fwe differs.** A Linux program under fwe is a macOS process: it
-shows in Activity Monitor, uses the Mac's files where they are rather
-than through a shared filesystem, uses the Mac's network stack and
-ports, and takes memory as it needs it rather than from a VM's fixed
-allotment. There is no VM to boot, so a program starts in milliseconds.
-The price is compatibility: a VM runs the real Linux kernel, whose every
-behaviour is right by definition; fwe is as faithful as its
-implementation (all 1213 of LTP's system-call tests that apply pass).
+shows in Activity Monitor, uses the Mac's files in place rather than
+through a shared filesystem, uses the Mac's network stack and ports, and
+takes memory as it needs it rather than from a VM's fixed allotment.
+There is no VM to boot, so a program starts in milliseconds. The price is
+compatibility: a VM runs the real Linux kernel, whose behaviour is right
+by definition; fwe is as faithful as its implementation, measured by LTP
+([ROADMAP.md](../ROADMAP.md#status)).
 
 ### WSL1 and WSL2
 
-WSL1 ran Linux programs on Windows as "pico processes" whose system calls
-the NT kernel sent to a Linux personality in the kernel. It was the
-closest predecessor to fwe's design, inside the host's kernel rather
-than beside it. Microsoft replaced it with WSL2, a real Linux kernel in
-a lightweight VM, chiefly because of file-system performance (Linux
-programs' many small file operations on NTFS through the personality)
-and the long tail of kernel behaviour that is hard to match.
+WSL1 runs Linux programs on Windows as "pico processes" whose system
+calls the NT kernel passes to a Linux personality in the kernel: fwe's
+design, inside the host's kernel rather than beside it. Microsoft
+followed it with WSL2, a real Linux kernel in a lightweight VM, chiefly
+because of file-system performance (Linux programs' many small file
+operations on NTFS through the personality) and the long tail of kernel
+behaviour that is hard to match.
 
-**For fwe.** WSL1's history is the risk this design carries: fidelity
-in the long tail. fwe measures it with LTP and with real programs in
-CI (Debian's bash, git, apt, Node.js and rustc; podman, containerd,
-Docker; Wine). Its file operations are the host's own calls on APFS,
-without a translation layer of the kind WSL1 had over NTFS, but each
-path is still resolved by fwe (mounts, overlays, the root).
+**For fwe.** WSL1's mechanism is fwe's model, and its weakness is the
+risk this design carries: fidelity in the long tail. fwe measures it
+with LTP and with real programs in CI (Debian's bash, git, apt, Node.js
+and rustc; Podman, containerd, Docker; Wine). Its file operations are
+the host's own calls on APFS, with no translation layer of the kind WSL1
+had over NTFS, though fwe still resolves each path (mounts, overlays, the
+root).
 
 ### QEMU and KVM
 
@@ -138,10 +139,10 @@ Linux container in a lightweight VM of its own, through
 Virtualization.framework, with a small Linux kernel and init, giving
 each container its own kernel and network address.
 
-**How fwe differs.** fwe runs container runtimes themselves (podman,
+**How fwe differs.** fwe runs the container runtimes themselves (Podman,
 crun, containerd, Docker) as Linux programs, and their containers as
 macOS processes in fwe's namespaces, with no VM per container. Isolation
-is accordingly weaker: see
+is weaker: see
 [Isolation and security](linux-on-macos.md#isolation-and-security).
 
 ## A userspace Linux kernel
@@ -176,6 +177,8 @@ purpose is compatibility on a macOS host: in the native backend the
 program shares fwe's address space, so fwe is no sandbox against a
 hostile program (see
 [Isolation and security](linux-on-macos.md#isolation-and-security)).
+The two compose: `runsc` is a Linux program, and running it on fwe, its
+`systrap` platform included, is a 1.0 goal (M7).
 
 ## Translating or instrumenting code
 
@@ -202,8 +205,8 @@ Valgrind work alike.
 fwe's scanner cannot tell from data and in JIT code, at the cost of
 running everything from a cache (typically tens of percent slower, and a
 large engine). fwe rewrites code in place instead, guided by the
-program's unwind tables and symbols, and falls back to traps where
-rewriting is not possible (see
+program's unwind tables and symbols, and traps where it cannot rewrite
+(see
 [linux-on-macos.md](linux-on-macos.md#which-instructions-get-translated-and-how)).
 
 ### FEX and Box64
@@ -214,9 +217,10 @@ call into, say, its OpenGL or SDL library goes to the host's native
 arm64 library instead of a translated x86 copy.
 
 **For fwe.** Neither applies to arm64 programs on an arm64 host. Library
-thunking is Wine's idea applied selectively, and could in principle let a
-guest use macOS libraries (Metal through a Vulkan or OpenGL library, say);
-fwe does not do this.
+thunking is Wine's idea applied selectively, and could let a guest use
+macOS libraries (Metal through a Vulkan or OpenGL library, say); fwe does
+not do this. FEX or Box64 would be what runs x86 Windows programs under
+Wine, which is not planned for 1.0.
 
 ### Rosetta 2
 
@@ -228,14 +232,16 @@ calls are macOS's. Apple also offers Rosetta inside Linux VMs, to run
 x86-64 Linux programs there.
 
 **For fwe.** fwe prepares a program's code (finds and rewrites its
-system calls, thread-pointer accesses and `x18` uses) each time a
-process maps it. Rosetta's cache is the model for keeping that work
-between runs: a prepared image cached by the file's identity.
+system calls, thread-pointer accesses and `x18` uses) and keeps what it
+found on disk by the file's identity, as Rosetta keeps its translations,
+so a later start replays it rather than scanning again
+([architecture.md](architecture.md)). Rosetta-style translation is
+allowed where it is feasible and sound ([PLAN.md](../PLAN.md#principles)).
 
 ## A Linux personality in another kernel: FreeBSD's Linuxulator
 
 FreeBSD runs Linux programs with the Linuxulator (`linux.ko`,
-`linux64.ko`, on arm64 since FreeBSD 13). The kernel recognises a Linux
+`linux64.ko`, on arm64 too). The kernel recognises a Linux
 ELF at `execve` and gives the process a second system-call table; Linux
 code runs natively, and its system calls go to `linux_*` functions in the
 kernel that translate arguments, structures, errno values and signals to
@@ -264,27 +270,28 @@ fwe builds:
 ## Rebuilding for macOS: Homebrew and Nix
 
 Homebrew and Nix build programs for macOS from source (or install builds
-made so), so they run as macOS programs with no translation at all. That
-is the fastest way to run what has been ported, and the right one where
-it exists. What has not been ported (anything that needs namespaces,
+made so), so they run as macOS programs with no translation at all: the
+fastest way to run what has been ported. What has not been ported (anything that needs namespaces,
 cgroups, `/proc`, Linux's system calls: container runtimes, much server
 software, Linux-only tools) cannot be had this way, and neither can a
 given binary, such as a vendor's build or a container image. Nix builds
 Linux packages on a Mac with a Linux VM (its `linux-builder`).
 
 **For fwe.** fwe is for the other case: running the Linux build itself.
-Homebrew is also how fwe is installed (`Formula/fwe.rb`).
+Homebrew's builds are also what fwe's benchmarks compare against, and how
+fwe is installed (`Formula/fwe.rb`).
 
 ## What fwe takes from each
 
-- From **Wine**: native execution in-process, one host process per guest
-  process, state shared between processes outside any one of them.
+- From **Wine** and **WSL1**: native execution in-process, one host
+  process per guest process, state shared between processes outside any
+  one of them.
 - From **FreeBSD's Linuxulator**: a Linux personality over the host's own
   services, and a separate Linux userland as the program's view.
 - From **gVisor**: a Linux kernel as an ordinary program, and diverting
   system calls by patching the instruction into a jump.
 - From **Noah** and **KVM** users: a VM with no kernel for what cannot run
   in-process.
-- From **Rosetta 2**: the case for caching prepared code between runs
-  (not yet done).
-- From **WSL1**: the warning to measure fidelity, not assume it.
+- From **Rosetta 2**: prepared code kept between runs.
+- From **WSL1**'s successor: the warning to measure fidelity, not assume
+  it.

@@ -6,9 +6,11 @@
 //! ([`crate::ns::Net`], [`crate::sysvipc::Ipc`]), which
 //! `/proc/sys` shows and a write there changes, with Linux's checks. The
 //! initial network namespace's start at Linux's defaults and are kept with
-//! the sysctls of no namespace: fwe consults them only for its own
-//! namespaces, so changing them changes nothing on the host. The initial
-//! IPC namespace is fwe's own, so root may change its limits.
+//! the sysctls of no namespace; fwe acts on them for the guest's sockets in
+//! that namespace as it does in its own (the privileged ports, the buffer
+//! sizes, the listen backlog, who may make a ping socket), and changing
+//! them changes nothing on the host. The initial IPC namespace is fwe's
+//! own, so root may change its limits.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::errno;
@@ -28,8 +30,14 @@ struct Sysctl {
 enum Space {
     Net,
     Ipc,
+    /// A user namespace's limits (`user.max_*`): the initial one's with
+    /// the rest, another's in a record inside its own ([`user_limit`]).
+    User,
     /// The rest: fwe's own, every process's ([`Globals`]).
     Global,
+    /// The caller's pid namespace's (`kernel.ns_last_pid`), kept in its
+    /// record ([`crate::pidns::PidNs`]).
+    Pid,
 }
 
 /// The sysctls of no namespace set from their defaults, by name: a record
@@ -110,6 +118,10 @@ enum Kind {
     Range,
     /// One unsigned 64-bit integer (`kernel.shmmax`).
     U64,
+    /// The huge page pool's size (`vm.nr_hugepages`): a count asked for,
+    /// of which the pool gets what can be allocated, which with fwe is
+    /// none, so it stays 0.
+    Pool,
     /// Integers, as many as given, each in a range (`kernel.sem`: four).
     Ints(usize, i64, i64),
     /// A line of text, up to the length given (with its NUL), the rest of
@@ -118,6 +130,12 @@ enum Kind {
 }
 
 const INT_MAX: i64 = i32::MAX as i64;
+/// Yama's `ptrace_scope`, whose writes are Yama's to check.
+const YAMA_SCOPE: &[u8] = b"kernel/yama/ptrace_scope";
+/// `kernel.unprivileged_bpf_disabled`, likewise BPF's.
+const BPF_DISABLED: &[u8] = b"kernel/unprivileged_bpf_disabled";
+/// `kernel.ns_last_pid`, whose writes are checked as it is written.
+const NS_LAST_PID: &[u8] = b"kernel/ns_last_pid";
 /// `IPCMNI`: the most objects of a kind a namespace may have.
 const IPCMNI: i64 = 32768;
 
@@ -155,9 +173,23 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, u32::MAX as i64),
         space: Space::Net,
     },
+    // The most connections `listen` queues.
     Sysctl {
         path: b"net/core/somaxconn",
         default: "4096",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Net,
+    },
+    // The largest socket buffers `SO_RCVBUF` and `SO_SNDBUF` give.
+    Sysctl {
+        path: b"net/core/rmem_max",
+        default: "212992",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::Net,
+    },
+    Sysctl {
+        path: b"net/core/wmem_max",
+        default: "212992",
         kind: Kind::Int(0, INT_MAX),
         space: Space::Net,
     },
@@ -242,6 +274,23 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, 1),
         space: Space::Global,
     },
+    // Whether `bpf` is closed to callers without `CAP_BPF` or
+    // `CAP_SYS_ADMIN`: 0 open (to maps and socket filters), 1 closed for
+    // good, 2 closed (Linux's default).
+    Sysctl { path: BPF_DISABLED, default: "2", kind: Kind::Int(0, 2), space: Space::Global },
+    // Whether a process that raised privilege, or changed its credentials,
+    // stays dumpable: 0 no, 1 yes, 2 for root only (`PR_GET_DUMPABLE` 2).
+    Sysctl { path: b"fs/suid_dumpable", default: "0", kind: Kind::Int(0, 2), space: Space::Global },
+    // Yama: who may attach to a process (`ptrace`, `/proc/<pid>/mem`,
+    // `process_vm_readv`): 0 any process of the same ids, 1 only its
+    // ancestors and the one it names, 2 only with `CAP_SYS_PTRACE`, 3 none.
+    // Setting it takes `CAP_SYS_PTRACE`, and 3 cannot be undone.
+    Sysctl {
+        path: b"kernel/yama/ptrace_scope",
+        default: "1",
+        kind: Kind::Int(0, 3),
+        space: Space::Global,
+    },
     Sysctl {
         path: b"fs/protected_symlinks",
         default: "0",
@@ -310,6 +359,9 @@ const SYSCTLS: &[Sysctl] = &[
     },
     // Pids are below it (fwe's namespaces number below it; the host's
     // own pids are the host's).
+    // The pid the caller's pid namespace gave last; the next is the one
+    // after it that is free.
+    Sysctl { path: NS_LAST_PID, default: "0", kind: Kind::Int(0, 4_194_304), space: Space::Pid },
     Sysctl {
         path: b"kernel/pid_max",
         default: "4194304",
@@ -334,10 +386,23 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, 1),
         space: Space::Global,
     },
+    // Kept, with no effect: the page cache is the host's, which only the
+    // host's root may drop.
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
+    // The huge page pool, empty: fwe has no huge pages to give, so a size
+    // asked for gets none, as on a Linux that cannot allocate them; and
+    // the group (beside `CAP_IPC_LOCK`) whose members may make
+    // `SHM_HUGETLB` segments.
+    Sysctl { path: b"vm/nr_hugepages", default: "0", kind: Kind::Pool, space: Space::Global },
+    Sysctl {
+        path: b"vm/hugetlb_shm_group",
+        default: "0",
+        kind: Kind::Int(i32::MIN as i64, INT_MAX),
+        space: Space::Global,
+    },
     // Pipe buffer pages a user may hold before new pipes get the least
-    // (soft) or none (hard, 0: no limit): Linux's defaults. A privileged
-    // process (every root one) is not held to them.
+    // (soft) or none (hard, 0: no limit), at Linux's defaults. Kept, not
+    // enforced: a pipe is a host pipe, whose buffer the host sizes.
     Sysctl {
         path: b"fs/pipe-user-pages-soft",
         default: "16384",
@@ -363,6 +428,58 @@ const SYSCTLS: &[Sysctl] = &[
         default: "65530",
         kind: Kind::Int(0, INT_MAX),
         space: Space::Global,
+    },
+    // The most namespaces of each kind the user namespace and those below
+    // it may hold, which [`crate::ns::may_make`] holds new ones to: half
+    // of `kernel.threads-max` in the initial one, as on Linux, and no
+    // limit of its own in another until set.
+    Sysctl {
+        path: b"user/max_cgroup_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_ipc_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_mnt_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_net_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_pid_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_time_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_user_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
+    },
+    Sysctl {
+        path: b"user/max_uts_namespaces",
+        default: "127414",
+        kind: Kind::Int(0, INT_MAX),
+        space: Space::User,
     },
     Sysctl {
         path: b"fs/mqueue/queues_max",
@@ -411,9 +528,59 @@ fn value(i: usize) -> String {
             None => globals().and_then(|r| r.get().0.get(&name).cloned()),
         },
         Space::Ipc => crate::sysvipc::current().and_then(|r| r.get().sysctls.get(&name).cloned()),
+        Space::Pid => {
+            return match crate::pidns::current().first() {
+                Some(ns) => (ns.get().next - 1).max(0).to_string(),
+                None => crate::host::last_pid().to_string(),
+            };
+        }
         Space::Global => globals().and_then(|r| r.get().0.get(&name).cloned()),
+        Space::User => match crate::userns::chain().first() {
+            Some(u) => {
+                return limits_of(u.dir()).map_or_else(
+                    || INT_MAX.to_string(),
+                    |r| r.get().0.get(&name).cloned().unwrap_or_else(|| INT_MAX.to_string()),
+                );
+            }
+            None => globals().and_then(|r| r.get().0.get(&name).cloned()),
+        },
     };
     set.unwrap_or_else(|| SYSCTLS[i].default.to_string())
+}
+
+/// The limits set in the user namespace whose record is at `dir`: a
+/// record inside it, which lives as long as it does (kept open, one per
+/// namespace, for the process's life).
+fn limits_of(dir: &[u8]) -> Option<std::sync::Arc<crate::shared::Record<Globals>>> {
+    use std::collections::HashMap;
+    use std::sync::{Arc, Mutex};
+    type Open = Mutex<Option<HashMap<Vec<u8>, Arc<crate::shared::Record<Globals>>>>>;
+    static OPEN: Open = Mutex::new(None);
+    let mut open = OPEN.lock().unwrap_or_else(|e| e.into_inner());
+    let open = open.get_or_insert_with(HashMap::new);
+    if let Some(r) = open.get(dir) {
+        return Some(r.clone());
+    }
+    let r = Arc::new(crate::shared::Record::at([dir, b"/limits"].concat(), Globals::default).ok()?);
+    open.insert(dir.to_vec(), r.clone());
+    Some(r)
+}
+
+/// The limit `name` (`user/max_net_namespaces`) of the user namespace
+/// whose record is at `dir` (`None`: the initial one).
+pub fn user_limit(dir: Option<&[u8]>, name: &str) -> i64 {
+    let set = match dir {
+        Some(d) => {
+            limits_of(d).and_then(|r| r.get().0.get(name).cloned()).unwrap_or(INT_MAX.to_string())
+        }
+        None => globals()
+            .and_then(|r| r.get().0.get(name).cloned())
+            .or_else(|| {
+                SYSCTLS.iter().find(|s| s.path == name.as_bytes()).map(|s| s.default.into())
+            })
+            .unwrap_or_default(),
+    };
+    set.trim().parse().unwrap_or(INT_MAX)
 }
 
 /// Set the sysctl of no namespace at `path` (under `/proc/sys`) to
@@ -465,15 +632,38 @@ pub fn is_dir(path: &[u8]) -> bool {
 }
 
 /// Opening sysctl `path` to write, by a caller with `creds`: the mark the
-/// descriptor carries, or the error. A network one takes `CAP_NET_ADMIN`
-/// in a namespace of fwe's (the initial one's are the host's); an IPC one,
-/// root's access to the file (`CAP_DAC_OVERRIDE`).
+/// descriptor carries, or the error. The file is root's of the user
+/// namespace owning the namespace it is of (the initial root's where that
+/// maps none), mode 0644, as Linux sets it, so its owner writes it; and a
+/// network one also `CAP_NET_ADMIN` in the user namespace owning the
+/// network namespace, an IPC one `CAP_DAC_OVERRIDE` in the one owning the
+/// IPC namespace, any other `CAP_DAC_OVERRIDE` in the initial one: a user
+/// namespace has no say over the whole system's.
 pub fn open_for_write(path: &[u8], creds: &crate::creds::Creds) -> Option<Result<Mark, i32>> {
+    use crate::caps::{CAP_DAC_OVERRIDE, CAP_NET_ADMIN};
     let i = index(path)?;
+    if SYSCTLS[i].path == YAMA_SCOPE && !creds.has(crate::caps::CAP_SYS_PTRACE)
+        || SYSCTLS[i].path == BPF_DISABLED && !creds.has(crate::caps::CAP_SYS_ADMIN)
+    {
+        return Some(Err(errno::EPERM));
+    }
     let allowed = match SYSCTLS[i].space {
-        Space::Net => creds.has(crate::caps::CAP_NET_ADMIN),
-        Space::Ipc | Space::Global => creds.has(crate::caps::CAP_DAC_OVERRIDE),
+        Space::Net => {
+            let owner = crate::netns::owner();
+            creds.has_in(&owner, CAP_NET_ADMIN) || creds.euid == crate::userns::root_of(&owner).0
+        }
+        Space::Ipc => {
+            let owner = crate::sysvipc::owner();
+            creds.has_in(&owner, CAP_DAC_OVERRIDE) || creds.euid == crate::userns::root_of(&owner).0
+        }
+        Space::Global => creds.has(CAP_DAC_OVERRIDE) || creds.euid == 0,
+        // `CAP_SYS_RESOURCE` in the caller's own user namespace, whose
+        // limits these are, as Linux checks it.
+        Space::User => creds.has_own(crate::caps::CAP_SYS_RESOURCE),
+        // Anyone's to open (mode 0666); the write is checked.
+        Space::Pid => true,
     };
+
     Some(if allowed { Ok(Mark::Sysctl(i as u8)) } else { Err(errno::EACCES) })
 }
 
@@ -485,12 +675,9 @@ pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     write_value(fd, &data[..data.len().min(256)], len)
 }
 
-/// Keep `data`, written to sysctl descriptor `fd` (`len` bytes in all).
-fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
-    let Some(Mark::Sysctl(i)) = fdmarks::marked(fd) else { return None };
-    let s = SYSCTLS.get(i as usize)?;
-    let text = String::from_utf8_lossy(data);
-    let kept = if let Kind::Text(max) = s.kind {
+/// What sysctl `s` keeps of `text` written to it, or why it refuses it.
+fn parse(s: &Sysctl, text: &str) -> Result<String, i32> {
+    Ok(if let Kind::Text(max) = s.kind {
         // The first line, as much of it as fits.
         let line = text.split('\n').next().unwrap_or("");
         let mut end = line.len().min(max - 1);
@@ -498,17 +685,34 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
             end -= 1;
         }
         line[..end].to_string()
+    } else if let Kind::Pool = s.kind {
+        match text.trim().parse::<u64>() {
+            Ok(_) => "0".to_string(),
+            Err(_) => return Err(errno::EINVAL),
+        }
     } else if let Kind::U64 = s.kind {
         match text.trim().parse::<u64>() {
             Ok(v) => v.to_string(),
-            Err(_) => return Some(fwe_abi::err(errno::EINVAL)),
+            Err(_) => return Err(errno::EINVAL),
         }
     } else {
         let words: Vec<i64> = match text.split_whitespace().map(str::parse::<i64>).collect() {
             Ok(w) => w,
-            Err(_) => return Some(fwe_abi::err(errno::EINVAL)),
+            Err(_) => return Err(errno::EINVAL),
         };
         match (s.kind, &words[..]) {
+            // Yama's scope 3 is for good.
+            (Kind::Int(..), [v])
+                if s.path == YAMA_SCOPE && *v != 3 && number(YAMA_SCOPE) == Some(3) =>
+            {
+                return Err(errno::EINVAL);
+            }
+            // So is BPF's 1.
+            (Kind::Int(..), [v])
+                if s.path == BPF_DISABLED && *v != 1 && number(BPF_DISABLED) == Some(1) =>
+            {
+                return Err(errno::EPERM);
+            }
             (Kind::Int(lo, hi), [v]) if (lo..=hi).contains(v) => v.to_string(),
             // A range of valid ids; a backwards one is taken as none
             // (`1 0`), as Linux takes it.
@@ -526,10 +730,28 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
             {
                 w.iter().map(i64::to_string).collect::<Vec<_>>().join("\t")
             }
-            _ => return Some(fwe_abi::err(errno::EINVAL)),
+            _ => return Err(errno::EINVAL),
         }
+    })
+}
+
+/// Keep `data`, written to sysctl descriptor `fd` (`len` bytes in all).
+fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
+    let Some(Mark::Sysctl(i)) = fdmarks::marked(fd) else { return None };
+    let s = SYSCTLS.get(i as usize)?;
+    let text = String::from_utf8_lossy(data);
+    let kept = match parse(s, &text) {
+        Ok(k) => k,
+        Err(e) => return Some(fwe_abi::err(e)),
     };
     let name = String::from_utf8_lossy(s.path).into_owned();
+    if s.space == Space::Pid {
+        let v: i32 = kept.parse().unwrap_or(0);
+        return Some(match set_last_pid(v) {
+            Ok(()) => len as i64,
+            Err(e) => fwe_abi::err(e),
+        });
+    }
     let r = match s.space {
         Space::Net if crate::netns::current().is_some() => {
             let net = crate::netns::current()?;
@@ -547,8 +769,19 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
                 Ok(())
             })
         }
+        Space::User if !crate::userns::chain().is_empty() => {
+            let dir = crate::userns::chain()[0].dir().to_vec();
+            let Some(r) = limits_of(&dir) else {
+                return Some(fwe_abi::err(errno::ENOMEM));
+            };
+            r.update(|t| {
+                t.0.insert(name.clone(), kept.clone());
+                Ok(())
+            })
+        }
+        Space::Pid => Err(errno::EINVAL),
         // The initial network namespace's, with those of no namespace.
-        Space::Global | Space::Net => {
+        Space::Global | Space::Net | Space::User => {
             let Some(r) = globals() else {
                 return Some(fwe_abi::err(errno::ENOMEM));
             };
@@ -564,6 +797,30 @@ fn write_value(fd: i32, data: &[u8], len: u64) -> Option<i64> {
     })
 }
 
+/// `kernel.ns_last_pid` written with `v`: the caller's pid namespace
+/// numbers its next process from `v + 1`, as Linux's `pid_ns_ctl_handler`
+/// sets it, if the caller has `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN`
+/// in the user namespace owning it (its capabilities as its record holds
+/// them), else `EPERM`. The initial namespace's numbers are the host's, not
+/// fwe's to choose (`EPERM`).
+fn set_last_pid(v: i32) -> Result<(), i32> {
+    use crate::caps::{CAP_CHECKPOINT_RESTORE, CAP_SYS_ADMIN};
+    let Some(ns) = crate::pidns::current().first().cloned() else { return Err(errno::EPERM) };
+    let me = crate::host::pid();
+    let effective = crate::procreg::security(me).unwrap_or_default().caps[0];
+    let euid = crate::procreg::ids(me)[1];
+    let owner = crate::ns::owner_dir(ns.dir());
+    let own = crate::userns::own_dir();
+    let may = |cap: u32| crate::userns::capable_of(&own, &owner, euid, effective & 1 << cap != 0);
+    if !may(CAP_CHECKPOINT_RESTORE) && !may(CAP_SYS_ADMIN) {
+        return Err(errno::EPERM);
+    }
+    ns.update(|n| {
+        n.next = v + 1;
+        Ok(())
+    })
+}
+
 /// The lowest port a caller without `CAP_NET_BIND_SERVICE` may bind in the
 /// process's network namespace.
 pub fn unprivileged_port_start() -> u16 {
@@ -572,9 +829,37 @@ pub fn unprivileged_port_start() -> u16 {
         .unwrap_or(1024)
 }
 
+/// The most connections a `listen` in the process's network namespace
+/// queues (`net.core.somaxconn`).
+pub fn somaxconn() -> i32 {
+    number(b"net/core/somaxconn").map_or(4096, |n| n.clamp(0, INT_MAX) as i32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In the initial pid namespace `kernel.ns_last_pid` reads the host's
+    /// latest pid, at least the caller's own, and is not fwe's to set.
+    #[test]
+    fn the_initial_namespaces_last_pid_is_the_hosts() {
+        let text = read(b"/proc/sys/kernel/ns_last_pid").unwrap();
+        let last: i32 = String::from_utf8(text).unwrap().trim().parse().unwrap();
+        assert!(last >= crate::host::pid());
+        assert_eq!(set_last_pid(100), Err(errno::EPERM));
+        assert!(children(b"/proc/sys/kernel").iter().any(|(n, _)| n == b"ns_last_pid"));
+    }
+
+    /// The huge page pool takes any count and gets none: it stays 0.
+    #[test]
+    fn the_huge_page_pool_stays_empty() {
+        let pool = &SYSCTLS[index(b"/proc/sys/vm/nr_hugepages").unwrap()];
+        assert_eq!(read(b"/proc/sys/vm/nr_hugepages").unwrap(), b"0\n");
+        assert_eq!(parse(pool, "16\n"), Ok("0".to_string()));
+        assert_eq!(parse(pool, "-1"), Err(errno::EINVAL));
+        assert_eq!(parse(pool, "x"), Err(errno::EINVAL));
+        assert_eq!(read(b"/proc/sys/vm/hugetlb_shm_group").unwrap(), b"0\n");
+    }
 
     #[test]
     fn sysctls_and_their_directories() {
@@ -586,5 +871,11 @@ mod tests {
         assert_eq!(net, [b"ipv4".to_vec(), b"core".to_vec()]);
         assert!(children(b"/proc/sys").contains(&(b"net".to_vec(), true)));
         assert_eq!(unprivileged_port_start(), 1024);
+        assert_eq!(read(b"/proc/sys/net/core/rmem_max").unwrap(), b"212992\n");
+        assert_eq!(read(b"/proc/sys/user/max_user_namespaces").unwrap(), b"127414\n");
+        assert!(is_dir(b"/proc/sys/user"));
+        let user: Vec<_> = children(b"/proc/sys/user").into_iter().map(|(n, _)| n).collect();
+        assert_eq!(user.len(), 8);
+        assert_eq!(somaxconn(), 4096);
     }
 }

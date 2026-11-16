@@ -14,6 +14,35 @@ use std::process::{Command, Output, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
+/// Processes are spawned one at a time. The host has no `pipe2`: a pipe the
+/// standard library makes for a child is close-on-exec only a moment after
+/// it is made, and a child another test spawns in that moment inherits it,
+/// holding that guest's output open past its exit.
+static SPAWNING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+trait Alone {
+    fn spawn_alone(&mut self) -> std::io::Result<std::process::Child>;
+    /// `output`: standard input empty, output and errors captured.
+    fn output_alone(&mut self) -> std::io::Result<Output>;
+    fn status_alone(&mut self) -> std::io::Result<std::process::ExitStatus>;
+}
+
+impl Alone for Command {
+    fn spawn_alone(&mut self) -> std::io::Result<std::process::Child> {
+        let _alone = SPAWNING.lock().unwrap_or_else(|e| e.into_inner());
+        self.spawn()
+    }
+
+    fn output_alone(&mut self) -> std::io::Result<Output> {
+        self.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+        self.spawn_alone()?.wait_with_output()
+    }
+
+    fn status_alone(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.spawn_alone()?.wait()
+    }
+}
+
 /// How long a guest may run before the harness kills it. A guest should
 /// finish in well under a second; a hang (e.g. a thread that never wakes)
 /// becomes a fast, visible failure instead of hanging CI.
@@ -97,7 +126,7 @@ fn sample_strays(cmd: &Command) {
     let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
         return;
     };
-    let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output() else {
+    let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output_alone() else {
         return;
     };
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("samples");
@@ -120,7 +149,7 @@ fn sample_strays(cmd: &Command) {
             .arg(&file)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
+            .status_alone();
         eprintln!("--- {pid} {command}");
         // Each thread, and the innermost fwe frame of its heaviest stack.
         let text = std::fs::read_to_string(&file).unwrap_or_default();
@@ -151,7 +180,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
     if feed {
         cmd.stdin(Stdio::piped());
     }
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn_alone().unwrap();
     if feed {
         let mut stdin = child.stdin.take().unwrap();
         let data = input.to_vec();
@@ -185,7 +214,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
             if let Ok(ps) = Command::new("ps")
                 .args(["-o", "pid,ppid,stat,wchan,command", "-g"])
                 .arg(child.id().to_string())
-                .output()
+                .output_alone()
             {
                 eprintln!(
                     "--- the guest's processes at the timeout:\n{}",
@@ -228,6 +257,15 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
         while !reader.is_finished() {
             if start.elapsed() > Duration::from_secs(10) {
                 eprintln!("--- a process outlived the guest holding its {which}");
+                // Which: every fwe process still running, with its group.
+                if let Ok(ps) = Command::new("ps")
+                    .args(["-A", "-o", "pid,ppid,pgid,stat,etime,command"])
+                    .output_alone()
+                {
+                    let all = String::from_utf8_lossy(&ps.stdout);
+                    let fwe: Vec<&str> = all.lines().filter(|l| l.contains("fwe")).collect();
+                    eprintln!("--- fwe processes now:\n{}", fwe.join("\n"));
+                }
                 return Vec::new();
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -297,7 +335,7 @@ fn out_dir() -> PathBuf {
 }
 
 fn run_checked(cmd: &mut Command) {
-    let out = cmd.output().unwrap_or_else(|e| panic!("running {cmd:?}: {e}"));
+    let out = cmd.output_alone().unwrap_or_else(|e| panic!("running {cmd:?}: {e}"));
     assert!(
         out.status.success(),
         "{cmd:?} failed:\n{}{}",
@@ -308,9 +346,9 @@ fn run_checked(cmd: &mut Command) {
 
 fn rust_lld() -> PathBuf {
     let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
-    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output().unwrap();
+    let sysroot = Command::new(&rustc).args(["--print", "sysroot"]).output_alone().unwrap();
     let sysroot = String::from_utf8(sysroot.stdout).unwrap();
-    let host = Command::new(&rustc).args(["--print", "host-tuple"]).output().unwrap();
+    let host = Command::new(&rustc).args(["--print", "host-tuple"]).output_alone().unwrap();
     let host = String::from_utf8(host.stdout).unwrap();
     Path::new(sysroot.trim()).join("lib/rustlib").join(host.trim()).join("bin/rust-lld")
 }
@@ -545,7 +583,22 @@ fn build_c_debug(name: &str, libc: Libc) -> PathBuf {
     build_c_as(name, libc, true, true, true)
 }
 
+/// [`build_c`] as asked, once per test run: tests of one guest run side by
+/// side, and one would run the program while another links it anew.
 fn build_c_as(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> PathBuf {
+    type Built = std::collections::HashMap<(String, u8, bool, bool, bool), PathBuf>;
+    static BUILT: std::sync::Mutex<Option<Built>> = std::sync::Mutex::new(None);
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    let key = (name.to_string(), libc as u8, crt, pie, debug);
+    if let Some(p) = built.get_or_insert_with(Default::default).get(&key) {
+        return p.clone();
+    }
+    let p = build_c_now(name, libc, crt, pie, debug);
+    built.get_or_insert_with(Default::default).insert(key, p.clone());
+    p
+}
+
+fn build_c_now(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> PathBuf {
     let out = out_dir().join("c");
     std::fs::create_dir_all(&out).unwrap();
     let mut tag =
@@ -925,6 +978,296 @@ fn a_library_longer_than_a_branch_gets_its_stubs() {
         let _ = std::fs::remove_dir_all(&root);
     }
     assert_eq!(run.status.code(), Some(0));
+}
+
+/// Threads that first run the same pages of the shared libc at once, with
+/// the libc's preparation kept from the run before: each page's code is
+/// written as it first runs, and a thread that runs it meanwhile runs on.
+#[test]
+fn threads_first_run_shared_code_together() {
+    let prog = build_c_dynamic("lazyrace", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "lazyrace");
+    // The first run keeps the libc's preparation; the next ones use it.
+    for run in 0..3 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        assert_eq!(stdout(&out), "ok\n", "run {run}: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0), "run {run}");
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A signal sent to a child the instant it exists ends it, even one fwe
+/// leaves deliverable across the host's `fork` (which reaches the child
+/// before it is set up).
+#[test]
+fn a_signal_sent_as_a_child_starts_ends_it() {
+    let prog = build_c_dynamic("forkkill", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "forkkill");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "signal 7: killed\nsignal 11: killed\nsignal 31: killed\nsignal 15: killed\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A child that asks for its parent often (fwe keeps the answer while the
+/// parent lives) sees it change once the parent ends.
+#[test]
+fn getppid_follows_the_parents_end() {
+    let prog = build_c_dynamic("ppidwatch", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "ppidwatch");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "same while it lived: 1, changed once it ended: 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A thread made after another ended starts as a new one, whatever host
+/// thread runs it: no signal stack, and its creator's name, signal mask
+/// and floating-point rounding mode, round after round.
+#[test]
+fn a_thread_after_another_ended_starts_afresh() {
+    let prog = build_c_dynamic("threadreuse", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "threadreuse");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    let line = "signal stack disabled: 1, name: maker, SIGUSR1 blocked: 0, rounding: 3\n";
+    assert_eq!(stdout(&out), line.repeat(4), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Run C guest `name` (built against glibc) under `fwe` with `args`, in a
+/// glibc root filesystem of its own, and check it exits 0 having printed
+/// `want`.
+fn c_guest_prints(name: &str, args: &[&str], want: &str) {
+    let prog = build_c_dynamic(name, Libc::Glibc, true);
+    // A root of the case's own: tests of one guest run side by side.
+    let root =
+        libc_rootfs(Libc::Glibc, &[name].iter().chain(args).copied().collect::<Vec<_>>().join("-"));
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).args(args);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), want, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A forked child is in its parent's cgroup however the child's start and
+/// the parent's record of it interleave.
+#[test]
+fn a_forked_child_starts_in_its_parents_cgroup() {
+    c_guest_prints("cgroupfork", &[], "children elsewhere: 0\n");
+}
+
+/// A signal for a process whose main thread blocks it is taken by another
+/// thread that does not, whether that one waits in `pause` or sleeps.
+#[test]
+fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
+    c_guest_prints("blockedwake", &[], "taken by the other thread\n");
+    c_guest_prints("blockedwake", &["sleeping"], "taken by the other thread\n");
+}
+
+/// A process keeps its pid in its pid namespace across an `execve` made
+/// while other threads run, which runs a fresh fwe from the exec state.
+#[test]
+fn a_pid_namespace_holds_across_a_threaded_execve() {
+    let prog = build_c_dynamic("pidnsexec", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "pidnsexec");
+    // Inside the root, where `/proc/self/exe` leads back to it.
+    let inside = root.join("pidnsexec");
+    std::fs::copy(&prog, &inside).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&inside);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "before execve: pid 1\nafter execve: pid 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Descriptors received with `MSG_CMSG_CLOEXEC` are close-on-exec.
+#[test]
+fn received_descriptors_close_on_exec_when_asked() {
+    c_guest_prints("scmrights", &["cloexec"], "close-on-exec as asked\n");
+}
+
+/// Linux's 253 descriptors go in one message, one more is refused, and
+/// descriptors the receiver has no room for are closed.
+#[test]
+fn descriptors_pass_as_many_as_linux_passes() {
+    c_guest_prints("scmrights", &["many"], "received 253\n");
+    c_guest_prints("scmrights", &["truncated"], "kept 2, truncated 1, end of pipe 0\n");
+}
+
+/// An eventfd, timerfd, signalfd, netlink socket and process descriptor
+/// passed to another process work there as they do in their maker.
+#[test]
+fn emulated_descriptors_work_where_they_are_passed() {
+    c_guest_prints(
+        "scmrights",
+        &["emulated"],
+        "timerfd: 8 1\nsignalfd: 128 signal 10\nnetlink: answered 1\npidfd: 1\neventfd: 5\n",
+    );
+}
+
+/// A socket belongs to the network namespace it was made in: one made
+/// before `unshare(CLONE_NEWNET)` binds the initial namespace's loopback
+/// and abstract names, one made after the new namespace's (its `lo` down).
+#[test]
+fn a_socket_stays_in_its_network_namespace() {
+    c_guest_prints(
+        "netns",
+        &["pinned"],
+        "early inet 0, late inet -1 errno 99, abstract name in each 0 0\n",
+    );
+}
+
+/// In a network namespace, a datagram to a loopback port nobody bound
+/// there never reaches the host's port of that number; a connected sender
+/// gets `ECONNREFUSED`; a reply reaches a client that never bound.
+#[test]
+fn a_datagram_to_an_unbound_namespace_port_goes_nowhere() {
+    c_guest_prints(
+        "netns",
+        &["unbound"],
+        "sent 4, connected 0 named 1, sent 4, then -1 errno 111, host got -1\n\
+         served 4, answered 4\n",
+    );
+}
+
+/// The UDP level's options are fwe's: `UDP_CORK` holds sends until
+/// cleared, `UDP_SEGMENT` cuts a send into datagrams, and one fwe cannot
+/// honour is refused rather than reaching the host as another option.
+#[test]
+fn udp_options_are_linuxs() {
+    c_guest_prints(
+        "sockopts",
+        &["udp"],
+        "corked:\nuncorked: 5\nsegmented: 4 4 2\nencap: -1 errno 92\n",
+    );
+}
+
+/// `MSG_FASTOPEN` on an unconnected TCP socket connects and sends, as
+/// Linux does; on a connected one it is `EISCONN`.
+#[test]
+fn fast_open_connects_and_sends() {
+    c_guest_prints("sockopts", &["fastopen"], "fast open: sent 5, read 5, again -1 errno 106\n");
+}
+
+/// Netlink (what `getifaddrs` reads) and `SIOCGIFCONF` list the same
+/// interfaces and addresses, the host's in the initial network namespace
+/// and `lo` in a new one, whose MTU netlink reports as `SIOCSIFMTU` set it.
+#[test]
+fn interface_views_agree() {
+    c_guest_prints(
+        "ifaces",
+        &[],
+        "initial namespace agrees: 1\nnew namespace agrees: 1, lo mtu 1280\n",
+    );
+}
+
+/// `pipe2` and `eventfd2` refuse flags Linux does not know (`EINVAL`), and
+/// a notification pipe as a kernel without the watch queue does
+/// (`ENOPKG`).
+#[test]
+fn pipe_and_eventfd_flags_are_checked() {
+    c_guest_prints(
+        "specialfds",
+        &["flags"],
+        "pipe2 -1 errno 22, notification pipe -1 errno 65, eventfd -1 errno 22\n",
+    );
+}
+
+/// A blocking eventfd write that would overflow its count waits for a
+/// read, as Linux's does, and a signal ends the wait with `EINTR`.
+#[test]
+fn an_overflowing_eventfd_write_waits() {
+    c_guest_prints(
+        "specialfds",
+        &["overflow"],
+        "interrupted -1 errno 4, after a read 8, count 5\n",
+    );
+}
+
+/// A signal two signalfds watch is read once, by the first to read it,
+/// and a standard signal sent twice before it is read is pending once.
+#[test]
+fn a_signal_is_read_once_across_signalfds() {
+    c_guest_prints("specialfds", &["once"], "first 128, other signalfd -1 errno 11, again -1\n");
+}
+
+/// `SO_PROTOCOL` reports the protocol a socket was made with (ICMP for a
+/// ping socket, made where `net.ipv4.ping_group_range` lets every group),
+/// and a Unix socket's error queue reads as empty.
+#[test]
+fn socket_protocol_and_error_queue_are_linuxs() {
+    c_guest_prints("sockopts", &["protocol"], "ping protocol 1, unix error queue -1 errno 11\n");
+}
+
+/// `poll` and `epoll` take and report events by Linux's numbers:
+/// `POLLWRNORM`, `POLLWRBAND` and `POLLRDHUP` as Linux reports them,
+/// `POLLMSG` never, `EPOLLRDNORM` for a read.
+#[test]
+fn poll_events_are_linuxs() {
+    c_guest_prints("sockopts", &["events"], "poll 3: 0x100 0x200 0x2001\nepoll 1: 0x40\n");
+}
+
+/// `SO_PEERCRED` names the peer by the ids it has in the guest,
+/// `SO_PASSCRED` brings the sender's credentials, and a sender may not
+/// claim credentials it lacks (`EPERM`).
+#[test]
+fn unix_socket_credentials_are_the_guests() {
+    c_guest_prints(
+        "scmrights",
+        &["creds"],
+        "child: claiming root -1 errno 1\npeer is child 1 uid 1000 gid 1000\n\
+         passed 1: child 1 uid 1000 gid 1000\ngiven 1: child 1 uid 1000 gid 1000\n",
+    );
+}
+
+/// A TCP socket's urgent data reaches `epoll` as `EPOLLPRI`.
+#[test]
+fn urgent_data_is_epollpri() {
+    c_guest_prints("sockopts", &["urgent"], "urgent: before 0, after 1 events 0x2\n");
+}
+
+/// `MSG_TRUNC` returns a datagram's whole length, and `SO_LINGER` is in
+/// seconds, as on Linux.
+#[test]
+fn whole_datagrams_and_linger_seconds() {
+    c_guest_prints("sockopts", &["trunc"], "whole datagram: peeked 10, read 10; linger 1 7\n");
+}
+
+/// A timerfd's absolute time is on its own clock, and a periodic timer
+/// first expires at its value.
+#[test]
+fn timerfd_keeps_its_clock_and_schedule() {
+    c_guest_prints(
+        "timerfd",
+        &[],
+        "clock 1: absolute time kept\nclock 7: absolute time kept\n\
+         clock 0: absolute time kept\nperiodic: first at its value\n",
+    );
 }
 
 /// Real dynamic linking, full startup: a normal `main` linked through musl's
@@ -1312,7 +1655,7 @@ fn manifest(manifest: &str) -> (String, Vec<(String, String)>) {
 }
 
 fn sha256(f: &Path) -> String {
-    let out = Command::new("shasum").args(["-a", "256"]).arg(f).output().unwrap();
+    let out = Command::new("shasum").args(["-a", "256"]).arg(f).output_alone().unwrap();
     String::from_utf8_lossy(&out.stdout).split_whitespace().next().unwrap_or("").to_string()
 }
 
@@ -1336,7 +1679,7 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
             .args(["-fsSL", "--retry", "3", "-o"])
             .arg(&part)
             .arg(url)
-            .status()
+            .status_alone()
             .is_ok_and(|s| s.success())
             && sha256(&part) == sha256_hex
     });
@@ -1387,7 +1730,9 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
             .map(|e| e.unwrap().path())
             .find(|p| p.file_name().unwrap().to_string_lossy().starts_with("data.tar"))
             .unwrap();
-        run_checked(Command::new("tar").arg("xf").arg(&data).arg("-C").arg(&root));
+        // `-p`: the modes as the archive has them (`/tmp`'s 1777), not
+        // narrowed by the umask.
+        run_checked(Command::new("tar").arg("xpf").arg(&data).arg("-C").arg(&root));
     }
     for name in ["ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6"] {
         std::fs::copy(repo().join("guests/glibc/lib").join(name), root.join("lib").join(name))
@@ -1426,6 +1771,9 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest_in("alpine", manifest_name);
+    // How it is unpacked counts too: a root unpacked another way is
+    // unpacked again.
+    let list = format!("{list}\nunpacked with the archive's modes\n");
     let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
     // The mark that it is whole is an extended attribute of its own: a
     // copy that lost them (CI's cache keeps none) is unpacked again, as
@@ -1434,15 +1782,23 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
         return root;
     }
     let files = fetched_alpine(manifest_name);
-    let _ = std::fs::remove_dir_all(&root);
+    // What is there goes whole: unpacking over it keeps its directories'
+    // modes, and its read-only ones (`/proc`, `/sys`) stop a removal
+    // halfway unless made writable first.
+    if root.exists() {
+        run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&root));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
     std::fs::create_dir_all(&root).unwrap();
     for f in &files {
         run_checked(
-            // With the files' extended attributes: a program's file
-            // capabilities (`security.capability`) among them.
+            // With the files' extended attributes (a program's file
+            // capabilities, `security.capability`, among them), and their
+            // modes as the archive has them (`-p`: `/tmp`'s 1777, not
+            // narrowed by the umask).
             Command::new("tar")
                 .arg("--xattrs")
-                .arg("-xzf")
+                .arg("-xpzf")
                 .arg(f)
                 .args(["--exclude", ".PKGINFO", "--exclude", ".SIGN.*", "--exclude", ".pre-*"])
                 .args(["--exclude", ".post-*", "--exclude", ".trigger", "-C"])
@@ -1640,7 +1996,7 @@ fn in_debugger_root(args: &[&str], prog: Option<&Path>, keep: Option<&str>) -> (
         args[0].replace('/', "-")
     ));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("ptrace")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("ptrace")).arg(&root));
     if let Some(p) = prog {
         std::fs::copy(p, root.join("prog")).unwrap();
     }
@@ -1754,12 +2110,12 @@ const IN_CONTAINER: &str = "echo pid $$ host $(hostname); cat /proc/self/cgroup;
 fn alpine_crun_runs_an_image() {
     let root = std::env::temp_dir().join(format!("fwe-crun-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("crun")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("crun")).arg(&root));
     let bundle = root.join("bundle");
     std::fs::create_dir_all(bundle.join("rootfs")).unwrap();
     run_checked(
         Command::new("tar")
-            .arg("xzf")
+            .arg("xpzf")
             .arg(alpine_image("crun"))
             .arg("-C")
             .arg(bundle.join("rootfs")),
@@ -1808,6 +2164,13 @@ fn alpine_crun_runs_an_image() {
          / /proc /dev /dev/pts /dev/shm /dev/mqueue /sys /sys/fs/cgroup /proc/keys /proc/sys\n3.20.10\n";
     if stdout(&out) != want {
         print_last_calls(&run_trace);
+        // And every call that moved a process or made its namespaces.
+        let trace = std::fs::read_to_string(&run_trace).unwrap_or_default();
+        for line in trace.lines().filter(|l| {
+            ["cgroup", "unshare", "clone", "setns", "execve"].iter().any(|w| l.contains(w))
+        }) {
+            eprintln!("{line}");
+        }
     }
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(stdout(&out), want);
@@ -1831,7 +2194,8 @@ fn alpine_oci_archive(manifest_name: &str, out: &Path, docker: bool) {
         (digest, bytes.len())
     };
     let layer = std::fs::read(alpine_image(manifest_name)).unwrap();
-    let tar = Command::new("gunzip").arg("-c").arg(alpine_image(manifest_name)).output().unwrap();
+    let tar =
+        Command::new("gunzip").arg("-c").arg(alpine_image(manifest_name)).output_alone().unwrap();
     let unpacked = dir.join("layer.tar");
     std::fs::write(&unpacked, &tar.stdout).unwrap();
     let diff_id = sha256(&unpacked);
@@ -1913,7 +2277,7 @@ const IN_PODMAN: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
 fn alpine_podman_runs_an_image() {
     let root = std::env::temp_dir().join(format!("fwe-podman-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("podman")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("podman")).arg(&root));
     let etc = root.join("etc/containers");
     std::fs::write(
         etc.join("storage.conf"),
@@ -1987,7 +2351,7 @@ const IN_CONTAINERD: &str = "cat /etc/alpine-release; echo pid $$; id -u; \
 fn alpine_containerd_runs_an_image() {
     let root = std::env::temp_dir().join(format!("fwe-containerd-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("containerd")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("containerd")).arg(&root));
     std::fs::create_dir_all(root.join("etc/containerd")).unwrap();
     std::fs::write(
         root.join("etc/containerd/config.toml"),
@@ -2014,7 +2378,7 @@ fn alpine_containerd_runs_an_image() {
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log)
-        .spawn()
+        .spawn_alone()
         .unwrap();
     let socket = root.join("run/containerd/containerd.sock");
     for _ in 0..600 {
@@ -2140,7 +2504,7 @@ fn alpine_docker_runs_and_builds_images() {
     }
     let root = std::env::temp_dir().join(format!("fwe-docker-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("docker")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("docker")).arg(&root));
     alpine_oci_archive("docker", &root.join("tmp/alpine.tar"), true);
     let context = root.join("tmp/context");
     std::fs::create_dir_all(&context).unwrap();
@@ -2168,7 +2532,7 @@ fn alpine_docker_runs_and_builds_images() {
         .stdin(Stdio::null())
         .stdout(log.try_clone().unwrap())
         .stderr(log)
-        .spawn()
+        .spawn_alone()
         .unwrap();
     let socket = root.join("run/docker.sock");
     for _ in 0..1200 {
@@ -2297,7 +2661,7 @@ fn alpine_podman_builds_pulls_and_runs_rootless() {
     }
     let root = std::env::temp_dir().join(format!("fwe-podman2-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(alpine_root("podman-further")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(alpine_root("podman-further")).arg(&root));
     let etc = root.join("etc/containers");
     std::fs::write(
         etc.join("storage.conf"),
@@ -2358,7 +2722,7 @@ fn alpine_podman_builds_pulls_and_runs_rootless() {
     .stdin(Stdio::null())
     .stdout(log.try_clone().unwrap())
     .stderr(log)
-    .spawn()
+    .spawn_alone()
     .unwrap();
     let registry_log =
         || std::fs::read_to_string(root.join("tmp/registry.log")).unwrap_or_default();
@@ -2480,7 +2844,7 @@ fn debian_podman_runs_in_the_vm() {
     let cached = fetched_root("podman");
     let root = std::env::temp_dir().join(format!("fwe-debpodman-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
     let etc = root.join("etc/containers");
     std::fs::create_dir_all(&etc).unwrap();
     std::fs::write(
@@ -2575,7 +2939,7 @@ fn alpine_wine_runs_windows_programs() {
     let cached = alpine_root("wine");
     let root = std::env::temp_dir().join(format!("fwe-wine-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(&cached).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
     for d in ["root", "tmp"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
@@ -2595,7 +2959,8 @@ fn alpine_wine_runs_windows_programs() {
     // room for Wine's (each VM process has a stand-in watcher too).
     // SAFETY: getuid cannot fail.
     let uid = unsafe { libc::getuid() };
-    let mine = Command::new("ps").args(["-U", &uid.to_string(), "-o", "pid="]).output().unwrap();
+    let mine =
+        Command::new("ps").args(["-U", &uid.to_string(), "-o", "pid="]).output_alone().unwrap();
     let cap = (stdout(&mine).lines().count() + 300) as libc::rlim_t;
     let mut wine = |command: &str| {
         step += 1;
@@ -2713,8 +3078,12 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         ),
     )
     .unwrap();
+    // Its calls, for the last of each process should it fail.
+    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node.trace");
+    let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root")
+    cmd.arg(format!("--strace-file={}", trace.display()))
+        .arg("--root")
         .arg(&root)
         .arg(root.join("usr/bin/node"))
         .arg(&script)
@@ -2724,7 +3093,15 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         .stdin(Stdio::null());
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
-    eprintln!("--- node stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        print_last_calls(&trace);
+        // Each signal, with where it was raised.
+        let text = std::fs::read_to_string(&trace).unwrap_or_default();
+        for l in text.lines().filter(|l| l.contains("--- signal") || l.contains("fault")) {
+            eprintln!("{l}");
+        }
+    }
     // The digests are the host's (`shasum`, `md5`, Python's hashlib).
     assert_eq!(
         stdout(&out),
@@ -2862,7 +3239,7 @@ fn debian_apt_installs_and_removes_a_package() {
     // changes it.
     let root = std::env::temp_dir().join(format!("fwe-apt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cR").arg(fetched_root("apt")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(fetched_root("apt")).arg(&root));
     let _workload = workload();
     let dir = |d: &str| std::fs::create_dir_all(root.join(d)).unwrap();
     for d in [
@@ -2890,10 +3267,10 @@ fn debian_apt_installs_and_removes_a_package() {
         .arg("-c")
         .arg("ar p \"$0\" control.tar.xz | tar xOf - ./control")
         .arg(deb)
-        .output()
+        .output_alone()
         .unwrap();
     assert!(control.status.success());
-    let sha = Command::new("shasum").args(["-a", "256"]).arg(deb).output().unwrap();
+    let sha = Command::new("shasum").args(["-a", "256"]).arg(deb).output_alone().unwrap();
     let sha = String::from_utf8_lossy(&sha.stdout).split_whitespace().next().unwrap().to_string();
     let size = std::fs::metadata(deb).unwrap().len();
     std::fs::write(
@@ -3073,7 +3450,8 @@ mimetype.assign = (".html" => "text/html", ".txt" => "text/plain")
             .env("PATH", "/usr/bin:/bin")
             .env("HOME", "/tmp")
             .stdin(Stdio::null());
-        let mut server = Server(cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap());
+        let mut server =
+            Server(cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn_alone().unwrap());
         let start = Instant::now();
         // Listening once its log says it started (a connection could reach
         // whoever else holds the port).
@@ -3448,7 +3826,7 @@ fn low_link_address_needs_the_hypervisor() {
 #[test]
 fn rejects_non_elf() {
     let this_file = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/guests.rs");
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(this_file).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_fwe")).arg(this_file).output_alone().unwrap();
     assert_eq!(out.status.code(), Some(126));
     assert!(String::from_utf8_lossy(&out.stderr).contains("not an ELF file"));
 }
@@ -3862,14 +4240,25 @@ fn namespaces(scenario: &str) -> String {
     }
     std::fs::write(root.join("newroot/etc/marker"), "new\n").unwrap();
     std::fs::copy(rust_guest("namespaces"), root.join("namespaces")).unwrap();
+    // The reaper's notes (whom it follows, who ended, what it reported)
+    // go to a file, shown with the output.
+    let trace =
+        std::env::temp_dir().join(format!("fwe-ns-{}-{scenario}.trace", std::process::id()));
+    let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace=failures")
+        .arg(format!("--strace-file={}", trace.display()))
         .arg("--root")
         .arg(&root)
         .arg(root.join("namespaces"))
         .arg(scenario);
     let out = run_bounded(cmd);
     eprintln!("--- namespaces {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let notes = std::fs::read_to_string(&trace).unwrap_or_default();
+    let reaper: Vec<&str> =
+        notes.lines().filter(|l| l.contains("reaper") || l.contains("SIGCHLD")).collect();
+    eprintln!("--- its reaper's notes:\n{}", reaper.join("\n"));
+    let _ = std::fs::remove_file(&trace);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
     stdout(&out)
@@ -4122,6 +4511,200 @@ fn process_descriptors_name_processes() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// The `identity` guest's output for check `check` with `args`, which
+/// must exit 0.
+fn identity(args: &[&str]) -> String {
+    let out = fwe(&rust_guest("identity"), args);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    stdout(&out)
+}
+
+/// A host process fwe did not start (one this test starts) can be named
+/// by a guest, but nothing that needs an fwe process to answer reaches
+/// it: fwe's internal wake signal, whose host default action would end
+/// it, is never sent to it. (`/proc/<pid>` of such a process holds only
+/// `stat`.)
+#[test]
+fn host_processes_never_get_fwes_internal_signals() {
+    let mut sleeper = Command::new("/bin/sleep").arg("60").spawn().unwrap();
+    let pid = sleeper.id().to_string();
+    let text = identity(&["host-process", &pid]);
+    let alive = sleeper.try_wait().unwrap().is_none();
+    let _ = sleeper.kill();
+    let _ = sleeper.wait();
+    assert_eq!(
+        text,
+        "pidfd_open: ok\npidfd_getfd: EPERM\nprocess_vm_readv: EPERM\n/proc/<pid>/mem: ENOENT\n\
+         kill real-time: EINVAL\npidfd_send_signal real-time: EINVAL\n"
+    );
+    assert!(alive, "the host process was ended");
+}
+
+/// `RLIMIT_STACK` sizes the main thread's stack of a program `execve`
+/// runs, natively.
+#[test]
+fn rlimit_stack_sizes_the_main_stack() {
+    assert_eq!(
+        identity(&["stack-limit"]),
+        "limit 32 MiB, 20 MiB used: exit 0; limit 1 MiB, 4 MiB used: killed\n"
+    );
+}
+
+/// `RLIMIT_NPROC` counts a user's threads at `fork`, as Linux counts its
+/// tasks.
+#[test]
+fn fork_counts_threads_against_rlimit_nproc() {
+    assert_eq!(
+        identity(&["nproc-threads"]),
+        "two more threads: fork at the least limit refused true, two more allowed true\n"
+    );
+}
+
+/// `prlimit` of another process reads its limits, and a limit set takes
+/// effect in it at once.
+#[test]
+fn prlimit_reaches_another_process_at_once() {
+    assert_eq!(
+        identity(&["prlimit-other"]),
+        "set 0: it reads (64, 64), the caller's own 128\nits highest descriptor 63\n\
+         after its execve: (4321, 4321)\n"
+    );
+}
+
+/// CPU affinity is per process and reaches across processes: one set on
+/// another process is what it reads; a fork child inherits it.
+#[test]
+fn affinity_is_kept_per_process() {
+    assert_eq!(
+        identity(&["affinity"]),
+        "set another's 0: it reads 0x2, own unchanged true\n\
+         child reads its own 0x2, getcpu 1\n\
+         own 0x4, getcpu 2, a fork child's exit 4\n"
+    );
+}
+
+/// `madvise` controls what a fork child is given (`MADV_DONTFORK`), makes
+/// guard pages, frees a shared file's pages (`MADV_REMOVE`) and discards
+/// locked memory (`MADV_DONTNEED_LOCKED`), as Linux does.
+#[test]
+fn madvise_controls_fork_guards_and_removal() {
+    assert_eq!(
+        identity(&["madvise"]),
+        "dontfork 0: child has it unmapped exit 1; dofork: child reads exit 7\n\
+         guard 0: access killed by 11, neighbours 2, after mprotect killed by 11; removed 0: reads 0\n\
+         locked: guard EINVAL, dontneed EINVAL, dontneed_locked 0 reads 0\n\
+         remove: private anonymous EINVAL, shared anonymous 0 reads 0, private file EACCES, \
+         shared file 0 file reads 0\n"
+    );
+}
+
+/// `RLIMIT_MEMLOCK` bounds locked mappings as it bounds `mlock`:
+/// `MAP_LOCKED` and mappings made after `mlockall(MCL_FUTURE)`.
+#[test]
+fn locked_mappings_are_bounded_by_rlimit_memlock() {
+    assert_eq!(
+        identity(&["memlock"]),
+        "limit 0: MAP_LOCKED EPERM\n\
+         limit 64 KiB: MAP_LOCKED 32 KiB ok, then 48 KiB EAGAIN\n\
+         mlockall(MCL_FUTURE) 0: 48 KiB EAGAIN, 16 KiB ok\n\
+         unlocked: 48 KiB mapped true, mlock of 16 KiB 0\n"
+    );
+}
+
+/// Nice values: per thread, as Linux keeps them, and the process's given
+/// to the host process (which lets it be raised, not lowered);
+/// `PRIO_USER` names a user of the caller's user namespace.
+#[test]
+fn nice_values_reach_the_host_and_name_threads() {
+    use std::io::{BufRead, Write};
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg(rust_guest("identity")).arg("priorities");
+    cmd.stdin(std::process::Stdio::piped()).stdout(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let mut out = std::io::BufReader::new(child.stdout.take().unwrap());
+    let mut text = String::new();
+    let mut host_nice = None;
+    loop {
+        let mut line = String::new();
+        if out.read_line(&mut line).unwrap() == 0 {
+            break;
+        }
+        if let Some(pid) = line.strip_prefix("pid ") {
+            let pid: libc::id_t = pid.trim().parse().unwrap();
+            // SAFETY: reading a process's priority; it waits on its input.
+            host_nice = Some(unsafe { libc::getpriority(libc::PRIO_PROCESS, pid) });
+            break;
+        }
+        text.push_str(&line);
+    }
+    child.stdin.take().unwrap().write_all(b"g").unwrap();
+    let mut rest = String::new();
+    std::io::Read::read_to_string(&mut out, &mut rest).unwrap();
+    text.push_str(&rest);
+    let status = child.wait().unwrap();
+    // A process starts with its parent's nice value, as on Linux: this
+    // test's (CI's runner starts it at -10).
+    // SAFETY: reading this process's own priority.
+    let start = unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) };
+    assert_eq!(
+        text,
+        format!(
+            "process: start {start}, set 5 0 reads 5, lowered to 2 0 reads 2\n\
+             thread: starts 2, set 9 0, reads 9, main thread's 2\n\
+             main thread: 2\n\
+             user namespace: user 500 (43211 outside) 2, user 43211 ESRCH\n"
+        )
+    );
+    assert_eq!(host_nice, Some(5), "the host process keeps the highest nice value it was given");
+    assert!(status.success());
+}
+
+/// `RLIMIT_SIGPENDING` bounds the signals queued: a `sigqueue` past it
+/// fails with `EAGAIN`, as does `timer_create`, and none is dropped.
+#[test]
+fn queued_signals_are_bounded_by_rlimit_sigpending() {
+    assert_eq!(
+        identity(&["sigpending"]),
+        "own: queued 10, then EAGAIN, timer refused true, kill 0, taken 10 in order true\n\
+         timer once there is room: true\n\
+         another: then EAGAIN, past its limit true, all taken in order true\n"
+    );
+}
+
+/// Each signal names its sender's pid and guest user, as Linux's
+/// `siginfo` does; `rt_sigqueueinfo` delivers the caller's own.
+#[test]
+fn signals_name_their_senders_guest_ids() {
+    assert_eq!(
+        identity(&["sender-ids"]),
+        "own kill: true\nown sigqueueinfo: Some((4242, 77))\n\
+         from uid 1000: true, si_code 0 to another refused true\n\
+         child's SIGCHLD: true, waitid: true\n"
+    );
+}
+
+/// A pid namespace's init takes only the signals it handles, from
+/// inside its namespace or its parent's; `SIGKILL` from outside ends it.
+#[test]
+fn pid_namespace_init_takes_only_handled_signals() {
+    assert_eq!(
+        identity(&["init-signals"]),
+        "init 1: own SIGTERM 0, SIGTSTP 0, child's sent true\nparent's SIGTERM: 0\n\
+         init lives, handled SIGUSR1 1\ninit killed by 9\n"
+    );
+}
+
+/// A signal to a process group reaches each member the sender may
+/// signal and no other, as Linux's `kill_pgrp` sends it.
+#[test]
+fn group_kills_check_each_member() {
+    assert_eq!(
+        identity(&["group-kill"]),
+        "own group: sent true, sender took it true, uid 1000 took it true, root took it false, \
+         parent took it false\nroot's group: EPERM true, its member took it false\n"
+    );
+}
+
 /// What the `ptrace` guest prints.
 const PTRACE: &str = "stop: signal 19\n\
     peek: true\n\
@@ -4303,7 +4886,11 @@ fn proc_is_read_through_a_detached_mount() {
 const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
     nstype 0x4000000, parent of a UTS namespace refused true\n\
     setns: 0, own name true, back true\n\
-    wrong type refused true\n";
+    wrong type refused true\n\
+    own user namespace: -1 errno 22\n\
+    without CAP_SYS_ADMIN: -1 errno 22, capabilities kept true\n\
+    unshare pid 0, setns into its own active one 0\n\
+    child: the namespace above refused, its own joined true\n";
 
 /// Namespace descriptors: `/proc/self/ns/uts` opened as nsfs shows it,
 /// the `NS_GET_*` requests, and `setns` back into the namespace it names.
@@ -4419,7 +5006,7 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     dnotify: 2 signals, parent's true, inner's true\n\
     real-time queue: [1, 2, 3]\n\
     file attributes: set 0, get 0, no-dump true\n\
-    lsm: 2 modules, ids 100 110, size 16\n\
+    lsm: 3 modules, ids 100 110, size 24\n\
     sync: 0, syncfs 0, file/ ENOTDIR\n\
     msg_next_id: id true, then -1\n\
     process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n\
@@ -4444,6 +5031,16 @@ fn more_calls() {
 fn hv_more_calls() {
     let Some(out) = fwe_hv(&rust_low_guest("calls3"), &[]) else { return };
     assert_eq!(stdout(&out), CALLS3, "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// `MADV_DONTNEED_LOCKED` discards locked memory in the VM as natively.
+#[test]
+fn hv_discards_locked_memory() {
+    let want = "locked 0: dontneed EINVAL, dontneed_locked 0, reads 0\n";
+    assert_eq!(identity(&["dontneed-locked"]), want);
+    let Some(out) = fwe_hv(&rust_low_guest("identity"), &["dontneed-locked"]) else { return };
+    assert_eq!(stdout(&out), want, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
 }
 
@@ -4674,7 +5271,7 @@ fn other_hypervisor_client() -> Option<String> {
         "VirtualBoxVM",
         "prl_vm_app",
     ];
-    let ps = Command::new("ps").args(["-axco", "comm="]).output().ok()?;
+    let ps = Command::new("ps").args(["-axco", "comm="]).output_alone().ok()?;
     String::from_utf8_lossy(&ps.stdout)
         .lines()
         .map(str::trim)
@@ -4716,7 +5313,7 @@ fn hv_mode() -> Option<&'static HvMode> {
                 // be unable to create a real VM.
                 let sig = Command::new("codesign")
                     .args(["-d", "--entitlements", "-", env!("CARGO_BIN_EXE_fwe")])
-                    .output()
+                    .output_alone()
                     .unwrap();
                 let sig =
                     String::from_utf8_lossy(&sig.stdout) + String::from_utf8_lossy(&sig.stderr);
@@ -4750,7 +5347,7 @@ fn real_fwe() -> Option<PathBuf> {
         );
         return None;
     }
-    let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output().ok()?;
+    let support = Command::new("sysctl").args(["-n", "kern.hv_support"]).output_alone().ok()?;
     if String::from_utf8_lossy(&support.stdout).trim() != "1" {
         return None;
     }
@@ -4761,7 +5358,7 @@ fn real_fwe() -> Option<PathBuf> {
         .args(["--sign", "-", "--force", "--entitlements"])
         .arg(repo().join("hypervisor.entitlements"))
         .arg(&signed)
-        .status()
+        .status_alone()
         .is_ok_and(|s| s.success());
     // A host that has the hypervisor but refuses the VM (no
     // entitlement honoured) also counts as unavailable.
@@ -6018,6 +6615,110 @@ fn a_users_namespace_is_its_makers_to_join() {
     assert_eq!(containers("userns-join"), "its maker joins: ok\nanother user joins: EPERM\n");
 }
 
+/// Capabilities are namespaced: a user's own user namespace gives it every
+/// capability over what that namespace owns, and none over root's file,
+/// root's process, the host name, global sysctls or BPF; in its own mount
+/// namespace it mounts, but the mounts it was given keep their flags and
+/// stay attached.
+#[test]
+fn capabilities_in_a_user_namespace_cover_what_it_owns() {
+    assert_eq!(
+        containers("userns-scope"),
+        "unshare: ok euid 0\nroot's file: EACCES\nroot's process: EPERM\nhost name: EPERM\n\
+         owner of the host's UTS: EPERM\nglobal sysctl: EACCES\nbpf: EPERM\nmount: ok\n\
+         remount clearing nosuid: EPERM\n\
+         umount a given mount: EINVAL\nown UTS: ok host name: ok\n\
+         its owner is its user namespace: true\n"
+    );
+}
+
+/// Who may trace whom, as Linux's `ptrace_may_access` with Yama (scope 1,
+/// the default) and Landlock decide it for a user without capabilities:
+/// its own child (`TracerPid` then names it), not an undumpable one, not a
+/// sibling unless the sibling names it (`PR_SET_PTRACER`), and nothing
+/// from inside a Landlock domain its target is outside. Yama's scope is
+/// root's to set.
+#[test]
+fn ptrace_access_follows_linux_and_yama() {
+    assert_eq!(
+        containers("ptrace-access"),
+        "its child: ok, shown as its tracer true\nan undumpable child: EPERM\n\
+         a sibling, unnamed: EPERM\na sibling, named by it: ok\nptrace_scope by a user: EPERM\n\
+         from a Landlock domain: EPERM\nptrace_scope: 1\n"
+    );
+}
+
+/// What a Landlock domain withholds beyond the calls it checks: a file
+/// opened without the right to truncate cannot be truncated through any
+/// descriptor of it, a dup, `F_DUPFD`, or one passed to a process outside
+/// the domain; a device opened without `IOCTL_DEV` takes only the requests
+/// any holder may make; a domain restricting files may not mount; a
+/// signal to a process group or to every process spares those outside a
+/// signal-scoped domain; a datagram to an abstract socket bound outside an
+/// abstract-scoped domain is refused.
+#[test]
+fn landlock_follows_open_files_signals_mounts_and_datagrams() {
+    assert_eq!(
+        containers("landlock-gaps"),
+        "restricted: ok\nftruncate: EACCES dup EACCES F_DUPFD EACCES\n\
+         a device's ioctl: EACCES, FIOCLEX ok\nmount: EPERM\n\
+         ftruncate where it was passed: EACCES\nftruncate of its own: ok\n\
+         kill(0): ok, kill(-1): ok, the one outside untouched\n\
+         abstract datagram: sendto EPERM, sendmsg EPERM\n"
+    );
+}
+
+/// File capabilities (`security.capability`): only revisions 2 and 3, of
+/// their sizes, may be written (`EINVAL`); a change of owner and a write
+/// remove them, as Linux's `chown` and `write` do; written in a user
+/// namespace they are kept for its root, revision 2 there and revision 3
+/// naming that root outside.
+#[test]
+fn file_capabilities_are_checked_and_cleared() {
+    assert_eq!(
+        containers("filecaps"),
+        "revision 1: EINVAL\nbad size: EINVAL\nset: ok read: rev 2 size 20\n\
+         after chown: ENODATA\nafter a write: ENODATA\n\
+         in a user namespace: set ok read rev 2 size 20\noutside it: rev 3 size 24\n"
+    );
+}
+
+/// seccomp beyond allowing and refusing: `Seccomp_filters` counts the
+/// filters; `SECCOMP_RET_LOG` writes an audit record to the kernel log
+/// (`syslog`); `SECCOMP_RET_TRACE` stops a tracer that set
+/// `PTRACE_O_TRACESECCOMP` with `PTRACE_EVENT_SECCOMP` and the filter's
+/// data, then the call goes on, and fails with `ENOSYS` without one.
+/// `capget` reads another process's sets; a ping socket takes a group in
+/// `net.ipv4.ping_group_range`, a raw one `CAP_NET_RAW`; the security
+/// sysctls are there at Linux's defaults.
+#[test]
+fn seccomp_logs_and_traces_and_security_sysctls() {
+    assert_eq!(
+        containers("seccomp-more"),
+        "Seccomp_filters:\t2\nlogged in the kernel log: true\ntraced, no tracer: ENOSYS\n\
+         seccomp stop: event 7 signal 5 data 42\ntraced call returns: true\n\
+         capget of another: ok effective 0x0\n\
+         ping socket, default range: EACCES\nping socket, every group: ok\n\
+         raw socket without CAP_NET_RAW: EPERM\n\
+         kernel/unprivileged_bpf_disabled: 2\nkernel/yama/ptrace_scope: 1\nfs/suid_dumpable: 0\n"
+    );
+}
+
+/// An eBPF socket filter reads the packet's bytes (`bpf_skb_load_bytes`)
+/// and decides on each message whichever call sends it: `write`,
+/// `sendto`, `writev` and `sendmsg` each report the whole length sent,
+/// and only what the filter keeps arrives.
+#[test]
+fn socket_filters_read_packets_on_every_send() {
+    assert_eq!(
+        containers("socket-filter"),
+        "loaded: true attached: ok\nwrite of x-write: 7\nwrite of k-write: 7\n\
+         sendto of x-sendto: 8\nsendto of k-sendto: 8\nwritev of x-writev: 8\n\
+         writev of k-writev: 8\nsendmsg of x-sendmsg: 9\nsendmsg of k-sendmsg: 9\n\
+         received: k-write k-sendto k-writev k-sendmsg\n"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.
@@ -6029,7 +6730,8 @@ fn exec_of_a_vm_program_without_a_vm_fails_cleanly() {
 /// What a program gives the user who runs it: file capabilities
 /// (`security.capability`, as `newuidmap` has `cap_setuid+ep`) raise its
 /// capabilities, a set-user-ID root program its effective uid and with it
-/// every capability; under `no_new_privs`, neither.
+/// every capability; under `no_new_privs`, or traced by a tracer without
+/// `CAP_SYS_PTRACE`, neither.
 #[test]
 fn programs_grant_file_capabilities_and_set_ids() {
     assert_eq!(
@@ -6038,9 +6740,39 @@ fn programs_grant_file_capabilities_and_set_ids() {
          set-uid: euid 0 CapEff:\t000001fffdffffff\n\
          capped, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
          set-uid, no_new_privs: euid 1000 CapEff:\t0000000000000000\n\
+         set-uid, traced by a privileged tracer: euid 0 CapEff:\t000001fffdffffff\n\
+         set-uid, traced by an unprivileged tracer: euid 1000 CapEff:\t0000000000000000\n\
+         capped, traced by an unprivileged tracer: euid 1000 CapEff:\t0000000000000000\n\
+         dumpable after setuid: 0\n\
          a user's mknod: whiteout ok, device EPERM\n\
          /proc owners: theirs Ok(1000), opened Ok(1000), own Ok(0)\n"
     );
+}
+
+/// What a program is told of its credentials as it starts (`AT_UID` to
+/// `AT_EGID`, the guest's ids), and `AT_SECURE` after an exec that raised
+/// privilege (a set-user-ID root program, file capabilities, run by a
+/// user): glibc then starts in secure mode and drops `LD_LIBRARY_PATH`.
+#[test]
+fn privilege_raising_programs_start_in_secure_mode() {
+    let root = libc_rootfs(Libc::Glibc, "secure");
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("containers"), root.join("containers")).unwrap();
+    std::fs::copy(build_c_dynamic("secure", Libc::Glibc, true), root.join("secure")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures").arg("--root").arg(&root).arg(root.join("containers"));
+    cmd.arg("secure-exec");
+    let out = run_bounded(cmd);
+    eprintln!("--- secure-exec stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "root: uid 0 euid 0 gid 0 egid 0 secure 0 LD_LIBRARY_PATH /nowhere\n\
+         user: uid 1000 euid 1000 gid 0 egid 0 secure 0 LD_LIBRARY_PATH /nowhere\n\
+         user, set-uid: uid 1000 euid 0 gid 0 egid 0 secure 1 LD_LIBRARY_PATH (removed)\n\
+         user, capped: uid 1000 euid 1000 gid 0 egid 0 secure 1 LD_LIBRARY_PATH (removed)\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// Extended attributes by Linux's namespaces: set, created once, read
@@ -6258,4 +6990,650 @@ fn strace_file_follows_children() {
         trace.lines().filter_map(|l| l.strip_prefix("[fwe ")?.split(']').next()).collect();
     assert_eq!(pids.len(), 2, "{pids:?}");
     assert!(trace.contains("setuid("), "the child's calls are there");
+}
+
+/// Run C guest `name` (built against glibc) as root in a glibc root
+/// filesystem with `/tmp`, with `args` and the variables `env` added to
+/// its environment: its output and status.
+fn run_c_guest(name: &str, args: &[&str], env: &[(&str, &str)]) -> Output {
+    let prog = build_c_dynamic(name, Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, name);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).args(args).envs(env.iter().copied());
+    let out = run_bounded(cmd);
+    eprintln!("--- {name} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let _ = std::fs::remove_dir_all(&root);
+    out
+}
+
+/// Sysctls: the socket buffer limits are there, each user namespace has
+/// its own namespace limits (none until set), which creation is held to
+/// (`ENOSPC`), as it is to Linux's nesting depth, and `listen` holds its
+/// backlog to `net.core.somaxconn`.
+#[test]
+fn sysctls_limit_namespaces_and_listen() {
+    let out = run_c_guest("sysctls", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "/proc/sys/net/core/rmem_max: 212992\n\
+         /proc/sys/net/core/wmem_max: 212992\n\
+         /proc/sys/user/max_user_namespaces: 127414\n\
+         /proc/sys/kernel/random/poolsize: 256\n\
+         random is a directory: 1\n\
+         nested user namespaces: 33, then errno 28\n\
+         /proc/sys/user/max_user_namespaces: 2147483647\n\
+         set max_net_namespaces 0: 0\n\
+         new net namespace: 28\n\
+         set max_user_namespaces 1: 0\n\
+         first new user namespace: 0\n\
+         second new user namespace: 28\n\
+         /proc/sys/net/core/somaxconn: 1\n\
+         queued with somaxconn 1: few\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Namespaces: a single-threaded process unshares its thread group,
+/// signal handlers and memory (with another thread, `EINVAL`);
+/// `NS_GET_USERNS` of a UTS namespace gives the user namespace it was
+/// made in (and `EPERM` for one out of reach); another process's
+/// `/proc/<pid>/cgroup` is shown from the reader's cgroup namespace.
+#[test]
+fn namespaces_owners_unshare_and_cgroup_paths() {
+    let out = run_c_guest("nsprocs", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "single-threaded: thread 0 sighand 0 vm 0\n\
+         with a thread: thread 22 sighand 22 vm 22\n\
+         uts owner is the user namespace it was made in: 1\n\
+         an initial namespace's owner, from below: 1\n\
+         own: 0::/\n\
+         sibling's: 0::/../b\n\
+         the root's: 0::/../..\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// cgroups: `cgroup.max.depth` and `cgroup.max.descendants` hold `mkdir`
+/// (`EAGAIN`); no threaded cgroups (`EOPNOTSUPP`); `pids.max` holds
+/// threads as well as forks, `pids.events` counting the refusals;
+/// `cgroup.threads` lists threads; a freeze holds the cgroups below and
+/// whoever joins or is forked into one; moves need write access to the
+/// common ancestor's `cgroup.procs` and stay in the cgroup namespace; and
+/// there is no cgroup v1 (`ENODEV`).
+#[test]
+fn cgroups_limits_freeze_and_delegation() {
+    let out = run_c_guest("cgroups", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "max.depth x: -22\n\
+         mkdir depth 1: 0\n\
+         mkdir depth 2: 11\n\
+         mkdir past descendants: 11\n\
+         cgroup.type: domain\n\
+         type threaded: -95, type junk: -22\n\
+         cgroup.threads lists the threads: 2\n\
+         thread past pids.max: 11\n\
+         fork past pids.max: 11\n\
+         p/pids.events: max 2\n\
+         thread within pids.max: 0\n\
+         thread past RLIMIT_NPROC: 11\n\
+         thread within RLIMIT_NPROC: 0\n\
+         member frozen: T\n\
+         f/k/cgroup.events: populated 1\nfrozen 1\n\
+         f/k/cgroup.events: populated 1\nfrozen 1\n\
+         still frozen under a frozen parent: T\n\
+         joined a frozen cgroup: T\n\
+         forked into a frozen cgroup: T\n\
+         thawed: 1\n\
+         unprivileged, common ancestor not writable: 13\n\
+         common ancestor writable: 0\n\
+         out of the cgroup namespace: 2\n\
+         cgroup v1 mount: 19\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// /proc: the host's memory in `/proc/meminfo` and `sysinfo`, `cpuinfo` in
+/// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
+/// `comm` and host name written as Linux writes them, another process's
+/// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
+/// a tracer reads, to one that may not trace it), and `/proc/net`.
+#[test]
+fn proc_files_programs_read() {
+    let out = run_c_guest("procfiles", &[], &[("FWE_PROC", "1")]);
+    let text = stdout(&out);
+    let (head, tail) = text.split_once("if_inet6: ").unwrap_or((&text, ""));
+    assert_eq!(
+        head,
+        "meminfo is sysinfo's: 1, procs counted: 1\n\
+         cpuinfo: cpus 1, BogoMIPS 1, Features fp asimd 1, BHID 0\n\
+         environ has FWE_PROC=1: 1\n\
+         limits: Limit                    | open files 1\n\
+         statm words: 7\n\
+         io read_bytes: 1\n\
+         comm write: 0\n\
+         comm now: renamed\nname: renamed\n\
+         hostname in the initial namespace: 1\n\
+         hostname in a new one: 0\n\
+         uname nodename: inner\n\
+         child's cwd: /tmp\n\
+         child's environ has FWE_PROC=1: 1\n\
+         child's limits: 1\n\
+         child's mountinfo is ours: 1\n\
+         unprivileged environ: 13\n\
+         unprivileged maps: 13\n\
+         unprivileged io: 13\n\
+         unprivileged limits: 0\n\
+         unprivileged cwd: 13\n\
+         /proc/net: self/net\n\
+         listen: 1\n\
+         tcp lists it: 1\n\
+         unix lists it: 1\n\
+         dev: 1\n"
+    );
+    assert_eq!(
+        tail,
+        "00000000000000000000000000000001 01 80 10 80       lo\n\
+         route: Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Linux 6.x calls: the `*xattrat` calls, the futex2 calls, `kcmp`,
+/// `process_madvise`, `clone3`'s `set_tid` in fwe's pid namespaces and
+/// `PR_SET_VMA` names; and `ENOSYS` for the features fwe's kernel is built
+/// without (modules, io_uring, perf events, fanotify, userfaultfd).
+#[test]
+fn newer_system_calls() {
+    let out = run_c_guest("newcalls", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "setxattrat: 0\n\
+         getxattrat: 5 value\n\
+         getxattrat with flags: -22\n\
+         small args: -22\n\
+         listxattrat has it: 1\n\
+         getxattrat of the descriptor: 5 value\n\
+         removexattrat: 0, again: -61\n\
+         unknown at flags: -22\n\
+         futex_wait woken: 0, word 1\n\
+         futex_wait on a changed word: -11\n\
+         64-bit futex: -22\n\
+         futex_wake with none waiting: 0\n\
+         futex_requeue: 0\n\
+         futex_requeue on a changed word: -11\n\
+         kcmp dup: 0, pipe dup: 0, two pipe ends differ: 1\n\
+         same file opened twice: 1, duplicated: 0\n\
+         bad descriptor: -9, bad type: -22\n\
+         own memory: 0, a child's: 1, inherited pipe: 0\n\
+         process_madvise: 98304\n\
+         destructive advice: -22, flags: -22, not a pidfd: -9\n\
+         PR_SET_VMA: 0\n\
+         bad name: 22\n\
+         maps names it: 1\n\
+         set_tid in the host's namespace: -1\n\
+         set_tid other than 1 with no init: -22\n\
+         chosen pid: 42\n\
+         taken: -17, too many: -22\n\
+         init made: 1\n\
+         modules: -38 -38 -38\n\
+         io_uring -38, perf -38, fanotify -38, userfaultfd -38\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Run one scenario of the `fsrules` guest in a root filesystem of its own
+/// (`/tmp`) and return its output.
+fn fsrules(scenario: &str) -> String {
+    fsrules_with(scenario, &[])
+}
+
+/// [`fsrules`] with more arguments.
+fn fsrules_with(scenario: &str, args: &[&str]) -> String {
+    fsrules_then(scenario, args, |_| {})
+}
+
+/// [`fsrules_with`], then `check` of the root filesystem it ran in.
+fn fsrules_then(scenario: &str, args: &[&str], check: impl FnOnce(&Path)) -> String {
+    let root = std::env::temp_dir().join(format!("fwe-fsr-{}-{scenario}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("fsrules"), root.join("fsrules")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace=failures").arg("--root").arg(&root).arg(root.join("fsrules")).arg(scenario);
+    cmd.args(args);
+    let out = run_bounded(cmd);
+    eprintln!("--- fsrules {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    check(&root);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(out.status.code(), Some(0), "{scenario}: {}", stdout(&out));
+    stdout(&out)
+}
+
+/// `access` answers as `open` checks: a user that is not root is held to
+/// the file's guest owner and mode, and to the search bits on the way; the
+/// real ids are checked unless `AT_EACCESS` asks for the effective ones;
+/// root searches a directory of no execute bit but runs no file of none.
+#[test]
+fn access_checks_the_guests_ids() {
+    assert_eq!(
+        fsrules("access"),
+        "root X_OK dir: ok file: EACCES\nuser R_OK: EACCES open: EACCES\n\
+         user W_OK: EACCES beyond a closed dir: EACCES\nreal: EACCES effective: ok\n"
+    );
+}
+
+/// The no-dump flag is the guest's own: a file given another owner (which
+/// fwe keeps under a host flag of the same name) is not no-dump to
+/// `lsattr` or `statx`, `chattr -d` keeps its owner, and `chattr +d` shows.
+#[test]
+fn nodump_is_apart_from_kept_owners() {
+    assert_eq!(
+        fsrules("nodump"),
+        "owned no-dump: (false, false)\nafter clearing: 1000:100\n\
+         set: (true, true) owner 1000:100\n"
+    );
+}
+
+/// `open_by_handle_at` opens as `openat` does, in the guest's own view:
+/// read through a handle, `O_PATH` for naming only, `EROFS` to write
+/// through a read-only mount, the file's mode for a caller without
+/// `CAP_DAC_OVERRIDE`, `EPERM` without `CAP_DAC_READ_SEARCH`; a handle
+/// forged for a host file outside the root is stale, as is one used with
+/// a descriptor of another file system; a link's own handle opens as
+/// `O_NOFOLLOW` opens it (`ELOOP`).
+#[test]
+fn file_handles_open_within_the_guests_view() {
+    use std::os::unix::fs::MetadataExt;
+    let outside = std::env::temp_dir().join(format!("fwe-fsr-outside-{}", std::process::id()));
+    std::fs::write(&outside, "host secret").unwrap();
+    let ino = std::fs::metadata(&outside).unwrap().ino().to_string();
+    let out = fsrules_with("handles", &[&ino]);
+    let _ = std::fs::remove_file(&outside);
+    assert_eq!(
+        out,
+        "read: hello\nO_PATH read: EBADF\nread-only mount: write EROFS read ok\n\
+         outside the root: ESTALE\nlink: ELOOP other file system: ESTALE\n\
+         without CAP_DAC_OVERRIDE: write EACCES read ok\n\
+         without CAP_DAC_READ_SEARCH: EPERM\n"
+    );
+}
+
+/// A bind mount keeps its source's read-only flag until a remount clears
+/// it; a Unix socket's node is not made on a read-only mount (`EROFS`); a
+/// read-only `/proc/sys` refuses writes to sysctls, as `faccessat` says.
+#[test]
+fn bind_mounts_keep_read_only() {
+    assert_eq!(
+        fsrules("romounts"),
+        "ro: ok\ncopy: ok\ncreate in the copy: EROFS\nremount rw: ok create: ok\n\
+         socket bind: EROFS\nro /proc/sys: ok\nsysctl write: EROFS\nsysctl W_OK: EROFS\n"
+    );
+}
+
+/// fwe's own work on a guest's file (by its path, at a path past the host's
+/// length limit too) never drops the record locks the process holds on it,
+/// which macOS drops on any close of a descriptor of the file.
+#[test]
+fn record_locks_survive_fwes_own_work_on_the_file() {
+    let line = "truncate ok held, utimensat ok held, stat ok held, access ok held, \
+                chmod ok held, chown ok held, getxattr ok held, file_getattr ok held, \
+                open ok held, fadvise 0 held, close released\n";
+    assert_eq!(fsrules("locks"), format!("lock: ok\n{line}lock: ok\n{line}"));
+}
+
+/// `FS_IOC_SETFLAGS` and `file_setattr` change a file only through a
+/// writable mount (`EROFS` otherwise), and copy an overlay's lower file up
+/// first, leaving the lower layer alone.
+#[test]
+fn inode_flags_change_as_files_do() {
+    assert_eq!(
+        fsrules("chattr"),
+        "overlay: ok\nioctl: ok\nfile_setattr: ok\nmerged: 64 64 lower: 0 0\nro: ok\n\
+         ioctl on ro: EROFS\nfile_setattr on ro: EROFS\n"
+    );
+}
+
+/// `F_GETLK` names a lock's holder by its pid in the caller's pid
+/// namespace, not the host's.
+#[test]
+fn getlk_reports_the_holder_in_the_callers_namespace() {
+    assert_eq!(fsrules("getlk"), "holder 1: type 1 pid 1\n");
+}
+
+/// `fchownat` and `fchmodat2` with `AT_EMPTY_PATH` on an `O_PATH`
+/// descriptor of a link or a FIFO (which fwe stands in for) act on that
+/// link or FIFO: a link's own owner, never its target's; a link's mode is
+/// not to be changed (`EOPNOTSUPP`).
+#[test]
+fn o_path_descriptors_change_the_file_they_name() {
+    assert_eq!(
+        fsrules("opath"),
+        "/tmp/link: chown ok chmod EOPNOTSUPP -> 1000:1000 777\n\
+         /tmp/fifo: chown ok chmod ok -> 1000:1000 600\ntarget: 0\n"
+    );
+}
+
+/// A Unix socket's node is held to its owner and mode as a file is:
+/// connecting or sending to it needs write permission by the caller's ids,
+/// making one needs write permission on its directory.
+#[test]
+fn unix_socket_nodes_are_held_to_their_modes() {
+    assert_eq!(
+        fsrules("unixperm"),
+        "connect EACCES sendto EACCES bind EACCES\nconnect ok sendto ok bind ok\n"
+    );
+}
+
+/// A socket is its maker's: a user who is not root may `fchmod` the one
+/// it made, which `fstat` shows and the node bound for it takes (less the
+/// umask).
+#[test]
+fn a_socket_is_its_makers_and_takes_its_mode_to_its_node() {
+    assert_eq!(fsrules("sockmode"), "made 777 1000 fchmod ok now 700 1000 bind ok node 700 1000\n");
+}
+
+/// An overlay's sticky directory restricts removal as any does: a user
+/// removes or renames only its own files there.
+#[test]
+fn overlay_sticky_directories_restrict_removal() {
+    assert_eq!(
+        fsrules("ovlsticky"),
+        "overlay: ok\nunlink another's: EPERM rename it: EPERM unlink own: ok\n"
+    );
+}
+
+/// A trailing slash names a directory in every path call: a lookup
+/// follows a final link and finds a file `ENOTDIR`; a file is not removed
+/// or renamed by such a name, nor made (`ENOENT`); a directory is.
+#[test]
+fn trailing_slashes_name_directories() {
+    assert_eq!(
+        fsrules("slash"),
+        "stat file/: ENOTDIR\nlstat link/: ok\nchmod file/: ENOTDIR\nunlink file/: ENOTDIR\n\
+         rename file/: ENOTDIR\nmkfifo new/: ENOENT\nmkdir new/: ok\nlink/ is a directory: true\n"
+    );
+}
+
+/// `telldir` and `seekdir`, which the C library builds on `d_off` and
+/// `lseek`, return to the same place in a directory's listing.
+#[test]
+fn seekdir_returns_to_a_telldir_position() {
+    assert_eq!(fsrules("telldir"), "back to the same entry: true\n");
+}
+
+/// A read through a `strictatime` mount sets the file's access time, as
+/// fwe sets it where the host did not, and leaves its change time.
+#[test]
+fn access_times_set_by_reads_leave_change_times() {
+    assert_eq!(fsrules("atime"), "strictatime: ok\naccess time set: true change time kept: true\n");
+}
+
+/// A set-ID file a user without `CAP_FSETID` changes loses its set-ID bits
+/// (set-group-ID as its group may run it) however it is changed.
+#[test]
+fn set_id_bits_go_with_any_change() {
+    assert_eq!(
+        fsrules("setid"),
+        "dup: 775\nftruncate: 775\ntruncate: 775\nfallocate: 775\ncopy_file_range: 775\n\
+         mmap: 775\n"
+    );
+}
+
+/// An `O_TMPFILE` file has no link until given one, which any duplicate
+/// of its descriptor may do; a fork child's close leaves it to its maker;
+/// one still open as its process ends leaves no hidden file behind.
+#[test]
+fn o_tmpfile_files_have_no_name_until_linked() {
+    let mut left = Vec::new();
+    let out = fsrules_then("tmpfile", &[], |root| {
+        left = std::fs::read_dir(root.join("tmp/left"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+    });
+    assert_eq!(out, "links: 0\nlinked through a duplicate: ok links: 1\n");
+    assert!(left.is_empty(), "{left:?}");
+}
+
+/// A tmpfs's size holds for `copy_file_range`, `pwritev` and `splice` into
+/// it as for `write` (`ENOSPC` once full), and a remount gives it a new
+/// size.
+#[test]
+fn tmpfs_size_holds_for_every_write() {
+    assert_eq!(
+        fsrules("tmpfs"),
+        "copy_file_range cut short: true\npwritev past the size: ENOSPC splice: ENOSPC\n\
+         remount: ok then a write of 64k: 65536\n"
+    );
+}
+
+/// `mountinfo` gives a host-backed mount the device numbers `stat`
+/// reports for its files, as tools matching the two need.
+#[test]
+fn mountinfo_device_numbers_match_stat() {
+    assert_eq!(fsrules("mountinfo"), "root's numbers match stat: true\n");
+}
+
+/// A FIFO open that waits for the other end holds up no other thread of
+/// the process (it waits without fwe's lock): for a FIFO another user
+/// owns, one opened from a directory descriptor, one in an overlay.
+#[test]
+fn fifo_opens_wait_without_the_lock() {
+    assert_eq!(fsrules("fifo"), "another's: ok\nfrom a directory: ok\nin an overlay: ok\n");
+}
+
+/// A device node made outside `/dev` opens as its device when opened only
+/// to read by an absolute path or from the working directory (which fwe
+/// opens in one host call when the file is a plain one).
+#[test]
+fn device_nodes_open_as_devices_to_read() {
+    assert_eq!(fsrules("devnode"), "mknod: ok\n/tmp/zero: 4 [0, 0, 0, 0]\nzero: 4 [0, 0, 0, 0]\n");
+}
+
+/// What checkpoint/restore tools ask of the kernel: `PR_GET_TID_ADDRESS`,
+/// `TFD_IOC_SET_TICKS`, `kernel.ns_last_pid` (the host's in the initial
+/// pid namespace, fwe's to set in its own, with `CAP_SYS_ADMIN` or
+/// `CAP_CHECKPOINT_RESTORE`), and `PR_SET_MM` with Linux's checks.
+#[test]
+fn checkpoint_restore_interfaces() {
+    let out = run_c_guest("restore", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "PR_GET_TID_ADDRESS: 0, the word set 1\n\
+         TFD_IOC_SET_TICKS: 0, read 8 of 5, then -11; 0 ticks -22\n\
+         host's ns_last_pid read: 1\n\
+         set in the host's namespace: -1\n\
+         in a new namespace: last 1, set 0, then 41, next pid 42 1, -1 -22, a user -1\n\
+         PR_SET_MM_MAP_SIZE: 0, 104\n\
+         arguments moved: 0 0, cmdline \"renamed\" \"by prctl\" (17 bytes)\n\
+         below mmap_min_addr -22, extra argument -22, program file mapped -16, auxv too big \
+         -22, auxv set 0: 32 bytes, AT_PAGESZ 4096\n\
+         a user's PR_SET_MM: -1\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Huge pages come from an empty pool (`ENOMEM` for `MAP_HUGETLB` and
+/// `SHM_HUGETLB`, `vm.nr_hugepages` staying 0, none in `/proc/meminfo`);
+/// `SHM_LOCK` charges a segment to its locker's `RLIMIT_MEMLOCK`;
+/// `MADV_COLD` and `MADV_PAGEOUT` refuse locked memory; a cgroup's files
+/// are its creator's, `pids.max` takes no suffix, a memory limit is kept
+/// in whole pages and `cgroup.subtree_control` refuses a controller Linux
+/// lacks.
+#[test]
+fn memory_limits_huge_pages_and_cgroup_files() {
+    let out = run_c_guest("memlimits", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "MAP_HUGETLB: 12\n\
+         MAP_HUGETLB|MAP_NORESERVE: 0\n\
+         SHM_HUGETLB: 12\n\
+         nr_hugepages: 0\n\
+         nr_hugepages = 8: 0\n\
+         nr_hugepages: 0\n\
+         meminfo: total 0, reserved 0\n\
+         SHM_LOCK by root: 0, shown locked: 1, SHM_UNLOCK: 0, shown locked: 0\n\
+         user: 3 pages past RLIMIT_MEMLOCK: 12, 2 pages: 0, again: 0, 1 more: 12, \
+         after unlocking 2: 0\n\
+         user: with RLIMIT_MEMLOCK 0: 1\n\
+         MADV_COLD: 0, locked: 22, MADV_PAGEOUT locked: 22, unlocked: 0\n\
+         pids.max 1K: -22, 10: 0, reads 10\n\
+         memory.max 5000 reads 4096\n\
+         subtree_control +bogus: -22, +pids +bogus: -22, +pids: 0, -cpu: 0\n\
+         mkdir as 1000: 0\n\
+         d/cgroup.procs: 1000:1000, d/pids.max: 1000:1000\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// An eventfd watched edge-triggered by `epoll` raises an edge on every
+/// write, whether or not its count was 0, as Linux's wakes its waiters on
+/// each.
+#[test]
+fn eventfd_edges_on_every_write() {
+    c_guest_prints(
+        "sockcases",
+        &["eventfd"],
+        "before: 0\nwrite 0: 1, then 0\nwrite 1: 1, then 0\nwrite 2: 1, then 0\n",
+    );
+}
+
+/// A Unix socket bound with its family alone takes an abstract name of
+/// five hexadecimal digits, as Linux's autobind gives it, and keeps it; one
+/// that passes credentials is given one when it sends or connects unbound,
+/// so its peer can tell who sent.
+#[test]
+fn unix_sockets_autobind_as_linux() {
+    c_guest_prints(
+        "sockcases",
+        &["autobind"],
+        "bind with the family alone: 0, autobound 1\nagain: 0, same name 1\n\
+         sent with credentials: 1 from autobound 1\nsent without: 1 from a name of 0 bytes\n\
+         connected with credentials: 0, autobound 1\n",
+    );
+}
+
+/// A Unix `SOCK_RAW` socket is made, as Linux makes it, a datagram one.
+#[test]
+fn unix_raw_sockets_are_datagram_sockets() {
+    c_guest_prints("sockcases", &["raw"], "raw: socket 1 type 2, pair 0, datagrams 2 3\n");
+}
+
+/// A netlink socket's own options are Linux's: those it lacks, or of
+/// another level, are `ENOPROTOOPT`; flags and groups are kept and read
+/// back; `NETLINK_CAP_ACK` caps an error's acknowledgement.
+#[test]
+fn netlink_options_are_linuxs() {
+    c_guest_prints(
+        "sockcases",
+        &["netlink"],
+        "rx ring: -1 errno 92\nlevel 0: -1 errno 92\next ack, short: -1 errno 22\n\
+         memberships before: 0, 0 bytes\next ack: 1 (4 bytes)\next ack off: 0\n\
+         group 37: -1 errno 22\ngroup 0: -1 errno 22\nmemberships: 8 bytes, 0x1 0x1\n\
+         after leaving 1: 0 0x1\nerror acknowledged in 52 bytes, capped 36\n",
+    );
+}
+
+/// Calls Linux always has, and the signals and limits around processes:
+/// `FUTEX_WAKE_OP` (private and shared), `restart_syscall` with nothing to
+/// restart (`EINTR`), `process_mrelease` of a process only on its way out;
+/// `kill` and `rt_sigqueueinfo` of another process's thread id reach its
+/// process, `rt_tgsigqueueinfo` the thread itself; a `uid_map` names only
+/// ids the parent namespace has; a `setuid` to a user past
+/// `RLIMIT_NPROC` fails the next `execve`; an alarm clock's timerfd needs
+/// `CAP_WAKE_ALARM`.
+#[test]
+fn signals_limits_and_always_there_calls() {
+    let out = run_c_guest("sigcalls", &[], &[]);
+    assert_eq!(
+        stdout(&out),
+        "wake_op woken: 1\n\
+         wake_op not met: 0, word 7\n\
+         unknown operation: -38, unaligned: -22\n\
+         shared wake_op woken: 1, child 0\n\
+         restart_syscall: -4\n\
+         process_mrelease alive: -22, flags: -22, not a pidfd: -9\n\
+         killed: 0, reaped: -3\n\
+         kill of the thread's id: 0\n  taken: 10 1 0 0\n\
+         rt_sigqueueinfo of the thread's id: 0\n  taken: 12 1 -1 42\n\
+         rt_tgsigqueueinfo to the thread: 0\n  taken: 12 1 -1 43\n\
+         to a thread not the process's: -3\n\
+         as the kernel: -1\n\
+         uid_map inside the initial namespace: 0\n\
+         uid_map of an id the parent lacks: -1, past its extent: -1, its own: 0\n\
+         with another: setuid: 0, execve: -11\n\
+         alone: setuid: 0, execve: -2\n\
+         alarm timerfd as root: 1\n\
+         as a user: -1 -1, bad flags: -22\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// `fs.protected_symlinks` refuses a trailing link in a sticky directory
+/// anyone may write to (not one the path passes through), to `openat2` as
+/// to `open`; a `nosymfollow` mount's links are followed by neither;
+/// `linkat` of a descriptor's file (`AT_EMPTY_PATH`) is `EXDEV` across
+/// mounts and held to `fs.protected_hardlinks`, as a path's is.
+#[test]
+fn link_rules_hold_for_every_walk() {
+    assert_eq!(
+        fsrules("linkrules"),
+        "trailing: open EACCES openat2 EACCES\npassed through: open ok openat2 ok\n\
+         nosymfollow: ok\nfollowed there: open ELOOP openat2 ELOOP, the link itself: ok\n\
+         other: ok\nAT_EMPTY_PATH: across mounts EXDEV within ok\n\
+         protected_hardlinks: by descriptor EPERM by path EPERM\n"
+    );
+}
+
+/// A sticky directory's `user.` attributes are changed by its owner or
+/// root only (`EPERM`), and read by anyone its mode lets.
+#[test]
+fn sticky_directory_user_attributes_are_the_owners() {
+    assert_eq!(
+        fsrules("stickyxattr"),
+        "another's sticky: set EPERM get ENODATA; own sticky: ok; not sticky: ok\nroot: ok\n"
+    );
+}
+
+/// `chattr +A` is kept and acted on: `FS_IOC_GETFLAGS` and
+/// `FS_IOC_FSGETXATTR` report it, a read leaves the file's access time
+/// (where a strict mount sets another's), and `FS_IOC_FSSETXATTR` clears
+/// it.
+#[test]
+fn noatime_flag_is_kept_and_acted_on() {
+    assert_eq!(
+        fsrules("noatimeflag"),
+        "strictatime: ok\nflags: 0x80 xflags: ok 0x40\nflagged kept: true other set: true\n\
+         cleared: ok flags: 0x0\n"
+    );
+}
+
+/// A tmpfs's `uid=`, `gid=` and `mode=` give its root, and `nr_inodes=`
+/// counts its root and each name (`ENOSPC` past it, `statfs`'s count); a
+/// value Linux refuses is `EINVAL`.
+#[test]
+fn tmpfs_owner_and_inode_options_hold() {
+    assert_eq!(
+        fsrules("tmpfsopts"),
+        "mount: ok\nroot: 750 1000:100\nfile: ok dir: ok past the inodes: ENOSPC\n\
+         statfs: files 3 free 0\nbad size: EINVAL bad uid: EINVAL\n"
+    );
+}
+
+/// `proc`'s `hidepid=invisible` hides another user's process from one who
+/// may not trace it, `noaccess` keeps them out of it (`EPERM`), and
+/// `subset=pid` shows the processes alone; `hidepid=3` is `EINVAL`.
+#[test]
+fn proc_hidepid_and_subset_hide_as_linux() {
+    assert_eq!(
+        fsrules("procopts"),
+        "hidepid=invisible: ok\nroot: stat ok listed true status ok\n\
+         another user: stat ENOENT listed false status ENOENT\nown: ok\n\
+         remount noaccess: ok\nanother user: stat ok listed true status EPERM\n\
+         subset=pid: ok\nmeminfo: ENOENT self: ok listed meminfo false pid true\n\
+         hidepid=3: EINVAL\n"
+    );
 }

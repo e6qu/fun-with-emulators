@@ -7,14 +7,109 @@
 //! or fwe's (`org.fwe.`), and a list shows only those in Linux's
 //! namespaces. Linux's rules decide who may do what:
 //!
-//! - `user.` attributes are for regular files and directories only;
+//! - `user.` attributes are for regular files and directories only, and a
+//!   sticky directory's are changed only by its owner (or with
+//!   `CAP_FOWNER`);
+
 //! - `trusted.` ones need `CAP_SYS_ADMIN`, and are hidden from others;
 //! - writing a `security.` one needs `CAP_SYS_ADMIN`, or `CAP_SETFCAP` for
 //!   `security.capability`;
 //! - `system.` holds POSIX ACLs, which fwe does not keep (`EOPNOTSUPP`).
+//!
+//! `security.capability` (file capabilities) is checked as it is written,
+//! revision 2 or 3 only, and kept as Linux keeps it: from a user namespace
+//! of fwe's as revision 3, naming the root it is for as the initial
+//! namespace's id; and read back as the reader's namespace sees it
+//! ([`store_file_caps`], [`show_file_caps`]). A change of owner, and a
+//! write, remove it ([`kill_file_caps`]).
 
 use fwe_abi::errno;
 use std::ffi::{CStr, CString};
+
+/// File capabilities' attribute.
+pub const CAPABILITY: &[u8] = b"security.capability";
+
+/// `vfs_cap_data`'s revisions, in its first word, and their sizes.
+const REVISION_MASK: u32 = 0xff00_0000;
+const REVISION_2: u32 = 0x0200_0000;
+const REVISION_3: u32 = 0x0300_0000;
+const SIZE_2: usize = 20;
+const SIZE_3: usize = 24;
+
+fn word(v: &[u8], i: usize) -> u32 {
+    u32::from_le_bytes(v[i * 4..i * 4 + 4].try_into().unwrap())
+}
+
+/// A file-capabilities value of `magic`'s flags and `v`'s sets, as
+/// revision 2, or with `rootid` revision 3.
+fn caps_value(v: &[u8], rootid: Option<u32>) -> Vec<u8> {
+    let rev = if rootid.is_some() { REVISION_3 } else { REVISION_2 };
+    let mut out = ((word(v, 0) & !REVISION_MASK) | rev).to_le_bytes().to_vec();
+    out.extend_from_slice(&v[4..SIZE_2]);
+    if let Some(r) = rootid {
+        out.extend_from_slice(&r.to_le_bytes());
+    }
+    out
+}
+
+/// What a `security.capability` value `v` written by this process is kept
+/// as (Linux's `cap_convert_nscap`): only revision 2 (20 bytes) or 3 (24),
+/// else `EINVAL`. Revision 2 from the initial user namespace is kept as it
+/// is; any other becomes revision 3 for its root, the writer's
+/// namespace's (revision 2) or the one it names (revision 3), as the
+/// initial namespace's id (`EINVAL` if it has none).
+pub fn store_file_caps(v: &[u8]) -> Result<Vec<u8>, i32> {
+    let rev = match v.len() {
+        SIZE_2 | SIZE_3 => word(v, 0) & REVISION_MASK,
+        _ => return Err(errno::EINVAL),
+    };
+    let ns_root = match (v.len(), rev) {
+        (SIZE_2, REVISION_2) if !crate::userns::nested() => return Ok(v.to_vec()),
+        (SIZE_2, REVISION_2) => 0,
+        (SIZE_3, REVISION_3) => word(v, 5),
+        _ => return Err(errno::EINVAL),
+    };
+    let kroot = crate::userns::from_ns(ns_root, false).ok_or(errno::EINVAL)?;
+    Ok(caps_value(v, Some(kroot)))
+}
+
+/// A kept `security.capability` value `v` as this process reads it
+/// (Linux's `cap_inode_getsecurity`): revision 3 for a root mapped in its
+/// user namespace (other than its own root) with that id; revision 2 for
+/// one that is root of its namespace or one above; `EOVERFLOW` for any
+/// other.
+pub fn show_file_caps(v: Vec<u8>) -> Result<Vec<u8>, i32> {
+    if v.len() != SIZE_3 || word(&v, 0) & REVISION_MASK != REVISION_3 {
+        return Ok(v);
+    }
+    let kroot = word(&v, 5);
+    if crate::userns::mapped(kroot, false) {
+        let mapped = crate::userns::to_ns(kroot, false);
+        if mapped != 0 {
+            return Ok(caps_value(&v, Some(mapped)));
+        }
+    }
+    if crate::userns::roots_above().contains(&kroot) {
+        Ok(caps_value(&v, None))
+    } else {
+        Err(errno::EOVERFLOW)
+    }
+}
+
+/// Whether the file `t` names has file capabilities.
+pub fn has_file_caps(t: &Target) -> bool {
+    let Ok(n) = host_name(CAPABILITY) else { return false };
+    raw_get(t, &n, std::ptr::null_mut(), 0) >= 0
+}
+
+/// Remove the file capabilities of the file `t` names, if it has any, as
+/// Linux does on a change of owner and on a write
+/// (`security_inode_killpriv`), whoever makes it.
+pub fn kill_file_caps(t: &Target) {
+    if has_file_caps(t) {
+        let _ = remove(t, CAPABILITY);
+    }
+}
 
 /// The largest value Linux keeps.
 pub const SIZE_MAX: usize = 65536;
@@ -74,6 +169,11 @@ impl Kind {
         let mode = (st.st_mode as u32 & libc::S_IFMT as u32) | perm;
         Kind { plain, meta: (mode, owner.0, owner.1) }
     }
+
+    /// Whether it is a directory with the sticky bit.
+    fn sticky_dir(&self) -> bool {
+        self.meta.0 & 0o171000 == 0o41000
+    }
 }
 
 /// What a caller is and what it acts on, for the permission checks.
@@ -85,6 +185,8 @@ pub struct Who {
     /// bits, or passing them.
     pub read_any: bool,
     pub write_any: bool,
+    /// Whether it owns the file, or has `CAP_FOWNER` over it.
+    pub owner: bool,
     pub kind: Kind,
 }
 
@@ -114,6 +216,9 @@ impl Who {
             Space::Security if name == b"security.capability" && !self.setfcap => Err(errno::EPERM),
             Space::Security if name != b"security.capability" && !self.admin => Err(errno::EPERM),
             Space::User if !self.kind.plain => Err(errno::EPERM),
+            // A sticky directory's are its owner's to change, as its
+            // entries are.
+            Space::User if self.kind.sticky_dir() && !self.owner => Err(errno::EPERM),
             Space::User if !self.bits_allow(2) => Err(errno::EACCES),
             _ => Ok(()),
         }
@@ -166,7 +271,6 @@ pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
     }
 }
 
-/// Set attribute `name` of `t` to `value`, with Linux `flags`.
 /// Whether the file `t` names is immutable or append-only, whose
 /// attributes Linux lets no one change (the host does).
 #[cfg(target_os = "macos")]
@@ -188,6 +292,7 @@ fn frozen(_: &Target) -> bool {
     false
 }
 
+/// Set attribute `name` of `t` to `value`, with Linux `flags`.
 pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32> {
     if flags & !(CREATE | REPLACE) != 0 {
         return Err(errno::EINVAL);
@@ -208,7 +313,7 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
     let n = host_name(name)?;
     let (v, len) = (value.as_ptr().cast(), value.len());
     // SAFETY: valid name and value buffers.
-    let r = unsafe {
+    let raw = || unsafe {
         match t {
             #[cfg(target_os = "macos")]
             Target::Path(p) => {
@@ -222,7 +327,29 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
             Target::Fd(fd) => libc::fsetxattr(*fd, n.as_ptr(), v, len, host_flags),
         }
     };
-    if r != 0 { fail() } else { Ok(()) }
+    owned(t, raw)
+}
+
+/// Run `raw`, a host call that changes `t`'s attributes, which fwe has
+/// allowed: refused by host bits that deny the owner (a file made with
+/// such a mode, [`crate::modes::made_file_perm`]), the mode is kept apart
+/// and `raw` run again.
+fn owned(t: &Target, raw: impl Fn() -> i32) -> Result<(), i32> {
+    if raw() == 0 {
+        return Ok(());
+    }
+    let e = fail();
+    if e != Err(errno::EACCES) {
+        return e;
+    }
+    let kept = match t {
+        Target::Path(p) => crate::modes::own_path(p),
+        Target::Fd(fd) => crate::modes::own_fd(*fd),
+    };
+    if kept.is_err() {
+        return e;
+    }
+    if raw() != 0 { fail() } else { Ok(()) }
 }
 
 /// Remove attribute `name` of `t`.
@@ -232,7 +359,7 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
     }
     let n = host_name(name)?;
     // SAFETY: a valid name.
-    let r = unsafe {
+    let raw = || unsafe {
         match t {
             #[cfg(target_os = "macos")]
             Target::Path(p) => libc::removexattr(p.as_ptr(), n.as_ptr(), libc::XATTR_NOFOLLOW),
@@ -244,7 +371,7 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
             Target::Fd(fd) => libc::fremovexattr(*fd, n.as_ptr()),
         }
     };
-    if r != 0 { fail() } else { Ok(()) }
+    owned(t, raw)
 }
 
 /// The names of `t`'s attributes `who` sees, each NUL-terminated, as
@@ -357,8 +484,14 @@ mod tests {
     #[test]
     fn rules_by_namespace() {
         let file = Kind { plain: true, meta: (0o100644, 0, 0) };
-        let user =
-            Who { admin: false, setfcap: false, read_any: true, write_any: true, kind: file };
+        let user = Who {
+            admin: false,
+            setfcap: false,
+            read_any: true,
+            write_any: true,
+            owner: false,
+            kind: file,
+        };
         assert_eq!(user.may_read(Space::Trusted), Err(errno::ENODATA));
         assert_eq!(user.may_write(b"trusted.x", Space::Trusted), Err(errno::EPERM));
         assert_eq!(user.may_write(b"user.x", Space::User), Ok(()));
@@ -369,10 +502,35 @@ mod tests {
         assert_eq!(user.may_write(b"user.x", Space::User), Err(errno::EACCES));
         assert_eq!(user.may_read(Space::User), Ok(()));
         let node = Kind { plain: false, meta: (0o20644, 0, 0) };
-        let node = Who { admin: true, setfcap: true, read_any: true, write_any: true, kind: node };
+        let node = Who { kind: node, admin: true, setfcap: true, owner: true, ..user };
         assert_eq!(node.may_write(b"user.x", Space::User), Err(errno::EPERM));
         assert_eq!(node.may_read(Space::User), Err(errno::ENODATA));
         assert_eq!(node.may_write(b"trusted.x", Space::Trusted), Ok(()));
+    }
+
+    /// A sticky directory's `user.` attributes are changed by its owner
+    /// (or with `CAP_FOWNER`) only, whatever its bits allow; read by any
+    /// who may read it (Linux's `xattr_permission`).
+    #[test]
+    fn sticky_directory_attributes_are_the_owners() {
+        let tmp = Kind { plain: true, meta: (0o41777, 0, 0) };
+        let other = Who {
+            admin: false,
+            setfcap: false,
+            read_any: true,
+            write_any: true,
+            owner: false,
+            kind: tmp,
+        };
+        assert_eq!(other.may_write(b"user.x", Space::User), Err(errno::EPERM));
+        assert_eq!(other.may_read(Space::User), Ok(()));
+        let owner = Who { owner: true, ..other };
+        assert_eq!(owner.may_write(b"user.x", Space::User), Ok(()));
+        let plain = Who { kind: Kind { plain: true, meta: (0o40777, 0, 0) }, ..other };
+        assert_eq!(plain.may_write(b"user.x", Space::User), Ok(()));
+        // A sticky regular file is no directory.
+        let file = Who { kind: Kind { plain: true, meta: (0o101666, 0, 0) }, ..other };
+        assert_eq!(file.may_write(b"user.x", Space::User), Ok(()));
     }
 
     /// On the host fwe runs on: a Linux host keeps `trusted.` attributes
@@ -389,6 +547,7 @@ mod tests {
             setfcap: true,
             read_any: true,
             write_any: true,
+            owner: true,
             kind: Kind { plain: true, meta: (0o100644, 0, 0) },
         };
         set(&t, b"user.a", b"1", 0).unwrap();
@@ -403,6 +562,40 @@ mod tests {
         assert_eq!(names, [&b"trusted.b"[..], b"user.a"]);
         remove(&t, b"user.a").unwrap();
         assert_eq!(get(&t, b"user.a"), Err(errno::ENODATA));
+        // File capabilities go at once.
+        set(&t, CAPABILITY, &[0; 20], 0).unwrap();
+        assert!(has_file_caps(&t));
+        kill_file_caps(&t);
+        assert!(!has_file_caps(&t));
         let _ = std::fs::remove_file(&dir);
+    }
+
+    /// File capabilities are written as revision 2 or 3 only, of their
+    /// sizes; revision 2 is kept as it is in the initial namespace, and
+    /// revision 3 names its root as the initial namespace's id, which a
+    /// reader sees as its namespace does.
+    #[test]
+    fn file_capabilities_are_checked_and_kept_as_linux_keeps_them() {
+        let v = |magic: u32, words: &[u32]| {
+            let mut out = magic.to_le_bytes().to_vec();
+            for w in words {
+                out.extend_from_slice(&w.to_le_bytes());
+            }
+            out
+        };
+        let v1 = v(0x0100_0001, &[1 << 7, 0]);
+        assert_eq!(store_file_caps(&v1), Err(errno::EINVAL));
+        assert_eq!(store_file_caps(&[0; 7]), Err(errno::EINVAL));
+        let v2 = v(0x0200_0001, &[1 << 7, 0, 0, 0]);
+        assert_eq!(store_file_caps(&v2), Ok(v2.clone()));
+        // A revision 3 header on a revision 2 size, and the other way.
+        assert_eq!(store_file_caps(&v(0x0300_0001, &[1 << 7, 0, 0, 0])), Err(errno::EINVAL));
+        assert_eq!(store_file_caps(&v(0x0200_0001, &[1 << 7, 0, 0, 0, 0])), Err(errno::EINVAL));
+        let v3 = v(0x0300_0001, &[1 << 7, 0, 0, 0, 1000]);
+        assert_eq!(store_file_caps(&v3), Ok(v3.clone()));
+        // Read back: for another root as it is; for root, revision 2.
+        assert_eq!(show_file_caps(v3.clone()), Ok(v3));
+        assert_eq!(show_file_caps(v(0x0300_0001, &[1 << 7, 0, 0, 0, 0])), Ok(v2.clone()));
+        assert_eq!(show_file_caps(v2.clone()), Ok(v2));
     }
 }

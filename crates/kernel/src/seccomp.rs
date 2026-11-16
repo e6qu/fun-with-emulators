@@ -5,10 +5,12 @@
 //! instruction pointer and the six arguments); it answers with an action.
 //! Every filter installed runs on every call, and the action with the
 //! highest precedence is taken: kill the process, kill the thread, raise
-//! `SIGSYS`, fail with an errno, or allow (`SECCOMP_RET_TRACE` and
-//! `SECCOMP_RET_USER_NOTIF` with nobody to hand the call to fail with
-//! `ENOSYS`, as on Linux). The backends ask [`check`] before they route a
-//! call anywhere, so no call escapes it.
+//! `SIGSYS`, fail with an errno, hand it to a tracer that asked for it
+//! (`SECCOMP_RET_TRACE`, [`crate::Kernel::seccomp_trace`]; `ENOSYS`
+//! without one), or allow. `SECCOMP_RET_USER_NOTIF` fails with `ENOSYS`:
+//! there is no listener. The backends ask [`check`] before they route a
+//! call anywhere, so no call escapes it. The actions Linux logs are
+//! written to the kernel log ([`crate::klog`]) as its audit records.
 //!
 //! Filters are the process's: one installed by a thread applies to all of
 //! them, as with `SECCOMP_FILTER_FLAG_TSYNC`. They are kept across `fork`
@@ -74,6 +76,14 @@ pub enum Action {
     KillProcess,
     /// Strict mode's end for a call it does not allow: `SIGKILL`.
     KillStrict,
+    /// `SECCOMP_RET_TRACE` with this data: a tracer that asked for it
+    /// (`PTRACE_O_TRACESECCOMP`) stops the call first
+    /// ([`crate::Kernel::seccomp_trace`]); without one it fails with
+    /// `ENOSYS`.
+    Trace(u16),
+    /// The tracer skipped the call (its number set to -1): it returns what
+    /// the tracer left in `x0`.
+    Skip,
 }
 
 const BPF_LD: u16 = 0x00;
@@ -238,10 +248,17 @@ fn run(f: &Filter, d: &[u8; DATA_LEN as usize]) -> u32 {
 pub(crate) struct State {
     strict: bool,
     filters: Vec<Arc<Filter>>,
+    /// For each filter, whether it was installed with
+    /// `SECCOMP_FILTER_FLAG_LOG`.
+    logged: Vec<bool>,
 }
 
 pub(crate) static STATE: crate::forklock::ForkRwLock<State> =
-    crate::forklock::ForkRwLock::new(State { strict: false, filters: Vec::new() });
+    crate::forklock::ForkRwLock::new(State {
+        strict: false,
+        filters: Vec::new(),
+        logged: Vec::new(),
+    });
 /// 0 with no seccomp, 1 strict, 2 filtering: what `/proc/self/status`
 /// shows, and what [`check`] looks at first.
 static MODE: AtomicU8 = AtomicU8::new(0);
@@ -251,8 +268,71 @@ pub fn mode() -> u8 {
     MODE.load(Ordering::Relaxed)
 }
 
+/// How many filters the process has (`Seccomp_filters:`).
+pub fn filter_count() -> u32 {
+    STATE.read().unwrap_or_else(|e| e.into_inner()).filters.len() as u32
+}
+
 /// The action for call `nr` with `args` at `pc`.
 pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
+    decide(nr, args, pc, false)
+}
+
+/// The action for call `nr` with `args` at `pc` once a tracer has seen it
+/// (`SECCOMP_RET_TRACE`): the filters run again on what it left, and
+/// tracing again allows it, as Linux's recheck after the tracer has it.
+pub fn recheck(nr: u64, args: &[u64; 6], pc: u64) -> Action {
+    decide(nr, args, pc, true)
+}
+
+/// Whether answer `ret`, from a filter installed with
+/// `SECCOMP_FILTER_FLAG_LOG` if `flagged`, is logged ([`log`]).
+fn logged(ret: u32, flagged: bool) -> bool {
+    match ret & ACTION_FULL {
+        RET_ALLOW => false,
+        RET_LOG | RET_KILL_THREAD | RET_KILL_PROCESS => true,
+        RET_TRAP | RET_ERRNO | RET_TRACE | RET_USER_NOTIF => flagged,
+        _ => true,
+    }
+}
+
+/// Linux's `seccomp_log`: an action is logged to the kernel log (an audit
+/// record, `type=1326`) by default for `SECCOMP_RET_LOG` and the kill
+/// actions, and for trap, errno, trace and user notification only from a
+/// filter installed with `SECCOMP_FILTER_FLAG_LOG`.
+fn log(nr: u64, pc: u64, ret: u32, flagged: bool) {
+    if !logged(ret, flagged) {
+        return;
+    }
+    let a = crate::creds::access();
+    let comm = crate::thread::name().map_or_else(String::new, |n| {
+        let end = n.iter().position(|&b| b == 0).unwrap_or(n.len());
+        String::from_utf8_lossy(&n[..end]).into_owned()
+    });
+    let now =
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+    // SAFETY: getpid cannot fail.
+    let pid = crate::pidns::to_guest(unsafe { libc::getpid() });
+    let sig = if ret & ACTION_FULL == RET_KILL_PROCESS || ret & ACTION_FULL == RET_KILL_THREAD {
+        fwe_abi::signal::SIGSYS
+    } else {
+        0
+    };
+    crate::klog::log(
+        crate::klog::NOTICE,
+        &format!(
+            "audit: type=1326 audit({}.{:03}:0): auid=4294967295 uid={} gid={} ses=4294967295 \
+             pid={pid} comm=\"{comm}\" sig={sig} arch={AUDIT_ARCH_AARCH64:x} syscall={nr} \
+             compat=0 ip={pc:#x} code={ret:#x}",
+            now.as_secs(),
+            now.subsec_millis(),
+            crate::userns::to_ns(a.fsuid, false),
+            crate::userns::to_ns(a.fsgid, true),
+        ),
+    );
+}
+
+fn decide(nr: u64, args: &[u64; 6], pc: u64, traced: bool) -> Action {
     match MODE.load(Ordering::Relaxed) {
         0 => Action::Allow,
         1 => {
@@ -272,21 +352,24 @@ pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
             let ret = st
                 .filters
                 .iter()
+                .enumerate()
                 .rev()
-                .map(|f| run(f, &d))
-                .min_by_key(|r| (r & ACTION_FULL) as i32);
-            match ret {
-                None => Action::Allow,
-                Some(r) => match r & ACTION_FULL {
-                    RET_ALLOW | RET_LOG => Action::Allow,
-                    RET_ERRNO => Action::Errno(((r & DATA) as i32).min(4095)),
-                    RET_TRAP => Action::Trap((r & DATA) as u16),
-                    // Nobody traces or listens: the call fails as Linux
-                    // fails it then.
-                    RET_TRACE | RET_USER_NOTIF => Action::Errno(errno::ENOSYS),
-                    RET_KILL_THREAD => Action::KillThread,
-                    _ => Action::KillProcess,
-                },
+                .map(|(i, f)| (run(f, &d), i))
+                .min_by_key(|(r, _)| (r & ACTION_FULL) as i32);
+            let Some((r, i)) = ret else { return Action::Allow };
+            let flagged = st.logged.get(i).copied().unwrap_or(false);
+            drop(st);
+            log(nr, pc, r, flagged);
+            match r & ACTION_FULL {
+                RET_ALLOW | RET_LOG => Action::Allow,
+                RET_ERRNO => Action::Errno(((r & DATA) as i32).min(4095)),
+                RET_TRAP => Action::Trap((r & DATA) as u16),
+                RET_TRACE if traced => Action::Allow,
+                RET_TRACE => Action::Trace((r & DATA) as u16),
+                // Nobody listens: the call fails as Linux fails it then.
+                RET_USER_NOTIF => Action::Errno(errno::ENOSYS),
+                RET_KILL_THREAD => Action::KillThread,
+                _ => Action::KillProcess,
             }
         }
     }
@@ -330,6 +413,7 @@ pub fn install_filter(prog: u64, flags: u64, allowed: bool) -> Result<i64, i32> 
         return Err(errno::EINVAL);
     }
     st.filters.push(Arc::new(f));
+    st.logged.push(flags & FLAG_LOG != 0);
     MODE.store(2, Ordering::SeqCst);
     Ok(0)
 }
@@ -366,6 +450,9 @@ pub fn save(e: &mut Enc) {
             e.u32(i.k);
         }
     }
+    for &l in &st.logged {
+        e.bool(l);
+    }
 }
 
 /// What [`save`] wrote, in the new process.
@@ -384,6 +471,7 @@ pub fn load_state(d: &mut Dec) {
             load(&insns).ok().map(Arc::new)
         })
         .collect::<Vec<_>>();
+    let logged = (0..filters.len()).map(|_| d.bool()).collect();
     let mode = if strict {
         1
     } else if filters.is_empty() {
@@ -391,7 +479,7 @@ pub fn load_state(d: &mut Dec) {
     } else {
         2
     };
-    *STATE.write().unwrap_or_else(|e| e.into_inner()) = State { strict, filters };
+    *STATE.write().unwrap_or_else(|e| e.into_inner()) = State { strict, filters, logged };
     MODE.store(mode, Ordering::SeqCst);
 }
 
@@ -425,5 +513,17 @@ mod tests {
         assert!(load(&[ins(BPF_LD | BPF_W | BPF_ABS, 0, 0, 2), ins(BPF_RET, 0, 0, 0)]).is_err());
         assert!(load(&[ins(BPF_JMP | 0x10, 5, 0, 0), ins(BPF_RET, 0, 0, 0)]).is_err());
         assert!(load(&[ins(BPF_LD | BPF_W | BPF_ABS, 0, 0, 0)]).is_err());
+    }
+
+    /// What Linux's default `kernel.seccomp.actions_logged` logs: the log
+    /// and kill actions always, trap, errno and trace only from a filter
+    /// installed with `SECCOMP_FILTER_FLAG_LOG`, allow never.
+    #[test]
+    fn actions_are_logged_as_linux_logs_them() {
+        assert!(logged(RET_LOG, false) && logged(RET_KILL_PROCESS, false));
+        assert!(logged(RET_KILL_THREAD | 3, false));
+        assert!(!logged(RET_ERRNO | 1, false) && logged(RET_ERRNO | 1, true));
+        assert!(!logged(RET_TRACE, false) && logged(RET_TRAP, true));
+        assert!(!logged(RET_ALLOW, true));
     }
 }
