@@ -228,7 +228,8 @@ jobs:
 
   # Alpine's OpenJDK (fetched) compiling and running a multi-threaded
   # application natively: HotSpot's JIT, threads and garbage collector.
-  # It runs here only (FWE_JDK_TESTS), not on a development machine.
+  # It runs here only (FWE_JDK_TESTS), not on a development machine. Node's
+  # test runs here too, its output shown: what V8's JIT code holds.
   jdk:
     name: JDK (macos-26)
     runs-on: macos-26
@@ -240,7 +241,7 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: cargo test -p fwe --test guests -- alpine_jdk --nocapture
+      - run: cargo test -p fwe --test guests -- alpine_jdk debian_node_runs_a_workload --nocapture
         env:
           FWE_JDK_TESTS: "1"
       # The calls of each step.
