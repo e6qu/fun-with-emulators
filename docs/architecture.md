@@ -1737,10 +1737,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A `CLOCK_REALTIME` timerfd set for an absolute time does not follow a
   later change of the host's clock, and `TFD_TIMER_CANCEL_ON_SET` never
   cancels.
-- A `poll`, `select` or `epoll` timeout on an idle host ends a quarter to
-  half a millisecond late (the host's timer wake), and on a loaded host
-  any sleep, or the gap between two successive calls, can stretch to
-  milliseconds: more than LTP's timer tests and `clock_gettime04` allow.
+- A sleep or timeout ends tens of microseconds late (the host's timer
+  wake and fwe's return to the guest), and on a loaded host it, or the
+  gap between two successive calls, can stretch to milliseconds. On a
+  virtual Mac (a CI runner) whose processors idle, the host's own
+  `NOTE_CRITICAL` timers, and so fwe's, end up to half the wait late (10
+  ms at most): more than LTP's timer tests and `clock_gettime04` allow,
+  so tools/ltp/run.py keeps every processor busy as they run.
 - inotify: a change by a program fwe does not run raises no event;
   `IN_DELETE_SELF` comes as the last link goes, not the last descriptor; a
   close raises its event once no descriptor of the open file is left in

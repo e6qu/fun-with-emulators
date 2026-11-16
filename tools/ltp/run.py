@@ -14,9 +14,14 @@ run at once, but those that change a machine-wide setting or measure time
 (see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
-`--update` rewrites it from the run. A regression is run again alone; a
-timer test that then fails only by sleeping too long is measured against
-the host's own timers (hosttimer.c), and named, not failed, if they, with
+`--update` rewrites it from the run. A regression is run again alone. A
+timer test (see TIMER) runs with every processor kept busy at the lowest
+priority (`hosttimer spin`), so that none idles: on a virtual machine, as
+a CI runner is, an idle processor's next timer is the VM host's to deliver,
+and there the host's own timers end up to half the wait late (10 ms at
+most). A timer test
+that fails again only by sleeping too long is measured against the host's
+own timers (hosttimer.c), as busy, and named, not failed, if they, with
 fwe's least cost per sleep, miss the same threshold; once the host has so
 missed in a run, its other timer tests that only slept too long are named
 with it. The pass rate is printed either way.
@@ -27,6 +32,7 @@ and is not among them is named (what fwe still lacks).
 
 import argparse
 import concurrent.futures
+import contextlib
 import os
 import re
 import shlex
@@ -175,8 +181,44 @@ def stacks(sid, work):
     return "\n" + "\n".join(out) + "\n"
 
 
+# The timer tests (LTP's tst_timer_test: how late a sleep or a timeout
+# ends), run with every processor kept busy.
+TIMER = re.compile(
+    r"^(select02|poll02|pselect01|epoll_pwait03|epoll_wait02"
+    r"|clock_nanosleep02|nanosleep01|futex_wait05|prctl09)(_64)?$"
+)
+
+
+def hosttimer(work):
+    """hosttimer.c, built in `work` once."""
+    probe = os.path.join(work, "hosttimer")
+    if not os.path.exists(probe):
+        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosttimer.c")
+        subprocess.run(["cc", "-O2", "-o", probe, source], check=True)
+    return probe
+
+
+@contextlib.contextmanager
+def processors_busy(work):
+    """Every processor kept busy at the lowest priority (`hosttimer spin`)
+    while the block runs: an idle processor of a virtual machine takes its
+    next timer late, as the VM host delivers it."""
+    spinner = subprocess.Popen([hosttimer(work), "spin"])
+    try:
+        yield
+    finally:
+        spinner.kill()
+        spinner.wait()
+
+
 def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """Run one test; (name, outcome, seconds, output tail)."""
+    with processors_busy(work) if TIMER.match(name) else contextlib.nullcontext():
+        return run_one_now(fwe, root, work, name, argv, hard_limit)
+
+
+def run_one_now(fwe, root, work, name, argv, hard_limit):
+    """`run_one` as the processors are."""
     bindir = "/opt/ltp/testcases/bin"
     prog = argv[0] if "/" in argv[0] else f"{bindir}/{argv[0]}"
     host_prog = os.path.join(root, prog.lstrip("/"))
@@ -270,7 +312,8 @@ def host_timers_late(work, tail):
     """For a timer test (LTP's tst_timer_test) whose only failures are
     sleeps that ended too late: evidence, as lines, that the host made each
     late sleep late itself, or none. The host's own sleeps of the same
-    length are measured (hosttimer.c, up to three rounds); fwe's least cost
+    length are measured (hosttimer.c, up to three rounds, with the
+    processors busy as for the test); fwe's least cost
     per sleep is what its shortest sleep took past the host's shortest.
     The host made the sleep late when its mean, with that cost, is past
     LTP's threshold already."""
@@ -287,15 +330,13 @@ def host_timers_late(work, tail):
                 late_sets.append((usec, n, threshold, int(res[1])))
     if not late_sets:
         return []
-    probe = os.path.join(work, "hosttimer")
-    if not os.path.exists(probe):
-        source = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hosttimer.c")
-        if subprocess.run(["cc", "-O2", "-o", probe, source]).returncode != 0:
-            return []
+    probe = hosttimer(work)
     found = []
     for usec, n, threshold, fwe_min in late_sets:
         for _ in range(3):
-            r = subprocess.run([probe, str(usec), str(n)], capture_output=True, text=True)
+            # As the timer tests run.
+            with processors_busy(work):
+                r = subprocess.run([probe, str(usec), str(n)], capture_output=True, text=True)
             try:
                 host_min, host_mean, host_max = (float(x) for x in r.stdout.split())
             except ValueError:
