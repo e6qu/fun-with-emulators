@@ -973,7 +973,7 @@ fn jit_code_runs_as_the_program_wrote_it() {
     eprintln!("--- jitlab stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(
         stdout(&out),
-        "calls: 90\nindirect: 21\npcrel: 30583\nx18: kept\ngetpid: matches\n\
+        "calls: 90\nindirect: 21\ncall through x30: 9900\npcrel: 30583\nx18: kept\ngetpid: matches\n\
          restart: 1 j, the handler saw the call\n\
          signal: seen in the code\n\
          tracer: pc in the code\n\

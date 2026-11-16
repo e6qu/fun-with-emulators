@@ -1388,9 +1388,11 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
     // Not translated: x16 and x17 back, x30 the program's return address
     // for a call, and the program's own branch through its register (whose
     // value is the target). Through x18, which has no register to branch
-    // through, fwe's trap takes it.
+    // through, or a call through x30, whose target the return address
+    // would replace, fwe's trap takes it.
+    let trapped = n == 18 || (n == 30 && link.is_some());
     let outside = out.len();
-    if n != 18 {
+    if !trapped {
         out[outside_at] |= ((outside - outside_at) as u32) << 5;
         if let Some(link) = link {
             let at = out.len();
@@ -1408,7 +1410,7 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
     // The miss: x16 and x17 back, then fwe's trap.
     let miss = out.len();
     out[miss_at] |= ((miss - miss_at) as u32) << 5;
-    if n == 18 {
+    if trapped {
         out[outside_at] |= ((miss - outside_at) as u32) << 5;
     }
     out.push(RESTORE);

@@ -1480,6 +1480,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   inline jump table in code the unwind table covers could be patched.
 
 **Processes**
+- A process may hold descriptors below 4096 only: root may raise
+  `RLIMIT_NOFILE` past it, as Linux allows, but an `open` past the 4096th
+  descriptor fails with `EMFILE`.
 - A `vfork` child shares the guest's memory but not its mappings (an
   `mmap`, `munmap` or `mprotect` in it stays in the child).
 - Native: a thread inside fwe's code during a `fork` (in a system call)

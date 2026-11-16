@@ -179,6 +179,16 @@ __asm__(
     "  cbz w1, 8b\n"
     "  ret\n"
 
+    /* long via_x30(long (*f)(long), long v): f(v), called through x30. */
+    "jl_via_x30:\n"
+    "  stp x29, x30, [sp, #-16]!\n"
+    "  mov x2, x0\n"
+    "  mov x0, x1\n"
+    "  mov x30, x2\n"
+    "  blr x30\n"
+    "  ldp x29, x30, [sp], #16\n"
+    "  ret\n"
+
     /* long getpid_jit(void) */
     "jl_getpid:\n"
     "  mov x8, #172\n"
@@ -223,7 +233,7 @@ __asm__(
 
 extern const char jl_begin[], jl_end[], jl_sum[], jl_indirect[], jl_pcrel[], jl_x18[],
     jl_getpid[], jl_fault[], jl_fault_load[], jl_fault_cont[], jl_ret1[], jl_retaddr[],
-    jl_retaddr_after[], jl_slots[], jl_read[], jl_read_svc[], jl_spin[];
+    jl_retaddr_after[], jl_slots[], jl_read[], jl_read_svc[], jl_spin[], jl_via_x30[];
 
 static size_t template_len(void) { return (size_t)(jl_end - jl_begin); }
 
@@ -249,6 +259,7 @@ static void flush(void *p, size_t n) {
 }
 
 static long host_add(long a, long b) { return a + b; }
+static long host_twice(long v) { return 2 * v; }
 
 static char *code;
 static atomic_int fault_seen;
@@ -389,6 +400,13 @@ int main(void) {
     long (*indirect)(long (*)(long, long), long, long) =
         (long (*)(long (*)(long, long), long, long))at(code, jl_indirect);
     printf("indirect: %ld\n", indirect(host_add, 5, 10));
+
+    long (*via_x30)(long (*)(long), long) = (long (*)(long (*)(long), long))at(code, jl_via_x30);
+    long x30_sum = 0;
+    for (long i = 0; i < 100; i++) {
+        x30_sum += via_x30(host_twice, i);
+    }
+    printf("call through x30: %ld\n", x30_sum);
 
     long (*pcrel)(void) = (long (*)(void))at(code, jl_pcrel);
     printf("pcrel: %ld\n", pcrel());
