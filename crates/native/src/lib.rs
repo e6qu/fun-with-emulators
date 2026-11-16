@@ -984,8 +984,9 @@ pub fn load_image(
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
+    let slots = (platform.tp_slot, platform.x18_slot);
     let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
-        loader::load(elf, page, id, |a, l, known, arena, cache| {
+        let loaded = loader::load(elf, page, id, slots, |a, l, known, arena, cache| {
             let stats =
                 platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
@@ -997,7 +998,11 @@ pub fn load_image(
             }
             Ok(())
         })
-        .map_err(Error::Load)
+        .map_err(Error::Load)?;
+        if strace && loaded.from_image {
+            tracer.note(&format!("{what} from its prepared image"));
+        }
+        Ok(loaded)
     };
 
     let loaded = load_object(&elf, file_id, "exe")?;

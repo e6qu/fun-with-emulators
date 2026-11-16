@@ -458,7 +458,7 @@ unsafe fn redirect(
     Ok(())
 }
 
-/// A stub region of a mapping being kept as an image
+/// A stub region of code being kept as an image
 /// ([`fwe_kernel::Platform::image_begin`]): where it is, its size, and the
 /// sites its stubs serve, in order.
 struct ImageRegion {
@@ -467,33 +467,39 @@ struct ImageRegion {
     sites: Vec<(u64, Site)>,
 }
 
-/// The stub regions of the mapping being kept as an image, while one is.
+/// The stub regions of the code being kept as an image, while some is.
 static IMAGE: std::sync::Mutex<Option<Vec<ImageRegion>>> = std::sync::Mutex::new(None);
 
 fn imaging() -> bool {
     IMAGE.lock().unwrap_or_else(|e| e.into_inner()).is_some()
 }
 
-/// A mapping to be kept as an image is about to be prepared: its stub
-/// regions are noted from now on, and each word is written at once.
+/// Code to be kept as an image is about to be prepared: its stub regions
+/// are noted from now on, and each word is written at once.
 pub fn image_begin() {
     *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
 }
 
-/// The preparation of the mapping [`image_begin`] began failed: nothing is
-/// kept.
+/// The preparation [`image_begin`] began failed: nothing is kept.
 pub fn image_abandon() {
     *IMAGE.lock().unwrap_or_else(|e| e.into_inner()) = None;
 }
 
+/// The stub regions noted since [`image_begin`], which ends.
+fn image_regions() -> Option<Vec<ImageRegion>> {
+    IMAGE.lock().unwrap_or_else(|e| e.into_inner()).take()
+}
+
 /// Encode site `s` for an image's layout.
 fn put_site(e: &mut fwe_kernel::snapshot::Enc, s: Site) {
-    match s {
-        Site::ReadThreadPointer { rt } => (e.u32(0), e.u32(rt)),
-        Site::WriteThreadPointer { rt } => (e.u32(1), e.u32(rt)),
-        Site::X18 { insn } => (e.u32(2), e.u32(insn)),
-        Site::Syscall { .. } => (e.u32(3), e.u32(0)),
+    let (kind, v) = match s {
+        Site::ReadThreadPointer { rt } => (0, rt),
+        Site::WriteThreadPointer { rt } => (1, rt),
+        Site::X18 { insn } => (2, insn),
+        Site::Syscall { .. } => (3, 0),
     };
+    e.u32(kind);
+    e.u32(v);
 }
 
 /// A site [`put_site`] encoded, a system call's calling `gate`.
@@ -508,6 +514,117 @@ fn get_site(d: &mut fwe_kernel::snapshot::Dec, gate: u64) -> Option<Site> {
     })
 }
 
+/// Encode `regions` as offsets from `origin`.
+fn put_regions(e: &mut fwe_kernel::snapshot::Enc, regions: &[ImageRegion], origin: u64) {
+    e.u64(regions.len() as u64);
+    for r in regions {
+        e.u64(r.at.wrapping_sub(origin));
+        e.u64(r.size);
+        e.u64(r.sites.len() as u64);
+        for &(at, site) in &r.sites {
+            e.u64(at.wrapping_sub(origin));
+            put_site(e, site);
+        }
+    }
+}
+
+/// The regions [`put_regions`] encoded, placed from `origin`, their system
+/// calls calling this process's gate; `None` if one cannot be made here.
+fn get_regions(d: &mut fwe_kernel::snapshot::Dec, origin: u64) -> Option<Vec<ImageRegion>> {
+    let gate = crate::syscall_gate();
+    let n = d.count(24);
+    let mut regions = Vec::with_capacity(n);
+    for _ in 0..n {
+        let (rel, size) = (d.u64(), d.u64());
+        let m = d.count(16);
+        let mut sites = Vec::with_capacity(m);
+        for _ in 0..m {
+            let at = origin.wrapping_add(d.u64());
+            sites.push((at, get_site(d, gate)?));
+        }
+        regions.push(ImageRegion { at: origin.wrapping_add(rel), size, sites });
+    }
+    Some(regions)
+}
+
+/// Map stub region `r` (exactly where it was, or, without `fixed`, only if
+/// nothing is there) and write its stubs for this process: false if it
+/// cannot be.
+fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> bool {
+    let flags = libc::MAP_PRIVATE | libc::MAP_ANON | if fixed { libc::MAP_FIXED } else { 0 };
+    // SAFETY: a fresh anonymous mapping of fwe's where the region was:
+    // inside fwe's own reservation with `fixed`, else wherever the host
+    // finds room, which must be that place.
+    let p = unsafe {
+        libc::mmap(
+            r.at as *mut libc::c_void,
+            r.size as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            flags,
+            STUB_TAG,
+            0,
+        )
+    };
+    if p == libc::MAP_FAILED {
+        return false;
+    }
+    if p as u64 != r.at {
+        // SAFETY: the mapping just made, elsewhere.
+        unsafe { libc::munmap(p, r.size as usize) };
+        return false;
+    }
+    let mut cursor = r.at;
+    for &(at, site) in &r.sites {
+        for (i, w) in rewrite::stub(site, slot, x18_slot, cursor, at + 4).iter().enumerate() {
+            // SAFETY: inside the region just mapped, writable.
+            unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
+        }
+        cursor += (STUB_WORDS * 4) as u64;
+    }
+    true
+}
+
+/// Make placed stub regions executable and visible to instruction fetch.
+fn finish_regions(regions: &[ImageRegion]) {
+    for r in regions {
+        if r.sites
+            .iter()
+            .any(|&(_, s)| matches!(s, Site::X18 { insn } if crate::decode::x18_writes_sp(insn)))
+        {
+            note_sp_stub_region(r.at, r.at + r.size);
+        }
+        // SAFETY: a stub region just written.
+        unsafe {
+            libc::mprotect(
+                r.at as *mut libc::c_void,
+                r.size as usize,
+                libc::PROT_READ | libc::PROT_EXEC,
+            );
+            flush_icache(r.at, r.size);
+        }
+    }
+}
+
+/// Map `len` bytes of image `file` from `offset` at `addr`, writable and
+/// private (macOS maps no file executable at once; its pages stay the
+/// host's cached ones until written).
+fn map_image_pages(file: &std::fs::File, addr: u64, len: u64, offset: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    // SAFETY: replacing memory the caller owns for this code with the
+    // image of it.
+    let p = unsafe {
+        libc::mmap(
+            addr as *mut libc::c_void,
+            len as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_FIXED,
+            file.as_raw_fd(),
+            offset as libc::off_t,
+        )
+    };
+    p != libc::MAP_FAILED
+}
+
 /// The mapping [`image_begin`] began, `[addr, addr + len)`, is prepared:
 /// its pages, and its stub regions as offsets from it with their sites,
 /// are kept under `key`.
@@ -515,18 +632,9 @@ fn get_site(d: &mut fwe_kernel::snapshot::Dec, gate: u64) -> Option<Site> {
 /// # Safety
 /// The range must be readable guest memory.
 pub unsafe fn keep_image(key: &[u8], addr: u64, len: u64) {
-    let Some(regions) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).take() else { return };
+    let Some(regions) = image_regions() else { return };
     let mut e = fwe_kernel::snapshot::Enc::new();
-    e.u64(regions.len() as u64);
-    for r in &regions {
-        e.u64(r.at.wrapping_sub(addr));
-        e.u64(r.size);
-        e.u64(r.sites.len() as u64);
-        for &(at, site) in &r.sites {
-            e.u64(at - addr);
-            put_site(&mut e, site);
-        }
-    }
+    put_regions(&mut e, &regions, addr);
     // SAFETY: the caller's guarantee.
     let image = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
     fwe_kernel::prepcache::store_image(key, &e.into_bytes(), image);
@@ -542,112 +650,101 @@ pub fn map_image(
     addr: u64,
     len: u64,
     prot: i32,
-    (slot, x18_slot): (u32, u32),
+    slots: (u32, u32),
 ) -> Result<bool, i32> {
-    use std::os::fd::AsRawFd;
     let Some((layout, file)) = fwe_kernel::prepcache::open_image(key, len) else {
         return Ok(false);
     };
-    let gate = crate::syscall_gate();
     let mut d = fwe_kernel::snapshot::Dec::new(&layout);
-    let mut regions = Vec::new();
-    for _ in 0..d.count(24) {
-        let (rel, size) = (d.u64(), d.u64());
-        let n = d.count(16);
-        let mut sites = Vec::with_capacity(n);
-        for _ in 0..n {
-            let at = addr + d.u64();
-            let Some(site) = get_site(&mut d, gate) else { return Ok(false) };
-            sites.push((at, site));
-        }
-        regions.push(ImageRegion { at: addr.wrapping_add(rel), size, sites });
-    }
+    let Some(regions) = get_regions(&mut d, addr) else { return Ok(false) };
     if d.finish().is_err() {
         return Ok(false);
     }
     // The stub regions first, each only where nothing is.
-    let mut placed: Vec<(u64, u64)> = Vec::new();
-    let undo = |placed: &[(u64, u64)]| {
-        for &(at, size) in placed {
+    let undo = |placed: &[ImageRegion]| {
+        for r in placed {
             // SAFETY: a region this call mapped.
-            unsafe { libc::munmap(at as *mut libc::c_void, size as usize) };
+            unsafe { libc::munmap(r.at as *mut libc::c_void, r.size as usize) };
         }
     };
-    for r in &regions {
-        // SAFETY: a fresh anonymous mapping of fwe's, asked for where the
-        // region was; the host puts it elsewhere if anything is there.
-        let p = unsafe {
-            libc::mmap(
-                r.at as *mut libc::c_void,
-                r.size as usize,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                STUB_TAG,
-                0,
-            )
-        };
-        if p == libc::MAP_FAILED {
-            undo(&placed);
+    for (i, r) in regions.iter().enumerate() {
+        if !place_region(r, false, slots) {
+            undo(&regions[..i]);
             return Ok(false);
-        }
-        placed.push((p as u64, r.size));
-        if p as u64 != r.at {
-            undo(&placed);
-            return Ok(false);
-        }
-        let mut cursor = r.at;
-        for &(at, site) in &r.sites {
-            for (i, w) in rewrite::stub(site, slot, x18_slot, cursor, at + 4).iter().enumerate() {
-                // SAFETY: inside the region just mapped, writable.
-                unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
-            }
-            cursor += (STUB_WORDS * 4) as u64;
         }
     }
-    // The image in place of the file's pages: mapped writable, as macOS
-    // maps no file executable at once, then given its protections. Its
-    // pages are still the host's cached ones, shared, until written.
-    // SAFETY: replacing the mapping the caller made for this code with the
-    // image of the same range.
-    let p = unsafe {
-        libc::mmap(
-            addr as *mut libc::c_void,
-            len as usize,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_FIXED,
-            file.as_raw_fd(),
-            0,
-        )
-    };
-    if p == libc::MAP_FAILED {
-        undo(&placed);
+    if !map_image_pages(&file, addr, len, 0) {
+        undo(&regions);
         return Ok(false);
     }
     // SAFETY: the mapping just made.
     if unsafe { libc::mprotect(addr as *mut libc::c_void, len as usize, prot) } != 0 {
         let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOMEM);
-        undo(&placed);
+        undo(&regions);
         return Err(e);
     }
-    for r in &regions {
-        if r.sites
-            .iter()
-            .any(|&(_, s)| matches!(s, Site::X18 { insn } if crate::decode::x18_writes_sp(insn)))
-        {
-            note_sp_stub_region(r.at, r.at + r.size);
+    finish_regions(&regions);
+    Ok(true)
+}
+
+/// The loader's image of a program (see [`crate::loader::load`]): its runs
+/// of pages `runs` (address and length), loaded from `base` with the stub
+/// arena's next free place `arena_next`, kept under `key` once prepared.
+///
+/// # Safety
+/// The runs must be readable memory.
+pub unsafe fn keep_load_image(key: &[u8], base: u64, runs: &[(u64, u64)], arena_next: u64) {
+    let Some(regions) = image_regions() else { return };
+    let mut e = fwe_kernel::snapshot::Enc::new();
+    e.u64(arena_next - base);
+    put_regions(&mut e, &regions, base);
+    let mut image = Vec::with_capacity(runs.iter().map(|r| r.1 as usize).sum());
+    for &(at, len) in runs {
+        // SAFETY: the caller's guarantee.
+        image.extend_from_slice(unsafe {
+            std::slice::from_raw_parts(at as *const u8, len as usize)
+        });
+    }
+    fwe_kernel::prepcache::store_image(key, &e.into_bytes(), &image);
+}
+
+/// Map the loader's image kept under `key` over runs `runs` of fwe's own
+/// reservation `[base, end)` (mapped writable), with its stubs where they
+/// were (in the reservation's arena, or, where it ran out, wherever
+/// nothing is): the arena's next free place, or `None` if there is no
+/// such image or a place is taken (the runs may then hold some of it, to
+/// be written over).
+pub fn map_load_image(
+    key: &[u8],
+    (base, end): (u64, u64),
+    runs: &[(u64, u64)],
+    slots: (u32, u32),
+) -> Option<u64> {
+    let total = runs.iter().map(|r| r.1).sum();
+    let (layout, file) = fwe_kernel::prepcache::open_image(key, total)?;
+    let mut d = fwe_kernel::snapshot::Dec::new(&layout);
+    let arena_next = base + d.u64();
+    let regions = get_regions(&mut d, base)?;
+    d.finish().ok()?;
+    let mut offset = 0;
+    for &(at, len) in runs {
+        if !map_image_pages(&file, at, len, offset) {
+            return None;
         }
-        // SAFETY: making the stub region just written executable and
-        // visible to instruction fetch.
-        unsafe {
-            libc::mprotect(
-                r.at as *mut libc::c_void,
-                r.size as usize,
-                libc::PROT_READ | libc::PROT_EXEC,
-            );
-            flush_icache(r.at, r.size);
+        offset += len;
+    }
+    for (i, r) in regions.iter().enumerate() {
+        let ours = r.at >= base && r.at + r.size <= end;
+        if !place_region(r, ours, slots) {
+            for r in regions[..i].iter().filter(|r| r.at < base || r.at + r.size > end) {
+                // SAFETY: a region this call mapped outside the reservation.
+                unsafe { libc::munmap(r.at as *mut libc::c_void, r.size as usize) };
+            }
+            return None;
         }
     }
-    Ok(true)
+    finish_regions(&regions);
+    Some(arena_next)
 }
 
 /// Reserve `size` bytes near `[lo, hi)` satisfying `reachable`.

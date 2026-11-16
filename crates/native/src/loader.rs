@@ -20,6 +20,8 @@ pub struct Loaded {
     pub load_base: u64,
     /// What is left of the stub space reserved after the image.
     pub stub_arena: StubArena,
+    /// Mapped from its prepared image (nothing copied or written).
+    pub from_image: bool,
 }
 
 #[derive(Debug)]
@@ -122,6 +124,7 @@ pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
     file: Option<fwe_kernel::prepcache::FileId>,
+    slots: (u32, u32),
     mut prepare_exec: impl PrepareFn,
 ) -> Result<Loaded, LoadError> {
     use fwe_kernel::prepcache as cache;
@@ -204,6 +207,20 @@ pub fn load(
         }
     }
 
+    // Loaded and prepared before: its image, mapped in place
+    // ([`crate::prepare::map_load_image`]), shared and written by no one.
+    let runs: Vec<(u64, u64)> = plan.runs.iter().map(|r| (r.start + bias, r.len)).collect();
+    let image = file.map(|id| cache::about(id, format!("image-{page_size}").as_bytes()));
+    if let Some(key) = &image
+        && let Some(next) = crate::prepare::map_load_image(key, (base, base + total), &runs, slots)
+    {
+        arena.next = next;
+        return finish(elf, &plan, bias, arena, true);
+    }
+    if image.is_some() {
+        crate::prepare::image_begin();
+    }
+
     for ph in elf.loads() {
         let src = &elf.data[ph.offset as usize..(ph.offset + ph.filesz) as usize];
         // SAFETY: the destination lies inside a run mapped read-write above;
@@ -249,10 +266,29 @@ pub fn load(
             });
             cache::code_key(id, vaddr | 1 << 63, size, k.as_deref())
         });
-        prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena, key.as_deref())
-            .map_err(|reason| LoadError::Prepare { start: vaddr + bias, reason })?;
+        prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena, key.as_deref()).map_err(
+            |reason| {
+                crate::prepare::image_abandon();
+                LoadError::Prepare { start: vaddr + bias, reason }
+            },
+        )?;
     }
+    if let Some(key) = &image {
+        // SAFETY: the runs, mapped readable and writable above.
+        unsafe { crate::prepare::keep_load_image(key, base, &runs, arena.next) };
+    }
+    finish(elf, &plan, bias, arena, false)
+}
 
+/// The runs of a loaded image given their protections, and what was
+/// loaded (`from_image`: mapped from its prepared image).
+fn finish(
+    elf: &Elf<'_>,
+    plan: &LoadPlan,
+    bias: u64,
+    arena: StubArena,
+    from_image: bool,
+) -> Result<Loaded, LoadError> {
     for run in &plan.runs {
         let addr = (run.start + bias) as *mut libc::c_void;
         // SAFETY: changing protections of the runs mapped above.
@@ -276,5 +312,6 @@ pub fn load(
         phent: elf.phentsize,
         end: hi + bias,
         load_base: lo + bias,
+        from_image,
     })
 }

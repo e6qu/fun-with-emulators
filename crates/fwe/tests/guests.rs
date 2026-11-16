@@ -1311,11 +1311,12 @@ fn dynamic_glibc_exit_maps_shared_libc() {
 /// glibc's crt objects, using the heap and buffered stdio from the shared
 /// libc. Covers the complete path — `ld-linux` maps and relocates `libc.so.6`,
 /// crt `_start`, `__libc_start_main` (thread-control-block and TLS setup),
-/// A library's code prepared once is mapped from its prepared image the
-/// next time, in the same root (the file unchanged): glibc's, which its
-/// dynamic linker maps, and the program runs as before.
+/// Code prepared once is mapped from its prepared image the next time, in
+/// the same root (the files unchanged): the program and its dynamic linker,
+/// which fwe loads, and glibc, which the dynamic linker maps; and the
+/// program runs as before.
 #[test]
-fn a_library_runs_from_its_prepared_image_the_next_time() {
+fn code_runs_from_its_prepared_image_the_next_time() {
     let prog = build_c_dynamic("dynhello", Libc::Glibc, true);
     let root = libc_rootfs(Libc::Glibc, "glibc-image");
     let run = || {
@@ -1326,13 +1327,23 @@ fn a_library_runs_from_its_prepared_image_the_next_time() {
     let first = run();
     let second = run();
     let _ = std::fs::remove_dir_all(&root);
-    let images = |out: &Output| {
-        String::from_utf8_lossy(&out.stderr).matches("from its prepared image").count()
+    let images = |out: &Output| -> Vec<String> {
+        String::from_utf8_lossy(&out.stderr)
+            .lines()
+            .filter(|l| l.contains("from its prepared image"))
+            .map(|l| l.split_whitespace().nth(1).unwrap_or("").to_string())
+            .collect()
     };
     assert_eq!(stdout(&first), "dynamic hello, again\n");
     assert_eq!(stdout(&second), "dynamic hello, again\n");
-    assert_eq!(images(&first), 0, "{}", String::from_utf8_lossy(&first.stderr));
-    assert!(images(&second) > 0, "{}", String::from_utf8_lossy(&second.stderr));
+    assert!(images(&first).is_empty(), "{}", String::from_utf8_lossy(&first.stderr));
+    // The program, its dynamic linker, and glibc's code.
+    assert_eq!(
+        images(&second),
+        ["exe", "interp", "code"],
+        "{}",
+        String::from_utf8_lossy(&second.stderr)
+    );
 }
 
 /// `main`, then `malloc`/`printf` — against a genuine glibc, the way a Debian
