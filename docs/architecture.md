@@ -251,8 +251,9 @@ The pieces:
   for guest threads). A block's way out is `brk #0x4a54`, told by the
   syndrome register; a direct branch is then linked, an indirect branch
   or return looks up a table of translations by guest address at 2^45
-  (`x16`/`x17` saved, restored by the translation's first word), and a
-  stub enters code not translated. Each translated word records what
+  (`x16`/`x17` saved, restored by the translation's first word); a
+  target not translated has 0 in the table, and the lookup restores
+  `x16`/`x17` and branches through the program's own register. Each translated word records what
   guest state it stands for (`Word`), so a fault or signal there is
   delivered as at the guest's instruction (`jit::to_guest`). A page
   translated from is write-protected before it is read; a write drops

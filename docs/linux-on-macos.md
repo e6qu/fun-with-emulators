@@ -607,10 +607,14 @@ code generated at run time:
   up in a table of translations by program address, `x16` and `x17`
   saved for the lookup; the translation it reaches checks that the target
   is its own (an entry can be taken over or dropped while a lookup reads
-  it), then restores them. A miss traps once and fills the table. Code that is not translated (a
-  library's, prepared in place) is entered through one stub that leaves
-  the target address in `x16`, as the arm64 procedure call standard lets
-  a call or return clobber `x16` and `x17`.
+  it), then restores them. A miss traps once and fills the table. A
+  branch or return into code that is not translated (a library's,
+  prepared in place) restores `x16` and `x17` and is made through the
+  program's own register, so every register is as the program left it:
+  code may count on more than the procedure call standard promises
+  (HotSpot calls its atomic stubs saying they clobber only `x8`, `x9` and
+  `x30`, and keeps values in `x16` across them). One through `x18` takes
+  fwe's trap.
 - **What the program sees stays its own.** Its memory reads back exactly
   as it wrote it. A fault or signal in a translation is delivered at the
   program's instruction, with its registers: an expansion stopped before

@@ -26,11 +26,14 @@
 //!   translations by program address ([`TABLE`]), saving `x16` and `x17`
 //!   for it; the translation checks the target is its own (an entry can be
 //!   taken over or dropped as a lookup reads it) and restores them. A
-//!   dropped entry leads to a retry stub, back to fwe. Code that is not
-//!   the program's run-time code (a library's, prepared in place) is
-//!   entered through one stub, which leaves the target's address in
-//!   `x16`: the arm64 procedure call standard lets a call or return
-//!   clobber `x16` and `x17`, for veneers like this.
+//!   dropped entry leads to a retry stub, back to fwe. A target that is
+//!   not the program's run-time code (a library's, prepared in place) has
+//!   0 for its translation: the lookup restores `x16` and `x17` and makes
+//!   the program's own branch through its register, so no register
+//!   changes (code may count on that beyond the procedure call standard:
+//!   HotSpot calls its atomic stubs saying they clobber only `x8`, `x9`
+//!   and `x30`). Through `x18`, which has no register to branch through,
+//!   fwe's trap makes it.
 //!
 //! What the program can observe stays its own: a fault or signal in a
 //! translation is delivered at the program's instruction, with its
@@ -130,6 +133,8 @@ const MISS: u32 = 0xb500_0011;
 const VALUE: u32 = 0xf940_0631;
 /// `br x17`
 const GO: u32 = 0xd61f_0220;
+/// `cbz x17, <outside>`: a table entry for a target not translated.
+const OUTSIDE: u32 = 0xb400_0011;
 
 /// Where a block's way out leads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,8 +174,8 @@ enum Word {
     Lookup { g: u64, link: Option<u64>, committed: bool },
     /// A way out, as at the branch at `g`.
     Out { g: u64, exit: Exit },
-    /// The stub into code not translated, at its `k`th word.
-    Static(u8),
+    /// The retry stub: a lookup that read an entry as it was dropped.
+    Retry,
 }
 
 /// A translated block.
@@ -200,7 +205,7 @@ struct Cache {
     chunks: Vec<Chunk>,
     /// The chunk new translations go in.
     current: usize,
-    /// The stub into code not translated, at the first chunk's start.
+    /// The retry stub (a dropped entry's value), at the first chunk's start.
     stub: u64,
     /// Bytes of translations in use, and of those dropped (written over,
     /// unmapped) or retired, whose room is had back by emptying the cache.
@@ -220,7 +225,7 @@ struct Chunk {
 }
 
 /// Bytes at the first chunk's start that hold the stub.
-const STUB_ROOM: u64 = 16;
+const STUB_ROOM: u64 = 8;
 
 pub struct State {
     /// Program memory whose code runs by translation: start -> end.
@@ -243,7 +248,7 @@ pub struct State {
     retried: BTreeMap<u64, (u64, u64)>,
     /// Program pages -> the blocks made from them.
     pages: BTreeMap<u64, Vec<usize>>,
-    /// Program addresses the table sends through the stub into code not
+    /// Program addresses the table says are code not
     /// translated.
     outside: std::collections::BTreeSet<u64>,
     cache: Option<Cache>,
@@ -382,12 +387,12 @@ pub fn code(addr: u64, len: u64) {
     s.drop_range(addr, len);
     remove(&mut s.regions, addr, len);
     s.regions.insert(addr, addr + len);
-    // Lookups that sent its addresses to code not translated go again.
-    if let Some(stub) = s.cache.as_ref().map(|c| c.stub) {
+    // Lookups that took its addresses for code not translated go again.
+    if s.cache.is_some() {
         let gone: Vec<u64> = s.outside.range(addr..addr.saturating_add(len)).copied().collect();
         for g in gone {
             s.outside.remove(&g);
-            unpublish(g, stub);
+            unpublish(g, 0);
         }
     }
 }
@@ -416,12 +421,12 @@ pub fn reset() {
         s.drop_range(a, e - a);
     }
     s.regions.clear();
-    if let Some(stub) = s.cache.as_ref().map(|c| c.stub) {
+    if s.cache.is_some() {
         let entries: Vec<(u64, u64)> = s
             .by_g
             .iter()
             .map(|(&g, &i)| (g, s.blocks[i].t))
-            .chain(s.outside.iter().map(|&g| (g, stub)))
+            .chain(s.outside.iter().map(|&g| (g, 0)))
             .collect();
         for (g, t) in entries {
             unpublish(g, t);
@@ -543,7 +548,7 @@ pub fn exit(regs: &mut Regs) -> bool {
     let exit = match word_at(&s, at) {
         Some(Word::Out { exit, .. }) => exit,
         // The retry stub: an entry dropped as a lookup read it.
-        Some(Word::Static(3)) => Exit::Retry,
+        Some(Word::Retry) => Exit::Retry,
         _ => return false,
     };
     EXITS.fetch_add(1, Ordering::Relaxed);
@@ -575,11 +580,9 @@ pub fn exit(regs: &mut Regs) -> bool {
         }
     };
     if !s.in_region(to) {
-        // Code not translated: its lookups go through the stub.
-        if let Some(stub) = s.cache.as_ref().map(|c| c.stub) {
-            publish(to, stub);
-            s.outside.insert(to);
-        }
+        // Code not translated: its lookups branch to it themselves.
+        publish(to, 0);
+        s.outside.insert(to);
         regs.pc = to;
         return true;
     }
@@ -623,7 +626,7 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
         | Word::Undo { g, .. }
         | Word::Finish { g }
         | Word::Lookup { g, .. } => Some(g),
-        Word::Static(_) => None,
+        Word::Retry => None,
     }
 }
 
@@ -665,22 +668,12 @@ pub fn to_guest(regs: &mut Regs) -> bool {
                 regs.pc = g;
             }
         }
-        Word::Static(k) => {
-            // `x16` holds the target; its own value is on the stack (below
-            // `sp` once the stub has moved it back).
+        Word::Retry => {
+            // `x16` holds the target; the program's `x16` and `x17` are on
+            // the stack.
             let to = regs.x[16];
-            match k {
-                // The stub's start, and the retry stub's way out.
-                0 | 3 => {
-                    (regs.x[16], regs.x[17]) = (stack(0), stack(8));
-                    regs.sp += 16;
-                }
-                1 => {
-                    regs.x[16] = stack(0);
-                    regs.sp += 16;
-                }
-                _ => regs.x[16] = stack(0u64.wrapping_sub(16)),
-            }
+            (regs.x[16], regs.x[17]) = (stack(0), stack(8));
+            regs.sp += 16;
             regs.pc = to;
         }
     }
@@ -689,8 +682,8 @@ pub fn to_guest(regs: &mut Regs) -> bool {
 
 fn word_at(s: &State, pc: u64) -> Option<Word> {
     let c = s.cache.as_ref()?;
-    if (c.stub..c.stub + STUB_ROOM).contains(&pc) {
-        return Some(Word::Static(((pc - c.stub) / 4) as u8));
+    if pc == c.stub {
+        return Some(Word::Retry);
     }
     let i = block_at(s, pc)?;
     s.blocks[i].words.get(((pc - s.blocks[i].t) / 4) as usize).copied()
@@ -910,7 +903,7 @@ fn new_chunk() -> Chunk {
     Chunk { rw, rx, used: 0, retired: false }
 }
 
-/// The code cache, its stub into code not translated, and the table.
+/// The code cache, its retry stub, and the table.
 fn new_cache() -> Cache {
     let mut table = TABLE;
     // SAFETY: fresh memory in this task, at the table's fixed place.
@@ -928,11 +921,10 @@ fn new_cache() -> Cache {
     }
     let mut c =
         Cache { chunks: vec![new_chunk()], current: 0, stub: 0, live: 0, garbage: 0, flushes: 0 };
-    // Into code not translated: `ldr x17, [sp, #8]; add sp, sp, #16;
-    // br x16`; then the retry stub, a dropped entry's value: fwe's trap.
-    c.stub = write(&mut c, &[0xf940_07f1, 0x9100_43ff, 0xd61f_0200, EXIT]);
+    // The retry stub, a dropped entry's value: fwe's trap.
+    c.stub = write(&mut c, &[EXIT]);
     c.chunks[0].used = STUB_ROOM;
-    RETRY.store(c.stub + 12, Ordering::Relaxed);
+    RETRY.store(c.stub, Ordering::Relaxed);
     c
 }
 
@@ -1369,6 +1361,11 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
         info.push(before);
     }
     let committed = Word::Lookup { g: pc, link, committed: true };
+    // A target fwe does not translate has no translation in the table (0):
+    // the branch is made as the program made it, every register its own.
+    let outside_at = out.len();
+    out.push(OUTSIDE);
+    info.push(committed);
     if let Some(link) = link {
         let at = out.len();
         materialize(30, link, out);
@@ -1376,9 +1373,32 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
     }
     out.push(GO);
     info.push(committed);
+    // Not translated: x16 and x17 back, x30 the program's return address
+    // for a call, and the program's own branch through its register (whose
+    // value is the target). Through x18, which has no register to branch
+    // through, fwe's trap takes it.
+    let outside = out.len();
+    if n != 18 {
+        out[outside_at] |= ((outside - outside_at) as u32) << 5;
+        if let Some(link) = link {
+            let at = out.len();
+            materialize(30, link, out);
+            info.extend((at..out.len()).map(|_| committed));
+        }
+        out.push(RESTORE);
+        info.push(committed);
+        // `ret xN` returns as it did; a call (its x30 set above) or a branch
+        // is `br xN`.
+        let ret = link.is_none() && n == 30;
+        out.push(if ret { 0xd65f_0000 } else { 0xd61f_0000 } | (n << 5));
+        info.push(Word::At(pc));
+    }
     // The miss: x16 and x17 back, then fwe's trap.
     let miss = out.len();
     out[miss_at] |= ((miss - miss_at) as u32) << 5;
+    if n == 18 {
+        out[outside_at] |= ((miss - outside_at) as u32) << 5;
+    }
     out.push(RESTORE);
     info.push(before);
     out.push(EXIT);

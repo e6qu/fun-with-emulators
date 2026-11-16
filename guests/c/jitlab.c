@@ -21,6 +21,9 @@
  * - code patched in place, then run;
  * - code copied elsewhere and run there;
  * - the return address a call leaves being the code's own address;
+ * - x16 and x17 kept across a call into it and its return, as a call
+ *   whose clobbers leave them out expects (HotSpot calls its atomic stubs
+ *   so);
  * - threads running code while another thread patches it;
  * - threads running code while writing data in its page, at once;
  * - code made executable with mprotect after it was written (W^X);
@@ -340,6 +343,31 @@ static void *writer(void *arg) {
     return 0;
 }
 
+/* Calls into code that say they clobber only x8, x9 and x30, as HotSpot
+ * calls its generated atomic stubs: x16 and x17 are kept live across
+ * them. The code (`mov x0, #1; ret`) is fresh, and called many times, so
+ * its returns take every way fwe has. In how many calls they changed. */
+static int fastcalls_changing(void) {
+    static const uint32_t ret1_words[] = {0xd2800020, 0xd65f03c0};
+    uint32_t *fn = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    memcpy(fn, ret1_words, sizeof ret1_words);
+    flush(fn, sizeof ret1_words);
+    int changed = 0;
+    for (int i = 0; i < 1000; i++) {
+        register uint64_t r16 __asm__("x16") = 0x1616161616161616ull + (uint64_t)i;
+        register uint64_t r17 __asm__("x17") = 0x1717171717171717ull + (uint64_t)i;
+        register uint64_t r0 __asm__("x0") = 0;
+        register void *f __asm__("x3") = fn;
+        __asm__ volatile("blr %[f]"
+                         : "+r"(r0), "+r"(r16), "+r"(r17)
+                         : [f] "r"(f)
+                         : "x8", "x9", "x30", "cc", "memory");
+        changed += r16 != 0x1616161616161616ull + (uint64_t)i ||
+                   r17 != 0x1717171717171717ull + (uint64_t)i;
+    }
+    return changed;
+}
+
 static uint32_t movz_x0(unsigned imm) { return 0xd2800000u | (imm << 5); }
 
 int main(void) {
@@ -458,6 +486,8 @@ int main(void) {
     flush(copy, len);
     printf("copy: %ld %ld\n", ((long (*)(long))at(copy, jl_sum))(10),
            ((long (*)(void))at(copy, jl_pcrel))());
+
+    printf("x16 and x17 across a call: changed in %d of 1000\n", fastcalls_changing());
 
     long (*retaddr)(void) = (long (*)(void))at(code, jl_retaddr);
     printf("return address: %s\n",

@@ -972,6 +972,7 @@ fn jit_code_runs_as_the_program_wrote_it() {
          signal: seen in the code\n\
          tracer: pc in the code\n\
          fault: seen at the load, 77\npatch: 1000 of 1000\ncopy: 90 30583\n\
+         x16 and x17 across a call: changed in 0 of 1000\n\
          return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nmemory: as written\n\
          fork: child ok, parent 1\n"
     );
