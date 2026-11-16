@@ -167,11 +167,12 @@ natively wherever fwe can make them fit the Mac.
   multiple of 4 GiB keeps its code right; what changes is each absolute
   address it holds, which a link that kept its relocations
   (`--emit-relocs`) lists: those executables are moved and run natively.
-  One linked without them (Debian's `python3`, GCC, clang, static Go
-  programs: their data holds absolute pointers nothing lists), linked
-  dynamically (its dynamic linker relocates it at its link address), or
-  holding an address no relocation follows, runs in the VM, and
-  `--strace` says why.
+  One linked without them, as every non-PIE program the distributions
+  ship is (most GCC builds, Go toolchains, Debian's and Ubuntu's Python
+  and Go programs: [which ones](docs/linux-on-macos.md#how-distributions-build-their-programs)),
+  linked dynamically (its dynamic linker relocates it at its link
+  address), or holding an address no relocation follows, runs in the
+  VM, and `--strace` says why.
 - [ ] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes
   and runs, many threads, a garbage collector) runs natively under fwe,
   and the benchmarks run a realistic workload on it (compiling and running
