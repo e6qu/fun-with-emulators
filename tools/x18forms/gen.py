@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Generate guests/c/x18forms.c from x18forms.tsv.
+"""Generate the x18forms guest from x18forms.tsv, into the file the one
+argument names (the end-to-end test does, into its build directory).
 
 x18forms.tsv lists instruction words that name x18 (or w18), one per line:
 the word in hex, its mnemonic and its operands as llvm-objdump prints them.
@@ -18,7 +19,6 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ROOT = HERE.parent.parent
 
 SKIP_MNEMONICS = {"cbz", "cbnz", "tbz", "tbnz", "adr", "adrp", "prfm", "b", "bl", "br", "blr", "ret"}
 
@@ -123,7 +123,7 @@ def main():
         .replace("@ASM@", asm_text)
         .replace("@TABLE@", "\n".join(table))
     )
-    (ROOT / "guests" / "c" / "x18forms.c").write_text(out)
+    Path(sys.argv[1]).write_text(out)
     print(f"{len(items)} instructions", file=sys.stderr)
 
 
