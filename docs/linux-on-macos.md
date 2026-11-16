@@ -593,20 +593,25 @@ code generated at run time:
   address), the uses of `x18`, system calls and thread-pointer accesses
   (expanded as their stubs are, inline), and branches out of the block.
 - **Branches.** A direct branch traps the first time and is then linked:
-  a branch straight to its target's translation. A call puts the
-  program's own return address in `x30`, so the stack holds only the
-  program's addresses. An indirect branch or a return looks its target
-  up in a table of translations by program address, `x16` and `x17`
-  saved for the lookup; the translation it reaches checks that the target
-  is its own (an entry can be taken over or dropped while a lookup reads
-  it), then restores them. A miss traps once and fills the table. A
-  branch or return into code that is not translated (a library's,
-  prepared in place) restores `x16` and `x17` and is made through the
-  program's own register, so every register is as the program left it:
-  code may count on more than the procedure call standard promises
-  (HotSpot calls its atomic stubs saying they clobber only `x8`, `x9` and
-  `x30`, and keeps values in `x16` across them). One through `x18`, or a
-  call through `x30`, takes fwe's trap.
+  straight to its target's translation, or to code that is not
+  translated (a runtime's helper a JIT calls with `bl`) straight there
+  where a branch reaches, otherwise through a veneer that loads the
+  target into `x16`, as a linker's veneer does (the procedure call
+  standard lets one clobber `x16` and `x17` on a direct branch to other
+  code). A `cbz` or `tbz` of `x18` tests the program's `x18` inline. A
+  call puts the program's own return address in `x30`, so the stack
+  holds only the program's addresses. An indirect branch or a return
+  looks its target up in a table of translations by program address,
+  `x16` and `x17` saved for the lookup; the translation it reaches checks
+  that the target is its own (an entry can be taken over or dropped while
+  a lookup reads it), then restores them. A miss traps once and fills the
+  table. An indirect branch or return into code that is not translated
+  (a library's, prepared in place) restores `x16` and `x17` and is made
+  through the program's own register, so every register is as the
+  program left it: code may count on more than the procedure call
+  standard promises (HotSpot calls its atomic stubs saying they clobber
+  only `x8`, `x9` and `x30`, and keeps values in `x16` across them). One
+  through `x18`, or a call through `x30`, takes fwe's trap.
 - **What the program sees stays its own.** Its memory reads back exactly
   as it wrote it. A fault or signal in a translation is delivered at the
   program's instruction, with its registers: an expansion stopped before

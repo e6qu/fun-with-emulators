@@ -75,6 +75,8 @@ void _exit(int code);
 #define PROT_WRITE 2
 #define PROT_EXEC 4
 #define MAP_SHARED 1
+#define MAP_FIXED 0x10
+#define PROT_NONE 0
 #define MAP_PRIVATE 2
 #define MAP_ANONYMOUS 0x20
 #define MAP_FAILED ((void *)-1)
@@ -614,6 +616,45 @@ int main(void) {
     long fpid = ((long (*)(void))fc)();
     printf("file code: getpid %s, memory %s\n", fpid == getpid() ? "matches" : "differs",
            memcmp(fc, getpid_code, sizeof getpid_code) == 0 ? "as written" : "changed");
+
+    /* Calls with `bl` from code made at run time to code of a file (code
+     * mapped private and not writable, which fwe does not translate) in
+     * reach of it, as a JIT calls its
+     * runtime's helpers: each returns into the code. */
+    {
+        static const uint32_t twice[] = {
+            0x8b000000, /* add x0, x0, x0 */
+            0xd65f03c0, /* ret */
+        };
+        int rfd = memfd_create("twice", 0);
+        write(rfd, twice, sizeof twice);
+        ftruncate(rfd, 16384);
+        char *both = mmap(0, 2 * 16384, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        mmap(both, 16384, PROT_READ | PROT_EXEC, MAP_PRIVATE | MAP_FIXED, rfd, 0);
+        uint32_t *bl = mmap(both + 16384, 16384, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+        /* long f(long n): x19 = n; x20 = 0; do x20 += twice(x19) while --x19 */
+        uint32_t words[] = {
+            0xa9be7bfd, /* stp x29, x30, [sp, #-32]! */
+            0xa90153f3, /* stp x19, x20, [sp, #16] */
+            0xaa0003f3, /* mov x19, x0 */
+            0xd2800014, /* mov x20, #0 */
+            0xaa1303e0, /* 1: mov x0, x19 */
+            0x94000000, /* bl twice (filled in) */
+            0x8b000294, /* add x20, x20, x0 */
+            0xf1000673, /* subs x19, x19, #1 */
+            0x54ffff81, /* b.ne 1b */
+            0xaa1403e0, /* mov x0, x20 */
+            0xa94153f3, /* ldp x19, x20, [sp, #16] */
+            0xa8c27bfd, /* ldp x29, x30, [sp], #32 */
+            0xd65f03c0, /* ret */
+        };
+        long off = ((long)both - (long)&bl[5]) / 4;
+        words[5] |= (uint32_t)off & 0x3ffffff;
+        memcpy(bl, words, sizeof words);
+        flush(bl, sizeof words);
+        printf("bl out: %ld\n", ((long (*)(long))bl)(1000));
+    }
 
     /* Made executable only (no PROT_READ), as Linux runs it. */
     uint32_t *xo = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);

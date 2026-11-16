@@ -154,9 +154,6 @@ enum Exit {
     /// To the address in register `n` (`x18`: the program's), `x30`
     /// becoming `link` first for a call.
     Reg { n: u32, link: Option<u64> },
-    /// A `cbz`/`cbnz`/`tbz`/`tbnz` of `x18`: `insn` decides between its
-    /// target and the next instruction, by the program's `x18`.
-    TestX18 { insn: u32, taken: u64, next: u64 },
     /// A lookup that came to the wrong block (its entry was taken over or
     /// dropped as it read it), or to the retry stub: on to the address in
     /// `x16`, the program's `x16` and `x17` on the stack.
@@ -269,6 +266,9 @@ pub struct State {
     /// translated from that they also map. Kept from writes: a write
     /// through one drops their translations.
     aliases: BTreeMap<u64, std::collections::BTreeSet<u64>>,
+    /// Code not translated -> the block that branches to it from the
+    /// cache where a direct branch does not reach ([`veneer`]).
+    veneers: BTreeMap<u64, usize>,
     cache: Option<Cache>,
 }
 
@@ -284,6 +284,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     outside: std::collections::BTreeSet::new(),
     objects: BTreeMap::new(),
     aliases: BTreeMap::new(),
+    veneers: BTreeMap::new(),
     cache: None,
 });
 
@@ -497,6 +498,7 @@ pub fn reset() {
     s.retried.clear();
     s.objects.clear();
     s.aliases.clear();
+    s.veneers.clear();
 }
 
 /// Held across a `fork`, so that the child's copy of the translations is
@@ -656,9 +658,6 @@ pub fn exit(regs: &mut Regs) -> bool {
             }
             (to, false)
         }
-        Exit::TestX18 { insn, taken, next } => {
-            (if test_taken(insn, regs.x[18]) { taken } else { next }, false)
-        }
         Exit::Retry => {
             let to = regs.x[16];
             let sp = regs.sp;
@@ -679,6 +678,20 @@ pub fn exit(regs: &mut Regs) -> bool {
         // Code not translated: its lookups branch to it themselves.
         publish(to, 0);
         s.outside.insert(to);
+        // A direct branch to it is linked: straight there where it
+        // reaches, else through a veneer.
+        if link_here && !from_retired && s.cache.as_ref().is_some_and(|c| c.flushes == flushes) {
+            if let Some(b) = rewrite::branch(at, to) {
+                s.patch(at, b);
+            } else {
+                let i = veneer(&mut s, to);
+                let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
+                if same && let Some(b) = rewrite::branch(at, s.blocks[i].t) {
+                    s.patch(at, b);
+                    s.blocks[i].linked.push(at);
+                }
+            }
+        }
         regs.pc = to;
         return true;
     }
@@ -697,18 +710,6 @@ pub fn exit(regs: &mut Regs) -> bool {
     }
     regs.pc = into;
     true
-}
-
-/// Whether a `cbz`/`cbnz`/`tbz`/`tbnz` of a register holding `v` branches.
-fn test_taken(insn: u32, v: u64) -> bool {
-    let nz = (insn >> 24) & 1 == 1;
-    if (insn >> 25) & 0x3f == 0b011010 {
-        let v = if insn >> 31 == 1 { v } else { v & 0xffff_ffff };
-        (v != 0) == nz
-    } else {
-        let bit = ((insn >> 31) << 5) | ((insn >> 19) & 0x1f);
-        ((v >> bit) & 1 == 1) == nz
-    }
 }
 
 /// The program's address of the instruction a word of a translation at
@@ -1150,6 +1151,39 @@ fn new_cache() -> Cache {
 /// the largest block; else, the cache is emptied where at least half of it
 /// is dropped translations, and the block goes in a chunk with room, or a
 /// new one.
+/// The block that branches from the cache to `to`, code not translated
+/// that a direct branch from the cache does not reach: `to` loaded into
+/// `x16`, then `br x16`, as a linker's veneer does (AAPCS64 lets one
+/// clobber `x16` and `x17` on a direct branch to other code). A block, so
+/// emptying the cache keeps it while a thread is in it, and unlinks the
+/// branches to it when it goes.
+fn veneer(s: &mut State, to: u64) -> usize {
+    if let Some(&i) = s.veneers.get(&to) {
+        return i;
+    }
+    cache_next(s);
+    let mut words = Vec::new();
+    materialize(16, to, &mut words);
+    words.push(0xd61f_0200); // br x16
+    let t = emit(s, &words);
+    let len = 4 * words.len() as u64;
+    s.cache.as_mut().expect("a code cache").live += len;
+    let i = s.blocks.len();
+    // A thread stopped in it goes on at `to`, its x16 the veneer's.
+    s.blocks.push(Block {
+        g: to,
+        t,
+        words: vec![Word::At(to); words.len()],
+        linked: Vec::new(),
+        len,
+        body: t,
+        retired: false,
+    });
+    s.by_t.insert(t, i);
+    s.veneers.insert(to, i);
+    i
+}
+
 fn cache_next(s: &mut State) -> u64 {
     let room = |k: &Chunk| !k.retired && k.used + BLOCK_ROOM <= chunk_size();
     let c = s.cache.as_ref().expect("a code cache");
@@ -1235,6 +1269,7 @@ fn flush(s: &mut State) {
     }
     // Nothing is translated from the program's pages now.
     s.objects.clear();
+    s.veneers.clear();
     s.aliases.clear();
     let pages = std::mem::take(&mut s.guarded);
     for p in pages {
@@ -1401,12 +1436,29 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
     let family = (w >> 25) & 0x3f;
     if family == 0b011010 || family == 0b011011 {
         let taken = if family == 0b011010 { imm19() } else { imm14() };
+        let field = if family == 0b011010 { 0x7_ffff << 5 } else { 0x3fff << 5 };
         if w & 0x1f == 18 {
-            out.push(EXIT);
-            info.push(Word::Out { g: pc, exit: Exit::TestX18 { insn: w, taken, next: pc + 4 } });
+            // Of x18: its value from its slot into x16 (x16 and x17 saved
+            // below sp, as a lookup saves them), tested there; each way
+            // restores them and goes on, linked as any branch is.
+            let before = Word::Lookup { g: pc, link: None, committed: false };
+            out.push(SAVE);
+            info.push(Word::At(pc));
+            let slot = crate::x18_slot();
+            out.extend([
+                rewrite::MRS_TPIDRRO | 16,
+                rewrite::AND_NOT7 | (16 << 5) | 16,
+                rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
+                (w & !field & !0x1f) | (3 << 5) | 16,
+                RESTORE,
+            ]);
+            info.extend([before; 5]);
+            jump(out, info, pc + 4);
+            out.push(RESTORE);
+            info.push(before);
+            jump(out, info, taken);
             return true;
         }
-        let field = if family == 0b011010 { 0x7_ffff << 5 } else { 0x3fff << 5 };
         out.push((w & !field) | (2 << 5));
         info.push(Word::At(pc));
         jump(out, info, pc + 4);

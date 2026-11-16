@@ -281,8 +281,11 @@ sees, is in
   the executable one. `jit::in_cache` tells a cache address without a
   lock. A block's ways out are `brk #0x4a54` (`jit::EXIT`), which
   `on_sigtrap` passes to `jit::exit`: a direct branch's target is
-  translated and the branch patched to it (linked, within a chunk); a
-  `cbz`/`tbz` of `x18` is decided on the guest's `x18`.
+  translated and the branch patched to it (linked, within a chunk); one
+  to code not translated is patched to it where a branch reaches, else
+  to a veneer block (`jit::veneer`: the target in `x16`, `br x16`). A
+  `cbz`/`tbz` of `x18` loads the guest's `x18` into `x16` (saved with
+  `x17` as a lookup saves them) and tests it there.
 - **The table** of translations by guest address is 2^20 entries of
   (address, translation) at 2^45 (32 TiB, reachable with one `orr`). An
   indirect branch or return saves `x16` and `x17`, indexes the table and
