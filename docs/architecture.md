@@ -240,8 +240,23 @@ The pieces:
   if not). The loader keeps the same for the program and its dynamic
   linker, with their stub space size and unwind tables' code ranges. The
   collector removes entries older than 30 days.
+- A mapping of a file's code is kept whole as well, as an image: its
+  pages as preparation left them, in a file beside the entry
+  (`prepcache::store_image`), with where its stub regions were, as offsets
+  from the mapping, and the sites each serves. A later mapping of the same
+  range of the same file maps the image in its place
+  (`Platform::map_image`, `crates/native/src/prepare.rs`): mapped writable
+  and then given its protections (macOS maps no file executable at once),
+  its pages are the host's cached ones, shared by every process and never
+  copied, since nothing writes them; the stub regions are mapped where
+  they were and their stubs written for this process (they name its gate
+  and slots). Where a stub region's place is taken, the mapping is
+  prepared as below. The process that makes an image writes every word
+  at once rather than as pages first run. The collector removes an image
+  once its file is gone or changed (found by device and inode through
+  `/.vol`), as well as after 30 days.
 - `crates/kernel/src/lazycode.rs` writes a kept range's pages as they
-  first run. Its stubs are written as it is mapped; the words its pages
+  first run, for code with no image. Its stubs are written as it is mapped; the words its pages
   owe (branches to stubs, system calls turned into traps) are kept aside,
   and those pages are mapped readable but not executable. The first
   instruction fetch there faults (on the instruction's own page; any other
