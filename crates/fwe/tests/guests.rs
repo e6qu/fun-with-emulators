@@ -3207,12 +3207,12 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
     let out = run("javac", &javac);
     assert!(out.status.success(), "javac failed");
     let out =
-        run("java", &[errors.into(), "-cp".into(), "/tmp/out".into(), "Main".into(), "1".into()]);
+        run("java", &[errors.into(), "-cp".into(), "/tmp/out".into(), "Main".into(), "4".into()]);
     assert_eq!(
         stdout(&out),
-        "words: 1280000 in 1884 kinds, most sa=35916 vi=35899 ar=35637 ka=35613 qu=35596\n\
-         primes below 20000000: 1270607, sum 12272577818052\n\
-         matrix 160x160 x2: checksum 669356318\n\
+        "words: 5120000 in 1884 kinds, most sa=142941 vi=142901 ka=142853 ne=142759 lo=142580\n\
+         primes below 80000000: 4669382, sum 180946446237951\n\
+         matrix 160x160 x8: checksum 774043540\n\
          bank: 100 accounts, 8 threads, total 100000, money moved\n\
          done\n"
     );

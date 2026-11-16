@@ -560,7 +560,8 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
             times[side].append(time.perf_counter() - start)
             if r.returncode != 0:
-                sys.exit(f"{name} {side} failed ({r.returncode}): {r.stderr[-3000:]}")
+                sys.exit(f"{name} {side} failed ({r.returncode}): {r.stderr[-3000:]}\n"
+                         f"its output: {r.stdout[-6000:]}")
             outs[side] = r.stdout
     if outs["fwe"] != outs["macOS"]:
         sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
@@ -857,8 +858,10 @@ def jdk(a, fwe, guest_env, results):
 
     def both(bindir, srcdir, out):
         files = " ".join(os.path.join(srcdir, f) for f in sources)
-        return (f"{bindir}/javac -d {out} {files} && "
-                f"{bindir}/java -cp {out} Main {JDK_SCALE}")
+        # A fatal error's report where the output shows it.
+        errors = "-XX:+ErrorFileToStdout"
+        return (f"{bindir}/javac -J{errors} -d {out} {files} && "
+                f"{bindir}/java {errors} -cp {out} Main {JDK_SCALE}")
 
     ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
                               both(bin_ours, "/tmp/jdksrc", "/tmp/jdkout")]
