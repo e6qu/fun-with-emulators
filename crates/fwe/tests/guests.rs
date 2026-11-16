@@ -3117,7 +3117,8 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node.trace");
     let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg(format!("--strace-file={}", trace.display()))
+    cmd.arg("--strace")
+        .arg(format!("--strace-file={}", trace.display()))
         .arg("--root")
         .arg(&root)
         .arg(root.join("usr/bin/node"))
