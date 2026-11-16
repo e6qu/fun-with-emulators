@@ -191,6 +191,8 @@ pub unsafe fn prepare(
     let len = (len + (addr - start)) & !3;
     // SAFETY: guaranteed by the caller.
     let code = unsafe { std::slice::from_raw_parts_mut(start as *mut u8, len as usize) };
+    // Code a JIT wrote: nothing says where its code is.
+    let jit = known.is_some_and(|r| r.is_empty());
     let known: Option<Vec<(u64, u64)>> = known
         .map(|ranges| {
             ranges
@@ -230,7 +232,8 @@ pub unsafe fn prepare(
     let patched = match replayed {
         Some(p) => p,
         None => {
-            let p = rewrite::patch(code, known.as_deref());
+            let p =
+                if jit { rewrite::patch_jit(code) } else { rewrite::patch(code, known.as_deref()) };
             if let Some(key) = cache
                 && len >= KEEP_FROM
             {

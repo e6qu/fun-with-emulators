@@ -248,9 +248,47 @@ pub fn replay(code: &mut [u8], noted: &[Noted], x18_deferred: usize) -> Option<P
 /// an `x18` instruction is data in practice — a constant table hand-written
 /// assembly keeps among its code — and is left alone.
 pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
+    patch_with(code, known, false)
+}
+
+/// [`patch`] for code a JIT wrote, which comes with nothing saying where
+/// its code is and keeps data among it (HotSpot's code blob headers and
+/// trampolines' addresses, V8's metadata): an `x18` instruction is taken
+/// for one only among instructions ([`among_instructions`]). A pointer or
+/// a small number beside it decodes as no instruction (a pointer's high
+/// half above 4 GiB is a small number), so data that happens to read as
+/// an `x18` instruction is left alone, and code is not.
+pub fn patch_jit(code: &mut [u8]) -> Patched {
+    patch_with(code, None, true)
+}
+
+/// Whether `w` decodes in one of the instruction classes a program's code
+/// is made of: not the reserved class (`udf`, and any small number), the
+/// unallocated ones, or SVE's (which Apple's cores do not have).
+fn instruction_class(w: u32) -> bool {
+    !matches!((w >> 25) & 0xf, 0b0000 | 0b0001 | 0b0010 | 0b0011)
+}
+
+/// Whether word `i` of `words` sits among instructions: the two words on
+/// each side of it that the range holds all decode in an instruction
+/// class. Words past either end of the range are not held against it (the
+/// code goes on in a page not being prepared).
+fn among_instructions(words: &[u32], i: usize) -> bool {
+    (1..=2).all(|n| {
+        (i < n || instruction_class(words[i - n]))
+            && words.get(i + n).is_none_or(|&w| instruction_class(w))
+    })
+}
+
+fn patch_with(code: &mut [u8], known: Option<&[(u64, u64)]>, jit: bool) -> Patched {
     let mut out = Patched::default();
     let words = code.len() / 4;
     let is_code: Vec<bool> = match known {
+        None if jit => {
+            let w: Vec<u32> =
+                code.as_chunks::<4>().0.iter().map(|c| u32::from_le_bytes(*c)).collect();
+            (0..words).map(|i| among_instructions(&w, i)).collect()
+        }
         None => vec![true; words],
         Some(ranges) => {
             let mut v = vec![false; words];
@@ -1258,6 +1296,32 @@ mod tests {
         assert_eq!(p.x18_deferred, 0);
         // The data word is untouched.
         assert_eq!(&code[8..12], &0xd283_0312u32.to_le_bytes());
+    }
+
+    /// In a JIT's code, an `x18` instruction among instructions is one;
+    /// the same word as the low half of a pointer, its high half beside it
+    /// (a small number), is data. Words past the range's ends do not count.
+    #[test]
+    fn jit_code_x18_sites_are_told_from_data_by_their_neighbours() {
+        fn le(ws: &[u32]) -> Vec<u8> {
+            ws.iter().flat_map(|w| w.to_le_bytes()).collect()
+        }
+        const NOP: u32 = 0xd503_201f;
+        // `ldr x0, [x18, #8]`
+        const LDR_X18: u32 = 0xf940_0640;
+        let mut code = le(&[NOP, NOP, LDR_X18, NOP, NOP]);
+        let p = patch_jit(&mut code);
+        assert_eq!(p.sites.len(), 1, "an x18 instruction among instructions");
+        // HotSpot's trampoline: `ldr x8, #8; br x8`, then the address.
+        let mut code = le(&[0x5800_0048, 0xd61f_0100, LDR_X18, 0x0000_0200, NOP, NOP]);
+        let p = patch_jit(&mut code);
+        assert!(p.sites.is_empty(), "a pointer's low half");
+        assert_eq!(&code[8..12], &LDR_X18.to_le_bytes(), "left as it was");
+        // At the start of the range: only what follows counts.
+        let mut code = le(&[LDR_X18, NOP, NOP]);
+        assert_eq!(patch_jit(&mut code).sites.len(), 1, "at the range's start");
+        let mut code = le(&[NOP, NOP, LDR_X18]);
+        assert_eq!(patch_jit(&mut code).sites.len(), 1, "at the range's end");
     }
 
     /// Outside the known code (what the unwind table covers), a word that

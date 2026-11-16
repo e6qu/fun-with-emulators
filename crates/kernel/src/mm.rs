@@ -1095,9 +1095,11 @@ fn jit_dump(addr: u64, len: u64) {
 }
 
 /// The known-code ranges given for memory a guest makes executable after
-/// mapping it (JIT code): none, so `x18` lookalikes there are left alone.
-/// JIT compilers for Linux arm64 do not use `x18` (V8 reserves it), while
-/// their code pages hold data that can look like an instruction naming it.
+/// mapping it (JIT code): none, as nothing says where a JIT's code is. Its
+/// `x18` uses get stubs where they sit among instructions (HotSpot's
+/// compilers use `x18` on Linux), and the data a JIT keeps among its code
+/// (HotSpot's code blob headers, V8's metadata) is left alone, however it
+/// reads (`fwe_native`'s `rewrite::patch_jit`).
 const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
 
 /// The executable sections of the ELF file open at `fd`, as file-offset
@@ -2355,10 +2357,8 @@ impl<P: Platform> Kernel<P> {
                 return last_error();
             }
             // Code made executable after it was mapped is a JIT's, with no
-            // unwind table to tell its code from the data in it (V8 keeps
-            // constant pools and metadata in its code pages), and JITs leave
-            // x18 alone: only its system calls and thread-pointer accesses
-            // are translated (see [`JIT_CODE`]).
+            // unwind table to tell its code from the data in it (see
+            // [`JIT_CODE`]).
             // Only what the file has (a page past its end has nothing to
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
