@@ -1079,6 +1079,21 @@ mod tests {
     }
 }
 
+/// TEMPORARY diagnostic: with `FWE_JIT_DUMP` naming a directory, the
+/// first 2000 JIT pages a process prepares are written there as they were
+/// before preparing (`<pid>-<address>.bin`).
+fn jit_dump(addr: u64, len: u64) {
+    static DUMPED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let Some(dir) = std::env::var_os("FWE_JIT_DUMP") else { return };
+    if DUMPED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 2000 {
+        return;
+    }
+    // SAFETY: memory being prepared: mapped and readable.
+    let bytes = unsafe { std::slice::from_raw_parts(addr as *const u8, len as usize) };
+    let path = std::path::Path::new(&dir).join(format!("{}-{addr:x}.bin", crate::host::pid()));
+    let _ = std::fs::write(path, bytes);
+}
+
 /// The known-code ranges given for memory a guest makes executable after
 /// mapping it (JIT code): none, so `x18` lookalikes there are left alone.
 /// JIT compilers for Linux arm64 do not use `x18` (V8 reserves it), while
@@ -2348,6 +2363,7 @@ impl<P: Platform> Kernel<P> {
             // read, and faults).
             let backed = self.backed_len(addr, self.page_up(len));
             if backed > 0 {
+                jit_dump(a as u64, backed);
                 match self.platform.prepare_exec(a as u64, backed, JIT_CODE, None) {
                     Ok(n) => self.jit_x18_note(a as u64, backed, n),
                     Err(e) => return self.prepare_failed(e),
@@ -2489,6 +2505,7 @@ impl<P: Platform> Kernel<P> {
         }
         if exec {
             let page = addr & !(self.page_size - 1);
+            jit_dump(page, self.page_size);
             match self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
                 Ok(n) => self.jit_x18_note(page, self.page_size, n),
                 Err(e) => {

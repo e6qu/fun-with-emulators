@@ -241,15 +241,22 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: mkdir -p target/tmp/jit-dumps
       - run: cargo test -p fwe --test guests -- alpine_jdk debian_node_runs_a_workload --nocapture
         env:
           FWE_JDK_TESTS: "1"
+          FWE_JIT_DUMP: ${{ github.workspace }}/target/tmp/jit-dumps
       # The calls of each step.
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: jdk-traces
           path: target/tmp/jdk-traces
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit-dumps
+          path: target/tmp/jit-dumps
 
   # The benchmarks (tools/bench/run.py): startup, system calls, threads,
   # fork and exec, and Lua's build, natively on arm64 Linux here (Lua in an

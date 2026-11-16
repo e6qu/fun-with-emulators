@@ -3176,6 +3176,11 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             .env("PATH", format!("{bin}:/usr/bin:/bin"))
             .env("HOME", "/tmp")
             .stdin(Stdio::null());
+        if let Some(d) = std::env::var_os("FWE_JIT_DUMP") {
+            let d = Path::new(&d).join(format!("{}-{name}", step.get()));
+            std::fs::create_dir_all(&d).unwrap();
+            cmd.env("FWE_JIT_DUMP", d);
+        }
         let out = run_bounded_for(cmd, &[], Duration::from_secs(600));
         eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
         jit_x18_summary(name, &trace);
@@ -3303,6 +3308,11 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
+    if let Some(d) = std::env::var_os("FWE_JIT_DUMP") {
+        let d = Path::new(&d).join("node");
+        std::fs::create_dir_all(&d).unwrap();
+        cmd.env("FWE_JIT_DUMP", d);
+    }
     let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
