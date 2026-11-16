@@ -244,17 +244,18 @@ jobs:
         run: |
           set +e
           failed=0
-          for opts in "" "-Xint" "-XX:TieredStopAtLevel=1" "-XX:-TieredCompilation" "-XX:+UseSerialGC" "-XX:+UnlockDiagnosticVMOptions -XX:+VerifyBeforeGC -XX:+VerifyAfterGC" "" ""; do
+          n=0
+          for opts in "-XX:+UseParallelGC" "-XX:ParallelGCThreads=1 -XX:ConcGCThreads=1 -XX:G1ConcRefinementThreads=0" "-Xint -XX:ParallelGCThreads=1 -XX:ConcGCThreads=1" "-Xint" "-Xlog:gc+heap=debug,gc+region=debug,gc+init=debug:stderr" ""; do
+            n=$((n+1))
             echo "=== options: '$opts'"
             FWE_JDK_JAVA_OPTIONS="$opts" cargo test -p fwe --test guests -- alpine_jdk --nocapture > jdk.out 2>&1
             r=$?
-            grep -E "SIGSEGV \(|SIGBUS \(|Problematic|^# +[VJjvC] |test result|Verif|verif|guarantee|assert" jdk.out | head -40
+            grep -E "SIGSEGV \(|SIGBUS \(|Problematic|^# +[VJjvC] |test result|guarantee|assert" jdk.out | head -20
             echo "=== options: '$opts' -> exit $r"
+            [ -d target/tmp/jdk-traces ] && mv target/tmp/jdk-traces "target/tmp/jdk-run-$n" && cp jdk.out "target/tmp/jdk-run-$n/test.out"
             [ $r -ne 0 ] && failed=1
           done
           exit $failed
-        env:
-          FWE_JDK_TESTS: "1"
       - if: always()
         run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== node round $i"; cargo test -p fwe --test guests -- debian_node --nocapture || exit 1; done
       # The calls of each step.
@@ -262,7 +263,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: jdk-traces
-          path: target/tmp/jdk-traces
+          path: target/tmp/jdk-run-*
 
   # The benchmarks (tools/bench/run.py): startup, system calls, threads,
   # fork and exec, and Lua's build, natively on arm64 Linux here (Lua in an

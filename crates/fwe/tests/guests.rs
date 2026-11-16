@@ -5280,10 +5280,12 @@ const PROCSIG: &str = "queued to -1: true\n\
 /// signal, `rt_sigqueueinfo` to -1 refused, signals the moment a child is
 /// forked, core dumps, a clone's own exit signal, a blocked `SIGCHLD` kept
 /// pending at its default action, a child sharing the
-/// memory, the hard CPU limit and an inherited timer slack.
+/// memory, the hard CPU limit and an inherited timer slack. (The CPU limit
+/// waits for its child to have run 2 s, which a machine busy with other
+/// tests gives it slowly.)
 #[test]
 fn process_signals_and_ends() {
-    let out = fwe(&rust_guest("procsig"), &[]);
+    let out = fwe_within(&rust_guest("procsig"), &[], Duration::from_secs(60));
     let expected = PROCSIG.replace("{shared}", "true");
     assert_eq!(stdout(&out), expected, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
