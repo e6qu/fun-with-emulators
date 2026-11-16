@@ -360,7 +360,9 @@ records Linux would:
 - **Ownership:** every guest range (images, stubs, stack, break,
   mappings) is recorded (`fwe_kernel::mm::track`) and removed when
   unmapped; fwe's own memory never is, so `execve` discards exactly the
-  old program.
+  old program. As in Linux's view below, the latest mapping waits beside
+  the set until anything else changes or reads it, so one unmapped at
+  once costs the set a single look.
 - **Linux's view** (`crates/kernel/src/maps.rs`): each successful memory
   call, with the guest's protections and sharing and the file and offset
   mapped; the loaders add the program, its dynamic linker (file-backed as
