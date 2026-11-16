@@ -423,7 +423,12 @@ impl Mem {
         for (a, b) in sorted {
             self.pending.push((generation, a, b - a));
         }
-        let host = window::alloc(len).ok_or(errno::ENOMEM)?;
+        // Right after a translated range's memory where the guest's range
+        // continues it, so the two read as one (a buffer across them is one
+        // host buffer, as Go's heap arenas, mapped side by side, need).
+        let host = uaccess::host_after(addr)
+            .filter(|&h| window::take_fixed(h, len))
+            .map_or_else(|| window::alloc(len).ok_or(errno::ENOMEM), Ok)?;
         uaccess::add_translation(addr, len, host);
         Ok(host)
     }

@@ -1765,7 +1765,8 @@ fn hv_vm_option_runs_a_pie_in_the_vm() {
 }
 
 /// In the VM, an `mmap` hint whose range is free is taken as given, as
-/// Linux takes it (guests/c/mmaphint.c).
+/// Linux takes it, and mappings hinted side by side read as one
+/// (guests/c/mmaphint.c).
 #[test]
 fn hv_mmap_takes_a_free_hint() {
     let prog = build_c_dynamic("mmaphint", Libc::Musl, true);
@@ -1774,7 +1775,7 @@ fn hv_mmap_takes_a_free_hint() {
     cmd.arg("--vm").arg("--root").arg(&root).arg(&prog);
     let out = run_hv(cmd, "mmaphint --vm");
     let _ = std::fs::remove_dir_all(&root);
-    assert_eq!(stdout(&out), "hint: taken, 7 9\n");
+    assert_eq!(stdout(&out), "hint: taken, 7 9\nread across: 6 across\n");
 }
 
 /// Real Debian coreutils: unmodified glibc programs from a Debian rootfs run

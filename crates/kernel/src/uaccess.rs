@@ -92,6 +92,22 @@ pub fn add_translation(guest: u64, len: u64, host: u64) {
     let mut t = table_mut();
     let at = t.partition_point(|x| x.lo < guest);
     t.insert(at, Translation { lo: guest, hi: guest + len, host });
+    // Ranges that continue each other in guest and host memory are one.
+    let mut merged: Vec<Translation> = Vec::with_capacity(t.len());
+    for x in t.iter() {
+        match merged.last_mut() {
+            Some(p) if p.hi == x.lo && p.host + (p.hi - p.lo) == x.host => p.hi = x.hi,
+            _ => merged.push(*x),
+        }
+    }
+    *t = merged;
+}
+
+/// The host address just past the memory of the translated range that
+/// ends at guest address `guest`, if one does: where a range continuing
+/// it would be backed to read as one with it.
+pub fn host_after(guest: u64) -> Option<u64> {
+    table().iter().find(|x| x.hi == guest).map(|x| x.host + (x.hi - x.lo))
 }
 
 /// Guest addresses `[guest, guest + len)` are their own host addresses
