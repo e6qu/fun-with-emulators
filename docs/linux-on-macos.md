@@ -1278,7 +1278,8 @@ type or a short `ucred` is `EINVAL`, a descriptor not open `EBADF`;
 other levels are passed over) and sends every `SCM_RIGHTS` message's
 descriptors, up to Linux's 253 (`EINVAL` past them; the host takes 254),
 as one host message, with `SCM_CREDENTIALS` (see below). On a socket that
-is not a Unix one, descriptors and credentials are `EINVAL`. A receive writes as many descriptors as the
+is not a Unix one, descriptors and credentials are let by and the data
+sent, as Linux's `__sock_cmsg_send` lets them by. A receive writes as many descriptors as the
 guest's buffer holds and closes the others, setting `MSG_CTRUNC`, as
 Linux does (the host installs them all whatever the buffer);
 `MSG_CMSG_CLOEXEC` makes them close-on-exec. A received

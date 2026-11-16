@@ -3133,8 +3133,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
 const HOST_CONTROL: usize = 12 + 4 * 256 + 64;
 
 /// The host control data for the guest's control buffer of a send on
-/// `fd` ([`crate::scm`]). A socket that is not a Unix one takes neither
-/// descriptors nor credentials (`EINVAL`), and passes the rest over.
+/// `fd` ([`crate::scm`]). A socket that is not a Unix one passes none of
+/// it: descriptors and credentials are a Unix socket's, which Linux's
+/// other sockets let by (`__sock_cmsg_send`), sending the data.
 ///
 /// Credentials it gives are checked ([`crate::scm::check_creds`]); a
 /// datagram to a socket that asked for them carries the sender's anyway,
@@ -3151,10 +3152,7 @@ fn send_control(
     }
     let ctl = uaccess::read_bytes(control, (len as usize).min(64 * 1024))?;
     if !is_unix(fd) {
-        return match crate::scm::parse(&ctl) {
-            Ok(o) if !o.fds.is_empty() || o.creds.is_some() => Err(errno::EINVAL),
-            _ => Ok(None),
-        };
+        return Ok(None);
     }
     let out = crate::scm::parse(&ctl)?;
     let creds = match out.creds {
@@ -3872,6 +3870,22 @@ mod udp_option_tests {
         // SAFETY: a valid buffer.
         let n = unsafe { recvfrom(rx as u64, b.as_mut_ptr() as u64, 64, MSG_DONTWAIT, 0, 0) };
         (n >= 0).then(|| b[..n as usize].to_vec())
+    }
+
+    /// Descriptors sent on a socket that is not a Unix one are let by, as
+    /// Linux lets them by: the data goes, none of them with it.
+    #[test]
+    fn rights_on_an_inet_socket_are_let_by() {
+        let (rx, tx, to) = udp_pair();
+        // SAFETY: a valid sockaddr.
+        assert_eq!(unsafe { connect(tx as u64, to.as_ptr() as u64, 16) }, 0);
+        assert_eq!(scm_tests::send_control(tx, &scm_tests::rights(&[0])), 1);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let (r, control, _) = scm_tests::recv_control(rx, 64, MSG_DONTWAIT);
+        assert_eq!(r, 1);
+        assert!(scm_tests::fds_in(&control).is_empty());
+        // SAFETY: the sockets made above.
+        unsafe { (libc::close(rx), libc::close(tx)) };
     }
 
     #[test]
