@@ -248,7 +248,7 @@ pub unsafe fn prepare(
     // A system call's site calls the gate through a stub, where there is
     // one; it is already the trap otherwise.
     let gate = crate::syscall_gate();
-    let all: Vec<(u64, Site)> = patched
+    let mut all: Vec<(u64, Site)> = patched
         .sites
         .iter()
         .filter_map(|&(off, site)| match site {
@@ -257,6 +257,23 @@ pub unsafe fn prepare(
             _ => Some((off, site)),
         })
         .collect();
+    // A JIT's site prepared before, as it is now, has its stub still: its
+    // branch is written back ([`fwe_kernel::jitsites`]).
+    if jit {
+        all.retain(|&(off, _)| {
+            let at = (start + off) as *mut u32;
+            // SAFETY: a word of the range, which is writable.
+            let was = unsafe { at.read() };
+            match fwe_kernel::jitsites::reusable(start + off, was) {
+                Some(now) => {
+                    // SAFETY: as above.
+                    unsafe { at.write(now) };
+                    false
+                }
+                None => true,
+            }
+        });
+    }
     let x18_sites = all.iter().filter(|(_, site)| matches!(site, Site::X18 { .. })).count();
     let mut stats = Prepared {
         syscalls: patched.syscalls,
@@ -351,6 +368,17 @@ pub unsafe fn prepare(
         // all of it.
         // SAFETY: the range is mapped.
         unsafe { flush_icache(start, len) };
+    }
+    // A JIT's words changed, each with what it was: put back whenever the
+    // JIT can write there.
+    if jit {
+        for &(off, was, _) in &patched.noted {
+            // SAFETY: a word of the range.
+            let now = unsafe { ((start + off) as *const u32).read() };
+            if now != was {
+                fwe_kernel::jitsites::record(start + off, was, now);
+            }
+        }
     }
     Ok(stats)
 }

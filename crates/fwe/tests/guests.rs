@@ -3117,17 +3117,23 @@ fn alpine_wine_runs_windows_programs() {
 /// many such instructions, from the notes of a `--strace-file` trace.
 fn jit_x18_summary(what: &str, trace: &Path) {
     let text = std::fs::read_to_string(trace).unwrap_or_default();
-    let (mut pages, mut uses) = (0, 0);
+    let (mut pages, mut uses, mut out) = (0, 0, 0);
     for l in text.lines().filter(|l| l.contains("x18 uses given stubs")) {
         pages += 1;
-        uses += l
+        let counts: Vec<usize> = l
             .rsplit(": ")
             .next()
-            .and_then(|r| r.split(' ').next())
-            .and_then(|n| n.parse::<usize>().ok())
-            .unwrap_or(0);
+            .unwrap_or("")
+            .split(", ")
+            .filter_map(|c| c.split(' ').next()?.parse().ok())
+            .collect();
+        uses += counts.first().copied().unwrap_or(0);
+        out += counts.get(1).copied().unwrap_or(0);
     }
-    eprintln!("{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses");
+    eprintln!(
+        "{what}: JIT code with x18 uses given stubs: {pages} pages, {uses} uses, \
+         {out} branches out of code"
+    );
 }
 
 /// Alpine's OpenJDK 25 (fetched: `guests/alpine/fetch/jdk.txt`): `javac`

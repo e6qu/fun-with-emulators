@@ -328,7 +328,12 @@ pub fn write_exec_writable(addr: u64, page_size: u64) -> bool {
     let rw = libc::PROT_READ | libc::PROT_WRITE;
     // SAFETY: a page of guest memory the guest mapped writable and
     // executable; only its host protections change.
-    unsafe { libc::mprotect(page as *mut libc::c_void, page_size as usize, rw) == 0 }
+    if unsafe { libc::mprotect(page as *mut libc::c_void, page_size as usize, rw) } != 0 {
+        return false;
+    }
+    // Writable, it is the code as the program wrote it.
+    crate::jitsites::restore(page, page_size);
+    true
 }
 
 /// Both `PROT_WRITE` and `PROT_EXEC`.
@@ -2113,6 +2118,7 @@ impl<P: Platform> Kernel<P> {
             let guest = if p == haddr && fixed { addr } else { p };
             // What was owed to the pages replaced goes with them.
             crate::lazycode::unmapped(p, self.page_up(len));
+            crate::jitsites::forget(p, self.page_up(len));
             {
                 let mut r = lock_ranges();
                 add_range(&mut r.guest, p, self.page_up(len));
@@ -2259,6 +2265,7 @@ impl<P: Platform> Kernel<P> {
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
         crate::lazycode::unmapped(addr, self.page_up(len));
+        crate::jitsites::forget(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
         }
@@ -2375,6 +2382,10 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             // Code with writes owed: made writable, they are made first.
             crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
+            // A JIT's code made writable is its code as it wrote it.
+            if final_prot(prot) & libc::PROT_WRITE != 0 {
+                crate::jitsites::restore(a as u64, self.page_up(len));
+            }
         }
         if r == 0 && prot & mman::PROT_EXEC == 0 {
             for &(s, e) in &views {
@@ -2492,10 +2503,31 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Under `--strace`: how many instructions naming `x18` were given
-    /// stubs in JIT code just prepared.
+    /// stubs in JIT code just prepared, and how many branches (not fwe's)
+    /// there lead out of the guest's executable memory.
     fn jit_x18_note(&self, addr: u64, len: u64, n: usize) {
-        if n > 0 {
-            self.tracer.note(&format!("JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs"));
+        if !self.tracer.enabled {
+            return;
+        }
+        let mut out = 0;
+        for at in (addr..addr + len).step_by(4) {
+            // SAFETY: a word of the range just prepared, readable.
+            let w = unsafe { (at as *const u32).read() };
+            if w >> 26 != 0b000101 || crate::jitsites::written(at) == Some(w) {
+                continue;
+            }
+            let imm = (((w & 0x03ff_ffff) << 6) as i32 >> 4) as i64;
+            let to = at.wrapping_add_signed(imm);
+            let code = crate::maps::record()
+                .areas_in(to, to + 4)
+                .iter()
+                .any(|p| p.value.prot & mman::PROT_EXEC != 0);
+            out += usize::from(!code);
+        }
+        if n > 0 || out > 0 {
+            self.tracer.note(&format!(
+                "JIT code at {addr:#x}+{len:#x}: {n} x18 uses given stubs, {out} branches out of code"
+            ));
         }
     }
 
