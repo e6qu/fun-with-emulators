@@ -1764,6 +1764,19 @@ fn hv_vm_option_runs_a_pie_in_the_vm() {
     }
 }
 
+/// In the VM, an `mmap` hint whose range is free is taken as given, as
+/// Linux takes it (guests/c/mmaphint.c).
+#[test]
+fn hv_mmap_takes_a_free_hint() {
+    let prog = build_c_dynamic("mmaphint", Libc::Musl, true);
+    let root = libc_rootfs(Libc::Musl, "vm-mmaphint");
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg("--root").arg(&root).arg(&prog);
+    let out = run_hv(cmd, "mmaphint --vm");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), "hint: taken, 7 9\n");
+}
+
 /// Real Debian coreutils: unmodified glibc programs from a Debian rootfs run
 /// and produce correct output. These are genuine distribution binaries, not
 /// built here — the whole chain (glibc dynamic linking, process startup, file

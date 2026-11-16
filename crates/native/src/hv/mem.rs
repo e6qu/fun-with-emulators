@@ -641,6 +641,14 @@ impl Mem {
                 return err(errno::EEXIST);
             }
             addr
+        } else if addr != 0
+            && addr & (PAGE - 1) == 0
+            && addr.checked_add(len).is_some_and(|e| e <= vm::CODE_VA)
+            && !self.vmas.any(addr, addr + len)
+        {
+            // A hint whose range is free is taken as given, as Linux takes
+            // it (SBCL asks for its spaces where its image expects them).
+            addr
         } else {
             match self.place(len) {
                 Ok(a) => a,

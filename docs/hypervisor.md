@@ -59,7 +59,8 @@ only the guest's own page tables change.
   (`Platform::memory`), which keeps the guest's mappings
   (`crates/kernel/src/vmas.rs`) and edits stage 1. A `MAP_FIXED` mapping
   over slab memory at its own address keeps using that memory, zeroed, so
-  translated ranges stay rare. The framework maps only host memory that
+  translated ranges stay rare; a hint whose range is free is taken as a
+  fixed mapping would be, as Linux takes it. The framework maps only host memory that
   may be written, which a shared mapping of a file opened read-only is
   not: such a segment is made of the same file opened again for writing
   (checked to be the same file; an `mprotect` asking to write fails with
