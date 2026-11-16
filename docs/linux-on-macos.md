@@ -605,8 +605,9 @@ code generated at run time:
   program's own return address in `x30`, so the stack holds only the
   program's addresses. An indirect branch or a return looks its target
   up in a table of translations by program address, `x16` and `x17`
-  saved for the lookup and restored by the translation's first word; a
-  miss traps once and fills the table. Code that is not translated (a
+  saved for the lookup; the translation it reaches checks that the target
+  is its own (an entry can be taken over or dropped while a lookup reads
+  it), then restores them. A miss traps once and fills the table. Code that is not translated (a
   library's, prepared in place) is entered through one stub that leaves
   the target address in `x16`, as the arm64 procedure call standard lets
   a call or return clobber `x16` and `x17`.
@@ -616,7 +617,8 @@ code generated at run time:
   its instruction ran is undone, one stopped after is finished. A system
   call made from a translation is the program's `svc`'s: a tracer stops
   there, a handler's frame holds it, and a restarted call is made again
-  from it.
+  from it. A signal delivered as a thread goes on into a translation
+  gets a frame with the program's state too.
 - **Code that changes.** A page code was translated from is kept from
   being written: a write faults, drops the page's translations (and the
   branches linked into them), and is retried; the code is translated
@@ -626,9 +628,15 @@ code generated at run time:
   others' writes are tried again.
 - **The code cache** is made of 128 MiB chunks (what a branch reaches),
   each one memory mapped twice, writable for fwe and executable for the
-  threads that run it; a full chunk is followed by a new one, and a
-  branch between chunks is not linked. A fork child maps its executable
-  views again from its own copies of the writable ones.
+  threads that run it; a branch between chunks is not linked. When a
+  chunk is full and at least half of the cache holds translations
+  dropped since it was last emptied, the cache is emptied: every other
+  thread is stopped, and the translations a thread may still be in or
+  return into (any its registers, the stack it is on, or a system call's
+  way back points into) are kept aside, their branches unlinked; the
+  rest is reused, and the code is translated again as it runs. Otherwise
+  a new chunk follows. A fork child maps its executable views again from
+  its own copies of the writable ones.
 
 ### CTR_EL0: emulated when it traps
 
@@ -2941,7 +2949,9 @@ fwe's own traps rather than faults the guest should see:
 | `SIGSEGV`/`SIGBUS` writing a page code was translated from | its translations dropped, the write retried | nothing |
 | `SIGTRAP` at a translation's way out (told by the syndrome's `brk` immediate) | on at the target's translation, the branch linked | nothing |
 | `SIGBUS` for an access the page's protection forbids (macOS reports some so) | turned into Linux's signal for it | `SIGSEGV` |
-| `SIGBUS` for an access the protection allows (past a mapped file's end) | kept | `SIGBUS` |
+| `SIGSEGV`/`SIGBUS` for an access the page allows now (another thread changed its protection, or mapped it, after the fault) | the access tried again; again only if a mapping or protection changed since | nothing |
+| `SIGBUS` for an access the protection allows that faults again with nothing changed (past a mapped file's end) | kept | `SIGBUS` |
+| `SIGSEGV`/`SIGBUS` whose syndrome is no abort of the interrupted instruction (left pending by macOS while another signal was delivered) | dropped: the instruction faults again if it still does when it runs | nothing |
 | a fault signal with a note from another fwe process | a sent signal, not a fault | that signal, with its sender |
 | a fault in fwe's checked copy of guest memory | the copy stops at its recovery point | the call fails with `EFAULT` |
 | a fault in fwe's own code anywhere else | fatal | the process dies of that signal |

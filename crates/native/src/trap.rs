@@ -541,6 +541,13 @@ fn settle(regs: &mut Regs) {
     if thread::deliverable() != 0
         && let Some(k) = kernel().as_mut()
     {
+        // Going on in a translation (a way out's target): a handler's frame
+        // holds the guest's state, as at the instruction it stands for, not
+        // fwe's code, which may be gone when the handler returns.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if crate::jit::in_cache(regs.pc) {
+            crate::jit::to_guest(regs);
+        }
         k.deliver_pending(regs);
     }
 }
@@ -1010,31 +1017,46 @@ fn fault_signal(host: libc::c_int) -> u64 {
     }
 }
 
-/// The Linux signal of host fault `host` at `addr` (`esr` its syndrome):
-/// macOS reports an access the page's protection forbids, on some
-/// mappings, as `SIGBUS`, which Linux reports as `SIGSEGV` (keeping
-/// `SIGBUS` for memory past a mapped file's end, whose protection allows
-/// the access).
-fn linux_fault_signal(host: libc::c_int, addr: u64, esr: u32) -> u64 {
-    let sig = fault_signal(host);
-    #[cfg(target_os = "macos")]
-    if host == libc::SIGBUS
-        && let Some(r) = fwe_kernel::mm::region::query(addr).filter(|r| r.start <= addr)
-    {
-        let class = (esr >> 26) & 0x3f;
-        let needed = if class == ESR_EC_INSTRUCTION_ABORT_LOWER {
-            libc::PROT_EXEC
-        } else if esr & (1 << 6) != 0 {
-            libc::PROT_WRITE
-        } else {
-            libc::PROT_READ
-        };
-        if r.protection & needed == 0 {
-            return fwe_abi::signal::SIGSEGV;
-        }
+/// The Linux signal of host fault `host`, whose access the page's
+/// protection allowed (`allowed`, read once for the fault) or not: macOS
+/// reports an access the protection forbids, on some mappings, as
+/// `SIGBUS`, which Linux reports as `SIGSEGV` (keeping `SIGBUS` for memory
+/// past a mapped file's end, whose protection allows the access).
+fn linux_fault_signal(host: libc::c_int, allowed: bool) -> u64 {
+    if host == libc::SIGBUS && !allowed {
+        return fwe_abi::signal::SIGSEGV;
     }
-    let _ = (addr, esr);
-    sig
+    fault_signal(host)
+}
+
+/// Whether the host's protection of the page at `addr` allows the access
+/// whose syndrome is `esr`.
+fn allowed_now(addr: u64, esr: u32) -> bool {
+    let Some(r) = fwe_kernel::mm::region::query(addr).filter(|r| r.start <= addr) else {
+        return false;
+    };
+    let needed = if (esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER {
+        libc::PROT_EXEC
+    } else if esr & (1 << 6) != 0 {
+        libc::PROT_WRITE
+    } else {
+        libc::PROT_READ
+    };
+    r.protection & needed == needed
+}
+
+thread_local! {
+    /// The address of the fault this thread last tried again as allowed,
+    /// and [`fwe_kernel::mm::protection_changes`] then.
+    static RETRIED: Cell<(u64, u64)> = const { Cell::new((0, u64::MAX)) };
+}
+
+/// A fault at `addr` that the page allows now is tried again, unless it is
+/// the one this thread last tried again and no mapping or protection has
+/// changed since.
+fn stale_fault(addr: u64) -> bool {
+    let now = (addr, fwe_kernel::mm::protection_changes());
+    RETRIED.with(|r| r.replace(now)) != now
 }
 
 /// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
@@ -1105,6 +1127,32 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if let Some(note) = fwe_kernel::signote::take(sig) {
         take_async(sig, || host::sent_info(note), ctx, guest_interrupted(ctx));
         return;
+    }
+    // A fault signal whose syndrome is no abort of the instruction it
+    // interrupts was left pending by the host: a thread's instruction
+    // faulted as another signal was being delivered to it, and this one
+    // came once the handler unblocked signals, somewhere else (in fwe's
+    // code, or the guest's handler). The instruction runs again when its
+    // thread gets back to it, and faults again if it still does, as if the
+    // other signal had come just before it. One another process sent is a
+    // signal for the guest.
+    if matches!(sig, libc::SIGSEGV | libc::SIGBUS) {
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let esr = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).es.esr };
+        if !matches!((esr >> 26) & 0x3f, 0x20 | 0x21 | 0x22 | 0x24 | 0x25 | 0x26) {
+            // SAFETY: `info` is valid for SA_SIGINFO handlers.
+            if unsafe { (*info).si_code } > 0 && unsafe { (*info).si_code } < 0x10000 {
+                return;
+            }
+            // SAFETY: `info` is valid for SA_SIGINFO handlers.
+            take_async(
+                sig,
+                || unsafe { host::signal_info(sig, info) },
+                ctx,
+                guest_interrupted(ctx),
+            );
+            return;
+        }
     }
     let in_guest = guest_interrupted(ctx);
     if in_guest {
@@ -1211,6 +1259,14 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if sig == libc::SIGSEGV && !exec && kernel().as_mut().is_some_and(|k| k.stack_fault(addr)) {
         return;
     }
+    // An access the page allows now: another thread changed its protection
+    // (or mapped it) after this one faulted, so it is tried again; one that
+    // faults again with nothing changed meanwhile (memory past a mapped
+    // file's end) stands.
+    let allowed = allowed_now(addr, mc.es.esr);
+    if allowed && !fwe_kernel::mm::poisoned(addr) && stale_fault(addr) {
+        return;
+    }
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
@@ -1234,7 +1290,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     let lsig = if fwe_kernel::mm::poisoned(addr) {
         fwe_abi::signal::SIGBUS
     } else {
-        linux_fault_signal(sig, addr, mc.es.esr)
+        linux_fault_signal(sig, allowed)
     };
     let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr));
     if delivered {
@@ -1425,6 +1481,8 @@ pub fn install_thread_altstack() {
 /// Install the per-thread signal stack and the process-wide handlers for
 /// running guest code (called once on the main thread).
 pub fn install_handlers() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::jit::configure();
     install_thread_altstack();
     install(libc::SIGTRAP, on_sigtrap);
     for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {

@@ -24,7 +24,9 @@
 //!   the program's addresses, as its unwinders and stack walkers expect.
 //!   An indirect branch or return looks its target up in a table of
 //!   translations by program address ([`TABLE`]), saving `x16` and `x17`
-//!   for it; the translation's first word restores them. Code that is not
+//!   for it; the translation checks the target is its own (an entry can be
+//!   taken over or dropped as a lookup reads it) and restores them. A
+//!   dropped entry leads to a retry stub, back to fwe. Code that is not
 //!   the program's run-time code (a library's, prepared in place) is
 //!   entered through one stub, which leaves the target's address in
 //!   `x16`: the arm64 procedure call standard lets a call or return
@@ -39,8 +41,11 @@
 //! The code cache is made of chunks, each one memory mapped twice: fwe
 //! writes translations through a writable view while threads run others
 //! from an executable one. A chunk is no larger than a branch reaches, so
-//! blocks in one chunk are linked to each other; a full chunk is followed
-//! by a new one.
+//! blocks in one chunk are linked to each other. A full chunk is followed
+//! by a new one, or, where at least half of the cache is translations
+//! dropped since, the cache is emptied ([`flush`]): every other thread is
+//! stopped, the blocks a thread may be in or return into are retired, and
+//! the rest of the room is reused.
 
 use crate::rewrite::{self, Site};
 use fwe_kernel::Regs;
@@ -68,12 +73,33 @@ static CHUNK_COUNT: AtomicU64 = AtomicU64::new(0);
 /// Whether `pc` is in fwe's code cache, cheaply (every system call asks).
 pub fn in_cache(pc: u64) -> bool {
     let n = CHUNK_COUNT.load(Ordering::Acquire) as usize;
-    CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < CACHE_SIZE)
+    let size = chunk_size();
+    CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < size)
 }
 
-/// A code cache chunk's size: what a branch reaches, so blocks in one chunk
-/// can be linked to each other. A full chunk is followed by another.
-const CACHE_SIZE: u64 = 128 << 20;
+/// The largest code cache chunk: what a branch reaches, so blocks in one
+/// chunk can be linked to each other.
+const MAX_CHUNK: u64 = 128 << 20;
+/// A chunk's size: [`MAX_CHUNK`], or less where `FWE_JIT_CHUNK` (bytes)
+/// says, so tests can fill the cache.
+static CHUNK_SIZE: AtomicU64 = AtomicU64::new(MAX_CHUNK);
+
+fn chunk_size() -> u64 {
+    CHUNK_SIZE.load(Ordering::Relaxed)
+}
+
+/// Read `FWE_JIT_CHUNK`, before any code runs by translation.
+pub fn configure() {
+    let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
+    let size: u64 = v
+        .to_str()
+        .and_then(|v| v.parse().ok())
+        .filter(|&n: &u64| (64 << 10..=MAX_CHUNK).contains(&n) && n.is_multiple_of(page_size()))
+        .unwrap_or_else(|| {
+            panic!("FWE_JIT_CHUNK: {v:?} is no size in bytes, a multiple of the page size, from 64 KiB to 128 MiB")
+        });
+    CHUNK_SIZE.store(size, Ordering::Relaxed);
+}
 /// Room left in a chunk below which the next block goes in a new one: the
 /// most a block's translation takes.
 const BLOCK_ROOM: u64 = 4 * 64 * 24;
@@ -116,6 +142,10 @@ enum Exit {
     /// A `cbz`/`cbnz`/`tbz`/`tbnz` of `x18`: `insn` decides between its
     /// target and the next instruction, by the program's `x18`.
     TestX18 { insn: u32, taken: u64, next: u64 },
+    /// A lookup that came to the wrong block (its entry was taken over or
+    /// dropped as it read it), or to the retry stub: on to the address in
+    /// `x16`, the program's `x16` and `x17` on the stack.
+    Retry,
 }
 
 /// What one word of a translation stands for: how a thread stopped there
@@ -125,9 +155,6 @@ enum Word {
     /// The program's instruction at this address, or the start of its
     /// expansion: the program's state is as at it.
     At(u64),
-    /// A block's first word, entered from a lookup: `x16` and `x17` still
-    /// saved on the stack.
-    Entry(u64),
     /// Inside an expansion of the program's instruction at `g` that
     /// started at `start`, before the instruction ran: undone (the
     /// registers it saved restored, `sp` as it was), it is as at `g`.
@@ -158,13 +185,29 @@ struct Block {
     words: Vec<Word>,
     /// The branches linked straight to it, to undo if it goes.
     linked: Vec<u64>,
+    /// Its translation's size in bytes.
+    len: u64,
+    /// Where a direct branch enters it: past the check and restore a
+    /// lookup enters through.
+    body: u64,
+    /// Kept when the cache was emptied, as a thread may still be in it or
+    /// return into it: found by no lookup, and its ways out not linked.
+    retired: bool,
 }
 
 /// The code cache: chunks, each one memory mapped twice.
 struct Cache {
     chunks: Vec<Chunk>,
-    /// The stub into code not translated.
+    /// The chunk new translations go in.
+    current: usize,
+    /// The stub into code not translated, at the first chunk's start.
     stub: u64,
+    /// Bytes of translations in use, and of those dropped (written over,
+    /// unmapped) or retired, whose room is had back by emptying the cache.
+    live: u64,
+    garbage: u64,
+    /// Times the cache was emptied.
+    flushes: u64,
 }
 
 /// A chunk of the code cache: its writable view and its executable one.
@@ -172,7 +215,12 @@ struct Chunk {
     rw: u64,
     rx: u64,
     used: u64,
+    /// Holds retired translations: nothing new goes in it.
+    retired: bool,
 }
+
+/// Bytes at the first chunk's start that hold the stub.
+const STUB_ROOM: u64 = 16;
 
 pub struct State {
     /// Program memory whose code runs by translation: start -> end.
@@ -221,6 +269,7 @@ static TRANSLATED: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 static ENTERED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// What [`TRANSLATED`] and the others counted, if any code ran by
 /// translation.
@@ -229,10 +278,11 @@ pub fn counts() -> Option<String> {
     (t > 0).then(|| {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe, {} entries by fetch, \
-             {} pages' translations dropped by writes",
+             {} pages' translations dropped by writes, the code cache emptied {} times",
             EXITS.load(Ordering::Relaxed),
             ENTERED.load(Ordering::Relaxed),
-            DROPPED.load(Ordering::Relaxed)
+            DROPPED.load(Ordering::Relaxed),
+            FLUSHES.load(Ordering::Relaxed)
         )
     })
 }
@@ -266,9 +316,15 @@ fn publish(g: u64, t: u64) {
 fn unpublish(g: u64, t: u64) {
     let e = entry(g);
     if e[0].load(Ordering::Acquire) == g && e[1].load(Ordering::Acquire) == t {
+        // A lookup that read the key before this reads the retry stub, not
+        // a translation that may go.
+        e[1].store(RETRY.load(Ordering::Relaxed), Ordering::Release);
         e[0].store(0, Ordering::Release);
     }
 }
+
+/// The retry stub's address ([`new_cache`]).
+static RETRY: AtomicU64 = AtomicU64::new(0);
 
 impl State {
     fn in_region(&self, addr: u64) -> bool {
@@ -278,7 +334,8 @@ impl State {
     /// Write `w` at `at` in the cache (its executable address).
     fn patch(&self, at: u64, w: u32) {
         let c = self.cache.as_ref().expect("a code cache");
-        let k = c.chunks.iter().find(|k| (k.rx..k.rx + CACHE_SIZE).contains(&at)).expect("a chunk");
+        let k =
+            c.chunks.iter().find(|k| (k.rx..k.rx + chunk_size()).contains(&at)).expect("a chunk");
         // SAFETY: a word of the cache, through its writable view.
         unsafe { ((at - k.rx + k.rw) as *mut u32).write_volatile(w) };
         // SAFETY: the word, in the executable view.
@@ -302,6 +359,11 @@ impl State {
                 if self.by_g.get(&g) == Some(&i) {
                     self.by_g.remove(&g);
                     unpublish(g, t);
+                    let len = self.blocks[i].len;
+                    if let Some(c) = self.cache.as_mut() {
+                        c.live -= len;
+                        c.garbage += len;
+                    }
                     // Branches linked to it trap again.
                     for at in std::mem::take(&mut self.blocks[i].linked) {
                         self.patch(at, EXIT);
@@ -394,7 +456,7 @@ pub fn forked(s: &mut State) {
                 mach::mach_vm_remap(
                     task,
                     &mut rx,
-                    CACHE_SIZE,
+                    chunk_size(),
                     0,
                     mach::VM_FLAGS_FIXED_OVERWRITE,
                     task,
@@ -408,7 +470,7 @@ pub fn forked(s: &mut State) {
             );
             assert_eq!(rx, k.rx);
             assert_eq!(
-                mach::mach_vm_protect(task, rx, CACHE_SIZE, 0, libc::PROT_READ | libc::PROT_EXEC),
+                mach::mach_vm_protect(task, rx, chunk_size(), 0, libc::PROT_READ | libc::PROT_EXEC),
                 0
             );
         }
@@ -478,8 +540,17 @@ pub fn written(addr: u64) -> bool {
 pub fn exit(regs: &mut Regs) -> bool {
     let mut s = state();
     let at = regs.pc;
-    let Some(Word::Out { exit, .. }) = word_at(&s, at) else { return false };
+    let exit = match word_at(&s, at) {
+        Some(Word::Out { exit, .. }) => exit,
+        // The retry stub: an entry dropped as a lookup read it.
+        Some(Word::Static(3)) => Exit::Retry,
+        _ => return false,
+    };
     EXITS.fetch_add(1, Ordering::Relaxed);
+    // A retired block's ways out are not linked: its room is had back once
+    // nothing is in it, and a link from it would outlive it.
+    let from_retired = block_at(&s, at).is_some_and(|i| s.blocks[i].retired);
+    let flushes = s.cache.as_ref().map_or(0, |c| c.flushes);
     let (to, link_here) = match exit {
         Exit::Jump(to) => (to, true),
         Exit::Reg { n, link } => {
@@ -491,6 +562,16 @@ pub fn exit(regs: &mut Regs) -> bool {
         }
         Exit::TestX18 { insn, taken, next } => {
             (if test_taken(insn, regs.x[18]) { taken } else { next }, false)
+        }
+        Exit::Retry => {
+            let to = regs.x[16];
+            let sp = regs.sp;
+            // SAFETY: the stack the lookup saved the program's `x16` and
+            // `x17` on.
+            let saved = |off: u64| unsafe { ((sp + off) as *const u64).read() };
+            (regs.x[16], regs.x[17]) = (saved(0), saved(8));
+            regs.sp += 16;
+            (to, false)
         }
     };
     if !s.in_region(to) {
@@ -504,8 +585,14 @@ pub fn exit(regs: &mut Regs) -> bool {
     }
     let i = translation(&mut s, to);
     let into = body(&s, i);
-    // Linked where the target is in reach (in the same chunk).
-    if link_here && let Some(b) = rewrite::branch(at, into) {
+    // Linked where the target is in reach (in the same chunk), unless the
+    // cache was emptied meanwhile (`at` may be reused).
+    let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
+    if link_here
+        && same
+        && !from_retired
+        && let Some(b) = rewrite::branch(at, into)
+    {
         s.patch(at, b);
         s.blocks[i].linked.push(at);
     }
@@ -536,7 +623,6 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
         | Word::Undo { g, .. }
         | Word::Finish { g }
         | Word::Lookup { g, .. } => Some(g),
-        Word::Entry(g) => Some(g),
         Word::Static(_) => None,
     }
 }
@@ -551,12 +637,13 @@ pub fn to_guest(regs: &mut Regs) -> bool {
     // SAFETY: the stack below which fwe's code saved registers.
     let stack = |off: u64| unsafe { (sp.wrapping_add(off) as *const u64).read() };
     match w {
-        Word::At(g) | Word::Out { g, .. } => regs.pc = g,
-        Word::Entry(g) => {
+        Word::Out { exit: Exit::Retry, .. } => {
+            let to = regs.x[16];
             (regs.x[16], regs.x[17]) = (stack(0), stack(8));
             regs.sp += 16;
-            regs.pc = g;
+            regs.pc = to;
         }
+        Word::At(g) | Word::Out { g, .. } => regs.pc = g,
         Word::Undo { g, start } => {
             undo(regs, start);
             regs.pc = g;
@@ -583,7 +670,8 @@ pub fn to_guest(regs: &mut Regs) -> bool {
             // `sp` once the stub has moved it back).
             let to = regs.x[16];
             match k {
-                0 => {
+                // The stub's start, and the retry stub's way out.
+                0 | 3 => {
                     (regs.x[16], regs.x[17]) = (stack(0), stack(8));
                     regs.sp += 16;
                 }
@@ -601,11 +689,17 @@ pub fn to_guest(regs: &mut Regs) -> bool {
 
 fn word_at(s: &State, pc: u64) -> Option<Word> {
     let c = s.cache.as_ref()?;
-    if (c.stub..c.stub + 12).contains(&pc) {
+    if (c.stub..c.stub + STUB_ROOM).contains(&pc) {
         return Some(Word::Static(((pc - c.stub) / 4) as u8));
     }
+    let i = block_at(s, pc)?;
+    s.blocks[i].words.get(((pc - s.blocks[i].t) / 4) as usize).copied()
+}
+
+/// The block whose translation holds `pc`.
+fn block_at(s: &State, pc: u64) -> Option<usize> {
     let (&t, &i) = s.by_t.range(..=pc).next_back()?;
-    s.blocks[i].words.get(((pc - t) / 4) as usize).copied()
+    (pc < t + s.blocks[i].len).then_some(i)
 }
 
 /// Undo an expansion's words from `start` up to `regs.pc`: each register
@@ -668,7 +762,7 @@ fn finish(regs: &mut Regs) {
 /// Where a direct branch enters block `i`: past the word that restores
 /// what a lookup saved.
 fn body(s: &State, i: usize) -> u64 {
-    s.blocks[i].t + 4
+    s.blocks[i].body
 }
 
 /// The translation of program address `g`, made if there is none.
@@ -681,14 +775,25 @@ fn translation(s: &mut State, g: u64) -> usize {
     }
     // The page is kept from writes before it is read: a write after this
     // faults and drops the translation, one before it is in what is read.
+    // (Room is made first: emptying the cache lifts every guard.)
     let page = g & !(page_size() - 1);
-    guard(s, page);
     let at = cache_next(s);
-    let (words, info) = translate(g, at);
+    guard(s, page);
+    let (words, info, entry) = translate(g, at);
     let t = emit(s, &words);
+    let len = 4 * words.len() as u64;
+    s.cache.as_mut().expect("a code cache").live += len;
     let i = s.blocks.len();
     s.pages.entry(page).or_default().push(i);
-    s.blocks.push(Block { g, t, words: info, linked: Vec::new() });
+    s.blocks.push(Block {
+        g,
+        t,
+        words: info,
+        linked: Vec::new(),
+        len,
+        body: t + 4 * entry as u64,
+        retired: false,
+    });
     s.by_g.insert(g, i);
     s.by_t.insert(t, i);
     publish(g, t);
@@ -747,6 +852,13 @@ mod mach {
             inherit: u32,
         ) -> i32;
         pub fn mach_vm_protect(task: u32, addr: u64, size: u64, set_max: i32, prot: i32) -> i32;
+        pub fn mach_vm_read_overwrite(
+            task: u32,
+            addr: u64,
+            size: u64,
+            data: u64,
+            out: *mut u64,
+        ) -> i32;
     }
     pub const VM_FLAGS_FIXED: i32 = 0;
     pub const VM_FLAGS_ANYWHERE: i32 = 1;
@@ -762,12 +874,12 @@ fn new_chunk() -> Chunk {
     // SAFETY: fresh memory in this task, mapped twice.
     unsafe {
         let task = mach::mach_task_self_;
-        assert_eq!(mach::mach_vm_allocate(task, &mut rw, CACHE_SIZE, mach::VM_FLAGS_ANYWHERE), 0);
+        assert_eq!(mach::mach_vm_allocate(task, &mut rw, chunk_size(), mach::VM_FLAGS_ANYWHERE), 0);
         assert_eq!(
             mach::mach_vm_remap(
                 task,
                 &mut rx,
-                CACHE_SIZE,
+                chunk_size(),
                 0,
                 mach::VM_FLAGS_ANYWHERE,
                 task,
@@ -780,7 +892,7 @@ fn new_chunk() -> Chunk {
             0
         );
         assert_eq!(
-            mach::mach_vm_protect(task, rx, CACHE_SIZE, 0, libc::PROT_READ | libc::PROT_EXEC),
+            mach::mach_vm_protect(task, rx, chunk_size(), 0, libc::PROT_READ | libc::PROT_EXEC),
             0
         );
     }
@@ -788,7 +900,7 @@ fn new_chunk() -> Chunk {
     assert!(n < MAX_CHUNKS, "fwe's code cache is full");
     CHUNK_RX[n].store(rx, Ordering::Relaxed);
     CHUNK_COUNT.store(n as u64 + 1, Ordering::Release);
-    Chunk { rw, rx, used: 0 }
+    Chunk { rw, rx, used: 0, retired: false }
 }
 
 /// The code cache, its stub into code not translated, and the table.
@@ -807,29 +919,165 @@ fn new_cache() -> Cache {
             "fwe's translation table's place ({TABLE:#x}) is taken"
         );
     }
-    let mut c = Cache { chunks: vec![new_chunk()], stub: 0 };
-    // `ldr x17, [sp, #8]; add sp, sp, #16; br x16`
-    c.stub = write(&mut c, &[0xf940_07f1, 0x9100_43ff, 0xd61f_0200]);
+    let mut c =
+        Cache { chunks: vec![new_chunk()], current: 0, stub: 0, live: 0, garbage: 0, flushes: 0 };
+    // Into code not translated: `ldr x17, [sp, #8]; add sp, sp, #16;
+    // br x16`; then the retry stub, a dropped entry's value: fwe's trap.
+    c.stub = write(&mut c, &[0xf940_07f1, 0x9100_43ff, 0xd61f_0200, EXIT]);
+    c.chunks[0].used = STUB_ROOM;
+    RETRY.store(c.stub + 12, Ordering::Relaxed);
     c
 }
 
-/// Where the next block goes: in the last chunk, or a new one where that
-/// lacks room for the largest block.
+/// Where the next block goes: in the current chunk while it has room for
+/// the largest block; else, the cache is emptied where at least half of it
+/// is dropped translations, and the block goes in a chunk with room, or a
+/// new one.
 fn cache_next(s: &mut State) -> u64 {
-    let c = s.cache.as_mut().expect("a code cache");
-    if c.chunks.last().is_none_or(|k| k.used + BLOCK_ROOM > CACHE_SIZE) {
-        c.chunks.push(new_chunk());
+    let room = |k: &Chunk| !k.retired && k.used + BLOCK_ROOM <= chunk_size();
+    let c = s.cache.as_ref().expect("a code cache");
+    if !room(&c.chunks[c.current]) {
+        if c.garbage >= c.live {
+            flush(s);
+        }
+        let c = s.cache.as_mut().expect("a code cache");
+        match c.chunks.iter().position(room) {
+            Some(k) => c.current = k,
+            None => {
+                c.chunks.push(new_chunk());
+                c.current = c.chunks.len() - 1;
+            }
+        }
     }
-    let k = c.chunks.last().expect("a chunk");
+    let c = s.cache.as_ref().expect("a code cache");
+    let k = &c.chunks[c.current];
     k.rx + k.used
 }
 
-/// Write `words` at the last chunk's next free place (8-byte aligned, as
-/// a system call's stub needs for its literal): their executable address.
+/// Words a flush reads of memory at a time.
+const SCAN_PIECE: usize = 2048;
+/// How far above a stopped thread's `sp` a flush looks: past the deepest
+/// stack fwe's code runs on (a signal stack, a gate stack).
+const SCAN_STACK: u64 = 2 << 20;
+
+/// Empty the code cache (every other thread stopped), but for the blocks a
+/// thread may be in or return into: any whose translation a thread's
+/// registers, the stack it is on, or a gate block (a call's way back)
+/// points into. Those are retired, their ways out unlinked; the room of
+/// every other block is had back, and their code translated again as it
+/// runs.
+fn flush(s: &mut State) {
+    let mut pinned = vec![false; s.blocks.len()];
+    let gates = crate::gate::blocks();
+    let mut buf = vec![0u64; SCAN_PIECE];
+    let stopped = {
+        let st: &State = s;
+        let mut mark = |v: u64| {
+            if in_cache(v)
+                && let Some(i) = block_at(st, v)
+            {
+                pinned[i] = true;
+            }
+        };
+        let stopped = crate::quiesce::stop_others(&mut |regs| {
+            for &r in &regs[..33] {
+                mark(r);
+            }
+            scan(regs[31], SCAN_STACK, &mut buf, &mut mark);
+        });
+        for &b in &gates {
+            scan(b, std::mem::size_of::<crate::gate::Block>() as u64, &mut buf, &mut mark);
+        }
+        stopped
+    };
+    let old = std::mem::take(&mut s.blocks);
+    let in_pinned = |s: &State, at: u64| {
+        s.by_t.range(..=at).next_back().is_some_and(|(&t, &i)| at < t + old[i].len && pinned[i])
+    };
+    for (&g, &i) in &s.by_g {
+        unpublish(g, old[i].t);
+    }
+    // No branch from a retired block leads into the room had back.
+    for b in &old {
+        for &at in &b.linked {
+            if in_pinned(s, at) {
+                s.patch(at, EXIT);
+            }
+        }
+    }
+    let mut kept = 0;
+    s.by_t.clear();
+    s.by_g.clear();
+    s.pages.clear();
+    for (i, b) in old.into_iter().enumerate() {
+        if pinned[i] {
+            kept += b.len;
+            s.by_t.insert(b.t, s.blocks.len());
+            s.blocks.push(Block { linked: Vec::new(), retired: true, ..b });
+        }
+    }
+    // Nothing is translated from the program's pages now.
+    let pages = std::mem::take(&mut s.guarded);
+    for (p, prot) in pages {
+        // SAFETY: a page of the program's memory fwe kept from writes; it
+        // gets the protections it had back.
+        unsafe { libc::mprotect(p as *mut libc::c_void, page_size() as usize, prot) };
+        *s.lifted.entry(p).or_default() += 1;
+    }
+    let size = chunk_size();
+    let blocks = &s.blocks;
+    let c = s.cache.as_mut().expect("a code cache");
+    for (n, k) in c.chunks.iter_mut().enumerate() {
+        k.retired = blocks.iter().any(|b| (k.rx..k.rx + size).contains(&b.t));
+        if !k.retired {
+            k.used = if n == 0 { STUB_ROOM } else { 0 };
+        }
+    }
+    c.live = 0;
+    c.garbage = kept;
+    c.flushes += 1;
+    FLUSHES.fetch_add(1, Ordering::Relaxed);
+    drop(stopped);
+}
+
+/// Pass each 8-byte word of `[from, from + len)` that can be read to
+/// `mark`, reading through the host's copy of this task's memory (which
+/// reports a hole rather than fault) a piece at a time; stops at the first
+/// piece that cannot be read. Takes no lock and allocates nothing.
+fn scan(from: u64, len: u64, buf: &mut [u64], mark: &mut impl FnMut(u64)) {
+    let piece = 8 * buf.len() as u64;
+    let end = from.saturating_add(len);
+    let mut at = from & !7;
+    while at < end {
+        let n = ((at / piece + 1) * piece).min(end) - at;
+        let mut out = 0u64;
+        // SAFETY: copying `n` bytes (at most `piece`) into `buf`.
+        let r = unsafe {
+            mach::mach_vm_read_overwrite(
+                mach::mach_task_self_,
+                at,
+                n,
+                buf.as_mut_ptr() as u64,
+                &mut out,
+            )
+        };
+        if r != 0 || out != n {
+            return;
+        }
+        for &w in &buf[..(n / 8) as usize] {
+            mark(w);
+        }
+        at += n;
+    }
+}
+
+/// Write `words` at the current chunk's next free place (8-byte aligned,
+/// as a system call's stub needs for its literal): their executable
+/// address.
 fn write(c: &mut Cache, words: &[u32]) -> u64 {
-    let k = c.chunks.last_mut().expect("a chunk");
+    let k = &mut c.chunks[c.current];
     let len = 4 * words.len() as u64;
-    assert!(k.used + len <= CACHE_SIZE, "a block larger than the room kept for one");
+    assert!(k.used + len <= chunk_size(), "a block larger than the room kept for one");
     let off = k.used;
     for (i, &w) in words.iter().enumerate() {
         // SAFETY: inside the chunk's writable view.
@@ -854,19 +1102,42 @@ fn read(g: u64) -> u32 {
 /// Translate the block at program address `g`, to be placed at `t`: its
 /// words, and what each stands for. A block ends at its page's end, so it
 /// is made from that page alone.
-fn translate(g: u64, t: u64) -> (Vec<u32>, Vec<Word>) {
-    let mut out: Vec<u32> = vec![RESTORE];
-    let mut info: Vec<Word> = vec![Word::Entry(g)];
+fn translate(g: u64, t: u64) -> (Vec<u32>, Vec<Word>, usize) {
+    // Entered from a lookup with the target in `x16`, the program's `x16`
+    // and `x17` on the stack: the target is checked to be this block's (a
+    // lookup can read an entry another thread is taking over), then they
+    // are restored. A direct branch enters past them.
+    let entered = Word::Lookup { g, link: None, committed: true };
+    let mut out: Vec<u32> = Vec::new();
+    materialize(17, g, &mut out);
+    out.push(CHECK);
+    let wrong_at = out.len();
+    out.push(MISS);
+    out.push(RESTORE);
+    let mut info: Vec<Word> = vec![entered; out.len()];
+    let entry = out.len();
+    body_of(g, t, &mut out, &mut info);
+    // The wrong block's way out.
+    let wrong = out.len();
+    out[wrong_at] |= ((wrong - wrong_at) as u32) << 5;
+    out.push(EXIT);
+    info.push(Word::Out { g, exit: Exit::Retry });
+    (out, info, entry)
+}
+
+/// The instructions of the block at program address `g`, translated onto
+/// `out` (the block placed at `t`).
+fn body_of(g: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) {
     let page = page_size();
     let mut pc = g;
     for _ in 0..BLOCK_INSNS {
         let w = read(pc);
-        let ended = one(w, pc, t, &mut out, &mut info);
+        let ended = one(w, pc, t, out, info);
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
         if ended {
-            return (out, info);
+            return;
         }
         if pc & (page - 1) == 0 {
             break;
@@ -874,7 +1145,6 @@ fn translate(g: u64, t: u64) -> (Vec<u32>, Vec<Word>) {
     }
     out.push(EXIT);
     info.push(Word::Out { g: pc, exit: Exit::Jump(pc) });
-    (out, info)
 }
 
 /// Translate the program's instruction `w` at `pc` into `out`, the block

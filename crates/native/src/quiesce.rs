@@ -1,5 +1,6 @@
-//! Stopping the guest's other threads for the instant a host `fork` copies
-//! memory, so the child sees one instant of the process as on Linux.
+//! Stopping the guest's other threads: for the instant a host `fork` copies
+//! memory, so the child sees one instant of the process as on Linux, and
+//! while fwe's code cache is emptied ([`stop_others`]).
 //!
 //! A host `fork` on macOS copies the address space while the parent's other
 //! threads keep running, so a thread writing two words in turn can leave
@@ -32,8 +33,9 @@ struct Slot {
 /// Every slot handed out. Slots are never freed, only reused.
 static SLOTS: Mutex<Vec<&'static Slot>> = Mutex::new(Vec::new());
 
-/// A fork is copying memory: threads wait before entering guest code.
-static FORKING: AtomicBool = AtomicBool::new(false);
+/// A fork is copying memory, or the code cache is being emptied: threads
+/// wait before entering guest code.
+static STOPPED: AtomicBool = AtomicBool::new(false);
 
 thread_local! {
     static MINE: Cell<Option<&'static Slot>> = const { Cell::new(None) };
@@ -95,11 +97,11 @@ pub fn enter() {
     let Some(slot) = MINE.get() else { return };
     loop {
         slot.in_guest.store(true, SeqCst);
-        if !FORKING.load(SeqCst) {
+        if !STOPPED.load(SeqCst) {
             return;
         }
         slot.in_guest.store(false, SeqCst);
-        while FORKING.load(SeqCst) {
+        while STOPPED.load(SeqCst) {
             std::thread::yield_now();
         }
     }
@@ -117,11 +119,11 @@ pub fn enter_at(slot: u64) {
     let slot = unsafe { &*(slot as *const Slot) };
     loop {
         slot.in_guest.store(true, SeqCst);
-        if !FORKING.load(SeqCst) {
+        if !STOPPED.load(SeqCst) {
             return;
         }
         slot.in_guest.store(false, SeqCst);
-        while FORKING.load(SeqCst) {
+        while STOPPED.load(SeqCst) {
             std::thread::yield_now();
         }
     }
@@ -152,11 +154,60 @@ pub fn forget_current() {
 
 /// Wait until suspended thread `port` is off the CPU: Mach reads a thread's
 /// state only once it has stopped.
-fn wait_stopped(port: u32) {
-    let mut state = [0u32; ARM_THREAD_STATE64_COUNT as usize];
+fn wait_stopped(port: u32) -> [u64; 34] {
+    let mut state = [0u64; 34];
     let mut count = ARM_THREAD_STATE64_COUNT;
-    // SAFETY: `state` has room for `count` words.
-    unsafe { thread_get_state(port, ARM_THREAD_STATE64, state.as_mut_ptr(), &mut count) };
+    // SAFETY: `state` has room for `count` 32-bit words.
+    unsafe { thread_get_state(port, ARM_THREAD_STATE64, state.as_mut_ptr().cast(), &mut count) };
+    state
+}
+
+/// Every other guest thread, stopped by [`stop_others`]: those that were in
+/// guest code stay stopped until this is dropped; none enters guest code
+/// before then.
+pub struct Stopped {
+    ports: Vec<u32>,
+    _slots: std::sync::MutexGuard<'static, Vec<&'static Slot>>,
+}
+
+impl Drop for Stopped {
+    fn drop(&mut self) {
+        STOPPED.store(false, SeqCst);
+        for &port in &self.ports {
+            // SAFETY: resuming a thread `stop_others` suspended.
+            unsafe { thread_resume(port) };
+        }
+    }
+}
+
+/// Stop every other guest thread, and pass each one's registers
+/// (`ARM_THREAD_STATE64`: `x0`-`x28`, `fp`, `lr`, `sp`, `pc`, `cpsr`) to
+/// `visit` while it is stopped. A thread in fwe's code goes on once
+/// visited (it may hold a lock `visit`'s caller needs later, `malloc`'s
+/// say) but waits before it enters guest code again; one in guest code
+/// stays stopped. `visit` runs with threads stopped that may hold any of
+/// fwe's or the host libraries' locks: it must take none, nor allocate.
+pub fn stop_others(visit: &mut dyn FnMut(&[u64; 34])) -> Stopped {
+    let me = mine();
+    let slots = slots();
+    let mut ports = Vec::with_capacity(slots.len());
+    STOPPED.store(true, SeqCst);
+    for slot in slots.iter().filter(|s| !std::ptr::eq(**s, me)) {
+        let port = slot.port.load(SeqCst);
+        // SAFETY: a thread of this task, registered in its slot (the slot
+        // lock keeps it from being freed meanwhile).
+        if port == 0 || unsafe { thread_suspend(port) } != 0 {
+            continue;
+        }
+        visit(&wait_stopped(port));
+        if slot.in_guest.load(SeqCst) {
+            ports.push(port);
+        } else {
+            // SAFETY: resuming the thread suspended above.
+            unsafe { thread_resume(port) };
+        }
+    }
+    Stopped { ports, _slots: slots }
 }
 
 /// Run `fork` (a host `fork`) with every other thread that is running guest
@@ -165,7 +216,7 @@ fn wait_stopped(port: u32) {
 pub fn fork_stopped(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     let me = mine();
     let slots = slots();
-    FORKING.store(true, SeqCst);
+    STOPPED.store(true, SeqCst);
     let mut stopped = Vec::new();
     for slot in slots.iter().filter(|s| !std::ptr::eq(**s, me)) {
         let port = slot.port.load(SeqCst);
@@ -183,7 +234,7 @@ pub fn fork_stopped(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         }
     }
     let pid = fork();
-    FORKING.store(false, SeqCst);
+    STOPPED.store(false, SeqCst);
     if pid == 0 {
         for slot in slots.iter() {
             slot.in_guest.store(false, SeqCst);

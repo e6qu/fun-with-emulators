@@ -7,7 +7,7 @@ use crate::{Kernel, MemCall, Platform};
 use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The program break: a reserved region after the executable image that
 /// `brk` commits and releases.
@@ -272,6 +272,22 @@ pub fn forked_child() {
             }
         }
     }
+}
+
+/// Calls that change mappings or protections, each counted as it starts
+/// and as it ends: a thread whose access faulted, but which the page's
+/// protection now allows, can tell whether another thread changed it
+/// meanwhile (the access is then tried again) from a fault that stands.
+static PROTECTION_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`PROTECTION_CHANGES`].
+pub fn count_protection_change() {
+    PROTECTION_CHANGES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// See [`PROTECTION_CHANGES`]. Async-signal-safe.
+pub fn protection_changes() -> u64 {
+    PROTECTION_CHANGES.load(Ordering::SeqCst)
 }
 
 /// The host's page size.

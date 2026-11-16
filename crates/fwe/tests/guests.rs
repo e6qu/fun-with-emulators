@@ -979,6 +979,41 @@ fn jit_code_runs_as_the_program_wrote_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code interrupted everywhere (guests/c/jitstorm.c): signals, faults
+/// and writes to its page landing while worker threads run every kind of
+/// instruction a translation expands leave each round's result as a quiet
+/// run's; and again with a code cache small enough to be emptied while
+/// they run.
+#[test]
+fn jit_code_survives_signals_faults_and_writes() {
+    let prog = build_c("jitstorm", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitstorm");
+    for chunk in [None, Some("65536")] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+        if let Some(c) = chunk {
+            cmd.env("FWE_JIT_CHUNK", c);
+        }
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let counts = err.lines().filter(|l| l.contains("JIT code:")).collect::<Vec<_>>();
+        eprintln!("--- chunk {chunk:?}: {counts:?}");
+        assert_eq!(
+            stdout(&out),
+            "storm: 40 of 40 rounds right\nstorm: signals landed, faults landed\n",
+            "chunk {chunk:?}, stderr:\n{err}"
+        );
+        assert_eq!(out.status.code(), Some(0));
+        if chunk.is_some() {
+            assert!(
+                counts.iter().any(|l| !l.contains("emptied 0 times")),
+                "the code cache was never emptied: {counts:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Real dynamic linking, minimal case: a PIE with its own `_start` that calls
 /// `write` and `_exit` resolved from a genuine musl shared libc. This drives
 /// the real musl dynamic linker end to end — it maps and self-relocates,

@@ -88,6 +88,15 @@ pub fn block() -> Option<&'static Block> {
     (!p.is_null()).then(|| unsafe { &*p })
 }
 
+/// Every block's address, for fwe's code cache to look in when it is
+/// emptied (a call made from a translation returns into it).
+static BLOCKS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// The addresses of every block made in this process.
+pub fn blocks() -> Vec<u64> {
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 /// Give this thread a block and gate stack, if it has none yet (a forked
 /// child keeps its parent thread's, a copy). Its guest code calls the gate
 /// from now on.
@@ -109,6 +118,7 @@ pub fn ensure_block() {
             0,
         );
         assert_ne!(p, libc::MAP_FAILED, "allocating the gate stack failed");
+        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(p as u64);
         let b = p as *mut Block;
         (*b).stack = p as u64 + size as u64;
         libc::pthread_setspecific(key(), p);

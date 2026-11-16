@@ -253,8 +253,12 @@ The pieces:
   guest state it stands for (`Word`), so a fault or signal there is
   delivered as at the guest's instruction (`jit::to_guest`). A page
   translated from is write-protected before it is read; a write drops
-  its translations and the links into them. `fork` holds the
-  translator's lock, and the child maps its executable views again.
+  its translations and the links into them. A full code cache is emptied
+  with every other thread stopped (`quiesce::stop_others`): the blocks
+  that a thread's registers, the stack its `sp` is in, or a gate block
+  point into are retired (kept, found by no lookup, their branches
+  unlinked), and the other chunks reused. `fork` holds the translator's
+  lock, and the child maps its executable views again.
 - `crates/kernel/src/prepcache.rs` keeps, in fwe's private directory and
   by a file's identity (device, inode, size, modification time), its
   sections' and unwind table's code ranges and, for each mapped code range
@@ -1541,8 +1545,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - Native: code made executable at run time costs a fault the first time
   each block runs, and a write to a page it was translated from drops its
   translations, which are made again as the code runs: slow for code that
-  writes and runs one page often. Translations are not freed; the code
-  cache grows by chunks.
+  writes and runs one page often.
 - VM: a private file mapping is a copy of the file when mapped, so later
   writes to the file do not show; a shared segment cannot grow with
   `mremap`, and `MREMAP_FIXED`/`MREMAP_DONTUNMAP` are refused (`EINVAL`).

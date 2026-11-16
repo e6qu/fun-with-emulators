@@ -271,6 +271,20 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn dispatch(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        // Counted before and after, for a fault to tell whether protections
+        // changed while it was taken ([`crate::mm::protection_changes`]).
+        let memory = changes_mappings(n);
+        if memory {
+            crate::mm::count_protection_change();
+        }
+        let r = self.dispatch_counted(n, a);
+        if memory {
+            crate::mm::count_protection_change();
+        }
+        r
+    }
+
+    fn dispatch_counted(&mut self, n: u64, a: [u64; 6]) -> i64 {
         // Limits another process set for this one take effect now.
         if crate::procreg::take_limits_left() {
             self.take_pending_limits();
@@ -4060,6 +4074,23 @@ fn is_dir_fd(fd: i32) -> bool {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR }
+}
+
+/// Whether call `n` may change which memory is mapped, or how.
+fn changes_mappings(n: u64) -> bool {
+    matches!(
+        n,
+        nr::MMAP
+            | nr::MUNMAP
+            | nr::MPROTECT
+            | nr::PKEY_MPROTECT
+            | nr::MREMAP
+            | nr::MADVISE
+            | nr::BRK
+            | nr::SHMAT
+            | nr::SHMDT
+            | nr::REMAP_FILE_PAGES
+    )
 }
 
 #[cfg(test)]
