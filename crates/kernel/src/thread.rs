@@ -60,16 +60,19 @@ pub fn init_main(pid: i32) {
     // number.
     crate::procreg::forget_end(crate::host::pid());
     forget_published();
-    // The calling thread's own set goes with the registry: what landed in
-    // it is moved to the process's, and a handler meanwhile posts there.
-    let early: Vec<(u64, SigInfo)> = with_own(|p| {
-        (1..=signal::NSIG)
-            .flat_map(|s| std::iter::from_fn(move || p.take(s)).map(move |i| (s, i)))
-            .collect()
-    });
-    HOT.with(|h| h.own.set(std::ptr::null()));
-    for (s, i) in early {
-        PROCESS.post(s, i);
+    // The calling thread's own set goes with the registry: handlers post
+    // to the process's from now on, and what landed in it before is moved
+    // there (none lands in it while it is emptied).
+    let own = HOT.with(|h| h.own.replace(std::ptr::null()));
+    std::sync::atomic::compiler_fence(Ordering::SeqCst);
+    if !own.is_null() {
+        // SAFETY: the registry, cleared below, still holds the set.
+        let own = unsafe { &*own };
+        for s in 1..=signal::NSIG {
+            while let Some(i) = own.take(s) {
+                PROCESS.post(s, i);
+            }
+        }
     }
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // The parent's threads are none of the child's.
