@@ -724,6 +724,44 @@ def breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total):
     print(f"{name}: host libraries: {'; '.join(named)}", file=sys.stderr)
 
 
+def callers(name, cmd, funcs):
+    """The call stacks into the host library functions `funcs` (pairs of
+    library and function, DTrace's pid-provider patterns) while `cmd` (one
+    fwe process) runs, most frequent first, named by DTrace from the
+    process it holds."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.callers")
+    proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    # Probes are put in fwe once it is running (after `env`'s exec too).
+    proc.stdin.write(b"\n")
+    proc.stdin.flush()
+    for _ in range(200):
+        if proc_name(proc.pid) == "fwe":
+            break
+        time.sleep(0.005)
+    probes = " ".join(f'pid$target:{lib}:{f}:entry {{ @s["{f}", ustack(12)] = count(); }}'
+                      for lib, f in funcs)
+    tracer = subprocess.run(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p",
+                             str(proc.pid), "-n", probes + ' END { printa("%s %@d%k\\n", @s); }',
+                             "-o", out],
+                            capture_output=True, text=True, errors="replace", timeout=600)
+    proc.wait(timeout=600)
+    if not os.path.exists(out):
+        print(f"{name}: no callers: {tracer.stdout.strip()[-400:]}", file=sys.stderr)
+        return
+    with open(out, errors="replace") as f:
+        text = f.read()
+    # Each stack: a line of the function and count, its frames, a blank.
+    shown = 0
+    for chunk in text.split("\n\n"):
+        lines = [l.strip() for l in chunk.strip().splitlines() if l.strip()]
+        if len(lines) < 2 or shown >= 12:
+            continue
+        print(f"{name}: into {lines[0]}: {' < '.join(lines[1:])[:1500]}", file=sys.stderr)
+        shown += 1
+
+
 def pcs(name, cmd, share=False, execname="fwe"):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
@@ -1031,6 +1069,14 @@ def jdk(a, fwe, guest_env, results):
     javac = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "javac"),
                                "-d", "/tmp/jdkout"] + [f"/tmp/jdksrc/{f}" for f in sources]
     pcs("JDK javac", javac)
+    shutil.rmtree(ours_out, ignore_errors=True)
+    os.makedirs(ours_out)
+    try:
+        callers("JDK javac", javac, [("libsystem_platform.dylib", "_platform_strncmp*"),
+                                     ("libsystem_kernel.dylib", "__getpid"),
+                                     ("libsystem_kernel.dylib", "__sigpending")])
+    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+        print(f"JDK javac: no callers: {e!r}", file=sys.stderr)
 
     # And natively, for what the same work costs the host's kernel.
     shutil.rmtree(theirs_out, ignore_errors=True)
