@@ -130,6 +130,9 @@ MICRO = [
     ("stat", ["file", "stat", "100000"], "ns"),
     ("open+close", ["file", "open", "50000"], "ns"),
     ("mmap+munmap", ["file", "mmap", "50000"], "ns"),
+    # A fault the program's own handler steps past (a JIT's implicit null
+    # check), there and back.
+    ("SIGSEGV handled", ["fault", "50000"], "us"),
 ]
 
 

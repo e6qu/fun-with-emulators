@@ -16,10 +16,19 @@
  *                        (4 KiB at offset 0), stat (of its path), open
  *                        (open + close), mmap (64 KiB anonymous, mapped and
  *                        unmapped); nanoseconds per call
+ *   bench fault N        N loads through a null pointer, each a SIGSEGV
+ *                        (or macOS's SIGBUS) its handler steps past, as a
+ *                        JIT's implicit null checks are; microseconds each
  *   bench exit           returns at once (for startup time)
  */
 #include <fcntl.h>
 #include <pthread.h>
+#include <signal.h>
+#ifdef __APPLE__
+#include <sys/ucontext.h>
+#else
+#include <ucontext.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -64,6 +73,21 @@ static void *par(void *arg) {
     close(fds[0]);
     close(fds[1]);
     return arg;
+}
+
+static volatile long faults;
+
+/* A fault's handler: on past the faulting load. */
+static void step_past(int sig, siginfo_t *si, void *ctx) {
+    (void)sig;
+    (void)si;
+    ucontext_t *uc = ctx;
+#ifdef __APPLE__
+    uc->uc_mcontext->__ss.__pc += 4;
+#else
+    uc->uc_mcontext.pc += 4;
+#endif
+    faults++;
 }
 
 int main(int argc, char **argv) {
@@ -116,6 +140,22 @@ int main(int argc, char **argv) {
             }
         }
         printf("%.1f\n", (now_ns() - start) / n / 1e3);
+    } else if (strcmp(argv[1], "fault") == 0) {
+        struct sigaction sa;
+        memset(&sa, 0, sizeof sa);
+        sa.sa_sigaction = step_past;
+        sa.sa_flags = SA_SIGINFO;
+        sigaction(SIGSEGV, &sa, NULL);
+        sigaction(SIGBUS, &sa, NULL);
+        start = now_ns();
+        for (long i = 0; i < n; i++) {
+            /* One load, through a register holding 0. */
+            __asm__ volatile("mov x10, #0\n ldr x9, [x10]" ::: "x9", "x10", "memory");
+        }
+        if (faults != n) {
+            return 1;
+        }
+        printf("%.2f\n", (now_ns() - start) / n / 1e3);
     } else if (strcmp(argv[1], "thread") == 0) {
         for (long i = 0; i < n; i++) {
             pthread_t t;
