@@ -96,6 +96,9 @@ fn chunk_size() -> u64 {
 pub fn configure() {
     install();
     reserve_table();
+    if let Some(n) = std::env::var("FWE_JIT_AHEAD").ok().and_then(|v| v.parse().ok()) {
+        AHEAD.store(n, Ordering::Relaxed);
+    }
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -652,12 +655,7 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
     // Called from code fwe prepared in place (`blr xN` before `lr`): that
     // site looks its targets up from now on, as a translation does.
     let site = lr.wrapping_sub(4);
-    if lr != pc
-        && !off("FWE_JIT_NO_CALL_SITES")
-        && !s.call_sites.contains(&site)
-        && !s.in_region(site)
-        && followable(site)
-    {
+    if lr != pc && !s.call_sites.contains(&site) && !s.in_region(site) && followable(site) {
         // (Read as the host copies: `lr` may be anything.)
         if let Some(w) = crate::trap::read_host::<u32>(site)
             && w & 0xffff_fc1f == 0xd63f_0000
@@ -816,8 +814,7 @@ fn exit_now(regs: &mut Regs) -> bool {
             Exit::Reg { n: 30, link: None } => s.returns.contains(&to),
             _ => true,
         }
-        && followable(to)
-        && !off("FWE_JIT_NO_FOLLOW");
+        && followable(to);
     if !s.in_region(to) && !follow {
         if link_here {
             EXITS_DIRECT_OUT.fetch_add(1, Ordering::Relaxed);
@@ -1136,7 +1133,9 @@ fn translation_one(s: &mut State, g: u64) -> usize {
 }
 
 /// Most blocks translated ahead of their first run for one translation.
-const AHEAD: usize = 16;
+/// TEMPORARY: `FWE_JIT_AHEAD` sets it, to measure in CI (removed before
+/// merge).
+static AHEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
 
 /// Translate ahead the blocks block `i` branches to directly in its own
 /// page, and theirs, up to [`AHEAD`]: each is linked as it is made, so the
@@ -1160,7 +1159,7 @@ fn ahead(s: &mut State, i: usize) {
             .filter(|&to| to & !(page_size() - 1) == page && to & 3 == 0)
             .collect();
         for to in targets {
-            if made == AHEAD {
+            if made == AHEAD.load(Ordering::Relaxed) {
                 return;
             }
             if s.by_g.contains_key(&to) {
@@ -1445,12 +1444,6 @@ fn veneer(s: &mut State, to: u64) -> usize {
 /// Whether program address `to` holds code fwe prepared in place that a
 /// translation may follow into: in an executable mapping of the program's,
 /// and not a stub of fwe's.
-/// TEMPORARY (bisecting a JDK crash in CI; removed before merge): whether
-/// the variable `name` turns a mechanism off.
-fn off(name: &str) -> bool {
-    std::env::var_os(name).is_some()
-}
-
 fn followable(to: u64) -> bool {
     !in_cache(to)
         && crate::prepare::stub_region(to).is_none()

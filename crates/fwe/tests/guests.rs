@@ -3619,7 +3619,7 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             .env("FWE_TIMING", "1")
             .stdin(Stdio::null());
         // TEMPORARY: fwe's own switches, to bisect in CI.
-        for v in ["FWE_JIT_NO_FOLLOW", "FWE_JIT_NO_CALL_SITES"] {
+        for v in ["FWE_JIT_AHEAD"] {
             if let Some(x) = std::env::var_os(v) {
                 cmd.env(v, x);
             }
