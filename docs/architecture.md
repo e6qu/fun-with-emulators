@@ -274,6 +274,10 @@ sees, is in
 
 - **Entry:** a fetch from it faults; `on_fault` asks `jit::enter`, which
   translates the block at the address and resumes the thread in it. A
+  new block's direct ways out are linked to targets already translated,
+  and ways out waiting for it to it (`jit::link_waiting`); the blocks it
+  branches to in its own page are translated ahead, up to 16
+  (`jit::ahead`), so most branches never take the trap. A
   block is at most 64 instructions, ends at a branch out, at an `isb` and
   at its page's end, so it is made from one page.
 - **The code cache** is chunks of 128 MiB (a branch's reach), each mapped
