@@ -845,49 +845,80 @@ pub fn written(addr: u64) -> bool {
 }
 
 /// The bytes general-register store `w` writes, given the registers
-/// (`reg`, with `sp` as 31): its address and each register's value and
-/// size, in order. A store fwe makes for the program: one with no base
-/// register written back (`str`, `strb`, `strh` with an unsigned or
-/// unscaled immediate or a register offset; `stp` with a signed offset).
+/// (`reg`, with `sp` as 31) ([`Store`]). A store fwe makes for the
+/// program: `str`, `strb`, `strh` with an immediate (unsigned, unscaled,
+/// or with its base written back before or after) or a register offset;
+/// `stp` with a signed offset or its base written back; `stlr`,
+/// `stlrb`, `stlrh` and their `stllr` forms.
 fn store_of(w: u32, reg: &impl Fn(usize) -> u64) -> Option<Store> {
     let rt = (w & 31) as usize;
     let rn = ((w >> 5) & 31) as usize;
     let data = |r: usize| if r == 31 { 0 } else { reg(r) };
     let base = reg(rn);
-    // str (unsigned immediate), stur, str (register)
-    if w & 0x3fc0_0000 == 0x3900_0000
-        || w & 0x3fe0_0c00 == 0x3800_0000
-        || w & 0x3fe0_0c00 == 0x3820_0800
-    {
-        let log = u64::from(w >> 30);
-        let offset = if w & 0x3fc0_0000 == 0x3900_0000 {
-            u64::from((w >> 10) & 0xfff) << log
-        } else if w & 0x0020_0000 == 0 {
-            ((((w >> 12) & 0x1ff) as i64) << 55 >> 55) as u64
-        } else {
-            let rm = reg_or_zero(((w >> 16) & 31) as usize, reg);
-            let v = match (w >> 13) & 7 {
-                0b010 => rm & 0xffff_ffff,
-                0b110 => (rm as i32) as i64 as u64,
-                0b011 | 0b111 => rm,
-                _ => return None,
-            };
-            if w & (1 << 12) != 0 { v << log } else { v }
-        };
-        return Some((base.wrapping_add(offset), vec![(data(rt), 1 << log)]));
+    let at = |addr: u64, parts: Vec<(u64, u64)>| Store { addr, parts, back: None, release: false };
+    // Base written back: the address before (post-index) or after
+    // (pre-index) adding the offset; the base becomes the sum.
+    let indexed = |offset: i64, pre: bool, parts: Vec<(u64, u64)>| {
+        let sum = base.wrapping_add(offset as u64);
+        Store { addr: if pre { sum } else { base }, parts, back: Some((rn, sum)), release: false }
+    };
+    let log = u64::from(w >> 30);
+    let imm9 = ((((w >> 12) & 0x1ff) as i64) << 55) >> 55;
+    // str (unsigned immediate)
+    if w & 0x3fc0_0000 == 0x3900_0000 {
+        let offset = u64::from((w >> 10) & 0xfff) << log;
+        return Some(at(base.wrapping_add(offset), vec![(data(rt), 1 << log)]));
     }
-    // stp (signed offset), of w or x registers
-    if w & 0x7fc0_0000 == 0x2900_0000 {
+    // stur
+    if w & 0x3fe0_0c00 == 0x3800_0000 {
+        return Some(at(base.wrapping_add(imm9 as u64), vec![(data(rt), 1 << log)]));
+    }
+    // str (immediate), post-index (bit 11 clear) or pre-index
+    if w & 0x3fe0_0400 == 0x3800_0400 {
+        return Some(indexed(imm9, w & (1 << 11) != 0, vec![(data(rt), 1 << log)]));
+    }
+    // str (register)
+    if w & 0x3fe0_0c00 == 0x3820_0800 {
+        let rm = reg_or_zero(((w >> 16) & 31) as usize, reg);
+        let v = match (w >> 13) & 7 {
+            0b010 => rm & 0xffff_ffff,
+            0b110 => (rm as i32) as i64 as u64,
+            0b011 | 0b111 => rm,
+            _ => return None,
+        };
+        let offset = if w & (1 << 12) != 0 { v << log } else { v };
+        return Some(at(base.wrapping_add(offset), vec![(data(rt), 1 << log)]));
+    }
+    // stp of w or x registers: signed offset, post-index, pre-index
+    let pair = w & 0x7e40_0000;
+    if pair == 0x2800_0000 && w & 0x0180_0000 != 0 {
         let size = if w >> 31 != 0 { 8 } else { 4 };
         let imm = ((((w >> 15) & 0x7f) as i64) << 57 >> 57) * size as i64;
         let rt2 = ((w >> 10) & 31) as usize;
-        return Some((base.wrapping_add(imm as u64), vec![(data(rt), size), (data(rt2), size)]));
+        let parts = vec![(data(rt), size), (data(rt2), size)];
+        return Some(match (w >> 23) & 3 {
+            0b10 => at(base.wrapping_add(imm as u64), parts),
+            0b01 => indexed(imm, false, parts),
+            _ => indexed(imm, true, parts),
+        });
+    }
+    // stlr, stllr (bit 15 clear), of each size
+    if w & 0x3fff_7c00 == 0x089f_7c00 {
+        return Some(Store { release: true, ..at(base, vec![(data(rt), 1 << log)]) });
     }
     None
 }
 
-/// A store's address, and each register's value and size, in order.
-type Store = (u64, Vec<(u64, u64)>);
+/// A store [`store_of`] reads: its address, each register's value and
+/// size in order, the base register written back and its new value, and
+/// whether it is a release (`stlr`).
+#[derive(Debug, PartialEq)]
+struct Store {
+    addr: u64,
+    parts: Vec<(u64, u64)>,
+    back: Option<(usize, u64)>,
+    release: bool,
+}
 
 /// Register `r`'s value, 0 for 31 (the zero register, as an offset).
 fn reg_or_zero(r: usize, reg: &impl Fn(usize) -> u64) -> u64 {
@@ -902,7 +933,13 @@ fn reg_or_zero(r: usize, reg: &impl Fn(usize) -> u64) -> u64 {
 /// and its translations stay but for those of the bytes written (an
 /// instruction patched). The caller goes on past the store. Any other
 /// store is [`written`]'s.
-pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
+pub fn store(
+    far: u64,
+    esr: u32,
+    w: u32,
+    reg: impl Fn(usize) -> u64,
+    mut set: impl FnMut(usize, u64),
+) -> bool {
     const EC_DATA_ABORT_LOWER: u32 = 0x24;
     let permission_write = esr >> 26 == EC_DATA_ABORT_LOWER
         && esr & (1 << 6) != 0 // WnR
@@ -917,7 +954,8 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
         STORES_LEFT[why].fetch_add(1, Ordering::Relaxed);
         false
     };
-    let Some((addr, parts)) = store_of(w, &reg).filter(|_| !names_x18) else {
+    let Some(Store { addr, parts, back, release }) = store_of(w, &reg).filter(|_| !names_x18)
+    else {
         undecoded(w);
         return left(0);
     };
@@ -952,6 +990,10 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     if *made > STORES_KEPT {
         return left(2);
     }
+    if release {
+        // What the thread wrote before is seen first.
+        std::sync::atomic::fence(Ordering::SeqCst);
+    }
     for (value, size) in parts {
         // SAFETY: `at` is in the page's writable mapping, `size` bytes of
         // it within the page; the program's mapping allows the write.
@@ -980,6 +1022,9 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
         for i in hit {
             s.drop_block(i, true);
         }
+    }
+    if let Some((r, v)) = back {
+        set(r, v);
     }
     true
 }
@@ -2322,21 +2367,56 @@ mod tests {
     #[test]
     fn stores_fwe_makes_are_read_from_their_instructions() {
         // Encodings from the assembler.
-        let cases: [(u32, &str, Option<Store>); 13] = [
-            (0xf900_0841, "str x1, [x2, #16]", Some((0x210, vec![(0x100, 8)]))),
-            (0x3900_0c41, "strb w1, [x2, #3]", Some((0x203, vec![(0x100, 1)]))),
-            (0x7900_0fe1, "strh w1, [sp, #6]", Some((0x9006, vec![(0x100, 2)]))),
-            (0xb900_0041, "str w1, [x2]", Some((0x200, vec![(0x100, 4)]))),
-            (0xf81f_8041, "stur x1, [x2, #-8]", Some((0x1f8, vec![(0x100, 8)]))),
-            (0xf823_7841, "str x1, [x2, x3, lsl #3]", Some((0x1a00, vec![(0x100, 8)]))),
-            (0xb823_c841, "str w1, [x2, w3, sxtw]", Some((0x500, vec![(0x100, 4)]))),
-            (0xa93f_0c41, "stp x1, x3, [x2, #-16]", Some((0x1f0, vec![(0x100, 8), (0x300, 8)]))),
-            (0x2901_7fe1, "stp w1, wzr, [sp, #8]", Some((0x9008, vec![(0x100, 4), (0, 4)]))),
-            (0xf900_0c5f, "str xzr, [x2, #24]", Some((0x218, vec![(0, 8)]))),
-            // Written back, or not a general register's: not made by fwe.
-            (0xf800_8c41, "str x1, [x2, #8]!", None),
-            (0xa881_0c41, "stp x1, x3, [x2], #16", None),
+        let at =
+            |addr: u64, parts: Vec<(u64, u64)>| Store { addr, parts, back: None, release: false };
+        let back = |addr: u64, parts: Vec<(u64, u64)>, r: usize, v: u64| Store {
+            back: Some((r, v)),
+            ..at(addr, parts)
+        };
+        let release =
+            |addr: u64, parts: Vec<(u64, u64)>| Store { release: true, ..at(addr, parts) };
+        let cases: [(u32, &str, Option<Store>); 26] = [
+            (0xf900_0841, "str x1, [x2, #16]", Some(at(0x210, vec![(0x100, 8)]))),
+            (0x3900_0c41, "strb w1, [x2, #3]", Some(at(0x203, vec![(0x100, 1)]))),
+            (0x7900_0fe1, "strh w1, [sp, #6]", Some(at(0x9006, vec![(0x100, 2)]))),
+            (0xb900_0041, "str w1, [x2]", Some(at(0x200, vec![(0x100, 4)]))),
+            (0xf81f_8041, "stur x1, [x2, #-8]", Some(at(0x1f8, vec![(0x100, 8)]))),
+            (0xf823_7841, "str x1, [x2, x3, lsl #3]", Some(at(0x1a00, vec![(0x100, 8)]))),
+            (0xb823_c841, "str w1, [x2, w3, sxtw]", Some(at(0x500, vec![(0x100, 4)]))),
+            (0xa93f_0c41, "stp x1, x3, [x2, #-16]", Some(at(0x1f0, vec![(0x100, 8), (0x300, 8)]))),
+            (0x2901_7fe1, "stp w1, wzr, [sp, #8]", Some(at(0x9008, vec![(0x100, 4), (0, 4)]))),
+            (0xf900_0c5f, "str xzr, [x2, #24]", Some(at(0x218, vec![(0, 8)]))),
+            // The base written back.
+            (0xf800_8c41, "str x1, [x2, #8]!", Some(back(0x208, vec![(0x100, 8)], 2, 0x208))),
+            (0xb800_4441, "str w1, [x2], #4", Some(back(0x200, vec![(0x100, 4)], 2, 0x204))),
+            (0x381f_fc41, "strb w1, [x2, #-1]!", Some(back(0x1ff, vec![(0x100, 1)], 2, 0x1ff))),
+            (0x7800_27e1, "strh w1, [sp], #2", Some(back(0x9000, vec![(0x100, 2)], 31, 0x9002))),
+            (
+                0xa881_0c41,
+                "stp x1, x3, [x2], #16",
+                Some(back(0x200, vec![(0x100, 8), (0x300, 8)], 2, 0x210)),
+            ),
+            (
+                0x29bf_0c41,
+                "stp w1, w3, [x2, #-8]!",
+                Some(back(0x1f8, vec![(0x100, 4), (0x300, 4)], 2, 0x1f8)),
+            ),
+            (
+                0xa9bf_7bfd,
+                "stp x29, x30, [sp, #-16]!",
+                Some(back(0x8ff0, vec![(0x1d00, 8), (0x1e00, 8)], 31, 0x8ff0)),
+            ),
+            // Releases.
+            (0x889f_fc41, "stlr w1, [x2]", Some(release(0x200, vec![(0x100, 4)]))),
+            (0xc89f_ffe1, "stlr x1, [sp]", Some(release(0x9000, vec![(0x100, 8)]))),
+            (0x089f_fc41, "stlrb w1, [x2]", Some(release(0x200, vec![(0x100, 1)]))),
+            (0x489f_fc5f, "stlrh wzr, [x2]", Some(release(0x200, vec![(0, 2)]))),
+            (0xc89f_7c41, "stllr x1, [x2]", Some(release(0x200, vec![(0x100, 8)]))),
+            // Not a general register's, or not a plain store: not made by fwe.
             (0x3d80_0040, "str q0, [x2]", None),
+            (0xfc00_8440, "str d0, [x2], #8", None),
+            (0xc8e1_fc43, "casal x1, x3, [x2]", None),
+            (0xc804_7c41, "stxr w4, x1, [x2]", None),
         ];
         for (w, text, want) in cases {
             assert_eq!(store_of(w, &reg), want, "{text}");

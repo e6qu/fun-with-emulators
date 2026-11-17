@@ -1319,15 +1319,24 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             return;
         }
     } else {
-        // A store beside the code translated from its page: made by fwe,
-        // the page and its translations kept.
+        // A store into a page code was translated from: made by fwe, the
+        // page and its translations kept (but for those of what it wrote),
+        // its base register written back.
         let regs = regs_from(mc);
         // SAFETY: the guest was executing at `pc`, so it is mapped.
         let w = unsafe { insn(mc.ss.pc) };
         let reg = |r: usize| if r == 31 { regs.sp } else { regs.x[r] };
+        let mut back = None;
         if let Some(w) = w
-            && crate::jit::store(mc.es.far, mc.es.esr, w, reg)
+            && crate::jit::store(mc.es.far, mc.es.esr, w, reg, |r, v| back = Some((r, v)))
         {
+            match back {
+                Some((29, v)) => mc.ss.fp = v,
+                Some((30, v)) => mc.ss.lr = v,
+                Some((31, v)) => mc.ss.sp = v,
+                Some((r, v)) => mc.ss.x[r] = v,
+                None => {}
+            }
             mc.ss.pc += 4;
             return;
         }
