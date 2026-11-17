@@ -708,6 +708,20 @@ def breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total):
         funcs[re.sub(r" \(in .*", "", sym).strip()[:100]] += n
     top = "; ".join(f"{f} {n * 100 / total:.1f}%" for f, n in funcs.most_common(15))
     print(f"{name}: {execname} by function: {top}", file=sys.stderr)
+    # The host's libraries' samples, named from the shared cache.
+    libs = collections.Counter()
+    for pc, n in counts:
+        w = where(pc)
+        if "+0x" in w and not w.startswith((f"{execname}+", "anonymous")):
+            libs[w] += n
+    named = []
+    for w, n in libs.most_common(8):
+        lib, off = w.split("+")
+        dylib = next((d for d in ("/usr/lib/system/" + lib, "/usr/lib/" + lib) if lib.endswith(".dylib")), None)
+        sym = subprocess.run(["atos", "-o", dylib, "-l", "0x0", off], capture_output=True, text=True,
+                             errors="replace").stdout.strip() if dylib else ""
+        named.append(f"{w} ({sym or '?'}) {n * 100 / total:.1f}%")
+    print(f"{name}: host libraries: {'; '.join(named)}", file=sys.stderr)
 
 
 def pcs(name, cmd, share=False, execname="fwe"):
@@ -1017,6 +1031,11 @@ def jdk(a, fwe, guest_env, results):
     javac = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "javac"),
                                "-d", "/tmp/jdkout"] + [f"/tmp/jdksrc/{f}" for f in sources]
     pcs("JDK javac", javac)
+    # And natively, for what the same work costs the host's kernel.
+    shutil.rmtree(theirs_out, ignore_errors=True)
+    os.makedirs(theirs_out)
+    pcs("JDK javac natively", [f"{bin_theirs}/javac", "-d", theirs_out]
+        + [os.path.join(JDK_SRC, f) for f in sources], execname="javac")
     shutil.rmtree(native, ignore_errors=True)
 
 
