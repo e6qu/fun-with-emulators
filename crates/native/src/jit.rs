@@ -384,6 +384,38 @@ static STORES_LEFT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 /// those of them into translated code.
 static STORES: AtomicU64 = AtomicU64::new(0);
 static STORES_INTO_CODE: AtomicU64 = AtomicU64::new(0);
+/// The forms of the stores not decoded ([`STORES_LEFT`]'s first): the
+/// instruction's top ten bits (its class, size and addressing) and how
+/// many, the first [`FORMS`] seen.
+const FORMS: usize = 8;
+static UNDECODED: [(AtomicU64, AtomicU64); FORMS] =
+    [const { (AtomicU64::new(u64::MAX), AtomicU64::new(0)) }; FORMS];
+
+/// Count store `w`, not decoded, by its form ([`UNDECODED`]).
+fn undecoded(w: u32) {
+    let form = u64::from(w & 0xffc0_0000);
+    for (k, n) in &UNDECODED {
+        let seen = match k.compare_exchange(u64::MAX, form, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => form,
+            Err(v) => v,
+        };
+        if seen == form {
+            n.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+    }
+}
+
+/// The forms [`undecoded`] counted, most first.
+fn undecoded_forms() -> String {
+    let mut forms: Vec<(u64, u64)> = UNDECODED
+        .iter()
+        .map(|(k, n)| (k.load(Ordering::Relaxed), n.load(Ordering::Relaxed)))
+        .filter(|&(k, _)| k != u64::MAX)
+        .collect();
+    forms.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
+    forms.iter().map(|(k, n)| format!(" {k:#010x}:{n}")).collect()
+}
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// What [`TRANSLATED`] and the others counted, if any code ran by
@@ -395,7 +427,7 @@ pub fn counts() -> Option<String> {
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, {} of them into code, \
-             left: {} not decoded, {} shared, {} past the limit), the code cache emptied {} times; \
+             left: {} not decoded ({}), {} shared, {} past the limit), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -409,6 +441,7 @@ pub fn counts() -> Option<String> {
             STORES.load(Ordering::Relaxed),
             STORES_INTO_CODE.load(Ordering::Relaxed),
             STORES_LEFT[0].load(Ordering::Relaxed),
+            undecoded_forms().trim_start(),
             STORES_LEFT[1].load(Ordering::Relaxed),
             STORES_LEFT[2].load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
@@ -884,7 +917,10 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
         STORES_LEFT[why].fetch_add(1, Ordering::Relaxed);
         false
     };
-    let Some((addr, parts)) = store_of(w, &reg).filter(|_| !names_x18) else { return left(0) };
+    let Some((addr, parts)) = store_of(w, &reg).filter(|_| !names_x18) else {
+        undecoded(w);
+        return left(0);
+    };
     let len: u64 = parts.iter().map(|&(_, n)| n).sum();
     let ps = page_size();
     let page = far & !(ps - 1);
