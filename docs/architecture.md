@@ -278,24 +278,24 @@ sees, is in
   and ways out waiting for it to it (`jit::link_waiting`). A
   block is at most 64 instructions, ends at a branch out, at an `isb` and
   at its page's end, so it is made from one page.
-- **The code cache** is chunks of 128 MiB (a branch's reach), each mapped
-  twice with `mach_vm_remap`: written through the writable view, run from
-  the executable one. `jit::in_cache` tells a cache address without a
-  lock. A block's way out (a direct branch's, or a lookup's miss) saves
-  `x16` and `x17` below `sp` and
-  branches to the exit gate (`gate::fwe_exit_gate`) with its own address
-  in `x16`; the gate saves the program's registers in the thread's block,
-  as the system-call gate does, and calls `jit::gate_exit` without a
-  signal: the target is translated and the branch patched to it (linked,
-  within a chunk), and the gate enters that translation as a lookup
-  does. Anything else (code not translated, a signal to deliver) takes
-  the gate's `brk`, whose handler goes on from the block. A way out
-  unlinked again when the cache is emptied is `brk #0x4a54`
-  (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`. A direct branch's target that is code not translated is
-  patched to it where a branch reaches, else
-  to a veneer block (`jit::veneer`: the target in `x16`, `br x16`). A
-  `cbz`/`tbz` of `x18` loads the guest's `x18` into `x16` (saved with
-  `x17` as a lookup saves them) and tests it there.
+- **The code cache** is chunks of 128 MiB (a branch's reach), each
+  mapped twice with `mach_vm_remap`: written through the writable view,
+  run from the executable one. `jit::in_cache` tells a cache address
+  without a lock. A block's way out (a direct branch's, or a lookup's
+  miss) saves `x16` and `x17` below `sp` and branches to the exit gate
+  (`gate::fwe_exit_gate`) with its own address in `x16`; the gate saves
+  the program's registers in the thread's block, as the system-call gate
+  does, and calls `jit::gate_exit` without a signal: the target is
+  translated and the branch patched to it (linked, within a chunk), and
+  the gate enters that translation as a lookup does. Anything else (code
+  not translated, a signal to deliver) takes the gate's `brk`, whose
+  handler goes on from the block. A way out unlinked again when the
+  cache is emptied is `brk #0x4a54` (`jit::EXIT`), which `on_sigtrap`
+  passes to `jit::exit`. A direct branch's target that is code not
+  translated is patched to it where a branch reaches, else to a veneer
+  block (`jit::veneer`: the target in `x16`, `br x16`). A `cbz`/`tbz` of
+  `x18` loads the guest's `x18` into `x16` (saved with `x17` as a lookup
+  saves them) and tests it there.
 - **The table** of translations by guest address is 2^20 entries of
   (address, translation) at 2^45 (32 TiB, reachable with one `orr`),
   its place taken as fwe starts (`jit::configure`), before the program
