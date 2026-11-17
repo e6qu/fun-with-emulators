@@ -37,8 +37,9 @@ pub fn write(st: &libc::stat, owner: Option<(u32, u32)>) -> Result<(), i32> {
     let mut v = [0u8; 8];
     v[..4].copy_from_slice(&uid.to_le_bytes());
     v[4..].copy_from_slice(&gid.to_le_bytes());
-    // Whole or not at all: written beside it, then put in its place.
-    let tmp = path.with_extension(format!("{}", crate::host::pid()));
+    // Whole or not at all: written beside it, then put in its place. (Its
+    // name is no entry's: [`collect`] leaves it while its writer runs.)
+    let tmp = std::path::PathBuf::from(format!("{}.{}.tmp", path.display(), crate::host::pid()));
     std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -50,13 +51,21 @@ pub fn write(st: &libc::stat, owner: Option<(u32, u32)>) -> Result<(), i32> {
         .map_err(|e| e.raw_os_error().map_or(fwe_abi::errno::EIO, crate::host::errno_to_linux))
 }
 
-/// Remove the owners of socket nodes that are gone.
+/// Remove the owners of socket nodes that are gone, and what a writer
+/// that ended left half written.
 pub fn collect() {
     let Some(dir) = dir() else { return };
     let Ok(entries) = std::fs::read_dir(&dir) else { return };
     for e in entries.flatten() {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
+        if let Some(rest) = name.strip_suffix(".tmp") {
+            let writer = rest.rsplit('.').next().and_then(|p| p.parse::<i32>().ok());
+            if writer.is_none_or(|p| !alive(p)) {
+                let _ = std::fs::remove_file(e.path());
+            }
+            continue;
+        }
         let mut f = name.split(['-', '.']);
         let (Some(dev), Some(ino)) = (f.next(), f.next()) else { continue };
         let node = format!("/.vol/{}/{}", i64::from_str_radix(dev, 16).unwrap_or(-1), ino_dec(ino));
@@ -66,6 +75,16 @@ pub fn collect() {
             let _ = std::fs::remove_file(e.path());
         }
     }
+}
+
+/// Whether host process `pid` exists (none at or below 0 is asked about).
+fn alive(pid: i32) -> bool {
+    if pid <= 0 {
+        return false;
+    }
+    // SAFETY: a signal 0 sends nothing; it asks whether `pid` exists.
+    let r = unsafe { libc::kill(pid, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
 fn ino_dec(hex: &str) -> u64 {
