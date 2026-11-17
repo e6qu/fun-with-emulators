@@ -803,6 +803,12 @@ def pcs(name, cmd, share=False, execname="fwe"):
               f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
+              # Mach traps (mach_vm_*, mach_msg) are not system calls to
+              # DTrace's syscall provider.
+              f'mach_trap:::entry /execname == "{execname}"/ {{ self->m = timestamp; }} '
+              'mach_trap:::return /self->m/ { @ns[strjoin("mach:", probefunc)] = '
+              'sum(timestamp - self->m); @n[strjoin("mach:", probefunc)] = count(); '
+              'self->m = 0; } '
               'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
               'printa("ks %@d%k\\nendks\\n", @ks); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
@@ -1077,8 +1083,7 @@ def jdk(a, fwe, guest_env, results):
     os.makedirs(ours_out)
     try:
         callers("JDK javac", javac, [("libsystem_platform.dylib", "_platform_strncmp*"),
-                                     ("libsystem_kernel.dylib", "__getpid"),
-                                     ("libsystem_kernel.dylib", "__sigpending")])
+                                     ("libsystem_kernel.dylib", "__getpid")])
     except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
         print(f"JDK javac: no callers: {e!r}", file=sys.stderr)
 

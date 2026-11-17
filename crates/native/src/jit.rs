@@ -376,6 +376,10 @@ static REVIVED: AtomicU64 = AtomicU64::new(0);
 /// Most stores fwe makes into a page while it is kept from writes; the
 /// next lets it be written.
 const STORES_KEPT: u64 = 16;
+/// Stores into pages kept from writes that fwe left to drop the page's
+/// translations, by why: not a store it decodes, on a page another
+/// mapping shares, into the code, or past [`STORES_KEPT`].
+static STORES_LEFT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 /// The program's stores fwe made for it into pages kept from writes.
 static STORES: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
@@ -388,7 +392,8 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe), the code cache emptied {} times; \
+             {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, \
+             left: {} not decoded, {} shared, {} into code, {} past the limit), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -400,6 +405,10 @@ pub fn counts() -> Option<String> {
             DROPPED.load(Ordering::Relaxed),
             REVIVED.load(Ordering::Relaxed),
             STORES.load(Ordering::Relaxed),
+            STORES_LEFT[0].load(Ordering::Relaxed),
+            STORES_LEFT[1].load(Ordering::Relaxed),
+            STORES_LEFT[2].load(Ordering::Relaxed),
+            STORES_LEFT[3].load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
             EXIT_NS.load(Ordering::Relaxed) / 1_000_000
@@ -861,7 +870,11 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     // (x18 is never a register of the program's code as it runs.)
     let names_x18 =
         w & 31 == 18 || (w >> 5) & 31 == 18 || (w >> 10) & 31 == 18 || (w >> 16) & 31 == 18;
-    let Some((addr, parts)) = store_of(w, &reg).filter(|_| !names_x18) else { return false };
+    let left = |why: usize| {
+        STORES_LEFT[why].fetch_add(1, Ordering::Relaxed);
+        false
+    };
+    let Some((addr, parts)) = store_of(w, &reg).filter(|_| !names_x18) else { return left(0) };
     let len: u64 = parts.iter().map(|&(_, n)| n).sum();
     let ps = page_size();
     let page = far & !(ps - 1);
@@ -871,11 +884,11 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     let mut s = state();
     // A page another mapping shares is left to `written`: its other
     // mappings' translations are not looked at here.
-    if !s.guarded.contains(&page)
-        || s.object_of.contains_key(&page)
-        || s.aliases.contains_key(&page)
-    {
+    if !s.guarded.contains(&page) {
         return false;
+    }
+    if s.object_of.contains_key(&page) || s.aliases.contains_key(&page) {
+        return left(1);
     }
     let writable = fwe_kernel::maps::record()
         .areas_in(page, page + ps)
@@ -892,7 +905,7 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
         })
     });
     if into_code {
-        return false;
+        return left(2);
     }
     let Some(wr) = writer(&mut s, page) else { return false };
     let mut at = wr + (addr - page);
@@ -901,7 +914,7 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     let made = &mut s.writers.get_mut(&page).expect("its writer").1;
     *made += 1;
     if *made > STORES_KEPT {
-        return false;
+        return left(3);
     }
     for (value, size) in parts {
         // SAFETY: `at` is in the page's writable mapping, `size` bytes of
