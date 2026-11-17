@@ -968,6 +968,13 @@ def jdk(a, fwe, guest_env, results):
     marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines()
              if "timing: " in l and ("JIT" in l or "timing: exit +" in l)]
     print("JDK: fwe's marks: " + "; ".join(marks), file=sys.stderr)
+    # Where `javac`'s time goes, by program counter: one process, so its
+    # mappings name each sample (translated code is in fwe's code cache).
+    shutil.rmtree(ours_out, ignore_errors=True)
+    os.makedirs(ours_out)
+    javac = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "javac"),
+                               "-d", "/tmp/jdkout"] + [f"/tmp/jdksrc/{f}" for f in sources]
+    pcs("JDK javac", javac)
     shutil.rmtree(native, ignore_errors=True)
 
 

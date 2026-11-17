@@ -96,9 +96,6 @@ fn chunk_size() -> u64 {
 pub fn configure() {
     install();
     reserve_table();
-    if let Some(n) = std::env::var("FWE_JIT_AHEAD").ok().and_then(|v| v.parse().ok()) {
-        AHEAD.store(n, Ordering::Relaxed);
-    }
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -347,8 +344,6 @@ static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Call sites of code not translated linked to translations.
 static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
-/// Blocks translated ahead of their first run ([`ahead`]).
-static AHEAD_MADE: AtomicU64 = AtomicU64::new(0);
 /// Time spent translating blocks, and in [`exit`] (with its lock), in
 /// nanoseconds.
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
@@ -362,11 +357,10 @@ pub fn counts() -> Option<String> {
     let t = TRANSLATED.load(Ordering::Relaxed);
     (t > 0).then(|| {
         format!(
-            "JIT code: {t} blocks translated ({} ahead), {} exits through fwe ({} direct and {} \
+            "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} pages' translations dropped by writes, the code cache emptied {} times; \
              {} ms translating, {} ms in ways out",
-            AHEAD_MADE.load(Ordering::Relaxed),
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
@@ -1066,23 +1060,6 @@ fn body(s: &State, i: usize) -> u64 {
 
 /// The translation of program address `g`, made if there is none.
 fn translation(s: &mut State, g: u64) -> usize {
-    let fresh = !s.by_g.contains_key(&g);
-    let i = translation_one(s, g);
-    if !fresh {
-        return i;
-    }
-    let flushes = s.cache.as_ref().map_or(0, |c| c.flushes);
-    ahead(s, i);
-    // Emptying the cache meanwhile renumbered the blocks (and may have
-    // dropped this one): it is looked up, or made, again.
-    if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
-        return translation_one(s, g);
-    }
-    i
-}
-
-/// [`translation`] without translating ahead.
-fn translation_one(s: &mut State, g: u64) -> usize {
     if let Some(&i) = s.by_g.get(&g) {
         // Its table entry may have gone to another address since (they
         // share entries): it is its own again.
@@ -1130,51 +1107,6 @@ fn translation_one(s: &mut State, g: u64) -> usize {
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
     link_waiting(s, i);
     i
-}
-
-/// Most blocks translated ahead of their first run for one translation.
-/// TEMPORARY: `FWE_JIT_AHEAD` sets it, to measure in CI (removed before
-/// merge).
-static AHEAD: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(16);
-
-/// Translate ahead the blocks block `i` branches to directly in its own
-/// page, and theirs, up to [`AHEAD`]: each is linked as it is made, so the
-/// branches into them never take fwe's trap (which costs several times
-/// what translating a block does). The page is kept from writes already,
-/// and read already: nothing is read that the first block's translation
-/// did not make safe to read.
-fn ahead(s: &mut State, i: usize) {
-    let page = s.blocks[i].g & !(page_size() - 1);
-    let flushes = s.cache.as_ref().map_or(0, |c| c.flushes);
-    let mut todo = vec![i];
-    let mut made = 0;
-    while let Some(b) = todo.pop() {
-        let targets: Vec<u64> = s.blocks[b]
-            .words
-            .iter()
-            .filter_map(|w| match *w {
-                Word::Out { exit: Exit::Jump(to), .. } => Some(to),
-                _ => None,
-            })
-            .filter(|&to| to & !(page_size() - 1) == page && to & 3 == 0)
-            .collect();
-        for to in targets {
-            if made == AHEAD.load(Ordering::Relaxed) {
-                return;
-            }
-            if s.by_g.contains_key(&to) {
-                continue;
-            }
-            made += 1;
-            AHEAD_MADE.fetch_add(1, Ordering::Relaxed);
-            let j = translation_one(s, to);
-            // The cache emptied to make room: block numbers changed.
-            if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
-                return;
-            }
-            todo.push(j);
-        }
-    }
 }
 
 /// Link the direct ways out of new block `i` to their targets' translations
