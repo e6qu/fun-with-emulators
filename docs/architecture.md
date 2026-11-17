@@ -344,7 +344,8 @@ sees, is in
   taken back if its words are unchanged (`jit::revive`), its entry
   published and its branches linked; only what the write changed is
   translated again. Unmapping, mapping anew or changing a page's protections
-  forgets them. A general register's store (`str`, `strb`, `strh` and
+  forgets them, as does giving the memory back (`MADV_DONTNEED`), which
+  also lifts the pages' guards first. A general register's store (`str`, `strb`, `strh` and
   `stp`, their base written back or not, `stlr` and `cas` of each size),
   decoded by `jit::store_of` (macOS gives no syndrome for it), into a
   page the program may write is made by fwe through a second, writable
