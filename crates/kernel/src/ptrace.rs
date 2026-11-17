@@ -789,6 +789,7 @@ fn killed() -> bool {
 
 /// Carry out the tracer's requests at a stop, until it says to go on.
 fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing: u64) -> Served {
+    let mut waited = false;
     loop {
         let req = mb.word(W_REQ).load(Ordering::Acquire);
         if req == mb.word(W_DONE).load(Ordering::Acquire) {
@@ -800,7 +801,16 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
                 mb.word(W_STATE).store(RUNNING, Ordering::Release);
                 break Served::Resume(Resume::Cont(0));
             }
+            // A stop its tracer has not taken after a whole wait: the
+            // tracer is woken again. Its wake may have come as it was
+            // about to sleep in the host's wait, before it knew it traced
+            // this process (whose `PTRACE_TRACEME` it had not seen): that
+            // wait slept on, the signal spent.
+            if waited && mb.word(W_STATE).load(Ordering::Acquire) == STOPPED {
+                crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+            }
             wait_word_for(mb.word(W_REQ), req, Duration::from_millis(100));
+            waited = true;
             continue;
         }
         let (op, addr, data) = (
