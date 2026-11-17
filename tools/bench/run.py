@@ -724,52 +724,6 @@ def breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total):
     print(f"{name}: host libraries: {'; '.join(named)}", file=sys.stderr)
 
 
-def kernel_work(name, cmd, execname="fwe"):
-    """Which of the kernel's own functions `cmd` (an fwe process) enters
-    and how long they take: signals sent and returned from, exceptions,
-    page faults and protection changes, by DTrace's kernel function
-    probes. For reading: a probe the kernel lacks is left out."""
-    funcs = ["sendsig", "sigreturn", "exception_triage", "vm_fault", "vm_fault_internal",
-             "vm_map_protect", "pmap_protect_options", "mach_vm_protect", "thread_set_state",
-             "thread_get_state", "machine_thread_state_convert_to_user", "vm_map_copyin_internal",
-             "act_set_state", "thread_suspend", "thread_resume", "vm_map_lookup_and_lock_object"]
-    probes = []
-    for f in funcs:
-        probes.append(f'fbt::{f}:entry /execname == "{execname}"/ {{ self->k_{f} = timestamp; }} '
-                      f'fbt::{f}:return /self->k_{f}/ {{ @n["{f}"] = count(); '
-                      f'@ns["{f}"] = sum(timestamp - self->k_{f}); self->k_{f} = 0; }}')
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.kfn")
-    proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
-                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL)
-    # `-Z`: a probe this kernel lacks matches nothing rather than failing.
-    tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-Z", "-n", " ".join(probes) +
-                               ' END { printa("k %s %@d %@d\\n", @n, @ns); }', "-o", out],
-                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                              errors="replace")
-    time.sleep(3)
-    proc.stdin.close()
-    proc.wait(timeout=600)
-    dtrace = subprocess.run(["pgrep", "-P", str(tracer.pid)], capture_output=True,
-                            text=True).stdout.split()
-    subprocess.run(["sudo", "-n", "kill", "-INT"] + dtrace, capture_output=True)
-    try:
-        said = tracer.communicate(timeout=60)[0]
-    except subprocess.TimeoutExpired:
-        subprocess.run(["sudo", "-n", "kill", "-KILL"] + dtrace, capture_output=True)
-        said = tracer.communicate()[0]
-    rows = []
-    if os.path.exists(out):
-        with open(out, errors="replace") as f:
-            for line in f:
-                p = line.split()
-                if len(p) == 4 and p[0] == "k":
-                    rows.append((p[1], int(p[2]), int(p[3])))
-    rows.sort(key=lambda r: -r[2])
-    top = ", ".join(f"{f} {n}x {ns / 1e6:.1f} ms" for f, n, ns in rows)
-    print(f"{name}: kernel functions: {top or said.strip()[-400:]}", file=sys.stderr)
-
-
 def pcs(name, cmd, share=False, execname="fwe"):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
@@ -1077,12 +1031,7 @@ def jdk(a, fwe, guest_env, results):
     javac = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "javac"),
                                "-d", "/tmp/jdkout"] + [f"/tmp/jdksrc/{f}" for f in sources]
     pcs("JDK javac", javac)
-    shutil.rmtree(ours_out, ignore_errors=True)
-    os.makedirs(ours_out)
-    try:
-        kernel_work("JDK javac", javac)
-    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
-        print(f"JDK javac: no kernel functions: {e!r}", file=sys.stderr)
+
     # And natively, for what the same work costs the host's kernel.
     shutil.rmtree(theirs_out, ignore_errors=True)
     os.makedirs(theirs_out)

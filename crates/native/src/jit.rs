@@ -57,13 +57,17 @@ use std::collections::BTreeMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `brk #0x4a54` ("JT"): a translated block's way out to fwe.
+/// `brk #0x4a54` ("JT"): a direct way out unlinked again, or the wrong
+/// block entered, into fwe by its trap.
 pub const EXIT_IMM: u32 = 0x4a54;
 pub const EXIT: u32 = 0xd420_0000 | (EXIT_IMM << 5);
 /// `udf #0`: an instruction no translation can stand for (an
 /// authenticated branch fwe does not offer); it faults as `SIGILL` at the
 /// program's instruction.
 const UDF: u32 = 0;
+/// Words of a direct way out ([`one`]'s `jump`).
+const JUMP_WORDS: u32 = 6;
+
 /// Most instructions a block holds before it ends and goes on to the next.
 const BLOCK_INSNS: usize = 64;
 /// The most chunks the code cache has (8 GiB of translations).
@@ -761,10 +765,22 @@ pub fn host_writes(addr: u64, len: u64) {
     }
 }
 
-/// The way out of a block at `regs.pc` (its trap): `regs` go on at the
-/// translation of where it leads, or at the address itself where that is
-/// not code run by translation; a direct branch is linked there. `false`
-/// if `pc` is no way out of fwe's.
+/// The way out at `regs.pc`, taken by the exit gate (outside a signal's
+/// handler): as [`exit`], and where it leads into a translation's body,
+/// that translation and its program address, for the gate to enter it as
+/// a lookup does.
+pub fn gate_exit(regs: &mut Regs) -> Option<(u64, u64)> {
+    assert!(exit(regs), "the exit gate entered from no way out ({:#x})", regs.pc);
+    let s = state();
+    let i = block_at(&s, regs.pc)?;
+    let b = &s.blocks[i];
+    (b.body == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.t, b.g))
+}
+
+/// The way out of a block at `regs.pc` (its trap, or the exit gate's
+/// call): `regs` go on at the translation of where it leads, or at the
+/// address itself where that is not code run by translation; a direct
+/// branch is linked there. `false` if `pc` is no way out of fwe's.
 pub fn exit(regs: &mut Regs) -> bool {
     let began = std::time::Instant::now();
     let r = exit_now(regs);
@@ -1146,7 +1162,7 @@ fn link_waiting(s: &mut State, i: usize) {
     }
 }
 
-/// Link way out `at` (a direct one, still fwe's trap) to block `j`, if it
+/// Link way out `at` (a direct one, still into fwe) to block `j`, if it
 /// is in a live translation and the branch reaches.
 fn link_site(s: &mut State, at: u64, j: usize) {
     let Some(from) = block_at(s, at) else { return };
@@ -1159,7 +1175,7 @@ fn link_site(s: &mut State, at: u64, j: usize) {
     let word = s.blocks[from].words.get(((at - s.blocks[from].t) / 4) as usize).copied();
     let waits = matches!(word, Some(Word::Out { exit: Exit::Jump(x), .. }) if x == to);
     // SAFETY: a word of fwe's code cache, readable.
-    let trap = unsafe { (at as *const u32).read() } == EXIT;
+    let trap = matches!(unsafe { (at as *const u32).read() }, EXIT | SAVE);
     if !waits || !trap || s.blocks[from].retired || s.blocks[j].retired {
         return;
     }
@@ -1622,9 +1638,26 @@ fn body_of(g: u64, t: u64, followed: bool, out: &mut Vec<u32>, info: &mut Vec<Wo
             break;
         }
     }
-    out.push(EXIT);
-    info.push(Word::Out { g: pc, exit: Exit::Jump(pc) });
+    gate_out(pc, Exit::Jump(pc), out, info);
     calls
+}
+
+/// A way out into fwe through the exit gate ([`JUMP_WORDS`] words): the
+/// program's x16 and x17 saved below sp, x16 the way out's address. A
+/// direct one is linked by making its first word a branch to the target's
+/// translation.
+fn gate_out(g: u64, exit: Exit, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+    let gate = crate::gate::exit_address();
+    out.extend([
+        SAVE,
+        0x10ff_fff0,                 // adr x16, #-4
+        0x5800_0000 | (2 << 5) | 17, // ldr x17, #8
+        GO,                          // br x17
+        gate as u32,
+        (gate >> 32) as u32,
+    ]);
+    info.push(Word::Out { g, exit });
+    info.extend([Word::Lookup { g, link: None, committed: false }; JUMP_WORDS as usize - 1]);
 }
 
 /// Translate the program's instruction `w` at `pc` into `out`, the block
@@ -1636,8 +1669,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
     let imm19 = || pc.wrapping_add_signed(i64::from((((w >> 5) & 0x7_ffff) << 13) as i32 >> 11));
     let imm14 = || pc.wrapping_add_signed(i64::from((((w >> 5) & 0x3fff) << 18) as i32 >> 16));
     let jump = |out: &mut Vec<u32>, info: &mut Vec<Word>, to: u64| {
-        out.push(EXIT);
-        info.push(Word::Out { g: pc, exit: Exit::Jump(to) });
+        gate_out(pc, Exit::Jump(to), out, info);
     };
     // b
     if w & 0xfc00_0000 == 0x1400_0000 {
@@ -1654,7 +1686,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
     }
     // b.cond (and bc.cond): to the taken way out two words on.
     if w & 0xff00_0000 == 0x5400_0000 {
-        out.push((w & !(0x7_ffff << 5)) | (2 << 5));
+        out.push((w & !(0x7_ffff << 5)) | ((1 + JUMP_WORDS) << 5));
         info.push(Word::At(pc));
         jump(out, info, pc + 4);
         jump(out, info, imm19());
@@ -1677,7 +1709,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
                 rewrite::MRS_TPIDRRO | 16,
                 rewrite::AND_NOT7 | (16 << 5) | 16,
                 rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
-                (w & !field & !0x1f) | (3 << 5) | 16,
+                (w & !field & !0x1f) | ((2 + JUMP_WORDS) << 5) | 16,
                 RESTORE,
             ]);
             info.extend([before; 5]);
@@ -1687,7 +1719,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
             jump(out, info, taken);
             return true;
         }
-        out.push((w & !field) | (2 << 5));
+        out.push((w & !field) | ((1 + JUMP_WORDS) << 5));
         info.push(Word::At(pc));
         jump(out, info, pc + 4);
         jump(out, info, taken);
@@ -1915,8 +1947,7 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
     }
     out.push(RESTORE);
     info.push(before);
-    out.push(EXIT);
-    info.push(Word::Out { g: pc, exit: Exit::Reg { n, link } });
+    gate_out(pc, Exit::Reg { n, link }, out, info);
 }
 
 /// Load the value `v` into `x<rd>` with `movz`/`movk`.

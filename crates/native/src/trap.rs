@@ -432,6 +432,36 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
 
 /// A system call's site: the program's `svc` where the call was made from a
 /// translation of code made executable at run time.
+/// The Rust half of the exit gate ([`crate::gate`]): take the way out of
+/// a translation whose state is in `b` (its `pc` the way out), as fwe's
+/// trap would. 0: it leads into a translation, which the gate enters (the
+/// block says which); 1: the trap is to go on (`b.ran` set: the state in
+/// the block is where the way out led, with anything pending delivered).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn fwe_exit_call(b: *mut crate::gate::Block) -> u64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    // SAFETY: the gate passes this thread's block, which only it uses now.
+    let b = unsafe { &mut *b };
+    if b.slot == 0 {
+        b.slot = crate::quiesce::mine_addr();
+    }
+    crate::quiesce::leave_at(b.slot);
+    b.regs.x[18] = guest_x18();
+    let into = crate::jit::gate_exit(&mut b.regs);
+    b.ran = 1;
+    b.seen = b.signals.load(SeqCst);
+    let (pending, mask) = thread::state();
+    match into {
+        Some((t, g)) if pending & !mask == 0 => {
+            (b.jit_t, b.jit_g) = (t, g);
+            crate::quiesce::enter_at(b.slot);
+            0
+        }
+        _ => 1,
+    }
+}
+
 fn guest_site(site: u64) -> u64 {
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     if crate::jit::in_cache(site) {
@@ -601,6 +631,20 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     }
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+    // The exit gate's trap: the state the way out led to is in the block.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // SAFETY: the thread was executing at `pc`, so it is mapped.
+    if crate::gate::in_gate(pc) && unsafe { insn(pc) } == Some(crate::gate::EXIT_GATE_TRAP) {
+        let b = crate::gate::block().expect("the exit gate's thread has a block");
+        let mut regs = b.regs;
+        b.active.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _host = HostCode::enter_blocked();
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
+        return;
+    }
     // The gate's trap: the guest's state is in this thread's block.
     // SAFETY: the thread was executing at `pc`, so it is mapped.
     let from_gate = crate::gate::in_gate(pc) && unsafe { insn(pc) } == Some(crate::gate::GATE_TRAP);
