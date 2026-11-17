@@ -623,6 +623,15 @@ pub fn code(addr: u64, len: u64) {
     }
 }
 
+/// `[addr, addr + len)` is about to be replaced by fresh pages, mapped as
+/// it was (`MADV_DONTNEED`): its translations go, and the pages kept from
+/// writes there get their protections back (a writable mapping of a page
+/// would write the memory it replaces), but it still holds code to
+/// translate.
+pub fn discarded(addr: u64, len: u64) {
+    state().drop_range(addr, len, false);
+}
+
 /// `[addr, addr + len)` no longer holds such code, or changed beyond what
 /// fwe kept watch over (unmapped, mapped anew, its protections changed):
 /// its translations are dropped. Whether any of it held such code.
@@ -1083,6 +1092,8 @@ pub fn store(
             set(rs, old);
         }
     }
+    // TEMPORARY (a JDK crash): what was written, read back below.
+    let check: Vec<(u64, u64)> = if compare.is_none() { parts.clone() } else { Vec::new() };
     for (value, size) in parts.into_iter().filter(|_| compare.is_none()) {
         // SAFETY: `at` is in the page's writable mapping, `size` bytes of
         // it within the page; the program's mapping allows the write.
@@ -1097,6 +1108,27 @@ pub fn store(
         at += size;
     }
     std::sync::atomic::fence(Ordering::SeqCst);
+    let mut g = addr;
+    for (value, size) in check {
+        let mask = if size == 8 { u64::MAX } else { (1u64 << (8 * size)) - 1 };
+        // SAFETY: the program's page, readable (kept from writes only).
+        let seen = unsafe {
+            match size {
+                1 => u64::from((g as *const u8).read_volatile()),
+                2 => u64::from((g as *const u16).read_unaligned()),
+                4 => u64::from((g as *const u32).read_unaligned()),
+                _ => (g as *const u64).read_unaligned(),
+            }
+        };
+        if seen != value & mask {
+            eprintln!(
+                "fwe: TEMPORARY: store {w:#010x} at {g:#x} (page {page:#x}, writer {wr:#x}) \
+                 wrote {:#x}, the program sees {seen:#x}",
+                value & mask
+            );
+        }
+        g += size;
+    }
     STORES.fetch_add(1, Ordering::Relaxed);
     // A store into code (an instruction patched) drops the blocks
     // translated from the bytes it wrote, not the page's others.
