@@ -28,6 +28,7 @@
  * - threads running code while writing data in its page, at once, with
  *   plain stores, releases and compare-and-swap;
  * - code made executable with mprotect after it was written (W^X);
+ * - code run, its memory given back (MADV_DONTNEED), written anew and run;
  * - a fork child running code translated before, and code it changes;
  * - and the memory reading back exactly as the program wrote it.
  *
@@ -44,6 +45,7 @@ void *memcpy(void *d, const void *s, size_t n);
 int memcmp(const void *a, const void *b, size_t n);
 void *mmap(void *addr, size_t len, int prot, int flags, int fd, long off);
 int mprotect(void *addr, size_t len, int prot);
+int madvise(void *addr, size_t len, int advice);
 int getpid(void);
 int pthread_create(unsigned long *t, const void *attr, void *(*fn)(void *), void *arg);
 int pthread_join(unsigned long t, void **ret);
@@ -724,6 +726,23 @@ int main(void) {
     flush(xo, 8);
     mprotect(xo, 4096, PROT_EXEC);
     printf("execute only: %ld\n", ((long (*)(void))xo)());
+
+    /* Run, data written beside it, given back with MADV_DONTNEED (zeros
+     * from now on, as Linux gives them), then written anew and run: the
+     * new code runs. */
+    volatile uint32_t *dn =
+        mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    dn[0] = movz_x0(7);
+    dn[1] = 0xd65f03c0; /* ret */
+    flush((void *)dn, 8);
+    long dn_ran = ((long (*)(void))dn)();
+    dn[2] = 1; /* data beside it, written after it ran */
+    madvise((void *)dn, 4096, 4 /* MADV_DONTNEED */);
+    uint32_t zero = dn[0];
+    dn[0] = movz_x0(9);
+    dn[1] = 0xd65f03c0;
+    flush((void *)dn, 8);
+    printf("discarded: %ld, then %u, then %ld\n", dn_ran, zero, ((long (*)(void))dn)());
 
     int same = memcmp(code, expect, len) == 0 && memcmp(copy, copy_expect, len) == 0 &&
                memcmp(wx, wx_expect, len) == 0;

@@ -2792,6 +2792,9 @@ impl<P: Platform> Kernel<P> {
                 // then maps the new ones (whatever the outcome, so the
                 // guest keeps the mappings it had).
                 self.platform.replacing_guest(addr, len);
+                // Code translated from it goes, its pages writable again
+                // (the protection the fresh pages take).
+                self.platform.jit_discarded(host, len);
                 let r = dontneed(areas.iter().map(|p| {
                     let (start, end) = (p.start.max(addr), p.end.min(addr + len));
                     let host = crate::uaccess::g2h(start);

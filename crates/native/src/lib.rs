@@ -185,6 +185,13 @@ impl Platform for NativePlatform {
         let _ = (addr, len);
     }
 
+    fn jit_discarded(&mut self, addr: u64, len: u64) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        jit::discarded(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = (addr, len);
+    }
+
     fn jit_changed(&mut self, addr: u64, len: u64) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         return jit::changed(addr, len);

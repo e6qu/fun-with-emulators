@@ -218,6 +218,11 @@ pub trait Platform {
     /// executable after mapping it.
     fn jit_code(&mut self, _addr: u64, _len: u64) {}
 
+    /// `[addr, addr + len)` (host addresses) is about to be replaced by
+    /// fresh pages, mapped as it was (`MADV_DONTNEED`): what was
+    /// translated from it goes, and it holds code to translate still.
+    fn jit_discarded(&mut self, _addr: u64, _len: u64) {}
+
     /// `[addr, addr + len)` (host addresses) was unmapped, mapped anew or
     /// given other protections: what was translated from it goes. Whether
     /// any of it held code the guest made executable after mapping it.
