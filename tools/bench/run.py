@@ -685,6 +685,31 @@ def shared_cache_name(pc):
     return f"shared cache+{pc:#x}"
 
 
+def breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total):
+    """[`pcs`]'s readings beyond the files: the kernel's most sampled
+    stacks, and the samples in `execname` by function, named by `atos`
+    from the binary `cmd` ran."""
+    kstacks.sort(key=lambda k: -k[0])
+    for n, frames in kstacks[:8]:
+        print(f"{name}: kernel {n * 100 / total:.1f}%: {' < '.join(frames)}", file=sys.stderr)
+    exe = next((c for c in cmd if os.path.basename(c) == execname and os.path.isfile(c)), None)
+    path = next((p for regions in looks for _, _, p, _, _ in regions
+                 if p and os.path.basename(p) == execname), None)
+    mine = [(pc, n) for pc, n in counts if where(pc).startswith(f"{execname}+")]
+    if not exe or path is None or not mine:
+        return
+    lo = base[path]
+    mine.sort(key=lambda c: -c[1])
+    mine = mine[:2000]
+    names = subprocess.run(["atos", "-o", exe, "-l", f"{lo:#x}"] + [f"{pc:#x}" for pc, _ in mine],
+                           capture_output=True, text=True, errors="replace").stdout.splitlines()
+    funcs = collections.Counter()
+    for (_, n), sym in zip(mine, names):
+        funcs[re.sub(r" \(in .*", "", sym).strip()[:100]] += n
+    top = "; ".join(f"{f} {n * 100 / total:.1f}%" for f, n in funcs.most_common(15))
+    print(f"{name}: {execname} by function: {top}", file=sys.stderr)
+
+
 def pcs(name, cmd, share=False, execname="fwe"):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
@@ -718,10 +743,12 @@ def pcs(name, cmd, share=False, execname="fwe"):
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     script = (f'profile-997 /execname == "{execname}"/ {{ @pc[arg1] = count(); }} '
+              f'profile-997 /execname == "{execname}" && arg0/ {{ @ks[stack(6)] = count(); }} '
               f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
-              'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); }')
+              'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
+              'printa("ks %@d%k\\nendks\\n", @ks); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -750,15 +777,24 @@ def pcs(name, cmd, share=False, execname="fwe"):
         subprocess.run(["sudo", "-n", "kill", "-KILL"] + dtrace, capture_output=True)
         said = tracer.communicate()[0]
         sys.exit(f"{name}: DTrace did not end when interrupted: {said.strip()[-2000:]}")
-    counts, calls = [], []
+    counts, calls, kstacks = [], [], []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
+            stack = None
             for line in f:
                 p = line.split()
-                if len(p) == 3 and p[0] == "pc":
+                if stack is not None:
+                    if p == ["endks"]:
+                        kstacks.append(stack)
+                        stack = None
+                    elif p:
+                        stack[1].append(p[0])
+                elif len(p) == 3 and p[0] == "pc":
                     counts.append((int(p[1], 16), int(p[2])))
                 elif len(p) == 4 and p[0] == "sys":
                     calls.append((p[1], int(p[2]), int(p[3])))
+                elif len(p) == 2 and p[0] == "ks":
+                    stack = (int(p[1]), [])
     if calls:
         calls.sort(key=lambda c: -c[1])
         top = ", ".join(f"{c} {n}x {ns / 1e6:.1f} ms ({ns / n:.0f} ns)" for c, ns, n in calls[:12])
@@ -807,6 +843,12 @@ def pcs(name, cmd, share=False, execname="fwe"):
                     for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
+    # What the kernel was doing, and fwe's samples by function: for
+    # reading only, so a failure here is said and the run goes on.
+    try:
+        breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total)
+    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+        print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
     # The unnamed regions most samples are in: their tag and protection.
     hot = {w for w, _ in by.most_common(8)}
     for regions in looks:
