@@ -345,15 +345,17 @@ sees, is in
   published and its branches linked; only what the write changed is
   translated again. Unmapping, mapping anew or changing a page's protections
   forgets them. A general register's store (`str`, `strb`, `strh` and
-  `stp`, their base written back or not, and `stlr` of each size),
+  `stp`, their base written back or not, `stlr` and `cas` of each size),
   decoded by `jit::store_of` (macOS gives no syndrome for it), into a
   page the program may write is made by fwe through a second, writable
   mapping of the page (`jit::store`), its base register written back,
   and the program goes on past it: the page stays read-only and its
   translations stay, but for the blocks made from the bytes it wrote
   (an instruction patched), which are dropped as a write drops them.
-  After 16 such stores in a page while it is read-only, the next write
-  drops its translations instead.
+  A `cas` is made atomically through that mapping, the same memory.
+  After as many such stores in a page while it is read-only as it has
+  blocks translated from it (16 at least), the next write drops its
+  translations instead.
 - **Emptying:** when the current chunk is full and dropped or retired
   translations are at least half the cache, `jit::flush` stops every
   other thread (`quiesce::stop_others`) and scans their registers, 2 MiB

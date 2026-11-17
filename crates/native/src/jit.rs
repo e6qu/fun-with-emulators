@@ -373,8 +373,11 @@ static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static REVIVED: AtomicU64 = AtomicU64::new(0);
-/// Most stores fwe makes into a page while it is kept from writes; the
-/// next lets it be written.
+/// Stores fwe makes into a page while it is kept from writes, at least,
+/// before the next lets it be written: as many as the page has blocks
+/// translated from it, if more. A store made is a fault (some 6 µs); a
+/// write let be made drops the page's blocks, and each taken back costs
+/// a way out through fwe (some 4 µs).
 const STORES_KEPT: u64 = 16;
 /// Stores into pages kept from writes that fwe left to drop the page's
 /// translations, by why: not a store it decodes, on a page another
@@ -849,18 +852,25 @@ pub fn written(addr: u64) -> bool {
 /// program: `str`, `strb`, `strh` with an immediate (unsigned, unscaled,
 /// or with its base written back before or after) or a register offset;
 /// `stp` with a signed offset or its base written back; `stlr`,
-/// `stlrb`, `stlrh` and their `stllr` forms.
+/// `stlrb`, `stlrh` and their `stllr` forms; `cas` of each size and
+/// ordering.
 fn store_of(w: u32, reg: &impl Fn(usize) -> u64) -> Option<Store> {
     let rt = (w & 31) as usize;
     let rn = ((w >> 5) & 31) as usize;
     let data = |r: usize| if r == 31 { 0 } else { reg(r) };
     let base = reg(rn);
-    let at = |addr: u64, parts: Vec<(u64, u64)>| Store { addr, parts, back: None, release: false };
+    let at = |addr: u64, parts: Vec<(u64, u64)>| Store {
+        addr,
+        parts,
+        back: None,
+        release: false,
+        compare: None,
+    };
     // Base written back: the address before (post-index) or after
     // (pre-index) adding the offset; the base becomes the sum.
     let indexed = |offset: i64, pre: bool, parts: Vec<(u64, u64)>| {
         let sum = base.wrapping_add(offset as u64);
-        Store { addr: if pre { sum } else { base }, parts, back: Some((rn, sum)), release: false }
+        Store { addr: if pre { sum } else { base }, back: Some((rn, sum)), ..at(base, parts) }
     };
     let log = u64::from(w >> 30);
     let imm9 = ((((w >> 12) & 0x1ff) as i64) << 55) >> 55;
@@ -906,18 +916,62 @@ fn store_of(w: u32, reg: &impl Fn(usize) -> u64) -> Option<Store> {
     if w & 0x3fff_7c00 == 0x089f_7c00 {
         return Some(Store { release: true, ..at(base, vec![(data(rt), 1 << log)]) });
     }
+    // cas, casa, casl, casal, of each size (bit 15 a release)
+    if w & 0x3fa0_7c00 == 0x08a0_7c00 {
+        let rs = ((w >> 16) & 31) as usize;
+        return Some(Store {
+            release: w & (1 << 15) != 0,
+            compare: Some(rs),
+            ..at(base, vec![(data(rt), 1 << log)])
+        });
+    }
     None
 }
 
 /// A store [`store_of`] reads: its address, each register's value and
 /// size in order, the base register written back and its new value, and
-/// whether it is a release (`stlr`).
+/// whether it is a release (`stlr`), and for a `cas`, its compared
+/// register.
 #[derive(Debug, PartialEq)]
 struct Store {
     addr: u64,
     parts: Vec<(u64, u64)>,
     back: Option<(usize, u64)>,
     release: bool,
+    /// A `cas`: the register holding the value compared, which gets the
+    /// value the memory held.
+    compare: Option<usize>,
+}
+
+/// Compare the `size` bytes at `at`, naturally aligned, with `expected`
+/// and, if equal, write `new` there, atomically: what was there.
+fn cas(at: u64, size: u64, expected: u64, new: u64) -> u64 {
+    use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32};
+    let o = Ordering::SeqCst;
+    // SAFETY: `at` is naturally aligned (the caller checks), `size` bytes
+    // of the page's writable mapping.
+    unsafe {
+        match size {
+            1 => u64::from(
+                AtomicU8::from_ptr(at as *mut u8)
+                    .compare_exchange(expected as u8, new as u8, o, o)
+                    .unwrap_or_else(|v| v),
+            ),
+            2 => u64::from(
+                AtomicU16::from_ptr(at as *mut u16)
+                    .compare_exchange(expected as u16, new as u16, o, o)
+                    .unwrap_or_else(|v| v),
+            ),
+            4 => u64::from(
+                AtomicU32::from_ptr(at as *mut u32)
+                    .compare_exchange(expected as u32, new as u32, o, o)
+                    .unwrap_or_else(|v| v),
+            ),
+            _ => AtomicU64::from_ptr(at as *mut u64)
+                .compare_exchange(expected, new, o, o)
+                .unwrap_or_else(|v| v),
+        }
+    }
 }
 
 /// Register `r`'s value, 0 for 31 (the zero register, as an offset).
@@ -954,7 +1008,8 @@ pub fn store(
         STORES_LEFT[why].fetch_add(1, Ordering::Relaxed);
         false
     };
-    let Some(Store { addr, parts, back, release }) = store_of(w, &reg).filter(|_| !names_x18)
+    let Some(Store { addr, parts, back, release, compare }) =
+        store_of(w, &reg).filter(|_| !names_x18)
     else {
         undecoded(w);
         return left(0);
@@ -963,6 +1018,10 @@ pub fn store(
     let ps = page_size();
     let page = far & !(ps - 1);
     if addr & !(ps - 1) != page || (addr + len - 1) & !(ps - 1) != page {
+        return false;
+    }
+    // A `cas` not naturally aligned faults for that, made again.
+    if compare.is_some() && !addr.is_multiple_of(len) {
         return false;
     }
     let mut s = state();
@@ -985,16 +1044,27 @@ pub fn store(
     let mut at = wr + (addr - page);
     // A page written often (code being written into it) is let be written
     // instead, its translations dropped: each store made here is a fault.
+    let blocks = s.pages.get(&page).map_or(0, Vec::len) as u64;
     let made = &mut s.writers.get_mut(&page).expect("its writer").1;
     *made += 1;
-    if *made > STORES_KEPT {
+    if *made > STORES_KEPT.max(blocks) {
         return left(2);
     }
     if release {
         // What the thread wrote before is seen first.
         std::sync::atomic::fence(Ordering::SeqCst);
     }
-    for (value, size) in parts {
+    if let Some(rs) = compare {
+        // Atomic, as the program's: the writable mapping is the same
+        // memory.
+        let (new, size) = parts[0];
+        let expected = reg_or_zero(rs, &reg);
+        let old = cas(at, size, expected, new);
+        if rs != 31 {
+            set(rs, old);
+        }
+    }
+    for (value, size) in parts.into_iter().filter(|_| compare.is_none()) {
         // SAFETY: `at` is in the page's writable mapping, `size` bytes of
         // it within the page; the program's mapping allows the write.
         unsafe {
@@ -2367,15 +2437,20 @@ mod tests {
     #[test]
     fn stores_fwe_makes_are_read_from_their_instructions() {
         // Encodings from the assembler.
-        let at =
-            |addr: u64, parts: Vec<(u64, u64)>| Store { addr, parts, back: None, release: false };
+        let at = |addr: u64, parts: Vec<(u64, u64)>| Store {
+            addr,
+            parts,
+            back: None,
+            release: false,
+            compare: None,
+        };
         let back = |addr: u64, parts: Vec<(u64, u64)>, r: usize, v: u64| Store {
             back: Some((r, v)),
             ..at(addr, parts)
         };
         let release =
             |addr: u64, parts: Vec<(u64, u64)>| Store { release: true, ..at(addr, parts) };
-        let cases: [(u32, &str, Option<Store>); 26] = [
+        let cases: [(u32, &str, Option<Store>); 27] = [
             (0xf900_0841, "str x1, [x2, #16]", Some(at(0x210, vec![(0x100, 8)]))),
             (0x3900_0c41, "strb w1, [x2, #3]", Some(at(0x203, vec![(0x100, 1)]))),
             (0x7900_0fe1, "strh w1, [sp, #6]", Some(at(0x9006, vec![(0x100, 2)]))),
@@ -2412,10 +2487,20 @@ mod tests {
             (0x089f_fc41, "stlrb w1, [x2]", Some(release(0x200, vec![(0x100, 1)]))),
             (0x489f_fc5f, "stlrh wzr, [x2]", Some(release(0x200, vec![(0, 2)]))),
             (0xc89f_7c41, "stllr x1, [x2]", Some(release(0x200, vec![(0x100, 8)]))),
+            // Compared and swapped.
+            (
+                0xc8e1_fc43,
+                "casal x1, x3, [x2]",
+                Some(Store { release: true, compare: Some(1), ..at(0x200, vec![(0x300, 8)]) }),
+            ),
+            (
+                0x08a0_7c41,
+                "casb w0, w1, [x2]",
+                Some(Store { compare: Some(0), ..at(0x200, vec![(0x100, 1)]) }),
+            ),
             // Not a general register's, or not a plain store: not made by fwe.
             (0x3d80_0040, "str q0, [x2]", None),
             (0xfc00_8440, "str d0, [x2], #8", None),
-            (0xc8e1_fc43, "casal x1, x3, [x2]", None),
             (0xc804_7c41, "stxr w4, x1, [x2]", None),
         ];
         for (w, text, want) in cases {

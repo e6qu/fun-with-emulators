@@ -25,7 +25,8 @@
  *   whose clobbers leave them out expects (HotSpot calls its atomic stubs
  *   so);
  * - threads running code while another thread patches it;
- * - threads running code while writing data in its page, at once;
+ * - threads running code while writing data in its page, at once, with
+ *   plain stores, releases and compare-and-swap;
  * - code made executable with mprotect after it was written (W^X);
  * - a fork child running code translated before, and code it changes;
  * - and the memory reading back exactly as the program wrote it.
@@ -343,20 +344,48 @@ static void *runner(void *arg) {
 #define WRITERS 4
 #define WRITES 2000
 
-/* Runs the code, then writes its own word in the code's page: the writers
- * write the page at once, each write after code there ran. */
+static void store_release(volatile long *p, long v) {
+    __asm__ volatile("stlr %1, [%0]" ::"r"(p), "r"(v) : "memory");
+}
+
+/* Add 1 to `*p` with compare-and-swap (LSE's `casal`, as a JIT's atomics). */
+static void cas_increment(volatile long *p) {
+    long old = *p;
+    for (;;) {
+        long seen = old;
+        __asm__ volatile(".arch_extension lse\n"
+                         "casal %0, %2, [%1]"
+                         : "+r"(seen)
+                         : "r"(p), "r"(old + 1)
+                         : "memory");
+        if (seen == old) {
+            return;
+        }
+        old = seen;
+    }
+}
+
+/* Runs the code, then writes its own word in the code's page (plainly
+ * and as a release, by turns) and adds 1 to a word they share there: the
+ * writers write the page at once, each write after code there ran. */
 static void *writer(void *arg) {
     long i = (long)arg;
     long (*sum)(long) = (long (*)(long))at(code, jl_sum);
     volatile long *slot = (volatile long *)at(code, jl_slots) + i;
+    volatile long *shared = (volatile long *)at(code, jl_slots) + 7;
     for (long k = 1; k <= WRITES; k++) {
         if (sum(10) != 90) {
             atomic_fetch_add(&bad, 1);
         }
-        *slot = k;
+        if (k & 1) {
+            *slot = k;
+        } else {
+            store_release(slot, k);
+        }
         if (*slot != k) {
             atomic_fetch_add(&bad, 1);
         }
+        cas_increment(shared);
     }
     return 0;
 }
@@ -557,6 +586,11 @@ int main(void) {
         long last = WRITES;
         memcpy((long *)at(expect, jl_slots) + i, &last, sizeof last);
     }
+    long total = WRITERS * WRITES;
+    if (*((volatile long *)at(code, jl_slots) + 7) != total) {
+        atomic_fetch_add(&bad, 1);
+    }
+    memcpy((long *)at(expect, jl_slots) + 7, &total, sizeof total);
     printf("writers: %s\n", atomic_load(&bad) ? "wrong results" : "ok");
 
     /* Written, then made executable (and back), as a W^X JIT does. */
