@@ -740,8 +740,12 @@ mod tests {
     /// tests running alongside are not affected.
     #[test]
     fn translated_ranges_split_copies_where_they_meet() {
-        let a = vec![0xaau8; 0x2000];
-        let b = vec![0xbbu8; 0x1000];
+        // Two host buffers apart (ranges whose memory continues each
+        // other's are one: [`ranges_continuing_each_other_are_one`]).
+        let mut mem = vec![0u8; 0x4000];
+        mem[..0x2000].fill(0xaa);
+        mem[0x3000..].fill(0xbb);
+        let (a, b) = (&mem[..0x2000], &mem[0x3000..]);
         add_translation(0x1_0000, 0x2000, a.as_ptr() as u64);
         add_translation(0x1_2000, 0x1000, b.as_ptr() as u64);
         assert_eq!(g2h(0x1_0010), a.as_ptr() as u64 + 0x10);
@@ -769,7 +773,22 @@ mod tests {
         clear_host_args();
         assert_eq!(guest_of(h + 8), h + 8);
         remove_translation(0x1_0000, 0x3000);
-        assert!(translations().iter().all(|&(g, _, _)| !(0x1_0000..0x1_0000_0000).contains(&g)));
+        assert!(translations().iter().all(|&(g, _, _)| !(0x1_0000..0x1_3000).contains(&g)));
+    }
+
+    /// A range added where another ends, its memory where the other's
+    /// ends, joins it: a buffer across the two has one host address.
+    #[test]
+    fn ranges_continuing_each_other_are_one() {
+        let mem = vec![0u8; 0x3000];
+        let base = mem.as_ptr() as u64;
+        add_translation(0x2_0000, 0x2000, base);
+        assert_eq!(host_after(0x2_2000), Some(base + 0x2000));
+        add_translation(0x2_2000, 0x1000, base + 0x2000);
+        assert!(!crosses(0x2_1000, 0x2000), "one range");
+        assert_eq!(g2h(0x2_2008), base + 0x2008);
+        remove_translation(0x2_0000, 0x3000);
+        assert_eq!(host_after(0x2_2000), None);
     }
 
     #[test]
