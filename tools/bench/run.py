@@ -748,7 +748,8 @@ def callers(name, cmd, funcs):
                             capture_output=True, text=True, errors="replace", timeout=600)
     proc.wait(timeout=600)
     if not os.path.exists(out):
-        print(f"{name}: no callers: {tracer.stdout.strip()[-400:]}", file=sys.stderr)
+        said = (tracer.stdout + tracer.stderr).strip()[-600:]
+        print(f"{name}: no callers (DTrace {tracer.returncode}): {said}", file=sys.stderr)
         return
     with open(out, errors="replace") as f:
         text = f.read()

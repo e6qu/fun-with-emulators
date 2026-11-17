@@ -317,10 +317,10 @@ pub struct State {
     /// translations that lead there, linked as the target is translated
     /// ([`link_waiting`]) rather than each through fwe's trap.
     waiting: BTreeMap<u64, Vec<u64>>,
-    /// Pages written to -> the blocks made from them that the write
-    /// dropped, each taken back as the page is translated from again if
+    /// Program addresses -> the block made there that a write to its page
+    /// dropped, taken back when the address is to be translated again if
     /// its words were not written ([`revive`]).
-    dormant: BTreeMap<u64, Vec<usize>>,
+    dormant: BTreeMap<u64, usize>,
     cache: Option<Cache>,
 }
 
@@ -459,9 +459,9 @@ impl State {
         let start = addr & !(page_size() - 1);
         let end = addr.saturating_add(len);
         if !written {
-            let gone: Vec<u64> = self.dormant.range(start..end).map(|(&p, _)| p).collect();
-            for p in gone {
-                self.dormant.remove(&p);
+            let gone: Vec<u64> = self.dormant.range(start..end).map(|(&g, _)| g).collect();
+            for g in gone {
+                self.dormant.remove(&g);
             }
         }
         // The pages in the range that are kept from writes or translated
@@ -497,7 +497,7 @@ impl State {
                     self.by_g.remove(&g);
                     unpublish(g, t);
                     if written {
-                        self.dormant.entry(p).or_default().push(i);
+                        self.dormant.insert(g, i);
                     }
                     let len = self.blocks[i].len;
                     if let Some(c) = self.cache.as_mut() {
@@ -1129,8 +1129,7 @@ fn translation(s: &mut State, g: u64) -> usize {
     let at = cache_next(s);
     guard(s, page);
     let followed = !s.in_region(g);
-    revive(s, page);
-    if let Some(&i) = s.by_g.get(&g) {
+    if let Some(i) = revive(s, g, page) {
         return i;
     }
     let began = std::time::Instant::now();
@@ -1168,38 +1167,32 @@ fn translation(s: &mut State, g: u64) -> usize {
     i
 }
 
-/// Take back the blocks made from page `p` that a write to it dropped
-/// ([`State::dormant`]) whose program words were not written: the page is
-/// kept from writes again (by the caller), so the words read now are what
-/// runs until a write drops them again. Taken back all at once, they are
-/// linked as new ones are, rather than each one's way in going through
-/// fwe to be translated again.
-fn revive(s: &mut State, p: u64) {
-    let Some(dropped) = s.dormant.remove(&p) else { return };
-    let mut back = Vec::new();
-    for i in dropped {
-        let b = &s.blocks[i];
-        if b.retired || s.by_g.contains_key(&b.g) || b.followed == s.in_region(b.g) {
-            continue;
-        }
-        let same = b.source.iter().zip((b.g..).step_by(4)).all(|(&w, at)| read(at) == w);
-        if !same {
-            continue;
-        }
-        let (g, t, len) = (b.g, b.t, b.len);
-        s.by_g.insert(g, i);
-        s.pages.entry(p).or_default().push(i);
-        publish(g, t);
-        if let Some(c) = s.cache.as_mut() {
-            c.live += len;
-            c.garbage -= len;
-        }
-        REVIVED.fetch_add(1, Ordering::Relaxed);
-        back.push(i);
+/// Take back the block at program address `g`, on page `p`, that a write
+/// to the page dropped ([`State::dormant`]), if its program words were not
+/// written: the page is kept from writes again (by the caller), so the
+/// words read now are what runs until a write drops it again. Only a
+/// block wanted again is taken back: a page holds many that do not run
+/// again before its next write.
+fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
+    let i = s.dormant.remove(&g)?;
+    let b = &s.blocks[i];
+    if b.retired || b.followed == s.in_region(g) || b.g & !(page_size() - 1) != p {
+        return None;
     }
-    for i in back {
-        link_waiting(s, i);
+    if !b.source.iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w) {
+        return None;
     }
+    let (t, len) = (b.t, b.len);
+    s.by_g.insert(g, i);
+    s.pages.entry(p).or_default().push(i);
+    publish(g, t);
+    if let Some(c) = s.cache.as_mut() {
+        c.live += len;
+        c.garbage -= len;
+    }
+    REVIVED.fetch_add(1, Ordering::Relaxed);
+    link_waiting(s, i);
+    Some(i)
 }
 
 /// Link the direct ways out of new block `i` to their targets' translations

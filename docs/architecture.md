@@ -339,11 +339,11 @@ sees, is in
   (`read`, `pread64`, `recvfrom`, every buffer it checks for writing,
   such as `recvmsg`'s, and every checked copy out), which does the same
   first. The blocks a write dropped are kept (`State::dormant`), with
-  the program's words each was made from: when the page is next
-  translated from, once it is read-only again, every one whose words are
-  unchanged is taken back at once (`jit::revive`), its entry published
-  and its branches linked, and only what the write changed is translated
-  again. Unmapping, mapping anew or changing a page's protections
+  the program's words each was made from: when its address is to be
+  translated again, once the page is read-only again, the block is
+  taken back if its words are unchanged (`jit::revive`), its entry
+  published and its branches linked; only what the write changed is
+  translated again. Unmapping, mapping anew or changing a page's protections
   forgets them.
 - **Emptying:** when the current chunk is full and dropped or retired
   translations are at least half the cache, `jit::flush` stops every
