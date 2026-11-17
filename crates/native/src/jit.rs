@@ -236,6 +236,11 @@ struct Block {
     /// Kept when the cache was emptied, as a thread may still be in it or
     /// return into it: found by no lookup, and its ways out not linked.
     retired: bool,
+    /// The program's words it was made from, from `g` on, and whether it
+    /// was followed into (code not run by translation): dropped by a write
+    /// to its page, it is taken back while they are the same ([`revive`]).
+    source: Vec<u32>,
+    followed: bool,
 }
 
 /// The code cache: chunks, each one memory mapped twice.
@@ -312,6 +317,10 @@ pub struct State {
     /// translations that lead there, linked as the target is translated
     /// ([`link_waiting`]) rather than each through fwe's trap.
     waiting: BTreeMap<u64, Vec<u64>>,
+    /// Pages written to -> the blocks made from them that the write
+    /// dropped, each taken back as the page is translated from again if
+    /// its words were not written ([`revive`]).
+    dormant: BTreeMap<u64, Vec<usize>>,
     cache: Option<Cache>,
 }
 
@@ -332,6 +341,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     returns: std::collections::BTreeSet::new(),
     call_sites: std::collections::BTreeSet::new(),
     waiting: BTreeMap::new(),
+    dormant: BTreeMap::new(),
     cache: None,
 });
 
@@ -356,6 +366,7 @@ static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
+static REVIVED: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// What [`TRANSLATED`] and the others counted, if any code ran by
@@ -366,7 +377,7 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} pages' translations dropped by writes, the code cache emptied {} times; \
+             {} pages' translations dropped by writes ({} blocks taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -376,6 +387,7 @@ pub fn counts() -> Option<String> {
             ENTERED_CALLS.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
+            REVIVED.load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
             EXIT_NS.load(Ordering::Relaxed) / 1_000_000
@@ -439,10 +451,19 @@ impl State {
     }
 
     /// Drop the translations made from `[addr, addr + len)`, and give the
-    /// pages kept from writes there their protections back.
-    fn drop_range(&mut self, addr: u64, len: u64) {
+    /// pages kept from writes there their protections back. `written`: a
+    /// write to the pages drops them, which keeps them to take back
+    /// ([`State::dormant`]); anything else (the memory unmapped, mapped
+    /// anew, its protections changed) forgets them.
+    fn drop_range(&mut self, addr: u64, len: u64, written: bool) {
         let start = addr & !(page_size() - 1);
         let end = addr.saturating_add(len);
+        if !written {
+            let gone: Vec<u64> = self.dormant.range(start..end).map(|(&p, _)| p).collect();
+            for p in gone {
+                self.dormant.remove(&p);
+            }
+        }
         // The pages in the range that are kept from writes or translated
         // from (not every page of it: a range may be a reservation of
         // terabytes).
@@ -457,7 +478,7 @@ impl State {
         let aliases: Vec<u64> = self.aliases.range(start..end).map(|(&q, _)| q).collect();
         for q in aliases {
             for p in self.aliases.remove(&q).unwrap_or_default() {
-                self.drop_range(p, page_size());
+                self.drop_range(p, page_size(), written);
             }
         }
         let pages: Vec<u64> = self.pages.range(start..end).map(|(&p, _)| p).collect();
@@ -475,6 +496,9 @@ impl State {
                 if self.by_g.get(&g) == Some(&i) {
                     self.by_g.remove(&g);
                     unpublish(g, t);
+                    if written {
+                        self.dormant.entry(p).or_default().push(i);
+                    }
                     let len = self.blocks[i].len;
                     if let Some(c) = self.cache.as_mut() {
                         c.live -= len;
@@ -511,7 +535,7 @@ fn lift(p: u64) {
 /// mapped it: it runs by translation from now on.
 pub fn code(addr: u64, len: u64) {
     let mut s = state();
-    s.drop_range(addr, len);
+    s.drop_range(addr, len, false);
     remove(&mut s.regions, addr, len);
     s.regions.insert(addr, addr + len);
     // Lookups that took its addresses for code not translated go again.
@@ -531,7 +555,7 @@ pub fn changed(addr: u64, len: u64) -> bool {
     let mut s = state();
     let end = addr.saturating_add(len);
     let held = s.regions.range(..end).any(|(_, &e)| e > addr);
-    s.drop_range(addr, len);
+    s.drop_range(addr, len, false);
     remove(&mut s.regions, addr, len);
     let gone: Vec<u64> = s.lifted.range(addr & !(page_size() - 1)..end).map(|(&p, _)| p).collect();
     for p in gone {
@@ -545,7 +569,7 @@ pub fn reset() {
     let mut s = state();
     let regions: Vec<(u64, u64)> = s.regions.iter().map(|(&a, &e)| (a, e)).collect();
     for (a, e) in regions {
-        s.drop_range(a, e - a);
+        s.drop_range(a, e - a, false);
     }
     s.regions.clear();
     if s.cache.is_some() {
@@ -570,6 +594,7 @@ pub fn reset() {
     s.returns.clear();
     s.call_sites.clear();
     s.waiting.clear();
+    s.dormant.clear();
 }
 
 /// Held across a `fork`, so that the child's copy of the translations is
@@ -740,7 +765,7 @@ pub fn written(addr: u64) -> bool {
     if s.guarded.contains(&page) {
         s.retried.remove(&thread);
         DROPPED.fetch_add(1, Ordering::Relaxed);
-        s.drop_range(page, page_size());
+        s.drop_range(page, page_size(), true);
         return true;
     }
     let Some(&lifts) = s.lifted.get(&page) else { return false };
@@ -761,7 +786,7 @@ pub fn host_writes(addr: u64, len: u64) {
     let kept: Vec<u64> = s.guarded.range(start..addr.saturating_add(len)).copied().collect();
     for p in kept {
         DROPPED.fetch_add(1, Ordering::Relaxed);
-        s.drop_range(p, page_size());
+        s.drop_range(p, page_size(), true);
     }
 }
 
@@ -1104,8 +1129,12 @@ fn translation(s: &mut State, g: u64) -> usize {
     let at = cache_next(s);
     guard(s, page);
     let followed = !s.in_region(g);
+    revive(s, page);
+    if let Some(&i) = s.by_g.get(&g) {
+        return i;
+    }
     let began = std::time::Instant::now();
-    let (words, info, entry, calls) = translate(g, at, followed);
+    let (words, info, entry, calls, end) = translate(g, at, followed);
     TRANSLATE_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
@@ -1128,6 +1157,8 @@ fn translation(s: &mut State, g: u64) -> usize {
         len,
         body: t + 4 * entry as u64,
         retired: false,
+        source: (g..end).step_by(4).map(read).collect(),
+        followed,
     });
     s.by_g.insert(g, i);
     s.by_t.insert(t, i);
@@ -1135,6 +1166,40 @@ fn translation(s: &mut State, g: u64) -> usize {
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
     link_waiting(s, i);
     i
+}
+
+/// Take back the blocks made from page `p` that a write to it dropped
+/// ([`State::dormant`]) whose program words were not written: the page is
+/// kept from writes again (by the caller), so the words read now are what
+/// runs until a write drops them again. Taken back all at once, they are
+/// linked as new ones are, rather than each one's way in going through
+/// fwe to be translated again.
+fn revive(s: &mut State, p: u64) {
+    let Some(dropped) = s.dormant.remove(&p) else { return };
+    let mut back = Vec::new();
+    for i in dropped {
+        let b = &s.blocks[i];
+        if b.retired || s.by_g.contains_key(&b.g) || b.followed == s.in_region(b.g) {
+            continue;
+        }
+        let same = b.source.iter().zip((b.g..).step_by(4)).all(|(&w, at)| read(at) == w);
+        if !same {
+            continue;
+        }
+        let (g, t, len) = (b.g, b.t, b.len);
+        s.by_g.insert(g, i);
+        s.pages.entry(p).or_default().push(i);
+        publish(g, t);
+        if let Some(c) = s.cache.as_mut() {
+            c.live += len;
+            c.garbage -= len;
+        }
+        REVIVED.fetch_add(1, Ordering::Relaxed);
+        back.push(i);
+    }
+    for i in back {
+        link_waiting(s, i);
+    }
 }
 
 /// Link the direct ways out of new block `i` to their targets' translations
@@ -1397,6 +1462,8 @@ fn veneer(s: &mut State, to: u64) -> usize {
         len,
         body: t,
         retired: false,
+        source: Vec::new(),
+        followed: true,
     });
     s.by_t.insert(t, i);
     s.veneers.insert(to, i);
@@ -1506,6 +1573,7 @@ fn flush(s: &mut State) {
     s.objects.clear();
     s.object_of.clear();
     s.waiting.clear();
+    s.dormant.clear();
     s.veneers.clear();
     s.aliases.clear();
     let pages = std::mem::take(&mut s.guarded);
@@ -1591,7 +1659,7 @@ fn read(g: u64) -> u32 {
 /// Translate the block at program address `g`, to be placed at `t`: its
 /// words, and what each stands for. A block ends at its page's end, so it
 /// is made from that page alone.
-fn translate(g: u64, t: u64, followed: bool) -> (Vec<u32>, Vec<Word>, usize, Vec<u64>) {
+fn translate(g: u64, t: u64, followed: bool) -> (Vec<u32>, Vec<Word>, usize, Vec<u64>, u64) {
     // Entered from a lookup with the target in `x16`, the program's `x16`
     // and `x17` on the stack: the target is checked to be this block's (a
     // lookup can read an entry another thread is taking over), then they
@@ -1605,19 +1673,26 @@ fn translate(g: u64, t: u64, followed: bool) -> (Vec<u32>, Vec<Word>, usize, Vec
     out.push(RESTORE);
     let mut info: Vec<Word> = vec![entered; out.len()];
     let entry = out.len();
-    let calls = body_of(g, t, followed, &mut out, &mut info);
+    let (calls, end) = body_of(g, t, followed, &mut out, &mut info);
     // The wrong block's way out.
     let wrong = out.len();
     out[wrong_at] |= ((wrong - wrong_at) as u32) << 5;
     out.push(EXIT);
     info.push(Word::Out { g, exit: Exit::Retry });
-    (out, info, entry, calls)
+    (out, info, entry, calls, end)
 }
 
 /// The instructions of the block at program address `g`, translated onto
 /// `out` (the block placed at `t`); `followed`, code fwe prepared in place
-/// (a library's), read as the program wrote it. Where its calls return.
-fn body_of(g: u64, t: u64, followed: bool, out: &mut Vec<u32>, info: &mut Vec<Word>) -> Vec<u64> {
+/// (a library's), read as the program wrote it. Where its calls return,
+/// and the end of the program's words it read.
+fn body_of(
+    g: u64,
+    t: u64,
+    followed: bool,
+    out: &mut Vec<u32>,
+    info: &mut Vec<Word>,
+) -> (Vec<u64>, u64) {
     let page = page_size();
     let mut pc = g;
     let mut calls = Vec::new();
@@ -1632,14 +1707,14 @@ fn body_of(g: u64, t: u64, followed: bool, out: &mut Vec<u32>, info: &mut Vec<Wo
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
         if ended {
-            return calls;
+            return (calls, pc);
         }
         if pc & (page - 1) == 0 {
             break;
         }
     }
     gate_out(pc, Exit::Jump(pc), out, info);
-    calls
+    (calls, pc)
 }
 
 /// A way out into fwe through the exit gate ([`JUMP_WORDS`] words): the

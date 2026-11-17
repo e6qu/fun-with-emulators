@@ -338,7 +338,13 @@ sees, is in
   `mm::host_writes` before the host writes guest memory for a call
   (`read`, `pread64`, `recvfrom`, every buffer it checks for writing,
   such as `recvmsg`'s, and every checked copy out), which does the same
-  first.
+  first. The blocks a write dropped are kept (`State::dormant`), with
+  the program's words each was made from: when the page is next
+  translated from, once it is read-only again, every one whose words are
+  unchanged is taken back at once (`jit::revive`), its entry published
+  and its branches linked, and only what the write changed is translated
+  again. Unmapping, mapping anew or changing a page's protections
+  forgets them.
 - **Emptying:** when the current chunk is full and dropped or retired
   translations are at least half the cache, `jit::flush` stops every
   other thread (`quiesce::stop_others`) and scans their registers, 2 MiB

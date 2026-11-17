@@ -6,7 +6,11 @@
  * - send the workers signals, whose handler returns;
  * - take away and give back the reading of a page the code loads from
  *   (through x18 too), the fault's handler giving it back;
- * - write data into the code's own page (its translations dropped).
+ * - write data into the code's own page, and change three of its
+ *   instructions, each between two that do the same (`nop` and `b .+4`,
+ *   which Arm lets one change while other cores run it): what was not
+ *   changed is taken back, what was is translated again, and the code
+ *   cache fills.
  *
  * A signal or fault landing in the middle of an expansion must leave the
  * code's registers as at its own instruction, so each round's checksum is
@@ -103,7 +107,9 @@ __asm__(
     "3: tbz x9, #0, 4f\n"
     "  add x9, x9, #7\n"
     /* now and then a system call (getpid) */
-    "4: ands x10, x4, #63\n"
+    /* changed by the patcher, doing the same either way */
+    "4: js_swap: nop\n"
+    "  ands x10, x4, #63\n"
     "  b.ne 5f\n"
     "  mov x8, #172\n"
     "  svc #0\n"
@@ -115,10 +121,12 @@ __asm__(
     "  ret\n"
 
     "js_leaf:\n"
+    "js_swap2: nop\n"
     "  add x9, x9, #5\n"
     "  eor x9, x9, x9, lsr #7\n"
     "  ret\n"
     "js_leaf2:\n"
+    "js_swap3: nop\n"
     "  eor x9, x9, x9, lsl #3\n"
     "  add x9, x9, #11\n"
     "  ret\n"
@@ -134,7 +142,8 @@ __asm__(
     ".balign 4096\n"
     ".text\n");
 
-extern const char js_begin[], js_end[], js_work[], js_scratch[];
+extern const char js_begin[], js_end[], js_work[], js_scratch[], js_swap[], js_swap2[],
+    js_swap3[];
 
 /* Make code just written visible to instruction fetch, as Linux's
  * __clear_cache does, by the cache lines CTR_EL0 gives. */
@@ -164,7 +173,7 @@ static atomic_int stop;
  * written this many times (each write drops its translations): the storm
  * lasts as long as the writes, however fast a round is. */
 #define ROUNDS 20
-#define WRITES 300
+#define WRITES 1000
 #define N 5000
 
 typedef long (*work_fn)(long, long *, long, long *);
@@ -232,8 +241,14 @@ static void *poller(void *arg) {
 static void *patcher(void *arg) {
     (void)arg;
     volatile long *scratch = (volatile long *)(code + (js_scratch - js_begin));
+    const char *swaps[] = {js_swap, js_swap2, js_swap3};
     while (!atomic_load(&stop)) {
         *scratch += 1;
+        for (int i = 0; i < 3; i++) {
+            volatile uint32_t *w = (volatile uint32_t *)(code + (swaps[i] - js_begin));
+            *w = *w == 0xd503201f ? 0x14000001 : 0xd503201f; /* nop, b .+4 */
+            flush((void *)w, 4);
+        }
         atomic_fetch_add(&written, 1);
         usleep(500);
     }

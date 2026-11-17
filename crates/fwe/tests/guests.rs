@@ -1225,8 +1225,8 @@ fn ioccc_winners_run_as_their_authors_say() {
 /// JIT code interrupted everywhere (guests/c/jitstorm.c): signals, faults
 /// and writes to its page landing while worker threads run every kind of
 /// instruction a translation expands leave each round's result as a quiet
-/// run's; and again with a code cache small enough to be emptied while
-/// they run.
+/// run's, blocks the writes left alone taken back; and again with a code
+/// cache small enough to be emptied while they run.
 #[test]
 fn jit_code_survives_signals_faults_and_writes() {
     let prog = build_c("jitstorm", Libc::Musl, true, true);
@@ -1251,6 +1251,11 @@ fn jit_code_survives_signals_faults_and_writes() {
             assert!(
                 counts.iter().any(|l| !l.contains("emptied 0 times")),
                 "the code cache was never emptied: {counts:?}"
+            );
+        } else {
+            assert!(
+                counts.iter().any(|l| !l.contains("(0 blocks taken back)")),
+                "no block the writes left alone was taken back: {counts:?}"
             );
         }
     }
