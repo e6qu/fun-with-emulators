@@ -861,6 +861,14 @@ fn exit_now(regs: &mut Regs) -> bool {
     true
 }
 
+/// The program's address of the `svc` whose system-call stub in a
+/// translation returns past `site` (as [`crate::gate::site_of`] gives it):
+/// kept in the two words before it, read without the translator's lock.
+pub fn syscall_site(site: u64) -> u64 {
+    // SAFETY: the words of a translation's system-call stub, in the cache.
+    unsafe { ((site - 4) as *const u64).read_unaligned() }
+}
+
 /// The program's address of the instruction a word of a translation at
 /// `pc` stands for, if `pc` is in one: a system call made from a
 /// translation is the program's `svc`'s, for the kernel (which restarts it
@@ -1847,7 +1855,9 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
                 info.push(Word::At(pc));
             }
             let stub_at = here(out);
-            let words = rewrite::stub(Site::Syscall { gate }, 0, 0, stub_at, stub_at + 32);
+            // Its way back goes past the program's address of the `svc`,
+            // kept after it for the gate ([`syscall_site`]).
+            let words = rewrite::stub(Site::Syscall { gate }, 0, 0, stub_at, stub_at + 40);
             for (k, &sw) in words.iter().enumerate() {
                 out.push(sw);
                 // Before the call returns: undone (the call not made);
@@ -1858,6 +1868,8 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
                     _ => Word::Finish { g: pc },
                 });
             }
+            out.extend([pc as u32, (pc >> 32) as u32]);
+            info.extend([Word::Finish { g: pc }; 2]);
         }
         return false;
     }

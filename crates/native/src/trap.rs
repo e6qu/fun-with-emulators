@@ -337,7 +337,8 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     crate::quiesce::leave_at(b.slot);
     // A call from a translation is the program's `svc`'s.
     let site = crate::gate::site_of(b.ret);
-    let site = guest_site(site);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let site = if crate::jit::in_cache(site) { crate::jit::syscall_site(site) } else { site };
     b.regs.pc = site;
     b.regs.x[18] = guest_x18();
     b.ran = 0;
