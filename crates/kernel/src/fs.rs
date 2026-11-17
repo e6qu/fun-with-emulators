@@ -3348,19 +3348,30 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
             libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NONBLOCK | flags_host)
         }
     };
+    // A writer already let through by the ends opened here, the one
+    // opened to look and the one above, and gone again (it opened and
+    // closed at once): Linux's open has seen it come, so this one
+    // succeeds. The host's would wait for a writer that is not coming.
+    let came_before = |fd: i32| {
+        matches!(crate::fifo::probe(fd), crate::fifo::Probe::HungUp | crate::fifo::Probe::Data)
+    };
+    #[cfg(target_os = "macos")]
+    let looked = seen.as_ref().is_some_and(|s| came_before(s.as_raw_fd()));
+    #[cfg(not(target_os = "macos"))]
+    let looked = false;
+    let already = early >= 0 && (looked || came_before(early));
     // The reader end above stands in for the one opened to look.
     #[cfg(target_os = "macos")]
     drop(seen);
-    // SAFETY: as above; waits for the other end.
-    let mut fd = unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) };
-    let err = e();
+    let mut fd = if already {
+        -1
+    } else {
+        // SAFETY: as above; waits for the other end.
+        unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) }
+    };
+    let err = if already { errno::EINTR } else { e() };
     if early >= 0 {
-        let came = fd < 0
-            && err == errno::EINTR
-            && matches!(
-                crate::fifo::probe(early),
-                crate::fifo::Probe::HungUp | crate::fifo::Probe::Data
-            );
+        let came = fd < 0 && err == errno::EINTR && (already || came_before(early));
         if came {
             // A writer came (and maybe went): the open succeeded, as Linux's.
             // SAFETY: fwe's own descriptor, made blocking as the guest asked.
