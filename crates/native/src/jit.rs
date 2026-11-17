@@ -378,10 +378,12 @@ static REVIVED: AtomicU64 = AtomicU64::new(0);
 const STORES_KEPT: u64 = 16;
 /// Stores into pages kept from writes that fwe left to drop the page's
 /// translations, by why: not a store it decodes, on a page another
-/// mapping shares, into the code, or past [`STORES_KEPT`].
-static STORES_LEFT: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
-/// The program's stores fwe made for it into pages kept from writes.
+/// mapping shares, or past [`STORES_KEPT`].
+static STORES_LEFT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+/// The program's stores fwe made for it into pages kept from writes, and
+/// those of them into translated code.
 static STORES: AtomicU64 = AtomicU64::new(0);
+static STORES_INTO_CODE: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// What [`TRANSLATED`] and the others counted, if any code ran by
@@ -392,8 +394,8 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, \
-             left: {} not decoded, {} shared, {} into code, {} past the limit), the code cache emptied {} times; \
+             {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, {} of them into code, \
+             left: {} not decoded, {} shared, {} past the limit), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -405,10 +407,10 @@ pub fn counts() -> Option<String> {
             DROPPED.load(Ordering::Relaxed),
             REVIVED.load(Ordering::Relaxed),
             STORES.load(Ordering::Relaxed),
+            STORES_INTO_CODE.load(Ordering::Relaxed),
             STORES_LEFT[0].load(Ordering::Relaxed),
             STORES_LEFT[1].load(Ordering::Relaxed),
             STORES_LEFT[2].load(Ordering::Relaxed),
-            STORES_LEFT[3].load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
             EXIT_NS.load(Ordering::Relaxed) / 1_000_000
@@ -514,29 +516,37 @@ impl State {
                 }
             }
             for i in self.pages.remove(&p).unwrap_or_default() {
-                let (g, t) = (self.blocks[i].g, self.blocks[i].t);
-                if self.by_g.get(&g) == Some(&i) {
-                    self.by_g.remove(&g);
-                    unpublish(g, t);
-                    if written {
-                        self.dormant.insert(g, i);
-                    }
-                    let len = self.blocks[i].len;
-                    if let Some(c) = self.cache.as_mut() {
-                        c.live -= len;
-                        c.garbage += len;
-                    }
-                    // Branches linked to it trap again, and wait for it to be
-                    // translated anew.
-                    for at in std::mem::take(&mut self.blocks[i].linked) {
-                        self.patch(at, EXIT);
-                        let live = block_at(self, at)
-                            .is_some_and(|f| self.by_g.get(&self.blocks[f].g) == Some(&f));
-                        if live {
-                            self.waiting.entry(g).or_default().push(at);
-                        }
-                    }
-                }
+                self.drop_block(i, written);
+            }
+        }
+    }
+
+    /// Drop block `i`'s translation, if it is its address's (the caller
+    /// takes it off its page's list). `written`: kept to take back, as in
+    /// [`State::drop_range`].
+    fn drop_block(&mut self, i: usize, written: bool) {
+        let (g, t) = (self.blocks[i].g, self.blocks[i].t);
+        if self.by_g.get(&g) != Some(&i) {
+            return;
+        }
+        self.by_g.remove(&g);
+        unpublish(g, t);
+        if written {
+            self.dormant.insert(g, i);
+        }
+        let len = self.blocks[i].len;
+        if let Some(c) = self.cache.as_mut() {
+            c.live -= len;
+            c.garbage += len;
+        }
+        // Branches linked to it trap again, and wait for it to be
+        // translated anew.
+        for at in std::mem::take(&mut self.blocks[i].linked) {
+            self.patch(at, EXIT);
+            let live =
+                block_at(self, at).is_some_and(|f| self.by_g.get(&self.blocks[f].g) == Some(&f));
+            if live {
+                self.waiting.entry(g).or_default().push(at);
             }
         }
     }
@@ -854,11 +864,11 @@ fn reg_or_zero(r: usize, reg: &impl Fn(usize) -> u64) -> u64 {
 /// A store by the program, instruction `w`, that faulted on a page kept
 /// from writes: `far` the address, `esr` the syndrome, `reg` the general
 /// registers (`sp` as 31). One fwe can make ([`store_of`]) into a page
-/// translated from, whose bytes miss the code translated there and which
-/// the program's mapping lets it write, is made through the page's
-/// writable mapping: the page stays kept from writes and its translations
-/// stay. The caller goes on past the store. Any other store, or one into
-/// the code, is [`written`]'s.
+/// translated from, which the program's mapping lets it write, is made
+/// through the page's writable mapping: the page stays kept from writes,
+/// and its translations stay but for those of the bytes written (an
+/// instruction patched). The caller goes on past the store. Any other
+/// store is [`written`]'s.
 pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     const EC_DATA_ABORT_LOWER: u32 = 0x24;
     let permission_write = esr >> 26 == EC_DATA_ABORT_LOWER
@@ -897,16 +907,6 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     if !writable {
         return false;
     }
-    let into_code = s.pages.get(&page).is_some_and(|blocks| {
-        blocks.iter().any(|&i| {
-            let b = &s.blocks[i];
-            let end = b.g + 4 * b.source.len() as u64;
-            s.by_g.get(&b.g) == Some(&i) && addr < end && addr + len > b.g
-        })
-    });
-    if into_code {
-        return left(2);
-    }
     let Some(wr) = writer(&mut s, page) else { return false };
     let mut at = wr + (addr - page);
     // A page written often (code being written into it) is let be written
@@ -914,7 +914,7 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     let made = &mut s.writers.get_mut(&page).expect("its writer").1;
     *made += 1;
     if *made > STORES_KEPT {
-        return left(3);
+        return left(2);
     }
     for (value, size) in parts {
         // SAFETY: `at` is in the page's writable mapping, `size` bytes of
@@ -931,6 +931,20 @@ pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
     }
     std::sync::atomic::fence(Ordering::SeqCst);
     STORES.fetch_add(1, Ordering::Relaxed);
+    // A store into code (an instruction patched) drops the blocks
+    // translated from the bytes it wrote, not the page's others.
+    let blocks = s.pages.get(&page).cloned().unwrap_or_default();
+    let (hit, kept): (Vec<usize>, Vec<usize>) = blocks.into_iter().partition(|&i| {
+        let b = &s.blocks[i];
+        addr < b.g + 4 * b.source.len() as u64 && addr + len > b.g
+    });
+    if !hit.is_empty() {
+        STORES_INTO_CODE.fetch_add(1, Ordering::Relaxed);
+        s.pages.insert(page, kept);
+        for i in hit {
+            s.drop_block(i, true);
+        }
+    }
     true
 }
 
