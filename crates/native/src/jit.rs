@@ -302,6 +302,10 @@ pub struct State {
     /// Call sites of code not translated that called into translated code
     /// and were linked to it, or tried ([`link_call_site`]).
     call_sites: std::collections::BTreeSet<u64>,
+    /// Program addresses not translated yet -> the direct ways out of
+    /// translations that lead there, linked as the target is translated
+    /// ([`link_waiting`]) rather than each through fwe's trap.
+    waiting: BTreeMap<u64, Vec<u64>>,
     cache: Option<Cache>,
 }
 
@@ -320,6 +324,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     veneers: BTreeMap::new(),
     returns: std::collections::BTreeSet::new(),
     call_sites: std::collections::BTreeSet::new(),
+    waiting: BTreeMap::new(),
     cache: None,
 });
 
@@ -464,9 +469,15 @@ impl State {
                         c.live -= len;
                         c.garbage += len;
                     }
-                    // Branches linked to it trap again.
+                    // Branches linked to it trap again, and wait for it to be
+                    // translated anew.
                     for at in std::mem::take(&mut self.blocks[i].linked) {
                         self.patch(at, EXIT);
+                        let live = block_at(self, at)
+                            .is_some_and(|f| self.by_g.get(&self.blocks[f].g) == Some(&f));
+                        if live {
+                            self.waiting.entry(g).or_default().push(at);
+                        }
                     }
                 }
             }
@@ -546,6 +557,7 @@ pub fn reset() {
     s.veneers.clear();
     s.returns.clear();
     s.call_sites.clear();
+    s.waiting.clear();
 }
 
 /// Held across a `fork`, so that the child's copy of the translations is
@@ -1091,7 +1103,55 @@ fn translation(s: &mut State, g: u64) -> usize {
     s.by_t.insert(t, i);
     publish(g, t);
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
+    link_waiting(s, i);
     i
+}
+
+/// Link the direct ways out of new block `i` to their targets' translations
+/// where there are ones, and the ways out waiting for `i`'s program address
+/// to it: as a way out's first run would, without its trap.
+fn link_waiting(s: &mut State, i: usize) {
+    let (t, g) = (s.blocks[i].t, s.blocks[i].g);
+    let outs: Vec<(u64, u64)> = s.blocks[i]
+        .words
+        .iter()
+        .enumerate()
+        .filter_map(|(k, w)| match *w {
+            Word::Out { exit: Exit::Jump(to), .. } => Some((t + 4 * k as u64, to)),
+            _ => None,
+        })
+        .collect();
+    for (at, to) in outs {
+        match s.by_g.get(&to).copied() {
+            Some(j) => link_site(s, at, j),
+            None => s.waiting.entry(to).or_default().push(at),
+        }
+    }
+    for at in s.waiting.remove(&g).unwrap_or_default() {
+        link_site(s, at, i);
+    }
+}
+
+/// Link way out `at` (a direct one, still fwe's trap) to block `j`, if it
+/// is in a live translation and the branch reaches.
+fn link_site(s: &mut State, at: u64, j: usize) {
+    let Some(from) = block_at(s, at) else { return };
+    // A block dropped (its program address another's, or none's) is left
+    // as it is: nothing new leads into it.
+    if s.by_g.get(&s.blocks[from].g) != Some(&from) {
+        return;
+    }
+    let to = s.blocks[j].g;
+    let waits = matches!(word_at(s, at), Some(Word::Out { exit: Exit::Jump(x), .. }) if x == to);
+    // SAFETY: a word of fwe's code cache, readable.
+    let trap = unsafe { (at as *const u32).read() } == EXIT;
+    if !waits || !trap || s.blocks[from].retired || s.blocks[j].retired {
+        return;
+    }
+    if let Some(b) = rewrite::branch(at, body(s, j)) {
+        s.patch(at, b);
+        s.blocks[j].linked.push(at);
+    }
 }
 
 /// Keep program page `p` from being written while translations of it are
@@ -1418,6 +1478,7 @@ fn flush(s: &mut State) {
     }
     // Nothing is translated from the program's pages now.
     s.objects.clear();
+    s.waiting.clear();
     s.veneers.clear();
     s.aliases.clear();
     let pages = std::mem::take(&mut s.guarded);
