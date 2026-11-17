@@ -2009,6 +2009,101 @@ impl Drop for ProgramRoot {
     }
 }
 
+/// Debian's SQLite compiling SQL into programs for its own virtual machine
+/// (its bytecode, the VDBE) and running them: some 600 statements, each
+/// different and so compiled anew, a recursive query drawing the
+/// Mandelbrot set in floating point, window functions, a trigger, an
+/// upsert returning what it wrote with a generated column, and JSON's
+/// table functions. The output is what SQLite prints on Linux (and on
+/// macOS, where it was taken).
+#[test]
+fn debian_sqlite_compiles_and_runs_its_own_programs() {
+    let _workload = workload();
+    let root = ProgramRoot::new("sqlite-vdbe", &[]);
+    std::fs::copy(debian_bin("sqlite3"), root.path("bin/sqlite3")).unwrap();
+    std::fs::copy(debian_bin("seq"), root.path("bin/seq")).unwrap();
+    let script = r#"
+set -e
+cd /tmp
+sqlite3 db "create table t(x integer primary key, y)"
+sqlite3 db "with recursive c(x) as (select 1 union all select x + 1 from c where x < 2000) insert into t select x, x * 7 % 101 from c"
+# Statements compiled one by one, each different: SQLite turns each into
+# a program for its virtual machine, then runs it.
+for i in $(seq 1 600); do
+    echo "insert into r values ($i, (select count(*) from t where y % $i = 0) + $i * $i);"
+done | sqlite3 -cmd "create table r(i integer primary key, v)" db
+sqlite3 db "select count(*), sum(v), max(v) from r"
+sqlite3 db "with recursive
+  xaxis(x) as (values(-2.0) union all select x + 0.05 from xaxis where x < 1.2),
+  yaxis(y) as (values(-1.0) union all select y + 0.1 from yaxis where y < 1.0),
+  m(iter, cx, cy, x, y) as (
+    select 0, x, y, 0.0, 0.0 from xaxis, yaxis
+    union all
+    select iter + 1, cx, cy, x * x - y * y + cx, 2.0 * x * y + cy from m
+    where (x * x + y * y) < 4.0 and iter < 28),
+  m2(iter, cx, cy) as (select max(iter), cx, cy from m group by cx, cy),
+  a(t) as (select group_concat(substr(' .+*#', 1 + min(iter / 7, 4), 1), '')
+           from m2 group by cy)
+select group_concat(rtrim(t), char(10)) from a"
+sqlite3 db "select x, sum(y) over (order by x rows 2 preceding), rank() over (order by y desc)
+            from t where x <= 6 order by x"
+sqlite3 db "create table log(n);
+            create trigger tr after insert on t begin insert into log values (new.x * 2); end;
+            insert into t values (3001, 1), (3002, 2);
+            select group_concat(n) from log"
+sqlite3 db "create table u(k primary key, n, twice as (n * 2));
+            insert into u values ('a', 1) on conflict(k) do update set n = n + 1 returning k, n, twice;
+            insert into u values ('a', 1) on conflict(k) do update set n = n + 1 returning k, n, twice"
+sqlite3 db "select key, value from json_each('{\"a\":[1,2],\"b\":{\"c\":3}}')
+            union all select fullkey, atom from json_tree('[10,[20]]') where atom is not null"
+"#;
+    let mut cmd = root.command("/bin/bash");
+    cmd.args(["-c", script]);
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+    eprintln!("--- sqlite stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), SQLITE_PROGRAMS);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What [`debian_sqlite_compiles_and_runs_its_own_programs`] prints.
+const SQLITE_PROGRAMS: &str = r#"600|72201050|360019
+                                    ....#
+                                   ..#*..
+                                 ..+####+.
+                            .......+####....   +
+                           ..##+*##########+.++++
+                          .+.##################+.
+              .............+###################+.+
+              ..++..#.....*#####################+.
+             ...+#######++#######################.
+          ....+*################################.
+ #############################################...
+          ....+*################################.
+             ...+#######++#######################.
+              ..++..#.....*#####################+.
+              .............+###################+.+
+                          .+.##################+.
+                           ..##+*##########+.++++
+                            .......+####....   +
+                                 ..+####+.
+                                   ..#*..
+                                    ....#
+                                    +.
+1|7|6
+2|21|5
+3|42|4
+4|63|3
+5|84|2
+6|105|1
+6002,6004
+a|1|2
+a|2|4
+a|[1,2]
+b|{"c":3}
+$[0]|10
+$[1][0]|20
+"#;
+
 /// Debian's SQLite, the first of M2's databases: a write-ahead-logged
 /// database (its index shared between processes through a `MAP_SHARED`
 /// mapping) with three processes inserting at once under `fcntl` locks,
