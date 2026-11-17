@@ -287,7 +287,9 @@ sees, is in
   `cbz`/`tbz` of `x18` loads the guest's `x18` into `x16` (saved with
   `x17` as a lookup saves them) and tests it there.
 - **The table** of translations by guest address is 2^20 entries of
-  (address, translation) at 2^45 (32 TiB, reachable with one `orr`). An
+  (address, translation) at 2^45 (32 TiB, reachable with one `orr`),
+  its place taken as fwe starts (`jit::configure`), before the program
+  maps anything that could take it. An
   indirect branch or return saves `x16` and `x17`, indexes the table and
   branches to the entry's translation, whose first words check that it
   is the target's (an entry can be taken over or dropped as it is read)

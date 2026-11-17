@@ -95,6 +95,7 @@ fn chunk_size() -> u64 {
 /// Read `FWE_JIT_CHUNK`, before any code runs by translation.
 pub fn configure() {
     install();
+    reserve_table();
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -104,6 +105,32 @@ pub fn configure() {
             panic!("FWE_JIT_CHUNK: {v:?} is no size in bytes, a multiple of the page size, from 64 KiB to 128 MiB")
         });
     CHUNK_SIZE.store(size, Ordering::Relaxed);
+}
+
+/// Whether this process holds the translation table.
+static TABLE_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Take the translation table's place, as fwe starts, before the program
+/// maps anything: a mapping the program asks for there with a hint goes
+/// elsewhere. (Its pages are the host's only as they are first written.)
+fn reserve_table() {
+    if TABLE_HELD.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let mut table = TABLE;
+    // SAFETY: fresh memory in this task, at the table's fixed place.
+    unsafe {
+        assert_eq!(
+            mach::mach_vm_allocate(
+                mach::mach_task_self_,
+                &mut table,
+                TABLE_SIZE,
+                mach::VM_FLAGS_FIXED
+            ),
+            0,
+            "fwe's translation table's place ({TABLE:#x}) is taken"
+        );
+    }
 }
 
 /// Have writes the host makes for the program release pages kept from
@@ -1226,20 +1253,6 @@ fn new_chunk() -> Chunk {
 
 /// The code cache, its retry stub, and the table.
 fn new_cache() -> Cache {
-    let mut table = TABLE;
-    // SAFETY: fresh memory in this task, at the table's fixed place.
-    unsafe {
-        assert_eq!(
-            mach::mach_vm_allocate(
-                mach::mach_task_self_,
-                &mut table,
-                TABLE_SIZE,
-                mach::VM_FLAGS_FIXED
-            ),
-            0,
-            "fwe's translation table's place ({TABLE:#x}) is taken"
-        );
-    }
     let mut c =
         Cache { chunks: vec![new_chunk()], current: 0, stub: 0, live: 0, garbage: 0, flushes: 0 };
     // The retry stub, a dropped entry's value: fwe's trap.
@@ -1249,10 +1262,6 @@ fn new_cache() -> Cache {
     c
 }
 
-/// Where the next block goes: in the current chunk while it has room for
-/// the largest block; else, the cache is emptied where at least half of it
-/// is dropped translations, and the block goes in a chunk with room, or a
-/// new one.
 /// The block that branches from the cache to `to`, code not translated
 /// that a direct branch from the cache does not reach: `to` loaded into
 /// `x16`, then `br x16`, as a linker's veneer does (AAPCS64 lets one
@@ -1304,6 +1313,10 @@ fn followable(to: u64) -> bool {
             .is_some_and(|a| a.value.prot & fwe_abi::mman::PROT_EXEC != 0)
 }
 
+/// Where the next block goes: in the current chunk while it has room for
+/// the largest block; else, the cache is emptied where at least half of it
+/// is dropped translations, and the block goes in a chunk with room, or a
+/// new one.
 fn cache_next(s: &mut State) -> u64 {
     let room = |k: &Chunk| !k.retired && k.used + BLOCK_ROOM <= chunk_size();
     let c = s.cache.as_ref().expect("a code cache");

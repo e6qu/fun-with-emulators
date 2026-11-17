@@ -389,6 +389,12 @@ static int fastcalls_changing(void) {
 static uint32_t movz_x0(unsigned imm) { return 0xd2800000u | (imm << 5); }
 
 int main(void) {
+    /* Memory asked for at 32 TiB first, as a JVM may place its heap or
+     * class space, before any code is made: where fwe keeps its table of
+     * translations (which takes its place before the program runs), so
+     * this goes elsewhere; Linux would place it there. Nothing printed
+     * depends on where. */
+    mmap((void *)(1ul << 45), 1 << 20, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     size_t len = template_len();
     code = mmap(0, len, PROT_READ | PROT_WRITE | PROT_EXEC, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (code == MAP_FAILED) {
