@@ -979,7 +979,7 @@ fn jit_code_runs_as_the_program_wrote_it() {
          tracer: pc in the code\n\
          fault: seen at the load, 77\npatch: 1000 of 1000\ncopy: 90 30583\n\
          x16 and x17 across a call: changed in 0 of 1000\n\
-         return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nread into code's page: 5 6 hello, then 5\ntwo views: 1 2 3\nfile code: getpid matches, memory as written\nbl out: 1001000\nexecute only: 4\nmemory: as written\n\
+         return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nread into code's page: 5 6 hello, then 5\ntwo views: 1 2 3\nfile code: getpid matches, memory as written\nbl out: 1001000\nx16 and x17 into the code: 1000 of 1000\nexecute only: 4\nmemory: as written\n\
          fork: child ok, parent 1\n"
     );
     assert_eq!(out.status.code(), Some(0));
@@ -1227,7 +1227,7 @@ fn jit_code_survives_signals_faults_and_writes() {
         eprintln!("--- chunk {chunk:?}: {counts:?}");
         assert_eq!(
             stdout(&out),
-            "storm: 40 of 40 rounds right\nstorm: signals landed, faults landed\n",
+            "storm: every round right\nstorm: signals landed, faults landed\n",
             "chunk {chunk:?}, stderr:\n{err}"
         );
         assert_eq!(out.status.code(), Some(0));

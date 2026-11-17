@@ -656,6 +656,27 @@ int main(void) {
         printf("bl out: %ld\n", ((long (*)(long))bl)(1000));
     }
 
+    /* Called with `blr` from the program's own code, `x16` and `x17` set
+     * for the callee to read: each call hands them over as they were,
+     * the first (which fwe sees) and every one after. */
+    {
+        uint32_t *rd = mmap(0, 4096, PROT_READ | PROT_WRITE | PROT_EXEC,
+                            MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        rd[0] = 0x8b110200; /* add x0, x16, x17 */
+        rd[1] = 0xd65f03c0; /* ret */
+        flush(rd, 8);
+        int same = 0;
+        for (int i = 0; i < 1000; i++) {
+            register long x0 __asm__("x0");
+            register long a __asm__("x16") = 0x1600 + i;
+            register long b __asm__("x17") = 0x1700;
+            register void *f __asm__("x9") = rd;
+            __asm__ volatile("blr %3" : "=r"(x0), "+r"(a), "+r"(b) : "r"(f) : "x30", "memory");
+            same += x0 == 0x2d00 + i && a == 0x1600 + i && b == 0x1700;
+        }
+        printf("x16 and x17 into the code: %d of 1000\n", same);
+    }
+
     /* Made executable only (no PROT_READ), as Linux runs it. */
     uint32_t *xo = mmap(0, 4096, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     xo[0] = movz_x0(4);

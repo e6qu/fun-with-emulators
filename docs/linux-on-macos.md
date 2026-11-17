@@ -612,6 +612,21 @@ code generated at run time:
   standard promises (HotSpot calls its atomic stubs saying they clobber
   only `x8`, `x9` and `x30`, and keeps values in `x16` across them). One
   through `x18`, or a call through `x30`, takes fwe's trap.
+- **Code a translation calls is translated too.** A runtime's helpers in
+  its library, the C library, the program's own functions: code fwe
+  prepared in place that a translation calls or branches to runs from
+  translations as well, read as the program wrote it (each instruction
+  fwe rewrote taken from the record of what it was), so what it calls and
+  where it returns stay in translations: a C helper's return into a JIT's
+  code is a lookup, not a fault. A return is followed only to where a
+  translated call returns; one to a caller that runs as it is (the code
+  that called into the JIT's) goes back there. The same code keeps
+  running as it is wherever it is called from code that is not
+  translated.
+- **Calls into translated code.** Native code's call into a JIT's code
+  faults the first time; that call site (`blr`) becomes a `bl` to a stub
+  in reach that looks the target up as a translation does, and goes to
+  its translation, so the next calls fault no more.
 - **What the program sees stays its own.** Its memory reads back exactly
   as it wrote it. A fault or signal in a translation is delivered at the
   program's instruction, with its registers: an expansion stopped before

@@ -160,7 +160,11 @@ static atomic_long signals, faults;
 static atomic_int stop;
 
 #define WORKERS 2
+/* At least this many rounds each, and on until the code's page was
+ * written this many times (each write drops its translations): the storm
+ * lasts as long as the writes, however fast a round is. */
 #define ROUNDS 20
+#define WRITES 300
 #define N 5000
 
 typedef long (*work_fn)(long, long *, long, long *);
@@ -190,15 +194,16 @@ static void on_segv(int sig, void *si, void *ctx) {
 }
 
 static long reference;
-static atomic_int right, done;
+static atomic_int right, rounds, done, written;
 static unsigned long workers[WORKERS];
 
 static void *worker(void *arg) {
     (void)arg;
-    for (int r = 0; r < ROUNDS; r++) {
+    for (int r = 0; r < ROUNDS || atomic_load(&written) < WRITES; r++) {
         if (run() == reference) {
             atomic_fetch_add(&right, 1);
         }
+        atomic_fetch_add(&rounds, 1);
     }
     atomic_fetch_add(&done, 1);
     return 0;
@@ -229,6 +234,7 @@ static void *patcher(void *arg) {
     volatile long *scratch = (volatile long *)(code + (js_scratch - js_begin));
     while (!atomic_load(&stop)) {
         *scratch += 1;
+        atomic_fetch_add(&written, 1);
         usleep(500);
     }
     return 0;
@@ -273,7 +279,11 @@ int main(void) {
         pthread_join(workers[i], 0);
     }
     mprotect(poll, 4096, PROT_READ | PROT_WRITE);
-    printf("storm: %d of %d rounds right\n", atomic_load(&right), WORKERS * ROUNDS);
+    if (atomic_load(&right) == atomic_load(&rounds)) {
+        printf("storm: every round right\n");
+    } else {
+        printf("storm: %d of %d rounds right\n", atomic_load(&right), atomic_load(&rounds));
+    }
     printf("storm: signals %s, faults %s\n", atomic_load(&signals) ? "landed" : "none",
            atomic_load(&faults) ? "landed" : "none");
     return 0;

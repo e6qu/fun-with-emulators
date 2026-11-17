@@ -296,6 +296,18 @@ sees, is in
   restores `x16` and `x17` and branches through the program's own
   register (through `x18`, or a call through `x30`, by the trap). A
   dropped entry reads as a retry stub at the first chunk's start.
+- **Following:** an exit to code fwe prepared in place
+  (`jit::followable`: in an executable mapping of the guest's, not a
+  stub) is translated as well, except a return, followed only to the
+  return point of a translated call (`State::returns`). Such code is read
+  through `prepare::original`, which gives back the instruction at a site
+  from the sites recorded as stubs were made (`prepare::SITES`), checked
+  against the stub's branch back.
+- **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
+  prepared in place links that site (`jit::link_call_site`): with every
+  other thread stopped, a stub doing the table lookup goes in the spare
+  page every stub region and loader arena keeps (`prepare::call_stub`),
+  and the `blr` becomes a `bl` to it.
 - **Guest state:** each translated word records what it stands for
   (`Word`: the guest instruction, a point inside an expansion before or
   after its instruction, a lookup, a way out), so `jit::to_guest` turns

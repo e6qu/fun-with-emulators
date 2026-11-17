@@ -332,6 +332,8 @@ fn finish(
     }
 
     let (lo, hi) = elf.bounds();
+    // What the code's stubs left of the arena: room for call stubs.
+    crate::prepare::spare_arena(arena.next, arena.end);
     Ok(Loaded {
         stub_arena: arena,
         bias,

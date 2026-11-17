@@ -269,6 +269,12 @@ pub struct State {
     /// Code not translated -> the block that branches to it from the
     /// cache where a direct branch does not reach ([`veneer`]).
     veneers: BTreeMap<u64, usize>,
+    /// Where calls made from translations return: a return there from
+    /// code followed into is followed back ([`exit`]).
+    returns: std::collections::BTreeSet<u64>,
+    /// Call sites of code not translated that called into translated code
+    /// and were linked to it, or tried ([`link_call_site`]).
+    call_sites: std::collections::BTreeSet<u64>,
     cache: Option<Cache>,
 }
 
@@ -285,6 +291,8 @@ static STATE: Mutex<State> = Mutex::new(State {
     objects: BTreeMap::new(),
     aliases: BTreeMap::new(),
     veneers: BTreeMap::new(),
+    returns: std::collections::BTreeSet::new(),
+    call_sites: std::collections::BTreeSet::new(),
     cache: None,
 });
 
@@ -302,6 +310,8 @@ static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 /// Of [`ENTERED`]: calls (`blr`) from code not translated, counted only
 /// for `FWE_TIMING` (it reads the caller's code).
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
+/// Call sites of code not translated linked to translations.
+static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
@@ -312,7 +322,7 @@ pub fn counts() -> Option<String> {
     (t > 0).then(|| {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
-             indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated), \
+             indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} pages' translations dropped by writes, the code cache emptied {} times",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -320,6 +330,7 @@ pub fn counts() -> Option<String> {
             ENTERED.load(Ordering::Relaxed),
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
+            CALL_SITES_LINKED.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed)
         )
@@ -499,6 +510,8 @@ pub fn reset() {
     s.objects.clear();
     s.aliases.clear();
     s.veneers.clear();
+    s.returns.clear();
+    s.call_sites.clear();
 }
 
 /// Held across a `fork`, so that the child's copy of the translations is
@@ -586,7 +599,70 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
         ENTERED_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     let i = translation(&mut s, pc);
-    Some(body(&s, i))
+    let into = body(&s, i);
+    // Called from code fwe prepared in place (`blr xN` before `lr`): that
+    // site looks its targets up from now on, as a translation does.
+    let site = lr.wrapping_sub(4);
+    if lr != pc && !s.call_sites.contains(&site) && !s.in_region(site) && followable(site) {
+        // (Read as the host copies: `lr` may be anything.)
+        if let Some(w) = crate::trap::read_host::<u32>(site)
+            && w & 0xffff_fc1f == 0xd63f_0000
+            && !matches!((w >> 5) & 0x1f, 18 | 30)
+        {
+            link_call_site(&mut s, site, (w >> 5) & 0x1f);
+        }
+    }
+    Some(into)
+}
+
+/// Give call site `site` (`blr xN`, in code fwe prepared in place) a stub
+/// within reach that looks the target up in the table, as a translation's
+/// lookup does, and goes to its translation, or makes the call as it was
+/// (target not translated, or not yet): every register as the call would
+/// leave it. The site becomes `bl` to it, made with every other thread
+/// stopped.
+fn link_call_site(s: &mut State, site: u64, n: u32) {
+    s.call_sites.insert(site);
+    let mut words = vec![
+        SAVE,
+        0xaa00_03f0 | (n << 16), // mov x16, xN
+        INDEX,
+        SCALE,
+        BASE,
+        KEY,
+        CHECK,
+        MISS,
+        INDEX,
+        SCALE,
+        BASE,
+        VALUE,
+        OUTSIDE,
+        GO,
+        RESTORE,
+        0xd61f_0000 | (n << 5), // br xN
+    ];
+    // Both to the restore and the call as it was.
+    words[7] |= 7 << 5;
+    words[12] |= 2 << 5;
+    let _stopped = crate::quiesce::stop_others(&mut |_| {});
+    let Some(stub) = crate::prepare::call_stub(site, &words) else { return };
+    let Some(b) = rewrite::branch(site, stub) else { return };
+    let page = site & !(page_size() - 1);
+    let prot = fwe_kernel::mm::host_prot_at(page);
+    // Writable a moment, not executable meanwhile (the host allows no page
+    // both at once).
+    let writable = (prot & !libc::PROT_EXEC) | libc::PROT_READ | libc::PROT_WRITE;
+    // SAFETY: a page of the program's code, no other thread running; it
+    // gets its protections back.
+    unsafe {
+        if libc::mprotect(page as *mut libc::c_void, page_size() as usize, writable) != 0 {
+            return;
+        }
+        (site as *mut u32).write(b | 0x8000_0000); // bl
+        libc::mprotect(page as *mut libc::c_void, page_size() as usize, prot);
+        crate::prepare::flush_icache(site, 4);
+    }
+    CALL_SITES_LINKED.fetch_add(1, Ordering::Relaxed);
 }
 
 /// A write to the program's memory at `addr` that faulted: if the page was
@@ -669,7 +745,18 @@ pub fn exit(regs: &mut Regs) -> bool {
             (to, false)
         }
     };
-    if !s.in_region(to) {
+    // Code fwe prepared in place (a library's, the program's own) that a
+    // translation calls or branches to is followed: translated too, so
+    // what it calls and where it returns stay in translations. A return
+    // is followed only to where a translated call returns; to a caller
+    // not translated, it goes back to code that runs as it is.
+    let follow = !s.in_region(to)
+        && match exit {
+            Exit::Reg { n: 30, link: None } => s.returns.contains(&to),
+            _ => true,
+        }
+        && followable(to);
+    if !s.in_region(to) && !follow {
         if link_here {
             EXITS_DIRECT_OUT.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -927,7 +1014,16 @@ fn translation(s: &mut State, g: u64) -> usize {
     let page = g & !(page_size() - 1);
     let at = cache_next(s);
     guard(s, page);
-    let (words, info, entry) = translate(g, at);
+    let followed = !s.in_region(g);
+    let (words, info, entry, calls) = translate(g, at, followed);
+    // Where its calls return is followed too, from code not translated
+    // (a library's function the call went to): no longer branched to as
+    // code not translated.
+    for r in calls {
+        if s.returns.insert(r) && s.outside.remove(&r) {
+            unpublish(r, 0);
+        }
+    }
     let t = emit(s, &words);
     let len = 4 * words.len() as u64;
     s.cache.as_mut().expect("a code cache").live += len;
@@ -1184,6 +1280,18 @@ fn veneer(s: &mut State, to: u64) -> usize {
     i
 }
 
+/// Whether program address `to` holds code fwe prepared in place that a
+/// translation may follow into: in an executable mapping of the program's,
+/// and not a stub of fwe's.
+fn followable(to: u64) -> bool {
+    !in_cache(to)
+        && crate::prepare::stub_region(to).is_none()
+        && fwe_kernel::maps::record()
+            .areas_in(to, to + 4)
+            .first()
+            .is_some_and(|a| a.value.prot & fwe_abi::mman::PROT_EXEC != 0)
+}
+
 fn cache_next(s: &mut State) -> u64 {
     let room = |k: &Chunk| !k.retired && k.used + BLOCK_ROOM <= chunk_size();
     let c = s.cache.as_ref().expect("a code cache");
@@ -1354,7 +1462,7 @@ fn read(g: u64) -> u32 {
 /// Translate the block at program address `g`, to be placed at `t`: its
 /// words, and what each stands for. A block ends at its page's end, so it
 /// is made from that page alone.
-fn translate(g: u64, t: u64) -> (Vec<u32>, Vec<Word>, usize) {
+fn translate(g: u64, t: u64, followed: bool) -> (Vec<u32>, Vec<Word>, usize, Vec<u64>) {
     // Entered from a lookup with the target in `x16`, the program's `x16`
     // and `x17` on the stack: the target is checked to be this block's (a
     // lookup can read an entry another thread is taking over), then they
@@ -1368,28 +1476,34 @@ fn translate(g: u64, t: u64) -> (Vec<u32>, Vec<Word>, usize) {
     out.push(RESTORE);
     let mut info: Vec<Word> = vec![entered; out.len()];
     let entry = out.len();
-    body_of(g, t, &mut out, &mut info);
+    let calls = body_of(g, t, followed, &mut out, &mut info);
     // The wrong block's way out.
     let wrong = out.len();
     out[wrong_at] |= ((wrong - wrong_at) as u32) << 5;
     out.push(EXIT);
     info.push(Word::Out { g, exit: Exit::Retry });
-    (out, info, entry)
+    (out, info, entry, calls)
 }
 
 /// The instructions of the block at program address `g`, translated onto
-/// `out` (the block placed at `t`).
-fn body_of(g: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+/// `out` (the block placed at `t`); `followed`, code fwe prepared in place
+/// (a library's), read as the program wrote it. Where its calls return.
+fn body_of(g: u64, t: u64, followed: bool, out: &mut Vec<u32>, info: &mut Vec<Word>) -> Vec<u64> {
     let page = page_size();
     let mut pc = g;
+    let mut calls = Vec::new();
     for _ in 0..BLOCK_INSNS {
-        let w = read(pc);
+        let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
+        // `bl`, `blr`
+        if w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000 {
+            calls.push(pc + 4);
+        }
         let ended = one(w, pc, t, out, info);
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
         if ended {
-            return;
+            return calls;
         }
         if pc & (page - 1) == 0 {
             break;
@@ -1397,6 +1511,7 @@ fn body_of(g: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) {
     }
     out.push(EXIT);
     info.push(Word::Out { g: pc, exit: Exit::Jump(pc) });
+    calls
 }
 
 /// Translate the program's instruction `w` at `pc` into `out`, the block
