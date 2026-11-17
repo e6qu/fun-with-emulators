@@ -60,9 +60,12 @@ only the guest's own page tables change.
   (`crates/kernel/src/vmas.rs`) and edits stage 1. A `MAP_FIXED` mapping
   over slab memory at its own address keeps using that memory, zeroed, so
   translated ranges stay rare; a hint whose range is free is taken as a
-  fixed mapping would be, as Linux takes it. A translated range that a
-  new one continues gets the new one's memory right after its own, and
-  the two become one, so a buffer across them is one host buffer. The framework maps only host memory that
+  fixed mapping would be, as Linux takes it, where it can read as one
+  with the translated ranges beside it: one that continues a translated
+  range (or that one continues) gets its memory right beside the
+  other's, and the two become one, so a buffer across them is one host
+  buffer. Where that memory is taken, the mapping goes where the VM
+  places mappings, as a hint allows. The framework maps only host memory that
   may be written, which a shared mapping of a file opened read-only is
   not: such a segment is made of the same file opened again for writing
   (checked to be the same file; an `mprotect` asking to write fails with

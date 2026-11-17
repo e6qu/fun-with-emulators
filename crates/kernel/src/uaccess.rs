@@ -103,6 +103,13 @@ pub fn add_translation(guest: u64, len: u64, host: u64) {
     *t = merged;
 }
 
+/// The host address of the memory of the translated range that starts at
+/// guest address `guest`, if one does: a range ending there is backed
+/// just below it to read as one with it.
+pub fn host_before(guest: u64) -> Option<u64> {
+    table().iter().find(|x| x.lo == guest).map(|x| x.host)
+}
+
 /// The host address just past the memory of the translated range that
 /// ends at guest address `guest`, if one does: where a range continuing
 /// it would be backed to read as one with it.

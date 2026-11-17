@@ -207,16 +207,22 @@ pub fn alloc(len: u64) -> Option<u64> {
 /// what of it held old data. False if any of it is in use, or it is not in
 /// the slab.
 pub fn take_fixed(addr: u64, len: u64) -> bool {
-    if !contains(addr, len) {
+    if !is_free(addr, len) {
         return false;
     }
     let mut st = state();
-    let end = addr + len;
-    if st.used.range(..end).next_back().is_some_and(|(_, &e)| e > addr) {
+    claim(&mut st, addr, addr + len);
+    true
+}
+
+/// Whether `[addr, addr + len)` is in the slab and none of it in use.
+pub fn is_free(addr: u64, len: u64) -> bool {
+    if !contains(addr, len) {
         return false;
     }
-    claim(&mut st, addr, end);
-    true
+    let st = state();
+    let end = addr + len;
+    !st.used.range(..end).next_back().is_some_and(|(_, &e)| e > addr)
 }
 
 /// Give back `[addr, addr + len)`: free, and zeroed when reused. The

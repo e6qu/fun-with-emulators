@@ -428,6 +428,11 @@ impl Mem {
         // host buffer, as Go's heap arenas, mapped side by side, need).
         let host = uaccess::host_after(addr)
             .filter(|&h| window::take_fixed(h, len))
+            .or_else(|| {
+                uaccess::host_before(end)
+                    .and_then(|h| h.checked_sub(len))
+                    .filter(|&h| window::take_fixed(h, len))
+            })
             .map_or_else(|| window::alloc(len).ok_or(errno::ENOMEM), Ok)?;
         uaccess::add_translation(addr, len, host);
         Ok(host)
@@ -650,9 +655,12 @@ impl Mem {
             && addr & (PAGE - 1) == 0
             && addr.checked_add(len).is_some_and(|e| e <= vm::CODE_VA)
             && !self.vmas.any(addr, addr + len)
+            && joins(addr, len)
         {
             // A hint whose range is free is taken as given, as Linux takes
-            // it (SBCL asks for its spaces where its image expects them).
+            // it (SBCL asks for its spaces where its image expects them),
+            // where the mapping can read as one with the translated ranges
+            // beside it.
             addr
         } else {
             match self.place(len) {
@@ -1545,5 +1553,21 @@ pub fn serve_vfork_child(sock: i32) {
             }
             _ => return,
         }
+    }
+}
+
+/// Whether a mapping at `[addr, addr + len)` can be backed so that it reads
+/// as one with the translated ranges ending and starting at its edges: in
+/// the slab, at its own address; else beside their memory, which must be
+/// free (with both, the two must leave exactly its room between them).
+fn joins(addr: u64, len: u64) -> bool {
+    if window::contains(addr, len) {
+        return true;
+    }
+    match (uaccess::host_after(addr), uaccess::host_before(addr + len)) {
+        (None, None) => true,
+        (Some(h), None) => window::is_free(h, len),
+        (None, Some(h)) => h.checked_sub(len).is_some_and(|l| window::is_free(l, len)),
+        (Some(a), Some(b)) => a + len == b && window::is_free(a, len),
     }
 }

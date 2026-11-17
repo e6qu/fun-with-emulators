@@ -3507,6 +3507,12 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             // into code not translated and back.
             .env("FWE_TIMING", "1")
             .stdin(Stdio::null());
+        // TEMPORARY: fwe's own switches, to bisect in CI.
+        for v in ["FWE_JIT_NO_FOLLOW", "FWE_JIT_NO_CALL_SITES"] {
+            if let Some(x) = std::env::var_os(v) {
+                cmd.env(v, x);
+            }
+        }
         // HotSpot options for every JVM the test starts, to narrow a failure
         // down (`-Xint`, a GC's verification).
         if let Ok(opts) = std::env::var("FWE_JDK_JAVA_OPTIONS") {
