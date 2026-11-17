@@ -100,6 +100,11 @@ fn chunk_size() -> u64 {
 pub fn configure() {
     install();
     reserve_table();
+    // TEMPORARY (bisecting a JDK crash): store forms left to drop pages
+    // (1 base written back, 2 release, 4 cas), and the flat limit.
+    let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
+    STORE_OFF.store(n("FWE_JIT_STORE_OFF"), Ordering::Relaxed);
+    STORE_FLAT.store(n("FWE_JIT_STORE_FLAT"), Ordering::Relaxed);
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -379,6 +384,8 @@ static REVIVED: AtomicU64 = AtomicU64::new(0);
 /// write let be made drops the page's blocks, and each taken back costs
 /// a way out through fwe (some 4 µs).
 const STORES_KEPT: u64 = 16;
+static STORE_OFF: AtomicU64 = AtomicU64::new(0);
+static STORE_FLAT: AtomicU64 = AtomicU64::new(0);
 /// Stores into pages kept from writes that fwe left to drop the page's
 /// translations, by why: not a store it decodes, on a page another
 /// mapping shares, or past [`STORES_KEPT`].
@@ -1014,6 +1021,14 @@ pub fn store(
         undecoded(w);
         return left(0);
     };
+    let off = STORE_OFF.load(Ordering::Relaxed);
+    if (back.is_some() && off & 1 != 0)
+        || (release && compare.is_none() && off & 2 != 0)
+        || (compare.is_some() && off & 4 != 0)
+    {
+        undecoded(w);
+        return left(0);
+    }
     let len: u64 = parts.iter().map(|&(_, n)| n).sum();
     let ps = page_size();
     let page = far & !(ps - 1);
@@ -1044,7 +1059,11 @@ pub fn store(
     let mut at = wr + (addr - page);
     // A page written often (code being written into it) is let be written
     // instead, its translations dropped: each store made here is a fault.
-    let blocks = s.pages.get(&page).map_or(0, Vec::len) as u64;
+    let blocks = if STORE_FLAT.load(Ordering::Relaxed) != 0 {
+        0
+    } else {
+        s.pages.get(&page).map_or(0, Vec::len) as u64
+    };
     let made = &mut s.writers.get_mut(&page).expect("its writer").1;
     *made += 1;
     if *made > STORES_KEPT.max(blocks) {
