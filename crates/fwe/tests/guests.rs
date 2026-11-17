@@ -1243,7 +1243,8 @@ fn jit_code_survives_signals_faults_and_writes() {
         eprintln!("--- chunk {chunk:?}: {counts:?}");
         assert_eq!(
             stdout(&out),
-            "storm: every round right\nstorm: signals landed, faults landed\n",
+            "storm: every round right\nstorm: signals landed, faults landed\n\
+             storm: every write kept\n",
             "chunk {chunk:?}, stderr:\n{err}"
         );
         assert_eq!(out.status.code(), Some(0));

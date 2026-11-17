@@ -6,11 +6,11 @@
  * - send the workers signals, whose handler returns;
  * - take away and give back the reading of a page the code loads from
  *   (through x18 too), the fault's handler giving it back;
- * - write data into the code's own page, and change three of its
- *   instructions, each between two that do the same (`nop` and `b .+4`,
- *   which Arm lets one change while other cores run it): what was not
- *   changed is taken back, what was is translated again, and the code
- *   cache fills.
+ * - write data into the code's own page (each write there kept), and
+ *   change three of its instructions, each between two that do the same
+ *   (`nop` and `b .+4`, which Arm lets one change while other cores run
+ *   it): what was not changed is taken back, what was is translated
+ *   again, and the code cache fills.
  *
  * A signal or fault landing in the middle of an expansion must leave the
  * code's registers as at its own instruction, so each round's checksum is
@@ -301,5 +301,12 @@ int main(void) {
     }
     printf("storm: signals %s, faults %s\n", atomic_load(&signals) ? "landed" : "none",
            atomic_load(&faults) ? "landed" : "none");
+    /* Each of the patcher's writes beside the code, there. */
+    long kept = *(volatile long *)(code + (js_scratch - js_begin));
+    if (kept == atomic_load(&written)) {
+        printf("storm: every write kept\n");
+    } else {
+        printf("storm: %ld of %d writes kept\n", kept, atomic_load(&written));
+    }
     return 0;
 }

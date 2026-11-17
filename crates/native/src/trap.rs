@@ -1302,8 +1302,22 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             mc.ss.pc = t;
             return;
         }
-    } else if crate::jit::written(addr) {
-        return;
+    } else {
+        // A store beside the code translated from its page: made by fwe,
+        // the page and its translations kept.
+        let regs = regs_from(mc);
+        // SAFETY: the guest was executing at `pc`, so it is mapped.
+        let w = unsafe { insn(mc.ss.pc) };
+        let reg = |r: usize| if r == 31 { regs.sp } else { regs.x[r] };
+        if let Some(w) = w
+            && crate::jit::store(mc.es.far, mc.es.esr, w, reg)
+        {
+            mc.ss.pc += 4;
+            return;
+        }
+        if crate::jit::written(addr) {
+            return;
+        }
     }
     // A page of a private mapping of a file with no name, first written:
     // it becomes a copy, and the write is tried again.

@@ -2929,7 +2929,8 @@ fwe's own traps rather than faults the guest should see:
 | `SIGTRAP` where the pc holds no `brk` | sent by another process | a relayed `SIGTRAP` |
 | `SIGILL` at `mrs <Xt>, ctr_el0` | emulated | the value, as Linux lets EL0 read it |
 | `SIGSEGV`/`SIGBUS` fetching code made executable at run time | the block translated, run there | nothing |
-| `SIGSEGV`/`SIGBUS` writing a page code was translated from | its translations dropped, the write retried | nothing |
+| `SIGSEGV`/`SIGBUS` storing beside the code in a page code was translated from (a plain store, decoded) | the store made by fwe through a writable mapping of the page, the program on past it | nothing |
+| `SIGSEGV`/`SIGBUS` writing a page code was translated from otherwise | its translations dropped, the write retried | nothing |
 | `SIGTRAP` at a translation's way out unlinked again (told by the syndrome's `brk` immediate) | on at the target's translation | nothing |
 | `SIGTRAP` at the exit gate's `brk` (a direct way out to code not translated, or with a signal to deliver) | on where the way out leads, from the state the gate saved | nothing |
 | `SIGBUS` for an access the page's protection forbids (macOS reports some so) | turned into Linux's signal for it | `SIGSEGV` |

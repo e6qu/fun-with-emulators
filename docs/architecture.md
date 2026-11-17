@@ -344,7 +344,13 @@ sees, is in
   taken back if its words are unchanged (`jit::revive`), its entry
   published and its branches linked; only what the write changed is
   translated again. Unmapping, mapping anew or changing a page's protections
-  forgets them.
+  forgets them. A store beside the code, not into it (`str`, `strb`,
+  `strh` and `stp` with no base written back, decoded by `jit::store_of`:
+  macOS gives no syndrome for it), into a page the program may write, is
+  made by fwe through a second, writable mapping of the page
+  (`jit::store`) and the program goes on past it: the page stays
+  read-only and its translations stay. After 16 such stores in a page
+  while it is read-only, the next write drops its translations instead.
 - **Emptying:** when the current chunk is full and dropped or retired
   translations are at least half the cache, `jit::flush` stops every
   other thread (`quiesce::stop_others`) and scans their registers, 2 MiB

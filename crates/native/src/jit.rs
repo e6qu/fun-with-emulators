@@ -321,6 +321,11 @@ pub struct State {
     /// dropped, taken back when the address is to be translated again if
     /// its words were not written ([`revive`]).
     dormant: BTreeMap<u64, usize>,
+    /// Pages kept from writes -> a second, writable mapping of each,
+    /// through which fwe makes the program's stores there that miss the
+    /// code translated from it ([`store`]), and how many it made there.
+    /// Not inherited by a fork child.
+    writers: BTreeMap<u64, (u64, u64)>,
     cache: Option<Cache>,
 }
 
@@ -342,6 +347,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     call_sites: std::collections::BTreeSet::new(),
     waiting: BTreeMap::new(),
     dormant: BTreeMap::new(),
+    writers: BTreeMap::new(),
     cache: None,
 });
 
@@ -367,6 +373,11 @@ static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static REVIVED: AtomicU64 = AtomicU64::new(0);
+/// Most stores fwe makes into a page while it is kept from writes; the
+/// next lets it be written.
+const STORES_KEPT: u64 = 16;
+/// The program's stores fwe made for it into pages kept from writes.
+static STORES: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// What [`TRANSLATED`] and the others counted, if any code ran by
@@ -377,7 +388,7 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} pages' translations dropped by writes ({} blocks taken back), the code cache emptied {} times; \
+             {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -388,6 +399,7 @@ pub fn counts() -> Option<String> {
             CALL_SITES_LINKED.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
             REVIVED.load(Ordering::Relaxed),
+            STORES.load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
             EXIT_NS.load(Ordering::Relaxed) / 1_000_000
@@ -470,6 +482,7 @@ impl State {
         let guarded: Vec<u64> = self.guarded.range(start..end).copied().collect();
         for p in guarded {
             self.guarded.remove(&p);
+            unwriter(self, p);
             lift(p);
             *self.lifted.entry(p).or_default() += 1;
         }
@@ -607,6 +620,8 @@ pub fn hold() -> std::sync::MutexGuard<'static, State> {
 /// copies of their own now, so the executable one is mapped anew from the
 /// writable one, which the child's translations are written to.
 pub fn forked(s: &mut State) {
+    // The pages' writable mappings are not the child's.
+    s.writers.clear();
     let Some(c) = s.cache.as_ref() else { return };
     for k in &c.chunks {
         let mut rx = k.rx;
@@ -775,6 +790,180 @@ pub fn written(addr: u64) -> bool {
     }
     s.retried.insert(thread, (addr, lifts));
     true
+}
+
+/// The bytes general-register store `w` writes, given the registers
+/// (`reg`, with `sp` as 31): its address and each register's value and
+/// size, in order. A store fwe makes for the program: one with no base
+/// register written back (`str`, `strb`, `strh` with an unsigned or
+/// unscaled immediate or a register offset; `stp` with a signed offset).
+fn store_of(w: u32, reg: &impl Fn(usize) -> u64) -> Option<Store> {
+    let rt = (w & 31) as usize;
+    let rn = ((w >> 5) & 31) as usize;
+    let data = |r: usize| if r == 31 { 0 } else { reg(r) };
+    let base = reg(rn);
+    // str (unsigned immediate), stur, str (register)
+    if w & 0x3fc0_0000 == 0x3900_0000
+        || w & 0x3fe0_0c00 == 0x3800_0000
+        || w & 0x3fe0_0c00 == 0x3820_0800
+    {
+        let log = u64::from(w >> 30);
+        let offset = if w & 0x3fc0_0000 == 0x3900_0000 {
+            u64::from((w >> 10) & 0xfff) << log
+        } else if w & 0x0020_0000 == 0 {
+            ((((w >> 12) & 0x1ff) as i64) << 55 >> 55) as u64
+        } else {
+            let rm = reg_or_zero(((w >> 16) & 31) as usize, reg);
+            let v = match (w >> 13) & 7 {
+                0b010 => rm & 0xffff_ffff,
+                0b110 => (rm as i32) as i64 as u64,
+                0b011 | 0b111 => rm,
+                _ => return None,
+            };
+            if w & (1 << 12) != 0 { v << log } else { v }
+        };
+        return Some((base.wrapping_add(offset), vec![(data(rt), 1 << log)]));
+    }
+    // stp (signed offset), of w or x registers
+    if w & 0x7fc0_0000 == 0x2900_0000 {
+        let size = if w >> 31 != 0 { 8 } else { 4 };
+        let imm = ((((w >> 15) & 0x7f) as i64) << 57 >> 57) * size as i64;
+        let rt2 = ((w >> 10) & 31) as usize;
+        return Some((base.wrapping_add(imm as u64), vec![(data(rt), size), (data(rt2), size)]));
+    }
+    None
+}
+
+/// A store's address, and each register's value and size, in order.
+type Store = (u64, Vec<(u64, u64)>);
+
+/// Register `r`'s value, 0 for 31 (the zero register, as an offset).
+fn reg_or_zero(r: usize, reg: &impl Fn(usize) -> u64) -> u64 {
+    if r == 31 { 0 } else { reg(r) }
+}
+
+/// A store by the program, instruction `w`, that faulted on a page kept
+/// from writes: `far` the address, `esr` the syndrome, `reg` the general
+/// registers (`sp` as 31). One fwe can make ([`store_of`]) into a page
+/// translated from, whose bytes miss the code translated there and which
+/// the program's mapping lets it write, is made through the page's
+/// writable mapping: the page stays kept from writes and its translations
+/// stay. The caller goes on past the store. Any other store, or one into
+/// the code, is [`written`]'s.
+pub fn store(far: u64, esr: u32, w: u32, reg: impl Fn(usize) -> u64) -> bool {
+    const EC_DATA_ABORT_LOWER: u32 = 0x24;
+    let permission_write = esr >> 26 == EC_DATA_ABORT_LOWER
+        && esr & (1 << 6) != 0 // WnR
+        && esr & 0x3c == 0x0c; // a permission fault
+    if !permission_write {
+        return false;
+    }
+    // (x18 is never a register of the program's code as it runs.)
+    let names_x18 =
+        w & 31 == 18 || (w >> 5) & 31 == 18 || (w >> 10) & 31 == 18 || (w >> 16) & 31 == 18;
+    let Some((addr, parts)) = store_of(w, &reg).filter(|_| !names_x18) else { return false };
+    let len: u64 = parts.iter().map(|&(_, n)| n).sum();
+    let ps = page_size();
+    let page = far & !(ps - 1);
+    if addr & !(ps - 1) != page || (addr + len - 1) & !(ps - 1) != page {
+        return false;
+    }
+    let mut s = state();
+    // A page another mapping shares is left to `written`: its other
+    // mappings' translations are not looked at here.
+    if !s.guarded.contains(&page)
+        || s.object_of.contains_key(&page)
+        || s.aliases.contains_key(&page)
+    {
+        return false;
+    }
+    let writable = fwe_kernel::maps::record()
+        .areas_in(page, page + ps)
+        .first()
+        .is_some_and(|a| a.value.prot & fwe_abi::mman::PROT_WRITE != 0);
+    if !writable {
+        return false;
+    }
+    let into_code = s.pages.get(&page).is_some_and(|blocks| {
+        blocks.iter().any(|&i| {
+            let b = &s.blocks[i];
+            let end = b.g + 4 * b.source.len() as u64;
+            s.by_g.get(&b.g) == Some(&i) && addr < end && addr + len > b.g
+        })
+    });
+    if into_code {
+        return false;
+    }
+    let Some(wr) = writer(&mut s, page) else { return false };
+    let mut at = wr + (addr - page);
+    // A page written often (code being written into it) is let be written
+    // instead, its translations dropped: each store made here is a fault.
+    let made = &mut s.writers.get_mut(&page).expect("its writer").1;
+    *made += 1;
+    if *made > STORES_KEPT {
+        return false;
+    }
+    for (value, size) in parts {
+        // SAFETY: `at` is in the page's writable mapping, `size` bytes of
+        // it within the page; the program's mapping allows the write.
+        unsafe {
+            match size {
+                1 => (at as *mut u8).write_volatile(value as u8),
+                2 => (at as *mut u16).write_unaligned(value as u16),
+                4 => (at as *mut u32).write_unaligned(value as u32),
+                _ => (at as *mut u64).write_unaligned(value),
+            }
+        }
+        at += size;
+    }
+    std::sync::atomic::fence(Ordering::SeqCst);
+    STORES.fetch_add(1, Ordering::Relaxed);
+    true
+}
+
+/// Page `p`'s writable mapping ([`State::writers`]), made if it has none.
+fn writer(s: &mut State, p: u64) -> Option<u64> {
+    if let Some(&(w, _)) = s.writers.get(&p) {
+        return Some(w);
+    }
+    let mut at = 0;
+    let (mut cur, mut max) = (0, 0);
+    // SAFETY: a new mapping, anywhere, of the program's page `p` (shared
+    // with it, not a copy), made writable; never inherited by a child.
+    unsafe {
+        let task = mach::mach_task_self_;
+        let ps = page_size();
+        if mach::mach_vm_remap(
+            task,
+            &mut at,
+            ps,
+            0,
+            mach::VM_FLAGS_ANYWHERE,
+            task,
+            p,
+            0,
+            &mut cur,
+            &mut max,
+            mach::VM_INHERIT_NONE,
+        ) != 0
+        {
+            return None;
+        }
+        if mach::mach_vm_protect(task, at, ps, 0, libc::PROT_READ | libc::PROT_WRITE) != 0 {
+            mach::mach_vm_deallocate(task, at, ps);
+            return None;
+        }
+    }
+    s.writers.insert(p, (at, 0));
+    Some(at)
+}
+
+/// Unmap page `p`'s writable mapping, if it has one.
+fn unwriter(s: &mut State, p: u64) {
+    if let Some((w, _)) = s.writers.remove(&p) {
+        // SAFETY: the mapping [`writer`] made, used by nothing now.
+        unsafe { mach::mach_vm_deallocate(mach::mach_task_self_, w, page_size()) };
+    }
 }
 
 /// The host is about to write program memory `[addr, addr + len)` for the
@@ -1378,6 +1567,10 @@ mod mach {
     pub const VM_FLAGS_ANYWHERE: i32 = 1;
     pub const VM_FLAGS_FIXED_OVERWRITE: i32 = 0x4000;
     pub const VM_INHERIT_COPY: u32 = 1;
+    pub const VM_INHERIT_NONE: u32 = 2;
+    unsafe extern "C" {
+        pub fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32;
+    }
 }
 
 /// A new chunk of the code cache: one memory, mapped a second time, the
@@ -1571,6 +1764,7 @@ fn flush(s: &mut State) {
     s.aliases.clear();
     let pages = std::mem::take(&mut s.guarded);
     for p in pages {
+        unwriter(s, p);
         lift(p);
         *s.lifted.entry(p).or_default() += 1;
     }
@@ -2050,5 +2244,39 @@ fn expansion(site: Site, pc: u64, start: u64, out: &mut Vec<u32>, info: &mut Vec
             Some(m) if k > m => Word::Finish { g: pc },
             _ => Word::Undo { g: pc, start },
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Store, store_of};
+
+    /// Registers whose value is 0x100 times their number, `sp` (31) 0x9000.
+    fn reg(r: usize) -> u64 {
+        if r == 31 { 0x9000 } else { 0x100 * r as u64 }
+    }
+
+    #[test]
+    fn stores_fwe_makes_are_read_from_their_instructions() {
+        // Encodings from the assembler.
+        let cases: [(u32, &str, Option<Store>); 13] = [
+            (0xf900_0841, "str x1, [x2, #16]", Some((0x210, vec![(0x100, 8)]))),
+            (0x3900_0c41, "strb w1, [x2, #3]", Some((0x203, vec![(0x100, 1)]))),
+            (0x7900_0fe1, "strh w1, [sp, #6]", Some((0x9006, vec![(0x100, 2)]))),
+            (0xb900_0041, "str w1, [x2]", Some((0x200, vec![(0x100, 4)]))),
+            (0xf81f_8041, "stur x1, [x2, #-8]", Some((0x1f8, vec![(0x100, 8)]))),
+            (0xf823_7841, "str x1, [x2, x3, lsl #3]", Some((0x1a00, vec![(0x100, 8)]))),
+            (0xb823_c841, "str w1, [x2, w3, sxtw]", Some((0x500, vec![(0x100, 4)]))),
+            (0xa93f_0c41, "stp x1, x3, [x2, #-16]", Some((0x1f0, vec![(0x100, 8), (0x300, 8)]))),
+            (0x2901_7fe1, "stp w1, wzr, [sp, #8]", Some((0x9008, vec![(0x100, 4), (0, 4)]))),
+            (0xf900_0c5f, "str xzr, [x2, #24]", Some((0x218, vec![(0, 8)]))),
+            // Written back, or not a general register's: not made by fwe.
+            (0xf800_8c41, "str x1, [x2, #8]!", None),
+            (0xa881_0c41, "stp x1, x3, [x2], #16", None),
+            (0x3d80_0040, "str q0, [x2]", None),
+        ];
+        for (w, text, want) in cases {
+            assert_eq!(store_of(w, &reg), want, "{text}");
+        }
     }
 }
