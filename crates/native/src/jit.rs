@@ -289,6 +289,8 @@ pub struct State {
     /// twice, writable and executable): the file's page (device, inode,
     /// offset) -> those pages.
     objects: BTreeMap<(u64, u64, u64), std::collections::BTreeSet<u64>>,
+    /// [`State::objects`] the other way: page -> its file page.
+    object_of: BTreeMap<u64, (u64, u64, u64)>,
     /// Pages of other mappings of those files' pages -> the pages
     /// translated from that they also map. Kept from writes: a write
     /// through one drops their translations.
@@ -320,6 +322,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     pages: BTreeMap::new(),
     outside: std::collections::BTreeSet::new(),
     objects: BTreeMap::new(),
+    object_of: BTreeMap::new(),
     aliases: BTreeMap::new(),
     veneers: BTreeMap::new(),
     returns: std::collections::BTreeSet::new(),
@@ -455,10 +458,14 @@ impl State {
         }
         let pages: Vec<u64> = self.pages.range(start..end).map(|(&p, _)| p).collect();
         for p in pages {
-            self.objects.retain(|_, ps| {
+            if let Some(k) = self.object_of.remove(&p)
+                && let Some(ps) = self.objects.get_mut(&k)
+            {
                 ps.remove(&p);
-                !ps.is_empty()
-            });
+                if ps.is_empty() {
+                    self.objects.remove(&k);
+                }
+            }
             for i in self.pages.remove(&p).unwrap_or_default() {
                 let (g, t) = (self.blocks[i].g, self.blocks[i].t);
                 if self.by_g.get(&g) == Some(&i) {
@@ -553,6 +560,7 @@ pub fn reset() {
     s.lifted.clear();
     s.retried.clear();
     s.objects.clear();
+    s.object_of.clear();
     s.aliases.clear();
     s.veneers.clear();
     s.returns.clear();
@@ -767,16 +775,20 @@ pub fn exit(regs: &mut Regs) -> bool {
 fn exit_now(regs: &mut Regs) -> bool {
     let mut s = state();
     let at = regs.pc;
-    let exit = match word_at(&s, at) {
+    let retry = s.cache.as_ref().is_some_and(|c| c.stub == at);
+    let from = if retry { None } else { block_at(&s, at) };
+    let word =
+        from.and_then(|i| s.blocks[i].words.get(((at - s.blocks[i].t) / 4) as usize).copied());
+    let exit = match word {
         Some(Word::Out { exit, .. }) => exit,
         // The retry stub: an entry dropped as a lookup read it.
-        Some(Word::Retry) => Exit::Retry,
+        _ if retry => Exit::Retry,
         _ => return false,
     };
     EXITS.fetch_add(1, Ordering::Relaxed);
     // A retired block's ways out are not linked: its room is had back once
     // nothing is in it, and a link from it would outlive it.
-    let from_retired = block_at(&s, at).is_some_and(|i| s.blocks[i].retired);
+    let from_retired = from.is_some_and(|i| s.blocks[i].retired);
     let flushes = s.cache.as_ref().map_or(0, |c| c.flushes);
     let (to, link_here) = match exit {
         Exit::Jump(to) => (to, true),
@@ -1144,7 +1156,8 @@ fn link_site(s: &mut State, at: u64, j: usize) {
         return;
     }
     let to = s.blocks[j].g;
-    let waits = matches!(word_at(s, at), Some(Word::Out { exit: Exit::Jump(x), .. }) if x == to);
+    let word = s.blocks[from].words.get(((at - s.blocks[from].t) / 4) as usize).copied();
+    let waits = matches!(word, Some(Word::Out { exit: Exit::Jump(x), .. }) if x == to);
     // SAFETY: a word of fwe's code cache, readable.
     let trap = unsafe { (at as *const u32).read() } == EXIT;
     if !waits || !trap || s.blocks[from].retired || s.blocks[j].retired {
@@ -1168,6 +1181,7 @@ fn guard(s: &mut State, p: u64) {
                 rec.areas().iter().filter_map(|a| alias_in(a, k)).filter(|&q| q != p).collect();
             drop(rec);
             s.objects.entry(k).or_default().insert(p);
+            s.object_of.insert(p, k);
             for q in others {
                 s.aliases.entry(q).or_default().insert(p);
                 keep(s, q);
@@ -1474,6 +1488,7 @@ fn flush(s: &mut State) {
     }
     // Nothing is translated from the program's pages now.
     s.objects.clear();
+    s.object_of.clear();
     s.waiting.clear();
     s.veneers.clear();
     s.aliases.clear();
