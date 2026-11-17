@@ -1016,6 +1016,22 @@ fn x18_instructions_of_a_real_binary_compute_as_with_another_register() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Calls into JIT code from many call sites of the program's own code at
+/// once (guests/c/jitcalls.c): each site, linked to the code's translation
+/// after its first call, still reaches its own target.
+#[test]
+fn jit_code_called_from_many_sites_at_once() {
+    let prog = build_c("jitcalls", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitcalls");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitcalls stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "wrong calls: 0\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `x18` in JIT code (guests/c/jitx18.c): one sequence of instructions
 /// working in `x18`, and the same in `x9`, compute the same, quietly and
 /// with signals landing anywhere in them.

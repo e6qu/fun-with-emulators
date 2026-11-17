@@ -125,6 +125,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     fwe_kernel::timing::mark("exec: checked");
     fwe_kernel::mm::release_guest_memory();
     crate::jit::reset();
+    crate::prepare::reset();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
         // SAFETY: closing the pipe end this child holds for its parent.

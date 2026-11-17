@@ -234,6 +234,16 @@ pub fn call_stub(site: u64, words: &[u32]) -> Option<u64> {
     Some(at)
 }
 
+/// A new program in this process (an `execve` in place): the old one's
+/// stub regions went with its memory, and with them what is known of them
+/// (sites, room for call stubs).
+pub fn reset() {
+    STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SP_STUB_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
 /// The stub region holding `pc`, if any: (start, end).
 pub fn stub_region(pc: u64) -> Option<(u64, u64)> {
     let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
@@ -756,6 +766,8 @@ fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> b
         return false;
     }
     note_stub_region(r.at, r.at + r.size);
+    // The guest's memory, as other stub regions are: an `execve` releases it.
+    fwe_kernel::mm::track(r.at, r.size);
     let mut cursor = r.at;
     for &(at, site) in &r.sites {
         note_site(at, site);
