@@ -3618,11 +3618,9 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
             // into code not translated and back.
             .env("FWE_TIMING", "1")
             .stdin(Stdio::null());
-        // TEMPORARY: fwe's own switches, to bisect in CI.
-        for v in ["FWE_JIT_AHEAD"] {
-            if let Some(x) = std::env::var_os(v) {
-                cmd.env(v, x);
-            }
+        // TEMPORARY: the translate-ahead limit, to measure in CI.
+        if let Some(x) = std::env::var_os("FWE_JIT_AHEAD") {
+            cmd.env("FWE_JIT_AHEAD", x);
         }
         // HotSpot options for every JVM the test starts, to narrow a failure
         // down (`-Xint`, a GC's verification).
