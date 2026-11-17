@@ -1087,8 +1087,13 @@ fn linux_fault_signal(host: libc::c_int, allowed: bool) -> u64 {
 }
 
 /// Whether the host's protection of the page at `addr` allows the access
-/// whose syndrome is `esr`.
+/// whose syndrome is `esr`. Below the lowest address the host lets a
+/// process map (a null pointer's access, as a JIT's implicit null checks
+/// make), nothing is mapped, and the host is not asked.
 fn allowed_now(addr: u64, esr: u32) -> bool {
+    if addr < crate::loader::host_min_address() {
+        return false;
+    }
     let Some(r) = fwe_kernel::mm::region::query(addr).filter(|r| r.start <= addr) else {
         return false;
     };
@@ -1223,8 +1228,19 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             return;
         }
         // Read as the host copies, which reports a hole rather than fault:
-        // the pc of an instruction-fetch fault is not mapped.
-        let word = |a: u64| read_host::<u32>(a);
+        // the pc of an instruction-fetch fault is not mapped. The word at
+        // the pc of any other fault was just fetched: read as it is (the
+        // host's copy is a Mach call, on every fault).
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let esr = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).es.esr };
+        let pc = ss.pc;
+        let at_pc = if (esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER {
+            read_host::<u32>(pc)
+        } else {
+            // SAFETY: the thread fetched the instruction at `pc`.
+            unsafe { insn(pc) }
+        };
+        let word = |a: u64| if a == pc { at_pc } else { read_host::<u32>(a) };
         if let Some(site) = crate::rewrite::syscall_stub_site(word, ss.pc) {
             // A system call's stub could not save registers below the
             // guest's sp (none is needed for a system call: musl's thread
