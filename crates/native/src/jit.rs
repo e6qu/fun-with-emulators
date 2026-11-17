@@ -339,6 +339,10 @@ static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Call sites of code not translated linked to translations.
 static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
+/// Time spent translating blocks, and in [`exit`] (with its lock), in
+/// nanoseconds.
+static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
+static EXIT_NS: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
@@ -350,7 +354,8 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} pages' translations dropped by writes, the code cache emptied {} times",
+             {} pages' translations dropped by writes, the code cache emptied {} times; \
+             {} ms translating, {} ms in ways out",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
@@ -359,7 +364,9 @@ pub fn counts() -> Option<String> {
             ENTERED_CALLS.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
-            FLUSHES.load(Ordering::Relaxed)
+            FLUSHES.load(Ordering::Relaxed),
+            TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
+            EXIT_NS.load(Ordering::Relaxed) / 1_000_000
         )
     })
 }
@@ -744,6 +751,13 @@ pub fn host_writes(addr: u64, len: u64) {
 /// not code run by translation; a direct branch is linked there. `false`
 /// if `pc` is no way out of fwe's.
 pub fn exit(regs: &mut Regs) -> bool {
+    let began = std::time::Instant::now();
+    let r = exit_now(regs);
+    EXIT_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    r
+}
+
+fn exit_now(regs: &mut Regs) -> bool {
     let mut s = state();
     let at = regs.pc;
     let exit = match word_at(&s, at) {
@@ -1048,7 +1062,9 @@ fn translation(s: &mut State, g: u64) -> usize {
     let at = cache_next(s);
     guard(s, page);
     let followed = !s.in_region(g);
+    let began = std::time::Instant::now();
     let (words, info, entry, calls) = translate(g, at, followed);
+    TRANSLATE_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
