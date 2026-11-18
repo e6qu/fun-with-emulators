@@ -878,7 +878,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
-    script = (f'profile-997 /execname == "{execname}"/ {{ @pc[arg1] = count(); }} '
+    script = (f'profile-997 /execname == "{execname}"/ {{ @pc[tid, arg1] = count(); }} '
               f'profile-997 /execname == "{execname}" && arg0/ {{ @ks[stack(6)] = count(); }} '
               f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
@@ -889,7 +889,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
               'mach_trap:::return /self->m/ { @ns[strjoin("mach:", probefunc)] = '
               'sum(timestamp - self->m); @n[strjoin("mach:", probefunc)] = count(); '
               'self->m = 0; } '
-              'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
+              'END { printa("pc %d %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
               'printa("ks %@d%k\\nendks\\n", @ks); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
@@ -919,7 +919,8 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
         subprocess.run(["sudo", "-n", "kill", "-KILL"] + dtrace, capture_output=True)
         said = tracer.communicate()[0]
         sys.exit(f"{name}: DTrace did not end when interrupted: {said.strip()[-2000:]}")
-    counts, calls, kstacks = [], [], []
+    # Samples by thread, and by program counter.
+    threads, calls, kstacks = collections.defaultdict(collections.Counter), [], []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
             stack = None
@@ -931,12 +932,13 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
                         stack = None
                     elif p:
                         stack[1].append(p[0])
-                elif len(p) == 3 and p[0] == "pc":
-                    counts.append((int(p[1], 16), int(p[2])))
+                elif len(p) == 4 and p[0] == "pc":
+                    threads[int(p[1])][int(p[2], 16)] += int(p[3])
                 elif len(p) == 4 and p[0] == "sys":
                     calls.append((p[1], int(p[2]), int(p[3])))
                 elif len(p) == 2 and p[0] == "ks":
                     stack = (int(p[1]), [])
+    counts = list(sum(threads.values(), collections.Counter()).items())
     if calls:
         calls.sort(key=lambda c: -c[1])
         top = ", ".join(f"{c} {n}x {ns / 1e6:.1f} ms ({ns / n:.0f} ns)" for c, ns, n in calls[:12])
@@ -985,6 +987,14 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
                     for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
+    # The threads that ran most: the longest of them bounds the run.
+    for tid, pcs_of in sorted(threads.items(), key=lambda t: -t[1].total())[:4]:
+        of = collections.Counter()
+        for pc, n in pcs_of.items():
+            of[where(pc).split("+")[0]] += n
+        n = pcs_of.total()
+        print(f"{name}: thread {tid}: {n} samples; by file: "
+              + ", ".join(f"{w} {k * 100 // n}%" for w, k in of.most_common(6)), file=sys.stderr)
     if jit_map:
         try:
             translated(name, jit_map, counts, where)
