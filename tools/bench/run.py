@@ -1190,6 +1190,15 @@ def jdk(a, fwe, guest_env, results):
     shutil.rmtree(jit_map, ignore_errors=True)
     pcs("JDK java natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE],
         execname="java")
+    # How long each part of the application takes, both ways (it says on
+    # standard error).
+    for how, cmd in [("under fwe", guest_env + fwe + [
+            "--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp",
+            "/tmp/jdkout", "Main", JDK_SCALE]),
+            ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])]:
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        print(f"JDK java parts {how}: " + ", ".join(r.stderr.split("\n")).strip(", "),
+              file=sys.stderr)
     shutil.rmtree(native, ignore_errors=True)
 
 
