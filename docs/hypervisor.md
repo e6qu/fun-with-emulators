@@ -65,7 +65,8 @@ only the guest's own page tables change.
   range (or that one continues) gets its memory right beside the
   other's, and the two become one, so a buffer across them is one host
   buffer. Where that memory is taken, the mapping goes where the VM
-  places mappings, as a hint allows. The framework maps only host memory that
+  places mappings, as a hint allows, and a read or write across it is cut
+  at its edge (a shorter count). The framework maps only host memory that
   may be written, which a shared mapping of a file opened read-only is
   not: such a segment is made of the same file opened again for writing
   (checked to be the same file; an `mprotect` asking to write fails with

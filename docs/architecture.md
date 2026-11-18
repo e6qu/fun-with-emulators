@@ -1674,8 +1674,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - VM: a private file mapping is a copy of the file when mapped, so later
   writes to the file do not show; a shared segment cannot grow with
   `mremap`, and `MREMAP_FIXED`/`MREMAP_DONTUNMAP` are refused (`EINVAL`).
-- VM: a buffer a host call takes whole (`read`'s, an `iovec`'s) that runs
-  over the edge of a translated range fails with `EINVAL`; `ioctl`'s
+- VM: a buffer a host call takes whole that runs over the edge of a
+  translated range fails with `EINVAL` (an `iovec`'s, `recvfrom`'s, a
+  datagram socket's `read`), but for `read`, `write`, `pread64` and
+  `pwrite64` on a file, pipe or stream, which are cut where the range
+  ends (a shorter count, as Linux may give); `ioctl`'s
   argument is translated but not checked against the guest's mappings; a
   `MAP_FIXED` mapping placed exactly where fwe keeps another translated
   range's memory makes their addresses ambiguous within a call that

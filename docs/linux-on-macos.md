@@ -1759,7 +1759,9 @@ hardware translation:
 The low 4 GiB can never be identity-mapped (it is `__PAGEZERO` on the
 host), so the low image is always translated. A host call given one
 buffer that runs over the edge of a translated range has no single host
-address and fails with `EINVAL`.
+address: a `read`, `write`, `pread64` or `pwrite64` of a file, pipe or
+stream is cut where the range ends, a shorter count the program goes on
+from, as Linux may return; any other such call fails with `EINVAL`.
 
 #### The mmap family
 
