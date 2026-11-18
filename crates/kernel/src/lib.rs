@@ -95,6 +95,7 @@ pub mod seqpacket;
 pub mod shared;
 #[cfg(target_os = "macos")]
 pub mod sharedfutex;
+pub mod shortlock;
 pub mod signal;
 pub mod signalfd;
 pub mod signote;

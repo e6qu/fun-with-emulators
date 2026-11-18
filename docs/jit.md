@@ -240,8 +240,8 @@ a processor that reports `DIC` clear.
   targets already translated, and ways out waiting for it to it
   (`jit::link_waiting`). The lock is held for microseconds at a time, so
   a thread that finds it held tries again for a few of them
-  (`jit::SPIN`) before it sleeps on it: sleeping and being woken cost
-  the host's scheduler far more than a hold.
+  (`fwe_kernel::shortlock`) before it sleeps on it: sleeping and being
+  woken cost the host's scheduler far more than a hold.
 - **Ways out:** a block's way out (a direct branch's, or a lookup's
   miss) saves `x16` and `x17` below `sp` unless they are saved already
   (`Word::Out`'s `saved`) and branches to the exit gate

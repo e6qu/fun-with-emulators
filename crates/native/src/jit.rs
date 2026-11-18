@@ -624,33 +624,15 @@ const HOLD_GATE: usize = 3;
 const HOLD_OTHER: usize = 4;
 static HOLD_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
-/// How long a thread tries for [`STATE`] held by another before it sleeps
-/// on it: a few holds' time.
-const SPIN: std::time::Duration = std::time::Duration::from_micros(20);
-
 fn lock_state() -> std::sync::MutexGuard<'static, State> {
     match STATE.try_lock() {
         Ok(s) => s,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
         Err(std::sync::TryLockError::WouldBlock) => {
-            // Held by another thread: how often, and how long it waits.
-            // A hold is short (a block placed, a way out linked, a few
-            // microseconds), while sleeping on the lock and being woken
-            // costs the host's scheduler far more: it is tried again for
-            // a while first.
+            // Held by another thread: how often, and how long it waits
+            // (held for moments, [`fwe_kernel::shortlock`]).
             let began = std::time::Instant::now();
-            let s = loop {
-                match STATE.try_lock() {
-                    Ok(s) => break s,
-                    Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
-                    Err(std::sync::TryLockError::WouldBlock) if began.elapsed() < SPIN => {
-                        std::hint::spin_loop();
-                    }
-                    Err(std::sync::TryLockError::WouldBlock) => {
-                        break STATE.lock().unwrap_or_else(|e| e.into_inner());
-                    }
-                }
-            };
+            let s = fwe_kernel::shortlock::lock(&STATE);
             LOCK_WAITS.fetch_add(1, Ordering::Relaxed);
             LOCK_WAIT_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
             s
