@@ -256,9 +256,11 @@ a processor that reports `DIC` clear.
   way on into another, while a new block is invalidated as it is
   written, before it is published. Anything else (code
   not translated, a signal to deliver) takes the gate's `brk`, whose
-  handler goes on from the block. A way out unlinked again when the
-  cache is emptied is `brk #0x4a54` (`jit::EXIT`), which `on_sigtrap`
-  passes to `jit::exit`. A direct branch's target that is code not
+  handler goes on from the block. A way out unlinked again (its target
+  dropped, or the cache emptied) has its first word as it was made, into
+  the gate again. A lookup that enters the wrong block (one whose entry
+  another address took as it read it) goes on at `brk #0x4a54`
+  (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`. A direct branch's target that is code not
   translated is patched to it where a branch reaches and `x16` and `x17`
   are the program's, else to a veneer block (`jit::veneer`: `x16` and
   `x17` restored if saved, then a branch, or the target in `x16` and

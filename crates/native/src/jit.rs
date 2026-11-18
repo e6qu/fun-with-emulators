@@ -88,8 +88,7 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `brk #0x4a54` ("JT"): a direct way out unlinked again, or the wrong
-/// block entered, into fwe by its trap.
+/// `brk #0x4a54` ("JT"): the wrong block entered, into fwe by its trap.
 pub const EXIT_IMM: u32 = 0x4a54;
 pub const EXIT: u32 = 0xd420_0000 | (EXIT_IMM << 5);
 /// `udf #0`: an instruction no translation can stand for (an
@@ -749,10 +748,14 @@ impl State {
         true
     }
 
-    /// Undo [`State::link`] of way out `at` in block `from`: it traps
-    /// again, and its conditional branch leads to it.
+    /// Undo [`State::link`] of way out `at` in block `from`: its first
+    /// word as it was made, into the exit gate again (no trap), and its
+    /// conditional branch leads to it.
     fn unlink(&self, from: &Block, at: u64) {
-        self.patch(at, EXIT);
+        let Some(&Word::Out { saved, .. }) = from.words.get(((at - from.t) / 4) as usize) else {
+            panic!("a link at {at:#x}, no way out");
+        };
+        self.patch(at, if saved { OUT } else { SAVE });
         if let Some(c) = conditional(from, at) {
             // SAFETY: a word of fwe's code cache, readable.
             if let Some(w) = retarget(unsafe { (c as *const u32).read() }, c, at) {
@@ -812,8 +815,8 @@ impl State {
             c.live -= len;
             c.garbage += len;
         }
-        // Branches linked to it trap again, and wait for it to be
-        // translated anew.
+        // Branches linked to it lead into fwe again, and wait for it to
+        // be translated anew.
         for at in std::mem::take(&mut self.blocks[i].linked) {
             let Some(f) = block_at(self, at) else { continue };
             self.unlink(&self.blocks[f], at);
@@ -1635,11 +1638,11 @@ fn link_site(s: &mut State, from: usize, at: u64, j: usize) {
     }
 }
 
-/// Whether way out `at` still leads into fwe (its first word as made, or
-/// unlinked again).
+/// Whether way out `at` still leads into fwe (its first word as made: not
+/// linked, or unlinked again).
 fn unlinked(at: u64) -> bool {
     // SAFETY: a word of fwe's code cache, readable.
-    matches!(unsafe { (at as *const u32).read() }, EXIT | SAVE | OUT)
+    matches!(unsafe { (at as *const u32).read() }, SAVE | OUT)
 }
 
 /// The conditional branch whose taken way is way out `at` of block `b`.
