@@ -509,7 +509,16 @@ pub fn write_map() {
                 format!("{w:08x}")
             })
             .collect();
-        text.push_str(&format!("{:x} {} {:x} {kinds} {words}\n", b.t, b.len, b.g));
+        // The program's words it was made from: how many, and the last
+        // (what ended it).
+        let last = b.source.last().copied().unwrap_or(0);
+        text.push_str(&format!(
+            "{:x} {} {:x} {kinds} {words} {}:{last:08x}\n",
+            b.t,
+            b.len,
+            b.g,
+            b.source.len()
+        ));
     }
     let path = std::path::Path::new(&dir).join(format!("jit-{}.map", std::process::id()));
     if let Err(e) = std::fs::write(&path, text) {

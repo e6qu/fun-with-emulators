@@ -800,13 +800,16 @@ def translated(name, jit_map, counts, where):
     restore, inside an expansion and of what, a lookup, a way out),
     the hottest blocks word by word,
     by the program's code each block was made from (`where` names its
-    address), and the hottest blocks."""
+    address), and the hottest blocks; and the blocks made, by the
+    program's code, by what ended each, and by how many instructions."""
     blocks = []
     for f in os.listdir(jit_map):
         with open(os.path.join(jit_map, f)) as m:
             for line in m:
-                t, size, g, kinds, words = line.split()
-                blocks.append((int(t, 16), int(size), int(g, 16), kinds, words))
+                t, size, g, kinds, words, source = line.split()
+                n, last = source.split(":")
+                blocks.append((int(t, 16), int(size), int(g, 16), kinds, words, int(n),
+                               int(last, 16)))
     blocks.sort()
     starts = [b[0] for b in blocks]
     names = {"a": "instruction", "s": "instruction, x16/x17 saved", "v": "save of x16/x17",
@@ -816,12 +819,28 @@ def translated(name, jit_map, counts, where):
              "c": "expansion of a system call", "l": "lookup", "L": "lookup", "o": "way out"}
     by_kind, by_code, by_block = collections.Counter(), collections.Counter(), collections.Counter()
     by_word = collections.Counter()
+    # The blocks made: whose code, what ended each, how long.
+    made_by, ends, lengths = collections.Counter(), collections.Counter(), collections.Counter()
+    for b in blocks:
+        made_by[where(b[2]).split("+")[0]] += 1
+        w, n = b[6], b[5]
+        ends["b" if w & 0xfc000000 == 0x14000000 else "bl" if w & 0xfc000000 == 0x94000000
+             else "br" if w & 0xfffffc1f == 0xd61f0000 else "blr" if w & 0xfffffc1f == 0xd63f0000
+             else "ret" if w & 0xfffffc1f == 0xd65f0000 else "the most instructions" if n >= 64
+             else "the page's end or else"] += 1
+        lengths["1-4" if n <= 4 else "5-8" if n <= 8 else "9-16" if n <= 16 else "17-63"
+                if n < 64 else "64"] += 1
+
+    def of(c):
+        return ", ".join(f"{w} {k * 100 // len(blocks)}%" for w, k in c.most_common(8))
+    print(f"{name}: blocks made: {len(blocks)}; by the program's code: {of(made_by)}; "
+          f"ended by: {of(ends)}; instructions: {of(lengths)}", file=sys.stderr)
     n_in = 0
     for pc, n in counts:
         i = bisect.bisect_right(starts, pc) - 1
         if i < 0 or pc >= blocks[i][0] + blocks[i][1]:
             continue
-        t, _, g, kinds, _ = blocks[i]
+        t, _, g, kinds = blocks[i][:4]
         k = (pc - t) // 4
         by_word[(i, k)] += n
         by_kind[names.get(kinds[k], "?") if k < len(kinds) else "?"] += n
@@ -844,7 +863,7 @@ def translated(name, jit_map, counts, where):
     for (i, _), n in by_word.items():
         hottest[i] += n
     for i, _ in hottest.most_common(3):
-        t, _, g, kinds, words = blocks[i]
+        t, _, g, kinds, words = blocks[i][:5]
         each = " ".join(f"{kinds[k]}:{words[8 * k:8 * k + 8]}:{by_word[(i, k)]}"
                         for k in range(len(kinds)))
         print(f"{name}: block {where(g)} (at {t:x}): {each}", file=sys.stderr)
