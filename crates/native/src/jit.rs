@@ -887,6 +887,13 @@ fn code_written(addr: u64, len: u64) {
 fn drop_lines(s: &mut State, addr: u64, len: u64) {
     let ps = page_size();
     let page = addr & !(ps - 1);
+    let (off, end) = (addr - page, (addr - page + len).min(ps));
+    // (Most lines a JIT flushes are on a page of its own mapping alone,
+    // and hold no block yet: code it just wrote.)
+    if !s.aliases.contains_key(&page) && !s.object_of.contains_key(&page) {
+        drop_on(s, page, off, end);
+        return;
+    }
     let mut pages = vec![page];
     pages.extend(s.aliases.get(&page).into_iter().flatten().copied());
     if let Some(ps) = s.object_of.get(&page).and_then(|k| s.objects.get(k)) {
@@ -894,21 +901,27 @@ fn drop_lines(s: &mut State, addr: u64, len: u64) {
     }
     pages.sort_unstable();
     pages.dedup();
-    let (off, end) = (addr - page, (addr - page + len).min(ps));
     for p in pages {
-        let Some(blocks) = s.pages.get(&p) else { continue };
-        let (hit, kept): (Vec<usize>, Vec<usize>) = blocks.iter().partition(|&&i| {
-            let b = &s.blocks[i];
-            p + off < b.g + 4 * b.source.len() as u64 && p + end > b.g
-        });
-        if hit.is_empty() {
-            continue;
-        }
-        s.pages.insert(p, kept);
-        for i in hit {
-            DROPPED.fetch_add(1, Ordering::Relaxed);
-            s.drop_block(i, true);
-        }
+        drop_on(s, p, off, end);
+    }
+}
+
+/// Drop the blocks made from `[p + off, p + end)`, on page `p`, kept to
+/// take back.
+fn drop_on(s: &mut State, p: u64, off: u64, end: u64) {
+    let Some(blocks) = s.pages.get(&p) else { return };
+    let hits = |i: usize| {
+        let b = &s.blocks[i];
+        p + off < b.g + 4 * b.source.len() as u64 && p + end > b.g
+    };
+    if !blocks.iter().any(|&i| hits(i)) {
+        return;
+    }
+    let (hit, kept): (Vec<usize>, Vec<usize>) = blocks.iter().partition(|&&i| hits(i));
+    s.pages.insert(p, kept);
+    for i in hit {
+        DROPPED.fetch_add(1, Ordering::Relaxed);
+        s.drop_block(i, true);
     }
 }
 
