@@ -105,7 +105,6 @@ pub fn configure() {
     let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     STORE_OFF.store(n("FWE_JIT_STORE_OFF"), Ordering::Relaxed);
     STORE_FLAT.store(n("FWE_JIT_STORE_FLAT"), Ordering::Relaxed);
-    STORE_MULT.store(n("FWE_JIT_STORE_MULT").max(1), Ordering::Relaxed);
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -387,7 +386,6 @@ static REVIVED: AtomicU64 = AtomicU64::new(0);
 const STORES_KEPT: u64 = 16;
 static STORE_OFF: AtomicU64 = AtomicU64::new(0);
 static STORE_FLAT: AtomicU64 = AtomicU64::new(0);
-static STORE_MULT: AtomicU64 = AtomicU64::new(1);
 /// Stores into pages kept from writes that fwe left to drop the page's
 /// translations, by why: not a store it decodes, on a page another
 /// mapping shares, or past [`STORES_KEPT`].
@@ -440,7 +438,7 @@ pub fn counts() -> Option<String> {
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, {} of them into code, \
              left: {} not decoded ({}), {} shared, {} past the limit), the code cache emptied {} times; \
-             {} ms translating, {} ms in ways out, {} waits for the lock ({} ms)",
+             {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in stores, {} in writes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
@@ -460,12 +458,65 @@ pub fn counts() -> Option<String> {
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
             EXIT_NS.load(Ordering::Relaxed) / 1_000_000,
             LOCK_WAITS.load(Ordering::Relaxed),
-            LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000_000
+            LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_EXIT].load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_STORE].load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_WRITTEN].load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_ENTER].load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_GATE].load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_OTHER].load(Ordering::Relaxed) / 1_000_000
         )
     })
 }
 
-fn state() -> std::sync::MutexGuard<'static, State> {
+/// The state, locked, for a caller of kind `site` ([`HOLD_NS`]).
+fn state_at(site: usize) -> Held {
+    Held { s: lock_state(), site, since: std::time::Instant::now() }
+}
+
+fn state() -> Held {
+    state_at(HOLD_OTHER)
+}
+
+/// [`STATE`] locked, and how long it is held counted by the kind of its
+/// holder.
+struct Held {
+    s: std::sync::MutexGuard<'static, State>,
+    site: usize,
+    since: std::time::Instant,
+}
+
+impl std::ops::Deref for Held {
+    type Target = State;
+    fn deref(&self) -> &State {
+        &self.s
+    }
+}
+
+impl std::ops::DerefMut for Held {
+    fn deref_mut(&mut self) -> &mut State {
+        &mut self.s
+    }
+}
+
+impl Drop for Held {
+    fn drop(&mut self) {
+        HOLD_NS[self.site].fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+}
+
+/// How long [`STATE`] was held, by its holders' kinds: ways out, stores
+/// fwe made, writes that dropped pages, entries by fetch, the exit gate's
+/// look at where it goes, and the rest.
+const HOLD_EXIT: usize = 0;
+const HOLD_STORE: usize = 1;
+const HOLD_WRITTEN: usize = 2;
+const HOLD_ENTER: usize = 3;
+const HOLD_GATE: usize = 4;
+const HOLD_OTHER: usize = 5;
+static HOLD_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+
+fn lock_state() -> std::sync::MutexGuard<'static, State> {
     match STATE.try_lock() {
         Ok(s) => s,
         Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
@@ -704,7 +755,7 @@ pub fn reset() {
 /// Held across a `fork`, so that the child's copy of the translations is
 /// whole (no other thread is midway through making one).
 pub fn hold() -> std::sync::MutexGuard<'static, State> {
-    state()
+    lock_state()
 }
 
 /// In a fork child, with [`hold`]'s guard: the code cache's two views are
@@ -766,7 +817,7 @@ fn remove(set: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 /// `lr`, which tells a return): the translation to run instead, if `pc`
 /// holds code that runs by translation.
 pub fn enter(pc: u64, lr: u64) -> Option<u64> {
-    let mut s = state();
+    let mut s = state_at(HOLD_ENTER);
     if !s.in_region(pc) {
         return None;
     }
@@ -864,7 +915,7 @@ fn link_call_site(s: &mut State, site: u64, n: u32) {
 /// changed since, so a write that faults for another reason is not tried
 /// forever.
 pub fn written(addr: u64) -> bool {
-    let mut s = state();
+    let mut s = state_at(HOLD_WRITTEN);
     let page = addr & !(page_size() - 1);
     // SAFETY: no preconditions.
     let thread = unsafe { libc::pthread_self() } as u64;
@@ -1068,7 +1119,7 @@ pub fn store(
     if compare.is_some() && !addr.is_multiple_of(len) {
         return false;
     }
-    let mut s = state();
+    let mut s = state_at(HOLD_STORE);
     // A page another mapping shares is left to `written`: its other
     // mappings' translations are not looked at here.
     if !s.guarded.contains(&page) {
@@ -1091,7 +1142,7 @@ pub fn store(
     let blocks = if STORE_FLAT.load(Ordering::Relaxed) != 0 {
         0
     } else {
-        s.pages.get(&page).map_or(0, Vec::len) as u64 * STORE_MULT.load(Ordering::Relaxed)
+        s.pages.get(&page).map_or(0, Vec::len) as u64
     };
     let made = &mut s.writers.get_mut(&page).expect("its writer").1;
     *made += 1;
@@ -1234,7 +1285,7 @@ pub fn host_writes(addr: u64, len: u64) {
 /// a lookup does.
 pub fn gate_exit(regs: &mut Regs) -> Option<(u64, u64)> {
     assert!(exit(regs), "the exit gate entered from no way out ({:#x})", regs.pc);
-    let s = state();
+    let s = state_at(HOLD_GATE);
     let i = block_at(&s, regs.pc)?;
     let b = &s.blocks[i];
     (b.body == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.t, b.g))
@@ -1252,7 +1303,7 @@ pub fn exit(regs: &mut Regs) -> bool {
 }
 
 fn exit_now(regs: &mut Regs) -> bool {
-    let mut s = state();
+    let mut s = state_at(HOLD_EXIT);
     let at = regs.pc;
     let retry = s.cache.as_ref().is_some_and(|c| c.stub == at);
     let from = if retry { None } else { block_at(&s, at) };

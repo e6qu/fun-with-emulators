@@ -248,7 +248,7 @@ jobs:
           failed=0
           n=0
           opts=""
-          for sw in X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4 X=1 FWE_JIT_STORE_MULT=4; do
+          for sw in X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1; do
             n=$((n+1))
             echo "=== options: '$opts', switches: $sw"
             env $sw FWE_JDK_JAVA_OPTIONS="$opts" cargo test -p fwe --test guests -- alpine_jdk --nocapture > jdk.out 2>&1
