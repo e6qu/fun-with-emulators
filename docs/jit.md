@@ -108,16 +108,53 @@ way.
 
 ## Code that changes
 
-On arm64 the instruction cache is not kept coherent with data writes on
-every processor, so the architecture has a program that writes code
-make it visible before running it: clean the data cache lines it wrote
-(`dc cvau`), invalidate the instruction cache lines (`ic ivau`), and
-synchronize (`dsb ish`, `isb`), which is what `__clear_cache` and every
-JIT's own flush routine do. A processor may report in `CTR_EL0` that it
-needs no such maintenance (`IDC`, `DIC`); the value fwe gives a program
-that reads it is Apple's under Linux, with both clear
+### Why a program flushes the instruction cache
+
+An arm64 core fetches instructions through an instruction cache of its
+own, beside the data cache its loads and stores go through. A store of
+new code lands in the data cache; the instruction cache may still hold
+the old instructions at that address, and the core may run them. So the
+architecture has a program that writes code make it visible before it
+runs it, with three steps for each cache line it wrote (the line sizes
+are in `CTR_EL0`: 64 bytes on Apple's processors):
+
+```
+dc   cvau, x0     // data cache: clean the line to the point of unification
+dsb  ish          // wait until that is done, for every core
+ic   ivau, x0     // instruction cache: invalidate the line
+dsb  ish          // wait until that is done, for every core
+isb               // this core: fetch what follows afresh
+```
+
+- **`dc cvau`** ("data cache clean by virtual address to the point of
+  unification") writes the line out of the data cache to the level
+  where instruction fetches and data accesses meet, so a fetch can see
+  it.
+- **`ic ivau`** ("instruction cache invalidate by virtual address to
+  the point of unification") discards the line from the instruction
+  caches, of every core in the inner shareable domain, so the next fetch
+  there reads the new code. User code may run it (Linux and macOS
+  allow it at EL0). It names an address, but the instruction cache the
+  `CTR_EL0` fwe gives describes is physically indexed and tagged (PIPT,
+  as Apple's is), so it works on the memory behind the address: a flush
+  through any mapping of that memory flushes them all.
+- **`dsb ish`** waits for the maintenance to finish everywhere, and
+  **`isb`** has this core drop instructions it has already fetched.
+  Another core that runs the new code needs an `isb` (or another
+  context synchronization, such as an exception's return) of its own.
+
+`__clear_cache` (GCC's `__aarch64_sync_cache_range`, LLVM's
+compiler-rt), and each JIT's own routine (HotSpot's
+`ICache::invalidate_range`, V8's `FlushInstructionCache`, LuaJIT's
+`lj_mcode_sync`), run this sequence over the range written. A processor
+may report in `CTR_EL0` that it needs part of it no more: `IDC` set,
+the clean is not needed; `DIC` set, the invalidation is not needed, and
+these routines skip it. The value fwe gives a program that reads
+`CTR_EL0` is Apple's under Linux, with both clear
 ([linux-on-macos.md](linux-on-macos.md#ctr_el0-emulated-when-it-traps)),
-so a program that writes code always flushes it.
+so a program that writes code always runs `ic ivau` over it.
+
+### What fwe does with it
 
 fwe takes that flush for the word that the code changed:
 
