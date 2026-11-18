@@ -81,8 +81,43 @@ pub fn signal(sig: i32) {
     }
 }
 
-/// The calls that took longest (number, count, milliseconds) and the
-/// signals taken (number, count), as text.
+/// What a host `SIGTRAP` was for, counted by [`trapped`].
+#[derive(Clone, Copy)]
+pub enum Trap {
+    /// A translation's way out by its own trap.
+    WayOut,
+    /// The exit gate's trap: on at code not translated, or a signal to
+    /// deliver.
+    ExitGate,
+    /// The system-call gate's trap after the call ran (a signal to
+    /// deliver).
+    GateRan,
+    /// The system-call gate's trap with the call not run.
+    Gate,
+    /// A system call's own trap, or a `brk` that is not fwe's.
+    Call,
+}
+
+const TRAP_NAMES: [&str; 5] = [
+    "ways out",
+    "exit gate",
+    "gate after its call",
+    "gate before its call",
+    "system calls and others",
+];
+
+static TRAPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+
+/// A host `SIGTRAP` taken for `what`, if [`on`].
+#[inline]
+pub fn trapped(what: Trap) {
+    if on() {
+        TRAPS[what as usize].fetch_add(1, Relaxed);
+    }
+}
+
+/// The calls that took longest (number, count, milliseconds), the signals
+/// taken (number, count) and what the traps among them were for, as text.
 pub fn calls_and_signals() -> String {
     let mut calls: Vec<(usize, u64, u64)> = (0..CALLS.len())
         .map(|i| (i, CALLS[i].load(Relaxed), CALL_NS[i].load(Relaxed)))
@@ -100,9 +135,15 @@ pub fn calls_and_signals() -> String {
         .filter(|s| s.1 > 0)
         .map(|(i, n)| format!("{i}: {n}"))
         .collect();
+    let traps: Vec<String> = (0..TRAPS.len())
+        .map(|i| (TRAP_NAMES[i], TRAPS[i].load(Relaxed)))
+        .filter(|t| t.1 > 0)
+        .map(|(name, n)| format!("{name} {n}"))
+        .collect();
     format!(
-        "{total} system calls, by number, the longest: {}; host signals by number: {}",
+        "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}",
         calls.join(", "),
-        signals.join(", ")
+        signals.join(", "),
+        traps.join(", ")
     )
 }

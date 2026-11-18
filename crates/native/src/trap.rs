@@ -646,6 +646,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         if (esr >> 26) & 0x3f == ESR_EC_BRK && esr & 0xffff == crate::jit::EXIT_IMM {
             let _host = HostCode::enter_blocked();
             let mut regs = regs_from(mc);
+            fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::WayOut);
             if crate::jit::exit(&mut regs, true) {
                 settle(&mut regs);
                 regs_to(mc, &regs);
@@ -670,6 +671,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     // SAFETY: the thread was executing at `pc`, so it is mapped.
     if crate::gate::in_gate(pc) && unsafe { insn(pc) } == Some(crate::gate::EXIT_GATE_TRAP) {
+        fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::ExitGate);
         let b = crate::gate::block().expect("the exit gate's thread has a block");
         let mut regs = b.regs;
         b.active.store(0, std::sync::atomic::Ordering::SeqCst);
@@ -687,6 +689,11 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         let b = crate::gate::block().expect("the gate's thread has a block");
         let mut regs = b.regs;
         let ran = b.ran != 0;
+        fwe_kernel::timing::trapped(if ran {
+            fwe_kernel::timing::Trap::GateRan
+        } else {
+            fwe_kernel::timing::Trap::Gate
+        });
         b.active.store(0, std::sync::atomic::Ordering::SeqCst);
         if ran {
             // The call ran: what is pending is delivered, and the guest
@@ -700,6 +707,9 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         }
         // As if the guest had trapped at its system call.
         regs_to(mc, &regs);
+    }
+    if !from_gate {
+        fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::Call);
     }
     syscall_trap(ctx, in_guest, from_gate);
 }
