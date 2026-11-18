@@ -78,7 +78,8 @@
 
 use crate::rewrite::{self, Site};
 use fwe_kernel::Regs;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -308,6 +309,33 @@ struct Cache {
     flushes: u64,
 }
 
+/// A map by program address, looked up and never walked in order: a way
+/// out takes the translator's lock to look up and add to these, and a
+/// tree's insert and walk cost several times a hash's.
+type AddrMap<V> = HashMap<u64, V, BuildHasherDefault<AddrHash>>;
+
+/// A program address's hash: its bits mixed by a multiply, the high half
+/// folded into the low, which pick the bucket.
+#[derive(Default)]
+struct AddrHash(u64);
+
+impl Hasher for AddrHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(self.0 ^ u64::from(b));
+        }
+    }
+
+    fn write_u64(&mut self, v: u64) {
+        let h = (self.0 ^ v).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
 /// A chunk of the code cache: its writable view and its executable one.
 struct Chunk {
     rw: u64,
@@ -321,7 +349,7 @@ pub struct State {
     /// Program memory whose code runs by translation: start -> end.
     regions: BTreeMap<u64, u64>,
     /// Translations by program address.
-    by_g: BTreeMap<u64, usize>,
+    by_g: AddrMap<usize>,
     /// Translations by their address in the cache: start -> block index.
     by_t: BTreeMap<u64, usize>,
     blocks: Vec<Block>,
@@ -351,9 +379,10 @@ pub struct State {
     /// and were linked to it, or tried ([`link_call_site`]).
     call_sites: std::collections::BTreeSet<u64>,
     /// Program addresses not translated yet -> the direct ways out of
-    /// translations that lead there, linked as the target is translated
-    /// ([`link_waiting`]) rather than each through fwe's trap.
-    waiting: BTreeMap<u64, Vec<u64>>,
+    /// translations that lead there (and their blocks), linked as the
+    /// target is translated ([`link_waiting`]) rather than each through
+    /// fwe's trap.
+    waiting: AddrMap<Vec<(u64, usize)>>,
     /// Program addresses -> the block made there that a flush of its
     /// words dropped, taken back when the address is to be translated
     /// again if its words were not changed ([`revive`]).
@@ -363,7 +392,7 @@ pub struct State {
 
 static STATE: Mutex<State> = Mutex::new(State {
     regions: BTreeMap::new(),
-    by_g: BTreeMap::new(),
+    by_g: AddrMap::with_hasher(BuildHasherDefault::new()),
     by_t: BTreeMap::new(),
     blocks: Vec::new(),
     pages: BTreeMap::new(),
@@ -374,7 +403,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     veneers: BTreeMap::new(),
     returns: std::collections::BTreeSet::new(),
     call_sites: std::collections::BTreeSet::new(),
-    waiting: BTreeMap::new(),
+    waiting: AddrMap::with_hasher(BuildHasherDefault::new()),
     dormant: BTreeMap::new(),
     cache: None,
 });
@@ -614,14 +643,15 @@ impl State {
         unsafe { crate::prepare::flush_icache(at, 4) };
     }
 
-    /// Link way out `at` (a direct one) to `into`, a translation's entry
-    /// as the way out has the program's `x16` and `x17`: a branch there,
-    /// and the conditional branch it is the taken way of straight there
-    /// too where that reaches. Whether it reaches.
-    fn link(&self, at: u64, into: u64) -> bool {
+    /// Link way out `at` (a direct one, not linked yet) of block `from` to
+    /// `into`, a translation's entry as the way out has the program's `x16`
+    /// and `x17`: a branch there, and the conditional branch it is the
+    /// taken way of straight there too where that reaches. Whether it
+    /// reaches.
+    fn link(&self, from: usize, at: u64, into: u64) -> bool {
         let Some(b) = rewrite::branch(at, into) else { return false };
         self.patch(at, b);
-        if let Some(c) = block_at(self, at).and_then(|i| conditional(&self.blocks[i], at)) {
+        if let Some(c) = conditional(&self.blocks[from], at) {
             // SAFETY: a word of fwe's code cache, readable.
             if let Some(w) = retarget(unsafe { (c as *const u32).read() }, c, into) {
                 self.patch(c, w);
@@ -696,13 +726,10 @@ impl State {
         // Branches linked to it trap again, and wait for it to be
         // translated anew.
         for at in std::mem::take(&mut self.blocks[i].linked) {
-            if let Some(f) = block_at(self, at) {
-                self.unlink(&self.blocks[f], at);
-            }
-            let live =
-                block_at(self, at).is_some_and(|f| self.by_g.get(&self.blocks[f].g) == Some(&f));
-            if live {
-                self.waiting.entry(g).or_default().push(at);
+            let Some(f) = block_at(self, at) else { continue };
+            self.unlink(&self.blocks[f], at);
+            if self.by_g.get(&self.blocks[f].g) == Some(&f) {
+                self.waiting.entry(g).or_default().push((at, f));
             }
         }
     }
@@ -1101,7 +1128,14 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     // Linked where the target is in reach (in the same chunk), unless the
     // cache was emptied meanwhile (`at` may be reused).
     let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
-    if link_here && same && !from_retired && s.link(at, entered(&s, i, saved)) {
+    // (Linked already where the way out waited for the translation.)
+    if link_here
+        && same
+        && !from_retired
+        && let Some(f) = from
+        && unlinked(at)
+        && s.link(f, at, entered(&s, i, saved))
+    {
         s.blocks[i].linked.push(at);
     }
     regs.pc = s.blocks[i].unsaved;
@@ -1406,19 +1440,18 @@ fn link_waiting(s: &mut State, i: usize) {
         .collect();
     for (at, to) in outs {
         match s.by_g.get(&to).copied() {
-            Some(j) => link_site(s, at, j),
-            None => s.waiting.entry(to).or_default().push(at),
+            Some(j) => link_site(s, i, at, j),
+            None => s.waiting.entry(to).or_default().push((at, i)),
         }
     }
-    for at in s.waiting.remove(&g).unwrap_or_default() {
-        link_site(s, at, i);
+    for (at, from) in s.waiting.remove(&g).unwrap_or_default() {
+        link_site(s, from, at, i);
     }
 }
 
 /// Link way out `at` (a direct one, still into fwe) to block `j`, if it
 /// is in a live translation and the branch reaches.
-fn link_site(s: &mut State, at: u64, j: usize) {
-    let Some(from) = block_at(s, at) else { return };
+fn link_site(s: &mut State, from: usize, at: u64, j: usize) {
     // A block dropped (its program address another's, or none's) is left
     // as it is: nothing new leads into it.
     if s.by_g.get(&s.blocks[from].g) != Some(&from) {
@@ -1427,14 +1460,19 @@ fn link_site(s: &mut State, at: u64, j: usize) {
     let to = s.blocks[j].g;
     let word = s.blocks[from].words.get(((at - s.blocks[from].t) / 4) as usize).copied();
     let Some(Word::Out { exit: Exit::Jump(x), saved, .. }) = word else { return };
-    // SAFETY: a word of fwe's code cache, readable.
-    let trap = matches!(unsafe { (at as *const u32).read() }, EXIT | SAVE | OUT);
-    if x != to || !trap || s.blocks[from].retired || s.blocks[j].retired {
+    if x != to || !unlinked(at) || s.blocks[from].retired || s.blocks[j].retired {
         return;
     }
-    if s.link(at, entered(s, j, saved)) {
+    if s.link(from, at, entered(s, j, saved)) {
         s.blocks[j].linked.push(at);
     }
+}
+
+/// Whether way out `at` still leads into fwe (its first word as made, or
+/// unlinked again).
+fn unlinked(at: u64) -> bool {
+    // SAFETY: a word of fwe's code cache, readable.
+    matches!(unsafe { (at as *const u32).read() }, EXIT | SAVE | OUT)
 }
 
 /// The conditional branch whose taken way is way out `at` of block `b`.
