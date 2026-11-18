@@ -788,8 +788,8 @@ def translated(name, jit_map, counts, where):
     """The samples in fwe's translations (`counts`, by program counter),
     named by the maps of the code cache fwe wrote to directory `jit_map`:
     by what each word stands for (the program's instruction with its `x16`
-    and `x17` in place or saved, their save or restore, inside an
-    expansion, a lookup, a way out),
+    and `x17` in place or saved, or its `x18` held in `x17`, their save or
+    restore, inside an expansion and of what, a lookup, a way out),
     by the program's code each block was made from (`where` names its
     address), and the hottest blocks."""
     blocks = []
@@ -801,8 +801,10 @@ def translated(name, jit_map, counts, where):
     blocks.sort()
     starts = [b[0] for b in blocks]
     names = {"a": "instruction", "s": "instruction, x16/x17 saved", "v": "save of x16/x17",
-             "r": "restore of x16/x17", "u": "expansion", "f": "expansion", "l": "lookup",
-             "L": "lookup", "o": "way out"}
+             "x": "instruction, x18 in x17", "r": "restore of x16/x17",
+             "8": "expansion of x18", "t": "expansion of the thread pointer",
+             "e": "expansion of a literal load", "i": "expansion of a cache flush",
+             "c": "expansion of a system call", "l": "lookup", "L": "lookup", "o": "way out"}
     by_kind, by_code, by_block = collections.Counter(), collections.Counter(), collections.Counter()
     n_in = 0
     for pc, n in counts:

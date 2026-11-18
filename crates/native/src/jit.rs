@@ -236,6 +236,23 @@ enum Exit {
     Retry,
 }
 
+/// What an expansion ([`Word::Undo`], [`Word::Finish`]) stands for: its
+/// letter in [`write_map`]'s maps.
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[repr(u8)]
+enum Of {
+    /// An instruction naming `x18`.
+    X18 = b'8',
+    /// A read or write of the thread pointer.
+    ThreadPointer = b't',
+    /// A literal load into a vector register.
+    Load = b'e',
+    /// A cache flush.
+    Flush = b'i',
+    /// A system call.
+    Syscall = b'c',
+}
+
 /// What one word of a translation stands for: how a thread stopped there
 /// is as the program at one of its instructions.
 #[derive(Debug, Clone, Copy)]
@@ -246,10 +263,11 @@ enum Word {
     /// Inside an expansion of the program's instruction at `g` that
     /// started at `start`, before the instruction ran: undone (the
     /// registers it saved restored, `sp` as it was), it is as at `g`.
-    Undo { g: u64, start: u64 },
+    Undo { g: u64, start: u64, of: Of },
     /// Inside an expansion after the instruction ran: finished (its
     /// remaining words run here), it is as at the next instruction.
-    Finish { g: u64 },
+    /// (`of` in both: what the expansion stands for, for [`write_map`].)
+    Finish { g: u64, of: Of },
     /// Inside the lookup of the branch at `g`, `x16` and `x17` saved:
     /// before it is committed (`to` none), as at `g`; once committed
     /// (`x30` being set for a call, or the branch taken), as at its
@@ -469,8 +487,7 @@ pub fn write_map() {
                 Word::At(_) => 'a',
                 Word::Saved(_) => 's',
                 Word::SavedX18(_) => 'x',
-                Word::Undo { .. } => 'u',
-                Word::Finish { .. } => 'f',
+                Word::Undo { of, .. } | Word::Finish { of, .. } => *of as u8 as char,
                 Word::Lookup { to: None, .. } => 'l',
                 Word::Lookup { .. } => 'L',
                 Word::Out { .. } => 'o',
@@ -1170,7 +1187,7 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
         | Word::SavedX18(g)
         | Word::Out { g, .. }
         | Word::Undo { g, .. }
-        | Word::Finish { g }
+        | Word::Finish { g, .. }
         | Word::Lookup { g, .. } => Some(g),
     }
 }
@@ -1204,12 +1221,12 @@ pub fn to_guest(regs: &mut Regs) -> bool {
             regs.sp += 16;
             regs.pc = g;
         }
-        Word::Undo { g, start } => {
+        Word::Undo { g, start, .. } => {
             undo(regs, start);
             regs.pc = g;
         }
-        Word::Finish { g } => {
-            finish(regs, |at| matches!(word_at(&s, at), Some(Word::Finish { g: o }) if o == g));
+        Word::Finish { g, .. } => {
+            finish(regs, |at| matches!(word_at(&s, at), Some(Word::Finish { g: o, .. }) if o == g));
             regs.pc = g + 4;
         }
         Word::Lookup { g, link, to } => {
@@ -2424,16 +2441,16 @@ fn one(
                 info.push(Word::At(pc));
                 let m = out.len();
                 materialize(16, addr, out);
-                info.extend((m..out.len()).map(|_| Word::Undo { g: pc, start }));
+                info.extend((m..out.len()).map(|_| Word::Undo { g: pc, start, of: Of::Load }));
                 let load = match opc {
                     0 => 0xbd40_0000,
                     1 => 0xfd40_0000,
                     _ => 0x3dc0_0000,
                 };
                 out.push(load | (16 << 5) | rt);
-                info.push(Word::Undo { g: pc, start });
+                info.push(Word::Undo { g: pc, start, of: Of::Load });
                 out.push(rewrite::POP | 16);
-                info.push(Word::Finish { g: pc });
+                info.push(Word::Finish { g: pc, of: Of::Load });
                 return false;
             }
         }
@@ -2466,12 +2483,12 @@ fn one(
             out.push(sw);
             info.push(match k {
                 0..=1 => Word::At(pc),
-                2..=3 => Word::Undo { g: pc, start: stub_at },
-                _ => Word::Finish { g: pc },
+                2..=3 => Word::Undo { g: pc, start: stub_at, of: Of::Flush },
+                _ => Word::Finish { g: pc, of: Of::Flush },
             });
         }
         out.extend([pc as u32, (pc >> 32) as u32]);
-        info.extend([Word::Finish { g: pc }; 2]);
+        info.extend([Word::Finish { g: pc, of: Of::Flush }; 2]);
         return false;
     }
     // A system call (Linux ignores `svc`'s immediate).
@@ -2495,12 +2512,12 @@ fn one(
                 // after: finished.
                 info.push(match k {
                     0 => Word::At(pc),
-                    1..=2 => Word::Undo { g: pc, start: stub_at },
-                    _ => Word::Finish { g: pc },
+                    1..=2 => Word::Undo { g: pc, start: stub_at, of: Of::Syscall },
+                    _ => Word::Finish { g: pc, of: Of::Syscall },
                 });
             }
             out.extend([pc as u32, (pc >> 32) as u32]);
-            info.extend([Word::Finish { g: pc }; 2]);
+            info.extend([Word::Finish { g: pc, of: Of::Syscall }; 2]);
         }
         return false;
     }
@@ -2639,6 +2656,7 @@ fn materialize(rd: u32, v: u64, out: &mut Vec<u32>) {
 fn expansion(site: Site, pc: u64, start: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) {
     let (tp, x18) = (crate::thread_pointer_slot(), crate::x18_slot());
     let words = rewrite::stub_body(site, tp, x18, pc);
+    let of = if matches!(site, Site::X18 { .. }) { Of::X18 } else { Of::ThreadPointer };
     // Where the instruction itself is: undone before, finished after.
     let main = match site {
         Site::X18 { insn } => rewrite::x18_special_main(insn).or_else(|| {
@@ -2651,8 +2669,8 @@ fn expansion(site: Site, pc: u64, start: u64, out: &mut Vec<u32>, info: &mut Vec
         out.push(sw);
         info.push(match main {
             _ if k == 0 => Word::At(pc),
-            Some(m) if k > m => Word::Finish { g: pc },
-            _ => Word::Undo { g: pc, start },
+            Some(m) if k > m => Word::Finish { g: pc, of },
+            _ => Word::Undo { g: pc, start, of },
         });
     }
 }
