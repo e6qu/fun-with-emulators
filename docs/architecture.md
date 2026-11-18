@@ -327,36 +327,30 @@ sees, is in
   state at its instruction: an expansion is undone (`undo`, reading back
   what it pushed) or finished (`finish`, `step`, carrying out its
   remaining words).
-- **Writes:** a page translated from is made read-only before it is read
-  (`jit::guard`), and so are the pages of other shared mappings of the
-  same file page (a memfd a JIT maps twice), found in the mapping record
-  then and as new mappings appear (`jit::mapped`). A write fault there
-  (`jit::written`) drops the page's translations, unpublishes their
-  entries, re-patches the branches linked to them into ways out, gives
-  the page its protections back and retries the write; threads writing
-  the page at once retry while its guard changes. The kernel calls
-  `mm::host_writes` before the host writes guest memory for a call
-  (`read`, `pread64`, `recvfrom`, every buffer it checks for writing,
-  such as `recvmsg`'s, and every checked copy out), which does the same
-  first. The blocks a write dropped are kept (`State::dormant`), with
-  the program's words each was made from: when its address is to be
-  translated again, once the page is read-only again, the block is
-  taken back if its words are unchanged (`jit::revive`), its entry
-  published and its branches linked; only what the write changed is
-  translated again. Unmapping, mapping anew or changing a page's protections
-  forgets them, as does giving the memory back (`MADV_DONTNEED`), which
-  also lifts the pages' guards first. A general register's store (`str`, `strb`, `strh` and
-  `stp`, their base written back or not, `stlr` and `cas` of each size),
-  decoded by `jit::store_of` (macOS gives no syndrome for it), into a
-  page the program may write is made by fwe through a second, writable
-  mapping of the page (`jit::store`), its base register written back,
-  and the program goes on past it: the page stays read-only and its
-  translations stay, but for the blocks made from the bytes it wrote
-  (an instruction patched), which are dropped as a write drops them.
-  A `cas` is made atomically through that mapping, the same memory.
-  After as many such stores in a page while it is read-only as it has
-  blocks translated from it (16 at least), the next write drops its
-  translations instead.
+- **Changes:** the program's `ic ivau` says which code changed. The
+  `CTR_EL0` fwe gives has `DIC` clear, as Apple's processors' has
+  under Linux, so a program that writes code invalidates each
+  instruction cache line it wrote before it runs it (`__clear_cache`).
+  In code prepared in place, `ic ivau` is a site whose stub
+  (`rewrite::flush_stub`) runs it and calls the system-call gate; a
+  translation expands it the same way. The gate tells the call from a
+  system call by the stub's load of its address (`rewrite::flush_reg`)
+  and calls `jit::flushed`, which drops the blocks made from that line
+  (`jit::drop_lines`): it unpublishes their entries and re-patches the
+  branches linked to them into ways out. A line flushed through another
+  shared mapping of the same file page (a memfd a JIT maps twice) drops
+  those of the page translated from: the mappings of each such file page
+  are noted as its code is first translated (`jit::note_aliases`) and as
+  new mappings appear (`jit::mapped`). The rest of the page is the
+  program's to write, without faults: a JIT's data beside its code. The
+  blocks a flush dropped are kept (`State::dormant`), with the program's
+  words each was made from: when its address is to be translated again,
+  the block is taken back if its words are unchanged (`jit::revive`), its
+  entry published and its branches linked. Unmapping, mapping anew,
+  changing a page's protections or giving it back (`MADV_DONTNEED`)
+  drops and forgets them, and a write fwe makes into code itself (a
+  debugger's, `procmem::write_forced`) drops the blocks of the bytes it
+  wrote (`jit::code_written`).
 - **Emptying:** when the current chunk is full and dropped or retired
   translations are at least half the cache, `jit::flush` stops every
   other thread (`quiesce::stop_others`) and scans their registers, 2 MiB
@@ -421,7 +415,7 @@ handlers (`on_fault` and `on_sigtrap` in `crates/native/src/trap.rs`) sort
 each into: a system call (a trap, or a stub that could not save below
 `sp`); an emulated instruction (`mrs` of `CTR_EL0`); the first fetch
 from a page owing lazy writes; a fetch from code run by translation or a
-translation's way out; a write to a page code was translated from; the
+translation's way out; the
 first write to a page of a nameless file's private mapping
 (`Kernel::view_fault`) or below a `MAP_GROWSDOWN` mapping
 (`Kernel::stack_fault`); an access another thread's protection change
@@ -1666,9 +1660,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   as Linux shows it to a process without `CAP_SYS_ADMIN`.
   `coredump_filter` is the default and cannot be changed.
 - Native: code made executable at run time costs a fault the first time
-  each block runs, and a write to a page it was translated from drops its
-  translations, which are made again as the code runs: slow for code that
-  writes and runs one page often. The code cache holds at most 8 GiB of
+  each block runs, and each instruction cache line the program flushes
+  drops the translations made from it, which are made again as the code
+  runs. Code changed without a flush (`ic ivau`) keeps running as it was
+  translated, as it may on Linux on a processor whose instruction cache
+  is kept apart (`CTR_EL0.DIC` clear, as fwe reports); so does code
+  another process writes through `/proc/<pid>/mem` other than its
+  tracer's. The code cache holds at most 8 GiB of
   translations: filling it while fewer than half of them are dropped
   ends fwe.
 - VM: a private file mapping is a copy of the file when mapped, so later

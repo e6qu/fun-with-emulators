@@ -245,7 +245,7 @@ stops running its own code:
 | code using `x18` | a stub branch per use (a few Linux toolchains allocate it) | the hardware register |
 | reading `CTR_EL0` | a trap per read (C libraries read it once) | read by the guest |
 | reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
-| JIT code | a fault the first time each block runs (it is translated), a trap the first time each branch out of it is taken (then linked) and when a lookup misses, a fault for a write to a page translated from ([Code made executable at run time](#code-made-executable-at-run-time-translated)) | no faults |
+| JIT code | a fault the first time each block runs (it is translated), a trap the first time each branch out of it is taken (then linked) and when a lookup misses, a call through the gate for each instruction cache line it flushes ([Code made executable at run time](#code-made-executable-at-run-time-translated)) | no faults |
 | `mmap`/`munmap` heavy | host calls | page-table edits; a TLB invalidation on every vCPU when access is taken away |
 | `fork` heavy | host `fork`, copy-on-write, after pausing the other guest threads ([fork](#fork)) | a new fwe process sent every page of guest memory that exists |
 | `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | a new process fetching pages as touched, then a re-exec |
@@ -447,7 +447,7 @@ instructions. The code that does it is described in
 ### What runs unchanged
 
 Almost everything: arithmetic, loads and stores, branches, floating point
-and SIMD, atomics and cache maintenance run directly on the processor.
+and SIMD, atomics and data cache maintenance run directly on the processor.
 Only instructions whose meaning depends on the kernel need help:
 
 | Instruction | What Linux expects | Why it cannot run unchanged on macOS | What fwe does |
@@ -456,6 +456,7 @@ Only instructions whose meaning depends on the kernel need help:
 | `mrs`/`msr` of `TPIDR_EL0` | the thread pointer, which the program owns | macOS does not preserve `TPIDR_EL0` for user code | rewritten to a branch to a stub |
 | any instruction naming `x18` | an ordinary register | macOS clears `x18` on every exception return, preemption included | rewritten to a branch to a stub |
 | `mrs <Xt>, ctr_el0` | readable at EL0 | macOS traps it | left alone; emulated when it traps |
+| `ic ivau, <Xt>` | invalidates an instruction cache line: code there was written | runs, but fwe runs code a program writes from translations it has to drop | rewritten to a branch to a stub that runs it and calls fwe's gate, which drops the translations made from the line |
 
 ### System calls: svc calls fwe's gate
 
@@ -635,20 +636,19 @@ code generated at run time:
   there, a handler's frame holds it, and a restarted call is made again
   from it. A signal delivered as a thread goes on into a translation
   gets a frame with the program's state too.
-- **Code that changes.** A page code was translated from is kept from
-  being written: a write faults, drops the page's translations (and the
-  branches linked into them), and is retried; the code is translated
-  again when it next runs. The page is protected before it is read, so a
-  write from another thread cannot slip in between. Threads writing the
-  page at once all fault; the first handled lifts the protection, and the
-  others' writes are tried again. A write the host makes there for the
-  program (a `read` into a buffer on the page, a result fwe copies out)
-  drops the translations first, as the program's own write would. Code
-  in a file mapped shared and open for writing (a memfd a JIT maps
-  twice, writable and executable) is mapped shared as it is and runs by
-  translation; the file's other mappings of a page translated from, made
-  before or after, are kept from writes too, so a write through either
-  view drops the translations. A translation ends at each `isb`, the
+- **Code that changes.** A program that writes code invalidates the
+  instruction cache lines it wrote (`ic ivau`, as `__clear_cache` does)
+  before it runs it: the `CTR_EL0` fwe reports, Apple's under Linux,
+  says the instruction cache is kept apart from data writes. fwe takes
+  each such flush, through a stub as for a system call, for the word
+  that the line changed: the translations made from it go (and the
+  branches linked into them), and the code is translated again when it
+  next runs. Nothing else the program writes costs anything: a JIT's
+  data beside its code is written as it is. A flush through another
+  mapping of the same memory (a memfd a JIT maps twice, writable and
+  executable, flushed through either view) drops the translations made
+  from it as well. Mapping, unmapping or protecting the memory anew, and
+  a debugger's write into the code, drop them too. A translation ends at each `isb`, the
   point from which the architecture has a program run what it wrote to
   its code, so code that rewrites instructions just ahead of itself runs
   the new ones.
@@ -2931,7 +2931,6 @@ fwe's own traps rather than faults the guest should see:
 | `SIGTRAP` where the pc holds no `brk` | sent by another process | a relayed `SIGTRAP` |
 | `SIGILL` at `mrs <Xt>, ctr_el0` | emulated | the value, as Linux lets EL0 read it |
 | `SIGSEGV`/`SIGBUS` fetching code made executable at run time | the block translated, run there | nothing |
-| `SIGSEGV`/`SIGBUS` storing into a page code was translated from (a general register's store, decoded) | the store made by fwe through a writable mapping of the page, the program on past it; the translations of the bytes written dropped | nothing |
 | `SIGSEGV`/`SIGBUS` writing a page code was translated from otherwise | its translations dropped, the write retried | nothing |
 | `SIGTRAP` at a translation's way out unlinked again (told by the syndrome's `brk` immediate) | on at the target's translation | nothing |
 | `SIGTRAP` at the exit gate's `brk` (a direct way out to code not translated, or with a signal to deliver) | on where the way out leads, from the state the gate saved | nothing |
