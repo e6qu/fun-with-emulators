@@ -61,6 +61,7 @@ Native speed, graphical programs and gVisor are the work left to 1.0;
 | [ROADMAP.md](ROADMAP.md) | What is done and what is left to 1.0 |
 | [docs/linux-on-macos.md](docs/linux-on-macos.md) | Which binaries run where, which instructions are rewritten, how the VM is used, and how each Linux concept maps onto macOS |
 | [docs/linking.md](docs/linking.md) | How programs are built and loaded, Linux and macOS on arm64: ELF and Mach-O, relocations, static and dynamic linking, PIE and static PIE and their code, virtual memory, ASLR, thread-local storage, program start |
+| [docs/arm64.md](docs/arm64.md) | arm64 assembly as fwe's work needs it: registers, encoding, calling conventions on Linux and macOS, atomics, barriers, system registers |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/comparisons.md](docs/comparisons.md) | fwe beside Wine, WSL, Linux VMs, gVisor, QEMU, Rosetta, FreeBSD's Linuxulator and others |
 | [docs/jit.md](docs/jit.md) | How code a program makes at run time (a JIT compiler's) runs by translation, what it costs, and the runtimes tested |

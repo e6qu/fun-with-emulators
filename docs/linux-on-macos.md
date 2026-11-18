@@ -442,7 +442,9 @@ taken by a vectored handler, and starts itself as a child process.
 
 This section is about the native backend; the VM backend translates no
 instructions. The code that does it is described in
-[architecture.md](architecture.md#rewriting-guest-code).
+[architecture.md](architecture.md#rewriting-guest-code); the
+instructions, registers and calling conventions themselves, in
+[arm64.md](arm64.md).
 
 ### What runs unchanged
 
@@ -1540,7 +1542,8 @@ its vCPU's `TPIDR_EL0` (VM). The stubs are under
 #### Cache maintenance, PAC and BTI
 
 - **Cache maintenance** is allowed at EL0 on both systems, so a JIT's own
-  `dc`/`ic` work natively. Code fwe writes into guest memory (images, file
+  `dc` works natively; its `ic ivau` runs in a stub that also tells fwe
+  which code changed ([jit.md](jit.md#code-that-changes)). Code fwe writes into guest memory (images, file
   data, a fork child's memory) has the instruction cache invalidated, as
   Apple's cores do not keep it coherent with data writes.
 - **Pointer authentication:** not reported natively (no `PACA`/`PACG` in

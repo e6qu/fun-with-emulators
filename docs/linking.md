@@ -6,7 +6,8 @@ what the code of each kind looks like, virtual memory, ASLR,
 thread-local storage, and how a kernel and a loader start a program,
 each on Linux and on macOS, both on arm64. What fwe does with
 them is in [linux-on-macos.md](linux-on-macos.md); this document is the
-background it assumes.
+background it assumes, as [arm64.md](arm64.md) is for the instruction
+set and the calling conventions.
 
 ## From source to a running program
 
