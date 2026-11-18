@@ -1206,9 +1206,20 @@ def jdk(a, fwe, guest_env, results):
             "--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp",
             "/tmp/jdkout", "Main", JDK_SCALE]),
             ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])]:
+        start = time.perf_counter()
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
-        print(f"JDK java parts {how}: " + ", ".join(r.stderr.split("\n")).strip(", "),
-              file=sys.stderr)
+        took = time.perf_counter() - start
+        print(f"JDK java parts {how} ({took:.2f} s in all): "
+              + ", ".join(r.stderr.split("\n")).strip(", "), file=sys.stderr)
+    # How long the JVM takes to start and end with no application.
+    took = []
+    for cmd in [guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"),
+                                   "-version"],
+                [f"{bin_theirs}/java", "-version"]]:
+        start = time.perf_counter()
+        subprocess.run(cmd, capture_output=True)
+        took.append(time.perf_counter() - start)
+    print(f"JDK java -version: {took[0]:.2f} s under fwe, {took[1]:.2f} s natively", file=sys.stderr)
     shutil.rmtree(native, ignore_errors=True)
 
 
