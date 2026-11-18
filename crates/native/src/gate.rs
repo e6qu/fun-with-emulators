@@ -232,9 +232,9 @@ unsafe extern "C" {
     /// way out as fwe's trap would (`jit::gate_exit`). Into a translation,
     /// its way out restores the registers and enters the translation as a
     /// lookup does: the program's `x16` and `x17` saved below `sp` again,
-    /// `x16` the program address, `x17` the translation. Any other way on
-    /// (code not translated, a signal to deliver) takes the trap, which
-    /// finds the program's state in the block.
+    /// `x16` the program address, `x17` the translation's saved entry. Any
+    /// other way on (code not translated, a signal to deliver) takes the
+    /// trap, which finds the program's state in the block.
     fn fwe_exit_gate();
     /// The exit gate's way out: a signal that lands in it starts it again,
     /// to look for that signal.

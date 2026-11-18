@@ -643,7 +643,7 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         if (esr >> 26) & 0x3f == ESR_EC_BRK && esr & 0xffff == crate::jit::EXIT_IMM {
             let _host = HostCode::enter_blocked();
             let mut regs = regs_from(mc);
-            if crate::jit::exit(&mut regs) {
+            if crate::jit::exit(&mut regs, true) {
                 settle(&mut regs);
                 regs_to(mc, &regs);
                 // SAFETY: `ctx` is this handler's ucontext.

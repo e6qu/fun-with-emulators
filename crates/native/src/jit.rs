@@ -20,22 +20,35 @@
 //!   expanded as [`crate::rewrite`]'s stubs do, inline;
 //! - a branch out of the block goes on at the translation of the
 //!   program's target. A direct branch traps the first time, and is then
-//!   linked, a branch straight to the target's translation. A call leaves
-//!   the program's own return address in `x30`, so the stack holds only
-//!   the program's addresses, as its unwinders and stack walkers expect.
-//!   An indirect branch or return looks its target up in a table of
-//!   translations by program address ([`TABLE`]), saving `x16` and `x17`
-//!   for it; the translation checks the target is its own (an entry can be
-//!   taken over or dropped as a lookup reads it) and restores them. A
-//!   dropped entry leads to a retry stub, back to fwe. A target that is
-//!   not the program's run-time code (a library's, prepared in place) has
-//!   0 for its translation: the lookup restores `x16` and `x17` and makes
+//!   linked, a branch straight to the target's translation; a block goes
+//!   on past a conditional branch, whose taken way is linked in the branch
+//!   itself where it reaches. A call leaves the program's own return
+//!   address in `x30`, so the stack holds only the program's addresses,
+//!   as its unwinders and stack walkers expect. An indirect branch or
+//!   return looks its target up in a table of translations by program
+//!   address ([`TABLE`]), saving `x16` and `x17` for it: one 16-byte load
+//!   reads an entry's address and translation together (single-copy
+//!   atomic, as the table's writes are), so a match is the target's
+//!   translation. Through `x16` or `x17`, which hold the target as it is
+//!   looked up, the address and translation are read apart, and the
+//!   translation's check (that the target is its own: an entry can be
+//!   taken over as a lookup reads it) comes first. A target that is not
+//!   the program's run-time code (a library's, prepared in place) has 0
+//!   for its translation: the lookup restores `x16` and `x17` and makes
 //!   the program's own branch through its register, so no register
 //!   changes (code may count on that beyond the procedure call standard:
 //!   HotSpot calls its atomic stubs saying they clobber only `x8`, `x9`
 //!   and `x30`). Through `x18`, which has no register to branch through,
 //!   fwe's trap makes it.
 //!
+//! A translation entered with `x16` and `x17` saved keeps them below `sp`
+//! until an instruction needs them or `sp` ([`keeps_saved`]), and a way
+//! out or lookup saves them again only if they were restored: a save and
+//! the load of what it saved cost a store's forwarding, and a loop of
+//! lookups would wait on each. A block is entered with the program's own
+//! registers past its restore, or at a copy of its words up to there
+//! ([`translate`]).
+
 //! What the program can observe stays its own: a fault or signal in a
 //! translation is delivered at the program's instruction, with its
 //! registers ([`to_guest`]).
@@ -77,8 +90,9 @@ pub const EXIT: u32 = 0xd420_0000 | (EXIT_IMM << 5);
 /// authenticated branch fwe does not offer); it faults as `SIGILL` at the
 /// program's instruction.
 const UDF: u32 = 0;
-/// Words of a direct way out ([`one`]'s `jump`).
-const JUMP_WORDS: u32 = 6;
+/// `adr x16, #0`: a way out's first word, the program's `x16` and `x17`
+/// saved, until it is linked.
+const OUT: u32 = 0x1000_0010;
 
 /// Most instructions a block holds before it ends and goes on to the next.
 const BLOCK_INSNS: usize = 64;
@@ -171,6 +185,19 @@ const SCALE: u32 = 0xd37c_ee31;
 const BASE: u32 = 0xb253_0231;
 /// `ldar x17, [x17]`: the entry's key, before its value.
 const KEY: u32 = 0xc8df_fe31;
+/// `ldp x16, x17, [x17]`: the entry's key and value at once.
+const ENTRY: u32 = 0xa940_4630;
+/// `cbnz x16, #off`
+const MISS_X16: u32 = 0xb500_0010;
+/// `sub x17, x17, #CHECK_WORDS * 4`: from a translation's saved entry
+/// back to its check.
+const TO_CHECK: u32 = 0xd100_0231 | ((4 * CHECK_WORDS as u32) << 10);
+/// Words of a translation's check that the target in `x16` is its own
+/// (its address in `x17`, padded to 4 words, `eor`, `cbnz`), before its
+/// saved entry.
+const CHECK_WORDS: usize = 6;
+/// `nop`
+const NOP: u32 = 0xd503_201f;
 /// `eor x17, x17, x16`
 const CHECK: u32 = 0xca10_0231;
 /// `cbnz x17, #off`
@@ -184,6 +211,16 @@ const ISB: u32 = 0xd503_3fdf;
 /// `cbz x17, <outside>`: a table entry for a target not translated.
 const OUTSIDE: u32 = 0xb400_0011;
 
+/// `ubfx x17, x<n>, #2, #20`: the table index of the address in `x<n>`.
+const fn index_of(n: u32) -> u32 {
+    0xd342_5411 | (n << 5)
+}
+
+/// `eor x16, x16, x<n>`: an entry's key against the target in `x<n>`.
+const fn key_against(n: u32) -> u32 {
+    0xca00_0210 | (n << 16)
+}
+
 /// Where a block's way out leads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Exit {
@@ -192,9 +229,9 @@ enum Exit {
     /// To the address in register `n` (`x18`: the program's), `x30`
     /// becoming `link` first for a call.
     Reg { n: u32, link: Option<u64> },
-    /// A lookup that came to the wrong block (its entry was taken over or
-    /// dropped as it read it), or to the retry stub: on to the address in
-    /// `x16`, the program's `x16` and `x17` on the stack.
+    /// A lookup that came to the wrong block (its entry was taken over as
+    /// it read it): on to the address in `x16`, the program's `x16` and
+    /// `x17` on the stack.
     Retry,
 }
 
@@ -213,14 +250,18 @@ enum Word {
     /// remaining words run here), it is as at the next instruction.
     Finish { g: u64 },
     /// Inside the lookup of the branch at `g`, `x16` and `x17` saved:
-    /// before it is committed, as at `g`; once committed (`x30` being set
-    /// for a call, or the branch taken), as at its target, which `x16`
-    /// holds.
-    Lookup { g: u64, link: Option<u64>, committed: bool },
-    /// A way out, as at the branch at `g`.
-    Out { g: u64, exit: Exit },
-    /// The retry stub: a lookup that read an entry as it was dropped.
-    Retry,
+    /// before it is committed (`to` none), as at `g`; once committed
+    /// (`x30` being set for a call, or the branch taken), as at its
+    /// target, which `x<to>` holds.
+    Lookup { g: u64, link: Option<u64>, to: Option<u8> },
+    /// The program's instruction at `g` (or the start of its stand-in), its
+    /// `x16` and `x17` saved below `sp`.
+    Saved(u64),
+    /// A way out, as at the branch at `g`; `saved`, with the program's
+    /// `x16` and `x17` below `sp` (and for [`Exit::Retry`], as at the
+    /// target in `x16`); the taken way of the conditional branch `cond`
+    /// words before it (0: none).
+    Out { g: u64, exit: Exit, saved: bool, cond: u16 },
 }
 
 /// A translated block.
@@ -237,9 +278,13 @@ struct Block {
     linked: Vec<u64>,
     /// Its translation's size in bytes.
     len: u64,
-    /// Where a direct branch enters it: past the check and restore a
-    /// lookup enters through.
+    /// Where a lookup or a direct branch enters it with the program's
+    /// `x16` and `x17` saved: past its check (its saved entry).
     body: u64,
+    /// Where it is entered with the program's own registers: past its
+    /// first word where that takes them back, else its start, which saves
+    /// them.
+    unsaved: u64,
     /// Kept when the cache was emptied, as a thread may still be in it or
     /// return into it: found by no lookup, and its ways out not linked.
     retired: bool,
@@ -255,8 +300,6 @@ struct Cache {
     chunks: Vec<Chunk>,
     /// The chunk new translations go in.
     current: usize,
-    /// The retry stub (a dropped entry's value), at the first chunk's start.
-    stub: u64,
     /// Bytes of translations in use, and of those dropped (flushed,
     /// unmapped) or retired, whose room is had back by emptying the cache.
     live: u64,
@@ -273,9 +316,6 @@ struct Chunk {
     /// Holds retired translations: nothing new goes in it.
     retired: bool,
 }
-
-/// Bytes at the first chunk's start that hold the stub.
-const STUB_ROOM: u64 = 8;
 
 pub struct State {
     /// Program memory whose code runs by translation: start -> end.
@@ -300,9 +340,10 @@ pub struct State {
     /// translated from that they also map: a flush through one drops
     /// their translations ([`flushed`]).
     aliases: BTreeMap<u64, std::collections::BTreeSet<u64>>,
-    /// Code not translated -> the block that branches to it from the
-    /// cache where a direct branch does not reach ([`veneer`]).
-    veneers: BTreeMap<u64, usize>,
+    /// Code not translated, and whether from a way out with the
+    /// program's `x16` and `x17` saved -> the block that branches to it
+    /// from the cache ([`veneer`]).
+    veneers: BTreeMap<(u64, bool), usize>,
     /// Where calls made from translations return: a return there from
     /// code followed into is followed back ([`exit`]).
     returns: std::collections::BTreeSet<u64>,
@@ -470,36 +511,53 @@ fn page_size() -> u64 {
     fwe_kernel::mm::host_page_size()
 }
 
-/// The table entry for program address `g`.
-fn entry(g: u64) -> &'static [AtomicU64; 2] {
-    let at = TABLE | (((g >> 2) & ((1 << TABLE_BITS) - 1)) << 4);
+/// The table entry for program address `g`: its key (the address) and
+/// value (a translation's lookup entry, or 0), 16 bytes aligned.
+fn entry(g: u64) -> u64 {
+    TABLE | (((g >> 2) & ((1 << TABLE_BITS) - 1)) << 4)
+}
+
+/// `g`'s entry as it is: key and value read at once (a 16-byte aligned
+/// `ldp` is single-copy atomic: FEAT_LSE2, which every Apple processor
+/// has).
+fn read_entry(g: u64) -> (u64, u64) {
+    let (k, v): (u64, u64);
     // SAFETY: an entry of the table, mapped for the process's life once the
-    // code cache exists; entries are only ever accessed atomically.
-    unsafe { &*(at as *const [AtomicU64; 2]) }
+    // code cache exists, 16 bytes aligned.
+    unsafe {
+        std::arch::asm!("ldp {k}, {v}, [{e}]", e = in(reg) entry(g), k = out(reg) k,
+            v = out(reg) v, options(nostack, readonly, preserves_flags));
+    }
+    (k, v)
 }
 
-/// Make `g`'s entry say translation `t`: the value first, then the key, so
-/// a lookup that finds the key finds the value with it.
-fn publish(g: u64, t: u64) {
-    let e = entry(g);
-    e[0].store(0, Ordering::Release);
-    e[1].store(t, Ordering::Release);
-    e[0].store(g, Ordering::Release);
-}
-
-/// Clear `g`'s entry if it says `t`.
-fn unpublish(g: u64, t: u64) {
-    let e = entry(g);
-    if e[0].load(Ordering::Acquire) == g && e[1].load(Ordering::Acquire) == t {
-        // A lookup that read the key before this reads the retry stub, not
-        // a translation that may go.
-        e[1].store(RETRY.load(Ordering::Relaxed), Ordering::Release);
-        e[0].store(0, Ordering::Release);
+/// Make `g`'s entry say `(key, value)` at once, after everything written
+/// before (the translation it leads to).
+fn write_entry(g: u64, key: u64, value: u64) {
+    // SAFETY: as [`read_entry`]; a lookup reads the pair with one `ldp`.
+    unsafe {
+        std::arch::asm!("dmb ish", "stp {k}, {v}, [{e}]", e = in(reg) entry(g), k = in(reg) key,
+            v = in(reg) value, options(nostack, preserves_flags));
     }
 }
 
-/// The retry stub's address ([`new_cache`]).
-static RETRY: AtomicU64 = AtomicU64::new(0);
+/// The value of an entry for the translation at `t`: its saved entry; 0
+/// (`t` 0) for code not translated.
+fn looked_up(t: u64) -> u64 {
+    if t == 0 { 0 } else { t + 4 * CHECK_WORDS as u64 }
+}
+
+/// Make `g`'s entry say translation `t` (0: code not translated).
+fn publish(g: u64, t: u64) {
+    write_entry(g, g, looked_up(t));
+}
+
+/// Clear `g`'s entry if it says translation `t`.
+fn unpublish(g: u64, t: u64) {
+    if read_entry(g) == (g, looked_up(t)) {
+        write_entry(g, 0, 0);
+    }
+}
 
 impl State {
     fn in_region(&self, addr: u64) -> bool {
@@ -515,6 +573,34 @@ impl State {
         unsafe { ((at - k.rx + k.rw) as *mut u32).write_volatile(w) };
         // SAFETY: the word, in the executable view.
         unsafe { crate::prepare::flush_icache(at, 4) };
+    }
+
+    /// Link way out `at` (a direct one) to `into`, a translation's entry
+    /// as the way out has the program's `x16` and `x17`: a branch there,
+    /// and the conditional branch it is the taken way of straight there
+    /// too where that reaches. Whether it reaches.
+    fn link(&self, at: u64, into: u64) -> bool {
+        let Some(b) = rewrite::branch(at, into) else { return false };
+        self.patch(at, b);
+        if let Some(c) = block_at(self, at).and_then(|i| conditional(&self.blocks[i], at)) {
+            // SAFETY: a word of fwe's code cache, readable.
+            if let Some(w) = retarget(unsafe { (c as *const u32).read() }, c, into) {
+                self.patch(c, w);
+            }
+        }
+        true
+    }
+
+    /// Undo [`State::link`] of way out `at` in block `from`: it traps
+    /// again, and its conditional branch leads to it.
+    fn unlink(&self, from: &Block, at: u64) {
+        self.patch(at, EXIT);
+        if let Some(c) = conditional(from, at) {
+            // SAFETY: a word of fwe's code cache, readable.
+            if let Some(w) = retarget(unsafe { (c as *const u32).read() }, c, at) {
+                self.patch(c, w);
+            }
+        }
     }
 
     /// Drop the translations made from `[addr, addr + len)`, and forget
@@ -571,7 +657,9 @@ impl State {
         // Branches linked to it trap again, and wait for it to be
         // translated anew.
         for at in std::mem::take(&mut self.blocks[i].linked) {
-            self.patch(at, EXIT);
+            if let Some(f) = block_at(self, at) {
+                self.unlink(&self.blocks[f], at);
+            }
             let live =
                 block_at(self, at).is_some_and(|f| self.by_g.get(&self.blocks[f].g) == Some(&f));
             if live {
@@ -800,7 +888,7 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
         ENTERED_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     let i = translation(&mut s, pc);
-    let into = body(&s, i);
+    let into = s.blocks[i].unsaved;
     // Called from code fwe prepared in place (`blr xN` before `lr`): that
     // site looks its targets up from now on, as a translation does.
     let site = lr.wrapping_sub(4);
@@ -824,27 +912,36 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
 /// stopped.
 fn link_call_site(s: &mut State, site: u64, n: u32) {
     s.call_sites.insert(site);
-    let mut words = vec![
-        SAVE,
-        0xaa00_03f0 | (n << 16), // mov x16, xN
-        INDEX,
-        SCALE,
-        BASE,
-        KEY,
-        CHECK,
-        MISS,
-        INDEX,
-        SCALE,
-        BASE,
-        VALUE,
-        OUTSIDE,
-        GO,
-        RESTORE,
-        0xd61f_0000 | (n << 5), // br xN
-    ];
+    // As a translation's lookup ([`lookup`]): in place, or through `x16`.
+    let mut words = if matches!(n, 16 | 17) {
+        vec![
+            SAVE,
+            0xaa00_03f0 | (n << 16), // mov x16, xN
+            INDEX,
+            SCALE,
+            BASE,
+            KEY,
+            CHECK,
+            MISS,
+            INDEX,
+            SCALE,
+            BASE,
+            VALUE,
+            OUTSIDE,
+            TO_CHECK,
+            GO,
+        ]
+    } else {
+        vec![SAVE, index_of(n), SCALE, BASE, ENTRY, key_against(n), MISS_X16, OUTSIDE, GO]
+    };
     // Both to the restore and the call as it was.
-    words[7] |= 7 << 5;
-    words[12] |= 2 << 5;
+    let restore = words.len() as u32;
+    for (k, w) in words.iter_mut().enumerate() {
+        if matches!(*w, MISS | MISS_X16 | OUTSIDE) {
+            *w |= (restore - k as u32) << 5;
+        }
+    }
+    words.extend([RESTORE, 0xd61f_0000 | (n << 5)]); // br xN
     let _stopped = crate::quiesce::stop_others(&mut |_| {});
     let Some(stub) = crate::prepare::call_stub(site, &words) else { return };
     let Some(b) = rewrite::branch(site, stub) else { return };
@@ -867,41 +964,46 @@ fn link_call_site(s: &mut State, site: u64, n: u32) {
 }
 
 /// The way out at `regs.pc`, taken by the exit gate (outside a signal's
-/// handler): as [`exit`], and where it leads into a translation's body,
-/// that translation and its program address, for the gate to enter it as
-/// a lookup does.
+/// handler): as [`exit`], and where it leads to a translation's start,
+/// that translation's saved entry and its program address, for the gate
+/// to enter it as a lookup does.
 pub fn gate_exit(regs: &mut Regs) -> Option<(u64, u64)> {
-    assert!(exit(regs), "the exit gate entered from no way out ({:#x})", regs.pc);
+    assert!(exit(regs, false), "the exit gate entered from no way out ({:#x})", regs.pc);
     let s = state_at(HOLD_GATE);
     let i = block_at(&s, regs.pc)?;
     let b = &s.blocks[i];
-    (b.body == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.t, b.g))
+    (b.unsaved == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.body, b.g))
 }
 
-/// The way out of a block at `regs.pc` (its trap, or the exit gate's
-/// call): `regs` go on at the translation of where it leads, or at the
-/// address itself where that is not code run by translation; a direct
-/// branch is linked there. `false` if `pc` is no way out of fwe's.
-pub fn exit(regs: &mut Regs) -> bool {
+/// The way out of a block at `regs.pc` (its trap (`trapped`), as the way
+/// out has the program's `x16` and `x17`, or the exit gate's call, which
+/// took them back): `regs`, the program's, go on at the translation of
+/// where it leads (entered with its registers), or at the address itself
+/// where that is not code run by translation; a direct branch is linked
+/// there. `false` if `pc` is no way out of fwe's.
+pub fn exit(regs: &mut Regs, trapped: bool) -> bool {
     let began = std::time::Instant::now();
-    let r = exit_now(regs);
+    let r = exit_now(regs, trapped);
     EXIT_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     r
 }
 
-fn exit_now(regs: &mut Regs) -> bool {
+fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     let mut s = state_at(HOLD_EXIT);
     let at = regs.pc;
-    let retry = s.cache.as_ref().is_some_and(|c| c.stub == at);
-    let from = if retry { None } else { block_at(&s, at) };
+    let from = block_at(&s, at);
     let word =
         from.and_then(|i| s.blocks[i].words.get(((at - s.blocks[i].t) / 4) as usize).copied());
-    let exit = match word {
-        Some(Word::Out { exit, .. }) => exit,
-        // The retry stub: an entry dropped as a lookup read it.
-        _ if retry => Exit::Retry,
-        _ => return false,
-    };
+    let Some(Word::Out { exit, saved, .. }) = word else { return false };
+    // A wrong block's way out has the target in x16.
+    let wrong_to = regs.x[16];
+    if trapped && saved {
+        let sp = regs.sp;
+        // SAFETY: the stack the program's `x16` and `x17` were saved on.
+        let saved = |off: u64| unsafe { ((sp + off) as *const u64).read() };
+        (regs.x[16], regs.x[17]) = (saved(0), saved(8));
+        regs.sp += 16;
+    }
     EXITS.fetch_add(1, Ordering::Relaxed);
     // A retired block's ways out are not linked: its room is had back once
     // nothing is in it, and a link from it would outlive it.
@@ -916,16 +1018,7 @@ fn exit_now(regs: &mut Regs) -> bool {
             }
             (to, false)
         }
-        Exit::Retry => {
-            let to = regs.x[16];
-            let sp = regs.sp;
-            // SAFETY: the stack the lookup saved the program's `x16` and
-            // `x17` on.
-            let saved = |off: u64| unsafe { ((sp + off) as *const u64).read() };
-            (regs.x[16], regs.x[17]) = (saved(0), saved(8));
-            regs.sp += 16;
-            (to, false)
-        }
+        Exit::Retry => (wrong_to, false),
     };
     // Code fwe prepared in place (a library's, the program's own) that a
     // translation calls or branches to is followed: translated too, so
@@ -948,12 +1041,13 @@ fn exit_now(regs: &mut Regs) -> bool {
         publish(to, 0);
         s.outside.insert(to);
         // A direct branch to it is linked: straight there where it
-        // reaches, else through a veneer.
+        // reaches and the program has its registers, else through a
+        // veneer.
         if link_here && !from_retired && s.cache.as_ref().is_some_and(|c| c.flushes == flushes) {
-            if let Some(b) = rewrite::branch(at, to) {
+            if let Some(b) = rewrite::branch(at, to).filter(|_| !saved) {
                 s.patch(at, b);
             } else {
-                let i = veneer(&mut s, to);
+                let i = veneer(&mut s, to, saved);
                 let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
                 if same && let Some(b) = rewrite::branch(at, s.blocks[i].t) {
                     s.patch(at, b);
@@ -965,19 +1059,13 @@ fn exit_now(regs: &mut Regs) -> bool {
         return true;
     }
     let i = translation(&mut s, to);
-    let into = body(&s, i);
     // Linked where the target is in reach (in the same chunk), unless the
     // cache was emptied meanwhile (`at` may be reused).
     let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
-    if link_here
-        && same
-        && !from_retired
-        && let Some(b) = rewrite::branch(at, into)
-    {
-        s.patch(at, b);
+    if link_here && same && !from_retired && s.link(at, entered(&s, i, saved)) {
         s.blocks[i].linked.push(at);
     }
-    regs.pc = into;
+    regs.pc = s.blocks[i].unsaved;
     true
 }
 
@@ -996,11 +1084,11 @@ pub fn syscall_site(site: u64) -> u64 {
 pub fn guest_pc(pc: u64) -> Option<u64> {
     match word_at(&state(), pc)? {
         Word::At(g)
+        | Word::Saved(g)
         | Word::Out { g, .. }
         | Word::Undo { g, .. }
         | Word::Finish { g }
         | Word::Lookup { g, .. } => Some(g),
-        Word::Retry => None,
     }
 }
 
@@ -1020,7 +1108,13 @@ pub fn to_guest(regs: &mut Regs) -> bool {
             regs.sp += 16;
             regs.pc = to;
         }
-        Word::At(g) | Word::Out { g, .. } => regs.pc = g,
+        Word::At(g) => regs.pc = g,
+        Word::Out { g, saved: false, .. } => regs.pc = g,
+        Word::Saved(g) | Word::Out { g, .. } => {
+            (regs.x[16], regs.x[17]) = (stack(0), stack(8));
+            regs.sp += 16;
+            regs.pc = g;
+        }
         Word::Undo { g, start } => {
             undo(regs, start);
             regs.pc = g;
@@ -1029,36 +1123,24 @@ pub fn to_guest(regs: &mut Regs) -> bool {
             finish(regs, |at| matches!(word_at(&s, at), Some(Word::Finish { g: o }) if o == g));
             regs.pc = g + 4;
         }
-        Word::Lookup { g, link, committed } => {
-            let to = regs.x[16];
+        Word::Lookup { g, link, to } => {
+            let target = to.map(|r| regs.x[usize::from(r)]);
             (regs.x[16], regs.x[17]) = (stack(0), stack(8));
             regs.sp += 16;
-            if committed {
+            if let Some(target) = target {
                 if let Some(link) = link {
                     regs.x[30] = link;
                 }
-                regs.pc = to;
+                regs.pc = target;
             } else {
                 regs.pc = g;
             }
-        }
-        Word::Retry => {
-            // `x16` holds the target; the program's `x16` and `x17` are on
-            // the stack.
-            let to = regs.x[16];
-            (regs.x[16], regs.x[17]) = (stack(0), stack(8));
-            regs.sp += 16;
-            regs.pc = to;
         }
     }
     true
 }
 
 fn word_at(s: &State, pc: u64) -> Option<Word> {
-    let c = s.cache.as_ref()?;
-    if pc == c.stub {
-        return Some(Word::Retry);
-    }
     let i = block_at(s, pc)?;
     s.blocks[i].words.get(((pc - s.blocks[i].t) / 4) as usize).copied()
 }
@@ -1181,10 +1263,10 @@ fn step(regs: &mut Regs, w: u32) -> bool {
     true
 }
 
-/// Where a direct branch enters block `i`: past the word that restores
-/// what a lookup saved.
-fn body(s: &State, i: usize) -> u64 {
-    s.blocks[i].body
+/// Where a direct branch enters block `i`: with the program's `x16` and
+/// `x17` saved below `sp` (`saved`), or in their registers.
+fn entered(s: &State, i: usize, saved: bool) -> u64 {
+    if saved { s.blocks[i].body } else { s.blocks[i].unsaved }
 }
 
 /// The translation of program address `g`, made if there is none.
@@ -1208,7 +1290,7 @@ fn translation(s: &mut State, g: u64) -> usize {
         return i;
     }
     let began = std::time::Instant::now();
-    let (words, info, entry, calls, end) = translate(g, at, followed);
+    let (words, info, entry, unsaved, calls, end) = translate(g, at, followed);
     TRANSLATE_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
@@ -1230,6 +1312,7 @@ fn translation(s: &mut State, g: u64) -> usize {
         linked: Vec::new(),
         len,
         body: t + 4 * entry as u64,
+        unsaved: t + 4 * unsaved as u64,
         retired: false,
         source: (g..end).step_by(4).map(read).collect(),
         followed,
@@ -1304,16 +1387,36 @@ fn link_site(s: &mut State, at: u64, j: usize) {
     }
     let to = s.blocks[j].g;
     let word = s.blocks[from].words.get(((at - s.blocks[from].t) / 4) as usize).copied();
-    let waits = matches!(word, Some(Word::Out { exit: Exit::Jump(x), .. }) if x == to);
+    let Some(Word::Out { exit: Exit::Jump(x), saved, .. }) = word else { return };
     // SAFETY: a word of fwe's code cache, readable.
-    let trap = matches!(unsafe { (at as *const u32).read() }, EXIT | SAVE);
-    if !waits || !trap || s.blocks[from].retired || s.blocks[j].retired {
+    let trap = matches!(unsafe { (at as *const u32).read() }, EXIT | SAVE | OUT);
+    if x != to || !trap || s.blocks[from].retired || s.blocks[j].retired {
         return;
     }
-    if let Some(b) = rewrite::branch(at, body(s, j)) {
-        s.patch(at, b);
+    if s.link(at, entered(s, j, saved)) {
         s.blocks[j].linked.push(at);
     }
+}
+
+/// The conditional branch whose taken way is way out `at` of block `b`.
+fn conditional(b: &Block, at: u64) -> Option<u64> {
+    match b.words.get(((at - b.t) / 4) as usize) {
+        Some(&Word::Out { cond, .. }) if cond != 0 => Some(at - 4 * u64::from(cond)),
+        _ => None,
+    }
+}
+
+/// Conditional branch `w` at `at` (`b.cond`, `cbz`, `cbnz`, `tbz`,
+/// `tbnz`) made to branch to `to`, if that reaches.
+fn retarget(w: u32, at: u64, to: u64) -> Option<u32> {
+    let bits = if (w >> 25) & 0x3f == 0b011011 { 14 } else { 19 };
+    let off = (to as i64).wrapping_sub(at as i64) >> 2;
+    let half = 1i64 << (bits - 1);
+    if !(-half..half).contains(&off) {
+        return None;
+    }
+    let field = ((1u32 << bits) - 1) << 5;
+    Some((w & !field) | (((off as u32) << 5) & field))
 }
 
 /// Note the other mappings of the file page that program page `p` maps,
@@ -1461,49 +1564,55 @@ fn new_chunk() -> Chunk {
     Chunk { rw, rx, used: 0, retired: false }
 }
 
-/// The code cache, its retry stub, and the table.
+/// The code cache.
 fn new_cache() -> Cache {
-    let mut c =
-        Cache { chunks: vec![new_chunk()], current: 0, stub: 0, live: 0, garbage: 0, flushes: 0 };
-    // The retry stub, a dropped entry's value: fwe's trap.
-    c.stub = write(&mut c, &[EXIT]);
-    c.chunks[0].used = STUB_ROOM;
-    RETRY.store(c.stub, Ordering::Relaxed);
-    c
+    Cache { chunks: vec![new_chunk()], current: 0, live: 0, garbage: 0, flushes: 0 }
 }
 
-/// The block that branches from the cache to `to`, code not translated
-/// that a direct branch from the cache does not reach: `to` loaded into
-/// `x16`, then `br x16`, as a linker's veneer does (AAPCS64 lets one
+/// The block that branches from the cache to `to`, code not translated,
+/// for a way out (with the program's `x16` and `x17` saved, `saved`: they
+/// are taken back first): a branch to `to`, or where that does not reach,
+/// `to` loaded
+/// into `x16` and `br x16`, as a linker's veneer does (AAPCS64 lets one
 /// clobber `x16` and `x17` on a direct branch to other code). A block, so
 /// emptying the cache keeps it while a thread is in it, and unlinks the
 /// branches to it when it goes.
-fn veneer(s: &mut State, to: u64) -> usize {
-    if let Some(&i) = s.veneers.get(&to) {
+fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
+    if let Some(&i) = s.veneers.get(&(to, saved)) {
         return i;
     }
-    cache_next(s);
-    let mut words = Vec::new();
-    materialize(16, to, &mut words);
-    words.push(0xd61f_0200); // br x16
+    let at = cache_next(s);
+    let mut words = if saved { vec![RESTORE] } else { Vec::new() };
+    if let Some(b) = rewrite::branch(at + 4 * words.len() as u64, to) {
+        words.push(b);
+    } else {
+        materialize(16, to, &mut words);
+        words.push(0xd61f_0200); // br x16
+    }
     let t = emit(s, &words);
     let len = 4 * words.len() as u64;
     s.cache.as_mut().expect("a code cache").live += len;
     let i = s.blocks.len();
-    // A thread stopped in it goes on at `to`, its x16 the veneer's.
+    // A thread stopped in it goes on at `to`, its x16 the veneer's once
+    // it loads it.
+    let mut info = vec![Word::At(to); words.len()];
+    if saved {
+        info[0] = Word::Saved(to);
+    }
     s.blocks.push(Block {
         g: to,
         t,
-        words: vec![Word::At(to); words.len()],
+        words: info,
         linked: Vec::new(),
         len,
         body: t,
+        unsaved: t,
         retired: false,
         source: Vec::new(),
         followed: true,
     });
     s.by_t.insert(t, i);
-    s.veneers.insert(to, i);
+    s.veneers.insert((to, saved), i);
     i
 }
 
@@ -1590,8 +1699,10 @@ fn flush(s: &mut State) {
     // No branch from a retired block leads into the room had back.
     for b in &old {
         for &at in &b.linked {
-            if in_pinned(s, at) {
-                s.patch(at, EXIT);
+            if in_pinned(s, at)
+                && let Some((_, &f)) = s.by_t.range(..=at).next_back()
+            {
+                s.unlink(&old[f], at);
             }
         }
     }
@@ -1616,10 +1727,10 @@ fn flush(s: &mut State) {
     let size = chunk_size();
     let blocks = &s.blocks;
     let c = s.cache.as_mut().expect("a code cache");
-    for (n, k) in c.chunks.iter_mut().enumerate() {
+    for k in c.chunks.iter_mut() {
         k.retired = blocks.iter().any(|b| (k.rx..k.rx + size).contains(&b.t));
         if !k.retired {
-            k.used = if n == 0 { STUB_ROOM } else { 0 };
+            k.used = 0;
         }
     }
     c.live = 0;
@@ -1691,154 +1802,318 @@ fn read(g: u64) -> u32 {
 /// Translate the block at program address `g`, to be placed at `t`: its
 /// words, and what each stands for. A block ends at its page's end, so it
 /// is made from that page alone.
-fn translate(g: u64, t: u64, followed: bool) -> (Vec<u32>, Vec<Word>, usize, Vec<u64>, u64) {
-    // Entered from a lookup with the target in `x16`, the program's `x16`
-    // and `x17` on the stack: the target is checked to be this block's (a
-    // lookup can read an entry another thread is taking over), then they
-    // are restored. A direct branch enters past them.
-    let entered = Word::Lookup { g, link: None, committed: true };
+fn translate(g: u64, t: u64, followed: bool) -> (Vec<u32>, Vec<Word>, usize, usize, Vec<u64>, u64) {
+    // A lookup that read an entry's address and translation at once, and a
+    // direct branch with the program's `x16` and `x17` saved below `sp`
+    // (as a lookup saves them), enter at the saved entry ([`CHECK_WORDS`]
+    // in). A lookup that read them apart enters at the check, the target
+    // in `x16`, which goes on to the saved entry if the target is this
+    // block's (an entry can be taken over as such a lookup reads it).
     let mut out: Vec<u32> = Vec::new();
     materialize(17, g, &mut out);
+    out.splice(0..0, std::iter::repeat_n(NOP, CHECK_WORDS - 2 - out.len()));
     out.push(CHECK);
     let wrong_at = out.len();
     out.push(MISS);
-    out.push(RESTORE);
-    let mut info: Vec<Word> = vec![entered; out.len()];
-    let entry = out.len();
-    let (calls, end) = body_of(g, t, followed, &mut out, &mut info);
+    debug_assert_eq!(out.len(), CHECK_WORDS);
+    let mut info = vec![Word::Lookup { g, link: None, to: Some(16) }; CHECK_WORDS];
+    let (calls, end, restore) = body_of(g, t, followed, true, None, &mut out, &mut info);
     // The wrong block's way out.
     let wrong = out.len();
     out[wrong_at] |= ((wrong - wrong_at) as u32) << 5;
     out.push(EXIT);
-    info.push(Word::Out { g, exit: Exit::Retry });
-    (out, info, entry, calls, end)
+    info.push(Word::Out { g, exit: Exit::Retry, saved: true, cond: 0 });
+    // A direct branch with the program's own registers, and fwe going on
+    // from a trap, enter where the block takes them back; if it does not
+    // at once, at its words up to there made again with them in their
+    // registers.
+    let unsaved = match restore {
+        Some((at, k)) if at == g => k + 1,
+        _ => {
+            let start = out.len();
+            body_of(g, t, followed, false, restore, &mut out, &mut info);
+            start
+        }
+    };
+    (out, info, CHECK_WORDS, unsaved, calls, end)
 }
 
 /// The instructions of the block at program address `g`, translated onto
 /// `out` (the block placed at `t`); `followed`, code fwe prepared in place
 /// (a library's), read as the program wrote it. Where its calls return,
-/// and the end of the program's words it read.
+/// the end of the program's words it read, and where it first restores
+/// the program's `x16` and `x17` (the program address, and the word).
+///
+/// The program's `x16` and `x17` stay on the stack, where the way in left
+/// them (if `saved`), until an instruction needs them or `sp`
+/// ([`keeps_saved`]): they are restored there, and saved again at a way
+/// out or a lookup. A save and the restore of what it saved cost a store's
+/// forwarding to the load, some cycles; through a loop of lookups whose
+/// code never needs them, each lookup would wait for the last's. Made
+/// with them in their registers (not `saved`), the words go on from
+/// `merge`'s address into the block made the other way, as they are there.
 fn body_of(
     g: u64,
     t: u64,
     followed: bool,
+    mut saved: bool,
+    merge: Option<(u64, usize)>,
     out: &mut Vec<u32>,
     info: &mut Vec<Word>,
-) -> (Vec<u64>, u64) {
+) -> (Vec<u64>, u64, Option<(u64, usize)>) {
     let page = page_size();
     let mut pc = g;
     let mut calls = Vec::new();
+    let mut sides = Vec::new();
+    let mut restore = None;
+    let mut ended = false;
     for _ in 0..BLOCK_INSNS {
+        if let Some((at, k)) = merge
+            && at == pc
+        {
+            // Into the other words: before their restore while saved.
+            let to = if saved { k } else { k + 1 };
+            out.push(0x1400_0000 | ((to as u32).wrapping_sub(out.len() as u32) & 0x3ff_ffff));
+            info.push(if saved { Word::Saved(pc) } else { Word::At(pc) });
+            ended = true;
+            break;
+        }
         let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
         // `bl`, `blr`
         if w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000 {
             calls.push(pc + 4);
         }
-        let ended = one(w, pc, t, out, info);
+        if saved && !is_branch(w) && !keeps_saved(w) {
+            if restore.is_none() {
+                restore = Some((pc, out.len()));
+            }
+            out.push(RESTORE);
+            info.push(Word::Saved(pc));
+            saved = false;
+        }
+        ended = one(w, pc, t, &mut saved, &mut sides, out, info);
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
-        if ended {
-            return (calls, pc);
-        }
-        if pc & (page - 1) == 0 {
+        if ended || pc & (page - 1) == 0 {
             break;
         }
     }
-    gate_out(pc, Exit::Jump(pc), out, info);
-    (calls, pc)
+    if !ended {
+        gate_out(pc, Exit::Jump(pc), saved, out, info);
+    }
+    // The taken ways of its conditional branches, after the rest.
+    for side in sides {
+        let at = out.len();
+        out[side.at] |= ((at - side.at) as u32) << 5;
+        gate_out(side.g, Exit::Jump(side.to), side.saved, out, info);
+        if let Word::Out { cond, .. } = &mut info[at] {
+            *cond = (at - side.at) as u16;
+        }
+    }
+    (calls, pc, restore)
 }
 
-/// A way out into fwe through the exit gate ([`JUMP_WORDS`] words): the
-/// program's x16 and x17 saved below sp, x16 the way out's address. A
-/// direct one is linked by making its first word a branch to the target's
-/// translation.
-fn gate_out(g: u64, exit: Exit, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+/// A conditional branch's taken way, out of line ([`body_of`]): the
+/// branch, word `at` of the block (its offset in the field at bit 5), at
+/// program address `g`, to `to`, the program's `x16` and `x17` saved there
+/// or not.
+struct Side {
+    at: usize,
+    g: u64,
+    to: u64,
+    saved: bool,
+}
+
+/// Whether `w` is a branch [`one`] makes from either state of `x16` and
+/// `x17` (saved or the program's).
+fn is_branch(w: u32) -> bool {
+    w & 0x7c00_0000 == 0x1400_0000 // b, bl
+        || w & 0xff00_0000 == 0x5400_0000 // b.cond, bc.cond
+        || matches!((w >> 25) & 0x3f, 0b011010 | 0b011011) // cbz, cbnz, tbz, tbnz
+        || matches!(w & 0xffff_fc1f, 0xd61f_0000 | 0xd65f_0000 | 0xd63f_0000) // br, ret, blr
+}
+
+/// Whether the program's instruction `w` runs as it is (or as [`one`]
+/// stands for it with its own registers alone) with the program's `x16`
+/// and `x17` saved below `sp`: it names neither, nor `sp`, and needs no
+/// stack of fwe's. Where a field may be a register, it is taken for one.
+fn keeps_saved(w: u32) -> bool {
+    let reg = |shift: u32| (w >> shift) & 31;
+    let named = |fields: &[u32]| fields.iter().any(|&f| matches!(reg(f), 16..=18));
+    let (rd, rn) = (reg(0), reg(5));
+    let op0 = (w >> 25) & 0xf;
+    match op0 {
+        // Loads and stores: `sp` as the base. A pair names a second
+        // register at 10; the forms with an immediate offset name no other.
+        0b0100 | 0b0110 | 0b1100 | 0b1110 => {
+            if rn == 31 {
+                return false;
+            }
+            // Literal loads: into a vector register, through x16.
+            if w & 0x3b00_0000 == 0x1800_0000 {
+                return (w >> 26) & 1 == 0 && !named(&[0]);
+            }
+            if (w >> 27) & 7 == 0b101 {
+                !named(&[0, 5, 10])
+            } else if (w >> 24) & 0x3b == 0x39 || ((w >> 24) & 0x3b == 0x38 && (w >> 21) & 1 == 0) {
+                !named(&[0, 5])
+            } else {
+                !named(&[0, 5, 10, 16])
+            }
+        }
+        // Data processing with an immediate: `sp` in add and subtract
+        // (and with tags) and in logical operations that set no flags.
+        0b1000 | 0b1001 => {
+            let not_s = (w >> 29) & 1 == 0;
+            let sp = match (w >> 23) & 7 {
+                0b010 => rn == 31 || (rd == 31 && not_s),
+                0b011 => rn == 31 || rd == 31,
+                0b100 => rd == 31 && (w >> 29) & 3 != 3,
+                _ => false,
+            };
+            !sp && !named(if (w >> 23) & 7 == 0b111 { &[0, 5, 16] } else { &[0, 5] })
+        }
+        // Data processing on registers: `sp` in add and subtract with an
+        // extended register, and (taken as such) in the one- and two-source
+        // operations (the tag ones).
+        0b0101 | 0b1101 => {
+            let rm = reg(16);
+            if (w >> 24) & 0x1f == 0b01011 && (w >> 21) & 1 == 1 {
+                rn != 31 && !(rd == 31 && (w >> 29) & 1 == 0) && !named(&[0, 5, 16])
+            } else if (w >> 21) & 0xff == 0b1101_0110 {
+                rd != 31 && rn != 31 && rm != 31 && !named(&[0, 5, 16])
+            } else if (w >> 24) & 0x1f == 0b11011 {
+                !named(&[0, 5, 10, 16])
+            } else {
+                !named(&[0, 5, 16])
+            }
+        }
+        // Floating point and vectors: general registers only in
+        // conversions and copies.
+        0b0111 | 0b1111 => {
+            let convert = (w >> 24) & 0x5f == 0x1e && (w >> 21) & 1 == 1 && (w >> 10) & 0x3f == 0;
+            let copy = w & 0x9fe0_8400 == 0x0e00_0400;
+            !((convert || copy) && named(&[0, 5]))
+        }
+        // System: hints and barriers.
+        0b1010 | 0b1011 => w & 0xffff_f01f == 0xd503_201f || w & 0xffff_f01f == 0xd503_301f,
+        _ => false,
+    }
+}
+
+/// A way out into fwe through the exit gate (first a save of the
+/// program's `x16` and `x17` below `sp` unless `saved`): `x16` the way
+/// out's address. A direct one is linked by making
+/// its first word a branch to the target's translation, entered as the
+/// way out has them ([`entered`]).
+fn gate_out(g: u64, exit: Exit, saved: bool, out: &mut Vec<u32>, info: &mut Vec<Word>) {
     let gate = crate::gate::exit_address();
+    if saved {
+        out.push(OUT);
+    } else {
+        out.extend([SAVE, 0x10ff_fff0]); // adr x16, #-4
+    }
     out.extend([
-        SAVE,
-        0x10ff_fff0,                 // adr x16, #-4
         0x5800_0000 | (2 << 5) | 17, // ldr x17, #8
         GO,                          // br x17
         gate as u32,
         (gate >> 32) as u32,
     ]);
-    info.push(Word::Out { g, exit });
-    info.extend([Word::Lookup { g, link: None, committed: false }; JUMP_WORDS as usize - 1]);
+    info.push(Word::Out { g, exit, saved, cond: 0 });
+    while info.len() < out.len() {
+        info.push(Word::Saved(g));
+    }
 }
 
 /// Translate the program's instruction `w` at `pc` into `out`, the block
-/// placed at `t`, recording what each word stands for. Whether it ends the
-/// block.
-fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> bool {
+/// placed at `t`, recording what each word stands for; `saved`, whether
+/// the program's `x16` and `x17` are below `sp` (only a branch is made
+/// from either state). A conditional branch goes on in the block, its
+/// taken way noted in `sides`. Whether it ends the block.
+fn one(
+    w: u32,
+    pc: u64,
+    t: u64,
+    saved: &mut bool,
+    sides: &mut Vec<Side>,
+    out: &mut Vec<u32>,
+    info: &mut Vec<Word>,
+) -> bool {
     let here = |out: &Vec<u32>| t + 4 * out.len() as u64;
     let imm26 = || pc.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4));
     let imm19 = || pc.wrapping_add_signed(i64::from((((w >> 5) & 0x7_ffff) << 13) as i32 >> 11));
     let imm14 = || pc.wrapping_add_signed(i64::from((((w >> 5) & 0x3fff) << 18) as i32 >> 16));
-    let jump = |out: &mut Vec<u32>, info: &mut Vec<Word>, to: u64| {
-        gate_out(pc, Exit::Jump(to), out, info);
+    // The program's x16 and x17 saved, if they are not.
+    let save = |saved: &mut bool, out: &mut Vec<u32>, info: &mut Vec<Word>| {
+        if !*saved {
+            out.push(SAVE);
+            info.push(Word::At(pc));
+            *saved = true;
+        }
     };
+    let at_pc = |saved: bool| if saved { Word::Saved(pc) } else { Word::At(pc) };
     // b
     if w & 0xfc00_0000 == 0x1400_0000 {
-        jump(out, info, imm26());
+        gate_out(pc, Exit::Jump(imm26()), *saved, out, info);
         return true;
     }
     // bl: the program's return address in x30, then on.
     if w & 0xfc00_0000 == 0x9400_0000 {
         let at = out.len();
         materialize(30, pc + 4, out);
-        info.extend((at..out.len()).map(|_| Word::At(pc)));
-        jump(out, info, imm26());
+        info.extend((at..out.len()).map(|_| at_pc(*saved)));
+        gate_out(pc, Exit::Jump(imm26()), *saved, out, info);
         return true;
     }
-    // b.cond (and bc.cond): to the taken way out two words on.
+    // b.cond (and bc.cond)
     if w & 0xff00_0000 == 0x5400_0000 {
-        out.push((w & !(0x7_ffff << 5)) | ((1 + JUMP_WORDS) << 5));
-        info.push(Word::At(pc));
-        jump(out, info, pc + 4);
-        jump(out, info, imm19());
-        return true;
+        sides.push(Side { at: out.len(), g: pc, to: imm19(), saved: *saved });
+        out.push(w & !(0x7_ffff << 5));
+        info.push(at_pc(*saved));
+        return false;
     }
     // cbz/cbnz, tbz/tbnz
     let family = (w >> 25) & 0x3f;
     if family == 0b011010 || family == 0b011011 {
         let taken = if family == 0b011010 { imm19() } else { imm14() };
         let field = if family == 0b011010 { 0x7_ffff << 5 } else { 0x3fff << 5 };
-        if w & 0x1f == 18 {
-            // Of x18: its value from its slot into x16 (x16 and x17 saved
-            // below sp, as a lookup saves them), tested there; each way
-            // restores them and goes on, linked as any branch is.
-            let before = Word::Lookup { g: pc, link: None, committed: false };
-            out.push(SAVE);
-            info.push(Word::At(pc));
+        let rt = w & 0x1f;
+        if rt == 18 {
+            // Of x18: its value from its slot into x16, tested there.
+            save(saved, out, info);
             let slot = crate::x18_slot();
             out.extend([
                 rewrite::MRS_TPIDRRO | 16,
                 rewrite::AND_NOT7 | (16 << 5) | 16,
                 rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
-                (w & !field & !0x1f) | ((2 + JUMP_WORDS) << 5) | 16,
-                RESTORE,
             ]);
-            info.extend([before; 5]);
-            jump(out, info, pc + 4);
-            out.push(RESTORE);
-            info.push(before);
-            jump(out, info, taken);
-            return true;
+            info.extend([Word::Saved(pc); 3]);
+            sides.push(Side { at: out.len(), g: pc, to: taken, saved: true });
+            out.push((w & !field & !0x1f) | 16);
+            info.push(Word::Saved(pc));
+            return false;
         }
-        out.push((w & !field) | ((1 + JUMP_WORDS) << 5));
-        info.push(Word::At(pc));
-        jump(out, info, pc + 4);
-        jump(out, info, taken);
-        return true;
+        if matches!(rt, 16 | 17) && *saved {
+            // Tested where the program has it.
+            out.push(RESTORE);
+            info.push(Word::Saved(pc));
+            *saved = false;
+        }
+        sides.push(Side { at: out.len(), g: pc, to: taken, saved: *saved });
+        out.push(w & !field);
+        info.push(at_pc(*saved));
+        return false;
     }
     // br, blr, ret
     match w & 0xffff_fc1f {
         0xd61f_0000 | 0xd65f_0000 => {
+            save(saved, out, info);
             lookup(pc, (w >> 5) & 0x1f, None, out, info);
             return true;
         }
         0xd63f_0000 => {
+            save(saved, out, info);
             lookup(pc, (w >> 5) & 0x1f, Some(pc + 4), out, info);
             return true;
         }
@@ -1847,7 +2122,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
     if (w >> 25) & 0x7f == 0b110_1011 {
         // Another branch through a register (authenticated): no stand-in.
         out.push(UDF);
-        info.push(Word::At(pc));
+        info.push(at_pc(*saved));
         return true;
     }
     // adr, adrp
@@ -1864,7 +2139,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
         } else {
             let at = out.len();
             materialize(w & 0x1f, v, out);
-            info.extend((at..out.len()).map(|_| Word::At(pc)));
+            info.extend((at..out.len()).map(|_| at_pc(*saved)));
         }
         return false;
     }
@@ -1908,7 +2183,7 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
                 return false;
             }
         }
-        info.extend((at..out.len()).map(|_| Word::At(pc)));
+        info.extend((at..out.len()).map(|_| at_pc(*saved)));
         return false;
     }
     // `isb`: from here the program runs what it wrote to code before it
@@ -1917,8 +2192,8 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
     // if a write dropped it (and unlinked the way there).
     if w == ISB {
         out.push(w);
-        info.push(Word::At(pc));
-        jump(out, info, pc + 4);
+        info.push(at_pc(*saved));
+        gate_out(pc, Exit::Jump(pc + 4), *saved, out, info);
         return true;
     }
     // A flush of an instruction cache line: run, and fwe told through the
@@ -1999,42 +2274,53 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
         return true;
     }
     out.push(w);
-    info.push(Word::At(pc));
+    info.push(at_pc(*saved));
     false
 }
 
 /// An indirect branch through `x<n>` at `pc`, a call if `link` (the
-/// return address): its target looked up in the table, `x16` and `x17`
-/// saved for it; a miss traps.
+/// return address), the program's `x16` and `x17` saved: its target looked
+/// up in the table; a miss goes into fwe.
+///
+/// The target stays in `x<n>`, where the program has it, while the entry's
+/// address and translation are read at once into `x16` and `x17`, and a
+/// match goes to the translation's lookup entry. Through `x16`, `x17` or
+/// `x18`, or a call through `x30` (whose target the return address
+/// replaces), the target is copied into `x16`, which leaves only `x17` to
+/// read the entry with: its address, then its translation, which is
+/// entered at its check.
 fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec<Word>) {
-    let before = Word::Lookup { g: pc, link, committed: false };
-    out.push(SAVE);
-    info.push(Word::At(pc));
-    // x16: the target.
-    match n {
-        16 => out.push(0xf940_03f0), // ldr x16, [sp]
-        17 => out.push(0xf940_07f0), // ldr x16, [sp, #8]
-        18 => {
-            let slot = crate::x18_slot();
-            out.extend([
-                rewrite::MRS_TPIDRRO | 16,
-                rewrite::AND_NOT7 | (16 << 5) | 16,
-                rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
-            ]);
+    let before = Word::Lookup { g: pc, link, to: None };
+    let in_place = !matches!(n, 16..=18) && !(n == 30 && link.is_some());
+    let (miss_at, to) = if in_place {
+        out.extend([index_of(n), SCALE, BASE, ENTRY, key_against(n)]);
+        out.push(MISS_X16); // its offset filled in below
+        (out.len() - 1, n as u8)
+    } else {
+        // x16: the target.
+        match n {
+            16 => out.push(0xf940_03f0), // ldr x16, [sp]
+            17 => out.push(0xf940_07f0), // ldr x16, [sp, #8]
+            18 => {
+                let slot = crate::x18_slot();
+                out.extend([
+                    rewrite::MRS_TPIDRRO | 16,
+                    rewrite::AND_NOT7 | (16 << 5) | 16,
+                    rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
+                ]);
+            }
+            _ => out.push(0xaa00_03f0 | (n << 16)), // mov x16, xN
         }
-        _ => out.push(0xaa00_03f0 | (n << 16)), // mov x16, xN
-    }
+        out.extend([INDEX, SCALE, BASE, KEY, CHECK]);
+        out.push(MISS); // its offset filled in below
+        let miss_at = out.len() - 1;
+        out.extend([INDEX, SCALE, BASE, VALUE]);
+        (miss_at, 16)
+    };
+    let committed = Word::Lookup { g: pc, link, to: Some(to) };
     while info.len() < out.len() {
         info.push(before);
     }
-    out.extend([INDEX, SCALE, BASE, KEY, CHECK]);
-    let miss_at = out.len();
-    out.push(MISS); // its offset filled in below
-    out.extend([INDEX, SCALE, BASE, VALUE]);
-    while info.len() < out.len() {
-        info.push(before);
-    }
-    let committed = Word::Lookup { g: pc, link, committed: true };
     // A target fwe does not translate has no translation in the table (0):
     // the branch is made as the program made it, every register its own.
     let outside_at = out.len();
@@ -2044,6 +2330,10 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
         let at = out.len();
         materialize(30, link, out);
         info.extend((at..out.len()).map(|_| committed));
+    }
+    if !in_place {
+        out.push(TO_CHECK);
+        info.push(committed);
     }
     out.push(GO);
     info.push(committed);
@@ -2069,15 +2359,13 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
         out.push(if ret { 0xd65f_0000 } else { 0xd61f_0000 } | (n << 5));
         info.push(Word::At(pc));
     }
-    // The miss: x16 and x17 back, then fwe's trap.
+    // The miss: into fwe.
     let miss = out.len();
     out[miss_at] |= ((miss - miss_at) as u32) << 5;
     if trapped {
         out[outside_at] |= ((miss - outside_at) as u32) << 5;
     }
-    out.push(RESTORE);
-    info.push(before);
-    gate_out(pc, Exit::Reg { n, link }, out, info);
+    gate_out(pc, Exit::Reg { n, link }, true, out, info);
 }
 
 /// Load the value `v` into `x<rd>` with `movz`/`movk`.
