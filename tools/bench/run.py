@@ -790,14 +790,15 @@ def translated(name, jit_map, counts, where):
     by what each word stands for (the program's instruction with its `x16`
     and `x17` in place or saved, or its `x18` held in `x17`, their save or
     restore, inside an expansion and of what, a lookup, a way out),
+    the hottest blocks word by word,
     by the program's code each block was made from (`where` names its
     address), and the hottest blocks."""
     blocks = []
     for f in os.listdir(jit_map):
         with open(os.path.join(jit_map, f)) as m:
             for line in m:
-                t, size, g, kinds = line.split()
-                blocks.append((int(t, 16), int(size), int(g, 16), kinds))
+                t, size, g, kinds, words = line.split()
+                blocks.append((int(t, 16), int(size), int(g, 16), kinds, words))
     blocks.sort()
     starts = [b[0] for b in blocks]
     names = {"a": "instruction", "s": "instruction, x16/x17 saved", "v": "save of x16/x17",
@@ -806,13 +807,15 @@ def translated(name, jit_map, counts, where):
              "e": "expansion of a literal load", "i": "expansion of a cache flush",
              "c": "expansion of a system call", "l": "lookup", "L": "lookup", "o": "way out"}
     by_kind, by_code, by_block = collections.Counter(), collections.Counter(), collections.Counter()
+    by_word = collections.Counter()
     n_in = 0
     for pc, n in counts:
         i = bisect.bisect_right(starts, pc) - 1
         if i < 0 or pc >= blocks[i][0] + blocks[i][1]:
             continue
-        t, _, g, kinds = blocks[i]
+        t, _, g, kinds, _ = blocks[i]
         k = (pc - t) // 4
+        by_word[(i, k)] += n
         by_kind[names.get(kinds[k], "?") if k < len(kinds) else "?"] += n
         by_code[where(g).split("+")[0]] += n
         by_block[g] += n
@@ -827,6 +830,16 @@ def translated(name, jit_map, counts, where):
     print(f"{name}: translations: {n_in} samples in {len(blocks)} blocks; by word: "
           f"{pct(by_kind)}; by the program's code: {pct(by_code)}; hottest blocks: {hot}",
           file=sys.stderr)
+    # The hottest blocks word by word: what each stands for, the word, and
+    # its samples.
+    hottest = collections.Counter()
+    for (i, _), n in by_word.items():
+        hottest[i] += n
+    for i, _ in hottest.most_common(3):
+        t, _, g, kinds, words = blocks[i]
+        each = " ".join(f"{kinds[k]}:{words[8 * k:8 * k + 8]}:{by_word[(i, k)]}"
+                        for k in range(len(kinds)))
+        print(f"{name}: block {where(g)} (at {t:x}): {each}", file=sys.stderr)
 
 
 def pcs(name, cmd, share=False, execname="fwe", jit_map=None):

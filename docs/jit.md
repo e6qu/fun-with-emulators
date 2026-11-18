@@ -334,8 +334,9 @@ back, how often the cache was emptied, and how long the translator's
 lock was waited for and held, by its holders' kinds. `FWE_JIT_MAP=<dir>`
 writes the code cache's map there as a process ends (`jit-<pid>.map`:
 each block's place in the cache, the program address it was made from,
-and what each of its words stands for), which the benchmarks use to name
-the samples taken in translations. The benchmarks
+what each of its words stands for, and the words), which the benchmarks
+use to name the samples taken in translations and to show the hottest
+blocks word by word. The benchmarks
 compare a JDK workload (compiling and running a multi-threaded
 application) with the same JDK built for macOS on the same runner
 ([ROADMAP.md](../ROADMAP.md)).

@@ -467,9 +467,10 @@ static FLUSHES: AtomicU64 = AtomicU64::new(0);
 /// time in translations goes (the benchmarks' samples): a line per block,
 /// its address in the cache, its size in bytes, its program address, and
 /// a letter per word for what it stands for (`a` the program's
-/// instruction, `s` one with its `x16` and `x17` saved, `v` and `r` their
-/// save and restore, `u` and `f` inside an expansion, `l` a lookup, `L`
-/// one committed, `o` a way out).
+/// instruction, `s` one with its `x16` and `x17` saved, `x` one with its
+/// `x18` held in `x17` too, `v` and `r` their save and restore, inside an
+/// expansion its [`Of`], `l` a lookup, `L` one committed, `o` a way out),
+/// and its words in hexadecimal.
 pub fn write_map() {
     let Some(dir) = std::env::var_os("FWE_JIT_MAP") else { return };
     let s = state();
@@ -493,7 +494,11 @@ pub fn write_map() {
                 Word::Out { .. } => 'o',
             })
             .collect();
-        text.push_str(&format!("{:x} {} {:x} {kinds}\n", b.t, b.len, b.g));
+        // SAFETY: the block's translation, in the cache.
+        let words: String = (0..b.words.len())
+            .map(|k| format!("{:08x}", unsafe { ((b.t + 4 * k as u64) as *const u32).read() }))
+            .collect();
+        text.push_str(&format!("{:x} {} {:x} {kinds} {words}\n", b.t, b.len, b.g));
     }
     let path = std::path::Path::new(&dir).join(format!("jit-{}.map", std::process::id()));
     if let Err(e) = std::fs::write(&path, text) {
