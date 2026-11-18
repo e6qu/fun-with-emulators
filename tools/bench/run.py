@@ -703,16 +703,24 @@ def cache_symbol(pc):
     return ""
 
 
-def breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total):
+def breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total):
     """[`pcs`]'s readings beyond the files: the kernel's most sampled
-    stacks, and the samples in `execname` by function, named by `atos`
-    from the binary `cmd` ran."""
-    kstacks.sort(key=lambda k: -k[0])
-    for n, frames in kstacks[:8]:
+    stacks (`kstacks`, by thread), in all and in thread `busiest`, and the
+    samples in `execname` by function, named by `atos` from the binary
+    `cmd` ran."""
+    def name_frames(frames):
         # The program's frame it entered from, named where it can be.
-        named = [where(int(f, 16)) + cache_symbol(int(f, 16)) if f.startswith("0x") else f
-                 for f in frames]
-        print(f"{name}: kernel {n * 100 / total:.1f}%: {' < '.join(named)}", file=sys.stderr)
+        return " < ".join(where(int(f, 16)) + cache_symbol(int(f, 16)) if f.startswith("0x")
+                          else f for f in frames)
+
+    merged = collections.Counter()
+    for _, n, frames in kstacks:
+        merged[tuple(frames)] += n
+    for frames, n in merged.most_common(8):
+        print(f"{name}: kernel {n * 100 / total:.1f}%: {name_frames(frames)}", file=sys.stderr)
+    for _, n, frames in sorted((k for k in kstacks if k[0] == busiest), key=lambda k: -k[1])[:6]:
+        print(f"{name}: thread {busiest}: kernel {n} samples: {name_frames(frames)}",
+              file=sys.stderr)
     exe = next((c for c in cmd if os.path.basename(c) == execname and os.path.isfile(c)), None)
     path = next((p for regions in looks for _, _, p, _, _ in regions
                  if p and os.path.basename(p) == execname), None)
@@ -879,7 +887,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     script = (f'profile-997 /execname == "{execname}"/ {{ @pc[tid, arg1] = count(); }} '
-              f'profile-997 /execname == "{execname}" && arg0/ {{ @ks[stack(6)] = count(); }} '
+              f'profile-997 /execname == "{execname}" && arg0/ {{ @ks[tid, stack(6)] = count(); }} '
               f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
@@ -890,7 +898,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
               'sum(timestamp - self->m); @n[strjoin("mach:", probefunc)] = count(); '
               'self->m = 0; } '
               'END { printa("pc %d %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
-              'printa("ks %@d%k\\nendks\\n", @ks); }')
+              'printa("ks %d %@d%k\\nendks\\n", @ks); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -920,6 +928,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
         said = tracer.communicate()[0]
         sys.exit(f"{name}: DTrace did not end when interrupted: {said.strip()[-2000:]}")
     # Samples by thread, and by program counter.
+    # The kernel's stacks by thread: (thread, samples, frames).
     threads, calls, kstacks = collections.defaultdict(collections.Counter), [], []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
@@ -931,13 +940,13 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
                         kstacks.append(stack)
                         stack = None
                     elif p:
-                        stack[1].append(p[0])
+                        stack[2].append(p[0])
                 elif len(p) == 4 and p[0] == "pc":
                     threads[int(p[1])][int(p[2], 16)] += int(p[3])
                 elif len(p) == 4 and p[0] == "sys":
                     calls.append((p[1], int(p[2]), int(p[3])))
-                elif len(p) == 2 and p[0] == "ks":
-                    stack = (int(p[1]), [])
+                elif len(p) == 3 and p[0] == "ks":
+                    stack = (int(p[1]), int(p[2]), [])
     counts = list(sum(threads.values(), collections.Counter()).items())
     if calls:
         calls.sort(key=lambda c: -c[1])
@@ -988,6 +997,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
     # The threads that ran most: the longest of them bounds the run.
+    busiest = max(threads, key=lambda t: threads[t].total())
     for tid, pcs_of in sorted(threads.items(), key=lambda t: -t[1].total())[:4]:
         of = collections.Counter()
         for pc, n in pcs_of.items():
@@ -1003,7 +1013,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     # What the kernel was doing, and fwe's samples by function: for
     # reading only, so a failure here is said and the run goes on.
     try:
-        breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total)
+        breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total)
     except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
         print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
     # The unnamed regions most samples are in: their tag and protection.
