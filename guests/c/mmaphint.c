@@ -1,9 +1,9 @@
 /* mmap with an address hint whose range is free: Linux maps it there (SBCL
  * asks for its spaces so), and a second one hinted just past the first
  * (as Go's heap arenas are) continues it: a read into a buffer across the
- * two is one read. A third, mapped between two others after them, may be
- * backed apart from both: a read or write across its edges is still
- * whole, each made of as many calls as Linux may need (a shorter count is
+ * two is one read. A third, mapped (at a fixed address) between two
+ * others after them, may be backed apart from both: a read or write
+ * across its edges is still whole, each made of as many calls as Linux may need (a shorter count is
  * read or written again from where it ended, as programs do). Every line
  * printed is what Linux prints. */
 int printf(const char *fmt, ...);
@@ -15,6 +15,7 @@ long read(int fd, void *buf, unsigned long n);
 #define PROT_READ 1
 #define PROT_WRITE 2
 #define MAP_PRIVATE 2
+#define MAP_FIXED 0x10
 #define MAP_ANONYMOUS 0x20
 #define MB (1ul << 20)
 
@@ -32,10 +33,14 @@ int main(void) {
     printf("read across: %ld %.6s\n", n, want + MB - 3);
 
     char *x = (char *)0x2f8000000ul;
-    char *a = mmap(x, MB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    char *b = mmap(x + 2 * MB, MB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-    char *c = mmap(x + MB, MB, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    int fixed = MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED;
+    char *a = mmap(x, MB, PROT_READ | PROT_WRITE, fixed, -1, 0);
+    char *b = mmap(x + 2 * MB, MB, PROT_READ | PROT_WRITE, fixed, -1, 0);
+    char *c = mmap(x + MB, MB, PROT_READ | PROT_WRITE, fixed, -1, 0);
     int whole = a == x && b == x + 2 * MB && c == x + MB;
+    if (!whole) {
+        printf("between: mapped at %p %p %p\n", (void *)a, (void *)b, (void *)c);
+    }
     for (int edge = 1; edge <= 2; edge++) {
         char *at = x + edge * MB - 3;
         write(fds[1], "seams!", 6);
@@ -55,11 +60,16 @@ int main(void) {
             }
             put += r;
         }
-        char back[6];
+        char back[6] = {0};
         long n2 = read(fds[0], back, 6);
-        whole = whole && got == 6 && put == 6 && n2 == 6;
+        int same = 1;
         for (int i = 0; i < 6; i++) {
-            whole = whole && back[i] == "seams!"[i];
+            same = same && back[i] == "seams!"[i];
+        }
+        if (got != 6 || put != 6 || n2 != 6 || !same) {
+            printf("between: edge %d read %ld, wrote %ld, read back %ld %.6s\n", edge, got, put,
+                   n2, back);
+            whole = 0;
         }
     }
     printf("between: %s\n", whole ? "whole" : "broken");
