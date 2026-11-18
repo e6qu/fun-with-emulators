@@ -1239,6 +1239,19 @@ def jdk(a, fwe, guest_env, results):
         subprocess.run(cmd, capture_output=True)
         took.append(time.perf_counter() - start)
     print(f"JDK javac alone: {took[0]:.2f} s under fwe, {took[1]:.2f} s natively", file=sys.stderr)
+    # What its JIT compilers did, both ways (`-XX:+CITime`, said as the
+    # JVM ends): how many methods each tier compiled, in how long.
+    at = javac.index("-d")
+    for how, out, cmd in [
+            ("under fwe", ours_out, javac[:at] + ["-J-XX:+CITime"] + javac[at:]),
+            ("natively", theirs_out, [f"{bin_theirs}/javac", "-J-XX:+CITime", "-d", theirs_out]
+             + [os.path.join(JDK_SRC, f) for f in sources])]:
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        said = [" ".join(line.split()) for line in r.stdout.splitlines()
+                if re.search(r"Total compil|C[12] {|Tier[1-4] {|nmethod code size", line)]
+        print(f"JDK javac's compilers {how}: " + "; ".join(said), file=sys.stderr)
     # How long each part of the application takes, both ways (it says on
     # standard error).
     for how, cmd in [("under fwe", guest_env + fwe + [
