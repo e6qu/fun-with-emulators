@@ -105,6 +105,7 @@ pub fn configure() {
     let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
     STORE_OFF.store(n("FWE_JIT_STORE_OFF"), Ordering::Relaxed);
     STORE_FLAT.store(n("FWE_JIT_STORE_FLAT"), Ordering::Relaxed);
+    STORE_MULT.store(n("FWE_JIT_STORE_MULT").max(1), Ordering::Relaxed);
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -386,6 +387,7 @@ static REVIVED: AtomicU64 = AtomicU64::new(0);
 const STORES_KEPT: u64 = 16;
 static STORE_OFF: AtomicU64 = AtomicU64::new(0);
 static STORE_FLAT: AtomicU64 = AtomicU64::new(0);
+static STORE_MULT: AtomicU64 = AtomicU64::new(1);
 /// Stores into pages kept from writes that fwe left to drop the page's
 /// translations, by why: not a store it decodes, on a page another
 /// mapping shares, or past [`STORES_KEPT`].
@@ -438,7 +440,7 @@ pub fn counts() -> Option<String> {
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, {} of them into code, \
              left: {} not decoded ({}), {} shared, {} past the limit), the code cache emptied {} times; \
-             {} ms translating, {} ms in ways out",
+             {} ms translating, {} ms in ways out, {} waits for the lock ({} ms)",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
@@ -456,14 +458,32 @@ pub fn counts() -> Option<String> {
             STORES_LEFT[2].load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
-            EXIT_NS.load(Ordering::Relaxed) / 1_000_000
+            EXIT_NS.load(Ordering::Relaxed) / 1_000_000,
+            LOCK_WAITS.load(Ordering::Relaxed),
+            LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000_000
         )
     })
 }
 
 fn state() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(|e| e.into_inner())
+    match STATE.try_lock() {
+        Ok(s) => s,
+        Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        Err(std::sync::TryLockError::WouldBlock) => {
+            // Held by another thread: how often, and how long it waits.
+            let began = std::time::Instant::now();
+            let s = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            LOCK_WAITS.fetch_add(1, Ordering::Relaxed);
+            LOCK_WAIT_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            s
+        }
+    }
 }
+
+/// The times a thread found [`STATE`] held by another, and how long they
+/// waited for it, in nanoseconds.
+static LOCK_WAITS: AtomicU64 = AtomicU64::new(0);
+static LOCK_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
 fn page_size() -> u64 {
     fwe_kernel::mm::host_page_size()
@@ -1071,7 +1091,7 @@ pub fn store(
     let blocks = if STORE_FLAT.load(Ordering::Relaxed) != 0 {
         0
     } else {
-        s.pages.get(&page).map_or(0, Vec::len) as u64
+        s.pages.get(&page).map_or(0, Vec::len) as u64 * STORE_MULT.load(Ordering::Relaxed)
     };
     let made = &mut s.writers.get_mut(&page).expect("its writer").1;
     *made += 1;
