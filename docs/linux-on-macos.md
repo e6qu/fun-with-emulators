@@ -245,7 +245,7 @@ stops running its own code:
 | code using `x18` | a stub branch per use (a few Linux toolchains allocate it) | the hardware register |
 | reading `CTR_EL0` | a trap per read (C libraries read it once) | read by the guest |
 | reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
-| JIT code | a fault the first time each block runs (it is translated), a trap the first time each branch out of it is taken (then linked) and when a lookup misses, a call through the gate for each instruction cache line it flushes ([Code made executable at run time](#code-made-executable-at-run-time-translated)) | no faults |
+| JIT code | a fault the first time each block runs (it is translated), a trap the first time each branch out of it is taken (then linked) and when a lookup misses, a call through the gate for each instruction cache line it flushes ([Code made executable at run time](jit.md)) | no faults |
 | `mmap`/`munmap` heavy | host calls | page-table edits; a TLB invalidation on every vCPU when access is taken away |
 | `fork` heavy | host `fork`, copy-on-write, after pausing the other guest threads ([fork](#fork)) | a new fwe process sent every page of guest memory that exists |
 | `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | a new process fetching pages as touched, then a re-exec |
@@ -363,7 +363,7 @@ child process, an HTTP server and client, and a worker thread). Each
 time V8 runs code it generated, fwe runs a translation of it, and V8's
 code pages, with the metadata and compressed pointers it keeps among its
 code, stay as V8 wrote them ([Code made executable at run
-time](#code-made-executable-at-run-time-translated)).
+time](jit.md)).
 
 ### Java and the JVM
 
@@ -375,7 +375,7 @@ interpreter and both of its compilers at work):
 - **Backend:** the `java` and `javac` launchers are PIEs; the JVM itself
   is a shared library (`libjvm.so`).
 - **JIT code:** HotSpot's code cache runs by translation ([Code made
-  executable at run time](#code-made-executable-at-run-time-translated)).
+  executable at run time](jit.md)).
   Its compilers allocate `x18` like any register on Linux (they keep it
   free only on macOS and Windows); the translations keep its value. Its
   code cache stays as HotSpot wrote it: the code blob headers and
@@ -420,7 +420,7 @@ taken by a vectored handler, and starts itself as a child process.
   the VM `x18` is the guest's own. Natively, Windows code Wine makes
   executable runs by translation, `x18` kept in its translations
   ([Code made executable at run
-  time](#code-made-executable-at-run-time-translated)).
+  time](jit.md)).
 - **wineserver** talks to Wine processes over Unix sockets, passing
   descriptors with `SCM_RIGHTS` (received descriptors are not held to
   `RLIMIT_NOFILE`), and suspends threads with ordinary signals. It stays
@@ -572,94 +572,15 @@ JIT's implicit null checks do), finds it where the program wrote it.
 
 ### Code made executable at run time: translated
 
-A JIT compiler writes code and runs it, and keeps data in the same
-pages: headers, constants, addresses (HotSpot its code blobs' headers and
-trampolines' addresses, V8 its metadata and compressed pointers). It
-reads that memory back, patches it, copies code from one place to
-another, and walks stacks of return addresses into it. macOS has no
-memory that can be run but not read, so any change fwe made there would
-be seen. So fwe changes nothing there, and never lets the host run it:
-memory the guest made executable after mapping it (`mprotect` adding
-`PROT_EXEC`, or mapped writable and executable at once) runs by
-translation (`crates/native/src/jit.rs`), as Rosetta 2 and DynamoRIO run
-code generated at run time:
-
-- **The fetch faults.** The page is never executable on the host; a jump
-  there faults, and fwe translates the block of code at that address
-  into its code cache and goes on there. Only code that runs is decoded,
-  following the program's control flow, so nothing has to tell code from
-  data.
-- **The translation** holds the program's instructions as they are,
-  except `adr`, `adrp` and literal loads (computed from the program's
-  address), the uses of `x18`, system calls and thread-pointer accesses
-  (expanded as their stubs are, inline), and branches out of the block.
-- **Branches.** A direct branch traps the first time and is then linked:
-  straight to its target's translation, or to code that is not
-  translated (a runtime's helper a JIT calls with `bl`) straight there
-  where a branch reaches, otherwise through a veneer that loads the
-  target into `x16`, as a linker's veneer does (the procedure call
-  standard lets one clobber `x16` and `x17` on a direct branch to other
-  code). A `cbz` or `tbz` of `x18` tests the program's `x18` inline. A
-  call puts the program's own return address in `x30`, so the stack
-  holds only the program's addresses. An indirect branch or a return
-  looks its target up in a table of translations by program address,
-  `x16` and `x17` saved for the lookup; the translation it reaches checks
-  that the target is its own (an entry can be taken over or dropped while
-  a lookup reads it), then restores them. A miss traps once and fills the
-  table. An indirect branch or return into code that is not translated
-  (a library's, prepared in place) restores `x16` and `x17` and is made
-  through the program's own register, so every register is as the
-  program left it: code may count on more than the procedure call
-  standard promises (HotSpot calls its atomic stubs saying they clobber
-  only `x8`, `x9` and `x30`, and keeps values in `x16` across them). One
-  through `x18`, or a call through `x30`, takes fwe's trap.
-- **Code a translation calls is translated too.** A runtime's helpers in
-  its library, the C library, the program's own functions: code fwe
-  prepared in place that a translation calls or branches to runs from
-  translations as well, read as the program wrote it (each instruction
-  fwe rewrote taken from the record of what it was), so what it calls and
-  where it returns stay in translations: a C helper's return into a JIT's
-  code is a lookup, not a fault. A return is followed only to where a
-  translated call returns; one to a caller that runs as it is (the code
-  that called into the JIT's) goes back there. The same code keeps
-  running as it is wherever it is called from code that is not
-  translated.
-- **Calls into translated code.** Native code's call into a JIT's code
-  faults the first time; that call site (`blr`) becomes a `bl` to a stub
-  in reach that looks the target up as a translation does, and goes to
-  its translation, so the next calls fault no more.
-- **What the program sees stays its own.** Its memory reads back exactly
-  as it wrote it. A fault or signal in a translation is delivered at the
-  program's instruction, with its registers: an expansion stopped before
-  its instruction ran is undone, one stopped after is finished. A system
-  call made from a translation is the program's `svc`'s: a tracer stops
-  there, a handler's frame holds it, and a restarted call is made again
-  from it. A signal delivered as a thread goes on into a translation
-  gets a frame with the program's state too.
-- **Code that changes.** A program that writes code invalidates the
-  instruction cache lines it wrote (`ic ivau`, as `__clear_cache` does)
-  before it runs it: the `CTR_EL0` fwe reports, Apple's under Linux,
-  says the instruction cache is kept apart from data writes. fwe takes
-  each such flush, through a stub as for a system call, for the word
-  that the line changed: the translations made from it go (and the
-  branches linked into them), and the code is translated again when it
-  next runs. Nothing else the program writes costs anything: a JIT's
-  data beside its code is written as it is. A flush through another
-  mapping of the same memory (a memfd a JIT maps twice, writable and
-  executable, flushed through either view) drops the translations made
-  from it as well. Mapping, unmapping or protecting the memory anew, and
-  a debugger's write into the code, drop them too. A translation ends at each `isb`, the
-  point from which the architecture has a program run what it wrote to
-  its code, so code that rewrites instructions just ahead of itself runs
-  the new ones.
-- **The code cache** is made of 128 MiB chunks (what a branch reaches),
-  each mapped twice, writable for fwe and executable for the threads
-  that run it. A full chunk is followed by a new one, or, when at least
-  half of the cache holds translations dropped since, the cache is
-  emptied with every other thread stopped, keeping aside the translations
-  a thread may still be in or return into; the code is translated again
-  as it runs. A fork child gets its own copy of the cache
-  ([architecture.md](architecture.md#rewriting-guest-code)).
+Memory a program makes executable after mapping it (`mprotect` adding
+`PROT_EXEC`), maps writable and executable at once, or maps from a file
+shared and open for writing is not prepared: a JIT compiler writes,
+patches and copies code there as it runs, and keeps its data beside it.
+Natively it runs by translation into fwe's code cache, the program's
+memory never changed and never executable on the host; the instructions
+above are expanded in the translations, and the program's `ic ivau`
+flushes tell fwe which code changed. How, what the program sees, what it
+costs and which runtimes are tested is in [jit.md](jit.md).
 
 ### CTR_EL0: emulated when it traps
 
@@ -683,7 +604,7 @@ while it is still writable and before any thread can run it
 - code made executable after it was mapped (`mprotect` adding
   `PROT_EXEC`), mapped writable and executable, or in a file mapped
   shared and open for writing, is not prepared but translated ([Code made
-  executable at run time](#code-made-executable-at-run-time-translated)).
+  executable at run time](jit.md)).
 
 Preparing is done once per file, not once per start, as Rosetta 2 keeps
 its translations: what a file's scan found is kept in fwe's private
@@ -1801,7 +1722,7 @@ without `MAP_JIT`, whose memory is switched per thread
 
 - **native:** the host maps it writable, never executable: its code runs
   by translation ([Code made executable at run
-  time](#code-made-executable-at-run-time-translated)).
+  time](jit.md)).
 - **VM:** stage 1 maps it writable and executable; nothing faults.
 
 #### Shared memory and memfd

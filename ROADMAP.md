@@ -130,10 +130,10 @@ natively wherever fwe can make them fit the Mac.
   executable as it runs (JIT compilers' code, self-modifying code, code
   on the stack) runs from translations in fwe's code cache, the
   program's memory never executable on the host and never changed: its
-  `x18` uses expanded in the translation, a write to code translated
-  from (through any mapping, or by the host for the program) dropping
-  the translations, a fault or signal delivered at the program's own
-  instruction. Tested with Node.js 18 and 24, LuaJIT, Racket, Guile,
+  `x18` uses expanded in the translation, the program's flush of the
+  code it changed (`ic ivau`, through any mapping) dropping the
+  translations, a fault or signal delivered at the program's own
+  instruction ([docs/jit.md](docs/jit.md)). Tested with Node.js 18 and 24, LuaJIT, Racket, Guile,
   Python's `eval`, OpenJDK, quines, IOCCC winners and self-modifying
   programs.
 - [ ] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes

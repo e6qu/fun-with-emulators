@@ -1,4 +1,5 @@
-//! Code a program makes executable at run time, run by translation.
+//! Code a program makes executable at run time, run by translation
+//! (described for readers in `docs/jit.md`).
 //!
 //! A JIT compiler writes code into memory and runs it, and keeps data in
 //! the same pages: headers, constants, addresses. It reads that memory

@@ -117,7 +117,7 @@ unpacked into a directory serves.
   control** behave as on Linux; `fork`, `exec` and `wait` make real Mac
   processes, one `fwe` for each Linux process.
 - **Programs that make code as they run** (the JIT compilers of Node.js,
-  Java, LuaJIT, Racket, Guile) run natively too.
+  Java, LuaJIT, Racket, Guile) run natively too ([jit.md](jit.md)).
 - **Networking** uses the Mac's: a server listening on a port is
   reachable from the Mac on that port, and outgoing connections go out as
   the Mac's do.

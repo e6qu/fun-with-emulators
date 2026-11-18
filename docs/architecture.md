@@ -267,101 +267,14 @@ The pieces:
 
 ### Code made executable at run time
 
-`crates/native/src/jit.rs` runs such code by translation, never changing the
-program's memory or letting the host execute it (why, and what the program
-sees, is in
-[linux-on-macos.md](linux-on-macos.md#code-made-executable-at-run-time-translated)):
-
-- **Entry:** a fetch from it faults; `on_fault` asks `jit::enter`, which
-  translates the block at the address and resumes the thread in it. A
-  new block's direct ways out are linked to targets already translated,
-  and ways out waiting for it to it (`jit::link_waiting`). A
-  block is at most 64 instructions, ends at a branch out, at an `isb` and
-  at its page's end, so it is made from one page.
-- **The code cache** is chunks of 128 MiB (a branch's reach), each
-  mapped twice with `mach_vm_remap`: written through the writable view,
-  run from the executable one. `jit::in_cache` tells a cache address
-  without a lock. A block's way out (a direct branch's, or a lookup's
-  miss) saves `x16` and `x17` below `sp` and branches to the exit gate
-  (`gate::fwe_exit_gate`) with its own address in `x16`; the gate saves
-  the program's registers in the thread's block, as the system-call gate
-  does, and calls `jit::gate_exit` without a signal: the target is
-  translated and the branch patched to it (linked, within a chunk), and
-  the gate enters that translation as a lookup does. Anything else (code
-  not translated, a signal to deliver) takes the gate's `brk`, whose
-  handler goes on from the block. A way out unlinked again when the
-  cache is emptied is `brk #0x4a54` (`jit::EXIT`), which `on_sigtrap`
-  passes to `jit::exit`. A direct branch's target that is code not
-  translated is patched to it where a branch reaches, else to a veneer
-  block (`jit::veneer`: the target in `x16`, `br x16`). A `cbz`/`tbz` of
-  `x18` loads the guest's `x18` into `x16` (saved with `x17` as a lookup
-  saves them) and tests it there.
-- **The table** of translations by guest address is 2^20 entries of
-  (address, translation) at 2^45 (32 TiB, reachable with one `orr`),
-  its place taken as fwe starts (`jit::configure`), before the program
-  maps anything that could take it. An
-  indirect branch or return saves `x16` and `x17`, indexes the table and
-  branches to the entry's translation, whose first words check that it
-  is the target's (an entry can be taken over or dropped as it is read)
-  and restore them; a miss takes the way out, which fills the entry. A
-  target outside run-time code (a library's) gets entry 0: the lookup
-  restores `x16` and `x17` and branches through the program's own
-  register (through `x18`, or a call through `x30`, by the trap). A
-  dropped entry reads as a retry stub at the first chunk's start.
-- **Following:** an exit to code fwe prepared in place
-  (`jit::followable`: in an executable mapping of the guest's, not a
-  stub) is translated as well, except a return, followed only to the
-  return point of a translated call (`State::returns`). Such code is read
-  through `prepare::original`, which gives back the instruction at a site
-  from the sites recorded as stubs were made (`prepare::SITES`), checked
-  against the stub's branch back.
-- **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
-  prepared in place links that site (`jit::link_call_site`): with every
-  other thread stopped, a stub doing the table lookup goes in the spare
-  page every stub region and loader arena keeps (`prepare::call_stub`),
-  and the `blr` becomes a `bl` to it.
-- **Guest state:** each translated word records what it stands for
-  (`Word`: the guest instruction, a point inside an expansion before or
-  after its instruction, a lookup, a way out), so `jit::to_guest` turns
-  a fault, signal, system call or tracer stop there into the guest's
-  state at its instruction: an expansion is undone (`undo`, reading back
-  what it pushed) or finished (`finish`, `step`, carrying out its
-  remaining words).
-- **Changes:** the program's `ic ivau` says which code changed. The
-  `CTR_EL0` fwe gives has `DIC` clear, as Apple's processors' has
-  under Linux, so a program that writes code invalidates each
-  instruction cache line it wrote before it runs it (`__clear_cache`).
-  In code prepared in place, `ic ivau` is a site whose stub
-  (`rewrite::flush_stub`) runs it and calls the system-call gate; a
-  translation expands it the same way. The gate tells the call from a
-  system call by the stub's load of its address (`rewrite::flush_reg`)
-  and calls `jit::flushed`, which drops the blocks made from that line
-  (`jit::drop_lines`): it unpublishes their entries and re-patches the
-  branches linked to them into ways out. A line flushed through another
-  shared mapping of the same file page (a memfd a JIT maps twice) drops
-  those of the page translated from: the mappings of each such file page
-  are noted as its code is first translated (`jit::note_aliases`) and as
-  new mappings appear (`jit::mapped`). The rest of the page is the
-  program's to write, without faults: a JIT's data beside its code. The
-  blocks a flush dropped are kept (`State::dormant`), with the program's
-  words each was made from: when its address is to be translated again,
-  the block is taken back if its words are unchanged (`jit::revive`), its
-  entry published and its branches linked. Unmapping, mapping anew,
-  changing a page's protections or giving it back (`MADV_DONTNEED`)
-  drops and forgets them, and a write fwe makes into code itself (a
-  debugger's, `procmem::write_forced`) drops the blocks of the bytes it
-  wrote (`jit::code_written`).
-- **Emptying:** when the current chunk is full and dropped or retired
-  translations are at least half the cache, `jit::flush` stops every
-  other thread (`quiesce::stop_others`) and scans their registers, 2 MiB
-  above each `sp` and the gate blocks for cache addresses: the blocks
-  found are retired (kept, found by no lookup, never linked), every page
-  guard is lifted, and each chunk holding no retired block is reused.
-  Otherwise a new chunk is added, up to 64 (8 GiB).
-- **Fork and exec:** `fork` holds the translator's lock (`jit::hold`),
-  and the child maps each chunk's executable view again from its own
-  copy of the writable one (`jit::forked`); an in-place `execve` drops
-  every translation (`jit::reset`).
+`crates/native/src/jit.rs` runs such code by translation into fwe's code
+cache, never changing the program's memory or letting the host execute
+it: a fetch from it faults and the block is translated (`jit::enter`),
+ways out go through the exit gate (`gate::fwe_exit_gate`) and are
+linked, indirect branches look their targets up in a table at 2^45, and
+the program's `ic ivau` drops the translations of the line it flushes
+(`jit::flushed`). Why, how each part works, what it costs and how other
+translators compare are in [jit.md](jit.md).
 
 ### Kept preparation and images
 
@@ -1662,11 +1575,12 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - Native: code made executable at run time costs a fault the first time
   each block runs, and each instruction cache line the program flushes
   drops the translations made from it, which are made again as the code
-  runs. Code changed without a flush (`ic ivau`) keeps running as it was
-  translated, as it may on Linux on a processor whose instruction cache
-  is kept apart (`CTR_EL0.DIC` clear, as fwe reports); so does code
-  another process writes through `/proc/<pid>/mem` other than its
-  tracer's. The code cache holds at most 8 GiB of
+  runs ([jit.md](jit.md#what-it-costs)). Code changed without a flush
+  (`ic ivau`) keeps running as it was translated, as it may on Linux on
+  a processor whose instruction cache is kept apart (`CTR_EL0.DIC`
+  clear, as fwe reports); so does code another process writes through
+  `/proc/<pid>/mem` other than its tracer's
+  ([jit.md](jit.md#code-that-changes)). The code cache holds at most 8 GiB of
   translations: filling it while fewer than half of them are dropped
   ends fwe.
 - VM: a private file mapping is a copy of the file when mapped, so later

@@ -75,6 +75,7 @@ Each document has one job; do not duplicate content across them.
 | [docs/linking.md](docs/linking.md) | Background, not fwe: how programs are built and loaded on Linux and macOS on arm64 (ELF and Mach-O, relocations, static and dynamic linking, PIE, static PIE and their code, virtual memory, ASLR, TLS, program start) |
 | [docs/architecture.md](docs/architecture.md) | How each part works, and the current limitations |
 | [docs/comparisons.md](docs/comparisons.md) | fwe beside other ways to run Linux programs (Wine, VMs, WSL, gVisor, translators, the Linuxulator, rebuilding) and what it takes from each |
+| [docs/jit.md](docs/jit.md) | Code made at run time (JIT compilers', self-modifying code): why and how it runs by translation, how changes are found, what it costs, the runtimes tested, how other translators do it |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
 

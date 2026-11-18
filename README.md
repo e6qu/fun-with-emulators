@@ -22,7 +22,7 @@ backends:
   one linked low whose link kept its relocations, moved above 4 GiB.
   `fwe` rewrites the few instructions macOS does not let a Linux program
   run unchanged, and runs code a program makes at run time (a JIT's) by
-  translation into a code cache of its own.
+  translation into a code cache of its own ([docs/jit.md](docs/jit.md)).
 - **Hypervisor**, for any other program linked at a fixed address below
   4 GiB, which macOS reserves: it runs unmodified in a small
   Hypervisor.framework VM, its system calls served by the same code. This
@@ -63,6 +63,7 @@ Native speed, graphical programs and gVisor are the work left to 1.0;
 | [docs/linking.md](docs/linking.md) | How programs are built and loaded, Linux and macOS on arm64: ELF and Mach-O, relocations, static and dynamic linking, PIE and static PIE and their code, virtual memory, ASLR, thread-local storage, program start |
 | [docs/architecture.md](docs/architecture.md) | How each part of fwe works, and its current limitations |
 | [docs/comparisons.md](docs/comparisons.md) | fwe beside Wine, WSL, Linux VMs, gVisor, QEMU, Rosetta, FreeBSD's Linuxulator and others |
+| [docs/jit.md](docs/jit.md) | How code a program makes at run time (a JIT compiler's) runs by translation, what it costs, and the runtimes tested |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, its safety rules, and running it |
 
 ## Usage

@@ -78,7 +78,7 @@ the roadmap.
   macOS forces (system calls, thread-pointer accesses and `x18` uses,
   each one instruction branched to a stub), and code a program makes at
   run time runs from translations in fwe's code cache, its own memory
-  untouched. No VM is used where one is not needed.
+  untouched ([docs/jit.md](docs/jit.md)). No VM is used where one is not needed.
 - **Native speed:** fwe's cost is what the layer adds; no abstraction of
   fwe's may put a cost in the program's own code. What fwe adds at system
   calls, process and thread creation, start-up and in programs at work is

@@ -211,6 +211,9 @@ as it wrote it. Code loaded from files it rewrites in place instead,
 guided by the program's unwind tables and symbols, and traps where it
 cannot rewrite (see
 [linux-on-macos.md](linux-on-macos.md#which-instructions-get-translated-and-how)).
+How its translation, and DynamoRIO's, QEMU's, FEX's and Box64's, learn
+that code changed and share their code caches is in
+[jit.md](jit.md#how-others-do-it).
 
 ### FEX and Box64
 
