@@ -163,6 +163,12 @@ pub fn crosses(addr: u64, len: u64) -> bool {
     table().iter().any(|t| addr < t.hi && end > t.lo && (addr < t.lo || end > t.hi))
 }
 
+/// How many bytes from guest address `addr` on share its translation (or
+/// its having none): what one host address reaches.
+pub fn span(addr: u64) -> u64 {
+    run(addr).1
+}
+
 /// The host address of guest address `addr`, and how many bytes from it
 /// on share its translation (`u64::MAX` for an untranslated run).
 #[cfg_attr(
