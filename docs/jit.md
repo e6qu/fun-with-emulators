@@ -229,7 +229,14 @@ a processor that reports `DIC` clear.
 
 - **Entry:** `on_fault` passes an instruction fetch fault to
   `jit::enter`, which translates the block (`jit::translate`) and
-  resumes the thread in it. A new block's direct ways out are linked to
+  resumes the thread in it. A block is translated with the translator's
+  lock let go (`jit::translation`), from one look at the program's words
+  (`jit::with_snapshot`), at no address in particular (its expansions'
+  starts set where it is placed, `jit::place`); with the lock taken
+  again it is placed only if the program's words are still as it saw
+  them and no other thread placed that block meanwhile, else it is made
+  again. A flush landing meanwhile finds nothing to drop, and the check
+  sees the change. A new block's direct ways out are linked to
   targets already translated, and ways out waiting for it to it
   (`jit::link_waiting`).
 - **Ways out:** a block's way out (a direct branch's, or a lookup's

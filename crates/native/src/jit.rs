@@ -67,6 +67,11 @@
 //! debugger's breakpoint); a write that `read` makes into memory is the
 //! program's, as on Linux, which syncs no instruction cache for it.
 //!
+//! A block is translated with the translator's lock let go, from one
+//! look at the program's words, and placed with it taken again if they
+//! are still as it saw them ([`translation`]): threads that make blocks
+//! at once wait on each other only to place them.
+//!
 //! The code cache is made of chunks, each one memory mapped twice: fwe
 //! writes translations through a writable view while threads run others
 //! from an executable one. A chunk is no larger than a branch reaches, so
@@ -545,7 +550,7 @@ pub fn counts() -> Option<String> {
 
 /// The state, locked, for a caller of kind `site` ([`HOLD_NS`]).
 fn state_at(site: usize) -> Held {
-    Held { s: lock_state(), site, since: std::time::Instant::now() }
+    Held { s: Some(lock_state()), site, since: std::time::Instant::now() }
 }
 
 fn state() -> Held {
@@ -555,21 +560,35 @@ fn state() -> Held {
 /// [`STATE`] locked, and how long it is held counted by the kind of its
 /// holder.
 struct Held {
-    s: std::sync::MutexGuard<'static, State>,
+    /// The lock (none only while [`Held::unlocked`] runs its work).
+    s: Option<std::sync::MutexGuard<'static, State>>,
     site: usize,
     since: std::time::Instant,
+}
+
+impl Held {
+    /// `work` done with the lock let go, and taken again after: the state
+    /// may have changed meanwhile.
+    fn unlocked<R>(&mut self, work: impl FnOnce() -> R) -> R {
+        HOLD_NS[self.site].fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.s = None;
+        let r = work();
+        self.s = Some(lock_state());
+        self.since = std::time::Instant::now();
+        r
+    }
 }
 
 impl std::ops::Deref for Held {
     type Target = State;
     fn deref(&self) -> &State {
-        &self.s
+        self.s.as_ref().expect("the translator's lock held")
     }
 }
 
 impl std::ops::DerefMut for Held {
     fn deref_mut(&mut self) -> &mut State {
-        &mut self.s
+        self.s.as_mut().expect("the translator's lock held")
     }
 }
 
@@ -1160,8 +1179,10 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     }
     let i = translation(&mut s, to);
     // Linked where the target is in reach (in the same chunk), unless the
-    // cache was emptied meanwhile (`at` may be reused).
+    // cache was emptied meanwhile (`at` may be reused) or the block left
+    // since (the lock let go as it was translated).
     let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
+    let from_retired = same && from.is_some_and(|f| s.blocks[f].retired);
     // (Linked already where the way out waited for the translation.)
     if link_here
         && same
@@ -1398,29 +1419,53 @@ fn entered(s: &State, i: usize, saved: bool, x18: bool) -> u64 {
     }
 }
 
-/// The translation of program address `g`, made if there is none.
-fn translation(s: &mut State, g: u64) -> usize {
-    if let Some(&i) = s.by_g.get(&g) {
-        // Its table entry may have gone to another address since (they
-        // share entries): it is its own again.
-        publish(g, s.blocks[i].t);
-        return i;
+/// The translation of program address `g`, made if there is none:
+/// without the lock (it is let go a moment), from one look at the
+/// program's words, and placed if they are still as it saw them and no
+/// other thread placed one meanwhile (else it looks again).
+fn translation(s: &mut Held, g: u64) -> usize {
+    loop {
+        if let Some(&i) = s.by_g.get(&g) {
+            // Its table entry may have gone to another address since (they
+            // share entries): it is its own again.
+            publish(g, s.blocks[i].t);
+            return i;
+        }
+        if s.cache.is_none() {
+            s.cache = Some(new_cache());
+        }
+        let page = g & !(page_size() - 1);
+        let followed = !s.in_region(g);
+        if let Some(i) = revive(s, g, page) {
+            return i;
+        }
+        let source = snapshot(g);
+        // (Made at 0, its words standing anywhere; placed below.)
+        let made = s.unlocked(|| {
+            let began = std::time::Instant::now();
+            let made = with_snapshot(g, &source, || translate(g, 0, followed));
+            TRANSLATE_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            made
+        });
+        let read_words = ((made.end - g) / 4) as usize;
+        let same = source[..read_words].iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w);
+        if s.by_g.contains_key(&g) || !same || followed == s.in_region(g) {
+            continue;
+        }
+        return place(s, g, followed, made, source[..read_words].to_vec());
     }
-    if s.cache.is_none() {
-        s.cache = Some(new_cache());
-    }
+}
+
+/// Place translation `made` of the block at `g` (`followed`, of code fwe
+/// prepared in place; `source`, the program's words it was made from) in
+/// the cache, and publish it.
+fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
+    let Made { words, mut info, entry, unsaved, x18, calls, end: _ } = made;
     // (Room is made first: emptying the cache forgets every page's other
     // mappings.)
     let page = g & !(page_size() - 1);
-    let at = cache_next(s);
+    cache_next(s);
     note_aliases(s, page);
-    let followed = !s.in_region(g);
-    if let Some(i) = revive(s, g, page) {
-        return i;
-    }
-    let began = std::time::Instant::now();
-    let Made { words, info, entry, unsaved, x18, calls, end } = translate(g, at, followed);
-    TRANSLATE_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
@@ -1430,6 +1475,12 @@ fn translation(s: &mut State, g: u64) -> usize {
         }
     }
     let t = emit(s, &words);
+    // Its expansions' starts, made at 0, where it stands.
+    for w in &mut info {
+        if let Word::Undo { start, .. } = w {
+            *start += t;
+        }
+    }
     let len = 4 * words.len() as u64;
     s.cache.as_mut().expect("a code cache").live += len;
     let i = s.blocks.len();
@@ -1444,7 +1495,7 @@ fn translation(s: &mut State, g: u64) -> usize {
         unsaved: t + 4 * unsaved as u64,
         x18: if x18 == 0 { 0 } else { t + 4 * x18 as u64 },
         retired: false,
-        source: (g..end).step_by(4).map(read).collect(),
+        source,
         followed,
     });
     s.by_g.insert(g, i);
@@ -1928,10 +1979,42 @@ fn emit(s: &mut State, words: &[u32]) -> u64 {
     write(s.cache.as_mut().expect("a code cache"), words)
 }
 
-/// The program's instruction at `g`, read from its memory.
+/// The program's instruction at `g`, read from its memory, or from the
+/// words [`with_snapshot`] holds there while it translates.
 fn read(g: u64) -> u32 {
+    let (base, words, n) = SNAPSHOT.with(std::cell::Cell::get);
+    if g >= base && g < base + 4 * n as u64 {
+        // SAFETY: inside the words `with_snapshot` keeps alive while it
+        // runs.
+        return unsafe { words.add(((g - base) / 4) as usize).read() };
+    }
     // SAFETY: the program's code, mapped readable (it runs by translation).
     unsafe { (g as *const u32).read() }
+}
+
+thread_local! {
+    /// The program's words [`read`] reads where it is asked for them: from
+    /// an address, so many ([`with_snapshot`]).
+    static SNAPSHOT: std::cell::Cell<(u64, *const u32, usize)> =
+        const { std::cell::Cell::new((0, std::ptr::null(), 0)) };
+}
+
+/// The program's words from `g` as far as a block made there reads them:
+/// up to its page's end.
+fn snapshot(g: u64) -> Vec<u32> {
+    let page = page_size();
+    let n = (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize);
+    (0..n as u64).map(|k| read(g + 4 * k)).collect()
+}
+
+/// `work`, with [`read`] taking the program's words from `g` from `words`:
+/// a translation made from one look at them, which another thread may be
+/// changing meanwhile.
+fn with_snapshot<R>(g: u64, words: &[u32], work: impl FnOnce() -> R) -> R {
+    SNAPSHOT.with(|c| c.set((g, words.as_ptr(), words.len())));
+    let r = work();
+    SNAPSHOT.with(|c| c.set((0, std::ptr::null(), 0)));
+    r
 }
 
 /// Translate the block at program address `g`, to be placed at `t`: its
