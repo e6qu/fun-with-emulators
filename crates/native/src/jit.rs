@@ -1017,9 +1017,9 @@ pub fn store(
     if !permission_write {
         return false;
     }
-    // (x18 is never a register of the program's code as it runs.)
-    let names_x18 =
-        w & 31 == 18 || (w >> 5) & 31 == 18 || (w >> 10) & 31 == 18 || (w >> 16) & 31 == 18;
+    // (x18 is never a register of the program's code as it runs; the
+    // fields an immediate fills are no register.)
+    let names_x18 = crate::decode::names_x18(w);
     let left = |why: usize| {
         STORES_LEFT[why].fetch_add(1, Ordering::Relaxed);
         false
@@ -2483,6 +2483,22 @@ mod tests {
     /// Registers whose value is 0x100 times their number, `sp` (31) 0x9000.
     fn reg(r: usize) -> u64 {
         if r == 31 { 0x9000 } else { 0x100 * r as u64 }
+    }
+
+    #[test]
+    fn a_store_names_x18_only_in_its_register_fields() {
+        // Encodings from the assembler; an immediate's bits are no register.
+        let cases = [
+            (0xf900_4841, "str x1, [x2, #144]", false),
+            (0xf900_0052, "str x18, [x2]", true),
+            (0xf900_0641, "str x1, [x18, #8]", true),
+            (0xa900_4841, "stp x1, x18, [x2]", true),
+            (0xf832_6841, "str x1, [x2, x18]", true),
+            (0xc8f2_fc41, "casal x18, x1, [x2]", true),
+        ];
+        for (w, text, x18) in cases {
+            assert_eq!(crate::decode::names_x18(w), x18, "{text}");
+        }
     }
 
     #[test]
