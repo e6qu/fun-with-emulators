@@ -401,6 +401,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let (before_x, before_sp, before_pstate) = (b.regs.x, b.regs.sp, b.regs.pstate);
     let regs = &mut b.regs;
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    let began = fwe_kernel::timing::call_began();
     if thread_clone {
         let a = if nr == CLONE {
             Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
@@ -418,6 +419,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     } else {
         KERNEL.syscall(regs);
     }
+    fwe_kernel::timing::call_done(nr, began);
     b.ran = 1;
     // A changed mask is the host thread's now (the guest's is in force in
     // its code): a signal it unblocks that is pending is seen below.
@@ -628,6 +630,7 @@ fn settle(regs: &mut Regs) {
 }
 
 extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    fwe_kernel::timing::signal(sig);
     let in_guest = IN_GUEST.with(Cell::get);
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let pc = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).ss.pc };
@@ -813,6 +816,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         unsafe { return_with_guest_mask(ctx) };
         return;
     }
+    let began = fwe_kernel::timing::call_began();
     if nr == fwe_abi::nr::CLONE || nr == fwe_abi::nr::CLONE3 {
         let a = if nr == fwe_abi::nr::CLONE {
             Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
@@ -881,6 +885,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     } else {
         KERNEL.syscall(&mut regs);
     }
+    fwe_kernel::timing::call_done(nr, began);
     // The exit's stop, its result in `x0`.
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, false);
@@ -898,6 +903,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
 /// and the signal is delivered when that call returns — a blocking call was
 /// interrupted by it.
 extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    fwe_kernel::timing::signal(sig);
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let sent = || unsafe { host::signal_info(sig, info) };
     take_async(sig, sent, ctx, guest_interrupted(ctx));
@@ -1211,6 +1217,7 @@ pub fn post_early() {
 }
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    fwe_kernel::timing::signal(sig);
     // A process that sends itself one of these signals has it emulated (see
     // `Kernel::sys_kill`), so here it is a fault, or a signal sent by
     // another process, which macOS's siginfo does not tell apart (it gives

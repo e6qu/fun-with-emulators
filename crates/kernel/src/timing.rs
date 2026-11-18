@@ -49,3 +49,60 @@ fn write_mark(name: &str) {
 pub fn on() -> bool {
     ON.load(Relaxed)
 }
+
+/// The guest's system calls by number, and the nanoseconds they took, and
+/// the host signals fwe handled by number: for `FWE_TIMING`'s mark as a
+/// process ends ([`calls_and_signals`]). Counted only with it on.
+static CALLS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+static CALL_NS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+static SIGNALS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
+
+/// The start of a system call's run, if [`on`].
+#[inline]
+pub fn call_began() -> Option<Instant> {
+    on().then(Instant::now)
+}
+
+/// System call `nr`, begun at `began` ([`call_began`]), done.
+#[inline]
+pub fn call_done(nr: u64, began: Option<Instant>) {
+    if let Some(b) = began {
+        let i = (nr as usize).min(CALLS.len() - 1);
+        CALLS[i].fetch_add(1, Relaxed);
+        CALL_NS[i].fetch_add(b.elapsed().as_nanos() as u64, Relaxed);
+    }
+}
+
+/// Host signal `sig` taken by fwe's handlers.
+#[inline]
+pub fn signal(sig: i32) {
+    if on() {
+        SIGNALS[(sig as usize).min(SIGNALS.len() - 1)].fetch_add(1, Relaxed);
+    }
+}
+
+/// The calls that took longest (number, count, milliseconds) and the
+/// signals taken (number, count), as text.
+pub fn calls_and_signals() -> String {
+    let mut calls: Vec<(usize, u64, u64)> = (0..CALLS.len())
+        .map(|i| (i, CALLS[i].load(Relaxed), CALL_NS[i].load(Relaxed)))
+        .filter(|c| c.1 > 0)
+        .collect();
+    calls.sort_by_key(|c| std::cmp::Reverse(c.2));
+    let total: u64 = calls.iter().map(|c| c.1).sum();
+    let calls: Vec<String> = calls
+        .iter()
+        .take(12)
+        .map(|(i, n, ns)| format!("{i}: {n} ({} ms)", ns / 1_000_000))
+        .collect();
+    let signals: Vec<String> = (0..SIGNALS.len())
+        .map(|i| (i, SIGNALS[i].load(Relaxed)))
+        .filter(|s| s.1 > 0)
+        .map(|(i, n)| format!("{i}: {n}"))
+        .collect();
+    format!(
+        "{total} system calls, by number, the longest: {}; host signals by number: {}",
+        calls.join(", "),
+        signals.join(", ")
+    )
+}

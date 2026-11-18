@@ -44,6 +44,7 @@ fn mark_exit() {
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();
         fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
+        fwe_kernel::timing::mark(&format!("exit: {}", fwe_kernel::timing::calls_and_signals()));
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if let Some(counts) = jit::counts() {
             fwe_kernel::timing::mark(&format!("exit: {counts}"));
