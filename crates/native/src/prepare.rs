@@ -140,6 +140,7 @@ pub fn original(at: u64, w: u32) -> u32 {
         Site::WriteThreadPointer { rt } => rewrite::MSR_TPIDR | rt,
         Site::X18 { insn } => insn,
         Site::Syscall { .. } => rewrite::SVC0,
+        Site::Flush { rt, .. } => rewrite::IC_IVAU | rt,
     }
 }
 
@@ -433,8 +434,9 @@ pub unsafe fn prepare(
         .sites
         .iter()
         .filter_map(|&(off, site)| match site {
-            Site::Syscall { .. } if gate == 0 => None,
+            Site::Syscall { .. } | Site::Flush { .. } if gate == 0 => None,
             Site::Syscall { .. } => Some((off, Site::Syscall { gate })),
+            Site::Flush { rt, .. } => Some((off, Site::Flush { rt, gate })),
             _ => Some((off, site)),
         })
         .collect();
@@ -689,6 +691,7 @@ fn put_site(e: &mut fwe_kernel::snapshot::Enc, s: Site) {
         Site::WriteThreadPointer { rt } => (1, rt),
         Site::X18 { insn } => (2, insn),
         Site::Syscall { .. } => (3, 0),
+        Site::Flush { rt, .. } => (4, rt),
     };
     e.u32(kind);
     e.u32(v);
@@ -702,6 +705,7 @@ fn get_site(d: &mut fwe_kernel::snapshot::Dec, gate: u64) -> Option<Site> {
         1 => Site::WriteThreadPointer { rt: v },
         2 => Site::X18 { insn: v },
         3 if gate != 0 => Site::Syscall { gate },
+        4 if gate != 0 => Site::Flush { rt: v, gate },
         _ => return None,
     })
 }

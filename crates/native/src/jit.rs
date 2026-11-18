@@ -37,10 +37,21 @@
 //!
 //! What the program can observe stays its own: a fault or signal in a
 //! translation is delivered at the program's instruction, with its
-//! registers ([`to_guest`]); a page a translation was made from is kept
-//! from being written, through its own mapping and any other of the same
-//! file's page, and a write to it (the program's, or the host's for it)
-//! drops its translations, so code the program changes is translated anew.
+//! registers ([`to_guest`]).
+//!
+//! Code the program changes is translated anew. The program says where:
+//! arm64 has the instruction cache kept apart from data writes (the
+//! `CTR_EL0` fwe gives says so, as Apple's processors' does under Linux),
+//! so a program that writes code invalidates each cache line it wrote
+//! (`ic ivau`) before it runs it, as `__clear_cache` does. fwe takes that
+//! instruction ([`crate::rewrite`]'s stub, or a translation's) for the
+//! word that the line changed, and drops the blocks made from it, through
+//! any mapping of the same memory ([`flushed`]). The rest of the page is
+//! the program's to write as it likes: a JIT keeps its data beside its
+//! code. Memory mapped, unmapped, given other protections or discarded
+//! drops its translations too, as does a write fwe makes into code (a
+//! debugger's breakpoint); a write that `read` makes into memory is the
+//! program's, as on Linux, which syncs no instruction cache for it.
 //!
 //! The code cache is made of chunks, each one memory mapped twice: fwe
 //! writes translations through a writable view while threads run others
@@ -98,13 +109,8 @@ fn chunk_size() -> u64 {
 
 /// Read `FWE_JIT_CHUNK`, before any code runs by translation.
 pub fn configure() {
-    install();
+    fwe_kernel::procmem::on_code_written(code_written);
     reserve_table();
-    // TEMPORARY (bisecting a JDK crash): store forms left to drop pages
-    // (1 base written back, 2 release, 4 cas), and the flat limit.
-    let n = |k: &str| std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-    STORE_OFF.store(n("FWE_JIT_STORE_OFF"), Ordering::Relaxed);
-    STORE_FLAT.store(n("FWE_JIT_STORE_FLAT"), Ordering::Relaxed);
     let Some(v) = std::env::var_os("FWE_JIT_CHUNK") else { return };
     let size: u64 = v
         .to_str()
@@ -142,11 +148,6 @@ fn reserve_table() {
     }
 }
 
-/// Have writes the host makes for the program release pages kept from
-/// writes first ([`host_writes`]).
-fn install() {
-    fwe_kernel::mm::on_host_writes(host_writes);
-}
 /// Room left in a chunk below which the next block goes in a new one: the
 /// most a block's translation takes.
 const BLOCK_ROOM: u64 = 4 * 64 * 24;
@@ -242,8 +243,8 @@ struct Block {
     /// return into it: found by no lookup, and its ways out not linked.
     retired: bool,
     /// The program's words it was made from, from `g` on, and whether it
-    /// was followed into (code not run by translation): dropped by a write
-    /// to its page, it is taken back while they are the same ([`revive`]).
+    /// was followed into (code not run by translation): dropped by a flush
+    /// of them, it is taken back while they are the same ([`revive`]).
     source: Vec<u32>,
     followed: bool,
 }
@@ -255,7 +256,7 @@ struct Cache {
     current: usize,
     /// The retry stub (a dropped entry's value), at the first chunk's start.
     stub: u64,
-    /// Bytes of translations in use, and of those dropped (written over,
+    /// Bytes of translations in use, and of those dropped (flushed,
     /// unmapped) or retired, whose room is had back by emptying the cache.
     live: u64,
     garbage: u64,
@@ -283,17 +284,6 @@ pub struct State {
     /// Translations by their address in the cache: start -> block index.
     by_t: BTreeMap<u64, usize>,
     blocks: Vec<Block>,
-    /// The program's pages kept from being written (written, they get
-    /// their protections back and their translations go).
-    guarded: std::collections::BTreeSet<u64>,
-    /// Pages -> how many times their guard was lifted. A write that faulted
-    /// on a guard another thread lifted before this one's fault was handled
-    /// finds the page unguarded: it is tried again while the page's guard
-    /// changes between its tries ([`written`]).
-    lifted: BTreeMap<u64, u64>,
-    /// Host threads -> the address and the page's lift count of the write
-    /// each last tried again with its page unguarded.
-    retried: BTreeMap<u64, (u64, u64)>,
     /// Program pages -> the blocks made from them.
     pages: BTreeMap<u64, Vec<usize>>,
     /// Program addresses the table says are code not
@@ -306,8 +296,8 @@ pub struct State {
     /// [`State::objects`] the other way: page -> its file page.
     object_of: BTreeMap<u64, (u64, u64, u64)>,
     /// Pages of other mappings of those files' pages -> the pages
-    /// translated from that they also map. Kept from writes: a write
-    /// through one drops their translations.
+    /// translated from that they also map: a flush through one drops
+    /// their translations ([`flushed`]).
     aliases: BTreeMap<u64, std::collections::BTreeSet<u64>>,
     /// Code not translated -> the block that branches to it from the
     /// cache where a direct branch does not reach ([`veneer`]).
@@ -322,15 +312,10 @@ pub struct State {
     /// translations that lead there, linked as the target is translated
     /// ([`link_waiting`]) rather than each through fwe's trap.
     waiting: BTreeMap<u64, Vec<u64>>,
-    /// Program addresses -> the block made there that a write to its page
-    /// dropped, taken back when the address is to be translated again if
-    /// its words were not written ([`revive`]).
+    /// Program addresses -> the block made there that a flush of its
+    /// words dropped, taken back when the address is to be translated
+    /// again if its words were not changed ([`revive`]).
     dormant: BTreeMap<u64, usize>,
-    /// Pages kept from writes -> a second, writable mapping of each,
-    /// through which fwe makes the program's stores there that miss the
-    /// code translated from it ([`store`]), and how many it made there.
-    /// Not inherited by a fork child.
-    writers: BTreeMap<u64, (u64, u64)>,
     cache: Option<Cache>,
 }
 
@@ -339,9 +324,6 @@ static STATE: Mutex<State> = Mutex::new(State {
     by_g: BTreeMap::new(),
     by_t: BTreeMap::new(),
     blocks: Vec::new(),
-    guarded: std::collections::BTreeSet::new(),
-    lifted: BTreeMap::new(),
-    retried: BTreeMap::new(),
     pages: BTreeMap::new(),
     outside: std::collections::BTreeSet::new(),
     objects: BTreeMap::new(),
@@ -352,7 +334,6 @@ static STATE: Mutex<State> = Mutex::new(State {
     call_sites: std::collections::BTreeSet::new(),
     waiting: BTreeMap::new(),
     dormant: BTreeMap::new(),
-    writers: BTreeMap::new(),
     cache: None,
 });
 
@@ -376,56 +357,12 @@ static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 /// nanoseconds.
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
+/// Cache lines the program flushed, the blocks those flushes dropped,
+/// and blocks taken back ([`revive`]).
+static LINES_FLUSHED: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static REVIVED: AtomicU64 = AtomicU64::new(0);
-/// Stores fwe makes into a page while it is kept from writes, at least,
-/// before the next lets it be written: as many as the page has blocks
-/// translated from it, if more. A store made is a fault (some 6 µs); a
-/// write let be made drops the page's blocks, and each taken back costs
-/// a way out through fwe (some 4 µs).
-const STORES_KEPT: u64 = 16;
-static STORE_OFF: AtomicU64 = AtomicU64::new(0);
-static STORE_FLAT: AtomicU64 = AtomicU64::new(0);
-/// Stores into pages kept from writes that fwe left to drop the page's
-/// translations, by why: not a store it decodes, on a page another
-/// mapping shares, or past [`STORES_KEPT`].
-static STORES_LEFT: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
-/// The program's stores fwe made for it into pages kept from writes, and
-/// those of them into translated code.
-static STORES: AtomicU64 = AtomicU64::new(0);
-static STORES_INTO_CODE: AtomicU64 = AtomicU64::new(0);
-/// The forms of the stores not decoded ([`STORES_LEFT`]'s first): the
-/// instruction's top ten bits (its class, size and addressing) and how
-/// many, the first [`FORMS`] seen.
-const FORMS: usize = 8;
-static UNDECODED: [(AtomicU64, AtomicU64); FORMS] =
-    [const { (AtomicU64::new(u64::MAX), AtomicU64::new(0)) }; FORMS];
-
-/// Count store `w`, not decoded, by its form ([`UNDECODED`]).
-fn undecoded(w: u32) {
-    let form = u64::from(w & 0xffc0_0000);
-    for (k, n) in &UNDECODED {
-        let seen = match k.compare_exchange(u64::MAX, form, Ordering::Relaxed, Ordering::Relaxed) {
-            Ok(_) => form,
-            Err(v) => v,
-        };
-        if seen == form {
-            n.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-    }
-}
-
-/// The forms [`undecoded`] counted, most first.
-fn undecoded_forms() -> String {
-    let mut forms: Vec<(u64, u64)> = UNDECODED
-        .iter()
-        .map(|(k, n)| (k.load(Ordering::Relaxed), n.load(Ordering::Relaxed)))
-        .filter(|&(k, _)| k != u64::MAX)
-        .collect();
-    forms.sort_by_key(|&(_, n)| std::cmp::Reverse(n));
-    forms.iter().map(|(k, n)| format!(" {k:#010x}:{n}")).collect()
-}
+/// Times the code cache was emptied.
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// What [`TRANSLATED`] and the others counted, if any code ran by
@@ -436,9 +373,8 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} pages' translations dropped by writes ({} blocks taken back, {} stores made by fwe, {} of them into code, \
-             left: {} not decoded ({}), {} shared, {} past the limit), the code cache emptied {} times; \
-             {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in stores, {} in writes, {} in entries, {} in the gate, {} else",
+             {} cache lines flushed ({} blocks dropped, {} taken back), the code cache emptied {} times; \
+             {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
@@ -446,22 +382,16 @@ pub fn counts() -> Option<String> {
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
+            LINES_FLUSHED.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
             REVIVED.load(Ordering::Relaxed),
-            STORES.load(Ordering::Relaxed),
-            STORES_INTO_CODE.load(Ordering::Relaxed),
-            STORES_LEFT[0].load(Ordering::Relaxed),
-            undecoded_forms().trim_start(),
-            STORES_LEFT[1].load(Ordering::Relaxed),
-            STORES_LEFT[2].load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
             TRANSLATE_NS.load(Ordering::Relaxed) / 1_000_000,
             EXIT_NS.load(Ordering::Relaxed) / 1_000_000,
             LOCK_WAITS.load(Ordering::Relaxed),
             LOCK_WAIT_NS.load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_EXIT].load(Ordering::Relaxed) / 1_000_000,
-            HOLD_NS[HOLD_STORE].load(Ordering::Relaxed) / 1_000_000,
-            HOLD_NS[HOLD_WRITTEN].load(Ordering::Relaxed) / 1_000_000,
+            HOLD_NS[HOLD_FLUSH].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_ENTER].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_GATE].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_OTHER].load(Ordering::Relaxed) / 1_000_000
@@ -505,16 +435,15 @@ impl Drop for Held {
     }
 }
 
-/// How long [`STATE`] was held, by its holders' kinds: ways out, stores
-/// fwe made, writes that dropped pages, entries by fetch, the exit gate's
-/// look at where it goes, and the rest.
+/// How long [`STATE`] was held, by its holders' kinds: ways out, the
+/// program's flushes, entries by fetch, the exit gate's look at where it
+/// goes, and the rest.
 const HOLD_EXIT: usize = 0;
-const HOLD_STORE: usize = 1;
-const HOLD_WRITTEN: usize = 2;
-const HOLD_ENTER: usize = 3;
-const HOLD_GATE: usize = 4;
-const HOLD_OTHER: usize = 5;
-static HOLD_NS: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+const HOLD_FLUSH: usize = 1;
+const HOLD_ENTER: usize = 2;
+const HOLD_GATE: usize = 3;
+const HOLD_OTHER: usize = 4;
+static HOLD_NS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
 
 fn lock_state() -> std::sync::MutexGuard<'static, State> {
     match STATE.try_lock() {
@@ -587,37 +516,22 @@ impl State {
         unsafe { crate::prepare::flush_icache(at, 4) };
     }
 
-    /// Drop the translations made from `[addr, addr + len)`, and give the
-    /// pages kept from writes there their protections back. `written`: a
-    /// write to the pages drops them, which keeps them to take back
-    /// ([`State::dormant`]); anything else (the memory unmapped, mapped
-    /// anew, its protections changed) forgets them.
-    fn drop_range(&mut self, addr: u64, len: u64, written: bool) {
+    /// Drop the translations made from `[addr, addr + len)`, and forget
+    /// them: the memory was unmapped, mapped anew, its protections changed
+    /// or its pages discarded.
+    fn drop_range(&mut self, addr: u64, len: u64) {
         let start = addr & !(page_size() - 1);
         let end = addr.saturating_add(len);
-        if !written {
-            let gone: Vec<u64> = self.dormant.range(start..end).map(|(&g, _)| g).collect();
-            for g in gone {
-                self.dormant.remove(&g);
-            }
+        let gone: Vec<u64> = self.dormant.range(start..end).map(|(&g, _)| g).collect();
+        for g in gone {
+            self.dormant.remove(&g);
         }
-        // The pages in the range that are kept from writes or translated
-        // from (not every page of it: a range may be a reservation of
-        // terabytes).
-        let guarded: Vec<u64> = self.guarded.range(start..end).copied().collect();
-        for p in guarded {
-            self.guarded.remove(&p);
-            unwriter(self, p);
-            lift(p);
-            *self.lifted.entry(p).or_default() += 1;
-        }
-        // Other mappings of translated pages: the code they map may change
-        // through them now, so its translations go too.
+        // Other mappings of translated pages there map something else now.
+        // (The pages in the range translated from, not every page of it:
+        // a range may be a reservation of terabytes.)
         let aliases: Vec<u64> = self.aliases.range(start..end).map(|(&q, _)| q).collect();
         for q in aliases {
-            for p in self.aliases.remove(&q).unwrap_or_default() {
-                self.drop_range(p, page_size(), written);
-            }
+            self.aliases.remove(&q);
         }
         let pages: Vec<u64> = self.pages.range(start..end).map(|(&p, _)| p).collect();
         for p in pages {
@@ -630,22 +544,22 @@ impl State {
                 }
             }
             for i in self.pages.remove(&p).unwrap_or_default() {
-                self.drop_block(i, written);
+                self.drop_block(i, false);
             }
         }
     }
 
     /// Drop block `i`'s translation, if it is its address's (the caller
-    /// takes it off its page's list). `written`: kept to take back, as in
-    /// [`State::drop_range`].
-    fn drop_block(&mut self, i: usize, written: bool) {
+    /// takes it off its page's list). `flushed`: kept to take back
+    /// ([`revive`]).
+    fn drop_block(&mut self, i: usize, flushed: bool) {
         let (g, t) = (self.blocks[i].g, self.blocks[i].t);
         if self.by_g.get(&g) != Some(&i) {
             return;
         }
         self.by_g.remove(&g);
         unpublish(g, t);
-        if written {
+        if flushed {
             self.dormant.insert(g, i);
         }
         let len = self.blocks[i].len;
@@ -666,22 +580,11 @@ impl State {
     }
 }
 
-/// Page `p`, kept from writes, gets the protections the program's mapping
-/// has now: what it had, or what a call that just changed it (`mmap`,
-/// `mprotect`) gave it. A page no longer mapped is left alone.
-fn lift(p: u64) {
-    let now = fwe_kernel::maps::record().areas_in(p, p + page_size()).first().map(|a| a.value.prot);
-    if let Some(prot) = now {
-        // SAFETY: a page of the program's memory.
-        unsafe { libc::mprotect(p as *mut libc::c_void, page_size() as usize, host_prot(prot)) };
-    }
-}
-
 /// `[addr, addr + len)` holds code the program made executable after it
 /// mapped it: it runs by translation from now on.
 pub fn code(addr: u64, len: u64) {
     let mut s = state();
-    s.drop_range(addr, len, false);
+    s.drop_range(addr, len);
     remove(&mut s.regions, addr, len);
     s.regions.insert(addr, addr + len);
     // Lookups that took its addresses for code not translated go again.
@@ -695,13 +598,78 @@ pub fn code(addr: u64, len: u64) {
 }
 
 /// `[addr, addr + len)` is about to be replaced by fresh pages, mapped as
-/// it was (`MADV_DONTNEED`): its translations go, and the pages kept from
-/// writes there get their protections back (a writable mapping of a page
-/// would write the memory it replaces), but it still holds code to
-/// translate.
+/// it was (`MADV_DONTNEED`): its translations go, but it still holds code
+/// to translate.
 pub fn discarded(addr: u64, len: u64) {
-    state().drop_range(addr, len, false);
+    state().drop_range(addr, len);
 }
+
+/// The program invalidated the instruction cache line at `addr` (`ic
+/// ivau`), as it does after writing code there: the blocks made from the
+/// line, through this mapping or another of the same memory, go. Each is
+/// kept, and taken back if its words turn out unchanged ([`revive`]).
+pub fn flushed(addr: u64) {
+    LINES_FLUSHED.fetch_add(1, Ordering::Relaxed);
+    if TRANSLATED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let line = 4 << (crate::hwcap::CTR_EL0 & 15);
+    let mut s = state_at(HOLD_FLUSH);
+    drop_lines(&mut s, addr & !(line - 1), line);
+}
+
+/// fwe wrote the program's code at `[addr, addr + len)` itself (a
+/// debugger's breakpoint, through `ptrace` or `/proc/pid/mem`): as Linux
+/// syncs the instruction cache there, the blocks made from it go.
+fn code_written(addr: u64, len: u64) {
+    // SAFETY: memory fwe just wrote, mapped.
+    unsafe { crate::prepare::flush_icache(addr, len) };
+    if TRANSLATED.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut s = state();
+    let (mut at, end) = (addr, addr.saturating_add(len));
+    while at < end {
+        let next = ((at & !(page_size() - 1)) + page_size()).min(end);
+        drop_lines(&mut s, at, next - at);
+        at = next;
+    }
+}
+
+/// Drop the blocks made from `[addr, addr + len)` (within a page), kept
+/// to take back, through this mapping and any other of the same file's
+/// page.
+fn drop_lines(s: &mut State, addr: u64, len: u64) {
+    let ps = page_size();
+    let page = addr & !(ps - 1);
+    let mut pages = vec![page];
+    pages.extend(s.aliases.get(&page).into_iter().flatten().copied());
+    if let Some(ps) = s.object_of.get(&page).and_then(|k| s.objects.get(k)) {
+        pages.extend(ps.iter().copied());
+    }
+    pages.sort_unstable();
+    pages.dedup();
+    let (off, end) = (addr - page, (addr - page + len).min(ps));
+    for p in pages {
+        let Some(blocks) = s.pages.get(&p) else { continue };
+        let (hit, kept): (Vec<usize>, Vec<usize>) = blocks.iter().partition(|&&i| {
+            let b = &s.blocks[i];
+            p + off < b.g + 4 * b.source.len() as u64 && p + end > b.g
+        });
+        if hit.is_empty() {
+            continue;
+        }
+        s.pages.insert(p, kept);
+        for i in hit {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            s.drop_block(i, true);
+        }
+    }
+}
+
+/// Whether a page translated from maps a file shared ([`State::objects`]),
+/// ever: until one does, a mapping takes no lock ([`mapped`]).
+static ANY_OBJECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// `[addr, addr + len)` no longer holds such code, or changed beyond what
 /// fwe kept watch over (unmapped, mapped anew, its protections changed):
@@ -710,12 +678,8 @@ pub fn changed(addr: u64, len: u64) -> bool {
     let mut s = state();
     let end = addr.saturating_add(len);
     let held = s.regions.range(..end).any(|(_, &e)| e > addr);
-    s.drop_range(addr, len, false);
+    s.drop_range(addr, len);
     remove(&mut s.regions, addr, len);
-    let gone: Vec<u64> = s.lifted.range(addr & !(page_size() - 1)..end).map(|(&p, _)| p).collect();
-    for p in gone {
-        s.lifted.remove(&p);
-    }
     held
 }
 
@@ -724,7 +688,7 @@ pub fn reset() {
     let mut s = state();
     let regions: Vec<(u64, u64)> = s.regions.iter().map(|(&a, &e)| (a, e)).collect();
     for (a, e) in regions {
-        s.drop_range(a, e - a, false);
+        s.drop_range(a, e - a);
     }
     s.regions.clear();
     if s.cache.is_some() {
@@ -740,8 +704,6 @@ pub fn reset() {
     }
     s.by_g.clear();
     s.outside.clear();
-    s.lifted.clear();
-    s.retried.clear();
     s.objects.clear();
     s.object_of.clear();
     s.aliases.clear();
@@ -762,8 +724,6 @@ pub fn hold() -> std::sync::MutexGuard<'static, State> {
 /// copies of their own now, so the executable one is mapped anew from the
 /// writable one, which the child's translations are written to.
 pub fn forked(s: &mut State) {
-    // The pages' writable mappings are not the child's.
-    s.writers.clear();
     let Some(c) = s.cache.as_ref() else { return };
     for k in &c.chunks {
         let mut rx = k.rx;
@@ -903,380 +863,6 @@ fn link_call_site(s: &mut State, site: u64, n: u32) {
         crate::prepare::flush_icache(site, 4);
     }
     CALL_SITES_LINKED.fetch_add(1, Ordering::Relaxed);
-}
-
-/// A write to the program's memory at `addr` that faulted: if the page was
-/// kept from writes because code was translated from it, the translations
-/// go and it is writable again (the write is to be tried again).
-///
-/// Threads that write a guarded page at once all fault; the first one
-/// handled lifts the guard, and the others find the page unguarded. Their
-/// writes are tried again: once, and again only while the page's guard has
-/// changed since, so a write that faults for another reason is not tried
-/// forever.
-pub fn written(addr: u64) -> bool {
-    let mut s = state_at(HOLD_WRITTEN);
-    let page = addr & !(page_size() - 1);
-    // SAFETY: no preconditions.
-    let thread = unsafe { libc::pthread_self() } as u64;
-    if s.guarded.contains(&page) {
-        s.retried.remove(&thread);
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-        s.drop_range(page, page_size(), true);
-        return true;
-    }
-    let Some(&lifts) = s.lifted.get(&page) else { return false };
-    if !s.in_region(addr) || s.retried.get(&thread) == Some(&(addr, lifts)) {
-        s.retried.remove(&thread);
-        return false;
-    }
-    s.retried.insert(thread, (addr, lifts));
-    true
-}
-
-/// The bytes general-register store `w` writes, given the registers
-/// (`reg`, with `sp` as 31) ([`Store`]). A store fwe makes for the
-/// program: `str`, `strb`, `strh` with an immediate (unsigned, unscaled,
-/// or with its base written back before or after) or a register offset;
-/// `stp` with a signed offset or its base written back; `stlr`,
-/// `stlrb`, `stlrh` and their `stllr` forms; `cas` of each size and
-/// ordering.
-fn store_of(w: u32, reg: &impl Fn(usize) -> u64) -> Option<Store> {
-    let rt = (w & 31) as usize;
-    let rn = ((w >> 5) & 31) as usize;
-    let data = |r: usize| if r == 31 { 0 } else { reg(r) };
-    let base = reg(rn);
-    let at = |addr: u64, parts: Vec<(u64, u64)>| Store {
-        addr,
-        parts,
-        back: None,
-        release: false,
-        compare: None,
-    };
-    // Base written back: the address before (post-index) or after
-    // (pre-index) adding the offset; the base becomes the sum.
-    let indexed = |offset: i64, pre: bool, parts: Vec<(u64, u64)>| {
-        let sum = base.wrapping_add(offset as u64);
-        Store { addr: if pre { sum } else { base }, back: Some((rn, sum)), ..at(base, parts) }
-    };
-    let log = u64::from(w >> 30);
-    let imm9 = ((((w >> 12) & 0x1ff) as i64) << 55) >> 55;
-    // str (unsigned immediate)
-    if w & 0x3fc0_0000 == 0x3900_0000 {
-        let offset = u64::from((w >> 10) & 0xfff) << log;
-        return Some(at(base.wrapping_add(offset), vec![(data(rt), 1 << log)]));
-    }
-    // stur
-    if w & 0x3fe0_0c00 == 0x3800_0000 {
-        return Some(at(base.wrapping_add(imm9 as u64), vec![(data(rt), 1 << log)]));
-    }
-    // str (immediate), post-index (bit 11 clear) or pre-index
-    if w & 0x3fe0_0400 == 0x3800_0400 {
-        return Some(indexed(imm9, w & (1 << 11) != 0, vec![(data(rt), 1 << log)]));
-    }
-    // str (register)
-    if w & 0x3fe0_0c00 == 0x3820_0800 {
-        let rm = reg_or_zero(((w >> 16) & 31) as usize, reg);
-        let v = match (w >> 13) & 7 {
-            0b010 => rm & 0xffff_ffff,
-            0b110 => (rm as i32) as i64 as u64,
-            0b011 | 0b111 => rm,
-            _ => return None,
-        };
-        let offset = if w & (1 << 12) != 0 { v << log } else { v };
-        return Some(at(base.wrapping_add(offset), vec![(data(rt), 1 << log)]));
-    }
-    // stp of w or x registers: signed offset, post-index, pre-index
-    let pair = w & 0x7e40_0000;
-    if pair == 0x2800_0000 && w & 0x0180_0000 != 0 {
-        let size = if w >> 31 != 0 { 8 } else { 4 };
-        let imm = ((((w >> 15) & 0x7f) as i64) << 57 >> 57) * size as i64;
-        let rt2 = ((w >> 10) & 31) as usize;
-        let parts = vec![(data(rt), size), (data(rt2), size)];
-        return Some(match (w >> 23) & 3 {
-            0b10 => at(base.wrapping_add(imm as u64), parts),
-            0b01 => indexed(imm, false, parts),
-            _ => indexed(imm, true, parts),
-        });
-    }
-    // stlr, stllr (bit 15 clear), of each size
-    if w & 0x3fff_7c00 == 0x089f_7c00 {
-        return Some(Store { release: true, ..at(base, vec![(data(rt), 1 << log)]) });
-    }
-    // cas, casa, casl, casal, of each size (bit 15 a release)
-    if w & 0x3fa0_7c00 == 0x08a0_7c00 {
-        let rs = ((w >> 16) & 31) as usize;
-        return Some(Store {
-            release: w & (1 << 15) != 0,
-            compare: Some(rs),
-            ..at(base, vec![(data(rt), 1 << log)])
-        });
-    }
-    None
-}
-
-/// A store [`store_of`] reads: its address, each register's value and
-/// size in order, the base register written back and its new value, and
-/// whether it is a release (`stlr`), and for a `cas`, its compared
-/// register.
-#[derive(Debug, PartialEq)]
-struct Store {
-    addr: u64,
-    parts: Vec<(u64, u64)>,
-    back: Option<(usize, u64)>,
-    release: bool,
-    /// A `cas`: the register holding the value compared, which gets the
-    /// value the memory held.
-    compare: Option<usize>,
-}
-
-/// Compare the `size` bytes at `at`, naturally aligned, with `expected`
-/// and, if equal, write `new` there, atomically: what was there.
-fn cas(at: u64, size: u64, expected: u64, new: u64) -> u64 {
-    use std::sync::atomic::{AtomicU8, AtomicU16, AtomicU32};
-    let o = Ordering::SeqCst;
-    // SAFETY: `at` is naturally aligned (the caller checks), `size` bytes
-    // of the page's writable mapping.
-    unsafe {
-        match size {
-            1 => u64::from(
-                AtomicU8::from_ptr(at as *mut u8)
-                    .compare_exchange(expected as u8, new as u8, o, o)
-                    .unwrap_or_else(|v| v),
-            ),
-            2 => u64::from(
-                AtomicU16::from_ptr(at as *mut u16)
-                    .compare_exchange(expected as u16, new as u16, o, o)
-                    .unwrap_or_else(|v| v),
-            ),
-            4 => u64::from(
-                AtomicU32::from_ptr(at as *mut u32)
-                    .compare_exchange(expected as u32, new as u32, o, o)
-                    .unwrap_or_else(|v| v),
-            ),
-            _ => AtomicU64::from_ptr(at as *mut u64)
-                .compare_exchange(expected, new, o, o)
-                .unwrap_or_else(|v| v),
-        }
-    }
-}
-
-/// Register `r`'s value, 0 for 31 (the zero register, as an offset).
-fn reg_or_zero(r: usize, reg: &impl Fn(usize) -> u64) -> u64 {
-    if r == 31 { 0 } else { reg(r) }
-}
-
-/// A store by the program, instruction `w`, that faulted on a page kept
-/// from writes: `far` the address, `esr` the syndrome, `reg` the general
-/// registers (`sp` as 31). One fwe can make ([`store_of`]) into a page
-/// translated from, which the program's mapping lets it write, is made
-/// through the page's writable mapping: the page stays kept from writes,
-/// and its translations stay but for those of the bytes written (an
-/// instruction patched). The caller goes on past the store. Any other
-/// store is [`written`]'s.
-pub fn store(
-    far: u64,
-    esr: u32,
-    w: u32,
-    reg: impl Fn(usize) -> u64,
-    mut set: impl FnMut(usize, u64),
-) -> bool {
-    const EC_DATA_ABORT_LOWER: u32 = 0x24;
-    let permission_write = esr >> 26 == EC_DATA_ABORT_LOWER
-        && esr & (1 << 6) != 0 // WnR
-        && esr & 0x3c == 0x0c; // a permission fault
-    if !permission_write {
-        return false;
-    }
-    // (x18 is never a register of the program's code as it runs; the
-    // fields an immediate fills are no register.)
-    let names_x18 = crate::decode::names_x18(w);
-    let left = |why: usize| {
-        STORES_LEFT[why].fetch_add(1, Ordering::Relaxed);
-        false
-    };
-    let Some(Store { addr, parts, back, release, compare }) =
-        store_of(w, &reg).filter(|_| !names_x18)
-    else {
-        undecoded(w);
-        return left(0);
-    };
-    let off = STORE_OFF.load(Ordering::Relaxed);
-    if (back.is_some() && off & 1 != 0)
-        || (release && compare.is_none() && off & 2 != 0)
-        || (compare.is_some() && off & 4 != 0)
-    {
-        undecoded(w);
-        return left(0);
-    }
-    let len: u64 = parts.iter().map(|&(_, n)| n).sum();
-    let ps = page_size();
-    let page = far & !(ps - 1);
-    if addr & !(ps - 1) != page || (addr + len - 1) & !(ps - 1) != page {
-        return false;
-    }
-    // A `cas` not naturally aligned faults for that, made again.
-    if compare.is_some() && !addr.is_multiple_of(len) {
-        return false;
-    }
-    let mut s = state_at(HOLD_STORE);
-    // A page another mapping shares is left to `written`: its other
-    // mappings' translations are not looked at here.
-    if !s.guarded.contains(&page) {
-        return false;
-    }
-    if s.object_of.contains_key(&page) || s.aliases.contains_key(&page) {
-        return left(1);
-    }
-    let writable = fwe_kernel::maps::record()
-        .areas_in(page, page + ps)
-        .first()
-        .is_some_and(|a| a.value.prot & fwe_abi::mman::PROT_WRITE != 0);
-    if !writable {
-        return false;
-    }
-    let Some(wr) = writer(&mut s, page) else { return false };
-    let mut at = wr + (addr - page);
-    // A page written often (code being written into it) is let be written
-    // instead, its translations dropped: each store made here is a fault.
-    let blocks = if STORE_FLAT.load(Ordering::Relaxed) != 0 {
-        0
-    } else {
-        s.pages.get(&page).map_or(0, Vec::len) as u64
-    };
-    let made = &mut s.writers.get_mut(&page).expect("its writer").1;
-    *made += 1;
-    if *made > STORES_KEPT.max(blocks) {
-        return left(2);
-    }
-    if release {
-        // What the thread wrote before is seen first.
-        std::sync::atomic::fence(Ordering::SeqCst);
-    }
-    if let Some(rs) = compare {
-        // Atomic, as the program's: the writable mapping is the same
-        // memory.
-        let (new, size) = parts[0];
-        let expected = reg_or_zero(rs, &reg);
-        let old = cas(at, size, expected, new);
-        if rs != 31 {
-            set(rs, old);
-        }
-    }
-    // TEMPORARY (a JDK crash): what was written, read back below.
-    let check: Vec<(u64, u64)> = if compare.is_none() { parts.clone() } else { Vec::new() };
-    for (value, size) in parts.into_iter().filter(|_| compare.is_none()) {
-        // SAFETY: `at` is in the page's writable mapping, `size` bytes of
-        // it within the page; the program's mapping allows the write.
-        unsafe {
-            match size {
-                1 => (at as *mut u8).write_volatile(value as u8),
-                2 => (at as *mut u16).write_unaligned(value as u16),
-                4 => (at as *mut u32).write_unaligned(value as u32),
-                _ => (at as *mut u64).write_unaligned(value),
-            }
-        }
-        at += size;
-    }
-    std::sync::atomic::fence(Ordering::SeqCst);
-    let mut g = addr;
-    for (value, size) in check {
-        let mask = if size == 8 { u64::MAX } else { (1u64 << (8 * size)) - 1 };
-        // SAFETY: the program's page, readable (kept from writes only).
-        let seen = unsafe {
-            match size {
-                1 => u64::from((g as *const u8).read_volatile()),
-                2 => u64::from((g as *const u16).read_unaligned()),
-                4 => u64::from((g as *const u32).read_unaligned()),
-                _ => (g as *const u64).read_unaligned(),
-            }
-        };
-        if seen != value & mask {
-            eprintln!(
-                "fwe: TEMPORARY: store {w:#010x} at {g:#x} (page {page:#x}, writer {wr:#x}) \
-                 wrote {:#x}, the program sees {seen:#x}",
-                value & mask
-            );
-        }
-        g += size;
-    }
-    STORES.fetch_add(1, Ordering::Relaxed);
-    // A store into code (an instruction patched) drops the blocks
-    // translated from the bytes it wrote, not the page's others.
-    let blocks = s.pages.get(&page).cloned().unwrap_or_default();
-    let (hit, kept): (Vec<usize>, Vec<usize>) = blocks.into_iter().partition(|&i| {
-        let b = &s.blocks[i];
-        addr < b.g + 4 * b.source.len() as u64 && addr + len > b.g
-    });
-    if !hit.is_empty() {
-        STORES_INTO_CODE.fetch_add(1, Ordering::Relaxed);
-        s.pages.insert(page, kept);
-        for i in hit {
-            s.drop_block(i, true);
-        }
-    }
-    if let Some((r, v)) = back {
-        set(r, v);
-    }
-    true
-}
-
-/// Page `p`'s writable mapping ([`State::writers`]), made if it has none.
-fn writer(s: &mut State, p: u64) -> Option<u64> {
-    if let Some(&(w, _)) = s.writers.get(&p) {
-        return Some(w);
-    }
-    let mut at = 0;
-    let (mut cur, mut max) = (0, 0);
-    // SAFETY: a new mapping, anywhere, of the program's page `p` (shared
-    // with it, not a copy), made writable; never inherited by a child.
-    unsafe {
-        let task = mach::mach_task_self_;
-        let ps = page_size();
-        if mach::mach_vm_remap(
-            task,
-            &mut at,
-            ps,
-            0,
-            mach::VM_FLAGS_ANYWHERE,
-            task,
-            p,
-            0,
-            &mut cur,
-            &mut max,
-            mach::VM_INHERIT_NONE,
-        ) != 0
-        {
-            return None;
-        }
-        if mach::mach_vm_protect(task, at, ps, 0, libc::PROT_READ | libc::PROT_WRITE) != 0 {
-            mach::mach_vm_deallocate(task, at, ps);
-            return None;
-        }
-    }
-    s.writers.insert(p, (at, 0));
-    Some(at)
-}
-
-/// Unmap page `p`'s writable mapping, if it has one.
-fn unwriter(s: &mut State, p: u64) {
-    if let Some((w, _)) = s.writers.remove(&p) {
-        // SAFETY: the mapping [`writer`] made, used by nothing now.
-        unsafe { mach::mach_vm_deallocate(mach::mach_task_self_, w, page_size()) };
-    }
-}
-
-/// The host is about to write program memory `[addr, addr + len)` for the
-/// program (a `read` into it): pages there kept from writes are written as
-/// by the program itself ([`written`]), their translations dropped.
-pub fn host_writes(addr: u64, len: u64) {
-    let mut s = state();
-    let start = addr & !(page_size() - 1);
-    let kept: Vec<u64> = s.guarded.range(start..addr.saturating_add(len)).copied().collect();
-    for p in kept {
-        DROPPED.fetch_add(1, Ordering::Relaxed);
-        s.drop_range(p, page_size(), true);
-    }
 }
 
 /// The way out at `regs.pc`, taken by the exit gate (outside a signal's
@@ -1611,12 +1197,11 @@ fn translation(s: &mut State, g: u64) -> usize {
     if s.cache.is_none() {
         s.cache = Some(new_cache());
     }
-    // The page is kept from writes before it is read: a write after this
-    // faults and drops the translation, one before it is in what is read.
-    // (Room is made first: emptying the cache lifts every guard.)
+    // (Room is made first: emptying the cache forgets every page's other
+    // mappings.)
     let page = g & !(page_size() - 1);
     let at = cache_next(s);
-    guard(s, page);
+    note_aliases(s, page);
     let followed = !s.in_region(g);
     if let Some(i) = revive(s, g, page) {
         return i;
@@ -1656,12 +1241,10 @@ fn translation(s: &mut State, g: u64) -> usize {
     i
 }
 
-/// Take back the block at program address `g`, on page `p`, that a write
-/// to the page dropped ([`State::dormant`]), if its program words were not
-/// written: the page is kept from writes again (by the caller), so the
-/// words read now are what runs until a write drops it again. Only a
-/// block wanted again is taken back: a page holds many that do not run
-/// again before its next write.
+/// Take back the block at program address `g`, on page `p`, that a flush
+/// of its words dropped ([`State::dormant`]), if they were not changed: a
+/// JIT flushes code it wrote anew as the same (a method installed again,
+/// a patch undone). Only a block wanted again is taken back.
 fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     let i = s.dormant.remove(&g)?;
     let b = &s.blocks[i];
@@ -1732,26 +1315,28 @@ fn link_site(s: &mut State, at: u64, j: usize) {
     }
 }
 
-/// Keep program page `p` from being written while translations of it are
-/// in use, through its own mapping and any other of the same file's page:
-/// a write faults ([`written`]).
-fn guard(s: &mut State, p: u64) {
-    if !s.pages.contains_key(&p) {
-        // Its first translation: the other mappings of what it maps.
-        let rec = fwe_kernel::maps::record();
-        if let Some(k) = shared_page(&rec, p) {
-            let others: Vec<u64> =
-                rec.areas().iter().filter_map(|a| alias_in(a, k)).filter(|&q| q != p).collect();
-            drop(rec);
-            s.objects.entry(k).or_default().insert(p);
-            s.object_of.insert(p, k);
-            for q in others {
-                s.aliases.entry(q).or_default().insert(p);
-                keep(s, q);
-            }
+/// Note the other mappings of the file page that program page `p` maps,
+/// as code is first translated from it: a flush through one of them is a
+/// flush of `p`'s code ([`flushed`]); a JIT that maps its code twice may
+/// flush either.
+fn note_aliases(s: &mut State, p: u64) {
+    if s.pages.contains_key(&p) {
+        return;
+    }
+    // Set before the record is read: a mapping made since is noted by
+    // [`mapped`], which sees it set.
+    ANY_OBJECTS.store(true, Ordering::SeqCst);
+    let rec = fwe_kernel::maps::record();
+    if let Some(k) = shared_page(&rec, p) {
+        let others: Vec<u64> =
+            rec.areas().iter().filter_map(|a| alias_in(a, k)).filter(|&q| q != p).collect();
+        drop(rec);
+        s.objects.entry(k).or_default().insert(p);
+        s.object_of.insert(p, k);
+        for q in others {
+            s.aliases.entry(q).or_default().insert(p);
         }
     }
-    keep(s, p);
 }
 
 /// The file page (device, inode, offset) program page `p` maps, if it
@@ -1775,9 +1360,13 @@ fn alias_in(
 }
 
 /// `[addr, addr + len)` was just mapped, or given other protections:
-/// pages of it that map a file's page code was translated from are kept
-/// from writes, as that code's other mappings are ([`guard`]).
+/// pages of it that map a file's page code was translated from are noted
+/// as that code's other mappings ([`note_aliases`]).
 pub fn mapped(addr: u64, len: u64) {
+    // Most programs map no file shared and run code from it: no lock.
+    if !ANY_OBJECTS.load(Ordering::SeqCst) {
+        return;
+    }
     // (Its lock before the record's, as everywhere.)
     let mut s = state();
     if s.objects.is_empty() {
@@ -1799,42 +1388,7 @@ pub fn mapped(addr: u64, len: u64) {
     drop(rec);
     for (q, p) in found {
         s.aliases.entry(q).or_default().insert(p);
-        keep(&mut s, q);
     }
-}
-
-/// Keep program page `p` from being written, if it may be.
-fn keep(s: &mut State, p: u64) {
-    if s.guarded.contains(&p) {
-        return;
-    }
-    let prot = fwe_kernel::maps::record()
-        .areas_in(p, p + page_size())
-        .first()
-        .map_or(libc::PROT_READ, |a| host_prot(a.value.prot));
-    if prot & libc::PROT_WRITE == 0 {
-        return;
-    }
-    // SAFETY: a page of the program's memory; it stays readable.
-    unsafe {
-        libc::mprotect(p as *mut libc::c_void, page_size() as usize, prot & !libc::PROT_WRITE)
-    };
-    s.guarded.insert(p);
-    fwe_kernel::mm::keeping_pages();
-}
-
-/// The host protections of the program's memory with Linux protections
-/// `prot`, code that runs by translation never executable.
-fn host_prot(prot: u64) -> libc::c_int {
-    let mut p = libc::PROT_NONE;
-    // Code is read by fwe to be translated: executable is readable.
-    if prot & (fwe_abi::mman::PROT_READ | fwe_abi::mman::PROT_EXEC) != 0 {
-        p |= libc::PROT_READ;
-    }
-    if prot & fwe_abi::mman::PROT_WRITE != 0 {
-        p |= libc::PROT_WRITE;
-    }
-    p
 }
 
 mod mach {
@@ -1867,10 +1421,6 @@ mod mach {
     pub const VM_FLAGS_ANYWHERE: i32 = 1;
     pub const VM_FLAGS_FIXED_OVERWRITE: i32 = 0x4000;
     pub const VM_INHERIT_COPY: u32 = 1;
-    pub const VM_INHERIT_NONE: u32 = 2;
-    unsafe extern "C" {
-        pub fn mach_vm_deallocate(task: u32, addr: u64, size: u64) -> i32;
-    }
 }
 
 /// A new chunk of the code cache: one memory, mapped a second time, the
@@ -2062,12 +1612,6 @@ fn flush(s: &mut State) {
     s.dormant.clear();
     s.veneers.clear();
     s.aliases.clear();
-    let pages = std::mem::take(&mut s.guarded);
-    for p in pages {
-        unwriter(s, p);
-        lift(p);
-        *s.lifted.entry(p).or_default() += 1;
-    }
     let size = chunk_size();
     let blocks = &s.blocks;
     let c = s.cache.as_mut().expect("a code cache");
@@ -2376,9 +1920,32 @@ fn one(w: u32, pc: u64, t: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) -> boo
         jump(out, info, pc + 4);
         return true;
     }
+    // A flush of an instruction cache line: run, and fwe told through the
+    // gate, as [`crate::rewrite`]'s stub does, its way back past the
+    // program's address kept after it, as a system call's is.
+    let gate = crate::syscall_gate();
+    if rewrite::is_ic_ivau(w) && gate != 0 {
+        if here(out) % 8 != 0 {
+            out.push(rewrite::NOP);
+            info.push(Word::At(pc));
+        }
+        let stub_at = here(out);
+        let site = Site::Flush { rt: w & rewrite::RT_MASK, gate };
+        let words = rewrite::stub(site, 0, 0, stub_at, stub_at + 40);
+        for (k, &sw) in words.iter().enumerate() {
+            out.push(sw);
+            info.push(match k {
+                0..=1 => Word::At(pc),
+                2..=3 => Word::Undo { g: pc, start: stub_at },
+                _ => Word::Finish { g: pc },
+            });
+        }
+        out.extend([pc as u32, (pc >> 32) as u32]);
+        info.extend([Word::Finish { g: pc }; 2]);
+        return false;
+    }
     // A system call (Linux ignores `svc`'s immediate).
     if w & 0xffe0_001f == 0xd400_0001 {
-        let gate = crate::syscall_gate();
         if gate == 0 {
             out.push(rewrite::TRAP);
             info.push(Word::At(pc));
@@ -2544,105 +2111,5 @@ fn expansion(site: Site, pc: u64, start: u64, out: &mut Vec<u32>, info: &mut Vec
             Some(m) if k > m => Word::Finish { g: pc },
             _ => Word::Undo { g: pc, start },
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{Store, store_of};
-
-    /// Registers whose value is 0x100 times their number, `sp` (31) 0x9000.
-    fn reg(r: usize) -> u64 {
-        if r == 31 { 0x9000 } else { 0x100 * r as u64 }
-    }
-
-    #[test]
-    fn a_store_names_x18_only_in_its_register_fields() {
-        // Encodings from the assembler; an immediate's bits are no register.
-        let cases = [
-            (0xf900_4841, "str x1, [x2, #144]", false),
-            (0xf900_0052, "str x18, [x2]", true),
-            (0xf900_0641, "str x1, [x18, #8]", true),
-            (0xa900_4841, "stp x1, x18, [x2]", true),
-            (0xf832_6841, "str x1, [x2, x18]", true),
-            (0xc8f2_fc41, "casal x18, x1, [x2]", true),
-        ];
-        for (w, text, x18) in cases {
-            assert_eq!(crate::decode::names_x18(w), x18, "{text}");
-        }
-    }
-
-    #[test]
-    fn stores_fwe_makes_are_read_from_their_instructions() {
-        // Encodings from the assembler.
-        let at = |addr: u64, parts: Vec<(u64, u64)>| Store {
-            addr,
-            parts,
-            back: None,
-            release: false,
-            compare: None,
-        };
-        let back = |addr: u64, parts: Vec<(u64, u64)>, r: usize, v: u64| Store {
-            back: Some((r, v)),
-            ..at(addr, parts)
-        };
-        let release =
-            |addr: u64, parts: Vec<(u64, u64)>| Store { release: true, ..at(addr, parts) };
-        let cases: [(u32, &str, Option<Store>); 27] = [
-            (0xf900_0841, "str x1, [x2, #16]", Some(at(0x210, vec![(0x100, 8)]))),
-            (0x3900_0c41, "strb w1, [x2, #3]", Some(at(0x203, vec![(0x100, 1)]))),
-            (0x7900_0fe1, "strh w1, [sp, #6]", Some(at(0x9006, vec![(0x100, 2)]))),
-            (0xb900_0041, "str w1, [x2]", Some(at(0x200, vec![(0x100, 4)]))),
-            (0xf81f_8041, "stur x1, [x2, #-8]", Some(at(0x1f8, vec![(0x100, 8)]))),
-            (0xf823_7841, "str x1, [x2, x3, lsl #3]", Some(at(0x1a00, vec![(0x100, 8)]))),
-            (0xb823_c841, "str w1, [x2, w3, sxtw]", Some(at(0x500, vec![(0x100, 4)]))),
-            (0xa93f_0c41, "stp x1, x3, [x2, #-16]", Some(at(0x1f0, vec![(0x100, 8), (0x300, 8)]))),
-            (0x2901_7fe1, "stp w1, wzr, [sp, #8]", Some(at(0x9008, vec![(0x100, 4), (0, 4)]))),
-            (0xf900_0c5f, "str xzr, [x2, #24]", Some(at(0x218, vec![(0, 8)]))),
-            // The base written back.
-            (0xf800_8c41, "str x1, [x2, #8]!", Some(back(0x208, vec![(0x100, 8)], 2, 0x208))),
-            (0xb800_4441, "str w1, [x2], #4", Some(back(0x200, vec![(0x100, 4)], 2, 0x204))),
-            (0x381f_fc41, "strb w1, [x2, #-1]!", Some(back(0x1ff, vec![(0x100, 1)], 2, 0x1ff))),
-            (0x7800_27e1, "strh w1, [sp], #2", Some(back(0x9000, vec![(0x100, 2)], 31, 0x9002))),
-            (
-                0xa881_0c41,
-                "stp x1, x3, [x2], #16",
-                Some(back(0x200, vec![(0x100, 8), (0x300, 8)], 2, 0x210)),
-            ),
-            (
-                0x29bf_0c41,
-                "stp w1, w3, [x2, #-8]!",
-                Some(back(0x1f8, vec![(0x100, 4), (0x300, 4)], 2, 0x1f8)),
-            ),
-            (
-                0xa9bf_7bfd,
-                "stp x29, x30, [sp, #-16]!",
-                Some(back(0x8ff0, vec![(0x1d00, 8), (0x1e00, 8)], 31, 0x8ff0)),
-            ),
-            // Releases.
-            (0x889f_fc41, "stlr w1, [x2]", Some(release(0x200, vec![(0x100, 4)]))),
-            (0xc89f_ffe1, "stlr x1, [sp]", Some(release(0x9000, vec![(0x100, 8)]))),
-            (0x089f_fc41, "stlrb w1, [x2]", Some(release(0x200, vec![(0x100, 1)]))),
-            (0x489f_fc5f, "stlrh wzr, [x2]", Some(release(0x200, vec![(0, 2)]))),
-            (0xc89f_7c41, "stllr x1, [x2]", Some(release(0x200, vec![(0x100, 8)]))),
-            // Compared and swapped.
-            (
-                0xc8e1_fc43,
-                "casal x1, x3, [x2]",
-                Some(Store { release: true, compare: Some(1), ..at(0x200, vec![(0x300, 8)]) }),
-            ),
-            (
-                0x08a0_7c41,
-                "casb w0, w1, [x2]",
-                Some(Store { compare: Some(0), ..at(0x200, vec![(0x100, 1)]) }),
-            ),
-            // Not a general register's, or not a plain store: not made by fwe.
-            (0x3d80_0040, "str q0, [x2]", None),
-            (0xfc00_8440, "str d0, [x2], #8", None),
-            (0xc804_7c41, "stxr w4, x1, [x2]", None),
-        ];
-        for (w, text, want) in cases {
-            assert_eq!(store_of(w, &reg), want, "{text}");
-        }
     }
 }

@@ -232,7 +232,8 @@ pub trait Platform {
 
     /// `[addr, addr + len)` (host addresses) was just mapped or given
     /// other protections, and the record of mappings says so: a mapping
-    /// of a file's pages code was translated from is watched as theirs.
+    /// of a file's pages code was translated from is noted as theirs (an
+    /// instruction cache flush through it is a flush of their code).
     fn jit_mapped(&mut self, _addr: u64, _len: u64) {}
 
     /// Map the prepared image kept under `key` ([`prepcache::image_key`])

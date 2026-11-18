@@ -342,6 +342,19 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     b.regs.pc = site;
     b.regs.x[18] = guest_x18();
     b.ran = 0;
+    // SAFETY: words of the stub that called the gate, mapped.
+    if let Some(rt) = crate::rewrite::flush_reg(|a| unsafe { (a as *const u32).read() }, b.ret) {
+        flush_line(if rt == 31 { 0 } else { b.regs.x[rt as usize] }, rt == 18);
+        b.regs.pc = site + 4;
+        b.ran = 1;
+        b.seen = b.signals.load(SeqCst);
+        let (pending, mask) = thread::state();
+        if pending & !mask != 0 {
+            return 1;
+        }
+        crate::quiesce::enter_at(b.slot);
+        return 0;
+    }
     let nr = b.regs.x[8];
     // A new thread of an untraced one is made here too: the trap would
     // make it from the same registers.
@@ -428,6 +441,25 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         crate::quiesce::enter_at(b.slot);
     }
     u64::from(!plain_return)
+}
+
+/// The program's `ic ivau` of the line at `addr` (its stub ran it, but
+/// through `x18`, `native`): the translations made from it go
+/// ([`crate::jit::flushed`]).
+fn flush_line(addr: u64, native: bool) {
+    let line = 4 << (crate::hwcap::CTR_EL0 & 15);
+    if native {
+        // Code that runs as it is may be there: the host's cache line
+        // too, where it is mapped (as the instruction faults elsewhere,
+        // which a stub through `x18` leaves to its translations).
+        let mapped = !fwe_kernel::maps::record().areas_in(addr, addr + 1).is_empty();
+        if mapped {
+            // SAFETY: a mapped line of the program's memory.
+            unsafe { crate::prepare::flush_icache(addr & !(line - 1), line) };
+        }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::jit::flushed(addr);
 }
 
 /// A system call's site: the program's `svc` where the call was made from a
@@ -1266,13 +1298,6 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if !in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
-        // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        let addr = unsafe { (*info).si_addr() } as u64;
-        if crate::jit::written(addr) {
-            // fwe writing for the guest into a page code was translated
-            // from: its translations go, and the write is retried.
-            return;
-        }
         if let Some(resume) = fwe_kernel::uaccess::fixup(ss.pc) {
             // A guest pointer the kernel was copying through was bad: the
             // copy reports EFAULT.
@@ -1310,39 +1335,11 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     }
 
     // Code the guest made executable after mapping it runs by translation:
-    // a fetch from it goes on at its translation; a write to a page code
-    // was translated from drops those translations and is tried again.
+    // a fetch from it goes on at its translation.
     let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
-    if exec {
-        if let Some(t) = crate::jit::enter(addr, mc.ss.lr) {
-            mc.ss.pc = t;
-            return;
-        }
-    } else {
-        // A store into a page code was translated from: made by fwe, the
-        // page and its translations kept (but for those of what it wrote),
-        // its base register written back.
-        let regs = regs_from(mc);
-        // SAFETY: the guest was executing at `pc`, so it is mapped.
-        let w = unsafe { insn(mc.ss.pc) };
-        let reg = |r: usize| if r == 31 { regs.sp } else { regs.x[r] };
-        let mut back = None;
-        if let Some(w) = w
-            && crate::jit::store(mc.es.far, mc.es.esr, w, reg, |r, v| back = Some((r, v)))
-        {
-            match back {
-                Some((29, v)) => mc.ss.fp = v,
-                Some((30, v)) => mc.ss.lr = v,
-                Some((31, v)) => mc.ss.sp = v,
-                Some((r, v)) => mc.ss.x[r] = v,
-                None => {}
-            }
-            mc.ss.pc += 4;
-            return;
-        }
-        if crate::jit::written(addr) {
-            return;
-        }
+    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr) {
+        mc.ss.pc = t;
+        return;
     }
     // A page of a private mapping of a file with no name, first written:
     // it becomes a copy, and the write is tried again.

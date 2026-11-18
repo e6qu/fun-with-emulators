@@ -16,6 +16,10 @@
 //! - Any instruction naming `x18`: macOS clears `x18` on every exception
 //!   return, so each such instruction becomes a branch to a stub that keeps
 //!   the guest's `x18` in another TSD slot (see [`crate::decode`]).
+//! - `ic ivau, xN`: the program says it changed the code at that cache
+//!   line. The stub runs it and tells fwe through the system-call gate,
+//!   which drops the translations made from that line (see
+//!   [`crate::jit`]).
 //!
 //! arm64 instructions are 4 bytes and 4-byte aligned, so scanning aligned
 //! words finds every instruction exactly. A data word that happens to match
@@ -105,6 +109,18 @@ pub enum Site {
     /// `svc #0`, already a `brk` ([`TRAP`]) in place: the stub calls the
     /// system-call gate at `gate` (0 until the caller knows it).
     Syscall { gate: u64 },
+    /// `ic ivau, xN`: the stub runs it and calls the gate at `gate` (as
+    /// [`Site::Syscall`]'s), which takes it for a flush of that line.
+    Flush { rt: u32, gate: u64 },
+}
+
+/// `ic ivau, xN`; `| n`.
+pub const IC_IVAU: u32 = 0xd50b_7520;
+
+/// Whether `insn` is `ic ivau, xN`: the program invalidating the
+/// instruction cache line at `xN`, as it must after writing code there.
+pub fn is_ic_ivau(insn: u32) -> bool {
+    insn & !RT_MASK == IC_IVAU
 }
 
 /// Whether `insn` names `x18` in an operand position this pass can rewrite by
@@ -184,6 +200,8 @@ fn classify(insn: u32, is_code: bool, known_code: bool) -> Word {
         }
     } else if insn & !RT_MASK == MSR_TPIDR {
         w.site = Some(Site::WriteThreadPointer { rt: insn & RT_MASK });
+    } else if is_code && is_ic_ivau(insn) {
+        w.site = Some(Site::Flush { rt: insn & RT_MASK, gate: 0 });
     } else if is_code && x18_site(insn) {
         w.site = Some(Site::X18 { insn });
     } else if is_code && crate::decode::names_x18(insn) {
@@ -362,6 +380,7 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
             return x18_branch_stub(insn, imm(x18_slot), stub, ret);
         }
         Site::Syscall { gate } => return syscall_stub(gate, stub, ret),
+        Site::Flush { rt, gate } => return flush_stub(rt, gate, stub, ret),
         _ => {}
     }
     let mut words = stub_body(site, tp_slot, x18_slot, ret - 4);
@@ -440,6 +459,7 @@ pub(crate) fn stub_body(site: Site, tp_slot: u32, x18_slot: u32, pc: u64) -> Vec
         }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
         Site::Syscall { .. } => panic!("a system call has a stub of its own"),
+        Site::Flush { .. } => panic!("a flush has a stub of its own"),
     }
 }
 
@@ -531,6 +551,40 @@ fn syscall_stub(gate: u64, stub: u64, ret: u64) -> Vec<u32> {
         gate as u32,
         (gate >> 32) as u32,
     ]
+}
+
+/// `ldr x30, <pc + 16>`: the gate's address, the literal at word 6 of a
+/// flush's stub, read from word 2. It tells the gate the call is a flush.
+pub const FLUSH_LDR_X30_LIT: u32 = 0x5800_0000 | (4 << 5) | 30;
+
+/// Stub for `ic ivau, xN`: the instruction itself (where it can fault, as
+/// at its site; through `x18`, whose value only the gate knows, it is the
+/// gate's), then the gate called as by a system call's stub, and back past
+/// the site. The gate knows a flush by the stub's literal load
+/// ([`flush_reg`]). `stub` is 8-byte aligned.
+fn flush_stub(rt: u32, gate: u64, stub: u64, ret: u64) -> Vec<u32> {
+    debug_assert!(stub.is_multiple_of(8), "a flush stub's literal must be aligned");
+    vec![
+        if rt == 18 { NOP } else { IC_IVAU | rt },
+        SYSCALL_STUB_ENTRY,
+        FLUSH_LDR_X30_LIT,
+        BLR_X30,
+        POP32_X30,
+        branch(stub + 20, ret).expect("stub placed within branch range of its site"),
+        gate as u32,
+        (gate >> 32) as u32,
+    ]
+}
+
+/// The register a flush's stub names, if the gate was called from one
+/// (`word(ret - 8)`, the word that loaded the gate's address, says), its
+/// call returning to `ret`.
+pub fn flush_reg(word: impl Fn(u64) -> u32, ret: u64) -> Option<u32> {
+    if word(ret - 8) != FLUSH_LDR_X30_LIT {
+        return None;
+    }
+    let w = word(ret - 16);
+    Some(if w == NOP { 18 } else { w & RT_MASK })
 }
 
 /// The system-call site of the stub whose first word is at `pc`, if it is
@@ -1064,6 +1118,33 @@ mod tests {
         assert_eq!(syscall_stub_site(word, 0x2000), Some(0x1000));
         // Any other word is not a stub's first.
         assert_eq!(syscall_stub_site(word, 0x2004), None);
+    }
+
+    /// `ic ivau, xN` in code becomes a site whose stub runs it and calls
+    /// the gate, which tells it from a system call's by the stub's load of
+    /// the gate's address; through `x18`, the stub leaves it to the gate.
+    #[test]
+    fn a_flush_calls_the_gate_and_is_told_from_a_system_call() {
+        let ic = IC_IVAU | 3; // ic ivau, x3
+        assert!(is_ic_ivau(ic) && !is_ic_ivau(0xd50b_7a23)); // dc cvau, x3
+        let p = patch(&mut words(&[ic]), Some(&[(0, 4)]));
+        assert_eq!(p.sites, vec![(0, Site::Flush { rt: 3, gate: 0 })]);
+        let (gate, at) = (0x1_2345_6780u64, 0x10_0000u64);
+        for (rt, first) in [(3, ic), (18, NOP)] {
+            let stub = stub(Site::Flush { rt, gate }, 0, 0, at, 0x20_0004);
+            assert_eq!(stub.len(), 8);
+            assert_eq!(stub[0], first);
+            assert_eq!(&stub[1..5], &[SYSCALL_STUB_ENTRY, FLUSH_LDR_X30_LIT, BLR_X30, POP32_X30]);
+            assert_eq!(u64::from(stub[6]) | u64::from(stub[7]) << 32, gate);
+            // The gate is called from word 3: it returns to word 4.
+            let word = |a: u64| stub[((a - at) / 4) as usize];
+            assert_eq!(flush_reg(word, at + 16), Some(rt));
+        }
+        let call = stub(Site::Syscall { gate }, 0, 0, at, 0x20_0004);
+        let word = |a: u64| call[((a - at) / 4) as usize];
+        assert_eq!(flush_reg(word, at + 12), None);
+        let fl = stub(Site::Flush { rt: 3, gate }, 0, 0, at, 0x20_0004);
+        assert_eq!(syscall_stub_site(|a| fl.get(((a - at) / 4) as usize).copied(), at + 4), None);
     }
 
     #[test]

@@ -636,7 +636,7 @@ int main(void) {
     flush(rx, 8);
     long v1 = view();
     rw[0] = movz_x0(2);
-    flush(rx, 4);
+    flush(rw, 4); /* through the view written: the same memory */
     long v2 = view();
     munmap(rw, 16384);
     rw = mmap(0, 16384, PROT_READ | PROT_WRITE, MAP_SHARED, mfd, 0);

@@ -1206,46 +1206,20 @@ fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
     ranges
 }
 
-/// What the backend does before the host writes guest memory itself, for
-/// pages it keeps from the guest's writes (the native backend's pages code
-/// was translated from), set as it starts.
-static HOST_WRITES: std::sync::OnceLock<fn(u64, u64)> = std::sync::OnceLock::new();
-
-/// Whether the backend keeps any page from writes yet: until it does, a
-/// write by the host takes no lock to look for one.
-static ANY_KEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Have `f` called with the host range the host is about to write for the
-/// guest, once [`keeping_pages`] has been called.
-pub fn on_host_writes(f: fn(u64, u64)) {
-    let _ = HOST_WRITES.set(f);
-}
-
-/// The backend now keeps pages from writes (see [`on_host_writes`]).
-pub fn keeping_pages() {
-    ANY_KEPT.store(true, std::sync::atomic::Ordering::SeqCst);
-}
-
 /// Whether a write the host makes for the guest has anything to do first
 /// ([`host_writes`]).
 pub fn host_writes_watched() -> bool {
-    ANY_KEPT.load(std::sync::atomic::Ordering::SeqCst) || any_views()
+    any_views()
 }
 
 /// The host is about to write guest `[addr, addr + len)` itself (a `read`
-/// into it, a result fwe copies): pages there it could not write become
-/// writable first, as the guest's own write would make them (file views,
-/// pages the backend keeps from writes).
+/// into it, a result fwe copies): pages of file views there become copies
+/// first, as the guest's own write would make them.
 pub fn host_writes(addr: u64, len: u64) {
     if len == 0 {
         return;
     }
     views_written(addr, len);
-    if ANY_KEPT.load(std::sync::atomic::Ordering::SeqCst)
-        && let Some(f) = HOST_WRITES.get()
-    {
-        f(crate::uaccess::g2h(addr), len);
-    }
 }
 
 /// Whether any page of a private file view waits to be written (see
