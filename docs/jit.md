@@ -94,6 +94,18 @@ way.
   code that runs either way, at a copy of that code made with them in
   place, which joins the rest at the restore. A fault or signal anywhere
   in between is delivered with the program's `x16`, `x17` and `sp`.
+- **`x18` in `x17`.** macOS keeps `x18` for itself, and Linux code uses it
+  like any other register (HotSpot's C2 allocates it), so outside
+  translations each use of `x18` is a stub that reads and writes the
+  program's value in a slot of the thread's (three saves and loads
+  around it). Where a translation has `x16` and `x17` saved, `x18` is
+  loaded into `x17` once (the slot's address in `x16`), each instruction
+  naming it is made to name `x17`, and the value goes back to its slot
+  before a branch, a lookup or the restore. A block that uses `x18`
+  before anything else loads it at its start, and a way out holding it
+  enters such a block past that load: a loop keeping a value in `x18`
+  runs as fast as with any other register. A fault or signal there is
+  delivered with the program's `x18` taken from `x17`.
 - **Code a translation calls is translated too.** A runtime's helpers in
   its library, the C library, the program's own functions: code fwe
   prepared in place that a translation calls or branches to runs from
@@ -231,7 +243,10 @@ a processor that reports `DIC` clear.
   translated is patched to it where a branch reaches and `x16` and `x17`
   are the program's, else to a veneer block (`jit::veneer`: `x16` and
   `x17` restored if saved, then a branch, or the target in `x16` and
-  `br x16`). A `cbz`/`tbz` of `x18` loads the guest's `x18` into `x16`
+  `br x16`). A way out with the guest's `x18` held in `x17`
+  (`Word::Out`'s `x18`) is linked past the target's load of it
+  (`Block::x18`, `jit::in_x17`, `jit::put_x18`). A `cbz`/`tbz` of `x18`
+  loads the guest's `x18` into `x16`
   (saved with `x17` as a lookup saves them) and tests it there.
 - **Entries:** a block starts with the check a lookup that read the
   table apart enters at (the target in `x16` against the block's
