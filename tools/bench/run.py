@@ -1151,11 +1151,13 @@ def jdk(a, fwe, guest_env, results):
     theirs = ["/bin/sh", "-c", both(bin_theirs, JDK_SRC, theirs_out)]
     workload(results, "JDK (s)", ours, theirs, (ours_out, theirs_out), len(guest_env) + 1)
     # Where its time goes: fwe's marks for each process (JIT code made
-    # writable and prepared again, and how long that took).
+    # writable and prepared again, and how long that took; its system
+    # calls and the host's signals).
     timed = ours[:2] + ["FWE_TIMING=1"] + ours[2:]
     r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
     marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines()
-             if "timing: " in l and ("JIT" in l or "timing: exit +" in l)]
+             if "timing: " in l
+             and ("JIT" in l or "timing: exit +" in l or "system calls" in l)]
     print("JDK: fwe's marks: " + "; ".join(marks), file=sys.stderr)
     # Where `javac`'s time goes, by program counter: one process, so its
     # mappings name each sample (translated code is in fwe's code cache).

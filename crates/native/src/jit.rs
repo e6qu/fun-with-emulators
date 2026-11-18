@@ -2028,6 +2028,9 @@ fn body_of(
         x18 = Some(false);
         x18_entry = Some(out.len());
     }
+    // What the code after each instruction writes before reading it, for
+    // scratch registers ([`x18_beside`]): made for a block naming `x18`.
+    let mut quiet = None;
     for _ in 0..BLOCK_INSNS {
         if let Some((at, k)) = merge
             && at == pc
@@ -2042,6 +2045,10 @@ fn body_of(
             break;
         }
         let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
+        if crate::decode::may_name_x18(w) && quiet.is_none() {
+            quiet = Some(overwritten_after(g, followed));
+        }
+        let quiet_here = quiet.as_ref().map_or(0, |q| q[((pc - g) / 4) as usize]);
         // `bl`, `blr`
         if w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000 {
             calls.push(pc + 4);
@@ -2056,7 +2063,7 @@ fn body_of(
             info.push(Word::Saved(pc));
             saved = false;
         }
-        ended = one(w, pc, t, followed, &mut saved, &mut x18, &mut sides, out, info);
+        ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, out, info);
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
@@ -2242,6 +2249,9 @@ fn in_x17(w: u32) -> Option<(u32, bool)> {
 /// and whether it reads and writes `x18` there; `None` if it does not
 /// name it, or names it in a field not known ([`crate::decode::operands`]).
 fn x18_as(w: u32, to: u32) -> Option<(u32, bool, bool)> {
+    if !crate::decode::may_name_x18(w) {
+        return None;
+    }
     let (mut reads, mut writes, mut renamed) = (false, false, w);
     for f in crate::decode::operands(w)? {
         if (w >> f.shift) & 31 == 18 {
@@ -2260,19 +2270,20 @@ const LDUR_SP_M16: u32 = 0xf85f_03e0;
 const STP_SP_M16: u32 = 0xa93f_03e0;
 const LDP_SP_M16: u32 = 0xa97f_03e0;
 
-/// The words standing for the program's instruction `w` at `pc`, which
-/// names `x18` but not `sp` (nor needs a stack), with the program's `x16`
-/// and `x17` in their registers; `followed` as for [`body_of`]. One or two
+/// The words standing for the program's instruction `w`, which names
+/// `x18` but not `sp` (nor needs a stack), with the program's `x16` and
+/// `x17` in their registers; `quiet`, the registers the code after it
+/// writes before it reads them ([`overwritten_after`]). One or two
 /// scratch registers are kept below `sp` without moving it (fwe's signal
 /// handlers run on a stack of their own), so no chain of updates of `sp`
 /// runs through them, and are ones the code after it writes before it
-/// reads them where it has such ([`overwritten_after`]), so nothing waits
+/// reads them where it has such, so nothing waits
 /// for them to be loaded back. The first holds `x18`'s value (from its
 /// slot, the thread's area found through it), the second, where `w`
 /// writes `x18`, the thread's area to store it back. With the index of
 /// `w`'s stand-in among them: before it, the words are undone; after it,
 /// finished ([`undo`], [`finish`]).
-fn x18_beside(w: u32, pc: u64, followed: bool) -> Option<(Vec<u32>, usize)> {
+fn x18_beside(w: u32, quiet: u32) -> Option<(Vec<u32>, usize)> {
     if is_branch(w) || crate::decode::x18_casp(w) || !names_none(w, 0) {
         return None;
     }
@@ -2280,7 +2291,6 @@ fn x18_beside(w: u32, pc: u64, followed: bool) -> Option<(Vec<u32>, usize)> {
     for f in crate::decode::operands(w)? {
         used |= 1 << ((w >> f.shift) & 31);
     }
-    let quiet = overwritten_after(pc, followed);
     let pick = |used: u32| {
         let free = !used;
         if free & quiet != 0 { (free & quiet).trailing_zeros() } else { free.trailing_zeros() }
@@ -2319,50 +2329,52 @@ fn x18_beside(w: u32, pc: u64, followed: bool) -> Option<(Vec<u32>, usize)> {
     Some((words, main))
 }
 
-/// The general registers the program's code after `pc` writes before it
-/// reads them, on its way on past conditional branches (up to 16
-/// instructions, the page's end, or another branch or an instruction
-/// [`crate::decode::operands`] does not know): scratch registers whose
-/// values nothing soon waits for.
-fn overwritten_after(pc: u64, followed: bool) -> u32 {
+/// For each instruction from `g` to its page's end (as far as a block
+/// and a little past it), the general registers the code after it writes
+/// before it reads them, on its way on past conditional branches up to
+/// another branch or an instruction [`crate::decode::operands`] does not
+/// know: scratch registers whose values nothing soon waits for. Each
+/// instruction is decoded once, the masks made from the last back.
+fn overwritten_after(g: u64, followed: bool) -> Vec<u32> {
     let page = page_size();
-    let (mut seen, mut written) = (0u32, 0u32);
-    let mut at = pc + 4;
-    for _ in 0..16 {
-        if at & (page - 1) == 0 {
-            break;
-        }
+    let n = (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize);
+    // What each instruction reads and writes, or none where the way on
+    // stops.
+    let effect = |at: u64| -> Option<(u32, u32)> {
         let w = if followed { crate::prepare::original(at, read(at)) } else { read(at) };
-        at += 4;
-        let family = (w >> 25) & 0x3f;
         if w & 0xff00_0000 == 0x5400_0000
             || w & 0xffff_f01f == 0xd503_201f
             || w & 0xffff_f01f == 0xd503_301f
         {
             // A conditional branch (gone past), a hint or a barrier.
-            continue;
+            return Some((0, 0));
         }
-        if family == 0b011010 || family == 0b011011 {
-            seen |= 1 << (w & 0x1f);
-            continue;
+        if matches!((w >> 25) & 0x3f, 0b011010 | 0b011011) {
+            return Some((1 << (w & 0x1f), 0));
         }
         if is_branch(w) || (w >> 25) & 0x7f == 0b110_1011 {
-            break;
+            return None;
         }
-        let Some(ops) = crate::decode::operands(w) else { break };
-        for f in &ops {
-            if f.read {
-                seen |= 1 << ((w >> f.shift) & 31);
-            }
-        }
-        for f in &ops {
+        let (mut reads, mut writes) = (0, 0);
+        for f in crate::decode::operands(w)? {
             let r = 1 << ((w >> f.shift) & 31);
-            if f.write && seen & r == 0 {
-                written |= r;
+            if f.read {
+                reads |= r;
+            }
+            if f.write {
+                writes |= r;
             }
         }
+        Some((reads, writes))
+    };
+    let mut quiet = vec![0u32; n];
+    for k in (0..n.saturating_sub(1)).rev() {
+        quiet[k] = match effect(g + 4 * (k as u64 + 1)) {
+            Some((reads, writes)) => (writes | quiet[k + 1]) & !reads & !(1 << 31 | 1 << 18),
+            None => 0,
+        };
     }
-    written & !(1 << 31 | 1 << 18)
+    quiet
 }
 
 /// The program's `x18`, held in `x17` ([`one`]), written back to its slot
@@ -2411,7 +2423,7 @@ fn one(
     w: u32,
     pc: u64,
     t: u64,
-    followed: bool,
+    quiet: u32,
     saved: &mut bool,
     x18: &mut Option<bool>,
     sides: &mut Vec<Side>,
@@ -2678,7 +2690,7 @@ fn one(
     }
     // x18
     if rewrite::x18_site(w) {
-        if let Some((words, main)) = x18_beside(w, pc, followed) {
+        if let Some((words, main)) = x18_beside(w, quiet) {
             let start = here(out);
             for (k, sw) in words.into_iter().enumerate() {
                 out.push(sw);
