@@ -249,7 +249,12 @@ a processor that reports `DIC` clear.
   entry for the way out's state of `x16` and `x17` (`jit::entered`), as
   is the conditional branch the way out is the taken way of, where it
   reaches (`State::link`, undone by `State::unlink`), and the gate enters
-  that translation as a lookup does. Anything else (code
+  that translation as a lookup does. The words patched have their
+  instruction cache lines invalidated together, with one barrier for all
+  (`State::sync_patched`), before the translator's lock is let go, new
+  words are written or stopped threads go on: a patch turns one right
+  way on into another, while a new block is invalidated as it is
+  written, before it is published. Anything else (code
   not translated, a signal to deliver) takes the gate's `brk`, whose
   handler goes on from the block. A way out unlinked again when the
   cache is emptied is `brk #0x4a54` (`jit::EXIT`), which `on_sigtrap`

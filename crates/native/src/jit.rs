@@ -419,6 +419,9 @@ pub struct State {
     /// again if its words were not changed ([`revive`]).
     dormant: BTreeMap<u64, usize>,
     cache: Option<Cache>,
+    /// Words of the cache [`State::patch`] changed whose instruction cache
+    /// lines are not invalidated yet ([`State::sync_patched`]).
+    patched: std::cell::RefCell<Vec<u64>>,
 }
 
 static STATE: Mutex<State> = Mutex::new(State {
@@ -437,6 +440,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     waiting: AddrMap::with_hasher(BuildHasherDefault::new()),
     dormant: BTreeMap::new(),
     cache: None,
+    patched: std::cell::RefCell::new(Vec::new()),
 });
 
 /// For `FWE_TIMING`: blocks translated, ways out taken through fwe (a
@@ -571,6 +575,7 @@ impl Held {
     /// may have changed meanwhile.
     fn unlocked<R>(&mut self, work: impl FnOnce() -> R) -> R {
         HOLD_NS[self.site].fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.sync_patched();
         self.s = None;
         let r = work();
         self.s = Some(lock_state());
@@ -594,6 +599,9 @@ impl std::ops::DerefMut for Held {
 
 impl Drop for Held {
     fn drop(&mut self) {
+        if let Some(s) = &self.s {
+            s.sync_patched();
+        }
         HOLD_NS[self.site].fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
     }
 }
@@ -685,15 +693,43 @@ impl State {
         self.regions.range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
     }
 
-    /// Write `w` at `at` in the cache (its executable address).
+    /// Write `w` at `at` in the cache (its executable address). Its
+    /// instruction cache line is invalidated with the others patched
+    /// before the lock is let go or new words are written
+    /// ([`State::sync_patched`]): a patch turns one way on into another
+    /// (a way out into a branch to a translation, or back), each right
+    /// meanwhile.
     fn patch(&self, at: u64, w: u32) {
         let c = self.cache.as_ref().expect("a code cache");
         let k =
             c.chunks.iter().find(|k| (k.rx..k.rx + chunk_size()).contains(&at)).expect("a chunk");
         // SAFETY: a word of the cache, through its writable view.
         unsafe { ((at - k.rx + k.rw) as *mut u32).write_volatile(w) };
-        // SAFETY: the word, in the executable view.
-        unsafe { crate::prepare::flush_icache(at, 4) };
+        self.patched.borrow_mut().push(at);
+    }
+
+    /// The instruction cache lines of the words [`State::patch`] changed
+    /// invalidated: each cleaned to the point of unification, then each
+    /// invalidated, with one barrier between and after, as
+    /// `sys_icache_invalidate` does for each alone.
+    fn sync_patched(&self) {
+        let mut patched = self.patched.borrow_mut();
+        if patched.is_empty() {
+            return;
+        }
+        // SAFETY: cache maintenance of words of the cache, mapped (in the
+        // executable view); it changes no memory.
+        unsafe {
+            for &at in patched.iter() {
+                std::arch::asm!("dc cvau, {0}", in(reg) at, options(nostack, preserves_flags));
+            }
+            std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+            for &at in patched.iter() {
+                std::arch::asm!("ic ivau, {0}", in(reg) at, options(nostack, preserves_flags));
+            }
+            std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
+        }
+        patched.clear();
     }
 
     /// Link way out `at` (a direct one, not linked yet) of block `from` to
@@ -1933,6 +1969,8 @@ fn flush(s: &mut State) {
     c.garbage = kept;
     c.flushes += 1;
     FLUSHES.fetch_add(1, Ordering::Relaxed);
+    // The ways out unlinked seen as such before the others go on.
+    s.sync_patched();
     drop(stopped);
 }
 
@@ -1986,6 +2024,9 @@ fn write(c: &mut Cache, words: &[u32]) -> u64 {
 }
 
 fn emit(s: &mut State, words: &[u32]) -> u64 {
+    // (Branches patched into room about to be written again lead there no
+    // longer.)
+    s.sync_patched();
     write(s.cache.as_mut().expect("a code cache"), words)
 }
 
