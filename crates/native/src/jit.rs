@@ -792,6 +792,7 @@ impl State {
 /// mapped it: it runs by translation from now on.
 pub fn code(addr: u64, len: u64) {
     let mut s = state();
+    ANY_CODE.store(true, Ordering::Release);
     s.drop_range(addr, len);
     remove(&mut s.regions, addr, len);
     s.regions.insert(addr, addr + len);
@@ -875,6 +876,11 @@ fn drop_lines(s: &mut State, addr: u64, len: u64) {
     }
 }
 
+/// Whether the program ever had code run by translation ([`code`], or a
+/// code cache): until it does, a change to its memory takes no lock
+/// ([`changed`]).
+static ANY_CODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Whether a page translated from maps a file shared ([`State::objects`]),
 /// ever: until one does, a mapping takes no lock ([`mapped`]).
 static ANY_OBJECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -883,6 +889,9 @@ static ANY_OBJECTS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// fwe kept watch over (unmapped, mapped anew, its protections changed):
 /// its translations are dropped. Whether any of it held such code.
 pub fn changed(addr: u64, len: u64) -> bool {
+    if !ANY_CODE.load(Ordering::Acquire) {
+        return false;
+    }
     let mut s = state();
     let end = addr.saturating_add(len);
     let held = s.regions.range(..end).any(|(_, &e)| e > addr);
@@ -1433,6 +1442,7 @@ fn translation(s: &mut Held, g: u64) -> usize {
         }
         if s.cache.is_none() {
             s.cache = Some(new_cache());
+            ANY_CODE.store(true, Ordering::Release);
         }
         let page = g & !(page_size() - 1);
         let followed = !s.in_region(g);
