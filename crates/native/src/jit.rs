@@ -494,9 +494,12 @@ pub fn write_map() {
                 Word::Out { .. } => 'o',
             })
             .collect();
-        // SAFETY: the block's translation, in the cache.
         let words: String = (0..b.words.len())
-            .map(|k| format!("{:08x}", unsafe { ((b.t + 4 * k as u64) as *const u32).read() }))
+            .map(|k| {
+                // SAFETY: a word of the block's translation, in the cache.
+                let w = unsafe { ((b.t + 4 * k as u64) as *const u32).read() };
+                format!("{w:08x}")
+            })
             .collect();
         text.push_str(&format!("{:x} {} {:x} {kinds} {words}\n", b.t, b.len, b.g));
     }
