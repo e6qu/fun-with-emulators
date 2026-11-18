@@ -1190,6 +1190,16 @@ def jdk(a, fwe, guest_env, results):
     shutil.rmtree(jit_map, ignore_errors=True)
     pcs("JDK java natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE],
         execname="java")
+    # How long `javac` takes alone, both ways.
+    took = []
+    for out, cmd in [(ours_out, javac), (theirs_out, [f"{bin_theirs}/javac", "-d", theirs_out]
+                                         + [os.path.join(JDK_SRC, f) for f in sources])]:
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        start = time.perf_counter()
+        subprocess.run(cmd, capture_output=True)
+        took.append(time.perf_counter() - start)
+    print(f"JDK javac alone: {took[0]:.2f} s under fwe, {took[1]:.2f} s natively", file=sys.stderr)
     # How long each part of the application takes, both ways (it says on
     # standard error).
     for how, cmd in [("under fwe", guest_env + fwe + [
