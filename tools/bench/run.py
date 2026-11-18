@@ -784,7 +784,50 @@ def callers(name, cmd, funcs):
         shown += 1
 
 
-def pcs(name, cmd, share=False, execname="fwe"):
+def translated(name, jit_map, counts, where):
+    """The samples in fwe's translations (`counts`, by program counter),
+    named by the maps of the code cache fwe wrote to directory `jit_map`:
+    by what each word stands for (the program's instruction with its `x16`
+    and `x17` in place or saved, their save or restore, inside an
+    expansion, a lookup, a way out),
+    by the program's code each block was made from (`where` names its
+    address), and the hottest blocks."""
+    blocks = []
+    for f in os.listdir(jit_map):
+        with open(os.path.join(jit_map, f)) as m:
+            for line in m:
+                t, size, g, kinds = line.split()
+                blocks.append((int(t, 16), int(size), int(g, 16), kinds))
+    blocks.sort()
+    starts = [b[0] for b in blocks]
+    names = {"a": "instruction", "s": "instruction, x16/x17 saved", "v": "save of x16/x17",
+             "r": "restore of x16/x17", "u": "expansion", "f": "expansion", "l": "lookup",
+             "L": "lookup", "o": "way out"}
+    by_kind, by_code, by_block = collections.Counter(), collections.Counter(), collections.Counter()
+    n_in = 0
+    for pc, n in counts:
+        i = bisect.bisect_right(starts, pc) - 1
+        if i < 0 or pc >= blocks[i][0] + blocks[i][1]:
+            continue
+        t, _, g, kinds = blocks[i]
+        k = (pc - t) // 4
+        by_kind[names.get(kinds[k], "?") if k < len(kinds) else "?"] += n
+        by_code[where(g).split("+")[0]] += n
+        by_block[g] += n
+        n_in += n
+    if not n_in:
+        print(f"{name}: translations: no samples ({len(blocks)} blocks)", file=sys.stderr)
+        return
+
+    def pct(c):
+        return ", ".join(f"{w} {n * 100 / n_in:.0f}%" for w, n in c.most_common(8))
+    hot = ", ".join(f"{where(g)} {n * 100 / n_in:.1f}%" for g, n in by_block.most_common(15))
+    print(f"{name}: translations: {n_in} samples in {len(blocks)} blocks; by word: "
+          f"{pct(by_kind)}; by the program's code: {pct(by_code)}; hottest blocks: {hot}",
+          file=sys.stderr)
+
+
+def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
     there and the offset into it: `sample` walks frames, which guest code
@@ -807,7 +850,11 @@ def pcs(name, cmd, share=False, execname="fwe"):
     anywhere else: its images and libraries, mapped or loaded into memory,
     the code it makes, and the kernel (the host's work for its system calls
     and faults, as Linux's would be). `cmd` is then one process: a forked
-    one's mappings are not the first's."""
+    one's mappings are not the first's.
+
+    With `jit_map`, the directory fwe writes its code cache's map to as the
+    process ends (`FWE_JIT_MAP`, which `cmd` sets), the samples in
+    translations are named too ([`translated`])."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
@@ -923,6 +970,11 @@ def pcs(name, cmd, share=False, execname="fwe"):
                     for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
+    if jit_map:
+        try:
+            translated(name, jit_map, counts, where)
+        except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+            print(f"{name}: no reading of translations: {e!r}", file=sys.stderr)
     # What the kernel was doing, and fwe's samples by function: for
     # reading only, so a failure here is said and the run goes on.
     try:
@@ -1096,7 +1148,10 @@ def jdk(a, fwe, guest_env, results):
     os.makedirs(ours_out)
     javac = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "javac"),
                                "-d", "/tmp/jdkout"] + [f"/tmp/jdksrc/{f}" for f in sources]
-    pcs("JDK javac", javac)
+    jit_map = tempfile.mkdtemp()
+    pcs("JDK javac", guest_env + [f"FWE_JIT_MAP={jit_map}"] + javac[len(guest_env):],
+        jit_map=jit_map)
+    shutil.rmtree(jit_map, ignore_errors=True)
     shutil.rmtree(ours_out, ignore_errors=True)
     os.makedirs(ours_out)
     try:
@@ -1110,6 +1165,14 @@ def jdk(a, fwe, guest_env, results):
     os.makedirs(theirs_out)
     pcs("JDK javac natively", [f"{bin_theirs}/javac", "-d", theirs_out]
         + [os.path.join(JDK_SRC, f) for f in sources], execname="javac")
+    # The application's run, both ways, from the classes just compiled.
+    jit_map = tempfile.mkdtemp()
+    pcs("JDK java", guest_env + [f"FWE_JIT_MAP={jit_map}"] + fwe
+        + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp", "/tmp/jdkout",
+           "Main", JDK_SCALE], jit_map=jit_map)
+    shutil.rmtree(jit_map, ignore_errors=True)
+    pcs("JDK java natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE],
+        execname="java")
     shutil.rmtree(native, ignore_errors=True)
 
 

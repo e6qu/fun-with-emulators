@@ -407,6 +407,45 @@ static REVIVED: AtomicU64 = AtomicU64::new(0);
 /// Times the code cache was emptied.
 static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
+/// With `FWE_JIT_MAP` naming a directory, write there (`jit-<pid>.map`)
+/// what the code cache holds as the process ends, for a profile of where
+/// time in translations goes (the benchmarks' samples): a line per block,
+/// its address in the cache, its size in bytes, its program address, and
+/// a letter per word for what it stands for (`a` the program's
+/// instruction, `s` one with its `x16` and `x17` saved, `v` and `r` their
+/// save and restore, `u` and `f` inside an expansion, `l` a lookup, `L`
+/// one committed, `o` a way out).
+pub fn write_map() {
+    let Some(dir) = std::env::var_os("FWE_JIT_MAP") else { return };
+    let s = state();
+    let mut text = String::new();
+    for b in &s.blocks {
+        let kinds: String = b
+            .words
+            .iter()
+            .enumerate()
+            // SAFETY: a word of the block's translation, in the cache.
+            .map(|(k, w)| (unsafe { ((b.t + 4 * k as u64) as *const u32).read() }, w))
+            .map(|(insn, w)| match w {
+                _ if insn == SAVE => 'v',
+                _ if insn == RESTORE => 'r',
+                Word::At(_) => 'a',
+                Word::Saved(_) => 's',
+                Word::Undo { .. } => 'u',
+                Word::Finish { .. } => 'f',
+                Word::Lookup { to: None, .. } => 'l',
+                Word::Lookup { .. } => 'L',
+                Word::Out { .. } => 'o',
+            })
+            .collect();
+        text.push_str(&format!("{:x} {} {:x} {kinds}\n", b.t, b.len, b.g));
+    }
+    let path = std::path::Path::new(&dir).join(format!("jit-{}.map", std::process::id()));
+    if let Err(e) = std::fs::write(&path, text) {
+        eprintln!("fwe: {}: {e}", path.display());
+    }
+}
+
 /// What [`TRANSLATED`] and the others counted, if any code ran by
 /// translation.
 pub fn counts() -> Option<String> {
