@@ -105,7 +105,14 @@ way.
   before anything else loads it at its start, and a way out holding it
   enters such a block past that load: a loop keeping a value in `x18`
   runs as fast as with any other register. A fault or signal there is
-  delivered with the program's `x18` taken from `x17`.
+  delivered with the program's `x18` taken from `x17`. Where `x16` and
+  `x17` are the program's (HotSpot allocates them too), an instruction
+  naming `x18` gets one or two scratch registers kept below `sp` without
+  moving it, preferring ones the code after it writes before reading:
+  no chain of `sp` updates and no wait for a register loaded back, about
+  twice as fast as a stub's pushes and pops. A fault or signal inside
+  it is delivered as at the instruction, its scratch registers read
+  back.
 - **Code a translation calls is translated too.** A runtime's helpers in
   its library, the C library, the program's own functions: code fwe
   prepared in place that a translation calls or branches to runs from

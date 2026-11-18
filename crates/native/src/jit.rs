@@ -1277,6 +1277,10 @@ fn undo(regs: &mut Regs, start: u64) {
         let w = unsafe { (at as *const u32).read() };
         if w & !0x1f == rewrite::PUSH {
             saved.push((vec![(w & 0x1f, 0)], 16));
+        } else if w & !0x1f == STUR_SP_M16 {
+            saved.push((vec![(w & 0x1f, (-16i64) as u64)], 0));
+        } else if w & !0x7c1f == STP_SP_M16 {
+            saved.push((vec![(w & 0x1f, (-16i64) as u64), ((w >> 10) & 0x1f, (-8i64) as u64)], 0));
         } else if w & !0x7c1f == rewrite::PUSH_PAIR {
             saved.push((vec![(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)], 16));
         } else if w == rewrite::SYSCALL_STUB_ENTRY {
@@ -1298,7 +1302,7 @@ fn undo(regs: &mut Regs, start: u64) {
     for (regs_saved, size) in saved.iter().rev() {
         for &(r, off) in regs_saved {
             // SAFETY: the stack the expansion saved registers on.
-            regs.x[r as usize] = unsafe { ((regs.sp + off) as *const u64).read() };
+            regs.x[r as usize] = unsafe { (regs.sp.wrapping_add(off) as *const u64).read() };
         }
         regs.sp += size;
     }
@@ -1354,6 +1358,11 @@ fn step(regs: &mut Regs, w: u32) -> bool {
     } else if w & 0xffc0_0000 == rewrite::LDR_UIMM {
         let imm = u64::from((w >> 10) & 0xfff) * 8;
         regs.x[t as usize] = read(base(regs, n) + imm);
+    } else if w & !0x1f == LDUR_SP_M16 {
+        regs.x[t as usize] = read(regs.sp - 16);
+    } else if w & !0x7c1f == LDP_SP_M16 {
+        regs.x[t as usize] = read(regs.sp - 16);
+        regs.x[((w >> 10) & 0x1f) as usize] = read(regs.sp - 8);
     } else if w & !0x7c1f == rewrite::LDP_SP {
         regs.x[t as usize] = read(regs.sp);
         regs.x[((w >> 10) & 0x1f) as usize] = read(regs.sp + 8);
@@ -2047,7 +2056,7 @@ fn body_of(
             info.push(Word::Saved(pc));
             saved = false;
         }
-        ended = one(w, pc, t, &mut saved, &mut x18, &mut sides, out, info);
+        ended = one(w, pc, t, followed, &mut saved, &mut x18, &mut sides, out, info);
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
@@ -2146,10 +2155,16 @@ fn is_branch(w: u32) -> bool {
 /// unless `x18`), and needs no stack of fwe's. Where a field may be a
 /// register, it is taken for one.
 fn keeps_saved(w: u32, x18: bool) -> bool {
+    names_none(w, 1 << 16 | 1 << 17 | if x18 { 0 } else { 1 << 18 })
+}
+
+/// Whether the program's instruction `w` names none of the general
+/// registers in `regs` (a bit each), nor `sp`, and needs no stack of
+/// fwe's ([`keeps_saved`]). Where a field may be a register, it is taken
+/// for one.
+fn names_none(w: u32, regs: u32) -> bool {
     let reg = |shift: u32| (w >> shift) & 31;
-    let named = |fields: &[u32]| {
-        fields.iter().any(|&f| matches!(reg(f), 16 | 17) || (!x18 && reg(f) == 18))
-    };
+    let named = |fields: &[u32]| fields.iter().any(|&f| reg(f) != 31 && regs & 1 << reg(f) != 0);
     let (rd, rn) = (reg(0), reg(5));
     let op0 = (w >> 25) & 0xf;
     match op0 {
@@ -2220,15 +2235,134 @@ fn in_x17(w: u32) -> Option<(u32, bool)> {
     if is_branch(w) || crate::decode::x18_casp(w) || !keeps_saved(w, true) {
         return None;
     }
-    let (mut named, mut writes, mut renamed) = (false, false, w);
+    x18_as(w, 17).map(|(renamed, _, writes)| (renamed, writes))
+}
+
+/// The program's instruction `w` made to name `to` where it names `x18`,
+/// and whether it reads and writes `x18` there; `None` if it does not
+/// name it, or names it in a field not known ([`crate::decode::operands`]).
+fn x18_as(w: u32, to: u32) -> Option<(u32, bool, bool)> {
+    let (mut reads, mut writes, mut renamed) = (false, false, w);
     for f in crate::decode::operands(w)? {
         if (w >> f.shift) & 31 == 18 {
-            named = true;
+            reads |= f.read;
             writes |= f.write;
-            renamed = (renamed & !(31 << f.shift)) | (17 << f.shift);
+            renamed = (renamed & !(31 << f.shift)) | (to << f.shift);
         }
     }
-    named.then_some((renamed, writes))
+    (reads || writes).then_some((renamed, reads, writes))
+}
+
+/// `stur xN, [sp, #-16]`, `stp xN, xM, [sp, #-16]` and the loads back:
+/// registers kept below `sp` without moving it ([`x18_beside`]).
+const STUR_SP_M16: u32 = 0xf81f_03e0;
+const LDUR_SP_M16: u32 = 0xf85f_03e0;
+const STP_SP_M16: u32 = 0xa93f_03e0;
+const LDP_SP_M16: u32 = 0xa97f_03e0;
+
+/// The words standing for the program's instruction `w` at `pc`, which
+/// names `x18` but not `sp` (nor needs a stack), with the program's `x16`
+/// and `x17` in their registers; `followed` as for [`body_of`]. One or two
+/// scratch registers are kept below `sp` without moving it (fwe's signal
+/// handlers run on a stack of their own), so no chain of updates of `sp`
+/// runs through them, and are ones the code after it writes before it
+/// reads them where it has such ([`overwritten_after`]), so nothing waits
+/// for them to be loaded back. The first holds `x18`'s value (from its
+/// slot, the thread's area found through it), the second, where `w`
+/// writes `x18`, the thread's area to store it back. With the index of
+/// `w`'s stand-in among them: before it, the words are undone; after it,
+/// finished ([`undo`], [`finish`]).
+fn x18_beside(w: u32, pc: u64, followed: bool) -> Option<(Vec<u32>, usize)> {
+    if is_branch(w) || crate::decode::x18_casp(w) || !names_none(w, 0) {
+        return None;
+    }
+    let mut used = 1u32 << 18 | 1 << 31;
+    for f in crate::decode::operands(w)? {
+        used |= 1 << ((w >> f.shift) & 31);
+    }
+    let quiet = overwritten_after(pc, followed);
+    let pick = |used: u32| {
+        let free = !used;
+        if free & quiet != 0 { (free & quiet).trailing_zeros() } else { free.trailing_zeros() }
+    };
+    let s1 = pick(used);
+    let (renamed, reads, writes) = x18_as(w, s1)?;
+    let slot = (crate::x18_slot() / 8) << 10;
+    let mut words;
+    let main;
+    if writes {
+        let s2 = pick(used | 1 << s1);
+        words = vec![
+            STP_SP_M16 | s2 << 10 | s1,
+            rewrite::MRS_TPIDRRO | s2,
+            rewrite::AND_NOT7 | s2 << 5 | s2,
+        ];
+        if reads {
+            words.push(rewrite::LDR_UIMM | slot | s2 << 5 | s1);
+        }
+        main = words.len();
+        words.extend([
+            renamed,
+            rewrite::STR_UIMM | slot | s2 << 5 | s1,
+            LDP_SP_M16 | s2 << 10 | s1,
+        ]);
+    } else {
+        words = vec![
+            STUR_SP_M16 | s1,
+            rewrite::MRS_TPIDRRO | s1,
+            rewrite::AND_NOT7 | s1 << 5 | s1,
+            rewrite::LDR_UIMM | slot | s1 << 5 | s1,
+        ];
+        main = words.len();
+        words.extend([renamed, LDUR_SP_M16 | s1]);
+    }
+    Some((words, main))
+}
+
+/// The general registers the program's code after `pc` writes before it
+/// reads them, on its way on past conditional branches (up to 16
+/// instructions, the page's end, or another branch or an instruction
+/// [`crate::decode::operands`] does not know): scratch registers whose
+/// values nothing soon waits for.
+fn overwritten_after(pc: u64, followed: bool) -> u32 {
+    let page = page_size();
+    let (mut seen, mut written) = (0u32, 0u32);
+    let mut at = pc + 4;
+    for _ in 0..16 {
+        if at & (page - 1) == 0 {
+            break;
+        }
+        let w = if followed { crate::prepare::original(at, read(at)) } else { read(at) };
+        at += 4;
+        let family = (w >> 25) & 0x3f;
+        if w & 0xff00_0000 == 0x5400_0000
+            || w & 0xffff_f01f == 0xd503_201f
+            || w & 0xffff_f01f == 0xd503_301f
+        {
+            // A conditional branch (gone past), a hint or a barrier.
+            continue;
+        }
+        if family == 0b011010 || family == 0b011011 {
+            seen |= 1 << (w & 0x1f);
+            continue;
+        }
+        if is_branch(w) || (w >> 25) & 0x7f == 0b110_1011 {
+            break;
+        }
+        let Some(ops) = crate::decode::operands(w) else { break };
+        for f in &ops {
+            if f.read {
+                seen |= 1 << ((w >> f.shift) & 31);
+            }
+        }
+        for f in &ops {
+            let r = 1 << ((w >> f.shift) & 31);
+            if f.write && seen & r == 0 {
+                written |= r;
+            }
+        }
+    }
+    written & !(1 << 31 | 1 << 18)
 }
 
 /// The program's `x18`, held in `x17` ([`one`]), written back to its slot
@@ -2277,6 +2411,7 @@ fn one(
     w: u32,
     pc: u64,
     t: u64,
+    followed: bool,
     saved: &mut bool,
     x18: &mut Option<bool>,
     sides: &mut Vec<Side>,
@@ -2543,7 +2678,19 @@ fn one(
     }
     // x18
     if rewrite::x18_site(w) {
-        expansion(Site::X18 { insn: w }, pc, here(out), out, info);
+        if let Some((words, main)) = x18_beside(w, pc, followed) {
+            let start = here(out);
+            for (k, sw) in words.into_iter().enumerate() {
+                out.push(sw);
+                info.push(match k {
+                    0 => Word::At(pc),
+                    k if k > main => Word::Finish { g: pc, of: Of::X18 },
+                    _ => Word::Undo { g: pc, start, of: Of::X18 },
+                });
+            }
+        } else {
+            expansion(Site::X18 { insn: w }, pc, here(out), out, info);
+        }
         return false;
     }
     if crate::decode::names_x18(w) {
