@@ -688,13 +688,31 @@ def shared_cache_name(pc):
     return f"shared cache+{pc:#x}"
 
 
+def cache_symbol(pc):
+    """The function of the host's shared cache at `pc`, as this process's
+    loader names it (the cache is at one address in every process), or
+    ""."""
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p),
+                    ("sname", ctypes.c_char_p), ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    if ctypes.CDLL(None).dladdr(ctypes.c_void_p(pc), ctypes.byref(info)) and info.sname:
+        return f" ({info.sname.decode(errors='replace')}+{pc - info.saddr:#x})"
+    return ""
+
+
 def breakdown(name, execname, cmd, counts, kstacks, looks, base, where, total):
     """[`pcs`]'s readings beyond the files: the kernel's most sampled
     stacks, and the samples in `execname` by function, named by `atos`
     from the binary `cmd` ran."""
     kstacks.sort(key=lambda k: -k[0])
     for n, frames in kstacks[:8]:
-        print(f"{name}: kernel {n * 100 / total:.1f}%: {' < '.join(frames)}", file=sys.stderr)
+        # The program's frame it entered from, named where it can be.
+        named = [where(int(f, 16)) + cache_symbol(int(f, 16)) if f.startswith("0x") else f
+                 for f in frames]
+        print(f"{name}: kernel {n * 100 / total:.1f}%: {' < '.join(named)}", file=sys.stderr)
     exe = next((c for c in cmd if os.path.basename(c) == execname and os.path.isfile(c)), None)
     path = next((p for regions in looks for _, _, p, _, _ in regions
                  if p and os.path.basename(p) == execname), None)
