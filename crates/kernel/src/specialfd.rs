@@ -1463,9 +1463,10 @@ mod tests {
         use fwe_abi::timerfd::*;
         // SAFETY: no pointers.
         let fd = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK) } as i32;
-        // First due 1.05 s ago, every 100 ms: 11 expiries at once.
-        let at = clock_ns(CLOCK_MONOTONIC) - 1_050_000_000;
-        let spec: [i64; 4] = [0, 100_000_000, at / 1_000_000_000, at % 1_000_000_000];
+        // First due 10.5 s ago, every second: 11 expiries at once, the
+        // next half a second away (however slowly the test runs).
+        let at = clock_ns(CLOCK_MONOTONIC) - 10_500_000_000;
+        let spec: [i64; 4] = [1, 0, at / 1_000_000_000, at % 1_000_000_000];
         // SAFETY: as above.
         let r = unsafe { timerfd_settime(fd as u64, TFD_TIMER_ABSTIME, spec.as_ptr() as u64, 0) };
         assert_eq!(r, 0);
