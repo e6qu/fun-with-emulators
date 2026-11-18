@@ -739,7 +739,7 @@ static POOL_HIGH: AtomicU64 = AtomicU64::new(0);
 /// The entries of [`POOL`] ever taken: those past them hold nothing, and
 /// are never read (a fork child would map in their pages to read them).
 fn used_pool() -> &'static [Queued] {
-    &POOL[..(POOL_HIGH.load(Ordering::Acquire) as usize).min(QUEUE_MAX)]
+    &POOL[..(POOL_HIGH.load(Ordering::SeqCst) as usize).min(QUEUE_MAX)]
 }
 
 /// How many signals are pending in the process, in all its sets: each
@@ -824,36 +824,54 @@ impl Pending {
     fn enqueue(&self, sig: u64, info: &SigInfo) -> bool {
         for (i, q) in POOL.iter().enumerate() {
             if q.state.compare_exchange(0, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                POOL_HIGH.fetch_max(i as u64 + 1, Ordering::AcqRel);
+                POOL_HIGH.fetch_max(i as u64 + 1, Ordering::SeqCst);
                 q.owner.store(self.id(), Ordering::Relaxed);
                 q.sig.store(sig, Ordering::Relaxed);
                 store_slot(&q.info, info);
                 POOL_USED.fetch_add(1, Ordering::Relaxed);
                 COUNT.fetch_add(1, Ordering::Relaxed);
                 let order = ORDER.fetch_add(1, Ordering::Relaxed);
-                q.state.store(order, Ordering::Release);
+                // In one order with the slot's claims and the look a
+                // promotion takes as it leaves the slot empty
+                // ([`Pending::promote`]).
+                q.state.store(order, Ordering::SeqCst);
                 return true;
             }
         }
         false
     }
 
-    /// The oldest signal queued of number `sig`, taken off the queue.
-    fn dequeue(&self, sig: u64) -> Option<SigInfo> {
+    /// The signals queued of number `sig`, each with the order it was
+    /// queued in.
+    fn queued(&self, sig: u64) -> impl Iterator<Item = (u64, &'static Queued)> {
         let me = self.id();
+        used_pool().iter().filter_map(move |q| {
+            let s = q.state.load(Ordering::SeqCst);
+            (s > CLAIMED
+                && q.owner.load(Ordering::Relaxed) == me
+                && q.sig.load(Ordering::Relaxed) == sig)
+                .then_some((s, q))
+        })
+    }
+
+    /// The oldest signal queued of number `sig`, taken off the queue. Only
+    /// the claim of the slot dequeues (a post's, a take's or a
+    /// promotion's), but posts queue as the pool is looked over: one may
+    /// queue a signal behind the look and then a newer one ahead of it. So
+    /// the oldest found is taken once a second look finds none older:
+    /// whatever was queued before it is seen by then.
+    fn dequeue(&self, sig: u64) -> Option<SigInfo> {
+        let oldest = || self.queued(sig).min_by_key(|&(s, _)| s);
+        let mut found = oldest()?;
         loop {
-            let oldest = used_pool()
-                .iter()
-                .filter_map(|q| {
-                    let s = q.state.load(Ordering::Acquire);
-                    (s > CLAIMED
-                        && q.owner.load(Ordering::Relaxed) == me
-                        && q.sig.load(Ordering::Relaxed) == sig)
-                        .then_some((s, q))
-                })
-                .min_by_key(|&(s, _)| s);
-            let (s, q) = oldest?;
+            let again = oldest()?;
+            if again.0 != found.0 {
+                found = again;
+                continue;
+            }
+            let (s, q) = found;
             if q.state.compare_exchange(s, CLAIMED, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                found = oldest()?;
                 continue;
             }
             let info = load_slot(&q.info);
@@ -967,18 +985,26 @@ impl Pending {
     fn promote(&self, sig: u64) {
         let i = (sig - 1) as usize;
         let (state, slot) = (&self.state[i], &self.info[i]);
-        // Pending still, or a post or take is there (a take brings the
-        // oldest queued in as it ends).
-        if state.compare_exchange(EMPTY, WRITING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
-            return;
-        }
-        match self.dequeue(sig) {
-            Some(next) => {
+        loop {
+            // Pending still, or a post or take is there (a take brings the
+            // oldest queued in as it ends).
+            if state.compare_exchange(EMPTY, WRITING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
+                return;
+            }
+            if let Some(next) = self.dequeue(sig) {
                 store_slot(slot, &next);
                 self.set_bit(1 << i);
                 state.store(FULL, Ordering::SeqCst);
+                return;
             }
-            None => state.store(EMPTY, Ordering::SeqCst),
+            state.store(EMPTY, Ordering::SeqCst);
+            // A post that queued one as the slot was claimed here, and
+            // found it claimed, left it to this promotion: queued in one
+            // order with the claims and this look, it is seen here, or its
+            // own promotion finds the slot empty.
+            if self.queued(sig).next().is_none() {
+                return;
+            }
         }
     }
 
@@ -1788,6 +1814,16 @@ mod tests {
         let _held = signals_held();
         const POSTS: u64 = 20_000;
         let rt = signal::SIGRTMIN + 3;
+        // Another set's signals over most of the pool, with a free entry
+        // after each (a third set's, gone): each look over the queue is
+        // long, and the entries this test's signals take lie between
+        // them, behind and ahead of a look as it goes.
+        let (other, gone) = (Pending::new(), Pending::new());
+        for v in 0..QUEUE_MAX as u64 * 3 / 8 {
+            other.post(rt, valued(v));
+            gone.post(rt, valued(v));
+        }
+        drop(gone);
         let p = Pending::new();
         let (done, count) = (AtomicBool::new(false), AtomicU64::new(0));
         let mut taken: Vec<u64> = std::thread::scope(|s| {
