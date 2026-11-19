@@ -384,6 +384,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         if child_stack != 0 {
             regs.sp = child_stack;
         }
+        // Its waits from here on are the program's.
+        fwe_kernel::procstore::entered();
         trap::prepare_guest_entry();
         // SAFETY: `regs` is the parent's runnable context with x0 cleared.
         unsafe { trap::enter_guest_full(&regs) }

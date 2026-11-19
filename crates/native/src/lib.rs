@@ -1297,7 +1297,9 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
         regs
     });
     // From here on this thread runs guest code, which may use x18 freely;
-    // the trap handlers leave the mode while they run host code.
+    // the trap handlers leave the mode while they run host code. Its waits
+    // from here on are the program's.
+    fwe_kernel::procstore::entered();
     trap::prepare_guest_entry();
     match traced {
         // SAFETY: the registers of the program's entry, as the tracer left them.

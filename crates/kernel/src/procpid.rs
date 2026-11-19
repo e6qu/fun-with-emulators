@@ -79,12 +79,16 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
                 tsize,
             )
         } == tsize;
+        let start = b.pbi_start_tvsec * 1_000_000 + b.pbi_start_tvusec;
         let state = match b.pbi_status {
+            4 => b'T', // SSTOP
+            5 => b'Z', // SZOMB
+            // Not yet in the program: whatever waits the host shows it in
+            // are its making's ([`crate::procstore::entered`]).
+            _ if crate::procstore::not_yet_entered(pid, start) => b'R',
             // SRUN: running or runnable, as the host sees a process that
             // is neither stopped nor ended; Linux tells from its threads.
             2 => threads_state(pid),
-            4 => b'T', // SSTOP
-            5 => b'Z', // SZOMB
             _ => b'S', // SIDL, SSLEEP
         };
         let ns_to_ticks = |ns: u64| ns * HZ / 1_000_000_000;

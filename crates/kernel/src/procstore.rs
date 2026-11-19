@@ -21,6 +21,8 @@
 //!   with its record, or once its process is gone.
 //! - **Busy marks**, one for each host pid: its main thread is in fwe's
 //!   own work, which the host may make it wait for ([`Busy`]).
+//! - **Entry marks**, one for each host pid: the start of the process
+//!   whose main thread has gone into the program ([`entered`]).
 //!
 //! A reader takes no lock: it reads the sequence number, the bytes and the
 //! number again, and reads again if a change came between. A writer holds
@@ -128,7 +130,9 @@ const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 const UNWRITTEN_AT: usize = USED_AT + PIDS / 8;
 /// Each pid's busy mark ([`Busy`]).
 const BUSY_AT: usize = UNWRITTEN_AT + PIDS / 8;
-const ENDED_AT: usize = BUSY_AT + PIDS * 4;
+/// Each pid's entry mark ([`entered`]).
+const ENTERED_AT: usize = BUSY_AT + PIDS * 4;
+const ENDED_AT: usize = ENTERED_AT + PIDS * 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
 /// How many ended accounts are kept or being kept or taken
 /// ([`Store::ended_kept`]), in the free hint's line.
@@ -317,6 +321,35 @@ fn busy_word(pid: i32) -> Option<&'static AtomicU32> {
 /// Whether host pid `pid`'s main thread is in fwe's own work ([`Busy`]).
 pub fn busy(pid: i32) -> bool {
     busy_word(pid).is_some_and(|w| w.load(SeqCst) != 0)
+}
+
+/// This process's main thread goes into the program: its first
+/// instruction, or a fork's return in the child. A host wait it is shown in
+/// before then is fwe's or the host's work of making it (a fork child
+/// waits for its parent), which Linux shows running: a program waiting
+/// for its child to sleep in a wait it is on its way to would take that
+/// for it ([`has_entered`]). The mark is the process's start, which no
+/// later process with the pid has.
+pub fn entered() {
+    let pid = crate::host::pid();
+    if let Some(w) = entered_word(pid)
+        && let Some((start, _, _)) = crate::procreg::host_info(pid)
+    {
+        w.store(start, SeqCst);
+    }
+}
+
+/// Whether host process `pid`, which started at `start` (microseconds,
+/// as the host says), is one of fwe's (it has a record, or writes its own)
+/// that has not yet gone into the program ([`entered`]).
+pub fn not_yet_entered(pid: i32, start: u64) -> bool {
+    (version(pid).is_some() || unwritten(pid))
+        && !entered_word(pid).is_some_and(|w| w.load(SeqCst) == start)
+}
+
+fn entered_word(pid: i32) -> Option<&'static AtomicU64> {
+    let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
+    Some(store().at(ENTERED_AT + i * 8))
 }
 
 /// This process's main thread is in none of fwe's work: it starts, or is

@@ -954,6 +954,8 @@ impl Vcpu {
 
     /// Run the guest from `regs` until the process ends.
     pub(super) fn run(&self, mut regs: Regs) -> ! {
+        // The process's waits from here on are the program's.
+        fwe_kernel::procstore::entered();
         self.set_regs(&regs);
         loop {
             if EXITING.load(std::sync::atomic::Ordering::SeqCst) {

@@ -1064,7 +1064,8 @@ contents come from is in
   it does fwe's own work, waiting for one of fwe's locks or the host's
   reading and writing of fwe's records (a mark in the process store,
   `procstore::Busy`), as a Linux task doing its kernel's work is not
-  asleep.
+  asleep, or before it has gone into the program (a fork's child whose
+  making waits; `procstore::entered` marks it as it goes in).
 - `cpuinfo` is Linux's arm64 format: BogoMIPS from the host's timer, the
   features of the hwcaps the program was given, the implementer and, for
   a chip Linux knows, the part from `hw.cpufamily`. `/proc/net` is
