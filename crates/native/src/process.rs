@@ -277,7 +277,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             fwe_kernel::timing::mark("fork: locked");
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
-                fork_with_signals_held(
+                let (pid, b) = fork_with_signals_held(
                     // SAFETY: plain host call; the child continues with only
                     // the calling thread, as on Linux.
                     || unsafe { libc::fork() },
@@ -288,9 +288,16 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                     |child| {
                         let sig =
                             if flags & cl::CLONE_PARENT != 0 { 0 } else { flags & cl::CSIGNAL };
-                        reaper::set_exit_signal(child, sig)
+                        reaper::set_exit_signal(child, sig);
+                        // Its record written here, where every page is
+                        // mapped already, before it goes on.
+                        if k.fork_write_child(&token, child) { WROTE } else { GO }
                     },
-                )
+                );
+                if pid == 0 {
+                    token.set_written(b == WROTE);
+                }
+                pid
             });
             set_shared(false);
             pid
@@ -434,8 +441,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
 )]
 fn fork_with_signals_held(
     fork: impl FnOnce() -> libc::pid_t,
-    in_parent: impl FnOnce(libc::pid_t),
-) -> libc::pid_t {
+    in_parent: impl FnOnce(libc::pid_t) -> u8,
+) -> (libc::pid_t, u8) {
     let mut go = [-1i32; 2];
     // SAFETY: a valid out-array; on failure the fork goes on without it.
     if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
@@ -463,18 +470,19 @@ fn fork_with_signals_held(
         fwe_kernel::timing::mark("fork: host fork returned");
         // What a failed fork left, kept for the caller across the calls below.
         let saved = host::last_errno();
+        let mut b = GO;
         if pid > 0 {
-            in_parent(pid);
+            b = in_parent(pid);
         }
         if pid != 0 {
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
             if go[1] >= 0 {
-                libc::write(go[1], b"g".as_ptr().cast(), 1);
+                libc::write(go[1], (&b as *const u8).cast(), 1);
             }
         } else if go[0] >= 0 {
             libc::close(go[1]);
-            // Until the parent's byte, or its end (should it be gone).
-            let mut b = 0u8;
+            // Until the parent's byte, or its end (should it be gone: then
+            // [`GO`], nothing written for it).
             while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
                 && host::last_errno() == libc::EINTR
             {}
@@ -487,9 +495,14 @@ fn fork_with_signals_held(
             libc::close(fd);
         }
         host::set_errno(saved);
-        pid
+        (pid, b)
     }
 }
+
+/// The byte a forking parent lets its child go on with: [`WROTE`] when it
+/// wrote the child's record for it, [`GO`] otherwise.
+const GO: u8 = b'g';
+const WROTE: u8 = b'w';
 
 /// A `wait` reaped host process `pid`, which ended with Linux wait status
 /// `wstatus`: its `SIGCHLD` given now if the host's has not landed, as

@@ -1166,20 +1166,29 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
 
 def phases(name, cmd):
     """Run `cmd` (fwe and its program) with `FWE_TIMING`, and log the time
-    between each of its marks and the one before it in the same process,
-    by mark (numbers in a mark's name taken as one), as the median and the
-    total over the run: where a step that repeats (a fork, a wait) spends
-    its time."""
+    and the page faults between each of its marks and the one before it in
+    the same process, by mark (numbers in a mark's name taken as one), as
+    medians over the run: where a step that repeats (a fork, a wait) spends
+    its time, and how many pages it writes (each a copy after a fork)."""
     r = subprocess.run(cmd, env=dict(os.environ, FWE_TIMING="1"), capture_output=True,
                        text=True, errors="replace")
-    steps = collections.defaultdict(list)
+    steps, faults = collections.defaultdict(list), collections.defaultdict(list)
+    first = None
     for line in r.stderr.splitlines():
-        m = re.match(r"\[fwe \d+\] timing: (.*?) \+(\d+)us \(\d+us\)$", line)
+        m = re.match(r"\[fwe (\d+)\] timing: (.*?) \+(\d+)us \(\d+us\) \+(\d+) faults$",
+                     line)
         if m:
-            steps[re.sub(r"\d+", "N", m.group(1))[:60]].append(int(m.group(2)))
+            pid, m = m.group(1), m.groups()[1:]
+            first = first or pid
+            # The first process's steps, and those of the processes after it.
+            who = "" if pid == first else "(others) "
+            step = who + re.sub(r"\d+", "N", m[0])[:60]
+            steps[step].append(int(m[1]))
+            faults[step].append(int(m[2]))
     took = sorted(steps.items(), key=lambda kv: -sum(kv[1]))
-    print(f"{name}: steps (median and total, us): "
-          + "; ".join(f"{k} {statistics.median(v):.0f} x{len(v)} = {sum(v)}"
+    print(f"{name}: steps (median us, median page faults, times): "
+          + "; ".join(f"{k} {statistics.median(v):.0f} us {statistics.median(faults[k]):.0f} "
+                      f"faults x{len(v)}"
                       for k, v in took if len(v) > 1),
           file=sys.stderr)
 

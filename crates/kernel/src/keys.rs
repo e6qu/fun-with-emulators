@@ -31,6 +31,7 @@ use crate::{Kernel, Platform, guest, uaccess};
 use fwe_abi::keyctl::*;
 use fwe_abi::{err, errno};
 use std::collections::BTreeMap;
+use std::sync::atomic::Ordering;
 
 /// Key state flags.
 const NEGATIVE: u32 = 1;
@@ -281,16 +282,22 @@ static STORE: std::sync::OnceLock<Option<Record<Store>>> = std::sync::OnceLock::
 
 /// The shared record.
 fn store() -> Option<&'static Record<Store>> {
-    STORE.get_or_init(|| Record::named("keys", 0, Store::default).ok()).as_ref()
+    STORE
+        .get_or_init(|| {
+            let r = Record::named("keys", 0, Store::default).ok()?;
+            // Every process looks for it from now on ([`existing`]).
+            crate::procstore::count(crate::procstore::Count::Keys).store(1, Ordering::SeqCst);
+            Some(r)
+        })
+        .as_ref()
 }
 
 /// The shared record, if any process has made it: so a fork or exec of a
-/// program that never used a key costs only a look.
+/// program that never used a key costs only a look at shared memory.
 fn existing() -> Option<&'static Record<Store>> {
-    use std::os::unix::ffi::OsStrExt;
-    let mut dir = crate::fs::shm::user_dir().ok()?;
-    dir.extend_from_slice(format!("/v{}-keys", crate::shared::FORMAT).as_bytes());
-    std::fs::metadata(std::ffi::OsStr::from_bytes(&dir)).ok()?;
+    if crate::procstore::count(crate::procstore::Count::Keys).load(Ordering::SeqCst) == 0 {
+        return None;
+    }
     store()
 }
 

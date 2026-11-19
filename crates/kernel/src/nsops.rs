@@ -82,6 +82,18 @@ pub struct ForkNs {
     /// [`crate::procreg::Prepared`]); none while a thread has a view of its
     /// own, which the child may take.
     prepared: Option<(crate::procreg::Prepared, Option<Vec<u8>>)>,
+    /// The parent wrote that record and view for the child, with the
+    /// child's start time, before letting it go on
+    /// ([`Kernel::fork_write_child`]): the child writes neither.
+    written: std::cell::Cell<bool>,
+}
+
+impl ForkNs {
+    /// In the child: whether its parent wrote its record and view for it
+    /// ([`Kernel::fork_write_child`]), as the parent told it.
+    pub fn set_written(&self, written: bool) {
+        self.written.set(written);
+    }
 }
 
 impl<P: Platform> Kernel<P> {
@@ -367,9 +379,7 @@ impl<P: Platform> Kernel<P> {
             }
         };
         // Within the cgroup's `pids.max`; frozen with it.
-        let start = cgroup.clone().unwrap_or_else(crate::cgroupfs::current);
-        crate::cgroupfs::fork_allowed(&start)?;
-        let frozen = crate::cgroupfs::frozen(&start);
+        let frozen = crate::cgroupfs::fork_checks(cgroup.as_deref())?;
         CLEAR_SIGHAND.store(
             flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
             std::sync::atomic::Ordering::SeqCst,
@@ -462,6 +472,7 @@ impl<P: Platform> Kernel<P> {
             pidfd: None,
             child_writes: None,
             prepared: None,
+            written: std::cell::Cell::new(false),
         })
     }
 
@@ -491,6 +502,22 @@ impl<P: Platform> Kernel<P> {
         t.child_writes = Some(from);
     }
 
+    /// In the parent, the host `fork` made `child`, which waits to be let
+    /// go on: its record and view, prepared before the fork, written for
+    /// it with its start time, so the child, whose every page touched is a
+    /// fault, writes neither. Whether they were (the child is told).
+    pub fn fork_write_child(&self, t: &ForkNs, child: i32) -> bool {
+        let Some((record, view)) = t.prepared.as_ref() else { return false };
+        if !crate::procreg::prepared_for(child, record) {
+            return false;
+        }
+        if let Some(view) = view {
+            crate::procstore::put_for(crate::procstore::Kind::View, child, view);
+        }
+        t.written.set(true);
+        true
+    }
+
     /// In the parent after the host `fork` (`child` is the child's host
     /// pid, or negative if it failed): back to its own namespaces. Returns
     /// the child's pid as the parent sees it.
@@ -516,7 +543,7 @@ impl<P: Platform> Kernel<P> {
             );
             // It holds this process's session keyring.
         }
-        if child > 0 && t.child_writes.is_some() {
+        if child > 0 && t.child_writes.is_some() && !t.written.get() {
             crate::procreg::child_writes_own(child);
         }
         if child > 0 {
@@ -554,7 +581,9 @@ impl<P: Platform> Kernel<P> {
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
         // Its view is the forking thread's, which other processes see.
         self.adopt_thread_view();
+        let written = t.written.get();
         match t.prepared.as_ref().map(|p| &p.1) {
+            Some(Some(_)) if written => {}
             Some(Some(view)) => {
                 crate::procstore::put_own(crate::procstore::Kind::View, Some(view));
             }
@@ -574,7 +603,8 @@ impl<P: Platform> Kernel<P> {
         // Its own record too: it may end before the parent writes it.
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
-        let prepared = t.prepared.as_ref().is_some_and(|p| crate::procreg::own_prepared(&p.0));
+        let prepared =
+            written || t.prepared.as_ref().is_some_and(|p| crate::procreg::own_prepared(&p.0));
         let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
         match &t.child_writes {
             _ if prepared => {}

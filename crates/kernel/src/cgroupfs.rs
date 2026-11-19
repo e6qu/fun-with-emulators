@@ -540,6 +540,7 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
                 _ => return Err(errno::EINVAL),
             };
             store(format!("{}\n", u8::from(on)))?;
+            changed();
             // Each process below takes the state its cgroup now has: one
             // in a cgroup a cgroup above it freezes stays frozen.
             let mut known: std::collections::HashMap<Vec<u8>, bool> = Default::default();
@@ -727,11 +728,18 @@ fn ancestors(cg: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
+/// Cgroup `cg` and each cgroup above it but the root, which has no
+/// `pids.max` or `cgroup.freeze` to read (a task of the root's has none
+/// of them).
+fn below_root(cg: &[u8]) -> impl Iterator<Item = Vec<u8>> {
+    ancestors(cg).into_iter().filter(|c| c != b"/")
+}
+
 /// Whether cgroup `cg` is frozen: its own `cgroup.freeze`, or one above
 /// it, says so.
 pub fn frozen(cg: &[u8]) -> bool {
-    ancestors(cg).iter().any(|c| {
-        host_dir(c).is_ok_and(|d| {
+    below_root(cg).any(|c| {
+        host_dir(&c).is_ok_and(|d| {
             read_words(&[&d[..], b"/cgroup.freeze"].concat()).first().is_some_and(|w| w == "1")
         })
     })
@@ -741,7 +749,7 @@ pub fn frozen(cg: &[u8]) -> bool {
 /// it and every cgroup above it (`EAGAIN` otherwise, counted in the
 /// `pids.events` of the cgroup whose limit it is).
 pub fn fork_allowed(cg: &[u8]) -> Result<(), i32> {
-    for at in ancestors(cg) {
+    for at in below_root(cg) {
         let Ok(dir) = host_dir(&at) else { continue };
         if let Some(max) = read_words(&[&dir[..], b"/pids.max"].concat()).first()
             && let Ok(max) = max.parse::<u64>()
@@ -764,9 +772,9 @@ fn count_max_event(dir: &[u8]) {
     replace(&p, format!("max {}\n", n + 1));
 }
 
-/// A record whose generation moves whenever a process changes cgroup or
-/// a `pids.max` changes: what [`thread_allowed`] knows of the process's
-/// cgroups is good until it moves.
+/// A record whose generation moves whenever a process changes cgroup, or
+/// a `pids.max` or `cgroup.freeze` changes: what [`looked`] knows of the
+/// process's cgroups is good until it moves.
 fn moves() -> Option<&'static crate::shared::Record<crate::sysctl::Globals>> {
     static R: std::sync::OnceLock<Option<crate::shared::Record<crate::sysctl::Globals>>> =
         std::sync::OnceLock::new();
@@ -776,7 +784,7 @@ fn moves() -> Option<&'static crate::shared::Record<crate::sysctl::Globals>> {
     .as_ref()
 }
 
-/// A process changed cgroup, or a `pids.max` changed.
+/// A process changed cgroup, or a `pids.max` or `cgroup.freeze` changed.
 fn changed() {
     if let Some(r) = moves() {
         let _ = r.update(|_| Ok(()));
@@ -784,9 +792,58 @@ fn changed() {
 }
 
 /// [`moves`]'s generation when this process last looked at its cgroups
-/// (`u64::MAX`: never), and whether a `pids.max` was set in one of them.
+/// (`u64::MAX`: never), whether a `pids.max` was set in one of them, and
+/// whether one of them was frozen.
 static SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
 static LIMITED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static FROZEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether a `pids.max` is set in this process's cgroup or one above it,
+/// and whether one of them is frozen: looked at again only after a process
+/// moved or a limit or freeze changed ([`moves`]), every time without the
+/// record that tells.
+fn looked() -> (bool, bool) {
+    use std::sync::atomic::Ordering;
+    let look = || {
+        let cg = current();
+        let limited = below_root(&cg).any(|c| {
+            host_dir(&c).is_ok_and(|d| {
+                read_words(&[&d[..], b"/pids.max"].concat())
+                    .first()
+                    .is_some_and(|w| w.parse::<u64>().is_ok())
+            })
+        });
+        (limited, frozen(&cg))
+    };
+    let Some(r) = moves() else { return look() };
+    let now = r.generation();
+    if SEEN.load(Ordering::Acquire) != now {
+        let (limited, frozen) = look();
+        LIMITED.store(limited, Ordering::Release);
+        FROZEN.store(frozen, Ordering::Release);
+        SEEN.store(now, Ordering::Release);
+    }
+    (LIMITED.load(Ordering::Acquire), FROZEN.load(Ordering::Acquire))
+}
+
+/// Whether a child may start in cgroup `cg` (this process's own if
+/// `None`): within the `pids.max` of it and those above it (`EAGAIN`
+/// otherwise); and whether it starts frozen.
+pub fn fork_checks(cg: Option<&[u8]>) -> Result<bool, i32> {
+    match cg {
+        Some(cg) => {
+            fork_allowed(cg)?;
+            Ok(frozen(cg))
+        }
+        None => {
+            let (limited, frozen) = looked();
+            if limited {
+                fork_allowed(&current())?;
+            }
+            Ok(frozen)
+        }
+    }
+}
 
 /// This process was just forked: it may be in another cgroup than its
 /// parent (`CLONE_INTO_CGROUP`), so it looks again.
@@ -798,21 +855,7 @@ pub fn forked() {
 /// its cgroups (`EAGAIN` otherwise). Most cgroups set none: whether one
 /// does is looked at again only after a process moved or a limit changed.
 pub fn thread_allowed() -> Result<(), i32> {
-    use std::sync::atomic::Ordering;
-    let Some(r) = moves() else { return Ok(()) };
-    let now = r.generation();
-    if SEEN.load(Ordering::Acquire) != now {
-        let limited = ancestors(&current()).iter().any(|c| {
-            host_dir(c).is_ok_and(|d| {
-                read_words(&[&d[..], b"/pids.max"].concat())
-                    .first()
-                    .is_some_and(|w| w.parse::<u64>().is_ok())
-            })
-        });
-        LIMITED.store(limited, Ordering::Release);
-        SEEN.store(now, Ordering::Release);
-    }
-    if LIMITED.load(Ordering::Acquire) { fork_allowed(&current()) } else { Ok(()) }
+    if looked().0 { fork_allowed(&current()) } else { Ok(()) }
 }
 
 /// Whether this process may have one more thread: within `RLIMIT_NPROC`

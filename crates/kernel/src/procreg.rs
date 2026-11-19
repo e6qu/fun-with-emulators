@@ -1420,6 +1420,23 @@ pub fn own_prepared(prepared: &Prepared) -> bool {
     true
 }
 
+/// In a parent, its child `child` just forked and waiting to go on: the
+/// record made for it ([`Prepared`]) written as the child's, with its start
+/// time. False, writing nothing, when the child is not there to tell its
+/// start time, or a record of it is there already.
+pub fn prepared_for(child: i32, prepared: &Prepared) -> bool {
+    let Some(start) = start_time(child) else { return false };
+    let Some(held) = crate::procstore::lock(child) else { return false };
+    let start = start.to_le_bytes();
+    if crate::procstore::get(child).is_some_and(|b| b.get(..8) == Some(&start[..])) {
+        return false;
+    }
+    let mut bytes = prepared.0.clone();
+    bytes[..8].copy_from_slice(&start);
+    crate::procstore::put(&held, child, &bytes);
+    true
+}
+
 /// Make this process a child subreaper, or not, with the orphans below it
 /// it is not to adopt (`declined`) and those it keeps (`kept`), see
 /// [`crate::reaper::set_subreaper`].
@@ -1578,6 +1595,14 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
                 info.pbi_ppid as i32,
                 info.pbi_status == 5,
             ));
+        }
+        // A process that is not there at all (one just reaped, say) is
+        // told apart in one cheap call (`ESRCH`; a zombie is still there),
+        // where the `sysctl` below costs tens of microseconds.
+        // SAFETY: signal 0 sends nothing; it only looks the process up.
+        if pid > 0 && unsafe { libc::kill(pid, 0) } != 0 && crate::host::last_errno() == libc::ESRCH
+        {
+            return None;
         }
         // The host tells nothing that way of a zombie, nor of a process
         // still ending (its descriptors not yet closed, so not gone): its

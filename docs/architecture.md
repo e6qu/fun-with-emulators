@@ -152,8 +152,10 @@ byte ranges):
   holds fwe's notes only, among them a file's times around each read
   whose access time fwe keeps or sets, and at the close of one opened
   with `O_NOATIME`.
-- `FWE_TIMING=1` prints how long each phase of a start, an `execve` and a
-  `fork` took, to standard error.
+- `FWE_TIMING=1` prints how long each phase of a start, an `execve`, a
+  `fork` (in the parent and the child) and a `wait` took, and the page
+  faults each took (in a fork's child every page touched is one; in the
+  parent every page written while the child lives), to standard error.
 - All are passed on across `execve` and `fork`. A failed code preparation
   is noted with its reason (no room for stubs, say) and the guest gets
   `ENOMEM`.

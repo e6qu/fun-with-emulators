@@ -1,6 +1,7 @@
 //! Phase timings of a start, an `execve` and a `fork`, for finding where
 //! their time goes: with `FWE_TIMING` set, each mark writes to standard
-//! error how long since the previous one and since the process began. A
+//! error how long since the previous one and since the process began,
+//! and how many page faults the process took since the previous one. A
 //! `backend:` mark names the backend each program starts in, native or the
 //! VM (the benchmarks count them).
 //! Off (the default), a mark costs one relaxed load.
@@ -13,6 +14,8 @@ static ON: AtomicBool = AtomicBool::new(false);
 static START: OnceLock<Instant> = OnceLock::new();
 /// Nanoseconds since [`START`] at the last mark.
 static LAST: AtomicU64 = AtomicU64::new(0);
+/// The process's page faults (reclaims included) at the last mark.
+static LAST_FAULTS: AtomicU64 = AtomicU64::new(0);
 
 /// Take `FWE_TIMING` from the environment; the process's time counts from
 /// here.
@@ -35,14 +38,37 @@ fn write_mark(name: &str) {
     let Some(start) = START.get() else { return };
     let now = start.elapsed().as_nanos() as u64;
     let last = LAST.swap(now, Relaxed);
+    let faults = faults();
+    // (A fork's child counts its own from 0.)
+    let since = LAST_FAULTS.swap(faults, Relaxed);
+    let since = if since > faults { faults } else { faults - since };
     let pid = crate::host::pid();
-    let line = format!(
-        "[fwe {pid}] timing: {name} +{}us ({}us)\n",
+    // Made on the stack: a mark allocates nothing, so it writes no page
+    // the step it ends would not (the faults it counts are the step's).
+    let mut line = [0u8; 4096];
+    let mut at = std::io::Cursor::new(&mut line[..]);
+    use std::io::Write;
+    let _ = writeln!(
+        at,
+        "[fwe {pid}] timing: {name} +{}us ({}us) +{since} faults",
         now.saturating_sub(last) / 1000,
         now / 1000
     );
-    // SAFETY: a buffer of its length.
-    unsafe { libc::write(2, line.as_ptr().cast(), line.len()) };
+    let len = at.position() as usize;
+    // SAFETY: a buffer of at least `len` bytes.
+    unsafe { libc::write(2, line.as_ptr().cast(), len) };
+}
+
+/// The page faults this process has taken: those the kernel resolved
+/// without reading anything (a copy on write, a page zeroed) and the rest.
+fn faults() -> u64 {
+    // SAFETY: zeroed bytes are a valid `rusage`; `getrusage` fills it.
+    let mut u: libc::rusage = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    if unsafe { libc::getrusage(libc::RUSAGE_SELF, &mut u) } != 0 {
+        return 0;
+    }
+    (u.ru_minflt + u.ru_majflt) as u64
 }
 
 /// Whether `FWE_TIMING` is set: for a mark whose name costs work to make.

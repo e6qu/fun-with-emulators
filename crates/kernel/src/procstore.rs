@@ -112,16 +112,22 @@ pub enum Count {
     /// Whether the registry of watched files is made
     /// ([`crate::inotify::registry`]): 1 once it is.
     Watches = 3,
+    /// Whether the record of keys is made ([`crate::keys`]): 1 once it
+    /// is, so a fork of a program that never used a key looks no further.
+    Keys = 4,
 }
+
+/// Room for the counts.
+const COUNTS: usize = 8;
 
 /// The store's layout: where each part starts in the file.
 const COUNTS_AT: usize = 0;
 /// The CPU's features as `AT_HWCAP` and `AT_HWCAP2` report them
 /// ([`hwcap`]), then whether they are set, past the counts.
-const HWCAP_AT: usize = 32;
+const HWCAP_AT: usize = COUNTS_AT + COUNTS * 8;
 /// The user's temporary directory as the host named it ([`user_temp`]):
 /// its length, then its bytes.
-const USER_TEMP_AT: usize = 64;
+const USER_TEMP_AT: usize = HWCAP_AT + 32;
 const USER_TEMP_MAX: usize = 1024;
 const ENTRIES_AT: usize = USER_TEMP_AT + 8 + USER_TEMP_MAX;
 const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
@@ -913,8 +919,22 @@ pub fn remove(_held: &Held, pid: i32) {
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
 pub fn put_own(kind: Kind, bytes: Option<&[u8]>) {
+    put_of(kind, crate::host::pid(), bytes);
+}
+
+/// In a parent, its child `pid`, just forked and waiting to go on (so
+/// writing nothing itself): its entry of `kind` holds `bytes`.
+pub fn put_for(kind: Kind, pid: i32, bytes: &[u8]) {
+    put_of(kind, pid, Some(bytes));
+}
+
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn put_of(kind: Kind, pid: i32, bytes: Option<&[u8]>) {
     let s = store();
-    let Some(e) = s.entry_of(kind, crate::host::pid()) else { return };
+    let Some(e) = s.entry_of(kind, pid) else { return };
     let (head, len) = match bytes {
         Some(b) => (s.write_chain(b), b.len() as u32),
         None => (0, 0),
