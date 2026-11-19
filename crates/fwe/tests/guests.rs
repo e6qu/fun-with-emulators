@@ -1113,6 +1113,33 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Translations of a file's code kept (guests/c/jitkept.c: generated code
+/// calling a function of the program's file, which then runs by
+/// translation too): a second run makes no block of the file's code, but
+/// takes each from those the first kept, its output as ever.
+#[test]
+fn jit_translations_of_a_files_code_are_kept_for_the_next_run() {
+    let prog = build_c("jitkept", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitkept");
+    let mut counts = Vec::new();
+    for _ in 0..2 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "calls into the file: summed\n", "{err}");
+        assert_eq!(out.status.code(), Some(0), "{err}");
+        let made = jit_counts(&err, "blocks made from files ");
+        let taken = jit_counts(&err, "taken from those kept from files ");
+        assert_eq!((made.len(), taken.len()), (1, 1), "{err}");
+        assert!(made[0] + taken[0] > 0, "no block of the file's code: {err}");
+        counts.push((made[0], taken[0]));
+    }
+    // (The first run may take some, kept by an earlier one.)
+    assert_eq!(counts[1], (0, counts[0].0 + counts[0].1), "{counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code each of whose blocks expands to many times its size
 /// (guests/c/jitroom.c: functions of back-to-back calls through x16), in a
 /// code cache small enough that such blocks land at every place in a chunk,

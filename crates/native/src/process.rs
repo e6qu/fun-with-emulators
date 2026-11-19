@@ -99,6 +99,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         fwe_kernel::release_robust_lists();
         let state = k.exec_state();
         crate::jitcount::write_seen();
+        crate::jit::keep_made();
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
     // The old image is untouched on failure, so the guest can handle it.

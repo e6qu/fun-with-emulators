@@ -45,6 +45,7 @@ fn mark_exit() {
         prepare::keep_hot();
         jit::write_map();
         jitcount::write_seen();
+        jit::keep_made();
     }
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();
@@ -1073,6 +1074,8 @@ pub fn load_image(
     };
 
     let loaded = load_object(&elf, file_id, Some(loader::PIE_BASE), "exe")?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    jit::program_is(file_id);
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 

@@ -139,6 +139,16 @@ way.
   (the code that called into the JIT's) goes back there. The same code
   keeps running as it is wherever it is called from code that is not
   translated.
+- **Translations of a file's code are kept.** The blocks made from a
+  file's code (a runtime's library, the C library, the program's own)
+  are kept on disk by the file's identity and the address it is loaded
+  at, as prepared code is, and a later process that comes to the same
+  code takes them rather than translating it again; this process does
+  too, for a block it dropped and needs again. A block is taken only
+  where the program's words are as it was made from, and so are the
+  calls made in other blocks' words that it goes on into; otherwise it
+  is made afresh. Each build of fwe keeps its own. Generated code's
+  blocks are made in each process.
 - **Calls into translated code.** Native code's call into a JIT's code
   faults the first time; that call site (`blr`) becomes a `bl` to a stub
   in reach that looks the target up as a translation does, and goes to
@@ -346,6 +356,23 @@ a processor that reports `DIC` clear.
   read through `prepare::original`, which gives back the instruction at
   a site from the sites recorded as stubs were made (`prepare::SITES`),
   checked against the stub's branch back.
+- **Kept translations:** `jit::kept` keeps a block made from a file's
+  code (`kept::keep`) as `jit::translate` made it, before it is placed:
+  the program's words it was made from, the calls made in other blocks'
+  words in its words' range (`State::calls_made`), its hot and cold
+  words with their branches still to resolve (`Asm::fixups`), what each
+  word stands for, packed (`Packed::to_bytes`), and its calls. The
+  records are files in fwe's private directory, under
+  `v<format>-translations/<UUID of fwe's image>-<its thread slots>/<device>-<inode>-<load
+  address>/` (the program's own file by its host identity, as the maps
+  record names it by none): each process adds the records it made as one
+  more file as it ends or replaces its program (a fork child its own
+  only), written aside and moved into place, and maps a part's files
+  read-only the first time it translates code there; one that finds
+  eight merges them into one. `jit::translation` looks for a record of
+  a file's code before it translates (`kept::take`), and places a block
+  taken (`Asm::restore`) as one just made. Other builds' records go
+  once they are an hour old.
 - **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
   prepared in place links that site (`jit::link_call_site`): with every
   other thread stopped, a stub doing the table lookup goes in the spare
@@ -412,7 +439,9 @@ each kind, the program's words a block holds and what its words end at
 (a branch, a branch through a register, a return, words made already,
 the page's end, or the most words a block takes), those made with a second pass of their words for an entry
 with the program's own `x16` and `x17` and those entered there,
-those made ahead of the program, and of the blocks in use those an
+those made ahead of the program, the blocks taken from those kept and the
+time taking them, and the records found for a block's words that the
+calls made around it would make otherwise, and of the blocks in use those an
 unconditional branch (`b`) leads to: in all, and those nothing else
 leads to directly, with their words, by where the branch is (close
 behind, within the words a block made at its block's address reads;

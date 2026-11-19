@@ -84,6 +84,8 @@
 //! stopped, the blocks a thread may be in or return into are retired, and
 //! the rest of the room is reused.
 
+mod kept;
+
 use crate::asm::{Asm, Field, Label, Pos, STUB, Sec};
 use crate::jitcount;
 use crate::rewrite::{self, Site};
@@ -409,6 +411,78 @@ impl Packed {
                 Packed::Out { to, g: off(g), cond, exit, saved, x18 }
             }
         }
+    }
+
+    /// Its 16 bytes as a kept record holds them ([`kept`]): a tag, then
+    /// its fields in turn, little-endian.
+    fn to_bytes(self) -> [u8; 16] {
+        let mut b = [0u8; 16];
+        let mut put = |at: usize, v: &[u8]| b[at..at + v.len()].copy_from_slice(v);
+        match self {
+            Packed::At(k) => put(0, &[0, k as u8, (k >> 8) as u8]),
+            Packed::Saved(k) => put(0, &[1, k as u8, (k >> 8) as u8]),
+            Packed::SavedX18(k) => put(0, &[2, k as u8, (k >> 8) as u8]),
+            Packed::Undo { g, start, of } => {
+                put(0, &[3]);
+                put(1, &g.to_le_bytes());
+                put(3, &start.to_le_bytes());
+                put(7, &[of as u8]);
+            }
+            Packed::Finish { g, of } => {
+                put(0, &[4]);
+                put(1, &g.to_le_bytes());
+                put(3, &[of as u8]);
+            }
+            Packed::Lookup { g, call, to } => {
+                put(0, &[5]);
+                put(1, &g.to_le_bytes());
+                put(3, &[u8::from(call), to.unwrap_or(0xff)]);
+            }
+            Packed::Out { to, g, cond, exit, saved, x18 } => {
+                put(0, &[6]);
+                put(1, &to.to_le_bytes());
+                put(9, &g.to_le_bytes());
+                put(11, &cond.to_le_bytes());
+                put(13, &[exit, u8::from(saved), u8::from(x18)]);
+            }
+        }
+        b
+    }
+
+    /// [`Packed::to_bytes`]'s word again, if `b` is one.
+    fn from_bytes(b: &[u8]) -> Option<Packed> {
+        let u16_at = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+        let of = |v: u8| {
+            [Of::X18, Of::ThreadPointer, Of::Load, Of::Flush, Of::Syscall]
+                .into_iter()
+                .find(|&o| o as u8 == v)
+        };
+        if b.len() != 16 {
+            return None;
+        }
+        Some(match b[0] {
+            0 => Packed::At(u16_at(1)),
+            1 => Packed::Saved(u16_at(1)),
+            2 => Packed::SavedX18(u16_at(1)),
+            3 => Packed::Undo {
+                g: u16_at(1),
+                start: u32::from_le_bytes(b[3..7].try_into().ok()?),
+                of: of(b[7])?,
+            },
+            4 => Packed::Finish { g: u16_at(1), of: of(b[3])? },
+            5 => {
+                Packed::Lookup { g: u16_at(1), call: b[3] == 1, to: (b[4] != 0xff).then_some(b[4]) }
+            }
+            6 => Packed::Out {
+                to: u64::from_le_bytes(b[1..9].try_into().ok()?),
+                g: u16_at(9),
+                cond: u16_at(11),
+                exit: b[13],
+                saved: b[14] == 1,
+                x18: b[15] == 1,
+            },
+            _ => return None,
+        })
     }
 
     /// The word again, in a block at program address `g0` placed at `t`.
@@ -1243,6 +1317,7 @@ impl State {
     /// them: the memory was unmapped, mapped anew, its protections changed
     /// or its pages discarded.
     fn drop_range(&mut self, addr: u64, len: u64) {
+        kept::remapped(addr, len);
         let start = addr & !(page_size() - 1);
         let end = addr.saturating_add(len);
         let gone: Vec<u64> = self.dormant.range(start..end).map(|(&g, _)| g).collect();
@@ -1442,9 +1517,22 @@ pub fn changed(addr: u64, len: u64) -> bool {
     held
 }
 
+/// The program's file is `id` (none if it has no identity of its own, a
+/// memfd's), for the blocks kept of its code ([`kept`]).
+pub fn program_is(id: Option<fwe_kernel::prepcache::FileId>) {
+    kept::program_is(id.map(|i| i.dev_ino()));
+}
+
+/// Add the blocks this process made from files' code to those kept
+/// ([`kept`]): as it ends, and before it replaces its program.
+pub fn keep_made() {
+    kept::write();
+}
+
 /// A new program in this process (`execve`): nothing of the old one's.
 pub fn reset() {
     jitcount::write_seen();
+    keep_made();
     let mut s = state();
     let regions: Vec<(u64, u64)> = s.regions.iter().map(|(&a, &e)| (a, e)).collect();
     for (a, e) in regions {
@@ -1482,6 +1570,7 @@ pub fn hold() -> std::sync::MutexGuard<'static, State> {
 /// copies of their own now, so the executable one is mapped anew from the
 /// writable one, which the child's translations are written to.
 pub fn forked(s: &mut State) {
+    kept::forked();
     let Some(c) = s.cache.as_ref() else { return };
     for k in &c.chunks {
         let mut rx = k.rx;
@@ -2056,6 +2145,23 @@ fn translation_(s: &mut Held, g: u64) -> usize {
         let c = Clock::now();
         let source = snapshot(g);
         c.add_to(&PROBE[1]);
+        // A file's code: its block as kept ([`kept`]), where its words and
+        // the calls made in other blocks' words that it goes on into are
+        // as they were.
+        let part = if followed && !jitcount::counting() { kept::part_of(g) } else { None };
+        if let Some(p) = part
+            && let Some((mut made, info)) = kept::take(p, g, &source, |end| calls_in(s, g, end))
+        {
+            // Its ways into calls made in other blocks' words, to where
+            // those words are now.
+            for (_, q, at) in &mut made.room.c.joins {
+                *at = s.calls_made.get(q).map_or(0, |&(_, a)| a);
+            }
+            let n = ((made.end - g) / 4) as usize;
+            let r = place(s, g, followed, made, info, source[..n].to_vec(), true);
+            making.add_to(&jitcount::TAKE_NS);
+            return r;
+        }
         // Calls made already from the words it may read: made there.
         let known: Vec<(u64, u64)> = s
             .calls_made
@@ -2075,7 +2181,15 @@ fn translation_(s: &mut Held, g: u64) -> usize {
             continue;
         }
         let c = Clock::now();
-        let r = place(s, g, followed, made, source[..read_words].to_vec());
+        let info = packed(&made.room.asm, g);
+        c.add_to(&PROBE[6]);
+        if let Some(p) = part {
+            let calls: Vec<u64> =
+                known.iter().map(|k| k.0).filter(|&q| q > g && q < made.end).collect();
+            kept::keep(p, g, &source[..read_words], &calls, &made, &info);
+        }
+        let c = Clock::now();
+        let r = place(s, g, followed, made, info, source[..read_words].to_vec(), false);
         c.add_to(&PROBE[5]);
         making.add_to(
             &jitcount::MAKE_NS[if followed { jitcount::FILE } else { jitcount::GENERATED }],
@@ -2140,23 +2254,51 @@ fn successors(b: &Block) -> Vec<u64> {
     to
 }
 
+/// The calls made in other blocks' words ([`State::calls_made`]) past `g`
+/// and before `end`: those a block made at `g` goes on into.
+fn calls_in(s: &State, g: u64, end: u64) -> Vec<u64> {
+    s.calls_made.range(g + 1..end).map(|(&p, _)| p).collect()
+}
+
+/// What each word of block `a`, at program address `g`, stands for, packed
+/// (its expansions' starts as made, at 0).
+fn packed(a: &Asm<Word>, g: u64) -> Vec<Packed> {
+    let (hot, cold) = (a.info(H), a.info(C));
+    let mut info = Vec::with_capacity(hot.len() + cold.len());
+    info.extend(hot.iter().chain(cold).map(|&w| Packed::of(w, g, 0)));
+    info
+}
+
 /// Place translation `made` of the block at `g` (`followed`, of code fwe
-/// prepared in place; `source`, the program's words it was made from) in
-/// the cache, and publish it.
+/// prepared in place; `info`, what its words stand for, packed; `source`,
+/// the program's words it was made from; `taken`, from a record kept
+/// rather than made now) in the cache, and publish it.
 #[inline(never)]
-fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
+fn place(
+    s: &mut State,
+    g: u64,
+    followed: bool,
+    made: Made,
+    info: Vec<Packed>,
+    source: Vec<u32>,
+    taken: bool,
+) -> usize {
     let Made { mut room, entry, unsaved, x18, end: _, second, counters } = made;
     let origin = if followed { jitcount::FILE } else { jitcount::GENERATED };
-    jitcount::MADE[origin].fetch_add(1, Ordering::Relaxed);
-    if let Some(n) = second {
-        jitcount::SECOND.fetch_add(1, Ordering::Relaxed);
-        jitcount::SECOND_WORDS.fetch_add(n as u64, Ordering::Relaxed);
-    }
     let ahead = MAKING_AHEAD.get();
-    if ahead {
-        jitcount::AHEAD.fetch_add(1, Ordering::Relaxed);
+    if taken {
+        jitcount::TAKEN[origin].fetch_add(1, Ordering::Relaxed);
+    } else {
+        jitcount::MADE[origin].fetch_add(1, Ordering::Relaxed);
+        if let Some(n) = second {
+            jitcount::SECOND.fetch_add(1, Ordering::Relaxed);
+            jitcount::SECOND_WORDS.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        if ahead {
+            jitcount::AHEAD.fetch_add(1, Ordering::Relaxed);
+        }
+        jitcount::seen(g, &source, origin);
     }
-    jitcount::seen(g, &source, origin);
     let Room { asm, c: calls } = &mut room;
     let (hot, cold) = (asm.len(H), asm.len(C));
     let c = Clock::now();
@@ -2169,13 +2311,6 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     // stub of its chunk.
     asm.finish([at, at_cold], stub);
     c.add_to(&PROBE[7]);
-    // The block keeps what its words stand for, packed, in room of their
-    // own (an expansion's start as made, at 0).
-    let c = Clock::now();
-    let mut info = Vec::with_capacity(hot + cold);
-    info.extend(asm.info(H).iter().map(|&w| Packed::of(w, g, 0)));
-    info.extend(asm.info(C).iter().map(|&w| Packed::of(w, g, 0)));
-    c.add_to(&PROBE[6]);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
@@ -2209,7 +2344,12 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         followed,
         pads: calls.pads.iter().map(|&(r, k)| (r, t + 4 * k as u64)).collect(),
         calls_made: Vec::new(),
-        notes: Notes { ahead, second: second.is_some(), used: Default::default(), counters },
+        notes: Notes {
+            ahead,
+            second: second.is_some() && !taken,
+            used: Default::default(),
+            counters,
+        },
     });
     s.by_g.insert(g, i);
     index_parts(&mut s.by_t, &s.blocks[i], i);
@@ -4102,6 +4242,9 @@ mod tests {
         ];
         for w in words {
             assert_eq!(Packed::of(w, g0, t).word(g0, t), w);
+            // And from the bytes a kept record holds it as.
+            let b = Packed::of(w, g0, t).to_bytes();
+            assert_eq!(Packed::from_bytes(&b).expect("a packed word").word(g0, t), w);
         }
     }
     /// A call is made once in a block, however its words are entered (here

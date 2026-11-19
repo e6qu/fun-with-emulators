@@ -237,6 +237,34 @@ impl<W: Copy> Asm<W> {
         self.resolve(at);
     }
 
+    /// Its branches still to resolve: each one's place, field and target
+    /// (a word of the block, or none for [`STUB`]).
+    pub(crate) fn fixups(&self) -> impl Iterator<Item = (Pos, Field, Option<Pos>)> + '_ {
+        self.fixups.iter().map(|f| {
+            let to = match self.labels[f.to.0] {
+                Some(Target::At(p)) => Some(p),
+                None if f.to == STUB => None,
+                t => panic!("a branch at {:?} to {t:?}, kept", f.at),
+            };
+            (f.at, f.field, to)
+        })
+    }
+
+    /// Made again as [`Asm::fixups`] and the words of each section
+    /// (`words`) say, still to resolve: with no word's meaning (a block
+    /// kept has them packed, apart).
+    pub(crate) fn restore(&mut self, words: [Vec<u32>; 2], fixups: &[(Pos, Field, Option<Pos>)]) {
+        self.clear();
+        self.words = words;
+        for &(at, field, to) in fixups {
+            let to = match to {
+                Some(p) => self.label_at(p),
+                None => STUB,
+            };
+            self.fixups.push(Fixup { at, field, to });
+        }
+    }
+
     /// The words of section `s`.
     pub(crate) fn words(&self, s: Sec) -> &[u32] {
         &self.words[s as usize]

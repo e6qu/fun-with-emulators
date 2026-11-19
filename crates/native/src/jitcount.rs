@@ -42,6 +42,13 @@ pub(crate) static SECOND_WORDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECOND_USED: AtomicU64 = AtomicU64::new(0);
 /// Blocks made ahead of the program.
 pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
+/// Blocks taken from those kept ([`crate::jit`]'s `kept`), by origin, and
+/// the nanoseconds taking them; records found for a block's words that
+/// another block's calls would make otherwise; records added.
+pub(crate) static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+pub(crate) static TAKE_NS: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KEPT_OTHER: AtomicU64 = AtomicU64::new(0);
+pub(crate) static KEPT_WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Blocks by how their words end ([`ENDS`]), and the program's words they
 /// hold (their first pass's).
 pub(crate) static ENDED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -302,6 +309,13 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&SECOND_USED),
         n(&AHEAD),
     );
+    out.push_str(&format!(
+        "; taken from those kept {} {} ({} ms), {} records found made otherwise",
+        ORIGINS[FILE],
+        n(&TAKEN[FILE]),
+        ms(&TAKE_NS),
+        n(&KEPT_OTHER),
+    ));
     let made = n(&MADE[FILE]) + n(&MADE[GENERATED]);
     out.push_str(&format!(
         "; {:.1} of the program's words a block; blocks end at {}",

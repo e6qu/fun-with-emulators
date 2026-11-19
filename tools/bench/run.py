@@ -1484,6 +1484,15 @@ def jdk(a, fwe, guest_env, results):
                 if "timing: exit: " in line and "; blocks made " in line]
         print(f"JDK {label}, the translator's counts (exit {r.returncode}): "
               + " | ".join("blocks made " + s for s in said), file=sys.stderr)
+        if label == "javac again":
+            # A file's code's blocks a run made again that an earlier
+            # made at the same address with the same words (none: they
+            # are kept).
+            again = [int(m.group(1)) for m in
+                     (re.search(r"made before by another process: from files (\d+) at the same", s)
+                      for s in said) if m]
+            print(f"JDK javac again: blocks of files' code an earlier run made, made again: "
+                  f"{sum(again)}", file=sys.stderr)
     shutil.rmtree(seen, ignore_errors=True)
     # How long `javac` takes alone, both ways.
     took = []
