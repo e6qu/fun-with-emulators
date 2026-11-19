@@ -5,13 +5,14 @@
 //! The hot section holds what runs each time the block runs; the cold one
 //! what runs only on the way into fwe or out of the common case (a
 //! conditional branch's way out until it is linked, a lookup's second
-//! look, its miss). With the split off, the cold section is the hot one:
-//! every word lands where it is made, in one run.
+//! look, its miss), placed apart so the hot words of many blocks lie
+//! close.
 //!
-//! A branch to a label is made with its offset field clear; resolving the
-//! sections at their addresses fills it in, and fails loudly where the
+//! A branch to a label is made with its offset field clear; finishing the
+//! block at the sections' addresses fills it in, and fails loudly where the
 //! label is not bound, the field is not clear or the target is out of the
-//! field's reach.
+//! field's reach. One label stands outside the block, for the place its
+//! ways out go ([`STUB`]).
 
 /// A section of a block's words.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -36,6 +37,17 @@ impl Pos {
 /// A place branched to, bound once.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) struct Label(usize);
+
+/// The label of the place outside the block its ways out branch to,
+/// bound to its address as the block is finished ([`Asm::finish`]).
+pub(crate) const STUB: Label = Label(0);
+
+/// Where a label is: a word of the block, or an address outside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Target {
+    At(Pos),
+    Addr(u64),
+}
 
 /// The offset field of a branch, in words: `b` and `bl` (26 bits at 0),
 /// `b.cond`, `cbz` and `cbnz` (19 bits at 5), `tbz` and `tbnz` (14 bits
@@ -88,29 +100,22 @@ struct Fixup {
 pub(crate) struct Asm<W> {
     words: [Vec<u32>; 2],
     info: [Vec<W>; 2],
-    labels: Vec<Option<Pos>>,
+    labels: Vec<Option<Target>>,
     fixups: Vec<Fixup>,
-    split: bool,
 }
 
 impl<W: Copy> Asm<W> {
     /// An empty block, its hot words made in `words` and `info` (cleared;
-    /// their room kept); `split`, whether the cold words go apart.
-    pub(crate) fn new(mut words: Vec<u32>, mut info: Vec<W>, split: bool) -> Asm<W> {
+    /// their room kept).
+    pub(crate) fn new(mut words: Vec<u32>, mut info: Vec<W>) -> Asm<W> {
         words.clear();
         info.clear();
         Asm {
             words: [words, Vec::new()],
             info: [info, Vec::new()],
-            labels: Vec::new(),
+            labels: vec![None],
             fixups: Vec::new(),
-            split,
         }
-    }
-
-    /// The section cold words go in: the hot one with the split off.
-    pub(crate) fn cold(&self) -> Sec {
-        if self.split { Sec::Cold } else { Sec::Hot }
     }
 
     /// The number of words in section `s`.
@@ -146,7 +151,7 @@ impl<W: Copy> Asm<W> {
 
     /// A label bound at `at`.
     pub(crate) fn label_at(&mut self, at: Pos) -> Label {
-        self.labels.push(Some(at));
+        self.labels.push(Some(Target::At(at)));
         Label(self.labels.len() - 1)
     }
 
@@ -155,7 +160,7 @@ impl<W: Copy> Asm<W> {
         let at = self.here(s);
         let slot = &mut self.labels[l.0];
         assert!(slot.is_none(), "a label bound twice");
-        *slot = Some(at);
+        *slot = Some(Target::At(at));
     }
 
     /// Branch `w` (its `field` clear), standing for `i`, at the end of
@@ -177,8 +182,8 @@ impl<W: Copy> Asm<W> {
         &mut self.info[at.sec as usize][at.k]
     }
 
-    /// The index of the word at `at` in [`Asm::finish`]'s run, once every
-    /// word is made.
+    /// The index of the word at `at` in [`Asm::finish`]'s run (the hot
+    /// words, then the cold), once every word is made.
     pub(crate) fn flat(&self, at: Pos) -> usize {
         match at.sec {
             Sec::Hot => at.k,
@@ -191,23 +196,27 @@ impl<W: Copy> Asm<W> {
     fn resolve(&mut self, at: [u64; 2]) {
         let addr = |p: Pos| at[p.sec as usize] + 4 * p.k as u64;
         for f in std::mem::take(&mut self.fixups) {
-            let to = self.labels[f.to.0].expect("a branch to a label never bound");
-            let words = (addr(to) as i64 - addr(f.at) as i64) / 4;
+            let to = match self.labels[f.to.0].expect("a branch to a label never bound") {
+                Target::At(p) => addr(p),
+                Target::Addr(a) => a,
+            };
+            let words = (to as i64 - addr(f.at) as i64) / 4;
             let w = &mut self.words[f.at.sec as usize][f.at.k];
             *w = f.field.set(*w, words).unwrap_or_else(|| {
                 panic!(
-                    "a branch at {f:?} to {to:?}, {words} words away, out of its reach",
+                    "a branch at {f:?} to {to:#x}, {words} words away, out of its reach",
                     f = f.at
                 )
             });
         }
     }
 
-    /// The block's words and what each stands for in one run, the cold
-    /// after the hot, its branches resolved.
-    pub(crate) fn finish(mut self) -> (Vec<u32>, Vec<W>) {
-        let hot = self.len(Sec::Hot);
-        self.resolve([0, 4 * hot as u64]);
+    /// The block's words and what each stands for in one run, the hot
+    /// then the cold, its branches resolved for the sections placed at the
+    /// byte addresses `at` (hot, cold) and [`STUB`] at `stub`.
+    pub(crate) fn finish(mut self, at: [u64; 2], stub: u64) -> (Vec<u32>, Vec<W>) {
+        self.labels[STUB.0] = Some(Target::Addr(stub));
+        self.resolve(at);
         let [mut words, cold] = self.words;
         let [mut info, cold_info] = self.info;
         words.extend(cold);
@@ -228,7 +237,7 @@ mod tests {
     /// their targets' distance in words in each field.
     #[test]
     fn branches_reach_their_labels() {
-        let mut a: Asm<u8> = Asm::new(Vec::new(), Vec::new(), true);
+        let mut a: Asm<u8> = Asm::new(Vec::new(), Vec::new());
         let back = a.label_at(Pos::hot(0));
         a.push(Sec::Hot, 1, 0);
         let fwd = a.label();
@@ -241,22 +250,35 @@ mod tests {
         a.push(Sec::Cold, 3, 0);
         a.bind(cold, Sec::Cold);
         a.branch(Sec::Cold, B, Field::Imm26, back, 0);
-        let (w, _) = a.finish();
+        a.branch(Sec::Cold, B, Field::Imm26, STUB, 0);
+        // The cold words 100 words past the hot, the stub 50 before them.
+        let (w, _) = a.finish([0x1000, 0x1000 + 4 * 100], 0x1000 - 4 * 50);
+        // Each branch back in two's complement: -101 is 2^26 - 101.
+        let back = |n: u32| (1 << 26) - n;
         assert_eq!(
             w,
-            vec![1, B | 3, CBZ | 4 << 5, TBZ | (0x3fff - 2) << 5, 2, 3, B | (0x3ff_ffff - 5)]
+            vec![
+                1,
+                B | 3,
+                CBZ | 99 << 5,
+                TBZ | (0x3fff - 2) << 5,
+                2,
+                3,
+                B | back(101),
+                B | back(152)
+            ]
         );
     }
 
-    /// With the split off, cold words land in the hot run where made.
+    /// Words made in turns land in their sections' runs, the hot first.
     #[test]
-    fn unsplit_cold_words_land_in_turn() {
-        let mut a: Asm<u8> = Asm::new(vec![9], vec![9], false);
+    fn words_land_in_their_sections() {
+        let mut a: Asm<u8> = Asm::new(vec![9], vec![9]);
         a.push(Sec::Hot, 1, 1);
-        let c = a.cold();
-        a.push(c, 2, 2);
+        a.push(Sec::Cold, 2, 2);
         a.push(Sec::Hot, 3, 3);
-        assert_eq!(a.finish(), (vec![1, 2, 3], vec![1, 2, 3]));
+        assert_eq!(a.flat(Pos { sec: Sec::Cold, k: 0 }), 2);
+        assert_eq!(a.finish([0, 8], 0), (vec![1, 3, 2], vec![1, 3, 2]));
     }
 
     /// Each field reaches as far as its bits do, and no further.
@@ -277,13 +299,13 @@ mod tests {
     #[test]
     #[should_panic(expected = "out of its reach")]
     fn a_branch_out_of_reach_fails() {
-        let mut a: Asm<u8> = Asm::new(Vec::new(), Vec::new(), true);
+        let mut a: Asm<u8> = Asm::new(Vec::new(), Vec::new());
         let l = a.label();
         a.branch(Sec::Hot, TBZ, Field::Imm14, l, 0);
         for _ in 0..1 << 13 {
             a.push(Sec::Hot, 0, 0);
         }
         a.bind(l, Sec::Hot);
-        a.finish();
+        a.finish([0, 0], 0);
     }
 }

@@ -81,7 +81,7 @@
 //! stopped, the blocks a thread may be in or return into are retired, and
 //! the rest of the room is reused.
 
-use crate::asm::{Asm, Field, Label, Pos, Sec};
+use crate::asm::{Asm, Field, Label, Pos, STUB, Sec};
 use crate::rewrite::{self, Site};
 use fwe_kernel::Regs;
 use std::collections::{BTreeMap, HashMap};
@@ -99,8 +99,6 @@ const UDF: u32 = 0;
 /// `adr x16, #0`: a way out's first word, the program's `x16` and `x17`
 /// saved, until it is linked.
 const OUT: u32 = 0x1000_0010;
-/// `b <the chunk's exit stub>`, as made (at 0, [`place`] points it there).
-const TO_STUB: u32 = 0x1400_0000;
 /// The bytes at the start of each chunk that its ways out branch to on
 /// into the exit gate ([`exit_stub`]).
 const EXIT_STUB: u64 = 16;
@@ -220,8 +218,10 @@ const RET_X17: u32 = 0xd65f_0220;
 const BL: u32 = 0x9400_0000;
 /// `b` (its offset added)
 const B: u32 = 0x1400_0000;
-/// The section of a block's words that runs each time it runs ([`Asm`]).
+/// The sections of a block's words ([`Asm`]): what runs each time it runs,
+/// and what runs only out of the common case.
 const H: Sec = Sec::Hot;
+const C: Sec = Sec::Cold;
 /// `eor x17, x17, #16`: an entry's address to the other's of its pair.
 const OTHER: u32 = 0xd27c_0231;
 /// `ldar x17, [x17]`: the entry's key, before its value.
@@ -446,12 +446,18 @@ struct Block {
     /// check that a lookup read apart from the table reached the block it
     /// looked for ([`CHECK_WORDS`], [`TO_CHECK`]); the entries follow.
     t: u64,
-    /// What each word of the translation stands for.
+    /// What each word of the translation stands for: its hot words', then
+    /// its cold ones' ([`crate::asm`]).
     words: Vec<Packed>,
     /// The branches linked straight to it, to undo if it goes.
     linked: Vec<u64>,
-    /// Its translation's size in bytes.
+    /// Its hot words' size in bytes, from `t`.
     len: u64,
+    /// Its cold words' address and size in bytes (0 if none): what runs
+    /// only out of the common case, apart from the hot words of the blocks
+    /// laid together ([`Chunk`]).
+    cold: u64,
+    cold_len: u64,
     /// Where a lookup or a direct branch enters it with the program's
     /// `x16` and `x17` saved: past its check (its saved entry).
     body: u64,
@@ -485,9 +491,31 @@ impl Block {
         self.words.get(k).map(|p| p.word(self.g, self.t))
     }
 
+    /// The index of its word at cache address `at`, if it holds one there.
+    fn index(&self, at: u64) -> Option<usize> {
+        if at.wrapping_sub(self.t) < self.len {
+            Some(((at - self.t) / 4) as usize)
+        } else if at.wrapping_sub(self.cold) < self.cold_len {
+            Some(((self.len + at - self.cold) / 4) as usize)
+        } else {
+            None
+        }
+    }
+
+    /// The cache address of its word `k`.
+    fn addr(&self, k: usize) -> u64 {
+        let off = 4 * k as u64;
+        if off < self.len { self.t + off } else { self.cold + off - self.len }
+    }
+
+    /// Its size in the cache, hot and cold, in bytes.
+    fn size(&self) -> u64 {
+        self.len + self.cold_len
+    }
+
     /// What its word at cache address `at` stands for.
     fn word_at(&self, at: u64) -> Option<Word> {
-        self.word(((at - self.t) / 4) as usize)
+        self.word(self.index(at)?)
     }
 
     /// What each of its words stands for.
@@ -499,7 +527,7 @@ impl Block {
     /// and whether it is a conditional branch's taken way.
     fn jumps(&self) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
         self.words.iter().enumerate().filter_map(|(k, p)| match *p {
-            Packed::Out { to, exit: 0, cond, .. } => Some((self.t + 4 * k as u64, to, cond != 0)),
+            Packed::Out { to, exit: 0, cond, .. } => Some((self.addr(k), to, cond != 0)),
             _ => None,
         })
     }
@@ -550,13 +578,56 @@ impl Hasher for AddrHash {
     }
 }
 
-/// A chunk of the code cache: its writable view and its executable one.
+/// A chunk of the code cache: its writable view and its executable one,
+/// filled a segment at a time ([`segment`]), the blocks' hot words from
+/// the segment's start up and their cold ones from its end down: the hot
+/// words of blocks made one after another lie together, each block's cold
+/// words in reach of its conditional branches.
 struct Chunk {
     rw: u64,
     rx: u64,
-    used: u64,
+    /// The current segment's next free byte for hot words, its lowest cold
+    /// one, and its end (offsets in the chunk).
+    hot: u64,
+    cold: u64,
+    end: u64,
     /// Holds retired translations: nothing new goes in it.
     retired: bool,
+}
+
+impl Chunk {
+    /// Where a block of `hot` and `cold` bytes goes in it: its parts'
+    /// offsets and the end of the segment they are in; in the current
+    /// segment if they fit, else in the next. Each part 8-byte aligned, as
+    /// a system call's stub needs for its literal.
+    fn fit(&self, hot: u64, cold: u64) -> Option<(u64, u64, u64)> {
+        let place = |start: u64, top: u64, end: u64| {
+            let c = (top - cold) & !7;
+            (start + hot <= c).then_some((start, c, end))
+        };
+        place(self.hot, self.cold, self.end).or_else(|| {
+            (self.end < chunk_size()).then(|| {
+                let end = (self.end + segment()).min(chunk_size());
+                place(self.end, end, end)
+            })?
+        })
+    }
+
+    /// Emptied: its first segment, past the exit stub, from the start.
+    fn empty(&mut self) {
+        self.hot = EXIT_STUB;
+        self.end = segment();
+        self.cold = self.end;
+    }
+}
+
+/// The most a segment of a chunk holds ([`Chunk`]): what a conditional
+/// branch reaches, from a block's hot words to its cold ones.
+const MAX_SEGMENT: u64 = 1 << 20;
+
+/// A segment's size: a quarter of a chunk, at most [`MAX_SEGMENT`].
+fn segment() -> u64 {
+    (chunk_size() / 4).min(MAX_SEGMENT)
 }
 
 pub struct State {
@@ -673,26 +744,29 @@ static FLUSHES: AtomicU64 = AtomicU64::new(0);
 
 /// With `FWE_JIT_MAP` naming a directory, write there (`jit-<pid>.map`)
 /// what the code cache holds as the process ends, for a profile of where
-/// time in translations goes (the benchmarks' samples): a line per block,
-/// its address in the cache, its size in bytes, its program address, and
-/// a letter per word for what it stands for (`a` the program's
-/// instruction, `s` one with its `x16` and `x17` saved, `x` one with its
-/// `x18` held in `x17` too, `v` and `r` their save and restore, inside an
-/// expansion its [`Of`], `l` a lookup, `L` one committed, `o` a way out),
-/// and its words in hexadecimal.
+/// time in translations goes (the benchmarks' samples): a line per block's
+/// hot words and another for its cold ones, each with its address in the
+/// cache, its size in bytes, the block's program address, a letter per
+/// word for what it stands for (`a` the program's instruction, `s` one
+/// with its `x16` and `x17` saved, `x` one with its `x18` held in `x17`
+/// too, `v` and `r` their save and restore, inside an expansion its
+/// [`Of`], `l` a lookup, `L` one committed, `o` a way out) and its words
+/// in hexadecimal; then, for the hot words, how many of the program's
+/// words the block was made from and the last of them, and for the cold
+/// ones `cold`.
 pub fn write_map() {
     let Some(dir) = std::env::var_os("FWE_JIT_MAP") else { return };
     let s = state();
     let mut text = String::new();
     for b in &s.blocks {
+        // SAFETY: a word of the block's translation, in the cache.
+        let insn = |k: usize| unsafe { (b.addr(k) as *const u32).read() };
         let kinds: String = b
             .all_words()
             .enumerate()
-            // SAFETY: a word of the block's translation, in the cache.
-            .map(|(k, w)| (unsafe { ((b.t + 4 * k as u64) as *const u32).read() }, w))
-            .map(|(insn, w)| match w {
-                _ if insn == SAVE => 'v',
-                _ if insn == RESTORE => 'r',
+            .map(|(k, w)| match w {
+                _ if insn(k) == SAVE => 'v',
+                _ if insn(k) == RESTORE => 'r',
                 Word::At(_) => 'a',
                 Word::Saved(_) => 's',
                 Word::SavedX18(_) => 'x',
@@ -702,23 +776,30 @@ pub fn write_map() {
                 Word::Out { .. } => 'o',
             })
             .collect();
-        let words: String = (0..b.words.len())
-            .map(|k| {
-                // SAFETY: a word of the block's translation, in the cache.
-                let w = unsafe { ((b.t + 4 * k as u64) as *const u32).read() };
-                format!("{w:08x}")
-            })
-            .collect();
+        let words: String = (0..b.words.len()).map(|k| format!("{:08x}", insn(k))).collect();
+        let hot = (b.len / 4) as usize;
         // The program's words it was made from: how many, and the last
         // (what ended it).
         let last = b.source.last().copied().unwrap_or(0);
         text.push_str(&format!(
-            "{:x} {} {:x} {kinds} {words} {}:{last:08x}\n",
+            "{:x} {} {:x} {} {} {}:{last:08x}\n",
             b.t,
             b.len,
             b.g,
+            &kinds[..hot],
+            &words[..8 * hot],
             b.source.len()
         ));
+        if b.cold_len > 0 {
+            text.push_str(&format!(
+                "{:x} {} {:x} {} {} cold\n",
+                b.cold,
+                b.cold_len,
+                b.g,
+                &kinds[hot..],
+                &words[8 * hot..]
+            ));
+        }
     }
     let path = std::path::Path::new(&dir).join(format!("jit-{}.map", std::process::id()));
     if let Err(e) = std::fs::write(&path, text) {
@@ -1074,9 +1155,12 @@ impl State {
         self.patch(at, if saved { OUT } else { SAVE });
         if let Some(c) = conditional(from, at) {
             // SAFETY: a word of fwe's code cache, readable.
-            if let Some(w) = retarget(unsafe { (c as *const u32).read() }, c, at) {
-                self.patch(c, w);
-            }
+            let w = retarget(unsafe { (c as *const u32).read() }, c, at);
+            // In one segment with it ([`Chunk`]).
+            self.patch(
+                c,
+                w.unwrap_or_else(|| panic!("way out {at:#x} out of reach of its branch {c:#x}")),
+            );
         }
     }
 
@@ -1131,7 +1215,7 @@ impl State {
         if flushed {
             self.dormant.insert(g, i);
         }
-        let len = self.blocks[i].len;
+        let len = self.blocks[i].size();
         if let Some(c) = self.cache.as_mut() {
             c.live -= len;
             c.garbage += len;
@@ -1713,10 +1797,19 @@ fn word_at(s: &State, pc: u64) -> Option<Word> {
     s.blocks[i].word_at(pc)
 }
 
-/// The block whose translation holds `pc`.
+/// The block whose translation holds `pc`, in its hot or cold words.
 fn block_at(s: &State, pc: u64) -> Option<usize> {
-    let (&t, &i) = s.by_t.range(..=pc).next_back()?;
-    (pc < t + s.blocks[i].len).then_some(i)
+    let (_, &i) = s.by_t.range(..=pc).next_back()?;
+    s.blocks[i].index(pc).map(|_| i)
+}
+
+/// Note block `i`'s parts' starts in `by_t` ([`State::by_t`]): its hot
+/// words', and its cold ones' if it has any.
+fn index_parts(by_t: &mut BTreeMap<u64, usize>, b: &Block, i: usize) {
+    by_t.insert(b.t, i);
+    if b.cold_len > 0 {
+        by_t.insert(b.cold, i);
+    }
 }
 
 /// Undo an expansion's words from `start` up to `regs.pc`: each register
@@ -1964,45 +2057,23 @@ fn successors(b: &Block) -> Vec<u64> {
 /// the cache, and publish it.
 #[inline(never)]
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
-    let Made {
-        mut words,
-        info: made_info,
-        entry,
-        unsaved,
-        x18,
-        calls,
-        pads,
-        calls_at,
-        joins,
-        end: _,
-    } = made;
+    let Made { asm, entry, unsaved, x18, calls, pads, calls_at, joins, end: _ } = made;
+    let (hot, cold) = (asm.len(H), asm.len(C));
+    let c = Clock::now();
+    // (Room is made first: emptying the cache forgets every page's other
+    // mappings.)
+    let page = g & !(page_size() - 1);
+    let (stub, at, at_cold) = cache_next(s, 4 * hot as u64, 4 * cold as u64);
+    note_aliases(s, page);
+    // Its branches resolved where it goes, its ways out on into the exit
+    // stub of its chunk.
+    let (words, made_info) = asm.finish([at, at_cold], stub);
+    c.add_to(&PROBE[7]);
     // The block keeps what its words stand for, packed, in room of their
     // own (an expansion's start as made, at 0).
     let c = Clock::now();
     let info: Vec<Packed> = made_info.iter().map(|&w| Packed::of(w, g, 0)).collect();
     c.add_to(&PROBE[6]);
-    let c = Clock::now();
-    // (Room is made first: emptying the cache forgets every page's other
-    // mappings.)
-    let page = g & !(page_size() - 1);
-    cache_next(s, 4 * words.len() as u64);
-    note_aliases(s, page);
-    // Its ways out on into the exit stub of the chunk it goes in.
-    let (stub, at) = {
-        let c = s.cache.as_ref().expect("a code cache");
-        let k = &c.chunks[c.current];
-        (k.rx, k.rx + k.used)
-    };
-    for (k, w) in made_info.iter().enumerate() {
-        if let Word::Out { exit, .. } = w
-            && !matches!(exit, Exit::Retry)
-        {
-            let b = k + if words[k] == OUT { 1 } else { 2 };
-            assert_eq!(words[b], TO_STUB, "a way out's branch to its stub at {g:#x}");
-            words[b] = rewrite::branch(at + 4 * b as u64, stub).expect("a chunk's stub in reach");
-        }
-    }
-    c.add_to(&PROBE[7]);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
@@ -2012,12 +2083,12 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         }
     }
     let c = Clock::now();
-    let t = emit(s, &words);
-    assert_eq!(t, at, "a block placed where its ways out were pointed");
+    let (t, cold_t) = emit(s, &words[..hot], &words[hot..]);
+    assert_eq!((t, cold_t), (at, at_cold), "a block placed where its branches were pointed");
     c.add_to(&PROBE[8]);
     let c = Clock::now();
-    let len = 4 * words.len() as u64;
-    s.cache.as_mut().expect("a code cache").live += len;
+    let (len, cold_len) = (4 * hot as u64, 4 * cold as u64);
+    s.cache.as_mut().expect("a code cache").live += len + cold_len;
     let i = s.blocks.len();
     s.pages.entry(page).or_default().push(i);
     s.blocks.push(Block {
@@ -2026,6 +2097,8 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         words: info,
         linked: Vec::new(),
         len,
+        cold: cold_t,
+        cold_len,
         body: t + 4 * entry as u64,
         unsaved: t + 4 * unsaved as u64,
         x18: if x18 == 0 { 0 } else { t + 4 * x18 as u64 },
@@ -2036,7 +2109,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         calls_made: Vec::new(),
     });
     s.by_g.insert(g, i);
-    s.by_t.insert(t, i);
+    index_parts(&mut s.by_t, &s.blocks[i], i);
     // Its calls for blocks made later, where none is made yet; its ways
     // into calls made already linked there, if they still are.
     for (p, k) in calls_at {
@@ -2081,7 +2154,7 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     if !b.unchanged() {
         return None;
     }
-    let len = b.len;
+    let len = b.size();
     s.by_g.insert(g, i);
     s.pages.entry(p).or_default().push(i);
     for (q, at) in s.blocks[i].calls_made.clone() {
@@ -2101,7 +2174,7 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
 /// where there are ones, and the ways out waiting for `i`'s program address
 /// to it: as a way out's first run would, without its trap.
 fn link_waiting(s: &mut State, i: usize) {
-    let (g, t) = (s.blocks[i].g, s.blocks[i].t);
+    let g = s.blocks[i].g;
     let c = Clock::now();
     c.add_to(&PROBE[13]);
     let c = Clock::now();
@@ -2109,7 +2182,7 @@ fn link_waiting(s: &mut State, i: usize) {
     // the blocks.
     for k in 0..s.blocks[i].words.len() {
         let Packed::Out { to, exit: 0, .. } = s.blocks[i].words[k] else { continue };
-        let at = t + 4 * k as u64;
+        let at = s.blocks[i].addr(k);
         match s.by_g.get(&to).copied() {
             Some(j) => link_site(s, i, at, j),
             None => wait(&mut s.waiting, to, (at, i)),
@@ -2182,8 +2255,9 @@ fn unlinked(at: u64) -> bool {
 
 /// The conditional branch whose taken way is way out `at` of block `b`.
 fn conditional(b: &Block, at: u64) -> Option<u64> {
-    match b.word_at(at) {
-        Some(Word::Out { cond, .. }) if cond != 0 => Some(at - 4 * u64::from(cond)),
+    let k = b.index(at)?;
+    match b.word(k) {
+        Some(Word::Out { cond, .. }) if cond != 0 => Some(b.addr(k - usize::from(cond))),
         _ => None,
     }
 }
@@ -2345,7 +2419,9 @@ fn new_chunk() -> Chunk {
     assert!(n < MAX_CHUNKS, "fwe's code cache is full");
     CHUNK_RX[n].store(rx, Ordering::Relaxed);
     CHUNK_COUNT.store(n as u64 + 1, Ordering::Release);
-    Chunk { rw, rx, used: EXIT_STUB, retired: false }
+    let mut k = Chunk { rw, rx, hot: 0, cold: 0, end: 0, retired: false };
+    k.empty();
+    k
 }
 
 /// Write the exit stub at the start of the chunk whose views are `rw` and
@@ -2381,7 +2457,7 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         return i;
     }
     // At most a restore, an address made in four words and `br`.
-    let at = cache_next(s, 4 * 6);
+    let (_, at, _) = cache_next(s, 4 * 6, 0);
     let mut words = if saved { vec![RESTORE] } else { Vec::new() };
     if let Some(b) = rewrite::branch(at + 4 * words.len() as u64, to) {
         words.push(b);
@@ -2389,7 +2465,7 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         materialize(16, to, &mut words);
         words.push(0xd61f_0200); // br x16
     }
-    let t = emit(s, &words);
+    let (t, _) = emit(s, &words, &[]);
     let len = 4 * words.len() as u64;
     s.cache.as_mut().expect("a code cache").live += len;
     let i = s.blocks.len();
@@ -2405,6 +2481,8 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         words: info,
         linked: Vec::new(),
         len,
+        cold: 0,
+        cold_len: 0,
         body: t,
         unsaved: t,
         x18: 0,
@@ -2431,14 +2509,19 @@ fn followable(to: u64) -> bool {
             .is_some_and(|a| a.value.prot & fwe_abi::mman::PROT_EXEC != 0)
 }
 
-/// Where the next block, `len` bytes, goes: in the current chunk while it
-/// has room for it; else, the cache is emptied where at least half of it is
-/// dropped translations, and the block goes in a chunk with room, or a new
-/// one.
+/// Where the next block, `hot` and `cold` bytes, goes: in the current
+/// chunk while it has room for it ([`Chunk::fit`]); else, the cache is
+/// emptied where at least half of it is dropped translations, and the block
+/// goes in a chunk with room, or a new one. Its chunk's exit stub, and its
+/// parts' addresses.
 #[inline(never)]
-fn cache_next(s: &mut State, len: u64) -> u64 {
-    assert!(len <= chunk_size() - EXIT_STUB, "a block of {len} bytes, larger than a chunk");
-    let room = |k: &Chunk| !k.retired && k.used + len <= chunk_size();
+fn cache_next(s: &mut State, hot: u64, cold: u64) -> (u64, u64, u64) {
+    // The first segment holds the exit stub; each part may be aligned.
+    assert!(
+        EXIT_STUB + hot + cold + 8 <= segment(),
+        "a block of {hot} and {cold} bytes, larger than a segment"
+    );
+    let room = |k: &Chunk| !k.retired && k.fit(hot, cold).is_some();
     let c = s.cache.as_ref().expect("a code cache");
     if !room(&c.chunks[c.current]) {
         if c.garbage >= c.live {
@@ -2455,7 +2538,8 @@ fn cache_next(s: &mut State, len: u64) -> u64 {
     }
     let c = s.cache.as_ref().expect("a code cache");
     let k = &c.chunks[c.current];
-    k.rx + k.used
+    let (h, c, _) = k.fit(hot, cold).expect("room for the block");
+    (k.rx, k.rx + h, k.rx + c)
 }
 
 /// Words a flush reads of memory at a time.
@@ -2496,7 +2580,10 @@ fn flush(s: &mut State) {
     };
     let old = std::mem::take(&mut s.blocks);
     let in_pinned = |s: &State, at: u64| {
-        s.by_t.range(..=at).next_back().is_some_and(|(&t, &i)| at < t + old[i].len && pinned[i])
+        s.by_t
+            .range(..=at)
+            .next_back()
+            .is_some_and(|(_, &i)| old[i].index(at).is_some() && pinned[i])
     };
     for &i in s.by_g.values() {
         unpublish_block(&old[i]);
@@ -2517,8 +2604,8 @@ fn flush(s: &mut State) {
     s.pages.clear();
     for (i, b) in old.into_iter().enumerate() {
         if pinned[i] {
-            kept += b.len;
-            s.by_t.insert(b.t, s.blocks.len());
+            kept += b.size();
+            index_parts(&mut s.by_t, &b, s.blocks.len());
             s.blocks.push(Block { linked: Vec::new(), retired: true, ..b });
         }
     }
@@ -2536,7 +2623,7 @@ fn flush(s: &mut State) {
     for k in c.chunks.iter_mut() {
         k.retired = blocks.iter().any(|b| (k.rx..k.rx + size).contains(&b.t));
         if !k.retired {
-            k.used = EXIT_STUB;
+            k.empty();
         }
     }
     c.live = 0;
@@ -2579,33 +2666,41 @@ fn scan(from: u64, len: u64, buf: &mut [u64], mark: &mut impl FnMut(u64)) {
     }
 }
 
-/// Write `words` at the current chunk's next free place (8-byte aligned,
-/// as a system call's stub needs for its literal): their executable
-/// address.
-fn write(c: &mut Cache, words: &[u32]) -> u64 {
+/// Write a block's `hot` and `cold` words in the current chunk where it
+/// has room for them ([`Chunk::fit`]): their executable addresses.
+fn write(c: &mut Cache, hot: &[u32], cold: &[u32]) -> (u64, u64) {
     let k = &mut c.chunks[c.current];
-    let len = 4 * words.len() as u64;
-    assert!(k.used + len <= chunk_size(), "a block placed past the room cache_next made");
-    let off = k.used;
-    for (i, &w) in words.iter().enumerate() {
-        // SAFETY: inside the chunk's writable view.
-        unsafe { ((k.rw + off + 4 * i as u64) as *mut u32).write(w) };
+    let (h, cl) = (4 * hot.len() as u64, 4 * cold.len() as u64);
+    let (at, at_cold, end) = k.fit(h, cl).expect("a block placed where cache_next made room");
+    for (off, words) in [(at, hot), (at_cold, cold)] {
+        for (i, &w) in words.iter().enumerate() {
+            // SAFETY: inside the chunk's writable view.
+            unsafe { ((k.rw + off + 4 * i as u64) as *mut u32).write(w) };
+        }
     }
-    k.used = (off + len + 7) & !7;
-    k.rx + off
+    k.hot = (at + h + 7) & !7;
+    k.cold = at_cold;
+    k.end = end;
+    (k.rx + at, k.rx + at_cold)
 }
 
-/// Write `words` in the cache ([`write`]), synced for instruction fetch
-/// with the words patched since the last sync ([`State::sync_patched`]),
-/// once for both: their executable address. (Room is written again only
-/// once the cache is emptied, which syncs the ways out it unlinks.)
-fn emit(s: &mut State, words: &[u32]) -> u64 {
-    let t = write(s.cache.as_mut().expect("a code cache"), words);
+/// Write a block's `hot` and `cold` words in the cache ([`write`]), synced
+/// for instruction fetch with the words patched since the last sync
+/// ([`State::sync_patched`]), once for all: their executable addresses.
+/// (Room is written again only once the cache is emptied, which syncs the
+/// ways out it unlinks.)
+fn emit(s: &mut State, hot: &[u32], cold: &[u32]) -> (u64, u64) {
+    let (t, cold_t) = write(s.cache.as_mut().expect("a code cache"), hot, cold);
     let line = 4 << (crate::hwcap::CTR_EL0 & 15);
-    let end = t + 4 * words.len() as u64;
-    s.patched.borrow_mut().extend((t & !(line - 1)..end).step_by(line as usize));
+    let mut patched = s.patched.borrow_mut();
+    for (at, n) in [(t, hot.len()), (cold_t, cold.len())] {
+        if n > 0 {
+            patched.extend((at & !(line - 1)..at + 4 * n as u64).step_by(line as usize));
+        }
+    }
+    drop(patched);
     s.sync_patched();
-    t
+    (t, cold_t)
 }
 
 /// The program's instruction at `g`, read from its memory, or from the
@@ -2649,11 +2744,11 @@ fn with_snapshot<R>(g: u64, words: &[u32], work: impl FnOnce() -> R) -> R {
 
 /// A block's translation ([`translate`]).
 struct Made {
-    /// Its words, and what each stands for.
-    words: Vec<u32>,
-    info: Vec<Word>,
-    /// Its saved, unsaved and `x18` entries ([`Block`]), as word indexes
-    /// (the last 0 if none).
+    /// Its words, hot and cold, and what each stands for, to be finished
+    /// where they are placed.
+    asm: Asm<Word>,
+    /// Its saved, unsaved and `x18` entries ([`Block`]), as indexes of its
+    /// hot words (the last 0 if none).
     entry: usize,
     unsaved: usize,
     x18: usize,
@@ -2689,7 +2784,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // in `x16`, which goes on to the saved entry if the target is this
     // block's (an entry can be taken over as such a lookup reads it).
     let (out, info) = BUFFERS.take();
-    let mut a = Asm::new(out, info, true);
+    let mut a = Asm::new(out, info);
     let check = Word::Lookup { g, link: None, to: Some(16) };
     let address = materialized(17, g).count();
     a.extend(H, std::iter::repeat_n(NOP, CHECK_WORDS - 2 - address), check);
@@ -2708,9 +2803,8 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     };
     let Body { calls, end, restore, x18 } = body_of(g, t, followed, true, None, &mut c, &mut a);
     // The wrong block's way out.
-    let cold = a.cold();
-    a.bind(wrong, cold);
-    a.push(cold, EXIT, Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 });
+    a.bind(wrong, C);
+    a.push(C, EXIT, Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 });
     // A direct branch with the program's own registers, and fwe going on
     // from a trap, enter where the block takes them back; if it does not
     // at once, at its words up to there made again with them in their
@@ -2745,8 +2839,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     let Calls { pads, made, joins, .. } = c;
     // Other blocks enter a call's words with `x18` in its slot.
     let calls_at = made.into_iter().filter(|m| !m.2).map(|m| (m.0, m.1)).collect();
-    let (words, info) = a.finish();
-    Made { words, info, entry: CHECK_WORDS, unsaved, x18, calls, end, pads, calls_at, joins }
+    Made { asm: a, entry: CHECK_WORDS, unsaved, x18, calls, end, pads, calls_at, joins }
 }
 
 /// A block's calls as [`body_of`] makes them: those made already in other
@@ -2920,7 +3013,7 @@ fn body_of(
             Side::Taken { at, to: label, g, target, saved, x18 } => {
                 // Out of the way, but a `tbz`'s (whose reach is short).
                 let near = a.word(at) & 0x7e00_0000 == 0x3600_0000;
-                let s = if near { H } else { a.cold() };
+                let s = if near { H } else { C };
                 a.bind(label, s);
                 let out = gate_out(g, Exit::Jump(target), saved, x18, s, a);
                 c.taken.push((out, at));
@@ -3245,7 +3338,7 @@ fn put_x18(x18: &mut Option<bool>, pc: u64, a: &mut Asm<Word>) {
 /// A way out into fwe through the exit gate, in section `s` (first a save
 /// of the program's `x16` and `x17` below `sp` unless `saved`): `x16` the
 /// way out's address, and a branch to its chunk's exit stub ([`exit_stub`],
-/// made [`TO_STUB`] and pointed there by [`place`]). A direct one is
+/// [`STUB`]). A direct one is
 /// linked by making its first word a branch to the target's translation,
 /// entered as the way out has them ([`entered`]). Its first word's place.
 fn gate_out(g: u64, exit: Exit, saved: bool, x18: bool, s: Sec, a: &mut Asm<Word>) -> Pos {
@@ -3257,7 +3350,7 @@ fn gate_out(g: u64, exit: Exit, saved: bool, x18: bool, s: Sec, a: &mut Asm<Word
         a.push(s, 0x10ff_fff0, Word::Saved(g)); // adr x16, #-4
         at
     };
-    a.push(s, TO_STUB, Word::Saved(g));
+    a.branch(s, B, Field::Imm26, STUB, Word::Saved(g));
     at
 }
 
@@ -3589,7 +3682,7 @@ fn lookup(
 ) -> Option<Tail> {
     let before = Word::Lookup { g: pc, link, to: None };
     let in_place = !matches!(n, 16..=18) && !(n == 30 && link.is_some());
-    let cold = a.cold();
+    let cold = C;
     // Where the look in the table of translations goes: past a return's
     // first look in the table of returns, out of the way.
     let main = if ret && in_place { cold } else { H };
@@ -3694,7 +3787,7 @@ struct Tail {
 /// it where the target is not translated, the second look, the miss.
 fn lookup_tail(t: &Tail, a: &mut Asm<Word>) {
     let &Tail { pc, n, link, in_place, main, miss, outside, outside_at, bl, committed, before } = t;
-    let cold = a.cold();
+    let cold = C;
     if let Some(bl) = bl {
         a.bind(bl, main);
     }
