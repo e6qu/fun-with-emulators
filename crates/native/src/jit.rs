@@ -1248,7 +1248,11 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
         regs.pc = to;
         return true;
     }
-    let i = translation(&mut s, to);
+    let mut i = translation(&mut s, to);
+    // (The cache emptied as blocks were made ahead: its block anew.)
+    if ahead(&mut s, i) {
+        i = translation(&mut s, to);
+    }
     // Linked where the target is in reach (in the same chunk), unless the
     // cache was emptied meanwhile (`at` may be reused) or the block left
     // since (the lock let go as it was translated).
@@ -1526,6 +1530,60 @@ fn translation(s: &mut Held, g: u64) -> usize {
         }
         return place(s, g, followed, made, source[..read_words].to_vec());
     }
+}
+
+/// How many blocks a way out makes ahead of the program ([`ahead`]).
+const AHEAD: usize = 4;
+
+/// Make the blocks block `i` goes on to whatever its conditions ([`AHEAD`]
+/// at most, from it on): its direct branch's target, a call's and where
+/// it returns, the next instruction past a block cut short. Each would be
+/// made at a way out of its own as the program reached it, through the
+/// gate and the lock, one at a time; made now, they are linked at once.
+/// Only code the program goes on to is made (a call may not return: its
+/// return site is the program's words, decoded and never run). Whether
+/// the cache was emptied meanwhile (block indices are then another's).
+fn ahead(s: &mut Held, i: usize) -> bool {
+    let flushes = s.cache.as_ref().map_or(0, |c| c.flushes);
+    let mut next = vec![i];
+    let mut made = 0;
+    while let Some(i) = next.pop() {
+        for to in successors(&s.blocks[i]) {
+            if made == AHEAD {
+                return false;
+            }
+            if s.by_g.contains_key(&to) || !(s.in_region(to) || followable(to)) {
+                continue;
+            }
+            let j = translation(s, to);
+            made += 1;
+            if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
+                return true;
+            }
+            next.push(j);
+        }
+    }
+    false
+}
+
+/// Where block `b` goes on to whatever its conditions: the targets of its
+/// direct ways out that are no conditional branch's taken way, and where
+/// a call among them returns.
+fn successors(b: &Block) -> Vec<u64> {
+    let mut to = Vec::new();
+    for w in &b.words {
+        if let Word::Out { g, exit: Exit::Jump(target), cond: 0, .. } = *w {
+            to.push(target);
+            // `bl`
+            let call = b.source.get(((g - b.g) / 4) as usize).is_some_and(|&w| w >> 26 == 0x25);
+            if call {
+                to.push(g + 4);
+            }
+        }
+    }
+    to.sort_unstable();
+    to.dedup();
+    to
 }
 
 /// Place translation `made` of the block at `g` (`followed`, of code fwe

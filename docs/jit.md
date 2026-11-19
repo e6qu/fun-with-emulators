@@ -252,7 +252,11 @@ a processor that reports `DIC` clear.
   entry for the way out's state of `x16` and `x17` (`jit::entered`), as
   is the conditional branch the way out is the taken way of, where it
   reaches (`State::link`, undone by `State::unlink`), and the gate enters
-  that translation as a lookup does. The words patched have their
+  that translation as a lookup does. The blocks the target goes on to
+  whatever its conditions (its direct branch's target, a call's and
+  where it returns) are made with it, a few deep (`jit::ahead`), and
+  linked at once: each would otherwise be a way out of its own as the
+  program reached it. The words patched have their
   instruction cache lines invalidated together, with one barrier for all
   (`State::sync_patched`), before the translator's lock is let go, new
   words are written or stopped threads go on: a patch turns one right
