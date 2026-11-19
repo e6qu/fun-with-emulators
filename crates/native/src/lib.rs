@@ -1,6 +1,8 @@
 //! The native execution backend: Linux code runs directly on the CPU inside
 //! this macOS process, with system calls redirected to the kernel layer.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod asm;
 pub mod decode;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod gate;
