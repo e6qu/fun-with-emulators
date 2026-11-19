@@ -1047,11 +1047,8 @@ fn jit_calls_to_targets_of_one_table_entry() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stdout(&out), "two: 1100000\nthree: 7000\n", "{err}");
     assert_eq!(out.status.code(), Some(0));
-    let exits: u64 = err
-        .lines()
-        .find_map(|l| l.split(" blocks translated, ").nth(1))
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
+    let exits = *jit_counts(&err, " blocks translated, ")
+        .first()
         .unwrap_or_else(|| panic!("no count of ways out: {err}"));
     assert!(exits < 20000, "{exits} ways out through fwe: {err}");
     let _ = std::fs::remove_dir_all(&root);
@@ -1072,11 +1069,8 @@ fn jit_calls_through_a_repointed_call_site() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stdout(&out), "sum: 120000\n", "{err}");
     assert_eq!(out.status.code(), Some(0));
-    let exits: u64 = err
-        .lines()
-        .find_map(|l| l.split(" blocks translated, ").nth(1))
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
+    let exits = *jit_counts(&err, " blocks translated, ")
+        .first()
         .unwrap_or_else(|| panic!("no count of ways out: {err}"));
     assert!(exits < 5000, "{exits} ways out through fwe: {err}");
     let _ = std::fs::remove_dir_all(&root);
@@ -1097,11 +1091,8 @@ fn jit_code_stays_translated_through_flushes_of_its_data() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stdout(&out), "sum: 1999000\n", "{err}");
     assert_eq!(out.status.code(), Some(0));
-    let dropped: u64 = err
-        .lines()
-        .find_map(|l| l.split(" blocks kept unchanged, ").nth(1))
-        .and_then(|rest| rest.split(' ').next())
-        .and_then(|n| n.parse().ok())
+    let dropped = *jit_counts(&err, " blocks kept unchanged, ")
+        .first()
         .unwrap_or_else(|| panic!("no count of blocks dropped: {err}"));
     assert_eq!(dropped, 0, "{err}");
     let _ = std::fs::remove_dir_all(&root);
@@ -1314,11 +1305,18 @@ fn ioccc_winners_run_as_their_authors_say() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The number right after `before` in each of `err`'s `FWE_TIMING` lines that
+/// has it: one for each process that ran code by translation.
+fn jit_counts(err: &str, before: &str) -> Vec<u64> {
+    err.lines().filter_map(|l| l.split(before).nth(1)?.split(' ').next()?.parse().ok()).collect()
+}
+
 /// JIT code interrupted everywhere (guests/c/jitstorm.c): signals, faults
 /// and writes to its page landing while worker threads run every kind of
 /// instruction a translation expands leave each round's result as a quiet
-/// run's, blocks the writes left alone taken back; and again with a code
-/// cache small enough to be emptied while they run.
+/// run's, blocks the writes left alone kept and those whose words came back
+/// taken back; and again with a code cache small enough to be emptied while
+/// they run.
 #[test]
 fn jit_code_survives_signals_faults_and_writes() {
     let prog = build_c("jitstorm", Libc::Musl, true, true);
@@ -1346,9 +1344,15 @@ fn jit_code_survives_signals_faults_and_writes() {
                 "the code cache was never emptied: {counts:?}"
             );
         } else {
+            // The flushes of lines the writes left alone keep their blocks;
+            // a block whose words came back as they were is taken back.
             assert!(
-                counts.iter().any(|l| !l.contains("(0 blocks taken back)")),
-                "no block the writes left alone was taken back: {counts:?}"
+                jit_counts(&err, " cache lines flushed (").iter().any(|&n| n > 0),
+                "no block kept through a flush: {counts:?}"
+            );
+            assert!(
+                jit_counts(&err, " dropped, ").iter().any(|&n| n > 0),
+                "no block taken back: {counts:?}"
             );
         }
     }
