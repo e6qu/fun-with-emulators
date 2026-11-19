@@ -277,7 +277,7 @@ it: a fetch from it faults and the block is translated (`jit::enter`),
 ways out go through the exit gate (`gate::fwe_exit_gate`) and are
 linked, indirect branches look their targets up in a table at 2^45, and
 the program's `ic ivau` drops the translations of the line it flushes
-(`jit::flushed`). Why, how each part works, what it costs and how other
+whose words changed (`jit::flushed`). Why, how each part works, what it costs and how other
 translators compare are in [jit.md](jit.md).
 
 ### Kept preparation and images
@@ -1580,8 +1580,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `coredump_filter` is the default and cannot be changed.
 - Native: code made executable at run time costs a fault the first time
   each block runs, and each instruction cache line the program flushes
-  drops the translations made from it, which are made again as the code
-  runs ([jit.md](jit.md#what-it-costs)). Code changed without a flush
+  drops the translations made from it whose words changed, which are
+  made again as the code runs ([jit.md](jit.md#what-it-costs)). Code changed without a flush
   (`ic ivau`) keeps running as it was translated, as it may on Linux on
   a processor whose instruction cache is kept apart (`CTR_EL0.DIC`
   clear, as fwe reports); so does code another process writes through

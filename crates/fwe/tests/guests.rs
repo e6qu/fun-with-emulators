@@ -1082,6 +1082,31 @@ fn jit_calls_through_a_repointed_call_site() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code reading a word of data in its own cache line, which the
+/// program changes and flushes before each of 2000 calls
+/// (guests/c/jitguard.c): each call reads the new word, and the
+/// translation, whose words never change, stays through the flushes
+/// rather than being dropped and made again at each call.
+#[test]
+fn jit_code_stays_translated_through_flushes_of_its_data() {
+    let prog = build_c("jitguard", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitguard");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 1999000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    let dropped: u64 = err
+        .lines()
+        .find_map(|l| l.split(" blocks kept unchanged, ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no count of blocks dropped: {err}"));
+    assert_eq!(dropped, 0, "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Memory a position-independent program asks for near its own code with
 /// a hint (guests/c/nearcode.c), as LuaJIT asks for room for its machine
 /// code within a branch's reach: it goes at the hint, below the program,

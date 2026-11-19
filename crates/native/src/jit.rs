@@ -466,7 +466,6 @@ struct Block {
     calls_made: Vec<(u64, u64)>,
 }
 
-/// The code cache: chunks, each one memory mapped twice.
 impl Block {
     /// What its word `k` stands for.
     fn word(&self, k: usize) -> Option<Word> {
@@ -491,8 +490,14 @@ impl Block {
             _ => None,
         })
     }
+
+    /// Whether the program's words it was made from are still there.
+    fn unchanged(&self) -> bool {
+        self.source.iter().zip((self.g..).step_by(4)).all(|(&w, at)| read(at) == w)
+    }
 }
 
+/// The code cache: chunks, each one memory mapped twice.
 struct Cache {
     chunks: Vec<Chunk>,
     /// The chunk new translations go in.
@@ -644,9 +649,10 @@ static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
 thread_local! { static PROBE_TEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 pub static PROBE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
-/// Cache lines the program flushed, the blocks those flushes dropped,
-/// and blocks taken back ([`revive`]).
+/// Cache lines the program flushed, the blocks those flushes kept (their
+/// words unchanged) and dropped, and blocks taken back ([`revive`]).
 static LINES_FLUSHED: AtomicU64 = AtomicU64::new(0);
+static KEPT: AtomicU64 = AtomicU64::new(0);
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 static REVIVED: AtomicU64 = AtomicU64::new(0);
 /// Times the code cache was emptied.
@@ -725,7 +731,7 @@ pub fn counts() -> Option<String> {
             "PROBE ms {probes}; JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
              {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
-             {} cache lines flushed ({} blocks dropped, {} taken back), the code cache emptied {} times; \
+             {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
@@ -739,6 +745,7 @@ pub fn counts() -> Option<String> {
             ENTERED_CALLS.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
             LINES_FLUSHED.load(Ordering::Relaxed),
+            KEPT.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
             REVIVED.load(Ordering::Relaxed),
             FLUSHES.load(Ordering::Relaxed),
@@ -1155,8 +1162,9 @@ pub fn discarded(addr: u64, len: u64) {
 
 /// The program invalidated the instruction cache line at `addr` (`ic
 /// ivau`), as it does after writing code there: the blocks made from the
-/// line, through this mapping or another of the same memory, go. Each is
-/// kept, and taken back if its words turn out unchanged ([`revive`]).
+/// line, through this mapping or another of the same memory, whose words
+/// it changed go. Each is kept, and taken back if its words turn out as
+/// they were ([`revive`]).
 pub fn flushed(addr: u64) {
     LINES_FLUSHED.fetch_add(1, Ordering::Relaxed);
     if TRANSLATED.load(Ordering::Relaxed) == 0 {
@@ -1185,9 +1193,9 @@ fn code_written(addr: u64, len: u64) {
     }
 }
 
-/// Drop the blocks made from `[addr, addr + len)` (within a page), kept
-/// to take back, through this mapping and any other of the same file's
-/// page.
+/// Drop the blocks made from `[addr, addr + len)` (within a page) whose
+/// words changed, kept to take back, through this mapping and any other
+/// of the same file's page.
 fn drop_lines(s: &mut State, addr: u64, len: u64) {
     let ps = page_size();
     let page = addr & !(ps - 1);
@@ -1210,18 +1218,26 @@ fn drop_lines(s: &mut State, addr: u64, len: u64) {
     }
 }
 
-/// Drop the blocks made from `[p + off, p + end)`, on page `p`, kept to
-/// take back.
+/// Drop the blocks made from `[p + off, p + end)`, on page `p`, whose
+/// words changed, kept to take back. A block whose words are the same
+/// stays: a JIT flushes lines whose instructions it left alone (a word
+/// of data beside them changed, code written next to them).
 fn drop_on(s: &mut State, p: u64, off: u64, end: u64) {
     let Some(blocks) = s.pages.get(&p) else { return };
-    let hits = |i: usize| {
+    let on = |i: usize| {
         let b = &s.blocks[i];
         p + off < b.g + 4 * b.source.len() as u64 && p + end > b.g
     };
-    if !blocks.iter().any(|&i| hits(i)) {
+    let on_line = blocks.iter().filter(|&&i| on(i)).count();
+    if on_line == 0 {
         return;
     }
-    let (hit, kept): (Vec<usize>, Vec<usize>) = blocks.iter().partition(|&&i| hits(i));
+    let (hit, kept): (Vec<usize>, Vec<usize>) =
+        blocks.iter().partition(|&&i| on(i) && !s.blocks[i].unchanged());
+    KEPT.fetch_add((on_line - hit.len()) as u64, Ordering::Relaxed);
+    if hit.is_empty() {
+        return;
+    }
     s.pages.insert(p, kept);
     for i in hit {
         DROPPED.fetch_add(1, Ordering::Relaxed);
@@ -2012,7 +2028,7 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     if b.retired || b.followed == s.in_region(g) || b.g & !(page_size() - 1) != p {
         return None;
     }
-    if !b.source.iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w) {
+    if !b.unchanged() {
         return None;
     }
     let len = b.len;

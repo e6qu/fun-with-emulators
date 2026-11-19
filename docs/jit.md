@@ -211,8 +211,11 @@ fwe takes that flush for the word that the code changed:
 - **`ic ivau` calls fwe.** In code prepared in place it is a site whose
   stub runs the instruction and calls the system-call gate; a
   translation expands it the same way. The gate drops the translations
-  made from that cache line (64 bytes), and the code is translated again
-  when it next runs. A translation running when its code is flushed
+  made from that cache line (64 bytes) whose words changed, and the code
+  is translated again when it next runs. A translation whose words are
+  as they were stays: a JIT also flushes lines whose instructions it
+  left alone (a word of data beside them changed, code written next to
+  them). A translation running when its code is flushed
   goes on to its end: the `isb` that follows a flush ends a block, so
   code that rewrites instructions just ahead of itself runs the new ones.
 - **The rest of the memory is the program's.** Nothing else it writes
@@ -222,10 +225,10 @@ fwe takes that flush for the word that the code changed:
   writable and executable) may flush either view, since both are the
   same memory: a flush through either drops the translations made from
   it.
-- **Taken back if unchanged.** A block a flush dropped is kept with the
-  words it was made from; when its address runs again and the words are
-  unchanged (a method installed again where it was), the block is
-  taken back instead of translated anew.
+- **Taken back if the same again.** A block a flush dropped is kept
+  with the words it was made from; when its address runs again and the
+  words are as they were (a method installed again where it was), the
+  block is taken back instead of translated anew.
 - **Other changes.** Mapping memory anew, unmapping it, changing its
   protections and giving it back (`MADV_DONTNEED`) drop its translations
   too, as does a write fwe makes into code itself (a debugger's
@@ -343,9 +346,9 @@ a processor that reports `DIC` clear.
   the gate invalidates itself) and calls the gate as a system call's
   stub does. The gate tells the two apart by the stub's load of its
   address (`rewrite::flush_reg`) and calls `jit::flushed`, which drops
-  the blocks made from that line (`jit::drop_lines`): it unpublishes
-  their entries and re-patches the branches linked to them into ways
-  out. The other mappings of each file page code was translated from
+  the blocks made from that line whose words changed
+  (`jit::drop_lines`): it unpublishes their entries and re-patches the
+  branches linked to them into ways out. The other mappings of each file page code was translated from
   are noted as that code is first translated (`jit::note_aliases`) and
   as new mappings appear (`jit::mapped`), so a line flushed through one
   drops those of the page translated from. Dropped blocks are kept in
