@@ -560,7 +560,8 @@ impl Block {
 
     /// Its direct ways out ([`Block::jumps`]) by what leads there: their
     /// targets, and whether an unconditional branch of the program's
-    /// (`b`) does, from the target's page.
+    /// (`b`) does, and whether ahead within the words a block made at its
+    /// own address could read ([`snapshot`]), from the target's page.
     fn leads(&self) -> impl Iterator<Item = (u64, jitcount::Lead)> + '_ {
         self.words.iter().filter_map(|p| match *p {
             Packed::Out { to, g, cond: 0, exit: 0, .. } => {
@@ -570,9 +571,11 @@ impl Block {
                         && at.wrapping_add_signed(i64::from((w << 6) as i32 >> 4)) == to
                 });
                 let page = !(page_size() - 1);
+                let ahead = to > at && to < self.g + 4 * (BLOCK_INSNS + 16) as u64;
                 Some((
                     to,
                     match (branch, at & page == to & page) {
+                        (true, true) if ahead => jitcount::Lead::Ahead,
                         (true, true) => jitcount::Lead::Branch,
                         (true, false) => jitcount::Lead::BranchAway,
                         _ => jitcount::Lead::Other,

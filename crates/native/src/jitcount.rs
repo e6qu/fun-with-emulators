@@ -232,42 +232,43 @@ pub(crate) struct Counted {
 }
 
 /// What leads a direct way out to its target: an unconditional branch of
-/// the program's (`b`) on the target's page, one from another page, or
-/// anything else (a conditional branch, the next instruction, a call).
+/// the program's (`b`) ahead within the words a block made at the
+/// branching block's address could read, one elsewhere on the target's
+/// page, one from another page, or anything else (a conditional branch,
+/// the next instruction, a call).
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Lead {
+    Ahead,
     Branch,
     BranchAway,
     Other,
 }
 
-/// Of the blocks in use, those an unconditional branch leads to: in all,
-/// and those nothing else leads to directly, with their program's words
-/// (all, and from the branch's own page).
-fn branched_to(blocks: &[Counted]) -> [u64; 5] {
-    let mut by: HashMap<u64, [u32; 3]> = HashMap::new();
+/// Of the blocks in use, those an unconditional branch leads to (all of
+/// them), and of those the ones nothing else leads to directly, by
+/// [`Lead`] of their one branch: how many, and their program's words.
+fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64); 3]) {
+    let mut by: HashMap<u64, [u32; 4]> = HashMap::new();
     for b in blocks.iter().filter(|b| b.live) {
         for &(to, lead) in &b.leads {
             by.entry(to).or_default()[lead as usize] += 1;
         }
     }
-    let mut n = [0u64; 5];
+    let (mut all, mut only) = (0, [(0u64, 0u64); 3]);
     for b in blocks.iter().filter(|b| b.live) {
-        let Some(&[near, away, other]) = by.get(&b.g) else { continue };
-        if near + away == 0 {
+        let Some(&leads) = by.get(&b.g) else { continue };
+        let branches: u32 = leads[..3].iter().sum();
+        if branches == 0 {
             continue;
         }
-        n[0] += 1;
-        if near + away == 1 && other == 0 {
-            n[1] += 1;
-            n[2] += b.words as u64;
-            if near == 1 {
-                n[3] += 1;
-                n[4] += b.words as u64;
-            }
+        all += 1;
+        if branches == 1 && leads[Lead::Other as usize] == 0 {
+            let k = leads.iter().position(|&n| n == 1).expect("one branch");
+            only[k].0 += 1;
+            only[k].1 += b.words as u64;
         }
     }
-    n
+    (all, only)
 }
 
 /// Whether the program's word `w` is one a translation changes: a system
@@ -311,10 +312,12 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
             .collect::<Vec<_>>()
             .join(", ")
     ));
-    let [to, only, only_words, near, near_words] = branched_to(blocks);
+    let (to, [ahead, near, away]) = branched_to(blocks);
     out.push_str(&format!(
-        "; blocks in use a branch leads to {to}, {only} of them led to by nothing else directly \
-         ({only_words} words), {near} of those from their page ({near_words} words)"
+        "; blocks in use a branch leads to {to}, led to by nothing else directly: from close \
+         behind {} ({} words), from elsewhere on their page {} ({} words), from another page {} \
+         ({} words)",
+        ahead.0, ahead.1, near.0, near.1, away.0, away.1
     ));
     if *SEEN_READ.get().unwrap_or(&false) {
         out.push_str(&format!(

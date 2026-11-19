@@ -414,8 +414,9 @@ the page's end, or the most words a block takes), those made with a second pass 
 with the program's own `x16` and `x17` and those entered there,
 those made ahead of the program, and of the blocks in use those an
 unconditional branch (`b`) leads to: in all, and those nothing else
-leads to directly (with their words, and how many of them are on the
-branch's own page). With `FWE_JIT_SEEN=<dir>` each process
+leads to directly, with their words, by where the branch is (close
+behind, within the words a block made at its block's address reads;
+elsewhere on their page; on another page). With `FWE_JIT_SEEN=<dir>` each process
 adds the blocks it made to that directory (their address and a hash of
 their words) and counts those an earlier one made, at the same address
 or elsewhere. With `FWE_JIT_COUNT=1` every block counts its runs and
