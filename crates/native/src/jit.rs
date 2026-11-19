@@ -437,9 +437,9 @@ impl Packed {
 struct Block {
     /// The program address it translates.
     g: u64,
-    /// Its translation's address in the executable view: its first word
-    /// restores `x16` and `x17` (entered from a lookup); a direct branch
-    /// enters at the next.
+    /// Its translation's address in the executable view: its first words
+    /// check that a lookup read apart from the table reached the block it
+    /// looked for ([`CHECK_WORDS`], [`TO_CHECK`]); the entries follow.
     t: u64,
     /// What each word of the translation stands for.
     words: Vec<Packed>,
@@ -2642,9 +2642,6 @@ fn with_snapshot<R>(g: u64, words: &[u32], work: impl FnOnce() -> R) -> R {
     r
 }
 
-/// Translate the block at program address `g`, to be placed at `t`: its
-/// words, and what each stands for. A block ends at its page's end, so it
-/// is made from that page alone.
 /// A block's translation ([`translate`]).
 struct Made {
     /// Its words, and what each stands for.
@@ -2676,6 +2673,9 @@ thread_local! {
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
 }
 
+/// Translate the block at program address `g`, to be placed at `t`: its
+/// words, and what each stands for. A block ends at its page's end, so it
+/// is made from that page alone.
 fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // A lookup that read an entry's address and translation at once, and a
     // direct branch with the program's `x16` and `x17` saved below `sp`
