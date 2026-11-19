@@ -182,8 +182,7 @@ const BLOCK_ROOM: u64 = 4 * 64 * 24;
 pub const TABLE: u64 = 1 << 45;
 /// The table of returns, laid out as [`TABLE`]: a call's return address,
 /// and the way back into the translation of the call (the words after
-/// its `bl`: a direct call's block going on, an indirect call's pad),
-/// where a return goes with `ret`. The
+/// its `bl`, where the block goes on), where a return goes with `ret`. The
 /// processor predicts a return to where the last `bl` would have come
 /// back to: found here, it is right, where a `br` to the address the
 /// table of translations gives would be guessed from the branches before
@@ -440,7 +439,7 @@ pub struct State {
     /// address, the block, and the address of its words (entered with the
     /// program's `x16` and `x17` saved). Another block that comes to it
     /// goes on there ([`Exit::Join`]): a call has one `bl`, and its return
-    /// one pad ([`RETS`]) the processor predicts.
+    /// one way back ([`RETS`]) the processor predicts.
     calls_made: BTreeMap<u64, (usize, u64)>,
     /// Where calls made from translations return: a return there from
     /// code followed into is followed back ([`exit`]).
@@ -809,8 +808,8 @@ fn unpublish_in(table: u64, g: u64, value: u64) {
     }
 }
 
-/// Block `b`'s calls' pads as returns find them ([`RETS`]), or not: each
-/// return address, and its pad.
+/// Block `b`'s calls' ways back as returns find them ([`RETS`]): each
+/// return address, and the words after the call's `bl`.
 fn pads(b: &Block) -> impl Iterator<Item = (u64, u64)> + '_ {
     b.pads.iter().copied()
 }
@@ -2430,7 +2429,8 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
 
 /// A block's calls as [`body_of`] makes them: those made already in other
 /// blocks' words (`known`: program address, words), and what it makes:
-/// pads ([`call_pad`]), calls made in its own first words (program
+/// ways back after its calls' `bl`s ([`RETS`]: return address, word
+/// index), calls made in its own first words (program
 /// address, word index), and ways out into known ones (word index, program
 /// address, words). A call's words are entered with the program's `x16`
 /// and `x17` saved.
@@ -2502,8 +2502,8 @@ fn body_of(
             break;
         }
         let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
-        // A call (`bl`, `blr`) is made once, with one pad where its return
-        // comes back ([`call_pad`]): where it is made already, in another
+        // A call (`bl`, `blr`) is made once, with one way back after its
+        // `bl` where its return comes ([`RETS`]): where it is made already, in another
         // block's words or in this one's made the other way, the words go
         // on there, entered as a call's words are after their save: `x18`
         // in its slot and the program's `x16` and `x17` saved.
@@ -2567,18 +2567,22 @@ fn body_of(
     // The taken ways of its conditional branches and its direct calls'
     // ways to their targets, after the rest.
     for side in sides {
-        let at = out.len();
-        if let Some(ret) = side.call {
-            out[side.at] |= (at - side.at) as u32;
-            materialize(30, ret, out);
-            info.extend((at..out.len()).map(|_| Word::Saved(side.g)));
-            gate_out(side.g, Exit::Jump(side.to), true, false, out, info);
-            continue;
-        }
-        out[side.at] |= ((at - side.at) as u32) << 5;
-        gate_out(side.g, Exit::Jump(side.to), side.saved, side.x18, out, info);
-        if let Word::Out { cond, .. } = &mut info[at] {
-            *cond = (at - side.at) as u16;
+        let here = out.len();
+        match side {
+            Side::Taken { at, g, to, saved, x18 } => {
+                out[at] |= ((here - at) as u32) << 5;
+                gate_out(g, Exit::Jump(to), saved, x18, out, info);
+                if let Word::Out { cond, .. } = &mut info[here] {
+                    *cond = (here - at) as u16;
+                }
+            }
+            Side::Call { at, g, to, ret } => {
+                out[at] |= (here - at) as u32;
+                materialize(30, ret, out);
+                info.extend((here..out.len()).map(|_| Word::Saved(g)));
+                gate_out(g, Exit::Jump(to), true, false, out, info);
+            }
+            Side::Lookup(tail) => lookup_tail(&tail, out, info),
         }
     }
     Body { calls, end: pc, restore, x18: x18_entry }
@@ -2632,20 +2636,20 @@ fn load_x18(pc: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) {
     info.extend([Word::Saved(pc); 3]);
 }
 
-/// A conditional branch's taken way, out of line ([`body_of`]): the
-/// branch, word `at` of the block (its offset in the field at bit 5), at
-/// program address `g`, to `to`, the program's `x16` and `x17` saved there
-/// or not, and its `x18` held in `x17` or not. Or a direct call's way to
-/// its target (`call`, where it returns): the `bl` at `at` (its offset in
-/// the field at bit 0) comes to it, `x30` is set to the return address,
-/// and it goes on to the target, `x16` and `x17` saved.
-struct Side {
-    at: usize,
-    g: u64,
-    to: u64,
-    saved: bool,
-    x18: bool,
-    call: Option<u64>,
+/// Words of a block out of line, after the rest ([`body_of`]).
+enum Side {
+    /// A conditional branch's taken way: the branch, word `at` of the
+    /// block (its offset in the field at bit 5), at program address `g`,
+    /// to `to`, the program's `x16` and `x17` saved there or not, and its
+    /// `x18` held in `x17` or not.
+    Taken { at: usize, g: u64, to: u64, saved: bool, x18: bool },
+    /// A direct call's way to its target: the `bl` at `at` (its offset in
+    /// the field at bit 0), at program address `g`, comes to it; `x30` is
+    /// set to `ret`, the return address, and it goes on to `to`, `x16` and
+    /// `x17` saved.
+    Call { at: usize, g: u64, to: u64, ret: u64 },
+    /// An indirect call's lookup past its `bl` ([`lookup`]).
+    Lookup(Tail),
 }
 
 /// Whether `w` is a branch [`one`] makes from either state of `x16` and
@@ -2890,28 +2894,6 @@ fn put_x18(x18: &mut Option<bool>, pc: u64, out: &mut Vec<u32>, info: &mut Vec<W
     }
 }
 
-/// A call's first word, standing for `word`: a `bl` over the call's pad,
-/// a way out to `ret`, the program's return address, to the words that
-/// follow (which make the call with `ret` in `x30`). Its return found in
-/// [`RETS`] comes back to the pad with `ret`, where the processor
-/// predicts it, and goes on from there at `ret`'s translation; the
-/// program sees only its own return address.
-fn call_pad(
-    ret: u64,
-    word: Word,
-    pads: &mut Vec<(u64, usize)>,
-    out: &mut Vec<u32>,
-    info: &mut Vec<Word>,
-) {
-    let bl = out.len();
-    out.push(BL);
-    info.push(word);
-    // Entered as a lookup enters a translation: `x16` and `x17` saved.
-    pads.push((ret, out.len()));
-    gate_out(ret, Exit::Jump(ret), true, false, out, info);
-    out[bl] |= (out.len() - bl) as u32;
-}
-
 /// A way out into fwe through the exit gate (first a save of the
 /// program's `x16` and `x17` below `sp` unless `saved`): `x16` the way
 /// out's address. A direct one is linked by making
@@ -2990,14 +2972,7 @@ fn one(
     // no longer holding x18).
     if w & 0xfc00_0000 == 0x9400_0000 {
         save(saved, out, info);
-        sides.push(Side {
-            at: out.len(),
-            g: pc,
-            to: imm26(),
-            saved: true,
-            x18: false,
-            call: Some(pc + 4),
-        });
+        sides.push(Side::Call { at: out.len(), g: pc, to: imm26(), ret: pc + 4 });
         out.push(BL);
         info.push(at_pc(true));
         pads.push((pc + 4, out.len()));
@@ -3006,13 +2981,12 @@ fn one(
     }
     // b.cond (and bc.cond)
     if w & 0xff00_0000 == 0x5400_0000 {
-        sides.push(Side {
+        sides.push(Side::Taken {
             at: out.len(),
             g: pc,
             to: imm19(),
             saved: *saved,
             x18: x18.is_some(),
-            call: None,
         });
         out.push(w & !(0x7_ffff << 5));
         info.push(at_pc(*saved));
@@ -3026,14 +3000,7 @@ fn one(
         let rt = w & 0x1f;
         if rt == 18 && x18.is_some() {
             // Of x18, held in x17 (back in its slot above).
-            sides.push(Side {
-                at: out.len(),
-                g: pc,
-                to: taken,
-                saved: true,
-                x18: true,
-                call: None,
-            });
+            sides.push(Side::Taken { at: out.len(), g: pc, to: taken, saved: true, x18: true });
             out.push((w & !field & !0x1f) | 17);
             info.push(Word::SavedX18(pc));
             return false;
@@ -3048,14 +3015,7 @@ fn one(
                 rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
             ]);
             info.extend([Word::Saved(pc); 3]);
-            sides.push(Side {
-                at: out.len(),
-                g: pc,
-                to: taken,
-                saved: true,
-                x18: false,
-                call: None,
-            });
+            sides.push(Side::Taken { at: out.len(), g: pc, to: taken, saved: true, x18: false });
             out.push((w & !field & !0x1f) | 16);
             info.push(Word::Saved(pc));
             return false;
@@ -3067,13 +3027,12 @@ fn one(
             *saved = false;
             *x18 = None;
         }
-        sides.push(Side {
+        sides.push(Side::Taken {
             at: out.len(),
             g: pc,
             to: taken,
             saved: *saved,
             x18: x18.is_some(),
-            call: None,
         });
         out.push(w & !field);
         info.push(at_pc(*saved));
@@ -3090,10 +3049,14 @@ fn one(
             lookup(pc, (w >> 5) & 0x1f, None, ret, pads, out, info);
             return true;
         }
+        // blr: the block goes on after the call's `bl`, where its return
+        // comes back, x16 and x17 saved; the rest of the lookup out of
+        // line.
         0xd63f_0000 => {
             save(saved, out, info);
-            lookup(pc, (w >> 5) & 0x1f, Some(pc + 4), false, pads, out, info);
-            return true;
+            let tail = lookup(pc, (w >> 5) & 0x1f, Some(pc + 4), false, pads, out, info);
+            sides.push(Side::Lookup(tail.expect("a call's lookup goes on")));
+            return false;
         }
         _ => {}
     }
@@ -3295,6 +3258,10 @@ fn one(
 /// replaces), the target is copied into `x16`, which leaves only `x17` to
 /// read the entry with: its address, then its translation, which is
 /// entered at its check.
+///
+/// A call ends in a `bl` to the rest ([`lookup_tail`]), which it returns
+/// to be put out of line: the block goes on after the `bl`, where the
+/// call's return comes back ([`RETS`]). A branch has the rest here.
 #[allow(clippy::too_many_arguments)]
 fn lookup(
     pc: u64,
@@ -3304,12 +3271,12 @@ fn lookup(
     pads: &mut Vec<(u64, usize)>,
     out: &mut Vec<u32>,
     info: &mut Vec<Word>,
-) {
+) -> Option<Tail> {
     let before = Word::Lookup { g: pc, link, to: None };
     let in_place = !matches!(n, 16..=18) && !(n == 30 && link.is_some());
     // A return: first the table of returns, where a call made in a
-    // translation left its pad ([`RETS`]), each entry of the pair in turn;
-    // found, back to the pad with `ret`, predicted.
+    // translation left the way back after its `bl` ([`RETS`]), each entry
+    // of the pair in turn; found, back there with `ret`, predicted.
     if ret && in_place {
         let committed = Word::Lookup { g: pc, link: None, to: Some(n as u8) };
         let mut misses = Vec::new();
@@ -3332,7 +3299,7 @@ fn lookup(
     }
     let (miss_at, to) = if in_place {
         out.extend([index_of(n), SCALE, BASE, ENTRY, key_against(n)]);
-        out.push(MISS_X16); // its offset filled in below
+        out.push(MISS_X16); // its offset filled in by the rest
         (out.len() - 1, n as u8)
     } else {
         // x16: the target.
@@ -3350,7 +3317,7 @@ fn lookup(
             _ => out.push(0xaa00_03f0 | (n << 16)), // mov x16, xN
         }
         out.extend([INDEX, SCALE, BASE, KEY, CHECK]);
-        out.push(MISS); // its offset filled in below
+        out.push(MISS); // its offset filled in by the rest
         let miss_at = out.len() - 1;
         out.extend([INDEX, SCALE, BASE, VALUE]);
         (miss_at, 16)
@@ -3364,8 +3331,45 @@ fn lookup(
     let outside_at = out.len();
     out.push(OUTSIDE);
     info.push(committed);
+    let mut tail = Tail { pc, n, link, in_place, miss_at, outside_at, bl: None, committed, before };
     if let Some(link) = link {
-        call_pad(link, committed, pads, out, info);
+        tail.bl = Some(out.len());
+        out.push(BL);
+        info.push(committed);
+        // Entered as a lookup enters a translation: `x16` and `x17` saved.
+        pads.push((link, out.len()));
+        return Some(tail);
+    }
+    lookup_tail(&tail, out, info);
+    None
+}
+
+/// The rest of a [`lookup`]: at `pc`, through `x<n>`, a call if `link`;
+/// its first look's miss at word `miss_at` and its target not translated
+/// at `outside_at`; for a call, its `bl` at `bl`. Its words are made as
+/// `committed` once the target is known, `before` until then.
+struct Tail {
+    pc: u64,
+    n: u32,
+    link: Option<u64>,
+    in_place: bool,
+    miss_at: usize,
+    outside_at: usize,
+    bl: Option<usize>,
+    committed: Word,
+    before: Word,
+}
+
+/// The words of `t` past its first look (a call's `bl` comes to them):
+/// on to the translation found, `x30` the return address for a call; the
+/// branch made as the program made it where the target is not translated;
+/// the second look; the miss.
+fn lookup_tail(t: &Tail, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+    let &Tail { pc, n, link, in_place, miss_at, outside_at, bl, committed, before } = t;
+    if let Some(bl) = bl {
+        out[bl] |= (out.len() - bl) as u32;
+    }
+    if let Some(link) = link {
         let at = out.len();
         materialize(30, link, out);
         info.extend((at..out.len()).map(|_| committed));
