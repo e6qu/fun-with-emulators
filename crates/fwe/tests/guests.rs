@@ -1054,6 +1054,23 @@ fn jit_calls_to_targets_of_one_table_entry() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code each of whose blocks expands to many times its size
+/// (guests/c/jitroom.c: functions of back-to-back calls through x16), in a
+/// code cache small enough that such blocks land at every place in a chunk,
+/// its end too: each is given the room it takes.
+#[test]
+fn jit_blocks_of_any_size_fit_in_the_code_cache() {
+    let prog = build_c("jitroom", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitroom");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_JIT_CHUNK", "65536");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "calls: every one made\n", "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code whose call site the program repoints each round
 /// (guests/c/jitrepatch.c), its loop's head in an earlier cache line than
 /// the call: each round's calls reach the new target, and once the call's

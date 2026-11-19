@@ -181,9 +181,6 @@ fn reserve_table() {
     }
 }
 
-/// Room left in a chunk below which the next block goes in a new one: the
-/// most a block's translation takes.
-const BLOCK_ROOM: u64 = 4 * 64 * 24;
 /// The table of translations by program address: at an address an `orr`
 /// can encode (one bit), 2^20 entries of (program address, translation).
 /// An address's entry is the one its bits pick, or the other of the pair
@@ -1983,7 +1980,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     // (Room is made first: emptying the cache forgets every page's other
     // mappings.)
     let page = g & !(page_size() - 1);
-    cache_next(s);
+    cache_next(s, 4 * words.len() as u64);
     note_aliases(s, page);
     // Its ways out on into the exit stub of the chunk it goes in.
     let (stub, at) = {
@@ -2378,7 +2375,8 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
     if let Some(&i) = s.veneers.get(&(to, saved)) {
         return i;
     }
-    let at = cache_next(s);
+    // At most a restore, an address made in four words and `br`.
+    let at = cache_next(s, 4 * 6);
     let mut words = if saved { vec![RESTORE] } else { Vec::new() };
     if let Some(b) = rewrite::branch(at + 4 * words.len() as u64, to) {
         words.push(b);
@@ -2428,13 +2426,14 @@ fn followable(to: u64) -> bool {
             .is_some_and(|a| a.value.prot & fwe_abi::mman::PROT_EXEC != 0)
 }
 
-/// Where the next block goes: in the current chunk while it has room for
-/// the largest block; else, the cache is emptied where at least half of it
-/// is dropped translations, and the block goes in a chunk with room, or a
-/// new one.
+/// Where the next block, `len` bytes, goes: in the current chunk while it
+/// has room for it; else, the cache is emptied where at least half of it is
+/// dropped translations, and the block goes in a chunk with room, or a new
+/// one.
 #[inline(never)]
-fn cache_next(s: &mut State) -> u64 {
-    let room = |k: &Chunk| !k.retired && k.used + BLOCK_ROOM <= chunk_size();
+fn cache_next(s: &mut State, len: u64) -> u64 {
+    assert!(len <= chunk_size() - EXIT_STUB, "a block of {len} bytes, larger than a chunk");
+    let room = |k: &Chunk| !k.retired && k.used + len <= chunk_size();
     let c = s.cache.as_ref().expect("a code cache");
     if !room(&c.chunks[c.current]) {
         if c.garbage >= c.live {
@@ -2581,7 +2580,7 @@ fn scan(from: u64, len: u64, buf: &mut [u64], mark: &mut impl FnMut(u64)) {
 fn write(c: &mut Cache, words: &[u32]) -> u64 {
     let k = &mut c.chunks[c.current];
     let len = 4 * words.len() as u64;
-    assert!(k.used + len <= chunk_size(), "a block larger than the room kept for one");
+    assert!(k.used + len <= chunk_size(), "a block placed past the room cache_next made");
     let off = k.used;
     for (i, &w) in words.iter().enumerate() {
         // SAFETY: inside the chunk's writable view.
