@@ -75,7 +75,9 @@
 //! The code cache is made of chunks, each one memory mapped twice: fwe
 //! writes translations through a writable view while threads run others
 //! from an executable one. A chunk is no larger than a branch reaches, so
-//! blocks in one chunk are linked to each other. A full chunk is followed
+//! blocks in one chunk are linked to each other. A block's words are made
+//! in two parts ([`crate::asm`]), its hot words and its cold ones, laid
+//! apart in a segment of its chunk ([`Chunk`]). A full chunk is followed
 //! by a new one, or, where at least half of the cache is translations
 //! dropped since, the cache is emptied ([`flush`]): every other thread is
 //! stopped, the blocks a thread may be in or return into are retired, and
@@ -635,7 +637,8 @@ pub struct State {
     regions: BTreeMap<u64, u64>,
     /// Translations by program address.
     by_g: AddrMap<usize>,
-    /// Translations by their address in the cache: start -> block index.
+    /// Translations by their address in the cache: the start of each part
+    /// (hot words, cold words) -> block index.
     by_t: BTreeMap<u64, usize>,
     blocks: Vec<Block>,
     /// Program pages -> the blocks made from them.
@@ -3006,8 +3009,8 @@ fn body_of(
         put_x18(&mut x18, pc, a);
         gate_out(pc, Exit::Jump(pc), saved, x18.is_some(), H, a);
     }
-    // The taken ways of its conditional branches and its direct calls'
-    // ways to their targets, after the rest.
+    // The taken ways of its conditional branches (out of the way, but a
+    // `tbz`'s) and its direct calls' ways to their targets, after the rest.
     for side in sides {
         match side {
             Side::Taken { at, to: label, g, target, saved, x18 } => {

@@ -150,11 +150,21 @@ way.
   gets a frame with the program's state too.
 - **The code cache** is made of 128 MiB chunks (what a branch reaches),
   each mapped twice, writable for fwe and executable for the threads
-  that run it. A full chunk is followed by a new one, or, when at least
-  half of the cache holds translations dropped since, the cache is
-  emptied with every other thread stopped, keeping aside the translations
-  a thread may still be in or return into; the code is translated again
-  as it runs. A fork child gets its own copy of the cache.
+  that run it. A block's words are made in two parts (`asm::Asm`): its
+  hot words, which run each time it runs, and its cold ones, which run
+  only on the way into fwe or out of the common case (a conditional
+  branch's way out until it is linked, a return's second look and the
+  rest of its lookup, a lookup's miss, a branch to code not translated).
+  A chunk is filled a segment at a time (at most 1 MiB, what a
+  conditional branch reaches): blocks' hot words from the segment's start
+  up and their cold ones from its end down, so the hot words of blocks
+  made one after another lie together, each block's cold words in reach
+  of its conditional branches. A full chunk is followed by a new one,
+  or, when at least half of the cache holds translations dropped since,
+  the cache is emptied with every other thread stopped, keeping aside
+  the translations a thread may still be in or return into; the code is
+  translated again as it runs. A fork child gets its own copy of the
+  cache.
 
 ## Code that changes
 
@@ -247,7 +257,8 @@ a processor that reports `DIC` clear.
   resumes the thread in it. A block is translated with the translator's
   lock let go (`jit::translation`), from one look at the program's words
   (`jit::with_snapshot`), at no address in particular (its expansions'
-  starts set where it is placed, `jit::place`); with the lock taken
+  starts set, and its branches resolved, where it is placed,
+  `jit::place`); with the lock taken
   again it is placed only if the program's words are still as it saw
   them and no other thread placed that block meanwhile, else it is made
   again. A flush landing meanwhile finds nothing to drop, and the check
@@ -392,13 +403,15 @@ blocks translated, ways out taken through fwe and the time spent in
 them, entries by fetch, cache lines flushed and blocks dropped and taken
 back, how often the cache was emptied, and how long the translator's
 lock was waited for and held, by its holders' kinds. `FWE_JIT_MAP=<dir>`
-writes the code cache's map there as a process ends (`jit-<pid>.map`:
-each block's place in the cache, the program address it was made from,
-what each of its words stands for, the words, and how many of the
-program's instructions it was made from and the last of them), which the
-benchmarks use to name the samples taken in translations, to show the
-hottest blocks word by word, and to count the blocks made by the code
-they come from, by what ended them and by their length. The benchmarks
+writes the code cache's map there as a process ends (`jit-<pid>.map`: a
+line for each block's hot words and one for its cold ones, each with its
+place in the cache, the program address the block was made from, what
+each of its words stands for and the words; then how many of the
+program's instructions the block was made from and the last of them, or
+`cold`), which the benchmarks use to name the samples taken in
+translations, with the share in cold words, to show the hottest blocks
+word by word, and to count the blocks made by the code they come from,
+by what ended them and by their length. The benchmarks
 compare a JDK workload (compiling and running a multi-threaded
 application) with the same JDK built for macOS on the same runner
 ([ROADMAP.md](../ROADMAP.md)).

@@ -853,21 +853,26 @@ def translated(name, jit_map, counts, where):
     named by the maps of the code cache fwe wrote to directory `jit_map`:
     by what each word stands for (the program's instruction with its `x16`
     and `x17` in place or saved, or its `x18` held in `x17`, their save or
-    restore, inside an expansion and of what, a lookup, a way out),
-    the hottest blocks word by word,
-    by the program's code each block was made from (`where` names its
-    address), and the hottest blocks; and the blocks made, by the
-    program's code, by what ended each, and by how many instructions."""
-    blocks = []
+    restore, inside an expansion and of what, a lookup, a way out) and
+    whether it is among a block's hot words or its cold ones, the hottest
+    blocks word by word, by the program's code each block was made from
+    (`where` names its address), and the hottest blocks; and the blocks
+    made, by the program's code, by what ended each, and by how many
+    instructions."""
+    # Each block's parts: its hot words (with how many of the program's
+    # words it was made from, and the last), and its cold ones.
+    parts = []
     for f in os.listdir(jit_map):
         with open(os.path.join(jit_map, f)) as m:
             for line in m:
                 t, size, g, kinds, words, source = line.split()
-                n, last = source.split(":")
-                blocks.append((int(t, 16), int(size), int(g, 16), kinds, words, int(n),
-                               int(last, 16)))
-    blocks.sort()
-    starts = [b[0] for b in blocks]
+                n, last = source.split(":") if source != "cold" else (None, None)
+                parts.append((int(t, 16), int(size), int(g, 16), kinds, words,
+                              None if n is None else int(n),
+                              None if last is None else int(last, 16)))
+    parts.sort()
+    starts = [b[0] for b in parts]
+    blocks = [b for b in parts if b[5] is not None]
     names = {"a": "instruction", "s": "instruction, x16/x17 saved", "v": "save of x16/x17",
              "x": "instruction, x18 in x17", "r": "restore of x16/x17",
              "8": "expansion of x18", "t": "expansion of the thread pointer",
@@ -891,18 +896,20 @@ def translated(name, jit_map, counts, where):
         return ", ".join(f"{w} {k * 100 // len(blocks)}%" for w, k in c.most_common(8))
     print(f"{name}: blocks made: {len(blocks)}; by the program's code: {of(made_by)}; "
           f"ended by: {of(ends)}; instructions: {of(lengths)}", file=sys.stderr)
-    n_in = 0
+    n_in, n_cold = 0, 0
     for pc, n in counts:
         i = bisect.bisect_right(starts, pc) - 1
-        if i < 0 or pc >= blocks[i][0] + blocks[i][1]:
+        if i < 0 or pc >= parts[i][0] + parts[i][1]:
             continue
-        t, _, g, kinds = blocks[i][:4]
+        t, _, g, kinds = parts[i][:4]
         k = (pc - t) // 4
         by_word[(i, k)] += n
         by_kind[names.get(kinds[k], "?") if k < len(kinds) else "?"] += n
         by_code[where(g).split("+")[0]] += n
         by_block[g] += n
         n_in += n
+        if parts[i][5] is None:
+            n_cold += n
     if not n_in:
         print(f"{name}: translations: no samples ({len(blocks)} blocks)", file=sys.stderr)
         return
@@ -910,7 +917,8 @@ def translated(name, jit_map, counts, where):
     def pct(c):
         return ", ".join(f"{w} {n * 100 / n_in:.0f}%" for w, n in c.most_common(8))
     hot = ", ".join(f"{where(g)} {n * 100 / n_in:.1f}%" for g, n in by_block.most_common(15))
-    print(f"{name}: translations: {n_in} samples in {len(blocks)} blocks; by word: "
+    print(f"{name}: translations: {n_in} samples in {len(blocks)} blocks "
+          f"({n_cold * 100 / n_in:.0f}% in their cold words); by word: "
           f"{pct(by_kind)}; by the program's code: {pct(by_code)}; hottest blocks: {hot}",
           file=sys.stderr)
     # The hottest blocks word by word: what each stands for, the word, and
@@ -919,7 +927,7 @@ def translated(name, jit_map, counts, where):
     for (i, _), n in by_word.items():
         hottest[i] += n
     for i, _ in hottest.most_common(3):
-        t, _, g, kinds, words = blocks[i][:5]
+        t, _, g, kinds, words = parts[i][:5]
         each = " ".join(f"{kinds[k]}:{words[8 * k:8 * k + 8]}:{by_word[(i, k)]}"
                         for k in range(len(kinds)))
         print(f"{name}: block {where(g)} (at {t:x}): {each}", file=sys.stderr)
