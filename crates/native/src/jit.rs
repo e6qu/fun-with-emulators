@@ -1606,7 +1606,9 @@ fn successors(b: &Block) -> Vec<u64> {
 /// prepared in place; `source`, the program's words it was made from) in
 /// the cache, and publish it.
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
-    let Made { words, mut info, entry, unsaved, x18, calls, end: _ } = made;
+    let Made { words, info: made_info, entry, unsaved, x18, calls, end: _ } = made;
+    // The block keeps what its words stand for, in room of their own.
+    let mut info = made_info.to_vec();
     // (Room is made first: emptying the cache forgets every page's other
     // mappings.)
     let page = g & !(page_size() - 1);
@@ -1649,6 +1651,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     publish(g, t);
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
     link_waiting(s, i);
+    BUFFERS.set((words, made_info));
     i
 }
 
@@ -2186,6 +2189,14 @@ struct Made {
     end: u64,
 }
 
+thread_local! {
+    /// The words of the block a thread translates and what each stands
+    /// for, kept with their room for the next ([`translate`], [`place`]):
+    /// made afresh, they grew a push at a time, copied at each doubling.
+    static BUFFERS: std::cell::Cell<(Vec<u32>, Vec<Word>)> =
+        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+}
+
 fn translate(g: u64, t: u64, followed: bool) -> Made {
     // A lookup that read an entry's address and translation at once, and a
     // direct branch with the program's `x16` and `x17` saved below `sp`
@@ -2193,14 +2204,16 @@ fn translate(g: u64, t: u64, followed: bool) -> Made {
     // in). A lookup that read them apart enters at the check, the target
     // in `x16`, which goes on to the saved entry if the target is this
     // block's (an entry can be taken over as such a lookup reads it).
-    let mut out: Vec<u32> = Vec::new();
+    let (mut out, mut info) = BUFFERS.take();
+    out.clear();
+    info.clear();
     materialize(17, g, &mut out);
     out.splice(0..0, std::iter::repeat_n(NOP, CHECK_WORDS - 2 - out.len()));
     out.push(CHECK);
     let wrong_at = out.len();
     out.push(MISS);
     debug_assert_eq!(out.len(), CHECK_WORDS);
-    let mut info = vec![Word::Lookup { g, link: None, to: Some(16) }; CHECK_WORDS];
+    info.extend([Word::Lookup { g, link: None, to: Some(16) }; CHECK_WORDS]);
     let Body { calls, end, restore, x18 } =
         body_of(g, t, followed, true, None, &mut out, &mut info);
     // The wrong block's way out.
