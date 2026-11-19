@@ -756,8 +756,8 @@ def breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where,
 def callers(name, cmd, funcs):
     """The call stacks into the host library functions `funcs` (pairs of
     library and function, DTrace's pid-provider patterns) while `cmd` (one
-    fwe process) runs, most frequent first, named by DTrace from the
-    process it holds."""
+    fwe process) runs, by the time spent in the calls (microseconds), most
+    first, named by DTrace from the process it holds."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.callers")
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
@@ -769,7 +769,10 @@ def callers(name, cmd, funcs):
         if proc_name(proc.pid) == "fwe":
             break
         time.sleep(0.005)
-    probes = " ".join(f'pid$target:{lib}:{f}:entry {{ @s["{f}", ustack(12)] = count(); }}'
+    probes = " ".join(f'pid$target:{lib}:{f}:entry {{ self->t[probefunc] = timestamp; }} '
+                      f'pid$target:{lib}:{f}:return /self->t[probefunc]/ {{ '
+                      f'@s[probefunc, ustack(12)] = sum((timestamp - self->t[probefunc]) / 1000); '
+                      f'self->t[probefunc] = 0; }}'
                       for lib, f in funcs)
     tracer = subprocess.run(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p",
                              str(proc.pid), "-n", probes + ' END { printa("%s %@d%k\\n", @s); }',
@@ -788,7 +791,7 @@ def callers(name, cmd, funcs):
         lines = [l.strip() for l in chunk.strip().splitlines() if l.strip()]
         if len(lines) < 2 or shown >= 12:
             continue
-        print(f"{name}: into {lines[0]}: {' < '.join(lines[1:])[:1500]}", file=sys.stderr)
+        print(f"{name}: into {lines[0]} us: {' < '.join(lines[1:])[:1500]}", file=sys.stderr)
         shown += 1
 
 
@@ -1210,11 +1213,6 @@ def jdk(a, fwe, guest_env, results):
     shutil.rmtree(jit_map, ignore_errors=True)
     shutil.rmtree(ours_out, ignore_errors=True)
     os.makedirs(ours_out)
-    try:
-        callers("JDK javac", javac, [("libsystem_platform.dylib", "_platform_strncmp*"),
-                                     ("libsystem_kernel.dylib", "__getpid")])
-    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
-        print(f"JDK javac: no callers: {e!r}", file=sys.stderr)
 
     # And natively, for what the same work costs the host's kernel.
     shutil.rmtree(theirs_out, ignore_errors=True)
@@ -1227,6 +1225,14 @@ def jdk(a, fwe, guest_env, results):
         + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp", "/tmp/jdkout",
            "Main", JDK_SCALE], jit_map=jit_map)
     shutil.rmtree(jit_map, ignore_errors=True)
+    # Where its threads wait on fwe's own locks.
+    try:
+        java = os.path.join(root, bin_ours.lstrip("/"), "java")
+        callers("JDK java", guest_env + fwe + ["--root", root, java, "-cp", "/tmp/jdkout", "Main",
+                                               JDK_SCALE],
+                [("libsystem_kernel.dylib", "__psynch_mutexwait")])
+    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+        print(f"JDK java: no callers: {e!r}", file=sys.stderr)
     pcs("JDK java natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE],
         execname="java")
     # How long `javac` takes alone, both ways.
