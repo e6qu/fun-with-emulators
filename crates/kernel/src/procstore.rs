@@ -23,6 +23,8 @@
 //!   own work, which the host may make it wait for ([`Busy`]).
 //! - **Entry marks**, one for each host pid: the start of the process
 //!   whose main thread has gone into the program ([`entered`]).
+//! - **Tasks**, one word for each host pid: its real user, as its record
+//!   says, and its threads, as it counts them ([`user_tasks`]).
 //!
 //! A reader takes no lock: it reads the sequence number, the bytes and the
 //! number again, and reads again if a change came between. A writer holds
@@ -138,7 +140,9 @@ const UNWRITTEN_AT: usize = USED_AT + PIDS / 8;
 const BUSY_AT: usize = UNWRITTEN_AT + PIDS / 8;
 /// Each pid's entry mark ([`entered`]).
 const ENTERED_AT: usize = BUSY_AT + PIDS * 4;
-const ENDED_AT: usize = ENTERED_AT + PIDS * 8;
+/// Each pid's tasks ([`user_tasks`]).
+const TASKS_AT: usize = ENTERED_AT + PIDS * 8;
+const ENDED_AT: usize = TASKS_AT + PIDS * 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
 /// How many ended accounts are kept or being kept or taken
 /// ([`Store::ended_kept`]), in the free hint's line.
@@ -356,6 +360,39 @@ pub fn not_yet_entered(pid: i32, start: u64) -> bool {
 fn entered_word(pid: i32) -> Option<&'static AtomicU64> {
     let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
     Some(store().at(ENTERED_AT + i * 8))
+}
+
+/// Host pid `pid`'s tasks words: its real user + 1 (0: not said), and
+/// its threads (0, before it says, counts as 1).
+fn tasks_words(pid: i32) -> Option<[&'static AtomicU32; 2]> {
+    let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
+    Some([store().at(TASKS_AT + i * 8), store().at(TASKS_AT + i * 8 + 4)])
+}
+
+/// Host process `pid`'s record says its real user is `uid` (an initial
+/// namespace id).
+pub fn set_task_user(pid: i32, uid: u32) {
+    if let Some([user, _]) = tasks_words(pid) {
+        user.store(uid.wrapping_add(1), SeqCst);
+    }
+}
+
+/// This process has `n` threads.
+pub fn set_own_threads(n: u32) {
+    if let Some([_, threads]) = tasks_words(crate::host::pid()) {
+        threads.store(n, SeqCst);
+    }
+}
+
+/// The tasks (threads, in every process) of user `uid` (an initial
+/// namespace id) by the tasks words of the pids `pids`, without a record
+/// read or a host call: what `RLIMIT_NPROC` counts.
+pub fn user_tasks(uid: u32, pids: impl IntoIterator<Item = i32>) -> u64 {
+    pids.into_iter()
+        .filter_map(tasks_words)
+        .filter(|[user, _]| user.load(SeqCst) == uid.wrapping_add(1))
+        .map(|[_, threads]| u64::from(threads.load(SeqCst).max(1)))
+        .sum()
 }
 
 /// This process's main thread is in none of fwe's work: it starts, or is
@@ -904,6 +941,11 @@ pub fn remove(_held: &Held, pid: i32) {
     let (old, old_len) = replace(e, 0, 0);
     s.used(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
     s.free_chain(old, old_len as usize);
+    if let Some(words) = tasks_words(pid) {
+        for w in words {
+            w.store(0, SeqCst);
+        }
+    }
     for kind in [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View] {
         if let Some(e) = s.entry_of(kind, pid) {
             let (old, old_len) = replace(e, 0, 0);

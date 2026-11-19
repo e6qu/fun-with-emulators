@@ -877,7 +877,16 @@ pub fn task_allowed() -> Result<(), i32> {
 /// real user `uid`: what `RLIMIT_NPROC` counts, as Linux counts a user's
 /// tasks.
 pub fn user_tasks(uid: u32) -> u64 {
-    procreg::all().into_iter().filter(|(_, r)| r.ids[0] == uid).map(|(p, _)| usage(p).0).sum()
+    // Every pid with a record first, without reading one: a process gone
+    // without its record removed (killed, its parent not fwe) counts there
+    // until a listing finds it gone, so only the processes alive count
+    // where the user is at a limit.
+    let all = crate::procstore::user_tasks(uid, crate::procstore::pids());
+    let nproc = crate::rlimits::get(fwe_abi::resource::RLIMIT_NPROC).0;
+    if all < nproc {
+        return all;
+    }
+    crate::procstore::user_tasks(uid, procreg::all().into_iter().map(|(p, _)| p))
 }
 
 /// The host process of pid `pid` (0: this one) of the caller's pid

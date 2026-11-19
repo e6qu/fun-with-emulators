@@ -553,7 +553,10 @@ and replace processes, and the per-process state it keeps:
   comes each second, and past the hard one fwe ends the process with
   `SIGKILL`; `RLIMIT_NPROC` is checked at `fork` and thread creation against
   the tasks (threads) of the user's fwe processes, and at the `execve` after
-  a `set*uid` made the process a user already past it.
+  a `set*uid` made the process a user already past it. Each process keeps
+  its real user and thread count in a word of the process store, so a
+  check reads one word per process; only a count at the limit looks at
+  which of them are alive.
 - **Core dumps** (`crates/kernel/src/coredump.rs`): a signal whose default
   dumps core leaves an ELF core (the thread's registers, the process, and
   the mappings Linux's default `coredump_filter` dumps, less memory given

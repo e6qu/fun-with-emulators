@@ -505,6 +505,8 @@ fn publish_tids(tids: &[i32]) {
     if TIDS_ENDED.load(Ordering::SeqCst) {
         return;
     }
+    // How many, for `RLIMIT_NPROC`.
+    crate::procstore::set_own_threads(tids.len() as u32);
     let me = crate::host::pid();
     // Its threads take turns.
     let mut published = PUBLISHED.lock().unwrap_or_else(|e| e.into_inner());
@@ -521,6 +523,7 @@ fn publish_tids(tids: &[i32]) {
 /// This process starts (or is a fork's child): a list its pid's earlier
 /// process left is not its own.
 pub(crate) fn forget_published() {
+    crate::procstore::set_own_threads(1);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
     crate::procstore::put_own(crate::procstore::Kind::Robust, None);
     ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -1357,6 +1360,8 @@ pub fn unregister_current() {
 /// more.
 pub fn process_ending() {
     TIDS_ENDED.store(true, Ordering::SeqCst);
+    // An ended process counts as one task until it is reaped.
+    crate::procstore::set_own_threads(1);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
     crate::procstore::put_own(crate::procstore::Kind::Robust, None);
 }

@@ -774,6 +774,7 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
         .unwrap_or_else(|| fresh(pid, start));
     f(&mut r);
     crate::procstore::put(&held, pid, &encode(&r));
+    crate::procstore::set_task_user(pid, r.ids[0]);
     Ok(())
 }
 
@@ -1380,7 +1381,7 @@ fn fill_child(
 /// the making needs, every page of them a fault in a process just forked.
 /// Its start time, which only the child knows, is left 0.
 #[derive(Clone, Debug)]
-pub struct Prepared(Vec<u8>);
+pub struct Prepared(Vec<u8>, u32);
 
 impl Prepared {
     pub fn of(
@@ -1397,7 +1398,7 @@ impl Prepared {
         let mut r = fresh(me(), 0);
         fill_child(&mut r, line, inherit, ns, maps, auxv, from);
         r.rlimits = rlimits;
-        Prepared(encode(&r))
+        Prepared(encode(&r), r.ids[0])
     }
 }
 
@@ -1417,6 +1418,7 @@ pub fn own_prepared(prepared: &Prepared) -> bool {
     let mut bytes = prepared.0.clone();
     bytes[..8].copy_from_slice(&start);
     crate::procstore::put(&held, me, &bytes);
+    crate::procstore::set_task_user(me, prepared.1);
     true
 }
 
@@ -1434,6 +1436,7 @@ pub fn prepared_for(child: i32, prepared: &Prepared) -> bool {
     let mut bytes = prepared.0.clone();
     bytes[..8].copy_from_slice(&start);
     crate::procstore::put(&held, child, &bytes);
+    crate::procstore::set_task_user(child, prepared.1);
     true
 }
 
