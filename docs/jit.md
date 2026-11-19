@@ -408,7 +408,9 @@ back, how often the cache was emptied, and how long the translator's
 lock was waited for and held, by its holders' kinds; and the counts that
 say which of its work could be skipped (`crates/native/src/jitcount.rs`):
 the blocks made from files and from generated code and the time making
-each kind, those made with a second pass of their words for an entry
+each kind, the program's words a block holds and what its words end at
+(a branch, a branch through a register, a return, words made already,
+the page's end, or the most words a block takes), those made with a second pass of their words for an entry
 with the program's own `x16` and `x17` and those entered there, and
 those made ahead of the program. With `FWE_JIT_SEEN=<dir>` each process
 adds the blocks it made to that directory (their address and a hash of

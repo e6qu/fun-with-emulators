@@ -3021,10 +3021,13 @@ fn body_of(
     // What the code after each instruction writes before reading it, for
     // scratch registers ([`x18_beside`]): made for a block naming `x18`.
     let mut quiet = None;
+    // How the words end, for the counts ([`jitcount::ENDED`]).
+    let mut end = jitcount::END_LENGTH;
     for _ in 0..BLOCK_INSNS {
         if let Some((at, k)) = merge
             && at == pc
         {
+            end = jitcount::END_JOIN;
             // Into the other words: before their restore while saved (x18
             // back in its slot, as there).
             put_x18(&mut x18, pc, a);
@@ -3054,6 +3057,7 @@ fn body_of(
             if held {
                 load_x18(pc, a);
             }
+            end = jitcount::END_JOIN;
             if known.is_some() {
                 c.joins.push((a.len(H), pc, at));
                 gate_out(pc, Exit::Join(pc), true, false, H, a);
@@ -3077,6 +3081,7 @@ fn body_of(
                 }
                 let to = a.label_at(Pos::hot(k));
                 a.branch(H, B, Field::Imm26, to, Word::Saved(pc));
+                end = jitcount::END_JOIN;
                 ended = true;
                 break;
             }
@@ -3105,6 +3110,13 @@ fn body_of(
         }
         let pads = c.pads.len();
         ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, &mut c.pads, a);
+        if ended {
+            end = match w & 0xffff_fc1f {
+                0xd65f_0000 => jitcount::END_RETURN,
+                0xd61f_0000 | 0xd63f_0000 => jitcount::END_REGISTER,
+                _ => jitcount::END_BRANCH,
+            };
+        }
         // Counting, a call's way back counts its returns ([`jitcount`]),
         // `x16` and `x17` saved there.
         if jitcount::counting() && c.pads.len() > pads && c.pads[pads].1 == a.len(H) {
@@ -3124,8 +3136,15 @@ fn body_of(
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
         if ended || pc & (page - 1) == 0 {
+            if !ended {
+                end = jitcount::END_PAGE;
+            }
             break;
         }
+    }
+    if first {
+        jitcount::ENDED[end].fetch_add(1, Ordering::Relaxed);
+        jitcount::WORDS.fetch_add((pc - g) / 4, Ordering::Relaxed);
     }
     if !ended {
         put_x18(&mut x18, pc, a);

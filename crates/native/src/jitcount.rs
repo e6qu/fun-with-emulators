@@ -42,6 +42,24 @@ pub(crate) static SECOND_WORDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECOND_USED: AtomicU64 = AtomicU64::new(0);
 /// Blocks made ahead of the program.
 pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
+/// Blocks by how their words end ([`ENDS`]), and the program's words they
+/// hold (their first pass's).
+pub(crate) static ENDED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
+pub(crate) static WORDS: AtomicU64 = AtomicU64::new(0);
+pub(crate) const END_BRANCH: usize = 0;
+pub(crate) const END_REGISTER: usize = 1;
+pub(crate) const END_RETURN: usize = 2;
+pub(crate) const END_JOIN: usize = 3;
+pub(crate) const END_PAGE: usize = 4;
+pub(crate) const END_LENGTH: usize = 5;
+const ENDS: [&str; 6] = [
+    "a branch",
+    "a branch through a register",
+    "a return",
+    "words made already",
+    "the page's end",
+    "the most words a block takes",
+];
 
 /// The blocks earlier processes made ([`FWE_JIT_SEEN`]), and this one's.
 struct Seen {
@@ -238,6 +256,16 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&SECOND_USED),
         n(&AHEAD),
     );
+    let made = n(&MADE[FILE]) + n(&MADE[GENERATED]);
+    out.push_str(&format!(
+        "; {:.1} of the program's words a block; blocks end at {}",
+        n(&WORDS) as f64 / made.max(1) as f64,
+        ENDS.iter()
+            .zip(&ENDED)
+            .map(|(name, c)| format!("{name} {}", n(c)))
+            .collect::<Vec<_>>()
+            .join(", ")
+    ));
     if *SEEN_READ.get().unwrap_or(&false) {
         out.push_str(&format!(
             "; made before by another process: {} {} at the same address, {} elsewhere; {} {}, {}",
