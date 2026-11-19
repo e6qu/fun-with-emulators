@@ -600,7 +600,7 @@ pub struct State {
     /// translations that lead there (and their blocks), linked as the
     /// target is translated ([`link_waiting`]) rather than each through
     /// fwe's trap.
-    waiting: AddrMap<Vec<(u64, usize)>>,
+    waiting: AddrMap<Waiting>,
     /// Program addresses -> the block made there that a flush of its
     /// words dropped, taken back when the address is to be translated
     /// again if its words were not changed ([`revive`]).
@@ -1140,7 +1140,7 @@ impl State {
             let Some(f) = block_at(self, at) else { continue };
             self.unlink(&self.blocks[f], at);
             if self.by_g.get(&self.blocks[f].g) == Some(&f) {
-                self.waiting.entry(g).or_default().push((at, f));
+                wait(&mut self.waiting, g, (at, f));
             }
         }
     }
@@ -2099,23 +2099,57 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
 /// where there are ones, and the ways out waiting for `i`'s program address
 /// to it: as a way out's first run would, without its trap.
 fn link_waiting(s: &mut State, i: usize) {
-    let g = s.blocks[i].g;
+    let (g, t) = (s.blocks[i].g, s.blocks[i].t);
     let c = Clock::now();
-    let outs: Vec<(u64, u64)> = s.blocks[i].jumps().map(|(at, to, _)| (at, to)).collect();
     c.add_to(&PROBE[13]);
     let c = Clock::now();
-    for (at, to) in outs {
+    // Its direct ways out ([`Block::jumps`]), by index: linking changes
+    // the blocks.
+    for k in 0..s.blocks[i].words.len() {
+        let Packed::Out { to, exit: 0, .. } = s.blocks[i].words[k] else { continue };
+        let at = t + 4 * k as u64;
         match s.by_g.get(&to).copied() {
             Some(j) => link_site(s, i, at, j),
-            None => s.waiting.entry(to).or_default().push((at, i)),
+            None => wait(&mut s.waiting, to, (at, i)),
         }
     }
     c.add_to(&PROBE[14]);
     let c = Clock::now();
-    for (at, from) in s.waiting.remove(&g).unwrap_or_default() {
-        link_site(s, from, at, i);
+    if let Some(w) = s.waiting.remove(&g) {
+        let (first, more) = match w {
+            Waiting::One(at, from) => (Some((at, from)), Vec::new()),
+            Waiting::Many(v) => (None, v),
+        };
+        for (at, from) in first.into_iter().chain(more) {
+            link_site(s, from, at, i);
+        }
     }
     c.add_to(&PROBE[15]);
+}
+
+/// The direct ways out waiting for one program address to be translated
+/// ([`State::waiting`]): their addresses and blocks. Mostly one, kept
+/// without a vector of its own.
+enum Waiting {
+    One(u64, usize),
+    Many(Vec<(u64, usize)>),
+}
+
+/// Note way out `w` (its address and block) waiting for program address
+/// `g`.
+fn wait(waiting: &mut AddrMap<Waiting>, g: u64, w: (u64, usize)) {
+    match waiting.entry(g) {
+        std::collections::hash_map::Entry::Vacant(e) => {
+            e.insert(Waiting::One(w.0, w.1));
+        }
+        std::collections::hash_map::Entry::Occupied(mut e) => {
+            let e = e.get_mut();
+            match e {
+                Waiting::One(at, from) => *e = Waiting::Many(vec![(*at, *from), w]),
+                Waiting::Many(v) => v.push(w),
+            }
+        }
+    }
 }
 
 /// Link way out `at` (a direct one, still into fwe) to block `j`, if it
