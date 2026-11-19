@@ -71,8 +71,11 @@ way.
   leads to the target's own translation. Through `x16` or `x17`, which
   hold the target while it is looked up, the two are read apart, and
   the translation checks that the target is its own (an entry can be
-  taken over while such a lookup reads it). A miss goes through fwe once
-  and fills the table. An indirect branch or return into code that is
+  taken over while such a lookup reads it). An address is looked for in
+  the entry its bits pick, then in the other entry of that one's pair,
+  so two targets that pick one entry, both run often, do not push each
+  other out at every turn. A miss goes through fwe once and fills the
+  table. An indirect branch or return into code that is
   not translated (a library's, prepared in place) restores `x16` and
   `x17` and is made through the program's own register, so every
   register is as the program left it: code may count on more than the
@@ -289,9 +292,11 @@ a processor that reports `DIC` clear.
   each 16 bytes aligned and written whole (`stp`) for lookups that read
   it whole (`ldp`, single-copy atomic on every Apple processor:
   FEAT_LSE2), its place taken as fwe starts (`jit::configure`), before
-  the program maps anything that could take it. A target outside
-  run-time code (a library's) gets translation 0; a dropped entry is
-  cleared.
+  the program maps anything that could take it. An address goes in the
+  entry its bits 2 to 21 pick, its earlier holder moving to the other of
+  that one's 32-byte pair (`jit::publish`), where a lookup that misses
+  the first looks next. A target outside run-time code (a library's)
+  gets translation 0; a dropped entry is cleared.
 - **The code cache's views:** each chunk is mapped twice with
   `mach_vm_remap`, written through the writable view and run from the
   executable one; `jit::in_cache` tells a cache address without a lock.

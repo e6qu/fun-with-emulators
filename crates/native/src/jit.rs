@@ -173,6 +173,10 @@ fn reserve_table() {
 const BLOCK_ROOM: u64 = 4 * 64 * 24;
 /// The table of translations by program address: at an address an `orr`
 /// can encode (one bit), 2^20 entries of (program address, translation).
+/// An address's entry is the one its bits pick, or the other of the pair
+/// of entries that one is in ([`OTHER`]): two addresses whose entry is the
+/// same, both run often, would each push the other out at every turn, a
+/// way into fwe each time.
 pub const TABLE: u64 = 1 << 45;
 const TABLE_BITS: u32 = 20;
 const TABLE_SIZE: u64 = 16 << TABLE_BITS;
@@ -188,6 +192,8 @@ const INDEX: u32 = 0xd342_5611;
 const SCALE: u32 = 0xd37c_ee31;
 /// `orr x17, x17, #TABLE`
 const BASE: u32 = 0xb253_0231;
+/// `eor x17, x17, #16`: an entry's address to the other's of its pair.
+const OTHER: u32 = 0xd27c_0231;
 /// `ldar x17, [x17]`: the entry's key, before its value.
 const KEY: u32 = 0xc8df_fe31;
 /// `ldp x16, x17, [x17]`: the entry's key and value at once.
@@ -679,34 +685,40 @@ fn page_size() -> u64 {
     fwe_kernel::mm::host_page_size()
 }
 
-/// The table entry for program address `g`: its key (the address) and
-/// value (a translation's lookup entry, or 0), 16 bytes aligned.
+/// The table entry program address `g`'s bits pick: its key (an
+/// address) and value (a translation's lookup entry, or 0), 16 bytes
+/// aligned. `g` is there or in the other entry of the pair ([`OTHER`]).
 fn entry(g: u64) -> u64 {
     TABLE | (((g >> 2) & ((1 << TABLE_BITS) - 1)) << 4)
 }
 
-/// `g`'s entry as it is: key and value read at once (a 16-byte aligned
+/// Entry `e` as it is: key and value read at once (a 16-byte aligned
 /// `ldp` is single-copy atomic: FEAT_LSE2, which every Apple processor
 /// has).
-fn read_entry(g: u64) -> (u64, u64) {
+fn read_entry(e: u64) -> (u64, u64) {
     let (k, v): (u64, u64);
     // SAFETY: an entry of the table, mapped for the process's life once the
     // code cache exists, 16 bytes aligned.
     unsafe {
-        std::arch::asm!("ldp {k}, {v}, [{e}]", e = in(reg) entry(g), k = out(reg) k,
+        std::arch::asm!("ldp {k}, {v}, [{e}]", e = in(reg) e, k = out(reg) k,
             v = out(reg) v, options(nostack, readonly, preserves_flags));
     }
     (k, v)
 }
 
-/// Make `g`'s entry say `(key, value)` at once, after everything written
+/// Make entry `e` say `(key, value)` at once, after everything written
 /// before (the translation it leads to).
-fn write_entry(g: u64, key: u64, value: u64) {
+fn write_entry(e: u64, key: u64, value: u64) {
     // SAFETY: as [`read_entry`]; a lookup reads the pair with one `ldp`.
     unsafe {
-        std::arch::asm!("dmb ish", "stp {k}, {v}, [{e}]", e = in(reg) entry(g), k = in(reg) key,
+        std::arch::asm!("dmb ish", "stp {k}, {v}, [{e}]", e = in(reg) e, k = in(reg) key,
             v = in(reg) value, options(nostack, preserves_flags));
     }
+}
+
+/// The entry that holds `g`, if one of its pair does.
+fn holding(g: u64) -> Option<u64> {
+    [entry(g), entry(g) ^ 16].into_iter().find(|&e| read_entry(e).0 == g)
 }
 
 /// The value of an entry for the translation at `t`: its saved entry; 0
@@ -715,16 +727,34 @@ fn looked_up(t: u64) -> u64 {
     if t == 0 { 0 } else { t + 4 * CHECK_WORDS as u64 }
 }
 
-/// Make `g`'s entry say translation `t` (0: code not translated).
+/// Make `g`'s entry say translation `t` (0: code not translated): the
+/// one that holds it, else the one its bits pick, whose address moves to
+/// the other of the pair (a lookup looks there first: the address wanted
+/// last stays where it is found soonest). Under [`STATE`]'s lock: one
+/// writer, and a lookup reads an entry whole, so it finds either address
+/// in one of them as they move.
 #[inline(never)]
 fn publish(g: u64, t: u64) {
-    write_entry(g, g, looked_up(t));
+    let (first, other) = (entry(g), entry(g) ^ 16);
+    let e = match holding(g) {
+        Some(e) => e,
+        None => {
+            let (k, v) = read_entry(first);
+            if k != 0 {
+                write_entry(other, k, v);
+            }
+            first
+        }
+    };
+    write_entry(e, g, looked_up(t));
 }
 
 /// Clear `g`'s entry if it says translation `t`.
 fn unpublish(g: u64, t: u64) {
-    if read_entry(g) == (g, looked_up(t)) {
-        write_entry(g, 0, 0);
+    if let Some(e) = holding(g)
+        && read_entry(e).1 == looked_up(t)
+    {
+        write_entry(e, 0, 0);
     }
 }
 
@@ -1134,33 +1164,47 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
 fn link_call_site(s: &mut State, site: u64, n: u32) {
     s.call_sites.insert(site);
     // As a translation's lookup ([`lookup`]): in place, or through `x16`.
-    let mut words = if matches!(n, 16 | 17) {
-        vec![
-            SAVE,
-            0xaa00_03f0 | (n << 16), // mov x16, xN
-            INDEX,
-            SCALE,
-            BASE,
-            KEY,
-            CHECK,
-            MISS,
-            INDEX,
-            SCALE,
-            BASE,
-            VALUE,
-            OUTSIDE,
-            TO_CHECK,
-            GO,
-        ]
+    // Each entry of the target's pair in turn: a miss in the first goes to
+    // the second's look, found goes on to the translation, and a miss in
+    // the second and a target not translated make the call as it was.
+    let (first, other, go) = if matches!(n, 16 | 17) {
+        let at = |other: bool| {
+            let mut w = vec![INDEX, SCALE, BASE];
+            w.extend(other.then_some(OTHER));
+            w.extend([KEY, CHECK, MISS, INDEX, SCALE, BASE]);
+            w.extend(other.then_some(OTHER));
+            w.extend([VALUE, OUTSIDE]);
+            w
+        };
+        (at(false), at(true), vec![TO_CHECK, GO])
     } else {
-        vec![SAVE, index_of(n), SCALE, BASE, ENTRY, key_against(n), MISS_X16, OUTSIDE, GO]
+        let at = |other: bool| {
+            let mut w = vec![index_of(n), SCALE, BASE];
+            w.extend(other.then_some(OTHER));
+            w.extend([ENTRY, key_against(n), MISS_X16, OUTSIDE]);
+            w
+        };
+        (at(false), at(true), vec![GO])
     };
-    // Both to the restore and the call as it was.
+    let mut words = vec![SAVE];
+    if matches!(n, 16 | 17) {
+        words.push(0xaa00_03f0 | (n << 16)); // mov x16, xN
+    }
+    words.extend(&first);
+    let go_at = words.len();
+    words.extend(&go);
+    let other_at = words.len();
+    words.extend(&other);
+    // (Found in the second: on to the translation.)
+    words.push(0x1400_0000 | ((go_at as u32).wrapping_sub(words.len() as u32) & 0x3ff_ffff));
     let restore = words.len() as u32;
     for (k, w) in words.iter_mut().enumerate() {
-        if matches!(*w, MISS | MISS_X16 | OUTSIDE) {
-            *w |= (restore - k as u32) << 5;
-        }
+        let to = match *w {
+            MISS | MISS_X16 if k < go_at => other_at as u32,
+            MISS | MISS_X16 | OUTSIDE => restore,
+            _ => continue,
+        };
+        *w |= (to - k as u32) << 5;
     }
     words.extend([RESTORE, 0xd61f_0000 | (n << 5)]); // br xN
     let _stopped = crate::quiesce::stop_others(&mut |_| {});
@@ -1283,8 +1327,8 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     if known {
         if link_here { &EXITS_KNOWN_DIRECT } else { &EXITS_KNOWN_INDIRECT }
             .fetch_add(1, Ordering::Relaxed);
-        let key = read_entry(to).0;
-        if !link_here && key != to && key != 0 {
+        let key = read_entry(entry(to)).0;
+        if !link_here && holding(to).is_none() && key != 0 {
             EXITS_KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -2996,7 +3040,8 @@ fn one(
 
 /// An indirect branch through `x<n>` at `pc`, a call if `link` (the
 /// return address), the program's `x16` and `x17` saved: its target looked
-/// up in the table; a miss goes into fwe.
+/// up in the table (the entry its bits pick, then the other of the pair:
+/// [`TABLE`]); a miss goes into fwe.
 ///
 /// The target stays in `x<n>`, where the program has it, while the entry's
 /// address and translation are read at once into `x16` and `x17`, and a
@@ -3074,6 +3119,23 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
         let ret = link.is_none() && n == 30;
         out.push(if ret { 0xd65f_0000 } else { 0xd61f_0000 } | (n << 5));
         info.push(Word::At(pc));
+    }
+    // The entry the target's bits pick holds another address: the other
+    // of its pair, as the first; found, on as from the first.
+    let second = out.len();
+    out[miss_at] |= ((second - miss_at) as u32) << 5;
+    let miss_at = if in_place {
+        out.extend([index_of(n), SCALE, BASE, OTHER, ENTRY, key_against(n), MISS_X16]);
+        out.len() - 1
+    } else {
+        out.extend([INDEX, SCALE, BASE, OTHER, KEY, CHECK, MISS]);
+        let miss_at = out.len() - 1;
+        out.extend([INDEX, SCALE, BASE, OTHER, VALUE]);
+        miss_at
+    };
+    out.push(0x1400_0000 | ((outside_at as u32).wrapping_sub(out.len() as u32) & 0x3ff_ffff));
+    while info.len() < out.len() {
+        info.push(before);
     }
     // The miss: into fwe.
     let miss = out.len();

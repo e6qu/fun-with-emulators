@@ -1032,6 +1032,31 @@ fn jit_code_called_from_many_sites_at_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code calling, in turn, functions 4 MiB apart (guests/c/jitpair.c),
+/// whose addresses pick the same entry of fwe's table of translations:
+/// each call reaches its own function, and two of them share the entry's
+/// pair without going into fwe at every call (100000 rounds of two calls
+/// each would make 200000 ways out).
+#[test]
+fn jit_calls_to_targets_of_one_table_entry() {
+    let prog = build_c("jitpair", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitpair");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "two: 1100000\nthree: 7000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    let exits: u64 = err
+        .lines()
+        .find_map(|l| l.split(" blocks translated, ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+    assert!(exits < 20000, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `x18` in JIT code (guests/c/jitx18.c): one sequence of instructions
 /// working in `x18`, and the same in `x9`, compute the same, quietly and
 /// with signals landing anywhere in them.
