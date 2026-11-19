@@ -48,7 +48,10 @@ way.
   translates the block of code at that address into its code cache and
   goes on there. A block is at most 64 instructions and ends at an
   unconditional or indirect branch, at an `isb` and at its page's end; it
-  goes on past a conditional branch, whose taken way leaves it.
+  goes on past a conditional branch, whose taken way leaves it, or goes
+  to the block's own translation of its target where the block holds it
+  (a loop's way back, a skip ahead) with the same registers in place: no
+  way out, nor a block of its own made from inside this one.
 - **The translation** holds the program's instructions as they are,
   except those whose meaning depends on where they are or that macOS
   does not let a program run unchanged: `adr`, `adrp` and literal loads

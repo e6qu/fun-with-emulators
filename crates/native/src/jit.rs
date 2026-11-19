@@ -22,7 +22,8 @@
 //!   program's target. A direct branch traps the first time, and is then
 //!   linked, a branch straight to the target's translation; a block goes
 //!   on past a conditional branch, whose taken way is linked in the branch
-//!   itself where it reaches. A call leaves the program's own return
+//!   itself where it reaches, or goes to the block's own words for its
+//!   target where it holds them. A call leaves the program's own return
 //!   address in `x30`, so the stack holds only the program's addresses,
 //!   as its unwinders and stack walkers expect. An indirect branch or
 //!   return looks its target up in a table of translations by program
@@ -2803,6 +2804,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
         lookups: Vec::new(),
         joins: Vec::new(),
         taken: Vec::new(),
+        entries: Vec::new(),
     };
     let Body { calls, end, restore, x18 } = body_of(g, t, followed, true, None, &mut c, &mut a);
     // The wrong block's way out.
@@ -2855,7 +2857,10 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
 /// out into known ones (word index, program address, words). A call's
 /// words, and those lookups, are entered with the program's `x16` and
 /// `x17` saved. Word indexes are of the hot words ([`Asm`]). And its
-/// conditional branches' taken ways (way out, branch).
+/// conditional branches' taken ways (way out, branch); and where each of
+/// its instructions' words begin, as their program address, word index,
+/// whether the program's `x16` and `x17` are saved there and whether its
+/// `x18` is held in `x17` ([`body_of`]).
 struct Calls<'a> {
     known: &'a [(u64, u64)],
     pads: Vec<(u64, usize)>,
@@ -2863,6 +2868,7 @@ struct Calls<'a> {
     lookups: Vec<(u64, usize)>,
     joins: Vec<(usize, u64, u64)>,
     taken: Vec<(Pos, Pos)>,
+    entries: Vec<(u64, usize, bool, bool)>,
 }
 
 /// The instructions of the block at program address `g`, translated into
@@ -2924,6 +2930,9 @@ fn body_of(
             ended = true;
             break;
         }
+        // Where its words begin, and as what, for a conditional branch of
+        // the block's to come to.
+        c.entries.push((pc, a.len(H), saved, x18.is_some()));
         let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
         // A call (`bl`, `blr`) is made once, with one way back after its
         // `bl` where its return comes ([`RETS`]): where it is made already,
@@ -2989,6 +2998,7 @@ fn body_of(
             }
             a.push(H, RESTORE, Word::Saved(pc));
             saved = false;
+            c.entries.push((pc, a.len(H), false, false));
         }
         ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, &mut c.pads, a);
         if let Some((k, was, held)) = call_at {
@@ -3014,6 +3024,16 @@ fn body_of(
     for side in sides {
         match side {
             Side::Taken { at, to: label, g, target, saved, x18 } => {
+                // Into the block's own words where they hold the target with
+                // the program's `x16` and `x17` as here, and need its `x18`
+                // in `x17` only where it is: no way out, nor a block of its
+                // own made for it.
+                let inside =
+                    c.entries.iter().rev().find(|e| e.0 == target && e.2 == saved && (x18 || !e.3));
+                if let Some(&(_, k, ..)) = inside {
+                    a.bind_at(label, Pos::hot(k));
+                    continue;
+                }
                 // Out of the way, but a `tbz`'s (whose reach is short).
                 let near = a.word(at) & 0x7e00_0000 == 0x3600_0000;
                 let s = if near { H } else { C };

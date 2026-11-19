@@ -1055,6 +1055,24 @@ fn jit_calls_to_targets_of_one_table_entry() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code looping within itself (guests/c/jitloop.c), its way back and
+/// a skip in its body conditional branches to its own instructions: one
+/// block, each branch going on in it, none a way out into a block of its
+/// own.
+#[test]
+fn jit_branches_within_a_block_stay_in_it() {
+    let prog = build_c("jitloop", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitloop");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "loop: summed\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(jit_counts(&err, "JIT code: "), [1], "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code each of whose blocks expands to many times its size
 /// (guests/c/jitroom.c: functions of back-to-back calls through x16), in a
 /// code cache small enough that such blocks land at every place in a chunk,

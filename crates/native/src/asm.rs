@@ -163,6 +163,13 @@ impl<W: Copy> Asm<W> {
         *slot = Some(Target::At(at));
     }
 
+    /// Bind `l` at `at`, a word made already.
+    pub(crate) fn bind_at(&mut self, l: Label, at: Pos) {
+        let slot = &mut self.labels[l.0];
+        assert!(slot.is_none(), "a label bound twice");
+        *slot = Some(Target::At(at));
+    }
+
     /// Branch `w` (its `field` clear), standing for `i`, at the end of
     /// section `s`, to `to`: its place.
     pub(crate) fn branch(&mut self, s: Sec, w: u32, field: Field, to: Label, i: W) -> Pos {
