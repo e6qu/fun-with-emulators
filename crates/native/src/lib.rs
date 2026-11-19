@@ -10,6 +10,8 @@ pub mod hv;
 pub mod hwcap;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub mod jit;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod jitcount;
 pub mod loader;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod pool;
@@ -42,6 +44,7 @@ fn mark_exit() {
     {
         prepare::keep_hot();
         jit::write_map();
+        jitcount::write_seen();
     }
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();

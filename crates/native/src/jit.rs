@@ -85,6 +85,7 @@
 //! the rest of the room is reused.
 
 use crate::asm::{Asm, Field, Label, Pos, STUB, Sec};
+use crate::jitcount;
 use crate::rewrite::{self, Site};
 use fwe_kernel::Regs;
 use std::collections::{BTreeMap, HashMap};
@@ -486,9 +487,31 @@ struct Block {
     /// The calls it makes for every block ([`State::calls_made`]): each
     /// one's program address and the address of its words.
     calls_made: Vec<(u64, u64)>,
+    /// What the translator's counts know of it ([`jitcount`]).
+    notes: Notes,
+}
+
+/// What [`jitcount`] counts of a block: whether it was made ahead of the
+/// program ([`ahead`]), whether its entry with the program's own `x16`
+/// and `x17` is a second pass of its words and whether that entry was
+/// used, and its counters, if blocks count their runs.
+#[derive(Default)]
+struct Notes {
+    ahead: bool,
+    second: bool,
+    used: std::cell::Cell<bool>,
+    counters: Option<u64>,
 }
 
 impl Block {
+    /// Its entry with the program's own `x16` and `x17`, noted as used.
+    fn unsaved_entry(&self) -> u64 {
+        if self.notes.second && !self.notes.used.replace(true) {
+            jitcount::SECOND_USED.fetch_add(1, Ordering::Relaxed);
+        }
+        self.unsaved
+    }
+
     /// What its word `k` stands for.
     fn word(&self, k: usize) -> Option<Word> {
         self.words.get(k).map(|p| p.word(self.g, self.t))
@@ -824,6 +847,20 @@ pub fn counts() -> Option<String> {
         PROBE_TEXT.with(|p| *p.borrow_mut() = v.join(" "));
     }
     let probes = PROBE_TEXT.with(|p| p.borrow().clone());
+    let counted = (t > 0).then(|| {
+        let s = state();
+        let blocks: Vec<jitcount::Counted> = s
+            .blocks
+            .iter()
+            .map(|b| jitcount::Counted {
+                g: b.g,
+                origin: if b.followed { jitcount::FILE } else { jitcount::GENERATED },
+                ahead: b.notes.ahead,
+                counters: b.notes.counters,
+            })
+            .collect();
+        jitcount::report(&blocks, |a| !s.in_region(a) && followable(a))
+    });
     (t > 0).then(|| {
         format!(
             "PROBE ms {probes}; JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
@@ -856,7 +893,8 @@ pub fn counts() -> Option<String> {
             HOLD_NS[HOLD_ENTER].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_GATE].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_OTHER].load(Ordering::Relaxed) / 1_000_000
-        )
+        ) + "; "
+            + counted.as_deref().unwrap_or_default()
     })
 }
 
@@ -1268,6 +1306,7 @@ pub fn discarded(addr: u64, len: u64) {
 /// they were ([`revive`]).
 pub fn flushed(addr: u64) {
     LINES_FLUSHED.fetch_add(1, Ordering::Relaxed);
+    jitcount::flushed(addr);
     if TRANSLATED.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -1372,6 +1411,7 @@ pub fn changed(addr: u64, len: u64) -> bool {
 
 /// A new program in this process (`execve`): nothing of the old one's.
 pub fn reset() {
+    jitcount::write_seen();
     let mut s = state();
     let regions: Vec<(u64, u64)> = s.regions.iter().map(|(&a, &e)| (a, e)).collect();
     for (a, e) in regions {
@@ -1484,7 +1524,7 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
         ENTERED_CALLS.fetch_add(1, Ordering::Relaxed);
     }
     let i = translation(&mut s, pc);
-    let into = s.blocks[i].unsaved;
+    let into = s.blocks[i].unsaved_entry();
     // Called from code fwe prepared in place (`blr xN` before `lr`): that
     // site looks its targets up from now on, as a translation does.
     let site = lr.wrapping_sub(4);
@@ -1703,7 +1743,7 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     } else if known && link_here {
         EXITS_KNOWN_UNLINKED.fetch_add(1, Ordering::Relaxed);
     }
-    regs.pc = s.blocks[i].unsaved;
+    regs.pc = s.blocks[i].unsaved_entry();
     true
 }
 
@@ -1945,7 +1985,7 @@ fn entered(s: &State, i: usize, saved: bool, x18: bool) -> u64 {
     match (saved, x18) {
         (true, true) if b.x18 != 0 => b.x18,
         (true, _) => b.body,
-        _ => b.unsaved,
+        _ => b.unsaved_entry(),
     }
 }
 
@@ -1979,6 +2019,7 @@ fn translation_(s: &mut Held, g: u64) -> usize {
         if let Some(i) = rv {
             return i;
         }
+        let making = Clock::now();
         let c = Clock::now();
         let source = snapshot(g);
         c.add_to(&PROBE[1]);
@@ -2003,12 +2044,20 @@ fn translation_(s: &mut Held, g: u64) -> usize {
         let c = Clock::now();
         let r = place(s, g, followed, made, source[..read_words].to_vec());
         c.add_to(&PROBE[5]);
+        making.add_to(
+            &jitcount::MAKE_NS[if followed { jitcount::FILE } else { jitcount::GENERATED }],
+        );
         return r;
     }
 }
 
 /// How many blocks a way out makes ahead of the program ([`ahead`]).
 const AHEAD: usize = 4;
+
+thread_local! {
+    /// Whether the blocks this thread makes are made ahead ([`jitcount`]).
+    static MAKING_AHEAD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
 /// Make the blocks block `i` goes on to whatever its conditions ([`AHEAD`]
 /// at most, from it on): its direct branch's target, a call's and where
@@ -2036,7 +2085,9 @@ fn ahead_(s: &mut Held, i: usize) -> bool {
             if s.by_g.contains_key(&to) || !(s.in_region(to) || followable(to)) {
                 continue;
             }
+            MAKING_AHEAD.set(true);
             let j = translation(s, to);
+            MAKING_AHEAD.set(false);
             made += 1;
             if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
                 return true;
@@ -2061,7 +2112,18 @@ fn successors(b: &Block) -> Vec<u64> {
 /// the cache, and publish it.
 #[inline(never)]
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
-    let Made { mut room, entry, unsaved, x18, end: _ } = made;
+    let Made { mut room, entry, unsaved, x18, end: _, second, counters } = made;
+    let origin = if followed { jitcount::FILE } else { jitcount::GENERATED };
+    jitcount::MADE[origin].fetch_add(1, Ordering::Relaxed);
+    if let Some(n) = second {
+        jitcount::SECOND.fetch_add(1, Ordering::Relaxed);
+        jitcount::SECOND_WORDS.fetch_add(n as u64, Ordering::Relaxed);
+    }
+    let ahead = MAKING_AHEAD.get();
+    if ahead {
+        jitcount::AHEAD.fetch_add(1, Ordering::Relaxed);
+    }
+    jitcount::seen(g, &source, origin);
     let Room { asm, c: calls } = &mut room;
     let (hot, cold) = (asm.len(H), asm.len(C));
     let c = Clock::now();
@@ -2114,6 +2176,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         followed,
         pads: calls.pads.iter().map(|&(r, k)| (r, t + 4 * k as u64)).collect(),
         calls_made: Vec::new(),
+        notes: Notes { ahead, second: second.is_some(), used: Default::default(), counters },
     });
     s.by_g.insert(g, i);
     index_parts(&mut s.by_t, &s.blocks[i], i);
@@ -2499,6 +2562,7 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         followed: true,
         pads: Vec::new(),
         calls_made: Vec::new(),
+        notes: Notes::default(),
     });
     s.by_t.insert(t, i);
     s.veneers.insert((to, saved), i);
@@ -2762,6 +2826,11 @@ struct Made {
     x18: usize,
     /// The end of the program's words it read.
     end: u64,
+    /// The words of its second pass, for its entry with the program's own
+    /// `x16` and `x17`, if it has one; and its counters, if blocks count
+    /// their runs ([`jitcount`]).
+    second: Option<usize>,
+    counters: Option<u64>,
 }
 
 /// The room a block is made in: its words ([`Asm`]) and calls ([`Calls`]).
@@ -2801,6 +2870,13 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     let wrong = a.label();
     a.branch(H, MISS, Field::Imm19, wrong, check);
     debug_assert_eq!(a.len(H), CHECK_WORDS);
+    // Counting its runs ([`jitcount`]): its saved entry's first, its
+    // other entry's after a save of the program's `x16` and `x17` there.
+    let counting = jitcount::counting();
+    let counters = counting.then(|| jitcount::units(2));
+    if let Some(at) = counters {
+        a.extend(H, counter(at), Word::Saved(g));
+    }
     let Body { end, restore, x18 } = body_of(g, t, followed, true, None, c, a);
     // The wrong block's way out.
     a.bind(wrong, C);
@@ -2812,8 +2888,10 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // x17 (loaded once, [`load_x18`]) and these would load and store at
     // each use, the entry saves x16 and x17 and goes on into the saved
     // words instead.
+    // (Counting, every such entry is made apart, to count its runs.)
+    let mut second = None;
     let unsaved = match restore {
-        Some((at, k)) if at == g => k + 1,
+        Some((at, k)) if at == g && !counting => k + 1,
         _ if x18.is_some() => {
             let start = a.len(H);
             a.push(H, SAVE, Word::At(g));
@@ -2823,7 +2901,13 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
         }
         _ => {
             let start = a.len(H);
+            if let Some(at) = counters {
+                a.push(H, SAVE, Word::At(g));
+                a.extend(H, counter(at + 8), Word::Saved(g));
+                a.push(H, RESTORE, Word::Saved(g));
+            }
             body_of(g, t, followed, false, restore, c, a);
+            second = Some(a.len(H) - start);
             start
         }
     };
@@ -2835,7 +2919,16 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
             *cond = u16::try_from(back).expect("a taken way within 2^16 words of its branch");
         }
     }
-    Made { room, entry: CHECK_WORDS, unsaved, x18: x18.unwrap_or(0), end }
+    // Counting, a link enters at its saved entry, never past its load of
+    // `x18`, to count the run.
+    let x18 = if counting { 0 } else { x18.unwrap_or(0) };
+    Made { room, entry: CHECK_WORDS, unsaved, x18, end, second, counters }
+}
+
+/// The words adding 1 to the counter at `at` ([`jitcount::units`]), with
+/// the program's `x16` and `x17` saved: `stadd`, atomic.
+fn counter(at: u64) -> impl Iterator<Item = u32> {
+    materialized(16, at).chain([0xd280_0031, 0xf831_021f]) // mov x17, #1; stadd x17, [x16]
 }
 
 /// A block's calls as [`body_of`] makes them: those made already in other
@@ -3010,7 +3103,16 @@ fn body_of(
             saved = false;
             c.entries.push((pc, a.len(H), false, false));
         }
+        let pads = c.pads.len();
         ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, &mut c.pads, a);
+        // Counting, a call's way back counts its returns ([`jitcount`]),
+        // `x16` and `x17` saved there.
+        if jitcount::counting() && c.pads.len() > pads && c.pads[pads].1 == a.len(H) {
+            let origin = if followed { jitcount::FILE } else { jitcount::GENERATED };
+            let target = (w & 0xfc00_0000 == 0x9400_0000)
+                .then(|| pc.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4)));
+            a.extend(H, counter(jitcount::pad(origin, target)), Word::Saved(pc + 4));
+        }
         if let Some((k, was, held)) = call_at {
             assert!(
                 was || a.word(Pos::hot(k)) == SAVE,

@@ -874,6 +874,13 @@ fn fields_name_x18(insn: u32) -> bool {
     gpr_fields(insn).is_some_and(|f| f.iter().any(|&s| reg(insn, s) == 18))
 }
 
+/// Whether `insn` may name `x18`: in one of its general-register fields
+/// where its group is known ([`gpr_fields`]), else wherever an instruction
+/// names one ([`may_name_x18`]).
+pub fn may_use_x18(insn: u32) -> bool {
+    gpr_fields(insn).map_or_else(|| may_name_x18(insn), |f| f.iter().any(|&s| reg(insn, s) == 18))
+}
+
 /// Whether `insn` has 18 in one of the places an instruction names a
 /// general register (bits 0, 5, 10 and 16): one that has not names no
 /// `x18`, which is told at once, where decoding it costs far more.

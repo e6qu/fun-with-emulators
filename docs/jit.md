@@ -405,7 +405,21 @@ a processor that reports `DIC` clear.
 blocks translated, ways out taken through fwe and the time spent in
 them, entries by fetch, cache lines flushed and blocks dropped and taken
 back, how often the cache was emptied, and how long the translator's
-lock was waited for and held, by its holders' kinds. `FWE_JIT_MAP=<dir>`
+lock was waited for and held, by its holders' kinds; and the counts that
+say which of its work could be skipped (`crates/native/src/jitcount.rs`):
+the blocks made from files and from generated code and the time making
+each kind, those made with a second pass of their words for an entry
+with the program's own `x16` and `x17` and those entered there, and
+those made ahead of the program. With `FWE_JIT_SEEN=<dir>` each process
+adds the blocks it made to that directory (their address and a hash of
+their words) and counts those an earlier one made, at the same address
+or elsewhere. With `FWE_JIT_COUNT=1` every block counts its runs and
+every way back after a call its returns (the words then differ: a
+counter at each entry, and every other entry made apart): the report
+adds the blocks that ran, those made ahead that ran, the returns into
+generated code by the call they come back from, and the pages of
+generated code that hold no word a translation changes, with how often
+their blocks ran and their lines were flushed. `FWE_JIT_MAP=<dir>`
 writes the code cache's map there as a process ends (`jit-<pid>.map`: a
 line for each block's hot words and one for its cold ones, each with its
 place in the cache, the program address the block was made from, what
@@ -417,7 +431,11 @@ word by word, and to count the blocks made by the code they come from,
 by what ended them and by their length. The benchmarks
 compare a JDK workload (compiling and running a multi-threaded
 application) with the same JDK built for macOS on the same runner
-([ROADMAP.md](../ROADMAP.md)).
+([ROADMAP.md](../ROADMAP.md)), report these counts for it, and run the
+same machine code made at run time under fwe and natively (calls and
+returns, a switch through `br`, calls through a register, a loop, 4096
+functions called in turn, and a function made and run once:
+`guests/c/bench.c`'s `jit`).
 
 ## Tested runtimes
 

@@ -133,6 +133,14 @@ MICRO = [
     # A fault the program's own handler steps past (a JIT's implicit null
     # check), there and back.
     ("SIGSEGV handled", ["fault", "50000"], "us"),
+    # Code made at run time (fwe runs it by translation, macOS as it is):
+    # the same machine code each way, at work and as it is made.
+    ("JIT code: calls and returns", ["jit", "calls", "200"], "ns"),
+    ("JIT code: a switch through br", ["jit", "indirect", "500000"], "ns"),
+    ("JIT code: calls through a register", ["jit", "pointers", "5000000"], "ns"),
+    ("JIT code: a loop", ["jit", "loop", "10000000"], "ns"),
+    ("JIT code: 4096 functions in turn", ["jit", "functions", "2000000"], "ns"),
+    ("JIT code: a function made and run", ["jit", "made", "2000"], "us"),
 ]
 
 
@@ -1310,6 +1318,26 @@ def jdk(a, fwe, guest_env, results):
         print(f"JDK java: no callers: {e!r}", file=sys.stderr)
     pcs("JDK java natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE],
         execname="java")
+    # What the translator's work is (`FWE_TIMING`'s counts): `javac` twice
+    # into one directory of the blocks made (`FWE_JIT_SEEN`), then `java`
+    # into it too, for how many blocks an earlier run made; then each with
+    # its blocks counting their runs (`FWE_JIT_COUNT`).
+    java = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"),
+                              "-cp", "/tmp/jdkout", "Main", JDK_SCALE]
+    seen = tempfile.mkdtemp()
+    for label, cmd, extra in [
+            ("javac", javac, [f"FWE_JIT_SEEN={seen}"]),
+            ("javac again", javac, [f"FWE_JIT_SEEN={seen}"]),
+            ("java after them", java, [f"FWE_JIT_SEEN={seen}"]),
+            ("javac with its blocks counting", javac, ["FWE_JIT_COUNT=1"]),
+            ("java with its blocks counting", java, ["FWE_JIT_COUNT=1"])]:
+        r = subprocess.run(guest_env + ["FWE_TIMING=1"] + extra + cmd[len(guest_env):],
+                           capture_output=True, text=True, errors="replace")
+        said = [line.split("; blocks made ", 1)[1] for line in r.stderr.splitlines()
+                if "timing: exit: " in line and "; blocks made " in line]
+        print(f"JDK {label}, the translator's counts (exit {r.returncode}): "
+              + " | ".join("blocks made " + s for s in said), file=sys.stderr)
+    shutil.rmtree(seen, ignore_errors=True)
     # How long `javac` takes alone, both ways.
     took = []
     for out, cmd in [(ours_out, javac), (theirs_out, [f"{bin_theirs}/javac", "-d", theirs_out]

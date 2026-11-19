@@ -1073,6 +1073,46 @@ fn jit_branches_within_a_block_stay_in_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The translator's counts (guests/c/jitloop.c): its one block made from
+/// generated code, made again by a second process that sees the first's
+/// blocks (`FWE_JIT_SEEN`), and, with every block counting its runs
+/// (`FWE_JIT_COUNT`), counted as run, the program's output as ever.
+#[test]
+fn jit_counts_say_what_ran_and_what_was_made_before() {
+    let prog = build_c("jitloop", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitcounts");
+    let seen = std::env::temp_dir().join(format!("fwe-jitseen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seen);
+    std::fs::create_dir_all(&seen).unwrap();
+    for round in 0..2 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        cmd.env("FWE_TIMING", "1").env("FWE_JIT_SEEN", &seen).env("FWE_JIT_COUNT", "1");
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "loop: summed\n", "{err}");
+        assert_eq!(out.status.code(), Some(0));
+        assert!(err.contains("blocks made from files 0 (0 ms), generated 1 ("), "{err}");
+        // An earlier process's block: at the same address, or elsewhere
+        // (where the program's mapping landed).
+        let before = err.split("made before by another process: ").nth(1).unwrap_or_default();
+        let seen: Vec<u64> = before
+            .split(';')
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches("generated ")
+            .split(", ")
+            .map(|n| n.trim().parse().unwrap_or(9))
+            .collect();
+        assert!(before.starts_with("from files 0 at the same address, 0 elsewhere"), "{err}");
+        assert_eq!(seen.iter().sum::<u64>(), round, "{err}");
+        assert!(err.contains("blocks run from files 0 of 0, generated 1 of 1"), "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&seen);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code each of whose blocks expands to many times its size
 /// (guests/c/jitroom.c: functions of back-to-back calls through x16), in a
 /// code cache small enough that such blocks land at every place in a chunk,
