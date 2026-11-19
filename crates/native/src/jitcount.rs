@@ -223,6 +223,51 @@ pub(crate) struct Counted {
     pub origin: usize,
     pub ahead: bool,
     pub counters: Option<u64>,
+    /// Whether it is its program address's translation still, the
+    /// program's words it holds, and its direct ways out by what leads
+    /// there.
+    pub live: bool,
+    pub words: usize,
+    pub leads: Vec<(u64, Lead)>,
+}
+
+/// What leads a direct way out to its target: an unconditional branch of
+/// the program's (`b`) on the target's page, one from another page, or
+/// anything else (a conditional branch, the next instruction, a call).
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Lead {
+    Branch,
+    BranchAway,
+    Other,
+}
+
+/// Of the blocks in use, those an unconditional branch leads to: in all,
+/// and those nothing else leads to directly, with their program's words
+/// (all, and from the branch's own page).
+fn branched_to(blocks: &[Counted]) -> [u64; 5] {
+    let mut by: HashMap<u64, [u32; 3]> = HashMap::new();
+    for b in blocks.iter().filter(|b| b.live) {
+        for &(to, lead) in &b.leads {
+            by.entry(to).or_default()[lead as usize] += 1;
+        }
+    }
+    let mut n = [0u64; 5];
+    for b in blocks.iter().filter(|b| b.live) {
+        let Some(&[near, away, other]) = by.get(&b.g) else { continue };
+        if near + away == 0 {
+            continue;
+        }
+        n[0] += 1;
+        if near + away == 1 && other == 0 {
+            n[1] += 1;
+            n[2] += b.words as u64;
+            if near == 1 {
+                n[3] += 1;
+                n[4] += b.words as u64;
+            }
+        }
+    }
+    n
 }
 
 /// Whether the program's word `w` is one a translation changes: a system
@@ -265,6 +310,11 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
             .map(|(name, c)| format!("{name} {}", n(c)))
             .collect::<Vec<_>>()
             .join(", ")
+    ));
+    let [to, only, only_words, near, near_words] = branched_to(blocks);
+    out.push_str(&format!(
+        "; blocks in use a branch leads to {to}, {only} of them led to by nothing else directly \
+         ({only_words} words), {near} of those from their page ({near_words} words)"
     ));
     if *SEEN_READ.get().unwrap_or(&false) {
         out.push_str(&format!(

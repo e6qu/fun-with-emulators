@@ -558,6 +558,32 @@ impl Block {
         })
     }
 
+    /// Its direct ways out ([`Block::jumps`]) by what leads there: their
+    /// targets, and whether an unconditional branch of the program's
+    /// (`b`) does, from the target's page.
+    fn leads(&self) -> impl Iterator<Item = (u64, jitcount::Lead)> + '_ {
+        self.words.iter().filter_map(|p| match *p {
+            Packed::Out { to, g, cond: 0, exit: 0, .. } => {
+                let at = self.g + 4 * u64::from(g);
+                let branch = self.source.get(usize::from(g)).is_some_and(|&w| {
+                    w & 0xfc00_0000 == 0x1400_0000
+                        && at.wrapping_add_signed(i64::from((w << 6) as i32 >> 4)) == to
+                });
+                let page = !(page_size() - 1);
+                Some((
+                    to,
+                    match (branch, at & page == to & page) {
+                        (true, true) => jitcount::Lead::Branch,
+                        (true, false) => jitcount::Lead::BranchAway,
+                        _ => jitcount::Lead::Other,
+                    },
+                ))
+            }
+            Packed::Out { to, exit: 0, .. } => Some((to, jitcount::Lead::Other)),
+            _ => None,
+        })
+    }
+
     /// Whether the program's words it was made from are still there.
     fn unchanged(&self) -> bool {
         self.source.iter().zip((self.g..).step_by(4)).all(|(&w, at)| read(at) == w)
@@ -852,11 +878,15 @@ pub fn counts() -> Option<String> {
         let blocks: Vec<jitcount::Counted> = s
             .blocks
             .iter()
-            .map(|b| jitcount::Counted {
+            .enumerate()
+            .map(|(i, b)| jitcount::Counted {
                 g: b.g,
                 origin: if b.followed { jitcount::FILE } else { jitcount::GENERATED },
                 ahead: b.notes.ahead,
                 counters: b.notes.counters,
+                live: s.by_g.get(&b.g) == Some(&i),
+                words: b.source.len(),
+                leads: b.leads().collect(),
             })
             .collect();
         jitcount::report(&blocks, |a| !s.in_region(a) && followable(a))

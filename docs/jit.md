@@ -411,8 +411,11 @@ the blocks made from files and from generated code and the time making
 each kind, the program's words a block holds and what its words end at
 (a branch, a branch through a register, a return, words made already,
 the page's end, or the most words a block takes), those made with a second pass of their words for an entry
-with the program's own `x16` and `x17` and those entered there, and
-those made ahead of the program. With `FWE_JIT_SEEN=<dir>` each process
+with the program's own `x16` and `x17` and those entered there,
+those made ahead of the program, and of the blocks in use those an
+unconditional branch (`b`) leads to: in all, and those nothing else
+leads to directly (with their words, and how many of them are on the
+branch's own page). With `FWE_JIT_SEEN=<dir>` each process
 adds the blocks it made to that directory (their address and a hash of
 their words) and counts those an earlier one made, at the same address
 or elsewhere. With `FWE_JIT_COUNT=1` every block counts its runs and
