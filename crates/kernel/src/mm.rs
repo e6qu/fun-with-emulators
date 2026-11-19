@@ -342,8 +342,16 @@ pub fn protection_changes() -> u64 {
 
 /// The host's page size.
 pub fn host_page_size() -> u64 {
+    // Read once (0: not yet); every thread reads the same value.
+    static SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let size = SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    if size != 0 {
+        return size;
+    }
     // SAFETY: sysconf only reads a system value.
-    (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
+    let size = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64;
+    SIZE.store(size, std::sync::atomic::Ordering::Relaxed);
+    size
 }
 
 /// The host protection of the memory at host address `addr`.

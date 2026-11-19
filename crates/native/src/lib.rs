@@ -880,8 +880,7 @@ pub fn probe(name: &str) -> Result<String, String> {
 }
 
 fn page_size() -> u64 {
-    // SAFETY: plain host call.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    fwe_kernel::mm::host_page_size()
 }
 
 /// `movz x8, #139` (rt_sigreturn).
