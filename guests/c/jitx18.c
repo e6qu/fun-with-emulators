@@ -131,6 +131,14 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
     "  add x11, x11, #2\n"                                                 \
     "5: adr " R ", 6f\n"                                                   \
     "  blr " R "\n"                                                        \
+    /* read, then a call, in a block entered past a read of sp (with the  \
+     * program's x16 and x17 in place) whose first branch comes first */  \
+    "  mov " R ", x1\n"                                                    \
+    "  add x10, sp, #0\n"                                                  \
+    "  b 7f\n"                                                             \
+    "7: cbz x1, 8f\n"                                                      \
+    "8: add x11, x11, " R "\n"                                             \
+    "  bl 6f\n"                                                            \
     "  mov x0, x11\n"                                                      \
     "  ldp x29, x30, [sp], #16\n"                                          \
     "  ret\n"                                                              \

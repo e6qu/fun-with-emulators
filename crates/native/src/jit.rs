@@ -2727,15 +2727,17 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
         }
     };
     let x18 = x18.unwrap_or(0);
-    let Calls { pads, made: calls_at, joins, .. } = c;
+    let Calls { pads, made, joins, .. } = c;
+    // Other blocks enter a call's words with `x18` in its slot.
+    let calls_at = made.into_iter().filter(|m| !m.2).map(|m| (m.0, m.1)).collect();
     Made { words: out, info, entry: CHECK_WORDS, unsaved, x18, calls, end, pads, calls_at, joins }
 }
 
 /// A block's calls as [`body_of`] makes them: those made already in other
 /// blocks' words (`known`: program address, words), and what it makes:
 /// ways back after its calls' `bl`s ([`RETS`]: return address, word
-/// index), calls made in its own first words (program
-/// address, word index), the lookups of its branches through a register
+/// index), calls made in its own first words (program address, word index,
+/// and whether `x18` is held in `x17` there, [`load_x18`]), the lookups of its branches through a register
 /// made in its first words with the program's `x16` and `x17` saved
 /// (program address, word index), and ways out into known ones (word
 /// index, program address, words). A call's words, and those lookups, are
@@ -2743,7 +2745,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
 struct Calls<'a> {
     known: &'a [(u64, u64)],
     pads: Vec<(u64, usize)>,
-    made: Vec<(u64, u64)>,
+    made: Vec<(u64, u64, bool)>,
     lookups: Vec<(u64, usize)>,
     joins: Vec<(usize, u64, u64)>,
 }
@@ -2819,11 +2821,15 @@ fn body_of(
         let call = w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000;
         let known = c.known.iter().find(|k| k.0 == pc).filter(|_| pc != g);
         let made = c.made.iter().find(|m| m.0 == pc).filter(|_| !first);
-        if call && let Some(&(_, at)) = known.or(made) {
+        if call && let Some((at, held)) = known.map(|k| (k.1, false)).or(made.map(|m| (m.1, m.2))) {
             put_x18(&mut x18, pc, out, info);
             if !saved {
                 out.push(SAVE);
                 info.push(Word::At(pc));
+            }
+            // Made where the first words hold `x18` in `x17`: loaded there.
+            if held {
+                load_x18(pc, out, info);
             }
             if known.is_some() {
                 c.joins.push((out.len(), pc, at));
@@ -2855,8 +2861,9 @@ fn body_of(
             }
         }
         // Where the words of a call made here are entered saved: past the
-        // save they begin with when made unsaved.
-        let call_at = (call && first && x18.is_none()).then_some((out.len(), saved));
+        // save they begin with when made unsaved; and whether `x18` is
+        // held in `x17` there.
+        let call_at = (call && first).then_some((out.len(), saved, x18.is_some()));
         if crate::decode::may_name_x18(w) && quiet.is_none() {
             quiet = Some(overwritten_after(g, followed));
         }
@@ -2876,9 +2883,9 @@ fn body_of(
             saved = false;
         }
         ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, &mut c.pads, out, info);
-        if let Some((k, was)) = call_at {
+        if let Some((k, was, held)) = call_at {
             assert!(was || out[k] == SAVE, "a call made unsaved at {pc:#x} with no save first");
-            c.made.push((pc, (k + usize::from(!was)) as u64));
+            c.made.push((pc, (k + usize::from(!was)) as u64, held));
         }
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
@@ -3825,5 +3832,20 @@ mod tests {
         for w in words {
             assert_eq!(Packed::of(w, g0, t).word(g0, t), w);
         }
+    }
+    /// A call is made once in a block, however its words are entered (here
+    /// the first with `x18` held in `x17` from its load after a branch): one
+    /// way back for each return address.
+    #[test]
+    fn a_call_held_x18_across_made_once() {
+        let g = 0x0200_1976_c000;
+        // cbz x1, +8; mov x0, x18; bl +0x100; add x0, x0, #1; ret
+        let mut words = vec![0xb400_0041, 0xaa1203e0, 0x9400_0040, 0x9100_0400, 0xd65f_03c0];
+        // As far as a block's look ahead reads ([`snapshot`]).
+        words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
+        let made = with_snapshot(g, &words, || translate(g, 0, false, &[]));
+        let mut rets: Vec<u64> = made.pads.iter().map(|p| p.0).collect();
+        rets.dedup();
+        assert_eq!(rets.len(), made.pads.len(), "pads {:x?}", made.pads);
     }
 }
