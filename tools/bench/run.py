@@ -73,7 +73,7 @@ def fetch(urls, sha256, cache):
         os.makedirs(cache, exist_ok=True)
         for u in urls:
             r = subprocess.run(
-                ["curl", "-sfL", "--retry", "5", "--retry-all-errors", "-o", path + ".part", u]
+                ["curl", "-sSfL", "--retry", "5", "--retry-all-errors", "-o", path + ".part", u]
             )
             if r.returncode == 0:
                 url = u
