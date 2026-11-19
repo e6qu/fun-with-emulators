@@ -1898,9 +1898,6 @@ fn translation_(s: &mut Held, g: u64) -> usize {
             began.add_to(&TRANSLATE_NS);
             made
         });
-        // TEMPORARY (phase 1): the old translator makes the same.
-        let was = with_snapshot(g, &source, || old::translate(g, 0, followed, &known));
-        same_made(g, &made, &was);
         let read_words = ((made.end - g) / 4) as usize;
         let same = source[..read_words].iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w);
         if s.by_g.contains_key(&g) || !same || followed == s.in_region(g) {
@@ -1910,50 +1907,6 @@ fn translation_(s: &mut Held, g: u64) -> usize {
         let r = place(s, g, followed, made, source[..read_words].to_vec());
         c.add_to(&PROBE[5]);
         return r;
-    }
-}
-
-// TEMPORARY (phase 1): the translator as it was, and a check that two
-// translations are the same in every part.
-#[path = "jit_old.rs"]
-mod old;
-fn same_made(g: u64, a: &Made, b: &Made) {
-    let differs = a.words != b.words
-        || a.info != b.info
-        || a.entry != b.entry
-        || a.unsaved != b.unsaved
-        || a.x18 != b.x18
-        || a.calls != b.calls
-        || a.end != b.end
-        || a.pads != b.pads
-        || a.calls_at != b.calls_at
-        || a.joins != b.joins;
-    if differs {
-        let k = (0..a.words.len().max(b.words.len()))
-            .find(|&k| a.words.get(k) != b.words.get(k) || a.info.get(k) != b.info.get(k));
-        panic!(
-            "the block at {g:#x} made differently, first at word {k:?}:\nnew {:x?} {:?} {} {} {} {:x?} {:x} {:x?} {:x?} {:x?}\nold {:x?} {:?} {} {} {} {:x?} {:x} {:x?} {:x?} {:x?}",
-            a.words,
-            a.info,
-            a.entry,
-            a.unsaved,
-            a.x18,
-            a.calls,
-            a.end,
-            a.pads,
-            a.calls_at,
-            a.joins,
-            b.words,
-            b.info,
-            b.entry,
-            b.unsaved,
-            b.x18,
-            b.calls,
-            b.end,
-            b.pads,
-            b.calls_at,
-            b.joins
-        );
     }
 }
 
