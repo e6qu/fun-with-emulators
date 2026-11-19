@@ -406,15 +406,19 @@ pub fn child_writes_own(child: i32) {
 
 /// This process's record as last read, by its version then
 /// ([`crate::procstore::version`]).
-static OWN: std::sync::Mutex<Option<(i32, u32, ProcRecord)>> = std::sync::Mutex::new(None);
+#[allow(clippy::type_complexity)]
+static OWN: std::sync::Mutex<Option<(i32, u32, std::sync::Arc<ProcRecord>)>> =
+    std::sync::Mutex::new(None);
 
-/// This process's start time, by pid.
-static OWN_START: std::sync::Mutex<(i32, u64)> = std::sync::Mutex::new((0, 0));
-
-/// [`read`] of this process's own record (host pid `me`): read again only
-/// once it changed, which its version tells (a thread started reads it,
-/// for its creator's timer slack).
+/// [`read`] of this process's own record (host pid `me`).
 fn read_own(me: i32) -> Option<ProcRecord> {
+    own_record(me).map(|r| (*r).clone())
+}
+
+/// This process's own record (host pid `me`), shared: read again only
+/// once it changed, which its version tells (a thread started reads it,
+/// for its creator's timer slack; a fork, for what its child inherits).
+fn own_record(me: i32) -> Option<std::sync::Arc<ProcRecord>> {
     let version = crate::procstore::version(me)?;
     {
         let own = OWN.lock().unwrap_or_else(|e| e.into_inner());
@@ -424,19 +428,23 @@ fn read_own(me: i32) -> Option<ProcRecord> {
             return Some(r.clone());
         }
     }
-    let start = {
-        let mut s = OWN_START.lock().unwrap_or_else(|e| e.into_inner());
-        if s.0 != me {
-            *s = (me, start_time(me)?);
-        }
-        s.1
-    };
-    let r = read_any(me).filter(|r| r.start == start)?;
+    let start = own_start()?;
+    let r = std::sync::Arc::new(read_any(me).filter(|r| r.start == start)?);
     // Kept only if it did not change while it was read.
     if version % 2 == 0 && crate::procstore::version(me) == Some(version) {
         *OWN.lock().unwrap_or_else(|e| e.into_inner()) = Some((me, version, r.clone()));
     }
     Some(r)
+}
+
+/// `f` of this process's record, without a copy of it: what [`read`] of
+/// it would give.
+fn with_own<R>(f: impl FnOnce(&ProcRecord) -> R) -> Option<R> {
+    let me = me();
+    if BATCHING.load(std::sync::atomic::Ordering::SeqCst) {
+        return read(me).map(|r| f(&r));
+    }
+    own_record(me).map(|r| f(&r))
 }
 
 /// The record kept for host pid `pid`, whether or not its process lives.
@@ -704,7 +712,7 @@ pub fn record_pgid(pid: i32) {
 /// The host reaps this process's children as they end, or not.
 pub fn own_autoreap(on: bool) {
     // Written only when it changes.
-    if read(me()).is_some_and(|r| r.autoreap != on) {
+    if with_own(|r| r.autoreap != on) == Some(true) {
         let _ = change(me(), |r| r.autoreap = on);
     }
 }
@@ -737,7 +745,7 @@ fn me() -> i32 {
 
 /// This process's cgroup: its record's, made in the root if it has none.
 pub fn own_cgroup() -> Vec<u8> {
-    cgroup_of(me())
+    with_own(|r| r.cgroup().to_vec()).unwrap_or_else(|| b"/".to_vec())
 }
 
 /// Host process `pid`'s cgroup (the root's for one fwe has no record of).
@@ -950,7 +958,10 @@ pub struct Inherit {
 /// that asked to reset on fork starts as an ordinary one, its nice value no
 /// less than 0, as on Linux.
 pub fn inherit() -> Inherit {
-    let Some(r) = read(me()) else { return Inherit::default() };
+    with_own(inherit_of).unwrap_or_default()
+}
+
+fn inherit_of(r: &ProcRecord) -> Inherit {
     let (sched, nice) = match r.sched {
         s if s.reset_on_fork => {
             use fwe_abi::sched::*;
@@ -973,8 +984,8 @@ pub fn inherit() -> Inherit {
         sched,
         slack,
         foster: false,
-        affinity: r.affinity,
-        rlimits: r.rlimits,
+        affinity: r.affinity.clone(),
+        rlimits: r.rlimits.clone(),
     }
 }
 
@@ -1056,8 +1067,8 @@ pub fn forked(
     maps: Vec<u8>,
     cgroup: Option<&[u8]>,
 ) {
-    let mine = read(me());
-    let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
+    let (comm, cmdline, exe) =
+        with_own(|r| (r.comm.clone(), r.cmdline.clone(), r.exe.clone())).unwrap_or_default();
     let cgroup = cgroup.map_or_else(own_cgroup, <[u8]>::to_vec);
     // Kept what the child has already written of itself (its program,
     // and its namespaces and cgroup, which it may have changed since).
@@ -1285,7 +1296,7 @@ pub fn child_line() -> (Vec<Proc>, Option<Proc>) {
     if let Some(start) = start_time(me) {
         line.push((me, start));
     }
-    line.extend(read(me).map(|r| r.lineage).unwrap_or_default());
+    with_own(|r| line.extend_from_slice(&r.lineage));
     let bound = crate::pidns::current()
         .first()
         .and_then(|r| r.get().host_of(1))
@@ -1346,8 +1357,8 @@ impl FromParent {
     /// This process's, for a child that starts in `cgroup` (else in this
     /// process's).
     pub fn of(cgroup: Option<&[u8]>) -> FromParent {
-        let mine = read(me());
-        let (comm, cmdline, exe) = mine.map(|r| (r.comm, r.cmdline, r.exe)).unwrap_or_default();
+        let (comm, cmdline, exe) =
+            with_own(|r| (r.comm.clone(), r.cmdline.clone(), r.exe.clone())).unwrap_or_default();
         FromParent {
             comm,
             cmdline,
@@ -1473,7 +1484,7 @@ pub fn set_own_subreaper(on: bool, declined: Vec<Proc>, kept: Vec<Proc>) {
 
 /// Whether this process is a child subreaper.
 pub fn own_subreaper() -> bool {
-    read(me()).is_some_and(|r| r.subreaper)
+    with_own(|r| r.subreaper) == Some(true)
 }
 
 /// Whether host process `pid` is stopped, and by which signal (the
@@ -1816,10 +1827,12 @@ pub fn exiting(status: i32) {
     // checks its record and records how it ended under the same lock, so
     // it sees the record with this account written, or no record at all.
     let _lock = crate::procstore::lock(me);
-    if let Some(r) = read(me) {
+    if let Some((start, lineage, bound, foster)) =
+        with_own(|r| (r.start, r.lineage.clone(), r.bound, r.foster))
+    {
         let ended = Ended {
             pid: me,
-            start: r.start,
+            start,
             status,
             // SAFETY: plain host call.
             pgid: unsafe { libc::getpgrp() },
@@ -1827,9 +1840,9 @@ pub fn exiting(status: i32) {
                 .iter()
                 .filter_map(|ns| Some((ns.dir().to_vec(), ns.get().number_of(me)?)))
                 .collect(),
-            lineage: r.lineage,
-            bound: r.bound,
-            foster: r.foster,
+            lineage,
+            bound,
+            foster,
         };
         if crate::reaper::takes_end(
             (ended.pid, ended.start),
