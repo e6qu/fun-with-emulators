@@ -64,8 +64,16 @@ way.
   procedure call standard lets one clobber `x16` and `x17` on a direct
   branch to other code). A `cbz` or `tbz` of `x18` tests the program's
   `x18` inline. A call puts the program's own return address in `x30`,
-  so the stack holds only the program's addresses. An indirect branch or
-  a return looks its target up in a table of translations by program
+  so the stack holds only the program's addresses, after a `bl` over a
+  pad: the way back into the translation of where it returns. A return
+  looks its address up in a table of returns first, and found there goes
+  to the call's pad with `ret`, which the processor predicts from the
+  `bl` as it predicts a native return; returns to one of many callers (a
+  tree walk's) would otherwise be guessed from the branches before them
+  and missed most times. A call is made once: a block that comes to a
+  call another block made already branches into that one's words, so a
+  return address has one pad. An indirect branch or
+  a return not found among the returns looks its target up in a table of translations by program
   address: one 16-byte load reads an entry's address and translation
   together (single-copy atomic, as the table's writes are), so a match
   leads to the target's own translation. Through `x16` or `x17`, which
@@ -297,6 +305,13 @@ a processor that reports `DIC` clear.
   that one's 32-byte pair (`jit::publish`), where a lookup that misses
   the first looks next. A target outside run-time code (a library's)
   gets translation 0; a dropped entry is cleared.
+- **The table of returns** at 2^45 + 2^44 is laid out as the table of
+  translations: a call's return address and its pad (`jit::RETS`,
+  `jit::call_pad`), published and dropped with the block that holds the
+  call. A call made in a block's words is noted (`State::calls_made`,
+  entered with `x16` and `x17` saved); a block translated later that
+  comes to it ends in a way out linked into those words (`Exit::Join`),
+  through fwe again if that block is dropped.
 - **The code cache's views:** each chunk is mapped twice with
   `mach_vm_remap`, written through the writable view and run from the
   executable one; `jit::in_cache` tells a cache address without a lock.
@@ -355,7 +370,9 @@ a processor that reports `DIC` clear.
 |---|---|---|
 | a block's first run | a fault and a translation | once per block, and again after a flush that changed it |
 | a direct branch's first run | a call through the exit gate | once per branch, then linked |
-| an indirect branch or return | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it used them or `sp` | each time; a miss goes through the exit gate |
+| a call | a `bl` over its pad, the return address set, and a branch to the target (a table lookup for `blr`) | each time |
+| a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
+| an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it used them or `sp` | each time; a miss goes through the exit gate |
 | a call from native code into JIT code | a fault | once per call site, then linked |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |

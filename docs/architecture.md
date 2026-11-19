@@ -1453,7 +1453,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   Silicon Mac.
 - Native: the program shares its address space with fwe, so a `MAP_FIXED`
   mapping over memory fwe keeps for itself (its own code, heap and
-  stacks, the stubs, the code cache, the translation table at 32 TiB)
+  stacks, the stubs, the code cache, the tables of translations and of
+  returns at 32 and 48 TiB)
   replaces it, and fwe fails. Mappings left to fwe never land there.
 - The memory-tagging instructions with an `sp` operand, `casp` on `sp`,
   an authenticated load written back onto `sp` and `blraa x18, x30` are

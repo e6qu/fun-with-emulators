@@ -152,19 +152,21 @@ fn reserve_table() {
     if TABLE_HELD.swap(true, Ordering::SeqCst) {
         return;
     }
-    let mut table = TABLE;
-    // SAFETY: fresh memory in this task, at the table's fixed place.
-    unsafe {
-        assert_eq!(
-            mach::mach_vm_allocate(
-                mach::mach_task_self_,
-                &mut table,
-                TABLE_SIZE,
-                mach::VM_FLAGS_FIXED
-            ),
-            0,
-            "fwe's translation table's place ({TABLE:#x}) is taken"
-        );
+    for at in [TABLE, RETS] {
+        let mut table = at;
+        // SAFETY: fresh memory in this task, at the table's fixed place.
+        unsafe {
+            assert_eq!(
+                mach::mach_vm_allocate(
+                    mach::mach_task_self_,
+                    &mut table,
+                    TABLE_SIZE,
+                    mach::VM_FLAGS_FIXED
+                ),
+                0,
+                "fwe's translation table's place ({at:#x}) is taken"
+            );
+        }
     }
 }
 
@@ -178,6 +180,15 @@ const BLOCK_ROOM: u64 = 4 * 64 * 24;
 /// same, both run often, would each push the other out at every turn, a
 /// way into fwe each time.
 pub const TABLE: u64 = 1 << 45;
+/// The table of returns, laid out as [`TABLE`]: a call's return address,
+/// and the way back into the translation of the call (its pad, which the
+/// call's `bl` stepped over), where a return goes with `ret`. The
+/// processor predicts a return to where the last `bl` would have come
+/// back to: found here, it is right, where a `br` to the address the
+/// table of translations gives would be guessed from the branches before
+/// it (a return to one of many callers, as a tree walk's, missed most
+/// times).
+pub const RETS: u64 = TABLE | 1 << 44;
 const TABLE_BITS: u32 = 20;
 const TABLE_SIZE: u64 = 16 << TABLE_BITS;
 
@@ -192,6 +203,12 @@ const INDEX: u32 = 0xd342_5611;
 const SCALE: u32 = 0xd37c_ee31;
 /// `orr x17, x17, #TABLE`
 const BASE: u32 = 0xb253_0231;
+/// `orr x17, x17, #RETS`
+const RETS_BASE: u32 = 0xb254_0631;
+/// `ret x17`
+const RET_X17: u32 = 0xd65f_0220;
+/// `bl` (its offset added)
+const BL: u32 = 0x9400_0000;
 /// `eor x17, x17, #16`: an entry's address to the other's of its pair.
 const OTHER: u32 = 0xd27c_0231;
 /// `ldar x17, [x17]`: the entry's key, before its value.
@@ -244,6 +261,10 @@ enum Exit {
     /// it read it): on to the address in `x16`, the program's `x16` and
     /// `x17` on the stack.
     Retry,
+    /// Into the call at this program address, made in another block's
+    /// words ([`State::calls_made`]): linked there, else on at its own
+    /// translation.
+    Join(u64),
 }
 
 /// What an expansion ([`Word::Undo`], [`Word::Finish`]) stands for: its
@@ -330,6 +351,11 @@ struct Block {
     /// of them, it is taken back while they are the same ([`revive`]).
     source: Vec<u32>,
     followed: bool,
+    /// Its calls' pads ([`RETS`]): ways out to where each returns.
+    pads: Vec<u64>,
+    /// The calls it makes for every block ([`State::calls_made`]): each
+    /// one's program address and the address of its words.
+    calls_made: Vec<(u64, u64)>,
 }
 
 /// The code cache: chunks, each one memory mapped twice.
@@ -408,6 +434,12 @@ pub struct State {
     /// program's `x16` and `x17` saved -> the block that branches to it
     /// from the cache ([`veneer`]).
     veneers: BTreeMap<(u64, bool), usize>,
+    /// Each call (`bl`, `blr`) made in a block's words: its program
+    /// address, the block, and the address of its words (entered with the
+    /// program's `x16` and `x17` saved). Another block that comes to it
+    /// goes on there ([`Exit::Join`]): a call has one `bl`, and its return
+    /// one pad ([`RETS`]) the processor predicts.
+    calls_made: BTreeMap<u64, (usize, u64)>,
     /// Where calls made from translations return: a return there from
     /// code followed into is followed back ([`exit`]).
     returns: std::collections::BTreeSet<u64>,
@@ -440,6 +472,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     object_of: BTreeMap::new(),
     aliases: BTreeMap::new(),
     veneers: BTreeMap::new(),
+    calls_made: BTreeMap::new(),
     returns: std::collections::BTreeSet::new(),
     call_sites: std::collections::BTreeSet::new(),
     waiting: AddrMap::with_hasher(BuildHasherDefault::new()),
@@ -689,7 +722,12 @@ fn page_size() -> u64 {
 /// address) and value (a translation's lookup entry, or 0), 16 bytes
 /// aligned. `g` is there or in the other entry of the pair ([`OTHER`]).
 fn entry(g: u64) -> u64 {
-    TABLE | (((g >> 2) & ((1 << TABLE_BITS) - 1)) << 4)
+    entry_in(TABLE, g)
+}
+
+/// [`entry`] in `table` ([`TABLE`] or [`RETS`]).
+fn entry_in(table: u64, g: u64) -> u64 {
+    table | (((g >> 2) & ((1 << TABLE_BITS) - 1)) << 4)
 }
 
 /// Entry `e` as it is: key and value read at once (a 16-byte aligned
@@ -716,9 +754,10 @@ fn write_entry(e: u64, key: u64, value: u64) {
     }
 }
 
-/// The entry that holds `g`, if one of its pair does.
-fn holding(g: u64) -> Option<u64> {
-    [entry(g), entry(g) ^ 16].into_iter().find(|&e| read_entry(e).0 == g)
+/// The entry of `table` that holds `g`, if one of its pair does.
+fn holding(table: u64, g: u64) -> Option<u64> {
+    let e = entry_in(table, g);
+    [e, e ^ 16].into_iter().find(|&e| read_entry(e).0 == g)
 }
 
 /// The value of an entry for the translation at `t`: its saved entry; 0
@@ -735,26 +774,62 @@ fn looked_up(t: u64) -> u64 {
 /// in one of them as they move.
 #[inline(never)]
 fn publish(g: u64, t: u64) {
-    let (first, other) = (entry(g), entry(g) ^ 16);
-    let e = match holding(g) {
-        Some(e) => e,
-        None => {
-            let (k, v) = read_entry(first);
-            if k != 0 {
-                write_entry(other, k, v);
-            }
-            first
-        }
-    };
-    write_entry(e, g, looked_up(t));
+    publish_in(TABLE, g, looked_up(t));
 }
 
 /// Clear `g`'s entry if it says translation `t`.
 fn unpublish(g: u64, t: u64) {
-    if let Some(e) = holding(g)
-        && read_entry(e).1 == looked_up(t)
+    unpublish_in(TABLE, g, looked_up(t));
+}
+
+/// [`publish`] in `table`: `g`'s entry says `value`.
+fn publish_in(table: u64, g: u64, value: u64) {
+    let first = entry_in(table, g);
+    let e = match holding(table, g) {
+        Some(e) => e,
+        None => {
+            let (k, v) = read_entry(first);
+            if k != 0 {
+                write_entry(first ^ 16, k, v);
+            }
+            first
+        }
+    };
+    write_entry(e, g, value);
+}
+
+/// [`unpublish`] in `table`: `g`'s entry cleared if it says `value`.
+fn unpublish_in(table: u64, g: u64, value: u64) {
+    if let Some(e) = holding(table, g)
+        && read_entry(e).1 == value
     {
         write_entry(e, 0, 0);
+    }
+}
+
+/// Block `b`'s calls' pads as returns find them ([`RETS`]), or not: each
+/// return address, and its pad.
+fn pads(b: &Block) -> impl Iterator<Item = (u64, u64)> + '_ {
+    b.pads.iter().filter_map(|&h| match b.words.get(((h - b.t) / 4) as usize) {
+        Some(&Word::Out { g, .. }) => Some((g, h)),
+        _ => None,
+    })
+}
+
+/// Block `b` found by lookups: its program address's translation, and
+/// its calls' pads by their return addresses.
+fn publish_block(b: &Block) {
+    publish(b.g, b.t);
+    for (g, h) in pads(b) {
+        publish_in(RETS, g, h);
+    }
+}
+
+/// Block `b` found by no lookup ([`publish_block`] undone).
+fn unpublish_block(b: &Block) {
+    unpublish(b.g, b.t);
+    for (g, h) in pads(b) {
+        unpublish_in(RETS, g, h);
     }
 }
 
@@ -872,12 +947,17 @@ impl State {
     /// takes it off its page's list). `flushed`: kept to take back
     /// ([`revive`]).
     fn drop_block(&mut self, i: usize, flushed: bool) {
-        let (g, t) = (self.blocks[i].g, self.blocks[i].t);
+        let g = self.blocks[i].g;
         if self.by_g.get(&g) != Some(&i) {
             return;
         }
         self.by_g.remove(&g);
-        unpublish(g, t);
+        unpublish_block(&self.blocks[i]);
+        for &(p, ..) in &self.blocks[i].calls_made {
+            if self.calls_made.get(&p).is_some_and(|&(j, ..)| j == i) {
+                self.calls_made.remove(&p);
+            }
+        }
         if flushed {
             self.dormant.insert(g, i);
         }
@@ -1032,14 +1112,11 @@ pub fn reset() {
     }
     s.regions.clear();
     if s.cache.is_some() {
-        let entries: Vec<(u64, u64)> = s
-            .by_g
-            .iter()
-            .map(|(&g, &i)| (g, s.blocks[i].t))
-            .chain(s.outside.iter().map(|&g| (g, 0)))
-            .collect();
-        for (g, t) in entries {
-            unpublish(g, t);
+        for &i in s.by_g.values() {
+            unpublish_block(&s.blocks[i]);
+        }
+        for &g in &s.outside {
+            unpublish(g, 0);
         }
     }
     s.by_g.clear();
@@ -1048,6 +1125,7 @@ pub fn reset() {
     s.object_of.clear();
     s.aliases.clear();
     s.veneers.clear();
+    s.calls_made.clear();
     s.returns.clear();
     s.call_sites.clear();
     s.waiting.clear();
@@ -1284,7 +1362,9 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             (to, false)
         }
         Exit::Retry => (wrong_to, false),
+        Exit::Join(to) => (to, false),
     };
+    let lookup = matches!(exit, Exit::Reg { .. } | Exit::Retry);
     // Code fwe prepared in place (a library's, the program's own) that a
     // translation calls or branches to is followed: translated too, so
     // what it calls and where it returns stay in translations. A return
@@ -1325,10 +1405,10 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     }
     let known = s.by_g.contains_key(&to);
     if known {
-        if link_here { &EXITS_KNOWN_DIRECT } else { &EXITS_KNOWN_INDIRECT }
+        if lookup { &EXITS_KNOWN_INDIRECT } else { &EXITS_KNOWN_DIRECT }
             .fetch_add(1, Ordering::Relaxed);
         let key = read_entry(entry(to)).0;
-        if !link_here && holding(to).is_none() && key != 0 {
+        if lookup && holding(TABLE, to).is_none() && key != 0 {
             EXITS_KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1589,7 +1669,7 @@ fn translation(s: &mut Held, g: u64) -> usize {
         if let Some(&i) = s.by_g.get(&g) {
             // Its table entry may have gone to another address since (they
             // share entries): it is its own again.
-            publish(g, s.blocks[i].t);
+            publish_block(&s.blocks[i]);
             return i;
         }
         if s.cache.is_none() {
@@ -1602,10 +1682,16 @@ fn translation(s: &mut Held, g: u64) -> usize {
             return i;
         }
         let source = snapshot(g);
+        // Calls made already from the words it may read: made there.
+        let known: Vec<(u64, u64)> = s
+            .calls_made
+            .range(g..g + 4 * source.len() as u64)
+            .map(|(&p, &(_, at))| (p, at))
+            .collect();
         // (Made at 0, its words standing anywhere; placed below.)
         let made = s.unlocked(|| {
             let began = Clock::now();
-            let made = with_snapshot(g, &source, || translate(g, 0, followed));
+            let made = with_snapshot(g, &source, || translate(g, 0, followed, &known));
             began.add_to(&TRANSLATE_NS);
             made
         });
@@ -1677,7 +1763,8 @@ fn successors(b: &Block) -> Vec<u64> {
 /// the cache, and publish it.
 #[inline(never)]
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
-    let Made { words, info: made_info, entry, unsaved, x18, calls, end: _ } = made;
+    let Made { words, info: made_info, entry, unsaved, x18, calls, pads, calls_at, joins, end: _ } =
+        made;
     // The block keeps what its words stand for, in room of their own.
     let mut info = made_info.to_vec();
     // (Room is made first: emptying the cache forgets every page's other
@@ -1716,10 +1803,30 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         retired: false,
         source,
         followed,
+        pads: pads.iter().map(|&k| t + 4 * k as u64).collect(),
+        calls_made: Vec::new(),
     });
     s.by_g.insert(g, i);
     s.by_t.insert(t, i);
-    publish(g, t);
+    // Its calls for blocks made later, where none is made yet; its ways
+    // into calls made already linked there, if they still are.
+    for (p, k) in calls_at {
+        if let std::collections::btree_map::Entry::Vacant(e) = s.calls_made.entry(p) {
+            e.insert((i, t + 4 * k));
+            s.blocks[i].calls_made.push((p, t + 4 * k));
+        }
+    }
+    for (k, p, at) in joins {
+        let from = t + 4 * k as u64;
+        if let Some(&(j, made)) = s.calls_made.get(&p)
+            && made == at
+            && !s.blocks[j].retired
+            && s.link(i, from, at)
+        {
+            s.blocks[j].linked.push(from);
+        }
+    }
+    publish_block(&s.blocks[i]);
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
     link_waiting(s, i);
     BUFFERS.set((words, made_info));
@@ -1740,10 +1847,13 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     if !b.source.iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w) {
         return None;
     }
-    let (t, len) = (b.t, b.len);
+    let len = b.len;
     s.by_g.insert(g, i);
     s.pages.entry(p).or_default().push(i);
-    publish(g, t);
+    for (q, at) in s.blocks[i].calls_made.clone() {
+        s.calls_made.entry(q).or_insert((i, at));
+    }
+    publish_block(&s.blocks[i]);
     if let Some(c) = s.cache.as_mut() {
         c.live += len;
         c.garbage -= len;
@@ -2018,6 +2128,8 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         retired: false,
         source: Vec::new(),
         followed: true,
+        pads: Vec::new(),
+        calls_made: Vec::new(),
     });
     s.by_t.insert(t, i);
     s.veneers.insert((to, saved), i);
@@ -2102,8 +2214,8 @@ fn flush(s: &mut State) {
     let in_pinned = |s: &State, at: u64| {
         s.by_t.range(..=at).next_back().is_some_and(|(&t, &i)| at < t + old[i].len && pinned[i])
     };
-    for (&g, &i) in &s.by_g {
-        unpublish(g, old[i].t);
+    for &i in s.by_g.values() {
+        unpublish_block(&old[i]);
     }
     // No branch from a retired block leads into the room had back.
     for b in &old {
@@ -2132,6 +2244,7 @@ fn flush(s: &mut State) {
     s.waiting.clear();
     s.dormant.clear();
     s.veneers.clear();
+    s.calls_made.clear();
     s.aliases.clear();
     let size = chunk_size();
     let blocks = &s.blocks;
@@ -2262,6 +2375,14 @@ struct Made {
     /// Where its calls return, and the end of the program's words it read.
     calls: Vec<u64>,
     end: u64,
+    /// Its calls' pads, as word indexes ([`RETS`]).
+    pads: Vec<usize>,
+    /// The calls it makes for every block ([`State::calls_made`]): each
+    /// one's program address and word index; and its ways out into calls
+    /// made already ([`Exit::Join`]): each one's word index, the call's
+    /// program address and the address of its words.
+    calls_at: Vec<(u64, u64)>,
+    joins: Vec<(usize, u64, u64)>,
 }
 
 thread_local! {
@@ -2272,7 +2393,7 @@ thread_local! {
         const { std::cell::Cell::new((Vec::new(), Vec::new())) };
 }
 
-fn translate(g: u64, t: u64, followed: bool) -> Made {
+fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // A lookup that read an entry's address and translation at once, and a
     // direct branch with the program's `x16` and `x17` saved below `sp`
     // (as a lookup saves them), enter at the saved entry ([`CHECK_WORDS`]
@@ -2289,8 +2410,9 @@ fn translate(g: u64, t: u64, followed: bool) -> Made {
     out.push(MISS);
     debug_assert_eq!(out.len(), CHECK_WORDS);
     info.extend([Word::Lookup { g, link: None, to: Some(16) }; CHECK_WORDS]);
+    let mut c = Calls { known, pads: Vec::new(), made: Vec::new(), joins: Vec::new() };
     let Body { calls, end, restore, x18 } =
-        body_of(g, t, followed, true, None, &mut out, &mut info);
+        body_of(g, t, followed, true, None, &mut c, &mut out, &mut info);
     // The wrong block's way out.
     let wrong = out.len();
     out[wrong_at] |= ((wrong - wrong_at) as u32) << 5;
@@ -2304,11 +2426,26 @@ fn translate(g: u64, t: u64, followed: bool) -> Made {
         Some((at, k)) if at == g => k + 1,
         _ => {
             let start = out.len();
-            body_of(g, t, followed, false, restore, &mut out, &mut info);
+            body_of(g, t, followed, false, restore, &mut c, &mut out, &mut info);
             start
         }
     };
-    Made { words: out, info, entry: CHECK_WORDS, unsaved, x18: x18.unwrap_or(0), calls, end }
+    let x18 = x18.unwrap_or(0);
+    let Calls { pads, made: calls_at, joins, .. } = c;
+    Made { words: out, info, entry: CHECK_WORDS, unsaved, x18, calls, end, pads, calls_at, joins }
+}
+
+/// A block's calls as [`body_of`] makes them: those made already in other
+/// blocks' words (`known`: program address, words), and what it makes:
+/// pads ([`call_pad`]), calls made in its own first words (program
+/// address, word index), and ways out into known ones (word index, program
+/// address, words). A call's words are entered with the program's `x16`
+/// and `x17` saved.
+struct Calls<'a> {
+    known: &'a [(u64, u64)],
+    pads: Vec<usize>,
+    made: Vec<(u64, u64)>,
+    joins: Vec<(usize, u64, u64)>,
 }
 
 /// The instructions of the block at program address `g`, translated onto
@@ -2322,17 +2459,22 @@ fn translate(g: u64, t: u64, followed: bool) -> Made {
 /// forwarding to the load, some cycles; through a loop of lookups whose
 /// code never needs them, each lookup would wait for the last's. Made
 /// with them in their registers (not `saved`), the words go on from
-/// `merge`'s address into the block made the other way, as they are there.
+/// `merge`'s address into the block made the other way, as they are there,
+/// and at a call it makes (noted in `c` as the words were made saved).
+#[allow(clippy::too_many_arguments)]
 fn body_of(
     g: u64,
     t: u64,
     followed: bool,
     mut saved: bool,
     merge: Option<(u64, usize)>,
+    c: &mut Calls,
     out: &mut Vec<u32>,
     info: &mut Vec<Word>,
 ) -> Body {
     let page = page_size();
+    // The words made first, with `x16` and `x17` saved.
+    let first = saved;
     let mut pc = g;
     let mut calls = Vec::new();
     let mut sides = Vec::new();
@@ -2367,6 +2509,34 @@ fn body_of(
             break;
         }
         let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
+        // A call (`bl`, `blr`) is made once, with one pad where its return
+        // comes back ([`call_pad`]): where it is made already, in another
+        // block's words or in this one's made the other way, the words go
+        // on there, entered as a call's words are after their save: `x18`
+        // in its slot and the program's `x16` and `x17` saved.
+        let call = w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000;
+        let known = c.known.iter().find(|k| k.0 == pc).filter(|_| pc != g);
+        let made = c.made.iter().find(|m| m.0 == pc).filter(|_| !first);
+        if call && let Some(&(_, at)) = known.or(made) {
+            put_x18(&mut x18, pc, out, info);
+            if !saved {
+                out.push(SAVE);
+                info.push(Word::At(pc));
+            }
+            if known.is_some() {
+                c.joins.push((out.len(), pc, at));
+                gate_out(pc, Exit::Join(pc), true, false, out, info);
+            } else {
+                let k = at as u32;
+                out.push(0x1400_0000 | (k.wrapping_sub(out.len() as u32) & 0x3ff_ffff));
+                info.push(Word::Saved(pc));
+            }
+            ended = true;
+            break;
+        }
+        // Where the words of a call made here are entered saved: past the
+        // save they begin with when made unsaved.
+        let call_at = (call && first && x18.is_none()).then_some((out.len(), saved));
         if crate::decode::may_name_x18(w) && quiet.is_none() {
             quiet = Some(overwritten_after(g, followed));
         }
@@ -2385,7 +2555,11 @@ fn body_of(
             info.push(Word::Saved(pc));
             saved = false;
         }
-        ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, out, info);
+        ended = one(w, pc, t, quiet_here, &mut saved, &mut x18, &mut sides, &mut c.pads, out, info);
+        if let Some((k, was)) = call_at {
+            assert!(was || out[k] == SAVE, "a call made unsaved at {pc:#x} with no save first");
+            c.made.push((pc, (k + usize::from(!was)) as u64));
+        }
         pc += 4;
         // Ends at a branch out, or at the page's end (the next page may not
         // be the program's code).
@@ -2711,6 +2885,22 @@ fn put_x18(x18: &mut Option<bool>, pc: u64, out: &mut Vec<u32>, info: &mut Vec<W
     }
 }
 
+/// A call's first word, standing for `word`: a `bl` over the call's pad,
+/// a way out to `ret`, the program's return address, to the words that
+/// follow (which make the call with `ret` in `x30`). Its return found in
+/// [`RETS`] comes back to the pad with `ret`, where the processor
+/// predicts it, and goes on from there at `ret`'s translation; the
+/// program sees only its own return address.
+fn call_pad(ret: u64, word: Word, pads: &mut Vec<usize>, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+    let bl = out.len();
+    out.push(BL);
+    info.push(word);
+    // Entered as a lookup enters a translation: `x16` and `x17` saved.
+    pads.push(out.len());
+    gate_out(ret, Exit::Jump(ret), true, false, out, info);
+    out[bl] |= (out.len() - bl) as u32;
+}
+
 /// A way out into fwe through the exit gate (first a save of the
 /// program's `x16` and `x17` below `sp` unless `saved`): `x16` the way
 /// out's address. A direct one is linked by making
@@ -2749,6 +2939,7 @@ fn one(
     saved: &mut bool,
     x18: &mut Option<bool>,
     sides: &mut Vec<Side>,
+    pads: &mut Vec<usize>,
     out: &mut Vec<u32>,
     info: &mut Vec<Word>,
 ) -> bool {
@@ -2780,8 +2971,11 @@ fn one(
         gate_out(pc, Exit::Jump(imm26()), *saved, x18.is_some(), out, info);
         return true;
     }
-    // bl: the program's return address in x30, then on.
+    // bl: x16 and x17 saved (as a call's words are entered, [`body_of`]),
+    // over its pad, the program's return address in x30, then on.
     if w & 0xfc00_0000 == 0x9400_0000 {
+        save(saved, out, info);
+        call_pad(pc + 4, at_pc(*saved), pads, out, info);
         let at = out.len();
         materialize(30, pc + 4, out);
         info.extend((at..out.len()).map(|_| at_pc(*saved)));
@@ -2842,12 +3036,13 @@ fn one(
     match w & 0xffff_fc1f {
         0xd61f_0000 | 0xd65f_0000 => {
             save(saved, out, info);
-            lookup(pc, (w >> 5) & 0x1f, None, out, info);
+            let ret = w & 0xffff_fc1f == 0xd65f_0000;
+            lookup(pc, (w >> 5) & 0x1f, None, ret, pads, out, info);
             return true;
         }
         0xd63f_0000 => {
             save(saved, out, info);
-            lookup(pc, (w >> 5) & 0x1f, Some(pc + 4), out, info);
+            lookup(pc, (w >> 5) & 0x1f, Some(pc + 4), false, pads, out, info);
             return true;
         }
         _ => {}
@@ -3050,9 +3245,41 @@ fn one(
 /// replaces), the target is copied into `x16`, which leaves only `x17` to
 /// read the entry with: its address, then its translation, which is
 /// entered at its check.
-fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+#[allow(clippy::too_many_arguments)]
+fn lookup(
+    pc: u64,
+    n: u32,
+    link: Option<u64>,
+    ret: bool,
+    pads: &mut Vec<usize>,
+    out: &mut Vec<u32>,
+    info: &mut Vec<Word>,
+) {
     let before = Word::Lookup { g: pc, link, to: None };
     let in_place = !matches!(n, 16..=18) && !(n == 30 && link.is_some());
+    // A return: first the table of returns, where a call made in a
+    // translation left its pad ([`RETS`]), each entry of the pair in turn;
+    // found, back to the pad with `ret`, predicted.
+    if ret && in_place {
+        let committed = Word::Lookup { g: pc, link: None, to: Some(n as u8) };
+        let mut misses = Vec::new();
+        for other in [false, true] {
+            out.extend([index_of(n), SCALE, RETS_BASE]);
+            out.extend(other.then_some(OTHER));
+            out.extend([ENTRY, key_against(n), MISS_X16]);
+            misses.push(out.len() - 1);
+            while info.len() < out.len() {
+                info.push(before);
+            }
+            out.push(RET_X17);
+            info.push(committed);
+        }
+        // Each one's miss past its `ret`: to the second, then to the table
+        // of translations.
+        for m in misses {
+            out[m] |= 2 << 5;
+        }
+    }
     let (miss_at, to) = if in_place {
         out.extend([index_of(n), SCALE, BASE, ENTRY, key_against(n)]);
         out.push(MISS_X16); // its offset filled in below
@@ -3088,6 +3315,7 @@ fn lookup(pc: u64, n: u32, link: Option<u64>, out: &mut Vec<u32>, info: &mut Vec
     out.push(OUTSIDE);
     info.push(committed);
     if let Some(link) = link {
+        call_pad(link, committed, pads, out, info);
         let at = out.len();
         materialize(30, link, out);
         info.extend((at..out.len()).map(|_| committed));
