@@ -5070,8 +5070,7 @@ fn process_signal_goes_to_unblocked_thread() {
 }
 
 /// A process signal sent while every thread blocks it reaches the thread
-/// that unblocks it first, though macOS parks it on the main thread, which
-/// never does.
+/// that unblocks it first, not the main thread, which never does.
 #[test]
 fn signal_blocked_everywhere_goes_to_the_thread_that_unblocks_it() {
     assert_eq!(signals("parked"), "parked signal handled on the unblocked thread: true\n");

@@ -653,7 +653,10 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 - **Parked signals:** a process-wide signal the host holds can sit on a
   thread running fwe's handlers. A native thread entering a system call
   with such a signal parked on it, one the guest catches, takes it off the
-  host and records it against the process, and the others are woken.
+  host and records it against the process, and the others are woken. The
+  look is a host call: a call that neither waits nor reads signal state
+  (ids, clocks, futex wakes) looks at most every 100 µs, every other call
+  each time.
 - **Wake signal:** a signal recorded without a host signal (real-time,
   emulated faults, caught `tgkill`) wakes its target thread, or every
   thread, with `SIGEMT`. Another process is sent it only if it is a live

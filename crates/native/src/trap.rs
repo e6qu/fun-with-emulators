@@ -103,6 +103,31 @@ thread_local! {
     /// [`reroute_parked`] is taking a signal parked on this thread: record
     /// it against the process rather than the thread.
     static REROUTING: Cell<bool> = const { Cell::new(false) };
+    /// When [`reroute_parked`] last looked at this thread's signals pending
+    /// on the host, by the virtual counter (0: it has not).
+    static LOOKED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How often a thread whose calls only glance ([`glances`]) looks at the
+/// signals the host parked on it ([`reroute_parked`]), at most: every
+/// 100 µs.
+const LOOK_EVERY_PER_SECOND: u64 = 10_000;
+
+/// Whether system call `nr`, with second argument `op`, neither waits nor
+/// reads signal state, whatever its other arguments: it reads ids or
+/// clocks, yields, or wakes futex waiters.
+fn glances(nr: u64, op: u64) -> bool {
+    use fwe_abi::futex;
+    use fwe_abi::nr::*;
+    match nr {
+        GETPID | GETPPID | GETTID | GETUID | GETEUID | GETGID | GETEGID | GETPGID | GETSID
+        | CLOCK_GETTIME | CLOCK_GETRES | GETTIMEOFDAY | GETCPU | SCHED_YIELD => true,
+        FUTEX => matches!(
+            op & futex::FUTEX_CMD_MASK,
+            futex::FUTEX_WAKE | futex::FUTEX_WAKE_OP | futex::FUTEX_WAKE_BITSET
+        ),
+        _ => false,
+    }
 }
 
 /// This host thread starts another guest thread
@@ -110,6 +135,7 @@ thread_local! {
 pub fn thread_reused() {
     IN_GUEST.with(|g| g.set(false));
     REROUTING.with(|r| r.set(false));
+    LOOKED.set(0);
     UNBLOCKED.with(|u| u.set(false));
 }
 
@@ -136,14 +162,40 @@ fn caught(sig: libc::c_int) -> bool {
 /// other threads are woken to take it. A signal with the default action
 /// or ignored stays where it is: unblocking it would apply that action to
 /// a signal Linux keeps pending.
+///
+/// A caught signal is parked so only if it came while every thread was in
+/// fwe's handlers (out of them, the host does not block it: the handler
+/// takes it whatever the guest's mask). The look costs a host call, so a
+/// call that neither waits nor reads signal state ([`glances`]) looks
+/// only once [`LOOK_EVERY_PER_SECOND`] says it is time again: a thread
+/// making such calls by the thousand (a runtime timing itself at each
+/// step) still looks thousands of times a second. Any other call (one
+/// that may wait, or reads what is pending) looks every time.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-fn reroute_parked(blocked: u64) {
+fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
+    let blocked = blocked & fwe_kernel::signal::caught();
     if blocked == 0 {
         return;
     }
+    let (now, hz): (u64, u64);
+    // SAFETY: reads of the virtual counter and its frequency, which macOS
+    // lets every thread read.
+    unsafe {
+        std::arch::asm!(
+            "mrs {}, cntvct_el0",
+            "mrs {}, cntfrq_el0",
+            out(reg) now,
+            out(reg) hz,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if now.wrapping_sub(LOOKED.get()) < hz / LOOK_EVERY_PER_SECOND && glance() {
+        return;
+    }
+    LOOKED.set(now);
     let parked = host::pending_signals() & blocked;
     if parked == 0 {
         return;
@@ -394,7 +446,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         return 1;
     }
     let mask = thread::mask();
-    reroute_parked(mask);
+    reroute_parked(mask, || glances(nr, b.regs.x[1]));
     // What a plain return keeps: the general registers but `x0`, `sp` and
     // the flags (the vector registers change only with the pc, as a
     // signal's delivery or return changes them).
@@ -757,7 +809,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // SAFETY: terminating the process.
         unsafe { libc::_exit(127) }
     }
-    reroute_parked(thread::mask());
+    reroute_parked(thread::mask(), || false);
     // A traced process stopping at system calls: the entry's stop, where
     // the tracer may change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
