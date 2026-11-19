@@ -298,9 +298,11 @@ a processor that reports `DIC` clear.
   tells which instructions run with them saved; `jit::body_of` restores
   them before any other. Its unsaved entry (`Block::unsaved`) is past
   that restore when the block starts with it, or a copy of the words up
-  to it made with them in their registers, which branches into the rest;
-  where those words name `x18`, which the saved words keep in `x17`, a
-  save of `x16` and `x17` and a branch into the saved words.
+  to it made with them in their registers, which branches into the rest,
+  or, at a call or a branch through a register the saved words make with
+  them saved, saves them and branches there; where those words name
+  `x18`, which the saved words keep in `x17`, a save of `x16` and `x17`
+  and a branch into the saved words.
 - **The table** of translations by guest address is 2^20 entries of
   (address, translation) at 2^45 (32 TiB, reachable with one `orr`),
   each 16 bytes aligned and written whole (`stp`) for lookups that read

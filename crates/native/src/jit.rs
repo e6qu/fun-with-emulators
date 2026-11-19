@@ -2596,7 +2596,8 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     out.push(MISS);
     debug_assert_eq!(out.len(), CHECK_WORDS);
     info.extend([Word::Lookup { g, link: None, to: Some(16) }; CHECK_WORDS]);
-    let mut c = Calls { known, pads: Vec::new(), made: Vec::new(), joins: Vec::new() };
+    let mut c =
+        Calls { known, pads: Vec::new(), made: Vec::new(), lookups: Vec::new(), joins: Vec::new() };
     let Body { calls, end, restore, x18 } =
         body_of(g, t, followed, true, None, &mut c, &mut out, &mut info);
     // The wrong block's way out.
@@ -2637,13 +2638,16 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
 /// blocks' words (`known`: program address, words), and what it makes:
 /// ways back after its calls' `bl`s ([`RETS`]: return address, word
 /// index), calls made in its own first words (program
-/// address, word index), and ways out into known ones (word index, program
-/// address, words). A call's words are entered with the program's `x16`
-/// and `x17` saved.
+/// address, word index), the lookups of its branches through a register
+/// made in its first words with the program's `x16` and `x17` saved
+/// (program address, word index), and ways out into known ones (word
+/// index, program address, words). A call's words, and those lookups, are
+/// entered with the program's `x16` and `x17` saved.
 struct Calls<'a> {
     known: &'a [(u64, u64)],
     pads: Vec<(u64, usize)>,
     made: Vec<(u64, u64)>,
+    lookups: Vec<(u64, usize)>,
     joins: Vec<(usize, u64, u64)>,
 }
 
@@ -2659,7 +2663,9 @@ struct Calls<'a> {
 /// code never needs them, each lookup would wait for the last's. Made
 /// with them in their registers (not `saved`), the words go on from
 /// `merge`'s address into the block made the other way, as they are there,
-/// and at a call it makes (noted in `c` as the words were made saved).
+/// and at a call it makes or a branch through a register it looks up saved
+/// (noted in `c` as the words were made saved): a lookup saves them first
+/// either way.
 #[allow(clippy::too_many_arguments)]
 fn body_of(
     g: u64,
@@ -2732,6 +2738,24 @@ fn body_of(
             }
             ended = true;
             break;
+        }
+        // A branch through a register (`br`, `ret`), looked up with them
+        // saved: made with them in their registers, saved and on into
+        // that lookup.
+        if matches!(w & 0xffff_fc1f, 0xd61f_0000 | 0xd65f_0000) {
+            if first && saved {
+                put_x18(&mut x18, pc, out, info);
+                c.lookups.push((pc, out.len()));
+            } else if let Some(&(_, k)) = c.lookups.iter().find(|l| l.0 == pc).filter(|_| !first) {
+                if !saved {
+                    out.push(SAVE);
+                    info.push(Word::At(pc));
+                }
+                out.push(0x1400_0000 | ((k as u32).wrapping_sub(out.len() as u32) & 0x3ff_ffff));
+                info.push(Word::Saved(pc));
+                ended = true;
+                break;
+            }
         }
         // Where the words of a call made here are entered saved: past the
         // save they begin with when made unsaved.
