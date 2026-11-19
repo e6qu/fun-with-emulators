@@ -452,6 +452,11 @@ static ENTERED: AtomicU64 = AtomicU64::new(0);
 /// ones (and lookup misses) to it; of [`ENTERED`]: returns (to `x30`).
 static EXITS_DIRECT_OUT: AtomicU64 = AtomicU64::new(0);
 static EXITS_INDIRECT_OUT: AtomicU64 = AtomicU64::new(0);
+/// Of [`EXITS`]: to a block made already, by a direct branch (and of
+/// those, ones left unlinked) and by an indirect one.
+static EXITS_KNOWN_DIRECT: AtomicU64 = AtomicU64::new(0);
+static EXITS_KNOWN_UNLINKED: AtomicU64 = AtomicU64::new(0);
+static EXITS_KNOWN_INDIRECT: AtomicU64 = AtomicU64::new(0);
 static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 /// Of [`ENTERED`]: calls (`blr`) from code not translated, counted only
 /// for `FWE_TIMING` (it reads the caller's code).
@@ -533,12 +538,16 @@ pub fn counts() -> Option<String> {
     (t > 0).then(|| {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
-             indirect to code not translated), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
+             indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
+             {} indirect), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} cache lines flushed ({} blocks dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
+            EXITS_KNOWN_DIRECT.load(Ordering::Relaxed),
+            EXITS_KNOWN_UNLINKED.load(Ordering::Relaxed),
+            EXITS_KNOWN_INDIRECT.load(Ordering::Relaxed),
             ENTERED.load(Ordering::Relaxed),
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
@@ -1248,6 +1257,11 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
         regs.pc = to;
         return true;
     }
+    let known = s.by_g.contains_key(&to);
+    if known {
+        if link_here { &EXITS_KNOWN_DIRECT } else { &EXITS_KNOWN_INDIRECT }
+            .fetch_add(1, Ordering::Relaxed);
+    }
     let mut i = translation(&mut s, to);
     // (The cache emptied as blocks were made ahead: its block anew.)
     if ahead(&mut s, i) {
@@ -1267,6 +1281,8 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
         && s.link(f, at, entered(&s, i, saved, x18))
     {
         s.blocks[i].linked.push(at);
+    } else if known && link_here {
+        EXITS_KNOWN_UNLINKED.fetch_add(1, Ordering::Relaxed);
     }
     regs.pc = s.blocks[i].unsaved;
     true
