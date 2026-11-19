@@ -2417,9 +2417,21 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // A direct branch with the program's own registers, and fwe going on
     // from a trap, enter where the block takes them back; if it does not
     // at once, at its words up to there made again with them in their
-    // registers.
+    // registers. Where those words name x18, which the saved ones keep in
+    // x17 (loaded once, [`load_x18`]) and these would load and store at
+    // each use, the entry saves x16 and x17 and goes on into the saved
+    // words instead.
     let unsaved = match restore {
         Some((at, k)) if at == g => k + 1,
+        _ if x18.is_some() => {
+            let start = out.len();
+            out.push(SAVE);
+            info.push(Word::At(g));
+            let to = CHECK_WORDS as u32;
+            out.push(0x1400_0000 | (to.wrapping_sub(out.len() as u32) & 0x3ff_ffff));
+            info.push(Word::Saved(g));
+            start
+        }
         _ => {
             let start = out.len();
             body_of(g, t, followed, false, restore, &mut c, &mut out, &mut info);
