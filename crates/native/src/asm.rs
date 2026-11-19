@@ -177,6 +177,15 @@ impl<W: Copy> Asm<W> {
         &mut self.info[at.sec as usize][at.k]
     }
 
+    /// The index of the word at `at` in [`Asm::finish`]'s run, once every
+    /// word is made.
+    pub(crate) fn flat(&self, at: Pos) -> usize {
+        match at.sec {
+            Sec::Hot => at.k,
+            Sec::Cold => self.len(Sec::Hot) + at.k,
+        }
+    }
+
     /// Fill in every branch's offset, the sections placed at the byte
     /// addresses `at` (hot, cold).
     fn resolve(&mut self, at: [u64; 2]) {

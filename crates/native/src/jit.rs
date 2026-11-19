@@ -2689,7 +2689,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // in `x16`, which goes on to the saved entry if the target is this
     // block's (an entry can be taken over as such a lookup reads it).
     let (out, info) = BUFFERS.take();
-    let mut a = Asm::new(out, info, false);
+    let mut a = Asm::new(out, info, true);
     let check = Word::Lookup { g, link: None, to: Some(16) };
     let address = materialized(17, g).count();
     a.extend(H, std::iter::repeat_n(NOP, CHECK_WORDS - 2 - address), check);
@@ -2698,8 +2698,14 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     let wrong = a.label();
     a.branch(H, MISS, Field::Imm19, wrong, check);
     debug_assert_eq!(a.len(H), CHECK_WORDS);
-    let mut c =
-        Calls { known, pads: Vec::new(), made: Vec::new(), lookups: Vec::new(), joins: Vec::new() };
+    let mut c = Calls {
+        known,
+        pads: Vec::new(),
+        made: Vec::new(),
+        lookups: Vec::new(),
+        joins: Vec::new(),
+        taken: Vec::new(),
+    };
     let Body { calls, end, restore, x18 } = body_of(g, t, followed, true, None, &mut c, &mut a);
     // The wrong block's way out.
     let cold = a.cold();
@@ -2727,6 +2733,14 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
             start
         }
     };
+    // Each conditional branch's distance back from its taken way, in the
+    // block's one run of words.
+    for &(out, at) in &c.taken {
+        let back = a.flat(out) - a.flat(at);
+        if let Word::Out { cond, .. } = a.info_mut(out) {
+            *cond = u16::try_from(back).expect("a taken way within 2^16 words of its branch");
+        }
+    }
     let x18 = x18.unwrap_or(0);
     let Calls { pads, made, joins, .. } = c;
     // Other blocks enter a call's words with `x18` in its slot.
@@ -2744,13 +2758,15 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
 /// program's `x16` and `x17` saved (program address, word index), and ways
 /// out into known ones (word index, program address, words). A call's
 /// words, and those lookups, are entered with the program's `x16` and
-/// `x17` saved. Word indexes are of the hot words ([`Asm`]).
+/// `x17` saved. Word indexes are of the hot words ([`Asm`]). And its
+/// conditional branches' taken ways (way out, branch).
 struct Calls<'a> {
     known: &'a [(u64, u64)],
     pads: Vec<(u64, usize)>,
     made: Vec<(u64, u64, bool)>,
     lookups: Vec<(u64, usize)>,
     joins: Vec<(usize, u64, u64)>,
+    taken: Vec<(Pos, Pos)>,
 }
 
 /// The instructions of the block at program address `g`, translated into
@@ -2902,13 +2918,12 @@ fn body_of(
     for side in sides {
         match side {
             Side::Taken { at, to: label, g, target, saved, x18 } => {
-                let s = a.cold();
+                // Out of the way, but a `tbz`'s (whose reach is short).
+                let near = a.word(at) & 0x7e00_0000 == 0x3600_0000;
+                let s = if near { H } else { a.cold() };
                 a.bind(label, s);
                 let out = gate_out(g, Exit::Jump(target), saved, x18, s, a);
-                assert_eq!(out.sec, at.sec, "a taken way apart from its branch");
-                if let Word::Out { cond, .. } = a.info_mut(out) {
-                    *cond = (out.k - at.k) as u16;
-                }
+                c.taken.push((out, at));
             }
             Side::Call { to: label, g, target, ret } => {
                 a.bind(label, H);
