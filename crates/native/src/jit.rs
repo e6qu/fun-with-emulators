@@ -482,6 +482,15 @@ impl Block {
     fn all_words(&self) -> impl Iterator<Item = Word> + '_ {
         self.words.iter().map(|p| p.word(self.g, self.t))
     }
+
+    /// Its direct ways out ([`Exit::Jump`]): where each is, its target,
+    /// and whether it is a conditional branch's taken way.
+    fn jumps(&self) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
+        self.words.iter().enumerate().filter_map(|(k, p)| match *p {
+            Packed::Out { to, exit: 0, cond, .. } => Some((self.t + 4 * k as u64, to, cond != 0)),
+            _ => None,
+        })
+    }
 }
 
 struct Cache {
@@ -765,9 +774,12 @@ struct Held {
 impl Held {
     /// `work` done with the lock let go, and taken again after: the state
     /// may have changed meanwhile.
+    /// (Words patched meanwhile are synced by the next holder: a way out
+    /// seen unlinked a while longer only goes through fwe, which finds it
+    /// linked; unlinks, of the program's flushes and of emptying the
+    /// cache, are synced before their holders let go.)
     fn unlocked<R>(&mut self, work: impl FnOnce() -> R) -> R {
         self.since.add_to(&HOLD_NS[self.site]);
-        self.sync_patched();
         self.s = None;
         let r = work();
         let c = Clock::now();
@@ -985,10 +997,11 @@ impl State {
         self.patched.borrow_mut().push(at);
     }
 
-    /// The instruction cache lines of the words [`State::patch`] changed
-    /// invalidated: each cleaned to the point of unification, then each
-    /// invalidated, with one barrier between and after, as
-    /// `sys_icache_invalidate` does for each alone.
+    /// The instruction cache lines of the words [`State::patch`] changed,
+    /// and of those [`emit`] wrote, invalidated: each cleaned to the point
+    /// of unification, then each invalidated, with one barrier between and
+    /// after, as `sys_icache_invalidate` does for a range (and a barrier
+    /// every 20 lines, as it does on the cores that need one).
     fn sync_patched(&self) {
         let mut patched = self.patched.borrow_mut();
         if patched.is_empty() {
@@ -1001,7 +1014,10 @@ impl State {
                 std::arch::asm!("dc cvau, {0}", in(reg) at, options(nostack, preserves_flags));
             }
             std::arch::asm!("dsb ish", options(nostack, preserves_flags));
-            for &at in patched.iter() {
+            for (k, &at) in patched.iter().enumerate() {
+                if k > 0 && k % 20 == 0 {
+                    std::arch::asm!("dsb ish", options(nostack, preserves_flags));
+                }
                 std::arch::asm!("ic ivau, {0}", in(reg) at, options(nostack, preserves_flags));
             }
             std::arch::asm!("dsb ish", "isb", options(nostack, preserves_flags));
@@ -1895,12 +1911,7 @@ fn ahead_(s: &mut Held, i: usize) -> bool {
 /// Where block `b` goes on to whatever its conditions: the targets of its
 /// direct ways out that are no conditional branch's taken way.
 fn successors(b: &Block) -> Vec<u64> {
-    let mut to = Vec::new();
-    for w in b.all_words() {
-        if let Word::Out { exit: Exit::Jump(target), cond: 0, .. } = w {
-            to.push(target);
-        }
-    }
+    let mut to: Vec<u64> = b.jumps().filter(|&(_, _, cond)| !cond).map(|(_, to, _)| to).collect();
     to.sort_unstable();
     to.dedup();
     to
@@ -2022,16 +2033,9 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
 /// where there are ones, and the ways out waiting for `i`'s program address
 /// to it: as a way out's first run would, without its trap.
 fn link_waiting(s: &mut State, i: usize) {
-    let (t, g) = (s.blocks[i].t, s.blocks[i].g);
+    let g = s.blocks[i].g;
     let c = Clock::now();
-    let outs: Vec<(u64, u64)> = s.blocks[i]
-        .all_words()
-        .enumerate()
-        .filter_map(|(k, w)| match w {
-            Word::Out { exit: Exit::Jump(to), .. } => Some((t + 4 * k as u64, to)),
-            _ => None,
-        })
-        .collect();
+    let outs: Vec<(u64, u64)> = s.blocks[i].jumps().map(|(at, to, _)| (at, to)).collect();
     c.add_to(&PROBE[13]);
     let c = Clock::now();
     for (at, to) in outs {
@@ -2468,16 +2472,20 @@ fn write(c: &mut Cache, words: &[u32]) -> u64 {
         unsafe { ((k.rw + off + 4 * i as u64) as *mut u32).write(w) };
     }
     k.used = (off + len + 7) & !7;
-    // SAFETY: the words just written, in the executable view.
-    unsafe { crate::prepare::flush_icache(k.rx + off, len) };
     k.rx + off
 }
 
+/// Write `words` in the cache ([`write`]), synced for instruction fetch
+/// with the words patched since the last sync ([`State::sync_patched`]),
+/// once for both: their executable address. (Room is written again only
+/// once the cache is emptied, which syncs the ways out it unlinks.)
 fn emit(s: &mut State, words: &[u32]) -> u64 {
-    // (Branches patched into room about to be written again lead there no
-    // longer.)
+    let t = write(s.cache.as_mut().expect("a code cache"), words);
+    let line = 4 << (crate::hwcap::CTR_EL0 & 15);
+    let end = t + 4 * words.len() as u64;
+    s.patched.borrow_mut().extend((t & !(line - 1)..end).step_by(line as usize));
     s.sync_patched();
-    write(s.cache.as_mut().expect("a code cache"), words)
+    t
 }
 
 /// The program's instruction at `g`, read from its memory, or from the
