@@ -2061,7 +2061,8 @@ fn successors(b: &Block) -> Vec<u64> {
 /// the cache, and publish it.
 #[inline(never)]
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
-    let Made { asm, entry, unsaved, x18, calls, pads, calls_at, joins, end: _ } = made;
+    let Made { mut room, entry, unsaved, x18, end: _ } = made;
+    let Room { asm, c: calls } = &mut room;
     let (hot, cold) = (asm.len(H), asm.len(C));
     let c = Clock::now();
     // (Room is made first: emptying the cache forgets every page's other
@@ -2071,23 +2072,25 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     note_aliases(s, page);
     // Its branches resolved where it goes, its ways out on into the exit
     // stub of its chunk.
-    let (words, made_info) = asm.finish([at, at_cold], stub);
+    asm.finish([at, at_cold], stub);
     c.add_to(&PROBE[7]);
     // The block keeps what its words stand for, packed, in room of their
     // own (an expansion's start as made, at 0).
     let c = Clock::now();
-    let info: Vec<Packed> = made_info.iter().map(|&w| Packed::of(w, g, 0)).collect();
+    let mut info = Vec::with_capacity(hot + cold);
+    info.extend(asm.info(H).iter().map(|&w| Packed::of(w, g, 0)));
+    info.extend(asm.info(C).iter().map(|&w| Packed::of(w, g, 0)));
     c.add_to(&PROBE[6]);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
-    for r in calls {
+    for &r in &calls.calls {
         if s.returns.insert(r) && s.outside.remove(&r) {
             unpublish(r, 0);
         }
     }
     let c = Clock::now();
-    let (t, cold_t) = emit(s, &words[..hot], &words[hot..]);
+    let (t, cold_t) = emit(s, asm.words(H), asm.words(C));
     assert_eq!((t, cold_t), (at, at_cold), "a block placed where its branches were pointed");
     c.add_to(&PROBE[8]);
     let c = Clock::now();
@@ -2109,20 +2112,21 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         retired: false,
         source,
         followed,
-        pads: pads.iter().map(|&(r, k)| (r, t + 4 * k as u64)).collect(),
+        pads: calls.pads.iter().map(|&(r, k)| (r, t + 4 * k as u64)).collect(),
         calls_made: Vec::new(),
     });
     s.by_g.insert(g, i);
     index_parts(&mut s.by_t, &s.blocks[i], i);
     // Its calls for blocks made later, where none is made yet; its ways
     // into calls made already linked there, if they still are.
-    for (p, k) in calls_at {
+    // Other blocks enter a call's words with `x18` in its slot.
+    for &(p, k, _) in calls.made.iter().filter(|m| !m.2) {
         if let std::collections::btree_map::Entry::Vacant(e) = s.calls_made.entry(p) {
             e.insert((i, t + 4 * k));
             s.blocks[i].calls_made.push((p, t + 4 * k));
         }
     }
-    for (k, p, at) in joins {
+    for &(k, p, at) in &calls.joins {
         let from = t + 4 * k as u64;
         if let Some(&(j, made)) = s.calls_made.get(&p)
             && made == at
@@ -2140,7 +2144,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     let c = Clock::now();
     link_waiting(s, i);
     c.add_to(&PROBE[11]);
-    BUFFERS.set((words, made_info));
+    ROOM.set(Some(room));
     i
 }
 
@@ -2748,33 +2752,30 @@ fn with_snapshot<R>(g: u64, words: &[u32], work: impl FnOnce() -> R) -> R {
 
 /// A block's translation ([`translate`]).
 struct Made {
-    /// Its words, hot and cold, and what each stands for, to be finished
-    /// where they are placed.
-    asm: Asm<Word>,
+    /// Its words, hot and cold, what each stands for (to be finished where
+    /// they are placed) and its calls.
+    room: Room,
     /// Its saved, unsaved and `x18` entries ([`Block`]), as indexes of its
     /// hot words (the last 0 if none).
     entry: usize,
     unsaved: usize,
     x18: usize,
-    /// Where its calls return, and the end of the program's words it read.
-    calls: Vec<u64>,
+    /// The end of the program's words it read.
     end: u64,
-    /// Its calls' pads ([`RETS`]): where each returns, and the word index.
-    pads: Vec<(u64, usize)>,
-    /// The calls it makes for every block ([`State::calls_made`]): each
-    /// one's program address and word index; and its ways out into calls
-    /// made already ([`Exit::Join`]): each one's word index, the call's
-    /// program address and the address of its words.
-    calls_at: Vec<(u64, u64)>,
-    joins: Vec<(usize, u64, u64)>,
+}
+
+/// The room a block is made in: its words ([`Asm`]) and calls ([`Calls`]).
+/// A thread keeps it for the next block ([`ROOM`]).
+struct Room {
+    asm: Asm<Word>,
+    c: Calls,
 }
 
 thread_local! {
-    /// The words of the block a thread translates and what each stands
-    /// for, kept with their room for the next ([`translate`], [`place`]):
-    /// made afresh, they grew a push at a time, copied at each doubling.
-    static BUFFERS: std::cell::Cell<(Vec<u32>, Vec<Word>)> =
-        const { std::cell::Cell::new((Vec::new(), Vec::new())) };
+    /// The room a thread makes blocks in ([`translate`], [`place`]), kept
+    /// for the next: made afresh, its words and the rest grew a push at a
+    /// time, copied at each doubling, and were let go each block.
+    static ROOM: std::cell::Cell<Option<Room>> = const { std::cell::Cell::new(None) };
 }
 
 /// Translate the block at program address `g`, to be placed at `t`: its
@@ -2787,8 +2788,11 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // in). A lookup that read them apart enters at the check, the target
     // in `x16`, which goes on to the saved entry if the target is this
     // block's (an entry can be taken over as such a lookup reads it).
-    let (out, info) = BUFFERS.take();
-    let mut a = Asm::new(out, info);
+    let mut room = ROOM.take().unwrap_or_else(|| Room { asm: Asm::new(), c: Calls::default() });
+    room.c.clear();
+    room.c.known.extend_from_slice(known);
+    let Room { asm: a, c } = &mut room;
+    a.clear();
     let check = Word::Lookup { g, link: None, to: Some(16) };
     let address = materialized(17, g).count();
     a.extend(H, std::iter::repeat_n(NOP, CHECK_WORDS - 2 - address), check);
@@ -2797,16 +2801,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     let wrong = a.label();
     a.branch(H, MISS, Field::Imm19, wrong, check);
     debug_assert_eq!(a.len(H), CHECK_WORDS);
-    let mut c = Calls {
-        known,
-        pads: Vec::new(),
-        made: Vec::new(),
-        lookups: Vec::new(),
-        joins: Vec::new(),
-        taken: Vec::new(),
-        entries: Vec::new(),
-    };
-    let Body { calls, end, restore, x18 } = body_of(g, t, followed, true, None, &mut c, &mut a);
+    let Body { end, restore, x18 } = body_of(g, t, followed, true, None, c, a);
     // The wrong block's way out.
     a.bind(wrong, C);
     a.push(C, EXIT, Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 });
@@ -2828,7 +2823,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
         }
         _ => {
             let start = a.len(H);
-            body_of(g, t, followed, false, restore, &mut c, &mut a);
+            body_of(g, t, followed, false, restore, c, a);
             start
         }
     };
@@ -2840,35 +2835,51 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
             *cond = u16::try_from(back).expect("a taken way within 2^16 words of its branch");
         }
     }
-    let x18 = x18.unwrap_or(0);
-    let Calls { pads, made, joins, .. } = c;
-    // Other blocks enter a call's words with `x18` in its slot.
-    let calls_at = made.into_iter().filter(|m| !m.2).map(|m| (m.0, m.1)).collect();
-    Made { asm: a, entry: CHECK_WORDS, unsaved, x18, calls, end, pads, calls_at, joins }
+    Made { room, entry: CHECK_WORDS, unsaved, x18: x18.unwrap_or(0), end }
 }
 
 /// A block's calls as [`body_of`] makes them: those made already in other
-/// blocks' words (`known`: program address, words), and what it makes:
-/// ways back after its calls' `bl`s ([`RETS`]: return address, word
-/// index), calls made in its own first words (program address, word index,
-/// and whether `x18` is held in `x17` there, [`load_x18`]), the lookups of
-/// its branches through a register made in its first words with the
-/// program's `x16` and `x17` saved (program address, word index), and ways
-/// out into known ones (word index, program address, words). A call's
-/// words, and those lookups, are entered with the program's `x16` and
-/// `x17` saved. Word indexes are of the hot words ([`Asm`]). And its
-/// conditional branches' taken ways (way out, branch); and where each of
-/// its instructions' words begin, as their program address, word index,
-/// whether the program's `x16` and `x17` are saved there and whether its
-/// `x18` is held in `x17` ([`body_of`]).
-struct Calls<'a> {
-    known: &'a [(u64, u64)],
+/// blocks' words (`known`: program address, words), where its own return,
+/// and what it makes: ways back after its calls' `bl`s ([`RETS`]: return
+/// address, word index), calls made in its own first words (program
+/// address, word index, and whether `x18` is held in `x17` there,
+/// [`load_x18`]), the lookups of its branches through a register made in
+/// its first words with the program's `x16` and `x17` saved (program
+/// address, word index), and ways out into known ones (word index, program
+/// address, words). A call's words, and those lookups, are entered with
+/// the program's `x16` and `x17` saved. Word indexes are of the hot words
+/// ([`Asm`]). And its conditional branches' taken ways (way out, branch);
+/// where each of its instructions' words begin, as their program address,
+/// word index, whether the program's `x16` and `x17` are saved there and
+/// whether its `x18` is held in `x17`; and its words out of line, made
+/// after the rest ([`Side`]).
+#[derive(Default)]
+struct Calls {
+    known: Vec<(u64, u64)>,
+    calls: Vec<u64>,
     pads: Vec<(u64, usize)>,
     made: Vec<(u64, u64, bool)>,
     lookups: Vec<(u64, usize)>,
     joins: Vec<(usize, u64, u64)>,
     taken: Vec<(Pos, Pos)>,
     entries: Vec<(u64, usize, bool, bool)>,
+    sides: Vec<Side>,
+}
+
+impl Calls {
+    /// Emptied for another block, their room kept.
+    fn clear(&mut self) {
+        let Calls { known, calls, pads, made, lookups, joins, taken, entries, sides } = self;
+        known.clear();
+        calls.clear();
+        pads.clear();
+        made.clear();
+        lookups.clear();
+        joins.clear();
+        taken.clear();
+        entries.clear();
+        sides.clear();
+    }
 }
 
 /// The instructions of the block at program address `g`, translated into
@@ -2899,8 +2910,7 @@ fn body_of(
     // The words made first, with `x16` and `x17` saved.
     let first = saved;
     let mut pc = g;
-    let mut calls = Vec::new();
-    let mut sides = Vec::new();
+    let mut sides = std::mem::take(&mut c.sides);
     let mut restore = None;
     let mut ended = false;
     // The program's x18 in x17, while x16 and x17 are saved: whether it
@@ -2987,8 +2997,8 @@ fn body_of(
         }
         let quiet_here = quiet.as_ref().map_or(0, |q| q[((pc - g) / 4) as usize]);
         // `bl`, `blr`
-        if w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000 {
-            calls.push(pc + 4);
+        if first && (w & 0xfc00_0000 == 0x9400_0000 || w & 0xffff_fc1f == 0xd63f_0000) {
+            c.calls.push(pc + 4);
         }
         if saved && !is_branch(w) && !keeps_saved(w, false) && in_x17(w).is_none() {
             put_x18(&mut x18, pc, a);
@@ -3021,7 +3031,7 @@ fn body_of(
     }
     // The taken ways of its conditional branches (out of the way, but a
     // `tbz`'s) and its direct calls' ways to their targets, after the rest.
-    for side in sides {
+    for side in sides.drain(..) {
         match side {
             Side::Taken { at, to: label, g, target, saved, x18 } => {
                 // Into the block's own words where they hold the target with
@@ -3049,15 +3059,14 @@ fn body_of(
             Side::Lookup(tail) => lookup_tail(&tail, a),
         }
     }
-    Body { calls, end: pc, restore, x18: x18_entry }
+    c.sides = sides;
+    Body { end: pc, restore, x18: x18_entry }
 }
 
-/// What [`body_of`] made: where the block's calls return, the end of the
-/// program's words it read, where it first restores the program's `x16`
-/// and `x17` (the program address, and the word), and where it is entered
-/// with its `x18` loaded (the word).
+/// What [`body_of`] made: the end of the program's words it read, where it
+/// first restores the program's `x16` and `x17` (the program address, and
+/// the word), and where it is entered with its `x18` loaded (the word).
 struct Body {
-    calls: Vec<u64>,
     end: u64,
     restore: Option<(u64, usize)>,
     x18: Option<usize>,
@@ -3952,8 +3961,9 @@ mod tests {
         // As far as a block's look ahead reads ([`snapshot`]).
         words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
         let made = with_snapshot(g, &words, || translate(g, 0, false, &[]));
-        let mut rets: Vec<u64> = made.pads.iter().map(|p| p.0).collect();
+        let pads = &made.room.c.pads;
+        let mut rets: Vec<u64> = pads.iter().map(|p| p.0).collect();
         rets.dedup();
-        assert_eq!(rets.len(), made.pads.len(), "pads {:x?}", made.pads);
+        assert_eq!(rets.len(), pads.len(), "pads {pads:x?}");
     }
 }

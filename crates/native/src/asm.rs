@@ -105,17 +105,26 @@ pub(crate) struct Asm<W> {
 }
 
 impl<W: Copy> Asm<W> {
-    /// An empty block, its hot words made in `words` and `info` (cleared;
-    /// their room kept).
-    pub(crate) fn new(mut words: Vec<u32>, mut info: Vec<W>) -> Asm<W> {
-        words.clear();
-        info.clear();
+    /// An empty block.
+    pub(crate) fn new() -> Asm<W> {
         Asm {
-            words: [words, Vec::new()],
-            info: [info, Vec::new()],
+            words: [Vec::new(), Vec::new()],
+            info: [Vec::new(), Vec::new()],
             labels: vec![None],
             fixups: Vec::new(),
         }
+    }
+
+    /// Emptied for another block, its room kept: a translator makes one
+    /// block after another in the same room.
+    pub(crate) fn clear(&mut self) {
+        for s in [Sec::Hot, Sec::Cold] {
+            self.words[s as usize].clear();
+            self.info[s as usize].clear();
+        }
+        self.labels.clear();
+        self.labels.push(None);
+        self.fixups.clear();
     }
 
     /// The number of words in section `s`.
@@ -138,9 +147,11 @@ impl<W: Copy> Asm<W> {
 
     /// Words `ws`, each standing for `i`, at the end of section `s`.
     pub(crate) fn extend(&mut self, s: Sec, ws: impl IntoIterator<Item = u32>, i: W) {
-        for w in ws {
-            self.push(s, w, i);
-        }
+        let words = &mut self.words[s as usize];
+        let before = words.len();
+        words.extend(ws);
+        let n = words.len() - before;
+        self.info[s as usize].extend(std::iter::repeat_n(i, n));
     }
 
     /// A new label, not yet bound.
@@ -202,7 +213,7 @@ impl<W: Copy> Asm<W> {
     /// addresses `at` (hot, cold).
     fn resolve(&mut self, at: [u64; 2]) {
         let addr = |p: Pos| at[p.sec as usize] + 4 * p.k as u64;
-        for f in std::mem::take(&mut self.fixups) {
+        for f in self.fixups.drain(..) {
             let to = match self.labels[f.to.0].expect("a branch to a label never bound") {
                 Target::At(p) => addr(p),
                 Target::Addr(a) => a,
@@ -218,17 +229,22 @@ impl<W: Copy> Asm<W> {
         }
     }
 
-    /// The block's words and what each stands for in one run, the hot
-    /// then the cold, its branches resolved for the sections placed at the
-    /// byte addresses `at` (hot, cold) and [`STUB`] at `stub`.
-    pub(crate) fn finish(mut self, at: [u64; 2], stub: u64) -> (Vec<u32>, Vec<W>) {
+    /// Its branches resolved for the sections placed at the byte addresses
+    /// `at` (hot, cold) and [`STUB`] at `stub`: each section's words are
+    /// then [`Asm::words`].
+    pub(crate) fn finish(&mut self, at: [u64; 2], stub: u64) {
         self.labels[STUB.0] = Some(Target::Addr(stub));
         self.resolve(at);
-        let [mut words, cold] = self.words;
-        let [mut info, cold_info] = self.info;
-        words.extend(cold);
-        info.extend(cold_info);
-        (words, info)
+    }
+
+    /// The words of section `s`.
+    pub(crate) fn words(&self, s: Sec) -> &[u32] {
+        &self.words[s as usize]
+    }
+
+    /// What each word of section `s` stands for.
+    pub(crate) fn info(&self, s: Sec) -> &[W] {
+        &self.info[s as usize]
     }
 }
 
@@ -244,7 +260,7 @@ mod tests {
     /// their targets' distance in words in each field.
     #[test]
     fn branches_reach_their_labels() {
-        let mut a: Asm<u8> = Asm::new(Vec::new(), Vec::new());
+        let mut a: Asm<u8> = Asm::new();
         let back = a.label_at(Pos::hot(0));
         a.push(Sec::Hot, 1, 0);
         let fwd = a.label();
@@ -259,7 +275,8 @@ mod tests {
         a.branch(Sec::Cold, B, Field::Imm26, back, 0);
         a.branch(Sec::Cold, B, Field::Imm26, STUB, 0);
         // The cold words 100 words past the hot, the stub 50 before them.
-        let (w, _) = a.finish([0x1000, 0x1000 + 4 * 100], 0x1000 - 4 * 50);
+        a.finish([0x1000, 0x1000 + 4 * 100], 0x1000 - 4 * 50);
+        let w = [a.words(Sec::Hot), a.words(Sec::Cold)].concat();
         // Each branch back in two's complement: -101 is 2^26 - 101.
         let back = |n: u32| (1 << 26) - n;
         assert_eq!(
@@ -280,12 +297,16 @@ mod tests {
     /// Words made in turns land in their sections' runs, the hot first.
     #[test]
     fn words_land_in_their_sections() {
-        let mut a: Asm<u8> = Asm::new(vec![9], vec![9]);
+        let mut a: Asm<u8> = Asm::new();
+        a.push(Sec::Hot, 9, 9);
+        a.clear();
         a.push(Sec::Hot, 1, 1);
         a.push(Sec::Cold, 2, 2);
         a.push(Sec::Hot, 3, 3);
         assert_eq!(a.flat(Pos { sec: Sec::Cold, k: 0 }), 2);
-        assert_eq!(a.finish([0, 8], 0), (vec![1, 3, 2], vec![1, 3, 2]));
+        a.finish([0, 8], 0);
+        assert_eq!((a.words(Sec::Hot), a.words(Sec::Cold)), (&[1, 3][..], &[2][..]));
+        assert_eq!((a.info(Sec::Hot), a.info(Sec::Cold)), (&[1, 3][..], &[2][..]));
     }
 
     /// Each field reaches as far as its bits do, and no further.
@@ -306,7 +327,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "out of its reach")]
     fn a_branch_out_of_reach_fails() {
-        let mut a: Asm<u8> = Asm::new(Vec::new(), Vec::new());
+        let mut a: Asm<u8> = Asm::new();
         let l = a.label();
         a.branch(Sec::Hot, TBZ, Field::Imm14, l, 0);
         for _ in 0..1 << 13 {
