@@ -453,10 +453,12 @@ static ENTERED: AtomicU64 = AtomicU64::new(0);
 static EXITS_DIRECT_OUT: AtomicU64 = AtomicU64::new(0);
 static EXITS_INDIRECT_OUT: AtomicU64 = AtomicU64::new(0);
 /// Of [`EXITS`]: to a block made already, by a direct branch (and of
-/// those, ones left unlinked) and by an indirect one.
+/// those, ones left unlinked) and by an indirect one (and of those, ones
+/// whose table entry another address held).
 static EXITS_KNOWN_DIRECT: AtomicU64 = AtomicU64::new(0);
 static EXITS_KNOWN_UNLINKED: AtomicU64 = AtomicU64::new(0);
 static EXITS_KNOWN_INDIRECT: AtomicU64 = AtomicU64::new(0);
+static EXITS_KNOWN_TAKEN: AtomicU64 = AtomicU64::new(0);
 static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 /// Of [`ENTERED`]: calls (`blr`) from code not translated, counted only
 /// for `FWE_TIMING` (it reads the caller's code).
@@ -539,7 +541,7 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
-             {} indirect), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
+             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} cache lines flushed ({} blocks dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
@@ -548,6 +550,7 @@ pub fn counts() -> Option<String> {
             EXITS_KNOWN_DIRECT.load(Ordering::Relaxed),
             EXITS_KNOWN_UNLINKED.load(Ordering::Relaxed),
             EXITS_KNOWN_INDIRECT.load(Ordering::Relaxed),
+            EXITS_KNOWN_TAKEN.load(Ordering::Relaxed),
             ENTERED.load(Ordering::Relaxed),
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
@@ -571,7 +574,7 @@ pub fn counts() -> Option<String> {
 
 /// The state, locked, for a caller of kind `site` ([`HOLD_NS`]).
 fn state_at(site: usize) -> Held {
-    Held { s: Some(lock_state()), site, since: std::time::Instant::now() }
+    Held { s: Some(lock_state()), site, since: Clock::now() }
 }
 
 fn state() -> Held {
@@ -584,19 +587,19 @@ struct Held {
     /// The lock (none only while [`Held::unlocked`] runs its work).
     s: Option<std::sync::MutexGuard<'static, State>>,
     site: usize,
-    since: std::time::Instant,
+    since: Clock,
 }
 
 impl Held {
     /// `work` done with the lock let go, and taken again after: the state
     /// may have changed meanwhile.
     fn unlocked<R>(&mut self, work: impl FnOnce() -> R) -> R {
-        HOLD_NS[self.site].fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.since.add_to(&HOLD_NS[self.site]);
         self.sync_patched();
         self.s = None;
         let r = work();
         self.s = Some(lock_state());
-        self.since = std::time::Instant::now();
+        self.since = Clock::now();
         r
     }
 }
@@ -619,7 +622,25 @@ impl Drop for Held {
         if let Some(s) = &self.s {
             s.sync_patched();
         }
-        HOLD_NS[self.site].fetch_add(self.since.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        self.since.add_to(&HOLD_NS[self.site]);
+    }
+}
+
+/// The time now, read only for `FWE_TIMING` (which says what the JIT's
+/// counters add up): a read costs as much as some of the work it times.
+#[derive(Clone, Copy)]
+struct Clock(Option<std::time::Instant>);
+
+impl Clock {
+    fn now() -> Self {
+        Clock(fwe_kernel::timing::on().then(std::time::Instant::now))
+    }
+
+    /// The nanoseconds since it was read, added to `to`.
+    fn add_to(self, to: &AtomicU64) {
+        if let Some(t) = self.0 {
+            to.fetch_add(t.elapsed().as_nanos() as u64, Ordering::Relaxed);
+        }
     }
 }
 
@@ -640,10 +661,10 @@ fn lock_state() -> std::sync::MutexGuard<'static, State> {
         Err(std::sync::TryLockError::WouldBlock) => {
             // Held by another thread: how often, and how long it waits
             // (held for moments, [`fwe_kernel::shortlock`]).
-            let began = std::time::Instant::now();
+            let began = Clock::now();
             let s = fwe_kernel::shortlock::lock(&STATE);
             LOCK_WAITS.fetch_add(1, Ordering::Relaxed);
-            LOCK_WAIT_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            began.add_to(&LOCK_WAIT_NS);
             s
         }
     }
@@ -695,6 +716,7 @@ fn looked_up(t: u64) -> u64 {
 }
 
 /// Make `g`'s entry say translation `t` (0: code not translated).
+#[inline(never)]
 fn publish(g: u64, t: u64) {
     write_entry(g, g, looked_up(t));
 }
@@ -1181,9 +1203,9 @@ pub fn gate_exit(regs: &mut Regs) -> Option<(u64, u64)> {
 /// where that is not code run by translation; a direct branch is linked
 /// there. `false` if `pc` is no way out of fwe's.
 pub fn exit(regs: &mut Regs, trapped: bool) -> bool {
-    let began = std::time::Instant::now();
+    let began = Clock::now();
     let r = exit_now(regs, trapped);
-    EXIT_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    began.add_to(&EXIT_NS);
     r
 }
 
@@ -1261,6 +1283,10 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     if known {
         if link_here { &EXITS_KNOWN_DIRECT } else { &EXITS_KNOWN_INDIRECT }
             .fetch_add(1, Ordering::Relaxed);
+        let key = read_entry(to).0;
+        if !link_here && key != to && key != 0 {
+            EXITS_KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed);
+        }
     }
     let mut i = translation(&mut s, to);
     // (The cache emptied as blocks were made ahead: its block anew.)
@@ -1534,9 +1560,9 @@ fn translation(s: &mut Held, g: u64) -> usize {
         let source = snapshot(g);
         // (Made at 0, its words standing anywhere; placed below.)
         let made = s.unlocked(|| {
-            let began = std::time::Instant::now();
+            let began = Clock::now();
             let made = with_snapshot(g, &source, || translate(g, 0, followed));
-            TRANSLATE_NS.fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+            began.add_to(&TRANSLATE_NS);
             made
         });
         let read_words = ((made.end - g) / 4) as usize;
@@ -1605,6 +1631,7 @@ fn successors(b: &Block) -> Vec<u64> {
 /// Place translation `made` of the block at `g` (`followed`, of code fwe
 /// prepared in place; `source`, the program's words it was made from) in
 /// the cache, and publish it.
+#[inline(never)]
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
     let Made { words, info: made_info, entry, unsaved, x18, calls, end: _ } = made;
     // The block keeps what its words stand for, in room of their own.
@@ -1659,6 +1686,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
 /// of its words dropped ([`State::dormant`]), if they were not changed: a
 /// JIT flushes code it wrote anew as the same (a method installed again,
 /// a patch undone). Only a block wanted again is taken back.
+#[inline(never)]
 fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     let i = s.dormant.remove(&g)?;
     let b = &s.blocks[i];
@@ -1757,6 +1785,7 @@ fn retarget(w: u32, at: u64, to: u64) -> Option<u32> {
 /// as code is first translated from it: a flush through one of them is a
 /// flush of `p`'s code ([`flushed`]); a JIT that maps its code twice may
 /// flush either.
+#[inline(never)]
 fn note_aliases(s: &mut State, p: u64) {
     if s.pages.contains_key(&p) {
         return;
@@ -1967,6 +1996,7 @@ fn followable(to: u64) -> bool {
 /// the largest block; else, the cache is emptied where at least half of it
 /// is dropped translations, and the block goes in a chunk with room, or a
 /// new one.
+#[inline(never)]
 fn cache_next(s: &mut State) -> u64 {
     let room = |k: &Chunk| !k.retired && k.used + BLOCK_ROOM <= chunk_size();
     let c = s.cache.as_ref().expect("a code cache");
@@ -2155,6 +2185,7 @@ thread_local! {
 
 /// The program's words from `g` as far as a block made there reads them:
 /// up to its page's end.
+#[inline(never)]
 fn snapshot(g: u64) -> Vec<u32> {
     let page = page_size();
     let n = (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize);
