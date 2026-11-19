@@ -1057,6 +1057,31 @@ fn jit_calls_to_targets_of_one_table_entry() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code whose call site the program repoints each round
+/// (guests/c/jitrepatch.c), its loop's head in an earlier cache line than
+/// the call: each round's calls reach the new target, and once the call's
+/// translation is dropped the loop's way into it is linked again rather
+/// than going through fwe at every call (40 rounds of 2000 calls).
+#[test]
+fn jit_calls_through_a_repointed_call_site() {
+    let prog = build_c("jitrepatch", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitrepatch");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 120000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    let exits: u64 = err
+        .lines()
+        .find_map(|l| l.split(" blocks translated, ").nth(1))
+        .and_then(|rest| rest.split(' ').next())
+        .and_then(|n| n.parse().ok())
+        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+    assert!(exits < 5000, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Memory a position-independent program asks for near its own code with
 /// a hint (guests/c/nearcode.c), as LuaJIT asks for room for its machine
 /// code within a branch's reach: it goes at the hint, below the program,

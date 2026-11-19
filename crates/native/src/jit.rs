@@ -262,8 +262,9 @@ enum Exit {
     /// `x17` on the stack.
     Retry,
     /// Into the call at this program address, made in another block's
-    /// words ([`State::calls_made`]): linked there, else on at its own
-    /// translation.
+    /// words ([`State::calls_made`]): linked there as the block is placed;
+    /// through fwe once those words are dropped, then linked to the
+    /// call's own translation.
     Join(u64),
 }
 
@@ -1360,7 +1361,10 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             (to, false)
         }
         Exit::Retry => (wrong_to, false),
-        Exit::Join(to) => (to, false),
+        // Into a call whose words left (its block dropped: the program
+        // changed the call, say): linked as a direct branch, to the
+        // translation of the call.
+        Exit::Join(to) => (to, true),
     };
     let lookup = matches!(exit, Exit::Reg { .. } | Exit::Retry);
     // Code fwe prepared in place (a library's, the program's own) that a
