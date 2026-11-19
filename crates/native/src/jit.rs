@@ -181,8 +181,9 @@ const BLOCK_ROOM: u64 = 4 * 64 * 24;
 /// way into fwe each time.
 pub const TABLE: u64 = 1 << 45;
 /// The table of returns, laid out as [`TABLE`]: a call's return address,
-/// and the way back into the translation of the call (its pad, which the
-/// call's `bl` stepped over), where a return goes with `ret`. The
+/// and the way back into the translation of the call (the words after
+/// its `bl`: a direct call's block going on, an indirect call's pad),
+/// where a return goes with `ret`. The
 /// processor predicts a return to where the last `bl` would have come
 /// back to: found here, it is right, where a `br` to the address the
 /// table of translations gives would be guessed from the branches before
