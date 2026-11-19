@@ -605,7 +605,7 @@ impl<P: Platform> Kernel<P> {
         // `/proc/<pid>/maps`.
         let prepared =
             written || t.prepared.as_ref().is_some_and(|p| crate::procreg::own_prepared(&p.0));
-        let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
+        let auxv = || self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
         match &t.child_writes {
             _ if prepared => {}
             Some(from) => crate::procreg::own_whole(
@@ -613,7 +613,7 @@ impl<P: Platform> Kernel<P> {
                 &t.inherit,
                 t.dirs.clone(),
                 crate::maps::forked(),
-                &auxv,
+                &auxv(),
                 from,
             ),
             None => crate::procreg::own_line(
@@ -621,7 +621,7 @@ impl<P: Platform> Kernel<P> {
                 &t.inherit,
                 t.dirs.clone(),
                 crate::maps::forked(),
-                &auxv,
+                &auxv(),
             ),
         }
         // Its limits, its parent's, for other processes to read (in the

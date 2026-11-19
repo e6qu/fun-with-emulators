@@ -391,6 +391,7 @@ def macos(a):
     # And a fork's: its steps in fwe, the host's calls and the kernel's
     # work in both processes, under fwe and natively.
     phases("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
+    faulted("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
     pcs("fork+exit+wait (micro)", fwe + [a.bench, "fork", "2000"])
     pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
         execname=os.path.basename(a.native)[:16])
@@ -1162,6 +1163,87 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
           f"{kernel * 100 / total:.1f}%), fwe's {(total - mine) * 100 / total:.1f}%",
           file=sys.stderr)
     return mine, total
+
+
+def faulted(name, cmd):
+    """The page faults of `cmd` (an fwe process) and of the processes it
+    forks, apart, each named by the function of fwe's (or the file) whose
+    instruction took it, with DTrace's `vminfo:::as_fault`: a fork child
+    starts with no page mapped, so every page of fwe's it touches, code or
+    data, is a fault, and every page either process writes after the fork
+    is a copy. For reading only: a failure is said and the run goes on."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.faults")
+    proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    first = proc.pid
+    script = (f'vminfo:::as_fault /execname == "fwe"/ {{ @f[pid == {first} ? 0 : 1, uregs[R_PC]] '
+              '= count(); } '
+              f'proc:::exit /execname == "fwe" && pid != {first}/ {{ @kids = count(); }} '
+              'END { printa("f %d %x %@d\\n", @f); printa("kids %@d\\n", @kids); }')
+    tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
+                               "-o", out],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              errors="replace")
+    time.sleep(2)
+    proc.stdin.close()
+    looks = []
+    while proc.poll() is None:
+        if proc_name(proc.pid) == "fwe":
+            regions = host_regions(proc.pid)
+            if regions and proc.poll() is None and (not looks or looks[-1] != regions):
+                looks.append(regions)
+        time.sleep(0.01)
+    proc.wait(timeout=300)
+    dtrace = subprocess.run(["pgrep", "-P", str(tracer.pid)], capture_output=True,
+                            text=True).stdout.split()
+    subprocess.run(["sudo", "-n", "kill", "-INT"] + dtrace, capture_output=True)
+    said = tracer.communicate(timeout=60)[0]
+    faults, kids = (collections.Counter(), collections.Counter()), 0
+    if os.path.exists(out):
+        for line in open(out, errors="replace"):
+            p = line.split()
+            if len(p) == 4 and p[0] == "f":
+                faults[int(p[1])][int(p[2], 16)] += int(p[3])
+            elif len(p) == 2 and p[0] == "kids":
+                kids = int(p[1])
+    if not faults[0] and not faults[1]:
+        print(f"{name}: no faults traced: {said.strip()[-500:]}", file=sys.stderr)
+        return
+    regions = looks[-1] if looks else []
+    lows = [r[0] for r in regions]
+    exe = next((c for c in cmd if os.path.basename(c) == "fwe" and os.path.isfile(c)), None)
+    lo = next((r[0] for r in regions if os.path.basename(r[2]) == "fwe"), None)
+    pcs = sorted({pc for side in faults for pc in side})
+    mine = [pc for pc in pcs
+            if (i := bisect.bisect_right(lows, pc) - 1) >= 0 and pc < regions[i][1]
+            and os.path.basename(regions[i][2]) == "fwe"]
+    names = subprocess.run(["atos", "-o", exe, "-l", f"{lo:#x}"] + [f"{pc:#x}" for pc in mine],
+                           capture_output=True, text=True,
+                           errors="replace").stdout.splitlines() if exe and lo and mine else []
+    func = {pc: rust_name(re.sub(r" \(in .*", "", sym).strip()) for pc, sym in zip(mine, names)}
+
+    def named(pc):
+        if pc in func:
+            return func[pc]
+        i = bisect.bisect_right(lows, pc) - 1
+        if i >= 0 and pc < regions[i][1]:
+            r = regions[i]
+            if r[3] == SHARED_CACHE_TAG or not r[2]:
+                return (shared_cache_name(pc).split("+")[0] if r[3] == SHARED_CACHE_TAG
+                        else f"anonymous (tag {r[3]})")
+            return os.path.basename(r[2])
+        return "unmapped (the program's)"
+
+    per = max(kids, 1)
+    for side, who in ((1, "children"), (0, "the first process")):
+        by = collections.Counter()
+        for pc, n in faults[side].items():
+            by[named(pc)] += n
+        total = sum(by.values())
+        top = "; ".join(f"{f} {n / per:.1f}" for f, n in by.most_common(40))
+        print(f"{name}: page faults of {who} per fork ({kids} forks): {total / per:.1f}: {top}",
+              file=sys.stderr)
 
 
 def phases(name, cmd):
