@@ -641,6 +641,7 @@ static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 /// Time spent translating blocks, and in [`exit`] (with its lock), in
 /// nanoseconds.
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
+thread_local! { static PROBE_TEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
 pub static PROBE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
 /// Cache lines the program flushed, the blocks those flushes dropped,
@@ -716,11 +717,12 @@ pub fn counts() -> Option<String> {
             .enumerate()
             .map(|(k, p)| format!("{k}:{}", p.load(Ordering::Relaxed) / 1_000_000))
             .collect();
-        eprintln!("PROBE ms {}", v.join(" "));
+        PROBE_TEXT.with(|p| *p.borrow_mut() = v.join(" "));
     }
+    let probes = PROBE_TEXT.with(|p| p.borrow().clone());
     (t > 0).then(|| {
         format!(
-            "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
+            "PROBE ms {probes}; JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
              {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} cache lines flushed ({} blocks dropped, {} taken back), the code cache emptied {} times; \
