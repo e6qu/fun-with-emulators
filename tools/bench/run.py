@@ -40,6 +40,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import struct
 import subprocess
 import sys
@@ -387,6 +388,12 @@ def macos(a):
         if args[0] == "file":
             sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
             pcs(f"{name} (micro)", fwe + [a.bench, "file", args[1], "300000"])
+    # And a fork's: its steps in fwe, the host's calls and the kernel's
+    # work in both processes, under fwe and natively.
+    phases("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
+    pcs("fork+exit+wait (micro)", fwe + [a.bench, "fork", "2000"])
+    pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
+        execname=os.path.basename(a.native)[:16])
     results = {"fwe": ours, "macOS": theirs}
     # The benchmark program alone, and forking and running itself.
     ran = backends(fwe + [a.bench, "forkexec", "2", a.bench])
@@ -1058,7 +1065,8 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     if not counts:
         print(f"{name}: no program counters: {said.strip()[-500:]}", file=sys.stderr)
         return None
-    print(f"{name}: its regions looked at as they changed: {len(looks)} times",
+    print(f"{name}: its regions looked at as they changed: {len(looks)} times"
+          + (f", {len(looks[-1])} regions at the last" if looks else ""),
           file=sys.stderr)
     # A file's offset from the lowest address it is mapped at.
     base = {}
@@ -1154,6 +1162,26 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
           f"{kernel * 100 / total:.1f}%), fwe's {(total - mine) * 100 / total:.1f}%",
           file=sys.stderr)
     return mine, total
+
+
+def phases(name, cmd):
+    """Run `cmd` (fwe and its program) with `FWE_TIMING`, and log the time
+    between each of its marks and the one before it in the same process,
+    by mark (numbers in a mark's name taken as one), as the median and the
+    total over the run: where a step that repeats (a fork, a wait) spends
+    its time."""
+    r = subprocess.run(cmd, env=dict(os.environ, FWE_TIMING="1"), capture_output=True,
+                       text=True, errors="replace")
+    steps = collections.defaultdict(list)
+    for line in r.stderr.splitlines():
+        m = re.match(r"\[fwe \d+\] timing: (.*?) \+(\d+)us \(\d+us\)$", line)
+        if m:
+            steps[re.sub(r"\d+", "N", m.group(1))[:60]].append(int(m.group(2)))
+    took = sorted(steps.items(), key=lambda kv: -sum(kv[1]))
+    print(f"{name}: steps (median and total, us): "
+          + "; ".join(f"{k} {statistics.median(v):.0f} x{len(v)} = {sum(v)}"
+                      for k, v in took if len(v) > 1),
+          file=sys.stderr)
 
 
 def sampled(name, cmd):

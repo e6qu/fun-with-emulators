@@ -240,6 +240,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             };
         }
         let k = kernel.as_mut().unwrap();
+        fwe_kernel::timing::mark("fork: begins");
         // The child's namespaces, which it inherits from this view.
         let mut token = match k.fork_begin(&a) {
             Ok(t) => t,
@@ -251,6 +252,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 return fwe_abi::err(e);
             }
         };
+        fwe_kernel::timing::mark("fork: namespaces and limits checked");
         // The child writes its whole record as it starts.
         k.fork_child_writes(&mut token);
         let kqueues = fwe_kernel::kqueue_state();
@@ -272,6 +274,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // The translations whole in the child.
         let mut jit = crate::jit::hold();
         let pid = fwe_kernel::fork_locked(|| {
+            fwe_kernel::timing::mark("fork: locked");
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
                 fork_with_signals_held(
@@ -309,6 +312,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
             thread::forked();
+            fwe_kernel::timing::mark("fork: child's threads forgotten");
             // A signal sent to it as it was being made is its own.
             trap::post_early();
             // The code pages its parent wrote are the parent's to keep.
@@ -320,7 +324,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);
-            k.fork_child(token)
+            fwe_kernel::timing::mark("fork: child's kqueues restored");
+            let r = k.fork_child(token);
+            fwe_kernel::timing::mark("fork: child's record written");
+            r
         } else {
             k.fork_parent(token, pid)
         };
@@ -337,6 +344,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         if pid == 0 && share.is_empty() {
             kernel.as_mut().unwrap().unmap_dont_fork();
         }
+        fwe_kernel::timing::mark("fork: what is not inherited unmapped");
         if pid == 0 {
             // SAFETY: this is the child, its only thread the caller, which
             // holds the lock.
@@ -388,6 +396,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // Its waits from here on are the program's.
         fwe_kernel::procstore::entered();
         trap::prepare_guest_entry();
+        fwe_kernel::timing::mark("fork: child enters the guest");
         // SAFETY: `regs` is the parent's runnable context with x0 cleared.
         unsafe { trap::enter_guest_full(&regs) }
     }
@@ -451,6 +460,7 @@ fn fork_with_signals_held(
         libc::sigdelset(&mut all, libc::SIGSYS);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
         let pid = fork();
+        fwe_kernel::timing::mark("fork: host fork returned");
         // What a failed fork left, kept for the caller across the calls below.
         let saved = host::last_errno();
         if pid > 0 {
@@ -468,6 +478,7 @@ fn fork_with_signals_held(
             while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
                 && host::last_errno() == libc::EINTR
             {}
+            fwe_kernel::timing::mark("fork: child let go");
         }
         for fd in go.into_iter().filter(|&fd| fd >= 0) {
             if pid == 0 && fd == go[1] {
@@ -795,8 +806,10 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     let mut status: libc::c_int = 0;
     // SAFETY: an all-zero rusage is a valid out-parameter.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    fwe_kernel::timing::mark("wait: begins");
     // SAFETY: `status` and `usage` are valid out-parameters.
     let mut r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
+    fwe_kernel::timing::mark("wait: host wait returned");
     if r < 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
         // The child's own SIGCHLD may interrupt the wait before the host
         // reports the child: Linux reports a child that is ready over the
@@ -833,6 +846,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         });
         reaper::reaped_child(r);
     }
+    fwe_kernel::timing::mark("wait: reaped");
     guest
 }
 
