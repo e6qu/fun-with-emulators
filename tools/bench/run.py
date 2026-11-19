@@ -1127,11 +1127,13 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
         breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total)
     except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
         print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
-    try:
-        inclusive(name, execname, cmd, ustacks, busiest, threads[busiest].total(), looks, base,
-                  where)
-    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
-        print(f"{name}: no stacks by function: {e!r}", file=sys.stderr)
+    # The busiest threads' (a program's other threads may spend theirs in
+    # fwe where its main one does not).
+    for tid, pcs_of in sorted(threads.items(), key=lambda t: -t[1].total())[:3]:
+        try:
+            inclusive(name, execname, cmd, ustacks, tid, pcs_of.total(), looks, base, where)
+        except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+            print(f"{name}: no stacks by function: {e!r}", file=sys.stderr)
     # The unnamed regions most samples are in: their tag and protection.
     hot = {w for w, _ in by.most_common(8)}
     for regions in looks:
@@ -1177,10 +1179,12 @@ def faulted(name, cmd):
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
     first = proc.pid
-    script = (f'vminfo:::as_fault /execname == "fwe"/ {{ @f[pid == {first} ? 0 : 1, uregs[R_PC]] '
-              '= count(); } '
+    # By the faulting instruction's stack: a fault in a library (`malloc`'s,
+    # mostly) is named by the function of fwe's that called it.
+    script = (f'vminfo:::as_fault /execname == "fwe"/ {{ @f[pid == {first} ? 0 : 1, '
+              'ustack(12)] = count(); } '
               f'proc:::exit /execname == "fwe" && pid != {first}/ {{ @kids = count(); }} '
-              'END { printa("f %d %x %@d\\n", @f); printa("kids %@d\\n", @kids); }')
+              'END { printa("f %d %@d%k\\nendf\\n", @f); printa("kids %@d\\n", @kids); }')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -1199,14 +1203,25 @@ def faulted(name, cmd):
                             text=True).stdout.split()
     subprocess.run(["sudo", "-n", "kill", "-INT"] + dtrace, capture_output=True)
     said = tracer.communicate(timeout=60)[0]
-    faults, kids = (collections.Counter(), collections.Counter()), 0
+    # (side, faults, frames), the frames as addresses.
+    stacks, kids, stack = [], 0, None
     if os.path.exists(out):
         for line in open(out, errors="replace"):
             p = line.split()
-            if len(p) == 4 and p[0] == "f":
-                faults[int(p[1])][int(p[2], 16)] += int(p[3])
+            if stack is not None:
+                if p == ["endf"]:
+                    stacks.append(stack)
+                    stack = None
+                elif p and p[0].startswith("0x"):
+                    stack[2].append(int(p[0], 16))
+            elif len(p) == 3 and p[0] == "f":
+                stack = (int(p[1]), int(p[2]), [])
             elif len(p) == 2 and p[0] == "kids":
                 kids = int(p[1])
+    faults = (collections.Counter(), collections.Counter())
+    for side, n, frames in stacks:
+        if frames:
+            faults[side][tuple(frames)] += n
     if not faults[0] and not faults[1]:
         print(f"{name}: no faults traced: {said.strip()[-500:]}", file=sys.stderr)
         return
@@ -1214,7 +1229,7 @@ def faulted(name, cmd):
     lows = [r[0] for r in regions]
     exe = next((c for c in cmd if os.path.basename(c) == "fwe" and os.path.isfile(c)), None)
     lo = next((r[0] for r in regions if os.path.basename(r[2]) == "fwe"), None)
-    pcs = sorted({pc for side in faults for pc in side})
+    pcs = sorted({pc for side in faults for frames in side for pc in frames})
     mine = [pc for pc in pcs
             if (i := bisect.bisect_right(lows, pc) - 1) >= 0 and pc < regions[i][1]
             and os.path.basename(regions[i][2]) == "fwe"]
@@ -1235,11 +1250,24 @@ def faulted(name, cmd):
             return os.path.basename(r[2])
         return "unmapped (the program's)"
 
+    def in_fwe(pc):
+        i = bisect.bisect_right(lows, pc) - 1
+        return i >= 0 and pc < regions[i][1] and os.path.basename(regions[i][2]) == "fwe"
+
+    def by_caller(frames):
+        # The faulting function, and the first of fwe's functions on its
+        # way there where it is another's (a library's).
+        leaf = named(frames[0])
+        if in_fwe(frames[0]):
+            return leaf
+        caller = next((pc for pc in frames[1:] if in_fwe(pc)), None)
+        return f"{leaf} < {named(caller)}" if caller is not None else leaf
+
     per = max(kids, 1)
     for side, who in ((1, "children"), (0, "the first process")):
         by = collections.Counter()
-        for pc, n in faults[side].items():
-            by[named(pc)] += n
+        for frames, n in faults[side].items():
+            by[by_caller(frames)] += n
         total = sum(by.values())
         top = "; ".join(f"{f} {n / per:.1f}" for f, n in by.most_common(40))
         print(f"{name}: page faults of {who} per fork ({kids} forks): {total / per:.1f}: {top}",

@@ -330,7 +330,7 @@ pub struct Caller {
 /// This process's identity: host pid and start time.
 fn me() -> (i32, u64) {
     let pid = crate::host::pid();
-    (pid, crate::procreg::host_info(pid).map_or(0, |i| i.0))
+    (pid, crate::procreg::own_start().unwrap_or(0))
 }
 
 /// How a key id is looked up (Linux's `KEY_LOOKUP_*`): whether a missing

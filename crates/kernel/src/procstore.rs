@@ -343,7 +343,7 @@ pub fn busy(pid: i32) -> bool {
 pub fn entered() {
     let pid = crate::host::pid();
     if let Some(w) = entered_word(pid)
-        && let Some((start, _, _)) = crate::procreg::host_info(pid)
+        && let Some(start) = crate::procreg::own_start()
     {
         w.store(start, SeqCst);
     }

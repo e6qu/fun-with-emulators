@@ -284,7 +284,31 @@ pub fn host_parent(pid: i32) -> Option<i32> {
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
 pub fn start_time(pid: i32) -> Option<u64> {
+    if pid == crate::host::pid() {
+        return own_start();
+    }
     host_info(pid).map(|(start, _, _)| start)
+}
+
+/// This process's start time, asked of the host once (a fork child's is
+/// its own: its pid is another).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn own_start() -> Option<u64> {
+    use std::sync::atomic::{AtomicI32, AtomicU64, Ordering::SeqCst};
+    static OF: AtomicI32 = AtomicI32::new(0);
+    static START: AtomicU64 = AtomicU64::new(0);
+    let pid = crate::host::pid();
+    if OF.load(SeqCst) == pid {
+        return Some(START.load(SeqCst));
+    }
+    let (start, _, _) = host_info(pid)?;
+    // (Two threads asking at once store the same.)
+    START.store(start, SeqCst);
+    OF.store(pid, SeqCst);
+    Some(start)
 }
 
 fn encode(r: &ProcRecord) -> Vec<u8> {
