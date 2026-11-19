@@ -128,7 +128,7 @@ process, whose `catatonit` is one, then waits in a loop of its own.
 ```mermaid
 flowchart TD
     start["fwe program args"] --> elf{"ELF type"}
-    elf -- "ET_DYN (PIE)" --> native["native backend: placed where macOS has room"]
+    elf -- "ET_DYN (PIE)" --> native["native backend: placed two thirds up the address space"]
     elf -- "ET_EXEC" --> where{"lowest page below 4 GiB?"}
     where -- no --> native2["native backend: placed at its link address"]
     where -- yes --> moves{"static, relocations kept?"}
@@ -1607,14 +1607,15 @@ flowchart TB
     subgraph host["fwe process address space (macOS, 16 KiB pages)"]
         direction TB
         pz["0 – 4 GiB: __PAGEZERO, unmappable"]
-        img["guest image (PIE: at a base the host picks, ET_EXEC: at its link address ≥ 4 GiB)"]
+        fwe["fwe's own: binary, dyld, libSystem, heap, signal stacks, rt_sigreturn trampoline"]
+        ld["dynamic linker (where macOS places it)"]
+        mm["shared libraries, guest mmap regions: from 2 TiB up"]
+        img["guest image (ET_EXEC: at its link address ≥ 4 GiB; PIE: at 0x5555_5555_0000, free room below)"]
         stubs["stub arena right after the image (code stubs, within 128 MiB branch range)"]
         brk["break: up to 1 GiB reserved after the image and stubs"]
-        ld["dynamic linker, shared libraries, guest mmap regions (where macOS places them)"]
-        stack["guest stack: RLIMIT_STACK (128 KiB to 4 GiB) + guard page"]
-        fwe["fwe's own: binary, dyld, libSystem, heap, signal stacks, rt_sigreturn trampoline"]
+        stack["guest stack, ending at 0x7fff_0000_0000: RLIMIT_STACK (128 KiB to 4 GiB) + guard page"]
     end
-    pz --- img --- stubs --- brk --- ld --- stack --- fwe
+    pz --- fwe --- ld --- mm --- img --- stubs --- brk --- stack
 ```
 
 - The loader reserves the image's whole span, then copies each segment

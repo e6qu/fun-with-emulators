@@ -169,7 +169,10 @@ and `fork`.
 ### Loading
 
 - The loader (`crates/native/src/loader.rs`) reserves the image's span (a
-  PIE where the host picks), copies each `PT_LOAD` segment in, writable,
+  PIE executable at `loader::PIE_BASE`, two thirds up the host's 47 bits
+  as Linux places one, with free room below it for memory a program wants
+  within a branch's reach of its code; its dynamic linker where the host
+  picks), copies each `PT_LOAD` segment in, writable,
   rewrites its code and sets the final protections, or maps its kept
   image (see [Kept preparation and images](#kept-preparation-and-images)).
   A static non-PIE program linked below 4 GiB whose link kept its
@@ -179,7 +182,8 @@ and `fork`.
 - The break is reserved after the image and its stub space (up to 1 GiB,
   halved while something is in the way) before the dynamic linker is
   placed. The main stack is as large as the soft `RLIMIT_STACK` (128 KiB
-  to 4 GiB), with a guard page.
+  to 4 GiB), with a guard page, and ends at `loader::STACK_TOP`, near the
+  top of the host's 47 bits, above the image as on Linux.
 - `execve` of a script runs its `#!` interpreter (`Kernel::exec_target`)
   in either backend, so no shell is needed.
 - The auxiliary vector's ids and `AT_SECURE` are the guest's, as the

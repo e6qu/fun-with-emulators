@@ -1048,8 +1048,8 @@ pub fn load_image(
 
     let strace = tracer.enabled;
     let slots = (platform.tp_slot, platform.x18_slot);
-    let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
-        let loaded = loader::load(elf, page, id, slots, |a, l, known, arena, cache| {
+    let load_object = |elf: &Elf, id, at, what: &str| -> Result<loader::Loaded, Error> {
+        let loaded = loader::load(elf, page, id, slots, at, |a, l, known, arena, cache| {
             let stats =
                 platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
@@ -1068,7 +1068,7 @@ pub fn load_image(
         Ok(loaded)
     };
 
-    let loaded = load_object(&elf, file_id, "exe")?;
+    let loaded = load_object(&elf, file_id, Some(loader::PIE_BASE), "exe")?;
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
@@ -1096,7 +1096,7 @@ pub fn load_image(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            let placed = load_object(&ielf, iid, "interp")?;
+            let placed = load_object(&ielf, iid, None, "interp")?;
             let name = fwe_kernel::maps::Name::Path(ip.as_slice().into());
             fwe_kernel::maps::record().loaded(
                 &ielf,
@@ -1113,12 +1113,14 @@ pub fn load_image(
     let interp_base = interp.map_or(0, |i| i.load_base);
 
     // A fresh thread stack, as large as `RLIMIT_STACK` lets it grow, with
-    // an inaccessible guard page below it.
+    // an inaccessible guard page below it, ending at `loader::STACK_TOP`
+    // where that is free.
     let stack = stack_size(stack_limit, page);
-    // SAFETY: a fresh mapping owned by the guest.
+    // SAFETY: a fresh mapping owned by the guest; not MAP_FIXED, the
+    // address is only a hint.
     let stack_base = unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            (loader::STACK_TOP - stack - page) as *mut libc::c_void,
             (stack + page) as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,

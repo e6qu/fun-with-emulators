@@ -1057,6 +1057,23 @@ fn jit_calls_to_targets_of_one_table_entry() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Memory a position-independent program asks for near its own code with
+/// a hint (guests/c/nearcode.c), as LuaJIT asks for room for its machine
+/// code within a branch's reach: it goes at the hint, below the program,
+/// and probing finds room within reach.
+#[test]
+fn a_mapping_hinted_near_the_program_s_code_goes_there() {
+    let prog = build_c("nearcode", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "nearcode");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- nearcode stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "below its code: at the hint\nprobing within reach: found\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// `x18` in JIT code (guests/c/jitx18.c): one sequence of instructions
 /// working in `x18`, and the same in `x9`, compute the same, quietly and
 /// with signals landing anywhere in them.
