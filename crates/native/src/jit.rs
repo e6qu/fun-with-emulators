@@ -98,6 +98,11 @@ const UDF: u32 = 0;
 /// `adr x16, #0`: a way out's first word, the program's `x16` and `x17`
 /// saved, until it is linked.
 const OUT: u32 = 0x1000_0010;
+/// `b <the chunk's exit stub>`, as made (at 0, [`place`] points it there).
+const TO_STUB: u32 = 0x1400_0000;
+/// The bytes at the start of each chunk that its ways out branch to on
+/// into the exit gate ([`exit_stub`]).
+const EXIT_STUB: u64 = 16;
 
 /// Most instructions a block holds before it ends and goes on to the next.
 const BLOCK_INSNS: usize = 64;
@@ -114,6 +119,12 @@ pub fn in_cache(pc: u64) -> bool {
     let n = CHUNK_COUNT.load(Ordering::Acquire) as usize;
     let size = chunk_size();
     CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < size)
+}
+
+/// Whether `pc` is in a chunk's exit stub ([`exit_stub`]).
+fn in_exit_stub(pc: u64) -> bool {
+    let n = CHUNK_COUNT.load(Ordering::Acquire) as usize;
+    CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < EXIT_STUB)
 }
 
 /// The largest code cache chunk: what a branch reaches, so blocks in one
@@ -1635,7 +1646,18 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
 /// is not in the cache.
 pub fn to_guest(regs: &mut Regs) -> bool {
     let s = state();
-    let Some(w) = word_at(&s, regs.pc) else { return false };
+    // On its way into the exit gate from the way out in `x16`, past its
+    // first words: as at the words of the way out after them.
+    let Some(w) = (if in_exit_stub(regs.pc) {
+        match word_at(&s, regs.x[16]) {
+            Some(Word::Out { g, .. }) => Some(Word::Saved(g)),
+            _ => None,
+        }
+    } else {
+        word_at(&s, regs.pc)
+    }) else {
+        return false;
+    };
     let sp = regs.sp;
     // SAFETY: the stack below which fwe's code saved registers.
     let stack = |off: u64| unsafe { (sp.wrapping_add(off) as *const u64).read() };
@@ -1940,8 +1962,18 @@ fn successors(b: &Block) -> Vec<u64> {
 /// the cache, and publish it.
 #[inline(never)]
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
-    let Made { words, info: made_info, entry, unsaved, x18, calls, pads, calls_at, joins, end: _ } =
-        made;
+    let Made {
+        mut words,
+        info: made_info,
+        entry,
+        unsaved,
+        x18,
+        calls,
+        pads,
+        calls_at,
+        joins,
+        end: _,
+    } = made;
     // The block keeps what its words stand for, packed, in room of their
     // own (an expansion's start as made, at 0).
     let c = Clock::now();
@@ -1953,6 +1985,21 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     let page = g & !(page_size() - 1);
     cache_next(s);
     note_aliases(s, page);
+    // Its ways out on into the exit stub of the chunk it goes in.
+    let (stub, at) = {
+        let c = s.cache.as_ref().expect("a code cache");
+        let k = &c.chunks[c.current];
+        (k.rx, k.rx + k.used)
+    };
+    for (k, w) in made_info.iter().enumerate() {
+        if let Word::Out { exit, .. } = w
+            && !matches!(exit, Exit::Retry)
+        {
+            let b = k + if words[k] == OUT { 1 } else { 2 };
+            assert_eq!(words[b], TO_STUB, "a way out's branch to its stub at {g:#x}");
+            words[b] = rewrite::branch(at + 4 * b as u64, stub).expect("a chunk's stub in reach");
+        }
+    }
     c.add_to(&PROBE[7]);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
@@ -1964,6 +2011,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
     }
     let c = Clock::now();
     let t = emit(s, &words);
+    assert_eq!(t, at, "a block placed where its ways out were pointed");
     c.add_to(&PROBE[8]);
     let c = Clock::now();
     let len = 4 * words.len() as u64;
@@ -2256,11 +2304,27 @@ fn new_chunk() -> Chunk {
             0
         );
     }
+    exit_stub(rw, rx);
     let n = CHUNK_COUNT.load(Ordering::Relaxed) as usize;
     assert!(n < MAX_CHUNKS, "fwe's code cache is full");
     CHUNK_RX[n].store(rx, Ordering::Relaxed);
     CHUNK_COUNT.store(n as u64 + 1, Ordering::Release);
-    Chunk { rw, rx, used: 0, retired: false }
+    Chunk { rw, rx, used: EXIT_STUB, retired: false }
+}
+
+/// Write the exit stub at the start of the chunk whose views are `rw` and
+/// `rx`: `ldr x17, #8; br x17` and the exit gate's address. Each way out
+/// of the chunk's blocks branches there, `x16` its own address
+/// ([`gate_out`]); the stub stays while the chunk does.
+fn exit_stub(rw: u64, rx: u64) {
+    let gate = crate::gate::exit_address();
+    let words = [0x5800_0000 | (2 << 5) | 17, GO, gate as u32, (gate >> 32) as u32];
+    for (k, w) in words.into_iter().enumerate() {
+        // SAFETY: the start of the chunk's writable view, fresh.
+        unsafe { ((rw + 4 * k as u64) as *mut u32).write(w) };
+    }
+    // SAFETY: the chunk's executable view, mapped.
+    unsafe { crate::prepare::flush_icache(rx, EXIT_STUB) };
 }
 
 /// The code cache.
@@ -2434,7 +2498,7 @@ fn flush(s: &mut State) {
     for k in c.chunks.iter_mut() {
         k.retired = blocks.iter().any(|b| (k.rx..k.rx + size).contains(&b.t));
         if !k.retired {
-            k.used = 0;
+            k.used = EXIT_STUB;
         }
     }
     c.live = 0;
@@ -3126,22 +3190,17 @@ fn put_x18(x18: &mut Option<bool>, pc: u64, out: &mut Vec<u32>, info: &mut Vec<W
 
 /// A way out into fwe through the exit gate (first a save of the
 /// program's `x16` and `x17` below `sp` unless `saved`): `x16` the way
-/// out's address. A direct one is linked by making
-/// its first word a branch to the target's translation, entered as the
-/// way out has them ([`entered`]).
+/// out's address, and a branch to its chunk's exit stub ([`exit_stub`],
+/// made [`TO_STUB`] and pointed there by [`place`]). A direct one is
+/// linked by making its first word a branch to the target's translation,
+/// entered as the way out has them ([`entered`]).
 fn gate_out(g: u64, exit: Exit, saved: bool, x18: bool, out: &mut Vec<u32>, info: &mut Vec<Word>) {
-    let gate = crate::gate::exit_address();
     if saved {
         out.push(OUT);
     } else {
         out.extend([SAVE, 0x10ff_fff0]); // adr x16, #-4
     }
-    out.extend([
-        0x5800_0000 | (2 << 5) | 17, // ldr x17, #8
-        GO,                          // br x17
-        gate as u32,
-        (gate >> 32) as u32,
-    ]);
+    out.push(TO_STUB);
     info.push(Word::Out { g, exit, saved, x18: saved && x18, cond: 0 });
     while info.len() < out.len() {
         info.push(Word::Saved(g));

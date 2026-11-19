@@ -259,8 +259,10 @@ a processor that reports `DIC` clear.
   woken cost the host's scheduler far more than a hold.
 - **Ways out:** a block's way out (a direct branch's, or a lookup's
   miss) saves `x16` and `x17` below `sp` unless they are saved already
-  (`Word::Out`'s `saved`) and branches to the exit gate
-  (`gate::fwe_exit_gate`) with its own address in `x16`; the gate saves
+  (`Word::Out`'s `saved`), puts its own address in `x16` and branches to
+  its chunk's exit stub (`jit::exit_stub`, the chunk's first words, which
+  load the exit gate's address and branch there), so a way out is two
+  or three words; the exit gate (`gate::fwe_exit_gate`) saves
   the program's registers in the thread's block, as the system-call gate
   does, and calls `jit::gate_exit` without a signal: the target is
   translated and the branch patched to it (linked, within a chunk) at the
@@ -338,8 +340,8 @@ a processor that reports `DIC` clear.
 - **Guest state:** each translated word records what it stands for
   (`Word`: the guest instruction, with `x16` and `x17` saved or not, a
   point inside an expansion before or after its instruction, a lookup, a
-  way out), so `jit::to_guest` turns
-  a fault, signal, system call or tracer stop there into the guest's
+  way out; in an exit stub, the way out in `x16`), so `jit::to_guest`
+  turns a fault, signal, system call or tracer stop there into the guest's
   state at its instruction: an expansion is undone (`undo`, reading back
   what it pushed) or finished (`finish`, `step`, carrying out its
   remaining words).
