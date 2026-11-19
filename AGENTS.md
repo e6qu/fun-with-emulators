@@ -10,8 +10,13 @@ outcome-sized pull requests, not small granular ones:
 - Inside a PR, commits are logical steps; there are no preparatory PRs.
   Refactors, scaffolding and dependency changes go into the PR that needs
   them.
-- A PR is ready when its outcome is proven by tests in CI — a milestone's
-  "Done when" criteria, or new end-to-end tests for a slice of one.
+- A PR is ready when its outcome is proven by tests in CI — its "Done
+  when" criteria in [ROADMAP.md](ROADMAP.md), which lays the work left out
+  as PRs, or new end-to-end tests for a slice of one.
+- A PR that changes speed brings its own measurement: counters of where
+  the time goes, micro benchmarks that isolate the costs it changes and
+  macro benchmarks of programs at work, in CI, built before the change
+  they judge.
 - Self-reviewed before opening: build, lint, tests and a review pass.
 - Split only for parallel workstreams that touch separate areas, or for a
   shared foundation that other in-flight work depends on.
@@ -70,7 +75,7 @@ Each document has one job; do not duplicate content across them.
 | [README.md](README.md) | What the project is, a short status, how to run and test it |
 | [docs/user-guide.md](docs/user-guide.md) | For users: installing, a Linux userland, running programs and containers, what does not work; its tested recipes run in CI |
 | [PLAN.md](PLAN.md) | Goal, approach, scope, the 1.0 finish line, principles, how progress is measured |
-| [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 with "Done when" criteria, and what is not planned |
+| [ROADMAP.md](ROADMAP.md) | Status, what is done, what is left to 1.0 as PRs with "Done when" criteria, and what is not planned |
 | [docs/linux-on-macos.md](docs/linux-on-macos.md) | How Linux programs run on macOS: which binaries run where and what costs least, how languages and runtimes fare, which instructions are rewritten, how the VM is used; Linux to macOS (what Linux does, what macOS has, what fwe does) and macOS to Linux (what happens on the host, what the guest sees) |
 | [docs/linking.md](docs/linking.md) | Background, not fwe: how programs are built and loaded on Linux and macOS on arm64 (ELF and Mach-O, relocations, static and dynamic linking, PIE, static PIE and their code, virtual memory, ASLR, TLS, program start) |
 | [docs/arm64.md](docs/arm64.md) | Background, not fwe: the arm64 instruction set as fwe's work needs it (registers, encoding, exception levels, the procedure call standard and how Linux's and Apple's differ, branches, loads, stores and atomics, barriers, system registers, PAC and BTI) |

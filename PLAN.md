@@ -78,15 +78,28 @@ the roadmap.
   macOS forces (system calls, thread-pointer accesses and `x18` uses,
   each one instruction branched to a stub), and code a program makes at
   run time runs from translations in fwe's code cache, its own memory
-  untouched ([docs/jit.md](docs/jit.md)). No VM is used where one is not needed.
+  untouched ([docs/jit.md](docs/jit.md)).
+- **The VM is the last resort:** it runs only a program that cannot run
+  in-process (an executable linked below 4 GiB without its relocations, a
+  layout the Mac's 16 KiB pages cannot keep), never one that could, and
+  is never the way to make a program faster.
 - **Native speed:** fwe's cost is what the layer adds; no abstraction of
   fwe's may put a cost in the program's own code. What fwe adds at system
   calls, process and thread creation, start-up and in programs at work is
-  held to budgets in CI. Work may be kept between runs (prepared images,
-  as Rosetta 2 keeps its translations).
+  held to budgets in CI.
+- **Skip work before speeding it up:** work kept between runs and shared
+  between processes (prepared images and translations, as Rosetta 2 keeps
+  its translations), work done only when something needs it, and answers
+  from fwe's own caches where Linux answers from its own, kept correct
+  against the host: a cached answer is checked, or its source cannot
+  change. What is left is then made cheaper, measured first: counts of
+  where the time goes decide which work to skip.
 - **No blockers:** an implementation problem is something to solve.
 - **Measured progress:** real workloads, LTP and the benchmarks define
-  what "working" means.
+  what "working" means, and measurement is how progress is made:
+  instrumentation, tests and benchmarks, macro and micro, are a large
+  part of every change, built before the change they judge. A cause is
+  found by counting and reproducing, not assumed.
 
 ## Measuring progress
 
@@ -97,6 +110,14 @@ the roadmap.
 - **Performance:** benchmarks in CI against native macOS on the same
   runner, with native Linux on arm64 beside them, and a Linux VM and fwe's
   VM backend from `tools/bench/vm.sh` on a Mac; a figure over its budget
-  fails CI.
+  fails CI. Macro benchmarks are real programs at work (a JDK, Python,
+  SQLite, git, a C build); micro benchmarks isolate one cost (a system
+  call, a fork, a lookup, a translated call or return), so a change shows
+  where it acts.
+- **Instrumentation:** fwe counts its own work (`FWE_TIMING`: blocks
+  translated, ways out, lock waits, system calls by number, host
+  signals), and the benchmarks profile each workload (CPU samples by
+  file, function and translated word) and report it in CI, so every run
+  says where the time went.
 
 [AGENTS.md](AGENTS.md) describes how work is delivered.
