@@ -351,8 +351,9 @@ struct Block {
     /// of them, it is taken back while they are the same ([`revive`]).
     source: Vec<u32>,
     followed: bool,
-    /// Its calls' pads ([`RETS`]): ways out to where each returns.
-    pads: Vec<u64>,
+    /// Its calls' pads ([`RETS`]): where each returns, and the address
+    /// of the words that go on there.
+    pads: Vec<(u64, u64)>,
     /// The calls it makes for every block ([`State::calls_made`]): each
     /// one's program address and the address of its words.
     calls_made: Vec<(u64, u64)>,
@@ -810,10 +811,7 @@ fn unpublish_in(table: u64, g: u64, value: u64) {
 /// Block `b`'s calls' pads as returns find them ([`RETS`]), or not: each
 /// return address, and its pad.
 fn pads(b: &Block) -> impl Iterator<Item = (u64, u64)> + '_ {
-    b.pads.iter().filter_map(|&h| match b.words.get(((h - b.t) / 4) as usize) {
-        Some(&Word::Out { g, .. }) => Some((g, h)),
-        _ => None,
-    })
+    b.pads.iter().copied()
 }
 
 /// Block `b` found by lookups: its program address's translation, and
@@ -1739,18 +1737,12 @@ fn ahead(s: &mut Held, i: usize) -> bool {
 }
 
 /// Where block `b` goes on to whatever its conditions: the targets of its
-/// direct ways out that are no conditional branch's taken way, and where
-/// a call among them returns.
+/// direct ways out that are no conditional branch's taken way.
 fn successors(b: &Block) -> Vec<u64> {
     let mut to = Vec::new();
     for w in &b.words {
-        if let Word::Out { g, exit: Exit::Jump(target), cond: 0, .. } = *w {
+        if let Word::Out { exit: Exit::Jump(target), cond: 0, .. } = *w {
             to.push(target);
-            // `bl`
-            let call = b.source.get(((g - b.g) / 4) as usize).is_some_and(|&w| w >> 26 == 0x25);
-            if call {
-                to.push(g + 4);
-            }
         }
     }
     to.sort_unstable();
@@ -1803,7 +1795,7 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         retired: false,
         source,
         followed,
-        pads: pads.iter().map(|&k| t + 4 * k as u64).collect(),
+        pads: pads.iter().map(|&(r, k)| (r, t + 4 * k as u64)).collect(),
         calls_made: Vec::new(),
     });
     s.by_g.insert(g, i);
@@ -2375,8 +2367,8 @@ struct Made {
     /// Where its calls return, and the end of the program's words it read.
     calls: Vec<u64>,
     end: u64,
-    /// Its calls' pads, as word indexes ([`RETS`]).
-    pads: Vec<usize>,
+    /// Its calls' pads ([`RETS`]): where each returns, and the word index.
+    pads: Vec<(u64, usize)>,
     /// The calls it makes for every block ([`State::calls_made`]): each
     /// one's program address and word index; and its ways out into calls
     /// made already ([`Exit::Join`]): each one's word index, the call's
@@ -2443,7 +2435,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
 /// and `x17` saved.
 struct Calls<'a> {
     known: &'a [(u64, u64)],
-    pads: Vec<usize>,
+    pads: Vec<(u64, usize)>,
     made: Vec<(u64, u64)>,
     joins: Vec<(usize, u64, u64)>,
 }
@@ -2571,9 +2563,17 @@ fn body_of(
         put_x18(&mut x18, pc, out, info);
         gate_out(pc, Exit::Jump(pc), saved, x18.is_some(), out, info);
     }
-    // The taken ways of its conditional branches, after the rest.
+    // The taken ways of its conditional branches and its direct calls'
+    // ways to their targets, after the rest.
     for side in sides {
         let at = out.len();
+        if let Some(ret) = side.call {
+            out[side.at] |= (at - side.at) as u32;
+            materialize(30, ret, out);
+            info.extend((at..out.len()).map(|_| Word::Saved(side.g)));
+            gate_out(side.g, Exit::Jump(side.to), true, false, out, info);
+            continue;
+        }
         out[side.at] |= ((at - side.at) as u32) << 5;
         gate_out(side.g, Exit::Jump(side.to), side.saved, side.x18, out, info);
         if let Word::Out { cond, .. } = &mut info[at] {
@@ -2634,13 +2634,17 @@ fn load_x18(pc: u64, out: &mut Vec<u32>, info: &mut Vec<Word>) {
 /// A conditional branch's taken way, out of line ([`body_of`]): the
 /// branch, word `at` of the block (its offset in the field at bit 5), at
 /// program address `g`, to `to`, the program's `x16` and `x17` saved there
-/// or not, and its `x18` held in `x17` or not.
+/// or not, and its `x18` held in `x17` or not. Or a direct call's way to
+/// its target (`call`, where it returns): the `bl` at `at` (its offset in
+/// the field at bit 0) comes to it, `x30` is set to the return address,
+/// and it goes on to the target, `x16` and `x17` saved.
 struct Side {
     at: usize,
     g: u64,
     to: u64,
     saved: bool,
     x18: bool,
+    call: Option<u64>,
 }
 
 /// Whether `w` is a branch [`one`] makes from either state of `x16` and
@@ -2891,12 +2895,18 @@ fn put_x18(x18: &mut Option<bool>, pc: u64, out: &mut Vec<u32>, info: &mut Vec<W
 /// [`RETS`] comes back to the pad with `ret`, where the processor
 /// predicts it, and goes on from there at `ret`'s translation; the
 /// program sees only its own return address.
-fn call_pad(ret: u64, word: Word, pads: &mut Vec<usize>, out: &mut Vec<u32>, info: &mut Vec<Word>) {
+fn call_pad(
+    ret: u64,
+    word: Word,
+    pads: &mut Vec<(u64, usize)>,
+    out: &mut Vec<u32>,
+    info: &mut Vec<Word>,
+) {
     let bl = out.len();
     out.push(BL);
     info.push(word);
     // Entered as a lookup enters a translation: `x16` and `x17` saved.
-    pads.push(out.len());
+    pads.push((ret, out.len()));
     gate_out(ret, Exit::Jump(ret), true, false, out, info);
     out[bl] |= (out.len() - bl) as u32;
 }
@@ -2939,7 +2949,7 @@ fn one(
     saved: &mut bool,
     x18: &mut Option<bool>,
     sides: &mut Vec<Side>,
-    pads: &mut Vec<usize>,
+    pads: &mut Vec<(u64, usize)>,
     out: &mut Vec<u32>,
     info: &mut Vec<Word>,
 ) -> bool {
@@ -2972,19 +2982,37 @@ fn one(
         return true;
     }
     // bl: x16 and x17 saved (as a call's words are entered, [`body_of`]),
-    // over its pad, the program's return address in x30, then on.
+    // a `bl` to the words that set the program's return address in x30
+    // and go on to the target, out of line ([`Side`]). Its return found in
+    // [`RETS`] comes back after the `bl` with `ret`, where the processor
+    // predicts it: the block goes on there, with x16 and x17 saved (x17
+    // no longer holding x18).
     if w & 0xfc00_0000 == 0x9400_0000 {
         save(saved, out, info);
-        call_pad(pc + 4, at_pc(*saved), pads, out, info);
-        let at = out.len();
-        materialize(30, pc + 4, out);
-        info.extend((at..out.len()).map(|_| at_pc(*saved)));
-        gate_out(pc, Exit::Jump(imm26()), *saved, x18.is_some(), out, info);
-        return true;
+        sides.push(Side {
+            at: out.len(),
+            g: pc,
+            to: imm26(),
+            saved: true,
+            x18: false,
+            call: Some(pc + 4),
+        });
+        out.push(BL);
+        info.push(at_pc(true));
+        pads.push((pc + 4, out.len()));
+        *x18 = None;
+        return false;
     }
     // b.cond (and bc.cond)
     if w & 0xff00_0000 == 0x5400_0000 {
-        sides.push(Side { at: out.len(), g: pc, to: imm19(), saved: *saved, x18: x18.is_some() });
+        sides.push(Side {
+            at: out.len(),
+            g: pc,
+            to: imm19(),
+            saved: *saved,
+            x18: x18.is_some(),
+            call: None,
+        });
         out.push(w & !(0x7_ffff << 5));
         info.push(at_pc(*saved));
         return false;
@@ -2997,7 +3025,14 @@ fn one(
         let rt = w & 0x1f;
         if rt == 18 && x18.is_some() {
             // Of x18, held in x17 (back in its slot above).
-            sides.push(Side { at: out.len(), g: pc, to: taken, saved: true, x18: true });
+            sides.push(Side {
+                at: out.len(),
+                g: pc,
+                to: taken,
+                saved: true,
+                x18: true,
+                call: None,
+            });
             out.push((w & !field & !0x1f) | 17);
             info.push(Word::SavedX18(pc));
             return false;
@@ -3012,7 +3047,14 @@ fn one(
                 rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
             ]);
             info.extend([Word::Saved(pc); 3]);
-            sides.push(Side { at: out.len(), g: pc, to: taken, saved: true, x18: false });
+            sides.push(Side {
+                at: out.len(),
+                g: pc,
+                to: taken,
+                saved: true,
+                x18: false,
+                call: None,
+            });
             out.push((w & !field & !0x1f) | 16);
             info.push(Word::Saved(pc));
             return false;
@@ -3024,7 +3066,14 @@ fn one(
             *saved = false;
             *x18 = None;
         }
-        sides.push(Side { at: out.len(), g: pc, to: taken, saved: *saved, x18: x18.is_some() });
+        sides.push(Side {
+            at: out.len(),
+            g: pc,
+            to: taken,
+            saved: *saved,
+            x18: x18.is_some(),
+            call: None,
+        });
         out.push(w & !field);
         info.push(at_pc(*saved));
         return false;
@@ -3251,7 +3300,7 @@ fn lookup(
     n: u32,
     link: Option<u64>,
     ret: bool,
-    pads: &mut Vec<usize>,
+    pads: &mut Vec<(u64, usize)>,
     out: &mut Vec<u32>,
     info: &mut Vec<Word>,
 ) {
