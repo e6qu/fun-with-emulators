@@ -13,6 +13,42 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  probe:
+    name: Thread registers (temporary probe)
+    strategy:
+      matrix:
+        os: [macos-15, macos-26]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - run: |
+          cat > m.c <<'EOF'
+          // How long reads of the thread registers take here.
+          #include <stdio.h>
+          #include <stdint.h>
+          #include <time.h>
+          static uint64_t now(void){struct timespec t;clock_gettime(CLOCK_MONOTONIC,&t);return t.tv_sec*1000000000ull+t.tv_nsec;}
+          #define N 2000000ull
+          int main(void){
+            uint64_t acc=0, slot[2]={1,2}; uint64_t *p=slot;
+            uint64_t t0=now();
+            for(uint64_t i=0;i<N;i++){__asm__ volatile("add %0,%0,%1":"+r"(acc):"r"(i));}
+            uint64_t t1=now();
+            for(uint64_t i=0;i<N;i++){uint64_t v; __asm__ volatile("mrs %1, tpidrro_el0\n add %0,%0,%1":"+r"(acc),"=&r"(v));}
+            uint64_t t2=now();
+            for(uint64_t i=0;i<N;i++){uint64_t v; __asm__ volatile("mrs %1, tpidr_el0\n add %0,%0,%1":"+r"(acc),"=&r"(v));}
+            uint64_t t3=now();
+            for(uint64_t i=0;i<N;i++){__asm__ volatile("str x4,[sp,#-16]\n mrs x4, tpidrro_el0\n and x4,x4,#~7\n ldr x4,[%1]\n add %0,%0,x4\n ldr x4,[sp,#-16]":"+r"(acc):"r"(p):"x4","memory");}
+            uint64_t t4=now();
+            for(uint64_t i=0;i<N;i++){__asm__ volatile("str x4,[sp,#-16]\n mov x4, %1\n and x4,x4,#~7\n ldr x4,[x4]\n add %0,%0,x4\n ldr x4,[sp,#-16]":"+r"(acc):"r"(p):"x4","memory");}
+            uint64_t t5=now();
+            printf("thread registers: loop %.2f ns; mrs tpidrro_el0 %.2f; mrs tpidr_el0 %.2f; x18 expansion %.2f; same from a register %.2f (%llu)\n",
+              (t1-t0)/(double)N,(t2-t1)/(double)N,(t3-t2)/(double)N,(t4-t3)/(double)N,(t5-t4)/(double)N,(unsigned long long)acc);
+          }
+          EOF
+          clang -O2 -o m m.c && ./m && ./m && ./m
+          sysctl -n machdep.cpu.brand_string hw.model
+
   lint:
     name: Lint and unit tests (Linux)
     runs-on: ubuntu-latest
