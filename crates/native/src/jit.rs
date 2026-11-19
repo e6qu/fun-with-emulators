@@ -287,7 +287,7 @@ enum Of {
 
 /// What one word of a translation stands for: how a thread stopped there
 /// is as the program at one of its instructions.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 enum Word {
     /// The program's instruction at this address, or the start of its
     /// expansion: the program's state is as at it.
@@ -319,6 +319,112 @@ enum Word {
     Out { g: u64, exit: Exit, saved: bool, x18: bool, cond: u16 },
 }
 
+/// A [`Word`] as a placed block keeps it, in 16 bytes rather than 40: its
+/// program address as instructions past the block's (`g`), an expansion's
+/// start as words past the block's translation, a call's return address
+/// as the one after `g` ([`Block::word`] makes the word again).
+#[derive(Clone, Copy)]
+enum Packed {
+    At(u16),
+    Saved(u16),
+    SavedX18(u16),
+    Undo {
+        g: u16,
+        start: u32,
+        of: Of,
+    },
+    Finish {
+        g: u16,
+        of: Of,
+    },
+    Lookup {
+        g: u16,
+        call: bool,
+        to: Option<u8>,
+    },
+    /// `exit`: 0 [`Exit::Jump`] to `to`, 1 [`Exit::Retry`], 2 [`Exit::Join`]
+    /// (into the call at `g`), 3 + 2n (+ 1 for a call) [`Exit::Reg`].
+    Out {
+        to: u64,
+        g: u16,
+        cond: u16,
+        exit: u8,
+        saved: bool,
+        x18: bool,
+    },
+}
+
+const _: () = assert!(std::mem::size_of::<Packed>() == 16);
+
+impl Packed {
+    /// Word `w` of a block at program address `g0` translated at `t` (an
+    /// expansion's start as made, at 0, or placed: `t` subtracted).
+    fn of(w: Word, g0: u64, t: u64) -> Packed {
+        let off = |g: u64| -> u16 {
+            let k = g.wrapping_sub(g0) / 4;
+            u16::try_from(k).unwrap_or_else(|_| panic!("word of {g:#x} in a block at {g0:#x}"))
+        };
+        let next = |g: u64, link: Option<u64>| -> bool {
+            assert!(link.is_none_or(|l| l == g + 4), "a call at {g:#x} returning to {link:x?}");
+            link.is_some()
+        };
+        match w {
+            Word::At(g) => Packed::At(off(g)),
+            Word::Saved(g) => Packed::Saved(off(g)),
+            Word::SavedX18(g) => Packed::SavedX18(off(g)),
+            Word::Undo { g, start, of } => Packed::Undo {
+                g: off(g),
+                start: u32::try_from((start - t) / 4).expect("an expansion in its block"),
+                of,
+            },
+            Word::Finish { g, of } => Packed::Finish { g: off(g), of },
+            Word::Lookup { g, link, to } => Packed::Lookup { g: off(g), call: next(g, link), to },
+            Word::Out { g, exit, saved, x18, cond } => {
+                let (exit, to) = match exit {
+                    Exit::Jump(to) => (0, to),
+                    Exit::Retry => (1, 0),
+                    Exit::Join(at) => {
+                        assert_eq!(at, g, "a join at {g:#x} into {at:#x}");
+                        (2, 0)
+                    }
+                    Exit::Reg { n, link } => (3 + 2 * n as u8 + u8::from(next(g, link)), 0),
+                };
+                Packed::Out { to, g: off(g), cond, exit, saved, x18 }
+            }
+        }
+    }
+
+    /// The word again, in a block at program address `g0` placed at `t`.
+    fn word(self, g0: u64, t: u64) -> Word {
+        let at = |k: u16| g0 + 4 * u64::from(k);
+        match self {
+            Packed::At(k) => Word::At(at(k)),
+            Packed::Saved(k) => Word::Saved(at(k)),
+            Packed::SavedX18(k) => Word::SavedX18(at(k)),
+            Packed::Undo { g, start, of } => {
+                Word::Undo { g: at(g), start: t + 4 * u64::from(start), of }
+            }
+            Packed::Finish { g, of } => Word::Finish { g: at(g), of },
+            Packed::Lookup { g, call, to } => {
+                Word::Lookup { g: at(g), link: call.then(|| at(g) + 4), to }
+            }
+            Packed::Out { to, g, cond, exit, saved, x18 } => {
+                let g = at(g);
+                let exit = match exit {
+                    0 => Exit::Jump(to),
+                    1 => Exit::Retry,
+                    2 => Exit::Join(g),
+                    e => Exit::Reg {
+                        n: u32::from((e - 3) / 2),
+                        link: ((e - 3) % 2 == 1).then_some(g + 4),
+                    },
+                };
+                Word::Out { g, exit, saved, x18, cond }
+            }
+        }
+    }
+}
+
 /// A translated block.
 struct Block {
     /// The program address it translates.
@@ -328,7 +434,7 @@ struct Block {
     /// enters at the next.
     t: u64,
     /// What each word of the translation stands for.
-    words: Vec<Word>,
+    words: Vec<Packed>,
     /// The branches linked straight to it, to undo if it goes.
     linked: Vec<u64>,
     /// Its translation's size in bytes.
@@ -361,6 +467,23 @@ struct Block {
 }
 
 /// The code cache: chunks, each one memory mapped twice.
+impl Block {
+    /// What its word `k` stands for.
+    fn word(&self, k: usize) -> Option<Word> {
+        self.words.get(k).map(|p| p.word(self.g, self.t))
+    }
+
+    /// What its word at cache address `at` stands for.
+    fn word_at(&self, at: u64) -> Option<Word> {
+        self.word(((at - self.t) / 4) as usize)
+    }
+
+    /// What each of its words stands for.
+    fn all_words(&self) -> impl Iterator<Item = Word> + '_ {
+        self.words.iter().map(|p| p.word(self.g, self.t))
+    }
+}
+
 struct Cache {
     chunks: Vec<Chunk>,
     /// The chunk new translations go in.
@@ -533,8 +656,7 @@ pub fn write_map() {
     let mut text = String::new();
     for b in &s.blocks {
         let kinds: String = b
-            .words
-            .iter()
+            .all_words()
             .enumerate()
             // SAFETY: a word of the block's translation, in the cache.
             .map(|(k, w)| (unsafe { ((b.t + 4 * k as u64) as *const u32).read() }, w))
@@ -544,7 +666,7 @@ pub fn write_map() {
                 Word::At(_) => 'a',
                 Word::Saved(_) => 's',
                 Word::SavedX18(_) => 'x',
-                Word::Undo { of, .. } | Word::Finish { of, .. } => *of as u8 as char,
+                Word::Undo { of, .. } | Word::Finish { of, .. } => of as u8 as char,
                 Word::Lookup { to: None, .. } => 'l',
                 Word::Lookup { .. } => 'L',
                 Word::Out { .. } => 'o',
@@ -897,7 +1019,7 @@ impl State {
     /// word as it was made, into the exit gate again (no trap), and its
     /// conditional branch leads to it.
     fn unlink(&self, from: &Block, at: u64) {
-        let Some(&Word::Out { saved, .. }) = from.words.get(((at - from.t) / 4) as usize) else {
+        let Some(Word::Out { saved, .. }) = from.word_at(at) else {
             panic!("a link at {at:#x}, no way out");
         };
         self.patch(at, if saved { OUT } else { SAVE });
@@ -1334,8 +1456,7 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     let mut s = state_at(HOLD_EXIT);
     let at = regs.pc;
     let from = block_at(&s, at);
-    let word =
-        from.and_then(|i| s.blocks[i].words.get(((at - s.blocks[i].t) / 4) as usize).copied());
+    let word = from.and_then(|i| s.blocks[i].word_at(at));
     let Some(Word::Out { exit, saved, x18, .. }) = word else { return false };
     // A wrong block's way out has the target in x16.
     let wrong_to = regs.x[16];
@@ -1520,7 +1641,7 @@ pub fn to_guest(regs: &mut Regs) -> bool {
 
 fn word_at(s: &State, pc: u64) -> Option<Word> {
     let i = block_at(s, pc)?;
-    s.blocks[i].words.get(((pc - s.blocks[i].t) / 4) as usize).copied()
+    s.blocks[i].word_at(pc)
 }
 
 /// The block whose translation holds `pc`.
@@ -1744,8 +1865,8 @@ fn ahead(s: &mut Held, i: usize) -> bool {
 /// direct ways out that are no conditional branch's taken way.
 fn successors(b: &Block) -> Vec<u64> {
     let mut to = Vec::new();
-    for w in &b.words {
-        if let Word::Out { exit: Exit::Jump(target), cond: 0, .. } = *w {
+    for w in b.all_words() {
+        if let Word::Out { exit: Exit::Jump(target), cond: 0, .. } = w {
             to.push(target);
         }
     }
@@ -1761,8 +1882,9 @@ fn successors(b: &Block) -> Vec<u64> {
 fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) -> usize {
     let Made { words, info: made_info, entry, unsaved, x18, calls, pads, calls_at, joins, end: _ } =
         made;
-    // The block keeps what its words stand for, in room of their own.
-    let mut info = made_info.to_vec();
+    // The block keeps what its words stand for, packed, in room of their
+    // own (an expansion's start as made, at 0).
+    let info: Vec<Packed> = made_info.iter().map(|&w| Packed::of(w, g, 0)).collect();
     // (Room is made first: emptying the cache forgets every page's other
     // mappings.)
     let page = g & !(page_size() - 1);
@@ -1777,12 +1899,6 @@ fn place(s: &mut State, g: u64, followed: bool, made: Made, source: Vec<u32>) ->
         }
     }
     let t = emit(s, &words);
-    // Its expansions' starts, made at 0, where it stands.
-    for w in &mut info {
-        if let Word::Undo { start, .. } = w {
-            *start += t;
-        }
-    }
     let len = 4 * words.len() as u64;
     s.cache.as_mut().expect("a code cache").live += len;
     let i = s.blocks.len();
@@ -1865,10 +1981,9 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
 fn link_waiting(s: &mut State, i: usize) {
     let (t, g) = (s.blocks[i].t, s.blocks[i].g);
     let outs: Vec<(u64, u64)> = s.blocks[i]
-        .words
-        .iter()
+        .all_words()
         .enumerate()
-        .filter_map(|(k, w)| match *w {
+        .filter_map(|(k, w)| match w {
             Word::Out { exit: Exit::Jump(to), .. } => Some((t + 4 * k as u64, to)),
             _ => None,
         })
@@ -1893,7 +2008,7 @@ fn link_site(s: &mut State, from: usize, at: u64, j: usize) {
         return;
     }
     let to = s.blocks[j].g;
-    let word = s.blocks[from].words.get(((at - s.blocks[from].t) / 4) as usize).copied();
+    let word = s.blocks[from].word_at(at);
     let Some(Word::Out { exit: Exit::Jump(x), saved, x18, .. }) = word else { return };
     if x != to || !unlinked(at) || s.blocks[from].retired || s.blocks[j].retired {
         return;
@@ -1912,8 +2027,8 @@ fn unlinked(at: u64) -> bool {
 
 /// The conditional branch whose taken way is way out `at` of block `b`.
 fn conditional(b: &Block, at: u64) -> Option<u64> {
-    match b.words.get(((at - b.t) / 4) as usize) {
-        Some(&Word::Out { cond, .. }) if cond != 0 => Some(at - 4 * u64::from(cond)),
+    match b.word_at(at) {
+        Some(Word::Out { cond, .. }) if cond != 0 => Some(at - 4 * u64::from(cond)),
         _ => None,
     }
 }
@@ -2108,9 +2223,9 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
     let i = s.blocks.len();
     // A thread stopped in it goes on at `to`, its x16 the veneer's once
     // it loads it.
-    let mut info = vec![Word::At(to); words.len()];
+    let mut info = vec![Packed::At(0); words.len()];
     if saved {
-        info[0] = Word::Saved(to);
+        info[0] = Packed::Saved(0);
     }
     s.blocks.push(Block {
         g: to,
@@ -3477,5 +3592,47 @@ fn expansion(site: Site, pc: u64, start: u64, out: &mut Vec<u32>, info: &mut Vec
             Some(m) if k > m => Word::Finish { g: pc, of },
             _ => Word::Undo { g: pc, start, of },
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Each kind of word comes back from a placed block's packed form as
+    /// it was made.
+    #[test]
+    fn words_packed_come_back_whole() {
+        let (g0, t) = (0x0200_1976_c000, 0x1_2261_0000);
+        let g = g0 + 4 * 63;
+        let words = [
+            Word::At(g0),
+            Word::Saved(g),
+            Word::SavedX18(g),
+            Word::Undo { g, start: t + 4 * 70, of: Of::X18 },
+            Word::Finish { g, of: Of::Flush },
+            Word::Lookup { g, link: None, to: None },
+            Word::Lookup { g, link: Some(g + 4), to: Some(30) },
+            Word::Out { g, exit: Exit::Jump(0x5555_5555_8000), saved: true, x18: true, cond: 9 },
+            Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 },
+            Word::Out { g, exit: Exit::Join(g), saved: true, x18: false, cond: 0 },
+            Word::Out {
+                g,
+                exit: Exit::Reg { n: 30, link: None },
+                saved: false,
+                x18: false,
+                cond: 0,
+            },
+            Word::Out {
+                g,
+                exit: Exit::Reg { n: 17, link: Some(g + 4) },
+                saved: true,
+                x18: false,
+                cond: 0,
+            },
+        ];
+        for w in words {
+            assert_eq!(Packed::of(w, g0, t).word(g0, t), w);
+        }
     }
 }
