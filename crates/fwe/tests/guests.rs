@@ -958,8 +958,9 @@ fn dynamic_loader_hands_off_to_interpreter() {
 /// returns and indirect calls into static code and back, PC-relative
 /// loads with data among the code, x18 kept across system calls, a system
 /// call, a blocking call interrupted by a handler with `SA_RESTART`, a signal
-/// landing in the code, a tracer's view of a call made from it, a null check's fault seen at its instruction and resumed at a
-/// continuation, code patched and run, code copied and run, return
+/// landing in the code, a tracer's view of a call made from it, a null
+/// check's fault seen at its instruction and resumed at a continuation, a
+/// `brk` seen at its instruction and stepped past, code patched and run, code copied and run, return
 /// addresses that are the code's own, threads running code another thread
 /// patches, threads writing data in a page of code they run, W^X toggling, a fork child running and changing code; and the
 /// program's memory reads back as it wrote it.
@@ -977,7 +978,7 @@ fn jit_code_runs_as_the_program_wrote_it() {
          restart: 1 j, the handler saw the call\n\
          signal: seen in the code\n\
          tracer: pc in the code\n\
-         fault: seen at the load, 77\npatch: 1000 of 1000\ncopy: 90 30583\n\
+         fault: seen at the load, 77\nbrk: at its instruction 1000 of 1000, 500500\npatch: 1000 of 1000\ncopy: 90 30583\n\
          x16 and x17 across a call: changed in 0 of 1000\n\
          return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nread into code's page: 5 6 hello, then 5\ntwo views: 1 2 3\nfile code: getpid matches, memory as written\nbl out: 1001000\nx16 and x17 into the code: 1000 of 1000\nexecute only: 4\ndiscarded: 7, then 0, then 9\nmemory: as written\n\
          fork: child ok, parent 1\n"

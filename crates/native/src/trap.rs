@@ -787,7 +787,13 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // the guest; one in fwe's own code is fatal.
         if in_guest {
             let mut regs = regs_from(mc);
-            let addr = mc.ss.pc;
+            // In a translation: the trap is at the program's own `brk`,
+            // with its registers as there.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if crate::jit::in_cache(regs.pc) {
+                crate::jit::to_guest(&mut regs);
+            }
+            let addr = regs.pc;
             let delivered = kernel()
                 .as_mut()
                 .is_some_and(|k| k.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr));

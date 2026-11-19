@@ -18,6 +18,8 @@
  *   reads is in the code;
  * - a load through a null pointer faulting at its own instruction, the
  *   handler sending it on to a continuation (a JIT's null check);
+ * - a `brk` in it trapping at its own instruction, again and again, the
+ *   handler stepping past it (a JIT's breakpoint or guard);
  * - code patched in place, then run;
  * - code copied elsewhere and run there;
  * - the return address a call leaves being the code's own address;
@@ -83,6 +85,7 @@ void _exit(int code);
 #define MAP_PRIVATE 2
 #define MAP_ANONYMOUS 0x20
 #define MAP_FAILED ((void *)-1)
+#define SIGTRAP 5
 #define SIGSEGV 11
 #define SA_SIGINFO 4
 #define SA_RESTART 0x10000000
@@ -96,6 +99,8 @@ void _exit(int code);
 #define NT_PRSTATUS 1
 /* The interrupted pc in an arm64 signal frame's ucontext. */
 #define UC_PC(ctx) (*(uint64_t *)((char *)(ctx) + 440))
+/* si_addr in a siginfo. */
+#define SI_ADDR(si) (*(uint64_t *)((char *)(si) + 16))
 
 __asm__(
     ".section .rodata\n"
@@ -215,6 +220,14 @@ __asm__(
     "  mov x0, #77\n"
     "  ret\n"
 
+    /* long trap(long v): v + 1, past a `brk` between. */
+    "jl_trap:\n"
+    "  mov x0, x0\n"
+    "jl_trap_brk:\n"
+    "  brk #7\n"
+    "  add x0, x0, #1\n"
+    "  ret\n"
+
     /* long ret1(void): patched to return other numbers. */
     "jl_ret1:\n"
     "  mov x0, #1\n"
@@ -242,7 +255,8 @@ __asm__(
     ".text\n");
 
 extern const char jl_begin[], jl_end[], jl_sum[], jl_indirect[], jl_pcrel[], jl_x18[],
-    jl_getpid[], jl_fault[], jl_fault_load[], jl_fault_cont[], jl_ret1[], jl_retaddr[],
+    jl_getpid[], jl_fault[], jl_fault_load[], jl_fault_cont[], jl_trap[], jl_trap_brk[], jl_ret1[],
+    jl_retaddr[],
     jl_retaddr_after[], jl_slots[], jl_read[], jl_read_svc[], jl_spin[], jl_via_x30[];
 
 static size_t template_len(void) { return (size_t)(jl_end - jl_begin); }
@@ -281,6 +295,16 @@ static void on_segv(int sig, void *si, void *ctx) {
         atomic_store(&fault_seen, 1);
     }
     UC_PC(ctx) = (uint64_t)at(code, jl_fault_cont);
+}
+
+static int traps_at_brk;
+
+/* A `brk`: seen at its instruction (pc and si_addr), and stepped past. */
+static void on_trap(int sig, void *si, void *ctx) {
+    (void)sig;
+    uint64_t brk = (uint64_t)at(code, jl_trap_brk);
+    traps_at_brk += UC_PC(ctx) == brk && SI_ADDR(si) == brk;
+    UC_PC(ctx) += 4;
 }
 
 static atomic_uint_least64_t usr1_pc;
@@ -527,6 +551,15 @@ int main(void) {
     long (*fault)(long *) = (long (*)(long *))at(code, jl_fault);
     long r = fault(0);
     printf("fault: %s, %ld\n", atomic_load(&fault_seen) ? "seen at the load" : "seen elsewhere", r);
+
+    sa.sa_sigaction = on_trap;
+    sigaction(SIGTRAP, &sa, 0);
+    long (*trap)(long) = (long (*)(long))at(code, jl_trap);
+    long sum_traps = 0;
+    for (long i = 0; i < 1000; i++) {
+        sum_traps += trap(i);
+    }
+    printf("brk: at its instruction %d of 1000, %ld\n", traps_at_brk, sum_traps);
 
     long (*ret1)(void) = (long (*)(void))at(code, jl_ret1);
     int patched = 0;
