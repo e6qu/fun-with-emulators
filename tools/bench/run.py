@@ -753,6 +753,58 @@ def breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where,
     print(f"{name}: host libraries: {'; '.join(named)}", file=sys.stderr)
 
 
+def rust_name(sym):
+    """A Rust symbol's last two names (`jit::translation`), from its v0
+    mangling; anything else as it is."""
+    if not re.match(r"_*R", sym):
+        return sym
+    # (Crate disambiguators and back references hold digits.)
+    s = re.sub(r"(?<=[CXMY])s[0-9A-Za-z]*_|B[0-9A-Za-z]*_", "", sym)
+    names, i = [], 0
+    while i < len(s):
+        m = re.match(r"\d+", s[i:])
+        if not m:
+            i += 1
+            continue
+        n = int(m.group())
+        i += len(m.group())
+        names.append(s[i:i + n])
+        i += n
+    return "::".join(names[-2:]) or sym
+
+
+def inclusive(name, execname, cmd, ustacks, busiest, samples, looks, base, where):
+    """Thread `busiest`'s samples in `execname` (fwe) by function with
+    what it calls ([`pcs`]'s user stacks, `samples` the thread's in all),
+    named by `atos` from the binary `cmd` ran: where fwe's own work goes,
+    whichever of its functions the compiler merged into which."""
+    exe = next((c for c in cmd if os.path.basename(c) == execname and os.path.isfile(c)), None)
+    path = next((p for regions in looks for _, _, p, _, _ in regions
+                 if p and os.path.basename(p) == execname), None)
+    if not exe or path is None or not samples:
+        return
+    # Frames DTrace named (`fwe`sym+0x10`), or left as addresses (the
+    # process gone when it printed them).
+    mine = [(n, [f.split("`", 1)[1].split("+")[0] if f.startswith(f"{execname}`")
+                 else int(f, 16) for f in frames
+                 if f.startswith(f"{execname}`")
+                 or f.startswith("0x") and where(int(f, 16)).startswith(f"{execname}+")])
+            for tid, n, frames in ustacks if tid == busiest]
+    unique = sorted({f for _, fs in mine for f in fs if isinstance(f, int)})
+    names = subprocess.run(["atos", "-o", exe, "-l", f"{base[path]:#x}"]
+                           + [f"{pc:#x}" for pc in unique],
+                           capture_output=True, text=True,
+                           errors="replace").stdout.splitlines() if unique else []
+    func = {pc: re.sub(r" \(in .*", "", sym).strip() for pc, sym in zip(unique, names)}
+    funcs = collections.Counter()
+    for n, fs in mine:
+        for f in {rust_name(func.get(f, "?") if isinstance(f, int) else f) for f in fs}:
+            funcs[f] += n
+    top = "; ".join(f"{f} {n * 100 / samples:.1f}%" for f, n in funcs.most_common(30))
+    print(f"{name}: thread {busiest}: {execname} by function with what it calls: {top}",
+          file=sys.stderr)
+
+
 def callers(name, cmd, funcs):
     """The call stacks into the host library functions `funcs` (pairs of
     library and function, DTrace's pid-provider patterns) while `cmd` (one
@@ -778,7 +830,8 @@ def callers(name, cmd, funcs):
                              str(proc.pid), "-n", probes + ' END { printa("%s %@d%k\\n", @s); }',
                              "-o", out],
                             capture_output=True, text=True, errors="replace", timeout=600)
-    proc.wait(timeout=600)
+    if proc.wait(timeout=600) != 0:
+        print(f"{name}: the probed run exited with {proc.returncode}", file=sys.stderr)
     if not os.path.exists(out):
         said = (tracer.stdout + tracer.stderr).strip()[-600:]
         print(f"{name}: no callers (DTrace {tracer.returncode}): {said}", file=sys.stderr)
@@ -910,7 +963,11 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
                             stderr=subprocess.DEVNULL)
     script = (f'profile-997 /execname == "{execname}"/ {{ @pc[tid, arg1] = count(); }} '
               f'profile-997 /execname == "{execname}" && arg0/ {{ @ks[tid, stack(6)] = count(); }} '
-              f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
+              # fwe's own stacks (frame records), for its time by function
+              # with what it calls.
+              + (f'profile-997 /execname == "{execname}" && arg1/ {{ @us[tid, ustack(24)] = count(); }} '
+                 if execname == "fwe" else "")
+              + f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
               # Mach traps (mach_vm_*, mach_msg) are not system calls to
@@ -920,7 +977,9 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
               'sum(timestamp - self->m); @n[strjoin("mach:", probefunc)] = count(); '
               'self->m = 0; } '
               'END { printa("pc %d %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
-              'printa("ks %d %@d%k\\nendks\\n", @ks); }')
+              'printa("ks %d %@d%k\\nendks\\n", @ks); '
+              + ('printa("us %d %@d%k\\nendus\\n", @us); ' if execname == "fwe" else "")
+              + '}')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
@@ -937,7 +996,9 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
             if regions and proc.poll() is None and (not looks or looks[-1] != regions):
                 looks.append(regions)
         time.sleep(0.01)
-    proc.wait(timeout=300)
+    # A run that failed is said: its profile is not the work's.
+    if proc.wait(timeout=300) != 0:
+        print(f"{name}: the profiled run exited with {proc.returncode}", file=sys.stderr)
     # DTrace itself, sudo's child: sudo passes on no signal from a process
     # of its own process group, as this one is.
     dtrace = subprocess.run(["pgrep", "-P", str(tracer.pid)], capture_output=True,
@@ -951,15 +1012,17 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
         sys.exit(f"{name}: DTrace did not end when interrupted: {said.strip()[-2000:]}")
     # Samples by thread, and by program counter.
     # The kernel's stacks by thread: (thread, samples, frames).
+    # And fwe's user stacks the same way.
     threads, calls, kstacks = collections.defaultdict(collections.Counter), [], []
+    ustacks = []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
-            stack = None
+            stack, into = None, None
             for line in f:
                 p = line.split()
                 if stack is not None:
-                    if p == ["endks"]:
-                        kstacks.append(stack)
+                    if p in (["endks"], ["endus"]):
+                        into.append(stack)
                         stack = None
                     elif p:
                         stack[2].append(p[0])
@@ -967,8 +1030,9 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
                     threads[int(p[1])][int(p[2], 16)] += int(p[3])
                 elif len(p) == 4 and p[0] == "sys":
                     calls.append((p[1], int(p[2]), int(p[3])))
-                elif len(p) == 3 and p[0] == "ks":
+                elif len(p) == 3 and p[0] in ("ks", "us"):
                     stack = (int(p[1]), int(p[2]), [])
+                    into = kstacks if p[0] == "ks" else ustacks
     counts = list(sum(threads.values(), collections.Counter()).items())
     if calls:
         calls.sort(key=lambda c: -c[1])
@@ -1038,6 +1102,11 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
         breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total)
     except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
         print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
+    try:
+        inclusive(name, execname, cmd, ustacks, busiest, threads[busiest].total(), looks, base,
+                  where)
+    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+        print(f"{name}: no stacks by function: {e!r}", file=sys.stderr)
     # The unnamed regions most samples are in: their tag and protection.
     hot = {w for w, _ in by.most_common(8)}
     for regions in looks:
@@ -1211,8 +1280,6 @@ def jdk(a, fwe, guest_env, results):
     pcs("JDK javac", guest_env + [f"FWE_JIT_MAP={jit_map}"] + javac[len(guest_env):],
         jit_map=jit_map)
     shutil.rmtree(jit_map, ignore_errors=True)
-    shutil.rmtree(ours_out, ignore_errors=True)
-    os.makedirs(ours_out)
 
     # And natively, for what the same work costs the host's kernel.
     shutil.rmtree(theirs_out, ignore_errors=True)
