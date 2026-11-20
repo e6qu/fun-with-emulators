@@ -21,6 +21,13 @@
 //! directory ([`Part`]): each process adds the records it made as one
 //! more, written aside and moved into place, and maps them read-only to
 //! take records from; one that finds many merges them into one.
+//!
+//! Code a program generates seldom comes again at the same address with
+//! the same words (a runtime's compilers place what they make as they
+//! go), and a record costs about as much to make as the block. So each
+//! generated block made is only noted, by its address and its words' key
+//! ([`Seen`]), and its record is kept only once a process makes it again,
+//! where a past one noted it: from then on, later processes take it.
 
 use super::{Calls, Made, Packed, Room};
 use crate::asm::{Asm, Field, Pos, Sec};
@@ -131,10 +138,92 @@ impl Drop for Seg {
     }
 }
 
-/// A part's files of records, as this process found them: oldest first.
+/// A part's files of records, as this process found them: oldest first;
+/// for code the program generated, the addresses they have records for,
+/// and the blocks past processes noted.
 #[derive(Default)]
 struct Loaded {
     segs: Vec<Seg>,
+    addresses: Option<std::collections::HashSet<u64>>,
+    seen: Option<Seen>,
+}
+
+/// The generated blocks past processes made, noted by their address and
+/// words' key ([`note_of`]): a table of notes found by their value
+/// (open addressing, 0 for an empty slot), mapped read-only. Each process
+/// that made some writes the table again with its own added, the oldest
+/// left out past [`SEEN_MOST`].
+struct Seen {
+    map: Seg,
+    slots: usize,
+}
+
+/// The file a part's notes are in, in its directory.
+const SEEN_FILE: &[u8] = b"/seen";
+
+/// A table of notes begins so, then its count of slots (a power of two),
+/// and the slots.
+const SEEN_MAGIC: &[u8; 8] = b"fweseen1";
+
+/// The most notes a part's table keeps.
+const SEEN_MOST: usize = 1 << 19;
+
+/// The note of the generated block at `g` made from words of key `key`:
+/// never 0.
+fn note_of(g: u64, key: u64) -> u64 {
+    let mut x = g ^ key.rotate_left(32);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    x ^= x >> 33;
+    x = x.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    x ^= x >> 33;
+    x | 1
+}
+
+impl Seen {
+    fn slot(&self, i: usize) -> u64 {
+        let b = &self.map.bytes()[12 + 8 * i..20 + 8 * i];
+        u64::from_le_bytes(b.try_into().expect("8 bytes"))
+    }
+
+    /// Whether `note` is in the table.
+    fn has(&self, note: u64) -> bool {
+        let mask = self.slots - 1;
+        let mut i = (note >> 7) as usize & mask;
+        loop {
+            match self.slot(i) {
+                0 => return false,
+                v if v == note => return true,
+                _ => i = (i + 1) & mask,
+            }
+        }
+    }
+
+    /// Its notes.
+    fn notes(&self) -> impl Iterator<Item = u64> + '_ {
+        (0..self.slots).map(|i| self.slot(i)).filter(|&v| v != 0)
+    }
+}
+
+/// A table of `notes` (none 0, none twice), as [`Seen`] reads it.
+fn seen_file(notes: &[u64]) -> Vec<u8> {
+    let slots = (2 * notes.len()).next_power_of_two().max(2);
+    let mask = slots - 1;
+    let mut table = vec![0u64; slots];
+    for &v in notes {
+        let mut i = (v >> 7) as usize & mask;
+        while table[i] != 0 {
+            i = (i + 1) & mask;
+        }
+        table[i] = v;
+    }
+    let mut out = Vec::with_capacity(12 + 8 * slots);
+    out.extend_from_slice(SEEN_MAGIC);
+    out.extend_from_slice(&(slots as u32).to_le_bytes());
+    for v in table {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    out
 }
 
 /// What this process knows of the records: the parts it looked at, the
@@ -149,11 +238,13 @@ struct Kept {
 }
 
 /// A part's records made in this process: each one's program address and
-/// its bytes' end, the bytes one after another.
+/// its bytes' end, the bytes one after another; and the generated blocks
+/// it made, noted ([`Seen`]).
 #[derive(Default)]
 struct New {
     ends: Vec<(u64, usize)>,
     bytes: Vec<u8>,
+    noted: Vec<u64>,
 }
 
 impl New {
@@ -261,6 +352,9 @@ pub(super) fn take(
     let mut k = kept();
     let k = begun(&mut k);
     let loaded = k.parts.entry(part).or_insert_with(|| load(part));
+    if loaded.addresses.as_ref().is_some_and(|a| !a.contains(&g)) {
+        return None;
+    }
     // The keys of the program's words there, as many as each record was
     // made from.
     let mut keys = HashMap::new();
@@ -305,7 +399,19 @@ pub(super) fn keep(
     info: &[Packed],
 ) {
     let mut k = kept();
-    let new = begun(&mut k).new.entry(part).or_default();
+    let k = begun(&mut k);
+    if part.base == GENERATED {
+        // Noted; kept only if a past process made it too.
+        let note = note_of(g, key_of(source.iter().copied()));
+        k.new.entry(part).or_default().noted.push(note);
+        let loaded = k.parts.entry(part).or_insert_with(|| load(part));
+        let again = loaded.seen.as_ref().is_some_and(|t| t.has(note));
+        if !again {
+            return;
+        }
+        jitcount::NOTED_AGAIN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    let new = k.new.entry(part).or_default();
     let w = &mut new.bytes;
     let put32 = |w: &mut Vec<u8>, v: u32| w.extend_from_slice(&v.to_le_bytes());
     let put64 = |w: &mut Vec<u8>, v: u64| w.extend_from_slice(&v.to_le_bytes());
@@ -537,7 +643,14 @@ fn build_id() -> [u8; 16] {
 /// Part `p`'s records, mapped.
 fn load(p: Part) -> Loaded {
     let began = fwe_kernel::timing::on().then(std::time::Instant::now);
-    let loaded = load_files(p);
+    let mut loaded = load_files(p);
+    if p.base == GENERATED {
+        // Few records (those made again): which addresses they are for,
+        // so that a block with none is looked for no further.
+        let addresses = loaded.segs.iter().flat_map(|s| (0..s.n).map(|i| s.entry(i).g));
+        loaded.addresses = Some(addresses.collect());
+        loaded.seen = part_dir(p).and_then(|d| load_seen(&[&d[..], SEEN_FILE].concat()));
+    }
     if let Some(t) = began {
         let n = loaded.segs.len();
         jitcount::LOADED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
@@ -545,6 +658,38 @@ fn load(p: Part) -> Loaded {
             .fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
     }
     loaded
+}
+
+/// The file at `path` mapped read-only, whole, if it is not empty.
+fn map(path: &[u8]) -> Option<Seg> {
+    let f = std::fs::File::open(std::ffi::OsStr::from_bytes(path)).ok()?;
+    let len = f.metadata().ok()?.len() as usize;
+    if len == 0 || len > u32::MAX as usize {
+        return None;
+    }
+    // SAFETY: a fresh read-only private mapping of the whole file.
+    let ptr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            std::os::fd::AsRawFd::as_raw_fd(&f),
+            0,
+        )
+    };
+    (ptr != libc::MAP_FAILED).then(|| Seg { ptr: ptr as *const u8, len, n: 0, path: path.to_vec() })
+}
+
+/// A part's table of notes at `path` ([`Seen`]), if it is whole.
+fn load_seen(path: &[u8]) -> Option<Seen> {
+    let map = map(path)?;
+    let mut r = Reader(map.bytes());
+    if r.take(8)? != &SEEN_MAGIC[..] {
+        return None;
+    }
+    let slots = r.u32()? as usize;
+    (slots.is_power_of_two() && 12 + 8 * slots == map.len).then_some(Seen { map, slots })
 }
 
 /// [`load`]'s work: part `p`'s files mapped.
@@ -563,27 +708,8 @@ fn load_files(p: Part) -> Loaded {
         if path.extension().is_none_or(|x| x != "rec") {
             continue;
         }
-        let Ok(f) = std::fs::File::open(&path) else { continue };
-        let Ok(len) = f.metadata().map(|m| m.len() as usize) else { continue };
-        if len < 12 || len > u32::MAX as usize {
-            continue;
-        }
-        // SAFETY: a fresh read-only private mapping of the whole file.
-        let ptr = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ,
-                libc::MAP_PRIVATE,
-                std::os::fd::AsRawFd::as_raw_fd(&f),
-                0,
-            )
-        };
-        if ptr == libc::MAP_FAILED {
-            continue;
-        }
-        let mut seg =
-            Seg { ptr: ptr as *const u8, len, n: 0, path: path.as_os_str().as_bytes().to_vec() };
+        let Some(mut seg) = map(path.as_os_str().as_bytes()) else { continue };
+        let len = seg.len;
         let mut r = Reader(seg.bytes());
         if r.take(8) != Some(&MAGIC[..]) {
             continue;
@@ -650,6 +776,12 @@ pub(super) fn write() {
         let Some(dir) = part_dir(part) else { continue };
         mkdir(&dir);
         let loaded = k.parts.entry(part).or_insert_with(|| load(part));
+        if !recs.noted.is_empty() {
+            write_seen(&dir, &recs.noted, loaded.seen.as_ref());
+        }
+        if recs.ends.is_empty() {
+            continue;
+        }
         let merge = loaded.segs.len() >= MERGE_AT;
         let mut all: Vec<(u64, &[u8])> = recs.records().collect();
         if merge {
@@ -696,6 +828,40 @@ pub(super) fn write() {
     }
 }
 
+/// Write a part's table of notes in its directory `dir` again: this
+/// process's `noted`, and about as many of the table it found, `old`, as
+/// fit under [`SEEN_MOST`]: a share of them, each kept by its bits mixed
+/// with a salt of this write's (so those left out are spread evenly, the
+/// slots they leave too, and a write leaves out its share of what earlier
+/// writes kept).
+/// Another process writing meanwhile may lose its own: notes only tell
+/// which blocks to keep.
+fn write_seen(dir: &[u8], noted: &[u64], old: Option<&Seen>) {
+    let mut notes: Vec<u64> = noted.to_vec();
+    notes.sort_unstable();
+    notes.dedup();
+    notes.truncate(SEEN_MOST);
+    if let Some(t) = old {
+        let mine: std::collections::HashSet<u64> = notes.iter().copied().collect();
+        let room = (SEEN_MOST - notes.len()) as u64;
+        let found = t.notes().count() as u64;
+        // Of each 65536, how many to keep.
+        let share = if found <= room { 1 << 16 } else { (room << 16) / found };
+        let salt = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos() as u64);
+        let kept = |v: u64| note_of(v, salt) >> 48 < share;
+        notes.extend(t.notes().filter(|&v| kept(v) && !mine.contains(&v)));
+    }
+    let name = format!("{}.tmp", fwe_kernel::host::pid());
+    let tmp = [dir, SEEN_FILE, b"-", name.as_bytes()].concat();
+    let path = [dir, SEEN_FILE].concat();
+    let (tmp, path) = (std::ffi::OsStr::from_bytes(&tmp), std::ffi::OsStr::from_bytes(&path));
+    if std::fs::write(tmp, seen_file(&notes)).is_err() || std::fs::rename(tmp, path).is_err() {
+        let _ = std::fs::remove_file(tmp);
+    }
+}
+
 /// Remove the records of other builds of fwe, which this one never reads,
 /// once their directory is an hour old (a build in use meanwhile makes its
 /// blocks afresh).
@@ -715,5 +881,67 @@ fn forget_other_builds(parent: &[u8], ours: &[u8]) {
         if old {
             let _ = std::fs::remove_dir_all(&path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fresh directory for a test's files.
+    fn dir(name: &str) -> Vec<u8> {
+        let d = std::env::temp_dir().join(format!("fwe-seen-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d.as_os_str().as_bytes().to_vec()
+    }
+
+    /// The longest run of filled slots, wrapping round.
+    fn longest_run(t: &Seen) -> usize {
+        let (mut best, mut run) = (0, 0);
+        for i in 0..2 * t.slots {
+            run = if t.slot(i % t.slots) != 0 { run + 1 } else { 0 };
+            best = best.max(run);
+        }
+        best
+    }
+
+    /// A table written has its notes and no others, and written again
+    /// with more, those too.
+    #[test]
+    fn notes_are_found_and_others_not() {
+        let d = dir("found");
+        let notes: Vec<u64> = (0..1000u64).map(|g| note_of(0x4000 + 4 * g, g)).collect();
+        write_seen(&d, &notes, None);
+        let t = load_seen(&[&d[..], SEEN_FILE].concat()).unwrap();
+        assert!(notes.iter().all(|&v| t.has(v)));
+        assert!(!(1000..2000u64).any(|g| t.has(note_of(0x4000 + 4 * g, g))));
+        let more: Vec<u64> = (1000..1500u64).map(|g| note_of(0x4000 + 4 * g, g)).collect();
+        write_seen(&d, &more, Some(&t));
+        let t = load_seen(&[&d[..], SEEN_FILE].concat()).unwrap();
+        assert!(notes.iter().chain(&more).all(|&v| t.has(v)));
+        let _ = std::fs::remove_dir_all(std::ffi::OsStr::from_bytes(&d));
+    }
+
+    /// Written again and again past [`SEEN_MOST`], a table keeps about so
+    /// many notes, this process's all, and its slots stay spread: no long
+    /// run of filled ones for a missing note to walk.
+    #[test]
+    fn a_full_table_stays_spread() {
+        let d = dir("full");
+        let path = [&d[..], SEEN_FILE].concat();
+        let batch = SEEN_MOST / 2;
+        for round in 0..4u64 {
+            let old = load_seen(&path);
+            let notes: Vec<u64> =
+                (0..batch as u64).map(|g| note_of(4 * g, round << 32 | g)).collect();
+            write_seen(&d, &notes, old.as_ref());
+            let t = load_seen(&path).unwrap();
+            assert!(notes.iter().all(|&v| t.has(v)), "round {round}");
+            let n = t.notes().count();
+            assert!(n <= SEEN_MOST + SEEN_MOST / 64, "round {round}: {n} notes");
+            assert!(longest_run(&t) < 200, "round {round}: a run of {}", longest_run(&t));
+        }
+        let _ = std::fs::remove_dir_all(std::ffi::OsStr::from_bytes(&d));
     }
 }

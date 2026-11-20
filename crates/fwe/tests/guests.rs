@@ -1197,16 +1197,18 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
 
 /// Translations kept (guests/c/jitkept.c: generated code calling a
 /// function of the program's file, which then runs by translation too, a
-/// system call's stub with it): a second run makes no block, of the file's
-/// code or of the code it generated at the same address from the same
-/// words, but takes each from those the first kept, its stub calling the
-/// gate where this process has it, its output as ever.
+/// system call's stub with it): a second run makes no block of the file's
+/// code, but takes each from those the first kept; a block of the code it
+/// generated is kept once a run makes it again at the same address from
+/// the same words, so a third makes none of those either. Each block
+/// taken has its stub calling the gate where this process has it, and the
+/// output is as ever.
 #[test]
 fn jit_translations_are_kept_for_the_next_run() {
     let prog = build_c("jitkept", Libc::Musl, true, true);
     let root = libc_rootfs(Libc::Musl, "jitkept");
     let mut counts = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
         let out = run_bounded(cmd);
@@ -1234,7 +1236,9 @@ fn jit_translations_are_kept_for_the_next_run() {
     }
     // (The first run may take some, kept by an earlier one.)
     let (mf, tf, mg, tg) = counts[0];
-    assert_eq!(counts[1], (0, mf + tf, 0, mg + tg), "{counts:?}");
+    assert_eq!((counts[1].0, counts[1].1), (0, mf + tf), "{counts:?}");
+    assert_eq!(counts[1].2 + counts[1].3, mg + tg, "{counts:?}");
+    assert_eq!(counts[2], (0, mf + tf, 0, mg + tg), "{counts:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -147,13 +147,13 @@ Done:
   forced most restores (the counts: javac 48.6M restores for the stack
   against 2.6M for an instruction naming them). Wide moves, PC-relative
   addresses and thread-pointer reads no longer restore them either.
-- [x] **Native code's ways into JIT code linked:** a call site (`blr`), or
-  each `br` the code a call (`bl`) leads to reaches, becomes a branch to
-  a stub that looks the target up, after its first fault (Node.js took
-  31M faults at one V8 stub).
+- [x] **Native code's ways into JIT code linked:** a call site (`blr`, or
+  a `bl` to code prepared in place) becomes a branch to a stub that looks
+  the target up, after its first fault (Node.js: 11 such faults a run).
 - [x] **Generated code's translations kept** by the program's file and
-  their address, and taken by a later run that writes the same words
-  there.
+  their address once a run makes them again where an earlier run noted
+  the same words (keeping every one cost javac more than taking saved),
+  and taken by later runs.
 - [x] **Macro benchmarks of JIT runtimes:** Node.js and LuaJIT at work
   against Homebrew's builds on the same runner, their output compared.
 - [x] **Micro benchmarks of translated code** against the same code run
@@ -188,9 +188,9 @@ Left, in this order:
 **Done when:** the micro benchmarks of translated code at work hold 1.3×
 of the same code run natively; a function made and run takes at most
 2 µs (making a translation has no native counterpart to compare with);
-Node.js's and LuaJIT's benchmarks hold 1.5×; and a second run of a JIT
+Node.js's and LuaJIT's benchmarks hold 1.5×; and a later run of a JIT
 runtime's workload takes, rather than makes, the blocks of generated
-code the first made at the same address from the same words.
+code two earlier runs made at the same address from the same words.
 
 #### PR 2 — Generated code run as it is, where it is sound
 

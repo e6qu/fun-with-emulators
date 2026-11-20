@@ -86,6 +86,9 @@ pub(crate) static KEPT_READ: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOAD_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KEPT_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Generated blocks made where a past process made one from the same
+/// words (and so kept).
+pub(crate) static NOTED_AGAIN: AtomicU64 = AtomicU64::new(0);
 /// Blocks by how their words end ([`ENDS`]), and the program's words they
 /// hold (their first pass's).
 pub(crate) static ENDED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -391,7 +394,8 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
     }
     out.push_str(&format!(
         "; taken from those kept {} {}, {} {} ({} ms), {} records read for them, {} found made \
-         otherwise, {} files of them mapped ({} ms)",
+         otherwise, {} files of them mapped ({} ms), {} generated made again where a past process \
+         made them (kept)",
         ORIGINS[FILE],
         n(&TAKEN[FILE]),
         ORIGINS[GENERATED],
@@ -401,6 +405,7 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&KEPT_OTHER),
         n(&LOADED),
         ms(&LOAD_NS),
+        n(&NOTED_AGAIN),
     ));
     let made = n(&MADE[FILE]) + n(&MADE[GENERATED]);
     out.push_str(&format!(
