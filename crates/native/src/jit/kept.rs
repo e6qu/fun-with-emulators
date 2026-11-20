@@ -97,8 +97,35 @@ struct Loaded {
 struct Kept {
     parts: HashMap<Part, Loaded>,
     last: Option<(u64, u64, Option<Part>)>,
-    new: HashMap<Part, Vec<(u64, Vec<u8>)>>,
+    new: HashMap<Part, New>,
     owner: i32,
+}
+
+/// A part's records made in this process: each one's program address and
+/// its bytes' end, the bytes one after another.
+#[derive(Default)]
+struct New {
+    ends: Vec<(u64, usize)>,
+    bytes: Vec<u8>,
+}
+
+impl New {
+    /// Each record's program address and bytes.
+    fn records(&self) -> impl Iterator<Item = (u64, &[u8])> {
+        self.ends.iter().enumerate().map(|(k, &(g, end))| {
+            let start = if k == 0 { 0 } else { self.ends[k - 1].1 };
+            (g, &self.bytes[start..end])
+        })
+    }
+}
+
+/// Words `ws` added to `w`, little-endian, at once.
+fn put_words(w: &mut Vec<u8>, ws: &[u32]) {
+    let at = w.len();
+    w.resize(at + 4 * ws.len(), 0);
+    for (d, x) in w[at..].as_chunks_mut::<4>().0.iter_mut().zip(ws) {
+        *d = x.to_le_bytes();
+    }
 }
 
 static KEPT: Mutex<Option<Kept>> = Mutex::new(None);
@@ -192,8 +219,8 @@ pub(super) fn take(
         let rec = seg.bytes().get(at.off as usize..(at.off + at.len) as usize)?;
         let mut r = Reader(rec);
         let n = r.u32()? as usize;
-        let words: Vec<u32> = (0..n).map(|_| r.u32()).collect::<Option<_>>()?;
-        if source.get(..n) != Some(&words[..]) {
+        let words = r.take(4 * n)?;
+        if source.len() < n || !words_of(words).zip(source).all(|(a, &b)| a == b) {
             continue;
         }
         let end = g + 4 * u64::from(r.u32()?);
@@ -219,64 +246,68 @@ pub(super) fn keep(
     made: &Made,
     info: &[Packed],
 ) {
-    let mut w = Vec::with_capacity(64 + 4 * source.len() + 8 * info.len() + 16 * known.len());
+    let mut k = kept();
+    let new = begun(&mut k).new.entry(part).or_default();
+    let w = &mut new.bytes;
     let put32 = |w: &mut Vec<u8>, v: u32| w.extend_from_slice(&v.to_le_bytes());
     let put64 = |w: &mut Vec<u8>, v: u64| w.extend_from_slice(&v.to_le_bytes());
-    put32(&mut w, source.len() as u32);
-    for &x in source {
-        put32(&mut w, x);
-    }
-    put32(&mut w, ((made.end - g) / 4) as u32);
-    put32(&mut w, known.len() as u32);
+    put32(w, source.len() as u32);
+    put_words(w, source);
+    put32(w, ((made.end - g) / 4) as u32);
+    put32(w, known.len() as u32);
     for &p in known {
-        put64(&mut w, p);
+        put64(w, p);
     }
     for v in [made.entry, made.unsaved, made.x18, made.second.unwrap_or(usize::MAX)] {
-        put32(&mut w, v as u32);
+        put32(w, v as u32);
     }
     // The gate its system calls' and flushes' stubs call, an address of
     // this process's ([`relocate`]).
-    put64(&mut w, crate::syscall_gate());
+    put64(w, crate::syscall_gate());
     let asm = &made.room.asm;
     let (hot, cold) = (asm.words(Sec::Hot), asm.words(Sec::Cold));
-    put32(&mut w, hot.len() as u32);
-    put32(&mut w, cold.len() as u32);
-    for &x in hot.iter().chain(cold) {
-        put32(&mut w, x);
-    }
+    put32(w, hot.len() as u32);
+    put32(w, cold.len() as u32);
+    put_words(w, hot);
+    put_words(w, cold);
     for &p in info {
-        p.put(&mut w);
+        p.put(w);
     }
-    let fixups: Vec<_> = asm.fixups().collect();
-    put32(&mut w, fixups.len() as u32);
-    for (at, field, to) in fixups {
+    // The fixups' count, set once they are written.
+    let count = w.len();
+    put32(w, 0);
+    let mut fixups = 0u32;
+    for (at, field, to) in asm.fixups() {
         w.extend_from_slice(&[at.sec as u8, field as u8, u8::from(to.is_some())]);
         w.push(to.map_or(0, |t| t.sec as u8));
-        put32(&mut w, at.k as u32);
-        put32(&mut w, to.map_or(0, |t| t.k as u32));
+        put32(w, at.k as u32);
+        put32(w, to.map_or(0, |t| t.k as u32));
+        fixups += 1;
     }
+    w[count..count + 4].copy_from_slice(&fixups.to_le_bytes());
     let c = &made.room.c;
-    put32(&mut w, c.calls.len() as u32);
+    put32(w, c.calls.len() as u32);
     for &r in &c.calls {
-        put64(&mut w, r);
+        put64(w, r);
     }
-    put32(&mut w, c.pads.len() as u32);
+    put32(w, c.pads.len() as u32);
     for &(r, k) in &c.pads {
-        put64(&mut w, r);
-        put32(&mut w, k as u32);
+        put64(w, r);
+        put32(w, k as u32);
     }
-    put32(&mut w, c.made.len() as u32);
+    put32(w, c.made.len() as u32);
     for &(p, k, held) in &c.made {
-        put64(&mut w, p);
-        put64(&mut w, k);
+        put64(w, p);
+        put64(w, k);
         w.push(u8::from(held));
     }
-    put32(&mut w, c.joins.len() as u32);
+    put32(w, c.joins.len() as u32);
     for &(k, p, _) in &c.joins {
-        put32(&mut w, k as u32);
-        put64(&mut w, p);
+        put32(w, k as u32);
+        put64(w, p);
     }
-    begun(&mut kept()).new.entry(part).or_default().push((g, w));
+    let end = w.len();
+    new.ends.push((g, end));
 }
 
 /// The block a record holds, read on from past its words and calls: made
@@ -286,10 +317,8 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     let [entry, unsaved, x18, second] = [r.u32()?, r.u32()?, r.u32()?, r.u32()?];
     let gate = r.u64()?;
     let (hot, cold) = (r.u32()? as usize, r.u32()? as usize);
-    let mut words = [Vec::with_capacity(hot), Vec::with_capacity(cold)];
-    for k in 0..hot + cold {
-        words[usize::from(k >= hot)].push(r.u32()?);
-    }
+    let (h, c) = (r.take(4 * hot)?, r.take(4 * cold)?);
+    let mut words = [words_of(h).collect::<Vec<_>>(), words_of(c).collect()];
     let mut info = Vec::with_capacity(hot + cold);
     for _ in 0..hot + cold {
         let (p, n) = Packed::read(r.0)?;
@@ -368,6 +397,11 @@ fn relocate(words: &mut [u32], info: &[Packed], was: u64, now: u64) {
 }
 
 /// A record's bytes, read in turn.
+/// The little-endian words of `b`.
+fn words_of(b: &[u8]) -> impl Iterator<Item = u32> + '_ {
+    b.as_chunks::<4>().0.iter().map(|&w| u32::from_le_bytes(w))
+}
+
 struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {
@@ -540,7 +574,7 @@ pub(super) fn write() {
         mkdir(&dir);
         let loaded = k.parts.entry(part).or_insert_with(|| load(part));
         let merge = loaded.segs.len() >= MERGE_AT;
-        let mut all: Vec<(u64, &[u8])> = recs.iter().map(|(g, r)| (*g, &r[..])).collect();
+        let mut all: Vec<(u64, &[u8])> = recs.records().collect();
         if merge {
             for (&g, ats) in &loaded.index {
                 for at in ats {
@@ -561,7 +595,8 @@ pub(super) fn write() {
             let _ = std::fs::remove_file(tmp);
             continue;
         }
-        jitcount::KEPT_WRITTEN.fetch_add(recs.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        jitcount::KEPT_WRITTEN
+            .fetch_add(recs.ends.len() as u64, std::sync::atomic::Ordering::Relaxed);
         if merge {
             // (Mapped still, until this process ends.)
             for seg in &loaded.segs {
