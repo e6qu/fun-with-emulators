@@ -10,9 +10,10 @@
 //! nothing but `x0` and no signal is to be delivered, the gate restores the
 //! registers and returns to the stub, which goes on past the site: no host
 //! exception, no signal, no change of the host's signal mask (the guest's
-//! is already in force). Every other outcome (a call that changes `pc`,
-//! `sp` or the mask, a signal to deliver, a traced or filtered call, and
-//! the calls fwe runs outside the kernel lock) takes the trap: the gate
+//! is already in force); so do the calls that may block, which run outside
+//! the kernel lock. Every other outcome (a call that changes `pc`, `sp` or
+//! the mask, a signal to deliver, a traced or filtered call) takes the
+//! trap: the gate
 //! executes `brk #GATE_IMM`, and the `SIGTRAP` handler takes the guest's
 //! state from the block and goes on as for a trapped `svc`.
 //!
