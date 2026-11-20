@@ -1127,9 +1127,15 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
         breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total)
     except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
         print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
-    # The busiest threads' (a program's other threads may spend theirs in
-    # fwe where its main one does not).
-    for tid, pcs_of in sorted(threads.items(), key=lambda t: -t[1].total())[:3]:
+    # The busiest threads', and any of the four busiest that runs mostly
+    # outside the program's code (a program's other threads may spend
+    # theirs in fwe where its main one does not).
+    def outside(pcs_of):
+        mine = sum(n for pc, n in pcs_of.items()
+                   if where(pc).split("+")[0] in (execname, "libsystem_malloc.dylib"))
+        return mine * 2 > pcs_of.total()
+    ranked = sorted(threads.items(), key=lambda t: -t[1].total())
+    for tid, pcs_of in ranked[:3] + [t for t in ranked[3:4] if outside(t[1])]:
         try:
             inclusive(name, execname, cmd, ustacks, tid, pcs_of.total(), looks, base, where)
         except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
