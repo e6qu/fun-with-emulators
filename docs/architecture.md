@@ -855,7 +855,13 @@ keeping fwe's own descriptors apart and Linux's limits exact:
 - fwe's own descriptors (the rootfs handle, pipe ends behind eventfd and
   signalfd, a vfork parent's pipe, the signal mailbox, in the VM every
   file mapping's file) live in a reserved range from just above the
-  guest's up to the host's limit (`crates/kernel/src/fdtable.rs`).
+  guest's up to the host's limit (`crates/kernel/src/fdtable.rs`). The
+  rootfs handle, which every process holds, sits lower: at the first free
+  number at or above the guest's soft limit, which no descriptor of the
+  guest's reaches, so a process holding nothing else of fwe's forks with a
+  small table (a host `fork` copies it up to the highest descriptor, and
+  its exit frees it: one at 16384 costs about 50 µs a fork). A raise of
+  the soft limit past it moves it above the new limit first.
 - At startup fwe raises its host soft limit as far as macOS allows and
   gives the guest a virtual `RLIMIT_NOFILE`: soft 1024, hard leaving fwe a
   quarter of the host's descriptors, at least 64 and at most 16384 (the

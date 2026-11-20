@@ -999,7 +999,7 @@ impl<P: Platform> Kernel<P> {
         creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
-        let _ = fdtable::set_limit(soft, hard);
+        let _ = self.set_nofile(soft, hard);
         if let Some(fs) = self.fs_opt_mut() {
             fs.set_umask(umask);
         }

@@ -6463,6 +6463,20 @@ fn descriptor_limit_bounds_the_guest() {
     assert_eq!(fds("limits"), FDS_LIMITS);
 }
 
+/// fwe's root directory descriptor sits above the guest's soft
+/// `RLIMIT_NOFILE`, out of its reach, and moves when the limit is raised
+/// past it: the numbers above the old limit are then the guest's, given in
+/// turn, and paths still resolve, in the process and in a child it forks.
+#[test]
+fn raising_the_descriptor_limit_moves_fwes_root_out_of_the_way() {
+    assert_eq!(
+        fds("raised"),
+        "close at the soft limit: -1 EBADF\nF_GETFD there: -1 EBADF\nraised by 64: 0\n\
+         dup stopped at the new limit: -1 EMFILE\npast the old limit: 64 in turn true\n\
+         own binary read through the root: true\nand by a child: true\n"
+    );
+}
+
 /// What the `fds` guest's `limits` scenario prints: the guest's soft
 /// `RLIMIT_NOFILE` held as Linux holds it.
 const FDS_LIMITS: &str = "\

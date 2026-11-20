@@ -449,6 +449,12 @@ pub struct Fs {
     pub ns: crate::ns::Namespaces,
 }
 
+impl Drop for Fs {
+    fn drop(&mut self) {
+        crate::fdtable::root_closed(self.root.as_raw_fd());
+    }
+}
+
 impl Fs {
     /// Write the filesystem view into a fork snapshot. The root directory
     /// descriptor is inherited, so its number is enough.
@@ -480,6 +486,7 @@ impl Fs {
         // SAFETY: the parent's root descriptor, inherited at the same number
         // and owned by nothing else in this process.
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        crate::fdtable::root_is(fd);
         let cwd = d.bytes();
         let cwd_mount = d.u32();
         let root_mount = d.u32();
@@ -565,10 +572,13 @@ impl Fs {
         if fd < 0 {
             return Err(e());
         }
-        // The root is fwe's: out of the guest's reach.
-        let fd = crate::fdtable::reserve(fd)?;
-        // SAFETY: `fd` is a fresh owned directory descriptor.
-        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The root is fwe's: out of the guest's reach, low while the
+        // guest's limit is ([`crate::fdtable::reserve_root`]).
+        let root = crate::fdtable::reserve_root(fd, 0);
+        // SAFETY: closing the descriptor just opened, now moved.
+        unsafe { libc::close(fd) };
+        // SAFETY: `root` is a fresh owned directory descriptor.
+        let root = unsafe { OwnedFd::from_raw_fd(root?) };
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
         let shm = shm::dir_path(&root_host).ok();
         let mnt = Arc::new(Ns::initial(&root_host, shm.as_deref())?);
@@ -751,6 +761,27 @@ impl Fs {
     /// The mount table as it is now.
     pub fn mounts(&self) -> Arc<Table> {
         self.mnt.table()
+    }
+
+    /// Move the root directory descriptor at or above `soft`, a soft
+    /// `RLIMIT_NOFILE` about to be set, if it is the process's and below
+    /// it ([`crate::fdtable::root_below`]): the guest may then be given
+    /// any number below `soft`. The view published for the socket calls
+    /// follows it.
+    pub(crate) fn keep_root_above(&mut self, soft: u64) -> Result<(), i32> {
+        let old = self.root.as_raw_fd();
+        if !crate::fdtable::root_below(old, soft) {
+            return Ok(());
+        }
+        let new = crate::fdtable::reserve_root(old, soft)?;
+        // SAFETY: a fresh descriptor of fwe's, owned by nothing else; the
+        // old one closes as it is replaced.
+        self.root = unsafe { OwnedFd::from_raw_fd(new) };
+        if let Some(v) = published().as_mut().filter(|v| v.root == old) {
+            VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+            v.root = new;
+        }
+        Ok(())
     }
 
     /// A copy of this view, for a thread to have as its own

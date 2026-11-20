@@ -698,7 +698,7 @@ fn answer_fd(caller: i32, fd: i32, token: u64) {
         }
         if s >= 0 && libc::connect(s, (&a as *const libc::sockaddr_un).cast(), alen) == 0 {
             let valid =
-                fd >= 0 && fd < crate::fdtable::guest_max() && libc::fcntl(fd, libc::F_GETFD) >= 0;
+                fd >= 0 && crate::fdtable::guest_visible(fd) && libc::fcntl(fd, libc::F_GETFD) >= 0;
             let mut answer: i32 = if valid { 0 } else { libc::EBADF };
             let mut iov = libc::iovec { iov_base: (&mut answer as *mut i32).cast(), iov_len: 4 };
             let mut ctl = [0u64; 4];

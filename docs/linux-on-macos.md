@@ -2022,7 +2022,7 @@ to the host.
 | Linux | macOS | fwe |
 |---|---|---|
 | a process's root (`chroot`) and mount table | one host filesystem | guest paths resolved component by component (`crates/kernel/src/fs.rs`): symlinks followed by fwe, mounts entered, `..` clamped at the process's root, as `openat2(RESOLVE_IN_ROOT)` would; the final host `openat` has `O_NOFOLLOW` added |
-| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 16384 at most), out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
+| descriptor numbers | the same kind of table | guest descriptors are host descriptors; fwe's own live in a reserved range above the guest's (which ends at 16384 at most), the root directory's at or above the guest's soft limit, out of the guest's reach (`EBADF`), the guest's below it whatever its virtual `RLIMIT_NOFILE` |
 | record locks (`F_SETLK`) | POSIX locks, different `struct flock`; any close of a file by the process drops its locks on it | translated; the host's, so they hold against host processes too; fwe reaches a guest's file by path for its own ends, but for the few it reads through a descriptor of its own, whose close drops them ([known limitations](architecture.md#known-limitations)) |
 | OFD locks (`F_OFD_*`) | private `F_OFD_*` commands | translated to them; owned by the open file, shared by its duplicates |
 | leases (`F_SETLEASE`) | none | a record every fwe process shares (`crates/kernel/src/leases.rs`): a conflicting open signals the holder and waits, up to `fs.lease-break-time` |

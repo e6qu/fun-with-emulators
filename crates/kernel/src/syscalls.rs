@@ -2522,7 +2522,7 @@ impl<P: Platform> Kernel<P> {
                 {
                     return err(errno::EPERM);
                 }
-                if let Err(e) = crate::fdtable::set_limit(n.rlim_cur, n.rlim_max) {
+                if let Err(e) = self.set_nofile(n.rlim_cur, n.rlim_max) {
                     return err(e);
                 }
                 publish_limits();
@@ -2631,6 +2631,18 @@ impl<P: Platform> Kernel<P> {
         0
     }
 
+    /// Set the guest's `RLIMIT_NOFILE` ([`crate::fdtable::limit_of`]), the
+    /// process's root directory descriptor moved at or above the new soft
+    /// limit first ([`crate::fs::Fs::keep_root_above`]): no thread is given its number
+    /// meanwhile.
+    pub(crate) fn set_nofile(&mut self, soft: u64, hard: u64) -> Result<(), i32> {
+        let (soft, hard) = crate::fdtable::limit_of(soft, hard)?;
+        if let Some(fs) = self.fs.as_mut() {
+            fs.keep_root_above(soft)?;
+        }
+        crate::fdtable::set_limit(soft, hard)
+    }
+
     /// Take up the resource limits another process set for this one, and
     /// publish them.
     pub(crate) fn take_pending_limits(&mut self) {
@@ -2641,7 +2653,7 @@ impl<P: Platform> Kernel<P> {
         for (res, soft, hard) in taken {
             let value = Rlimit { rlim_cur: soft, rlim_max: hard };
             if u64::from(res) == resource::RLIMIT_NOFILE {
-                let _ = crate::fdtable::set_limit(soft, hard);
+                let _ = self.set_nofile(soft, hard);
             } else if crate::rlimits::kept(u64::from(res)) {
                 // The setter was allowed to (`prlimit_other`).
                 let _ = crate::rlimits::set(u64::from(res), soft, hard, true);
