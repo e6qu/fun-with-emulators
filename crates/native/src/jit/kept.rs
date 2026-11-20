@@ -219,7 +219,7 @@ pub(super) fn keep(
     made: &Made,
     info: &[Packed],
 ) {
-    let mut w = Vec::with_capacity(64 + 4 * source.len() + 20 * info.len());
+    let mut w = Vec::with_capacity(64 + 4 * source.len() + 8 * info.len() + 16 * known.len());
     let put32 = |w: &mut Vec<u8>, v: u32| w.extend_from_slice(&v.to_le_bytes());
     let put64 = |w: &mut Vec<u8>, v: u64| w.extend_from_slice(&v.to_le_bytes());
     put32(&mut w, source.len() as u32);
@@ -244,8 +244,8 @@ pub(super) fn keep(
     for &x in hot.iter().chain(cold) {
         put32(&mut w, x);
     }
-    for p in info {
-        w.extend_from_slice(&p.to_bytes());
+    for &p in info {
+        p.put(&mut w);
     }
     let fixups: Vec<_> = asm.fixups().collect();
     put32(&mut w, fixups.len() as u32);
@@ -290,8 +290,12 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     for k in 0..hot + cold {
         words[usize::from(k >= hot)].push(r.u32()?);
     }
-    let info: Vec<Packed> =
-        (0..hot + cold).map(|_| Packed::from_bytes(r.take(16)?)).collect::<Option<_>>()?;
+    let mut info = Vec::with_capacity(hot + cold);
+    for _ in 0..hot + cold {
+        let (p, n) = Packed::read(r.0)?;
+        r.take(n)?;
+        info.push(p);
+    }
     relocate(&mut words[0], &info[..hot], gate, crate::syscall_gate());
     let field = |v: u8| [Field::Imm26, Field::Imm19, Field::Imm14].get(usize::from(v)).copied();
     let sec = |v: u8| [Sec::Hot, Sec::Cold].get(usize::from(v)).copied();
@@ -382,7 +386,7 @@ impl<'a> Reader<'a> {
 
 /// A file of records begins so, then its count of records and for each its
 /// program address, offset and length; their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept4";
+const MAGIC: &[u8; 8] = b"fwekept5";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],

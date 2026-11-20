@@ -376,7 +376,7 @@ a processor that reports `DIC` clear.
   tells how many it read), where its own end, the calls made in other blocks'
   words in its words' range (`State::calls_made`), its hot and cold
   words with their branches still to resolve (`Asm::fixups`), what each
-  word stands for, packed (`Packed::to_bytes`), and its calls. The
+  word stands for, packed (`Packed::put`), and its calls. The
   records are files in fwe's private directory, under
   `v<format>-translations/<UUID of fwe's image>-<its thread slots>/<device>-<inode>-<load
   address>/` (the program's own file by its host identity, as the maps

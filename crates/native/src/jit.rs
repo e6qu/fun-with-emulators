@@ -491,76 +491,90 @@ impl Packed {
         }
     }
 
-    /// Its 16 bytes as a kept record holds them ([`kept`]): a tag, then
-    /// its fields in turn, little-endian.
-    fn to_bytes(self) -> [u8; 16] {
-        let mut b = [0u8; 16];
-        let mut put = |at: usize, v: &[u8]| b[at..at + v.len()].copy_from_slice(v);
+    /// Its bytes as a kept record holds them ([`kept`]), added to `w`: a
+    /// tag, then its fields in turn, little-endian, as many bytes as its
+    /// kind takes (most words three).
+    fn put(self, w: &mut Vec<u8>) {
         match self {
-            Packed::At(k) => put(0, &[0, k as u8, (k >> 8) as u8]),
-            Packed::Saved(k) => put(0, &[1, k as u8, (k >> 8) as u8]),
-            Packed::SavedX18(k) => put(0, &[2, k as u8, (k >> 8) as u8]),
-            Packed::Stashed(k) => put(0, &[7, k as u8, (k >> 8) as u8]),
+            Packed::At(k) => w.extend_from_slice(&[0, k as u8, (k >> 8) as u8]),
+            Packed::Saved(k) => w.extend_from_slice(&[1, k as u8, (k >> 8) as u8]),
+            Packed::SavedX18(k) => w.extend_from_slice(&[2, k as u8, (k >> 8) as u8]),
+            Packed::Stashed(k) => w.extend_from_slice(&[7, k as u8, (k >> 8) as u8]),
             Packed::Undo { g, start, of } => {
-                put(0, &[3]);
-                put(1, &g.to_le_bytes());
-                put(3, &start.to_le_bytes());
-                put(7, &[of as u8]);
+                let s = start.to_le_bytes();
+                w.extend_from_slice(&[
+                    3,
+                    g as u8,
+                    (g >> 8) as u8,
+                    s[0],
+                    s[1],
+                    s[2],
+                    s[3],
+                    of as u8,
+                ]);
             }
             Packed::Finish { g, of } => {
-                put(0, &[4]);
-                put(1, &g.to_le_bytes());
-                put(3, &[of as u8]);
+                w.extend_from_slice(&[4, g as u8, (g >> 8) as u8, of as u8])
             }
-            Packed::Lookup { g, call, to } => {
-                put(0, &[5]);
-                put(1, &g.to_le_bytes());
-                put(3, &[u8::from(call), to.unwrap_or(0xff)]);
-            }
+            Packed::Lookup { g, call, to } => w.extend_from_slice(&[
+                5,
+                g as u8,
+                (g >> 8) as u8,
+                u8::from(call),
+                to.unwrap_or(0xff),
+            ]),
             Packed::Out { to, g, cond, exit, saved, x18 } => {
-                put(0, &[6]);
-                put(1, &to.to_le_bytes());
-                put(9, &g.to_le_bytes());
-                put(11, &cond.to_le_bytes());
-                put(13, &[exit, u8::from(saved), u8::from(x18)]);
+                w.push(6);
+                w.extend_from_slice(&to.to_le_bytes());
+                w.extend_from_slice(&g.to_le_bytes());
+                w.extend_from_slice(&cond.to_le_bytes());
+                w.extend_from_slice(&[exit, u8::from(saved), u8::from(x18)]);
             }
         }
-        b
     }
 
-    /// [`Packed::to_bytes`]'s word again, if `b` is one.
-    fn from_bytes(b: &[u8]) -> Option<Packed> {
-        let u16_at = |at: usize| u16::from_le_bytes([b[at], b[at + 1]]);
+    /// The word [`Packed::put`] put at the start of `b`, and how many bytes
+    /// it took, if `b` starts with one.
+    fn read(b: &[u8]) -> Option<(Packed, usize)> {
+        let byte = |at: usize| b.get(at).copied();
+        let u16_at = |at: usize| Some(u16::from_le_bytes([byte(at)?, byte(at + 1)?]));
         let of = |v: u8| {
             [Of::X18, Of::ThreadPointer, Of::Load, Of::Flush, Of::Syscall]
                 .into_iter()
                 .find(|&o| o as u8 == v)
         };
-        if b.len() != 16 {
-            return None;
-        }
-        Some(match b[0] {
-            0 => Packed::At(u16_at(1)),
-            1 => Packed::Saved(u16_at(1)),
-            2 => Packed::SavedX18(u16_at(1)),
-            7 => Packed::Stashed(u16_at(1)),
-            3 => Packed::Undo {
-                g: u16_at(1),
-                start: u32::from_le_bytes(b[3..7].try_into().ok()?),
-                of: of(b[7])?,
-            },
-            4 => Packed::Finish { g: u16_at(1), of: of(b[3])? },
-            5 => {
-                Packed::Lookup { g: u16_at(1), call: b[3] == 1, to: (b[4] != 0xff).then_some(b[4]) }
+        Some(match byte(0)? {
+            0 => (Packed::At(u16_at(1)?), 3),
+            1 => (Packed::Saved(u16_at(1)?), 3),
+            2 => (Packed::SavedX18(u16_at(1)?), 3),
+            7 => (Packed::Stashed(u16_at(1)?), 3),
+            3 => {
+                let start = u32::from_le_bytes(b.get(3..7)?.try_into().ok()?);
+                (Packed::Undo { g: u16_at(1)?, start, of: of(byte(7)?)? }, 8)
             }
-            6 => Packed::Out {
-                to: u64::from_le_bytes(b[1..9].try_into().ok()?),
-                g: u16_at(9),
-                cond: u16_at(11),
-                exit: b[13],
-                saved: b[14] == 1,
-                x18: b[15] == 1,
-            },
+            4 => (Packed::Finish { g: u16_at(1)?, of: of(byte(3)?)? }, 4),
+            5 => {
+                let to = byte(4)?;
+                (
+                    Packed::Lookup {
+                        g: u16_at(1)?,
+                        call: byte(3)? == 1,
+                        to: (to != 0xff).then_some(to),
+                    },
+                    5,
+                )
+            }
+            6 => (
+                Packed::Out {
+                    to: u64::from_le_bytes(b.get(1..9)?.try_into().ok()?),
+                    g: u16_at(9)?,
+                    cond: u16_at(11)?,
+                    exit: byte(13)?,
+                    saved: byte(14)? == 1,
+                    x18: byte(15)? == 1,
+                },
+                16,
+            ),
             _ => return None,
         })
     }
@@ -4563,8 +4577,10 @@ mod tests {
         for w in words {
             assert_eq!(Packed::of(w, g0, t).word(g0, t), w);
             // And from the bytes a kept record holds it as.
-            let b = Packed::of(w, g0, t).to_bytes();
-            assert_eq!(Packed::from_bytes(&b).expect("a packed word").word(g0, t), w);
+            let mut b = vec![0xaa];
+            Packed::of(w, g0, t).put(&mut b);
+            let (p, n) = Packed::read(&b[1..]).expect("a packed word");
+            assert_eq!((p.word(g0, t), n), (w, b.len() - 1));
         }
     }
     /// A call is made once in a block, however its words are entered (here
