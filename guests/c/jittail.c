@@ -1,7 +1,7 @@
 /* Branches (not calls) through a register into code made at run time, from
  * the program's own code, many times over: a tail call, as a runtime's
- * entry stub makes into a JIT's compiled code, from a function called
- * from a loop a level above. The branch's site, found from the call that
+ * entry stub makes into a JIT's compiled code (past branches of its
+ * own), from a function called from a loop a level above. The branch's site, found from the call that
  * led to it, looks its targets up from then on, as a translation does.
  * Every line printed is what Linux prints. */
 #include <stdint.h>
@@ -10,9 +10,17 @@ void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, long off)
 
 static uint32_t *code;
 
-/* A tail call through x9 into `f`, which returns to this one's caller. */
+/* A tail call through x9 into `f`, which returns to this one's caller,
+ * past a conditional branch and a branch back, as a runtime's entry stub
+ * checks what it calls first. */
 __attribute__((naked, noinline)) static long jump(void *f, long v) {
-    __asm__ volatile("mov x9, x0\n"
+    __asm__ volatile("cbnz x0, 2f\n"
+                     "1: mov x0, xzr\n"
+                     "ret\n"
+                     "2: tbnz x0, #0, 1b\n"
+                     "b 3f\n"
+                     "nop\n"
+                     "3: mov x9, x0\n"
                      "mov x0, x1\n"
                      "br x9");
 }

@@ -159,7 +159,7 @@ way.
   its translation, so the next calls fault no more. A branch through a
   register (`br`, a tail call into a JIT's compiled code, as a runtime's
   entry stub makes) is linked alike where a call (`bl`) led to it: the
-  call's target's words up to their first branch end in it. Code read
+  call's target's code reaches it. Code read
   through such a site to be translated has its own word back. A way in
   that tells nothing of where it came from has where it returns (`x30`)
   followed instead: the code that came in goes on by translation from
@@ -390,8 +390,9 @@ a processor that reports `DIC` clear.
   go once they are an hour old.
 - **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
   prepared in place, `xN` holding the target, links that site; one whose
-  `x30` follows a `bl` links the `br xN` that ends its target's words up
-  to their first branch (`jit::branch_site`, `jit::link_call_site`):
+  `x30` follows a `bl` links each `br xN` its target's code reaches, both
+  ways of its conditional branches, `xN` holding the target
+  (`jit::branch_sites`, `jit::link_call_site`):
   with every other thread stopped, a stub doing the table lookup goes in
   the spare page every stub region and loader arena keeps
   (`prepare::call_stub`), and the `blr` becomes a `bl` to it (the `br` a

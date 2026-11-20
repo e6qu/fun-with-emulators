@@ -1780,18 +1780,19 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
     }
     // Called from code fwe prepared in place (`blr xN` before `lr`, `xN`
     // the target), or branched to from code a call there led to (`bl`
-    // before `lr`, whose target's words up to their first branch end in
-    // `br xN`): that site looks its targets up from now on, as a
-    // translation does. (Read as the host copies: `lr` may be anything.)
-    let site = branch_site(&s, lr.wrapping_sub(4), held);
-    let linked = site.is_some_and(|(site, n, call)| {
+    // before `lr`, whose target's code reaches `br xN`): that site looks
+    // its targets up from now on, as a translation does. (Read as the host
+    // copies: `lr` may be anything.)
+    // (Sites linked before that a fetch still came past were not where
+    // it came from.)
+    let mut linked = false;
+    for (site, n, call) in branch_sites(&s, lr.wrapping_sub(4), held) {
         let counter = if call { &ENTERED_CALLS } else { &ENTERED_BRANCHES };
         counter.fetch_add(1, Ordering::Relaxed);
-        match s.call_sites.get(&site) {
-            Some(&linked) => linked,
-            None => link_call_site(&mut s, site, n, call),
+        if !s.call_sites.contains_key(&site) {
+            linked |= link_call_site(&mut s, site, n, call);
         }
-    });
+    }
     // Else nothing tells where it came from (a branch through a register,
     // a call whose site took no stub): where it returns is followed, so the
     // code that came in runs by translation from there, its next ways in
@@ -1805,31 +1806,67 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
     Some(into)
 }
 
-/// The site of code fwe prepared in place that a fetch came from, `xN`
-/// holding its target (`held`, as [`enter`] has it), found from the word at
-/// `at`, before the thread's `x30`: `blr xN` there, or `bl` there whose
-/// target's words up to their first branch end in `br xN` (a hint, such
-/// as `bti`, being none). The site, `N`, and whether it is a call.
-fn branch_site(s: &State, at: u64, held: u32) -> Option<(u64, u32, bool)> {
+/// The sites of code fwe prepared in place that a fetch may have come
+/// from, `xN` holding its target (`held`, as [`enter`] has it), found from
+/// the word at `at`, before the thread's `x30`: `blr xN` there; or, `bl`
+/// there, each `br xN` its target's code reaches (both ways of each
+/// conditional branch and on through direct branches and calls, no
+/// further than [`REACHED`] words), each linked as a call's site would
+/// be. Each site, its `N`, and whether it is a call.
+fn branch_sites(s: &State, at: u64, held: u32) -> Vec<(u64, u32, bool)> {
     let usable = |at: u64| !s.in_region(at) && followable(at);
-    let read = |at: u64| usable(at).then(|| crate::trap::read_host::<u32>(at)).flatten();
-    let w = read(at)?;
-    let (site, w, call) = if w & 0xfc00_0000 == 0x9400_0000 {
-        let to = at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4));
-        // Up to a block's words in a straight line.
-        (0..64u64).map(|k| to + 4 * k).find_map(|at| {
-            let w = read(at)?;
-            let branch = (w >> 26) & 0x7 == 0b101 && w & 0xffff_f01f != 0xd503_201f;
-            branch.then_some((at, w, false))
-        })?
-    } else {
-        (at, w, true)
+    // The program's own word, where a site is linked already.
+    let read = |at: u64| {
+        usable(at)
+            .then(|| crate::trap::read_host::<u32>(at))
+            .flatten()
+            .map(|w| crate::prepare::original(at, w))
     };
-    let op = if call { 0xd63f_0000 } else { 0xd61f_0000 };
-    let n = (w >> 5) & 0x1f;
-    (w & 0xffff_fc1f == op && held & 1 << n != 0 && !matches!(n, 18 | 30))
-        .then_some((site, n, call))
+    let holds = |n: u32| held & 1 << n != 0 && !matches!(n, 18 | 30);
+    let Some(w) = read(at) else { return Vec::new() };
+    if w & 0xffff_fc1f == 0xd63f_0000 {
+        let n = (w >> 5) & 0x1f;
+        return if holds(n) { vec![(at, n, true)] } else { Vec::new() };
+    }
+    if w & 0xfc00_0000 != 0x9400_0000 {
+        return Vec::new();
+    }
+    let offset = |w: u32, bits: u32, shift: u32| {
+        i64::from(((w >> shift) << (32 - bits)) as i32 >> (32 - bits)) * 4
+    };
+    let mut sites = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    let mut next = vec![at.wrapping_add_signed(offset(w, 26, 0))];
+    while let Some(at) = next.pop() {
+        if seen.len() >= REACHED || !seen.insert(at) {
+            continue;
+        }
+        let Some(w) = read(at) else { continue };
+        let on = at + 4;
+        if w & 0xffff_fc1f == 0xd61f_0000 {
+            let n = (w >> 5) & 0x1f;
+            if holds(n) {
+                sites.push((at, n, false));
+            }
+        } else if w & 0xfc00_0000 == 0x1400_0000 {
+            next.push(at.wrapping_add_signed(offset(w, 26, 0)));
+        } else if w & 0xff00_0010 == 0x5400_0000 || matches!((w >> 25) & 0x3f, 0b011010) {
+            // b.cond, cbz, cbnz
+            next.extend([on, at.wrapping_add_signed(offset(w, 19, 5))]);
+        } else if matches!((w >> 25) & 0x3f, 0b011011) {
+            // tbz, tbnz
+            next.extend([on, at.wrapping_add_signed(offset(w, 14, 5))]);
+        } else if w & 0xfe00_0000 != 0xd600_0000 || (w >> 21) & 0xf == 1 {
+            // On past anything else but a return or another branch through
+            // a register (a call, `blr` too, returns here).
+            next.push(on);
+        }
+    }
+    sites
 }
+
+/// How many words of a call's target [`branch_sites`] reads at most.
+const REACHED: usize = 512;
 
 /// Give site `site` (`blr xN` if `call`, else `br xN`, in code fwe
 /// prepared in place) a stub within reach that looks the target up in the
