@@ -245,7 +245,7 @@ stops running its own code:
 | code using `x18` | a stub branch per use (a few Linux toolchains allocate it) | the hardware register |
 | reading `CTR_EL0` | a trap per read (C libraries read it once) | read by the guest |
 | reading `CNTPCT_EL0` | read by the guest | a trap per read (`CNTVCT_EL0` is direct) |
-| JIT code | a fault the first time each block runs (it is translated), a trap the first time each branch out of it is taken (then linked) and when a lookup misses, a call through the gate for each instruction cache line it flushes ([Code made executable at run time](jit.md)) | no faults |
+| JIT code | a translation the first time each block runs, a way out through fwe the first time each branch out of it is taken (then linked) and when a lookup misses, a fault the first time native code enters it at a place, a call through the gate for each instruction cache line it flushes ([Code made executable at run time](jit.md)) | no faults |
 | `mmap`/`munmap` heavy | host calls | page-table edits; a TLB invalidation on every vCPU when access is taken away |
 | `fork` heavy | host `fork`, copy-on-write, after pausing the other guest threads ([fork](#fork)) | a new fwe process sent every page of guest memory that exists |
 | `posix_spawn`/`vfork` + `exec` | host `fork` sharing memory, then an in-place or re-exec `execve` | a new process fetching pages as touched, then a re-exec |

@@ -1592,8 +1592,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `pagemap` entry tells whether a page is in memory, its frame number 0,
   as Linux shows it to a process without `CAP_SYS_ADMIN`.
   `coredump_filter` is the default and cannot be changed.
-- Native: code made executable at run time costs a fault the first time
-  each block runs, and each instruction cache line the program flushes
+- Native: code made executable at run time costs a translation the first
+  time each block runs (and a fault the first time native code enters it
+  at a place), and each instruction cache line the program flushes
   drops the translations made from it whose words changed, which are
   made again as the code runs ([jit.md](jit.md#what-it-costs)). Code changed without a flush
   (`ic ivau`) keeps running as it was translated, as it may on Linux on

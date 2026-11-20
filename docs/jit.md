@@ -15,12 +15,8 @@ the program's memory stays exactly as the program wrote it. In the VM
 backend, code made at run time runs as it is: the guest's `x18` and
 system calls are its own there.
 
-This document holds why fwe translates such code, how translation works
-and what the program sees, how fwe learns that code changed, what it
-costs, which runtimes it is tested with, and how other translators solve
-the same problems. The current limitations are in
-[architecture.md](architecture.md#known-limitations), and the code is
-`crates/native/src/jit.rs`.
+The code is `crates/native/src/jit.rs`; the current limitations are in
+[architecture.md](architecture.md#known-limitations).
 
 ## Why translation
 
@@ -58,43 +54,40 @@ way.
   are computed from the program's address; uses of `x18`, system calls,
   thread-pointer accesses and instruction cache flushes are expanded as
   their stubs are, inline; branches out of the block go to translations.
-- **Branches.** A direct branch goes through fwe the first time and is
-  then linked: straight to its target's translation (a conditional
-  branch itself where it reaches, else its way out at the block's end),
-  or to code that is not translated (a runtime's helper a JIT calls with
-  `bl`) straight there where a branch reaches, otherwise through a veneer
-  that loads the target into `x16`, as a linker's veneer does (the
-  procedure call standard lets one clobber `x16` and `x17` on a direct
-  branch to other code). A `cbz` or `tbz` of `x18` tests the program's
-  `x18` inline. A call puts the program's own return address in `x30`,
-  so the stack holds only the program's addresses, in words out of line
-  that a `bl` goes to (for an indirect call, after its lookup's first
-  look), so the block goes on after the `bl` with the code after the
-  call. A return looks its address up in a table of returns
-  first, and found there goes back to after the call's `bl` with `ret`,
-  which the processor predicts from the `bl` as it predicts a native
-  return; returns to one of many callers (a tree walk's) would otherwise
-  be guessed from the branches before them and missed most times. A call
+- **Direct branches** go through fwe the first time and are then linked:
+  straight to the target's translation (a conditional branch itself
+  where it reaches, else its way out at the block's end), or to code that
+  is not translated (a runtime's helper a JIT calls with `bl`) straight
+  there where a branch reaches, otherwise through a veneer that loads the
+  target into `x16`, as a linker's veneer does (the procedure call
+  standard lets one clobber `x16` and `x17` on a direct branch to other
+  code). A `cbz` or `tbz` of `x18` tests the program's `x18` inline.
+- **Calls and returns.** A call puts the program's own return address in
+  `x30`, so the stack holds only the program's addresses, from words out
+  of line that a `bl` goes to (for an indirect call, after its lookup's
+  first look); the block goes on after the `bl` with the code after the
+  call. A return looks its address up in a table of returns first and,
+  found, goes back to after the call's `bl` with `ret`, which the
+  processor predicts from the `bl` as it predicts a native return. A call
   is made once: a block that comes to a call another block made already
   branches into that one's words, so a return address has one way back.
-  An indirect branch or a return not found among the returns looks its
-  target up in a table of translations by program address: one 16-byte load reads an entry's address and translation
-  together (single-copy atomic, as the table's writes are), so a match
-  leads to the target's own translation. Through `x16` or `x17`, which
-  hold the target while it is looked up, the two are read apart, and
-  the translation checks that the target is its own (an entry can be
-  taken over while such a lookup reads it). An address is looked for in
-  the entry its bits pick, then in the other entry of that one's pair,
-  so two targets that pick one entry, both run often, do not push each
-  other out at every turn. A miss goes through fwe once and fills the
-  table. An indirect branch or return into code that is
-  not translated (a library's, prepared in place) restores `x16` and
-  `x17` and is made through the program's own register, so every
-  register is as the program left it: code may count on more than the
-  procedure call standard promises (HotSpot calls its atomic stubs
-  saying they clobber only `x8`, `x9` and `x30`, and keeps values in
-  `x16` across them). One through `x18`, or a call through `x30`, takes
-  fwe's trap.
+- **Indirect branches**, and returns not found among the returns, look
+  their target up in a table of translations by program address. One
+  16-byte load reads an entry's address and translation together
+  (single-copy atomic, as the table's writes are), so a match leads to
+  the target's own translation; through `x16` or `x17`, which hold the
+  target meanwhile, the two are read apart, and the translation checks
+  that the target is its own (an entry can be taken over as such a
+  lookup reads it). An address is looked for in the entry its bits pick,
+  then in the other of that one's pair, so two targets that pick one
+  entry do not push each other out at every turn. A miss goes through fwe
+  once and fills the table. An indirect branch into code that is not
+  translated (a library's) restores `x16` and `x17` and goes through the
+  program's own register, so every register is as the program left it:
+  code may count on more than the procedure call standard promises
+  (HotSpot's atomic stubs clobber only `x8`, `x9` and `x30`, and it keeps
+  values in `x16` across them). One through `x18`, or a call through
+  `x30`, takes fwe's trap.
 - **`x16` and `x17` stay saved.** A lookup needs two registers, and the
   program owns them all: it saves `x16` and `x17` in two slots of the
   thread's own (reached through `tpidrro_el0`, as `x18`'s is). The
@@ -294,41 +287,32 @@ a processor that reports `DIC` clear.
   (`fwe_kernel::shortlock`) before it sleeps on it: sleeping and being
   woken cost the host's scheduler far more than a hold.
 - **Ways out:** a block's way out (a direct branch's, or a lookup's
-  miss) saves `x16` and `x17` in their slots unless they are saved already
-  (`Word::Out`'s `saved`), puts its own address in `x16` and branches to
-  its chunk's exit stub (`jit::exit_stub`, the chunk's first words, which
-  load the exit gate's address and branch there), so a way out is two
-  or three words; the exit gate (`gate::fwe_exit_gate`) saves
-  the program's registers in the thread's block, as the system-call gate
-  does, and calls `jit::gate_exit` without a signal: the target is
-  translated and the branch patched to it (linked, within a chunk) at the
-  entry for the way out's state of `x16` and `x17` (`jit::entered`), as
-  is the conditional branch the way out is the taken way of, where it
-  reaches (`State::link`, undone by `State::unlink`), and the gate enters
-  that translation as a lookup does. The blocks the target goes on to
-  whatever its conditions (its direct branch's target, a call's and
-  where it returns) are made with it, a few deep (`jit::ahead`), and
-  linked at once: each would otherwise be a way out of its own as the
-  program reached it. The words patched have their
-  instruction cache lines invalidated together, with one barrier for all
-  (`State::sync_patched`), before the translator's lock is let go, new
-  words are written or stopped threads go on: a patch turns one right
-  way on into another, while a new block is invalidated as it is
-  written, before it is published. Anything else (code
-  not translated, a signal to deliver) takes the gate's `brk`, whose
-  handler goes on from the block. A way out unlinked again (its target
-  dropped, or the cache emptied) has its first word as it was made, into
-  the gate again. A lookup that enters the wrong block (one whose entry
+  miss) saves `x16` and `x17` in their slots unless they are saved
+  already (`Word::Out`'s `saved`), puts its own address in `x16` and
+  branches to its chunk's exit stub (`jit::exit_stub`, the chunk's first
+  words, which branch to the exit gate): two or three words. The exit
+  gate (`gate::fwe_exit_gate`) saves the program's registers in the
+  thread's block, as the system-call gate does, and calls
+  `jit::gate_exit` without a signal; anything else (code not translated,
+  a signal to deliver) takes the gate's `brk`, whose handler goes on from
+  the block. A lookup that enters the wrong block (one whose entry
   another address took as it read it) goes on at `brk #0x4a54`
-  (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`. A direct branch's target that is code not
-  translated is patched to it where a branch reaches and `x16` and `x17`
-  are the program's, else to a veneer block (`jit::veneer`: `x16` and
-  `x17` restored if saved, then a branch, or the target in `x16` and
-  `br x16`). A way out with the guest's `x18` held in `x17`
-  (`Word::Out`'s `x18`) is linked past the target's load of it
-  (`Block::x18`, `jit::in_x17`, `jit::put_x18`). A `cbz`/`tbz` of `x18`
-  loads the guest's `x18` into `x16`
-  (saved with `x17` as a lookup saves them) and tests it there.
+  (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`.
+- **Linking:** the target is translated and the way out patched to the
+  entry for its state of `x16` and `x17` (`jit::entered`), as is the
+  conditional branch it is the taken way of, where that reaches
+  (`State::link`, undone by `State::unlink`, which puts the first word
+  back). The blocks the target goes on to whatever its conditions are
+  made with it, a few deep (`jit::ahead`), and linked at once. Patched
+  words have their instruction cache lines invalidated together, with
+  one barrier for all (`State::sync_patched`), before the translator's
+  lock is let go; a new block is invalidated as it is written, before it
+  is published. A target that is code not translated is branched to
+  where a branch reaches and `x16` and `x17` are the program's, else
+  through a veneer block (`jit::veneer`). A way out with the program's
+  `x18` held in `x17` (`Word::Out`'s `x18`) is linked past the target's
+  load of it (`Block::x18`, `jit::in_x17`, `jit::put_x18`). A `cbz` or
+  `tbz` of `x18` loads it into `x16` and tests it there.
 - **Entries:** a block starts with the check a lookup that read the
   table apart enters at (the target in `x16` against the block's
   address), then its saved entry, where lookups and direct branches with
@@ -449,59 +433,45 @@ a processor that reports `DIC` clear.
 | a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
-| a call from native code into JIT code | a fault | once per call site, then linked; a branch in once, then linked where a call led to it, else followed |
+| a call or branch from native code into JIT code | a fault | once per site, then linked (a branch nothing leads to: followed) |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
 
-`FWE_TIMING=1` prints, as a process exits, what its translations cost:
-blocks translated, ways out taken through fwe and the time spent in
-them, entries by fetch, cache lines flushed and blocks dropped and taken
-back, how often the cache was emptied, and how long the translator's
-lock was waited for and held, by its holders' kinds; and the counts that
-say which of its work could be skipped (`crates/native/src/jitcount.rs`):
-the blocks made from files and from generated code and the time making
-each kind, the program's words a block holds and what its words end at
-(a branch, a branch through a register, a return, words made already,
-the page's end, or the most words a block takes), those made with a second pass of their words for an entry
-with the program's own `x16` and `x17` and those entered there,
-those made ahead of the program, the blocks taken from those kept and the
-time taking them, and the records found for a block's words that the
-calls made around it would make otherwise, and of the blocks in use those an
-unconditional branch (`b`) leads to: in all, and those nothing else
-leads to directly, with their words, by where the branch is (close
-behind, within the words a block made at its block's address reads;
-elsewhere on their page; on another page). With `FWE_JIT_SEEN=<dir>` each process
-adds the blocks it made to that directory (their address and a hash of
-their words) and counts those an earlier one made, at the same address
-or elsewhere. With `FWE_JIT_COUNT=1` every block counts its runs and
-every way back after a call its returns, and every lookup of a branch
-or call through a register whether it goes where it went last (the
-words then differ: a counter at each entry and lookup, and every other
-entry made apart): the report adds the blocks that ran, those made ahead
-that ran, how often the program's `x16` and `x17` were taken back from
-their slots (for an instruction naming them, and for the other
-instructions most often), the lookups that went where they went last
-(and the runs at sites that did 9 times in 10), the returns into
-generated code by the call they come back from, and the pages of
-generated code that hold no word a translation changes, with how often
-their blocks ran and their lines were flushed. `FWE_JIT_MAP=<dir>`
-writes the code cache's map there as a process ends (`jit-<pid>.map`: a
-line for each block's hot words and one for its cold ones, each with its
-place in the cache, the program address the block was made from, what
-each of its words stands for and the words; then how many of the
-program's instructions the block was made from and the last of them, or
-`cold`), which the benchmarks use to name the samples taken in
-translations, with the share in cold words, to show the hottest blocks
-word by word, and to count the blocks made by the code they come from,
-by what ended them and by their length. The benchmarks
-compare a JDK workload (compiling and running a multi-threaded
-application), a Node.js script and a Lua script under LuaJIT with the
-same releases built for macOS on the same runner
-([ROADMAP.md](../ROADMAP.md)), report these counts for each, and run the
-same machine code made at run time under fwe and natively (calls and
-returns, a switch through `br`, calls through a register, a loop, 4096
-functions called in turn, and a function made and run once:
-`guests/c/bench.c`'s `jit`).
+What fwe counts, for the benchmarks to report
+(`crates/native/src/jitcount.rs`):
+
+- **`FWE_TIMING=1`**, as a process exits: blocks translated, ways out
+  taken through fwe and their time, entries by fetch (and their places),
+  cache lines flushed, blocks dropped and taken back, emptyings of the
+  cache, and the translator's lock waited for and held, by holder. Then
+  the blocks made from files and from generated code and the time each
+  took, the program's words a block holds and what ended it, blocks made
+  with a second pass for the program's own `x16` and `x17` and those
+  entered there, blocks made ahead, blocks taken from those kept, and the
+  blocks in use that only a direct branch leads to, by where the branch
+  is.
+- **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
+  and a hash of their words) and counts those an earlier one made, at the
+  same address or elsewhere.
+- **`FWE_JIT_COUNT=1`:** blocks count their runs, ways back their returns
+  and lookups through a register whether they go where they went last
+  (the words then differ). The report adds the blocks that ran, those
+  made ahead that ran, the restores of `x16` and `x17` by the instruction
+  that caused them, the lookups that went where they went last, the
+  returns into generated code by the call they come back from, and the
+  pages of generated code that hold no word a translation changes.
+- **`FWE_JIT_MAP=<dir>`:** the code cache's map as a process ends
+  (`jit-<pid>.map`: a line for each block's hot and cold words, with its
+  place, the program address it was made from, what each word stands for
+  and the words), with which the benchmarks name the samples taken in
+  translations and count blocks by where their code comes from.
+
+The benchmarks ([ROADMAP.md](../ROADMAP.md) has their budgets) run a JDK
+workload, a Node.js script and a Lua script under LuaJIT against the same
+releases built for macOS, and the same machine code made at run time
+under fwe and natively (`guests/c/bench.c`'s `jit`: calls and returns, a
+switch through `br`, calls through a register, a loop, 4096 functions in
+turn, and a function made and run once).
 
 ## Tested runtimes
 

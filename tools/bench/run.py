@@ -24,8 +24,9 @@ macOS and natively on Linux.
         With the Linux results, a table of all three is printed (and
         appended to $GITHUB_STEP_SUMMARY). `--no-build` leaves the build and
         the workloads out (Alpine's programs run only in CI). It fails when
-        a figure of fwe's exceeds its budget against macOS's (BUDGETS), or
-        a computing program's share of fwe's its own (SHARE_BUDGETS).
+        a figure of fwe's exceeds its budget against macOS's (BUDGETS) or
+        its own limit (LIMITS), or a computing program's share of fwe's its
+        own (SHARE_BUDGETS).
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -171,6 +172,19 @@ BUDGETS = {
     "JDK (s)": 1.5,
     "Node.js (s)": 1.5,
     "LuaJIT (s)": 1.5,
+    # Code made at run time at work, against the same code run from the
+    # program's file (the same machine code, natively).
+    "JIT code: calls and returns (ns)": 1.3,
+    "JIT code: a switch through br (ns)": 1.3,
+    "JIT code: calls through a register (ns)": 1.3,
+    "JIT code: a loop (ns)": 1.3,
+}
+
+# The most fwe's figure may be, in the row's own unit: making a
+# translation, which running code natively has no counterpart of (a
+# function made and run: the block made for it, placed and linked).
+LIMITS = {
+    "JIT code: a function made and run (us)": 2.0,
 }
 
 # How much longer than its own code fwe may make a program that computes
@@ -430,9 +444,9 @@ def macos(a):
 
 
 def over_budget(results):
-    """The benchmarks whose fwe / macOS ratio exceeds its budget, or whose
-    share of fwe's exceeds its share budget. A missing figure is one: the
-    budget is not shown to hold."""
+    """The benchmarks whose fwe / macOS ratio exceeds its budget, whose
+    figure exceeds its limit, or whose share of fwe's exceeds its share
+    budget. A missing figure is one: the budget is not shown to hold."""
     over = []
     shares = results.get(SHARE, {})
     for row, budget in SHARE_BUDGETS.items():
@@ -451,6 +465,10 @@ def over_budget(results):
             over.append(f"{row}: no macOS figure")
         elif fwe / mac > budget:
             over.append(f"{row} {fwe / mac:.1f}x > {budget}x")
+    for row, limit in LIMITS.items():
+        fwe = results["fwe"].get(row)
+        if fwe is not None and fwe > limit:
+            over.append(f"{row} {fwe:.2f} > {limit}")
     return over
 
 
@@ -1750,7 +1768,8 @@ def render(results):
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
         share = f"{shares[row]:.2f}x" if row in shares else ""
         budget = (f"{BUDGETS[row]}x" if row in BUDGETS
-                  else f"{SHARE_BUDGETS[row]}x of share" if row in SHARE_BUDGETS else "")
+                  else f"{SHARE_BUDGETS[row]}x of share" if row in SHARE_BUDGETS
+                  else f"at most {LIMITS[row]}" if row in LIMITS else "")
         lines.append(f"| {row} | {ran.get(row, '')} | " + " | ".join(cells + ratios) + f" | {share} | {budget} |")
     return "\n".join(lines)
 
