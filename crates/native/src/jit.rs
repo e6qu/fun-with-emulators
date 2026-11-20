@@ -952,11 +952,11 @@ static EXITS_KNOWN_UNLINKED: AtomicU64 = AtomicU64::new(0);
 static EXITS_KNOWN_INDIRECT: AtomicU64 = AtomicU64::new(0);
 static EXITS_KNOWN_TAKEN: AtomicU64 = AtomicU64::new(0);
 static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
-/// Of [`ENTERED`]: calls (`blr`) from code not translated, branches (`br`)
-/// from code such a call (`bl`) led to, and the others (not linked to
-/// their site) whose return is followed.
+/// Of [`ENTERED`]: calls through a register (`blr`) from code not
+/// translated, those that came from code a direct call (`bl`) there led
+/// to, and the others (not linked to their site) whose return is followed.
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
-static ENTERED_BRANCHES: AtomicU64 = AtomicU64::new(0);
+static ENTERED_DIRECT: AtomicU64 = AtomicU64::new(0);
 static ENTERED_FOLLOWED: AtomicU64 = AtomicU64::new(0);
 /// Sites of code not translated linked to translations.
 static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
@@ -1077,7 +1077,7 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
-             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} branches from code a call led to, {} sites linked, {} whose return is followed), \
+             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls through a register from code not translated, {} from code a direct call there led to, {} sites linked, {} whose return is followed), \
              {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
@@ -1090,7 +1090,7 @@ pub fn counts() -> Option<String> {
             ENTERED.load(Ordering::Relaxed),
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
-            ENTERED_BRANCHES.load(Ordering::Relaxed),
+            ENTERED_DIRECT.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
             ENTERED_FOLLOWED.load(Ordering::Relaxed),
             LINES_FLUSHED.load(Ordering::Relaxed),
@@ -1812,20 +1812,26 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
         ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
         return Some(into);
     }
-    // Called from code fwe prepared in place (`blr xN` before `lr`, `xN`
-    // the target), or branched to from code a call there led to (`bl`
-    // before `lr`, whose target's code reaches `br xN`): that site looks
-    // its targets up from now on, as a translation does. (Read as the host
-    // copies: `lr` may be anything.)
-    // (Sites linked before that a fetch still came past were not where
-    // it came from.)
+    // Called from code fwe prepared in place: `blr xN` before `lr`, `xN`
+    // the target, or `bl` before `lr`, whose target's code came here
+    // (through a branch on a register, a tail call, as a runtime's entry
+    // stubs make). That site looks its target up from now on, as a
+    // translation does, so the code it calls runs by translation and its
+    // ways in here are lookups. (Read as the host copies: `lr` may be
+    // anything.)
     let mut linked = false;
-    for (site, n, call) in branch_sites(&s, lr.wrapping_sub(4), held) {
-        let counter = if call { &ENTERED_CALLS } else { &ENTERED_BRANCHES };
+    if let Some(site) = call_site(&s, lr.wrapping_sub(4), held) {
+        let at = lr.wrapping_sub(4);
+        let counter =
+            if matches!(site, CallSite::Call(_)) { &ENTERED_CALLS } else { &ENTERED_DIRECT };
         counter.fetch_add(1, Ordering::Relaxed);
-        if !s.call_sites.contains_key(&site) {
-            linked |= link_call_site(&mut s, site, n, call);
+        if let CallSite::Direct(to) = site {
+            // Its target translated, for the lookup to find (again, if
+            // its translation went since).
+            translation(&mut s, to);
         }
+        linked = s.call_sites.get(&at) == Some(&true)
+            || !s.call_sites.contains_key(&at) && link_call_site(&mut s, at, site);
     }
     // Else nothing tells where it came from (a branch through a register,
     // a call whose site took no stub): where it returns is followed, so the
@@ -1840,76 +1846,52 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
     Some(into)
 }
 
-/// The sites of code fwe prepared in place that a fetch may have come
-/// from, `xN` holding its target (`held`, as [`enter`] has it), found from
-/// the word at `at`, before the thread's `x30`: `blr xN` there; or, `bl`
-/// there, each `br xN` its target's code reaches (both ways of each
-/// conditional branch and on through direct branches and calls, no
-/// further than [`REACHED`] words), each linked as a call's site would
-/// be. Each site, its `N`, and whether it is a call.
-fn branch_sites(s: &State, at: u64, held: u32) -> Vec<(u64, u32, bool)> {
-    let usable = |at: u64| !s.in_region(at) && followable(at);
-    // The program's own word, where a site is linked already.
-    let read = |at: u64| {
-        usable(at)
-            .then(|| crate::trap::read_host::<u32>(at))
-            .flatten()
-            .map(|w| crate::prepare::original(at, w))
-    };
-    let holds = |n: u32| held & 1 << n != 0 && !matches!(n, 18 | 30);
-    let Some(w) = read(at) else { return Vec::new() };
-    if w & 0xffff_fc1f == 0xd63f_0000 {
-        let n = (w >> 5) & 0x1f;
-        return if holds(n) { vec![(at, n, true)] } else { Vec::new() };
-    }
-    if w & 0xfc00_0000 != 0x9400_0000 {
-        return Vec::new();
-    }
-    let offset = |w: u32, bits: u32, shift: u32| {
-        i64::from(((w >> shift) << (32 - bits)) as i32 >> (32 - bits)) * 4
-    };
-    let mut sites = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut next = vec![at.wrapping_add_signed(offset(w, 26, 0))];
-    while let Some(at) = next.pop() {
-        if seen.len() >= REACHED || !seen.insert(at) {
-            continue;
-        }
-        let Some(w) = read(at) else { continue };
-        let on = at + 4;
-        if w & 0xffff_fc1f == 0xd61f_0000 {
-            let n = (w >> 5) & 0x1f;
-            if holds(n) {
-                sites.push((at, n, false));
-            }
-        } else if w & 0xfc00_0000 == 0x1400_0000 {
-            next.push(at.wrapping_add_signed(offset(w, 26, 0)));
-        } else if w & 0xff00_0010 == 0x5400_0000 || matches!((w >> 25) & 0x3f, 0b011010) {
-            // b.cond, cbz, cbnz
-            next.extend([on, at.wrapping_add_signed(offset(w, 19, 5))]);
-        } else if matches!((w >> 25) & 0x3f, 0b011011) {
-            // tbz, tbnz
-            next.extend([on, at.wrapping_add_signed(offset(w, 14, 5))]);
-        } else if w & 0xfe00_0000 != 0xd600_0000 || (w >> 21) & 0xf == 1 {
-            // On past anything else but a return or another branch through
-            // a register (a call, `blr` too, returns here).
-            next.push(on);
-        }
-    }
-    sites
+/// A call site of code fwe prepared in place that a fetch may have come
+/// from ([`call_site`]).
+#[derive(Clone, Copy)]
+enum CallSite {
+    /// `blr xN`, `xN` holding the target.
+    Call(u32),
+    /// `bl` to code fwe prepared in place, at this address.
+    Direct(u64),
 }
 
-/// How many words of a call's target [`branch_sites`] reads at most.
-const REACHED: usize = 512;
+/// The call site at `at`, before the thread's `x30`, that a fetch may have
+/// come from, `held` the registers holding the fetch's address (as
+/// [`enter`] has them): `blr xN`, `xN` among them; or `bl` to code fwe
+/// prepared in place, whose code came to the fetch.
+fn call_site(s: &State, at: u64, held: u32) -> Option<CallSite> {
+    let usable = |at: u64| !s.in_region(at) && followable(at);
+    if !usable(at) {
+        return None;
+    }
+    // The program's own word, where the site is linked already.
+    let w = crate::prepare::original(at, crate::trap::read_host::<u32>(at)?);
+    if w & 0xffff_fc1f == 0xd63f_0000 {
+        let n = (w >> 5) & 0x1f;
+        return (held & 1 << n != 0 && !matches!(n, 18 | 30)).then_some(CallSite::Call(n));
+    }
+    if w & 0xfc00_0000 != 0x9400_0000 {
+        return None;
+    }
+    let to = at.wrapping_add_signed(i64::from((w << 6) as i32 >> 4));
+    usable(to).then_some(CallSite::Direct(to))
+}
 
-/// Give site `site` (`blr xN` if `call`, else `br xN`, in code fwe
-/// prepared in place) a stub within reach that looks the target up in the
-/// table, as a translation's lookup does, and goes to its translation, or
-/// makes the call or branch as it was (target not translated, or not
-/// yet): every register as the site would leave it. The site becomes `bl`
-/// (`b`) to it, made with every other thread stopped. Whether it did.
-fn link_call_site(s: &mut State, site: u64, n: u32, call: bool) -> bool {
+/// Give call site `at` (in code fwe prepared in place) a stub within reach
+/// that looks the target up in the table, as a translation's lookup does,
+/// and goes to its translation, or makes the call as it was (target not
+/// translated, or not yet). A `blr xN`'s leaves every register as the site
+/// would; a `bl`'s puts its target in `x16` first, as a linker's veneer may
+/// (the procedure call standard lets a direct call to other code clobber
+/// `x16` and `x17`), and its lookup reads it there. The site becomes `bl`
+/// to it, made with every other thread stopped. Whether it did.
+fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
     s.call_sites.insert(site, false);
+    let n = match call {
+        CallSite::Call(n) => n,
+        CallSite::Direct(_) => 16,
+    };
     // As a translation's lookup ([`lookup`]): in place, or through `x16`.
     // Each entry of the target's pair in turn: a miss in the first goes to
     // the second's look, found goes on to the translation, and a miss in
@@ -1934,11 +1916,16 @@ fn link_call_site(s: &mut State, site: u64, n: u32, call: bool) -> bool {
         (at(false), at(true), vec![GO])
     };
     let mut words = save_words().to_vec();
-    if matches!(n, 16 | 17) {
-        // The target from its slot, the area's address in x17 after the save.
-        let (s16, s17) = crate::parked_slots();
-        let slot = if n == 16 { s16 } else { s17 };
-        words.push(rewrite::LDR_UIMM | ((slot / 8) << 10) | (17 << 5) | 16);
+    match call {
+        CallSite::Direct(to) => materialize(16, to, &mut words),
+        CallSite::Call(n) if matches!(n, 16 | 17) => {
+            // The target from its slot, the area's address in x17 after
+            // the save.
+            let (s16, s17) = crate::parked_slots();
+            let slot = if n == 16 { s16 } else { s17 };
+            words.push(rewrite::LDR_UIMM | ((slot / 8) << 10) | (17 << 5) | 16);
+        }
+        CallSite::Call(_) => {}
     }
     words.extend(&first);
     let go_at = words.len();
@@ -1957,6 +1944,9 @@ fn link_call_site(s: &mut State, site: u64, n: u32, call: bool) -> bool {
         *w |= (to - k as u32) << 5;
     }
     words.extend(restore_words());
+    if let CallSite::Direct(to) = call {
+        materialize(16, to, &mut words);
+    }
     words.push(0xd61f_0000 | (n << 5)); // br xN
     let _stopped = crate::quiesce::stop_others(&mut |_| {});
     let Some(stub) = crate::prepare::call_stub(site, &words) else { return false };
@@ -1968,15 +1958,18 @@ fn link_call_site(s: &mut State, site: u64, n: u32, call: bool) -> bool {
     // both at once).
     let writable = (prot & !libc::PROT_EXEC) | libc::PROT_READ | libc::PROT_WRITE;
     // Code read through the site to be translated has its own word back.
-    let own = if call { 0xd63f_0000 } else { 0xd61f_0000 };
-    crate::prepare::note_call_site(site, own | (n << 5));
+    let own = match call {
+        CallSite::Call(n) => 0xd63f_0000 | (n << 5),
+        CallSite::Direct(to) => 0x9400_0000 | ((to.wrapping_sub(site) as u32 >> 2) & 0x3ff_ffff),
+    };
+    crate::prepare::note_call_site(site, own);
     // SAFETY: a page of the program's code, no other thread running; it
     // gets its protections back.
     unsafe {
         if libc::mprotect(page as *mut libc::c_void, page_size() as usize, writable) != 0 {
             return false;
         }
-        (site as *mut u32).write(if call { b | 0x8000_0000 } else { b }); // bl or b
+        (site as *mut u32).write(b | 0x8000_0000); // bl
         libc::mprotect(page as *mut libc::c_void, page_size() as usize, prot);
         crate::prepare::flush_icache(site, 4);
     }

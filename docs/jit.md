@@ -150,11 +150,14 @@ way.
 - **Calls into translated code.** Native code's call into a JIT's code
   faults the first time; that call site (`blr`) becomes a `bl` to a stub
   in reach that looks the target up as a translation does, and goes to
-  its translation, so the next calls fault no more. A branch through a
-  register (`br`, a tail call into a JIT's compiled code, as a runtime's
-  entry stub makes) is linked alike where a call (`bl`) led to it: the
-  call's target's code reaches it. Code read
-  through such a site to be translated has its own word back. A way in
+  its translation, so the next calls fault no more. Where the fault came
+  from code a direct call (`bl`) led to, past a branch through a register
+  (a tail call into a JIT's compiled code, as a runtime's entry stubs
+  make), the `bl` is linked alike: its stub puts the call's target in
+  `x16`, as a linker's veneer may, and looks that up, so the called code
+  runs by translation and its branches into the JIT's code are lookups.
+  Code read through such a site to be translated has its own word back.
+  A way in
   that tells nothing of where it came from has where it returns (`x30`)
   followed instead: the code that came in goes on by translation from
   there, and its next ways in are lookups.
@@ -382,15 +385,15 @@ a processor that reports `DIC` clear.
   image lands elsewhere in each, `kept::relocate`). Other builds' records
   go once they are an hour old.
 - **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
-  prepared in place, `xN` holding the target, links that site; one whose
-  `x30` follows a `bl` links each `br xN` its target's code reaches, both
-  ways of its conditional branches, `xN` holding the target
-  (`jit::branch_sites`, `jit::link_call_site`):
+  prepared in place, `xN` holding the target, or a `bl` to code prepared
+  in place, links that site (`jit::call_site`, `jit::link_call_site`):
   with every other thread stopped, a stub doing the table lookup goes in
   the spare page every stub region and loader arena keeps
-  (`prepare::call_stub`), and the `blr` becomes a `bl` to it (the `br` a
-  `b`). A thread stopped in such a stub is as at the site, which calls
-  or branches again (`jit::call_stub_to_guest`):
+  (`prepare::call_stub`), and the site becomes a `bl` to it. A `bl`'s
+  stub puts its target in `x16` before the lookup and again before going
+  to it untranslated, and its target is translated as it is linked. A
+  thread stopped in such a stub is as at the site, which calls again
+  (`jit::call_stub_to_guest`):
   a handler running translated code may save its own `x16` and `x17` in
   the slots meanwhile.
 - **Guest state:** each translated word records what it stands for
@@ -439,7 +442,7 @@ a processor that reports `DIC` clear.
 | a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
-| a call or branch from native code into JIT code | a fault | once per site, then linked (a branch nothing leads to: followed) |
+| a call or branch from native code into JIT code | a fault | once per call site, then linked (a branch no call leads to: followed) |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
 

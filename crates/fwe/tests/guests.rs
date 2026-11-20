@@ -1060,9 +1060,9 @@ fn jit_calls_keep_x16_x17_through_signals() {
 
 /// Tail calls through a register into JIT code from the program's own
 /// code, from a function a loop calls (guests/c/jittail.c): each reaches
-/// the code, and only the first is a fault into fwe (the branch's site is
-/// linked from then on, the next ones lookups), not one for each of the
-/// 100000.
+/// the code, and only the first is a fault into fwe (the call that led to
+/// the branch is linked from then on, the branch translated and a lookup),
+/// not one for each of the 100000.
 #[test]
 fn jit_code_branched_into_faults_once() {
     let prog = build_c("jittail", Libc::Musl, true, true);

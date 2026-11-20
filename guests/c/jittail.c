@@ -1,8 +1,9 @@
 /* Branches (not calls) through a register into code made at run time, from
  * the program's own code, many times over: a tail call, as a runtime's
  * entry stub makes into a JIT's compiled code (past branches of its
- * own), from a function called from a loop a level above. The branch's site, found from the call that
- * led to it, looks its targets up from then on, as a translation does.
+ * own), from a function called from a loop a level above. The call that
+ * led to the branch looks its target up from then on, as a translation
+ * does, so the branch runs translated and is a lookup.
  * Every line printed is what Linux prints. */
 #include <stdint.h>
 int printf(const char *fmt, ...);
