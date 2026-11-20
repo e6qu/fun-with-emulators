@@ -165,9 +165,12 @@ BUDGETS = {
     # repository), as a call is.
     "SQLite (s)": 1.5,
     "git (s)": 1.5,
-    # A JIT runtime at work (compiling, then running, a multi-threaded
-    # application), against the same release of OpenJDK built for macOS.
+    # JIT runtimes at work (OpenJDK compiling, then running, a
+    # multi-threaded application; Node.js and LuaJIT running a script),
+    # against the same releases built for macOS.
     "JDK (s)": 1.5,
+    "Node.js (s)": 1.5,
+    "LuaJIT (s)": 1.5,
 }
 
 # How much longer than its own code fwe may make a program that computes
@@ -204,6 +207,8 @@ BREW = {
     "git": "opt/git/bin/git",
     "xz": "opt/xz/bin/xz",
     "jdk": "opt/openjdk@25/bin",
+    "node": "opt/node@24/bin/node",
+    "luajit": "opt/luajit/bin/luajit",
 }
 
 
@@ -560,7 +565,41 @@ def build(a, fwe, results):
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     jdk(a, fwe, guest_env, results)
+    for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
+                                            ("LuaJIT", "luajit", "/usr/bin/luajit", "bench.lua")]:
+        jit_runtime(a, fwe, guest_env, results, name, manifest, program, script)
     shutil.rmtree(native, ignore_errors=True)
+
+
+def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
+    """A JIT runtime at work: `program` of Alpine's root `manifest` running
+    `script` (tools/bench/workloads) under fwe, and Homebrew's build of the
+    same release natively (BREW, by the program's name). Then where its
+    time goes under fwe, by program counter, translated code named by the
+    code cache's map; and the translator's counts, the script run twice
+    into one directory of the blocks made (`FWE_JIT_SEEN`): how many the
+    second run made that the first had, of a file's code and generated."""
+    root = alpine_root(manifest, a.cache)
+    shutil.copytree(WORKLOADS, os.path.join(root, "tmp/wl"), dirs_exist_ok=True)
+    ours = guest_env + fwe + ["--root", root, os.path.join(root, program.lstrip("/")),
+                              f"/tmp/wl/{script}"]
+    theirs = [os.path.join(a.brew, BREW[os.path.basename(program)]),
+              os.path.join(WORKLOADS, script)]
+    workload(results, f"{name} (s)", ours, theirs, (), len(guest_env) + 1)
+    jit_map = tempfile.mkdtemp()
+    pcs(name, guest_env + [f"FWE_JIT_MAP={jit_map}"] + ours[len(guest_env):], jit_map=jit_map)
+    shutil.rmtree(jit_map, ignore_errors=True)
+    pcs(f"{name} natively", theirs, execname=os.path.basename(program))
+    seen = tempfile.mkdtemp()
+    for label in ("", " again"):
+        r = subprocess.run(guest_env + ["FWE_TIMING=1", f"FWE_JIT_SEEN={seen}"]
+                           + ours[len(guest_env):], capture_output=True, text=True,
+                           errors="replace")
+        said = [line.split("; blocks made ", 1)[1] for line in r.stderr.splitlines()
+                if "timing: exit: " in line and "; blocks made " in line]
+        print(f"{name}{label}, the translator's counts (exit {r.returncode}): "
+              + " | ".join("blocks made " + s for s in said), file=sys.stderr)
+    shutil.rmtree(seen, ignore_errors=True)
 
 
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):

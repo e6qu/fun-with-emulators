@@ -467,8 +467,9 @@ translations, with the share in cold words, to show the hottest blocks
 word by word, and to count the blocks made by the code they come from,
 by what ended them and by their length. The benchmarks
 compare a JDK workload (compiling and running a multi-threaded
-application) with the same JDK built for macOS on the same runner
-([ROADMAP.md](../ROADMAP.md)), report these counts for it, and run the
+application), a Node.js script and a Lua script under LuaJIT with the
+same releases built for macOS on the same runner
+([ROADMAP.md](../ROADMAP.md)), report these counts for each, and run the
 same machine code made at run time under fwe and natively (calls and
 returns, a switch through `br`, calls through a register, a loop, 4096
 functions called in turn, and a function made and run once:
