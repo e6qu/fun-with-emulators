@@ -1534,7 +1534,7 @@ def jdk(a, fwe, guest_env, results):
     for how, cmd in [("under fwe", guest_env + fwe + [
             "--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp",
             "/tmp/jdkout", "Main", JDK_SCALE]),
-            ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])] * 4:  # TEMPORARY x4
+            ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])]:
         start = time.perf_counter()
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         took = time.perf_counter() - start

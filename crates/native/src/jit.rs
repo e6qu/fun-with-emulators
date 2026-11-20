@@ -860,8 +860,6 @@ static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 /// Time spent translating blocks, and in [`exit`] (with its lock), in
 /// nanoseconds.
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
-thread_local! { static PROBE_TEXT: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) }; }
-pub static PROBE: [AtomicU64; 16] = [const { AtomicU64::new(0) }; 16];
 static EXIT_NS: AtomicU64 = AtomicU64::new(0);
 /// Cache lines the program flushed, the blocks those flushes kept (their
 /// words unchanged) and dropped, and blocks taken back ([`revive`]).
@@ -941,15 +939,6 @@ pub fn write_map() {
 /// translation.
 pub fn counts() -> Option<String> {
     let t = TRANSLATED.load(Ordering::Relaxed);
-    if t > 0 {
-        let v: Vec<String> = PROBE
-            .iter()
-            .enumerate()
-            .map(|(k, p)| format!("{k}:{}", p.load(Ordering::Relaxed) / 1_000_000))
-            .collect();
-        PROBE_TEXT.with(|p| *p.borrow_mut() = v.join(" "));
-    }
-    let probes = PROBE_TEXT.with(|p| p.borrow().clone());
     let counted = (t > 0).then(|| {
         let s = state();
         let blocks: Vec<jitcount::Counted> = s
@@ -970,7 +959,7 @@ pub fn counts() -> Option<String> {
     });
     (t > 0).then(|| {
         format!(
-            "PROBE ms {probes}; JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
+            "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
              {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
              {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
@@ -1034,9 +1023,7 @@ impl Held {
         self.since.add_to(&HOLD_NS[self.site]);
         self.s = None;
         let r = work();
-        let c = Clock::now();
         self.s = Some(lock_state());
-        c.add_to(&PROBE[4]);
         self.since = Clock::now();
         r
     }
@@ -1171,7 +1158,6 @@ fn looked_up(t: u64) -> u64 {
 /// last stays where it is found soonest). Under [`STATE`]'s lock: one
 /// writer, and a lookup reads an entry whole, so it finds either address
 /// in one of them as they move.
-#[inline(never)]
 fn publish(g: u64, t: u64) {
     publish_in(TABLE, g, looked_up(t));
 }
@@ -2116,12 +2102,6 @@ fn entered(s: &State, i: usize, saved: bool, x18: bool) -> u64 {
 /// program's words, and placed if they are still as it saw them and no
 /// other thread placed one meanwhile (else it looks again).
 fn translation(s: &mut Held, g: u64) -> usize {
-    let c = Clock::now();
-    let r = translation_(s, g);
-    c.add_to(&PROBE[0]);
-    r
-}
-fn translation_(s: &mut Held, g: u64) -> usize {
     loop {
         if let Some(&i) = s.by_g.get(&g) {
             // Its table entry may have gone to another address since (they
@@ -2135,16 +2115,11 @@ fn translation_(s: &mut Held, g: u64) -> usize {
         }
         let page = g & !(page_size() - 1);
         let followed = !s.in_region(g);
-        let c = Clock::now();
-        let rv = revive(s, g, page);
-        c.add_to(&PROBE[2]);
-        if let Some(i) = rv {
+        if let Some(i) = revive(s, g, page) {
             return i;
         }
         let making = Clock::now();
-        let c = Clock::now();
         let source = snapshot(g);
-        c.add_to(&PROBE[1]);
         // A file's code: its block as kept ([`kept`]), where its words and
         // the calls made in other blocks' words that it goes on into are
         // as they were.
@@ -2180,17 +2155,13 @@ fn translation_(s: &mut Held, g: u64) -> usize {
         if s.by_g.contains_key(&g) || !same || followed == s.in_region(g) {
             continue;
         }
-        let c = Clock::now();
         let info = packed(&made.room.asm, g);
-        c.add_to(&PROBE[6]);
         if let Some(p) = part {
             let calls: Vec<u64> =
                 known.iter().map(|k| k.0).filter(|&q| q > g && q < made.end).collect();
             kept::keep(p, g, &source[..read_words], &calls, &made, &info);
         }
-        let c = Clock::now();
         let r = place(s, g, followed, made, info, source[..read_words].to_vec(), false);
-        c.add_to(&PROBE[5]);
         making.add_to(
             &jitcount::MAKE_NS[if followed { jitcount::FILE } else { jitcount::GENERATED }],
         );
@@ -2215,12 +2186,6 @@ thread_local! {
 /// return site is the program's words, decoded and never run). Whether
 /// the cache was emptied meanwhile (block indices are then another's).
 fn ahead(s: &mut Held, i: usize) -> bool {
-    let c = Clock::now();
-    let r = ahead_(s, i);
-    c.add_to(&PROBE[12]);
-    r
-}
-fn ahead_(s: &mut Held, i: usize) -> bool {
     let flushes = s.cache.as_ref().map_or(0, |c| c.flushes);
     let mut next = vec![i];
     let mut made = 0;
@@ -2273,7 +2238,6 @@ fn packed(a: &Asm<Word>, g: u64) -> Vec<Packed> {
 /// prepared in place; `info`, what its words stand for, packed; `source`,
 /// the program's words it was made from; `taken`, from a record kept
 /// rather than made now) in the cache, and publish it.
-#[inline(never)]
 fn place(
     s: &mut State,
     g: u64,
@@ -2301,7 +2265,6 @@ fn place(
     }
     let Room { asm, c: calls } = &mut room;
     let (hot, cold) = (asm.len(H), asm.len(C));
-    let c = Clock::now();
     // (Room is made first: emptying the cache forgets every page's other
     // mappings.)
     let page = g & !(page_size() - 1);
@@ -2310,7 +2273,6 @@ fn place(
     // Its branches resolved where it goes, its ways out on into the exit
     // stub of its chunk.
     asm.finish([at, at_cold], stub);
-    c.add_to(&PROBE[7]);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
@@ -2319,11 +2281,8 @@ fn place(
             unpublish(r, 0);
         }
     }
-    let c = Clock::now();
     let (t, cold_t) = emit(s, asm.words(H), asm.words(C));
     assert_eq!((t, cold_t), (at, at_cold), "a block placed where its branches were pointed");
-    c.add_to(&PROBE[8]);
-    let c = Clock::now();
     let (len, cold_len) = (4 * hot as u64, 4 * cold as u64);
     s.cache.as_mut().expect("a code cache").live += len + cold_len;
     let i = s.blocks.len();
@@ -2372,14 +2331,9 @@ fn place(
             s.blocks[j].linked.push(from);
         }
     }
-    c.add_to(&PROBE[9]);
-    let c = Clock::now();
     publish_block(&s.blocks[i]);
-    c.add_to(&PROBE[10]);
     TRANSLATED.fetch_add(1, Ordering::Relaxed);
-    let c = Clock::now();
     link_waiting(s, i);
-    c.add_to(&PROBE[11]);
     ROOM.set(Some(room));
     i
 }
@@ -2388,7 +2342,6 @@ fn place(
 /// of its words dropped ([`State::dormant`]), if they were not changed: a
 /// JIT flushes code it wrote anew as the same (a method installed again,
 /// a patch undone). Only a block wanted again is taken back.
-#[inline(never)]
 fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     let i = s.dormant.remove(&g)?;
     let b = &s.blocks[i];
@@ -2419,9 +2372,6 @@ fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
 /// to it: as a way out's first run would, without its trap.
 fn link_waiting(s: &mut State, i: usize) {
     let g = s.blocks[i].g;
-    let c = Clock::now();
-    c.add_to(&PROBE[13]);
-    let c = Clock::now();
     // Its direct ways out ([`Block::jumps`]), by index: linking changes
     // the blocks.
     for k in 0..s.blocks[i].words.len() {
@@ -2432,8 +2382,6 @@ fn link_waiting(s: &mut State, i: usize) {
             None => wait(&mut s.waiting, to, (at, i)),
         }
     }
-    c.add_to(&PROBE[14]);
-    let c = Clock::now();
     if let Some(w) = s.waiting.remove(&g) {
         let (first, more) = match w {
             Waiting::One(at, from) => (Some((at, from)), Vec::new()),
@@ -2443,7 +2391,6 @@ fn link_waiting(s: &mut State, i: usize) {
             link_site(s, from, at, i);
         }
     }
-    c.add_to(&PROBE[15]);
 }
 
 /// The direct ways out waiting for one program address to be translated
@@ -2523,7 +2470,6 @@ fn retarget(w: u32, at: u64, to: u64) -> Option<u32> {
 /// as code is first translated from it: a flush through one of them is a
 /// flush of `p`'s code ([`flushed`]); a JIT that maps its code twice may
 /// flush either.
-#[inline(never)]
 fn note_aliases(s: &mut State, p: u64) {
     if s.pages.contains_key(&p) {
         return;
@@ -2759,7 +2705,6 @@ fn followable(to: u64) -> bool {
 /// emptied where at least half of it is dropped translations, and the block
 /// goes in a chunk with room, or a new one. Its chunk's exit stub, and its
 /// parts' addresses.
-#[inline(never)]
 fn cache_next(s: &mut State, hot: u64, cold: u64) -> (u64, u64, u64) {
     // The first segment holds the exit stub; each part may be aligned.
     assert!(
@@ -2970,7 +2915,6 @@ thread_local! {
 
 /// The program's words from `g` as far as a block made there reads them:
 /// up to its page's end.
-#[inline(never)]
 fn snapshot(g: u64) -> Vec<u32> {
     let page = page_size();
     let n = (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize);

@@ -232,7 +232,7 @@ jobs:
   jdk:
     name: JDK (macos-26)
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -240,38 +240,17 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - name: The JDK, ten times
+      - name: The JDK
         env:
           FWE_JDK_TESTS: "1"
-        run: |
-          set +e
-          failed=0
-          n=0
-          opts=""
-          for sw in X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1 X=1; do
-            n=$((n+1))
-            echo "=== options: '$opts', switches: $sw"
-            env $sw FWE_JDK_JAVA_OPTIONS="$opts" cargo test -p fwe --test guests -- alpine_jdk --nocapture > jdk.out 2>&1
-            r=$?
-            grep -q "alpine_jdk_compiles_and_runs_a_multithreaded_application ... " jdk.out || { echo "the JDK test did not run"; exit 1; }
-            grep -E "SIGSEGV \(|SIGBUS \(|Problematic|^# +[VJjvC] |test result|guarantee|assert|JIT code:" jdk.out | head -20
-            echo "=== switches: $sw -> exit $r"
-            [ -d target/tmp/jdk-traces ] && mv target/tmp/jdk-traces "target/tmp/jdk-run-$n" && cp jdk.out "target/tmp/jdk-run-$n/test.out"
-            [ $r -ne 0 ] && failed=1
-          done
-          exit $failed
-      - if: always()
-        run: for i in 1 2 3 4 5 6 7 8 9 10; do echo "=== JIT runtimes round $i"; cargo test -p fwe --test guests -- node_runs luajit racket guile python_evaluates --nocapture || exit 1; done
+        run: cargo test -p fwe --test guests -- alpine_jdk --nocapture
       # The calls of each step.
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: jdk-traces
-          path: target/tmp/jdk-run-*
+          path: target/tmp/jdk-traces
 
-  # The benchmarks (tools/bench/run.py): startup, system calls, threads,
-  # fork and exec, and Lua's build, natively on arm64 Linux here (Lua in an
-  # Alpine container, the GCC fwe's run uses) ...
   # The Homebrew formula (Formula/fwe.rb), built from this commit's source
   # in place of a release's, installed and tested as a user would.
   homebrew:
@@ -296,6 +275,9 @@ jobs:
           brew test local/fwe/fwe
           codesign -d --entitlements - "$(brew --prefix)/bin/fwe"
 
+  # The benchmarks (tools/bench/run.py): startup, system calls, threads,
+  # fork and exec, and Lua's build, natively on arm64 Linux here (Lua in an
+  # Alpine container, the GCC fwe's run uses) ...
   bench-linux:
     name: Benchmarks (Linux arm64)
     runs-on: ubuntu-24.04-arm

@@ -134,14 +134,7 @@ Done:
   [which ones](docs/linux-on-macos.md#how-distributions-build-their-programs)),
   linked dynamically, or holding an address no relocation follows runs
   in the VM, and `--strace` says why.
-Left, as pull requests in order. Each brings the instrumentation that
-shows where its time goes, micro benchmarks that isolate the costs it
-attacks and macro benchmarks of programs at work, all in CI; counts
-decide which work is skipped before any is built.
-
-#### PR 1 — A JDK at work (#90, open)
-
-- [ ] **Code made at run time, by translation:** code a program makes
+- [x] **Code made at run time, by translation:** code a program makes
   executable as it runs (JIT compilers' code, self-modifying code, code
   on the stack) runs from translations in fwe's code cache, the
   program's memory never executable on the host and never changed: its
@@ -151,38 +144,33 @@ decide which work is skipped before any is built.
   instruction ([docs/jit.md](docs/jit.md)). Tested with Node.js 18 and
   24, LuaJIT, Racket, Guile, Python's `eval`, OpenJDK, quines, IOCCC
   winners and self-modifying programs.
-- [ ] **Where the translator's time goes, counted:** `FWE_TIMING` and the
+- [x] **Where the translator's time goes, counted:** `FWE_TIMING` and the
   benchmarks' report count, per workload, the blocks made by where their
   code comes from (a file, or generated), those whose address and words
   a run made before, entries made with the program's own `x16` and
   `x17` and those entered, blocks made ahead and those run, calls from
-  translated code into a library's, and the time making each block.
-- [ ] **Micro benchmarks of translated code** in CI, each against the
-  same code run from the program's file: calls and returns, indirect
-  branches, a loop, many small functions in random order (code
-  footprint), and blocks made per second.
-- [ ] **Translations kept and shared:** translations of a file's code (a
-  runtime's library, the C library) kept on disk by the file's identity
-  and where it is loaded, and of generated code by its address and words,
-  as prepared images are kept; mapped into each process and shared by
-  processes running at once. Each block is checked against the program's
-  words before it runs, so a stale one never does.
-- [ ] **Blocks made only when needed:** a block's entry with the
-  program's own `x16` and `x17` made on its first use, not with every
-  block; blocks made ahead of the program only as far as the counts show
-  they are run.
-- [ ] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes
+  translated code into a library's, and the time making each block; and
+  micro benchmarks of translated code against the same code run from the
+  program's file (calls and returns, indirect branches, a loop, many
+  small functions in random order, a function made and run).
+- [x] **Translations of a file's code kept:** the blocks made from a
+  file's code (a runtime's library, the C library, the program's own)
+  kept on disk by the file's identity and where it is loaded, as prepared
+  images are kept, and taken by a later process, or this one, that comes
+  to the same code; a block is taken only where the program's words are
+  as it was made from, so a stale one never runs.
+- [x] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes
   and runs, many threads, a garbage collector) runs natively under fwe,
   and the benchmarks run a realistic workload on it (compiling and running
   a multi-threaded application) against Homebrew's OpenJDK of the same
   release on the same runner, their output compared, within 1.5×.
 
-**Done when:** the JIT runtimes above pass in CI; the JDK benchmark holds
-1.5× in every run of a repeated CI benchmark job; a second run of the JDK
-workload makes no block from a file's code that the first made; and the
-counts and micro benchmarks are in every benchmark report.
+Left, as pull requests in order. Each brings the instrumentation that
+shows where its time goes, micro benchmarks that isolate the costs it
+attacks and macro benchmarks of programs at work, all in CI; counts
+decide which work is skipped before any is built.
 
-#### PR 2 — Translated code at native speed
+#### PR 1 — Translated code at native speed
 
 - [ ] **Traces:** chains of blocks the program runs hot made again as one
   straight run of code, their cold paths out of line, dropped with any
@@ -192,14 +180,23 @@ counts and micro benchmarks are in every benchmark report.
   translation, the table looked up only when they differ.
 - [ ] **Cheaper blocks:** what each word stands for written in its
   compact form directly, with no larger form made first.
+- [ ] **Generated code's translations kept:** a block made from
+  generated code kept by its address and words, and taken by a later run
+  that writes the same words there.
+- [ ] **Blocks made only when needed:** a block's entry with the
+  program's own `x16` and `x17` made on its first use, not with every
+  block; blocks made ahead of the program only as far as the counts show
+  they are run.
 - [ ] **Macro benchmarks of JIT runtimes:** Node.js and LuaJIT at work
   against Homebrew's builds on the same runner, their output compared.
 
 **Done when:** the micro benchmarks of translated code hold 1.3× of the
-same code run from the program's file, and Node.js's and LuaJIT's
-benchmarks 1.5×.
+same code run from the program's file; Node.js's and LuaJIT's benchmarks
+1.5×; and a second run of a JIT runtime's workload takes, rather than
+makes, the blocks of generated code the first made at the same address
+from the same words.
 
-#### PR 3 — Generated code run as it is, where it is sound
+#### PR 2 — Generated code run as it is, where it is sound
 
 Decided by counts from the JDK, Node.js and LuaJIT workloads, each
 adopted only where it saves more than it costs, otherwise listed under
@@ -216,7 +213,7 @@ adopted only where it saves more than it costs, otherwise listed under
 **Done when:** each item is adopted with its benchmarks holding their
 budgets, or listed as not planned with the counts that decided it.
 
-#### PR 4 — File lookups without the host
+#### PR 3 — File lookups without the host
 
 - [ ] **Counted:** the benchmarks' report counts path lookups by kind
   (found, absent, in a container image's layers) and host calls per
@@ -242,7 +239,7 @@ in a directory looked at before each hold 0.5× macOS (or the directory
 cache is listed as not planned with its counts), and `open`+`close` holds
 1.1× macOS.
 
-#### PR 5 — `fork` and signals
+#### PR 4 — `fork` and signals
 
 - [ ] **Fewer mappings to fork:** fwe's code cache, translation tables
   and descriptor room made on first use, in as few host regions as they
@@ -253,7 +250,7 @@ cache is listed as not planned with its counts), and `open`+`close` holds
 **Done when:** `fork` + exit + wait holds 2× macOS (from 3×) and a handled
 `SIGSEGV` 2× macOS (now without a budget).
 
-#### PR 6 — 4 KiB pages natively
+#### PR 5 — 4 KiB pages natively
 
 - [ ] **4 KiB pages natively:** `mmap`, `mprotect` and `munmap` at 4 KiB
   granularity on the Mac's 16 KiB pages: file contents at 4 KiB offsets
@@ -270,7 +267,7 @@ cache is listed as not planned with its counts), and `open`+`close` holds
 calls hold the system-call budget, and what still needs the VM for its
 pages is listed with the reason.
 
-#### PR 7 — Wine natively
+#### PR 6 — Wine natively
 
 - [ ] **Wine natively:** Windows' ARM64 code keeps the thread's TEB in
   `x18`, which macOS clears, so code Wine maps executable is prepared as a
