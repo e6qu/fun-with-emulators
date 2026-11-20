@@ -51,18 +51,41 @@ pub(super) fn generated() -> Option<Part> {
     program.map(|(dev, ino)| Part { dev, ino, base: GENERATED })
 }
 
-/// A record's place: its file of records, offset and length.
+/// A record's entry in its file's table: its program address, offset,
+/// length and key ([`key_of`]), which a block is looked for by before its
+/// record is read.
 #[derive(Clone, Copy)]
 struct At {
-    seg: u32,
+    g: u64,
     off: u32,
     len: u32,
+    key: u64,
 }
 
-/// A file of records mapped read-only.
+/// The bytes of an entry of a file's table ([`file_of`]).
+const ENTRY: usize = 24;
+
+/// The key of a record made from the program's words `words`: how many
+/// they are, in the top 16 bits, and a hash of them (FNV-1a) in the rest.
+fn key_of(words: impl Iterator<Item = u32>) -> u64 {
+    let (mut n, mut h) = (0u64, 0xcbf2_9ce4_8422_2325u64);
+    for w in words {
+        h = (h ^ u64::from(w)).wrapping_mul(0x100_0000_01b3);
+        n += 1;
+    }
+    (n.min(0xffff) << 48) | (h & ((1 << 48) - 1))
+}
+
+/// The most records an address keeps in a part's files: those of the
+/// processes that made one last. A merge leaves out older ones.
+const PER_ADDRESS: usize = 8;
+
+/// A file of records mapped read-only, its table of `n` entries checked
+/// to lie within it.
 struct Seg {
     ptr: *const u8,
     len: usize,
+    n: usize,
     path: Vec<u8>,
 }
 
@@ -74,6 +97,31 @@ impl Seg {
         // SAFETY: the mapping lives as long as `self`.
         unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
     }
+
+    /// Entry `i` of its table.
+    fn entry(&self, i: usize) -> At {
+        let e = &self.bytes()[12 + ENTRY * i..12 + ENTRY * (i + 1)];
+        let u32_at = |k: usize| u32::from_le_bytes([e[k], e[k + 1], e[k + 2], e[k + 3]]);
+        let u64_at = |k: usize| u64::from(u32_at(k)) | u64::from(u32_at(k + 4)) << 32;
+        At { g: u64_at(0), off: u32_at(8), len: u32_at(12), key: u64_at(16) }
+    }
+
+    /// Its entries for program address `g` (the table is in address
+    /// order), found by halves: no index of them made.
+    fn entries(&self, g: u64) -> impl Iterator<Item = At> + '_ {
+        let mut lo = 0;
+        let mut hi = self.n;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.entry(mid).g < g { lo = mid + 1 } else { hi = mid }
+        }
+        (lo..self.n).map(|i| self.entry(i)).take_while(move |e| e.g == g)
+    }
+
+    /// The bytes of the record at `at`, if they lie within the file.
+    fn record(&self, at: At) -> Option<&[u8]> {
+        self.bytes().get(at.off as usize..(at.off as usize).checked_add(at.len as usize)?)
+    }
 }
 
 impl Drop for Seg {
@@ -83,11 +131,10 @@ impl Drop for Seg {
     }
 }
 
-/// A part's records, as this process found them.
+/// A part's files of records, as this process found them: oldest first.
 #[derive(Default)]
 struct Loaded {
     segs: Vec<Seg>,
-    index: HashMap<u64, Vec<At>>,
 }
 
 /// What this process knows of the records: the parts it looked at, the
@@ -214,9 +261,20 @@ pub(super) fn take(
     let mut k = kept();
     let k = begun(&mut k);
     let loaded = k.parts.entry(part).or_insert_with(|| load(part));
-    for at in loaded.index.get(&g)? {
-        let seg = loaded.segs.get(at.seg as usize)?;
-        let rec = seg.bytes().get(at.off as usize..(at.off + at.len) as usize)?;
+    // The keys of the program's words there, as many as each record was
+    // made from.
+    let mut keys = HashMap::new();
+    for (seg, at) in loaded.segs.iter().rev().flat_map(|seg| seg.entries(g).map(move |e| (seg, e)))
+    {
+        let n = (at.key >> 48) as usize;
+        let want = *keys.entry(n).or_insert_with(|| {
+            (n <= source.len()).then(|| key_of(source[..n.min(source.len())].iter().copied()))
+        });
+        if want != Some(at.key) {
+            continue;
+        }
+        jitcount::KEPT_READ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let Some(rec) = seg.record(at) else { continue };
         let mut r = Reader(rec);
         let n = r.u32()? as usize;
         let words = r.take(4 * n)?;
@@ -418,9 +476,10 @@ impl<'a> Reader<'a> {
     }
 }
 
-/// A file of records begins so, then its count of records and for each its
-/// program address, offset and length; their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept5";
+/// A file of records begins so, then its count of records and a table of
+/// them in address order, for each its program address, offset, length
+/// and key ([`key_of`]); their bytes follow.
+const MAGIC: &[u8; 8] = b"fwekept6";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],
@@ -480,7 +539,7 @@ fn load(p: Part) -> Loaded {
     let began = fwe_kernel::timing::on().then(std::time::Instant::now);
     let loaded = load_files(p);
     if let Some(t) = began {
-        let n: usize = loaded.index.values().map(Vec::len).sum();
+        let n = loaded.segs.len();
         jitcount::LOADED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
         jitcount::LOAD_NS
             .fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
@@ -488,13 +547,19 @@ fn load(p: Part) -> Loaded {
     loaded
 }
 
-/// [`load`]'s work: part `p`'s files mapped and their records indexed.
+/// [`load`]'s work: part `p`'s files mapped.
 fn load_files(p: Part) -> Loaded {
     let mut loaded = Loaded::default();
     let Some(dir) = part_dir(p) else { return loaded };
     let Ok(entries) = std::fs::read_dir(std::ffi::OsStr::from_bytes(&dir)) else { return loaded };
-    for e in entries.flatten() {
-        let path = e.path();
+    // Oldest first, by the time in their names ([`write`]): an address's
+    // records end with its newest.
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    paths.sort_by_key(|p| {
+        let stem = p.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+        stem.rsplit('-').next().and_then(|t| t.parse::<u128>().ok()).unwrap_or(0)
+    });
+    for path in paths {
         if path.extension().is_none_or(|x| x != "rec") {
             continue;
         }
@@ -517,23 +582,17 @@ fn load_files(p: Part) -> Loaded {
         if ptr == libc::MAP_FAILED {
             continue;
         }
-        let seg = Seg { ptr: ptr as *const u8, len, path: path.as_os_str().as_bytes().to_vec() };
-        let k = loaded.segs.len() as u32;
+        let mut seg =
+            Seg { ptr: ptr as *const u8, len, n: 0, path: path.as_os_str().as_bytes().to_vec() };
         let mut r = Reader(seg.bytes());
         if r.take(8) != Some(&MAGIC[..]) {
             continue;
         }
         let Some(n) = r.u32() else { continue };
-        let mut index = Vec::new();
-        for _ in 0..n {
-            let (Some(g), Some(off), Some(rlen)) = (r.u64(), r.u32(), r.u32()) else { break };
-            if (off as usize).saturating_add(rlen as usize) <= len {
-                index.push((g, At { seg: k, off, len: rlen }));
-            }
+        if 12 + ENTRY * n as usize > len {
+            continue;
         }
-        for (g, at) in index {
-            loaded.index.entry(g).or_default().push(at);
-        }
+        seg.n = n as usize;
         loaded.segs.push(seg);
     }
     loaded
@@ -545,11 +604,16 @@ fn file_of<'a>(recs: impl ExactSizeIterator<Item = (u64, &'a [u8])> + Clone) -> 
     let mut out = Vec::new();
     out.extend_from_slice(MAGIC);
     out.extend_from_slice(&(n as u32).to_le_bytes());
-    let mut off = 12 + 16 * n;
+    let mut off = 12 + 24 * n;
     for (g, r) in recs.clone() {
+        // (A record begins with the count of the program's words it was
+        // made from, and those words: [`keep`].)
+        let mut rr = Reader(r);
+        let words = rr.u32().and_then(|n| rr.take(4 * n as usize)).unwrap_or_default();
         out.extend_from_slice(&g.to_le_bytes());
         out.extend_from_slice(&(off as u32).to_le_bytes());
         out.extend_from_slice(&(r.len() as u32).to_le_bytes());
+        out.extend_from_slice(&key_of(words_of(words)).to_le_bytes());
         off += r.len();
     }
     for (_, r) in recs {
@@ -589,13 +653,26 @@ pub(super) fn write() {
         let merge = loaded.segs.len() >= MERGE_AT;
         let mut all: Vec<(u64, &[u8])> = recs.records().collect();
         if merge {
-            for (&g, ats) in &loaded.index {
-                for at in ats {
-                    let seg = &loaded.segs[at.seg as usize];
-                    all.push((g, &seg.bytes()[at.off as usize..(at.off + at.len) as usize]));
+            // This process's records first, then the files' newest first,
+            // at most [`PER_ADDRESS`] for an address.
+            let mut count: HashMap<u64, usize> = HashMap::new();
+            for &(g, _) in &all {
+                *count.entry(g).or_default() += 1;
+            }
+            for seg in loaded.segs.iter().rev() {
+                for at in (0..seg.n).map(|i| seg.entry(i)) {
+                    let c = count.entry(at.g).or_default();
+                    if *c < PER_ADDRESS
+                        && let Some(r) = seg.record(at)
+                    {
+                        *c += 1;
+                        all.push((at.g, r));
+                    }
                 }
             }
         }
+        // (In address order, for [`Seg::entries`].)
+        all.sort_by_key(|&(g, _)| g);
         let bytes = file_of(all.iter().copied());
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

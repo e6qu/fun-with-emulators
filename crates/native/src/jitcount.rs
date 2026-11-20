@@ -79,7 +79,9 @@ pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) static TAKE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KEPT_OTHER: AtomicU64 = AtomicU64::new(0);
-/// Records indexed as their parts' files were first looked at, and the
+/// Records read as a block was looked for: their keys matched its words'.
+pub(crate) static KEPT_READ: AtomicU64 = AtomicU64::new(0);
+/// Files of records mapped as their parts were first looked at, and the
 /// nanoseconds that took.
 pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
 pub(crate) static LOAD_NS: AtomicU64 = AtomicU64::new(0);
@@ -388,13 +390,14 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         out.push_str(if k + 1 < STEPS.len() { "," } else { "" });
     }
     out.push_str(&format!(
-        "; taken from those kept {} {}, {} {} ({} ms), {} records found made otherwise, {} \
-         records indexed ({} ms)",
+        "; taken from those kept {} {}, {} {} ({} ms), {} records read for them, {} found made \
+         otherwise, {} files of them mapped ({} ms)",
         ORIGINS[FILE],
         n(&TAKEN[FILE]),
         ORIGINS[GENERATED],
         n(&TAKEN[GENERATED]),
         ms(&TAKE_NS),
+        n(&KEPT_READ),
         n(&KEPT_OTHER),
         n(&LOADED),
         ms(&LOAD_NS),

@@ -369,7 +369,13 @@ a processor that reports `DIC` clear.
   more file as it ends or replaces its program (a fork child its own
   only), written aside and moved into place, and maps a part's files
   read-only the first time it translates code there; one that finds
-  eight merges them into one. `jit::translation` looks for a record of
+  eight merges them into one, keeping an address's newest eight records.
+  A file's table lists its records in address order, each with a key (how
+  many of the program's words it was made from and their hash,
+  `kept::key_of`), so a look for a block halves the table and reads only
+  the records whose key its words match: no index is made, and a JIT that
+  writes other code at the same addresses run after run costs no more
+  reads. `jit::translation` looks for a record of
   the code before it translates (`kept::take`), and places a block
   taken (`Asm::restore`) as one just made, the literal of each system
   call's and flush's stub set to where the gate is in this process (fwe's
@@ -449,8 +455,8 @@ What fwe counts, for the benchmarks to report
   looking for a kept one, translating, checking, packing, keeping,
   finding room, writing, indexing, linking), the program's words a block holds and what ended it, blocks made
   with a second pass for the program's own `x16` and `x17` and those
-  entered there, blocks made ahead, blocks taken from those kept (and the records
-  indexed to find them), and the
+  entered there, blocks made ahead, blocks taken from those kept (the records read and
+  the files mapped to find them), and the
   blocks in use that only a direct branch leads to, by where the branch
   is.
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
