@@ -3735,8 +3735,14 @@ fn names_none(w: u32, regs: u32, sp: bool) -> bool {
             let copy = w & 0x9fe0_8400 == 0x0e00_0400;
             !((convert || copy) && named(&[0, 5]))
         }
-        // System: hints and barriers.
-        0b1010 | 0b1011 => w & 0xffff_f01f == 0xd503_201f || w & 0xffff_f01f == 0xd503_301f,
+        // System: hints and barriers, and a read of the thread pointer
+        // into a register other than `x16`, `x17` and `x18` ([`one`] stands
+        // for it with that register alone).
+        0b1010 | 0b1011 => {
+            w & 0xffff_f01f == 0xd503_201f
+                || w & 0xffff_f01f == 0xd503_301f
+                || (w & !rewrite::RT_MASK == rewrite::MRS_TPIDR && !matches!(rd, 16..=18))
+        }
         _ => false,
     }
 }
@@ -4187,7 +4193,14 @@ fn one(
     // The thread pointer.
     if w & !rewrite::RT_MASK == rewrite::MRS_TPIDR {
         let rt = w & rewrite::RT_MASK;
-        if rt != 31 {
+        if rt != 31 && *saved {
+            // Its words write `rt` alone, with `x16` and `x17` in their
+            // slots ([`keeps_saved`]): stopped among them, it runs again.
+            let site = Site::ReadThreadPointer { rt };
+            let words =
+                rewrite::stub_body(site, crate::thread_pointer_slot(), crate::x18_slot(), pc);
+            a.extend(H, words, at_pc(true));
+        } else if rt != 31 {
             expansion(Site::ReadThreadPointer { rt }, pc, here(a), a);
         }
         return false;
@@ -4488,6 +4501,18 @@ mod tests {
         for w in [0xd280_0030, 0xf280_0051, 0x9000_0010, 0x1000_0011] {
             assert!(!keeps_saved(w, false), "{w:08x}");
         }
+    }
+
+    /// A read of the thread pointer keeps `x16` and `x17` saved unless it
+    /// writes one of them or `x18`.
+    #[test]
+    fn thread_pointer_read_keeps_them_saved() {
+        assert!(keeps_saved(0xd53b_d041, false)); // mrs x1, tpidr_el0
+        assert!(keeps_saved(0xd53b_d041, true));
+        for rt in 16..=18 {
+            assert!(!keeps_saved(0xd53b_d040 | rt, true), "x{rt}");
+        }
+        assert!(!keeps_saved(0xd51b_d041, false)); // msr tpidr_el0, x1
     }
 
     /// Each kind of word comes back from a placed block's packed form as
