@@ -96,19 +96,21 @@ way.
   `x16` across them). One through `x18`, or a call through `x30`, takes
   fwe's trap.
 - **`x16` and `x17` stay saved.** A lookup needs two registers, and the
-  program owns them all: it saves `x16` and `x17` below `sp`. The
+  program owns them all: it saves `x16` and `x17` in two slots of the
+  thread's own (reached through `tpidrro_el0`, as `x18`'s is). The
   translation it reaches keeps them there until one of its instructions
-  names them or `sp`, or needs fwe's stack (a system call, another
-  expansion), and restores them there; a way out or the next lookup saves
-  them again only if they were restored. A save and the load of what it
-  saved cost a store's forwarding, a few cycles, and each lookup in a
-  loop would wait for the last one's: a loop of lookups whose code never
-  needs them (an interpreter's dispatch, calls through pointers) runs as
-  fast as natively. A block reached by a direct branch with the program's
+  names them or needs fwe's stack (a system call, another expansion),
+  and restores them there; a way out or the next lookup saves them again
+  only if they were restored. Code that never names them (an
+  interpreter's dispatch, calls through pointers, a recursion moving
+  `sp` at each call) runs its calls, returns and lookups with no save
+  or restore between them. A save, with no register free, puts both below
+  `sp` first (without moving it), then each in its slot: six words; a
+  restore is four. A block reached by a direct branch with the program's
   own registers is entered past its restore, or where it starts with
   code that runs either way, at a copy of that code made with them in
   place, which joins the rest at the restore. A fault or signal anywhere
-  in between is delivered with the program's `x16`, `x17` and `sp`.
+  in between is delivered with the program's `x16` and `x17`.
 - **`x18` in `x17`.** macOS keeps `x18` for itself, and Linux code uses it
   like any other register (HotSpot's C2 allocates it), so outside
   translations each use of `x18` is a stub that reads and writes the
@@ -282,7 +284,7 @@ a processor that reports `DIC` clear.
   (`fwe_kernel::shortlock`) before it sleeps on it: sleeping and being
   woken cost the host's scheduler far more than a hold.
 - **Ways out:** a block's way out (a direct branch's, or a lookup's
-  miss) saves `x16` and `x17` below `sp` unless they are saved already
+  miss) saves `x16` and `x17` in their slots unless they are saved already
   (`Word::Out`'s `saved`), puts its own address in `x16` and branches to
   its chunk's exit stub (`jit::exit_stub`, the chunk's first words, which
   load the exit gate's address and branch there), so a way out is two
@@ -379,10 +381,13 @@ a processor that reports `DIC` clear.
   prepared in place links that site (`jit::link_call_site`): with every
   other thread stopped, a stub doing the table lookup goes in the spare
   page every stub region and loader arena keeps (`prepare::call_stub`),
-  and the `blr` becomes a `bl` to it.
+  and the `blr` becomes a `bl` to it. A thread stopped in such a stub is
+  as at the call site, which calls it again (`jit::call_stub_to_guest`):
+  a handler running translated code may save its own `x16` and `x17` in
+  the slots meanwhile.
 - **Guest state:** each translated word records what it stands for
-  (`Word`: the guest instruction, with `x16` and `x17` saved or not, a
-  point inside an expansion before or after its instruction, a lookup, a
+  (`Word`: the guest instruction, with `x16` and `x17` saved or not or
+  on their way into their slots, a point inside an expansion before or after its instruction, a lookup, a
   way out; in an exit stub, the way out in `x16`), so `jit::to_guest`
   turns a fault, signal, system call or tracer stop there into the guest's
   state at its instruction: an expansion is undone (`undo`, reading back
@@ -425,7 +430,7 @@ a processor that reports `DIC` clear.
 | a direct branch's first run | a call through the exit gate | once per branch, then linked |
 | a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
-| an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it used them or `sp` | each time; a miss goes through the exit gate |
+| an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
 | a call from native code into JIT code | a fault | once per call site, then linked |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
@@ -480,8 +485,10 @@ functions called in turn, and a function made and run once:
 In CI, each against what Linux prints:
 
 - **Contract tests** (`guests/c/jitlab.c`, `jitstorm.c`, `jitx18.c`,
-  `jitcalls.c`, `selfmod.c`, `perverse.c`): calls in and out, indirect
-  branches, PC-relative forms, `x18`, system calls, restarts, signals,
+  `jitcalls.c`, `jitstubsig.c`, `selfmod.c`, `perverse.c`): calls in and
+  out (with `x16` and `x17` kept through signals whose handlers run
+  translated code), indirect branches, PC-relative forms, `x18`, system
+  calls, restarts, signals,
   faults resumed at a continuation, a tracer's stops, code patched,
   copied, flushed through either of two views, made executable after it
   was written, given back and written anew, run by many threads while

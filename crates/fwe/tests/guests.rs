@@ -1033,6 +1033,24 @@ fn jit_code_called_from_many_sites_at_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Calls into JIT code from the program's own code with `x16` and `x17`
+/// set, signalled over and over by another thread, the handler calling
+/// JIT code that sets them to its own values (guests/c/jitstubsig.c): a
+/// signal landing in the call (in its linked site's stub, or the
+/// translation) leaves every call the `x16` and `x17` its caller set.
+#[test]
+fn jit_calls_keep_x16_x17_through_signals() {
+    let prog = build_c("jitstubsig", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitstubsig");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitstubsig stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "wrong calls: 0\nsignals handled: many\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code calling, in turn, functions 4 MiB apart (guests/c/jitpair.c),
 /// whose addresses pick the same entry of fwe's table of translations:
 /// each call reaches its own function, and two of them share the entry's

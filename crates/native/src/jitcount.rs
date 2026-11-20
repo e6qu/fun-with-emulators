@@ -18,7 +18,7 @@
 //! entry for the program's own registers made with a second pass), and
 //! each way back after a call its returns; at the end, the report says
 //! which blocks ran, how often the program's `x16` and `x17` were taken
-//! back from below `sp` (by why) and saved again, how often returns came
+//! back from their slots (by why) and saved again, how often returns came
 //! back into generated code, and
 //! which pages of generated code hold no word a translation would have to
 //! change (a system call, a thread-pointer access, a use of `x18`, a
@@ -194,15 +194,15 @@ fn count(at: u64) -> u64 {
     unsafe { (*(at as *const AtomicU64)).load(Ordering::Relaxed) }
 }
 
-/// Counters of the program's `x16` and `x17` taken back from below `sp`
-/// (for an instruction that names `sp` or needs fwe's stack, and for one
-/// that names them) and saved there again.
+/// Counters of the program's `x16` and `x17` taken back from their slots
+/// (for an instruction that needs fwe's stack, and for one that names
+/// them) and saved there again.
 static MOVES: OnceLock<u64> = OnceLock::new();
-pub(crate) const RESTORE_SP: u64 = 0;
+pub(crate) const RESTORE_STACK: u64 = 0;
 pub(crate) const RESTORE_NAMED: u64 = 1;
 pub(crate) const SAVED_AGAIN: u64 = 2;
 
-/// The counter of `x16` and `x17`'s moves of kind `k` ([`RESTORE_SP`]...).
+/// The counter of `x16` and `x17`'s moves of kind `k` ([`RESTORE_STACK`]...).
 pub(crate) fn moves(k: u64) -> u64 {
     *MOVES.get_or_init(|| units(3)) + 8 * k
 }
@@ -397,12 +397,12 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         ahead,
         ahead_ran,
     ));
-    // The program's x16 and x17 taken back from below sp, by why, and
+    // The program's x16 and x17 taken back from their slots, by why, and
     // saved there again.
     out.push_str(&format!(
-        "; x16 and x17 taken back {} times for sp or fwe's stack, {} for an instruction naming \
-         them, saved again {} times",
-        count(moves(RESTORE_SP)),
+        "; x16 and x17 taken back {} times for fwe's stack, {} for an instruction naming them, \
+         saved again {} times",
+        count(moves(RESTORE_STACK)),
         count(moves(RESTORE_NAMED)),
         count(moves(SAVED_AGAIN)),
     ));

@@ -674,7 +674,7 @@ fn settle(regs: &mut Regs) {
         // holds the guest's state, as at the instruction it stands for, not
         // fwe's code, which may be gone when the handler returns.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if crate::jit::in_cache(regs.pc) {
+        if crate::jit::stands_for_program(regs.pc) {
             crate::jit::to_guest(regs);
         }
         k.deliver_pending(regs);
@@ -1048,7 +1048,7 @@ fn take_async(
     // In a translation: the guest's state as at the instruction it stands
     // for, which is what a tracer, a handler's frame or a core sees.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::jit::in_cache(regs.pc) {
+    if crate::jit::stands_for_program(regs.pc) {
         crate::jit::to_guest(&mut regs);
     }
     k.deliver_pending(&mut regs);

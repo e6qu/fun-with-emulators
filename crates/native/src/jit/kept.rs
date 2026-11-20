@@ -362,17 +362,20 @@ impl<'a> Reader<'a> {
 
 /// A file of records begins so, then its count of records and for each its
 /// program address, offset and length; their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept2";
+const MAGIC: &[u8; 8] = b"fwekept3";
 
 /// The directory of this build's records, with the thread's slots its
-/// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`]:
-/// keys made as a process starts, the same in every one).
+/// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],
+/// [`crate::parked_slots`]: keys made as a process starts, the same in
+/// every one).
 fn build_dir() -> Option<Vec<u8>> {
     let mut d = fwe_kernel::prepcache::beside("translations")?;
     d.extend_from_slice(b"/");
     d.extend(build_id().iter().flat_map(|b| format!("{b:02x}").into_bytes()));
+    let (s16, s17) = crate::parked_slots();
     d.extend_from_slice(
-        format!("-{:x}-{:x}", crate::thread_pointer_slot(), crate::x18_slot()).as_bytes(),
+        format!("-{:x}-{:x}-{s16:x}-{s17:x}", crate::thread_pointer_slot(), crate::x18_slot())
+            .as_bytes(),
     );
     Some(d)
 }
