@@ -1,8 +1,8 @@
 /* Branches (not calls) through a register into code made at run time, from
- * the program's own code, many times over: a tail call, as an interpreter
- * makes into a JIT's compiled code. Where nothing tells fwe the branch's
- * site, it follows where the code returns, so the code that branched in
- * runs by translation from then on and its later branches in are lookups.
+ * the program's own code, many times over: a tail call, as a runtime's
+ * entry stub makes into a JIT's compiled code, from a function called
+ * from a loop a level above. The branch's site, found from the call that
+ * led to it, looks its targets up from then on, as a translation does.
  * Every line printed is what Linux prints. */
 #include <stdint.h>
 int printf(const char *fmt, ...);
@@ -17,6 +17,15 @@ __attribute__((naked, noinline)) static long jump(void *f, long v) {
                      "br x9");
 }
 
+static volatile long last;
+
+/* The call into `jump`, returning to a loop that runs natively. */
+__attribute__((noinline)) static long step(long i) {
+    long r = jump(code, i);
+    last = r;
+    return r;
+}
+
 int main(void) {
     code = mmap(0, 16384, 7, 0x22, -1, 0);
     code[0] = 0x91000400; /* add x0, x0, #1 */
@@ -27,7 +36,7 @@ int main(void) {
                      "isb" ::"r"(code));
     long sum = 0;
     for (long i = 0; i < 100000; i++) {
-        sum += jump(code, i);
+        sum += step(i);
     }
     printf("sum: %ld\n", sum);
     return 0;

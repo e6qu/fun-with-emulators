@@ -155,12 +155,14 @@ way.
 - **Calls into translated code.** Native code's call into a JIT's code
   faults the first time; that call site (`blr`) becomes a `bl` to a stub
   in reach that looks the target up as a translation does, and goes to
-  its translation, so the next calls fault no more. Code read through
-  that site to be translated has its `blr` back. A way in that tells
-  nothing of where it came from (a branch through a register, as an
-  interpreter's tail call into a JIT's compiled code) has where it
-  returns (`x30`) followed instead: the code that came in goes on by
-  translation from there, and its next ways in are lookups.
+  its translation, so the next calls fault no more. A branch through a
+  register (`br`, a tail call into a JIT's compiled code, as a runtime's
+  entry stub makes) is linked alike where a call (`bl`) led to it: the
+  call's target's words up to their first branch end in it. Code read
+  through such a site to be translated has its own word back. A way in
+  that tells nothing of where it came from has where it returns (`x30`)
+  followed instead: the code that came in goes on by translation from
+  there, and its next ways in are lookups.
 - **What the program sees stays its own.** Its memory reads back exactly
   as it wrote it. A fault or signal in a translation is delivered at the
   program's instruction, with its registers: an expansion stopped before
@@ -364,7 +366,7 @@ a processor that reports `DIC` clear.
   to its site (`State::returns`). Such code is read through
   `prepare::original`, which gives back the instruction at a site from
   the sites recorded as stubs were made (`prepare::SITES`), checked
-  against the stub's branch back, and a call site's `blr` from those
+  against the stub's branch back, and a site's `blr` or `br` from those
   linked to call stubs (`prepare::CALL_SITES`).
 - **Kept translations:** `jit::kept` keeps a block made from a file's
   code (`kept::keep`) as `jit::translate` made it, before it is placed:
@@ -386,11 +388,14 @@ a processor that reports `DIC` clear.
   image lands elsewhere in each, `kept::relocate`). Other builds' records
   go once they are an hour old.
 - **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
-  prepared in place links that site (`jit::link_call_site`): with every
-  other thread stopped, a stub doing the table lookup goes in the spare
-  page every stub region and loader arena keeps (`prepare::call_stub`),
-  and the `blr` becomes a `bl` to it. A thread stopped in such a stub is
-  as at the call site, which calls it again (`jit::call_stub_to_guest`):
+  prepared in place, `xN` holding the target, links that site; one whose
+  `x30` follows a `bl` links the `br xN` that ends its target's words up
+  to their first branch (`jit::branch_site`, `jit::link_call_site`):
+  with every other thread stopped, a stub doing the table lookup goes in
+  the spare page every stub region and loader arena keeps
+  (`prepare::call_stub`), and the `blr` becomes a `bl` to it (the `br` a
+  `b`). A thread stopped in such a stub is as at the site, which calls
+  or branches again (`jit::call_stub_to_guest`):
   a handler running translated code may save its own `x16` and `x17` in
   the slots meanwhile.
 - **Guest state:** each translated word records what it stands for
@@ -439,7 +444,7 @@ a processor that reports `DIC` clear.
 | a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
-| a call from native code into JIT code | a fault | once per call site, then linked; a branch in once, then followed |
+| a call from native code into JIT code | a fault | once per call site, then linked; a branch in once, then linked where a call led to it, else followed |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
 
@@ -496,7 +501,7 @@ In CI, each against what Linux prints:
   `jitcalls.c`, `jitstubsig.c`, `jittail.c`, `selfmod.c`, `perverse.c`):
   calls in and out (with `x16` and `x17` kept through signals whose
   handlers run translated code), branches in through a register (one
-  fault, then followed), indirect branches, PC-relative forms, `x18`, system
+  fault, then linked), indirect branches, PC-relative forms, `x18`, system
   calls, restarts, signals,
   faults resumed at a continuation, a tracer's stops, code patched,
   copied, flushed through either of two views, made executable after it
