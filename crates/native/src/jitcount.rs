@@ -15,10 +15,12 @@
 //!
 //! With `FWE_JIT_COUNT` set: each block's entries count their runs (its
 //! words then differ: a few more at each entry, and every block with an
-//! entry for the program's own registers made with a second pass), and
-//! each way back after a call its returns; at the end, the report says
-//! which blocks ran, how often the program's `x16` and `x17` were taken
-//! back from their slots (by why) and saved again, how often returns came
+//! entry for the program's own registers made with a second pass), each
+//! way back after a call its returns, and each lookup of a branch or call
+//! through a register whether it goes where it went last; at the end, the
+//! report says which blocks ran, how often the program's `x16` and `x17`
+//! were taken back from their slots (by the instruction) and saved again,
+//! how often lookups went where they went last, how often returns came
 //! back into generated code, and
 //! which pages of generated code hold no word a translation would have to
 //! change (a system call, a thread-pointer access, a use of `x18`, a
@@ -215,6 +217,19 @@ static RESTORES: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
 pub(crate) fn restore(w: u32) -> u64 {
     let at = units(1);
     RESTORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((at, w));
+    at
+}
+
+/// Each lookup of a branch or a call through a register: its counters
+/// (the target it took last, its runs to that same target again, its
+/// runs), and whether it is a call.
+static LOOKUPS: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
+
+/// Counters for a lookup of a branch (or a call, `call`) through a
+/// register: their address ([`LOOKUPS`]).
+pub(crate) fn lookup(call: bool) -> u64 {
+    let at = units(3);
+    LOOKUPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((at, call));
     at
 }
 
@@ -427,6 +442,27 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         most.join(", "),
         count(moves(SAVED_AGAIN)),
     ));
+    // Lookups of branches and calls through a register: their runs, those
+    // to the target taken there last, and the runs at sites that went
+    // there at least 9 times in 10.
+    for call in [false, true] {
+        let (mut runs, mut same, mut steady) = (0, 0, 0);
+        for &(at, c) in LOOKUPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            if c == call {
+                let (s, r) = (count(at + 8), count(at + 16));
+                runs += r;
+                same += s;
+                if 10 * s >= 9 * r {
+                    steady += r;
+                }
+            }
+        }
+        out.push_str(&format!(
+            "; {} through a register {runs} times, {same} of them to where the last went, {steady} \
+             at sites that went there 9 times in 10",
+            if call { "calls" } else { "branches" },
+        ));
+    }
     // Returns into each origin's code, by the call they come back from.
     let mut returns: HashMap<(usize, &str), u64> = HashMap::new();
     for p in PADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {

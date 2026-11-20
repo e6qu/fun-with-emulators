@@ -4312,6 +4312,27 @@ fn lookup(
             a.bind(next, s);
         }
     }
+    // (Counting, whether it goes where it went last: [`jitcount::lookup`].)
+    if jitcount::counting() && !ret && in_place {
+        let at = jitcount::lookup(link.is_some());
+        a.extend(H, materialized(16, at), before);
+        a.extend(
+            H,
+            [
+                0xf940_0211,             // ldr x17, [x16]: the last target
+                0xf900_0200 | n,         // str xN, [x16]
+                0xca00_0231 | (n << 16), // eor x17, x17, xN
+                0x9100_2210,             // add x16, x16, #8
+                0xb500_0071,             // cbnz x17, +12
+                0xd280_0031,             // mov x17, #1
+                0xf831_021f,             // stadd x17, [x16]: the same again
+                0x9100_2210,             // add x16, x16, #8
+                0xd280_0031,             // mov x17, #1
+                0xf831_021f,             // stadd x17, [x16]: a run
+            ],
+            before,
+        );
+    }
     let miss = a.label();
     let to = if in_place {
         a.extend(main, [index_of(n), SCALE, BASE, ENTRY, key_against(n)], before);

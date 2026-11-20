@@ -474,9 +474,14 @@ elsewhere on their page; on another page). With `FWE_JIT_SEEN=<dir>` each proces
 adds the blocks it made to that directory (their address and a hash of
 their words) and counts those an earlier one made, at the same address
 or elsewhere. With `FWE_JIT_COUNT=1` every block counts its runs and
-every way back after a call its returns (the words then differ: a
-counter at each entry, and every other entry made apart): the report
-adds the blocks that ran, those made ahead that ran, the returns into
+every way back after a call its returns, and every lookup of a branch
+or call through a register whether it goes where it went last (the
+words then differ: a counter at each entry and lookup, and every other
+entry made apart): the report adds the blocks that ran, those made ahead
+that ran, how often the program's `x16` and `x17` were taken back from
+their slots (for an instruction naming them, and for the other
+instructions most often), the lookups that went where they went last
+(and the runs at sites that did 9 times in 10), the returns into
 generated code by the call they come back from, and the pages of
 generated code that hold no word a translation changes, with how often
 their blocks ran and their lines were flushed. `FWE_JIT_MAP=<dir>`
