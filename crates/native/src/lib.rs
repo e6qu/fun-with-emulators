@@ -1,11 +1,17 @@
 //! The native execution backend: Linux code runs directly on the CPU inside
 //! this macOS process, with system calls redirected to the kernel layer.
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod asm;
 pub mod decode;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod gate;
 pub mod hv;
 pub mod hwcap;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub mod jit;
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod jitcount;
 pub mod loader;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod pool;
@@ -28,13 +34,27 @@ static LIVE_THREADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicU
 
 /// `FWE_TIMING`'s mark as the process ends, with how many code pages were
 /// written as they first ran.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn mark_exit() {
     fwe_kernel::timing::mark("exit");
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    prepare::keep_hot();
+    {
+        prepare::keep_hot();
+        jit::write_map();
+        jitcount::write_seen();
+        jit::keep_made();
+    }
     if fwe_kernel::timing::on() {
         let pages = fwe_kernel::lazycode::written();
         fwe_kernel::timing::mark(&format!("exit: {pages} code pages written as first run"));
+        fwe_kernel::timing::mark(&format!("exit: {}", fwe_kernel::timing::calls_and_signals()));
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if let Some(counts) = jit::counts() {
+            fwe_kernel::timing::mark(&format!("exit: {counts}"));
+        }
     }
 }
 
@@ -157,6 +177,41 @@ impl Platform for NativePlatform {
         })
     }
 
+    fn translates_jit(&self) -> bool {
+        cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    }
+
+    fn jit_code(&mut self, addr: u64, len: u64) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        jit::code(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = (addr, len);
+    }
+
+    fn jit_mapped(&mut self, addr: u64, len: u64) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        jit::mapped(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = (addr, len);
+    }
+
+    fn jit_discarded(&mut self, addr: u64, len: u64) {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        jit::discarded(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        let _ = (addr, len);
+    }
+
+    fn jit_changed(&mut self, addr: u64, len: u64) -> bool {
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        return jit::changed(addr, len);
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        {
+            let _ = (addr, len);
+            false
+        }
+    }
+
     fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {
         prepare::map_image(key, addr, len, prot, (self.tp_slot, self.x18_slot))
             .map_err(fwe_kernel::host::errno_to_linux)
@@ -171,6 +226,10 @@ impl Platform for NativePlatform {
         unsafe { prepare::keep_image(key, addr, len) };
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn exit(&mut self, code: i32) -> ! {
         mark_exit();
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
@@ -347,11 +406,10 @@ fn read_program(
     } else if let Some(guest) = guest_path_in_root(path, options) {
         in_guest(&guest)
     } else {
-        use std::io::Read;
         use std::os::fd::AsRawFd;
-        let mut f = std::fs::File::open(path).map_err(Error::Read)?;
-        let mut data = Vec::new();
-        f.read_to_end(&mut data).map_err(Error::Read)?;
+        let f = std::fs::File::open(path).map_err(Error::Read)?;
+        let data = fwe_kernel::fs::read_all_fd(f.as_raw_fd())
+            .map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))?;
         Ok((data, fwe_kernel::prepcache::FileId::of_fd(f.as_raw_fd())))
     }
 }
@@ -828,8 +886,7 @@ pub fn probe(name: &str) -> Result<String, String> {
 }
 
 fn page_size() -> u64 {
-    // SAFETY: plain host call.
-    unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 }
+    fwe_kernel::mm::host_page_size()
 }
 
 /// `movz x8, #139` (rt_sigreturn).
@@ -996,8 +1053,8 @@ pub fn load_image(
 
     let strace = tracer.enabled;
     let slots = (platform.tp_slot, platform.x18_slot);
-    let load_object = |elf: &Elf, id, what: &str| -> Result<loader::Loaded, Error> {
-        let loaded = loader::load(elf, page, id, slots, |a, l, known, arena, cache| {
+    let load_object = |elf: &Elf, id, at, what: &str| -> Result<loader::Loaded, Error> {
+        let loaded = loader::load(elf, page, id, slots, at, |a, l, known, arena, cache| {
             let stats =
                 platform.prepare(a, l, Some(arena), known, cache).map_err(|e| e.to_string())?;
             if strace {
@@ -1016,7 +1073,9 @@ pub fn load_image(
         Ok(loaded)
     };
 
-    let loaded = load_object(&elf, file_id, "exe")?;
+    let loaded = load_object(&elf, file_id, Some(loader::PIE_BASE), "exe")?;
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    jit::program_is(file_id);
     // The program's file is told by `/proc/self/exe` when listed.
     fwe_kernel::maps::record().loaded(&elf, loaded.bias, page, fwe_kernel::maps::Name::Exe, (0, 0));
 
@@ -1044,7 +1103,7 @@ pub fn load_image(
                     "the dynamic linker is not position-independent".into(),
                 ));
             }
-            let placed = load_object(&ielf, iid, "interp")?;
+            let placed = load_object(&ielf, iid, None, "interp")?;
             let name = fwe_kernel::maps::Name::Path(ip.as_slice().into());
             fwe_kernel::maps::record().loaded(
                 &ielf,
@@ -1061,12 +1120,14 @@ pub fn load_image(
     let interp_base = interp.map_or(0, |i| i.load_base);
 
     // A fresh thread stack, as large as `RLIMIT_STACK` lets it grow, with
-    // an inaccessible guard page below it.
+    // an inaccessible guard page below it, ending at `loader::STACK_TOP`
+    // where that is free.
     let stack = stack_size(stack_limit, page);
-    // SAFETY: a fresh mapping owned by the guest.
+    // SAFETY: a fresh mapping owned by the guest; not MAP_FIXED, the
+    // address is only a hint.
     let stack_base = unsafe {
         libc::mmap(
-            std::ptr::null_mut(),
+            (loader::STACK_TOP - stack - page) as *mut libc::c_void,
             (stack + page) as usize,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_PRIVATE | libc::MAP_ANON,
@@ -1243,7 +1304,9 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
         regs
     });
     // From here on this thread runs guest code, which may use x18 freely;
-    // the trap handlers leave the mode while they run host code.
+    // the trap handlers leave the mode while they run host code. Its waits
+    // from here on are the program's.
+    fwe_kernel::procstore::entered();
     trap::prepare_guest_entry();
     match traced {
         // SAFETY: the registers of the program's entry, as the tracer left them.

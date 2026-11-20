@@ -116,6 +116,8 @@ unpacked into a directory serves.
 - **Threads, processes, signals, pipes, sockets, terminals and job
   control** behave as on Linux; `fork`, `exec` and `wait` make real Mac
   processes, one `fwe` for each Linux process.
+- **Programs that make code as they run** (the JIT compilers of Node.js,
+  Java, LuaJIT, Racket, Guile) run natively too ([jit.md](jit.md)).
 - **Networking** uses the Mac's: a server listening on a port is
   reachable from the Mac on that port, and outgoing connections go out as
   the Mac's do.
@@ -126,15 +128,16 @@ unpacked into a directory serves.
 
 macOS keeps the lowest 4 GiB of a process's address space for itself, so
 a program linked to load there (a non-PIE executable, such as Debian's
-Python, GCC, clang and Go) runs in a small VM instead, through
-Hypervisor.framework; `fwe` chooses the VM by itself, and `fwe --strace`
-says why. A static program linked there with its relocations kept
-(`-Wl,--emit-relocs`) runs natively instead, moved above 4 GiB. This needs
-`fwe` signed with the hypervisor entitlement (Homebrew's and the
-releases' are) on a Mac that offers the hypervisor
+Python, GCC, clang and Go, or Alpine's SBCL) runs in a small VM instead,
+through Hypervisor.framework; `fwe` chooses the VM by itself, and
+`fwe --strace` says why. (A static program linked there with its
+relocations kept, `-Wl,--emit-relocs`, runs natively instead, moved above
+4 GiB.) The VM needs `fwe` signed with the hypervisor entitlement
+(Homebrew's and the releases' are) on a Mac that offers the hypervisor
 (`sysctl kern.hv_support` prints `1`); otherwise `fwe` says the program
-needs the VM and exits with status 126. `fwe --vm` runs every program in
-the VM, for programs that need 4 KiB pages, such as Wine.
+needs the hypervisor backend and exits with status 126. `fwe --vm` runs
+every program in the VM, for programs that need 4 KiB pages, such as
+Wine.
 
 The VM backend is tested only on a software stand-in for
 Hypervisor.framework, since CI's machines offer no hypervisor
@@ -152,9 +155,8 @@ env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/
 ```
 
 CI's `wine` job runs `guests/windows/winprog.c` (built with
-`zig cc -target aarch64-windows-gnu`) this way, exercising files,
-threads, exceptions and a child process. Programs with windows do not run
-yet (see below).
+`zig cc -target aarch64-windows-gnu`) this way. Programs with windows do
+not run yet (see below).
 
 ## Containers
 
@@ -227,6 +229,7 @@ that lacks it, and `--strace` names it.
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are
   the Mac's.
+- **More than 16384 open descriptors** in one process.
 - The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10);
   where `fwe` differs from Linux in detail is in the
   [architecture's known limitations](architecture.md#known-limitations).

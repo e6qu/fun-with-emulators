@@ -83,15 +83,27 @@ impl<'a> Dec<'a> {
     pub fn u8(&mut self) -> u8 {
         self.array::<1>()[0]
     }
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn bool(&mut self) -> bool {
         self.u8() != 0
     }
     pub fn u32(&mut self) -> u32 {
         u32::from_le_bytes(self.array())
     }
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn i32(&mut self) -> i32 {
         self.u32() as i32
     }
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn u64(&mut self) -> u64 {
         u64::from_le_bytes(self.array())
     }
@@ -100,6 +112,10 @@ impl<'a> Dec<'a> {
     }
     /// A count of items, each at least `min` bytes long: bounded by what is
     /// left, so a corrupt count cannot ask for a huge allocation.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn count(&mut self, min: usize) -> usize {
         let n = self.u64() as usize;
         if n > (self.buf.len() - self.at) / min.max(1) {
@@ -108,6 +124,10 @@ impl<'a> Dec<'a> {
         }
         n
     }
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn bytes(&mut self) -> Vec<u8> {
         let n = self.count(1);
         self.take(n).to_vec()
@@ -125,6 +145,10 @@ impl<'a> Dec<'a> {
         !self.bad
     }
     /// Whether everything read was there and nothing is left over.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn finish(&self) -> Result<(), String> {
         if self.bad || self.at != self.buf.len() {
             return Err("the fork state is malformed".into());

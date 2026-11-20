@@ -31,6 +31,13 @@ pub const GATE_IMM: u32 = 0x4c5a;
 /// `brk #GATE_IMM`.
 pub const GATE_TRAP: u32 = 0xd420_0000 | (GATE_IMM << 5);
 
+/// Immediate of the `brk` the exit gate takes for every way out but into a
+/// translation.
+pub const EXIT_GATE_IMM: u32 = 0x4c5b;
+
+/// `brk #EXIT_GATE_IMM`.
+pub const EXIT_GATE_TRAP: u32 = 0xd420_0000 | (EXIT_GATE_IMM << 5);
+
 /// Size of each thread's gate stack.
 const STACK_SIZE: usize = 1 << 20;
 
@@ -55,6 +62,10 @@ pub struct Block {
     /// This thread's slot in [`crate::quiesce`], once looked up: the gate
     /// marks itself in and out of guest code there without a thread-local.
     pub slot: u64,
+    /// The exit gate's way on: the translation it enters, and the program
+    /// address that translation is of (see [`fwe_exit_gate`]).
+    pub jit_t: u64,
+    pub jit_g: u64,
 }
 
 const _: () = assert!(std::mem::size_of::<Regs>() == 800);
@@ -81,11 +92,24 @@ fn key() -> libc::pthread_key_t {
 }
 
 /// This thread's block, if it has one. Async-signal-safe.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn block() -> Option<&'static Block> {
     // SAFETY: reading this thread's value of fwe's key.
     let p = unsafe { libc::pthread_getspecific(key()) } as *const Block;
     // SAFETY: a block is never freed while its thread runs guest code.
     (!p.is_null()).then(|| unsafe { &*p })
+}
+
+/// Every block's address, for fwe's code cache to look in when it is
+/// emptied (a call made from a translation returns into it).
+static BLOCKS: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+
+/// The addresses of every block made in this process.
+pub fn blocks() -> Vec<u64> {
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// Give this thread a block and gate stack, if it has none yet (a forked
@@ -109,6 +133,7 @@ pub fn ensure_block() {
             0,
         );
         assert_ne!(p, libc::MAP_FAILED, "allocating the gate stack failed");
+        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(p as u64);
         let b = p as *mut Block;
         (*b).stack = p as u64 + size as u64;
         libc::pthread_setspecific(key(), p);
@@ -144,13 +169,24 @@ pub fn block_mapping() -> Option<u64> {
 /// Whether `pc` is in the gate's own instructions. Async-signal-safe.
 pub fn in_gate(pc: u64) -> bool {
     (fwe_gate as *const () as u64..fwe_gate_end as *const () as u64).contains(&pc)
+        || (fwe_exit_gate as *const () as u64..fwe_exit_gate_end as *const () as u64).contains(&pc)
 }
 
 /// A signal landed at `pc` in fwe's code: if that is the gate's way out,
 /// the address to start it again from (it looks for a signal first).
 pub fn rewind(pc: u64) -> Option<u64> {
     let exit = fwe_gate_exit as *const () as u64;
+    let out = fwe_exit_gate_out as *const () as u64;
+    if (out..fwe_exit_gate_end as *const () as u64).contains(&pc) {
+        return Some(out);
+    }
     (exit..fwe_gate_end as *const () as u64).contains(&pc).then_some(exit)
+}
+
+/// The address of the exit gate, which translations' ways out branch to.
+pub fn exit_address() -> u64 {
+    key();
+    fwe_exit_gate as *const () as u64
 }
 
 /// Whether this thread is in the gate's Rust half. Async-signal-safe.
@@ -189,6 +225,22 @@ unsafe extern "C" {
     fn fwe_gate_exit();
     /// The end of the gate's instructions.
     fn fwe_gate_end();
+    /// The exit gate: a translation's way out branches to it with the way
+    /// out's address in `x16` and the program's `x16` and `x17` saved at
+    /// `[sp]` and `[sp, #8]`. It saves the program's registers in the
+    /// block, as the gate does, and calls `fwe_exit_call`, which takes the
+    /// way out as fwe's trap would (`jit::gate_exit`). Into a translation,
+    /// its way out restores the registers and enters the translation as a
+    /// lookup does: the program's `x16` and `x17` saved below `sp` again,
+    /// `x16` the program address, `x17` the translation's saved entry. Any
+    /// other way on (code not translated, a signal to deliver) takes the
+    /// trap, which finds the program's state in the block.
+    fn fwe_exit_gate();
+    /// The exit gate's way out: a signal that lands in it starts it again,
+    /// to look for that signal.
+    fn fwe_exit_gate_out();
+    /// The end of the exit gate's instructions.
+    fn fwe_exit_gate_end();
 }
 
 core::arch::global_asm!(
@@ -328,4 +380,146 @@ core::arch::global_asm!(
     ".globl _fwe_gate_end",
     "_fwe_gate_end:",
     "brk #0",
+);
+
+core::arch::global_asm!(
+    ".text",
+    ".p2align 4",
+    ".globl _fwe_exit_gate",
+    "_fwe_exit_gate:",
+    // x16: the way out's address; the program's x16 and x17 at [sp] and
+    // [sp, #8]. x0 and x1 go below them, two scratch registers.
+    "stp x0, x1, [sp, #-16]!",
+    "mrs x0, tpidrro_el0",
+    "and x0, x0, #0xfffffffffffffff8",
+    "adrp x1, _FWE_GATE_SLOT@PAGE",
+    "ldr x1, [x1, _FWE_GATE_SLOT@PAGEOFF]",
+    "ldr x0, [x0, x1]",
+    "stp x2, x3, [x0, #16]",
+    "stp x4, x5, [x0, #32]",
+    "stp x6, x7, [x0, #48]",
+    "stp x8, x9, [x0, #64]",
+    "stp x10, x11, [x0, #80]",
+    "stp x12, x13, [x0, #96]",
+    "stp x14, x15, [x0, #112]",
+    "stp x18, x19, [x0, #144]",
+    "stp x20, x21, [x0, #160]",
+    "stp x22, x23, [x0, #176]",
+    "stp x24, x25, [x0, #192]",
+    "stp x26, x27, [x0, #208]",
+    "stp x28, x29, [x0, #224]",
+    "str x30, [x0, #240]",
+    "ldp x2, x3, [sp]",
+    "stp x2, x3, [x0, #0]",
+    "ldp x2, x3, [sp, #16]",
+    "stp x2, x3, [x0, #128]",
+    // The program's sp, above what was saved, and its pc: the way out.
+    "add x2, sp, #32",
+    "str x2, [x0, #248]",
+    "str x16, [x0, #256]",
+    "mrs x2, nzcv",
+    "str x2, [x0, #264]",
+    "add x2, x0, #272",
+    "stp q0, q1, [x2, #0]",
+    "stp q2, q3, [x2, #32]",
+    "stp q4, q5, [x2, #64]",
+    "stp q6, q7, [x2, #96]",
+    "stp q8, q9, [x2, #128]",
+    "stp q10, q11, [x2, #160]",
+    "stp q12, q13, [x2, #192]",
+    "stp q14, q15, [x2, #224]",
+    "stp q16, q17, [x2, #256]",
+    "stp q18, q19, [x2, #288]",
+    "stp q20, q21, [x2, #320]",
+    "stp q22, q23, [x2, #352]",
+    "stp q24, q25, [x2, #384]",
+    "stp q26, q27, [x2, #416]",
+    "stp q28, q29, [x2, #448]",
+    "stp q30, q31, [x2, #480]",
+    "mrs x3, fpsr",
+    "mrs x4, fpcr",
+    "str w3, [x0, #784]",
+    "str w4, [x0, #788]",
+    "mov x2, #1",
+    "str x2, [x0, #808]",
+    "ldr x2, [x0, #832]",
+    "mov sp, x2",
+    "bl _fwe_exit_call",
+    "cbnz x0, 9f",
+    ".globl _fwe_exit_gate_out",
+    "_fwe_exit_gate_out:",
+    "mrs x0, tpidrro_el0",
+    "and x0, x0, #0xfffffffffffffff8",
+    "adrp x1, _FWE_GATE_SLOT@PAGE",
+    "ldr x1, [x1, _FWE_GATE_SLOT@PAGEOFF]",
+    "ldr x0, [x0, x1]",
+    // A signal since the call last looked: the trap delivers it.
+    "ldr x1, [x0, #816]",
+    "ldr x2, [x0, #824]",
+    "cmp x1, x2",
+    "b.ne 9f",
+    "add x2, x0, #272",
+    "ldp q0, q1, [x2, #0]",
+    "ldp q2, q3, [x2, #32]",
+    "ldp q4, q5, [x2, #64]",
+    "ldp q6, q7, [x2, #96]",
+    "ldp q8, q9, [x2, #128]",
+    "ldp q10, q11, [x2, #160]",
+    "ldp q12, q13, [x2, #192]",
+    "ldp q14, q15, [x2, #224]",
+    "ldp q16, q17, [x2, #256]",
+    "ldp q18, q19, [x2, #288]",
+    "ldp q20, q21, [x2, #320]",
+    "ldp q22, q23, [x2, #352]",
+    "ldp q24, q25, [x2, #384]",
+    "ldp q26, q27, [x2, #416]",
+    "ldp q28, q29, [x2, #448]",
+    "ldp q30, q31, [x2, #480]",
+    "ldr w3, [x0, #784]",
+    "mrs x5, fpsr",
+    "cmp x3, x5",
+    "b.eq 2f",
+    "msr fpsr, x3",
+    "2:",
+    "ldr w4, [x0, #788]",
+    "mrs x5, fpcr",
+    "cmp x4, x5",
+    "b.eq 3f",
+    "msr fpcr, x4",
+    "3:",
+    "ldr x3, [x0, #264]",
+    "msr nzcv, x3",
+    // The program's x16 and x17 below its sp, as a lookup leaves them for
+    // the translation it enters.
+    "ldr x3, [x0, #248]",
+    "sub sp, x3, #16",
+    "ldp x2, x3, [x0, #128]",
+    "stp x2, x3, [sp]",
+    "ldr x30, [x0, #240]",
+    "ldp x2, x3, [x0, #16]",
+    "ldp x4, x5, [x0, #32]",
+    "ldp x6, x7, [x0, #48]",
+    "ldp x8, x9, [x0, #64]",
+    "ldp x10, x11, [x0, #80]",
+    "ldp x12, x13, [x0, #96]",
+    "ldp x14, x15, [x0, #112]",
+    "ldp x18, x19, [x0, #144]",
+    "ldp x20, x21, [x0, #160]",
+    "ldp x22, x23, [x0, #176]",
+    "ldp x24, x25, [x0, #192]",
+    "ldp x26, x27, [x0, #208]",
+    "ldp x28, x29, [x0, #224]",
+    "str xzr, [x0, #808]",
+    "ldr x16, [x0, #{g}]",
+    "ldr x17, [x0, #{t}]",
+    "ldp x0, x1, [x0, #0]",
+    "br x17",
+    // Any other way on: the trap takes it from the block.
+    "9:",
+    "brk #0x4c5b",
+    ".globl _fwe_exit_gate_end",
+    "_fwe_exit_gate_end:",
+    "brk #0",
+    g = const std::mem::offset_of!(Block, jit_g),
+    t = const std::mem::offset_of!(Block, jit_t),
 );

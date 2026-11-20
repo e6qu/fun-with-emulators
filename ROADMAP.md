@@ -2,8 +2,11 @@
 
 The path to the goal in [PLAN.md](PLAN.md): Linux command-line programs,
 containers, graphical Linux programs, Windows programs through Wine and
-gVisor's sandbox, all on macOS at native speed. A milestone is done when
-its **Done when** criteria pass as end-to-end tests in CI.
+gVisor's sandbox, all on macOS at native speed. The work left is laid out
+as pull requests, in order, each delivering one outcome
+([AGENTS.md](AGENTS.md#development-process)): a pull request is done when
+its **Done when** criteria pass as end-to-end tests and benchmarks in CI,
+and a milestone when its pull requests are merged.
 [docs/architecture.md](docs/architecture.md#known-limitations) lists the
 current limitations in detail.
 
@@ -15,17 +18,20 @@ current limitations in detail.
 | M1 Core userland | Done |
 | M2 Everyday software | Done but for the VM backend's run on real hardware |
 | M3 Containers | Done |
-| M4 Compatibility | Done: all 1213 of LTP's system-call tests that apply pass (1551 run) |
+| M4 Compatibility | Done: every LTP system-call test that applies passes |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way |
 | M7 Graphical programs and sandboxes | Not started |
 | M8 Virtual networking | After 1.0 |
 
 What runs unmodified, with its output checked in CI:
-- **Natively, in-process:** Debian's coreutils, bash, git, SQLite, lighttpd,
-  Node.js (V8's JIT), rustc with Cargo, and apt.
-- **In the VM**, for executables linked below 4 GiB: Debian's Python, GCC,
-  clang and Go, on the software stand-in for Hypervisor.framework only.
+- **Natively, in-process:** Debian's coreutils, bash, git, SQLite,
+  lighttpd, rustc with Cargo, apt and Node.js 18; Alpine's Node.js 24,
+  LuaJIT, Racket, GNU Guile and OpenJDK, whose JIT compilers' code runs
+  from fwe's translations, and Python making code with `eval`.
+- **In the VM**, for executables linked below 4 GiB: Debian's Python,
+  GCC, clang and Go, and Alpine's SBCL, on the software stand-in for
+  Hypervisor.framework only.
 - **Containers:** crun, Podman and containerd run the `alpine` image;
   Podman builds images, pushes and pulls them through a registry and runs
   rootless, and Debian's Podman runs in the VM; Docker loads, runs and
@@ -35,46 +41,31 @@ What runs unmodified, with its output checked in CI:
 
 ## Done
 
-**M0 — Foundation.** CI on macOS 15 and 26 plus a Linux unit-test job; ELF
-loading; system calls trapped by rewriting `svc #0`; an end-to-end harness
-of assembly and Rust guests. *A static Linux binary prints "hello".*
+- **M0 — Foundation:** CI on macOS 15 and 26 and Linux; ELF loading;
+  system calls trapped; an end-to-end harness. *A static Linux binary
+  prints "hello".*
+- **M1 — Core userland:** processes and threads, memory, files confined
+  to a Linux root filesystem, signals with Linux's frame layout, pipes,
+  glibc and musl dynamic linking. *bash and coreutils run from a Debian
+  root filesystem.*
+- **M2 — Everyday software** (but for the real-hardware run): networking,
+  terminals and job control, `epoll` and the descriptor-based event
+  calls, `/proc` and `/sys`, virtual credentials, the hypervisor backend
+  for executables linked below 4 GiB. *git, compilers, Node, Go, Rust,
+  apt, a database and a web server run unmodified.*
+- **M3 — Containers:** namespaces, cgroups v2, overlay mounts, seccomp
+  and capabilities. *crun, Podman and containerd run standard images.*
+- **M4 — Compatibility:** the rest of Linux's call table that macOS can
+  carry, ptrace for `strace` and `gdb`, Docker with BuildKit and Compose,
+  rootless Podman, Wine's console programs in the VM. *Every LTP
+  system-call test that applies passes, the rest listed with their
+  reasons in `tools/ltp/exceptions.txt`.*
+- **M5 — Release** (but for the first release): benchmarks in CI, the
+  system-call gate, user documentation whose recipes CI runs, the
+  Homebrew formula, `fwe --pull`, and a release workflow that signs and
+  notarizes.
 
-**M1 — Core userland.** Processes and threads (`clone`, futexes, `fork`,
-`execve`, `wait4`), memory, files confined to a Linux root filesystem,
-signals with Linux's frame layout, pipes, rewriting of `svc`, `TPIDR_EL0`
-and `x18`, and glibc and musl dynamic linking. *bash and coreutils run from
-a Debian rootfs.*
-
-**M2 — Everyday software**, but for the real-hardware run. Networking (TCP,
-UDP, IPv4, IPv6, `AF_UNIX` with descriptor passing); terminals, ptys and
-job control; `epoll`, `eventfd`, `timerfd`, `signalfd`; the `/proc` and
-`/sys` files programs read; virtual credentials; signals between processes
-and threads; `vfork`, `posix_spawn`, `execveat`, `clone3`; `EFAULT` for
-bad pointers; fwe's own descriptors out of the guest's reach; the
-hypervisor backend for executables linked below 4 GiB, with threads,
-`fork`, `vfork`, `execve` in both directions, pointer authentication and
-BTI. *The target programs (git, compilers, Node, Go, Rust, apt, a
-database, a web server) run unmodified.*
-
-**M3 — Containers.** Mount, pid, user, UTS, IPC, network and cgroup
-namespaces; cgroups v2 with device programs; overlay mounts; seccomp and
-capabilities. *crun, Podman and containerd run standard images.*
-
-**M4 — Compatibility.** Every LTP system-call test that applies passes in
-CI, the rest listed with their reasons in `tools/ltp/exceptions.txt`;
-ptrace serves Alpine's `strace` and `gdb`; Docker Engine with BuildKit and
-Compose, and Podman building, pushing, pulling and running rootless (and
-Debian's in the VM); Wine runs ARM64 Windows console programs under
-`fwe --vm`; the rare `x18` forms are rewritten, and a binary without
-section headers has its unwind table found through `PT_GNU_EH_FRAME`.
-*Each is tested end to end in CI.* Beyond M3 it brought process
-descriptors, real-time and cross-process signals, ptrace, POSIX timers,
-resource limits and scheduling; Linux's memory calls; the file calls
-(`openat2`, `O_TMPFILE`, file handles, leases, OFD locks, splice, inotify,
-AIO); the new mount API and propagation; System V IPC, message queues,
-keyrings, eBPF maps and socket filters; and the rest of Linux's call
-table that macOS can carry. What each Linux mechanism becomes under fwe
-is in
+What each Linux mechanism becomes under fwe is in
 [linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces).
 
 ## Left to 1.0
@@ -90,24 +81,10 @@ is in
 **Done when:** the target programs run unmodified, those in the VM on real
 hardware.
 
-### M5 — Release
+### M5 — finish
 
-- [x] **Performance:** benchmarks in CI of start-up, system-call cost (one
-  thread and several at once), `fork`/`exec` and a C project's build,
-  against native macOS and Linux on arm64; system calls through a direct
-  gate rather than a trap; a kernel lock whose reading calls run side by
-  side.
-- [ ] **Packaging:** a signed and notarized `fwe` with the hypervisor
-  entitlement, a Homebrew formula, and a command that fetches and unpacks
-  a Debian or Alpine root filesystem. In place: `fwe --pull` (CI pulls and
-  runs Alpine's and Debian's images), the formula (`Formula/fwe.rb`, which
-  CI installs and tests from source), and the release workflow, which
-  signs under the hardened runtime and notarizes with a Developer ID.
-  Left: the Developer ID secrets and the first release, whose tag the
-  formula names (the owner's actions, not code).
-- [x] **User documentation:** installing, running programs and containers,
-  and what is not supported ([docs/user-guide.md](docs/user-guide.md),
-  whose recipes CI runs as written).
+- [ ] **The first release:** the Developer ID secrets and the release
+  whose tag the formula names (the owner's actions, not code).
 
 **Done when:** a user installs a release and runs a Debian or Alpine
 userland and Podman with it, following the documentation.
@@ -116,32 +93,24 @@ userland and Podman with it, following the documentation.
 
 Linux code runs at native speed, what fwe adds is held to budgets
 ([PLAN.md](PLAN.md#principles)), and programs that need the VM run
-natively wherever fwe can make them fit the Mac.
+natively wherever fwe can make them fit the Mac. Speed comes first from
+skipping work: work kept between runs and shared between processes, work
+done only when something needs it, answers from fwe's own caches where
+they stay correct. The VM is never the way to make a program faster.
+
+Done:
 
 - [x] **Benchmark budgets in CI:** the benchmark job fails when a figure
-  exceeds its budget; the job summary shows each run's figures. Programs
-  run under fwe as Alpine builds them, on realistic workloads (a Lua
-  script, a Python script, an SQLite database on disk, a git repository's
-  commits, history and status, xz compressing and decompressing), and
-  natively as Homebrew builds the same projects (the C build with
-  Homebrew's clang of the release Alpine's root has); both sides' output
-  must match.
-  - **Programs that compute** (building Lua, sampled by one compile; the
-    Lua script, the Python script, xz):
-    the budget applies to fwe's share, from CPU sampling (DTrace) in the
-    same run: all samples ÷ samples in the program's own code. fwe's are
-    those in fwe, the macOS libraries it calls, its stubs (which carry a
-    memory tag of fwe's) and anything unplaced; the macOS kernel's time
-    counts as the program's. Their time against Homebrew's builds stays in the
-    table as information, since it also measures the builds' differences
-    (compiler, C library).
-  - **Everything else** keeps its budget against native macOS on the same
-    runner.
-  - Each row names the backend fwe ran its programs in (from fwe's own
-    `backend:` marks), and the table adds native Linux on arm64 (another
-    machine), and, from `tools/bench/vm.sh` on a Mac, a Linux VM on that
-    Mac and fwe's VM backend (`fwe --vm`), the alternatives fwe competes
-    with.
+  exceeds its budget. Programs run under fwe as Alpine builds them, on
+  realistic workloads (a Lua script, a Python script, SQLite on disk,
+  git's commits, history and status, xz), against the same projects
+  built natively by Homebrew, both sides' output compared. A program that
+  computes is held to fwe's share of its CPU samples (DTrace: all samples
+  ÷ those in the program's own code), since its time against Homebrew's
+  build also measures the builds' differences; everything else to its
+  time against native macOS on the same runner. Each row names the
+  backend fwe ran it in; the table adds native Linux on arm64, and
+  `tools/bench/vm.sh` a Linux VM and fwe's VM backend on a Mac.
 
   | Benchmark | Budget |
   |---|---|
@@ -152,32 +121,140 @@ natively wherever fwe can make them fit the Mac.
   | start-up | 3× macOS |
   | SQLite on disk, git | 1.5× macOS |
   | building a C project (Lua), a Lua script, a Python script, xz | fwe's share 1.2× |
-- [x] **Prepared images kept:** the code fwe prepares in a program (its
-  system calls, thread-pointer accesses and `x18` uses rewritten) is kept
-  on disk whole, by the file's identity, and mapped from there the next
-  time, as Rosetta 2 keeps its translations: the program and its dynamic
-  linker as fwe loads them, and each library's code as the dynamic linker
-  maps it. A program is prepared once rather than at every start, and its
-  code pages are the host's cached ones, shared and never copied
-  ([architecture](docs/architecture.md)).
+- [x] **Prepared images kept:** the code fwe prepares in a program and its
+  libraries is kept on disk by the file's identity and mapped from there
+  the next time, as Rosetta 2 keeps its translations: prepared once, its
+  pages the host's cached ones, shared and never copied.
 - [x] **Executables linked below 4 GiB:** macOS keeps the low 4 GiB from
-  every arm64 process (a smaller `__PAGEZERO` is killed at exec), so such
-  an executable runs natively only moved above it. arm64 code reaches its
-  own code and data PC-relatively, so moving a whole static image by a
-  multiple of 4 GiB keeps its code right; what changes is each absolute
-  address it holds, which a link that kept its relocations
-  (`--emit-relocs`) lists: those executables are moved and run natively.
-  One linked without them, as every non-PIE program the distributions
-  ship is (most GCC builds, Go toolchains, Debian's and Ubuntu's Python
-  and Go programs: [which ones](docs/linux-on-macos.md#how-distributions-build-their-programs)),
-  linked dynamically (its dynamic linker relocates it at its link
-  address), or holding an address no relocation follows, runs in the
-  VM, and `--strace` says why.
+  every arm64 process, so such an executable runs natively only moved
+  above it. A static one whose link kept its relocations
+  (`--emit-relocs`) is moved by a multiple of 4 GiB, its absolute
+  addresses relocated, and runs natively. One linked without them (as
+  every non-PIE program the distributions ship is:
+  [which ones](docs/linux-on-macos.md#how-distributions-build-their-programs)),
+  linked dynamically, or holding an address no relocation follows runs
+  in the VM, and `--strace` says why.
+Left, as pull requests in order. Each brings the instrumentation that
+shows where its time goes, micro benchmarks that isolate the costs it
+attacks and macro benchmarks of programs at work, all in CI; counts
+decide which work is skipped before any is built.
+
+#### PR 1 — A JDK at work (#90, open)
+
+- [ ] **Code made at run time, by translation:** code a program makes
+  executable as it runs (JIT compilers' code, self-modifying code, code
+  on the stack) runs from translations in fwe's code cache, the
+  program's memory never executable on the host and never changed: its
+  `x18` uses expanded in the translation, the program's flush of the
+  code it changed (`ic ivau`, through any mapping) dropping the
+  translations, a fault or signal delivered at the program's own
+  instruction ([docs/jit.md](docs/jit.md)). Tested with Node.js 18 and
+  24, LuaJIT, Racket, Guile, Python's `eval`, OpenJDK, quines, IOCCC
+  winners and self-modifying programs.
+- [ ] **Where the translator's time goes, counted:** `FWE_TIMING` and the
+  benchmarks' report count, per workload, the blocks made by where their
+  code comes from (a file, or generated), those whose address and words
+  a run made before, entries made with the program's own `x16` and
+  `x17` and those entered, blocks made ahead and those run, calls from
+  translated code into a library's, and the time making each block.
+- [ ] **Micro benchmarks of translated code** in CI, each against the
+  same code run from the program's file: calls and returns, indirect
+  branches, a loop, many small functions in random order (code
+  footprint), and blocks made per second.
+- [ ] **Translations kept and shared:** translations of a file's code (a
+  runtime's library, the C library) kept on disk by the file's identity
+  and where it is loaded, and of generated code by its address and words,
+  as prepared images are kept; mapped into each process and shared by
+  processes running at once. Each block is checked against the program's
+  words before it runs, so a stale one never does.
+- [ ] **Blocks made only when needed:** a block's entry with the
+  program's own `x16` and `x17` made on its first use, not with every
+  block; blocks made ahead of the program only as far as the counts show
+  they are run.
 - [ ] **A JDK at work:** Alpine's OpenJDK (a JIT runtime: code it writes
   and runs, many threads, a garbage collector) runs natively under fwe,
   and the benchmarks run a realistic workload on it (compiling and running
   a multi-threaded application) against Homebrew's OpenJDK of the same
   release on the same runner, their output compared, within 1.5×.
+
+**Done when:** the JIT runtimes above pass in CI; the JDK benchmark holds
+1.5× in every run of a repeated CI benchmark job; a second run of the JDK
+workload makes no block from a file's code that the first made; and the
+counts and micro benchmarks are in every benchmark report.
+
+#### PR 2 — Translated code at native speed
+
+- [ ] **Traces:** chains of blocks the program runs hot made again as one
+  straight run of code, their cold paths out of line, dropped with any
+  block they hold.
+- [ ] **Inline caches:** a `br`, `blr` or `ret` first compares its target
+  with the one last taken there and branches straight to its
+  translation, the table looked up only when they differ.
+- [ ] **Cheaper blocks:** what each word stands for written in its
+  compact form directly, with no larger form made first.
+- [ ] **Macro benchmarks of JIT runtimes:** Node.js and LuaJIT at work
+  against Homebrew's builds on the same runner, their output compared.
+
+**Done when:** the micro benchmarks of translated code hold 1.3× of the
+same code run from the program's file, and Node.js's and LuaJIT's
+benchmarks 1.5×.
+
+#### PR 3 — Generated code run as it is, where it is sound
+
+Decided by counts from the JDK, Node.js and LuaJIT workloads, each
+adopted only where it saves more than it costs, otherwise listed under
+[Not planned](#not-planned-for-10) with the numbers:
+
+- [ ] **Clean pages run natively:** a page of generated code none of
+  whose words is a system call, a thread-pointer access or a use of `x18`
+  runs as it is, translated again once written (the counts: such pages'
+  share of the time, and how often they are written).
+- [ ] **A library's code run natively when generated code calls it:** its
+  return into generated code taken as a fetch (the counts: calls from
+  translated code into a library against the work done there).
+
+**Done when:** each item is adopted with its benchmarks holding their
+budgets, or listed as not planned with the counts that decided it.
+
+#### PR 4 — File lookups without the host
+
+- [ ] **Counted:** the benchmarks' report counts path lookups by kind
+  (found, absent, in a container image's layers) and host calls per
+  guest call.
+- [ ] **Image layers cached:** names, links and attributes in a
+  container image's read-only layers (an overlay's lower layers, which
+  Linux too requires unchanged) kept in memory every fwe process shares.
+- [ ] **Directories cached, kept correct by the host:** the names a
+  directory holds, absent ones included, cached and checked before use
+  against a kqueue watch of the directory, which the host posts during
+  the call that changes it; adopted if a check costs well under a lookup.
+- [ ] **Descriptors opened when used:** an `O_PATH` descriptor opens the
+  host file only when a call needs it.
+- [ ] **`open` and `close` at the host's cost:** fwe's bookkeeping per
+  descriptor made when something asks for it.
+- [ ] **Benchmarks:** micro: a lookup of an absent name, a `stat` in an
+  image's layer, `open`+`close`; macro: Python's start-up (its import
+  search), `git status` in a large tree, a command started in a
+  container.
+
+**Done when:** a `stat` in an image's layer and a lookup of an absent name
+in a directory looked at before each hold 0.5× macOS (or the directory
+cache is listed as not planned with its counts), and `open`+`close` holds
+1.1× macOS.
+
+#### PR 5 — `fork` and signals
+
+- [ ] **Fewer mappings to fork:** fwe's code cache, translation tables
+  and descriptor room made on first use, in as few host regions as they
+  can be; the benchmarks report a process's host mappings.
+- [ ] **A signal handler's return without a host signal:** `rt_sigreturn`
+  through the gate.
+
+**Done when:** `fork` + exit + wait holds 2× macOS (from 3×) and a handled
+`SIGSEGV` 2× macOS (now without a budget).
+
+#### PR 6 — 4 KiB pages natively
+
 - [ ] **4 KiB pages natively:** `mmap`, `mprotect` and `munmap` at 4 KiB
   granularity on the Mac's 16 KiB pages: file contents at 4 KiB offsets
   copied in, each host page given the union of its parts' protections and
@@ -186,6 +263,15 @@ natively wherever fwe can make them fit the Mac.
   that needs it. A layout that cannot be kept so (an execute-only part
   beside a writable one in one host page, say) sends the program to the
   VM.
+- [ ] **Benchmarks:** micro: `mmap`, `mprotect` and `munmap` of 4 KiB
+  parts, and a write caught in a read-only part.
+
+**Done when:** a program that needs 4 KiB pages runs natively in CI, its
+calls hold the system-call budget, and what still needs the VM for its
+pages is listed with the reason.
+
+#### PR 7 — Wine natively
+
 - [ ] **Wine natively:** Windows' ARM64 code keeps the thread's TEB in
   `x18`, which macOS clears, so code Wine maps executable is prepared as a
   program's own is, with its `x18` uses rewritten; its images' 4 KiB
@@ -195,20 +281,39 @@ natively wherever fwe can make them fit the Mac.
   Alpine's Wine on fwe, against the same sources built natively for macOS
   on the same runner, their output compared, within 1.5×.
 
-**Done when:** the budgets hold in CI; a low-linked executable whose link
-kept its relocations, and Wine's test program, run natively in CI; the
-JDK's and Wine's benchmarks hold their budgets; and what still needs the
-VM is listed with the reason.
+**Done when:** Wine's test program runs natively in CI and its benchmarks
+hold 1.5×.
+
+**M6 is done when** these pull requests are merged: the budgets hold in
+CI; a low-linked executable whose link kept its relocations, the JIT
+runtimes and programs above, and Wine's test program run natively in CI;
+and what still needs the VM is listed with the reason.
 
 ### M7 — Graphical programs and sandboxes
 
 Linux programs with windows on the Mac's screen, Windows programs through
-Wine with theirs, and a Linux program inside gVisor, all on fwe.
+Wine with theirs, and a Linux program inside gVisor, all on fwe. CI starts
+an X server and drives each program with synthetic input (keys, clicks, a
+page loaded, a file edited), checking what it draws by the server's
+screenshot.
+
+#### PR 1 — A display
 
 - [ ] **A display for Linux programs:** X11 clients drawn by an X server
   on the Mac (XQuartz), reached through the socket `DISPLAY` names, with
   shared memory (`MIT-SHM`) where the server offers it; Wayland clients
   through a compositor that speaks to the Mac, if one proves practical.
+- [ ] **Demo programs:** `xterm`, `xeyes`, `xclock`, GTK's and Qt's demo
+  programs.
+- [ ] **Benchmarks:** micro: a window's frame drawn through shared memory,
+  and an X request's round trip; macro: a demo program's frames per
+  second against the same program on Linux.
+
+**Done when:** `xterm`, `xeyes`, `xclock` and GTK's and Qt's demo
+programs run under fwe in CI, driven and checked by what they draw.
+
+#### PR 2 — The GPU
+
 - [ ] **GPU acceleration:** a Linux GPU device (`/dev/dri/renderD128`)
   that fwe provides, speaking virtio-gpu's interface to Mesa's Venus
   Vulkan driver, whose commands fwe runs on the Mac's GPU through
@@ -216,8 +321,16 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
   does for its VMs; OpenGL through Mesa's Zink (OpenGL on Vulkan), and
   Direct3D under Wine through DXVK and VKD3D-Proton (Direct3D on
   Vulkan). Frames reach the X server as images in shared memory.
-- [ ] **Demo programs:** `xterm`, `xeyes`, `xclock`, `glxgears`, `vkcube`,
-  GTK's and Qt's demo programs.
+- [ ] **GPU demo programs:** `glxgears` and `vkcube`.
+- [ ] **Benchmarks:** micro: a Vulkan command buffer submitted and a
+  frame presented; macro: `vkcube`'s frame rate against MoltenVK's
+  natively on the same runner.
+
+**Done when:** `glxgears` and `vkcube` draw on the GPU, as their renderer
+names it, and `vkcube`'s frame rate holds 1.5× of MoltenVK's natively.
+
+#### PR 3 — Browsers and application frameworks
+
 - [ ] **Browsers:** Chrome (Google's Linux arm64 build, or Chromium where
   none is published) and Firefox, with their sandboxes on and their
   content, GPU and network processes, browsing local pages and playing
@@ -225,9 +338,23 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
 - [ ] **Application frameworks:** an Electron app (Electron's quick-start
   and Visual Studio Code); Zed, the editor (Vulkan); a Tauri app (Rust,
   WebKitGTK); a Wails app (Go, WebKitGTK); a tkinter app (Python, Tk).
+- [ ] **Benchmarks:** a page loaded and a video's frames played against
+  the same browser natively on macOS; an Electron app's start-up.
+
+**Done when:** the browsers, Zed and the framework apps above run in CI
+on the GPU, driven and checked by what they draw.
+
+#### PR 4 — Graphical Wine
+
 - [ ] **Graphical Wine:** Windows programs with windows through Wine's
   X11 driver, natively (M6's Wine item): Wine's own (Notepad,
   Minesweeper, `regedit`) and a Direct3D demo.
+
+**Done when:** Wine's own programs and the Direct3D demo draw in CI, the
+demo on the GPU.
+
+#### PR 5 — gVisor on fwe
+
 - [ ] **gVisor on fwe:** `runsc` running a Linux program on its `systrap`
   platform (`seccomp`'s `SECCOMP_RET_TRAP`, `SIGSYS` and memory shared
   between its sentry and stub processes) or its `ptrace` platform, as
@@ -237,14 +364,8 @@ Wine with theirs, and a Linux program inside gVisor, all on fwe.
   `runsc` on fwe against the same workload under `runsc` on Linux, its
   output compared.
 
-**Done when:** CI starts an X server and runs every program above under
-fwe, each driven by synthetic input (keys, clicks, a page loaded, a file
-edited) and checked by what it draws (the server's screenshot compared),
-the GPU programs (`glxgears`, `vkcube`, the browsers, Zed, the Direct3D
-demo) drawing on the GPU, as their renderer names it, with `vkcube`'s
-frame rate within 1.5× of MoltenVK's natively on the same runner; and
-runs the JDK workload through `runsc` on fwe, its benchmark beside
-`runsc` on Linux.
+**Done when:** CI runs the JDK workload through `runsc` on fwe, its
+benchmark beside `runsc` on Linux.
 
 ## After 1.0
 
@@ -254,12 +375,24 @@ Multi-process and multi-container Linux applications on networks of their
 own, as on a Linux host, with the host's TCP/IP stack carrying the
 traffic at native speed.
 
+#### PR 1 — Addresses per network namespace
+
 - [ ] **Addresses per network namespace:** veth pairs and bridges as fwe's
   records, with the interfaces, addresses and routes netlink shows and
   sets; a socket bound or connected to a namespace's address is mapped to
   a host endpoint (a loopback port or a Unix socket) through a table all
   fwe processes share, with `connect`, `accept`, `getsockname` and
   `getpeername` translated, so no packet passes through fwe.
+- [ ] **Benchmarks:** micro: a connection's set-up and a round trip
+  between two namespaces, against loopback natively; macro: an HTTP
+  server's throughput between two containers.
+
+**Done when:** two network namespaces reach each other by address
+through veth pairs and a bridge, at the host's loopback speed within
+1.5×.
+
+#### PR 2 — Container networks
+
 - [ ] **Container networks:** Podman's netavark and Docker's bridge driver
   set them up through those calls; containers reach each other by address
   and by name (aardvark-dns and Docker's embedded resolver, which run as

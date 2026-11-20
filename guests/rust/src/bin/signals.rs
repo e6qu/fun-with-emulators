@@ -559,9 +559,8 @@ fn main() {
             );
         }
         // A process signal sent while every thread blocks it goes to the
-        // first thread to unblock it, even though the host parks it on
-        // another thread (macOS picks the main one, which blocks it for
-        // good).
+        // first thread to unblock it, not to the main one, which blocks it
+        // for good.
         "parked" => {
             catch(SIGUSR1, 0);
             // SAFETY: a valid signal set.

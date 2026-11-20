@@ -6,17 +6,25 @@
 //!
 //! - **Entries**, one for each host pid: a lock, a sequence number (odd
 //!   while the record changes), where the record's bytes are and how many,
-//!   and the Linux wait status the process left as it ended of a signal.
-//!   A bit for each pid with a record lets a listing skip the rest.
+//!   and the Linux wait status the process left as it ended of a signal;
+//!   one of each kind (its record, thread list, mappings...), a pid's side
+//!   by side. A bit for each pid with a record lets a listing skip the
+//!   rest.
 //! - **Blocks** of 4 KiB hold the bytes, chained, taken from and given back
 //!   to a bitmap of free ones.
 //! - **Ended accounts** (how a process ended, for its reaper): a table of
-//!   their own, each taken whole by one reaper.
+//!   their own, each taken whole by one reaper, and a count of them.
 //! - **Thread numbers** outside a pid namespace ([`crate::thread`]): a
 //!   counter blocks of them are taken from, and each block's process.
 //! - **Signal mailboxes** ([`crate::signote`]): a pool of them, each given
 //!   to a pid as it is first sent a signal through one, and taken back
 //!   with its record, or once its process is gone.
+//! - **Busy marks**, one for each host pid: its main thread is in fwe's
+//!   own work, which the host may make it wait for ([`Busy`]).
+//! - **Entry marks**, one for each host pid: the start of the process
+//!   whose main thread has gone into the program ([`entered`]).
+//! - **Tasks**, one word for each host pid: its real user, as its record
+//!   says, and its threads, as it counts them ([`user_tasks`]).
 //!
 //! A reader takes no lock: it reads the sequence number, the bytes and the
 //! number again, and reads again if a change came between. A writer holds
@@ -106,24 +114,39 @@ pub enum Count {
     /// Whether the registry of watched files is made
     /// ([`crate::inotify::registry`]): 1 once it is.
     Watches = 3,
+    /// Whether the record of keys is made ([`crate::keys`]): 1 once it
+    /// is, so a fork of a program that never used a key looks no further.
+    Keys = 4,
 }
+
+/// Room for the counts.
+const COUNTS: usize = 8;
 
 /// The store's layout: where each part starts in the file.
 const COUNTS_AT: usize = 0;
 /// The CPU's features as `AT_HWCAP` and `AT_HWCAP2` report them
 /// ([`hwcap`]), then whether they are set, past the counts.
-const HWCAP_AT: usize = 32;
+const HWCAP_AT: usize = COUNTS_AT + COUNTS * 8;
 /// The user's temporary directory as the host named it ([`user_temp`]):
 /// its length, then its bytes.
-const USER_TEMP_AT: usize = 64;
+const USER_TEMP_AT: usize = HWCAP_AT + 32;
 const USER_TEMP_MAX: usize = 1024;
 const ENTRIES_AT: usize = USER_TEMP_AT + 8 + USER_TEMP_MAX;
 const USED_AT: usize = ENTRIES_AT + KINDS * PIDS * size_of::<Entry>();
 /// The pids whose record their process writes itself as it starts, and
 /// has not yet ([`mark_unwritten`]).
 const UNWRITTEN_AT: usize = USED_AT + PIDS / 8;
-const ENDED_AT: usize = UNWRITTEN_AT + PIDS / 8;
+/// Each pid's busy mark ([`Busy`]).
+const BUSY_AT: usize = UNWRITTEN_AT + PIDS / 8;
+/// Each pid's entry mark ([`entered`]).
+const ENTERED_AT: usize = BUSY_AT + PIDS * 4;
+/// Each pid's tasks ([`user_tasks`]).
+const TASKS_AT: usize = ENTERED_AT + PIDS * 8;
+const ENDED_AT: usize = TASKS_AT + PIDS * 8;
 const FREE_HINT_AT: usize = ENDED_AT + ENDED * size_of::<Ended>();
+/// How many ended accounts are kept or being kept or taken
+/// ([`Store::ended_kept`]), in the free hint's line.
+const ENDED_KEPT_AT: usize = FREE_HINT_AT + 8;
 /// Thread-number blocks: the next block's first number, then each
 /// block's process.
 pub const TID_BLOCKS: usize = 1 << 16;
@@ -254,6 +277,130 @@ fn fatal(why: &str) -> ! {
 /// Map the store now, before a signal handler may need it.
 pub fn init() {
     store();
+    // A process before this one with the pid may have ended busy.
+    not_busy();
+}
+
+/// While one lives, the calling thread, if it is its process's main
+/// thread, is in fwe's own work (a record's file read or written under
+/// its lock), which the host may make it wait for, as a Linux thread
+/// doing its kernel's work is not asleep in a wait of the guest's:
+/// `/proc` shows it running ([`busy`]), where a program waiting for it
+/// to sleep (in a semaphore wait it is on its way to, say) would take a
+/// host wait of fwe's for that.
+pub struct Busy(bool);
+
+impl Busy {
+    pub fn new() -> Busy {
+        let main = crate::thread::tid() == crate::thread::tgid();
+        if main && let Some(w) = busy_word(crate::host::pid()) {
+            w.fetch_add(1, SeqCst);
+        }
+        Busy(main)
+    }
+}
+
+impl Default for Busy {
+    fn default() -> Busy {
+        Busy::new()
+    }
+}
+
+impl Drop for Busy {
+    fn drop(&mut self) {
+        if self.0
+            && let Some(w) = busy_word(crate::host::pid())
+        {
+            // (Not below zero: a fork child starts with none.)
+            let mut n = w.load(SeqCst);
+            while n > 0 {
+                match w.compare_exchange(n, n - 1, SeqCst, SeqCst) {
+                    Ok(_) => break,
+                    Err(now) => n = now,
+                }
+            }
+        }
+    }
+}
+
+fn busy_word(pid: i32) -> Option<&'static AtomicU32> {
+    let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
+    Some(store().at(BUSY_AT + i * 4))
+}
+
+/// Whether host pid `pid`'s main thread is in fwe's own work ([`Busy`]).
+pub fn busy(pid: i32) -> bool {
+    busy_word(pid).is_some_and(|w| w.load(SeqCst) != 0)
+}
+
+/// This process's main thread goes into the program: its first
+/// instruction, or a fork's return in the child. A host wait it is shown in
+/// before then is fwe's or the host's work of making it (a fork child
+/// waits for its parent), which Linux shows running: a program waiting
+/// for its child to sleep in a wait it is on its way to would take that
+/// for it ([`has_entered`]). The mark is the process's start, which no
+/// later process with the pid has.
+pub fn entered() {
+    let pid = crate::host::pid();
+    if let Some(w) = entered_word(pid)
+        && let Some(start) = crate::procreg::own_start()
+    {
+        w.store(start, SeqCst);
+    }
+}
+
+/// Whether host process `pid`, which started at `start` (microseconds,
+/// as the host says), is one of fwe's (it has a record, or writes its own)
+/// that has not yet gone into the program ([`entered`]).
+pub fn not_yet_entered(pid: i32, start: u64) -> bool {
+    (version(pid).is_some() || unwritten(pid))
+        && !entered_word(pid).is_some_and(|w| w.load(SeqCst) == start)
+}
+
+fn entered_word(pid: i32) -> Option<&'static AtomicU64> {
+    let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
+    Some(store().at(ENTERED_AT + i * 8))
+}
+
+/// Host pid `pid`'s tasks words: its real user + 1 (0: not said), and
+/// its threads (0, before it says, counts as 1).
+fn tasks_words(pid: i32) -> Option<[&'static AtomicU32; 2]> {
+    let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
+    Some([store().at(TASKS_AT + i * 8), store().at(TASKS_AT + i * 8 + 4)])
+}
+
+/// Host process `pid`'s record says its real user is `uid` (an initial
+/// namespace id).
+pub fn set_task_user(pid: i32, uid: u32) {
+    if let Some([user, _]) = tasks_words(pid) {
+        user.store(uid.wrapping_add(1), SeqCst);
+    }
+}
+
+/// This process has `n` threads.
+pub fn set_own_threads(n: u32) {
+    if let Some([_, threads]) = tasks_words(crate::host::pid()) {
+        threads.store(n, SeqCst);
+    }
+}
+
+/// The tasks (threads, in every process) of user `uid` (an initial
+/// namespace id) by the tasks words of the pids `pids`, without a record
+/// read or a host call: what `RLIMIT_NPROC` counts.
+pub fn user_tasks(uid: u32, pids: impl IntoIterator<Item = i32>) -> u64 {
+    pids.into_iter()
+        .filter_map(tasks_words)
+        .filter(|[user, _]| user.load(SeqCst) == uid.wrapping_add(1))
+        .map(|[_, threads]| u64::from(threads.load(SeqCst).max(1)))
+        .sum()
+}
+
+/// This process's main thread is in none of fwe's work: it starts, or is
+/// a fork child (the parent's marks are not its own).
+pub fn not_busy() {
+    if let Some(w) = busy_word(crate::host::pid()) {
+        w.store(0, SeqCst);
+    }
 }
 
 /// The count `c`.
@@ -322,9 +469,11 @@ impl Store {
         self.entry_of(Kind::Record, pid)
     }
 
+    /// A pid's entries side by side, one of each kind: a process just
+    /// forked, which writes several of its own, finds them on one page.
     fn entry_of(&self, kind: Kind, pid: i32) -> Option<&Entry> {
         let i = usize::try_from(pid).ok().filter(|&i| i > 0 && i < PIDS)?;
-        Some(self.at(ENTRIES_AT + (kind as usize * PIDS + i) * size_of::<Entry>()))
+        Some(self.at(ENTRIES_AT + (i * KINDS + kind as usize) * size_of::<Entry>()))
     }
 
     fn unwritten(&self, word: usize) -> &AtomicU64 {
@@ -346,6 +495,14 @@ impl Store {
     /// The lowest word of the block bitmap that may have a free block.
     fn free_hint(&self) -> &AtomicU32 {
         self.at(FREE_HINT_AT)
+    }
+
+    /// How many ended-account slots are not free: counted up before one is
+    /// filled and down once it is free again, so that none is in use while
+    /// it reads 0, and a look for an account, most often when there is
+    /// none (a parent reaping its child), reads one word, not the table.
+    fn ended_kept(&self) -> &AtomicU32 {
+        self.at(ENDED_KEPT_AT)
     }
 
     /// Block `b` (from 1): its link to the next (0 for none) and its room.
@@ -397,6 +554,10 @@ impl Store {
 
     /// Write `bytes` into new blocks: the first. With no room (256 MiB of
     /// records), the process ends saying so.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     fn write_chain(&self, bytes: &[u8]) -> u32 {
         let mut chunks: Vec<&[u8]> = bytes.chunks(ROOM).collect();
         if chunks.is_empty() {
@@ -563,6 +724,10 @@ pub fn free_cell(tag: u64) {
 /// The page tagged `tag` (not 0), or with `make` (`Some(owner)`) a new
 /// one, zeroed, kept until [`free_page`], or until host process `owner`
 /// is gone and the pages run short (`None`: none so tagged).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn page(tag: u64, make: Option<i32>) -> Option<&'static [Word; PAGE_WORDS]> {
     let s = store();
     let tags = |i: usize| -> &'static [Word; 2] { s.at(PAGE_TAGS_AT + i * 16) };
@@ -651,6 +816,10 @@ pub fn get(pid: i32) -> Option<Vec<u8>> {
 }
 
 /// What host pid `pid`'s entry of `kind` holds, if anything.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
     let s = store();
     let e = s.entry_of(kind, pid)?;
@@ -691,12 +860,20 @@ impl Drop for Held {
 }
 
 /// Hold host pid `pid`'s record lock while the result lives.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn lock(pid: i32) -> Option<Held> {
     Some(hold(&store().entry(pid)?.lock))
 }
 
 /// Hold the lock `word` (its holder's host pid, 0: free) while the result
 /// lives. A lock its holder left as it died is taken over.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn hold(word: &'static AtomicU32) -> Held {
     let me = crate::host::pid() as u32;
     loop {
@@ -717,6 +894,10 @@ fn hold(word: &'static AtomicU32) -> Held {
 }
 
 /// Write `bytes` as host pid `pid`'s record, under its lock (`_held`).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn put(_held: &Held, pid: i32, bytes: &[u8]) {
     let s = store();
     let Some(e) = s.entry(pid) else { return };
@@ -760,6 +941,11 @@ pub fn remove(_held: &Held, pid: i32) {
     let (old, old_len) = replace(e, 0, 0);
     s.used(pid as usize / 64).fetch_and(!(1 << (pid as usize % 64)), SeqCst);
     s.free_chain(old, old_len as usize);
+    if let Some(words) = tasks_words(pid) {
+        for w in words {
+            w.store(0, SeqCst);
+        }
+    }
     for kind in [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View] {
         if let Some(e) = s.entry_of(kind, pid) {
             let (old, old_len) = replace(e, 0, 0);
@@ -770,9 +956,27 @@ pub fn remove(_held: &Held, pid: i32) {
 
 /// Write `bytes` as this process's entry of `kind` (one it alone writes,
 /// its threads taking turns): `None` for none.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn put_own(kind: Kind, bytes: Option<&[u8]>) {
+    put_of(kind, crate::host::pid(), bytes);
+}
+
+/// In a parent, its child `pid`, just forked and waiting to go on (so
+/// writing nothing itself): its entry of `kind` holds `bytes`.
+pub fn put_for(kind: Kind, pid: i32, bytes: &[u8]) {
+    put_of(kind, pid, Some(bytes));
+}
+
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn put_of(kind: Kind, pid: i32, bytes: Option<&[u8]>) {
     let s = store();
-    let Some(e) = s.entry_of(kind, crate::host::pid()) else { return };
+    let Some(e) = s.entry_of(kind, pid) else { return };
     let (head, len) = match bytes {
         Some(b) => (s.write_chain(b), b.len() as u32),
         None => (0, 0),
@@ -840,9 +1044,12 @@ pub fn put_ended(pid: i32, start: u64, bytes: &[u8]) {
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
-        if st(cur) != FREE
-            || slot.state.compare_exchange(cur, next(cur, FILLING), SeqCst, SeqCst).is_err()
-        {
+        if st(cur) != FREE {
+            continue;
+        }
+        s.ended_kept().fetch_add(1, SeqCst);
+        if slot.state.compare_exchange(cur, next(cur, FILLING), SeqCst, SeqCst).is_err() {
+            s.ended_kept().fetch_sub(1, SeqCst);
             continue;
         }
         slot.pid.store(pid as u32, SeqCst);
@@ -859,6 +1066,9 @@ pub fn put_ended(pid: i32, start: u64, bytes: &[u8]) {
 pub fn ended(wanted: impl Fn(i32) -> bool) -> Vec<Vec<u8>> {
     let s = store();
     let mut out = Vec::new();
+    if s.ended_kept().load(SeqCst) == 0 {
+        return out;
+    }
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
@@ -881,6 +1091,9 @@ pub fn ended(wanted: impl Fn(i32) -> bool) -> Vec<Vec<u8>> {
 /// whether this caller took it (one caller does).
 pub fn take_ended(pid: i32, start: u64) -> bool {
     let s = store();
+    if s.ended_kept().load(SeqCst) == 0 {
+        return false;
+    }
     for i in 0..ENDED {
         let slot = s.ended(i);
         let cur = slot.state.load(SeqCst);
@@ -894,6 +1107,7 @@ pub fn take_ended(pid: i32, start: u64) -> bool {
         let (head, len) = (slot.head.load(SeqCst), slot.len.load(SeqCst) as usize);
         s.free_chain(head, len);
         slot.state.store(next(next(cur, TAKING), FREE), SeqCst);
+        s.ended_kept().fetch_sub(1, SeqCst);
         return true;
     }
     false
@@ -903,12 +1117,13 @@ pub fn take_ended(pid: i32, start: u64) -> bool {
 /// is kept.
 pub fn has_ended(pid: i32, start: u64) -> bool {
     let s = store();
-    (0..ENDED).any(|i| {
-        let slot = s.ended(i);
-        st(slot.state.load(SeqCst)) == FULL
-            && slot.pid.load(SeqCst) == pid as u32
-            && slot.start.load(SeqCst) == start
-    })
+    s.ended_kept().load(SeqCst) != 0
+        && (0..ENDED).any(|i| {
+            let slot = s.ended(i);
+            st(slot.state.load(SeqCst)) == FULL
+                && slot.pid.load(SeqCst) == pid as u32
+                && slot.start.load(SeqCst) == start
+        })
 }
 
 /// Wait while `word` is `value`, `timeout_ns` at most, for another process

@@ -286,6 +286,10 @@ pub(crate) fn import(
 }
 
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     #[cfg(target_os = "linux")]
     {
@@ -306,6 +310,10 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 /// Rebuild the registry in a fork child from [`save`]'s record: eventfd pipes
 /// are inherited as they are; each timerfd gets a fresh kqueue at its number,
 /// armed for what was left of its time.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     #[cfg(target_os = "linux")]
     let _ = d.count(1);
@@ -750,6 +758,10 @@ mod imp {
         })
     }
 
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub(super) fn hold<R>(f: impl FnOnce() -> R) -> R {
         let _g = REG.lock();
         f()
@@ -1451,9 +1463,10 @@ mod tests {
         use fwe_abi::timerfd::*;
         // SAFETY: no pointers.
         let fd = unsafe { timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK) } as i32;
-        // First due 1.05 s ago, every 100 ms: 11 expiries at once.
-        let at = clock_ns(CLOCK_MONOTONIC) - 1_050_000_000;
-        let spec: [i64; 4] = [0, 100_000_000, at / 1_000_000_000, at % 1_000_000_000];
+        // First due 10.5 s ago, every second: 11 expiries at once, the
+        // next half a second away (however slowly the test runs).
+        let at = clock_ns(CLOCK_MONOTONIC) - 10_500_000_000;
+        let spec: [i64; 4] = [1, 0, at / 1_000_000_000, at % 1_000_000_000];
         // SAFETY: as above.
         let r = unsafe { timerfd_settime(fd as u64, TFD_TIMER_ABSTIME, spec.as_ptr() as u64, 0) };
         assert_eq!(r, 0);

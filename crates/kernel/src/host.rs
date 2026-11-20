@@ -233,6 +233,10 @@ pub fn rlim_to_host(v: u64) -> libc::rlim_t {
 }
 
 /// Host signal for a Linux signal number, if the host has an equivalent.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn signal_to_host(sig: u64) -> Option<libc::c_int> {
     Some(match sig {
         signal::SIGHUP => libc::SIGHUP,
@@ -556,6 +560,10 @@ pub fn process_exists(pid: libc::pid_t) -> bool {
     r == 0 || r == fwe_abi::err(fwe_abi::errno::EPERM)
 }
 
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn empty_sigset() -> libc::sigset_t {
     // SAFETY: an all-zero sigset_t is valid storage; sigemptyset initializes it.
     unsafe {
@@ -566,6 +574,10 @@ pub fn empty_sigset() -> libc::sigset_t {
 }
 
 /// The host signal set holding the relayed signals in Linux set `mask`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn host_sigset(mask: u64) -> libc::sigset_t {
     let mut set = empty_sigset();
     for sig in 1..=signal::NSIG {
@@ -660,6 +672,10 @@ pub fn blocked_signals() -> u64 {
 
 /// Relayed signals pending in the host for the calling thread or process
 /// (those the guest blocks), as a Linux set.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn pending_signals() -> u64 {
     let mut set = empty_sigset();
     // SAFETY: `set` is a valid out-parameter.
@@ -698,6 +714,10 @@ pub fn sigchld_nocldstop() -> bool {
 
 /// Whether the host reaps this process's children as they end, leaving no
 /// zombie for `wait`: it ignores `SIGCHLD`, or set `SA_NOCLDWAIT`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn children_reaped_by_host() -> bool {
     // SAFETY: querying a disposition into a zeroed sigaction.
     unsafe {
@@ -2324,8 +2344,39 @@ pub fn pid_now() -> i32 {
     }
 }
 
+/// Whether the calling thread is its process's only host thread, as the
+/// host counts them.
+#[cfg(target_os = "macos")]
+pub fn only_thread() -> bool {
+    // SAFETY: zeroed bytes are a valid `proc_taskinfo`, which the call fills.
+    let mut info: libc::proc_taskinfo = unsafe { std::mem::zeroed() };
+    let size = size_of::<libc::proc_taskinfo>() as libc::c_int;
+    // SAFETY: a buffer of the size given.
+    let n = unsafe {
+        libc::proc_pidinfo(
+            pid(),
+            libc::PROC_PIDTASKINFO,
+            0,
+            (&mut info as *mut libc::proc_taskinfo).cast(),
+            size,
+        )
+    };
+    n == size && info.pti_threadnum == 1
+}
+
+/// Another host than macOS, where fwe runs only the kernel's unit tests:
+/// a fork there takes every lock ([`crate::fork_locked`]).
+#[cfg(not(target_os = "macos"))]
+pub fn only_thread() -> bool {
+    false
+}
+
 /// This process's host pid, kept: asked of the host once, and again in a
 /// fork child (a `pthread_atfork` handler forgets it).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn pid() -> i32 {
     use std::sync::atomic::Ordering::Relaxed;
     let p = PID.load(Relaxed);

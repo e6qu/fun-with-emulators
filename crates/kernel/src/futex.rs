@@ -80,16 +80,24 @@ impl Park {
         }
     }
 
-    /// Wake its thread. Called with the queues locked: a thread napping
-    /// cannot have left its wait (nor ended) meanwhile, so its wake pipe is
-    /// still its own.
-    fn wake(&self) {
+    /// Mark it woken, and end its thread's nap if it naps. Called with the
+    /// queues locked: a thread napping cannot have left its wait (nor
+    /// ended) meanwhile, so its wake pipe is still its own.
+    fn mark(&self) {
         self.word.store(1, Ordering::SeqCst);
         if self.napping.load(Ordering::SeqCst) && self.poke >= 0 {
             // SAFETY: one byte to the waiting thread's own non-blocking
             // pipe; a full pipe is woken already.
             unsafe { libc::write(self.poke, b"f".as_ptr().cast(), 1) };
         }
+    }
+
+    /// Wake its thread if it sleeps on its word, once [`Park::mark`]ed:
+    /// with the queues let go, as the host's wake is a system call that
+    /// may switch to the thread woken, and every futex call waits for the
+    /// queues. (A thread that left its wait meanwhile is woken by none:
+    /// the word is the park's, alive while it is held.)
+    fn rouse(&self) {
         #[cfg(target_os = "macos")]
         {
             unsafe extern "C" {
@@ -118,6 +126,13 @@ impl Park {
 /// them whatever the word holds), and wakes each one's thread alone.
 struct Table {
     queues: Mutex<HashMap<u64, VecDeque<Arc<Waiter>>>>,
+}
+
+impl Table {
+    /// The queues, locked ([`crate::shortlock`]: held for moments).
+    fn lock(&self) -> std::sync::MutexGuard<'_, Queues> {
+        crate::shortlock::lock(&self.queues)
+    }
 }
 
 fn table() -> &'static Table {
@@ -500,7 +515,7 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
         woken.unwrap_or(err(e))
     };
     let park = Park::new();
-    let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queues = table.lock();
     for &(uaddr, val, private) in &list {
         if let Err(e) = load(uaddr) {
             return done(held, &mut queues, e);
@@ -544,12 +559,12 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
         if let Some(step) = deadline.and_then(|d| near(d, now)) {
             drop(queues);
             precise_sleep(step);
-            queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+            queues = table.lock();
             continue;
         }
         drop(queues);
         park.sleep(slice);
-        queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+        queues = table.lock();
     }
 }
 
@@ -566,6 +581,10 @@ pub fn process_started() {
 /// waiter woken, so the next to lock it learns its owner died
 /// (`EOWNERDEAD`). The entry being added or removed (`list_op_pending`)
 /// last; the walk stops at a fault, the list's end, or 2048 entries.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn release_robust(head: u64, tid: i32) {
     use crate::uaccess::read;
     if head == 0 {
@@ -689,8 +708,12 @@ fn wait_deadline_abs(timeout: u64, realtime: bool) -> crate::uaccess::Result<Opt
 }
 
 /// Run `f` holding the wait-queue lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
-    let _g = table().queues.lock().unwrap_or_else(|e| e.into_inner());
+    let _g = table().lock();
     f()
 }
 
@@ -706,7 +729,7 @@ pub(crate) fn wait_private(uaddr: u64, val: u32, deadline: Option<Instant>) -> i
 /// [`wait_private`] for a wake for any of `bits` (`FUTEX_WAIT_BITSET`).
 pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
     let table = table();
-    let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queues = table.lock();
     // Compared under the lock a waker takes: a wake that follows a change
     // of the word either finds this waiter queued or the word changed.
     match load(uaddr) {
@@ -741,7 +764,7 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
             // registry's) so the reader wakes.
             drop(queues);
             crate::signal::drain_to_signalfd();
-            queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+            queues = table.lock();
             continue;
         }
         let now = Instant::now();
@@ -756,12 +779,12 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
             drop(queues);
             crate::thread::nap_ns(d.saturating_duration_since(now).as_nanos() as i64);
             park.napping.store(false, Ordering::SeqCst);
-            queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+            queues = table.lock();
             continue;
         }
         drop(queues);
         park.sleep(slice);
-        queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+        queues = table.lock();
     }
 }
 
@@ -825,15 +848,23 @@ fn key(uaddr: u64) -> u64 {
 /// A fork child has none of its parent's other threads: their waits are
 /// not its own (a wake must not take them).
 pub fn forked_child() {
-    table().queues.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    table().lock().clear();
 }
 
-/// Mark `woken` woken and wake their threads. Called with the queues
-/// locked ([`Park::wake`]).
-fn wake_all_of(woken: &[Arc<Waiter>]) {
+/// Mark `woken` woken. Called with the queues locked ([`Park::mark`]);
+/// their threads are woken once they are let go ([`rouse_all_of`]).
+fn mark_all_of(woken: &[Arc<Waiter>]) {
     for w in woken {
         w.woken.store(true, Ordering::SeqCst);
-        w.park.wake();
+        w.park.mark();
+    }
+}
+
+/// Wake the threads of `woken`, marked woken ([`mark_all_of`]), with the
+/// queues let go.
+fn rouse_all_of(woken: &[Arc<Waiter>]) {
+    for w in woken {
+        w.park.rouse();
     }
 }
 
@@ -846,9 +877,11 @@ pub(crate) fn wake_private(uaddr: u64, count: u32) -> i64 {
 /// (`FUTEX_WAKE_BITSET`).
 pub(crate) fn wake_private_bits(uaddr: u64, count: u32, bits: u32) -> i64 {
     let table = table();
-    let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queues = table.lock();
     let woken = take(&mut queues, key(uaddr), count, bits);
-    wake_all_of(&woken);
+    mark_all_of(&woken);
+    drop(queues);
+    rouse_all_of(&woken);
     woken.len() as i64
 }
 
@@ -863,7 +896,7 @@ pub(crate) fn requeue_private(
     expect: Option<u32>,
 ) -> i64 {
     let table = table();
-    let mut queues = table.queues.lock().unwrap_or_else(|e| e.into_inner());
+    let mut queues = table.lock();
     // `FUTEX_CMP_REQUEUE`'s comparison, under the lock a waiter queues
     // under, as Linux makes it: no waiter comes or goes in between.
     if let Some(v3) = expect {
@@ -875,10 +908,12 @@ pub(crate) fn requeue_private(
     }
     let (uaddr, uaddr2) = (key(uaddr), key(uaddr2));
     let woken = take(&mut queues, uaddr, wake, u32::MAX);
-    wake_all_of(&woken);
+    mark_all_of(&woken);
     let moved = take(&mut queues, uaddr, requeue, u32::MAX);
     let n = moved.len();
     queues.entry(uaddr2).or_default().extend(moved);
+    drop(queues);
+    rouse_all_of(&woken);
     (woken.len() + n) as i64
 }
 

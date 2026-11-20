@@ -406,6 +406,10 @@ impl Namespaces {
 
     /// Make these the namespaces the process's sockets act in (see
     /// [`crate::netns`]); called whenever the process's change.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn activate(&self) {
         crate::netns::set_current(self.net.clone());
         crate::userns::set_current(self.user.clone());
@@ -420,6 +424,10 @@ impl Namespaces {
     /// IPC ([`crate::threadfs`]), or the process's again (`None`). (A user
     /// namespace is never a thread's own: one with other threads cannot
     /// change it.)
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn activate_thread(own: Option<Namespaces>) {
         crate::netns::set_thread(own.as_ref().map(|n| n.net.clone()));
         crate::sysvipc::set_thread(own.map(|n| n.ipc));

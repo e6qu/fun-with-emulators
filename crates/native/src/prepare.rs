@@ -63,10 +63,12 @@ impl StubArena {
 pub fn stub_space(code: &[u8], page: u64) -> u64 {
     let sites = rewrite::count_sites(code) as u64;
     if sites == 0 {
-        return 0;
+        // Room for call stubs alone.
+        return page;
     }
     let groups = (code.len() as u64).div_ceil(GROUP_SPAN);
-    (sites * (STUB_WORDS as u64) * 4).div_ceil(page) * page + groups * page
+    // Each group's region rounded up, and a page more for call stubs.
+    (sites * (STUB_WORDS as u64) * 4).div_ceil(page) * page + 2 * groups * page
 }
 
 /// The stub regions holding a stub for an instruction that writes `sp`
@@ -85,6 +87,191 @@ fn note_sp_stub_region(start: u64, end: u64) {
         SP_STUB_REGIONS[2 * i + 1].store(end, SeqCst);
     }
     SP_STUB_COUNT.store(i + 1, SeqCst);
+}
+
+/// Every stub region: start -> end. Stubs sit in slots of
+/// [`STUB_WORDS`] words from their region's start.
+static STUB_REGIONS: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn note_stub_region(start: u64, end: u64) {
+    STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).insert(start, end);
+}
+
+/// The sites given stubs, by address: what each stood for, so code read
+/// through its site (to be translated) is had as the program wrote it.
+static SITES: std::sync::Mutex<std::collections::BTreeMap<u64, Site>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn note_site(at: u64, site: Site) {
+    SITES.lock().unwrap_or_else(|e| e.into_inner()).insert(at, site);
+}
+
+/// The instruction the program wrote at `at` in code fwe prepared, which
+/// holds `w` now: `w` itself, unless it is fwe's own word there, the trap
+/// a system call became or the branch to the stub a site became (whose
+/// branch back leads past `at`).
+pub fn original(at: u64, w: u32) -> u32 {
+    if w == rewrite::TRAP {
+        return rewrite::SVC0;
+    }
+    if w & 0xfc00_0000 != rewrite::B {
+        return w;
+    }
+    let to = at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4));
+    if stub_region(to).is_none() {
+        return w;
+    }
+    let Some(site) = SITES.lock().unwrap_or_else(|e| e.into_inner()).get(&at).copied() else {
+        return w;
+    };
+    let back = (0..STUB_WORDS as u64).any(|i| {
+        let a = to + 4 * i;
+        // SAFETY: a word of a stub slot, in a stub region (readable).
+        let x = unsafe { (a as *const u32).read() };
+        x & 0xfc00_0000 == rewrite::B
+            && a.wrapping_add_signed(i64::from(((x << 6) as i32) >> 4)) == at + 4
+    });
+    if !back {
+        return w;
+    }
+    match site {
+        Site::ReadThreadPointer { rt } => rewrite::MRS_TPIDR | rt,
+        Site::WriteThreadPointer { rt } => rewrite::MSR_TPIDR | rt,
+        Site::X18 { insn } => insn,
+        Site::Syscall { .. } => rewrite::SVC0,
+        Site::Flush { rt, .. } => rewrite::IC_IVAU | rt,
+    }
+}
+
+/// Regions holding call stubs ([`call_stub`]): start, end, next free.
+static CALL_STUBS: std::sync::Mutex<Vec<(u64, u64, u64)>> = std::sync::Mutex::new(Vec::new());
+
+/// The rest of a loader's arena, `[start, end)` (reserved, inaccessible),
+/// once the code it served is prepared: room for call stubs.
+pub fn spare_arena(start: u64, end: u64) {
+    if start >= end {
+        return;
+    }
+    // SAFETY: replacing the rest of our own reservation with fresh memory
+    // of fwe's.
+    let p = unsafe {
+        libc::mmap(
+            start as *mut libc::c_void,
+            (end - start) as usize,
+            libc::PROT_READ | libc::PROT_EXEC,
+            libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+            STUB_TAG,
+            0,
+        )
+    };
+    if p != libc::MAP_FAILED {
+        note_stub_region(start, end);
+        spare(start, end);
+    }
+}
+
+/// `[start, end)`, the end of a stub region no stub took: room for call
+/// stubs.
+fn spare(start: u64, end: u64) {
+    if start < end {
+        CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner()).push((start, end, start));
+    }
+}
+
+/// Place `words` as a stub in a stub region within branch reach of
+/// `site`, executable: its address, or `None` with no room in reach. Other
+/// threads are to be stopped (a region in use is made writable a moment).
+pub fn call_stub(site: u64, words: &[u32]) -> Option<u64> {
+    let len = 4 * words.len() as u64;
+    let page = fwe_kernel::mm::host_page_size();
+    let mut regions = CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner());
+    let reach = |a: u64| a.abs_diff(site) + len < BRANCH_RANGE;
+    let i = match regions.iter().position(|&(_, e, c)| c + len <= e && reach(c)) {
+        Some(i) => i,
+        None => {
+            let r =
+                find_region(page, page, site, site + 4, |r| r.abs_diff(site) + page < BRANCH_RANGE)
+                    .ok()?;
+            // SAFETY: replacing the region just reserved by us with fresh
+            // memory, carrying fwe's tag.
+            let p = unsafe {
+                libc::mmap(
+                    r as *mut libc::c_void,
+                    page as usize,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE | libc::MAP_ANON | libc::MAP_FIXED,
+                    STUB_TAG,
+                    0,
+                )
+            };
+            if p == libc::MAP_FAILED {
+                return None;
+            }
+            note_stub_region(r, r + page);
+            regions.push((r, r + page, r));
+            regions.len() - 1
+        }
+    };
+    let (start, end, at) = regions[i];
+    // SAFETY: a stub region of fwe's, no other thread running.
+    unsafe {
+        libc::mprotect(
+            start as *mut libc::c_void,
+            (end - start) as usize,
+            libc::PROT_READ | libc::PROT_WRITE,
+        );
+        for (k, &w) in words.iter().enumerate() {
+            ((at + 4 * k as u64) as *mut u32).write(w);
+        }
+        libc::mprotect(
+            start as *mut libc::c_void,
+            (end - start) as usize,
+            libc::PROT_READ | libc::PROT_EXEC,
+        );
+        flush_icache(at, len);
+    }
+    regions[i].2 = (at + len + 7) & !7;
+    Some(at)
+}
+
+/// A new program in this process (an `execve` in place): the old one's
+/// stub regions went with its memory, and with them what is known of them
+/// (sites, room for call stubs).
+pub fn reset() {
+    STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    SP_STUB_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
+    SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// The stub region holding `pc`, if any: (start, end).
+pub fn stub_region(pc: u64) -> Option<(u64, u64)> {
+    let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+    let (&start, &end) = regions.range(..=pc).next_back()?;
+    (pc < end).then_some((start, end))
+}
+
+/// A fault at `pc` with the stack at `sp`, as if at the site of the stub
+/// `pc` is in, if it is in one ([`rewrite::rewind`]): the program's own
+/// instruction faulted, and its handler sees it there, with its registers.
+pub fn rewind_fault(pc: u64, sp: u64) -> Option<rewrite::Rewound> {
+    let (start, end) = {
+        let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
+        let (&start, &end) = regions.range(..=pc).next_back()?;
+        (start, end)
+    };
+    if pc >= end {
+        return None;
+    }
+    let slot = (STUB_WORDS * 4) as u64;
+    let stub = start + (pc - start) / slot * slot;
+    // SAFETY: a slot of a stub region, mapped and readable.
+    let words = unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) };
+    rewrite::rewind(words, stub, pc, sp, |off| {
+        // SAFETY: the stack the stub pushed to, below which it faulted.
+        Some(unsafe { ((sp + off) as *const u64).read() })
+    })
 }
 
 /// Whether `pc` may be in a stub for an instruction that writes `sp` from
@@ -247,8 +434,9 @@ pub unsafe fn prepare(
         .sites
         .iter()
         .filter_map(|&(off, site)| match site {
-            Site::Syscall { .. } if gate == 0 => None,
+            Site::Syscall { .. } | Site::Flush { .. } if gate == 0 => None,
             Site::Syscall { .. } => Some((off, Site::Syscall { gate })),
+            Site::Flush { rt, .. } => Some((off, Site::Flush { rt, gate })),
             _ => Some((off, site)),
         })
         .collect();
@@ -391,7 +579,10 @@ unsafe fn redirect(
 ) -> Result<(), NoStubSpace> {
     let first = base + group[0].0;
     let last = base + group[group.len() - 1].0;
-    let size = ((group.len() * STUB_WORDS * 4) as u64).div_ceil(page) * page;
+    // A page more than the stubs take: room for call stubs in reach of
+    // this code ([`call_stub`]).
+    let used = ((group.len() * STUB_WORDS * 4) as u64).div_ceil(page) * page;
+    let size = used + page;
     let reachable =
         |region: u64| region + size <= first + BRANCH_RANGE && region + BRANCH_RANGE > last + size;
     let region = match arena.and_then(|a| a.take(size, reachable)) {
@@ -416,9 +607,11 @@ unsafe fn redirect(
         let last_error = std::io::Error::last_os_error().to_string();
         return Err(NoStubSpace { near: first, last_error });
     }
+    note_stub_region(region, region + size);
     let mut cursor = region;
     for &(offset, site) in group {
         let at = base + offset;
+        note_site(at, site);
         let words = rewrite::stub(site, slot, x18_slot, cursor, at + 4);
         for (i, w) in words.iter().enumerate() {
             // SAFETY: inside the region, which is writable.
@@ -455,6 +648,7 @@ unsafe fn redirect(
         );
         flush_icache(region, size);
     }
+    spare(region + used, region + size);
     Ok(())
 }
 
@@ -497,6 +691,7 @@ fn put_site(e: &mut fwe_kernel::snapshot::Enc, s: Site) {
         Site::WriteThreadPointer { rt } => (1, rt),
         Site::X18 { insn } => (2, insn),
         Site::Syscall { .. } => (3, 0),
+        Site::Flush { rt, .. } => (4, rt),
     };
     e.u32(kind);
     e.u32(v);
@@ -510,6 +705,7 @@ fn get_site(d: &mut fwe_kernel::snapshot::Dec, gate: u64) -> Option<Site> {
         1 => Site::WriteThreadPointer { rt: v },
         2 => Site::X18 { insn: v },
         3 if gate != 0 => Site::Syscall { gate },
+        4 if gate != 0 => Site::Flush { rt: v, gate },
         _ => return None,
     })
 }
@@ -573,8 +769,12 @@ fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> b
         unsafe { libc::munmap(p, r.size as usize) };
         return false;
     }
+    note_stub_region(r.at, r.at + r.size);
+    // The guest's memory, as other stub regions are: an `execve` releases it.
+    fwe_kernel::mm::track(r.at, r.size);
     let mut cursor = r.at;
     for &(at, site) in &r.sites {
+        note_site(at, site);
         for (i, w) in rewrite::stub(site, slot, x18_slot, cursor, at + 4).iter().enumerate() {
             // SAFETY: inside the region just mapped, writable.
             unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
@@ -602,6 +802,11 @@ fn finish_regions(regions: &[ImageRegion]) {
             );
             flush_icache(r.at, r.size);
         }
+        let page = fwe_kernel::mm::host_page_size();
+        spare(
+            (r.at + (r.sites.len() * STUB_WORDS * 4) as u64).div_ceil(page) * page,
+            r.at + r.size,
+        );
     }
 }
 
@@ -829,9 +1034,11 @@ mod tests {
     #[test]
     fn stub_space_estimate() {
         let page = 0x4000;
-        assert_eq!(stub_space(&[0u8; 64], page), 0);
+        // No sites: a page for call stubs.
+        assert_eq!(stub_space(&[0u8; 64], page), page);
+        // One: its stub's page, rounding room, and a page for call stubs.
         let one = 0xd53b_d049u32.to_le_bytes(); // mrs x9, tpidr_el0
-        assert_eq!(stub_space(&one, page), 2 * page);
+        assert_eq!(stub_space(&one, page), 3 * page);
     }
 
     #[test]

@@ -92,13 +92,7 @@ pub type Proc = (i32, u64);
 
 /// This process.
 pub fn me() -> Proc {
-    static ME: Mutex<Proc> = Mutex::new((0, 0));
-    let pid = crate::host::pid();
-    let mut m = ME.lock().unwrap_or_else(|e| e.into_inner());
-    if m.0 != pid {
-        *m = (pid, crate::procreg::start_time(pid).unwrap_or(0));
-    }
-    *m
+    (crate::host::pid(), crate::procreg::own_start().unwrap_or(0))
 }
 
 fn alive(p: Proc) -> bool {
@@ -730,6 +724,10 @@ pub(crate) static CURRENT: Mutex<Option<Arc<Record<Ipc>>>> = Mutex::new(None);
 
 /// The process's namespaces are now these: its IPC namespace's record
 /// (the initial namespace's for `None`).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn activate(ipc: Option<Arc<Record<Ipc>>>) {
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = ipc;
 }
@@ -759,6 +757,10 @@ pub(crate) fn thread_reused() {
 }
 
 /// Make `ipc` this thread's own (`Some`), or the process's again (`None`).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn set_thread(ipc: Option<Option<Arc<Record<Ipc>>>>) {
     THREAD.with(|t| *t.borrow_mut() = ipc);
 }
@@ -1116,6 +1118,10 @@ pub fn forked_child() {
 
 /// This process runs another program (`exec` true) or ends: its
 /// attachments go, and its undo adjustments are applied, as Linux does.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn process_leaving(exec: bool) {
     let attached: Vec<(u64, (i32, u64))> =
         std::mem::take(&mut *ATTACHED.lock().unwrap_or_else(|e| e.into_inner()))

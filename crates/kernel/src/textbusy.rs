@@ -91,6 +91,10 @@ fn alive(pid: u64) -> bool {
 }
 
 /// This process runs the program whose file is host `dev`, `ino`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn running(dev: u64, ino: u64) {
     MY_DEV.store(dev, Ordering::Relaxed);
     MY_INO.store(ino, Ordering::Relaxed);

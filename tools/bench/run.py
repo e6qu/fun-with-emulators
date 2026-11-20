@@ -32,12 +32,16 @@ best is the least disturbed.
 """
 
 import argparse
+import bisect
 import collections
+import ctypes
 import hashlib
 import json
 import os
 import re
 import shutil
+import statistics
+import struct
 import subprocess
 import sys
 import tempfile
@@ -70,7 +74,7 @@ def fetch(urls, sha256, cache):
         os.makedirs(cache, exist_ok=True)
         for u in urls:
             r = subprocess.run(
-                ["curl", "-sfL", "--retry", "5", "--retry-all-errors", "-o", path + ".part", u]
+                ["curl", "-sSfL", "--retry", "5", "--retry-all-errors", "-o", path + ".part", u]
             )
             if r.returncode == 0:
                 url = u
@@ -127,6 +131,17 @@ MICRO = [
     ("stat", ["file", "stat", "100000"], "ns"),
     ("open+close", ["file", "open", "50000"], "ns"),
     ("mmap+munmap", ["file", "mmap", "50000"], "ns"),
+    # A fault the program's own handler steps past (a JIT's implicit null
+    # check), there and back.
+    ("SIGSEGV handled", ["fault", "50000"], "us"),
+    # Code made at run time (fwe runs it by translation, macOS as it is):
+    # the same machine code each way, at work and as it is made.
+    ("JIT code: calls and returns", ["jit", "calls", "200"], "ns"),
+    ("JIT code: a switch through br", ["jit", "indirect", "500000"], "ns"),
+    ("JIT code: calls through a register", ["jit", "pointers", "5000000"], "ns"),
+    ("JIT code: a loop", ["jit", "loop", "10000000"], "ns"),
+    ("JIT code: 4096 functions in turn", ["jit", "functions", "2000000"], "ns"),
+    ("JIT code: a function made and run", ["jit", "made", "2000"], "us"),
 ]
 
 
@@ -150,6 +165,9 @@ BUDGETS = {
     # repository), as a call is.
     "SQLite (s)": 1.5,
     "git (s)": 1.5,
+    # A JIT runtime at work (compiling, then running, a multi-threaded
+    # application), against the same release of OpenJDK built for macOS.
+    "JDK (s)": 1.5,
 }
 
 # How much longer than its own code fwe may make a program that computes
@@ -185,6 +203,7 @@ BREW = {
     "sqlite": "opt/sqlite/bin/sqlite3",
     "git": "opt/git/bin/git",
     "xz": "opt/xz/bin/xz",
+    "jdk": "opt/openjdk@25/bin",
 }
 
 
@@ -369,6 +388,13 @@ def macos(a):
         if args[0] == "file":
             sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
             pcs(f"{name} (micro)", fwe + [a.bench, "file", args[1], "300000"])
+    # And a fork's: its steps in fwe, the host's calls and the kernel's
+    # work in both processes, under fwe and natively.
+    phases("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
+    faulted("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
+    pcs("fork+exit+wait (micro)", fwe + [a.bench, "fork", "2000"])
+    pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
+        execname=os.path.basename(a.native)[:16])
     results = {"fwe": ours, "macOS": theirs}
     # The benchmark program alone, and forking and running itself.
     ran = backends(fwe + [a.bench, "forkexec", "2", a.bench])
@@ -533,6 +559,7 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    jdk(a, fwe, guest_env, results)
     shutil.rmtree(native, ignore_errors=True)
 
 
@@ -555,7 +582,12 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
             r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
             times[side].append(time.perf_counter() - start)
             if r.returncode != 0:
-                sys.exit(f"{name} {side} failed ({r.returncode}): {r.stderr[-3000:]}")
+                # The head of the output holds a crash report's summary (a
+                # JVM's), its end what led to the failure.
+                out = r.stdout if len(r.stdout) <= 12000 else (
+                    f"{r.stdout[:6000]}\n[...]\n{r.stdout[-6000:]}")
+                sys.exit(f"{name} {side} failed ({r.returncode}): {r.stderr[-3000:]}\n"
+                         f"its output: {out}")
             outs[side] = r.stdout
     if outs["fwe"] != outs["macOS"]:
         sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
@@ -618,23 +650,333 @@ def git_commands(ours, theirs, fresh, root):
               file=sys.stderr)
 
 
-def pcs(name, cmd, share=False, execname="fwe"):
+# A process's regions, as `vmmap` lists them but in milliseconds, not the
+# half second `vmmap` takes (longer than some of the programs measured
+# run): `proc_pidinfo`'s `PROC_PIDREGIONPATHINFO`, a `struct
+# proc_regionwithpathinfo` (the protection at 0, the user tag at 32, the
+# address and size at 80, the file's path at 248).
+REGION_INFO = 8
+REGION_SIZE = 96 + 152 + 1024
+# The user tags of the host's shared library cache, one region in the
+# listing (`VM_MEMORY_SHARED_PMAP`), and of fwe's stubs (`STUB_TAG` in
+# crates/native/src/prepare.rs, "Memory Tag 241" in `vmmap`).
+SHARED_CACHE_TAG = 32
+STUB_TAG = 241
+
+
+def host_regions(pid):
+    """Process `pid`'s regions in address order, (start, end, path or "",
+    user tag, protection): empty once it has ended."""
+    lib = ctypes.CDLL("/usr/lib/libproc.dylib")
+    buf = ctypes.create_string_buffer(REGION_SIZE)
+    out = []
+    at = 0
+    while lib.proc_pidinfo(pid, REGION_INFO, ctypes.c_uint64(at), buf, REGION_SIZE) > 0:
+        raw = buf.raw
+        prot = struct.unpack_from("<I", raw, 0)[0]
+        tag = struct.unpack_from("<I", raw, 32)[0]
+        start, size = struct.unpack_from("<QQ", raw, 80)
+        path = raw[248:].split(b"\0", 1)[0].decode(errors="replace")
+        out.append((start, start + size, path, tag, prot))
+        at = start + size
+    return out
+
+
+def proc_name(pid):
+    """The name of process `pid`'s program: "" once it has ended."""
+    buf = ctypes.create_string_buffer(256)
+    n = ctypes.CDLL("/usr/lib/libproc.dylib").proc_name(pid, buf, len(buf))
+    return buf.raw[:max(n, 0)].decode(errors="replace")
+
+
+def shared_cache_name(pc):
+    """The library of the host's shared cache at `pc`, and the offset into
+    it: the cache is at one address in every process, so this one's
+    loader names it."""
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p),
+                    ("sname", ctypes.c_char_p), ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    if ctypes.CDLL(None).dladdr(ctypes.c_void_p(pc), ctypes.byref(info)) and info.fname:
+        return f"{os.path.basename(info.fname.decode())}+{pc - info.fbase:#x}"
+    return f"shared cache+{pc:#x}"
+
+
+def cache_symbol(pc):
+    """The function of the host's shared cache at `pc`, as this process's
+    loader names it (the cache is at one address in every process), or
+    ""."""
+
+    class DlInfo(ctypes.Structure):
+        _fields_ = [("fname", ctypes.c_char_p), ("fbase", ctypes.c_void_p),
+                    ("sname", ctypes.c_char_p), ("saddr", ctypes.c_void_p)]
+
+    info = DlInfo()
+    if ctypes.CDLL(None).dladdr(ctypes.c_void_p(pc), ctypes.byref(info)) and info.sname:
+        return f" ({info.sname.decode(errors='replace')}+{pc - info.saddr:#x})"
+    return ""
+
+
+def breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total):
+    """[`pcs`]'s readings beyond the files: the kernel's most sampled
+    stacks (`kstacks`, by thread), in all and in thread `busiest`, and the
+    samples in `execname` by function, named by `atos` from the binary
+    `cmd` ran."""
+    def name_frames(frames):
+        # The program's frame it entered from, named where it can be.
+        return " < ".join(where(int(f, 16)) + cache_symbol(int(f, 16)) if f.startswith("0x")
+                          else f for f in frames)
+
+    merged = collections.Counter()
+    for _, n, frames in kstacks:
+        merged[tuple(frames)] += n
+    for frames, n in merged.most_common(8):
+        print(f"{name}: kernel {n * 100 / total:.1f}%: {name_frames(frames)}", file=sys.stderr)
+    for _, n, frames in sorted((k for k in kstacks if k[0] == busiest), key=lambda k: -k[1])[:6]:
+        print(f"{name}: thread {busiest}: kernel {n} samples: {name_frames(frames)}",
+              file=sys.stderr)
+    exe = next((c for c in cmd if os.path.basename(c) == execname and os.path.isfile(c)), None)
+    path = next((p for regions in looks for _, _, p, _, _ in regions
+                 if p and os.path.basename(p) == execname), None)
+    mine = [(pc, n) for pc, n in counts if where(pc).startswith(f"{execname}+")]
+    if not exe or path is None or not mine:
+        return
+    lo = base[path]
+    mine.sort(key=lambda c: -c[1])
+    mine = mine[:2000]
+    names = subprocess.run(["atos", "-o", exe, "-l", f"{lo:#x}"] + [f"{pc:#x}" for pc, _ in mine],
+                           capture_output=True, text=True, errors="replace").stdout.splitlines()
+    funcs = collections.Counter()
+    for (_, n), sym in zip(mine, names):
+        funcs[re.sub(r" \(in .*", "", sym).strip()[:100]] += n
+    top = "; ".join(f"{f} {n * 100 / total:.1f}%" for f, n in funcs.most_common(15))
+    print(f"{name}: {execname} by function: {top}", file=sys.stderr)
+    # The host's libraries' samples, named from the shared cache.
+    libs = collections.Counter()
+    for pc, n in counts:
+        w = where(pc)
+        if "+0x" in w and not w.startswith((f"{execname}+", "anonymous")):
+            libs[w] += n
+    named = []
+    for w, n in libs.most_common(8):
+        lib, off = w.split("+")
+        dylib = next((d for d in ("/usr/lib/system/" + lib, "/usr/lib/" + lib) if lib.endswith(".dylib")), None)
+        sym = subprocess.run(["atos", "-o", dylib, "-l", "0x0", off], capture_output=True, text=True,
+                             errors="replace").stdout.strip() if dylib else ""
+        named.append(f"{w} ({sym or '?'}) {n * 100 / total:.1f}%")
+    print(f"{name}: host libraries: {'; '.join(named)}", file=sys.stderr)
+
+
+def rust_name(sym):
+    """A Rust symbol's last two names (`jit::translation`), from its v0
+    mangling; anything else as it is."""
+    if not re.match(r"_*R", sym):
+        return sym
+    # (Crate disambiguators and back references hold digits.)
+    s = re.sub(r"(?<=[CXMY])s[0-9A-Za-z]*_|B[0-9A-Za-z]*_", "", sym)
+    names, i = [], 0
+    while i < len(s):
+        m = re.match(r"\d+", s[i:])
+        if not m:
+            i += 1
+            continue
+        n = int(m.group())
+        i += len(m.group())
+        names.append(s[i:i + n])
+        i += n
+    return "::".join(names[-2:]) or sym
+
+
+def inclusive(name, execname, cmd, ustacks, busiest, samples, looks, base, where):
+    """Thread `busiest`'s samples in `execname` (fwe) by function with
+    what it calls ([`pcs`]'s user stacks, `samples` the thread's in all),
+    named by `atos` from the binary `cmd` ran: where fwe's own work goes,
+    whichever of its functions the compiler merged into which."""
+    exe = next((c for c in cmd if os.path.basename(c) == execname and os.path.isfile(c)), None)
+    path = next((p for regions in looks for _, _, p, _, _ in regions
+                 if p and os.path.basename(p) == execname), None)
+    if not exe or path is None or not samples:
+        return
+    # Frames DTrace named (`fwe`sym+0x10`), or left as addresses (the
+    # process gone when it printed them).
+    mine = [(n, [f.split("`", 1)[1].split("+")[0] if f.startswith(f"{execname}`")
+                 else int(f, 16) for f in frames
+                 if f.startswith(f"{execname}`")
+                 or f.startswith("0x") and where(int(f, 16)).startswith(f"{execname}+")])
+            for tid, n, frames in ustacks if tid == busiest]
+    unique = sorted({f for _, fs in mine for f in fs if isinstance(f, int)})
+    names = subprocess.run(["atos", "-o", exe, "-l", f"{base[path]:#x}"]
+                           + [f"{pc:#x}" for pc in unique],
+                           capture_output=True, text=True,
+                           errors="replace").stdout.splitlines() if unique else []
+    func = {pc: re.sub(r" \(in .*", "", sym).strip() for pc, sym in zip(unique, names)}
+    funcs = collections.Counter()
+    for n, fs in mine:
+        for f in {rust_name(func.get(f, "?") if isinstance(f, int) else f) for f in fs}:
+            funcs[f] += n
+    top = "; ".join(f"{f} {n * 100 / samples:.1f}%" for f, n in funcs.most_common(30))
+    print(f"{name}: thread {busiest}: {execname} by function with what it calls: {top}",
+          file=sys.stderr)
+
+
+def callers(name, cmd, funcs):
+    """The call stacks into the host library functions `funcs` (pairs of
+    library and function, DTrace's pid-provider patterns) while `cmd` (one
+    fwe process) runs, by the time spent in the calls (microseconds), most
+    first, named by DTrace from the process it holds."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.callers")
+    proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    # Probes are put in fwe once it is running (after `env`'s exec too).
+    proc.stdin.write(b"\n")
+    proc.stdin.flush()
+    for _ in range(200):
+        if proc_name(proc.pid) == "fwe":
+            break
+        time.sleep(0.005)
+    probes = " ".join(f'pid$target:{lib}:{f}:entry {{ self->t[probefunc] = timestamp; }} '
+                      f'pid$target:{lib}:{f}:return /self->t[probefunc]/ {{ '
+                      f'@s[probefunc, ustack(12)] = sum((timestamp - self->t[probefunc]) / 1000); '
+                      f'self->t[probefunc] = 0; }}'
+                      for lib, f in funcs)
+    tracer = subprocess.run(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-p",
+                             str(proc.pid), "-n", probes + ' END { printa("%s %@d%k\\n", @s); }',
+                             "-o", out],
+                            capture_output=True, text=True, errors="replace", timeout=600)
+    if proc.wait(timeout=600) != 0:
+        print(f"{name}: the probed run exited with {proc.returncode}", file=sys.stderr)
+    if not os.path.exists(out):
+        said = (tracer.stdout + tracer.stderr).strip()[-600:]
+        print(f"{name}: no callers (DTrace {tracer.returncode}): {said}", file=sys.stderr)
+        return
+    with open(out, errors="replace") as f:
+        text = f.read()
+    # Each stack: a line of the function and count, its frames, a blank.
+    shown = 0
+    for chunk in text.split("\n\n"):
+        lines = [l.strip() for l in chunk.strip().splitlines() if l.strip()]
+        if len(lines) < 2 or shown >= 12:
+            continue
+        print(f"{name}: into {lines[0]} us: {' < '.join(lines[1:])[:1500]}", file=sys.stderr)
+        shown += 1
+
+
+def translated(name, jit_map, counts, where):
+    """The samples in fwe's translations (`counts`, by program counter),
+    named by the maps of the code cache fwe wrote to directory `jit_map`:
+    by what each word stands for (the program's instruction with its `x16`
+    and `x17` in place or saved, or its `x18` held in `x17`, their save or
+    restore, inside an expansion and of what, a lookup, a way out) and
+    whether it is among a block's hot words or its cold ones, the hottest
+    blocks word by word, by the program's code each block was made from
+    (`where` names its address), and the hottest blocks; and the blocks
+    made, by the program's code, by what ended each, and by how many
+    instructions."""
+    # Each block's parts: its hot words (with how many of the program's
+    # words it was made from, and the last), and its cold ones.
+    parts = []
+    for f in os.listdir(jit_map):
+        with open(os.path.join(jit_map, f)) as m:
+            for line in m:
+                t, size, g, kinds, words, source = line.split()
+                n, last = source.split(":") if source != "cold" else (None, None)
+                parts.append((int(t, 16), int(size), int(g, 16), kinds, words,
+                              None if n is None else int(n),
+                              None if last is None else int(last, 16)))
+    parts.sort()
+    starts = [b[0] for b in parts]
+    blocks = [b for b in parts if b[5] is not None]
+    names = {"a": "instruction", "s": "instruction, x16/x17 saved", "v": "save of x16/x17",
+             "x": "instruction, x18 in x17", "r": "restore of x16/x17",
+             "8": "expansion of x18", "t": "expansion of the thread pointer",
+             "e": "expansion of a literal load", "i": "expansion of a cache flush",
+             "c": "expansion of a system call", "l": "lookup", "L": "lookup", "o": "way out"}
+    by_kind, by_code, by_block = collections.Counter(), collections.Counter(), collections.Counter()
+    by_word = collections.Counter()
+    # The blocks made: whose code, what ended each, how long.
+    made_by, ends, lengths = collections.Counter(), collections.Counter(), collections.Counter()
+    for b in blocks:
+        made_by[where(b[2]).split("+")[0]] += 1
+        w, n = b[6], b[5]
+        ends["b" if w & 0xfc000000 == 0x14000000 else "bl" if w & 0xfc000000 == 0x94000000
+             else "br" if w & 0xfffffc1f == 0xd61f0000 else "blr" if w & 0xfffffc1f == 0xd63f0000
+             else "ret" if w & 0xfffffc1f == 0xd65f0000 else "the most instructions" if n >= 64
+             else "the page's end or else"] += 1
+        lengths["1-4" if n <= 4 else "5-8" if n <= 8 else "9-16" if n <= 16 else "17-63"
+                if n < 64 else "64"] += 1
+
+    def of(c):
+        return ", ".join(f"{w} {k * 100 // len(blocks)}%" for w, k in c.most_common(8))
+    print(f"{name}: blocks made: {len(blocks)}; by the program's code: {of(made_by)}; "
+          f"ended by: {of(ends)}; instructions: {of(lengths)}", file=sys.stderr)
+    n_in, n_cold = 0, 0
+    for pc, n in counts:
+        i = bisect.bisect_right(starts, pc) - 1
+        if i < 0 or pc >= parts[i][0] + parts[i][1]:
+            continue
+        t, _, g, kinds = parts[i][:4]
+        k = (pc - t) // 4
+        by_word[(i, k)] += n
+        by_kind[names.get(kinds[k], "?") if k < len(kinds) else "?"] += n
+        by_code[where(g).split("+")[0]] += n
+        by_block[g] += n
+        n_in += n
+        if parts[i][5] is None:
+            n_cold += n
+    if not n_in:
+        print(f"{name}: translations: no samples ({len(blocks)} blocks)", file=sys.stderr)
+        return
+
+    def pct(c):
+        return ", ".join(f"{w} {n * 100 / n_in:.0f}%" for w, n in c.most_common(8))
+    hot = ", ".join(f"{where(g)} {n * 100 / n_in:.1f}%" for g, n in by_block.most_common(15))
+    print(f"{name}: translations: {n_in} samples in {len(blocks)} blocks "
+          f"({n_cold * 100 / n_in:.0f}% in their cold words); by word: "
+          f"{pct(by_kind)}; by the program's code: {pct(by_code)}; hottest blocks: {hot}",
+          file=sys.stderr)
+    # The hottest blocks word by word: what each stands for, the word, and
+    # its samples.
+    hottest = collections.Counter()
+    for (i, _), n in by_word.items():
+        hottest[i] += n
+    for i, _ in hottest.most_common(3):
+        t, _, g, kinds, words = parts[i][:5]
+        each = " ".join(f"{kinds[k]}:{words[8 * k:8 * k + 8]}:{by_word[(i, k)]}"
+                        for k in range(len(kinds)))
+        print(f"{name}: block {where(g)} (at {t:x}): {each}", file=sys.stderr)
+
+
+def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     """Where `cmd` (an fwe process, and those it forks) runs, by the exact
     program counter of each of DTrace's samples, named by the file mapped
-    there (as `vmmap` lists it in the first process while it runs) and the
-    offset into it: `sample` walks frames, which guest code without frame
-    records leaves it short of. And the time the processes spend in each
-    host system call. `execname` is the processes' name: fwe's, or a native
-    program's to compare with.
+    there and the offset into it: `sample` walks frames, which guest code
+    without frame records leaves it short of. And the time the processes
+    spend in each host system call. `execname` is the processes' name:
+    fwe's, or a native program's to compare with.
+
+    What is mapped where is the first process's ([`host_regions`]), looked
+    at again and again from when it runs `execname` to its end; a sample is
+    named by the latest look that saw its address mapped. One look at one
+    moment would miss what is mapped after it, and a look slower than the
+    program (`vmmap`'s, half a second, against a compile's third) would
+    see nothing.
 
     With `share`, it returns the samples in the program's own code and all
-    of them. A sample is fwe's in fwe itself, the host's libraries fwe
-    calls, fwe's stubs (the regions they carry its memory tag in,
-    "Memory Tag 241") and anything `vmmap` did not see mapped; it is the
-    program's anywhere else: its images and libraries, mapped or loaded
-    into memory, the code it makes, and the kernel (the host's work for its
-    system calls and faults, as Linux's would be). `cmd` is then one
-    process: a forked one's mappings are not the first's."""
+    of them (none when no look saw the process). A sample is fwe's in fwe
+    itself, the host's libraries fwe calls (the shared cache, and anything
+    under `/usr/lib` or `/System`), fwe's stubs (the regions they carry its
+    memory tag in) and anything no look saw mapped; it is the program's
+    anywhere else: its images and libraries, mapped or loaded into memory,
+    the code it makes, and the kernel (the host's work for its system calls
+    and faults, as Linux's would be). `cmd` is then one process: a forked
+    one's mappings are not the first's.
+
+    With `jit_map`, the directory fwe writes its code cache's map to as the
+    process ends (`FWE_JIT_MAP`, which `cmd` sets), the samples in
+    translations are named too ([`translated`])."""
     out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
@@ -643,27 +985,44 @@ def pcs(name, cmd, share=False, execname="fwe"):
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
-    script = (f'profile-997 /execname == "{execname}"/ {{ @pc[arg1] = count(); }} '
-              f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
+    script = (f'profile-997 /execname == "{execname}"/ {{ @pc[tid, arg1] = count(); }} '
+              f'profile-997 /execname == "{execname}" && arg0/ {{ @ks[tid, stack(6)] = count(); }} '
+              # fwe's own stacks (frame records), for its time by function
+              # with what it calls.
+              + (f'profile-997 /execname == "{execname}" && arg1/ {{ @us[tid, ustack(24)] = count(); }} '
+                 if execname == "fwe" else "")
+              + f'syscall:::entry /execname == "{execname}"/ {{ self->t = timestamp; }} '
               'syscall:::return /self->t/ { @ns[probefunc] = sum(timestamp - self->t); '
               '@n[probefunc] = count(); self->t = 0; } '
-              'END { printa("pc %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); }')
+              # Mach traps (mach_vm_*, mach_msg) are not system calls to
+              # DTrace's syscall provider.
+              f'mach_trap:::entry /execname == "{execname}"/ {{ self->m = timestamp; }} '
+              'mach_trap:::return /self->m/ { @ns[strjoin("mach:", probefunc)] = '
+              'sum(timestamp - self->m); @n[strjoin("mach:", probefunc)] = count(); '
+              'self->m = 0; } '
+              'END { printa("pc %d %x %@d\\n", @pc); printa("sys %s %@d %@d\\n", @ns, @n); '
+              'printa("ks %d %@d%k\\nendks\\n", @ks); '
+              + ('printa("us %d %@d%k\\nendus\\n", @us); ' if execname == "fwe" else "")
+              + '}')
     tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
                                "-o", out],
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                               errors="replace")
     time.sleep(2)
     proc.stdin.close()
-    time.sleep(0.25)
-    regions = []
-    vm = subprocess.run(["vmmap", "-wide", str(proc.pid)], capture_output=True, text=True,
-                        errors="replace").stdout
-    for line in vm.splitlines():
-        m = re.search(r"([0-9a-f]+)-([0-9a-f]+)\s+\[.*?\]\s+\S+\s+SM=\S+\s*(.*)$", line)
-        if m:
-            regions.append((int(m.group(1), 16), int(m.group(2), 16), m.group(3).strip(),
-                            " ".join(line.split())))
-    proc.wait(timeout=300)
+    # Its regions from when it runs `execname` to its end, each look kept
+    # when it differs from the last.
+    looks = []
+    while proc.poll() is None:
+        if proc_name(proc.pid) == execname:
+            regions = host_regions(proc.pid)
+            # (A look its end cut short is not kept.)
+            if regions and proc.poll() is None and (not looks or looks[-1] != regions):
+                looks.append(regions)
+        time.sleep(0.01)
+    # A run that failed is said: its profile is not the work's.
+    if proc.wait(timeout=300) != 0:
+        print(f"{name}: the profiled run exited with {proc.returncode}", file=sys.stderr)
     # DTrace itself, sudo's child: sudo passes on no signal from a process
     # of its own process group, as this one is.
     dtrace = subprocess.run(["pgrep", "-P", str(tracer.pid)], capture_output=True,
@@ -675,15 +1034,30 @@ def pcs(name, cmd, share=False, execname="fwe"):
         subprocess.run(["sudo", "-n", "kill", "-KILL"] + dtrace, capture_output=True)
         said = tracer.communicate()[0]
         sys.exit(f"{name}: DTrace did not end when interrupted: {said.strip()[-2000:]}")
-    counts, calls = [], []
+    # Samples by thread, and by program counter.
+    # The kernel's stacks by thread: (thread, samples, frames).
+    # And fwe's user stacks the same way.
+    threads, calls, kstacks = collections.defaultdict(collections.Counter), [], []
+    ustacks = []
     if os.path.exists(out):
         with open(out, errors="replace") as f:
+            stack, into = None, None
             for line in f:
                 p = line.split()
-                if len(p) == 3 and p[0] == "pc":
-                    counts.append((int(p[1], 16), int(p[2])))
+                if stack is not None:
+                    if p in (["endks"], ["endus"]):
+                        into.append(stack)
+                        stack = None
+                    elif p:
+                        stack[2].append(p[0])
+                elif len(p) == 4 and p[0] == "pc":
+                    threads[int(p[1])][int(p[2], 16)] += int(p[3])
                 elif len(p) == 4 and p[0] == "sys":
                     calls.append((p[1], int(p[2]), int(p[3])))
+                elif len(p) == 3 and p[0] in ("ks", "us"):
+                    stack = (int(p[1]), int(p[2]), [])
+                    into = kstacks if p[0] == "ks" else ustacks
+    counts = list(sum(threads.values(), collections.Counter()).items())
     if calls:
         calls.sort(key=lambda c: -c[1])
         top = ", ".join(f"{c} {n}x {ns / 1e6:.1f} ms ({ns / n:.0f} ns)" for c, ns, n in calls[:12])
@@ -692,19 +1066,37 @@ def pcs(name, cmd, share=False, execname="fwe"):
     if not counts:
         print(f"{name}: no program counters: {said.strip()[-500:]}", file=sys.stderr)
         return None
+    print(f"{name}: its regions looked at as they changed: {len(looks)} times"
+          + (f", {len(looks[-1])} regions at the last" if looks else ""),
+          file=sys.stderr)
     # A file's offset from the lowest address it is mapped at.
     base = {}
-    for lo, _, what, _ in regions:
-        if what:
-            base[what] = min(base.get(what, lo), lo)
+    for regions in looks:
+        for lo, _, path, _, _ in regions:
+            if path:
+                base[path] = min(base.get(path, lo), lo)
+    starts = [[r[0] for r in regions] for regions in looks]
+
+    def region(pc):
+        """The region at `pc` in the latest look that saw one there."""
+        for regions, lows in zip(reversed(looks), reversed(starts)):
+            i = bisect.bisect_right(lows, pc) - 1
+            if i >= 0 and pc < regions[i][1]:
+                return regions[i]
+        return None
 
     def where(pc):
         if pc == 0:
             return "kernel"  # (No user program counter: in a system call.)
-        for lo, hi, what, _ in regions:
-            if lo <= pc < hi:
-                return f"{os.path.basename(what)}+{pc - base[what]:#x}" if what else f"anonymous {lo:#x}+{pc - lo:#x}"
-        return "unmapped"
+        r = region(pc)
+        if r is None:
+            return "unmapped"
+        lo, _, path, tag, _ = r
+        if path:
+            return f"{os.path.basename(path)}+{pc - base[path]:#x}"
+        if tag == SHARED_CACHE_TAG:
+            return shared_cache_name(pc)
+        return f"anonymous {lo:#x}+{pc - lo:#x}"
 
     total = sum(n for _, n in counts)
     by = collections.Counter()
@@ -715,22 +1107,63 @@ def pcs(name, cmd, share=False, execname="fwe"):
                     for pc, n in sorted(counts, key=lambda c: -c[1])[:15])
     print(f"{name}: {total} samples by program counter; by file: {files}; hottest: {top}",
           file=sys.stderr)
-    # What vmmap says of the unnamed regions most samples are in.
-    for w, _ in by.most_common(8):
-        for lo, _, what, line in regions:
-            if not what and w == f"anonymous {lo:#x}":
-                print(f"{name}: {w}: {line}", file=sys.stderr)
+    # The threads that ran most: the longest of them bounds the run.
+    busiest = max(threads, key=lambda t: threads[t].total())
+    for tid, pcs_of in sorted(threads.items(), key=lambda t: -t[1].total())[:4]:
+        of = collections.Counter()
+        for pc, n in pcs_of.items():
+            of[where(pc).split("+")[0]] += n
+        n = pcs_of.total()
+        print(f"{name}: thread {tid}: {n} samples; by file: "
+              + ", ".join(f"{w} {k * 100 // n}%" for w, k in of.most_common(6)), file=sys.stderr)
+    if jit_map:
+        try:
+            translated(name, jit_map, counts, where)
+        except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+            print(f"{name}: no reading of translations: {e!r}", file=sys.stderr)
+    # What the kernel was doing, and fwe's samples by function: for
+    # reading only, so a failure here is said and the run goes on.
+    try:
+        breakdown(name, execname, cmd, counts, kstacks, busiest, looks, base, where, total)
+    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+        print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
+    # The busiest threads', and any of the four busiest that runs mostly
+    # outside the program's code (a program's other threads may spend
+    # theirs in fwe where its main one does not).
+    def outside(pcs_of):
+        mine = sum(n for pc, n in pcs_of.items()
+                   if where(pc).split("+")[0] in (execname, "libsystem_malloc.dylib"))
+        return mine * 2 > pcs_of.total()
+    ranked = sorted(threads.items(), key=lambda t: -t[1].total())
+    for tid, pcs_of in ranked[:3] + [t for t in ranked[3:4] if outside(t[1])]:
+        try:
+            inclusive(name, execname, cmd, ustacks, tid, pcs_of.total(), looks, base, where)
+        except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+            print(f"{name}: no stacks by function: {e!r}", file=sys.stderr)
+    # The unnamed regions most samples are in: their tag and protection.
+    hot = {w for w, _ in by.most_common(8)}
+    for regions in looks:
+        for lo, hi, path, tag, prot in regions:
+            w = f"anonymous {lo:#x}"
+            if not path and w in hot:
+                hot.discard(w)
+                rwx = "".join(c if prot & b else "-" for c, b in (("r", 1), ("w", 2), ("x", 4)))
+                print(f"{name}: {w}: {lo:x}-{hi:x} tag {tag} {rwx}", file=sys.stderr)
     if not share:
         return None
+    if not looks:
+        print(f"{name}: no look saw the process's regions: no share", file=sys.stderr)
+        return None
 
-    def fwes(what, line):
-        return (line.startswith("Memory Tag 241")
-                or what.startswith(("/usr/lib/", "/System/"))
-                or os.path.basename(what) == "fwe")
+    def fwes(r):
+        _, _, path, tag, _ = r
+        return (tag in (STUB_TAG, SHARED_CACHE_TAG)
+                or path.startswith(("/usr/lib/", "/System/"))
+                or os.path.basename(path) == "fwe")
 
     def owns(pc):
-        return pc == 0 or any(lo <= pc < hi and not fwes(what, line)
-                              for lo, hi, what, line in regions)
+        r = region(pc)
+        return pc == 0 or (r is not None and not fwes(r))
 
     mine = sum(n for pc, n in counts if owns(pc))
     kernel = sum(n for pc, n in counts if pc == 0)
@@ -738,6 +1171,142 @@ def pcs(name, cmd, share=False, execname="fwe"):
           f"{kernel * 100 / total:.1f}%), fwe's {(total - mine) * 100 / total:.1f}%",
           file=sys.stderr)
     return mine, total
+
+
+def faulted(name, cmd):
+    """The page faults of `cmd` (an fwe process) and of the processes it
+    forks, apart, each named by the function of fwe's (or the file) whose
+    instruction took it, with DTrace's `vminfo:::as_fault`: a fork child
+    starts with no page mapped, so every page of fwe's it touches, code or
+    data, is a fault, and every page either process writes after the fork
+    is a copy. For reading only: a failure is said and the run goes on."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.faults")
+    proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
+                            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+    first = proc.pid
+    # By the faulting instruction's stack: a fault in a library (`malloc`'s,
+    # mostly) is named by the function of fwe's that called it.
+    script = (f'vminfo:::as_fault /execname == "fwe"/ {{ @f[pid == {first} ? 0 : 1, '
+              'ustack(12)] = count(); } '
+              f'proc:::exit /execname == "fwe" && pid != {first}/ {{ @kids = count(); }} '
+              'END { printa("f %d %@d%k\\nendf\\n", @f); printa("kids %@d\\n", @kids); }')
+    tracer = subprocess.Popen(["sudo", "-n", "dtrace", "-q", "-x", "aggsortrev", "-n", script,
+                               "-o", out],
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                              errors="replace")
+    time.sleep(2)
+    proc.stdin.close()
+    looks = []
+    while proc.poll() is None:
+        if proc_name(proc.pid) == "fwe":
+            regions = host_regions(proc.pid)
+            if regions and proc.poll() is None and (not looks or looks[-1] != regions):
+                looks.append(regions)
+        time.sleep(0.01)
+    proc.wait(timeout=300)
+    dtrace = subprocess.run(["pgrep", "-P", str(tracer.pid)], capture_output=True,
+                            text=True).stdout.split()
+    subprocess.run(["sudo", "-n", "kill", "-INT"] + dtrace, capture_output=True)
+    said = tracer.communicate(timeout=60)[0]
+    # (side, faults, frames), the frames as addresses.
+    stacks, kids, stack = [], 0, None
+    if os.path.exists(out):
+        for line in open(out, errors="replace"):
+            p = line.split()
+            if stack is not None:
+                if p == ["endf"]:
+                    stacks.append(stack)
+                    stack = None
+                elif p and p[0].startswith("0x"):
+                    stack[2].append(int(p[0], 16))
+            elif len(p) == 3 and p[0] == "f":
+                stack = (int(p[1]), int(p[2]), [])
+            elif len(p) == 2 and p[0] == "kids":
+                kids = int(p[1])
+    faults = (collections.Counter(), collections.Counter())
+    for side, n, frames in stacks:
+        if frames:
+            faults[side][tuple(frames)] += n
+    if not faults[0] and not faults[1]:
+        print(f"{name}: no faults traced: {said.strip()[-500:]}", file=sys.stderr)
+        return
+    regions = looks[-1] if looks else []
+    lows = [r[0] for r in regions]
+    exe = next((c for c in cmd if os.path.basename(c) == "fwe" and os.path.isfile(c)), None)
+    lo = next((r[0] for r in regions if os.path.basename(r[2]) == "fwe"), None)
+    pcs = sorted({pc for side in faults for frames in side for pc in frames})
+    mine = [pc for pc in pcs
+            if (i := bisect.bisect_right(lows, pc) - 1) >= 0 and pc < regions[i][1]
+            and os.path.basename(regions[i][2]) == "fwe"]
+    names = subprocess.run(["atos", "-o", exe, "-l", f"{lo:#x}"] + [f"{pc:#x}" for pc in mine],
+                           capture_output=True, text=True,
+                           errors="replace").stdout.splitlines() if exe and lo and mine else []
+    func = {pc: rust_name(re.sub(r" \(in .*", "", sym).strip()) for pc, sym in zip(mine, names)}
+
+    def named(pc):
+        if pc in func:
+            return func[pc]
+        i = bisect.bisect_right(lows, pc) - 1
+        if i >= 0 and pc < regions[i][1]:
+            r = regions[i]
+            if r[3] == SHARED_CACHE_TAG or not r[2]:
+                return (shared_cache_name(pc).split("+")[0] if r[3] == SHARED_CACHE_TAG
+                        else f"anonymous (tag {r[3]})")
+            return os.path.basename(r[2])
+        return "unmapped (the program's)"
+
+    def in_fwe(pc):
+        i = bisect.bisect_right(lows, pc) - 1
+        return i >= 0 and pc < regions[i][1] and os.path.basename(regions[i][2]) == "fwe"
+
+    def by_caller(frames):
+        # The faulting function, and the first of fwe's functions on its
+        # way there where it is another's (a library's).
+        leaf = named(frames[0])
+        if in_fwe(frames[0]):
+            return leaf
+        caller = next((pc for pc in frames[1:] if in_fwe(pc)), None)
+        return f"{leaf} < {named(caller)}" if caller is not None else leaf
+
+    per = max(kids, 1)
+    for side, who in ((1, "children"), (0, "the first process")):
+        by = collections.Counter()
+        for frames, n in faults[side].items():
+            by[by_caller(frames)] += n
+        total = sum(by.values())
+        top = "; ".join(f"{f} {n / per:.1f}" for f, n in by.most_common(40))
+        print(f"{name}: page faults of {who} per fork ({kids} forks): {total / per:.1f}: {top}",
+              file=sys.stderr)
+
+
+def phases(name, cmd):
+    """Run `cmd` (fwe and its program) with `FWE_TIMING`, and log the time
+    and the page faults between each of its marks and the one before it in
+    the same process, by mark (numbers in a mark's name taken as one), as
+    medians over the run: where a step that repeats (a fork, a wait) spends
+    its time, and how many pages it writes (each a copy after a fork)."""
+    r = subprocess.run(cmd, env=dict(os.environ, FWE_TIMING="1"), capture_output=True,
+                       text=True, errors="replace")
+    steps, faults = collections.defaultdict(list), collections.defaultdict(list)
+    first = None
+    for line in r.stderr.splitlines():
+        m = re.match(r"\[fwe (\d+)\] timing: (.*?) \+(\d+)us \(\d+us\) \+(\d+) faults$",
+                     line)
+        if m:
+            pid, m = m.group(1), m.groups()[1:]
+            first = first or pid
+            # The first process's steps, and those of the processes after it.
+            who = "" if pid == first else "(others) "
+            step = who + re.sub(r"\d+", "N", m[0])[:60]
+            steps[step].append(int(m[1]))
+            faults[step].append(int(m[2]))
+    took = sorted(steps.items(), key=lambda kv: -sum(kv[1]))
+    print(f"{name}: steps (median us, median page faults, times): "
+          + "; ".join(f"{k} {statistics.median(v):.0f} us {statistics.median(faults[k]):.0f} "
+                      f"faults x{len(v)}"
+                      for k, v in took if len(v) > 1),
+          file=sys.stderr)
 
 
 def sampled(name, cmd):
@@ -827,6 +1396,160 @@ def profile(name, cmd, theirs, fresh, share=False):
     marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines() if "timing: " in l]
     print(f"{name}: fwe's marks: " + "; ".join(marks), file=sys.stderr)
     return mine
+
+
+# The JDK workload's sources: a multi-threaded application, and the scale
+# of its run.
+JDK_SRC = os.path.join(WORKLOADS, "jdk")
+JDK_SCALE = "4"
+
+
+def jdk(a, fwe, guest_env, results):
+    """OpenJDK 25 at work: `javac` compiling the application in
+    tools/bench/workloads/jdk, then `java` running it, under fwe in its
+    Alpine root, and natively with Homebrew's build of the same release."""
+    root = alpine_root("jdk", a.cache)
+    tmp = os.path.join(root, "tmp")
+    src = os.path.join(tmp, "jdksrc")
+    shutil.rmtree(src, ignore_errors=True)
+    shutil.copytree(JDK_SRC, src)
+    sources = sorted(f for f in os.listdir(JDK_SRC) if f.endswith(".java"))
+    bin_ours = "/usr/lib/jvm/java-25-openjdk/bin"
+    bin_theirs = os.path.join(a.brew, BREW["jdk"])
+    native = tempfile.mkdtemp()
+    ours_out, theirs_out = os.path.join(tmp, "jdkout"), os.path.join(native, "jdkout")
+
+    def both(bindir, srcdir, out):
+        files = " ".join(os.path.join(srcdir, f) for f in sources)
+        # A fatal error's report where the output shows it.
+        errors = "-XX:+ErrorFileToStdout"
+        return (f"{bindir}/javac -J{errors} -d {out} {files} && "
+                f"{bindir}/java {errors} -cp {out} Main {JDK_SCALE}")
+
+    ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
+                              both(bin_ours, "/tmp/jdksrc", "/tmp/jdkout")]
+    theirs = ["/bin/sh", "-c", both(bin_theirs, JDK_SRC, theirs_out)]
+    workload(results, "JDK (s)", ours, theirs, (ours_out, theirs_out), len(guest_env) + 1)
+    # Where its time goes: fwe's marks for each process (JIT code made
+    # writable and prepared again, and how long that took; its system
+    # calls and the host's signals).
+    timed = ours[:2] + ["FWE_TIMING=1"] + ours[2:]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace")
+    marks = [l.split("timing: ", 1)[1] for l in r.stderr.splitlines()
+             if "timing: " in l
+             and ("JIT" in l or "timing: exit +" in l or "system calls" in l)]
+    print("JDK: fwe's marks: " + "; ".join(marks), file=sys.stderr)
+    # Where `javac`'s time goes, by program counter: one process, so its
+    # mappings name each sample (translated code is in fwe's code cache).
+    shutil.rmtree(ours_out, ignore_errors=True)
+    os.makedirs(ours_out)
+    javac = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "javac"),
+                               "-d", "/tmp/jdkout"] + [f"/tmp/jdksrc/{f}" for f in sources]
+    jit_map = tempfile.mkdtemp()
+    pcs("JDK javac", guest_env + [f"FWE_JIT_MAP={jit_map}"] + javac[len(guest_env):],
+        jit_map=jit_map)
+    shutil.rmtree(jit_map, ignore_errors=True)
+
+    # And natively, for what the same work costs the host's kernel.
+    shutil.rmtree(theirs_out, ignore_errors=True)
+    os.makedirs(theirs_out)
+    pcs("JDK javac natively", [f"{bin_theirs}/javac", "-d", theirs_out]
+        + [os.path.join(JDK_SRC, f) for f in sources], execname="javac")
+    # The application's run, both ways, from the classes just compiled.
+    jit_map = tempfile.mkdtemp()
+    pcs("JDK java", guest_env + [f"FWE_JIT_MAP={jit_map}"] + fwe
+        + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp", "/tmp/jdkout",
+           "Main", JDK_SCALE], jit_map=jit_map)
+    shutil.rmtree(jit_map, ignore_errors=True)
+    # Where its threads wait on fwe's own locks.
+    try:
+        java = os.path.join(root, bin_ours.lstrip("/"), "java")
+        callers("JDK java", guest_env + fwe + ["--root", root, java, "-cp", "/tmp/jdkout", "Main",
+                                               JDK_SCALE],
+                [("libsystem_kernel.dylib", "__psynch_mutexwait")])
+    except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
+        print(f"JDK java: no callers: {e!r}", file=sys.stderr)
+    pcs("JDK java natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE],
+        execname="java")
+    # What the translator's work is (`FWE_TIMING`'s counts): `javac` twice
+    # into one directory of the blocks made (`FWE_JIT_SEEN`), then `java`
+    # into it too, for how many blocks an earlier run made; then each with
+    # its blocks counting their runs (`FWE_JIT_COUNT`).
+    java = guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"),
+                              "-cp", "/tmp/jdkout", "Main", JDK_SCALE]
+    seen = tempfile.mkdtemp()
+    for label, cmd, extra in [
+            ("javac", javac, [f"FWE_JIT_SEEN={seen}"]),
+            ("javac again", javac, [f"FWE_JIT_SEEN={seen}"]),
+            ("java after them", java, [f"FWE_JIT_SEEN={seen}"]),
+            ("javac with its blocks counting", javac, ["FWE_JIT_COUNT=1"]),
+            ("java with its blocks counting", java, ["FWE_JIT_COUNT=1"])]:
+        r = subprocess.run(guest_env + ["FWE_TIMING=1"] + extra + cmd[len(guest_env):],
+                           capture_output=True, text=True, errors="replace")
+        said = [line.split("; blocks made ", 1)[1] for line in r.stderr.splitlines()
+                if "timing: exit: " in line and "; blocks made " in line]
+        print(f"JDK {label}, the translator's counts (exit {r.returncode}): "
+              + " | ".join("blocks made " + s for s in said), file=sys.stderr)
+        if label == "javac again":
+            # A file's code's blocks a run made again that an earlier
+            # made at the same address with the same words (none: they
+            # are kept).
+            again = [int(m.group(1)) for m in
+                     (re.search(r"made before by another process: from files (\d+) at the same", s)
+                      for s in said) if m]
+            print(f"JDK javac again: blocks of files' code an earlier run made, made again: "
+                  f"{sum(again)}", file=sys.stderr)
+    shutil.rmtree(seen, ignore_errors=True)
+    # How long `javac` takes alone, both ways: the median of three rounds,
+    # taken in turn (a runner's load moves in minutes).
+    took = ([], [])
+    for _ in range(3):
+        for side, (out, cmd) in enumerate(
+                [(ours_out, javac), (theirs_out, [f"{bin_theirs}/javac", "-d", theirs_out]
+                                     + [os.path.join(JDK_SRC, f) for f in sources])]):
+            shutil.rmtree(out, ignore_errors=True)
+            os.makedirs(out)
+            start = time.perf_counter()
+            subprocess.run(cmd, capture_output=True)
+            took[side].append(time.perf_counter() - start)
+    print(f"JDK javac alone: {statistics.median(took[0]):.2f} s under fwe, "
+          f"{statistics.median(took[1]):.2f} s natively (medians of "
+          f"{', '.join(f'{t:.2f}' for t in took[0])} and {', '.join(f'{t:.2f}' for t in took[1])})",
+          file=sys.stderr)
+    # What its JIT compilers did, both ways (`-XX:+CITime`, said as the
+    # JVM ends): how many methods each tier compiled, in how long.
+    at = javac.index("-d")
+    for how, out, cmd in [
+            ("under fwe", ours_out, javac[:at] + ["-J-XX:+CITime"] + javac[at:]),
+            ("natively", theirs_out, [f"{bin_theirs}/javac", "-J-XX:+CITime", "-d", theirs_out]
+             + [os.path.join(JDK_SRC, f) for f in sources])]:
+        shutil.rmtree(out, ignore_errors=True)
+        os.makedirs(out)
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        said = [" ".join(line.split()) for line in r.stdout.splitlines()
+                if re.search(r"Total compil|C[12] {|Tier[1-4] {|nmethod code size", line)]
+        print(f"JDK javac's compilers {how}: " + "; ".join(said), file=sys.stderr)
+    # How long each part of the application takes, both ways (it says on
+    # standard error).
+    for how, cmd in [("under fwe", guest_env + fwe + [
+            "--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp",
+            "/tmp/jdkout", "Main", JDK_SCALE]),
+            ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])] * 4:  # TEMPORARY x4
+        start = time.perf_counter()
+        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+        took = time.perf_counter() - start
+        print(f"JDK java parts {how} ({took:.2f} s in all): "
+              + ", ".join(r.stderr.split("\n")).strip(", "), file=sys.stderr)
+    # How long the JVM takes to start and end with no application.
+    took = []
+    for cmd in [guest_env + fwe + ["--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"),
+                                   "-version"],
+                [f"{bin_theirs}/java", "-version"]]:
+        start = time.perf_counter()
+        subprocess.run(cmd, capture_output=True)
+        took.append(time.perf_counter() - start)
+    print(f"JDK java -version: {took[0]:.2f} s under fwe, {took[1]:.2f} s natively", file=sys.stderr)
+    shutil.rmtree(native, ignore_errors=True)
 
 
 def workloads(a, fwe, guest_env, lua_src, results):
@@ -933,8 +1656,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
     # And xz alone, on the data that left (its code named by its library's
     # offsets, not its shell's): its two runs, each one process, are the
     # workload's share of fwe's.
-    # (Decompressing sixty times over: once is over before `vmmap` has
-    # looked.)
+    # (Decompressing sixty times over: once is over in a few samples.)
     mine = [pcs("xz -6", under("/usr/bin/xz", "-6", "-T1", "-c", "-k", "/tmp/w/data"), True),
             pcs("xz -d", under("/usr/bin/xz", "-d", "-T1", "-c", "-k", *["/tmp/w/data.xz"] * 60),
                 True)]

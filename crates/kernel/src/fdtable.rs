@@ -15,6 +15,14 @@
 //! what needed one fails. The limit may be raised past the range, up to
 //! `fs.nr_open`, as Linux allows; the descriptors the guest gets stay below
 //! it.
+//!
+//! The process's root directory descriptor, which every process holds, sits
+//! lower ([`reserve_root`]): at or above the guest's soft limit, where no
+//! descriptor of the guest's can be made (a new one at or above it fails,
+//! [`over_limit`], [`check_limit`]), and below the reserved range, so a
+//! process that holds nothing else of fwe's forks with a small table. A
+//! raise of the soft limit past it moves it above the new limit first
+//! (`Fs::keep_root_above`).
 
 use fwe_abi::resource::RLIM_INFINITY;
 use std::sync::Mutex;
@@ -31,13 +39,19 @@ static GUEST_MAX: AtomicI32 = AtomicI32::new(1024);
 pub(crate) static LIMIT: Mutex<(u64, u64)> = Mutex::new((1024, 1024));
 /// Where the next reserved descriptor is looked for.
 static NEXT: AtomicI32 = AtomicI32::new(0);
+/// The process's root directory descriptor (-1 for none), out of the
+/// guest's reach wherever it is ([`reserve_root`]).
+static ROOT: AtomicI32 = AtomicI32::new(-1);
 
 /// The guest's default soft limit, Linux's.
 const DEFAULT_SOFT: u64 = 1024;
 
-/// The most descriptors the guest may have open at once: a range ending
-/// at 69120 (a quarter of the host's left to fwe) makes each host `fork`
-/// copy that much table, 70% more than a fork of a small one.
+/// The most descriptors the guest may have open at once: as many as
+/// programs a Linux distribution runs count on (LTP's `pipe15` opens
+/// 8195). A host `fork` copies the descriptor table as far as its highest
+/// descriptor, fwe's reserved range just above this: a fork, exit and
+/// wait takes about 6% longer than with the range from 4096 (from 69120,
+/// the host's, far more).
 pub const GUEST_CAP: i32 = 16384;
 
 #[cfg(target_os = "macos")]
@@ -117,9 +131,50 @@ pub fn guest_max() -> i32 {
 }
 
 /// Whether `fd` names a descriptor the guest may hold: below the reserved
-/// range (negative values, such as `AT_FDCWD`, are left to the call).
+/// range, and not the process's root (negative values, such as
+/// `AT_FDCWD`, are left to the call).
 pub fn guest_visible(fd: i32) -> bool {
-    fd < guest_max()
+    fd < guest_max() && fd != ROOT.load(Ordering::Relaxed)
+}
+
+/// A close-on-exec duplicate of `fd`, the process's root directory, at the
+/// lowest free number at or above the guest's soft limit (or `floor`, if
+/// higher): out of the guest's reach, and, while below the reserved
+/// range, out of the way of a host `fork`, which copies the table as far
+/// as the highest descriptor. In the reserved range when the limit reaches
+/// it. `EMFILE` when there is no room.
+pub fn reserve_root(fd: i32, floor: u64) -> Result<i32, i32> {
+    let at = limit().0.max(floor);
+    let root = if at >= guest_max() as u64 {
+        dup_reserved(fd)?
+    } else {
+        // SAFETY: plain host call on a descriptor the caller holds.
+        let r = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, at as i32) };
+        if r < 0 {
+            return Err(fwe_abi::errno::EMFILE);
+        }
+        r
+    };
+    ROOT.store(root, Ordering::SeqCst);
+    Ok(root)
+}
+
+/// The process's root directory descriptor, `fd`, inherited at its number
+/// (a fork snapshot taken up).
+pub(crate) fn root_is(fd: i32) {
+    ROOT.store(fd, Ordering::SeqCst);
+}
+
+/// `fd`, the process's root directory descriptor if it is, closed.
+pub(crate) fn root_closed(fd: i32) {
+    let _ = ROOT.compare_exchange(fd, -1, Ordering::SeqCst, Ordering::SeqCst);
+}
+
+/// Whether the process's root directory descriptor, `fd`, is below `soft`
+/// (a soft limit to be set) and the reserved range: then to be moved
+/// before the limit is, or the guest could be given its number.
+pub(crate) fn root_below(fd: i32, soft: u64) -> bool {
+    fd == ROOT.load(Ordering::SeqCst) && fd < guest_max() && (fd as u64) < soft
 }
 
 /// Move `fd` into the reserved range, close-on-exec, and return its new
@@ -174,9 +229,10 @@ pub fn limit() -> (u64, u64) {
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Set the guest's `RLIMIT_NOFILE`. Fails with `EINVAL` if soft exceeds
-/// hard, and `EPERM` above the range the host leaves the guest.
-pub fn set_limit(soft: u64, hard: u64) -> Result<(), i32> {
+/// The guest's `RLIMIT_NOFILE` as `(soft, hard)` would be set from
+/// `soft` and `hard` ([`set_limit`]), or `EINVAL` if soft exceeds hard and
+/// `EPERM` above `fs.nr_open`.
+pub fn limit_of(soft: u64, hard: u64) -> Result<(u64, u64), i32> {
     let max = guest_max() as u64;
     let hard = if hard == RLIM_INFINITY { max } else { hard };
     let soft = if soft == RLIM_INFINITY { hard } else { soft };
@@ -190,6 +246,14 @@ pub fn set_limit(soft: u64, hard: u64) -> Result<(), i32> {
     if hard > nr_open {
         return Err(fwe_abi::errno::EPERM);
     }
+    Ok((soft, hard))
+}
+
+/// Set the guest's `RLIMIT_NOFILE` ([`limit_of`]). Only through
+/// `Kernel::set_nofile`, which first moves the process's root directory
+/// descriptor at or above the new soft limit.
+pub(crate) fn set_limit(soft: u64, hard: u64) -> Result<(), i32> {
+    let (soft, hard) = limit_of(soft, hard)?;
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = (soft, hard);
     Ok(())
 }
@@ -310,6 +374,10 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
 }
 
 /// `EBADF` if a call would name one of fwe's own descriptors.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
     let bad = |fd: u64| !guest_visible(fd as i32);
     if (first_arg_is_fd(nr) && bad(a[0]))
@@ -348,6 +416,10 @@ pub fn check_limit(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
 }
 
 /// The descriptors call `nr` (arguments `a`) made, given its `result`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn made(nr: u64, a: &[u64; 6], result: i64) -> Vec<i32> {
     use fwe_abi::{fcntl, nr as n};
     if result < 0 {
@@ -423,6 +495,30 @@ mod tests {
         let a = [high as u64, 0, 0, 0, 0, 0];
         assert!(check_args(fwe_abi::nr::CLOSE, &a).is_err());
         assert!(check_args(fwe_abi::nr::KILL, &a).is_ok());
+    }
+
+    #[test]
+    fn the_root_sits_at_or_above_the_soft_limit_out_of_reach() {
+        init();
+        // SAFETY: opening a directory by path.
+        let dir = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
+        assert!(dir >= 0);
+        let floor = 2000;
+        let root = reserve_root(dir, floor).unwrap();
+        assert!(root as u64 >= floor && root < guest_max(), "{root}");
+        assert!(!guest_visible(root));
+        // To be moved for a soft limit past it, not for one at it.
+        assert!(root_below(root, root as u64 + 1));
+        assert!(!root_below(root, root as u64));
+        let a = [root as u64, 0, 0, 0, 0, 0];
+        assert!(check_args(fwe_abi::nr::CLOSE, &a).is_err());
+        root_closed(root);
+        assert!(guest_visible(root));
+        // SAFETY: closing the descriptors opened above.
+        unsafe {
+            libc::close(root);
+            libc::close(dir);
+        }
     }
 
     #[test]

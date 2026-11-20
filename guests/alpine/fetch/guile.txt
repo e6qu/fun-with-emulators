@@ -1,0 +1,13 @@
+# Alpine Linux 3.24 aarch64 files the guile test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and GNU Guile 3.0 (its bytecode compiler and its JIT to machine code),
+# with what it needs. Each line is a path under that URL and the file's
+# SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/main/aarch64/guile-3.0.9-r2.apk ac679282bd470539b39f657a30f84ac9284a42d52cbaf513412f8756de398b0c
+v3.24/main/aarch64/guile-libs-3.0.9-r2.apk 3cb9a037d1f8b3b6fb6a2aa244fe7e5274a528089849689aaece8fb48a6766e4
+v3.24/main/aarch64/libunistring-1.4.2-r0.apk 58abfcbce2459071c505771a572a79953d6043d72b643ed0d5285ca39cdaf85c
+v3.24/main/aarch64/gmp-6.3.0-r4.apk 4dab6e86b850fe1b5bc0cf2fac17efa4d7f648bea44f3d9019694cc1e1cb12b7
+v3.24/main/aarch64/gc-8.2.12-r0.apk 1d1ae224ec917da3fbd9a8a2ee5d41dc95d28f1d5745649e5890fe135b297267
+v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+v3.24/main/aarch64/libffi-3.5.2-r1.apk 9a67280b0c7c62db658c2d4d32ed1199903bef859c32dd4245e1a7e35c89ab4b

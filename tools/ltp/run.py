@@ -14,7 +14,14 @@ run at once, but those that change a machine-wide setting or measure time
 (see SERIAL) run one at a time, after the rest. A test passes when it exits 0; LTP's exit status
 otherwise says why (TCONF, 32: not applicable here). The baseline lists the
 tests that pass; a run fails if any of them does not (a regression), and
-`--update` rewrites it from the run. A regression is run again alone; a
+`--update` rewrites it from the run. On a virtual machine (a CI runner:
+the host's `kern.hv_vmm_present`) the tests are told so, as
+`systemd-detect-virt`, which the root lacks, would tell them on a Linux
+one (`LTP_VIRT_OVERRIDE`): LTP's timer tests then check no upper bound,
+which a virtual machine cannot keep (there the host's own timers end up to
+half the wait late, 10 ms at most), clock_gettime04 allows ten times the
+gap, and a test that does not run on one skips (named, not failed). A
+regression is run again alone; a
 timer test that then fails only by sleeping too long is measured against
 the host's own timers (hosttimer.c), and named, not failed, if they, with
 fwe's least cost per sleep, miss the same threshold; once the host has so
@@ -73,6 +80,19 @@ def process_limit():
 
 
 PROCESS_LIMIT = process_limit()
+
+
+def virtual_machine():
+    """Whether the host is a virtual machine."""
+    found = subprocess.run(["sysctl", "-n", "kern.hv_vmm_present"], capture_output=True, text=True)
+    return found.stdout.strip() == "1"
+
+
+# What `systemd-detect-virt` names Apple's virtual machines, for
+# `LTP_VIRT_OVERRIDE` (lib/tst_virt.c), on one; else nothing.
+VIRT = "apple" if virtual_machine() else None
+# What a test says as it skips on a virtual machine.
+SKIPS_ON_VM = b"not supported on a virtual machine"
 
 
 def prepare(root):
@@ -175,6 +195,13 @@ def stacks(sid, work):
     return "\n" + "\n".join(out) + "\n"
 
 
+# Tests run with fwe's notes kept ([`run_one`]): open12, whose O_NOATIME
+# read now and then finds the file's access time changed in CI, and never
+# here; the notes give the file's times before and after the read, as
+# fwe sets it back, and at the close.
+TRACED = re.compile(r"^open12$")
+
+
 def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """Run one test; (name, outcome, seconds, output tail)."""
     bindir = "/opt/ltp/testcases/bin"
@@ -210,6 +237,8 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
         "HOME": guest_tmp,
         "LANG": "C",
     }
+    if VIRT:
+        env["LTP_VIRT_OVERRIDE"] = VIRT
     start = time.monotonic()
     # Output to a file, not a pipe: a process the test leaves behind, in a
     # process group of its own, would hold a pipe open and the read would
@@ -220,6 +249,11 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     if IPC_TESTS.match(name):
         busybox = os.path.join(root, "bin", "busybox")
         command = [fwe, "--root", root, busybox, "unshare", "-i", "--", prog, *argv[1:]]
+    # A test whose failure fwe's notes explain is traced to a file (no
+    # system call, the notes only), shown if it does not pass.
+    trace = os.path.join(tmp, "fwe-notes") if TRACED.match(name) else None
+    if trace:
+        command.insert(1, f"--strace-file={trace}")
     with tempfile.TemporaryFile(dir=work) as log:
         proc = subprocess.Popen(
             # (At most the host's hard limit, when that is lower.)
@@ -248,10 +282,15 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             pass
         log.seek(0)
         out = log.read()
+    if trace and outcome != "pass" and os.path.exists(trace):
+        with open(trace, "rb") as f:
+            out += b"\n--- fwe's notes:\n" + f.read()[-20000:]
     shutil.rmtree(tmp, ignore_errors=True)
     # (A timer test's every measurement, for `host_timers_late`.)
-    keep = 400 if outcome == "timeout" or b"slept for too long" in out else 40
+    keep = 400 if outcome == "timeout" or b"slept for too long" in out or b"--- fwe's notes" in out else 40
     tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
+    if outcome == "conf" and VIRT and SKIPS_ON_VM in out:
+        outcome = "conf-vm"
     return name, outcome, time.monotonic() - start, tail
 
 
@@ -370,6 +409,12 @@ def main():
     if os.getpriority(os.PRIO_PROCESS, 0) < 0:
         os.setpriority(os.PRIO_PROCESS, 0, 0)
 
+    # Whether Spotlight indexes the volume the tests' files are on (a
+    # reader of theirs fwe does not see; open12's access times).
+    if shutil.which("mdutil"):
+        indexing = subprocess.run(["mdutil", "-s", tempfile.gettempdir()], capture_output=True, text=True)
+        print("Spotlight: " + " ".join((indexing.stdout + indexing.stderr).split()), flush=True)
+
     fwe = os.path.abspath(args.fwe)
     root = os.path.abspath(args.root)
     tests = entries(os.path.join(root, "opt", "ltp"))
@@ -405,7 +450,7 @@ def main():
             done += 1
             results[name] = outcome
             print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
-            if args.show and outcome not in ("pass", "conf", "script", "missing"):
+            if args.show and outcome not in ("pass", "conf", "conf-vm", "script", "missing"):
                 print("    " + tail.replace("\n", "\n    "), flush=True)
 
         parallel = [(n, a) for n, a in tests if not SERIAL.match(n)]
@@ -439,26 +484,34 @@ def main():
         counts[outcome] = counts.get(outcome, 0) + 1
     passed = counts.get("pass", 0)
     run = len(results) - counts.get("script", 0) - counts.get("missing", 0)
-    applicable = run - counts.get("conf", 0) - counts.get("exception", 0)
+    applicable = run - counts.get("conf", 0) - counts.get("conf-vm", 0) - counts.get("exception", 0)
     print("\noutcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     print(f"passed {passed} of {run} run ({100 * passed / max(run, 1):.1f}%), "
           f"{passed} of {applicable} applicable ({100 * passed / max(applicable, 1):.1f}%)")
 
     if args.update:
+        # (One that skipped on a virtual machine stays as it was.)
+        with open(args.baseline) as f:
+            was = {line.strip() for line in f if line.strip() and not line.startswith("#")}
+        keep = {n for n, o in results.items() if o == "pass" or o == "conf-vm" and n in was}
         with open(args.baseline, "w") as f:
             f.write("# LTP system-call tests that pass under fwe (tools/ltp/run.py --update).\n")
-            for name in sorted(n for n, o in results.items() if o == "pass"):
+            for name in sorted(keep):
                 f.write(name + "\n")
         print(f"baseline: {passed} tests written to {args.baseline}")
         return 0
 
     with open(args.baseline) as f:
         baseline = [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    regressed = [n for n in baseline if n in results and results[n] != "pass"]
+    # A test that skips on a virtual machine has not regressed there.
+    regressed = [n for n in baseline if n in results and results[n] not in ("pass", "conf-vm")]
     newly = sorted(n for n, o in results.items() if o == "pass" and n not in set(baseline))
     if newly:
         print(f"passing, not in the baseline ({len(newly)}): " + " ".join(newly))
     skipped = sorted(n for n, o in results.items() if o == "conf")
+    on_vm = sorted(n for n, o in results.items() if o == "conf-vm")
+    if on_vm:
+        print(f"skipped on a virtual machine ({len(on_vm)}): " + " ".join(on_vm))
     if skipped:
         print(f"skipped, not in the exceptions ({len(skipped)}): " + " ".join(skipped))
     if regressed:

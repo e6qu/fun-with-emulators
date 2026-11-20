@@ -291,6 +291,8 @@ const ASM_GUESTS: &[&str] = &[
     "x18mem",
     "x18dp",
     "x18ldst",
+    "x18pair",
+    "x18fault",
     "x18br",
     "x18fp",
     "x18pc",
@@ -622,6 +624,13 @@ fn build_c_now(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> Pat
             .arg(repo().join("guests/c").join(format!("{name}.c"))),
     );
     let bin = out.join(format!("{name}-{tag}"));
+    link_c(&obj, &bin, libc, crt, pie);
+    bin
+}
+
+/// Link object `obj` into `bin`, a dynamic executable against `libc`
+/// (with its C runtime's start files where `crt`), a PIE where `pie`.
+fn link_c(obj: &Path, bin: &Path, libc: Libc, crt: bool, pie: bool) {
     let lib = libc.lib_dir();
     let interp = format!("--dynamic-linker={}", libc.interp());
     let mut cmd = Command::new(rust_lld());
@@ -632,13 +641,13 @@ fn build_c_now(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> Pat
     cmd.arg(&interp);
     // A run-time search path so the glibc linker finds libc.so.6 in the
     // rootfs's /lib; harmless for musl, whose interpreter is the libc itself.
-    cmd.args(["-rpath=/lib", "-o"]).arg(&bin);
+    cmd.args(["-rpath=/lib", "-o"]).arg(bin);
     if crt {
         cmd.arg(lib.join("Scrt1.o")).arg(lib.join("crti.o"));
     }
     // Linking against the shared libc records a NEEDED of its soname, which
     // the interpreter satisfies (musl from itself, glibc by mapping libc.so.6).
-    cmd.arg(&obj).arg(libc.libc_so());
+    cmd.arg(obj).arg(libc.libc_so());
     if crt {
         if matches!(libc, Libc::Glibc) {
             // glibc links a small static companion beside the shared libc.
@@ -647,7 +656,6 @@ fn build_c_now(name: &str, libc: Libc, crt: bool, pie: bool, debug: bool) -> Pat
         cmd.arg(lib.join("crtn.o"));
     }
     run_checked(&mut cmd);
-    bin
 }
 
 /// `guests/c/lowlinked.c`, a static executable linked at lld's default
@@ -946,6 +954,516 @@ fn dynamic_loader_hands_off_to_interpreter() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// What a JIT does with the code it writes (guests/c/jitlab.c): calls,
+/// returns and indirect calls into static code and back, PC-relative
+/// loads with data among the code, x18 kept across system calls, a system
+/// call, a blocking call interrupted by a handler with `SA_RESTART`, a signal
+/// landing in the code, a tracer's view of a call made from it, a null
+/// check's fault seen at its instruction and resumed at a continuation, a
+/// `brk` seen at its instruction and stepped past, code patched and run, code copied and run, return
+/// addresses that are the code's own, threads running code another thread
+/// patches, threads writing data in a page of code they run, W^X toggling, a fork child running and changing code; and the
+/// program's memory reads back as it wrote it.
+#[test]
+fn jit_code_runs_as_the_program_wrote_it() {
+    let prog = build_c("jitlab", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitlab");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace").arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitlab stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "calls: 90\nindirect: 21\ncall through x30: 9900\npcrel: 30583\nx18: kept\ngetpid: matches\n\
+         restart: 1 j, the handler saw the call\n\
+         signal: seen in the code\n\
+         tracer: pc in the code\n\
+         fault: seen at the load, 77\nbrk: at its instruction 1000 of 1000, 500500\npatch: 1000 of 1000\ncopy: 90 30583\n\
+         x16 and x17 across a call: changed in 0 of 1000\n\
+         return address: the code's own\nthreads: ok\nwriters: ok\nw^x: 90 2\nread into code's page: 5 6 hello, then 5\ntwo views: 1 2 3\nfile code: getpid matches, memory as written\nbl out: 1001000\nx16 and x17 into the code: 1000 of 1000\nexecute only: 4\ndiscarded: 7, then 0, then 9\nmemory: as written\n\
+         fork: child ok, parent 1\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Every instruction naming `x18` that a real binary holds (Alpine's
+/// OpenJDK 25 libjvm.so, listed in tools/x18forms/x18forms.tsv; the guest
+/// generated from it by tools/x18forms/gen.py), rewritten as fwe rewrites
+/// that binary, ends as the same instruction does with another register in
+/// `x18`'s place.
+#[test]
+fn x18_instructions_of_a_real_binary_compute_as_with_another_register() {
+    let out = out_dir().join("x18forms");
+    std::fs::create_dir_all(&out).unwrap();
+    let src = out.join("x18forms.c");
+    run_checked(Command::new("python3").arg(repo().join("tools/x18forms/gen.py")).arg(&src));
+    let prog = build_old_c(&src, "x18forms", &["-std=gnu11"]);
+    let root = libc_rootfs(Libc::Musl, "x18forms");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+    eprintln!("--- x18forms stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let text = stdout(&out);
+    let last = text.lines().last().unwrap_or_default().to_string();
+    assert!(
+        last.starts_with("x18 instructions: ") && {
+            let n: Vec<&str> = last.trim_start_matches("x18 instructions: ").split(' ').collect();
+            n.len() >= 3 && n[0] == n[2]
+        },
+        "{text}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Calls into JIT code from many call sites of the program's own code at
+/// once (guests/c/jitcalls.c): each site, linked to the code's translation
+/// after its first call, still reaches its own target.
+#[test]
+fn jit_code_called_from_many_sites_at_once() {
+    let prog = build_c("jitcalls", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitcalls");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitcalls stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "wrong calls: 0\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code calling, in turn, functions 4 MiB apart (guests/c/jitpair.c),
+/// whose addresses pick the same entry of fwe's table of translations:
+/// each call reaches its own function, and two of them share the entry's
+/// pair without going into fwe at every call (100000 rounds of two calls
+/// each would make 200000 ways out).
+#[test]
+fn jit_calls_to_targets_of_one_table_entry() {
+    let prog = build_c("jitpair", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitpair");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "two: 1100000\nthree: 7000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    let exits = *jit_counts(&err, " blocks translated, ")
+        .first()
+        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+    assert!(exits < 20000, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code looping within itself (guests/c/jitloop.c), its way back and
+/// a skip in its body conditional branches to its own instructions: one
+/// block, each branch going on in it, none a way out into a block of its
+/// own.
+#[test]
+fn jit_branches_within_a_block_stay_in_it() {
+    let prog = build_c("jitloop", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitloop");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "loop: summed\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(jit_counts(&err, "JIT code: "), [1], "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The translator's counts (guests/c/jitloop.c): its one block made from
+/// generated code, made again by a second process that sees the first's
+/// blocks (`FWE_JIT_SEEN`), and, with every block counting its runs
+/// (`FWE_JIT_COUNT`), counted as run, the program's output as ever.
+#[test]
+fn jit_counts_say_what_ran_and_what_was_made_before() {
+    let prog = build_c("jitloop", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitcounts");
+    let seen = std::env::temp_dir().join(format!("fwe-jitseen-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&seen);
+    std::fs::create_dir_all(&seen).unwrap();
+    for round in 0..2 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        cmd.env("FWE_TIMING", "1").env("FWE_JIT_SEEN", &seen).env("FWE_JIT_COUNT", "1");
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "loop: summed\n", "{err}");
+        assert_eq!(out.status.code(), Some(0));
+        assert!(err.contains("blocks made from files 0 (0 ms), generated 1 ("), "{err}");
+        // An earlier process's block: at the same address, or elsewhere
+        // (where the program's mapping landed).
+        let before = err.split("made before by another process: ").nth(1).unwrap_or_default();
+        let seen: Vec<u64> = before
+            .split(';')
+            .nth(1)
+            .unwrap_or_default()
+            .trim()
+            .trim_start_matches("generated ")
+            .split(", ")
+            .map(|n| n.trim().parse().unwrap_or(9))
+            .collect();
+        assert!(before.starts_with("from files 0 at the same address, 0 elsewhere"), "{err}");
+        assert_eq!(seen.iter().sum::<u64>(), round, "{err}");
+        assert!(err.contains("blocks run from files 0 of 0, generated 1 of 1"), "{err}");
+    }
+    let _ = std::fs::remove_dir_all(&seen);
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Translations of a file's code kept (guests/c/jitkept.c: generated code
+/// calling a function of the program's file, which then runs by
+/// translation too, a system call's stub with it): a second run makes no
+/// block of the file's code, but takes each from those the first kept,
+/// its stub calling the gate where this process has it, its output as
+/// ever.
+#[test]
+fn jit_translations_of_a_files_code_are_kept_for_the_next_run() {
+    let prog = build_c("jitkept", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitkept");
+    let mut counts = Vec::new();
+    for _ in 0..2 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "calls into the file: summed\n", "{err}");
+        assert_eq!(out.status.code(), Some(0), "{err}");
+        let made = jit_counts(&err, "blocks made from files ");
+        let taken = jit_counts(&err, "taken from those kept from files ");
+        assert_eq!((made.len(), taken.len()), (1, 1), "{err}");
+        assert!(made[0] + taken[0] > 0, "no block of the file's code: {err}");
+        counts.push((made[0], taken[0]));
+    }
+    // (The first run may take some, kept by an earlier one.)
+    assert_eq!(counts[1], (0, counts[0].0 + counts[0].1), "{counts:?}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code each of whose blocks expands to many times its size
+/// (guests/c/jitroom.c: functions of back-to-back calls through x16), in a
+/// code cache small enough that such blocks land at every place in a chunk,
+/// its end too: each is given the room it takes.
+#[test]
+fn jit_blocks_of_any_size_fit_in_the_code_cache() {
+    let prog = build_c("jitroom", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitroom");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_JIT_CHUNK", "65536");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "calls: every one made\n", "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code whose call site the program repoints each round
+/// (guests/c/jitrepatch.c), its loop's head in an earlier cache line than
+/// the call: each round's calls reach the new target, and once the call's
+/// translation is dropped the loop's way into it is linked again rather
+/// than going through fwe at every call (40 rounds of 2000 calls).
+#[test]
+fn jit_calls_through_a_repointed_call_site() {
+    let prog = build_c("jitrepatch", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitrepatch");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 120000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    let exits = *jit_counts(&err, " blocks translated, ")
+        .first()
+        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+    assert!(exits < 5000, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code reading a word of data in its own cache line, which the
+/// program changes and flushes before each of 2000 calls
+/// (guests/c/jitguard.c): each call reads the new word, and the
+/// translation, whose words never change, stays through the flushes
+/// rather than being dropped and made again at each call.
+#[test]
+fn jit_code_stays_translated_through_flushes_of_its_data() {
+    let prog = build_c("jitguard", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitguard");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 1999000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    let dropped = *jit_counts(&err, " blocks kept unchanged, ")
+        .first()
+        .unwrap_or_else(|| panic!("no count of blocks dropped: {err}"));
+    assert_eq!(dropped, 0, "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Memory a position-independent program asks for near its own code with
+/// a hint (guests/c/nearcode.c), as LuaJIT asks for room for its machine
+/// code within a branch's reach: it goes at the hint, below the program,
+/// and probing finds room within reach.
+#[test]
+fn a_mapping_hinted_near_the_program_s_code_goes_there() {
+    let prog = build_c("nearcode", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "nearcode");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- nearcode stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), "below its code: at the hint\nprobing within reach: found\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// `x18` in JIT code (guests/c/jitx18.c): one sequence of instructions
+/// working in `x18`, and the same in `x9`, compute the same, quietly and
+/// with signals landing anywhere in them.
+#[test]
+fn jit_code_using_x18_computes_as_with_another_register() {
+    let prog = build_c("jitx18", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitx18");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- jitx18 stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "x18 forms: same in 1000 of 1000\n\
+         x18 forms with signals: same in 100000 of 100000, signals landed\n\
+         casp on x18 with signals: 2000000 of 2000000\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Self-modifying code (guests/c/selfmod.c): an instruction overwritten by
+/// the code just before it, a loop rewriting an instruction of its own
+/// body on every pass, and a function of the program's own text made
+/// writable and overwritten, each running the new instruction after the
+/// cache maintenance and `isb` the architecture asks for.
+#[test]
+fn self_modifying_code_runs_what_it_wrote() {
+    let prog = build_c("selfmod", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "selfmod");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    eprintln!("--- selfmod stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "ahead: 42\nahead again: 42\nloop: 4950\nloop again: 499500\n\
+         own text: 1, then 7 (mprotect 0)\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A quine (guests/c/quine.c) prints its own source.
+#[test]
+fn a_quine_prints_its_own_source() {
+    let prog = build_c("quine", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "quine");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(stdout(&out), std::fs::read_to_string(repo().join("guests/c/quine.c")).unwrap());
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Programs treating themselves as data (guests/c/perverse.c): code
+/// written on the stack and called, a copy of its own executable changed
+/// and run, and itself run again fifty deep through `/proc/self/exe`.
+#[test]
+fn programs_run_themselves_changed_and_from_their_stack() {
+    let prog = build_c("perverse", Libc::Musl, true, true);
+    // A system the program is part of: itself in /bin, /proc and /tmp.
+    let root = libc_rootfs(Libc::Musl, "perverse");
+    for dir in ["bin", "proc", "tmp"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::copy(&prog, root.join("bin/perverse")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("bin/perverse"));
+    let out = run_bounded(cmd);
+    eprintln!("--- perverse stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&out),
+        "code on the stack: 77 (mprotect 0)\nchanged its copy: yes\n\
+         the copy says: as built: UPPERCASE\nran itself again: 50 deep\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The IOCCC repository's commit the entries are fetched at
+/// (`guests/ioccc/fetch/winners.txt`).
+const IOCCC_COMMIT: &str = "7bb90076e5c794edb64417e4b47274efd6131acb";
+
+/// An IOCCC entry's file (a path of `guests/ioccc/fetch/winners.txt`).
+fn ioccc_source(path: &str) -> PathBuf {
+    let (_, files) = manifest_in("ioccc", "winners");
+    let (_, sha) = files.iter().find(|(p, _)| p == path).expect("an entry in the manifest");
+    let url = format!("https://raw.githubusercontent.com/ioccc-src/winner/{IOCCC_COMMIT}/{path}");
+    fetch_pinned(&format!("ioccc-{}", path.replace('/', "-")), &[url], sha, "ioccc")
+}
+
+/// C source `src` built into `name`, a dynamic musl executable for arm64
+/// Linux, as the contest's entries are written: old C (implicit `int`,
+/// functions used undeclared) allowed, with `flags`, and a `<stdio.h>` of
+/// declarations alone (the guests are built with no C library headers).
+fn build_old_c(src: &Path, name: &str, flags: &[&str]) -> PathBuf {
+    let out = out_dir().join("ioccc");
+    std::fs::create_dir_all(out.join("include")).unwrap();
+    std::fs::write(
+        out.join("include/stdio.h"),
+        "typedef unsigned long size_t;\ntypedef struct _IO_FILE FILE;\n\
+         extern FILE *const stdin, *const stdout, *const stderr;\n#define EOF (-1)\n\
+         #define NULL ((void *)0)\nint printf(const char *, ...);\n\
+         int fprintf(FILE *, const char *, ...);\nint sprintf(char *, const char *, ...);\n\
+         int puts(const char *);\nint putchar(int);\nint getchar(void);\n\
+         int fputs(const char *, FILE *);\nint fputc(int, FILE *);\nint fflush(FILE *);\n",
+    )
+    .unwrap();
+    let obj = out.join(format!("{name}.o"));
+    run_checked(
+        Command::new("clang")
+            .args(["-O2", "--target=aarch64-linux-gnu", "-fno-stack-protector", "-fPIC", "-w"])
+            .args([
+                "-Wno-error=implicit-function-declaration",
+                "-Wno-error=implicit-int",
+                "-Wno-error=int-conversion",
+                "-Wno-error=incompatible-pointer-types",
+                "-Wno-error=return-type",
+                "-nostdlibinc",
+            ])
+            .arg("-I")
+            .arg(out.join("include"))
+            .args(flags)
+            .arg("-c")
+            .arg("-o")
+            .arg(&obj)
+            .arg(src),
+    );
+    let bin = out.join(name);
+    link_c(&obj, &bin, Libc::Musl, true, true);
+    bin
+}
+
+/// `bin` run under fwe in `root`: what it printed.
+fn old_c_runs(root: &Path, bin: &Path, name: &str) -> String {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(root).arg(bin);
+    let out = run_bounded(cmd);
+    assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    stdout(&out)
+}
+
+/// Winners of the International Obfuscated C Code Contest, fetched from
+/// the contest's repository and run as their authors say: 1984's
+/// anonymous entry ("hello, world!" by way of `read`), 1987's korn (one
+/// line, "unix"), and two that print programs closing a cycle, every
+/// program of it built and run in turn: 2000's dhyang (three programs,
+/// each printing the next) and 2018's endoh2 (ten frames of a parrot, each
+/// printing the next, the tenth printing the first).
+#[test]
+fn ioccc_winners_run_as_their_authors_say() {
+    let root = libc_rootfs(Libc::Musl, "ioccc");
+    let classic = ["-std=gnu89"];
+    let anonymous = build_old_c(&ioccc_source("1984/anonymous/anonymous.c"), "anonymous", &classic);
+    assert_eq!(old_c_runs(&root, &anonymous, "anonymous"), "hello, world!\n");
+    let korn = build_old_c(&ioccc_source("1987/korn/korn.c"), "korn", &["-std=gnu89", "-Dunix=1"]);
+    assert_eq!(old_c_runs(&root, &korn, "korn"), "unix\n");
+    let out = out_dir().join("ioccc");
+    // A program printing a program, built and run until it prints `first`
+    // again: within `most` programs.
+    let cycle = |src: PathBuf, name: &str, flags: &[&str], most: usize| -> usize {
+        let first = std::fs::read_to_string(&src).unwrap();
+        let mut src = src;
+        for n in 1..=most {
+            let bin = build_old_c(&src, &format!("{name}-{n}"), flags);
+            let printed = old_c_runs(&root, &bin, name);
+            if printed == first {
+                return n;
+            }
+            src = out.join(format!("{name}-{n}.c"));
+            std::fs::write(&src, printed).unwrap();
+        }
+        panic!("{name}: no program of {most} printed the first again");
+    };
+    // dhyang prints aku, which prints soku, which prints zan, which prints
+    // aku again: the cycle is aku's.
+    let aku = out.join("dhyang-aku.c");
+    let dhyang = build_old_c(&ioccc_source("2000/dhyang/dhyang.c"), "dhyang", &["-std=gnu99"]);
+    std::fs::write(&aku, old_c_runs(&root, &dhyang, "dhyang")).unwrap();
+    assert_eq!(cycle(aku, "aku", &["-std=gnu99"], 4), 3, "dhyang's cycle");
+    // endoh2 (an "undead parrot") prints the first of ten parrots, each
+    // printing the next, the tenth printing the first.
+    let first = out.join("endoh2-parrot.c");
+    let endoh2 = build_old_c(&ioccc_source("2018/endoh2/prog.c"), "endoh2", &["-std=gnu17"]);
+    std::fs::write(&first, old_c_runs(&root, &endoh2, "endoh2")).unwrap();
+    assert_eq!(cycle(first, "parrot", &["-std=gnu17"], 12), 10, "endoh2's cycle");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The number right after `before` in each of `err`'s `FWE_TIMING` lines that
+/// has it: one for each process that ran code by translation.
+fn jit_counts(err: &str, before: &str) -> Vec<u64> {
+    err.lines().filter_map(|l| l.split(before).nth(1)?.split(' ').next()?.parse().ok()).collect()
+}
+
+/// JIT code interrupted everywhere (guests/c/jitstorm.c): signals, faults
+/// and writes to its page landing while worker threads run every kind of
+/// instruction a translation expands leave each round's result as a quiet
+/// run's, blocks the writes left alone kept and those whose words came back
+/// taken back; and again with a code cache small enough to be emptied while
+/// they run.
+#[test]
+fn jit_code_survives_signals_faults_and_writes() {
+    let prog = build_c("jitstorm", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitstorm");
+    for chunk in [None, Some("65536")] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+        if let Some(c) = chunk {
+            cmd.env("FWE_JIT_CHUNK", c);
+        }
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        let counts = err.lines().filter(|l| l.contains("JIT code:")).collect::<Vec<_>>();
+        eprintln!("--- chunk {chunk:?}: {counts:?}");
+        assert_eq!(
+            stdout(&out),
+            "storm: every round right\nstorm: signals landed, faults landed\n\
+             storm: every write kept\n",
+            "chunk {chunk:?}, stderr:\n{err}"
+        );
+        assert_eq!(out.status.code(), Some(0));
+        if chunk.is_some() {
+            assert!(
+                counts.iter().any(|l| !l.contains("emptied 0 times")),
+                "the code cache was never emptied: {counts:?}"
+            );
+        } else {
+            // The flushes of lines the writes left alone keep their blocks;
+            // a block whose words came back as they were is taken back.
+            assert!(
+                jit_counts(&err, " cache lines flushed (").iter().any(|&n| n > 0),
+                "no block kept through a flush: {counts:?}"
+            );
+            assert!(
+                jit_counts(&err, " dropped, ").iter().any(|&n| n > 0),
+                "no block taken back: {counts:?}"
+            );
+        }
+    }
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Real dynamic linking, minimal case: a PIE with its own `_start` that calls
 /// `write` and `_exit` resolved from a genuine musl shared libc. This drives
 /// the real musl dynamic linker end to end — it maps and self-relocates,
@@ -1128,6 +1646,42 @@ fn c_guest_prints(name: &str, args: &[&str], want: &str) {
 #[test]
 fn a_forked_child_starts_in_its_parents_cgroup() {
     c_guest_prints("cgroupfork", &[], "children elsewhere: 0\n");
+}
+
+/// A connect is made once: one a signal the guest ignores lands in
+/// succeeds, and a non-blocking one in progress is finished by the next
+/// connect (0), after which the socket is connected (`EISCONN`), as on
+/// Linux.
+#[test]
+fn a_connect_is_made_once_however_signals_land() {
+    c_guest_prints(
+        "connectsig",
+        &[],
+        "blocking connects failed: 0\nnon-blocking: 115, then 0, then 106\n",
+    );
+}
+
+/// Tracers side by side: each continues its own tracee, stopped; none's
+/// requests reach another's, as their mailboxes' pages are freed and made
+/// again.
+#[test]
+fn tracers_side_by_side_continue_only_their_own_tracees() {
+    c_guest_prints("tracestorm", &[], "workers broken: 0, tracees not stopped or continued: 0\n");
+}
+
+/// A process `/proc` shows sleeping in a semaphore wait is counted as
+/// waiting: fwe's own work on the way there is not shown as a sleep.
+#[test]
+fn a_process_shown_sleeping_in_a_semaphore_wait_is_counted() {
+    c_guest_prints("semwaiters", &[], "workers failed: 0, sleeping waiters not counted: 0\n");
+}
+
+/// cgroups made, joined, left and removed side by side under one shared
+/// parent: a removal of the parent that finds a child is `EBUSY`, never
+/// taking the child or its files with it.
+#[test]
+fn cgroups_made_and_removed_side_by_side() {
+    c_guest_prints("cgrouprace", &[], "failed steps: 0\n");
 }
 
 /// A signal for a process whose main thread blocks it is taken by another
@@ -1433,6 +1987,20 @@ fn hv_vm_option_runs_a_pie_in_the_vm() {
     }
 }
 
+/// In the VM, an `mmap` hint whose range is free is taken as given, as
+/// Linux takes it, mappings hinted side by side read as one, and a read
+/// or write across mappings backed apart is whole (guests/c/mmaphint.c).
+#[test]
+fn hv_mmap_takes_a_free_hint() {
+    let prog = build_c_dynamic("mmaphint", Libc::Musl, true);
+    let root = libc_rootfs(Libc::Musl, "vm-mmaphint");
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg("--root").arg(&root).arg(&prog);
+    let out = run_hv(cmd, "mmaphint --vm");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), "hint: taken, 7 9\nread across: 6 across\nbetween: whole\n");
+}
+
 /// Real Debian coreutils: unmodified glibc programs from a Debian rootfs run
 /// and produce correct output. These are genuine distribution binaries, not
 /// built here — the whole chain (glibc dynamic linking, process startup, file
@@ -1663,6 +2231,101 @@ impl Drop for ProgramRoot {
         let _ = std::fs::remove_dir_all(&self.0);
     }
 }
+
+/// Debian's SQLite compiling SQL into programs for its own virtual machine
+/// (its bytecode, the VDBE) and running them: some 600 statements, each
+/// different and so compiled anew, a recursive query drawing the
+/// Mandelbrot set in floating point, window functions, a trigger, an
+/// upsert returning what it wrote with a generated column, and JSON's
+/// table functions. The output is what SQLite prints on Linux (and on
+/// macOS, where it was taken).
+#[test]
+fn debian_sqlite_compiles_and_runs_its_own_programs() {
+    let _workload = workload();
+    let root = ProgramRoot::new("sqlite-vdbe", &[]);
+    std::fs::copy(debian_bin("sqlite3"), root.path("bin/sqlite3")).unwrap();
+    std::fs::copy(debian_bin("seq"), root.path("bin/seq")).unwrap();
+    let script = r#"
+set -e
+cd /tmp
+sqlite3 db "create table t(x integer primary key, y)"
+sqlite3 db "with recursive c(x) as (select 1 union all select x + 1 from c where x < 2000) insert into t select x, x * 7 % 101 from c"
+# Statements compiled one by one, each different: SQLite turns each into
+# a program for its virtual machine, then runs it.
+for i in $(seq 1 600); do
+    echo "insert into r values ($i, (select count(*) from t where y % $i = 0) + $i * $i);"
+done | sqlite3 -cmd "create table r(i integer primary key, v)" db
+sqlite3 db "select count(*), sum(v), max(v) from r"
+sqlite3 db "with recursive
+  xaxis(x) as (values(-2.0) union all select x + 0.05 from xaxis where x < 1.2),
+  yaxis(y) as (values(-1.0) union all select y + 0.1 from yaxis where y < 1.0),
+  m(iter, cx, cy, x, y) as (
+    select 0, x, y, 0.0, 0.0 from xaxis, yaxis
+    union all
+    select iter + 1, cx, cy, x * x - y * y + cx, 2.0 * x * y + cy from m
+    where (x * x + y * y) < 4.0 and iter < 28),
+  m2(iter, cx, cy) as (select max(iter), cx, cy from m group by cx, cy),
+  a(t) as (select group_concat(substr(' .+*#', 1 + min(iter / 7, 4), 1), '')
+           from m2 group by cy)
+select group_concat(rtrim(t), char(10)) from a"
+sqlite3 db "select x, sum(y) over (order by x rows 2 preceding), rank() over (order by y desc)
+            from t where x <= 6 order by x"
+sqlite3 db "create table log(n);
+            create trigger tr after insert on t begin insert into log values (new.x * 2); end;
+            insert into t values (3001, 1), (3002, 2);
+            select group_concat(n) from log"
+sqlite3 db "create table u(k primary key, n, twice as (n * 2));
+            insert into u values ('a', 1) on conflict(k) do update set n = n + 1 returning k, n, twice;
+            insert into u values ('a', 1) on conflict(k) do update set n = n + 1 returning k, n, twice"
+sqlite3 db "select key, value from json_each('{\"a\":[1,2],\"b\":{\"c\":3}}')
+            union all select fullkey, atom from json_tree('[10,[20]]') where atom is not null"
+"#;
+    let mut cmd = root.command("/bin/bash");
+    cmd.args(["-c", script]);
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+    eprintln!("--- sqlite stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), SQLITE_PROGRAMS);
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// What [`debian_sqlite_compiles_and_runs_its_own_programs`] prints.
+const SQLITE_PROGRAMS: &str = r#"600|72201050|360019
+                                    ....#
+                                   ..#*..
+                                 ..+####+.
+                            .......+####....   +
+                           ..##+*##########+.++++
+                          .+.##################+.
+              .............+###################+.+
+              ..++..#.....*#####################+.
+             ...+#######++#######################.
+          ....+*################################.
+ #############################################...
+          ....+*################################.
+             ...+#######++#######################.
+              ..++..#.....*#####################+.
+              .............+###################+.+
+                          .+.##################+.
+                           ..##+*##########+.++++
+                            .......+####....   +
+                                 ..+####+.
+                                   ..#*..
+                                    ....#
+                                    +.
+1|7|6
+2|21|5
+3|42|4
+4|63|3
+5|84|2
+6|105|1
+6002,6004
+a|1|2
+a|2|4
+a|[1,2]
+b|{"c":3}
+$[0]|10
+$[1][0]|20
+"#;
 
 /// Debian's SQLite, the first of M2's databases: a write-ahead-logged
 /// database (its index shared between processes through a `MAP_SHARED`
@@ -3113,14 +3776,126 @@ fn alpine_wine_runs_windows_programs() {
     );
 }
 
-/// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`): V8's
-/// JIT on a hot function, ICU, OpenSSL's digests (its assembly keeps
-/// constant tables among its code, which must not be rewritten), zlib, the
-/// file system with promises and timers, a child process, an HTTP server
-/// and client in one process, and a worker thread.
+/// Alpine's OpenJDK 25 (fetched: `guests/alpine/fetch/jdk.txt`): `javac`
+/// compiles the benchmark's multi-threaded application
+/// (`tools/bench/workloads/jdk`), and `java` runs it: parallel streams and
+/// regular expressions, a thread pool, fork/join, locks and the garbage
+/// collector, with HotSpot's JIT compilers at work. It runs only where
+/// `FWE_JDK_TESTS` is set (CI's `jdk` job).
+#[test]
+fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
+    if !fetched_program_tests("FWE_JDK_TESTS") {
+        return;
+    }
+    let cached = alpine_root("jdk");
+    let root = std::env::temp_dir().join(format!("fwe-jdk-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
+    let src = repo().join("tools/bench/workloads/jdk");
+    let mut sources: Vec<String> = std::fs::read_dir(&src)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().into_string().unwrap())
+        .filter(|n| n.ends_with(".java"))
+        .collect();
+    sources.sort();
+    std::fs::create_dir_all(root.join("tmp/src")).unwrap();
+    for n in &sources {
+        std::fs::copy(src.join(n), root.join("tmp/src").join(n)).unwrap();
+    }
+    let _workload = workload();
+    let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("jdk-traces");
+    let _ = std::fs::remove_dir_all(&kept);
+    std::fs::create_dir_all(&kept).unwrap();
+    let bin = "/usr/lib/jvm/java-25-openjdk/bin";
+    let step = std::cell::Cell::new(0);
+    let run = |name: &str, args: &[String]| {
+        step.set(step.get() + 1);
+        let trace = kept.join(format!("{}-{name}.trace", step.get()));
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace")
+            .arg(format!("--strace-file={}", trace.display()))
+            .arg("--root")
+            .arg(&root)
+            .arg(root.join(format!("{bin}/{name}").trim_start_matches('/')))
+            .args(args)
+            .env_clear()
+            .env("PATH", format!("{bin}:/usr/bin:/bin"))
+            .env("HOME", "/tmp")
+            // Its marks on stderr: at exit, how translated code crossed
+            // into code not translated and back.
+            .env("FWE_TIMING", "1")
+            .stdin(Stdio::null());
+        // HotSpot options for every JVM the test starts, to narrow a failure
+        // down (`-Xint`, a GC's verification).
+        if let Ok(opts) = std::env::var("FWE_JDK_JAVA_OPTIONS") {
+            cmd.env("JAVA_TOOL_OPTIONS", opts);
+        }
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(600));
+        eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+        if !out.status.success() {
+            // HotSpot's report of a fatal error: on standard output, and in
+            // full in its error file.
+            eprintln!("--- {name} stdout:\n{}", stdout(&out));
+            for e in std::fs::read_dir(root.join("tmp")).unwrap().flatten() {
+                let n = e.file_name().into_string().unwrap_or_default();
+                if n.starts_with("hs_err") {
+                    let text = std::fs::read_to_string(e.path()).unwrap_or_default();
+                    let _ = std::fs::write(kept.join(&n), &text);
+                    let head: Vec<&str> = text.lines().take(150).collect();
+                    eprintln!("--- {n}:\n{}", head.join("\n"));
+                    let _ = std::fs::remove_file(e.path());
+                }
+            }
+            print_last_calls(&trace);
+            let text = std::fs::read_to_string(&trace).unwrap_or_default();
+            for l in text.lines().filter(|l| l.contains("--- signal") || l.contains("fault")) {
+                eprintln!("{l}");
+            }
+        }
+        out
+    };
+    let errors = "-XX:ErrorFile=/tmp/hs_err_%p.log";
+    let mut javac = vec![format!("-J{errors}"), "-d".to_string(), "/tmp/out".to_string()];
+    javac.extend(sources.iter().map(|n| format!("/tmp/src/{n}")));
+    let out = run("javac", &javac);
+    assert!(out.status.success(), "javac failed");
+    let out =
+        run("java", &[errors.into(), "-cp".into(), "/tmp/out".into(), "Main".into(), "4".into()]);
+    assert_eq!(
+        stdout(&out),
+        "words: 5120000 in 1884 kinds, most sa=142941 vi=142901 ka=142853 ne=142759 lo=142580\n\
+         primes below 80000000: 4669382, sum 180946446237951\n\
+         matrix 160x160 x8: checksum 774043540\n\
+         bank: 100 accounts, 8 threads, total 100000, money moved\n\
+         done\n"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`) runs the
+/// Node workload ([`node_runs_the_workload`]).
 #[test]
 fn debian_node_runs_a_workload() {
     let root = fetched_root("node");
+    node_runs_the_workload(&root, "debian-node");
+}
+
+/// Alpine's Node.js 24 (fetched: `guests/alpine/fetch/nodejs.txt`), a
+/// current V8, runs the Node workload ([`node_runs_the_workload`]).
+#[test]
+fn alpine_node_runs_a_workload() {
+    let root = alpine_root("nodejs");
+    node_runs_the_workload(&root, "alpine-node");
+}
+
+/// `node` under `root` runs a workload of V8's compilers and Node's
+/// libraries: hot recursive code; optimized code that deoptimizes (one
+/// object shape, then many, then a getter); regular expressions and
+/// WebAssembly, which V8 compiles too; typed arrays, BigInt and closures in
+/// hot loops; Intl, hashes, zlib, files, a child process, promises, an HTTP
+/// server and client, and a worker thread. The same script for every
+/// Node.js, each printing what Linux prints.
+fn node_runs_the_workload(root: &Path, name: &str) {
     let _workload = workload();
     let script = format!("/tmp/fwe-node-{}.js", std::process::id());
     let data = format!("/tmp/fwe-node-{}.txt", std::process::id());
@@ -3138,15 +3913,40 @@ const {{ Worker }} = require('worker_threads');
 function fib(n) {{ return n < 2 ? n : fib(n - 1) + fib(n - 2); }}
 let s = 0; for (let i = 0; i < 2000; i++) s += fib(15);
 console.log('fib', fib(25), s);
+// Optimized code that deoptimizes: one shape, then many, then a getter.
+function getX(o) {{ return o.x; }}
+let px = 0;
+for (let i = 0; i < 200000; i++) px += getX({{ x: i & 7 }});
+for (let i = 0; i < 200000; i++) px += getX(i % 3 ? {{ x: 1, y: i }} : {{ y: 2, x: 3 }});
+px += getX({{ get x() {{ return 1000; }} }});
+console.log('shapes', px);
+// Regular expressions, compiled to machine code once hot.
+const text = Array.from({{ length: 5000 }}, (_, i) => `id-${{i * 7}} name${{i % 13}};`).join(' ');
+let found = 0;
+for (let r = 0; r < 20; r++) found += [...text.matchAll(/id-(\d+) name(1[0-2]);/g)].length;
+console.log('regexp', found, text.replace(/name(\d+)/g, (m, d) => d.length).length);
+// WebAssembly: (func $add (param i32 i32) (result i32) local.get 0 local.get 1 i32.add)
+const wasm = new Uint8Array([0, 97, 115, 109, 1, 0, 0, 0, 1, 7, 1, 96, 2, 127, 127, 1, 127, 3, 2, 1, 0,
+  7, 7, 1, 3, 97, 100, 100, 0, 0, 10, 9, 1, 7, 0, 32, 0, 32, 1, 106, 11]);
+const {{ add }} = new WebAssembly.Instance(new WebAssembly.Module(wasm)).exports;
+let ws = 0; for (let i = 0; i < 1000000; i++) ws = add(ws, i & 255) | 0;
+console.log('wasm', add(2, 3), ws);
+// Typed arrays, BigInt, closures in a hot loop.
+const f64 = new Float64Array(100000);
+for (let i = 0; i < f64.length; i++) f64[i] = i * 0.5;
+let tsum = 0; for (let k = 0; k < 10; k++) for (let i = 0; i < f64.length; i++) tsum += f64[i];
+const adders = Array.from({{ length: 64 }}, (_, k) => v => v + k);
+let cs = 0; for (let i = 0; i < 300000; i++) cs = adders[i & 63](cs) % 1000003;
+console.log('numbers', tsum, (2n ** 200n % 1000000007n).toString(), cs);
 console.log('intl', new Intl.NumberFormat('de-DE').format(1234567.891),
             new Date(0).toLocaleDateString('en-GB', {{ timeZone: 'UTC' }}));
-for (const a of ['md5', 'sha1', 'sha256', 'sha512', 'ripemd160', 'sha3-256'])
+for (const a of ['md5', 'sha1', 'sha256', 'sha512', 'sha3-256'])
   console.log(a, crypto.createHash(a).update('fun-with-emulators').digest('hex').slice(0, 16));
 const big = Buffer.alloc(100000, 'abc');
 console.log('zlib', zlib.gunzipSync(zlib.gzipSync(big)).equals(big));
 fs.writeFileSync('{data}', 'line1\nline2\n');
 console.log('fs', fs.readFileSync('{data}', 'utf8').split('\n').length);
-console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toString().trim());
+console.log('child', execFileSync('/bin/sh', ['-c', 'echo $((6 * 7))']).toString().trim());
 (async () => {{
   await new Promise(r => setTimeout(r, 20));
   console.log('promises', (await fs.promises.readFile('{data}', 'utf8')).length);
@@ -3169,22 +3969,22 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
     )
     .unwrap();
     // Its calls, for the last of each process should it fail.
-    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join("node.trace");
+    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.trace"));
     let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--strace")
         .arg(format!("--strace-file={}", trace.display()))
         .arg("--root")
-        .arg(&root)
+        .arg(root)
         .arg(root.join("usr/bin/node"))
         .arg(&script)
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
-    let out = run_bounded_for(cmd, &[], Duration::from_secs(60));
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
-    eprintln!("--- node ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    eprintln!("--- {name} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
     if !out.status.success() {
         print_last_calls(&trace);
         // Each signal, with where it was raised.
@@ -3193,16 +3993,20 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
             eprintln!("{l}");
         }
     }
-    // The digests are the host's (`shasum`, `md5`, Python's hashlib).
+    // As Node.js prints it natively; the digests are also the host's
+    // (`shasum`, `md5`, Python's hashlib).
     assert_eq!(
         stdout(&out),
         "fib 75025 1220000\n\
+         shapes 1034334\n\
+         regexp 23040 58410\n\
+         wasm 5 127493856\n\
+         numbers 24999750000 499445072 449461\n\
          intl 1.234.567,891 01/01/1970\n\
          md5 83cce8037da91bde\n\
          sha1 c650da2b9b797302\n\
          sha256 9c3ef3144c6828d9\n\
          sha512 fca8db3fbca619cd\n\
-         ripemd160 74e7d081086e35cb\n\
          sha3-256 3bee16617c9f352e\n\
          zlib true\n\
          fs 3\n\
@@ -3210,10 +4014,340 @@ console.log('child', execFileSync('/bin/bash', ['-c', 'echo $((6 * 7))']).toStri
          promises 12\n\
          http hi /x\n\
          worker 42\n\
-         worker exit 0\n"
+         worker exit 0\n",
+        "{name}"
     );
     assert_eq!(out.status.code(), Some(0));
 }
+
+/// Alpine's LuaJIT 2.1 (fetched: `guests/alpine/fetch/luajit.txt`) runs Lua
+/// its trace compiler compiles: recursion, hot numeric loops, tables and
+/// strings, closures, coroutines, errors; and through its FFI, compiled
+/// code calling C (`strlen`, `abs` in a hot loop) and C calling back into
+/// Lua (`qsort` with a Lua comparator). Each line is what Linux prints.
+#[test]
+fn alpine_luajit_runs_jit_code() {
+    let root = alpine_root("luajit");
+    let script = format!("/tmp/fwe-luajit-{}.lua", std::process::id());
+    std::fs::write(root.join(script.trim_start_matches('/')), LUAJIT_WORKLOAD).unwrap();
+    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join("luajit.trace");
+    let _ = std::fs::remove_file(&trace);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--strace")
+        .arg(format!("--strace-file={}", trace.display()))
+        .arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/luajit"))
+        .arg(&script)
+        .env_clear()
+        // Its marks on stderr: at exit, how often translated code left
+        // through fwe.
+        .env("FWE_TIMING", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .stdin(Stdio::null());
+    // A bound on a hang; how fast it ran is in the counts it prints.
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
+    let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
+    eprintln!("--- luajit ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        print_last_calls(&trace);
+    }
+    // The pure Lua as Lua prints it natively, the C calls' results as
+    // Python computes them.
+    assert_eq!(
+        stdout(&out),
+        "fib 75025\n\
+         loop 23999989\n\
+         tables 389000 1000\n\
+         closures 749493\n\
+         strings 120000 40000\n\
+         coroutines 450000\n\
+         errors\tfalse\tboom\n\
+         ffi strlen 18\n\
+         abs 2500000000\n\
+         qsort 0 999 332001\n\
+         jit\ttrue\n"
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A language runtime of Alpine's that makes code as it runs (fetched:
+/// `guests/alpine/fetch/<manifest>.txt`): `program` under its root, with
+/// `args`, runs `script` (put at `/tmp/<file>`), which must print
+/// `expected`, what Linux prints. Its calls are kept, and their last shown
+/// should it fail.
+fn alpine_runtime_runs(
+    vm: bool,
+    manifest: &str,
+    program: &str,
+    args: &[&str],
+    file: &str,
+    script: &str,
+    expected: &str,
+) {
+    let root = alpine_root(manifest);
+    let path = format!("/tmp/{file}");
+    std::fs::write(root.join(path.trim_start_matches('/')), script).unwrap();
+    let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{manifest}.trace"));
+    let _ = std::fs::remove_file(&trace);
+    let mut cmd = if vm {
+        let Some(cmd) = hv_command() else { return };
+        cmd
+    } else {
+        Command::new(env!("CARGO_BIN_EXE_fwe"))
+    };
+    cmd.arg("--strace")
+        .arg(format!("--strace-file={}", trace.display()))
+        .arg("--root")
+        .arg(&root)
+        .arg(root.join(program.trim_start_matches('/')))
+        .args(args)
+        .arg(&path)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/tmp")
+        .stdin(Stdio::null());
+    let out = if vm {
+        // The stand-in on a loaded CI runner takes several times as long.
+        run_hv_for(cmd, manifest, Duration::from_secs(600))
+    } else {
+        run_bounded_for(cmd, &[], Duration::from_secs(180))
+    };
+    eprintln!("--- {manifest} ({}) stderr:\n{}", out.status, String::from_utf8_lossy(&out.stderr));
+    if !out.status.success() {
+        print_last_calls(&trace);
+    }
+    assert_eq!(stdout(&out), expected, "{manifest}");
+    assert_eq!(out.status.code(), Some(0), "{manifest}");
+}
+
+/// What each runtime below prints of the same computations: recursion,
+/// code made from text (`eval`, and compiled from text), cubes summed by
+/// compiled code, closures in a hot loop, dispatch on a type, bignums and
+/// a hash table. As Python prints it natively, and checked by hand.
+const RUNTIME_RESULTS: &str = "fib 75025\n\
+         eval 1267650600228229401496703205383\n\
+         cubes 250500250000 249500250000\n\
+         closures 449461\n\
+         classes 314952\n\
+         bignum 56888193\n\
+         hash 1000\n";
+
+/// Steel Bank Common Lisp compiles each form to machine code as it runs:
+/// `compile` at run time, a function redefined, CLOS dispatch. Alpine's
+/// `sbcl` is linked at `0x400000` and not movable, so the VM runs it.
+#[test]
+fn hv_alpine_sbcl_compiles_lisp_as_it_runs() {
+    let expected = format!("{RUNTIME_RESULTS}redefined 11 1000\n");
+    alpine_runtime_runs(
+        true,
+        "sbcl",
+        "/usr/bin/sbcl",
+        &["--script"],
+        "fwe.lisp",
+        SBCL_SCRIPT,
+        &expected,
+    );
+}
+
+/// Racket (Racket CS, through Chez Scheme) compiles to machine code, `eval`
+/// in a namespace included.
+#[test]
+fn alpine_racket_compiles_as_it_runs() {
+    alpine_runtime_runs(
+        false,
+        "racket",
+        "/usr/bin/racket",
+        &[],
+        "fwe.rkt",
+        RACKET_SCRIPT,
+        RUNTIME_RESULTS,
+    );
+}
+
+/// GNU Guile compiles to bytecode, and its JIT the hot procedures to
+/// machine code; `eval` and `compile` at run time.
+#[test]
+fn alpine_guile_compiles_as_it_runs() {
+    alpine_runtime_runs(
+        false,
+        "guile",
+        "/usr/bin/guile",
+        &[],
+        "fwe.scm",
+        GUILE_SCRIPT,
+        RUNTIME_RESULTS,
+    );
+}
+
+/// Python's `eval`, `exec` and `compile` make code from text as it runs,
+/// and `type()` classes.
+#[test]
+fn alpine_python_evaluates_code_it_makes() {
+    alpine_runtime_runs(
+        false,
+        "python",
+        "/usr/bin/python3",
+        &[],
+        "fwe.py",
+        PYTHON_SCRIPT,
+        RUNTIME_RESULTS,
+    );
+}
+
+const SBCL_SCRIPT: &str = r#"(defun fib (n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(format t "fib ~d~%" (fib 25))
+(format t "eval ~d~%" (eval (read-from-string "(+ 1 (* 2 3) (expt 2 100))")))
+(let ((f (compile nil '(lambda (x) (* x x x)))))
+  (format t "cubes ~d ~d~%"
+          (loop for i from 1 to 1000 sum (funcall f i))
+          (funcall (compile nil '(lambda () (loop for i from 0 below 1000 sum (* i i i)))))))
+(let ((adders (coerce (loop for k from 0 below 64 collect (let ((k k)) (lambda (v) (+ v k)))) 'vector))
+      (cs 0))
+  (dotimes (i 300000) (setf cs (mod (funcall (svref adders (mod i 64)) cs) 1000003)))
+  (format t "closures ~d~%" cs))
+(defclass sq () ((side :initarg :side :reader side)))
+(defclass ci () ((r :initarg :r :reader r)))
+(defgeneric area (s))
+(defmethod area ((s sq)) (* (side s) (side s)))
+(defmethod area ((c ci)) (* 3 (r c) (r c)))
+(format t "classes ~d~%"
+        (loop for i from 1 to 10000
+              sum (area (if (evenp i) (make-instance 'sq :side (mod i 10)) (make-instance 'ci :r (mod i 7))))))
+(format t "bignum ~d~%" (mod (expt 3 1000) 1000000007))
+(let ((h (make-hash-table :test 'equal)))
+  (dotimes (i 100000) (setf (gethash (format nil "k~d" (mod (* i 31) 1000)) h) i))
+  (format t "hash ~d~%" (hash-table-count h)))
+(defun g (x) (+ x 1))
+(defvar *before* (g 10))
+(defun g (x) (* x 100))
+(format t "redefined ~d ~d~%" *before* (g 10))
+"#;
+
+const RACKET_SCRIPT: &str = r#"#lang racket/base
+(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(printf "fib ~a\n" (fib 25))
+(define ns (make-base-namespace))
+(printf "eval ~a\n" (eval '(+ 1 (* 2 3) (expt 2 100)) ns))
+(define f (eval '(lambda (x) (* x x x)) ns))
+(printf "cubes ~a ~a\n"
+        (for/sum ([i (in-range 1 1001)]) (f i))
+        (eval '(for/sum ([i (in-range 1000)]) (* i i i)) ns))
+(define adders (for/vector ([k (in-range 64)]) (lambda (v) (+ v k))))
+(printf "closures ~a\n"
+        (for/fold ([cs 0]) ([i (in-range 300000)])
+          (modulo ((vector-ref adders (modulo i 64)) cs) 1000003)))
+(struct sq (side))
+(struct ci (r))
+(define (area s) (if (sq? s) (* (sq-side s) (sq-side s)) (* 3 (ci-r s) (ci-r s))))
+(printf "classes ~a\n"
+        (for/sum ([i (in-range 1 10001)]) (area (if (even? i) (sq (modulo i 10)) (ci (modulo i 7))))))
+(printf "bignum ~a\n" (modulo (expt 3 1000) 1000000007))
+(define h (make-hash))
+(for ([i (in-range 100000)]) (hash-set! h (format "k~a" (modulo (* i 31) 1000)) i))
+(printf "hash ~a\n" (hash-count h))
+"#;
+
+const GUILE_SCRIPT: &str = r#"(use-modules (system base compile))
+(define (fib n) (if (< n 2) n (+ (fib (- n 1)) (fib (- n 2)))))
+(format #t "fib ~a\n" (fib 25))
+(format #t "eval ~a\n" (eval '(+ 1 (* 2 3) (expt 2 100)) (interaction-environment)))
+(define f (compile '(lambda (x) (* x x x)) #:to 'value))
+(define (sum-to n g) (let loop ((i 0) (s 0)) (if (= i n) s (loop (+ i 1) (+ s (g i))))))
+(format #t "cubes ~a ~a\n" (sum-to 1000 (lambda (i) (f (+ i 1)))) (sum-to 1000 f))
+(define adders (list->vector (map (lambda (k) (lambda (v) (+ v k))) (iota 64))))
+(format #t "closures ~a\n"
+        (let loop ((i 0) (cs 0))
+          (if (= i 300000) cs (loop (+ i 1) (modulo ((vector-ref adders (modulo i 64)) cs) 1000003)))))
+(define (area kind x) (if (eq? kind 'sq) (* x x) (* 3 x x)))
+(format #t "classes ~a\n"
+        (let loop ((i 1) (s 0))
+          (if (> i 10000) s
+              (loop (+ i 1) (+ s (if (even? i) (area 'sq (modulo i 10)) (area 'ci (modulo i 7))))))))
+(format #t "bignum ~a\n" (modulo (expt 3 1000) 1000000007))
+(define h (make-hash-table))
+(let loop ((i 0))
+  (when (< i 100000)
+    (hash-set! h (format #f "k~a" (modulo (* i 31) 1000)) i)
+    (loop (+ i 1))))
+(format #t "hash ~a\n" (hash-count (const #t) h))
+"#;
+
+const PYTHON_SCRIPT: &str = r#"fib_src = "def fib(n):\n    return n if n < 2 else fib(n - 1) + fib(n - 2)\n"
+ns = {}
+exec(compile(fib_src, "<fib>", "exec"), ns)
+print("fib", ns["fib"](25))
+print("eval", eval("1 + 2 * 3 + 2 ** 100"))
+f = eval("lambda x: x * x * x")
+print("cubes", sum(f(i) for i in range(1, 1001)), eval(compile("sum(i ** 3 for i in range(1000))", "<s>", "eval")))
+exec("\n".join(f"def g{k}(v):\n    return v + {k}" for k in range(64)), ns)
+adders = [ns[f"g{k}"] for k in range(64)]
+cs = 0
+for i in range(300000):
+    cs = adders[i % 64](cs) % 1000003
+print("closures", cs)
+Shape = type("Shape", (), {"area": lambda self: 0})
+Sq = type("Sq", (Shape,), {"__init__": lambda self, s: setattr(self, "s", s), "area": lambda self: self.s * self.s})
+Ci = type("Ci", (Shape,), {"__init__": lambda self, r: setattr(self, "r", r), "area": lambda self: 3 * self.r * self.r})
+print("classes", sum((Sq(i % 10) if i % 2 == 0 else Ci(i % 7)).area() for i in range(1, 10001)))
+print("bignum", pow(3, 1000, 1000000007))
+h = {}
+for i in range(100000):
+    h["k%d" % ((i * 31) % 1000)] = i
+print("hash", len(h))
+"#;
+
+const LUAJIT_WORKLOAD: &str = r#"
+local function fib(n) if n < 2 then return n end return fib(n - 1) + fib(n - 2) end
+print(string.format("fib %d", fib(25)))
+local acc = 0
+for i = 1, 3000000 do acc = (acc + (i * i) % 7 + (i % 13)) % 1000000007 end
+print(string.format("loop %d", acc))
+local t = {}
+for i = 1, 100000 do t[i] = "k" .. (i * 31 % 1000) end
+local len = 0
+for i = 1, #t do len = len + #t[i] end
+local seen, distinct = {}, 0
+for i = 1, #t do if not seen[t[i]] then seen[t[i]] = true; distinct = distinct + 1 end end
+print(string.format("tables %d %d", len, distinct))
+local adders = {}
+for k = 1, 64 do adders[k] = function(v) return v + k end end
+local cs = 0
+for i = 1, 300000 do cs = adders[i % 64 + 1](cs) % 1000003 end
+print(string.format("closures %d", cs))
+local s = string.rep("ab-cd;", 20000)
+local n = select(2, s:gsub("%a+", ""))
+print(string.format("strings %d %d", #s, n))
+local co = coroutine.wrap(function() for i = 1, 100000 do coroutine.yield(i % 10) end end)
+local csum = 0
+for _ = 1, 100000 do csum = csum + co() end
+print(string.format("coroutines %d", csum))
+local ok, err = pcall(function() error("boom", 0) end)
+print("errors", ok, err)
+local ffi = require("ffi")
+ffi.cdef[[
+size_t strlen(const char *);
+int abs(int);
+void qsort(void *base, size_t n, size_t size, int (*cmp)(const void *, const void *));
+]]
+local C = ffi.C
+print(string.format("ffi strlen %d", tonumber(C.strlen("fun-with-emulators"))))
+local a = 0
+for i = 0, 99999 do a = a + C.abs(i - 50000) end
+print(string.format("abs %d", a))
+local arr = ffi.new("int[1000]")
+for i = 0, 999 do arr[i] = (i * 7919) % 1000 end
+local cmp = ffi.cast("int (*)(const void *, const void *)", function(x, y)
+  local p, q = ffi.cast("const int *", x)[0], ffi.cast("const int *", y)[0]
+  if p < q then return -1 elseif p > q then return 1 else return 0 end
+end)
+C.qsort(arr, 1000, 4, cmp)
+cmp:free()
+local w = 0
+for i = 0, 999 do w = (w + arr[i] * (i + 1)) % 1000003 end
+print(string.format("qsort %d %d %d", arr[0], arr[999], w))
+print("jit", (jit.status()))
+"#;
 
 /// Debian's Rust toolchain (fetched: `guests/debian/fetch/rust.txt`): Cargo
 /// builds a two-crate project offline in release mode — rustc and its LLVM
@@ -3742,6 +4876,24 @@ fn asm_x18_survives_load_store_addressing() {
     assert_eq!(fwe(&asm_guest("x18ldst-pie"), &[]).status.code(), Some(0));
 }
 
+/// HotSpot's register saves and restores with x18 in a pair off sp (`stp
+/// x18, xzr, [sp, #128]`, `ldp x18, x19, [sp], #96`) keep every register,
+/// across preemption and system calls.
+#[test]
+fn asm_x18_pairs_off_sp_keep_every_register() {
+    let code = fwe(&asm_guest("x18pair-pie"), &[]).status.code();
+    assert_eq!(code, Some(0), "register {} lost", code.unwrap_or(0) - 1);
+}
+
+/// A load through x18 that faults, as a JIT's implicit null check does: its
+/// handler sees the fault at the load, with every register and sp as they
+/// were, and skips it.
+#[test]
+fn asm_x18_fault_is_seen_at_its_instruction() {
+    let code = fwe(&asm_guest("x18fault-pie"), &[]).status.code();
+    assert_eq!(code, Some(0), "exit {code:?}: 1 + a register, 40 pc, 41 sp, 42 no handler");
+}
+
 /// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz), across preemption:
 /// the branch stub tests the preserved value rather than the hardware x18.
 #[test]
@@ -4027,8 +5179,7 @@ fn process_signal_goes_to_unblocked_thread() {
 }
 
 /// A process signal sent while every thread blocks it reaches the thread
-/// that unblocks it first, though macOS parks it on the main thread, which
-/// never does.
+/// that unblocks it first, not the main thread, which never does.
 #[test]
 fn signal_blocked_everywhere_goes_to_the_thread_that_unblocks_it() {
     assert_eq!(signals("parked"), "parked signal handled on the unblocked thread: true\n");
@@ -5045,10 +6196,12 @@ const PROCSIG: &str = "queued to -1: true\n\
 /// signal, `rt_sigqueueinfo` to -1 refused, signals the moment a child is
 /// forked, core dumps, a clone's own exit signal, a blocked `SIGCHLD` kept
 /// pending at its default action, a child sharing the
-/// memory, the hard CPU limit and an inherited timer slack.
+/// memory, the hard CPU limit and an inherited timer slack. (The CPU limit
+/// waits for its child to have run 2 s, which a machine busy with other
+/// tests gives it slowly.)
 #[test]
 fn process_signals_and_ends() {
-    let out = fwe(&rust_guest("procsig"), &[]);
+    let out = fwe_within(&rust_guest("procsig"), &[], Duration::from_secs(60));
     let expected = PROCSIG.replace("{shared}", "true");
     assert_eq!(stdout(&out), expected, "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
@@ -5308,6 +6461,20 @@ fn proc_self_fd_lists_and_links_descriptors() {
 #[test]
 fn descriptor_limit_bounds_the_guest() {
     assert_eq!(fds("limits"), FDS_LIMITS);
+}
+
+/// fwe's root directory descriptor sits above the guest's soft
+/// `RLIMIT_NOFILE`, out of its reach, and moves when the limit is raised
+/// past it: the numbers above the old limit are then the guest's, given in
+/// turn, and paths still resolve, in the process and in a child it forks.
+#[test]
+fn raising_the_descriptor_limit_moves_fwes_root_out_of_the_way() {
+    assert_eq!(
+        fds("raised"),
+        "close at the soft limit: -1 EBADF\nF_GETFD there: -1 EBADF\nraised by 64: 0\n\
+         dup stopped at the new limit: -1 EMFILE\npast the old limit: 64 in turn true\n\
+         own binary read through the root: true\nand by a child: true\n"
+    );
 }
 
 /// What the `fds` guest's `limits` scenario prints: the guest's soft

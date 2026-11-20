@@ -103,6 +103,31 @@ thread_local! {
     /// [`reroute_parked`] is taking a signal parked on this thread: record
     /// it against the process rather than the thread.
     static REROUTING: Cell<bool> = const { Cell::new(false) };
+    /// When [`reroute_parked`] last looked at this thread's signals pending
+    /// on the host, by the virtual counter (0: it has not).
+    static LOOKED: Cell<u64> = const { Cell::new(0) };
+}
+
+/// How often a thread whose calls only glance ([`glances`]) looks at the
+/// signals the host parked on it ([`reroute_parked`]), at most: every
+/// 100 µs.
+const LOOK_EVERY_PER_SECOND: u64 = 10_000;
+
+/// Whether system call `nr`, with second argument `op`, neither waits nor
+/// reads signal state, whatever its other arguments: it reads ids or
+/// clocks, yields, or wakes futex waiters.
+fn glances(nr: u64, op: u64) -> bool {
+    use fwe_abi::futex;
+    use fwe_abi::nr::*;
+    match nr {
+        GETPID | GETPPID | GETTID | GETUID | GETEUID | GETGID | GETEGID | GETPGID | GETSID
+        | CLOCK_GETTIME | CLOCK_GETRES | GETTIMEOFDAY | GETCPU | SCHED_YIELD => true,
+        FUTEX => matches!(
+            op & futex::FUTEX_CMD_MASK,
+            futex::FUTEX_WAKE | futex::FUTEX_WAKE_OP | futex::FUTEX_WAKE_BITSET
+        ),
+        _ => false,
+    }
 }
 
 /// This host thread starts another guest thread
@@ -110,6 +135,7 @@ thread_local! {
 pub fn thread_reused() {
     IN_GUEST.with(|g| g.set(false));
     REROUTING.with(|r| r.set(false));
+    LOOKED.set(0);
     UNBLOCKED.with(|u| u.set(false));
 }
 
@@ -136,10 +162,40 @@ fn caught(sig: libc::c_int) -> bool {
 /// other threads are woken to take it. A signal with the default action
 /// or ignored stays where it is: unblocking it would apply that action to
 /// a signal Linux keeps pending.
-fn reroute_parked(blocked: u64) {
+///
+/// A caught signal is parked so only if it came while every thread was in
+/// fwe's handlers (out of them, the host does not block it: the handler
+/// takes it whatever the guest's mask). The look costs a host call, so a
+/// call that neither waits nor reads signal state ([`glances`]) looks
+/// only once [`LOOK_EVERY_PER_SECOND`] says it is time again: a thread
+/// making such calls by the thousand (a runtime timing itself at each
+/// step) still looks thousands of times a second. Any other call (one
+/// that may wait, or reads what is pending) looks every time.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
+    let blocked = blocked & fwe_kernel::signal::caught();
     if blocked == 0 {
         return;
     }
+    let (now, hz): (u64, u64);
+    // SAFETY: reads of the virtual counter and its frequency, which macOS
+    // lets every thread read.
+    unsafe {
+        std::arch::asm!(
+            "mrs {}, cntvct_el0",
+            "mrs {}, cntfrq_el0",
+            out(reg) now,
+            out(reg) hz,
+            options(nomem, nostack, preserves_flags)
+        );
+    }
+    if now.wrapping_sub(LOOKED.get()) < hz / LOOK_EVERY_PER_SECOND && glance() {
+        return;
+    }
+    LOOKED.set(now);
     let parked = host::pending_signals() & blocked;
     if parked == 0 {
         return;
@@ -289,6 +345,10 @@ impl Drop for HostCode {
 /// Prepare this thread to jump into guest code (a new program, a forked
 /// child, a new thread): it runs guest code from here, under its guest
 /// mask.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn prepare_guest_entry() {
     crate::gate::ensure_block();
     block_async_signals();
@@ -312,6 +372,10 @@ fn guest_interrupted(ctx: *mut libc::c_void) -> bool {
 /// and nothing is to be delivered (the gate returns to the guest); 1: the
 /// trap is to finish it (`b.ran` says whether it ran).
 #[unsafe(no_mangle)]
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     use fwe_abi::nr::*;
     use std::sync::atomic::Ordering::SeqCst;
@@ -323,10 +387,26 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         b.slot = crate::quiesce::mine_addr();
     }
     crate::quiesce::leave_at(b.slot);
+    // A call from a translation is the program's `svc`'s.
     let site = crate::gate::site_of(b.ret);
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    let site = if crate::jit::in_cache(site) { crate::jit::syscall_site(site) } else { site };
     b.regs.pc = site;
     b.regs.x[18] = guest_x18();
     b.ran = 0;
+    // SAFETY: words of the stub that called the gate, mapped.
+    if let Some(rt) = crate::rewrite::flush_reg(|a| unsafe { (a as *const u32).read() }, b.ret) {
+        flush_line(if rt == 31 { 0 } else { b.regs.x[rt as usize] }, rt == 18);
+        b.regs.pc = site + 4;
+        b.ran = 1;
+        b.seen = b.signals.load(SeqCst);
+        let (pending, mask) = thread::state();
+        if pending & !mask != 0 {
+            return 1;
+        }
+        crate::quiesce::enter_at(b.slot);
+        return 0;
+    }
     let nr = b.regs.x[8];
     // A new thread of an untraced one is made here too: the trap would
     // make it from the same registers.
@@ -366,13 +446,14 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         return 1;
     }
     let mask = thread::mask();
-    reroute_parked(mask);
+    reroute_parked(mask, || glances(nr, b.regs.x[1]));
     // What a plain return keeps: the general registers but `x0`, `sp` and
     // the flags (the vector registers change only with the pc, as a
     // signal's delivery or return changes them).
     let (before_x, before_sp, before_pstate) = (b.regs.x, b.regs.sp, b.regs.pstate);
     let regs = &mut b.regs;
     let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+    let began = fwe_kernel::timing::call_began();
     if thread_clone {
         let a = if nr == CLONE {
             Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
@@ -390,6 +471,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     } else {
         KERNEL.syscall(regs);
     }
+    fwe_kernel::timing::call_done(nr, began);
     b.ran = 1;
     // A changed mask is the host thread's now (the guest's is in force in
     // its code): a signal it unblocks that is pending is seen below.
@@ -413,6 +495,65 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         crate::quiesce::enter_at(b.slot);
     }
     u64::from(!plain_return)
+}
+
+/// The program's `ic ivau` of the line at `addr` (its stub ran it, but
+/// through `x18`, `native`): the translations made from it go
+/// ([`crate::jit::flushed`]).
+fn flush_line(addr: u64, native: bool) {
+    let line = 4 << (crate::hwcap::CTR_EL0 & 15);
+    if native {
+        // Code that runs as it is may be there: the host's cache line
+        // too, where it is mapped (as the instruction faults elsewhere,
+        // which a stub through `x18` leaves to its translations).
+        let mapped = !fwe_kernel::maps::record().areas_in(addr, addr + 1).is_empty();
+        if mapped {
+            // SAFETY: a mapped line of the program's memory.
+            unsafe { crate::prepare::flush_icache(addr & !(line - 1), line) };
+        }
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::jit::flushed(addr);
+}
+
+/// A system call's site: the program's `svc` where the call was made from a
+/// translation of code made executable at run time.
+/// The Rust half of the exit gate ([`crate::gate`]): take the way out of
+/// a translation whose state is in `b` (its `pc` the way out), as fwe's
+/// trap would. 0: it leads into a translation, which the gate enters (the
+/// block says which); 1: the trap is to go on (`b.ran` set: the state in
+/// the block is where the way out led, with anything pending delivered).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+#[unsafe(no_mangle)]
+extern "C" fn fwe_exit_call(b: *mut crate::gate::Block) -> u64 {
+    use std::sync::atomic::Ordering::SeqCst;
+    // SAFETY: the gate passes this thread's block, which only it uses now.
+    let b = unsafe { &mut *b };
+    if b.slot == 0 {
+        b.slot = crate::quiesce::mine_addr();
+    }
+    crate::quiesce::leave_at(b.slot);
+    b.regs.x[18] = guest_x18();
+    let into = crate::jit::gate_exit(&mut b.regs);
+    b.ran = 1;
+    b.seen = b.signals.load(SeqCst);
+    let (pending, mask) = thread::state();
+    match into {
+        Some((t, g)) if pending & !mask == 0 => {
+            (b.jit_t, b.jit_g) = (t, g);
+            crate::quiesce::enter_at(b.slot);
+            0
+        }
+        _ => 1,
+    }
+}
+
+fn guest_site(site: u64) -> u64 {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::jit::in_cache(site) {
+        return crate::jit::guest_pc(site).expect("a system call's site in a translation");
+    }
+    site
 }
 
 /// The TSD key of the guest `x18` slot (see [`crate::x18_slot`]).
@@ -461,6 +602,60 @@ fn regs_to(mc: &mut Mcontext, regs: &Regs) {
     mc.ns.fpcr = regs.fp.fpcr;
 }
 
+/// Under `--strace`, an instruction fetch that faulted, with what led
+/// there: the registers (the guest's `x18` among them), the code before
+/// the return address, and, where that is a call, the code it called. Code
+/// is read only where the guest's mappings say it is readable.
+fn fetch_fault_report(regs: &Regs) {
+    if !kernel().as_ref().is_some_and(|k| k.tracer.enabled) {
+        return;
+    }
+    let readable = |a: u64| {
+        fwe_kernel::maps::record()
+            .areas_in(a, a + 4)
+            .iter()
+            .any(|p| p.value.prot & fwe_abi::mman::PROT_READ != 0)
+    };
+    let word = |a: u64| -> Option<u32> {
+        // SAFETY: an address the guest's mappings say is readable.
+        readable(a).then(|| unsafe { (a as *const u32).read() })
+    };
+    let dump = |from: u64, n: u64| -> String {
+        (0..n)
+            .map(|i| from + 4 * i)
+            .map(|a| match word(a) {
+                Some(w) => format!("{a:#x}:{w:08x}"),
+                None => format!("{a:#x}:-"),
+            })
+            .collect::<Vec<_>>()
+            .join(" ")
+    };
+    let mut r = format!(
+        "fetch fault at {:#x} (stub region {:?}); sp {:#x}; x18 {:#x}; regs",
+        regs.pc,
+        crate::prepare::stub_region(regs.pc),
+        regs.sp,
+        regs.x[18]
+    );
+    for (i, x) in regs.x.iter().enumerate() {
+        r.push_str(&format!(" x{i}={x:#x}"));
+    }
+    let lr = regs.x[30];
+    r.push_str(&format!("; before lr: {}", dump(lr.wrapping_sub(32), 10)));
+    if let Some(w) = word(lr.wrapping_sub(4)) {
+        if w & 0xfc00_0000 == 0x9400_0000 {
+            let to = lr.wrapping_sub(4).wrapping_add_signed(i64::from(((w << 6) as i32) >> 4));
+            r.push_str(&format!("; called {to:#x}: {}", dump(to, 48)));
+        } else if w & 0xffff_fc1f == 0xd63f_0000 {
+            let n = ((w >> 5) & 31) as usize;
+            r.push_str(&format!("; called through x{n} = {:#x}", regs.x[n]));
+        }
+    }
+    if let Some(k) = kernel().as_ref() {
+        k.tracer.note(&r);
+    }
+}
+
 /// Whether `word` is a `brk` instruction (any immediate).
 fn is_brk(word: u32) -> bool {
     word & 0xffe0_001f == 0xd420_0000
@@ -475,14 +670,44 @@ fn settle(regs: &mut Regs) {
     if thread::deliverable() != 0
         && let Some(k) = kernel().as_mut()
     {
+        // Going on in a translation (a way out's target): a handler's frame
+        // holds the guest's state, as at the instruction it stands for, not
+        // fwe's code, which may be gone when the handler returns.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        if crate::jit::in_cache(regs.pc) {
+            crate::jit::to_guest(regs);
+        }
         k.deliver_pending(regs);
     }
 }
 
 extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    fwe_kernel::timing::signal(sig);
     let in_guest = IN_GUEST.with(Cell::get);
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let pc = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).ss.pc };
+    // A translated block's way out, told by what the hardware says
+    // trapped: another thread may have linked the word since (made it a
+    // branch). On at where it leads; in fwe's code from here, signals
+    // held, so a signal delivered meanwhile cannot take the translator's
+    // lock this thread holds.
+    if in_guest {
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+        let esr = mc.es.esr;
+        if (esr >> 26) & 0x3f == ESR_EC_BRK && esr & 0xffff == crate::jit::EXIT_IMM {
+            let _host = HostCode::enter_blocked();
+            let mut regs = regs_from(mc);
+            fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::WayOut);
+            if crate::jit::exit(&mut regs, true) {
+                settle(&mut regs);
+                regs_to(mc, &regs);
+                // SAFETY: `ctx` is this handler's ucontext.
+                unsafe { return_with_guest_mask(ctx) };
+                return;
+            }
+        }
+    }
     // macOS's siginfo does not tell a trap from a sent SIGTRAP (both have
     // code 0), so look at the instruction: anything but a `brk` means the
     // signal was sent by another process, a signal for the guest.
@@ -494,6 +719,21 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     }
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
+    // The exit gate's trap: the state the way out led to is in the block.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    // SAFETY: the thread was executing at `pc`, so it is mapped.
+    if crate::gate::in_gate(pc) && unsafe { insn(pc) } == Some(crate::gate::EXIT_GATE_TRAP) {
+        fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::ExitGate);
+        let b = crate::gate::block().expect("the exit gate's thread has a block");
+        let mut regs = b.regs;
+        b.active.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _host = HostCode::enter_blocked();
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
+        return;
+    }
     // The gate's trap: the guest's state is in this thread's block.
     // SAFETY: the thread was executing at `pc`, so it is mapped.
     let from_gate = crate::gate::in_gate(pc) && unsafe { insn(pc) } == Some(crate::gate::GATE_TRAP);
@@ -501,6 +741,11 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         let b = crate::gate::block().expect("the gate's thread has a block");
         let mut regs = b.regs;
         let ran = b.ran != 0;
+        fwe_kernel::timing::trapped(if ran {
+            fwe_kernel::timing::Trap::GateRan
+        } else {
+            fwe_kernel::timing::Trap::Gate
+        });
         b.active.store(0, std::sync::atomic::Ordering::SeqCst);
         if ran {
             // The call ran: what is pending is delivered, and the guest
@@ -514,6 +759,9 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
         }
         // As if the guest had trapped at its system call.
         regs_to(mc, &regs);
+    }
+    if !from_gate {
+        fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::Call);
     }
     syscall_trap(ctx, in_guest, from_gate);
 }
@@ -539,7 +787,13 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         // the guest; one in fwe's own code is fatal.
         if in_guest {
             let mut regs = regs_from(mc);
-            let addr = mc.ss.pc;
+            // In a translation: the trap is at the program's own `brk`,
+            // with its registers as there.
+            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+            if crate::jit::in_cache(regs.pc) {
+                crate::jit::to_guest(&mut regs);
+            }
+            let addr = regs.pc;
             let delivered = kernel()
                 .as_mut()
                 .is_some_and(|k| k.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr));
@@ -555,12 +809,13 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         return;
     }
     let mut regs = regs_from(mc);
+    regs.pc = guest_site(regs.pc);
     if kernel().is_none() {
         report("fwe: system call before the kernel was initialized\n");
         // SAFETY: terminating the process.
         unsafe { libc::_exit(127) }
     }
-    reroute_parked(thread::mask());
+    reroute_parked(thread::mask(), || false);
     // A traced process stopping at system calls: the entry's stop, where
     // the tracer may change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
@@ -629,6 +884,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         unsafe { return_with_guest_mask(ctx) };
         return;
     }
+    let began = fwe_kernel::timing::call_began();
     if nr == fwe_abi::nr::CLONE || nr == fwe_abi::nr::CLONE3 {
         let a = if nr == fwe_abi::nr::CLONE {
             Ok(fwe_kernel::CloneArgs::from_clone(&regs.x))
@@ -697,6 +953,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     } else {
         KERNEL.syscall(&mut regs);
     }
+    fwe_kernel::timing::call_done(nr, began);
     // The exit's stop, its result in `x0`.
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, false);
@@ -714,6 +971,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
 /// and the signal is delivered when that call returns — a blocking call was
 /// interrupted by it.
 extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    fwe_kernel::timing::signal(sig);
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let sent = || unsafe { host::signal_info(sig, info) };
     take_async(sig, sent, ctx, guest_interrupted(ctx));
@@ -787,6 +1045,12 @@ fn take_async(
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     let mut regs = regs_from(mc);
     finish_sp_stub(&mut regs);
+    // In a translation: the guest's state as at the instruction it stands
+    // for, which is what a tracer, a handler's frame or a core sees.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::jit::in_cache(regs.pc) {
+        crate::jit::to_guest(&mut regs);
+    }
     k.deliver_pending(&mut regs);
     drop(guard);
     settle(&mut regs);
@@ -798,7 +1062,7 @@ fn take_async(
 /// The `T` at host address `addr`, or `None` where nothing readable is,
 /// read through the host's copy of this task's memory, which reports a hole
 /// rather than fault. Async-signal-safe.
-fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
+pub(crate) fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
@@ -916,35 +1180,58 @@ fn fault_signal(host: libc::c_int) -> u64 {
     }
 }
 
-/// The Linux signal of host fault `host` at `addr` (`esr` its syndrome):
-/// macOS reports an access the page's protection forbids, on some
-/// mappings, as `SIGBUS`, which Linux reports as `SIGSEGV` (keeping
-/// `SIGBUS` for memory past a mapped file's end, whose protection allows
-/// the access).
-fn linux_fault_signal(host: libc::c_int, addr: u64, esr: u32) -> u64 {
-    let sig = fault_signal(host);
-    #[cfg(target_os = "macos")]
-    if host == libc::SIGBUS
-        && let Some(r) = fwe_kernel::mm::region::query(addr).filter(|r| r.start <= addr)
-    {
-        let class = (esr >> 26) & 0x3f;
-        let needed = if class == ESR_EC_INSTRUCTION_ABORT_LOWER {
-            libc::PROT_EXEC
-        } else if esr & (1 << 6) != 0 {
-            libc::PROT_WRITE
-        } else {
-            libc::PROT_READ
-        };
-        if r.protection & needed == 0 {
-            return fwe_abi::signal::SIGSEGV;
-        }
+/// The Linux signal of host fault `host`, whose access the page's
+/// protection allowed (`allowed`, read once for the fault) or not: macOS
+/// reports an access the protection forbids, on some mappings, as
+/// `SIGBUS`, which Linux reports as `SIGSEGV` (keeping `SIGBUS` for memory
+/// past a mapped file's end, whose protection allows the access).
+fn linux_fault_signal(host: libc::c_int, allowed: bool) -> u64 {
+    if host == libc::SIGBUS && !allowed {
+        return fwe_abi::signal::SIGSEGV;
     }
-    let _ = (addr, esr);
-    sig
+    fault_signal(host)
+}
+
+/// Whether the host's protection of the page at `addr` allows the access
+/// whose syndrome is `esr`. Below the lowest address the host lets a
+/// process map (a null pointer's access, as a JIT's implicit null checks
+/// make), nothing is mapped, and the host is not asked.
+fn allowed_now(addr: u64, esr: u32) -> bool {
+    if addr < crate::loader::host_min_address() {
+        return false;
+    }
+    let Some(r) = fwe_kernel::mm::region::query(addr).filter(|r| r.start <= addr) else {
+        return false;
+    };
+    let needed = if (esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER {
+        libc::PROT_EXEC
+    } else if esr & (1 << 6) != 0 {
+        libc::PROT_WRITE
+    } else {
+        libc::PROT_READ
+    };
+    r.protection & needed == needed
+}
+
+thread_local! {
+    /// The address of the fault this thread last tried again as allowed,
+    /// and [`fwe_kernel::mm::protection_changes`] then.
+    static RETRIED: Cell<(u64, u64)> = const { Cell::new((0, u64::MAX)) };
+}
+
+/// A fault at `addr` that the page allows now is tried again, unless it is
+/// the one this thread last tried again and no mapping or protection has
+/// changed since.
+fn stale_fault(addr: u64) -> bool {
+    let now = (addr, fwe_kernel::mm::protection_changes());
+    RETRIED.with(|r| r.replace(now)) != now
 }
 
 /// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
 const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
+/// The exception class of a `brk` instruction (its immediate in the low 16
+/// bits of the syndrome).
+const ESR_EC_BRK: u32 = 0x3c;
 
 /// The pid of a process forking, from before its host `fork` until its
 /// child is set up (in the child) or the fork has returned (in the
@@ -998,6 +1285,7 @@ pub fn post_early() {
 }
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    fwe_kernel::timing::signal(sig);
     // A process that sends itself one of these signals has it emulated (see
     // `Kernel::sys_kill`), so here it is a fault, or a signal sent by
     // another process, which macOS's siginfo does not tell apart (it gives
@@ -1008,6 +1296,32 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if let Some(note) = fwe_kernel::signote::take(sig) {
         take_async(sig, || host::sent_info(note), ctx, guest_interrupted(ctx));
         return;
+    }
+    // A fault signal whose syndrome is no abort of the instruction it
+    // interrupts was left pending by the host: a thread's instruction
+    // faulted as another signal was being delivered to it, and this one
+    // came once the handler unblocked signals, somewhere else (in fwe's
+    // code, or the guest's handler). The instruction runs again when its
+    // thread gets back to it, and faults again if it still does, as if the
+    // other signal had come just before it. One another process sent is a
+    // signal for the guest.
+    if matches!(sig, libc::SIGSEGV | libc::SIGBUS) {
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let esr = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).es.esr };
+        if !matches!((esr >> 26) & 0x3f, 0x20 | 0x21 | 0x22 | 0x24 | 0x25 | 0x26) {
+            // SAFETY: `info` is valid for SA_SIGINFO handlers.
+            if unsafe { (*info).si_code } > 0 && unsafe { (*info).si_code } < 0x10000 {
+                return;
+            }
+            // SAFETY: `info` is valid for SA_SIGINFO handlers.
+            take_async(
+                sig,
+                || unsafe { host::signal_info(sig, info) },
+                ctx,
+                guest_interrupted(ctx),
+            );
+            return;
+        }
     }
     let in_guest = guest_interrupted(ctx);
     if in_guest {
@@ -1021,8 +1335,19 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             return;
         }
         // Read as the host copies, which reports a hole rather than fault:
-        // the pc of an instruction-fetch fault is not mapped.
-        let word = |a: u64| read_host::<u32>(a);
+        // the pc of an instruction-fetch fault is not mapped. The word at
+        // the pc of any other fault was just fetched: read as it is (the
+        // host's copy is a Mach call, on every fault).
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
+        let esr = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).es.esr };
+        let pc = ss.pc;
+        let at_pc = if (esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER {
+            read_host::<u32>(pc)
+        } else {
+            // SAFETY: the thread fetched the instruction at `pc`.
+            unsafe { insn(pc) }
+        };
+        let word = |a: u64| if a == pc { at_pc } else { read_host::<u32>(a) };
         if let Some(site) = crate::rewrite::syscall_stub_site(word, ss.pc) {
             // A system call's stub could not save registers below the
             // guest's sp (none is needed for a system call: musl's thread
@@ -1048,13 +1373,6 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if !in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let ss = unsafe { &mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss };
-        // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        let addr = unsafe { (*info).si_addr() } as u64;
-        if fwe_kernel::mm::write_exec_writable(addr, crate::page_size()) {
-            // fwe writing for the guest into a page of its writable and
-            // executable memory that was last executed: retry the write.
-            return;
-        }
         if let Some(resume) = fwe_kernel::uaccess::fixup(ss.pc) {
             // A guest pointer the kernel was copying through was bad: the
             // copy reports EFAULT.
@@ -1091,10 +1409,11 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         return;
     }
 
-    // Memory the guest mapped writable and executable: the page becomes
-    // what this access needs, and the access is retried.
+    // Code the guest made executable after mapping it runs by translation:
+    // a fetch from it goes on at its translation.
     let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
-    if kernel().as_mut().is_some_and(|k| k.write_exec_fault(addr, exec)) {
+    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr) {
+        mc.ss.pc = t;
         return;
     }
     // A page of a private mapping of a file with no name, first written:
@@ -1108,14 +1427,38 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if sig == libc::SIGSEGV && !exec && kernel().as_mut().is_some_and(|k| k.stack_fault(addr)) {
         return;
     }
+    // An access the page allows now: another thread changed its protection
+    // (or mapped it) after this one faulted, so it is tried again; one that
+    // faults again with nothing changed meanwhile (memory past a mapped
+    // file's end) stands.
+    let allowed = allowed_now(addr, mc.es.esr);
+    if allowed && !fwe_kernel::mm::poisoned(addr) && stale_fault(addr) {
+        return;
+    }
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);
+    if exec {
+        fetch_fault_report(&regs);
+    }
+    // A fault in a stub is the program's own instruction's, at its site
+    // (a JIT's null checks fault on purpose, and its handler looks for
+    // the instruction it wrote).
+    if let Some(r) = crate::prepare::rewind_fault(regs.pc, regs.sp) {
+        for (reg, value) in r.restored {
+            regs.x[reg as usize] = value;
+        }
+        regs.sp = r.sp;
+        regs.pc = r.site;
+    } else {
+        // In a translation: the guest's instruction it stands for.
+        crate::jit::to_guest(&mut regs);
+    }
     // Memory `MADV_HWPOISON` poisoned fails with a bus error.
     let lsig = if fwe_kernel::mm::poisoned(addr) {
         fwe_abi::signal::SIGBUS
     } else {
-        linux_fault_signal(sig, addr, mc.es.esr)
+        linux_fault_signal(sig, allowed)
     };
     let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr));
     if delivered {
@@ -1252,6 +1595,10 @@ fn install(
 /// Give the calling thread a signal stack if it has none. A forked child's
 /// thread does not inherit the parent thread's: without one, its handlers
 /// would run on the guest stack, which `execve` unmaps.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn ensure_thread_altstack() {
     // SAFETY: querying this thread's signal stack into a zeroed stack_t.
     let disabled = unsafe {
@@ -1306,6 +1653,8 @@ pub fn install_thread_altstack() {
 /// Install the per-thread signal stack and the process-wide handlers for
 /// running guest code (called once on the main thread).
 pub fn install_handlers() {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    crate::jit::configure();
     install_thread_altstack();
     install(libc::SIGTRAP, on_sigtrap);
     for sig in [libc::SIGSEGV, libc::SIGBUS, libc::SIGILL, libc::SIGFPE] {

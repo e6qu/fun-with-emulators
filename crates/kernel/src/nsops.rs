@@ -77,6 +77,23 @@ pub struct ForkNs {
     /// What the parent alone would know of the child's record, for a child
     /// that writes its whole record itself ([`Kernel::fork_child_writes`]).
     child_writes: Option<crate::procreg::FromParent>,
+    /// For such a child: its record and its view as other processes see
+    /// it ([`crate::fs::Fs::shared`]), made before the fork (see
+    /// [`crate::procreg::Prepared`]); none while a thread has a view of its
+    /// own, which the child may take.
+    prepared: Option<(crate::procreg::Prepared, Option<Vec<u8>>)>,
+    /// The parent wrote that record and view for the child, with the
+    /// child's start time, before letting it go on
+    /// ([`Kernel::fork_write_child`]): the child writes neither.
+    written: std::cell::Cell<bool>,
+}
+
+impl ForkNs {
+    /// In the child: whether its parent wrote its record and view for it
+    /// ([`Kernel::fork_write_child`]), as the parent told it.
+    pub fn set_written(&self, written: bool) {
+        self.written.set(written);
+    }
 }
 
 impl<P: Platform> Kernel<P> {
@@ -216,6 +233,10 @@ impl<P: Platform> Kernel<P> {
     /// The calling thread's own view, if it has one, becomes the
     /// process's: it is the only thread left (a `fork` child), or the one
     /// that goes on to run another program.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn adopt_thread_view(&mut self) {
         if let Some(fs) = crate::threadfs::take_for_child() {
             fs.publish();
@@ -358,9 +379,7 @@ impl<P: Platform> Kernel<P> {
             }
         };
         // Within the cgroup's `pids.max`; frozen with it.
-        let start = cgroup.clone().unwrap_or_else(crate::cgroupfs::current);
-        crate::cgroupfs::fork_allowed(&start)?;
-        let frozen = crate::cgroupfs::frozen(&start);
+        let frozen = crate::cgroupfs::fork_checks(cgroup.as_deref())?;
         CLEAR_SIGHAND.store(
             flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0,
             std::sync::atomic::Ordering::SeqCst,
@@ -452,20 +471,56 @@ impl<P: Platform> Kernel<P> {
             exit_signal,
             pidfd: None,
             child_writes: None,
+            prepared: None,
+            written: std::cell::Cell::new(false),
         })
+    }
+
+    /// For a fork whose child runs [`Kernel::fork_child`]: the child writes
+    /// its whole record as it starts, with what this process knows of it,
+    /// and this process writes none (a look at the child's record waits
+    /// for it, [`crate::procreg::read`]). The record, and the view the
+    /// child shows, are made here, before the fork, for the child to write
+    /// as they are ([`crate::procreg::Prepared`]).
+    pub fn fork_child_writes(&self, t: &mut ForkNs) {
+        let from = crate::procreg::FromParent::of(t.cgroup.as_deref());
+        // The forking thread's own view, which the child takes, is made
+        // into the child's view and record only once it has it.
+        if !crate::threadfs::any() {
+            let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
+            let record = crate::procreg::Prepared::of(
+                &t.line,
+                &t.inherit,
+                t.dirs.clone(),
+                crate::maps::forked(),
+                &auxv,
+                &from,
+                crate::syscalls::own_limits(),
+            );
+            t.prepared = Some((record, self.fs_opt().map(|fs| fs.shared())));
+        }
+        t.child_writes = Some(from);
+    }
+
+    /// In the parent, the host `fork` made `child`, which waits to be let
+    /// go on: its record and view, prepared before the fork, written for
+    /// it with its start time, so the child, whose every page touched is a
+    /// fault, writes neither. Whether they were (the child is told).
+    pub fn fork_write_child(&self, t: &ForkNs, child: i32) -> bool {
+        let Some((record, view)) = t.prepared.as_ref() else { return false };
+        if !crate::procreg::prepared_for(child, record) {
+            return false;
+        }
+        if let Some(view) = view {
+            crate::procstore::put_for(crate::procstore::Kind::View, child, view);
+        }
+        t.written.set(true);
+        true
     }
 
     /// In the parent after the host `fork` (`child` is the child's host
     /// pid, or negative if it failed): back to its own namespaces. Returns
     /// the child's pid as the parent sees it.
-    /// For a fork whose child runs [`Kernel::fork_child`]: the child writes
-    /// its whole record as it starts, with what this process knows of it,
-    /// and this process writes none (a look at the child's record waits
-    /// for it, [`crate::procreg::read`]).
-    pub fn fork_child_writes(t: &mut ForkNs) {
-        t.child_writes = Some(crate::procreg::FromParent::of(t.cgroup.as_deref()));
-    }
-
     pub fn fork_parent(&mut self, t: ForkNs, child: i32) -> i32 {
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         if let Some(caps) = t.caps {
@@ -488,7 +543,7 @@ impl<P: Platform> Kernel<P> {
             );
             // It holds this process's session keyring.
         }
-        if child > 0 && t.child_writes.is_some() {
+        if child > 0 && t.child_writes.is_some() && !t.written.get() {
             crate::procreg::child_writes_own(child);
         }
         if child > 0 {
@@ -526,8 +581,17 @@ impl<P: Platform> Kernel<P> {
     pub fn fork_child(&mut self, t: ForkNs) -> i32 {
         // Its view is the forking thread's, which other processes see.
         self.adopt_thread_view();
-        if let Some(fs) = self.fs_opt() {
-            fs.share();
+        let written = t.written.get();
+        match t.prepared.as_ref().map(|p| &p.1) {
+            Some(Some(_)) if written => {}
+            Some(Some(view)) => {
+                crate::procstore::put_own(crate::procstore::Kind::View, Some(view));
+            }
+            _ => {
+                if let Some(fs) = self.fs_opt() {
+                    fs.share();
+                }
+            }
         }
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
@@ -539,14 +603,17 @@ impl<P: Platform> Kernel<P> {
         // Its own record too: it may end before the parent writes it.
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
-        let auxv = self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
+        let prepared =
+            written || t.prepared.as_ref().is_some_and(|p| crate::procreg::own_prepared(&p.0));
+        let auxv = || self.fs_opt().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
         match &t.child_writes {
+            _ if prepared => {}
             Some(from) => crate::procreg::own_whole(
                 &t.line,
                 &t.inherit,
                 t.dirs.clone(),
                 crate::maps::forked(),
-                &auxv,
+                &auxv(),
                 from,
             ),
             None => crate::procreg::own_line(
@@ -554,11 +621,14 @@ impl<P: Platform> Kernel<P> {
                 &t.inherit,
                 t.dirs.clone(),
                 crate::maps::forked(),
-                &auxv,
+                &auxv(),
             ),
         }
-        // Its limits, its parent's, for other processes to read.
-        crate::syscalls::publish_limits();
+        // Its limits, its parent's, for other processes to read (in the
+        // record prepared for it already).
+        if !prepared {
+            crate::syscalls::publish_limits();
+        }
         if t.inherit.foster {
             crate::reaper::foster_started(&t.line.0);
         }
@@ -579,7 +649,11 @@ impl<P: Platform> Kernel<P> {
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
-        crate::reaper::start_if_reaper();
+        // A reaper: a pid namespace's init, or one its record makes one (the
+        // record prepared for it never does).
+        if !prepared || t.nums.first() == Some(&1) {
+            crate::reaper::start_if_reaper();
+        }
         t.nums.first().copied().unwrap_or_else(crate::host::pid)
     }
 

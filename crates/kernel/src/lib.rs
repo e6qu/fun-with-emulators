@@ -95,6 +95,7 @@ pub mod seqpacket;
 pub mod shared;
 #[cfg(target_os = "macos")]
 pub mod sharedfutex;
+pub mod shortlock;
 pub mod signal;
 pub mod signalfd;
 pub mod signote;
@@ -205,6 +206,36 @@ pub trait Platform {
         known: Option<&[(u64, u64)]>,
         cache: Option<&[u8]>,
     ) -> Result<(), PrepareFailed>;
+
+    /// Whether code the guest makes executable after mapping it (a JIT's)
+    /// runs by translation, the guest's memory never executable on the
+    /// host (the native backend): then such memory is handed over with
+    /// [`Platform::jit_code`] rather than prepared in place.
+    fn translates_jit(&self) -> bool {
+        false
+    }
+
+    /// `[addr, addr + len)` (host addresses) now holds code the guest made
+    /// executable after mapping it.
+    fn jit_code(&mut self, _addr: u64, _len: u64) {}
+
+    /// `[addr, addr + len)` (host addresses) is about to be replaced by
+    /// fresh pages, mapped as it was (`MADV_DONTNEED`): what was
+    /// translated from it goes, and it holds code to translate still.
+    fn jit_discarded(&mut self, _addr: u64, _len: u64) {}
+
+    /// `[addr, addr + len)` (host addresses) was unmapped, mapped anew or
+    /// given other protections: what was translated from it goes. Whether
+    /// any of it held code the guest made executable after mapping it.
+    fn jit_changed(&mut self, _addr: u64, _len: u64) -> bool {
+        false
+    }
+
+    /// `[addr, addr + len)` (host addresses) was just mapped or given
+    /// other protections, and the record of mappings says so: a mapping
+    /// of a file's pages code was translated from is noted as theirs (an
+    /// instruction cache flush through it is a flush of their code).
+    fn jit_mapped(&mut self, _addr: u64, _len: u64) {}
 
     /// Map the prepared image kept under `key` ([`prepcache::image_key`])
     /// over the mapping of a file's code at `[addr, addr + len)`, with
@@ -968,7 +999,7 @@ impl<P: Platform> Kernel<P> {
         creds::publish(&self.creds);
         // The limit was the guest's own, so it fits the new process's range
         // (the host limit is inherited); keep the default if it does not.
-        let _ = fdtable::set_limit(soft, hard);
+        let _ = self.set_nofile(soft, hard);
         if let Some(fs) = self.fs_opt_mut() {
             fs.set_umask(umask);
         }
@@ -1047,6 +1078,10 @@ impl<P: Platform> Kernel<P> {
     /// call runs again; if the handler has `SA_RESTART` and the call is one
     /// Linux restarts, it runs again after the handler returns; otherwise the
     /// guest gets `EINTR` once the handler returns.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.tracer.syscall(nr, args, result);
         // (`restart_syscall`'s own `EINTR` is its answer, not a host's.)
@@ -1148,6 +1183,10 @@ pub fn thread_reused() {
 /// Release every thread's robust futexes (`set_robust_list`) as the
 /// process ends or runs another program, its memory still there: Linux
 /// releases each thread's as the thread ends.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn release_robust_lists() {
     futex::release_robust(thread::take_robust_list(), thread::tid());
     for (tid, head) in thread::take_others_robust() {
@@ -1382,7 +1421,11 @@ pub fn forbid_fork() {
 /// the kernel's own registries use held, so that in a multithreaded guest
 /// the child cannot inherit one locked by a thread that does not exist in
 /// it. The caller holds the kernel lock itself. The locks are released in
-/// both processes.
+/// both processes. A process with no other thread takes none.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     if NO_FORK.load(std::sync::atomic::Ordering::SeqCst) {
         // SAFETY: setting this thread's errno.
@@ -1396,6 +1439,12 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
             *libc::__errno_location() = libc::ENOSYS
         };
         return -1;
+    }
+    // With no other thread in the process, none holds a lock the child
+    // would find held: the locks are not taken, which would touch (and
+    // copy, in both processes) the pages of every one of them.
+    if host::only_thread() {
+        return fork();
     }
     reaper::hold(|| {
         signalfd::hold(|| {
@@ -1462,6 +1511,10 @@ pub fn wake_futex(addr: u64, count: u32) {
 ///
 /// # Safety
 /// Pointer arguments must reference valid guest memory for the call.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     // None of the calls run on the shared side waits, nor does a memory
     // call.
@@ -1501,6 +1554,10 @@ pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
 /// differs: a write refused to a sealed memfd, a socket that stands in for
 /// another kind, a read of an unconnected Unix socket, and the `SIGPIPE` a
 /// socket write to a closed peer raises.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     inotify::after_io(nr, a, r);
     if r > 0 && matches!(nr, fwe_abi::nr::WRITE | fwe_abi::nr::WRITEV) {
@@ -1984,16 +2041,20 @@ fn sigpipe_for_socket(nr: u64, a: &[u64; 6]) {
 ///
 /// # Safety
 /// As for [`blocking_syscall`].
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     use fwe_abi::nr as n;
     if let Err(e) = fdtable::check_args(nr, &a) {
         return Some(e);
     }
-    // The host writes these buffers itself: pages of a private file view
-    // in them become the guest's own first (see `mm::views_written`).
-    if mm::any_views() {
+    // The host writes these buffers itself: pages in them it could not
+    // write become writable first (see `mm::host_writes`).
+    if mm::host_writes_watched() {
         match nr {
-            n::READ | n::PREAD64 => mm::views_written(a[1], a[2]),
+            n::READ | n::PREAD64 | n::RECVFROM => mm::host_writes(a[1], a[2]),
             n::READV | n::PREADV | n::PREADV2 => {
                 for v in uaccess::read_bytes(a[1], (a[2].min(uaccess::UIO_MAXIOV) * 16) as usize)
                     .unwrap_or_default()
@@ -2003,7 +2064,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 {
                     let base = u64::from_ne_bytes(v[0..8].try_into().unwrap());
                     let len = u64::from_ne_bytes(v[8..16].try_into().unwrap());
-                    mm::views_written(base, len);
+                    mm::host_writes(base, len);
                 }
             }
             _ => {}

@@ -132,13 +132,29 @@ impl<F: FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena, Option<&[u8]>) ->
 {
 }
 
+/// Where a position-independent executable is asked to go: two thirds of
+/// the host's 47 bits of address space, as Linux places one in a space of
+/// 47 bits. Far from fwe's own memory and from the mappings left to fwe
+/// ([`fwe_kernel::mm`]), it has free room below it, where a program may
+/// map memory it wants within a branch's reach of its own code (LuaJIT
+/// probes for its machine code there); its break grows above it.
+pub const PIE_BASE: u64 = 0x5555_5555_0000;
+
+/// Where the main stack is asked to end: near the top of the host's 47
+/// bits, above the program's image, as Linux places it at the top of the
+/// address space.
+pub const STACK_TOP: u64 = 0x7fff_0000_0000;
+
 /// Load `elf`, read from file `file` (its identity, under which what is
-/// learned of its code is kept: [`fwe_kernel::prepcache`]).
+/// learned of its code is kept: [`fwe_kernel::prepcache`]); if it is
+/// position-independent, at `at` where that is free, else where the host
+/// finds room.
 pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
     file: Option<fwe_kernel::prepcache::FileId>,
     slots: (u32, u32),
+    at: Option<u64>,
     mut prepare_exec: impl PrepareFn,
 ) -> Result<Loaded, LoadError> {
     use fwe_kernel::prepcache as cache;
@@ -183,10 +199,11 @@ pub fn load(
     // Reserve the whole range first so segments land at fixed offsets from
     // each other and gaps between them stay inaccessible.
     let base = if elf.is_pie() {
-        // SAFETY: a fresh inaccessible reservation anywhere; not MAP_FIXED.
+        // SAFETY: a fresh inaccessible reservation; not MAP_FIXED, `at` is
+        // only a hint.
         let p = unsafe {
             libc::mmap(
-                std::ptr::null_mut(),
+                at.unwrap_or(0) as *mut libc::c_void,
                 total as usize,
                 libc::PROT_NONE,
                 libc::MAP_PRIVATE | libc::MAP_ANON,
@@ -332,6 +349,8 @@ fn finish(
     }
 
     let (lo, hi) = elf.bounds();
+    // What the code's stubs left of the arena: room for call stubs.
+    crate::prepare::spare_arena(arena.next, arena.end);
     Ok(Loaded {
         stub_arena: arena,
         bias,

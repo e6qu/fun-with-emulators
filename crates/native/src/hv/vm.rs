@@ -179,7 +179,7 @@ fn flushed_hook(generation: u64) {
 }
 
 /// The generation an edit that lost a translation belongs to; memory it
-/// freed is reusable once [`flushed`] reaches it.
+/// freed is reusable once [`flushed_generation`] reaches it.
 pub fn generation() -> u64 {
     GENERATION.load(SeqCst)
 }

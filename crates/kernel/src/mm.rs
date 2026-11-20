@@ -6,9 +6,8 @@ use crate::vmas::Piece;
 use crate::{Kernel, MemCall, Platform};
 use fwe_abi::{err, errno, mman};
 use std::collections::BTreeMap;
-use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The program break: a reserved region after the executable image that
 /// `brk` commits and releases.
@@ -30,14 +29,12 @@ pub(crate) struct Ranges {
     /// Linux discards the old address space; fwe's own memory is never in
     /// the set.
     guest: BTreeMap<u64, u64>,
-    /// Guest memory the guest mapped both writable and executable, host
-    /// addresses. macOS never maps memory so, so the host keeps these
-    /// writable only: in the hypervisor backend the VM alone executes them,
-    /// and the native backend makes a page executable when the guest runs
-    /// code in it and writable again when it writes there
-    /// ([`Kernel::write_exec_fault`]), as a JIT compiler expects of such
-    /// memory.
-    write_exec: BTreeMap<u64, u64>,
+    /// The host range of the latest mapping the guest made, not yet in
+    /// [`Ranges::guest`]: kept apart until anything else changes or reads
+    /// the set ([`lock_ranges`] puts it in first), so that a mapping
+    /// unmapped at once, as an allocator's often is, costs the set one look
+    /// instead of an insertion and a removal.
+    latest: Option<(u64, u64)>,
     /// Pages of private mappings of files with no name (a memfd, or a file
     /// unlinked once opened: memory shared through it) not yet written,
     /// host addresses. Linux shows such a page what is written to the file
@@ -73,7 +70,7 @@ pub(crate) struct Ranges {
 impl Ranges {
     const NONE: Ranges = Ranges {
         guest: BTreeMap::new(),
-        write_exec: BTreeMap::new(),
+        latest: None,
         file_views: BTreeMap::new(),
         wipe_on_fork: BTreeMap::new(),
         grows_down: BTreeMap::new(),
@@ -83,9 +80,31 @@ impl Ranges {
         guard: BTreeMap::new(),
     };
 
+    /// Put the latest mapping ([`Ranges::latest`]) in the guest's set.
+    fn settle(&mut self) {
+        if let Some((addr, len)) = self.latest.take() {
+            add_range(&mut self.guest, addr, len);
+        }
+    }
+
+    /// The guest mapped host range `[addr, addr + len)`: the latest
+    /// mapping, the one before it put in the set.
+    fn mapped(&mut self, addr: u64, len: u64) {
+        self.settle();
+        self.latest = Some((addr, len));
+    }
+
     /// Forget unmapped memory, `len` bytes at host address `host` and guest
     /// address `guest`, in every set.
     fn forget(&mut self, host: u64, guest: u64, len: u64) {
+        // The latest mapping, unmapped whole, never goes in: the set loses
+        // what it would have replaced, as it would with it put in and taken
+        // out.
+        if self.latest == Some((host, len)) {
+            self.latest = None;
+        } else {
+            self.settle();
+        }
         self.forget_host(host, len);
         remove_range(&mut self.wipe_on_fork, host, len);
         for set in [
@@ -104,7 +123,7 @@ impl Ranges {
     /// Forget host range `[host, host + len)` of a mapping just made that
     /// failed (`mmap_call`), as its making added it.
     fn forget_host(&mut self, host: u64, len: u64) {
-        for set in [&mut self.guest, &mut self.write_exec, &mut self.file_views] {
+        for set in [&mut self.guest, &mut self.file_views] {
             remove_range(set, host, len);
         }
     }
@@ -119,7 +138,20 @@ static ANY_GROWS_DOWN: AtomicBool = AtomicBool::new(false);
 /// ([`hold`]).
 static RANGES: Mutex<Ranges> = Mutex::new(Ranges::NONE);
 
+/// The ranges, the latest mapping among them.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn lock_ranges() -> std::sync::MutexGuard<'static, Ranges> {
+    let mut r = lock_ranges_as_they_are();
+    r.settle();
+    r
+}
+
+/// The ranges, the latest mapping still apart ([`Ranges::latest`]), for
+/// [`Ranges::mapped`] and [`Ranges::forget`].
+fn lock_ranges_as_they_are() -> std::sync::MutexGuard<'static, Ranges> {
     RANGES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
@@ -163,13 +195,17 @@ fn remove_range(maps: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
         return;
     }
     let end = addr.saturating_add(len);
-    // Most often the range is one of the set, whole (a mapping unmapped as
-    // it was made): no other overlaps it.
-    if let std::collections::btree_map::Entry::Occupied(o) = maps.entry(addr)
-        && *o.get() == end
-    {
-        o.remove();
-        return;
+    // Most often nothing overlaps the range, or it is one of the set,
+    // whole (a mapping unmapped as it was made): one look, at the last
+    // range that starts before its end.
+    match maps.range(..end).next_back() {
+        Some((&s, &e)) if e > addr => {
+            if (s, e) == (addr, end) {
+                maps.remove(&s);
+                return;
+            }
+        }
+        _ => return,
     }
     // From the last range that overlaps down to the first: what is put
     // back of one is outside the range, and not taken again.
@@ -263,6 +299,10 @@ impl<P: Platform> Kernel<P> {
 /// gives the child new memory there. They are zeroed in place, the
 /// mappings left as they are (a backend may map the memory itself),
 /// writable for the moment if they are not.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn forked_child() {
     // Kept as start and end.
     let ranges: Vec<(u64, u64)> =
@@ -284,10 +324,34 @@ pub fn forked_child() {
     }
 }
 
+/// Calls that change mappings or protections, each counted as it starts
+/// and as it ends: a thread whose access faulted, but which the page's
+/// protection now allows, can tell whether another thread changed it
+/// meanwhile (the access is then tried again) from a fault that stands.
+static PROTECTION_CHANGES: AtomicU64 = AtomicU64::new(0);
+
+/// See [`PROTECTION_CHANGES`].
+pub fn count_protection_change() {
+    PROTECTION_CHANGES.fetch_add(1, Ordering::SeqCst);
+}
+
+/// See [`PROTECTION_CHANGES`]. Async-signal-safe.
+pub fn protection_changes() -> u64 {
+    PROTECTION_CHANGES.load(Ordering::SeqCst)
+}
+
 /// The host's page size.
 pub fn host_page_size() -> u64 {
+    // Read once (0: not yet); every thread reads the same value.
+    static SIZE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let size = SIZE.load(std::sync::atomic::Ordering::Relaxed);
+    if size != 0 {
+        return size;
+    }
     // SAFETY: sysconf only reads a system value.
-    (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64
+    let size = (unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).max(4096) as u64;
+    SIZE.store(size, std::sync::atomic::Ordering::Relaxed);
+    size
 }
 
 /// The host protection of the memory at host address `addr`.
@@ -310,26 +374,6 @@ fn region_prot(addr: u64) -> libc::c_int {
 /// Whether a file view was ever made: until one is, a write for the guest
 /// takes no lock to look for one.
 static ANY_VIEWS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Whether host address `addr` is in writable and executable guest memory.
-fn is_write_exec(addr: u64) -> bool {
-    lock_ranges().write_exec.range(..=addr).next_back().is_some_and(|(_, &end)| addr < end)
-}
-
-/// If host address `addr` is in writable and executable guest memory, make
-/// its page (of `page_size` bytes) writable, and report whether it was. Takes
-/// no kernel lock, so fwe's own code may use it when a write it makes for the
-/// guest faults.
-pub fn write_exec_writable(addr: u64, page_size: u64) -> bool {
-    if !is_write_exec(addr) {
-        return false;
-    }
-    let page = addr & !(page_size - 1);
-    let rw = libc::PROT_READ | libc::PROT_WRITE;
-    // SAFETY: a page of guest memory the guest mapped writable and
-    // executable; only its host protections change.
-    unsafe { libc::mprotect(page as *mut libc::c_void, page_size as usize, rw) == 0 }
-}
 
 /// Both `PROT_WRITE` and `PROT_EXEC`.
 fn wants_write_exec(prot: u64) -> bool {
@@ -547,6 +591,10 @@ pub(crate) fn resident(start: u64, end: u64) -> u64 {
 }
 
 /// Run `f` holding the tracking lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = lock_ranges();
     f()
@@ -994,6 +1042,37 @@ mod tests {
         assert_eq!(here(tracked()), vec![]);
     }
 
+    /// The latest mapping is kept apart and put in the set when anything
+    /// else comes; unmapped at once it never goes in, and what it replaced
+    /// goes all the same.
+    #[test]
+    fn latest_mapping_goes_in_unless_unmapped_at_once() {
+        let mut r = Ranges::NONE;
+        r.mapped(0x10000, 0x8000);
+        assert!(r.guest.is_empty());
+        r.mapped(0x20000, 0x4000);
+        assert_eq!(r.guest.iter().collect::<Vec<_>>(), vec![(&0x10000, &0x18000)]);
+        r.forget(0x20000, 0x20000, 0x4000);
+        assert_eq!(r.latest, None);
+        assert_eq!(r.guest.iter().collect::<Vec<_>>(), vec![(&0x10000, &0x18000)]);
+        // Fixed over the middle of the first, then unmapped: the middle
+        // goes.
+        r.mapped(0x12000, 0x2000);
+        r.forget(0x12000, 0x12000, 0x2000);
+        assert_eq!(
+            r.guest.iter().collect::<Vec<_>>(),
+            vec![(&0x10000, &0x12000), (&0x14000, &0x18000)]
+        );
+        // Unmapped other than whole: it went in first.
+        r.mapped(0x30000, 0x4000);
+        r.forget(0x30000, 0x30000, 0x2000);
+        r.settle();
+        assert_eq!(
+            r.guest.iter().collect::<Vec<_>>(),
+            vec![(&0x10000, &0x12000), (&0x14000, &0x18000), (&0x32000, &0x34000)]
+        );
+    }
+
     /// Locked memory is wired on the host, and unwired again.
     #[test]
     fn locked_memory_is_wired_on_the_host() {
@@ -1079,12 +1158,6 @@ mod tests {
     }
 }
 
-/// The known-code ranges given for memory a guest makes executable after
-/// mapping it (JIT code): none, so `x18` lookalikes there are left alone.
-/// JIT compilers for Linux arm64 do not use `x18` (V8 reserves it), while
-/// their code pages hold data that can look like an instruction naming it.
-const JIT_CODE: Option<&[(u64, u64)]> = Some(&[]);
-
 /// The executable sections of the ELF file open at `fd`, as file-offset
 /// ranges (its executable segments' without section headers), or `None` if
 /// it is not a readable regular ELF (then the caller translates the whole
@@ -1141,15 +1214,31 @@ fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
     ranges
 }
 
+/// Whether a write the host makes for the guest has anything to do first
+/// ([`host_writes`]).
+pub fn host_writes_watched() -> bool {
+    any_views()
+}
+
+/// The host is about to write guest `[addr, addr + len)` itself (a `read`
+/// into it, a result fwe copies): pages of file views there become copies
+/// first, as the guest's own write would make them.
+pub fn host_writes(addr: u64, len: u64) {
+    if len == 0 {
+        return;
+    }
+    views_written(addr, len);
+}
+
 /// Whether any page of a private file view waits to be written (see
-/// [`FILE_VIEWS`]).
+/// [`Ranges::file_views`]).
 pub fn any_views() -> bool {
     ANY_VIEWS.load(std::sync::atomic::Ordering::SeqCst) && !lock_ranges().file_views.is_empty()
 }
 
 /// fwe is about to write guest range `[addr, addr + len)` for the guest:
 /// pages of a file view in it become copies of themselves first (see
-/// [`FILE_VIEWS`]), as the guest's own write would make them. Cheap where
+/// [`Ranges::file_views`]), as the guest's own write would make them. Cheap where
 /// there are none.
 pub fn views_written(addr: u64, len: u64) {
     if len == 0 || !any_views() {
@@ -1220,7 +1309,8 @@ fn host_prot(prot: u64) -> libc::c_int {
 }
 
 /// The host protections guest protections `prot` end up as: writable and
-/// executable memory is only writable (see [`WRITE_EXEC`]).
+/// executable memory is only writable (the native backend runs it by
+/// translation, the VM as it is).
 fn final_prot(prot: u64) -> libc::c_int {
     let p = host_prot(prot);
     if wants_write_exec(prot) { p & !libc::PROT_EXEC } else { p }
@@ -1399,6 +1489,9 @@ impl<P: Platform> Kernel<P> {
         }
         if nowrite {
             crate::maps::record().no_write(r as u64, len);
+        }
+        if shared && self.platform.translates_jit() {
+            self.platform.jit_mapped(crate::uaccess::g2h(r as u64), len);
         }
         // Writes through a shared writable mapping are not seen one by one:
         // a set-ID file mapped so loses its bits as it is mapped, as one
@@ -1608,6 +1701,9 @@ impl<P: Platform> Kernel<P> {
         if r == 0 {
             let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
             crate::maps::record().protected(addr, self.page_up(len), prot);
+            if self.platform.translates_jit() {
+                self.platform.jit_mapped(crate::uaccess::g2h(addr), self.page_up(len));
+            }
         }
         if r >= 0 {
             crate::maps::publish();
@@ -1659,6 +1755,17 @@ impl<P: Platform> Kernel<P> {
         }
         if r >= 0 {
             crate::maps::publish();
+            // Code a JIT moved: translated anew from where it is now.
+            if self.platform.translates_jit() {
+                let moved =
+                    self.platform.jit_changed(crate::uaccess::g2h(old), self.page_up(old_len));
+                let host = crate::uaccess::g2h(r as u64);
+                let _ = self.platform.jit_changed(host, self.page_up(new_len));
+                if moved {
+                    self.platform.jit_code(host, self.page_up(new_len));
+                }
+                self.platform.jit_mapped(host, self.page_up(new_len));
+            }
         }
         r
     }
@@ -2037,7 +2144,7 @@ impl<P: Platform> Kernel<P> {
         // mappings are made private for this, since the code is modified.
         let exec = prot & mman::PROT_EXEC != 0;
         // A private mapping of a file with no name: shared on the host,
-        // never writable there (see [`FILE_VIEWS`]).
+        // never writable there (see [`Ranges::file_views`]).
         let view = !anonymous
             && !exec
             && hflags & libc::MAP_PRIVATE != 0
@@ -2045,7 +2152,24 @@ impl<P: Platform> Kernel<P> {
         if view {
             hflags = (hflags & !libc::MAP_PRIVATE) | libc::MAP_SHARED;
         }
-        let initial_prot = if exec {
+        // Code in a file shared and open for writing (a JIT's code mapped
+        // twice through a memfd, writable and executable): it changes
+        // through the file's other mappings, so it is mapped shared as it
+        // is, never executable on the host, and runs by translation where
+        // the backend translates.
+        let changing = exec
+            && !anonymous
+            && hflags & libc::MAP_SHARED != 0
+            && self.platform.translates_jit()
+            // SAFETY: F_GETFL only queries the descriptor.
+            && unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDWR;
+        // It, and memory mapped writable and executable (a JIT's), runs by
+        // translation: never prepared, its words as the program wrote them.
+        let translated = changing || (wants_write_exec(prot) && self.platform.translates_jit());
+        let exec = exec && !translated;
+        let initial_prot = if translated {
+            (host_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ
+        } else if exec {
             if hflags & libc::MAP_SHARED != 0 && !anonymous {
                 hflags = (hflags & !libc::MAP_SHARED) | libc::MAP_PRIVATE;
             }
@@ -2059,8 +2183,11 @@ impl<P: Platform> Kernel<P> {
         let host_fd = if anonymous { -1 } else { fd as i32 };
         if flags & mman::MAP_FIXED != 0 {
             // A fixed mapping replaces what is there: the VM lets go of it
-            // before the host frees it.
+            // before the host frees it, and translations of code there go
+            // (their pages' protections given back before the mapping
+            // sets its own).
             self.platform.unmap_guest(addr, self.page_up(len));
+            let _ = self.platform.jit_changed(haddr, self.page_up(len));
         }
         let mut retried = false;
         let guest = 'map: loop {
@@ -2097,19 +2224,19 @@ impl<P: Platform> Kernel<P> {
             // What was owed to the pages replaced goes with them.
             crate::lazycode::unmapped(p, self.page_up(len));
             {
-                let mut r = lock_ranges();
-                add_range(&mut r.guest, p, self.page_up(len));
+                let mut r = lock_ranges_as_they_are();
+                r.mapped(p, self.page_up(len));
                 if view {
                     ANY_VIEWS.store(true, std::sync::atomic::Ordering::SeqCst);
                     add_range(&mut r.file_views, p, self.page_up(len));
                 } else {
                     remove_range(&mut r.file_views, p, self.page_up(len));
                 }
-                if wants_write_exec(prot) {
-                    add_range(&mut r.write_exec, p, self.page_up(len));
-                } else {
-                    remove_range(&mut r.write_exec, p, self.page_up(len));
-                }
+            }
+            // Writable and executable: a JIT's code, run by translation
+            // where the backend translates it.
+            if translated {
+                self.platform.jit_code(p, self.page_up(len));
             }
             if let Err(e) = self.platform.map_guest(guest, self.page_up(len), prot) {
                 // SAFETY: unmapping the mapping just created.
@@ -2241,6 +2368,7 @@ impl<P: Platform> Kernel<P> {
     /// Unmap guest host memory, or have the backend take it back
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
+        let _ = self.platform.jit_changed(addr, self.page_up(len));
         crate::lazycode::unmapped(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
@@ -2262,7 +2390,7 @@ impl<P: Platform> Kernel<P> {
         self.platform.unmap_guest(addr, self.page_up(len));
         let r = self.unmap_host(host as u64, len);
         if r == 0 {
-            lock_ranges().forget(host as u64, addr, self.page_up(len));
+            lock_ranges_as_they_are().forget(host as u64, addr, self.page_up(len));
         }
         r
     }
@@ -2314,7 +2442,7 @@ impl<P: Platform> Kernel<P> {
         }
         let a = crate::uaccess::g2h(addr) as *mut libc::c_void;
         // Not yet written pages of a file view stay unwritable on the host
-        // (see [`FILE_VIEWS`]); made executable, a copy (code is prepared in
+        // (see [`Ranges::file_views`]); made executable, a copy (code is prepared in
         // place).
         let views: Vec<(u64, u64)> = {
             let len = self.page_up(len);
@@ -2334,27 +2462,23 @@ impl<P: Platform> Kernel<P> {
                 remove_range(&mut lock_ranges().file_views, s, e - s);
             }
         }
-        if prot & mman::PROT_EXEC != 0 {
-            // SAFETY: guest-requested protection change of guest memory.
-            if unsafe { libc::mprotect(a, len as usize, libc::PROT_READ | libc::PROT_WRITE) } != 0 {
-                return last_error();
-            }
-            // Code made executable after it was mapped is a JIT's, with no
-            // unwind table to tell its code from the data in it (V8 keeps
-            // constant pools and metadata in its code pages), and JITs leave
-            // x18 alone: only its system calls and thread-pointer accesses
-            // are translated (see [`JIT_CODE`]).
-            // Only what the file has (a page past its end has nothing to
-            // read, and faults).
-            let backed = self.backed_len(addr, self.page_up(len));
-            if backed > 0
-                && let Err(e) = self.platform.prepare_exec(a as u64, backed, JIT_CODE, None)
-            {
-                return self.prepare_failed(e);
-            }
+        // Code a JIT makes executable runs by translation where the backend
+        // translates it: never executable on the host, nothing written.
+        let translated = self.platform.translates_jit();
+        if translated {
+            let _ = self.platform.jit_changed(a as u64, self.page_up(len));
         }
+        // (Readable: fwe reads the code to translate it.)
+        let host = if translated && prot & mman::PROT_EXEC != 0 {
+            (final_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ
+        } else {
+            final_prot(prot)
+        };
         // SAFETY: guest-requested protection change of guest memory.
-        let r = ret(unsafe { libc::mprotect(a, len as usize, final_prot(prot)) });
+        let r = ret(unsafe { libc::mprotect(a, len as usize, host) });
+        if r == 0 && translated && prot & mman::PROT_EXEC != 0 {
+            self.platform.jit_code(a as u64, self.page_up(len));
+        }
         if r == 0 {
             // Code with writes owed: made writable, they are made first.
             crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
@@ -2372,33 +2496,9 @@ impl<P: Platform> Kernel<P> {
             }
         }
         if r == 0 {
-            let mut r = lock_ranges();
-            if wants_write_exec(prot) {
-                add_range(&mut r.write_exec, a as u64, self.page_up(len));
-            } else {
-                remove_range(&mut r.write_exec, a as u64, self.page_up(len));
-            }
-            drop(r);
             self.platform.protect_guest(addr, self.page_up(len), prot);
         }
         r
-    }
-
-    /// How much of guest range `[addr, addr + len)`, from its start, has
-    /// something behind it: all of it, but for a file mapping the pages up
-    /// to the file's end.
-    fn backed_len(&self, addr: u64, len: u64) -> u64 {
-        use crate::vmas::Mapping;
-        let Some(p) = crate::maps::record().areas_in(addr, addr + len).into_iter().next() else {
-            return len;
-        };
-        let area = p.value.at(addr.saturating_sub(p.start));
-        if !matches!(area.object.name, crate::maps::Name::Path(_) | crate::maps::Name::Exe) {
-            return len;
-        }
-        let Some(path) = region_file(crate::uaccess::g2h(addr)) else { return len };
-        let Ok(meta) = std::fs::metadata(std::ffi::OsStr::from_bytes(&path)) else { return len };
-        self.page_up(meta.len().saturating_sub(area.object.offset)).min(len)
     }
 
     /// A fault the guest took at host address `addr`: if it is below a
@@ -2437,14 +2537,9 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
-    /// A fault the guest took at host address `addr`, fetching an
-    /// instruction (`exec`) or writing: if `addr` is in memory the guest
-    /// mapped writable and executable, switch its page to what the access
-    /// needs — executable, with its code prepared as any guest code is, or
-    /// writable — and report it handled, so the access is retried.
     /// A write the guest made at host address `addr` faulted: if it is a
     /// page of a file view not yet written that the guest may write, the
-    /// page becomes a copy of itself (see [`FILE_VIEWS`]), and the write is
+    /// page becomes a copy of itself (see [`Ranges::file_views`]), and the write is
     /// tried again.
     pub fn view_fault(&mut self, addr: u64) -> bool {
         let page = addr & !(self.page_size - 1);
@@ -2471,24 +2566,6 @@ impl<P: Platform> Kernel<P> {
             )
         };
         remove_range(&mut lock_ranges().file_views, page, self.page_size);
-        true
-    }
-
-    pub fn write_exec_fault(&mut self, addr: u64, exec: bool) -> bool {
-        if !write_exec_writable(addr, self.page_size) {
-            return false;
-        }
-        if exec {
-            let page = addr & !(self.page_size - 1);
-            if let Err(e) = self.platform.prepare_exec(page, self.page_size, JIT_CODE, None) {
-                self.tracer.note(&format!("code at {page:#x} not prepared: {}", e.why));
-                return false;
-            }
-            let rx = libc::PROT_READ | libc::PROT_EXEC;
-            // SAFETY: a page of guest memory the guest mapped writable and
-            // executable; only its host protections change.
-            unsafe { libc::mprotect(page as *mut libc::c_void, self.page_size as usize, rx) };
-        }
         true
     }
 
@@ -2697,6 +2774,9 @@ impl<P: Platform> Kernel<P> {
                 // then maps the new ones (whatever the outcome, so the
                 // guest keeps the mappings it had).
                 self.platform.replacing_guest(addr, len);
+                // Code translated from it goes, its pages writable again
+                // (the protection the fresh pages take).
+                self.platform.jit_discarded(host, len);
                 let r = dontneed(areas.iter().map(|p| {
                     let (start, end) = (p.start.max(addr), p.end.min(addr + len));
                     let host = crate::uaccess::g2h(start);
@@ -2902,7 +2982,6 @@ impl<P: Platform> Kernel<P> {
                 self.platform.unmap_guest(old + new_len, old_len - new_len);
                 self.unmap_host(tail, old_len - new_len);
                 untrack(tail, old_len - new_len);
-                remove_range(&mut lock_ranges().write_exec, tail, old_len - new_len);
             }
             return old as i64;
         }

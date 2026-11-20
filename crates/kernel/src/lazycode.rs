@@ -13,7 +13,7 @@
 //! first ([`protected`]), so that none lands on what the guest wrote.
 //!
 //! Which pages a run wrote is kept with the code's preparation
-//! ([`keep_hot`]): the next start of the same file writes those at once,
+//! (the backend's `prepare::keep_hot`): the next start of the same file writes those at once,
 //! as it prepares the code, and owes only the rest.
 
 use std::collections::BTreeMap;

@@ -2021,7 +2021,16 @@ impl<P: Platform> Kernel<P> {
         let mode = self.fs().apply_umask(mode as u32) & 0o1777;
         let host_mode = crate::modes::host_perm(mode, true);
         let dir = r.dir.as_raw_fd();
-        // A new cgroup, within the limits of those above it.
+        // A new cgroup, within the limits of those above it, made whole
+        // under the hierarchy's lock (no removal of its parent between).
+        let _cgroups = if r.fstype == crate::mounts::FsType::Cgroup2 {
+            match crate::cgroupfs::lock_tree() {
+                Ok(l) => Some(l),
+                Err(e) => return err(e),
+            }
+        } else {
+            None
+        };
         if r.fstype == crate::mounts::FsType::Cgroup2
             && stat_at(dir, &name).is_err()
             && let Some(parent) = crate::fs::host_path_in(dir, b".")

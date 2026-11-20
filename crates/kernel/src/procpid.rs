@@ -79,12 +79,16 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
                 tsize,
             )
         } == tsize;
+        let start = b.pbi_start_tvsec * 1_000_000 + b.pbi_start_tvusec;
         let state = match b.pbi_status {
+            4 => b'T', // SSTOP
+            5 => b'Z', // SZOMB
+            // Not yet in the program: whatever waits the host shows it in
+            // are its making's ([`crate::procstore::entered`]).
+            _ if crate::procstore::not_yet_entered(pid, start) => b'R',
             // SRUN: running or runnable, as the host sees a process that
             // is neither stopped nor ended; Linux tells from its threads.
             2 => threads_state(pid),
-            4 => b'T', // SSTOP
-            5 => b'Z', // SZOMB
             _ => b'S', // SIDL, SSLEEP
         };
         let ns_to_ticks = |ns: u64| ns * HZ / 1_000_000_000;
@@ -129,11 +133,16 @@ fn ticks_since_boot(started: f64) -> u64 {
 /// for a processor, `S` if it sleeps, as a thread in a system call that
 /// waits does, which programs wait to see). This process's main thread is
 /// fwe's record of it; another's is the first the host lists, the one
-/// created first.
+/// created first. One in fwe's own work, waiting for the host or not, is
+/// running ([`crate::procstore::Busy`]), as a Linux thread doing its
+/// kernel's work is.
 #[cfg(target_os = "macos")]
 fn threads_state(pid: i32) -> u8 {
     /// `PROC_PIDLISTTHREADS`: the process's thread handles.
     const PROC_PIDLISTTHREADS: i32 = 6;
+    if crate::procstore::busy(pid) {
+        return b'R';
+    }
     if pid == crate::host::pid() {
         return match crate::thread::host_state(crate::thread::tgid()) {
             Some((_, _, true)) | None => b'R',
@@ -163,7 +172,16 @@ fn threads_state(pid: i32) -> u8 {
             tsize,
         )
     };
-    if n == tsize && t.pth_run_state != libc::TH_STATE_RUNNING { b'S' } else { b'R' }
+    if n != tsize {
+        return b'R';
+    }
+    match t.pth_run_state {
+        libc::TH_STATE_RUNNING => b'R',
+        // A wait it cannot be woken from by a signal (a page brought in):
+        // Linux's disk sleep.
+        libc::TH_STATE_UNINTERRUPTIBLE => b'D',
+        _ => b'S',
+    }
 }
 
 /// The CPU time host process `pid` has used, user and system, in

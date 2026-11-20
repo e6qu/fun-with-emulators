@@ -10,6 +10,7 @@ const EPERM: i32 = 1;
 const EINVAL: i32 = 22;
 const EMFILE: i32 = 24;
 const F_DUPFD: i32 = 0;
+const F_GETFD: i32 = 1;
 const SYS_CLOSE_RANGE: i64 = 436;
 
 #[repr(C)]
@@ -33,6 +34,9 @@ unsafe extern "C" {
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn syscall(n: i64, ...) -> i64;
+    fn fork() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+    fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
 
@@ -224,6 +228,53 @@ fn main() {
             // SAFETY: an 8-byte buffer.
             let n = unsafe { read(fd, v.as_mut_ptr(), 8) };
             println!("and counts: {w} {n} {}", u64::from_ne_bytes(v));
+        }
+        Some("raised") => {
+            // Nothing is open at the soft limit, whatever fwe holds.
+            let lim = nofile();
+            let at = lim.cur as i32;
+            // SAFETY: plain calls.
+            let (r, e) = unsafe { (close(at), errno()) };
+            println!("close at the soft limit: {r} {}", name(e));
+            // SAFETY: plain calls.
+            let (r, e) = unsafe { (fcntl(at, F_GETFD), errno()) };
+            println!("F_GETFD there: {r} {}", name(e));
+            // Raised past it, the numbers above it are the guest's, given
+            // in turn, and the root is still fwe's.
+            let raised = Rlimit { cur: lim.cur + 64, max: lim.max };
+            // SAFETY: a valid in-parameter.
+            let r = unsafe { setrlimit(RLIMIT_NOFILE, &raised) };
+            println!("raised by 64: {r}");
+            let mut held = Vec::new();
+            loop {
+                // SAFETY: plain call.
+                let fd = unsafe { fcntl(1, F_DUPFD, 0) };
+                if fd < 0 {
+                    println!("dup stopped at the new limit: {} {}", fd, name(errno()));
+                    break;
+                }
+                held.push(fd);
+            }
+            let past: Vec<i32> = held.iter().copied().filter(|&fd| fd >= at).collect();
+            let each = past.windows(2).all(|w| w[1] == w[0] + 1);
+            println!("past the old limit: {} in turn {each}", past.len());
+            for fd in held.into_iter().filter(|&fd| fd > 2) {
+                // SAFETY: closing what this scenario opened.
+                unsafe { close(fd) };
+            }
+            let own = std::fs::read("/fds").is_ok_and(|b| b.starts_with(b"\x7fELF"));
+            println!("own binary read through the root: {own}");
+            // SAFETY: a fork; the child only reads a file and leaves.
+            let pid = unsafe { fork() };
+            if pid == 0 {
+                let ok = std::fs::read("/fds").is_ok_and(|b| b.starts_with(b"\x7fELF"));
+                // SAFETY: leaving the child at once.
+                unsafe { _exit(if ok { 0 } else { 1 }) };
+            }
+            let mut status = 0;
+            // SAFETY: a valid out-parameter.
+            unsafe { waitpid(pid, &mut status, 0) };
+            println!("and by a child: {}", status == 0);
         }
         other => {
             eprintln!("unknown scenario {other:?}");

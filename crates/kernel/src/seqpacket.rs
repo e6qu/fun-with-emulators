@@ -78,6 +78,10 @@ static LOCKS: Mutex<BTreeMap<u64, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new())
 /// Run a host `fork` (see [`crate::fork_locked`]) with the table of locks
 /// held; in the child, the sockets' locks are new: one a thread of the
 /// parent held (blocked in a receive, say) has no holder there.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
     let mut locks = LOCKS.lock().unwrap_or_else(|e| e.into_inner());
     let pid = fork();

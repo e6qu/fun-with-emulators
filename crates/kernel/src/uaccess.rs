@@ -92,6 +92,29 @@ pub fn add_translation(guest: u64, len: u64, host: u64) {
     let mut t = table_mut();
     let at = t.partition_point(|x| x.lo < guest);
     t.insert(at, Translation { lo: guest, hi: guest + len, host });
+    // Ranges that continue each other in guest and host memory are one.
+    let mut merged: Vec<Translation> = Vec::with_capacity(t.len());
+    for x in t.iter() {
+        match merged.last_mut() {
+            Some(p) if p.hi == x.lo && p.host + (p.hi - p.lo) == x.host => p.hi = x.hi,
+            _ => merged.push(*x),
+        }
+    }
+    *t = merged;
+}
+
+/// The host address of the memory of the translated range that starts at
+/// guest address `guest`, if one does: a range ending there is backed
+/// just below it to read as one with it.
+pub fn host_before(guest: u64) -> Option<u64> {
+    table().iter().find(|x| x.lo == guest).map(|x| x.host)
+}
+
+/// The host address just past the memory of the translated range that
+/// ends at guest address `guest`, if one does: where a range continuing
+/// it would be backed to read as one with it.
+pub fn host_after(guest: u64) -> Option<u64> {
+    table().iter().find(|x| x.hi == guest).map(|x| x.host + (x.hi - x.lo))
 }
 
 /// Guest addresses `[guest, guest + len)` are their own host addresses
@@ -140,8 +163,18 @@ pub fn crosses(addr: u64, len: u64) -> bool {
     table().iter().any(|t| addr < t.hi && end > t.lo && (addr < t.lo || end > t.hi))
 }
 
+/// How many bytes from guest address `addr` on share its translation (or
+/// its having none): what one host address reaches.
+pub fn span(addr: u64) -> u64 {
+    run(addr).1
+}
+
 /// The host address of guest address `addr`, and how many bytes from it
 /// on share its translation (`u64::MAX` for an untranslated run).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn run(addr: u64) -> (u64, u64) {
     if TRANSLATED.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return (addr, u64::MAX);
@@ -240,7 +273,7 @@ pub fn valid(addr: u64, len: u64, write: bool) -> bool {
     if write {
         // Pages of a file view become the guest's own first (as its own
         // write makes them).
-        crate::mm::views_written(addr, len);
+        crate::mm::host_writes(addr, len);
     }
     len == 0 || VALIDATOR.get().is_none_or(|f| f(addr, len, write))
 }
@@ -377,6 +410,10 @@ fn check(ok: bool) -> Result<()> {
 ///
 /// # Safety
 /// `buf` must be valid for `len` bytes.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Result<()> {
     let addr = guest_of(addr);
     // Past a user address space (48 bits), or wrapping: never the guest's,
@@ -716,8 +753,12 @@ mod tests {
     /// tests running alongside are not affected.
     #[test]
     fn translated_ranges_split_copies_where_they_meet() {
-        let a = vec![0xaau8; 0x2000];
-        let b = vec![0xbbu8; 0x1000];
+        // Two host buffers apart (ranges whose memory continues each
+        // other's are one: [`ranges_continuing_each_other_are_one`]).
+        let mut mem = vec![0u8; 0x4000];
+        mem[..0x2000].fill(0xaa);
+        mem[0x3000..].fill(0xbb);
+        let (a, b) = (&mem[..0x2000], &mem[0x3000..]);
         add_translation(0x1_0000, 0x2000, a.as_ptr() as u64);
         add_translation(0x1_2000, 0x1000, b.as_ptr() as u64);
         assert_eq!(g2h(0x1_0010), a.as_ptr() as u64 + 0x10);
@@ -745,7 +786,22 @@ mod tests {
         clear_host_args();
         assert_eq!(guest_of(h + 8), h + 8);
         remove_translation(0x1_0000, 0x3000);
-        assert!(translations().iter().all(|&(g, _, _)| !(0x1_0000..0x1_0000_0000).contains(&g)));
+        assert!(translations().iter().all(|&(g, _, _)| !(0x1_0000..0x1_3000).contains(&g)));
+    }
+
+    /// A range added where another ends, its memory where the other's
+    /// ends, joins it: a buffer across the two has one host address.
+    #[test]
+    fn ranges_continuing_each_other_are_one() {
+        let mem = vec![0u8; 0x3000];
+        let base = mem.as_ptr() as u64;
+        add_translation(0x2_0000, 0x2000, base);
+        assert_eq!(host_after(0x2_2000), Some(base + 0x2000));
+        add_translation(0x2_2000, 0x1000, base + 0x2000);
+        assert!(!crosses(0x2_1000, 0x2000), "one range");
+        assert_eq!(g2h(0x2_2008), base + 0x2008);
+        remove_translation(0x2_0000, 0x3000);
+        assert_eq!(host_after(0x2_2000), None);
     }
 
     #[test]

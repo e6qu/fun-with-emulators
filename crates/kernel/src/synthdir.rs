@@ -31,6 +31,10 @@ fn with<R>(f: impl FnOnce(&mut HashMap<i32, Dir>) -> R) -> R {
 }
 
 /// Run `f` holding the registry lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = REG.lock();
     f()

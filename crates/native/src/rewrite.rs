@@ -5,7 +5,7 @@
 //!
 //! - `svc #0` (a Linux system call) would enter the macOS kernel. It becomes
 //!   a branch to a stub that calls fwe's system-call gate directly (see
-//!   `trap`'s gate), which runs the Linux system call and returns past the
+//!   [`crate::gate`]), which runs the Linux system call and returns past the
 //!   site. Where no stub can be placed it becomes a `brk` with a distinctive
 //!   immediate instead, whose trap fwe's handler services the same way.
 //! - `mrs`/`msr` of `TPIDR_EL0` (the Linux thread pointer): macOS does not
@@ -16,6 +16,10 @@
 //! - Any instruction naming `x18`: macOS clears `x18` on every exception
 //!   return, so each such instruction becomes a branch to a stub that keeps
 //!   the guest's `x18` in another TSD slot (see [`crate::decode`]).
+//! - `ic ivau, xN`: the program says it changed the code at that cache
+//!   line. The stub runs it and tells fwe through the system-call gate,
+//!   which drops the translations made from that line (see
+//!   [`crate::jit`]).
 //!
 //! arm64 instructions are 4 bytes and 4-byte aligned, so scanning aligned
 //! words finds every instruction exactly. A data word that happens to match
@@ -37,54 +41,54 @@ pub const TRAP_IMM: u32 = 0x4c58;
 /// `brk #TRAP_IMM`.
 pub const TRAP: u32 = 0xd420_0000 | (TRAP_IMM << 5);
 
-const NOP: u32 = 0xd503_201f;
-const RT_MASK: u32 = 0x1f;
+pub(crate) const NOP: u32 = 0xd503_201f;
+pub(crate) const RT_MASK: u32 = 0x1f;
 /// `mrs xN, tpidr_el0`
-const MRS_TPIDR: u32 = 0xd53b_d040;
+pub(crate) const MRS_TPIDR: u32 = 0xd53b_d040;
 /// `msr tpidr_el0, xN`
-const MSR_TPIDR: u32 = 0xd51b_d040;
+pub(crate) const MSR_TPIDR: u32 = 0xd51b_d040;
 /// `mrs xN, tpidrro_el0`
-const MRS_TPIDRRO: u32 = 0xd53b_d060;
+pub(crate) const MRS_TPIDRRO: u32 = 0xd53b_d060;
 /// `and xD, xN, #~7`
-const AND_NOT7: u32 = 0x927d_f000;
+pub(crate) const AND_NOT7: u32 = 0x927d_f000;
 /// `ldr xT, [xN, #imm]` (unsigned offset, imm/8 in bits 10..22)
-const LDR_UIMM: u32 = 0xf940_0000;
+pub(crate) const LDR_UIMM: u32 = 0xf940_0000;
 /// `str xT, [xN, #imm]` (unsigned offset)
-const STR_UIMM: u32 = 0xf900_0000;
+pub(crate) const STR_UIMM: u32 = 0xf900_0000;
 /// `str xT, [sp, #-16]!`
-const PUSH: u32 = 0xf81f_0fe0;
+pub(crate) const PUSH: u32 = 0xf81f_0fe0;
 /// `ldr xT, [sp], #16`
-const POP: u32 = 0xf841_07e0;
+pub(crate) const POP: u32 = 0xf841_07e0;
 /// `add xD, sp, #48`: the `sp` a three-register stub was entered with.
 const ADD_SP_48: u32 = 0x9100_c3e0;
 /// `sub sp, sp, #imm12`; `| (imm << 10)`.
-const SUB_SP: u32 = 0xd100_03ff;
+pub(crate) const SUB_SP: u32 = 0xd100_03ff;
 /// `add sp, sp, #imm12`; `| (imm << 10)`.
-const ADD_SP: u32 = 0x9100_03ff;
+pub(crate) const ADD_SP: u32 = 0x9100_03ff;
 /// `add xD, sp, #imm12`; `| (imm << 10) | d`.
 const ADD_FROM_SP: u32 = 0x9100_03e0;
 /// `mov sp, xN` (`add sp, xN, #0`); `| (n << 5)`.
-const MOV_TO_SP: u32 = 0x9100_001f;
+pub(crate) const MOV_TO_SP: u32 = 0x9100_001f;
 /// `stp xA, xB, [sp]`; `| (b << 10) | a`.
-const STP_SP: u32 = 0xa900_03e0;
+pub(crate) const STP_SP: u32 = 0xa900_03e0;
 /// `ldp xA, xB, [sp]`; `| (b << 10) | a`.
-const LDP_SP: u32 = 0xa940_03e0;
+pub(crate) const LDP_SP: u32 = 0xa940_03e0;
 /// `stp xA, xB, [sp, #-16]!`; `| (b << 10) | a`.
-const PUSH_PAIR: u32 = 0xa9bf_03e0;
+pub(crate) const PUSH_PAIR: u32 = 0xa9bf_03e0;
 /// `ldp xA, xB, [sp], #16`; `| (b << 10) | a`.
-const POP_PAIR: u32 = 0xa8c1_03e0;
+pub(crate) const POP_PAIR: u32 = 0xa8c1_03e0;
 /// `ldur xT, [xN, #imm9]`; `| ((imm & 0x1ff) << 12) | (n << 5) | t`.
 pub const LDUR: u32 = 0xf840_0000;
 /// `mov xD, xM` (`orr xD, xzr, xM`); `| (m << 16) | d`.
-const MOV: u32 = 0xaa00_03e0;
+pub(crate) const MOV: u32 = 0xaa00_03e0;
 /// `add xD, xN, xM`; `| (m << 16) | (n << 5) | d`.
-const ADD_REG: u32 = 0x8b00_0000;
+pub(crate) const ADD_REG: u32 = 0x8b00_0000;
 /// `b <label>`
-const B: u32 = 0x1400_0000;
+pub(crate) const B: u32 = 0x1400_0000;
 /// `movz xN, #imm16` base; `| (hw << 21) | (imm16 << 5) | n`.
-const MOVZ: u32 = 0xd280_0000;
+pub(crate) const MOVZ: u32 = 0xd280_0000;
 /// `movk xN, #imm16` base.
-const MOVK: u32 = 0xf280_0000;
+pub(crate) const MOVK: u32 = 0xf280_0000;
 
 /// Largest stub, in instructions. The `x18` branch stub and the stub for a
 /// load or store written back onto `sp` are the biggest.
@@ -105,6 +109,18 @@ pub enum Site {
     /// `svc #0`, already a `brk` ([`TRAP`]) in place: the stub calls the
     /// system-call gate at `gate` (0 until the caller knows it).
     Syscall { gate: u64 },
+    /// `ic ivau, xN`: the stub runs it and calls the gate at `gate` (as
+    /// [`Site::Syscall`]'s), which takes it for a flush of that line.
+    Flush { rt: u32, gate: u64 },
+}
+
+/// `ic ivau, xN`; `| n`.
+pub const IC_IVAU: u32 = 0xd50b_7520;
+
+/// Whether `insn` is `ic ivau, xN`: the program invalidating the
+/// instruction cache line at `xN`, as it must after writing code there.
+pub fn is_ic_ivau(insn: u32) -> bool {
+    insn & !RT_MASK == IC_IVAU
 }
 
 /// Whether `insn` names `x18` in an operand position this pass can rewrite by
@@ -116,7 +132,7 @@ fn rewritable_x18(insn: u32) -> bool {
 
 /// Whether `insn` is any instruction naming `x18` that this pass rewrites —
 /// operand substitution, a PC-relative form, a branch, or an indirect branch.
-fn x18_site(insn: u32) -> bool {
+pub(crate) fn x18_site(insn: u32) -> bool {
     // Most words name no x18, which the quick check tells.
     crate::decode::may_name_x18(insn) && x18_form(insn)
 }
@@ -184,6 +200,8 @@ fn classify(insn: u32, is_code: bool, known_code: bool) -> Word {
         }
     } else if insn & !RT_MASK == MSR_TPIDR {
         w.site = Some(Site::WriteThreadPointer { rt: insn & RT_MASK });
+    } else if is_code && is_ic_ivau(insn) {
+        w.site = Some(Site::Flush { rt: insn & RT_MASK, gate: 0 });
     } else if is_code && x18_site(insn) {
         w.site = Some(Site::X18 { insn });
     } else if is_code && crate::decode::names_x18(insn) {
@@ -351,6 +369,32 @@ pub fn branch(from: u64, to: u64) -> Option<u32> {
 /// `x18_slot` are the byte offsets of the guest thread pointer and of the guest
 /// `x18` in the host TSD.
 pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec<u32> {
+    let imm = |slot: u32| (slot / 8) << 10;
+    match site {
+        // Indirect and compare/test branches through x18, and system calls:
+        // complete stubs of their own, with their own ways out.
+        Site::X18 { insn } if crate::decode::x18_indirect(insn).is_some() => {
+            return x18_indirect_stub(insn, imm(x18_slot), ret);
+        }
+        Site::X18 { insn } if crate::decode::x18_branch(insn) => {
+            return x18_branch_stub(insn, imm(x18_slot), stub, ret);
+        }
+        Site::Syscall { gate } => return syscall_stub(gate, stub, ret),
+        Site::Flush { rt, gate } => return flush_stub(rt, gate, stub, ret),
+        _ => {}
+    }
+    let mut words = stub_body(site, tp_slot, x18_slot, ret - 4);
+    let at = stub + 4 * words.len() as u64;
+    words.push(branch(at, ret).expect("stub placed within branch range of its site"));
+    assert!(words.len() <= STUB_WORDS, "a stub longer than its slot");
+    words
+}
+
+/// The words of the stub for `site` (a thread-pointer access, or an
+/// instruction naming `x18` other than a branch), for the instruction at
+/// `pc`, without the branch back: they run on into what follows them.
+pub(crate) fn stub_body(site: Site, tp_slot: u32, x18_slot: u32, pc: u64) -> Vec<u32> {
+    let ret = pc + 4;
     let imm = |slot: u32| {
         assert!(
             slot.is_multiple_of(8) && slot / 8 < 4096,
@@ -358,7 +402,7 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
         );
         (slot / 8) << 10
     };
-    let mut words = match site {
+    match site {
         // Through `x18`: from one slot to the other.
         Site::ReadThreadPointer { rt: 18 } | Site::WriteThreadPointer { rt: 18 } => {
             let (from, to) = match site {
@@ -394,15 +438,10 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
                 POP | s,
             ]
         }
-        // An indirect branch through x18 builds a complete, self-terminating
-        // stub (it ends in `br`), so it is returned directly.
-        Site::X18 { insn } if crate::decode::x18_indirect(insn).is_some() => {
-            return x18_indirect_stub(insn, imm(x18_slot), ret);
-        }
-        // A compare/test branch that reads x18 also builds its own complete
-        // stub, including its outgoing branches.
-        Site::X18 { insn } if crate::decode::x18_branch(insn) => {
-            return x18_branch_stub(insn, imm(x18_slot), stub, ret);
+        Site::X18 { insn }
+            if crate::decode::x18_indirect(insn).is_some() || crate::decode::x18_branch(insn) =>
+        {
+            panic!("a branch through x18 has a stub of its own")
         }
         // PC-relative forms materialize the value computed from the original pc.
         Site::X18 { insn } if crate::decode::x18_adr(insn).is_some() => {
@@ -419,12 +458,68 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
             x18_writes_sp_stub(insn, imm(x18_slot))
         }
         Site::X18 { insn } => x18_stub(insn, imm(x18_slot)),
-        Site::Syscall { gate } => return syscall_stub(gate, stub, ret),
-    };
-    let at = stub + 4 * words.len() as u64;
-    words.push(branch(at, ret).expect("stub placed within branch range of its site"));
-    assert!(words.len() <= STUB_WORDS, "a stub longer than its slot");
-    words
+        Site::Syscall { .. } => panic!("a system call has a stub of its own"),
+        Site::Flush { .. } => panic!("a flush has a stub of its own"),
+    }
+}
+
+/// A fault in a stub, as if at its site: the stub's words from its start
+/// up to the faulting one (`ran`), and its branch back among the rest
+/// give the site; each register the stub saved below `sp` before the
+/// fault and has not taken back yet is read back (`stack(offset from sp)`),
+/// and `sp` is as at the site. `None` if the words are no stub's.
+pub struct Rewound {
+    pub site: u64,
+    pub restored: Vec<(u32, u64)>,
+    pub sp: u64,
+}
+
+/// See [`Rewound`]. `words` is the stub's slot from its start (`stub`),
+/// `pc` the faulting instruction in it.
+pub fn rewind(
+    words: &[u32],
+    stub: u64,
+    pc: u64,
+    sp: u64,
+    stack: impl Fn(u64) -> Option<u64>,
+) -> Option<Rewound> {
+    let ran = ((pc.checked_sub(stub)?) / 4) as usize;
+    // The branch back: the first plain branch leading out of the slot.
+    let end = stub + 4 * words.len() as u64;
+    let site = words.iter().enumerate().find_map(|(i, &w)| {
+        let at = stub + 4 * i as u64;
+        let to = (w & 0xfc00_0000 == B)
+            .then(|| at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4)))?;
+        (to < stub || to >= end).then(|| to.wrapping_sub(4))
+    })?;
+    // What was saved below `sp` and not yet taken back before `pc`, frame
+    // by frame: the registers and their offsets, and the frame's size.
+    let mut pushed: Vec<(Vec<(u32, u64)>, u64)> = Vec::new();
+    for &w in words.get(..ran)? {
+        if w & !0x1f == PUSH {
+            pushed.push((vec![(w & 0x1f, 0)], 16));
+        } else if w & !0x7c1f == PUSH_PAIR {
+            pushed.push((vec![(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)], 16));
+        } else if w & 0xffc0_03ff == SUB_SP {
+            // A frame made at once, filled by the stores below.
+            pushed.push((Vec::new(), u64::from((w >> 10) & 0xfff)));
+        } else if w & !0x7c1f == STP_SP {
+            pushed.last_mut()?.0.extend([(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)]);
+        } else if w & 0xffc0_03e0 == STR_UIMM | 31 << 5 {
+            pushed.last_mut()?.0.push((w & 0x1f, u64::from((w >> 10) & 0xfff) * 8));
+        } else if w & !0x1f == POP || w & !0x7c1f == POP_PAIR {
+            pushed.pop()?;
+        }
+    }
+    let mut restored = Vec::new();
+    let mut at = sp;
+    for (regs, size) in pushed.iter().rev() {
+        for &(r, off) in regs {
+            restored.push((r, stack(at - sp + off)?));
+        }
+        at += size;
+    }
+    Some(Rewound { site, restored, sp: at })
 }
 
 /// `stp x30, x0, [sp, #-32]!`: a system-call stub's first word, its only
@@ -456,6 +551,40 @@ fn syscall_stub(gate: u64, stub: u64, ret: u64) -> Vec<u32> {
         gate as u32,
         (gate >> 32) as u32,
     ]
+}
+
+/// `ldr x30, <pc + 16>`: the gate's address, the literal at word 6 of a
+/// flush's stub, read from word 2. It tells the gate the call is a flush.
+pub const FLUSH_LDR_X30_LIT: u32 = 0x5800_0000 | (4 << 5) | 30;
+
+/// Stub for `ic ivau, xN`: the instruction itself (where it can fault, as
+/// at its site; through `x18`, whose value only the gate knows, it is the
+/// gate's), then the gate called as by a system call's stub, and back past
+/// the site. The gate knows a flush by the stub's literal load
+/// ([`flush_reg`]). `stub` is 8-byte aligned.
+fn flush_stub(rt: u32, gate: u64, stub: u64, ret: u64) -> Vec<u32> {
+    debug_assert!(stub.is_multiple_of(8), "a flush stub's literal must be aligned");
+    vec![
+        if rt == 18 { NOP } else { IC_IVAU | rt },
+        SYSCALL_STUB_ENTRY,
+        FLUSH_LDR_X30_LIT,
+        BLR_X30,
+        POP32_X30,
+        branch(stub + 20, ret).expect("stub placed within branch range of its site"),
+        gate as u32,
+        (gate >> 32) as u32,
+    ]
+}
+
+/// The register a flush's stub names, if the gate was called from one
+/// (`word(ret - 8)`, the word that loaded the gate's address, says), its
+/// call returning to `ret`.
+pub fn flush_reg(word: impl Fn(u64) -> u32, ret: u64) -> Option<u32> {
+    if word(ret - 8) != FLUSH_LDR_X30_LIT {
+        return None;
+    }
+    let w = word(ret - 16);
+    Some(if w == NOP { 18 } else { w & RT_MASK })
 }
 
 /// The system-call site of the stub whose first word is at `pc`, if it is
@@ -782,6 +911,41 @@ fn x18_writes_sp_stub(insn: u32, imm: u32) -> Vec<u32> {
 
 /// Body of the stub for an `x18`-naming instruction (without the final branch
 /// back). `x18` lives in the TSD slot whose `ldr`/`str` immediate is `imm`.
+/// Where in [`x18_stub`]'s words for `insn` the instruction itself is: the
+/// words before it only save registers and load `x18`'s value, so a
+/// signal there can undo them; the words after it store `x18` back and
+/// restore the registers, so a signal there must finish them, the
+/// instruction having run (it may be an atomic one).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn x18_stub_main(insn: u32) -> usize {
+    let ops = crate::decode::operands(insn).expect("x18 site must decode");
+    let reads = ops.iter().any(|f| (insn >> f.shift) & 0x1f == 18 && f.read);
+    let sp_base = crate::decode::sp_scratch_field(insn).is_some();
+    2 + if sp_base { 2 } else { 0 } + 2 + usize::from(reads)
+}
+
+/// Where in the stub for an `x18`-naming `casp`, load or store written
+/// back onto `sp`, or instruction writing `sp` the instruction itself is
+/// ([`x18_stub_main`] for the others): before it the stub saves registers
+/// and loads `x18`'s value, after it stores `x18` back, restores them and
+/// moves `sp`.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn x18_special_main(insn: u32) -> Option<usize> {
+    if crate::decode::x18_casp(insn) {
+        let (rs, rt, rn) = ((insn >> 16) & 0x1f, insn & 0x1f, (insn >> 5) & 0x1f);
+        let pair = rs == 18 || rt == 18;
+        Some(3 + if pair { 3 } else { 0 } + usize::from(rn == 18))
+    } else if crate::decode::x18_sp_writeback(insn) {
+        let pair = insn & 0x3a00_0000 == 0x2800_0000;
+        let load = if pair { (insn >> 22) & 1 == 1 } else { (insn >> 22) & 3 != 0 };
+        Some(6 + usize::from(!load))
+    } else if crate::decode::x18_writes_sp(insn) {
+        Some(6)
+    } else {
+        None
+    }
+}
+
 fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     let ops = crate::decode::operands(insn).expect("x18 site must decode");
     let field_reg = |f: &crate::decode::Field| (insn >> f.shift) & 0x1f;
@@ -954,6 +1118,33 @@ mod tests {
         assert_eq!(syscall_stub_site(word, 0x2000), Some(0x1000));
         // Any other word is not a stub's first.
         assert_eq!(syscall_stub_site(word, 0x2004), None);
+    }
+
+    /// `ic ivau, xN` in code becomes a site whose stub runs it and calls
+    /// the gate, which tells it from a system call's by the stub's load of
+    /// the gate's address; through `x18`, the stub leaves it to the gate.
+    #[test]
+    fn a_flush_calls_the_gate_and_is_told_from_a_system_call() {
+        let ic = IC_IVAU | 3; // ic ivau, x3
+        assert!(is_ic_ivau(ic) && !is_ic_ivau(0xd50b_7a23)); // dc cvau, x3
+        let p = patch(&mut words(&[ic]), Some(&[(0, 4)]));
+        assert_eq!(p.sites, vec![(0, Site::Flush { rt: 3, gate: 0 })]);
+        let (gate, at) = (0x1_2345_6780u64, 0x10_0000u64);
+        for (rt, first) in [(3, ic), (18, NOP)] {
+            let stub = stub(Site::Flush { rt, gate }, 0, 0, at, 0x20_0004);
+            assert_eq!(stub.len(), 8);
+            assert_eq!(stub[0], first);
+            assert_eq!(&stub[1..5], &[SYSCALL_STUB_ENTRY, FLUSH_LDR_X30_LIT, BLR_X30, POP32_X30]);
+            assert_eq!(u64::from(stub[6]) | u64::from(stub[7]) << 32, gate);
+            // The gate is called from word 3: it returns to word 4.
+            let word = |a: u64| stub[((a - at) / 4) as usize];
+            assert_eq!(flush_reg(word, at + 16), Some(rt));
+        }
+        let call = stub(Site::Syscall { gate }, 0, 0, at, 0x20_0004);
+        let word = |a: u64| call[((a - at) / 4) as usize];
+        assert_eq!(flush_reg(word, at + 12), None);
+        let fl = stub(Site::Flush { rt: 3, gate }, 0, 0, at, 0x20_0004);
+        assert_eq!(syscall_stub_site(|a| fl.get(((a - at) / 4) as usize).copied(), at + 4), None);
     }
 
     #[test]
@@ -1258,6 +1449,49 @@ mod tests {
         assert_eq!(p.x18_deferred, 0);
         // The data word is untouched.
         assert_eq!(&code[8..12], &0xd283_0312u32.to_le_bytes());
+    }
+
+    /// A fault in an `x18` stub at its moved instruction is a fault at the
+    /// site: the two registers it pushed come back from the stack, and `sp`
+    /// is as the site had it.
+    #[test]
+    fn a_fault_in_a_stub_rewinds_to_its_site() {
+        let (stub_at, site) = (0x10_0000u64, 0x20_0000u64);
+        // `ldr x0, [x18, #8]`
+        let words = stub(Site::X18 { insn: 0xf940_0640 }, 8, 16, stub_at, site + 4);
+        let at = words.iter().position(|&w| w & 0xffff_fc1f == 0xf940_0400).unwrap();
+        let sp = 0x7000u64;
+        let r =
+            rewind(&words, stub_at, stub_at + 4 * at as u64, sp, |off| Some(0xaa00 + off)).unwrap();
+        assert_eq!(r.site, site);
+        assert_eq!(r.sp, sp + 32);
+        // Pushed first, so deepest: the first push's register at sp + 16.
+        let (s1, s2) = (words[0] & 0x1f, words[1] & 0x1f);
+        assert_eq!(r.restored, vec![(s2, 0xaa00), (s1, 0xaa10)]);
+    }
+
+    /// A fault at the access of the stub for an `x18` store written back
+    /// onto `sp` is a fault at the site: the frame the stub made at once
+    /// below `sp` is taken back, its three scratch registers with it.
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[test]
+    fn a_fault_in_an_sp_writeback_stub_rewinds_its_frame() {
+        let (stub_at, site) = (0x10_0000u64, 0x20_0000u64);
+        // `str x18, [sp, #-16]!`
+        let insn = 0xf81f_0ff2;
+        let words = stub(Site::X18 { insn }, 8, 16, stub_at, site + 4);
+        let at = x18_special_main(insn).unwrap();
+        // The access: a store with an unsigned offset, after the address.
+        assert_eq!(words[at] & 0x3b00_0000, 0x3900_0000);
+        assert_eq!(words[at - 1] & 0xffc0_03e0, ADD_FROM_SP);
+        let sp = 0x7000u64;
+        let r =
+            rewind(&words, stub_at, stub_at + 4 * at as u64, sp, |off| Some(0xaa00 + off)).unwrap();
+        assert_eq!(r.site, site);
+        assert_eq!(words[0], SUB_SP | 48 << 10);
+        assert_eq!(r.sp, sp + 48);
+        let (s1, s2, s3) = (words[1] & 0x1f, (words[1] >> 10) & 0x1f, words[2] & 0x1f);
+        assert_eq!(r.restored, vec![(s1, 0xaa00), (s2, 0xaa08), (s3, 0xaa10)]);
     }
 
     /// Outside the known code (what the unwind table covers), a word that

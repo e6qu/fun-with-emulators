@@ -1,0 +1,8 @@
+# Alpine Linux 3.24 aarch64 files the LuaJIT test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and LuaJIT 2.1 (its
+# trace compiler, and its FFI calling into C and C calling back into Lua),
+# which needs only musl and libgcc. Each line is a path under that URL and
+# the file's SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/main/aarch64/luajit-2.1_p20251030-r0.apk 24bcae697a0d12a7fd20e54a26a0b91f92b7b5cbb212c4d9fbec613c6a5bb847
+v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403

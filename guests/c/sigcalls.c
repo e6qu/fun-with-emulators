@@ -156,6 +156,10 @@ static void on_signal(int sig, struct siginfo *info, void *ctx) {
 
 static void *other_thread(void *arg) {
     int *ready = arg;
+    /* It takes the signals the main thread blocks, from before it says it
+     * is ready. */
+    unsigned long unblock[16] = {(1ul << (SIGUSR1 - 1)) | (1ul << (SIGUSR2 - 1))};
+    syscall(135, 1 /* SIG_UNBLOCK */, unblock, 0, 8);
     thread_tid = gettid();
     write(ready[1], &thread_tid, sizeof thread_tid);
     for (;;) {
@@ -183,12 +187,13 @@ static void other_threads(void) {
         sa.flags = SA_SIGINFO;
         sigaction(SIGUSR1, &sa, 0);
         sigaction(SIGUSR2, &sa, 0);
-        /* The main thread blocks them: the other thread takes them,
-         * whichever thread a process signal lands on. */
+        /* The main thread blocks them, before the other thread is made:
+         * the other thread takes them, whichever thread a process signal
+         * lands on. */
         unsigned long block[16] = {(1ul << (SIGUSR1 - 1)) | (1ul << (SIGUSR2 - 1))};
+        syscall(135, 0 /* SIG_BLOCK */, block, 0, 8);
         pthread_t t;
         pthread_create(&t, 0, other_thread, ready);
-        syscall(135, 0 /* SIG_BLOCK */, block, 0, 8);
         for (;;) {
             usleep(1000);
         }

@@ -1,0 +1,20 @@
+# Alpine Linux 3.24 aarch64 files the Node.js test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and Node.js 24 (a
+# current V8: its baseline and optimizing compilers, its regular expression
+# and WebAssembly compilers) with the libraries it links, and ICU's full
+# locale data. Each line is a path under that URL and the file's SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/main/aarch64/nodejs-24.22.3-r0.apk e5d0dc9749acedadb08ddd48fab57c1c842e0361dc49e7206269bdd2751e29fc
+v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818
+v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+v3.24/main/aarch64/sqlite-libs-3.53.4-r0.apk b39d8d73c1208838a436f2d481ba605b52a095f8d6ff781556eafc81cd1a13e9
+v3.24/main/aarch64/simdutf-9.0.0-r0.apk 336f5dfe8b0f784462cbccb4b58f71c15d64388c784ebca8568c8615b6f3c6b2
+v3.24/main/aarch64/simdjson-4.2.4-r0.apk 8e35f0644c8157c0d5ccdaaf001e70bb6640777b1b680e714e6a453d178829fd
+v3.24/main/aarch64/nghttp2-libs-1.70.0-r0.apk 7ef451f4dcdc065aa872c2f3c78b9d9bb4348caa5bcc70dee0c9e1fcf8e4c1fd
+v3.24/main/aarch64/icu-libs-78.1-r0.apk 2393882dcf1e3f5be98696665c3468dd0d2a85cd568d50abd232729863df9738
+v3.24/main/aarch64/c-ares-1.34.9-r0.apk 1bda7f36597a3f6d616b0c8bd25cd611299bf353ec5ee2ae102e97694885c2f1
+v3.24/main/aarch64/brotli-libs-1.2.1-r0.apk f802b9d5a329c216f02e73607cb8f662c434767e41686367ac0afcf6d0d45d64
+v3.24/main/aarch64/ada-libs-4.0.0-r0.apk 2abf46b79346803a9dbc5dd6de97ddaab907c662805547bff6c6adc76ebb7362
+v3.24/main/aarch64/ca-certificates-20261020-r0.apk 6e3a34ed8b40718f9b9291319f7890638156a3d63807284a66d9672d3a8b1d3e
+v3.24/main/aarch64/icu-data-full-78.1-r0.apk e5034d8b51ad6f4b2a934afb39bde070dcaafaafa8251b56948e9d480978d092

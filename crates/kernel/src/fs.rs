@@ -449,6 +449,12 @@ pub struct Fs {
     pub ns: crate::ns::Namespaces,
 }
 
+impl Drop for Fs {
+    fn drop(&mut self) {
+        crate::fdtable::root_closed(self.root.as_raw_fd());
+    }
+}
+
 impl Fs {
     /// Write the filesystem view into a fork snapshot. The root directory
     /// descriptor is inherited, so its number is enough.
@@ -480,6 +486,7 @@ impl Fs {
         // SAFETY: the parent's root descriptor, inherited at the same number
         // and owned by nothing else in this process.
         let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        crate::fdtable::root_is(fd);
         let cwd = d.bytes();
         let cwd_mount = d.u32();
         let root_mount = d.u32();
@@ -565,10 +572,13 @@ impl Fs {
         if fd < 0 {
             return Err(e());
         }
-        // The root is fwe's: out of the guest's reach.
-        let fd = crate::fdtable::reserve(fd)?;
-        // SAFETY: `fd` is a fresh owned directory descriptor.
-        let root = unsafe { OwnedFd::from_raw_fd(fd) };
+        // The root is fwe's: out of the guest's reach, low while the
+        // guest's limit is ([`crate::fdtable::reserve_root`]).
+        let root = crate::fdtable::reserve_root(fd, 0);
+        // SAFETY: closing the descriptor just opened, now moved.
+        unsafe { libc::close(fd) };
+        // SAFETY: `root` is a fresh owned directory descriptor.
+        let root = unsafe { OwnedFd::from_raw_fd(root?) };
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
         let shm = shm::dir_path(&root_host).ok();
         let mnt = Arc::new(Ns::initial(&root_host, shm.as_deref())?);
@@ -751,6 +761,27 @@ impl Fs {
     /// The mount table as it is now.
     pub fn mounts(&self) -> Arc<Table> {
         self.mnt.table()
+    }
+
+    /// Move the root directory descriptor at or above `soft`, a soft
+    /// `RLIMIT_NOFILE` about to be set, if it is the process's and below
+    /// it ([`crate::fdtable::root_below`]): the guest may then be given
+    /// any number below `soft`. The view published for the socket calls
+    /// follows it.
+    pub(crate) fn keep_root_above(&mut self, soft: u64) -> Result<(), i32> {
+        let old = self.root.as_raw_fd();
+        if !crate::fdtable::root_below(old, soft) {
+            return Ok(());
+        }
+        let new = crate::fdtable::reserve_root(old, soft)?;
+        // SAFETY: a fresh descriptor of fwe's, owned by nothing else; the
+        // old one closes as it is replaced.
+        self.root = unsafe { OwnedFd::from_raw_fd(new) };
+        if let Some(v) = published().as_mut().filter(|v| v.root == old) {
+            VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+            v.root = new;
+        }
+        Ok(())
     }
 
     /// A copy of this view, for a thread to have as its own
@@ -1720,20 +1751,7 @@ impl Fs {
         // SAFETY: `fd` is a fresh owned descriptor.
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
         let id = crate::prepcache::FileId::of_fd(fd.as_raw_fd());
-        let mut data = Vec::new();
-        let mut chunk = [0u8; 65536];
-        loop {
-            // SAFETY: reading into a valid local buffer.
-            let n = unsafe { libc::read(fd.as_raw_fd(), chunk.as_mut_ptr().cast(), chunk.len()) };
-            if n < 0 {
-                return Err(e());
-            }
-            if n == 0 {
-                break;
-            }
-            data.extend_from_slice(&chunk[..n as usize]);
-        }
-        Ok((data, id))
+        Ok((read_all(fd.as_raw_fd())?, id))
     }
 
     /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
@@ -1831,6 +1849,11 @@ impl Fs {
     /// namespace, root and working directory (namespace paths), and the
     /// process's resource limits ([`OtherView`]).
     pub fn share(&self) {
+        crate::procstore::put_own(crate::procstore::Kind::View, Some(&self.shared()));
+    }
+
+    /// What [`Fs::share`] lets other processes see.
+    pub fn shared(&self) -> Vec<u8> {
         let mut e = crate::snapshot::Enc::new();
         e.bytes(self.mnt.dir());
         e.bytes(&self.proc_root);
@@ -1841,7 +1864,7 @@ impl Fs {
             e.u64(soft);
             e.u64(hard);
         }
-        crate::procstore::put_own(crate::procstore::Kind::View, Some(&e.into_bytes()));
+        e.into_bytes()
     }
 
     /// Translate a host path to the guest path it is reached by, through
@@ -3006,6 +3029,10 @@ pub(crate) fn unpublish() {
 }
 
 /// Run `f` holding the published view's lock (see [`crate::fork_locked`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _g = published();
     f()
@@ -3352,19 +3379,30 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
             libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NONBLOCK | flags_host)
         }
     };
+    // A writer already let through by the ends opened here, the one
+    // opened to look and the one above, and gone again (it opened and
+    // closed at once): Linux's open has seen it come, so this one
+    // succeeds. The host's would wait for a writer that is not coming.
+    let came_before = |fd: i32| {
+        matches!(crate::fifo::probe(fd), crate::fifo::Probe::HungUp | crate::fifo::Probe::Data)
+    };
+    #[cfg(target_os = "macos")]
+    let looked = seen.as_ref().is_some_and(|s| came_before(s.as_raw_fd()));
+    #[cfg(not(target_os = "macos"))]
+    let looked = false;
+    let already = early >= 0 && (looked || came_before(early));
     // The reader end above stands in for the one opened to look.
     #[cfg(target_os = "macos")]
     drop(seen);
-    // SAFETY: as above; waits for the other end.
-    let mut fd = unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) };
-    let err = e();
+    let mut fd = if already {
+        -1
+    } else {
+        // SAFETY: as above; waits for the other end.
+        unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) }
+    };
+    let err = if already { errno::EINTR } else { e() };
     if early >= 0 {
-        let came = fd < 0
-            && err == errno::EINTR
-            && matches!(
-                crate::fifo::probe(early),
-                crate::fifo::Probe::HungUp | crate::fifo::Probe::Data
-            );
+        let came = fd < 0 && err == errno::EINTR && (already || came_before(early));
         if came {
             // A writer came (and maybe went): the open succeeded, as Linux's.
             // SAFETY: fwe's own descriptor, made blocking as the guest asked.
@@ -3612,14 +3650,34 @@ pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever
-/// its offset.
-/// All of the file open as `fd`, from where it is.
-pub(crate) fn read_all_fd(fd: i32) -> Result<Vec<u8>, i32> {
+/// its offset ([`read_all`]).
+pub fn read_all_fd(fd: i32) -> Result<Vec<u8>, i32> {
     read_all(fd)
 }
 
+/// The whole contents of host file `path` ([`read_all`]).
+pub fn read_all_path(path: &[u8]) -> Result<Vec<u8>, i32> {
+    let path = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(e());
+    }
+    // SAFETY: a fresh descriptor this owns.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    read_all(fd.as_raw_fd())
+}
+
+/// The whole of the file open on `fd`, into memory sized for it at once (a
+/// program's bytes, grown as they were read, were copied at every
+/// doubling).
 fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
-    let mut data = Vec::new();
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    let size =
+        if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size.max(0) as usize } else { 0 };
+    let mut data = Vec::with_capacity(size);
     let mut chunk = [0u8; 65536];
     loop {
         // SAFETY: reading into a valid local buffer.

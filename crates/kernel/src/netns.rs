@@ -127,6 +127,10 @@ pub fn set_thread(net: Option<Option<Arc<Record<Net>>>>) {
 }
 
 /// Make `net` the process's ([`crate::ns::Namespaces::net`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn set_current(net: Option<Arc<Record<Net>>>) {
     *CURRENT.lock().unwrap_or_else(|e| e.into_inner()) = net;
 }

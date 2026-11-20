@@ -1982,7 +1982,7 @@ struct PkeyParams<'a> {
     hash: Option<&'a str>,
 }
 
-/// Parses "enc=<encoding> hash=<hash>" (`keyctl_pkey_params_parse`): the
+/// Parses `enc=<encoding> hash=<hash>` (`keyctl_pkey_params_parse`): the
 /// encoding defaults to "raw"; an unknown, repeated or empty option is
 /// `EINVAL`.
 fn parse_info(info: &str) -> Result<PkeyParams<'_>, i32> {

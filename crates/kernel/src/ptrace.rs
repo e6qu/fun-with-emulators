@@ -157,6 +157,17 @@ const EXITED: u64 = 3;
 /// Stopped in a group-stop the tracer listens to (`PTRACE_LISTEN`): not
 /// stopped as far as ptrace's requests go, until it reports again.
 const LISTENING: u64 = 4;
+/// Traced no more (detached, or ended with the host's `wait` to tell its
+/// parent): nothing to report. Its tracer frees the mailbox as it next
+/// looks ([`take_stop`]): a tracee never frees one its live tracer may
+/// still be writing to, which would write into another's page made there
+/// meanwhile.
+const GONE: u64 = 5;
+
+/// Whether mailbox `mb`'s tracee is traced no more.
+fn ended(mb: &Page) -> bool {
+    matches!(mb.word(W_STATE).load(Ordering::Acquire), EXITED | GONE)
+}
 
 /// Requests: memory, and going on (the signal in [`W_DATA`]).
 const OP_PEEK: u64 = 1;
@@ -379,15 +390,26 @@ pub fn traceme(parent: i32) -> Result<(), i32> {
     begin(parent)
 }
 
-/// This thread's tracing ends (detached, or the tracer gone).
+/// This thread's tracing ends (detached, or the tracer gone): its mailbox
+/// is freed, by its tracer if that lives ([`GONE`]).
 fn end() {
     set_traced(false);
     SYSCALLS.with(|t| t.set(false));
-    crate::procstore::free_page(mailbox_tag(self_id()));
+    let tag = mailbox_tag(self_id());
+    match open(tag, None) {
+        Some(mb) if alive(mb.word(W_TRACER).load(Ordering::Acquire) as i32) => {
+            mb.word(W_STATE).store(GONE, Ordering::Release);
+        }
+        _ => crate::procstore::free_page(tag),
+    }
 }
 
 /// In a fork child: not traced (its parent's tracer does not trace it),
 /// and no tracer named by `PR_SET_PTRACER`.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn forked_child() {
     let follow = FOLLOW.swap(0, Ordering::AcqRel);
     PTRACER.store(0, Ordering::Relaxed);
@@ -767,6 +789,7 @@ fn killed() -> bool {
 
 /// Carry out the tracer's requests at a stop, until it says to go on.
 fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing: u64) -> Served {
+    let mut waited = false;
     loop {
         let req = mb.word(W_REQ).load(Ordering::Acquire);
         if req == mb.word(W_DONE).load(Ordering::Acquire) {
@@ -778,7 +801,16 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
                 mb.word(W_STATE).store(RUNNING, Ordering::Release);
                 break Served::Resume(Resume::Cont(0));
             }
+            // A stop its tracer has not taken after a whole wait: the
+            // tracer is woken again. Its wake may have come as it was
+            // about to sleep in the host's wait, before it knew it traced
+            // this process (whose `PTRACE_TRACEME` it had not seen): that
+            // wait slept on, the signal spent.
+            if waited && mb.word(W_STATE).load(Ordering::Acquire) == STOPPED {
+                crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+            }
             wait_word_for(mb.word(W_REQ), req, Duration::from_millis(100));
+            waited = true;
             continue;
         }
         let (op, addr, data) = (
@@ -1075,7 +1107,7 @@ fn proc_of(mb: &Page) -> i32 {
 fn tracee(pid: i32) -> Result<Page, i32> {
     let mb = open(mailbox_tag(pid), None).ok_or(errno::ESRCH)?;
     if mb.word(W_TRACER).load(Ordering::Acquire) != me() as u64
-        || mb.word(W_STATE).load(Ordering::Acquire) == EXITED
+        || ended(&mb)
         || !alive(proc_of(&mb))
     {
         return Err(errno::ESRCH);
@@ -1288,6 +1320,13 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, 
         }
         let state = mb.word(W_STATE).load(Ordering::Acquire);
         let thread = proc_of(&mb) != pid;
+        if state == GONE {
+            if !peek {
+                crate::procstore::free_page(mailbox_tag(pid));
+                let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
+            }
+            continue;
+        }
         if state == EXITED {
             let status = mb.word(W_STATUS).load(Ordering::Acquire) as i32;
             if !peek {
@@ -1403,7 +1442,7 @@ pub fn event_msg(pid: i32) -> Result<u64, i32> {
 pub fn is_traced(pid: i32) -> bool {
     // (The process's main thread's mailbox.)
     open(mailbox_tag(pid), None)
-        .is_some_and(|mb| alive(mb.word(W_TRACER).load(Ordering::Acquire) as i32))
+        .is_some_and(|mb| !ended(&mb) && alive(mb.word(W_TRACER).load(Ordering::Acquire) as i32))
 }
 
 /// Whether this process traces host process `pid`.
@@ -1457,7 +1496,7 @@ pub fn attached(sig: u64) -> bool {
     if tracer <= 0 || !alive(tracer) {
         return false;
     }
-    if mb.word(W_STATE).load(Ordering::Acquire) == EXITED {
+    if ended(&mb) {
         return false;
     }
     mb.word(W_PROC).store(me() as u64, Ordering::Release);
@@ -1472,10 +1511,7 @@ pub fn attached(sig: u64) -> bool {
 fn begin_seized() -> bool {
     let Some(mb) = open(mailbox_tag(self_id()), None) else { return false };
     let tracer = mb.word(W_TRACER).load(Ordering::Acquire) as i32;
-    if mb.word(W_SEIZED).load(Ordering::Acquire) != 1
-        || tracer <= 0
-        || !alive(tracer)
-        || mb.word(W_STATE).load(Ordering::Acquire) == EXITED
+    if mb.word(W_SEIZED).load(Ordering::Acquire) != 1 || tracer <= 0 || !alive(tracer) || ended(&mb)
     {
         return false;
     }
@@ -1637,6 +1673,10 @@ impl<P: crate::Platform> crate::Kernel<P> {
 
     /// The exit event's stop (`PTRACE_O_TRACEEXIT`), as the process ends
     /// with wait status `status`.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
     pub fn ptrace_exit_stop(&mut self, status: i32) {
         if traced() && options() & PTRACE_O_TRACEEXIT != 0 {
             let mut regs = crate::Regs::default();

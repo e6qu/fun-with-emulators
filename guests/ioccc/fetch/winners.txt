@@ -1,0 +1,10 @@
+# Winning entries of the International Obfuscated C Code Contest the IOCCC
+# tests fetch from the contest's own repository,
+# https://raw.githubusercontent.com/ioccc-src/winner/7bb90076e5c794edb64417e4b47274efd6131acb/,
+# under the terms of CC BY-SA 4.0 (Creative Commons Attribution-ShareAlike
+# 4.0 International). Each line is a path under that URL and the file's
+# SHA-256.
+1984/anonymous/anonymous.c 9517d7cc6751d79c33d450e1ba2507e84aa9514915761ea89e4a01803dbf8a76
+1987/korn/korn.c f8896beaec00f9de940ce9cbc8bfd863822cad176c37346594f4e370e4ce8122
+2000/dhyang/dhyang.c c7ac71efa15288188ad7e34ba6d6c7cd6d5e1dc1c0aa944db0d843ccfefdfab8
+2018/endoh2/prog.c ddf101bd716633deebbf242e4847d2dad7ed0c33243c5b1abaa6df542e53e622

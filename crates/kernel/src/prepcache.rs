@@ -58,6 +58,11 @@ impl FileId {
         self.0[2]
     }
 
+    /// The file's device and inode.
+    pub fn dev_ino(&self) -> (u64, u64) {
+        (self.0[0], self.0[1])
+    }
+
     fn encode(&self, e: &mut Enc) {
         for v in self.0 {
             e.u64(v);
@@ -91,7 +96,7 @@ pub fn code_key(id: FileId, offset: u64, len: u64, known: Option<&[(u64, u64)]>)
 /// The entry kept under `key`, if there is one.
 pub fn load(key: &[u8]) -> Option<Vec<u8>> {
     let path = path_of(key)?;
-    let data = std::fs::read(std::ffi::OsStr::from_bytes(&path)).ok()?;
+    let data = crate::fs::read_all_path(&path).ok()?;
     let mut d = Dec::new(&data);
     let (k, v) = (d.bytes(), d.bytes());
     (d.finish().is_ok() && k == key).then_some(v)
@@ -157,8 +162,14 @@ fn image_path(key: &[u8]) -> Option<Vec<u8>> {
 
 /// The directory of the entries.
 pub fn dir() -> Option<Vec<u8>> {
+    beside("prepared")
+}
+
+/// A directory of fwe's private one for what is kept like these entries,
+/// named `name` (the translations of the backend's code cache).
+pub fn beside(name: &str) -> Option<Vec<u8>> {
     let mut d = crate::fs::shm::user_dir().ok()?;
-    d.extend_from_slice(format!("/v{}-prepared", crate::shared::FORMAT).as_bytes());
+    d.extend_from_slice(format!("/v{}-{name}", crate::shared::FORMAT).as_bytes());
     Some(d)
 }
 

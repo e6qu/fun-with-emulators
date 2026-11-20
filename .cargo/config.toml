@@ -1,0 +1,4 @@
+# The crates are internal: their documentation covers their private items,
+# which it links to.
+[build]
+rustdocflags = ["--document-private-items", "-A", "rustdoc::private_intra_doc_links"]

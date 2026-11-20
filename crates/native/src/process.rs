@@ -98,6 +98,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
         fwe_kernel::release_robust_lists();
         let state = k.exec_state();
+        crate::jitcount::write_seen();
+        crate::jit::keep_made();
         return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
     }
     // The old image is untouched on failure, so the guest can handle it.
@@ -124,6 +126,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     fwe_kernel::release_robust_lists();
     fwe_kernel::timing::mark("exec: checked");
     fwe_kernel::mm::release_guest_memory();
+    crate::jit::reset();
+    crate::prepare::reset();
     let done = VFORK_DONE.swap(-1, Ordering::SeqCst);
     if done >= 0 {
         // SAFETY: closing the pipe end this child holds for its parent.
@@ -210,6 +214,10 @@ pub(crate) fn reserve_pair(fds: [i32; 2]) -> Result<[i32; 2], i32> {
 /// the child has called `execve` or exited, as Linux suspends it; what the
 /// child writes before then (glibc's `posix_spawn` reporting an exec
 /// failure, say) the parent sees.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool) -> i64 {
     let fwe_kernel::CloneArgs { flags, stack: child_stack, parent_tid, child_tid, .. } = a;
 
@@ -233,6 +241,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             };
         }
         let k = kernel.as_mut().unwrap();
+        fwe_kernel::timing::mark("fork: begins");
         // The child's namespaces, which it inherits from this view.
         let mut token = match k.fork_begin(&a) {
             Ok(t) => t,
@@ -244,8 +253,9 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                 return fwe_abi::err(e);
             }
         };
+        fwe_kernel::timing::mark("fork: namespaces and limits checked");
         // The child writes its whole record as it starts.
-        fwe_kernel::Kernel::<NativePlatform>::fork_child_writes(&mut token);
+        k.fork_child_writes(&mut token);
         let kqueues = fwe_kernel::kqueue_state();
         // A child of CLONE_VM shares the guest's memory: its private parts
         // are shared for the fork, then copied again by any later one (in
@@ -262,10 +272,13 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // A fault signal sent to the child before it is set up is kept
         // for it (`trap::post_early`).
         trap::FORKING.store(host::pid(), Ordering::SeqCst);
+        // The translations whole in the child.
+        let mut jit = crate::jit::hold();
         let pid = fwe_kernel::fork_locked(|| {
+            fwe_kernel::timing::mark("fork: locked");
             set_shared(true);
             let pid = crate::quiesce::fork_stopped(|| {
-                fork_with_signals_held(
+                let (pid, b) = fork_with_signals_held(
                     // SAFETY: plain host call; the child continues with only
                     // the calling thread, as on Linux.
                     || unsafe { libc::fork() },
@@ -276,13 +289,25 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
                     |child| {
                         let sig =
                             if flags & cl::CLONE_PARENT != 0 { 0 } else { flags & cl::CSIGNAL };
-                        reaper::set_exit_signal(child, sig)
+                        reaper::set_exit_signal(child, sig);
+                        // Its record written here, where every page is
+                        // mapped already, before it goes on.
+                        if k.fork_write_child(&token, child) { WROTE } else { GO }
                     },
-                )
+                );
+                if pid == 0 {
+                    token.set_written(b == WROTE);
+                }
+                pid
             });
             set_shared(false);
             pid
         });
+        // The child's code cache's views, its own.
+        if pid == 0 {
+            crate::jit::forked(&mut jit);
+        }
+        drop(jit);
         if pid != 0 {
             trap::FORKING.store(0, Ordering::SeqCst);
         }
@@ -295,6 +320,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // before any is taken (they stay blocked until the child enters
             // guest code), once the locks held across the fork are free.
             thread::forked();
+            fwe_kernel::timing::mark("fork: child's threads forgotten");
             // A signal sent to it as it was being made is its own.
             trap::post_early();
             // The code pages its parent wrote are the parent's to keep.
@@ -306,7 +332,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
             // The kqueues first, at their numbers, before anything the child
             // starts (a reaper's thread) makes descriptors of its own.
             fwe_kernel::restore_kqueues(&kqueues);
-            k.fork_child(token)
+            fwe_kernel::timing::mark("fork: child's kqueues restored");
+            let r = k.fork_child(token);
+            fwe_kernel::timing::mark("fork: child's record written");
+            r
         } else {
             k.fork_parent(token, pid)
         };
@@ -323,6 +352,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         if pid == 0 && share.is_empty() {
             kernel.as_mut().unwrap().unmap_dont_fork();
         }
+        fwe_kernel::timing::mark("fork: what is not inherited unmapped");
         if pid == 0 {
             // SAFETY: this is the child, its only thread the caller, which
             // holds the lock.
@@ -371,7 +401,10 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         if child_stack != 0 {
             regs.sp = child_stack;
         }
+        // Its waits from here on are the program's.
+        fwe_kernel::procstore::entered();
         trap::prepare_guest_entry();
+        fwe_kernel::timing::mark("fork: child enters the guest");
         // SAFETY: `regs` is the parent's runnable context with x0 cleared.
         unsafe { trap::enter_guest_full(&regs) }
     }
@@ -403,10 +436,14 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
 /// The child goes on only once the parent has unblocked them: a signal the
 /// child sends its parent sooner would be left pending, and macOS empties
 /// the `siginfo` of a signal it holds blocked, so its sender would be lost.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
 fn fork_with_signals_held(
     fork: impl FnOnce() -> libc::pid_t,
-    in_parent: impl FnOnce(libc::pid_t),
-) -> libc::pid_t {
+    in_parent: impl FnOnce(libc::pid_t) -> u8,
+) -> (libc::pid_t, u8) {
     let mut go = [-1i32; 2];
     // SAFETY: a valid out-array; on failure the fork goes on without it.
     if unsafe { libc::pipe(go.as_mut_ptr()) } != 0 {
@@ -431,23 +468,26 @@ fn fork_with_signals_held(
         libc::sigdelset(&mut all, libc::SIGSYS);
         libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
         let pid = fork();
+        fwe_kernel::timing::mark("fork: host fork returned");
         // What a failed fork left, kept for the caller across the calls below.
         let saved = host::last_errno();
+        let mut b = GO;
         if pid > 0 {
-            in_parent(pid);
+            b = in_parent(pid);
         }
         if pid != 0 {
             libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
             if go[1] >= 0 {
-                libc::write(go[1], b"g".as_ptr().cast(), 1);
+                libc::write(go[1], (&b as *const u8).cast(), 1);
             }
         } else if go[0] >= 0 {
             libc::close(go[1]);
-            // Until the parent's byte, or its end (should it be gone).
-            let mut b = 0u8;
+            // Until the parent's byte, or its end (should it be gone: then
+            // [`GO`], nothing written for it).
             while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
                 && host::last_errno() == libc::EINTR
             {}
+            fwe_kernel::timing::mark("fork: child let go");
         }
         for fd in go.into_iter().filter(|&fd| fd >= 0) {
             if pid == 0 && fd == go[1] {
@@ -456,9 +496,14 @@ fn fork_with_signals_held(
             libc::close(fd);
         }
         host::set_errno(saved);
-        pid
+        (pid, b)
     }
 }
+
+/// The byte a forking parent lets its child go on with: [`WROTE`] when it
+/// wrote the child's record for it, [`GO`] otherwise.
+const GO: u8 = b'g';
+const WROTE: u8 = b'w';
 
 /// A `wait` reaped host process `pid`, which ended with Linux wait status
 /// `wstatus`: its `SIGCHLD` given now if the host's has not landed, as
@@ -775,8 +820,10 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     let mut status: libc::c_int = 0;
     // SAFETY: an all-zero rusage is a valid out-parameter.
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    fwe_kernel::timing::mark("wait: begins");
     // SAFETY: `status` and `usage` are valid out-parameters.
     let mut r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
+    fwe_kernel::timing::mark("wait: host wait returned");
     if r < 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
         // The child's own SIGCHLD may interrupt the wait before the host
         // reports the child: Linux reports a child that is ready over the
@@ -813,6 +860,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         });
         reaper::reaped_child(r);
     }
+    fwe_kernel::timing::mark("wait: reaped");
     guest
 }
 

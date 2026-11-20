@@ -954,6 +954,8 @@ impl Vcpu {
 
     /// Run the guest from `regs` until the process ends.
     pub(super) fn run(&self, mut regs: Regs) -> ! {
+        // The process's waits from here on are the program's.
+        fwe_kernel::procstore::entered();
         self.set_regs(&regs);
         loop {
             if EXITING.load(std::sync::atomic::Ordering::SeqCst) {
@@ -1473,6 +1475,25 @@ fn one_host_range(n: u64, i: usize, a: &[u64; 6]) -> bool {
     host_buffer(n, i, a).is_none_or(|(len, _)| !uaccess::crosses(a[i], len))
 }
 
+/// Whether descriptor `fd` is a socket whose messages a shorter read
+/// would cut (a datagram or sequenced-packet one).
+fn datagram(fd: i32) -> bool {
+    let mut kind: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid out-parameter of the length given; a descriptor that
+    // is no socket fails.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            (&mut kind as *mut libc::c_int).cast(),
+            &mut len,
+        )
+    };
+    r == 0 && kind != libc::SOCK_STREAM
+}
+
 /// Pointer argument `i` of system call `n` as a buffer of known length the
 /// host is given whole: its length, and whether the host writes it.
 fn host_buffer(n: u64, i: usize, a: &[u64; 6]) -> Option<(u64, bool)> {
@@ -1538,6 +1559,17 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
             kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EFAULT));
             return;
         }
+    }
+    // A read or write whose buffer spans two translated ranges is cut
+    // where the first ends: a shorter read or write, which Linux may
+    // make too and a program goes on from (not for a datagram, whose
+    // rest would be lost).
+    if matches!(n, nr::READ | nr::WRITE | nr::PREAD64 | nr::PWRITE64)
+        && args[1] != 0
+        && uaccess::crosses(args[1], args[2])
+        && !datagram(args[0] as i32)
+    {
+        args[2] = args[2].min(uaccess::span(args[1]));
     }
     // Buffers the host is given whole must have one host address.
     for (i, &a) in args.iter().enumerate() {

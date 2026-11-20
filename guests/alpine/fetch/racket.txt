@@ -1,0 +1,11 @@
+# Alpine Linux 3.24 aarch64 files the racket test fetches from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs and Racket 9 (Racket CS, compiling through Chez Scheme to machine code, `eval`
+# included),
+# with what it needs. Each line is a path under that URL and the file's
+# SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/community/aarch64/racket-9.2-r0.apk c3bd5eb2decd8e0e0c092aab6cdfe6abae408a8c744fbf867d0794d6f1b7534b
+v3.24/main/aarch64/libncursesw-6.6_p20260516-r0.apk 51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6
+v3.24/main/aarch64/ncurses-terminfo-base-6.6_p20260516-r0.apk e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d
+v3.24/main/aarch64/lz4-libs-1.10.0-r1.apk af6cbe553adda941e04ac40cf0123455b714d65392472389113e7d6dcebbd8d8
+v3.24/main/aarch64/ca-certificates-20261020-r0.apk 6e3a34ed8b40718f9b9291319f7890638156a3d63807284a66d9672d3a8b1d3e

@@ -1,5 +1,7 @@
 //! `fwe`: run a Linux arm64 executable on macOS.
 
+#[cfg(target_os = "macos")]
+mod alloc;
 mod json;
 mod pull;
 mod tarlist;
@@ -275,3 +277,7 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
     }
     None
 }
+
+#[cfg(target_os = "macos")]
+#[global_allocator]
+static ALLOCATOR: alloc::Allocator = alloc::Allocator;
