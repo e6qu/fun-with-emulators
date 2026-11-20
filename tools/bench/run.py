@@ -1500,16 +1500,22 @@ def jdk(a, fwe, guest_env, results):
             print(f"JDK javac again: blocks of files' code an earlier run made, made again: "
                   f"{sum(again)}", file=sys.stderr)
     shutil.rmtree(seen, ignore_errors=True)
-    # How long `javac` takes alone, both ways.
-    took = []
-    for out, cmd in [(ours_out, javac), (theirs_out, [f"{bin_theirs}/javac", "-d", theirs_out]
-                                         + [os.path.join(JDK_SRC, f) for f in sources])]:
-        shutil.rmtree(out, ignore_errors=True)
-        os.makedirs(out)
-        start = time.perf_counter()
-        subprocess.run(cmd, capture_output=True)
-        took.append(time.perf_counter() - start)
-    print(f"JDK javac alone: {took[0]:.2f} s under fwe, {took[1]:.2f} s natively", file=sys.stderr)
+    # How long `javac` takes alone, both ways: the median of three rounds,
+    # taken in turn (a runner's load moves in minutes).
+    took = ([], [])
+    for _ in range(3):
+        for side, (out, cmd) in enumerate(
+                [(ours_out, javac), (theirs_out, [f"{bin_theirs}/javac", "-d", theirs_out]
+                                     + [os.path.join(JDK_SRC, f) for f in sources])]):
+            shutil.rmtree(out, ignore_errors=True)
+            os.makedirs(out)
+            start = time.perf_counter()
+            subprocess.run(cmd, capture_output=True)
+            took[side].append(time.perf_counter() - start)
+    print(f"JDK javac alone: {statistics.median(took[0]):.2f} s under fwe, "
+          f"{statistics.median(took[1]):.2f} s natively (medians of "
+          f"{', '.join(f'{t:.2f}' for t in took[0])} and {', '.join(f'{t:.2f}' for t in took[1])})",
+          file=sys.stderr)
     # What its JIT compilers did, both ways (`-XX:+CITime`, said as the
     # JVM ends): how many methods each tier compiled, in how long.
     at = javac.index("-d")

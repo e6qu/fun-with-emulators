@@ -335,8 +335,6 @@ jobs:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
-      # TEMPORARY: the host's mmap and munmap, with and without fwe's hint.
-      - run: clang -O2 -o mmprobe tools/bench/tmp/mmprobe.c && for h in 0 0x20000000000 0 0x20000000000; do ./mmprobe $h; done
       # The native side's programs: the clang release Alpine's root has, and
       # the workloads' programs (tools/bench/run.py, BREW).
       - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25
