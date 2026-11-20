@@ -876,9 +876,9 @@ pub struct State {
     /// Where calls made from translations return: a return there from
     /// code followed into is followed back ([`exit`]).
     returns: std::collections::BTreeSet<u64>,
-    /// Call sites of code not translated that called into translated code
-    /// and were linked to it, or tried ([`link_call_site`]).
-    call_sites: std::collections::BTreeSet<u64>,
+    /// Call sites of code not translated that called into translated code,
+    /// and whether they were linked to it ([`link_call_site`]).
+    call_sites: BTreeMap<u64, bool>,
     /// The stubs those sites call: each one's address -> its site and its
     /// words ([`call_stub_to_guest`]).
     call_stubs: BTreeMap<u64, (u64, Vec<u32>)>,
@@ -910,7 +910,7 @@ static STATE: Mutex<State> = Mutex::new(State {
     veneers: BTreeMap::new(),
     calls_made: BTreeMap::new(),
     returns: std::collections::BTreeSet::new(),
-    call_sites: std::collections::BTreeSet::new(),
+    call_sites: BTreeMap::new(),
     call_stubs: BTreeMap::new(),
     waiting: AddrMap::with_hasher(BuildHasherDefault::new()),
     dormant: BTreeMap::new(),
@@ -936,9 +936,10 @@ static EXITS_KNOWN_UNLINKED: AtomicU64 = AtomicU64::new(0);
 static EXITS_KNOWN_INDIRECT: AtomicU64 = AtomicU64::new(0);
 static EXITS_KNOWN_TAKEN: AtomicU64 = AtomicU64::new(0);
 static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
-/// Of [`ENTERED`]: calls (`blr`) from code not translated, counted only
-/// for `FWE_TIMING` (it reads the caller's code).
+/// Of [`ENTERED`]: calls (`blr`) from code not translated, and the others
+/// (not linked to their site) whose return is followed.
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
+static ENTERED_FOLLOWED: AtomicU64 = AtomicU64::new(0);
 /// Call sites of code not translated linked to translations.
 static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 /// For `FWE_TIMING`: entries by fetch by their target and `x30`, each
@@ -1058,7 +1059,7 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
-             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked), \
+             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls from code not translated, {} call sites linked, {} whose return is followed), \
              {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
@@ -1072,6 +1073,7 @@ pub fn counts() -> Option<String> {
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
+            ENTERED_FOLLOWED.load(Ordering::Relaxed),
             LINES_FLUSHED.load(Ordering::Relaxed),
             KEPT.load(Ordering::Relaxed),
             DROPPED.load(Ordering::Relaxed),
@@ -1731,9 +1733,9 @@ fn remove(set: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 }
 
 /// A fetch from the program's memory at `pc` (the thread's `x30` being
-/// `lr`, which tells a return): the translation to run instead, if `pc`
-/// holds code that runs by translation.
-/// `held` has a bit for each register `x0`..`x30` holding `pc`.
+/// `lr`, which tells a return; `held` a bit for each of `x0`..`x30` that
+/// holds `pc`): the translation to run instead, if `pc` holds code that
+/// runs by translation.
 pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
     let mut s = state_at(HOLD_ENTER);
     if !s.in_region(pc) {
@@ -1751,27 +1753,37 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
         let mut spots = ENTRY_SPOTS.lock().unwrap_or_else(|e| e.into_inner());
         spots.entry((pc, lr)).or_insert((0, held)).0 += 1;
     }
-    if lr == pc {
-        ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
-    } else if fwe_kernel::timing::on()
-        && !s.in_region(lr.wrapping_sub(4))
-        && crate::trap::read_host::<u32>(lr.wrapping_sub(4))
-            .is_some_and(|w| w & 0xffff_fc1f == 0xd63f_0000)
-    {
-        ENTERED_CALLS.fetch_add(1, Ordering::Relaxed);
-    }
     let i = translation(&mut s, pc);
     let into = s.blocks[i].unsaved_entry();
-    // Called from code fwe prepared in place (`blr xN` before `lr`): that
-    // site looks its targets up from now on, as a translation does.
+    if lr == pc {
+        ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
+        return Some(into);
+    }
+    // Called from code fwe prepared in place (`blr xN` before `lr`, `xN`
+    // the target): that site looks its targets up from now on, as a
+    // translation does. (Read as the host copies: `lr` may be anything.)
     let site = lr.wrapping_sub(4);
-    if lr != pc && !s.call_sites.contains(&site) && !s.in_region(site) && followable(site) {
-        // (Read as the host copies: `lr` may be anything.)
-        if let Some(w) = crate::trap::read_host::<u32>(site)
-            && w & 0xffff_fc1f == 0xd63f_0000
-            && !matches!((w >> 5) & 0x1f, 18 | 30)
-        {
-            link_call_site(&mut s, site, (w >> 5) & 0x1f);
+    let call = (!s.in_region(site) && followable(site))
+        .then(|| crate::trap::read_host::<u32>(site))
+        .flatten()
+        .filter(|&w| w & 0xffff_fc1f == 0xd63f_0000)
+        .map(|w| (w >> 5) & 0x1f)
+        .filter(|&n| held & 1 << n != 0 && !matches!(n, 18 | 30));
+    let linked = call.is_some_and(|n| {
+        ENTERED_CALLS.fetch_add(1, Ordering::Relaxed);
+        match s.call_sites.get(&site) {
+            Some(&linked) => linked,
+            None => link_call_site(&mut s, site, n),
+        }
+    });
+    // Else nothing tells where it came from (a branch through a register,
+    // a call whose site took no stub): where it returns is followed, so the
+    // code that came in runs by translation from there, its next ways in
+    // lookups rather than faults.
+    if !linked && !s.in_region(lr) && followable(lr) {
+        ENTERED_FOLLOWED.fetch_add(1, Ordering::Relaxed);
+        if s.returns.insert(lr) && s.outside.remove(&lr) {
+            unpublish(lr, 0);
         }
     }
     Some(into)
@@ -1782,9 +1794,9 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
 /// lookup does, and goes to its translation, or makes the call as it was
 /// (target not translated, or not yet): every register as the call would
 /// leave it. The site becomes `bl` to it, made with every other thread
-/// stopped.
-fn link_call_site(s: &mut State, site: u64, n: u32) {
-    s.call_sites.insert(site);
+/// stopped. Whether it did.
+fn link_call_site(s: &mut State, site: u64, n: u32) -> bool {
+    s.call_sites.insert(site, false);
     // As a translation's lookup ([`lookup`]): in place, or through `x16`.
     // Each entry of the target's pair in turn: a miss in the first goes to
     // the second's look, found goes on to the translation, and a miss in
@@ -1834,25 +1846,29 @@ fn link_call_site(s: &mut State, site: u64, n: u32) {
     words.extend(restore_words());
     words.push(0xd61f_0000 | (n << 5)); // br xN
     let _stopped = crate::quiesce::stop_others(&mut |_| {});
-    let Some(stub) = crate::prepare::call_stub(site, &words) else { return };
+    let Some(stub) = crate::prepare::call_stub(site, &words) else { return false };
     s.call_stubs.insert(stub, (site, words));
-    let Some(b) = rewrite::branch(site, stub) else { return };
+    let Some(b) = rewrite::branch(site, stub) else { return false };
     let page = site & !(page_size() - 1);
     let prot = fwe_kernel::mm::host_prot_at(page);
     // Writable a moment, not executable meanwhile (the host allows no page
     // both at once).
     let writable = (prot & !libc::PROT_EXEC) | libc::PROT_READ | libc::PROT_WRITE;
+    // Code read through the site to be translated has its `blr` back.
+    crate::prepare::note_call_site(site, 0xd63f_0000 | (n << 5));
     // SAFETY: a page of the program's code, no other thread running; it
     // gets its protections back.
     unsafe {
         if libc::mprotect(page as *mut libc::c_void, page_size() as usize, writable) != 0 {
-            return;
+            return false;
         }
         (site as *mut u32).write(b | 0x8000_0000); // bl
         libc::mprotect(page as *mut libc::c_void, page_size() as usize, prot);
         crate::prepare::flush_icache(site, 4);
     }
     CALL_SITES_LINKED.fetch_add(1, Ordering::Relaxed);
+    s.call_sites.insert(site, true);
+    true
 }
 
 /// The way out at `regs.pc`, taken by the exit gate (outside a signal's
@@ -1915,8 +1931,9 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     // Code fwe prepared in place (a library's, the program's own) that a
     // translation calls or branches to is followed: translated too, so
     // what it calls and where it returns stay in translations. A return
-    // is followed only to where a translated call returns; to a caller
-    // not translated, it goes back to code that runs as it is.
+    // is followed only to where a translated call returns, or an entry by
+    // fetch not linked to its site ([`enter`]); to a caller not
+    // translated, it goes back to code that runs as it is.
     let follow = !s.in_region(to)
         && match exit {
             Exit::Reg { n: 30, link: None } => s.returns.contains(&to),

@@ -107,13 +107,28 @@ fn note_site(at: u64, site: Site) {
     SITES.lock().unwrap_or_else(|e| e.into_inner()).insert(at, site);
 }
 
+/// Call sites made a `bl` to a call stub ([`call_stub`]), by address: the
+/// word the program wrote there.
+static CALL_SITES: std::sync::Mutex<std::collections::BTreeMap<u64, u32>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Call site `at`, which held `w`, made a `bl` to a call stub.
+pub fn note_call_site(at: u64, w: u32) {
+    CALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).insert(at, w);
+}
+
 /// The instruction the program wrote at `at` in code fwe prepared, which
 /// holds `w` now: `w` itself, unless it is fwe's own word there, the trap
-/// a system call became or the branch to the stub a site became (whose
-/// branch back leads past `at`).
+/// a system call became, the branch to the stub a site became (whose
+/// branch back leads past `at`) or the call to a call stub a call site
+/// became ([`note_call_site`]).
 pub fn original(at: u64, w: u32) -> u32 {
     if w == rewrite::TRAP {
         return rewrite::SVC0;
+    }
+    if w & 0xfc00_0000 == 0x9400_0000 {
+        let sites = CALL_SITES.lock().unwrap_or_else(|e| e.into_inner());
+        return sites.get(&at).copied().unwrap_or(w);
     }
     if w & 0xfc00_0000 != rewrite::B {
         return w;
@@ -242,6 +257,7 @@ pub fn reset() {
     STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
     SP_STUB_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    CALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 

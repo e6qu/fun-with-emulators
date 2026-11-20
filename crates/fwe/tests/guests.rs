@@ -1037,17 +1037,48 @@ fn jit_code_called_from_many_sites_at_once() {
 /// set, signalled over and over by another thread, the handler calling
 /// JIT code that sets them to its own values (guests/c/jitstubsig.c): a
 /// signal landing in the call (in its linked site's stub, or the
-/// translation) leaves every call the `x16` and `x17` its caller set.
+/// translation) leaves every call the `x16` and `x17` its caller set, in
+/// each of six rounds, each a program started afresh.
 #[test]
 fn jit_calls_keep_x16_x17_through_signals() {
     let prog = build_c("jitstubsig", Libc::Musl, true, true);
+    // Itself in /bin, with /proc, to run itself again.
     let root = libc_rootfs(Libc::Musl, "jitstubsig");
+    for dir in ["bin", "proc"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::copy(&prog, root.join("bin/jitstubsig")).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg(&prog);
+    cmd.arg("--root").arg(&root).arg(root.join("bin/jitstubsig"));
     let out = run_bounded(cmd);
     eprintln!("--- jitstubsig stderr:\n{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(stdout(&out), "wrong calls: 0\nsignals handled: many\n");
+    let rounds: String = (1..=6).map(|r| format!("round {r}: wrong calls: 0\n")).collect();
+    assert_eq!(stdout(&out), rounds);
     assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Tail calls through a register into JIT code from the program's own
+/// code (guests/c/jittail.c): each reaches the code, and only the first is
+/// a fault into fwe (where the code returns is followed from then on, the
+/// next ones lookups), not one for each of the 100000.
+#[test]
+fn jit_code_branched_into_faults_once() {
+    let prog = build_c("jittail", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jittail");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 5000050000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    // "..., N entries by fetch (...": N, for the one process.
+    let fetched: Vec<u64> = err
+        .lines()
+        .filter(|l| l.contains(" entries by fetch ("))
+        .filter_map(|l| l.split(" entries by fetch (").next()?.rsplit(' ').next()?.parse().ok())
+        .collect();
+    assert_eq!(fetched, [1], "{err}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

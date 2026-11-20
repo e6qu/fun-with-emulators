@@ -137,10 +137,11 @@ way.
   fwe rewrote taken from the record of what it was), so what it calls and
   where it returns stay in translations: a C helper's return into a
   JIT's code is a lookup, not a fault. A return is followed only to
-  where a translated call returns; one to a caller that runs as it is
-  (the code that called into the JIT's) goes back there. The same code
-  keeps running as it is wherever it is called from code that is not
-  translated.
+  where a translated call returns, or where the code that came into the
+  JIT's by a branch fwe could not link returns (below); one to a caller
+  that runs as it is (the code that called into the JIT's) goes back
+  there. The same code keeps running as it is wherever it is called from
+  code that is not translated.
 - **Translations of a file's code are kept.** The blocks made from a
   file's code (a runtime's library, the C library, the program's own)
   are kept on disk by the file's identity and the address it is loaded
@@ -154,7 +155,12 @@ way.
 - **Calls into translated code.** Native code's call into a JIT's code
   faults the first time; that call site (`blr`) becomes a `bl` to a stub
   in reach that looks the target up as a translation does, and goes to
-  its translation, so the next calls fault no more.
+  its translation, so the next calls fault no more. Code read through
+  that site to be translated has its `blr` back. A way in that tells
+  nothing of where it came from (a branch through a register, as an
+  interpreter's tail call into a JIT's compiled code) has where it
+  returns (`x30`) followed instead: the code that came in goes on by
+  translation from there, and its next ways in are lookups.
 - **What the program sees stays its own.** Its memory reads back exactly
   as it wrote it. A fault or signal in a translation is delivered at the
   program's instruction, with its registers: an expansion stopped before
@@ -354,10 +360,12 @@ a processor that reports `DIC` clear.
 - **Following:** an exit to code fwe prepared in place
   (`jit::followable`: in an executable mapping of the guest's, not a
   stub) is translated as well, except a return, followed only to the
-  return point of a translated call (`State::returns`). Such code is
-  read through `prepare::original`, which gives back the instruction at
-  a site from the sites recorded as stubs were made (`prepare::SITES`),
-  checked against the stub's branch back.
+  return point of a translated call or of an entry by fetch not linked
+  to its site (`State::returns`). Such code is read through
+  `prepare::original`, which gives back the instruction at a site from
+  the sites recorded as stubs were made (`prepare::SITES`), checked
+  against the stub's branch back, and a call site's `blr` from those
+  linked to call stubs (`prepare::CALL_SITES`).
 - **Kept translations:** `jit::kept` keeps a block made from a file's
   code (`kept::keep`) as `jit::translate` made it, before it is placed:
   the program's words it was made from, the calls made in other blocks'
@@ -431,7 +439,7 @@ a processor that reports `DIC` clear.
 | a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
-| a call from native code into JIT code | a fault | once per call site, then linked |
+| a call from native code into JIT code | a fault | once per call site, then linked; a branch in once, then followed |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
 
@@ -485,9 +493,10 @@ functions called in turn, and a function made and run once:
 In CI, each against what Linux prints:
 
 - **Contract tests** (`guests/c/jitlab.c`, `jitstorm.c`, `jitx18.c`,
-  `jitcalls.c`, `jitstubsig.c`, `selfmod.c`, `perverse.c`): calls in and
-  out (with `x16` and `x17` kept through signals whose handlers run
-  translated code), indirect branches, PC-relative forms, `x18`, system
+  `jitcalls.c`, `jitstubsig.c`, `jittail.c`, `selfmod.c`, `perverse.c`):
+  calls in and out (with `x16` and `x17` kept through signals whose
+  handlers run translated code), branches in through a register (one
+  fault, then followed), indirect branches, PC-relative forms, `x18`, system
   calls, restarts, signals,
   faults resumed at a continuation, a tracer's stops, code patched,
   copied, flushed through either of two views, made executable after it

@@ -4,8 +4,11 @@
  * over and the handler calls code made at run time too, which sets x16
  * and x17 to values of its own. A signal that lands in the middle of a
  * call must not let the handler's values into the call it interrupted:
- * every call must see the x16 and x17 its caller set. Every line printed
- * is what Linux prints. */
+ * every call must see the x16 and x17 its caller set. (Once a signal
+ * lands in the code made at run time, the caller goes on by translation
+ * and its calls no longer go through the stub: each round is a program
+ * of its own, started afresh by execve.) Every line printed is what Linux
+ * prints. */
 #include <stdint.h>
 int printf(const char *fmt, ...);
 void *mmap(void *addr, unsigned long len, int prot, int flags, int fd, long off);
@@ -14,6 +17,7 @@ int pthread_join(unsigned long t, void **ret);
 unsigned long pthread_self(void);
 int pthread_kill(unsigned long t, int sig);
 int nanosleep(const void *req, void *rem);
+int execve(const char *path, char *const argv[], char *const envp[]);
 
 /* musl's struct sigaction. */
 struct sigaction {
@@ -25,7 +29,9 @@ struct sigaction {
 int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
 
 #define SIGUSR1 10
-#define ROUNDS 4000000
+#define CALLS 1000000
+#define SIGNALS 200
+#define ROUNDS 6
 
 static uint32_t *code;
 static unsigned long caller;
@@ -62,7 +68,8 @@ static void *signaller(void *arg) {
     return 0;
 }
 
-int main(void) {
+int main(int argc, char **argv) {
+    int round = argc;
     code = mmap(0, 16384, 7, 0x22, -1, 0);
     code[0] = 0xca110200; /* eor x0, x16, x17 */
     code[1] = 0xd65f03c0; /* ret */
@@ -83,7 +90,8 @@ int main(void) {
     unsigned long t;
     pthread_create(&t, 0, signaller, 0);
     long bad = 0;
-    for (long i = 0; i < ROUNDS; i++) {
+    /* At least so many calls, and on until so many signals came. */
+    for (long i = 0; i < CALLS || handled < SIGNALS; i++) {
         long a = i * 0x10001, b = ~i;
         if (call(a, b) != (a ^ b)) {
             bad++;
@@ -91,7 +99,16 @@ int main(void) {
     }
     done = 1;
     pthread_join(t, 0);
-    printf("wrong calls: %ld\n", bad);
-    printf("signals handled: %s\n", handled > 100 ? "many" : "few");
+    printf("round %d: wrong calls: %ld\n", round, bad);
+    if (round < ROUNDS) {
+        char *next[ROUNDS + 2];
+        for (int k = 0; k <= round; k++) {
+            next[k] = argv[0];
+        }
+        next[round + 1] = 0;
+        execve("/proc/self/exe", next, 0);
+        printf("execve failed\n");
+        return 1;
+    }
     return 0;
 }
