@@ -17,7 +17,9 @@
 //! words then differ: a few more at each entry, and every block with an
 //! entry for the program's own registers made with a second pass), and
 //! each way back after a call its returns; at the end, the report says
-//! which blocks ran, how often returns came back into generated code, and
+//! which blocks ran, how often the program's `x16` and `x17` were taken
+//! back from below `sp` (by why) and saved again, how often returns came
+//! back into generated code, and
 //! which pages of generated code hold no word a translation would have to
 //! change (a system call, a thread-pointer access, a use of `x18`, a
 //! cache flush), with how often those ran and were flushed.
@@ -190,6 +192,19 @@ fn count(at: u64) -> u64 {
     // SAFETY: a counter of [`units`], in its mapping, which lives as long
     // as the process; read as the translations add to it.
     unsafe { (*(at as *const AtomicU64)).load(Ordering::Relaxed) }
+}
+
+/// Counters of the program's `x16` and `x17` taken back from below `sp`
+/// (for an instruction that names `sp` or needs fwe's stack, and for one
+/// that names them) and saved there again.
+static MOVES: OnceLock<u64> = OnceLock::new();
+pub(crate) const RESTORE_SP: u64 = 0;
+pub(crate) const RESTORE_NAMED: u64 = 1;
+pub(crate) const SAVED_AGAIN: u64 = 2;
+
+/// The counter of `x16` and `x17`'s moves of kind `k` ([`RESTORE_SP`]...).
+pub(crate) fn moves(k: u64) -> u64 {
+    *MOVES.get_or_init(|| units(3)) + 8 * k
 }
 
 /// A way back after a call, counting its returns: its counter, the
@@ -381,6 +396,15 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         second_runs,
         ahead,
         ahead_ran,
+    ));
+    // The program's x16 and x17 taken back from below sp, by why, and
+    // saved there again.
+    out.push_str(&format!(
+        "; x16 and x17 taken back {} times for sp or fwe's stack, {} for an instruction naming \
+         them, saved again {} times",
+        count(moves(RESTORE_SP)),
+        count(moves(RESTORE_NAMED)),
+        count(moves(SAVED_AGAIN)),
     ));
     // Returns into each origin's code, by the call they come back from.
     let mut returns: HashMap<(usize, &str), u64> = HashMap::new();

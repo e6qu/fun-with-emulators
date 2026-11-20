@@ -578,7 +578,8 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     time goes under fwe, by program counter, translated code named by the
     code cache's map; and the translator's counts, the script run twice
     into one directory of the blocks made (`FWE_JIT_SEEN`): how many the
-    second run made that the first had, of a file's code and generated."""
+    second run made that the first had, of a file's code and generated;
+    then once with its blocks counting their runs (`FWE_JIT_COUNT`)."""
     root = alpine_root(manifest, a.cache)
     shutil.copytree(WORKLOADS, os.path.join(root, "tmp/wl"), dirs_exist_ok=True)
     ours = guest_env + fwe + ["--root", root, os.path.join(root, program.lstrip("/")),
@@ -591,10 +592,10 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     shutil.rmtree(jit_map, ignore_errors=True)
     pcs(f"{name} natively", theirs, execname=os.path.basename(program))
     seen = tempfile.mkdtemp()
-    for label in ("", " again"):
-        r = subprocess.run(guest_env + ["FWE_TIMING=1", f"FWE_JIT_SEEN={seen}"]
-                           + ours[len(guest_env):], capture_output=True, text=True,
-                           errors="replace")
+    for label, extra in [("", [f"FWE_JIT_SEEN={seen}"]), (" again", [f"FWE_JIT_SEEN={seen}"]),
+                         (" with its blocks counting", ["FWE_JIT_COUNT=1"])]:
+        r = subprocess.run(guest_env + ["FWE_TIMING=1"] + extra + ours[len(guest_env):],
+                           capture_output=True, text=True, errors="replace")
         said = [line.split("; blocks made ", 1)[1] for line in r.stderr.splitlines()
                 if "timing: exit: " in line and "; blocks made " in line]
         print(f"{name}{label}, the translator's counts (exit {r.returncode}): "

@@ -3218,6 +3218,16 @@ fn body_of(
         if saved && !is_branch(w) && !keeps_saved(w, false) && in_x17(w).is_none() {
             put_x18(&mut x18, pc, a);
             x18 = None;
+            // (Counting, why they are taken back, before the restore a
+            // word index names.)
+            if jitcount::counting() {
+                let why = if crate::decode::names_x16_x17(w) {
+                    jitcount::RESTORE_NAMED
+                } else {
+                    jitcount::RESTORE_SP
+                };
+                a.extend(H, counter(jitcount::moves(why)), Word::Saved(pc));
+            }
             if restore.is_none() {
                 restore = Some((pc, a.len(H)));
             }
@@ -3649,6 +3659,9 @@ fn one(
     let save = |saved: &mut bool, a: &mut Asm<Word>| {
         if !*saved {
             a.push(H, SAVE, Word::At(pc));
+            if jitcount::counting() {
+                a.extend(H, counter(jitcount::moves(jitcount::SAVED_AGAIN)), Word::Saved(pc));
+            }
             *saved = true;
         }
     };
