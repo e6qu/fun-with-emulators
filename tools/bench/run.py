@@ -41,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import struct
 import subprocess
@@ -638,13 +639,55 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     seen = tempfile.mkdtemp()
     for label, extra in [("", [f"FWE_JIT_SEEN={seen}"]), (" again", [f"FWE_JIT_SEEN={seen}"]),
                          (" with its blocks counting", ["FWE_JIT_COUNT=1"])]:
-        r = subprocess.run(guest_env + ["FWE_TIMING=1"] + extra + ours[len(guest_env):],
-                           capture_output=True, text=True, errors="replace")
+        r = run_limited(guest_env + ["FWE_TIMING=1"] + extra + ours[len(guest_env):],
+                        f"{name}{label}")
         said = [line.split("timing: ", 1)[1] for line in r.stderr.splitlines()
                 if "timing: exit" in line and ("JIT code: " in line or "system calls" in line)]
         print(f"{name}{label}, fwe's marks (exit {r.returncode}): " + " | ".join(said),
               file=sys.stderr)
     shutil.rmtree(seen, ignore_errors=True)
+
+
+# The most seconds one run of a workload may take: a run that hangs fails
+# the benchmarks with where it is, rather than the job's time limit with
+# nothing.
+LIMIT = 300
+
+
+def run_limited(cmd, name):
+    """`cmd` run as `subprocess.run` with its output captured as text, for
+    at most LIMIT seconds. Past them, each of its processes is sampled
+    (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
+    on top of its threads' stacks printed), the process group it was started
+    in is stopped, and the benchmarks fail."""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         errors="replace", start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=LIMIT)
+    except subprocess.TimeoutExpired:
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        pids, todo = [], [p.pid]
+        while todo:
+            pid = todo.pop()
+            pids.append(pid)
+            kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
+            todo += [int(k) for k in kids.stdout.split()]
+        for pid in pids:
+            path = os.path.abspath(f"bench-{slug}-hung-{pid}.sample")
+            subprocess.run(["sample", str(pid), "3", "-file", path], capture_output=True)
+            try:
+                with open(path, errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            top = text.split("Sort by top of stack", 1)[-1].split("\n\n", 1)[0].splitlines()[1:25]
+            print(f"{name}: process {pid} after {LIMIT} s, on top of its stacks:\n"
+                  + "\n".join(top), file=sys.stderr)
+        os.killpg(p.pid, signal.SIGKILL)
+        out, err = p.communicate()
+        sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
+                 f"{err[-3000:]}")
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):
@@ -663,7 +706,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
                 shutil.rmtree(d, ignore_errors=True)
                 os.makedirs(d)
             start = time.perf_counter()
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            r = run_limited(cmd, f"{name} {side}")
             times[side].append(time.perf_counter() - start)
             if r.returncode != 0:
                 # The head of the output holds a crash report's summary (a
@@ -681,9 +724,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     trace = os.path.abspath(f"bench-{name.split()[0].lower()}.trace")
-    subprocess.run(
-        ours[:at] + ["--strace", f"--strace-file={trace}"] + ours[at:], capture_output=True
-    )
+    run_limited(ours[:at] + ["--strace", f"--strace-file={trace}"] + ours[at:], f"{name} traced")
     calls = collections.Counter()
     with open(trace, errors="replace") as f:
         for line in f:
