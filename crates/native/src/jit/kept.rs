@@ -477,6 +477,19 @@ fn build_id() -> [u8; 16] {
 
 /// Part `p`'s records, mapped.
 fn load(p: Part) -> Loaded {
+    let began = fwe_kernel::timing::on().then(std::time::Instant::now);
+    let loaded = load_files(p);
+    if let Some(t) = began {
+        let n: usize = loaded.index.values().map(Vec::len).sum();
+        jitcount::LOADED.fetch_add(n as u64, std::sync::atomic::Ordering::Relaxed);
+        jitcount::LOAD_NS
+            .fetch_add(t.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+    }
+    loaded
+}
+
+/// [`load`]'s work: part `p`'s files mapped and their records indexed.
+fn load_files(p: Part) -> Loaded {
     let mut loaded = Loaded::default();
     let Some(dir) = part_dir(p) else { return loaded };
     let Ok(entries) = std::fs::read_dir(std::ffi::OsStr::from_bytes(&dir)) else { return loaded };

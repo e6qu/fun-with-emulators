@@ -449,7 +449,8 @@ What fwe counts, for the benchmarks to report
   looking for a kept one, translating, checking, packing, keeping,
   finding room, writing, indexing, linking), the program's words a block holds and what ended it, blocks made
   with a second pass for the program's own `x16` and `x17` and those
-  entered there, blocks made ahead, blocks taken from those kept, and the
+  entered there, blocks made ahead, blocks taken from those kept (and the records
+  indexed to find them), and the
   blocks in use that only a direct branch leads to, by where the branch
   is.
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address

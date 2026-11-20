@@ -79,6 +79,10 @@ pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) static TAKE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KEPT_OTHER: AtomicU64 = AtomicU64::new(0);
+/// Records indexed as their parts' files were first looked at, and the
+/// nanoseconds that took.
+pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOAD_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KEPT_WRITTEN: AtomicU64 = AtomicU64::new(0);
 /// Blocks by how their words end ([`ENDS`]), and the program's words they
 /// hold (their first pass's).
@@ -384,13 +388,16 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         out.push_str(if k + 1 < STEPS.len() { "," } else { "" });
     }
     out.push_str(&format!(
-        "; taken from those kept {} {}, {} {} ({} ms), {} records found made otherwise",
+        "; taken from those kept {} {}, {} {} ({} ms), {} records found made otherwise, {} \
+         records indexed ({} ms)",
         ORIGINS[FILE],
         n(&TAKEN[FILE]),
         ORIGINS[GENERATED],
         n(&TAKEN[GENERATED]),
         ms(&TAKE_NS),
         n(&KEPT_OTHER),
+        n(&LOADED),
+        ms(&LOAD_NS),
     ));
     let made = n(&MADE[FILE]) + n(&MADE[GENERATED]);
     out.push_str(&format!(
