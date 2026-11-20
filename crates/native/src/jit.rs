@@ -808,9 +808,6 @@ pub struct State {
     /// words dropped, taken back when the address is to be translated
     /// again if its words were not changed ([`revive`]).
     dormant: BTreeMap<u64, usize>,
-    /// The program addresses of blocks whose successors are to be made
-    /// ahead of the program ([`ahead_later`]), the latest last.
-    ahead: Vec<u64>,
     cache: Option<Cache>,
     /// Words of the cache [`State::patch`] changed whose instruction cache
     /// lines are not invalidated yet ([`State::sync_patched`]).
@@ -833,7 +830,6 @@ static STATE: Mutex<State> = Mutex::new(State {
     call_sites: std::collections::BTreeSet::new(),
     waiting: AddrMap::with_hasher(BuildHasherDefault::new()),
     dormant: BTreeMap::new(),
-    ahead: Vec::new(),
     cache: None,
     patched: std::cell::RefCell::new(Vec::new()),
 });
@@ -1562,7 +1558,6 @@ pub fn reset() {
     s.call_sites.clear();
     s.waiting.clear();
     s.dormant.clear();
-    s.ahead.clear();
 }
 
 /// Held across a `fork`, so that the child's copy of the translations is
@@ -1848,8 +1843,11 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             EXITS_KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let i = translation(&mut s, to);
-    ahead_later(&mut s, to);
+    let mut i = translation(&mut s, to);
+    // (The cache emptied as blocks were made ahead: its block anew.)
+    if ahead(&mut s, i) {
+        i = translation(&mut s, to);
+    }
     // Linked where the target is in reach (in the same chunk), unless the
     // cache was emptied meanwhile (`at` may be reused) or the block left
     // since (the lock let go as it was translated).
@@ -2119,23 +2117,17 @@ fn entered(s: &State, i: usize, saved: bool, x18: bool) -> u64 {
 /// other thread placed one meanwhile (else it looks again).
 fn translation(s: &mut Held, g: u64) -> usize {
     let c = Clock::now();
-    let r = translation_(s, g, false).expect("a block of the program's code");
+    let r = translation_(s, g);
     c.add_to(&PROBE[0]);
     r
 }
-
-/// [`translation`], made ahead of the program (`ahead`) by fwe's own thread
-/// ([`maker`]), which reads the program's words only through the host's
-/// copy of the task's memory: no fault where they are gone meanwhile (their
-/// mapping's translations are dropped before the host unmaps it), and no
-/// block. Its index, if there is one.
-fn translation_(s: &mut Held, g: u64, ahead: bool) -> Option<usize> {
+fn translation_(s: &mut Held, g: u64) -> usize {
     loop {
         if let Some(&i) = s.by_g.get(&g) {
             // Its table entry may have gone to another address since (they
             // share entries): it is its own again.
             publish_block(&s.blocks[i]);
-            return Some(i);
+            return i;
         }
         if s.cache.is_none() {
             s.cache = Some(new_cache());
@@ -2144,14 +2136,14 @@ fn translation_(s: &mut Held, g: u64, ahead: bool) -> Option<usize> {
         let page = g & !(page_size() - 1);
         let followed = !s.in_region(g);
         let c = Clock::now();
-        let rv = revive(s, g, page, ahead);
+        let rv = revive(s, g, page);
         c.add_to(&PROBE[2]);
         if let Some(i) = rv {
-            return Some(i);
+            return i;
         }
         let making = Clock::now();
         let c = Clock::now();
-        let source = if ahead { read_safely(g, snapshot_len(g))? } else { snapshot(g) };
+        let source = snapshot(g);
         c.add_to(&PROBE[1]);
         // A file's code: its block as kept ([`kept`]), where its words and
         // the calls made in other blocks' words that it goes on into are
@@ -2168,7 +2160,7 @@ fn translation_(s: &mut Held, g: u64, ahead: bool) -> Option<usize> {
             let n = ((made.end - g) / 4) as usize;
             let r = place(s, g, followed, made, info, source[..n].to_vec(), true);
             making.add_to(&jitcount::TAKE_NS);
-            return Some(r);
+            return r;
         }
         // Calls made already from the words it may read: made there.
         let known: Vec<(u64, u64)> = s
@@ -2184,11 +2176,7 @@ fn translation_(s: &mut Held, g: u64, ahead: bool) -> Option<usize> {
             made
         });
         let read_words = ((made.end - g) / 4) as usize;
-        let same = if ahead {
-            read_safely(g, read_words).is_some_and(|now| now == source[..read_words])
-        } else {
-            source[..read_words].iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w)
-        };
+        let same = source[..read_words].iter().zip((g..).step_by(4)).all(|(&w, at)| read(at) == w);
         if s.by_g.contains_key(&g) || !same || followed == s.in_region(g) {
             continue;
         }
@@ -2206,85 +2194,12 @@ fn translation_(s: &mut Held, g: u64, ahead: bool) -> Option<usize> {
         making.add_to(
             &jitcount::MAKE_NS[if followed { jitcount::FILE } else { jitcount::GENERATED }],
         );
-        return Some(r);
+        return r;
     }
 }
 
 /// How many blocks a way out makes ahead of the program ([`ahead`]).
 const AHEAD: usize = 4;
-
-/// The most blocks waiting for their successors to be made ahead
-/// ([`State::ahead`]): past it, the oldest half are let go (a thread that
-/// comes to a block not made makes it itself).
-const AHEAD_WAITING: usize = 256;
-
-/// Make the blocks the block at program address `g` goes on to ahead of
-/// the program ([`ahead`]), on fwe's own thread for it ([`maker`]): the
-/// program's thread goes on meanwhile, and makes any block it comes to
-/// first itself.
-fn ahead_later(s: &mut State, g: u64) {
-    if s.ahead.len() >= AHEAD_WAITING {
-        s.ahead.drain(..AHEAD_WAITING / 2);
-    }
-    s.ahead.push(g);
-    MAKER_WORK.fetch_add(1, Ordering::Release);
-    let me = fwe_kernel::host::pid();
-    if MAKER_OF.load(Ordering::Acquire) != me {
-        if MAKER_OF.swap(me, Ordering::AcqRel) != me {
-            let _ = fwe_kernel::host::with_signals_blocked(|| {
-                std::thread::Builder::new().name("fwe-ahead".into()).spawn(maker)
-            });
-        }
-    } else if MAKER_ASLEEP.swap(false, Ordering::AcqRel) {
-        // SAFETY: wakes the maker waiting on the word; reads nothing.
-        unsafe {
-            mach::__ulock_wake(
-                mach::UL_COMPARE_AND_WAIT | mach::ULF_NO_ERRNO,
-                MAKER_WORK.as_ptr().cast(),
-                0,
-            )
-        };
-    }
-}
-
-/// Changed as work for the maker is added ([`ahead_later`]): it sleeps
-/// while the word stays as it saw it with none left.
-static MAKER_WORK: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-/// Whether the maker sleeps (or is about to), to be woken.
-static MAKER_ASLEEP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// The process (host pid) the maker runs in: a fork child, which has
-/// none, starts its own.
-static MAKER_OF: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// fwe's thread that makes blocks ahead of the program ([`ahead_later`]),
-/// with every host signal blocked (they are the program's threads' to
-/// take), the latest work first.
-fn maker() {
-    loop {
-        let seen = MAKER_WORK.load(Ordering::Acquire);
-        let mut s = state();
-        if let Some(g) = s.ahead.pop() {
-            if let Some(&i) = s.by_g.get(&g) {
-                ahead(&mut s, i);
-            }
-            continue;
-        }
-        drop(s);
-        MAKER_ASLEEP.store(true, Ordering::Release);
-        // SAFETY: fwe's own word; the host sleeps while it still reads
-        // `seen` (work added since wakes it at once).
-        unsafe {
-            mach::__ulock_wait2(
-                mach::UL_COMPARE_AND_WAIT | mach::ULF_NO_ERRNO,
-                MAKER_WORK.as_ptr().cast(),
-                u64::from(seen),
-                0,
-                0,
-            )
-        };
-        MAKER_ASLEEP.store(false, Ordering::Release);
-    }
-}
 
 thread_local! {
     /// Whether the blocks this thread makes are made ahead ([`jitcount`]).
@@ -2318,11 +2233,8 @@ fn ahead_(s: &mut Held, i: usize) -> bool {
                 continue;
             }
             MAKING_AHEAD.set(true);
-            let c = Clock::now();
-            let j = translation_(s, to, true);
-            c.add_to(&PROBE[0]);
+            let j = translation(s, to);
             MAKING_AHEAD.set(false);
-            let Some(j) = j else { continue };
             made += 1;
             if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
                 return true;
@@ -2477,18 +2389,13 @@ fn place(
 /// JIT flushes code it wrote anew as the same (a method installed again,
 /// a patch undone). Only a block wanted again is taken back.
 #[inline(never)]
-fn revive(s: &mut State, g: u64, p: u64, ahead: bool) -> Option<usize> {
+fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
     let i = s.dormant.remove(&g)?;
     let b = &s.blocks[i];
     if b.retired || b.followed == s.in_region(g) || b.g & !(page_size() - 1) != p {
         return None;
     }
-    let unchanged = if ahead {
-        read_safely(b.g, b.source.len()).is_some_and(|now| now == b.source)
-    } else {
-        b.unchanged()
-    };
-    if !unchanged {
+    if !b.unchanged() {
         return None;
     }
     let len = b.size();
@@ -2714,20 +2621,7 @@ mod mach {
             data: u64,
             out: *mut u64,
         ) -> i32;
-        /// Sleep while the word at `addr` reads `value` (`op`
-        /// [`UL_COMPARE_AND_WAIT`]), up to `timeout_ns` (0: no limit).
-        pub fn __ulock_wait2(
-            op: u32,
-            addr: *mut libc::c_void,
-            value: u64,
-            timeout_ns: u64,
-            value2: u64,
-        ) -> libc::c_int;
-        /// Wake a thread sleeping on the word at `addr`.
-        pub fn __ulock_wake(op: u32, addr: *mut libc::c_void, wake_value: u64) -> libc::c_int;
     }
-    pub const UL_COMPARE_AND_WAIT: u32 = 1;
-    pub const ULF_NO_ERRNO: u32 = 0x0100_0000;
     pub const VM_FLAGS_FIXED: i32 = 0;
     pub const VM_FLAGS_ANYWHERE: i32 = 1;
     pub const VM_FLAGS_FIXED_OVERWRITE: i32 = 0x4000;
@@ -3078,33 +2972,9 @@ thread_local! {
 /// up to its page's end.
 #[inline(never)]
 fn snapshot(g: u64) -> Vec<u32> {
-    (0..snapshot_len(g) as u64).map(|k| read(g + 4 * k)).collect()
-}
-
-/// How many words [`snapshot`] reads from `g`.
-fn snapshot_len(g: u64) -> usize {
     let page = page_size();
-    (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize)
-}
-
-/// The program's `n` words from `g`, read through the host's copy of the
-/// task's memory, if all of them are there: where they are not (unmapped
-/// meanwhile), no fault.
-fn read_safely(g: u64, n: usize) -> Option<Vec<u32>> {
-    let mut words = vec![0u32; n];
-    let (size, mut out) = (4 * n as u64, 0u64);
-    // SAFETY: copying `size` bytes into `words`, which has room for them;
-    // the host reports a hole rather than fault.
-    let r = unsafe {
-        mach::mach_vm_read_overwrite(
-            mach::mach_task_self_,
-            g,
-            size,
-            words.as_mut_ptr() as u64,
-            &mut out,
-        )
-    };
-    (r == 0 && out == size).then_some(words)
+    let n = (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize);
+    (0..n as u64).map(|k| read(g + 4 * k)).collect()
 }
 
 /// `work`, with [`read`] taking the program's words from `g` from `words`:

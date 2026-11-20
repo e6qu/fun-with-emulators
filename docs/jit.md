@@ -295,13 +295,9 @@ a processor that reports `DIC` clear.
   reaches (`State::link`, undone by `State::unlink`), and the gate enters
   that translation as a lookup does. The blocks the target goes on to
   whatever its conditions (its direct branch's target, a call's and
-  where it returns) are made a few deep (`jit::ahead`) and linked as
-  each is placed, by a thread of fwe's own (`jit::maker`, started with
-  the first, every host signal blocked) while the program's thread goes
-  on (`jit::ahead_later`): each would otherwise be a way out of its own
-  as the program reached it. A thread that comes to such a block before
-  it is made makes it itself; the latest blocks' successors are made
-  first, and past 256 waiting the oldest half are let go. The words patched have their
+  where it returns) are made with it, a few deep (`jit::ahead`), and
+  linked at once: each would otherwise be a way out of its own as the
+  program reached it. The words patched have their
   instruction cache lines invalidated together, with one barrier for all
   (`State::sync_patched`), before the translator's lock is let go, new
   words are written or stopped threads go on: a patch turns one right
@@ -415,9 +411,8 @@ a processor that reports `DIC` clear.
   added, up to 64 (8 GiB).
 - **Fork and exec:** `fork` holds the translator's lock (`jit::hold`),
   and the child maps each chunk's executable view again from its own
-  copy of the writable one (`jit::forked`) and starts a maker thread of
-  its own when it first needs one; an in-place `execve` drops every
-  translation (`jit::reset`).
+  copy of the writable one (`jit::forked`); an in-place `execve` drops
+  every translation (`jit::reset`).
 - **One lock:** the translator's state is behind one lock, taken to
   translate, to link a way out, to drop a flushed line and to enter by
   a fetch. Lookups and linked branches take none.
