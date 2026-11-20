@@ -39,6 +39,33 @@ const ORIGINS: [&str; 2] = ["from files", "generated"];
 /// Blocks made, and the nanoseconds making them, by origin.
 pub(crate) static MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) static MAKE_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Making or taking a block, by step ([`STEPS`]): the nanoseconds and
+/// the times each ran.
+pub(crate) static STEP_NS: [AtomicU64; STEPS.len()] = [const { AtomicU64::new(0) }; STEPS.len()];
+pub(crate) static STEP_RUNS: [AtomicU64; STEPS.len()] = [const { AtomicU64::new(0) }; STEPS.len()];
+pub(crate) const STEP_SNAPSHOT: usize = 0;
+pub(crate) const STEP_LOOK: usize = 1;
+pub(crate) const STEP_TRANSLATE: usize = 2;
+pub(crate) const STEP_CHECK: usize = 3;
+pub(crate) const STEP_PACK: usize = 4;
+pub(crate) const STEP_KEEP: usize = 5;
+pub(crate) const STEP_ROOM: usize = 6;
+pub(crate) const STEP_EMIT: usize = 7;
+pub(crate) const STEP_INDEX: usize = 8;
+pub(crate) const STEP_LINK: usize = 9;
+const STEPS: [&str; 10] = [
+    "the words read",
+    "a kept one looked for",
+    "translated (the lock let go and taken again)",
+    "the words checked",
+    "packed",
+    "kept",
+    "room found and branches resolved",
+    "written and made ready to run",
+    "indexed",
+    "linked",
+];
+
 /// Blocks made with a second pass of their words, those words, and the
 /// blocks whose entry there was used.
 pub(crate) static SECOND: AtomicU64 = AtomicU64::new(0);
@@ -350,6 +377,12 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&SECOND_USED),
         n(&AHEAD),
     );
+    out.push_str("; making a block, ns each step:");
+    for (k, name) in STEPS.iter().enumerate() {
+        let runs = n(&STEP_RUNS[k]);
+        out.push_str(&format!(" {name} {}", n(&STEP_NS[k]) / runs.max(1)));
+        out.push_str(if k + 1 < STEPS.len() { "," } else { "" });
+    }
     out.push_str(&format!(
         "; taken from those kept {} {}, {} {} ({} ms), {} records found made otherwise",
         ORIGINS[FILE],

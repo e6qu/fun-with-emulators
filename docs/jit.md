@@ -445,7 +445,9 @@ What fwe counts, for the benchmarks to report
   cache lines flushed, blocks dropped and taken back, emptyings of the
   cache, and the translator's lock waited for and held, by holder. Then
   the blocks made from files and from generated code and the time each
-  took, the program's words a block holds and what ended it, blocks made
+  took, the time of each step of making or taking one (reading its words,
+  looking for a kept one, translating, checking, packing, keeping,
+  finding room, writing, indexing, linking), the program's words a block holds and what ended it, blocks made
   with a second pass for the program's own `x16` and `x17` and those
   entered there, blocks made ahead, blocks taken from those kept, and the
   blocks in use that only a direct branch leads to, by where the branch
