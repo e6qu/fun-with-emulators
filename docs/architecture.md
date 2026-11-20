@@ -1258,7 +1258,9 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   `crates/kernel/src/pty.rs` (mapping in
   [linux-on-macos.md](linux-on-macos.md#terminals-and-key-strokes)). A
   closed pty master keeps its number mapped, since another process may
-  still hold it.
+  still hold it. The process that opens a master holds its slave too, so
+  what the slave wrote outlives the slave's last guest holder; fwe tells
+  the hang-up itself, by looking at the guest processes' descriptors.
 
 ## Containers
 

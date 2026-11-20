@@ -1233,8 +1233,9 @@ taken reach the guest even if a further take to fill the guest's buffer
 is interrupted, so an edge-triggered event is never lost (Go's runtime,
 interrupted by its own preemption signals, would otherwise wait for ever
 on a pipe's end). Cases the host does not report are looked at in slices:
-the read end of a named FIFO whose writers have gone, a mounts file, and
-a pipe smaller than the host's while it is full. The timeout is rounded
+the read end of a named FIFO whose writers have gone, a pty master whose
+slave hung up, a mounts file, and a pipe smaller than the host's while it
+is full. The timeout is rounded
 up to whole milliseconds, `epoll_pwait2`'s too.
 
 **`ppoll`, `pselect6`**: `struct pollfd` and the `POLL*` bits are the same
@@ -2953,6 +2954,7 @@ a guest shell and a host shell share job control on one terminal:
 | process groups and sessions (`setpgid`, `setsid`, `getpgid`, `getsid`) | the host's | the host's, with ids mapped through the guest's pid namespace; fwe records each process's group |
 | the foreground group, the controlling terminal | the host tty's | the host tty's |
 | `/dev/ptmx`, `TIOCGPTN`, `TIOCSPTLCK`, `/dev/pts/N` | `posix_openpt`, `grantpt`, `unlockpt`, `ptsname`, `/dev/ttysNNN` | `/dev/ptmx` allocates with `posix_openpt` and numbers the slave; `TIOCGPTN` returns that number; `TIOCSPTLCK` is accepted (the slave is unlocked already); `/dev/pts/N` opens the host slave (`crates/kernel/src/pty.rs`) |
+| the slave's last holder closes it: the master reads what it wrote, then `EIO`; `poll` reports `POLLHUP` | unread output thrown away; the master reads 0 | the process that opens a master holds its slave too, out of the guest's reach (across `fork` and `execve`), so the output is kept; a slave a guest opened that no guest process holds any more is hung up: a master `read` with nothing left fails with `EIO`, and `read`, `poll`, `select` and `epoll` waits look between short slices |
 
 ### Children ending
 
@@ -3076,6 +3078,7 @@ for each kind of descriptor:
 | `EV_EOF` on a pipe's write filter (readers gone) | an error to write | `EPOLLOUT \| EPOLLERR` |
 | `EV_ERROR` | — | `EPOLLERR` |
 | a FIFO's last writer gone (macOS reports nothing) | `select` asked between short slices | `POLLHUP`/`EPOLLHUP` |
+| a pty slave's last guest holder gone (fwe holds it, so macOS reports nothing) | the guest processes' descriptors looked at between short slices | `POLLHUP`/`EPOLLHUP` |
 | readiness on an `O_ASYNC` descriptor: host `SIGIO` with no sender | the descriptor and its events found with `poll`; sent as the signal `F_SETSIG` chose, to the owner thread if one is set | that signal with `si_fd`, `si_band` and `POLL_IN`/`POLL_OUT`/`POLL_PRI`/`POLL_HUP` |
 | out-of-band data: `SIGURG` (16) | relayed | `SIGURG` (23) |
 | reading an unconnected Unix stream socket: `ENOTCONN` | Linux's answer | `EINVAL` |

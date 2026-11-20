@@ -3386,9 +3386,47 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
         Ok(ns) => ns,
         Err(e) => return e,
     };
-    // On time, and ended by a signal however soon it lands.
-    if let Err(e) = poll_linux(&mut fds, ns) {
-        return err(e);
+    // Readers whose hang-up the host does not report (FIFOs', pty
+    // masters'): waited for in slices, looked at between them, as `ppoll`
+    // does.
+    let watched: Vec<usize> = (0..fds.len())
+        .filter(|&i| fds[i].events & libc::POLLIN != 0 && crate::fifo::watched(fds[i].fd))
+        .collect();
+    let deadline =
+        (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
+    let mut first = true;
+    loop {
+        let wait = if watched.is_empty() {
+            ns
+        } else if first {
+            0
+        } else {
+            let slice = i64::from(crate::fifo::SLICE_MS) * 1_000_000;
+            deadline.map_or(slice, |d| {
+                (d.saturating_duration_since(std::time::Instant::now()).as_nanos() as i64)
+                    .min(slice)
+            })
+        };
+        first = false;
+        // On time, and ended by a signal however soon it lands.
+        let n = match poll_linux(&mut fds, wait) {
+            Ok(n) => n,
+            Err(e) => return err(e),
+        };
+        let mut hung = false;
+        for &i in &watched {
+            if fds[i].revents & libc::POLLHUP == 0 && crate::fifo::hung_up(fds[i].fd) {
+                fds[i].revents |= libc::POLLHUP;
+                hung = true;
+            }
+        }
+        if n > 0
+            || hung
+            || watched.is_empty()
+            || deadline.is_some_and(|d| std::time::Instant::now() >= d)
+        {
+            break;
+        }
     }
     if fds.iter().any(|p| p.revents & libc::POLLNVAL != 0) {
         return err(errno::EBADF);
@@ -3447,13 +3485,14 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         Err(e) => return e,
     };
     // The read ends of named FIFOs it watches, whose writers' end the
-    // host does not report ([`crate::fifo`]): waited for in slices,
+    // host does not report ([`crate::fifo`]), and pty masters, whose
+    // slave's hang-up fwe tells ([`crate::pty`]): waited for in slices,
     // looked at between them.
     let fifos: Vec<usize> = if nfds as usize <= 4096 {
         (0..nfds as usize)
             .filter(|&i| {
                 uaccess::read::<Pollfd>(fds + (i * size_of::<Pollfd>()) as u64)
-                    .is_ok_and(|p| p.events & libc::POLLIN != 0 && crate::fifo::is_reader(p.fd))
+                    .is_ok_and(|p| p.events & libc::POLLIN != 0 && crate::fifo::watched(p.fd))
             })
             .collect()
     } else {
@@ -3498,9 +3537,7 @@ unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
         }
         for &i in &fifos {
             let p = &mut set[i];
-            if p.revents & libc::POLLHUP == 0
-                && matches!(crate::fifo::probe(p.fd), crate::fifo::Probe::HungUp)
-            {
+            if p.revents & libc::POLLHUP == 0 && crate::fifo::hung_up(p.fd) {
                 p.revents |= libc::POLLHUP;
             }
         }

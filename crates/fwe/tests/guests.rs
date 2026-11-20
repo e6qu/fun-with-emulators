@@ -874,6 +874,38 @@ fn session_and_process_groups() {
     }
 }
 
+/// A pty master whose slave's last holder went (guests/c/ptyhup.c): what
+/// the slave wrote is still there, through an execve, `poll` reports it
+/// and the hang-up, and `read` hands it out, then fails with `EIO` (a
+/// duplicate's too), as on Linux (macOS throws it away and reads 0).
+#[test]
+fn pty_master_reads_what_a_hung_up_slave_left() {
+    let prog = build_c("ptyhup", Libc::Musl, true, true);
+    // Itself in /bin, with /proc and /dev, to run itself again.
+    let root = libc_rootfs(Libc::Musl, "ptyhup");
+    for dir in ["bin", "proc", "dev"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::copy(&prog, root.join("bin/ptyhup")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("bin/ptyhup"));
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "no slave yet: poll 0 revents 0\n\
+         child: 0\n\
+         after hang-up: poll 1 revents 0x11\n\
+         first read: 7\n\
+         all read: poll 1 revents 0x10\n\
+         next read: -1 errno 5\n\
+         a duplicate's read: -1 errno 5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// fork and wait: a guest forks, the child exits 7, and the parent reaps it
 /// and exits with the child's decoded `WEXITSTATUS` — so a passing run (7)
 /// confirms the whole fork/exit/wait path and the Linux status encoding.
