@@ -3693,7 +3693,9 @@ fn names_none(w: u32, regs: u32, sp: bool) -> bool {
             }
         }
         // Data processing with an immediate: `sp` in add and subtract
-        // (and with tags) and in logical operations that set no flags.
+        // (and with tags) and in logical operations that set no flags; the
+        // PC-relative forms and the wide moves name one register, the
+        // rest of their bits an immediate, extract one more at 16.
         0b1000 | 0b1001 => {
             let not_s = (w >> 29) & 1 == 0;
             let names_sp = match (w >> 23) & 7 {
@@ -3702,7 +3704,12 @@ fn names_none(w: u32, regs: u32, sp: bool) -> bool {
                 0b100 => rd == 31 && (w >> 29) & 3 != 3,
                 _ => false,
             };
-            !(sp && names_sp) && !named(if (w >> 23) & 7 == 0b111 { &[0, 5, 16] } else { &[0, 5] })
+            let fields: &[u32] = match (w >> 23) & 7 {
+                0b000 | 0b001 | 0b101 => &[0],
+                0b111 => &[0, 5, 16],
+                _ => &[0, 5],
+            };
+            !(sp && names_sp) && !named(fields)
         }
         // Data processing on registers: `sp` in add and subtract with an
         // extended register, and (taken as such) in the one- and two-source
@@ -4466,6 +4473,21 @@ mod tests {
         // ldr x0, [x5, w18, uxtw #3]: x18 named, kept only where it may be.
         assert!(!keeps_saved(0xf872_58a0, false));
         assert!(keeps_saved(0xf872_58a0, true));
+    }
+
+    /// A wide move or a PC-relative address names its destination alone:
+    /// the bits of its immediate are none.
+    #[test]
+    fn immediates_named_as_no_register() {
+        // movz x2, #0x50; movk xzr, #0x370; movz x6, #0x2110; adrp x4, ..;
+        // adr x0, ..: 16 or 17 in the bits at 5.
+        for w in [0xd280_0a02, 0xf280_6e1f, 0xd284_2206, 0xb000_f244, 0x1000_0220] {
+            assert!(keeps_saved(w, false), "{w:08x}");
+        }
+        // movz x16, #1; movk x17, #2; adrp x16, ..; adr x17, ..
+        for w in [0xd280_0030, 0xf280_0051, 0x9000_0010, 0x1000_0011] {
+            assert!(!keeps_saved(w, false), "{w:08x}");
+        }
     }
 
     /// Each kind of word comes back from a placed block's packed form as
