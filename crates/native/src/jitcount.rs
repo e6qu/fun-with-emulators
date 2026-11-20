@@ -195,16 +195,27 @@ fn count(at: u64) -> u64 {
 }
 
 /// Counters of the program's `x16` and `x17` taken back from their slots
-/// (for an instruction that needs fwe's stack, and for one that names
-/// them) and saved there again.
+/// for an instruction that names them, and saved there again.
 static MOVES: OnceLock<u64> = OnceLock::new();
-pub(crate) const RESTORE_STACK: u64 = 0;
-pub(crate) const RESTORE_NAMED: u64 = 1;
-pub(crate) const SAVED_AGAIN: u64 = 2;
+pub(crate) const RESTORE_NAMED: u64 = 0;
+pub(crate) const SAVED_AGAIN: u64 = 1;
 
-/// The counter of `x16` and `x17`'s moves of kind `k` ([`RESTORE_STACK`]...).
+/// The counter of `x16` and `x17`'s moves of kind `k` ([`RESTORE_NAMED`]...).
 pub(crate) fn moves(k: u64) -> u64 {
-    *MOVES.get_or_init(|| units(3)) + 8 * k
+    *MOVES.get_or_init(|| units(2)) + 8 * k
+}
+
+/// Each place they are taken back for an instruction that names neither
+/// (one fwe does not translate with them saved): its counter and the
+/// instruction.
+static RESTORES: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+
+/// A counter for `x16` and `x17` taken back for the program's instruction
+/// `w`, which names neither: its address.
+pub(crate) fn restore(w: u32) -> u64 {
+    let at = units(1);
+    RESTORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((at, w));
+    at
 }
 
 /// A way back after a call, counting its returns: its counter, the
@@ -398,12 +409,20 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         ahead_ran,
     ));
     // The program's x16 and x17 taken back from their slots, by why, and
-    // saved there again.
+    // saved there again; those for other instructions by the instruction.
+    let mut other: HashMap<u32, u64> = HashMap::new();
+    for &(at, w) in RESTORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+        *other.entry(w).or_default() += count(at);
+    }
+    let mut other: Vec<(u32, u64)> = other.into_iter().filter(|&(_, n)| n > 0).collect();
+    other.sort_unstable_by_key(|&(w, n)| (std::cmp::Reverse(n), w));
+    let most: Vec<String> = other.iter().take(8).map(|(w, n)| format!("{w:08x} {n}")).collect();
     out.push_str(&format!(
-        "; x16 and x17 taken back {} times for fwe's stack, {} for an instruction naming them, \
-         saved again {} times",
-        count(moves(RESTORE_STACK)),
+        "; x16 and x17 taken back {} times for an instruction naming them, {} for another \
+         (most often: {}), saved again {} times",
         count(moves(RESTORE_NAMED)),
+        other.iter().map(|&(_, n)| n).sum::<u64>(),
+        most.join(", "),
         count(moves(SAVED_AGAIN)),
     ));
     // Returns into each origin's code, by the call they come back from.

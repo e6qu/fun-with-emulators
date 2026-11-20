@@ -99,7 +99,8 @@ way.
   program owns them all: it saves `x16` and `x17` in two slots of the
   thread's own (reached through `tpidrro_el0`, as `x18`'s is). The
   translation it reaches keeps them there until one of its instructions
-  names them or needs fwe's stack (a system call, another expansion),
+  names them or fwe's code for it needs them in their registers (a
+  system call, a read of the thread pointer, another expansion),
   and restores them there; a way out or the next lookup saves them again
   only if they were restored. Code that never names them (an
   interpreter's dispatch, calls through pointers, a recursion moving

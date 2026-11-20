@@ -44,7 +44,8 @@
 //!
 //! A translation entered with `x16` and `x17` saved keeps them in two
 //! slots of the thread's (reached through `tpidrro_el0`, as `x18`'s is)
-//! until an instruction names them or needs fwe's stack ([`keeps_saved`]),
+//! until an instruction names them or fwe's code for it needs them in
+//! their registers ([`keeps_saved`]),
 //! and a way out or lookup saves them again only if they were restored:
 //! code that never names them (an interpreter's dispatch, a recursion
 //! moving `sp` at each call) runs its lookups and calls with no save or
@@ -3323,8 +3324,8 @@ impl Calls {
 /// `a` (the block placed at `t`); `followed`, code fwe prepared in place
 /// (a library's), read as the program wrote it ([`Body`]).
 ///
-/// The program's `x16` and `x17` stay on the stack, where the way in left
-/// them (if `saved`), until an instruction needs them or `sp`
+/// The program's `x16` and `x17` stay in their slots, where the way in
+/// left them (if `saved`), until an instruction needs them
 /// ([`keeps_saved`]): they are restored there, and saved again at a way
 /// out or a lookup. A save and the restore of what it saved cost a store's
 /// forwarding to the load, some cycles; through a loop of lookups whose
@@ -3448,12 +3449,12 @@ fn body_of(
             // (Counting, why they are taken back, before the restore a
             // word index names.)
             if jitcount::counting() {
-                let why = if crate::decode::names_x16_x17(w) {
-                    jitcount::RESTORE_NAMED
+                let at = if crate::decode::names_x16_x17(w) {
+                    jitcount::moves(jitcount::RESTORE_NAMED)
                 } else {
-                    jitcount::RESTORE_STACK
+                    jitcount::restore(w)
                 };
-                a.extend(H, counter(jitcount::moves(why)), Word::Saved(pc));
+                a.extend(H, counter(at), Word::Saved(pc));
             }
             if restore.is_none() {
                 restore = Some((pc, a.len(H)));
@@ -3613,15 +3614,18 @@ fn is_branch(w: u32) -> bool {
 /// Whether the program's instruction `w` runs as it is (or as [`one`]
 /// stands for it with its own registers alone) with the program's `x16`
 /// and `x17` saved in their slots: it names neither (nor `x18`, unless
-/// `x18`), and needs no stack of fwe's. Where a field may be a register,
-/// it is taken for one.
+/// `x18`), and is of a kind known to name no other (a system instruction
+/// other than a hint or a barrier, such as a system call or a read of the
+/// thread pointer, is not; nor a literal load into a vector register,
+/// made through `x16`). Where a field may be a register, it is taken for
+/// one.
 fn keeps_saved(w: u32, x18: bool) -> bool {
     names_none(w, 1 << 16 | 1 << 17 | if x18 { 0 } else { 1 << 18 }, false)
 }
 
 /// Whether the program's instruction `w` names none of the general
-/// registers in `regs` (a bit each), nor `sp` where `sp` counts, and needs
-/// no stack of fwe's ([`keeps_saved`]). Where a field may be a register,
+/// registers in `regs` (a bit each), nor `sp` where `sp` counts, as
+/// [`keeps_saved`] tells. Where a field may be a register,
 /// it is taken for one.
 fn names_none(w: u32, regs: u32, sp: bool) -> bool {
     let reg = |shift: u32| (w >> shift) & 31;
@@ -3630,7 +3634,9 @@ fn names_none(w: u32, regs: u32, sp: bool) -> bool {
     let op0 = (w >> 25) & 0xf;
     match op0 {
         // Loads and stores: `sp` as the base. A pair names a second
-        // register at 10; the forms with an immediate offset name no other.
+        // register at 10; the forms with an immediate offset name no other,
+        // those with a register offset and the atomic operations one at 16
+        // (their bits at 10 being no register).
         0b0100 | 0b0110 | 0b1100 | 0b1110 => {
             // Literal loads: into a vector register, through x16.
             if w & 0x3b00_0000 == 0x1800_0000 {
@@ -3643,6 +3649,8 @@ fn names_none(w: u32, regs: u32, sp: bool) -> bool {
                 !named(&[0, 5, 10])
             } else if (w >> 24) & 0x3b == 0x39 || ((w >> 24) & 0x3b == 0x38 && (w >> 21) & 1 == 0) {
                 !named(&[0, 5])
+            } else if (w >> 24) & 0x3b == 0x38 {
+                !named(&[0, 5, 16])
             } else {
                 !named(&[0, 5, 10, 16])
             }
@@ -4407,6 +4415,21 @@ fn expansion(site: Site, pc: u64, start: u64, a: &mut Asm<Word>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A load with a register offset, or an atomic operation, names
+    /// registers at 0, 5 and 16 alone: its bits at 10 are none.
+    #[test]
+    fn register_offsets_named_where_they_are() {
+        // ldrb w1, [x5, w0, sxtw]: 18 in the bits at 10.
+        assert!(keeps_saved(0x3860_c8a1, false));
+        // ldr x16, [x5, x0]; ldr x0, [x5, x17]; ldadd x16, x0, [x1]
+        for w in [0xf860_68b0, 0xf871_68a0, 0xf830_0020] {
+            assert!(!keeps_saved(w, false), "{w:08x}");
+        }
+        // ldr x0, [x5, w18, uxtw #3]: x18 named, kept only where it may be.
+        assert!(!keeps_saved(0xf872_58a0, false));
+        assert!(keeps_saved(0xf872_58a0, true));
+    }
 
     /// Each kind of word comes back from a placed block's packed form as
     /// it was made.
