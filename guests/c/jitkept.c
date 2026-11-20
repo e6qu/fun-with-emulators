@@ -1,7 +1,7 @@
 /* Code made at run time calling a function of the program's own file
  * through a register, again and again: its return address is the made
- * code's own, so the function runs by translation too. Every line printed
- * is what Linux prints. */
+ * code's own, so the function runs by translation too, its system call's
+ * stub with it. Every line printed is what Linux prints. */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -31,13 +31,18 @@ static void flush(void *p, size_t n) {
     __asm__ volatile("dsb ish\n isb" ::: "memory");
 }
 
-/* A function of the program's file, with a loop and a branch of its own. */
+/* A function of the program's file, with a loop, a branch and a system
+ * call of its own (whose stub in the translation calls fwe's gate, at an
+ * address of each process's own). */
 __attribute__((noinline)) long spread(long x) {
     long s = 0;
     for (long k = 0; k < 8; k++) {
         s += (x >> k) & 1 ? k : 1;
     }
-    return s;
+    register long x8 __asm__("x8") = 172; /* getpid */
+    register long x0 __asm__("x0");
+    __asm__ volatile("svc 0" : "=r"(x0) : "r"(x8) : "memory");
+    return s + (x0 > 0);
 }
 
 /* long f(long x, long (*g)(long)): g(x) + 1, made as the program runs. */

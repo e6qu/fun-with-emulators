@@ -212,6 +212,9 @@ pub(super) fn keep(
     for v in [made.entry, made.unsaved, made.x18, made.second.unwrap_or(usize::MAX)] {
         put32(&mut w, v as u32);
     }
+    // The gate its system calls' and flushes' stubs call, an address of
+    // this process's ([`relocate`]).
+    put64(&mut w, crate::syscall_gate());
     let asm = &made.room.asm;
     let (hot, cold) = (asm.words(Sec::Hot), asm.words(Sec::Cold));
     put32(&mut w, hot.len() as u32);
@@ -261,6 +264,7 @@ pub(super) fn keep(
 /// packed.
 fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     let [entry, unsaved, x18, second] = [r.u32()?, r.u32()?, r.u32()?, r.u32()?];
+    let gate = r.u64()?;
     let (hot, cold) = (r.u32()? as usize, r.u32()? as usize);
     let mut words = [Vec::with_capacity(hot), Vec::with_capacity(cold)];
     for k in 0..hot + cold {
@@ -268,6 +272,7 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     }
     let info: Vec<Packed> =
         (0..hot + cold).map(|_| Packed::from_bytes(r.take(16)?)).collect::<Option<_>>()?;
+    relocate(&mut words[0], &info[..hot], gate, crate::syscall_gate());
     let field = |v: u8| [Field::Imm26, Field::Imm19, Field::Imm14].get(usize::from(v)).copied();
     let sec = |v: u8| [Sec::Hot, Sec::Cold].get(usize::from(v)).copied();
     let mut fixups = Vec::new();
@@ -312,6 +317,32 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     Some((made, info))
 }
 
+/// The hot words `words` of a block made where the system-call gate was at
+/// `was`, for a process whose gate is at `now` (fwe's image lands
+/// elsewhere in each): the gate's address in the literal of each system
+/// call's and flush's stub (two words among those finishing it,
+/// [`Packed::Finish`]) set to `now`.
+fn relocate(words: &mut [u32], info: &[Packed], was: u64, now: u64) {
+    if was == now {
+        return;
+    }
+    let stub =
+        |p: &Packed| matches!(p, Packed::Finish { of: super::Of::Syscall | super::Of::Flush, .. });
+    let mut k = 0;
+    while k + 1 < words.len() {
+        if stub(&info[k])
+            && stub(&info[k + 1])
+            && (words[k], words[k + 1]) == (was as u32, (was >> 32) as u32)
+        {
+            words[k] = now as u32;
+            words[k + 1] = (now >> 32) as u32;
+            k += 2;
+        } else {
+            k += 1;
+        }
+    }
+}
+
 /// A record's bytes, read in turn.
 struct Reader<'a>(&'a [u8]);
 
@@ -331,7 +362,7 @@ impl<'a> Reader<'a> {
 
 /// A file of records begins so, then its count of records and for each its
 /// program address, offset and length; their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept1";
+const MAGIC: &[u8; 8] = b"fwekept2";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`]:

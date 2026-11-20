@@ -375,8 +375,10 @@ a processor that reports `DIC` clear.
   read-only the first time it translates code there; one that finds
   eight merges them into one. `jit::translation` looks for a record of
   a file's code before it translates (`kept::take`), and places a block
-  taken (`Asm::restore`) as one just made. Other builds' records go
-  once they are an hour old.
+  taken (`Asm::restore`) as one just made, the literal of each system
+  call's and flush's stub set to where the gate is in this process (fwe's
+  image lands elsewhere in each, `kept::relocate`). Other builds' records
+  go once they are an hour old.
 - **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
   prepared in place links that site (`jit::link_call_site`): with every
   other thread stopped, a stub doing the table lookup goes in the spare

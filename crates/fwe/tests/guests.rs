@@ -1115,8 +1115,10 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
 
 /// Translations of a file's code kept (guests/c/jitkept.c: generated code
 /// calling a function of the program's file, which then runs by
-/// translation too): a second run makes no block of the file's code, but
-/// takes each from those the first kept, its output as ever.
+/// translation too, a system call's stub with it): a second run makes no
+/// block of the file's code, but takes each from those the first kept,
+/// its stub calling the gate where this process has it, its output as
+/// ever.
 #[test]
 fn jit_translations_of_a_files_code_are_kept_for_the_next_run() {
     let prog = build_c("jitkept", Libc::Musl, true, true);
