@@ -565,10 +565,32 @@ def build(a, fwe, results):
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     jdk(a, fwe, guest_env, results)
+    host_faults()
     for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
                                             ("LuaJIT", "luajit", "/usr/bin/luajit", "bench.lua")]:
         jit_runtime(a, fwe, guest_env, results, name, manifest, program, script)
     shutil.rmtree(native, ignore_errors=True)
+
+
+def host_faults():
+    """What a fault costs the host, natively (tools/bench/fault.c): a fetch
+    from a page that is not executable, as native code's jump into a JIT's
+    code reaches fwe, and a read of a page with no access; and the lines
+    the kernel logged for the process meanwhile."""
+    d = tempfile.mkdtemp()
+    exe = os.path.join(d, "fault")
+    subprocess.run(["cc", "-O2", "-o", exe, os.path.join(os.path.dirname(__file__), "fault.c")],
+                   check=True)
+    p = subprocess.Popen([exe, "20000"], stdout=subprocess.PIPE, text=True)
+    fetch, read = p.communicate()[0].split()
+    logged = subprocess.run(["log", "show", "--last", "5m", "--style", "compact", "--predicate",
+                             f"processID == {p.pid} AND sender == \"kernel\""],
+                            capture_output=True, text=True, errors="replace").stdout.splitlines()
+    logged = [l for l in logged if str(p.pid) in l]
+    print(f"The host's faults: a fetch from a page not executable {fetch} us, a read of a page "
+          f"with no access {read} us; the kernel logged {len(logged)} lines for them"
+          + (f", the first: {logged[0]}" if logged else ""), file=sys.stderr)
+    shutil.rmtree(d, ignore_errors=True)
 
 
 def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
@@ -596,10 +618,10 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
                          (" with its blocks counting", ["FWE_JIT_COUNT=1"])]:
         r = subprocess.run(guest_env + ["FWE_TIMING=1"] + extra + ours[len(guest_env):],
                            capture_output=True, text=True, errors="replace")
-        said = [line.split("; blocks made ", 1)[1] for line in r.stderr.splitlines()
-                if "timing: exit: " in line and "; blocks made " in line]
-        print(f"{name}{label}, the translator's counts (exit {r.returncode}): "
-              + " | ".join("blocks made " + s for s in said), file=sys.stderr)
+        said = [line.split("timing: ", 1)[1] for line in r.stderr.splitlines()
+                if "timing: exit" in line and ("JIT code: " in line or "system calls" in line)]
+        print(f"{name}{label}, fwe's marks (exit {r.returncode}): " + " | ".join(said),
+              file=sys.stderr)
     shutil.rmtree(seen, ignore_errors=True)
 
 

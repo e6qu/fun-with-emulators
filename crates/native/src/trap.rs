@@ -1412,7 +1412,14 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // Code the guest made executable after mapping it runs by translation:
     // a fetch from it goes on at its translation.
     let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
-    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr) {
+    let held = (0..31)
+        .filter(|&r| match r {
+            29 => mc.ss.fp,
+            30 => mc.ss.lr,
+            r => mc.ss.x[r],
+        } == addr)
+        .fold(0, |m, r| m | 1 << r);
+    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held) {
         mc.ss.pc = t;
         return;
     }

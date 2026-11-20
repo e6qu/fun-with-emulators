@@ -857,6 +857,10 @@ static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
 /// Call sites of code not translated linked to translations.
 static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
+/// For `FWE_TIMING`: entries by fetch by their target and `x30`, each
+/// with how many there were and the registers that held the target.
+static ENTRY_SPOTS: std::sync::Mutex<BTreeMap<(u64, u64), (u64, u32)>> =
+    std::sync::Mutex::new(BTreeMap::new());
 /// Time spent translating blocks, and in [`exit`] (with its lock), in
 /// nanoseconds.
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
@@ -989,9 +993,35 @@ pub fn counts() -> Option<String> {
             HOLD_NS[HOLD_ENTER].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_GATE].load(Ordering::Relaxed) / 1_000_000,
             HOLD_NS[HOLD_OTHER].load(Ordering::Relaxed) / 1_000_000
-        ) + "; "
+        ) + &entry_spots()
+            + "; "
             + counted.as_deref().unwrap_or_default()
     })
+}
+
+/// The entries by fetch taken most often ([`ENTRY_SPOTS`]): the target,
+/// `x30`, the word before `x30` (a call's) and the registers holding the
+/// target.
+fn entry_spots() -> String {
+    let spots = ENTRY_SPOTS.lock().unwrap_or_else(|e| e.into_inner());
+    let mut top: Vec<((u64, u64), (u64, u32))> = spots.iter().map(|(&k, &v)| (k, v)).collect();
+    top.sort_by_key(|&(_, (n, _))| std::cmp::Reverse(n));
+    let said: Vec<String> = top
+        .iter()
+        .take(8)
+        .map(|&((pc, lr), (n, held))| {
+            let before = crate::trap::read_host::<u32>(lr.wrapping_sub(4))
+                .map_or("?".into(), |w| format!("{w:08x}"));
+            let regs: Vec<String> =
+                (0..31).filter(|r| held & 1 << r != 0).map(|r| format!("x{r}")).collect();
+            format!("{n} to {pc:#x} with x30 {lr:#x} after {before} in {}", regs.join(" "))
+        })
+        .collect();
+    if said.is_empty() {
+        String::new()
+    } else {
+        format!("; entries by fetch at {} places, most often: {}", spots.len(), said.join(", "))
+    }
 }
 
 /// The state, locked, for a caller of kind `site` ([`HOLD_NS`]).
@@ -1609,7 +1639,8 @@ fn remove(set: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 /// A fetch from the program's memory at `pc` (the thread's `x30` being
 /// `lr`, which tells a return): the translation to run instead, if `pc`
 /// holds code that runs by translation.
-pub fn enter(pc: u64, lr: u64) -> Option<u64> {
+/// `held` has a bit for each register `x0`..`x30` holding `pc`.
+pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
     let mut s = state_at(HOLD_ENTER);
     if !s.in_region(pc) {
         return None;
@@ -1622,6 +1653,10 @@ pub fn enter(pc: u64, lr: u64) -> Option<u64> {
         return None;
     }
     ENTERED.fetch_add(1, Ordering::Relaxed);
+    if fwe_kernel::timing::on() {
+        let mut spots = ENTRY_SPOTS.lock().unwrap_or_else(|e| e.into_inner());
+        spots.entry((pc, lr)).or_insert((0, held)).0 += 1;
+    }
     if lr == pc {
         ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
     } else if fwe_kernel::timing::on()
