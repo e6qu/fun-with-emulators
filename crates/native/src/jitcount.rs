@@ -336,9 +336,11 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&AHEAD),
     );
     out.push_str(&format!(
-        "; taken from those kept {} {} ({} ms), {} records found made otherwise",
+        "; taken from those kept {} {}, {} {} ({} ms), {} records found made otherwise",
         ORIGINS[FILE],
         n(&TAKEN[FILE]),
+        ORIGINS[GENERATED],
+        n(&TAKEN[GENERATED]),
         ms(&TAKE_NS),
         n(&KEPT_OTHER),
     ));

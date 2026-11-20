@@ -1163,14 +1163,14 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Translations of a file's code kept (guests/c/jitkept.c: generated code
-/// calling a function of the program's file, which then runs by
-/// translation too, a system call's stub with it): a second run makes no
-/// block of the file's code, but takes each from those the first kept,
-/// its stub calling the gate where this process has it, its output as
-/// ever.
+/// Translations kept (guests/c/jitkept.c: generated code calling a
+/// function of the program's file, which then runs by translation too, a
+/// system call's stub with it): a second run makes no block, of the file's
+/// code or of the code it generated at the same address from the same
+/// words, but takes each from those the first kept, its stub calling the
+/// gate where this process has it, its output as ever.
 #[test]
-fn jit_translations_of_a_files_code_are_kept_for_the_next_run() {
+fn jit_translations_are_kept_for_the_next_run() {
     let prog = build_c("jitkept", Libc::Musl, true, true);
     let root = libc_rootfs(Libc::Musl, "jitkept");
     let mut counts = Vec::new();
@@ -1181,14 +1181,28 @@ fn jit_translations_of_a_files_code_are_kept_for_the_next_run() {
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(stdout(&out), "calls into the file: summed\n", "{err}");
         assert_eq!(out.status.code(), Some(0), "{err}");
-        let made = jit_counts(&err, "blocks made from files ");
-        let taken = jit_counts(&err, "taken from those kept from files ");
+        // "blocks made from files F (.. ms), generated G (.. ms)" and
+        // "taken from those kept from files F, generated G (.. ms)".
+        let pairs = |before: &str, between: &str| -> Vec<(u64, u64)> {
+            err.lines()
+                .filter_map(|l| {
+                    let rest = l.split(before).nth(1)?;
+                    let file = rest.split([' ', ',']).next()?.parse().ok()?;
+                    let generated = rest.split(between).nth(1)?.split(' ').next()?.parse().ok()?;
+                    Some((file, generated))
+                })
+                .collect()
+        };
+        let made = pairs("blocks made from files ", "), generated ");
+        let taken = pairs("taken from those kept from files ", ", generated ");
         assert_eq!((made.len(), taken.len()), (1, 1), "{err}");
-        assert!(made[0] + taken[0] > 0, "no block of the file's code: {err}");
-        counts.push((made[0], taken[0]));
+        let ((mf, mg), (tf, tg)) = (made[0], taken[0]);
+        assert!(mf + tf > 0 && mg + tg > 0, "no block of the file's code or of generated: {err}");
+        counts.push((mf, tf, mg, tg));
     }
     // (The first run may take some, kept by an earlier one.)
-    assert_eq!(counts[1], (0, counts[0].0 + counts[0].1), "{counts:?}");
+    let (mf, tf, mg, tg) = counts[0];
+    assert_eq!(counts[1], (0, mf + tf, 0, mg + tg), "{counts:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

@@ -1,13 +1,15 @@
 //! Translations kept: the blocks made from a file's code, kept on disk by
-//! the file's identity and where it is loaded, and taken again by a later
-//! process (or this one) that comes to the same code, as prepared images
-//! are kept ([`fwe_kernel::prepcache`]). A block taken again is what
+//! the file's identity and where it is loaded, and those made from code
+//! the program generated, by the program's file and their address; taken
+//! again by a later process (or this one) that comes to the same code, as
+//! prepared images are kept ([`fwe_kernel::prepcache`]). A block taken again is what
 //! [`translate`] made, before it was placed: its words, what each stands
 //! for, its branches to resolve and its calls; placing it is as for a
 //! block just made.
 //!
-//! A record holds the program's words the block was made from, and the
-//! calls made in other blocks' words that its translation went on into
+//! A record holds the program's words the block was made from (and those
+//! past them its translation looked at), and the calls made in other
+//! blocks' words that its translation went on into
 //! ([`State::calls_made`]): it is taken only where both are as they are now,
 //! so a block whose code changed, or that the state around it would make
 //! otherwise, is made afresh. Translations depend on fwe's own code and the
@@ -28,12 +30,25 @@ use std::os::unix::ffi::OsStrExt;
 use std::sync::Mutex;
 
 /// Where a file's code is: the file (Linux's device and inode) and the
-/// address its start is mapped at.
+/// address its start is mapped at; or code a program generated: the
+/// program's file, and [`GENERATED`] for an address (its records name
+/// theirs whole).
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(super) struct Part {
     dev: u64,
     ino: u64,
     base: u64,
+}
+
+/// [`Part::base`] of code a program generated: no address a file's start
+/// is mapped at (not page-aligned).
+const GENERATED: u64 = u64::MAX;
+
+/// The part of code the program generated: by the program's file, if it
+/// has one.
+pub(super) fn generated() -> Option<Part> {
+    let program = *PROGRAM.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    program.map(|(dev, ino)| Part { dev, ino, base: GENERATED })
 }
 
 /// A record's place: its file of records, offset and length.
@@ -114,15 +129,20 @@ fn kept() -> std::sync::MutexGuard<'static, Option<Kept>> {
     KEPT.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The part the code at `g` is in, if it is a file's.
-pub(super) fn part_of(g: u64) -> Option<Part> {
-    let mut k = kept();
-    let k = k.get_or_insert_with(|| Kept {
+/// [`KEPT`], begun if it was not.
+fn begun(k: &mut Option<Kept>) -> &mut Kept {
+    k.get_or_insert_with(|| Kept {
         parts: HashMap::new(),
         last: None,
         new: HashMap::new(),
         owner: fwe_kernel::host::pid(),
-    });
+    })
+}
+
+/// The part the code at `g` is in, if it is a file's.
+pub(super) fn part_of(g: u64) -> Option<Part> {
+    let mut k = kept();
+    let k = begun(&mut k);
     if let Some((start, end, part)) = k.last
         && (start..end).contains(&g)
     {
@@ -154,10 +174,10 @@ pub(super) fn remapped(addr: u64, len: u64) {
     }
 }
 
-/// A record of part `part` for the block at `g` made from `source` (its
-/// words, as far as it read them) with the calls in `known` made in other
-/// blocks' words: the block as made, its words' meanings packed, and where
-/// its words end.
+/// A record of part `part` for the block at `g` made from `source` (the
+/// program's words from `g`, as far as a block's translation may read
+/// them) with the calls in `known` made in other blocks' words: the block
+/// as made, its words' meanings packed, and where its words end.
 pub(super) fn take(
     part: Part,
     g: u64,
@@ -165,7 +185,7 @@ pub(super) fn take(
     known: impl Fn(u64) -> Vec<u64>,
 ) -> Option<(Made, Vec<Packed>)> {
     let mut k = kept();
-    let k = k.as_mut()?;
+    let k = begun(&mut k);
     let loaded = k.parts.entry(part).or_insert_with(|| load(part));
     for at in loaded.index.get(&g)? {
         let seg = loaded.segs.get(at.seg as usize)?;
@@ -176,7 +196,7 @@ pub(super) fn take(
         if source.get(..n) != Some(&words[..]) {
             continue;
         }
-        let end = g + 4 * n as u64;
+        let end = g + 4 * u64::from(r.u32()?);
         let calls: Vec<u64> = (0..r.u32()?).map(|_| r.u64()).collect::<Option<_>>()?;
         if calls != known(end) {
             jitcount::KEPT_OTHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -187,9 +207,10 @@ pub(super) fn take(
     None
 }
 
-/// Keep the block at `g` of part `part`, made from `source` with the calls
-/// `known` (in its words, made in other blocks'), as `made`, its words'
-/// meanings `info`.
+/// Keep the block at `g` of part `part`, made from `source` (the words its
+/// translation read, its own and those it looked at past them) with the
+/// calls `known` (in its words, made in other blocks'), as `made`, its
+/// words' meanings `info`.
 pub(super) fn keep(
     part: Part,
     g: u64,
@@ -205,6 +226,7 @@ pub(super) fn keep(
     for &x in source {
         put32(&mut w, x);
     }
+    put32(&mut w, ((made.end - g) / 4) as u32);
     put32(&mut w, known.len() as u32);
     for &p in known {
         put64(&mut w, p);
@@ -254,9 +276,7 @@ pub(super) fn keep(
         put32(&mut w, k as u32);
         put64(&mut w, p);
     }
-    if let Some(k) = kept().as_mut() {
-        k.new.entry(part).or_default().push((g, w));
-    }
+    begun(&mut kept()).new.entry(part).or_default().push((g, w));
 }
 
 /// The block a record holds, read on from past its words and calls: made
@@ -362,7 +382,7 @@ impl<'a> Reader<'a> {
 
 /// A file of records begins so, then its count of records and for each its
 /// program address, offset and length; their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept3";
+const MAGIC: &[u8; 8] = b"fwekept4";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],
