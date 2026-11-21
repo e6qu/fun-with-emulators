@@ -52,6 +52,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROUNDS = 9
@@ -277,6 +278,35 @@ def x_server(xvfb):
     os.environ["DISPLAY"] = f":{n}"
 
 
+GEARS = "glxgears frame (ms)"
+# Mesa's software renderer, on one thread: the runners' cores differ.
+GEARS_ENV = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe", "LP_NUM_THREADS": "1"}
+
+
+def gears_ms(cmd, env=None):
+    """glxgears' time per frame as `cmd` runs it on the benchmarks' X
+    server: it reports its frames every 5 seconds; the second report, the
+    first's taking its start too."""
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    timer = threading.Timer(120, p.kill)
+    timer.start()
+    rates = []
+    try:
+        for line in p.stdout:
+            m = re.search(r"= ([0-9.]+) FPS", line)
+            if m:
+                rates.append(float(m.group(1)))
+            if len(rates) == 2:
+                break
+    finally:
+        timer.cancel()
+        p.kill()
+        p.wait()
+    if len(rates) < 2 or rates[1] <= 0:
+        sys.exit(f"glxgears gave no frame rate: {rates}")
+    return 1000.0 / rates[1]
+
+
 def best(f, rounds=ROUNDS):
     return min(f() for _ in range(rounds))
 
@@ -411,6 +441,14 @@ def linux(a):
                 subprocess.run(full, check=True, capture_output=True)
                 return time.perf_counter() - start
 
+            # glxgears, Alpine's, drawing on this host's X server.
+            env = [x for k, v in GEARS_ENV.items() for x in ("-e", f"{k}={v}")]
+            r[GEARS] = gears_ms(
+                ["docker", "run", "--rm", "-v", "/tmp/.X11-unix:/tmp/.X11-unix", "-e", "DISPLAY"]
+                + env
+                + [image, "sh", "-c",
+                   "apk add -q mesa-utils mesa-dri-gallium && exec glxgears -geometry 300x300+0+0"]
+            )
             for row, cmd in (
                 ("Lua script (s)", "/src/src/lua /src/wl/bench.lua"),
                 ("Python script (s)", "python3 /src/wl/bench.py"),
@@ -613,6 +651,14 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    # glxgears under fwe, drawing on the benchmarks' X server (the host's
+    # display fwe's `DISPLAY` names); against Linux's, there being no
+    # macOS build of the same program.
+    gears = alpine_root("display", a.cache)
+    results["fwe"][GEARS] = gears_ms(
+        guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + [f"{k}={v}" for k, v in GEARS_ENV.items()]
+        + fwe + ["--root", gears, os.path.join(gears, "usr/bin/glxgears"), "-geometry", "300x300+0+0"]
+    )
     jdk(a, fwe, guest_env, results)
     host_costs()
     for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
