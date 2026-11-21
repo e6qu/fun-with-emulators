@@ -9893,6 +9893,63 @@ fn alpine_display_wine_notepad_in_the_vm() {
     assert_ne!(after.digest, before.digest, "typing showed nothing: {}", notepad.report());
 }
 
+/// Wayland: Weston, drawing on the X display (its X11 back end, Pixman's
+/// renderer), with a Wayland client and an X11 one in it. foot (a Wayland
+/// terminal) is drawn in Weston's window and runs what is typed into it
+/// (the keys going from the X server through Weston to foot); then xeyes,
+/// on the display of Weston's Xwayland (the guest's own `:0`), is drawn
+/// there too.
+#[test]
+fn alpine_display_weston_runs_wayland_and_xwayland_clients() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("weston");
+    // No panel (its clock would change what the window shows), and a
+    // background of one colour: what changes is the clients'.
+    let config = root.0.join("root/.config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("weston.ini"),
+        "[shell]\npanel-position=none\nbackground-color=0xff204060\n",
+    )
+    .unwrap();
+    let args = [
+        "--backend=x11",
+        "--renderer=pixman",
+        "--socket=wayland-1",
+        "--xwayland",
+        "--width=800",
+        "--height=600",
+    ];
+    let mut weston = Gui::start(&x, "weston", &root, "/usr/bin/weston", &args, &[]);
+    let w = x.window(&mut weston, &["--name", "Weston Compositor"], 180);
+    std::thread::sleep(Duration::from_secs(3));
+    let empty = x.shot(&w, "weston-empty");
+    let wl = [("WAYLAND_DISPLAY", "wayland-1")];
+    let mut foot = Gui::start(&x, "foot", &root, "/usr/bin/foot", &[], &wl);
+    let with_foot = x.changes(&w, &empty, "weston-foot", 120);
+    assert!(
+        with_foot.drawn > empty.drawn + 10_000,
+        "foot drew {with_foot:?} on {empty:?}: {}\n{}",
+        foot.report(),
+        weston.report()
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    x.type_into(&w, "echo typed in foot > /tmp/typed\n");
+    let typed = root.0.join("tmp/typed");
+    let began = Instant::now();
+    while std::fs::read_to_string(&typed).unwrap_or_default() != "typed in foot\n" {
+        assert!(began.elapsed() < Duration::from_secs(60), "foot ran nothing: {}", foot.report());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Xwayland's display is the guest's own: fwe's `DISPLAY` stays the
+    // host's, the guest's names `:0`.
+    let before = x.shot(&w, "weston-before-xeyes");
+    let xeyes = ["-c", "DISPLAY=:0 exec /usr/bin/xeyes"];
+    let mut eyes = Gui::start(&x, "xeyes-xwayland", &root, "/bin/sh", &xeyes, &[]);
+    let with_eyes = x.changes(&w, &before, "weston-xeyes", 180);
+    assert_ne!(with_eyes.digest, before.digest, "xeyes drew nothing: {}", eyes.report());
+}
+
 /// The toolkits' root (`guests/alpine/fetch/toolkits.txt`: GTK 3 and 4
 /// and their demos, Python with tkinter and PyQt6), a root of its own for
 /// `test`.
@@ -10359,16 +10416,25 @@ impl Probe {
             "<html><body style='background:#36c;color:white;font:48px sans-serif'><h1>Hello from Chromium on fwe</h1><p id=t></p><script>document.getElementById('t').textContent = 'script ran: ' + (6 * 7);</script></body></html>",
         )
         .unwrap();
-        for (name, extra) in [("chromium", vec![]), ("chromium-nosandbox", vec!["--no-sandbox"])] {
+        for (name, sandbox) in [("chromium", true), ("chromium-nosandbox", false)] {
             let mut args = vec![
                 "--ozone-platform=x11",
                 "--user-data-dir=/tmp/chrome",
                 "--no-first-run",
                 "--disable-gpu",
             ];
-            args.extend(extra);
+            if !sandbox {
+                args.push("--no-sandbox");
+            }
             args.push("file:///tmp/page.html");
-            let mut r = self.fwe(name, &root, "/usr/lib/chromium/chromium", &args, &[]);
+            // Sandboxed as a user of its own: Chromium refuses its sandbox
+            // to root.
+            let mut r = if sandbox {
+                let line = format!("HOME=/tmp exec /usr/lib/chromium/chromium {}", args.join(" "));
+                self.fwe(name, &root, "/bin/su", &["-s", "/bin/sh", "nobody", "-c", &line], &[])
+            } else {
+                self.fwe(name, &root, "/usr/lib/chromium/chromium", &args, &[])
+            };
             self.settle(&mut r, 180);
             self.stop(r);
         }
@@ -10406,11 +10472,22 @@ app.whenReady().then(() => {
 "#,
         )
         .unwrap();
-        for (name, extra) in [("electron", vec![]), ("electron-nosandbox", vec!["--no-sandbox"])] {
+        for (name, sandbox) in [("electron", true), ("electron-nosandbox", false)] {
             let mut args = vec!["--ozone-platform=x11", "--disable-gpu"];
-            args.extend(extra);
+            if !sandbox {
+                args.push("--no-sandbox");
+            }
             args.push("/opt/app");
-            let mut r = self.fwe(name, &root, "/opt/electron/electron", &args, &[]);
+            // Sandboxed as `nobody` (the root has no `su`: Perl drops to it).
+            let mut r = if sandbox {
+                let drop = "$ENV{HOME} = '/tmp'; $( = $) = '65534 65534'; $< = $> = 65534; \
+                            exec @ARGV or die \"exec: $!\"";
+                let mut perl = vec!["-e", drop, "--", "/opt/electron/electron"];
+                perl.extend(&args);
+                self.fwe(name, &root, "/usr/bin/perl", &perl, &[])
+            } else {
+                self.fwe(name, &root, "/opt/electron/electron", &args, &[])
+            };
             self.settle(&mut r, 180);
             self.stop(r);
         }
