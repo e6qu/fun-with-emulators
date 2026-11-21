@@ -65,6 +65,15 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     if raw.is_empty() {
         return Ok(Vec::new()); // unnamed / autobind
     }
+    // The host display's socket, by either of its names ([`crate::x11`]).
+    let name = if raw[0] == 0 {
+        &raw[1..]
+    } else {
+        &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]
+    };
+    if let Some(host) = crate::x11::host_socket(name) {
+        return Ok(host);
+    }
     if raw[0] == 0 {
         // Abstract namespace: no macOS equivalent. Map the name to a stable
         // file under a per-host temp directory so peers rendezvous, the
@@ -1192,6 +1201,12 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, false, &a.guest);
     }
+    if r == 0 && family(&hb) == libc::AF_UNIX {
+        let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
+        if crate::x11::is_host_socket(&hb[2..end]) {
+            crate::x11::connected(fd as i32, &hb[2..end]);
+        }
+    }
     if r == 0 {
         crate::netns::used(fd as i32);
     }
@@ -1519,8 +1534,20 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     // ENAMETOOLONG where the host cannot send from a directory.
     let mut r = err(errno::ENAMETOOLONG);
     in_dir(dir.as_ref(), || {
-        // SAFETY: `hmsg` references the guest buffer and the local name.
-        r = unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) };
+        let mut send = |iov: &[libc::iovec]| {
+            hmsg.msg_iov = iov.as_ptr() as *mut libc::iovec;
+            hmsg.msg_iovlen = iov.len() as _;
+            // SAFETY: `hmsg` references the guest buffer and the local name.
+            unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) }
+        };
+        // An X connection's requests, followed ([`crate::x11`]).
+        r = if ctl_len == 0 && !named {
+            crate::x11::write(fd as i32, &iov, &mut send).unwrap_or_else(|| send(&iov))
+        } else {
+            let r = send(&iov);
+            crate::x11::sent(fd as i32, &iov, r);
+            r
+        };
         0
     });
     #[cfg(not(target_os = "linux"))]
@@ -2835,12 +2862,26 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
             msg_flags_to_host(flags),
         )
     } else {
-        let mut hmsg = hmsg;
         // ENAMETOOLONG where the host cannot send from a directory.
         let mut r = err(errno::ENAMETOOLONG);
         in_dir(dir.as_ref(), || {
-            // SAFETY: `hmsg` references guest iov and local name/control buffers.
-            r = unsafe { send_corked(fd as i32, &mut hmsg, flags, msg_flags_to_host(flags)) };
+            let send = |iov: &[libc::iovec]| {
+                let mut m = hmsg;
+                m.msg_iov = iov.as_ptr() as *mut libc::iovec;
+                m.msg_iovlen = iov.len() as _;
+                // SAFETY: `m` references guest iov and local name/control
+                // buffers.
+                unsafe { send_corked(fd as i32, &mut m, flags, msg_flags_to_host(flags)) }
+            };
+            // An X connection's requests, followed ([`crate::x11`]): one
+            // with control data or an address goes as it is.
+            r = if ctl_len == 0 && name_ptr.is_null() {
+                crate::x11::write(fd as i32, &hiov, send).unwrap_or_else(|| send(&hiov))
+            } else {
+                let r = send(&hiov);
+                crate::x11::sent(fd as i32, &hiov, r);
+                r
+            };
             0
         });
         r

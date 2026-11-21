@@ -533,6 +533,10 @@ pub(crate) fn reexec(
     }
     argv.push(b"--cwd".to_vec());
     argv.push(fs.cwd().to_vec());
+    if let Some(display) = fwe_kernel::x11::host_value() {
+        argv.push(b"--host-display".to_vec());
+        argv.push(display.to_vec());
+    }
     // fwe's private directory, which the new fwe would otherwise look up
     // again (slowly).
     if let Some(dir) = fwe_kernel::fs::host_dir() {

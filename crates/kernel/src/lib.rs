@@ -121,6 +121,7 @@ pub mod trace;
 pub mod uaccess;
 pub mod userns;
 pub mod vmas;
+pub mod x11;
 pub mod xattr;
 
 pub use cloneargs::CloneArgs;
@@ -2181,6 +2182,14 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             if let Some(r) = specialwrite::write(fd, specialwrite::Source::Guest(buf), len) {
                 return Some(r);
             }
+            // An X connection's requests, followed ([`x11`]).
+            let iov = [libc::iovec { iov_base: buf as *mut _, iov_len: len as usize }];
+            if let Some(r) = x11::write(fd, &iov, |p| {
+                // SAFETY: a part of the guest's buffer; the host checks it.
+                host::ret(unsafe { libc::writev(fd, p.as_ptr(), p.len() as i32) } as i64)
+            }) {
+                return Some(r);
+            }
             if netlink::is(fd) {
                 if netlink::too_large(len) {
                     return Some(fwe_abi::err(fwe_abi::errno::EMSGSIZE));
@@ -2263,6 +2272,15 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
+                // An X connection's requests, followed ([`x11`]).
+                if let Some(r) = x11::write(a[0] as i32, &iov, |p| {
+                    // SAFETY: a part of the same buffers; the host checks them.
+                    host::ret(
+                        unsafe { libc::writev(a[0] as i32, p.as_ptr(), p.len() as i32) } as i64
+                    )
+                }) {
+                    return Some(r);
+                }
                 let total = specialwrite::total(&iov);
                 // A socket whose peer filters what arrives: what it lets in.
                 let (iov, total, dropped) = match bpf::filtering()
