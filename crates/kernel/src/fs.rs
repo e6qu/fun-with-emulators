@@ -2327,16 +2327,22 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     } else {
         None
     };
-    // The standard device nodes, in the rootfs's own /dev.
+    // The standard device nodes, in the rootfs's own /dev, wherever the
+    // rootfs is mounted (a sandbox's `pivot_root` puts it under the new
+    // root, its /dev at `<put_old>/dev`).
     let device = absolute.as_deref().and_then(|a| {
-        let name = a.strip_prefix(b"/dev/")?;
+        let (parent, name) = a.split_at(a.iter().rposition(|&b| b == b'/')? + 1);
+        if !parent.ends_with(b"/dev/") {
+            return None;
+        }
         let own = crate::loopdev::node_named(name);
         if !DEVICES.contains(&name) && own.is_none() {
             return None;
         }
         let ns = to_ns(v.proc_root, a);
-        let (m, _) = table.locate(&ns);
-        is_rootfs(m, v.root_host).then(|| (name.to_vec(), own, ns, m.flags, m.fstype, m.id))
+        let (m, rest) = table.locate(&ns);
+        (is_rootfs(m, v.root_host) && rest.strip_prefix(b"/dev/") == Some(name))
+            .then(|| (name.to_vec(), own, ns, m.flags, m.fstype, m.id))
     });
     if let Some((name, own, ns, mount_flags, fstype, mount_id)) = device {
         // The host has no /dev/full and no loop devices: fwe's own nodes

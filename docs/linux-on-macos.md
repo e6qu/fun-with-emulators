@@ -2073,7 +2073,9 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   The sockets are fwe's processes' in the namespace, as the host reports
   each (`PROC_PIDFDSOCKETINFO`), with the namespace's port numbers.
 - `/proc/self/fd/N`, `cwd` and `root` behave as magic links.
-- `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's;
+- `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's,
+  wherever the root filesystem's `/dev` is (a sandbox's `pivot_root`
+  keeps the old root under the new one, and binds its nodes from there);
   `full`, `loop-control` and `loopN` are fwe's; `/dev/ptmx` and
   `/dev/pts` are fwe's pty layer; `/dev/fd`, `stdin`, `stdout`, `stderr`
   link into `/proc/self/fd`; `/dev/shm` and `/dev/mqueue` are fwe's

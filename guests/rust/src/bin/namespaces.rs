@@ -527,6 +527,43 @@ fn main() {
             });
             println!("child exited {code}");
         }
+        // A sandbox's root, as bubblewrap makes it: `pivot_root` into a new
+        // root with the old one kept under it, whose /dev it then opens.
+        Some("pivot-old") => {
+            let code = in_child(|| {
+                // SAFETY: plain calls with NUL-terminated strings.
+                unsafe {
+                    unshare(CLONE_NEWNS);
+                    mount(
+                        c"none".as_ptr(),
+                        c"/".as_ptr(),
+                        std::ptr::null(),
+                        MS_REC | MS_PRIVATE,
+                        std::ptr::null(),
+                    );
+                    mount(
+                        c"/newroot".as_ptr(),
+                        c"/newroot".as_ptr(),
+                        std::ptr::null(),
+                        MS_BIND | MS_REC,
+                        std::ptr::null(),
+                    );
+                    chdir(c"/newroot".as_ptr());
+                    println!(
+                        "pivot: {}",
+                        syscall(SYS_PIVOT_ROOT, c"/newroot".as_ptr(), c"/newroot/oldroot".as_ptr())
+                    );
+                    chdir(c"/".as_ptr());
+                }
+                println!("marker: {}", std::fs::read_to_string("/etc/marker").unwrap().trim());
+                let null = std::fs::OpenOptions::new().write(true).open("/oldroot/dev/null");
+                println!("old root's /dev/null: {}", null.map(|_| "opened").unwrap_or("missing"));
+                let zero = std::fs::File::open("/oldroot/dev/zero").is_ok();
+                println!("old root's /dev/zero opened: {zero}");
+                0
+            });
+            println!("child exited {code}");
+        }
         // `chroot`, and the namespaces a clone makes for its child.
         Some("chroot") => {
             let code = in_child(|| {
