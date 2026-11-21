@@ -9128,6 +9128,75 @@ fn proc_hidepid_and_subset_hide_as_linux() {
     );
 }
 
+/// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
+/// names it; the tests skip without it, as on a development machine),
+/// listening on its Unix socket only, at a display number of its own.
+struct Xvfb {
+    number: u32,
+    child: std::process::Child,
+}
+
+impl Xvfb {
+    fn start() -> Option<Xvfb> {
+        let Some(xvfb) = std::env::var_os("XVFB") else {
+            eprintln!("skipped: set XVFB to an Xvfb to run the display tests");
+            return None;
+        };
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let number = 70 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        let child = Command::new(xvfb)
+            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-nolisten", "tcp"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let x = Xvfb { number, child };
+        let began = Instant::now();
+        while !socket.exists() {
+            assert!(began.elapsed() < Duration::from_secs(30), "Xvfb :{number} did not start");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some(x)
+    }
+
+    fn display(&self) -> String {
+        format!(":{}", self.number)
+    }
+}
+
+impl Drop for Xvfb {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+/// An X client writing the protocol itself (guests/c/x11shm.c), on the
+/// host's display as fwe's `DISPLAY` names it: it connects by the
+/// display's Unix socket in the guest's `/tmp/.X11-unix`, the host
+/// server's; and draws through MIT-SHM, a System V segment of fwe's that
+/// the server attaches (fwe passes it the segment's file): what the guest
+/// puts in the segment the server draws, and what the server writes there
+/// the guest reads.
+#[test]
+fn display_x11_client_draws_through_shared_memory() {
+    let prog = build_c("x11shm", Libc::Musl, true, true);
+    let Some(x) = Xvfb::start() else { return };
+    let root = libc_rootfs(Libc::Musl, "x11shm");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("DISPLAY", x.display());
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout(&out),
+        "connected: depth 24\nput through shared memory: drawn\ngot through shared memory: filled\n",
+        "{err}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// TEMPORARY (M7 probe, removed before merge): what of Linux's graphical
 /// programs runs on fwe today, against a headless X server (Xvfb, from
 /// Homebrew's xorg-server: `XVFB`, with `LIBX11` for screenshots), only
@@ -9192,7 +9261,7 @@ impl Probe {
     }
 
     fn host(&self, program: &str, args: &[&str]) -> Output {
-        Command::new(program).args(args).output_alone().unwrap()
+        Command::new(program).args(args).env("DISPLAY", PROBE_DISPLAY).output_alone().unwrap()
     }
 
     /// A root of its own, copied from the fetched one.
@@ -9206,6 +9275,32 @@ impl Probe {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         run_checked(Command::new("chmod").arg("700").arg(root.join("tmp/xdg")));
+        // What apk's triggers would have made: loader caches, schemas,
+        // font and MIME databases.
+        for (prog, args) in [
+            ("/usr/bin/gdk-pixbuf-query-loaders", vec!["--update-cache"]),
+            ("/usr/bin/glib-compile-schemas", vec!["/usr/share/glib-2.0/schemas"]),
+            ("/usr/bin/fc-cache", vec!["-f"]),
+            ("/usr/bin/update-mime-database", vec!["/usr/share/mime"]),
+        ] {
+            if !root.join(prog.trim_start_matches('/')).exists() {
+                continue;
+            }
+            let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+                .arg("--root")
+                .arg(&root)
+                .arg(root.join(prog.trim_start_matches('/')))
+                .args(&args)
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin")
+                .output_alone()
+                .unwrap();
+            eprintln!(
+                "=== {manifest}: {prog}: {}{}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
         root
     }
 
@@ -9241,7 +9336,7 @@ impl Probe {
             .env("PATH", "/usr/bin:/bin")
             .env("XDG_RUNTIME_DIR", "/tmp/xdg")
             .env("LANG", "C.UTF-8")
-            .env("DISPLAY", PROBE_TCP);
+            .env("DISPLAY", PROBE_DISPLAY);
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -9344,7 +9439,13 @@ impl Probe {
             self.stop(r);
         }
         // xterm, typed into from the host.
-        let mut r = self.fwe("xterm", &root, "/usr/bin/xterm", &["-e", "/bin/sh"], &[]);
+        let mut r = self.fwe(
+            "xterm",
+            &root,
+            "/usr/bin/xterm",
+            &["-fa", "monospace", "-fs", "11", "-e", "/bin/sh"],
+            &[],
+        );
         self.settle(&mut r, 60);
         let typed = self.host(
             "xdotool",
@@ -9457,6 +9558,30 @@ impl Probe {
 
     fn wine(&self) {
         let root = self.root("wine-x11");
+        // Natively first: Wine's own 4 KiB pages on fwe's 16 KiB ones.
+        for (name, command, secs) in [
+            ("wine-native-version", "wine --version", 120),
+            ("wineboot-native", "wine wineboot --init; wineserver -w", 900),
+            ("notepad-native", "wine notepad", 300),
+        ] {
+            let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+            cmd.arg("--strace")
+                .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
+                .arg("--root")
+                .arg(&root)
+                .arg(root.join("bin/busybox"))
+                .args(["sh", "-c", command])
+                .env_clear()
+                .env("HOME", "/root")
+                .env("PATH", "/usr/bin:/bin")
+                .env("WINEPREFIX", "/root/.wine-native")
+                .env("WINEDEBUG", "err+all")
+                .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
+                .env("DISPLAY", PROBE_DISPLAY);
+            let mut r = self.spawn(name, cmd);
+            self.settle(&mut r, secs);
+            self.stop(r);
+        }
         let wine = |name: &str, command: &str, secs: u64| {
             let mut cmd = hv_command().expect("the stand-in");
             cmd.arg("--vm")
@@ -9472,7 +9597,7 @@ impl Probe {
                 .env("WINEPREFIX", "/root/.wine")
                 .env("WINEDEBUG", "err+all")
                 .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
-                .env("DISPLAY", PROBE_TCP);
+                .env("DISPLAY", PROBE_DISPLAY);
             let mut r = self.spawn(name, cmd);
             self.settle(&mut r, secs);
             self.stop(r);

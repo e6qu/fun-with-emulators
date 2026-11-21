@@ -226,6 +226,21 @@ jobs:
             target/tmp/wine-traces
             target/tmp/samples
 
+  # Linux's graphical programs on the host's display: X clients of fwe's
+  # tests against a headless X server (Homebrew's Xvfb, `XVFB`).
+  display:
+    name: Display (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install xorg-server
+      - name: The display tests
+        run: |
+          export XVFB="$(brew --prefix)/bin/Xvfb"
+          cargo test -p fwe --test guests -- display_ --nocapture
+
   # TEMPORARY (M7 probe, removed before merge): Linux's graphical programs
   # on fwe against a headless X server (Homebrew's Xvfb), natively, and
   # Wine's notepad in the VM; screenshots, outputs and calls kept.

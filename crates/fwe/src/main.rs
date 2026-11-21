@@ -112,6 +112,8 @@ fn main() -> ExitCode {
     }
     let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
+    // The host display, given by the fwe that re-executes this one.
+    let mut host_display: Option<OsString> = None;
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {
             b"--strace" => options.strace.enabled = true,
@@ -138,13 +140,16 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--user-dir" => {
+            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--user-dir"
+            | b"--host-display" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
                     return ExitCode::from(2);
                 };
-                if flag == "--user-dir" {
+                if flag == "--host-display" {
+                    host_display = Some(value);
+                } else if flag == "--user-dir" {
                     fwe_native::adopt_user_dir(value.as_bytes());
                 } else if flag == "--cwd" {
                     options.cwd = Some(value.as_bytes().to_vec());
@@ -243,8 +248,20 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let path = PathBuf::from(program);
+    // The host display: fwe's `DISPLAY`, or for an fwe re-executed on a
+    // guest's program (whose environment is the guest's) the one given.
+    let host = if options.guest_path { host_display } else { std::env::var_os("DISPLAY") };
+    fwe_kernel::x11::set_host(host.as_ref().map(|v| v.as_bytes()));
+    // The guest's environment is fwe's, but for the host display, which
+    // the guest knows by its number ([`fwe_kernel::x11`]).
     let env: Vec<OsString> = std::env::vars_os()
         .map(|(k, v)| {
+            use std::os::unix::ffi::{OsStrExt, OsStringExt};
+            let v = if k == "DISPLAY" {
+                OsString::from_vec(fwe_kernel::x11::guest_display(v.as_bytes()))
+            } else {
+                v
+            };
             let mut kv = k;
             kv.push("=");
             kv.push(v);
@@ -267,9 +284,8 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
             b"--vm" | b"--hv-standin" | b"--hv-record" => {
                 return Some(a.to_string_lossy().into_owned());
             }
-            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--probe" => {
-                i += 2
-            }
+            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--probe"
+            | b"--host-display" => i += 2,
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
             _ => return None,
