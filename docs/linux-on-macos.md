@@ -1377,7 +1377,11 @@ all three on shared records ([Kernel-wide state](#kernel-wide-state)):
 one set per IPC namespace for System V objects and queues, one record for
 every key. A change is made under the record's `flock`; a call that must
 wait sleeps on the record's mapped generation word until another process
-changes it. What a process that has gone leaves (attachments, `SEM_UNDO`
+changes it. Any change wakes every waiter in the namespace; a waiter
+woken tries its operation on the data read without the lock first, and
+takes the lock only if it can now go on, so a change costs the lock once
+for each waiter it lets go, not for every waiter. What a process that has
+gone leaves (attachments, `SEM_UNDO`
 adjustments) is cleaned up by the next process that looks. The initial
 namespace's records last until the host reboots
 (`crates/kernel/src/sysvipc.rs`, `ipcops.rs`, `mqueue.rs`, `keys.rs`).

@@ -687,6 +687,12 @@ impl<P: Platform> Kernel<P> {
 /// `until` (`EAGAIN`), and no longer than a signal for the guest
 /// (`EINTR`). `gone` is what the object having gone while it waited
 /// gives (`EIDRM`).
+///
+/// Every change of the namespace's objects wakes every waiter in it. A
+/// waiter woken tries its step first on the data as it is, read without
+/// the lock: one that would go on waiting, with nothing to change, waits
+/// again without taking it, so a change costs the lock once for each
+/// waiter it lets go on, not once for every waiter.
 fn ipc_wait<T>(
     r: &Arc<Record<Ipc>>,
     until: Option<Instant>,
@@ -696,6 +702,19 @@ fn ipc_wait<T>(
     let mut waited = false;
     loop {
         let seen = r.generation();
+        if waited {
+            let mut look = (*r.get()).clone();
+            let still =
+                !look.needs_reap() && matches!(step(&mut look, true), Ok((Try::Wait, false)));
+            crate::timing::ipc_woken(!still);
+            if still {
+                if let Err(e) = r.wait_change(seen, until) {
+                    let _ = r.update_maybe(|t| Ok(((), cancel(t))));
+                    return Err(e);
+                }
+                continue;
+            }
+        }
         match r.update_maybe(|t| {
             let reaped = t.reap(r);
             let (out, changed) = step(t, waited)?;
@@ -1100,6 +1119,71 @@ fn remove_segment(r: &Record<Ipc>, id: i32) {
 mod tests {
     use super::*;
     use crate::creds::Creds;
+
+    /// Waiters woken by changes to objects they do not wait on go on
+    /// waiting without taking the namespace's lock: each takes it again
+    /// only once what it waits for is there.
+    #[test]
+    fn ipc_waiters_woken_by_other_changes_take_no_lock() {
+        use std::os::unix::ffi::OsStrExt;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = std::env::temp_dir().join(format!("fwe-ipc-herd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let r =
+            Arc::new(Record::<Ipc>::at(dir.as_os_str().as_bytes().to_vec(), Ipc::default).unwrap());
+        const WAITERS: usize = 4;
+        let waiting = Arc::new(AtomicUsize::new(0));
+        let before = crate::timing::ipc_wakes();
+        let threads: Vec<_> = (0..WAITERS)
+            .map(|i| {
+                let (r, waiting) = (r.clone(), waiting.clone());
+                std::thread::spawn(move || {
+                    let mut first = true;
+                    ipc_wait(
+                        &r,
+                        None,
+                        |t, _| {
+                            if t.sysctls.contains_key(&format!("go-{i}")) {
+                                return Ok((Try::Done(()), false));
+                            }
+                            if std::mem::take(&mut first) {
+                                waiting.fetch_add(1, Ordering::SeqCst);
+                            }
+                            Ok((Try::Wait, false))
+                        },
+                        |_| false,
+                    )
+                })
+            })
+            .collect();
+        while waiting.load(Ordering::SeqCst) < WAITERS {
+            std::thread::yield_now();
+        }
+        // Changes none of them waits for, each waking them all.
+        for n in 0..40 {
+            r.update(|t| {
+                t.sysctls.insert(format!("other-{n}"), String::new());
+                Ok(())
+            })
+            .unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        for i in 0..WAITERS {
+            r.update(|t| {
+                t.sysctls.insert(format!("go-{i}"), String::new());
+                Ok(())
+            })
+            .unwrap();
+        }
+        for t in threads {
+            assert_eq!(t.join().unwrap(), Ok(()));
+        }
+        let after = crate::timing::ipc_wakes();
+        let (woken, retried) = (after.0 - before.0, after.1 - before.1);
+        assert!(woken > WAITERS as u64, "woken {woken}");
+        assert_eq!(retried, WAITERS as u64, "woken {woken}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A caller of user and group `id`, in no other group, with no
     /// capabilities.
