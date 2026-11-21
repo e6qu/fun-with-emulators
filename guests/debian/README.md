@@ -98,7 +98,6 @@ it). Nothing fetched is redistributed in this repository.
 | `fetch/clang.txt` | clang 14 with LLVM 14 and its libraries, GNU binutils, and the glibc, GCC and libstdc++ files a program builds and links with | 63 MB |
 | `fetch/go.txt` | Go 1.19: the `go` command, its tools and the standard library's sources | 74 MB |
 | `fetch/podman.txt` | podman 4.3, conmon, crun, catatonit, the containers configuration, and the libraries they load (gpgme, libseccomp, libsubid, devmapper, glib, libsystemd, yajl and theirs) | 14 MB |
-| `fetch/electron.txt` | The libraries Electron's Linux build loads (GLib, GTK 3, NSS, CUPS, D-Bus, ALSA, gbm, X11, xkbcommon and theirs) with a font; Electron 45.4.1 itself, MIT, is fetched from its GitHub release (`electron-v45.4.1-linux-arm64.zip`, 125 MB) and checked against its SHA-256 | 72 MB |
 
 ## License
 

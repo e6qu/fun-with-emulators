@@ -258,38 +258,6 @@ jobs:
           name: display
           path: target/tmp/display
 
-  # TEMPORARY (M7 probe, removed before merge): Linux's graphical programs
-  # on fwe against a headless X server (Homebrew's Xvfb), natively, and
-  # Wine's notepad in the VM; screenshots, outputs and calls kept.
-  display-probe:
-    name: Display probe ${{ matrix.set }} (macos-26)
-    strategy:
-      fail-fast: false
-      matrix:
-        set: [native, wine]
-    runs-on: macos-26
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: brew install xorg-server xdpyinfo xwininfo xdotool unicorn
-      - name: The probe
-        run: |
-          export XVFB="$(brew --prefix)/bin/Xvfb"
-          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
-          cargo test -p fwe --test guests -- alpine_display_probe --nocapture
-        env:
-          FWE_DISPLAY_PROBE: ${{ matrix.set }}
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: display-probe-${{ matrix.set }}
-          path: target/tmp/display-probe
-
   # Alpine's OpenJDK (fetched) compiling and running a multi-threaded
   # application natively: HotSpot's JIT, threads and garbage collector.
   # It runs here only (FWE_JDK_TESTS), not on a development machine.
