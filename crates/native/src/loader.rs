@@ -194,7 +194,14 @@ pub fn load(
         }
         None => count(),
     };
-    let total = plan.len + stub_len;
+    // An image larger than a branch reaches across has its code's stubs
+    // before it too: the code nearer its start reaches those.
+    let front = if elf.is_pie() && plan.len + stub_len > crate::rewrite::BRANCH_RANGE {
+        stub_len
+    } else {
+        0
+    };
+    let total = front + plan.len + stub_len;
 
     // Reserve the whole range first so segments land at fixed offsets from
     // each other and gaps between them stay inaccessible.
@@ -214,16 +221,22 @@ pub fn load(
         if p == libc::MAP_FAILED {
             return Err(LoadError::Map(std::io::Error::last_os_error()));
         }
-        p as u64
+        p as u64 + front
     } else {
         let at = plan.start + if patches.is_some() { MOVE } else { 0 };
         fwe_kernel::host::reserve_fixed(at, total)
             .map_err(|reason| LoadError::AddressUnavailable { start: at, len: total, reason })?;
         at
     };
-    fwe_kernel::mm::track(base, total);
+    let start = base - front;
+    fwe_kernel::mm::track(start, total);
     let bias = base - plan.start;
-    let mut arena = StubArena { next: base + plan.len, end: base + total };
+    let mut arena = StubArena {
+        next: base + plan.len,
+        end: start + total,
+        front_start: start,
+        front_end: base,
+    };
 
     for run in &plan.runs {
         // SAFETY: replacing part of our own reservation.
@@ -245,11 +258,13 @@ pub fn load(
     // Loaded and prepared before: its image, mapped in place
     // ([`crate::prepare::map_load_image`]), shared and written by no one.
     let runs: Vec<(u64, u64)> = plan.runs.iter().map(|r| (r.start + bias, r.len)).collect();
-    let image = file.map(|id| cache::about(id, format!("image-{page_size}").as_bytes()));
+    let image = file.map(|id| cache::about(id, format!("image2-{page_size}").as_bytes()));
     if let Some(key) = &image
-        && let Some(next) = crate::prepare::map_load_image(key, (base, base + total), &runs, slots)
+        && let Some((next, front_end)) =
+            crate::prepare::map_load_image(key, base, (start, start + total), &runs, slots)
     {
         arena.next = next;
+        arena.front_end = front_end;
         return finish(elf, &plan, bias, arena, true);
     }
     if image.is_some() {
@@ -321,7 +336,7 @@ pub fn load(
     }
     if let Some(key) = &image {
         // SAFETY: the runs, mapped readable and writable above.
-        unsafe { crate::prepare::keep_load_image(key, base, &runs, arena.next) };
+        unsafe { crate::prepare::keep_load_image(key, base, &runs, &arena) };
     }
     finish(elf, &plan, bias, arena, false)
 }
@@ -349,8 +364,9 @@ fn finish(
     }
 
     let (lo, hi) = elf.bounds();
-    // What the code's stubs left of the arena: room for call stubs.
+    // What the code's stubs left of the arenas: room for call stubs.
     crate::prepare::spare_arena(arena.next, arena.end);
+    crate::prepare::spare_arena(arena.front_start, arena.front_end);
     Ok(Loaded {
         stub_arena: arena,
         bias,

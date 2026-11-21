@@ -39,20 +39,30 @@ impl std::fmt::Display for NoStubSpace {
     }
 }
 
-/// Address space reserved (inaccessible) in advance for stubs, typically
-/// right after a loaded image.
+/// Address space reserved (inaccessible) in advance for stubs: right after
+/// a loaded image (`next` to `end`), and for an image larger than a branch
+/// reaches, right before it too (`front_start` to `front_end`, taken from
+/// its end down, nearest the code first).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StubArena {
     pub next: u64,
     pub end: u64,
+    pub front_start: u64,
+    pub front_end: u64,
 }
 
 impl StubArena {
-    /// Take `size` bytes if they are reachable according to `reachable`.
+    /// Take `size` bytes if they are reachable according to `reachable`:
+    /// after the image, or else before it.
     fn take(&mut self, size: u64, reachable: impl Fn(u64) -> bool) -> Option<u64> {
         let at = self.next;
-        (at + size <= self.end && reachable(at)).then(|| {
+        if at + size <= self.end && reachable(at) {
             self.next += size;
+            return Some(at);
+        }
+        let at = self.front_end.checked_sub(size)?;
+        (at >= self.front_start && reachable(at)).then(|| {
+            self.front_end = at;
             at
         })
     }
@@ -914,14 +924,15 @@ pub fn map_image(
 
 /// The loader's image of a program (see [`crate::loader::load`]): its runs
 /// of pages `runs` (address and length), loaded from `base` with the stub
-/// arena's next free place `arena_next`, kept under `key` once prepared.
+/// arena `arena` as its stubs left it, kept under `key` once prepared.
 ///
 /// # Safety
 /// The runs must be readable memory.
-pub unsafe fn keep_load_image(key: &[u8], base: u64, runs: &[(u64, u64)], arena_next: u64) {
+pub unsafe fn keep_load_image(key: &[u8], base: u64, runs: &[(u64, u64)], arena: &StubArena) {
     let Some(regions) = image_regions() else { return };
     let mut e = fwe_kernel::snapshot::Enc::new();
-    e.u64(arena_next - base);
+    e.u64(arena.next - base);
+    e.u64(arena.front_end.wrapping_sub(base));
     put_regions(&mut e, &regions, base);
     let mut image = Vec::with_capacity(runs.iter().map(|r| r.1 as usize).sum());
     for &(at, len) in runs {
@@ -933,22 +944,25 @@ pub unsafe fn keep_load_image(key: &[u8], base: u64, runs: &[(u64, u64)], arena_
     fwe_kernel::prepcache::store_image(key, &e.into_bytes(), &image);
 }
 
-/// Map the loader's image kept under `key` over runs `runs` of fwe's own
-/// reservation `[base, end)` (mapped writable), with its stubs where they
-/// were (in the reservation's arena, or, where it ran out, wherever
-/// nothing is): the arena's next free place, or `None` if there is no
-/// such image or a place is taken (the runs may then hold some of it, to
-/// be written over).
+/// Map the loader's image kept under `key`, loaded from `base`, over runs
+/// `runs` of fwe's own reservation `[start, end)` (mapped writable), with
+/// its stubs where they were (in the reservation's arenas, or, where they
+/// ran out, wherever nothing is): the arenas' next free places (after the
+/// image, and the end of what is free before it), or `None` if there is
+/// no such image or a place is taken (the runs may then hold some of it,
+/// to be written over).
 pub fn map_load_image(
     key: &[u8],
-    (base, end): (u64, u64),
+    base: u64,
+    (start, end): (u64, u64),
     runs: &[(u64, u64)],
     slots: (u32, u32),
-) -> Option<u64> {
+) -> Option<(u64, u64)> {
     let total = runs.iter().map(|r| r.1).sum();
     let (layout, file) = fwe_kernel::prepcache::open_image(key, total)?;
     let mut d = fwe_kernel::snapshot::Dec::new(&layout);
     let arena_next = base + d.u64();
+    let front_end = base.wrapping_add(d.u64());
     let regions = get_regions(&mut d, base)?;
     d.finish().ok()?;
     let mut offset = 0;
@@ -959,9 +973,9 @@ pub fn map_load_image(
         offset += len;
     }
     for (i, r) in regions.iter().enumerate() {
-        let ours = r.at >= base && r.at + r.size <= end;
+        let ours = r.at >= start && r.at + r.size <= end;
         if !place_region(r, ours, slots) {
-            for r in regions[..i].iter().filter(|r| r.at < base || r.at + r.size > end) {
+            for r in regions[..i].iter().filter(|r| r.at < start || r.at + r.size > end) {
                 // SAFETY: a region this call mapped outside the reservation.
                 unsafe { libc::munmap(r.at as *mut libc::c_void, r.size as usize) };
             }
@@ -969,7 +983,7 @@ pub fn map_load_image(
         }
     }
     finish_regions(&regions);
-    Some(arena_next)
+    Some((arena_next, front_end))
 }
 
 /// Reserve `size` bytes near `[lo, hi)` satisfying `reachable`.
@@ -1063,11 +1077,19 @@ mod tests {
 
     #[test]
     fn arena_hands_out_reachable_space() {
-        let mut arena = StubArena { next: 0x1000, end: 0x3000 };
+        let mut arena = StubArena { next: 0x1000, end: 0x3000, front_start: 0, front_end: 0 };
         assert_eq!(arena.take(0x1000, |_| true), Some(0x1000));
         assert_eq!(arena.take(0x1000, |_| false), None);
         assert_eq!(arena.take(0x1000, |_| true), Some(0x2000));
         assert_eq!(arena.take(0x1000, |_| true), None);
+        // Before the image too: from its end down, where reachable.
+        let mut arena =
+            StubArena { next: 0x9000, end: 0xa000, front_start: 0x1000, front_end: 0x4000 };
+        assert_eq!(arena.take(0x1000, |at| at < 0x5000), Some(0x3000));
+        assert_eq!(arena.take(0x1000, |at| at == 0x9000), Some(0x9000));
+        assert_eq!(arena.take(0x1000, |_| true), Some(0x2000));
+        assert_eq!(arena.take(0x2000, |_| true), None);
+        assert_eq!(arena.take(0x1000, |_| true), Some(0x1000));
     }
 
     fn page() -> u64 {
