@@ -241,7 +241,7 @@ fn reserve_table() {
     if TABLE_HELD.swap(true, Ordering::SeqCst) {
         return;
     }
-    for at in [TABLE, RETS] {
+    for at in [TABLE, RETS, NEAR] {
         let mut table = at;
         // SAFETY: fresh memory in this task, at the table's fixed place.
         unsafe {
@@ -275,6 +275,17 @@ pub const TABLE: u64 = 1 << 45;
 /// it (a return to one of many callers, as a tree walk's, missed most
 /// times).
 pub const RETS: u64 = TABLE | 1 << 44;
+/// The near table, a lookup's first look: laid out as [`TABLE`], but an
+/// address's entry picked by its bits 6 to 25, its bits 2 to 5 folded into
+/// the index's top ([`near_entry`]), holding a translation only, the one
+/// of an address there published last. Targets a lookup goes to that are
+/// far apart in the program, as functions are, have their entries close
+/// together: the entries of thousands of them stay in the data cache,
+/// where the table's (one for each instruction of the program's) would
+/// not, and the branch through a register waits for that read. Targets
+/// close together (a switch's cases) have entries far apart. A target the
+/// near table does not hold is looked for in the table.
+pub const NEAR: u64 = 1 << 46;
 const TABLE_BITS: u32 = 20;
 const TABLE_SIZE: u64 = 16 << TABLE_BITS;
 
@@ -368,6 +379,8 @@ const SCALE: u32 = 0xd37c_ee31;
 const BASE: u32 = 0xb253_0231;
 /// `orr x17, x17, #RETS`
 const RETS_BASE: u32 = 0xb254_0631;
+/// `orr x17, x17, #NEAR`: the near table's base ([`near_look`]).
+const NEAR_BASE: u32 = 0xb252_0231;
 /// `ret x17`
 const RET_X17: u32 = 0xd65f_0220;
 /// `bl` (its offset added)
@@ -412,20 +425,29 @@ const fn index_of(n: u32) -> u32 {
     0xd342_5411 | (n << 5)
 }
 
+/// The near table's entry ([`near_entry`]) of the address in `x<n>`,
+/// into `x17`: `ubfx x17, x<n>, #6, #20`; `eor x17, x17, x<n>, lsl #14`
+/// (its bits 2 to 5 at the index's 16 to 19); `ubfiz x17, x17, #4, #20`;
+/// `orr x17, x17, #NEAR`.
+const fn near_look(n: u32) -> [u32; 4] {
+    [0xd346_6411 | (n << 5), 0xca00_3a31 | (n << 16), 0xd37c_4e31, NEAR_BASE]
+}
+
 /// `eor x16, x16, x<n>`: an entry's key against the target in `x<n>`.
 const fn key_against(n: u32) -> u32 {
     0xca00_0210 | (n << 16)
 }
 
 /// A look in the table (in the entry its bits pick, or the `other` of its
-/// pair) for a target in the program's `x<n>` (16, 17 or 18), which its
+/// pair), or in the near table if `near` ([`NEAR`]; `other` then unused),
+/// for a target in the program's `x<n>` (16, 17 or 18), which its
 /// slot holds while the lookup has the registers: the target loaded into
 /// `x16`, the entry read whole (`x16` its address, `x17` its translation),
 /// the translation set below `sp` (as a save sets the registers there)
 /// while `x17` reads the target again, against the address. Then `x17` is
 /// 0 where the entry is the target's, and a [`MISS`] follows; found, the
 /// lookup takes the translation back ([`UNSTASH`]), `x16` the target.
-fn slot_look(n: u32, other: bool) -> impl Iterator<Item = u32> {
+fn slot_look(n: u32, other: bool, near: bool) -> impl Iterator<Item = u32> {
     let (s16, s17) = crate::parked_slots();
     let slot = match n {
         16 => s16,
@@ -440,10 +462,11 @@ fn slot_look(n: u32, other: bool) -> impl Iterator<Item = u32> {
             rewrite::LDR_UIMM | ((slot / 8) << 10) | (r << 5) | r,
         ]
     };
+    let (index, k) = if near { (near_look(16), 4) } else { ([INDEX, SCALE, BASE, 0], 3) };
     target(16)
         .into_iter()
-        .chain([INDEX, SCALE, BASE])
-        .chain(other.then_some(OTHER))
+        .chain(index.into_iter().take(k))
+        .chain((other && !near).then_some(OTHER))
         .chain([ENTRY, STASH])
         .chain(target(17))
         .chain([CHECK])
@@ -1458,11 +1481,26 @@ fn looked_up(t: u64) -> u64 {
 /// in one of them as they move.
 fn publish(g: u64, t: u64) {
     publish_in(TABLE, g, looked_up(t));
+    // A translation's, in the near table too, in place of whatever address
+    // there it held.
+    if t != 0 {
+        write_entry(near_entry(g), g, looked_up(t));
+    }
 }
 
-/// Clear `g`'s entry if it says translation `t`.
+/// Clear `g`'s entry if it says translation `t`, and its near one.
 fn unpublish(g: u64, t: u64) {
     unpublish_in(TABLE, g, looked_up(t));
+    let e = near_entry(g);
+    if t != 0 && read_entry(e) == (g, looked_up(t)) {
+        write_entry(e, 0, 0);
+    }
+}
+
+/// `g`'s entry in the near table ([`NEAR`]): its bits 6 to 25, the index's
+/// 16 to 19 changed by its bits 2 to 5 ([`near_look`]).
+fn near_entry(g: u64) -> u64 {
+    NEAR | ((((g >> 6) ^ (g << 14)) & ((1 << TABLE_BITS) - 1)) << 4)
 }
 
 /// [`publish`] in `table`: `g`'s entry says `value`.
@@ -2063,7 +2101,7 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
         (at(false), at(true), vec![GO])
     } else if matches!(n, 16 | 17) {
         let at = |other: bool| {
-            let mut w: Vec<u32> = slot_look(n, other).collect();
+            let mut w: Vec<u32> = slot_look(n, other, false).collect();
             w.extend([MISS, UNSTASH, OUTSIDE]);
             w
         };
@@ -4592,31 +4630,52 @@ fn lookup(
             before,
         );
     }
+    // First the near table ([`NEAR`]), which holds translations only; not
+    // there, the table, out of the way: each entry of the target's pair in
+    // turn (the second's look in [`lookup_tail`]), then on as from the
+    // first look. (A lookup out of the way already, a return's after the
+    // table of returns, looks in the table alone.)
     let miss = a.label();
-    let to = if in_place {
-        a.extend(main, [index_of(n), SCALE, BASE, ENTRY, key_against(n)], before);
-        a.branch(main, MISS_X16, Field::Imm19, miss, before);
-        n as u8
-    } else {
-        // A call through x30, whose return address replaces the target
-        // there: found, the target in x16 as well. Through x16, x17 or
-        // x18: the target in its slot.
-        if n == 30 {
-            a.extend(main, [index_of(30), SCALE, BASE, ENTRY, key_against(30)], before);
-            a.branch(main, MISS_X16, Field::Imm19, miss, before);
-            a.push(main, 0xaa1e_03f0, before); // mov x16, x30
+    let looks = |a: &mut Asm<Word>, s: Sec, near: bool, to: Label| {
+        if in_place || n == 30 {
+            // A call through x30, whose return address replaces the target
+            // there: found, the target in x16 as well.
+            if near {
+                a.extend(s, near_look(n), before);
+            } else {
+                a.extend(s, [index_of(n), SCALE, BASE], before);
+            }
+            a.extend(s, [ENTRY, key_against(n)], before);
+            a.branch(s, MISS_X16, Field::Imm19, to, before);
+            if !in_place {
+                a.push(s, 0xaa1e_03f0, before); // mov x16, x30
+            }
         } else {
-            a.extend(main, slot_look(n, false), before);
-            a.branch(main, MISS, Field::Imm19, miss, before);
-            a.push(main, UNSTASH, before);
+            // Through x16, x17 or x18: the target in its slot.
+            a.extend(s, slot_look(n, false, near), before);
+            a.branch(s, MISS, Field::Imm19, to, before);
+            a.push(s, UNSTASH, before);
         }
-        16
     };
+    let to = if in_place { n as u8 } else { 16 };
     let committed = Word::Lookup { g: pc, link, to: Some(to) };
-    // A target fwe does not translate has no translation in the table (0):
-    // the branch is made as the program made it, every register its own.
     let outside = a.label();
-    let outside_at = a.branch(main, OUTSIDE, Field::Imm19, outside, committed);
+    let outside_at = if main == H {
+        let far = a.label();
+        looks(a, main, true, far);
+        let found = a.label_at(a.here(main));
+        a.bind(far, cold);
+        looks(a, cold, false, miss);
+        // A target fwe does not translate has no translation in the table
+        // (0): the branch is made as the program made it, every register
+        // its own.
+        let at = a.branch(cold, OUTSIDE, Field::Imm19, outside, committed);
+        a.branch(cold, B, Field::Imm26, found, committed);
+        at
+    } else {
+        looks(a, main, false, miss);
+        a.branch(main, OUTSIDE, Field::Imm19, outside, committed)
+    };
     let mut tail = Tail {
         pc,
         n,
@@ -4711,7 +4770,7 @@ fn lookup_tail(t: &Tail, a: &mut Asm<Word>) {
             a.push(cold, 0xaa1e_03f0, before); // mov x16, x30
         }
     } else {
-        a.extend(cold, slot_look(n, true), before);
+        a.extend(cold, slot_look(n, true, false), before);
         a.branch(cold, MISS, Field::Imm19, second_miss, before);
         a.push(cold, UNSTASH, before);
     }
@@ -4884,6 +4943,35 @@ mod tests {
         let ret: Vec<u32> = materialized(16, g + 8).collect();
         assert_eq!(&hot[bl - ret.len()..bl], &ret[..]);
         assert!(info[bl - ret.len()..=bl].iter().all(|&w| w == Word::Saved(g + 4)));
+    }
+
+    /// The near table's look in a lookup's words picks the entry
+    /// `near_entry` does; functions 64 bytes apart have entries next to
+    /// each other, and targets in one 64 bytes entries of their own.
+    #[test]
+    fn near_entries_dense_for_functions_apart_for_targets_close() {
+        #[cfg(target_arch = "aarch64")]
+        for g in [0x0200_1976_c000u64, 0x0200_1976_c0c8, 0x5555_5555_8a14, 0x7fff_ffff_fffc] {
+            let e: u64;
+            // SAFETY: arithmetic on registers alone (the words of
+            // `near_look(9)`).
+            unsafe {
+                std::arch::asm!(
+                    ".inst {a}", ".inst {b}", ".inst {c}", ".inst {d}",
+                    a = const near_look(9)[0], b = const near_look(9)[1],
+                    c = const near_look(9)[2], d = const near_look(9)[3],
+                    in("x9") g, out("x17") e, options(nomem, nostack, preserves_flags),
+                );
+            }
+            assert_eq!(e, near_entry(g), "{g:#x}");
+        }
+        let f = 0x0200_1976_c000u64;
+        for k in 0..4096 {
+            assert_eq!(near_entry(f + 64 * k), near_entry(f) + 16 * k, "function {k}");
+        }
+        let cases: std::collections::HashSet<u64> =
+            (0..16).map(|k| near_entry(f + 0x40 + 4 * k)).collect();
+        assert_eq!(cases.len(), 16);
     }
 
     /// A thread stopped at a call entry is at the target, its `x30` the

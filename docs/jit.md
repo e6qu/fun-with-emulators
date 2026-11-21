@@ -80,10 +80,15 @@ way.
   (single-copy atomic, as the table's writes are), so a match leads to
   the target's own translation; through `x16` or `x17`, which the lookup
   takes for itself, the target is read again from its slot to compare,
-  the translation set below `sp` meanwhile. An address is looked for in the entry its bits pick,
-  then in the other of that one's pair, so two targets that pick one
-  entry do not push each other out at every turn. A miss goes through fwe
-  once and fills the table. An indirect branch into code that is not
+  the translation set below `sp` meanwhile. A lookup looks first in a
+  near table, one entry for each 64 bytes of the program's code, which
+  holds the entries of thousands of functions in the data cache, as the
+  table (an entry for each instruction) cannot: the branch through a
+  register waits for that read. Not there, an address is looked for,
+  out of line, in the table's entry its bits pick, then in the other of
+  that one's pair, so two targets that pick one entry do not push each
+  other out at every turn. A miss goes through fwe once and fills the
+  table. An indirect branch into code that is not
   translated (a library's) restores `x16` and `x17` and goes through the
   program's own register, so every register is as the program left it:
   code may count on more than the procedure call standard promises
@@ -354,7 +359,15 @@ a processor that reports `DIC` clear.
   entry its bits 2 to 21 pick, its earlier holder moving to the other of
   that one's 32-byte pair (`jit::publish`), where a lookup that misses
   the first looks next. A target outside run-time code (a library's)
-  gets translation 0; a dropped entry is cleared.
+  gets translation 0; a dropped entry is cleared. The near table
+  (`jit::NEAR`, at 2^46) is laid out alike, an address's entry picked by
+  its bits 6 to 25 with its bits 2 to 5 folded into the index's top four
+  (`jit::near_entry`, `jit::near_look`: functions 64 bytes apart have
+  entries side by side, a switch's cases close together have their own),
+  and holds the translation of the address there published last; a
+  lookup through `x16`, `x17` or `x18` reads it as it reads the table.
+  The table of returns' tail, a return whose first look misses, and call
+  sites' stubs look in the table alone.
 - **The table of returns** at 2^45 + 2^44 is laid out as the table of
   translations: a call's return address and the words after its `bl`
   (`jit::RETS`; the call's words out of line are a `jit::Side`),
@@ -477,7 +490,7 @@ a processor that reports `DIC` clear.
 | a direct branch's first run | a call through the exit gate | once per branch, then linked |
 | a call | the return address set and a `bl` to the target (after a table lookup, and through words out of line, for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
-| an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
+| an indirect branch | an inline look in the near table, about ten instructions, and a save of `x16` and `x17` where the code before it named them; not there, the table's, out of line | each time; a miss in both goes through the exit gate |
 | a call or branch from native code into JIT code | a fault, then a table lookup in the site's stub (a target not translated yet: a call through the exit gate) | a fault once per call site, then linked (a branch no call leads to: followed) |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
