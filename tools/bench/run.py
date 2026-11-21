@@ -3,13 +3,14 @@
 project's build and programs' realistic workloads, under fwe, natively on
 macOS and natively on Linux.
 
-    run.py linux --bench BENCH --cache DIR --out linux.json
+    run.py linux --bench BENCH --cache DIR --xvfb XVFB --out linux.json
         On arm64 Linux: BENCH (guests/c/bench.c, built static-pie) runs
         natively; Lua is built, and the workloads run, in an Alpine 3.24
         container (docker).
 
     run.py macos --fwe FWE --bench BENCH --native NATIVE --brew PREFIX
-                 --cache DIR [--linux linux.json] [--no-build] --out macos.json
+                 --cache DIR --xvfb XVFB [--linux linux.json] [--no-build]
+                 --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
         source built for macOS) runs natively. Lua is built with clang under
         FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched into
@@ -28,11 +29,15 @@ macOS and natively on Linux.
         its own limit (LIMITS), or a computing program's share of fwe's its
         own (SHARE_BUDGETS).
 
+The X benchmarks talk to an X server run here (XVFB, an Xvfb), the same
+one for fwe's side and the native one.
+
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
 """
 
 import argparse
+import atexit
 import bisect
 import collections
 import ctypes
@@ -144,6 +149,10 @@ MICRO = [
     ("JIT code: a loop", ["jit", "loop", "10000000"], "ns"),
     ("JIT code: 4096 functions in turn", ["jit", "functions", "2000000"], "ns"),
     ("JIT code: a function made and run", ["jit", "made", "2000"], "us"),
+    # A graphical program's traffic with its X server ([`x_server`]): a
+    # request waited for, and a window's frame drawn through shared memory.
+    ("X request round trip", ["x11", "rtt", "20000"], "us"),
+    ("X frame through shared memory", ["x11", "shm", "300"], "us"),
 ]
 
 
@@ -179,6 +188,9 @@ BUDGETS = {
     "JIT code: a switch through br (ns)": 1.3,
     "JIT code: calls through a register (ns)": 1.3,
     "JIT code: a loop (ns)": 1.3,
+    # A graphical program's calls to its X server, as a system call is.
+    "X request round trip (us)": 1.5,
+    "X frame through shared memory (us)": 1.5,
 }
 
 # The most fwe's figure may be, in the row's own unit: making a
@@ -247,6 +259,22 @@ def backends(cmd, fresh=()):
     if len(n) == 1:
         return "native" if "native" in n else "VM"
     return f"native {n['native']}, VM {n['vm']}"
+
+
+def x_server(xvfb):
+    """A headless X server (`xvfb`, an Xvfb) for the X benchmarks, at a
+    display of its own on its Unix socket only: `DISPLAY` names it to every
+    program run here. Stopped when this ends."""
+    n = 57
+    p = subprocess.Popen([xvfb, f":{n}", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(lambda: (p.terminate(), p.wait()))
+    deadline = time.monotonic() + 30
+    while not os.path.exists(f"/tmp/.X11-unix/X{n}"):
+        if p.poll() is not None or time.monotonic() > deadline:
+            sys.exit(f"{xvfb} :{n} did not start")
+        time.sleep(0.1)
+    os.environ["DISPLAY"] = f":{n}"
 
 
 def best(f, rounds=ROUNDS):
@@ -348,6 +376,7 @@ def lua_build_once(cmd_for, cc, retrace=None):
 
 
 def linux(a):
+    x_server(a.xvfb)
     r = micro([], a.bench)
     lua = fetch(*LUA, a.cache)
     with tempfile.TemporaryDirectory() as d:
@@ -396,6 +425,7 @@ def linux(a):
 
 
 def macos(a):
+    x_server(a.xvfb)
     fwe = [a.fwe]
     # Where a start's time goes (FWE_TIMING), for the log.
     for args in (["exit"], ["forkexec", "2", a.bench]):
@@ -1842,6 +1872,7 @@ def main():
     lx.add_argument("--bench", required=True)
     lx.add_argument("--cache", required=True)
     lx.add_argument("--out", required=True)
+    lx.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
     mc = sub.add_parser("macos")
     mc.add_argument("--fwe", required=True)
     mc.add_argument("--bench", required=True)
@@ -1853,6 +1884,7 @@ def main():
     mc.add_argument("--no-build", action="store_true")
     mc.add_argument("--brew", required=True, help="Homebrew's prefix: the native programs")
     mc.add_argument("--out", required=True)
+    mc.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)
 

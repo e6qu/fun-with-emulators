@@ -31,6 +31,14 @@
  *                        nanoseconds each; and `made` (N functions written
  *                        and each run once: making new code), microseconds
  *                        each
+ *   bench x11 WHAT N     on the X display DISPLAY names (`:<n>`, by its
+ *                        Unix socket), with the protocol written here:
+ *                        `rtt`, N requests each waiting for its reply
+ *                        (GetInputFocus), microseconds each; `shm`, N
+ *                        frames of 512x512 written into a System V shared
+ *                        memory segment and drawn into a window from it
+ *                        (MIT-SHM's ShmPutImage), each waited for,
+ *                        microseconds each
  *   bench exit           returns at once (for startup time)
  */
 #include <fcntl.h>
@@ -45,7 +53,10 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/shm.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/syscall.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
@@ -309,6 +320,126 @@ static double jit(const char *kind, long n) {
     return -1;
 }
 
+/* The X connection: its socket, a buffer for replies, the next
+ * resource id. */
+static int xfd = -1;
+static unsigned char xbuf[1 << 16];
+static unsigned xid;
+
+static int xput(const void *p, size_t n) {
+    const unsigned char *b = p;
+    while (n > 0) {
+        ssize_t r = write(xfd, b, n);
+        if (r <= 0) return -1;
+        b += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+static int xget(void *p, size_t n) {
+    unsigned char *b = p;
+    while (n > 0) {
+        ssize_t r = read(xfd, b, n);
+        if (r <= 0) return -1;
+        b += r;
+        n -= (size_t)r;
+    }
+    return 0;
+}
+
+static unsigned x16(const unsigned char *p) { return p[0] | p[1] << 8; }
+static unsigned x32(const unsigned char *p) { return p[0] | p[1] << 8 | p[2] << 16 | (unsigned)p[3] << 24; }
+
+/* The next reply into xbuf (an error is -1; events are passed over). */
+static int xreply(void) {
+    for (;;) {
+        if (xget(xbuf, 32) < 0 || xbuf[0] == 0) return -1;
+        if (xbuf[0] == 1) {
+            size_t more = 4 * (size_t)x32(xbuf + 4);
+            return more > sizeof xbuf - 32 || xget(xbuf + 32, more) < 0 ? -1 : 0;
+        }
+    }
+}
+
+/* A request: its words, the length put in. */
+static int xreq(unsigned *w, unsigned words) {
+    w[0] |= words << 16;
+    return xput(w, 4 * words);
+}
+
+/* GetInputFocus, waited for: a round trip. */
+static int xsync(void) {
+    unsigned w[1] = {43};
+    return xreq(w, 1) < 0 ? -1 : xreply();
+}
+
+/* Connect to DISPLAY with no authorization: the root window and depth. */
+static int xconnect(unsigned *root, unsigned *depth) {
+    const char *d = getenv("DISPLAY");
+    if (!d || d[0] != ':') return -1;
+    struct sockaddr_un a = {.sun_family = AF_UNIX};
+    snprintf(a.sun_path, sizeof a.sun_path, "/tmp/.X11-unix/X%d", atoi(d + 1));
+    xfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (xfd < 0 || connect(xfd, (struct sockaddr *)&a, sizeof a) != 0) return -1;
+    unsigned char setup[12] = {'l', 0, 11, 0};
+    if (xput(setup, 12) < 0 || xget(xbuf, 8) < 0 || xbuf[0] != 1) return -1;
+    if (xget(xbuf + 8, 4 * x16(xbuf + 6)) < 0) return -1;
+    xid = x32(xbuf + 12);
+    unsigned vendor = x16(xbuf + 24), formats = xbuf[29];
+    const unsigned char *screen = xbuf + 40 + ((vendor + 3) & ~3u) + 8 * formats;
+    *root = x32(screen);
+    *depth = screen[38];
+    return 0;
+}
+
+static double x11(const char *what, long n) {
+    unsigned root, depth;
+    if (xconnect(&root, &depth) < 0) return -1;
+    if (strcmp(what, "rtt") == 0) {
+        double start = now_ns();
+        for (long i = 0; i < n; i++)
+            if (xsync() < 0) return -1;
+        return (now_ns() - start) / n / 1e3;
+    }
+    if (strcmp(what, "shm") != 0) return -1;
+    enum { W = 512, H = 512 };
+    /* QueryExtension("MIT-SHM"). */
+    unsigned q[4] = {98, 7};
+    memcpy(q + 2, "MIT-SHM\0", 8);
+    if (xreq(q, 4) < 0 || xreply() < 0 || !xbuf[8]) return -1;
+    unsigned shm = xbuf[9];
+    unsigned win = xid++, gc = xid++, seg = xid++;
+    /* CreateWindow (copying the parent's depth and visual), mapped. */
+    unsigned cw[8] = {1 | depth << 8, win, root, 0, W | H << 16, 0, 0, 0};
+    unsigned map[2] = {8, win};
+    unsigned cg[4] = {55, gc, win, 0};
+    if (xreq(cw, 8) < 0 || xreq(map, 2) < 0 || xreq(cg, 4) < 0) return -1;
+    int id = shmget(IPC_PRIVATE, W * H * 4, IPC_CREAT | 0600);
+    unsigned *pixels = id < 0 ? (void *)-1 : shmat(id, 0, 0);
+    if (pixels == (void *)-1) return -1;
+    /* ShmAttach (read-write). */
+    unsigned at[4] = {shm | 1 << 8, seg, (unsigned)id, 0};
+    if (xreq(at, 4) < 0 || xsync() < 0) {
+        shmctl(id, IPC_RMID, 0);
+        return -1;
+    }
+    double start = now_ns();
+    for (long i = 0; i < n; i++) {
+        for (unsigned k = 0; k < W * H; k++) pixels[k] = (k + (unsigned)i) * 2654435761u;
+        /* ShmPutImage: all of it, ZPixmap, at the window's origin. */
+        unsigned put[10] = {shm | 3 << 8, win, gc, W | H << 16, 0, W | H << 16, 0,
+                            depth | 2 << 8, seg, 0};
+        if (xreq(put, 10) < 0 || xsync() < 0) {
+            shmctl(id, IPC_RMID, 0);
+            return -1;
+        }
+    }
+    double us = (now_ns() - start) / n / 1e3;
+    shmctl(id, IPC_RMID, 0);
+    return us;
+}
+
 /* A fault's handler: on past the faulting load. */
 static void step_past(int sig, siginfo_t *si, void *ctx) {
     (void)sig;
@@ -447,6 +578,13 @@ int main(int argc, char **argv) {
         printf("%.1f\n", (now_ns() - start) / n);
         close(fd);
         unlink(path);
+    } else if (strcmp(argv[1], "x11") == 0) {
+        double each = x11(argv[2], argc > 3 ? atol(argv[3]) : 1000);
+        if (each < 0) {
+            fprintf(stderr, "x11 %s: no X display, or it refused\n", argv[2]);
+            return 1;
+        }
+        printf("%.2f\n", each);
     } else {
         fprintf(stderr, "unknown benchmark %s\n", argv[1]);
         return 2;

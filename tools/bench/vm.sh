@@ -6,7 +6,7 @@
 #
 # Needs Lima, Homebrew's builds the native side runs and a password for
 # sudo (DTrace, for fwe's share):
-#     brew install lima llvm@22 python@3.14 sqlite git xz
+#     brew install lima llvm@22 python@3.14 sqlite git xz xorg-server
 # Run from the repository: sh tools/bench/vm.sh. The VM (fwe-bench) is
 # kept, stopped, for the next run; `limactl delete fwe-bench` removes it.
 # A Linux VM is a hypervisor client: not while fwe's VM tests run.
@@ -44,10 +44,10 @@ if ! limactl list -q | grep -qx "$vm"; then
 fi
 limactl start "$vm"
 limactl shell --workdir "$repo" "$vm" sh -euc "
-    command -v docker >/dev/null && command -v gcc >/dev/null ||
-        { sudo apt-get update -q && sudo apt-get install -qy docker.io gcc; }
+    command -v docker >/dev/null && command -v gcc >/dev/null && command -v Xvfb >/dev/null ||
+        { sudo apt-get update -q && sudo apt-get install -qy docker.io gcc xvfb; }
     gcc -O2 -static-pie -o $out/bench guests/c/bench.c
-    sudo python3 tools/bench/run.py linux --bench $out/bench --cache $out/cache --out $out/linux-vm.json
+    sudo python3 tools/bench/run.py linux --bench $out/bench --cache $out/cache --xvfb /usr/bin/Xvfb --out $out/linux-vm.json
 "
 limactl stop "$vm"
 
@@ -63,10 +63,10 @@ if $fwe_vm; then
     chmod +x "$out/fwe-vm"
     python3 tools/bench/run.py macos --fwe "$out/fwe-vm" --bench "$out/bench" \
         --native "$out/bench-mac" --brew "$(brew --prefix)" --cache target/bench-cache \
-        --out "$out/macos-vm.json" || true
+        --xvfb "$(brew --prefix)/bin/Xvfb" --out "$out/macos-vm.json" || true
     with_vm="--fwe-vm $out/macos-vm.json"
 fi
 # shellcheck disable=SC2086 # `with_vm` is two words or none
 python3 tools/bench/run.py macos --fwe target/release/fwe --bench "$out/bench" \
     --native "$out/bench-mac" --brew "$(brew --prefix)" --cache target/bench-cache \
-    --linux-vm "$out/linux-vm.json" $with_vm --out "$out/macos.json"
+    --xvfb "$(brew --prefix)/bin/Xvfb" --linux-vm "$out/linux-vm.json" $with_vm --out "$out/macos.json"

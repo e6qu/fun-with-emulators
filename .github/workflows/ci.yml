@@ -352,7 +352,9 @@ jobs:
           path: /tmp/bench-cache
           key: bench-linux-cache-${{ hashFiles('tools/bench/run.py') }}
       - run: gcc -O2 -static-pie -o bench guests/c/bench.c
-      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --out linux.json
+      # An X server for the X benchmarks.
+      - run: sudo apt-get update -q && sudo apt-get install -qy xvfb
+      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --xvfb /usr/bin/Xvfb --out linux.json
       - uses: actions/upload-artifact@v4
         with:
           name: bench-linux
@@ -381,9 +383,9 @@ jobs:
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
       # The native side's programs: the clang release Alpine's root has, and
-      # the workloads' programs (tools/bench/run.py, BREW).
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit
-      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --linux linux.json --out macos.json
+      # the workloads' programs (tools/bench/run.py, BREW), and an X server.
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit xorg-server
+      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --linux linux.json --out macos.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:
