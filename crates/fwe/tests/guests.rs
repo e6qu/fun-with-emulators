@@ -5237,8 +5237,8 @@ fn hv_sp_off_alignment() {
     let Some(mut cmd) = hv_command() else { return };
     // PROBE (temporary): the stand-in's events and the calls, the last of
     // them shown if the run fails.
-    cmd.env("FWE_STANDIN_DEBUG", "1").arg("--strace");
-    cmd.arg("--vm").arg(asm_guest("spalign"));
+    cmd.arg("--vm").env("FWE_STANDIN_DEBUG", "1").arg("--strace");
+    cmd.arg(asm_guest("spalign"));
     let limit =
         if matches!(hv_mode(), Some(HvMode::Standin)) { STANDIN_TIMEOUT } else { GUEST_TIMEOUT };
     let out = run_hv_quietly(cmd, "spalign --vm", limit);
