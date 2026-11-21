@@ -1011,10 +1011,12 @@ impl Vcpu {
                         // not mapped (or not for this access).
                         EC_DABT_LOWER | EC_IABT_LOWER => {
                             regs = self.regs(self.get(HV_REG_PC), self.get(HV_REG_CPSR));
+                            // (A lower level's abort, as EL1 would see it.)
                             fault(
                                 &mut regs,
                                 fwe_abi::signal::SIGSEGV,
                                 exit.exception.virtual_address,
+                                Some(syndrome),
                             );
                         }
                         // `wfi`/`wfe`, which Linux lets EL0 execute: the
@@ -1076,7 +1078,7 @@ impl Vcpu {
             regs.pc = pc + 4;
             return regs;
         }
-        fault(&mut regs, fwe_abi::signal::SIGILL, pc);
+        fault(&mut regs, fwe_abi::signal::SIGILL, pc, None);
         regs
     }
 
@@ -1096,8 +1098,8 @@ impl Vcpu {
                 regs.pc = elr - 4;
                 syscall(self, &mut regs);
             }
-            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr),
-            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far),
+            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr, None),
+            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far, None),
             EC_DABT_LOWER | EC_IABT_LOWER => {
                 // A translation fault (DFSC/IFSC 0b0001xx) a vfork child
                 // takes on memory it has not fetched yet: fetched now, the
@@ -1119,11 +1121,11 @@ impl Vcpu {
                         k.tracer.note(&format!("guest abort: esr {esr:#x}, far {far:#x}"));
                     }
                     drop(k);
-                    fault(&mut regs, s::SIGSEGV, far)
+                    fault(&mut regs, s::SIGSEGV, far, Some(esr))
                 }
             }
-            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr),
-            _ => fault(&mut regs, s::SIGILL, elr),
+            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr, None),
+            _ => fault(&mut regs, s::SIGILL, elr, None),
         }
         regs
     }
@@ -1165,11 +1167,12 @@ fn stale_permissions(esr: u64, far: u64) -> bool {
     true
 }
 
-/// Deliver synchronous fault `sig` at `addr`, or die of it.
-fn fault(regs: &mut Regs, sig: u64, addr: u64) {
+/// Deliver synchronous fault `sig` at `addr` (an abort's syndrome `esr`,
+/// which its handler's frame holds), or die of it.
+fn fault(regs: &mut Regs, sig: u64, addr: u64, esr: Option<u64>) {
     let mut guard = kernel();
     let Some(k) = guard.as_mut() else { fatal("fault before the kernel exists") };
-    if !k.deliver_fault(regs, sig, addr, None) {
+    if !k.deliver_fault(regs, sig, addr, esr) {
         if k.tracer.enabled {
             k.tracer.note(&format!(
                 "guest fault: signal {sig} at pc {:#x}, address {addr:#x}",
