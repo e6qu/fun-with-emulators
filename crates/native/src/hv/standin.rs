@@ -63,8 +63,7 @@
 //! hook costs about half the emulation speed in tight loops.
 //!
 //! Not modelled: the virtual
-//! timer, the exact fault address of an alignment fault outside the
-//! exclusive and atomic instructions, stack-pointer alignment checks, and
+//! timer, stack-pointer alignment checks, and
 //! code another vCPU writes without a mapping change (each emulated CPU
 //! sees its own writes to code, and every mapping change discards
 //! translated code).
@@ -1628,8 +1627,9 @@ extern "C" fn on_exception(uc: Uc, intno: u32, d: *mut c_void) {
         }
         EXCP_DATA_ABORT => {
             // Alignment (stage 1 never faults otherwise, and stage 2 faults
-            // come through the memory hooks): DFSC 0x21.
-            let far = fetch(d, pc).map_or(0, |i| exclusive_or_atomic_base(uc, i));
+            // come through the memory hooks): DFSC 0x21, at the access.
+            let reg = |n: u32| if n == 31 { read(uc, R_SP) } else { read(uc, xreg(n)) };
+            let far = fetch(d, pc).and_then(|i| data_access(i, pc, reg)).map_or(0, |(at, _)| at);
             let wnr = fetch(d, pc).map_or(0, |i| u64::from(i & (1 << 22) == 0) << 6);
             Event::El1 { esr: (0x24 << 26) | il | wnr | 0x21, elr: pc, far }
         }
@@ -1641,9 +1641,6 @@ extern "C" fn on_exception(uc: Uc, intno: u32, d: *mut c_void) {
     record(d, ev);
 }
 
-/// The address an exclusive or atomic instruction uses: its base register
-/// (they have no offset). Anything else gives 0, which the stand-in does
-/// not model.
 /// The address and size of the memory the load or store `insn` at `pc`
 /// accesses, its registers `reg(n)` (31: `sp` as a base): the forms by
 /// immediate, register offset, pair, literal, exclusive and atomic, and
@@ -1711,16 +1708,6 @@ fn data_access(insn: u32, pc: u64, reg: impl Fn(u32) -> u64) -> Option<(u64, u64
     let off = sext((insn >> 12) & 0x1ff, 9);
     let at = if (insn >> 10) & 3 == 1 { base } else { base.wrapping_add_signed(off) };
     Some((at, size))
-}
-
-fn exclusive_or_atomic_base(uc: Uc, insn: u32) -> u64 {
-    let exclusive = insn & 0x3f00_0000 == 0x0800_0000;
-    let atomic = insn & 0x3f20_0c00 == 0x3820_0000;
-    if !(exclusive || atomic) {
-        return 0;
-    }
-    let rn = (insn >> 5) & 31;
-    if rn == 31 { read(uc, R_SP) } else { read(uc, xreg(rn)) }
 }
 
 /// A stage-2 abort: the framework's exit, at the faulting instruction.
