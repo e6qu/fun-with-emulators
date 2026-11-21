@@ -425,7 +425,9 @@ a processor that reports `DIC` clear.
   the records whose key its words match: no index is made, and a JIT that
   writes other code at the same addresses run after run costs no more
   reads. `jit::translation` looks for a record of
-  the code before it translates (`kept::take`), and places a block
+  the code before it translates (`kept::take`; of a block made again for
+  its entry with the program's own `x16` and `x17`, the record with that
+  entry first), and places a block
   taken (`Asm::restore`) as one just made, the literal of each system
   call's and flush's stub set to where the gate is in this process (fwe's
   image lands elsewhere in each, `kept::relocate`). Other builds' records
@@ -515,7 +517,8 @@ What fwe counts, for the benchmarks to report
   is (and, with `FWE_JIT_COUNT`, how often they ran: each run a branch
   from one block into the next that a trace would not take).
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
-  and a hash of their words) and counts those an earlier one made, at the
+  and a hash of the words their translation read, past their own too, as
+  a kept record is keyed) and counts those an earlier one made, at the
   same address (and of those, the ones two or more earlier processes made
   there, which kept translations should have given it) or elsewhere. The
   benchmarks run each JIT runtime three times so and fail if the third

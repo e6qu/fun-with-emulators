@@ -1360,7 +1360,8 @@ fn jit_calls_into_jit_code_keep_x30_through_signals_and_rewrites() {
 /// branch first comes to it), and the branches are linked there (the
 /// loop's rounds do not go through fwe). Run three times (a copy of its
 /// own, whose generated code no other test's runs keep): the third makes
-/// no block, taking each as the second kept it, with that entry too.
+/// no block, taking each as the second kept it, with that entry too (none
+/// then made again for it).
 #[test]
 fn jit_branches_holding_x16_x17_enter_blocks_made_again_for_them() {
     let built = build_c("jitunsaved", Libc::Musl, true, true);
@@ -1377,8 +1378,8 @@ fn jit_branches_holding_x16_x17_enter_blocks_made_again_for_them() {
         let remade = *jit_counts(&err, " entered there, ")
             .first()
             .unwrap_or_else(|| panic!("no count of blocks made again: {err}"));
-        assert!(remade >= 1, "blocks made again for the program's x16 and x17: {err}");
         if round == 0 {
+            assert!(remade >= 1, "blocks made again for the program's x16 and x17: {err}");
             assert!(err.contains("; 2 with a second pass ("), "{err}");
             assert!(err.contains(" words), 2 of them entered there, "), "{err}");
             let exits = *jit_counts(&err, " blocks translated, ")
@@ -1388,6 +1389,7 @@ fn jit_branches_holding_x16_x17_enter_blocks_made_again_for_them() {
         }
         if round == 2 {
             assert!(err.contains("blocks made from files 0 (0 ms), generated 0 ("), "{err}");
+            assert_eq!(remade, 0, "{err}");
         }
     }
     let _ = std::fs::remove_dir_all(&root);

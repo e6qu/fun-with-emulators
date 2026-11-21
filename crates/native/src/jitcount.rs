@@ -10,7 +10,8 @@
 //! blocks made ahead of the program.
 //!
 //! With `FWE_JIT_SEEN` naming a directory: each process adds there the
-//! blocks it made (their program address and a hash of their words) as it
+//! blocks it made (their program address and a hash of the words their
+//! translation read) as it
 //! ends or replaces its program, and counts the blocks it made that an
 //! earlier one had: at the same address (and of those, the ones two or
 //! more earlier processes made there, which it should have taken from

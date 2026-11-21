@@ -346,9 +346,11 @@ pub(super) fn remapped(addr: u64, len: u64) {
 /// A record of part `part` for the block at `g` made from `source` (the
 /// program's words from `g`, as far as a block's translation may read
 /// them) with the calls in `known` made in other blocks' words, and an
-/// entry with the program's own `x16` and `x17` if `unsaved` (a block a
-/// past process made again for that entry has a record of each): the
-/// block as made, its words' meanings packed, and where its words end.
+/// entry with the program's own `x16` and `x17` if `unsaved`; one with
+/// that entry before one without it either way (a block a past process
+/// made again for that entry has a record of each, and the entry is
+/// likely wanted again): the block as made, its words' meanings packed,
+/// and where its words end.
 pub(super) fn take(
     part: Part,
     g: u64,
@@ -365,6 +367,7 @@ pub(super) fn take(
     // The keys of the program's words there, as many as each record was
     // made from.
     let mut keys = HashMap::new();
+    let mut without = None;
     for (seg, at) in loaded.segs.iter().rev().flat_map(|seg| seg.entries(g).map(move |e| (seg, e)))
     {
         let n = (at.key >> 48) as usize;
@@ -389,11 +392,15 @@ pub(super) fn take(
             continue;
         }
         match decode(&mut r, end) {
-            Some((made, _)) if unsaved && made.unsaved.is_none() => continue,
+            Some((made, info)) if made.unsaved.is_none() => {
+                if !unsaved && without.is_none() {
+                    without = Some((made, info));
+                }
+            }
             taken => return taken,
         }
     }
-    None
+    without
 }
 
 /// Keep the block at `g` of part `part`, made from `source` (the words its

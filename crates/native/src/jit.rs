@@ -2717,6 +2717,9 @@ fn translation(s: &mut Held, g: u64, unsaved: bool) -> usize {
             kept::keep(p, g, &source[..looked], &calls, &made, &info);
             lap.step(jitcount::STEP_KEEP);
         }
+        // (By the words it was made from, as a record of it is.)
+        let origin = if followed { jitcount::FILE } else { jitcount::GENERATED };
+        jitcount::seen(g, &source[..looked], origin);
         let r = place(s, g, followed, made, info, source[..read_words].to_vec(), false);
         making.add_to(
             &jitcount::MAKE_NS[if followed { jitcount::FILE } else { jitcount::GENERATED }],
@@ -2817,7 +2820,6 @@ fn place(
         if ahead {
             jitcount::AHEAD.fetch_add(1, Ordering::Relaxed);
         }
-        jitcount::seen(g, &source, origin);
     }
     let mut lap = Lap::now();
     let Room { asm, c: calls } = &mut room;
