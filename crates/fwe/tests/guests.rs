@@ -5235,9 +5235,17 @@ fn asm_sp_off_alignment() {
 #[test]
 fn hv_sp_off_alignment() {
     let Some(mut cmd) = hv_command() else { return };
+    // PROBE (temporary): the stand-in's events and the calls, the last of
+    // them shown if the run fails.
+    cmd.env("FWE_STANDIN_DEBUG", "1").arg("--strace");
     cmd.arg("--vm").arg(asm_guest("spalign"));
-    let out = run_hv(cmd, "spalign --vm");
-    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let limit =
+        if matches!(hv_mode(), Some(HvMode::Standin)) { STANDIN_TIMEOUT } else { GUEST_TIMEOUT };
+    let out = run_hv_quietly(cmd, "spalign --vm", limit);
+    let err = String::from_utf8_lossy(&out.stderr);
+    let lines: Vec<&str> = err.lines().collect();
+    let tail = lines[lines.len().saturating_sub(80)..].join("\n");
+    assert_eq!(out.status.code(), Some(0), "{} lines, the last:\n{tail}", lines.len());
 }
 
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
@@ -9750,12 +9758,11 @@ impl Xvfb {
         assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
     }
 
-    /// Keys (xdotool's names, `ctrl+q`) pressed in window `w`: pressed
-    /// only, as a program that ends on the press (a quit key) has no
-    /// window left for their release.
+    /// Keys (xdotool's names, `ctrl+q`) pressed and released with window
+    /// `w` focused, through the server as a keyboard's are (XTEST): a
+    /// popup's grab gets them first, as it would a user's.
     fn key_into(&self, w: &Window, keys: &str) {
-        let out =
-            self.xdotool(&["windowfocus", "--sync", &w.id, "keydown", "--window", &w.id, keys]);
+        let out = self.xdotool(&["windowfocus", "--sync", &w.id, "key", keys]);
         assert!(out.status.success(), "xdotool key: {}", String::from_utf8_lossy(&out.stderr));
     }
 }
@@ -10054,8 +10061,9 @@ fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
     x.type_into(&w, "button");
     let after = x.changes(&w, &before, &format!("{name}-searched"), 30);
     assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
-    // The search closed first (GTK 3's is a popup that keeps the keys).
+    // The search closed first (GTK 3's is a popup that grabs the keys).
     x.key_into(&w, "Escape");
+    x.shot(&w, &format!("{name}-escaped"));
     x.key_into(&w, "ctrl+q");
     let status = gui.exits(60);
     assert!(status.success(), "{name}: {status}: {}", gui.report());
