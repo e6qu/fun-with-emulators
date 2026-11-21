@@ -9763,6 +9763,20 @@ impl Xvfb {
         assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
     }
 
+    /// Window `w` asked to close, as a window manager's close button asks
+    /// (`tools/display/close.py`: there is no window manager to).
+    fn close(&self, w: &Window) {
+        let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
+        let out = Command::new("python3")
+            .arg(repo().join("tools/display/close.py"))
+            .arg(lib)
+            .arg(self.display())
+            .arg(&w.id)
+            .output_alone()
+            .unwrap();
+        assert!(out.status.success(), "close.py: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
     /// Keys (xdotool's names, `ctrl+q`) pressed and released with window
     /// `w` focused, through the server as a keyboard's are (XTEST): a
     /// popup's grab gets them first, as it would a user's.
@@ -10068,25 +10082,12 @@ fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
     x.type_into(&w, "button");
     let after = x.changes(&w, &before, &format!("{name}-searched"), 30);
     assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
-    // The search closed first (GTK 3's is a popup that grabs the keys).
+    // The search closed first (GTK 3's is a popup whose grab keeps a
+    // close request from its window), then the window closed as a window
+    // manager's close button closes it.
     x.key_into(&w, "Escape");
-    x.shot(&w, &format!("{name}-escaped"));
-    x.key_into(&w, "ctrl+q");
-    // PROBE (temporary): if it has not ended, whether keys reach it at all
-    // (a letter opens GTK 3's search again).
-    let began = Instant::now();
-    while !gui.ended() && began.elapsed() < Duration::from_secs(15) {
-        std::thread::sleep(Duration::from_millis(200));
-    }
-    if !gui.ended() {
-        let stuck = x.shot(&w, &format!("{name}-not-quit"));
-        x.key_into(&w, "a");
-        let lettered = x.changes(&w, &stuck, &format!("{name}-lettered"), 10);
-        eprintln!(
-            "{name}: a letter after ctrl+q changed the window: {}",
-            lettered.digest != stuck.digest
-        );
-    }
+    std::thread::sleep(Duration::from_secs(1));
+    x.close(&w);
     let status = gui.exits(60);
     assert!(status.success(), "{name}: {status}: {}", gui.report());
 }
