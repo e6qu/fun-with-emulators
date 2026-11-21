@@ -9426,7 +9426,7 @@ fn display_x11_client_draws_through_shared_memory() {
 /// fork child (a new fwe process, which gets the host display from its
 /// parent's hand-off, not from an environment or its arguments).
 #[test]
-fn hv_display_x11_client_draws_from_a_fork_child() {
+fn display_x11_client_draws_from_a_fork_child_in_the_vm() {
     let prog = build_c("x11shm", Libc::Musl, true, true);
     let Some(x) = Xvfb::start() else { return };
     let root = libc_rootfs(Libc::Musl, "vm-x11shm");
