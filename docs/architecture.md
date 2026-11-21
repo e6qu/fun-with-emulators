@@ -248,6 +248,20 @@ The pieces:
   - large data (a heap, an arena) fills upwards with the rest: adjacent
     mappings are one host region, and a host fork's cost grows with the
     regions.
+- A Linux program may keep `sp` off 16-byte alignment while it addresses
+  memory through other registers (pixman's NEON functions do), and the
+  host's alignment check faults any access through such an `sp`. Where
+  the access is fwe's (a stub's or call stub's push or pop, a
+  translation's save of `x16` and `x17`), and the program's own
+  instruction there is not addressed through `sp`, the fault handler
+  makes it as the host copies and goes on past it, with those right
+  after it (`unaligned_sp_access` in `crates/native/src/trap.rs`,
+  decoded by `rewrite::sp_access`): a stub's pushes cost one fault, its
+  pops another. A flush stub's call into the gate, which works below the
+  program's `sp`, is replaced by the flush made in the handler
+  (`unaligned_flush`); a system call's stub takes the trap. The exit
+  gate saves through `x17`, not `sp`. The program's own access through
+  such an `sp` is a `SIGBUS` (`BUS_ADRALN`) at `sp`, as on Linux.
 - The stub for an instruction writing `sp` from `x18` sets `sp` before it
   reloads its two scratch registers from below the old `sp`; a signal
   delivered on those loads has them done first (`finish_sp_stub` in
@@ -1505,6 +1519,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   forms fault (`SIGILL`). A binary with neither section headers nor an
   unwind table has its whole executable segment taken as code, and an
   inline jump table in code the unwind table covers could be patched.
+- Native: a program reading its own code where fwe rewrote it (a system
+  call, a thread-pointer access, a use of `x18`) reads fwe's branch to
+  the stub, not its instruction; code it copies from there runs that
+  branch.
 
 **Processes**
 - A process may hold descriptors below 16384 only: root may raise

@@ -474,6 +474,19 @@ pub struct Rewound {
     pub sp: u64,
 }
 
+/// The site of the stub whose slot (from its start, `stub`) holds
+/// `words`: before where its branch back, the first plain branch leading
+/// out of the slot, goes.
+pub fn site_of(words: &[u32], stub: u64) -> Option<u64> {
+    let end = stub + 4 * words.len() as u64;
+    words.iter().enumerate().find_map(|(i, &w)| {
+        let at = stub + 4 * i as u64;
+        let to = (w & 0xfc00_0000 == B)
+            .then(|| at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4)))?;
+        (to < stub || to >= end).then(|| to.wrapping_sub(4))
+    })
+}
+
 /// See [`Rewound`]. `words` is the stub's slot from its start (`stub`),
 /// `pc` the faulting instruction in it.
 pub fn rewind(
@@ -484,14 +497,7 @@ pub fn rewind(
     stack: impl Fn(u64) -> Option<u64>,
 ) -> Option<Rewound> {
     let ran = ((pc.checked_sub(stub)?) / 4) as usize;
-    // The branch back: the first plain branch leading out of the slot.
-    let end = stub + 4 * words.len() as u64;
-    let site = words.iter().enumerate().find_map(|(i, &w)| {
-        let at = stub + 4 * i as u64;
-        let to = (w & 0xfc00_0000 == B)
-            .then(|| at.wrapping_add_signed(i64::from(((w << 6) as i32) >> 4)))?;
-        (to < stub || to >= end).then(|| to.wrapping_sub(4))
-    })?;
+    let site = site_of(words, stub)?;
     // What was saved below `sp` and not yet taken back before `pc`, frame
     // by frame: the registers and their offsets, and the frame's size.
     let mut pushed: Vec<(Vec<(u32, u64)>, u64)> = Vec::new();
@@ -1013,6 +1019,81 @@ fn x18_stub(insn: u32, imm: u32) -> Vec<u32> {
     words
 }
 
+/// A load or store of general registers through `sp` (`ldr`/`str`,
+/// `ldur`/`stur`, `ldp`/`stp` of 32 or 64 bits, by offset, pre- or
+/// post-indexed), as fwe's stubs and translations save and restore
+/// registers with: the registers (a pair's second, if any), whether it
+/// loads, the size of each, the offset from `sp` it accesses at, and the
+/// `sp` written back after (as an offset), if it is.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SpAccess {
+    pub rt: u32,
+    pub rt2: Option<u32>,
+    pub load: bool,
+    pub size: u64,
+    pub at: i64,
+    pub writeback: Option<i64>,
+}
+
+/// See [`SpAccess`]; `None` for any other instruction.
+pub fn sp_access(w: u32) -> Option<SpAccess> {
+    if (w >> 5) & 0x1f != 31 {
+        return None;
+    }
+    let rt = w & 0x1f;
+    let sext = |v: u32, bits: u32| i64::from(((v << (32 - bits)) as i32) >> (32 - bits));
+    if w & 0x3e00_0000 == 0x2800_0000 {
+        // A pair of general registers.
+        let size = match w >> 30 {
+            0 => 4,
+            2 => 8,
+            _ => return None,
+        };
+        let imm = sext((w >> 15) & 0x7f, 7) * size as i64;
+        let (at, writeback) = match (w >> 23) & 3 {
+            1 => (0, Some(imm)),
+            2 => (imm, None),
+            3 => (imm, Some(imm)),
+            _ => return None,
+        };
+        let load = (w >> 22) & 1 == 1;
+        return Some(SpAccess { rt, rt2: Some((w >> 10) & 0x1f), load, size, at, writeback });
+    }
+    let size = match w >> 30 {
+        2 => 4,
+        3 => 8,
+        _ => return None,
+    };
+    let load = match (w >> 22) & 3 {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    if w & 0x3f00_0000 == 0x3900_0000 {
+        let at = i64::from((w >> 10) & 0xfff) * size as i64;
+        return Some(SpAccess { rt, rt2: None, load, size, at, writeback: None });
+    }
+    if w & 0x3f20_0000 != 0x3800_0000 {
+        return None;
+    }
+    let imm = sext((w >> 12) & 0x1ff, 9);
+    let (at, writeback) = match (w >> 10) & 3 {
+        0 => (imm, None),
+        1 => (0, Some(imm)),
+        3 => (imm, Some(imm)),
+        _ => return None,
+    };
+    Some(SpAccess { rt, rt2: None, load, size, at, writeback })
+}
+
+/// Whether `w` is a load or store addressed through `sp` (one whose
+/// access checks `sp`'s alignment).
+pub fn uses_sp_base(w: u32) -> bool {
+    let load_store = (w >> 25) & 0b101 == 0b100;
+    let literal = w & 0x3b00_0000 == 0x1800_0000;
+    load_store && !literal && (w >> 5) & 0x1f == 31
+}
+
 #[cfg(test)]
 mod tests {
     /// A replay of what `patch` noted does the same to the same code.
@@ -1038,6 +1119,40 @@ mod tests {
     }
 
     use super::*;
+
+    /// The loads and stores through `sp` fwe's words make, decoded; and
+    /// which instructions are addressed through `sp`.
+    #[test]
+    fn sp_accesses_decoded() {
+        let acc = |rt, rt2, load, size, at, writeback| {
+            Some(SpAccess { rt, rt2, load, size, at, writeback })
+        };
+        assert_eq!(sp_access(PUSH | 3), acc(3, None, false, 8, -16, Some(-16)));
+        assert_eq!(sp_access(POP | 3), acc(3, None, true, 8, 0, Some(16)));
+        assert_eq!(sp_access(PUSH_PAIR | 5 << 10 | 4), acc(4, Some(5), false, 8, -16, Some(-16)));
+        assert_eq!(sp_access(POP_PAIR | 5 << 10 | 4), acc(4, Some(5), true, 8, 0, Some(16)));
+        assert_eq!(sp_access(STP_SP | 2 << 10 | 1), acc(1, Some(2), false, 8, 0, None));
+        assert_eq!(sp_access(LDP_SP | 2 << 10 | 1), acc(1, Some(2), true, 8, 0, None));
+        assert_eq!(sp_access(STR_UIMM | 31 << 5 | 2 << 10 | 7), acc(7, None, false, 8, 16, None));
+        assert_eq!(sp_access(SYSCALL_STUB_ENTRY), acc(30, Some(0), false, 8, -32, Some(-32)));
+        assert_eq!(sp_access(POP32_X30), acc(30, None, true, 8, 0, Some(32)));
+        // `stur x17, [sp, #-16]`, `ldur x17, [sp, #-16]`, `stp x16, x17,
+        // [sp, #-16]`, `ldr w0, [sp, #4]`.
+        assert_eq!(sp_access(0xf81f_03f1), acc(17, None, false, 8, -16, None));
+        assert_eq!(sp_access(0xf85f_03f1), acc(17, None, true, 8, -16, None));
+        assert_eq!(sp_access(0xa93f_47f0), acc(16, Some(17), false, 8, -16, None));
+        assert_eq!(sp_access(0xb940_07e0), acc(0, None, true, 4, 4, None));
+        // Through another register, SIMD, sign-extending: not one.
+        assert_eq!(sp_access(0xf900_0020), None);
+        assert_eq!(sp_access(0xfd00_03e0), None);
+        assert_eq!(sp_access(0xb980_03e0), None);
+        assert!(uses_sp_base(0xf900_03e0));
+        assert!(uses_sp_base(0xfd00_03e0));
+        assert!(uses_sp_base(0xc85f_7fe0)); // ldxr x0, [sp]
+        assert!(!uses_sp_base(0xf900_0020));
+        assert!(!uses_sp_base(0x5800_001f)); // ldr x31? a literal load
+        assert!(!uses_sp_base(0x9100_03e0)); // add x0, sp, #0
+    }
 
     fn words(ws: &[u32]) -> Vec<u8> {
         ws.iter().flat_map(|w| w.to_le_bytes()).collect()

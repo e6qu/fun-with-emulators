@@ -293,22 +293,35 @@ pub fn stub_region(pc: u64) -> Option<(u64, u64)> {
     (pc < end).then_some((start, end))
 }
 
+/// Whether `pc` is in a region of call stubs ([`call_stub`]), which are
+/// packed one after another rather than in slots.
+pub fn in_call_stubs(pc: u64) -> bool {
+    CALL_STUBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(s, e, _)| (s..e).contains(&pc))
+}
+
+/// The stub slot `pc` is in, if any: its start and its words. A call
+/// stub has none ([`in_call_stubs`]).
+pub fn stub_slot(pc: u64) -> Option<(u64, &'static [u32])> {
+    if in_call_stubs(pc) {
+        return None;
+    }
+    let (start, _) = stub_region(pc)?;
+    let slot = (STUB_WORDS * 4) as u64;
+    let stub = start + (pc - start) / slot * slot;
+    // SAFETY: a slot of a stub region, mapped and readable while fwe runs
+    // (stub regions are never unmapped).
+    Some((stub, unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) }))
+}
+
 /// A fault at `pc` with the stack at `sp`, as if at the site of the stub
 /// `pc` is in, if it is in one ([`rewrite::rewind`]): the program's own
 /// instruction faulted, and its handler sees it there, with its registers.
 pub fn rewind_fault(pc: u64, sp: u64) -> Option<rewrite::Rewound> {
-    let (start, end) = {
-        let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-        let (&start, &end) = regions.range(..=pc).next_back()?;
-        (start, end)
-    };
-    if pc >= end {
-        return None;
-    }
-    let slot = (STUB_WORDS * 4) as u64;
-    let stub = start + (pc - start) / slot * slot;
-    // SAFETY: a slot of a stub region, mapped and readable.
-    let words = unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) };
+    let (stub, words) = stub_slot(pc)?;
     rewrite::rewind(words, stub, pc, sp, |off| {
         // SAFETY: the stack the stub pushed to, below which it faulted.
         Some(unsafe { ((sp + off) as *const u64).read() })

@@ -565,6 +565,17 @@ for the stub's push). `casp` with `x18` in a pair, a load or store of
 `x18` written back onto `sp`, and `sp` written from `x18` have stubs of
 their own.
 
+The stub's pushes go through `sp`, which the hardware checks for 16-byte
+alignment (Linux and macOS both turn the check on). Linux programs may
+keep `sp` off alignment while they address memory through other
+registers (pixman's NEON functions take `sub sp, sp, #0xe8` and save
+`x18` through `x29`); there the push faults, and fwe's fault handler
+makes the pushes itself and lets the stub run on, as it does the pops
+after it: each such use costs two faults. The same holds for every save
+fwe's words make below `sp` (call stubs, translations of code made at
+run time). The program's own access through such an `sp` faults as on
+Linux: `SIGBUS`, `BUS_ADRALN`, at `sp`.
+
 A system call or signal frame sees the guest's real `x18`, `rt_sigreturn`
 restores it, and a new thread starts with its creator's. A fault or
 signal in a stub is delivered as at its site: the frame has the program's
@@ -2921,6 +2932,9 @@ the processor reports every such fault as a translation fault):
 `SEGV_MAPERR` where it has none; `BUS_ADRALN` for a misaligned pc, stack
 or access, `BUS_MCEERR_AR` for poisoned memory, `BUS_ADRERR` otherwise;
 `TRAP_BRKPT` for a breakpoint; `ILL_ILLOPC` for an unknown instruction.
+A misaligned `sp` or `pc` is a `SIGBUS` with the `sp` or `pc` for its
+address, as Linux gives it (macOS gives a `SIGSEGV` without an address
+for `sp`).
 
 A fault with a guest handler enters it with Linux's frame. With none, the
 process dies of the signal (natively after a register and code dump under

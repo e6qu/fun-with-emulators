@@ -1259,6 +1259,172 @@ pub fn post_early() {
     thread::post_process(sig, info);
 }
 
+/// ESR's exception classes for a misaligned `pc` and `sp`.
+const ESR_EC_PC_ALIGNMENT: u32 = 0x22;
+const ESR_EC_SP_ALIGNMENT: u32 = 0x26;
+
+fn reg_of(ss: &ThreadState, r: u32) -> u64 {
+    match r {
+        29 => ss.fp,
+        30 => ss.lr,
+        31 => 0,
+        r => ss.x[r as usize],
+    }
+}
+
+fn set_reg(ss: &mut ThreadState, r: u32, v: u64) {
+    match r {
+        29 => ss.fp = v,
+        30 => ss.lr = v,
+        31 => {}
+        r => ss.x[r as usize] = v,
+    }
+}
+
+/// Writes `bytes` at `addr` as the host copies: `false` where the memory
+/// is not mapped writable.
+fn write_host(addr: u64, bytes: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        unsafe extern "C" {
+            fn mach_vm_write(task: u32, a: u64, data: *const u8, count: u32) -> i32;
+            static mach_task_self_: u32;
+        }
+        // SAFETY: copying `bytes`, which is valid for its length.
+        unsafe { mach_vm_write(mach_task_self_, addr, bytes.as_ptr(), bytes.len() as u32) == 0 }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (addr, bytes);
+        false
+    }
+}
+
+/// The program's instruction a word of fwe's at `pc` (a stub's, or a
+/// translation's) stands for: its address and the word it wrote there.
+fn program_insn(pc: u64) -> Option<(u64, u32)> {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::jit::in_cache(pc) {
+        // Code made executable at run time is left as the program wrote it.
+        let g = crate::jit::guest_pc(pc)?;
+        return Some((g, read_host::<u32>(g)?));
+    }
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if crate::prepare::in_call_stubs(pc) {
+        // A call made a call to its stub: the word the program wrote.
+        let site = crate::jit::call_stub_site(pc)?;
+        return Some((site, crate::prepare::original(site, read_host::<u32>(site)?)));
+    }
+    let (stub, words) = crate::prepare::stub_slot(pc)?;
+    let site = crate::rewrite::site_of(words, stub)?;
+    Some((site, crate::prepare::original(site, read_host::<u32>(site)?)))
+}
+
+/// A load or store of fwe's own through an `sp` the program keeps off
+/// 16-byte alignment, which the host's alignment check (`SCTLR_EL1.SA0`,
+/// as Linux sets it) faults: Linux programs may keep such an `sp` while
+/// they address memory through other registers (pixman's NEON functions
+/// do), and a stub or translation saving registers below it is fwe's, not
+/// theirs. The access is made here as the host copies (a page the
+/// program's stack or a private view would make on a first touch made
+/// first) and the thread goes on past it. Not where the program's own
+/// instruction is addressed through `sp`, which faults on Linux too, nor
+/// in a call into fwe's gate (which works below the program's `sp`; a
+/// flush's is made here: [`unaligned_flush`]). True if handled here.
+fn unaligned_sp_access(ss: &mut ThreadState, esr: u32) -> bool {
+    if (esr >> 26) & 0x3f != ESR_EC_SP_ALIGNMENT || ss.sp & 15 == 0 {
+        return false;
+    }
+    // The access that faulted, and those right after it (a stub's pushes
+    // or pops together): one fault for them all.
+    let mut made = 0;
+    while sp_access_at(ss) {
+        made += 1;
+    }
+    made > 0
+}
+
+/// [`unaligned_sp_access`]'s access at `ss.pc`, if it is fwe's: made, and
+/// `ss` past it.
+fn sp_access_at(ss: &mut ThreadState) -> bool {
+    // SAFETY: the thread fetched the instruction at `pc` (the first), or
+    // it is the next word of the same stub or translation.
+    let word = unsafe { insn(ss.pc) };
+    if word == Some(crate::rewrite::SYSCALL_STUB_ENTRY) {
+        return false;
+    }
+    let Some(acc) = word.and_then(crate::rewrite::sp_access) else { return false };
+    let Some((_, own)) = program_insn(ss.pc) else { return false };
+    if crate::rewrite::uses_sp_base(own) {
+        return false;
+    }
+    let mut at = ss.sp.wrapping_add_signed(acc.at);
+    let mut loaded = [(0, 0); 2];
+    for (i, r) in [Some(acc.rt), acc.rt2].into_iter().flatten().enumerate() {
+        if acc.load {
+            let v = if acc.size == 8 {
+                read_host::<u64>(at)
+            } else {
+                read_host::<u32>(at).map(u64::from)
+            };
+            let Some(v) = v else { return false };
+            loaded[i] = (r, v);
+        } else {
+            let v = reg_of(ss, r).to_le_bytes();
+            let bytes = &v[..acc.size as usize];
+            let made = || kernel().as_mut().is_some_and(|k| k.view_fault(at) || k.stack_fault(at));
+            if !write_host(at, bytes) && !(made() && write_host(at, bytes)) {
+                return false;
+            }
+        }
+        at += acc.size;
+    }
+    if acc.load {
+        // Set once both are loaded: nothing changes where an access fails.
+        for (r, v) in loaded.into_iter().take(1 + usize::from(acc.rt2.is_some())) {
+            set_reg(ss, r, v);
+        }
+    }
+    if let Some(wb) = acc.writeback {
+        ss.sp = ss.sp.wrapping_add_signed(wb);
+    }
+    ss.pc += 4;
+    true
+}
+
+/// A flush stub (`ic ivau`, [`crate::rewrite`]'s or a translation's)
+/// whose call into fwe's gate faulted on an `sp` the program keeps off
+/// alignment: the gate works below the program's `sp`, so the flush is
+/// made here, as the gate makes it, and the thread goes on where the
+/// stub's branch back leads. True if handled here.
+fn unaligned_flush(ss: &mut ThreadState, esr: u32) -> bool {
+    use crate::rewrite::{B, FLUSH_LDR_X30_LIT, SYSCALL_STUB_ENTRY};
+    if (esr >> 26) & 0x3f != ESR_EC_SP_ALIGNMENT || ss.sp & 15 == 0 {
+        return false;
+    }
+    let pc = ss.pc;
+    // SAFETY: the thread fetched the instruction at `pc`.
+    if unsafe { insn(pc) } != Some(SYSCALL_STUB_ENTRY)
+        || read_host::<u32>(pc + 4) != Some(FLUSH_LDR_X30_LIT)
+    {
+        return false;
+    }
+    let Some(rt) = crate::rewrite::flush_reg(|a| read_host::<u32>(a).unwrap_or(0), pc + 12) else {
+        return false;
+    };
+    let Some(back) = read_host::<u32>(pc + 16).filter(|&b| b & 0xfc00_0000 == B) else {
+        return false;
+    };
+    let addr = match rt {
+        31 => 0,
+        18 => guest_x18(),
+        r => reg_of(ss, r),
+    };
+    flush_line(addr, rt == 18);
+    ss.pc = (pc + 16).wrapping_add_signed(i64::from(((back << 6) as i32) >> 4));
+    true
+}
+
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     fwe_kernel::timing::signal(sig);
     // A process that sends itself one of these signals has it emulated (see
@@ -1365,11 +1531,24 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let addr = unsafe { (*info).si_addr() } as u64;
 
+    // fwe's own access below an `sp` the program keeps off alignment.
+    if unaligned_flush(&mut mc.ss, mc.es.esr) || unaligned_sp_access(&mut mc.ss, mc.es.esr) {
+        let mut regs = regs_from(mc);
+        settle(&mut regs);
+        regs_to(mc, &regs);
+        // SAFETY: `ctx` is this handler's ucontext.
+        unsafe { return_with_guest_mask(ctx) };
+        return;
+    }
+
     // `mrs <Xt>, ctr_el0`, which Linux lets user space run and macOS traps:
     // the value is emulated.
-    // SAFETY: the guest was executing at `pc`, so it is mapped.
-    if let Some(word) = unsafe { insn(mc.ss.pc) }
-        .filter(|&w| sig == libc::SIGILL && crate::hwcap::is_mrs_ctr_el0(w))
+    if let Some(word) = (sig == libc::SIGILL)
+        // SAFETY: a SIGILL's instruction was fetched, so `pc` is mapped (a
+        // fetch's fault may leave it unmapped).
+        .then(|| unsafe { insn(mc.ss.pc) })
+        .flatten()
+        .filter(|&w| crate::hwcap::is_mrs_ctr_el0(w))
     {
         let mut regs = regs_from(mc);
         let rt = (word & 31) as usize;
@@ -1436,11 +1615,18 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         // In a translation: the guest's instruction it stands for.
         crate::jit::to_guest(&mut regs);
     }
-    // Memory `MADV_HWPOISON` poisoned fails with a bus error.
-    let lsig = if fwe_kernel::mm::poisoned(addr) {
-        fwe_abi::signal::SIGBUS
+    // Memory `MADV_HWPOISON` poisoned fails with a bus error, and so does
+    // a misaligned `sp` or `pc`, at it (macOS gives a `SIGSEGV` without
+    // an address for `sp`).
+    let ec = (mc.es.esr >> 26) & 0x3f;
+    let (lsig, addr) = if ec == ESR_EC_SP_ALIGNMENT {
+        (fwe_abi::signal::SIGBUS, regs.sp)
+    } else if ec == ESR_EC_PC_ALIGNMENT {
+        (fwe_abi::signal::SIGBUS, regs.pc)
+    } else if fwe_kernel::mm::poisoned(addr) {
+        (fwe_abi::signal::SIGBUS, addr)
     } else {
-        linux_fault_signal(sig, allowed)
+        (linux_fault_signal(sig, allowed), addr)
     };
     // The fault's syndrome, as the host had it from the processor.
     let esr = Some(u64::from(mc.es.esr));
@@ -1462,8 +1648,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     if tracing {
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let addr = unsafe { (*info).si_addr() } as u64;
-        // SAFETY: the guest was executing at `pc`, so it is mapped.
-        let word = unsafe { insn(mc.ss.pc) }.map_or(String::from("?"), |w| format!("{w:#010x}"));
+        // Read as the host copies: a fetch's fault leaves `pc` unmapped.
+        let word = read_host::<u32>(mc.ss.pc).map_or(String::from("?"), |w| format!("{w:#010x}"));
         report(&format!(
             "[fwe] guest fault: signal {sig} at pc {:#x} (insn {word}), address {addr:#x}, esr {:#x}\n",
             mc.ss.pc, mc.es.esr
@@ -1518,8 +1704,8 @@ extern "C" fn on_probe_signal(
     let (code, addr, mc) = unsafe {
         ((*info).si_code, (*info).si_addr() as u64, &*(*(ctx as *mut Ucontext)).uc_mcontext)
     };
-    // SAFETY: the thread was executing at `pc`, so it is mapped.
-    let word = unsafe { insn(mc.ss.pc) }.map_or(String::from("?"), |w| format!("{w:#010x}"));
+    // Read as the host copies: a fetch's fault leaves `pc` unmapped.
+    let word = read_host::<u32>(mc.ss.pc).map_or(String::from("?"), |w| format!("{w:#010x}"));
     report(&format!(
         "probe: signal {sig} code {code} at pc {:#x} (insn {word}), address {addr:#x}, \
          esr {:#x}, far {:#x}, x18 {:#x}, lr {:#x}, custom x18 ABI on: {mode_was_on}\n",

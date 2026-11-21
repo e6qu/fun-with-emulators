@@ -2451,6 +2451,14 @@ const IN_SLOT: u8 = 32;
 /// which calls or branches again (`x30` as a call sets it), the program's `x16`
 /// and `x17` in their registers at its first and last words, below `sp`
 /// in its save, and in their slots after. `false` if `regs.pc` is in none.
+/// The call site whose call stub ([`link_call_site`]) holds `pc`, if
+/// one does.
+pub fn call_stub_site(pc: u64) -> Option<u64> {
+    let s = state();
+    let (&stub, c) = s.call_stubs.range(..=pc).next_back()?;
+    (((pc - stub) / 4) < c.words.len() as u64).then_some(c.site)
+}
+
 fn call_stub_to_guest(s: &State, regs: &mut Regs) -> bool {
     let Some((&stub, CallStub { site, words, .. })) = s.call_stubs.range(..=regs.pc).next_back()
     else {
