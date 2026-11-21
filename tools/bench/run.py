@@ -287,7 +287,8 @@ def gears_ms(cmd, env=None):
     """glxgears' time per frame as `cmd` runs it on the benchmarks' X
     server: it reports its frames every 5 seconds; the second report, the
     first's taking its start too."""
-    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True)
+    err = tempfile.TemporaryFile()
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=err, text=True)
     timer = threading.Timer(120, p.kill)
     timer.start()
     rates = []
@@ -303,7 +304,9 @@ def gears_ms(cmd, env=None):
         p.kill()
         p.wait()
     if len(rates) < 2 or rates[1] <= 0:
-        sys.exit(f"glxgears gave no frame rate: {rates}")
+        err.seek(0)
+        said = err.read().decode(errors="replace")[-4000:]
+        sys.exit(f"glxgears gave no frame rate: {rates}, exit {p.returncode}; it said:\n{said}")
     return 1000.0 / rates[1]
 
 
