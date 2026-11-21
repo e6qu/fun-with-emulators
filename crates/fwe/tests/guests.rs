@@ -9310,11 +9310,14 @@ impl Probe {
 
     /// A root of its own, copied from the fetched one.
     fn root(&self, manifest: &str) -> PathBuf {
-        let cached = alpine_root(manifest);
+        self.root_of(&alpine_root(manifest), manifest)
+    }
+
+    fn root_of(&self, cached: &Path, manifest: &str) -> PathBuf {
         let root =
             std::env::temp_dir().join(format!("fwe-probe-{manifest}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
+        run_checked(Command::new("cp").arg("-cpR").arg(cached).arg(&root));
         for d in ["root", "tmp", "tmp/xdg", "tmp/.X11-unix"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
@@ -9595,6 +9598,47 @@ impl Probe {
             args.extend(extra);
             args.push("file:///tmp/page.html");
             let mut r = self.fwe(name, &root, "/usr/lib/chromium/chromium", &args, &[]);
+            self.settle(&mut r, 180);
+            self.stop(r);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        // Electron (its GitHub build, glibc's) with an app of its own, in a
+        // Debian root.
+        let root = self.root_of(&fetched_root("electron"), "electron");
+        let zip = fetch_pinned(
+            "electron-v45.4.1-linux-arm64.zip",
+            &["https://github.com/electron/electron/releases/download/v45.4.1/electron-v45.4.1-linux-arm64.zip".to_string()],
+            "3da04c450fa682e3b80961e92a918a1c2a1a10796527a7e63dec7b8e466b6334",
+            "electron",
+        );
+        run_checked(
+            Command::new("unzip").arg("-q").arg(&zip).arg("-d").arg(root.join("opt/electron")),
+        );
+        std::fs::create_dir_all(root.join("opt/app")).unwrap();
+        std::fs::write(
+            root.join("opt/app/package.json"),
+            r#"{"name": "fwe-probe", "main": "main.js"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("opt/app/main.js"),
+            r#"const { app, BrowserWindow } = require('electron');
+app.whenReady().then(() => {
+  console.log('ready');
+  const w = new BrowserWindow({ width: 800, height: 600, backgroundColor: '#3366cc' });
+  w.webContents.on('did-finish-load', () => console.log('loaded'));
+  w.loadURL('data:text/html,' + encodeURIComponent(
+    "<body style='background:#36c;color:white;font:48px sans-serif'><h1>Hello from Electron on fwe</h1>" +
+    "<p id=t></p><script>document.getElementById('t').textContent = 'script ran: ' + (6 * 7)</script></body>"));
+});
+"#,
+        )
+        .unwrap();
+        for (name, extra) in [("electron", vec![]), ("electron-nosandbox", vec!["--no-sandbox"])] {
+            let mut args = vec!["--ozone-platform=x11", "--disable-gpu"];
+            args.extend(extra);
+            args.push("/opt/app");
+            let mut r = self.fwe(name, &root, "/opt/electron/electron", &args, &[]);
             self.settle(&mut r, 180);
             self.stop(r);
         }

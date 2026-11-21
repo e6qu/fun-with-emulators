@@ -34,6 +34,10 @@ package there fails its checksum.
 | `fetch/guile.txt` | The 3.24.4 minirootfs and GNU Guile 3.0 with libunistring, gmp, the Boehm GC, libstdc++, libgcc and libffi | 17 MB |
 | `fetch/python.txt` | The 3.24.4 minirootfs and Python 3.14 with its libraries (sqlite, readline, ncurses, mpdecimal, libstdc++, libgcc, xz, gdbm, libffi, expat, bzip2) | 15 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
+| `fetch/display.txt` | The 3.24.4 minirootfs, X11 clients (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, Weston 14 with its X11 back end and clients, foot and Xwayland, and their libraries (libX11 and the other X libraries, xcb, Wayland, pixman, cairo, pango, fontconfig, freetype, Mesa, libinput and theirs) | 123 MB |
+| `fetch/toolkits.txt` | The 3.24.4 minirootfs, Python 3.14 with tkinter (Tcl/Tk 8.6), GTK 3's and GTK 4's demo programs with glycin's image loaders, PyQt6 with Qt 6.11's X11 and Wayland platforms, a font, xwd and xdotool, and their libraries (GLib, cairo, pango, gdk-pixbuf, GStreamer, Mesa, LLVM, ICU and theirs) | 242 MB |
+| `fetch/chromium.txt` | The 3.24.4 minirootfs, Chromium 158 (the engine Electron embeds) with a font, xwd and xdotool, and their libraries (NSS, GTK 3, Mesa, ffmpeg, ICU and theirs) | 352 MB |
+| `fetch/wine-x11.txt` | The 3.24.4 minirootfs, Wine 11.0, and the X libraries, fontconfig and font its X11 driver loads | 85 MB |
 
 ## License
 
