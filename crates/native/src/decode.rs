@@ -869,6 +869,12 @@ pub fn names_x18(insn: u32) -> bool {
     may_name_x18(insn) && fields_name_x18(insn)
 }
 
+/// Whether `insn` names `x16` or `x17` in a general-purpose register
+/// field, where its group is known ([`gpr_fields`]).
+pub fn names_x16_x17(insn: u32) -> bool {
+    gpr_fields(insn).is_some_and(|f| f.iter().any(|&s| matches!(reg(insn, s), 16 | 17)))
+}
+
 /// [`names_x18`] by decoding alone.
 fn fields_name_x18(insn: u32) -> bool {
     gpr_fields(insn).is_some_and(|f| f.iter().any(|&s| reg(insn, s) == 18))

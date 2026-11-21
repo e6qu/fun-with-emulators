@@ -24,8 +24,9 @@ macOS and natively on Linux.
         With the Linux results, a table of all three is printed (and
         appended to $GITHUB_STEP_SUMMARY). `--no-build` leaves the build and
         the workloads out (Alpine's programs run only in CI). It fails when
-        a figure of fwe's exceeds its budget against macOS's (BUDGETS), or
-        a computing program's share of fwe's its own (SHARE_BUDGETS).
+        a figure of fwe's exceeds its budget against macOS's (BUDGETS) or
+        its own limit (LIMITS), or a computing program's share of fwe's its
+        own (SHARE_BUDGETS).
 
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
@@ -40,6 +41,7 @@ import json
 import os
 import re
 import shutil
+import signal
 import statistics
 import struct
 import subprocess
@@ -165,9 +167,25 @@ BUDGETS = {
     # repository), as a call is.
     "SQLite (s)": 1.5,
     "git (s)": 1.5,
-    # A JIT runtime at work (compiling, then running, a multi-threaded
-    # application), against the same release of OpenJDK built for macOS.
+    # JIT runtimes at work (OpenJDK compiling, then running, a
+    # multi-threaded application; Node.js and LuaJIT running a script),
+    # against the same releases built for macOS.
     "JDK (s)": 1.5,
+    "Node.js (s)": 1.5,
+    "LuaJIT (s)": 1.5,
+    # Code made at run time at work, against the same code run from the
+    # program's file (the same machine code, natively).
+    "JIT code: calls and returns (ns)": 1.3,
+    "JIT code: a switch through br (ns)": 1.3,
+    "JIT code: calls through a register (ns)": 1.3,
+    "JIT code: a loop (ns)": 1.3,
+}
+
+# The most fwe's figure may be, in the row's own unit: making a
+# translation, which running code natively has no counterpart of (a
+# function made and run: the block made for it, placed and linked).
+LIMITS = {
+    "JIT code: a function made and run (us)": 2.0,
 }
 
 # How much longer than its own code fwe may make a program that computes
@@ -204,6 +222,8 @@ BREW = {
     "git": "opt/git/bin/git",
     "xz": "opt/xz/bin/xz",
     "jdk": "opt/openjdk@25/bin",
+    "node": "opt/node@24/bin/node",
+    "luajit": "opt/luajit/bin/luajit",
 }
 
 
@@ -425,9 +445,9 @@ def macos(a):
 
 
 def over_budget(results):
-    """The benchmarks whose fwe / macOS ratio exceeds its budget, or whose
-    share of fwe's exceeds its share budget. A missing figure is one: the
-    budget is not shown to hold."""
+    """The benchmarks whose fwe / macOS ratio exceeds its budget, whose
+    figure exceeds its limit, or whose share of fwe's exceeds its share
+    budget. A missing figure is one: the budget is not shown to hold."""
     over = []
     shares = results.get(SHARE, {})
     for row, budget in SHARE_BUDGETS.items():
@@ -446,6 +466,10 @@ def over_budget(results):
             over.append(f"{row}: no macOS figure")
         elif fwe / mac > budget:
             over.append(f"{row} {fwe / mac:.1f}x > {budget}x")
+    for row, limit in LIMITS.items():
+        fwe = results["fwe"].get(row)
+        if fwe is not None and fwe > limit:
+            over.append(f"{row} {fwe:.2f} > {limit}")
     return over
 
 
@@ -560,7 +584,110 @@ def build(a, fwe, results):
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     jdk(a, fwe, guest_env, results)
+    host_costs()
+    for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
+                                            ("LuaJIT", "luajit", "/usr/bin/luajit", "bench.lua")]:
+        jit_runtime(a, fwe, guest_env, results, name, manifest, program, script)
     shutil.rmtree(native, ignore_errors=True)
+
+
+def host_costs():
+    """What the host's work behind a translator costs, natively
+    (tools/bench/host.c): a fault, a fetch from a page that is not
+    executable (as native code's jump into a JIT's code reaches fwe) and a
+    read of a page with no access, and the lines the kernel logged for the
+    process meanwhile; and code made ready to run after it is written, a
+    cache line at a time."""
+    d = tempfile.mkdtemp()
+    exe = os.path.join(d, "host")
+    subprocess.run(["cc", "-O2", "-o", exe, os.path.join(os.path.dirname(__file__), "host.c")],
+                   check=True)
+    p = subprocess.Popen([exe, "20000"], stdout=subprocess.PIPE, text=True)
+    fetch, read, dc, ic, sys_call = p.communicate()[0].split()
+    logged = subprocess.run(["log", "show", "--last", "5m", "--style", "compact", "--predicate",
+                             f"processID == {p.pid} AND sender == \"kernel\""],
+                            capture_output=True, text=True, errors="replace").stdout.splitlines()
+    logged = [l for l in logged if str(p.pid) in l]
+    print(f"The host's faults: a fetch from a page not executable {fetch} us, a read of a page "
+          f"with no access {read} us; the kernel logged {len(logged)} lines for them"
+          + (f", the first: {logged[0]}" if logged else ""), file=sys.stderr)
+    print(f"The host's code made ready to run, a cache line: dc cvau {dc} ns, ic ivau {ic} ns, "
+          f"sys_icache_invalidate {sys_call} ns", file=sys.stderr)
+    shutil.rmtree(d, ignore_errors=True)
+
+
+def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
+    """A JIT runtime at work: `program` of Alpine's root `manifest` running
+    `script` (tools/bench/workloads) under fwe, and Homebrew's build of the
+    same release natively (BREW, by the program's name). Then where its
+    time goes under fwe, by program counter, translated code named by the
+    code cache's map; and the translator's counts, the script run twice
+    into one directory of the blocks made (`FWE_JIT_SEEN`): how many the
+    second run made that the first had, of a file's code and generated;
+    then once with its blocks counting their runs (`FWE_JIT_COUNT`)."""
+    root = alpine_root(manifest, a.cache)
+    shutil.copytree(WORKLOADS, os.path.join(root, "tmp/wl"), dirs_exist_ok=True)
+    ours = guest_env + fwe + ["--root", root, os.path.join(root, program.lstrip("/")),
+                              f"/tmp/wl/{script}"]
+    theirs = [os.path.join(a.brew, BREW[os.path.basename(program)]),
+              os.path.join(WORKLOADS, script)]
+    workload(results, f"{name} (s)", ours, theirs, (), len(guest_env) + 1)
+    jit_map = tempfile.mkdtemp()
+    pcs(name, guest_env + [f"FWE_JIT_MAP={jit_map}"] + ours[len(guest_env):], jit_map=jit_map)
+    shutil.rmtree(jit_map, ignore_errors=True)
+    pcs(f"{name} natively", theirs, execname=os.path.basename(program))
+    seen = tempfile.mkdtemp()
+    for label, extra in [("", [f"FWE_JIT_SEEN={seen}"]), (" again", [f"FWE_JIT_SEEN={seen}"]),
+                         (" with its blocks counting", ["FWE_JIT_COUNT=1"])]:
+        r = run_limited(guest_env + ["FWE_TIMING=1"] + extra + ours[len(guest_env):],
+                        f"{name}{label}")
+        said = [line.split("timing: ", 1)[1] for line in r.stderr.splitlines()
+                if "timing: exit" in line and ("JIT code: " in line or "system calls" in line)]
+        print(f"{name}{label}, fwe's marks (exit {r.returncode}): " + " | ".join(said),
+              file=sys.stderr)
+    shutil.rmtree(seen, ignore_errors=True)
+
+
+# The most seconds one run of a workload may take: a run that hangs fails
+# the benchmarks with where it is, rather than the job's time limit with
+# nothing.
+LIMIT = 300
+
+
+def run_limited(cmd, name):
+    """`cmd` run as `subprocess.run` with its output captured as text, for
+    at most LIMIT seconds. Past them, each of its processes is sampled
+    (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
+    on top of its threads' stacks printed), the process group it was started
+    in is stopped, and the benchmarks fail."""
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         errors="replace", start_new_session=True)
+    try:
+        out, err = p.communicate(timeout=LIMIT)
+    except subprocess.TimeoutExpired:
+        slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+        pids, todo = [], [p.pid]
+        while todo:
+            pid = todo.pop()
+            pids.append(pid)
+            kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
+            todo += [int(k) for k in kids.stdout.split()]
+        for pid in pids:
+            path = os.path.abspath(f"bench-{slug}-hung-{pid}.sample")
+            subprocess.run(["sample", str(pid), "3", "-file", path], capture_output=True)
+            try:
+                with open(path, errors="replace") as f:
+                    text = f.read()
+            except OSError:
+                continue
+            top = text.split("Sort by top of stack", 1)[-1].split("\n\n", 1)[0].splitlines()[1:25]
+            print(f"{name}: process {pid} after {LIMIT} s, on top of its stacks:\n"
+                  + "\n".join(top), file=sys.stderr)
+        os.killpg(p.pid, signal.SIGKILL)
+        out, err = p.communicate()
+        sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
+                 f"{err[-3000:]}")
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
 
 
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):
@@ -579,7 +706,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
                 shutil.rmtree(d, ignore_errors=True)
                 os.makedirs(d)
             start = time.perf_counter()
-            r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
+            r = run_limited(cmd, f"{name} {side}")
             times[side].append(time.perf_counter() - start)
             if r.returncode != 0:
                 # The head of the output holds a crash report's summary (a
@@ -597,9 +724,7 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     trace = os.path.abspath(f"bench-{name.split()[0].lower()}.trace")
-    subprocess.run(
-        ours[:at] + ["--strace", f"--strace-file={trace}"] + ours[at:], capture_output=True
-    )
+    run_limited(ours[:at] + ["--strace", f"--strace-file={trace}"] + ours[at:], f"{name} traced")
     calls = collections.Counter()
     with open(trace, errors="replace") as f:
         for line in f:
@@ -1534,7 +1659,7 @@ def jdk(a, fwe, guest_env, results):
     for how, cmd in [("under fwe", guest_env + fwe + [
             "--root", root, os.path.join(root, bin_ours.lstrip("/"), "java"), "-cp",
             "/tmp/jdkout", "Main", JDK_SCALE]),
-            ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])] * 4:  # TEMPORARY x4
+            ("natively", [f"{bin_theirs}/java", "-cp", theirs_out, "Main", JDK_SCALE])]:
         start = time.perf_counter()
         r = subprocess.run(cmd, capture_output=True, text=True, errors="replace")
         took = time.perf_counter() - start
@@ -1684,7 +1809,8 @@ def render(results):
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
         share = f"{shares[row]:.2f}x" if row in shares else ""
         budget = (f"{BUDGETS[row]}x" if row in BUDGETS
-                  else f"{SHARE_BUDGETS[row]}x of share" if row in SHARE_BUDGETS else "")
+                  else f"{SHARE_BUDGETS[row]}x of share" if row in SHARE_BUDGETS
+                  else f"at most {LIMITS[row]}" if row in LIMITS else "")
         lines.append(f"| {row} | {ran.get(row, '')} | " + " | ".join(cells + ratios) + f" | {share} | {budget} |")
     return "\n".join(lines)
 

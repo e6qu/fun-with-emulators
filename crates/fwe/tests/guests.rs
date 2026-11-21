@@ -874,6 +874,38 @@ fn session_and_process_groups() {
     }
 }
 
+/// A pty master whose slave's last holder went (guests/c/ptyhup.c): what
+/// the slave wrote is still there, through an execve, `poll` reports it
+/// and the hang-up, and `read` hands it out, then fails with `EIO` (a
+/// duplicate's too), as on Linux (macOS throws it away and reads 0).
+#[test]
+fn pty_master_reads_what_a_hung_up_slave_left() {
+    let prog = build_c("ptyhup", Libc::Musl, true, true);
+    // Itself in /bin, with /proc and /dev, to run itself again.
+    let root = libc_rootfs(Libc::Musl, "ptyhup");
+    for dir in ["bin", "proc", "dev"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::copy(&prog, root.join("bin/ptyhup")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("bin/ptyhup"));
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "no slave yet: poll 0 revents 0\n\
+         child: 0\n\
+         after hang-up: poll 1 revents 0x11\n\
+         first read: 7\n\
+         all read: poll 1 revents 0x10\n\
+         next read: -1 errno 5\n\
+         a duplicate's read: -1 errno 5\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// fork and wait: a guest forks, the child exits 7, and the parent reaps it
 /// and exits with the child's decoded `WEXITSTATUS` — so a passing run (7)
 /// confirms the whole fork/exit/wait path and the Linux status encoding.
@@ -1033,6 +1065,84 @@ fn jit_code_called_from_many_sites_at_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Calls into JIT code from the program's own code with `x16` and `x17`
+/// set, signalled over and over by another thread, the handler calling
+/// JIT code that sets them to its own values (guests/c/jitstubsig.c): a
+/// signal landing in the call (in its linked site's stub, or the
+/// translation) leaves every call the `x16` and `x17` its caller set, in
+/// each of six rounds, each a program started afresh.
+#[test]
+fn jit_calls_keep_x16_x17_through_signals() {
+    let prog = build_c("jitstubsig", Libc::Musl, true, true);
+    // Itself in /bin, with /proc, to run itself again.
+    let root = libc_rootfs(Libc::Musl, "jitstubsig");
+    for dir in ["bin", "proc"] {
+        std::fs::create_dir_all(root.join(dir)).unwrap();
+    }
+    std::fs::copy(&prog, root.join("bin/jitstubsig")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("bin/jitstubsig"));
+    let out = run_bounded(cmd);
+    eprintln!("--- jitstubsig stderr:\n{}", String::from_utf8_lossy(&out.stderr));
+    let rounds: String = (1..=6).map(|r| format!("round {r}: wrong calls: 0\n")).collect();
+    assert_eq!(stdout(&out), rounds);
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Tail calls through a register into JIT code from the program's own
+/// code, from a function a loop calls (guests/c/jittail.c): each reaches
+/// the code, and only the first is a fault into fwe (the call that led to
+/// the branch is linked from then on, the branch translated and a lookup),
+/// not one for each of the 100000.
+#[test]
+fn jit_code_branched_into_faults_once() {
+    let prog = build_c("jittail", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jittail");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 5000050000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    // "..., N entries by fetch (...": N, for the one process.
+    let fetched: Vec<u64> = err
+        .lines()
+        .filter(|l| l.contains(" entries by fetch ("))
+        .filter_map(|l| l.split(" entries by fetch (").next()?.rsplit(' ').next()?.parse().ok())
+        .collect();
+    assert_eq!(fetched, [1], "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Functions made at run time, each called once through one call site of
+/// the program's own (guests/c/jitmade.c): each runs, the site faults into
+/// fwe once and is linked, and every later call to a function not
+/// translated yet goes into fwe from the site's stub rather than faulting.
+#[test]
+fn jit_functions_made_and_run_go_in_from_the_call_stub() {
+    let prog = build_c("jitmade", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitmade");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 7998000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    // "..., N entries by fetch (..." and "... exits through fwe (S from
+    // call stubs; ...": for the one process.
+    let count = |after: &str| -> Vec<u64> {
+        err.lines()
+            .filter(|l| l.contains(after))
+            .filter_map(|l| l.split(after).next()?.rsplit([' ', '(']).next()?.parse().ok())
+            .collect()
+    };
+    assert_eq!(count(" entries by fetch ("), [1], "{err}");
+    let stubs = count(" from call stubs");
+    assert!(stubs.len() == 1 && stubs[0] >= 3999, "{stubs:?}: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code calling, in turn, functions 4 MiB apart (guests/c/jitpair.c),
 /// whose addresses pick the same entry of fwe's table of translations:
 /// each call reaches its own function, and two of them share the entry's
@@ -1113,32 +1223,50 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Translations of a file's code kept (guests/c/jitkept.c: generated code
-/// calling a function of the program's file, which then runs by
-/// translation too, a system call's stub with it): a second run makes no
-/// block of the file's code, but takes each from those the first kept,
-/// its stub calling the gate where this process has it, its output as
-/// ever.
+/// Translations kept (guests/c/jitkept.c: generated code calling a
+/// function of the program's file, which then runs by translation too, a
+/// system call's stub with it): a second run makes no block of the file's
+/// code, but takes each from those the first kept; a block of the code it
+/// generated is kept once a run makes it again at the same address from
+/// the same words, so a third makes none of those either. Each block
+/// taken has its stub calling the gate where this process has it, and the
+/// output is as ever.
 #[test]
-fn jit_translations_of_a_files_code_are_kept_for_the_next_run() {
+fn jit_translations_are_kept_for_the_next_run() {
     let prog = build_c("jitkept", Libc::Musl, true, true);
     let root = libc_rootfs(Libc::Musl, "jitkept");
     let mut counts = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..3 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
         let out = run_bounded(cmd);
         let err = String::from_utf8_lossy(&out.stderr);
         assert_eq!(stdout(&out), "calls into the file: summed\n", "{err}");
         assert_eq!(out.status.code(), Some(0), "{err}");
-        let made = jit_counts(&err, "blocks made from files ");
-        let taken = jit_counts(&err, "taken from those kept from files ");
+        // "blocks made from files F (.. ms), generated G (.. ms)" and
+        // "taken from those kept from files F, generated G (.. ms)".
+        let pairs = |before: &str, between: &str| -> Vec<(u64, u64)> {
+            err.lines()
+                .filter_map(|l| {
+                    let rest = l.split(before).nth(1)?;
+                    let file = rest.split([' ', ',']).next()?.parse().ok()?;
+                    let generated = rest.split(between).nth(1)?.split(' ').next()?.parse().ok()?;
+                    Some((file, generated))
+                })
+                .collect()
+        };
+        let made = pairs("blocks made from files ", "), generated ");
+        let taken = pairs("taken from those kept from files ", ", generated ");
         assert_eq!((made.len(), taken.len()), (1, 1), "{err}");
-        assert!(made[0] + taken[0] > 0, "no block of the file's code: {err}");
-        counts.push((made[0], taken[0]));
+        let ((mf, mg), (tf, tg)) = (made[0], taken[0]);
+        assert!(mf + tf > 0 && mg + tg > 0, "no block of the file's code or of generated: {err}");
+        counts.push((mf, tf, mg, tg));
     }
     // (The first run may take some, kept by an earlier one.)
-    assert_eq!(counts[1], (0, counts[0].0 + counts[0].1), "{counts:?}");
+    let (mf, tf, mg, tg) = counts[0];
+    assert_eq!((counts[1].0, counts[1].1), (0, mf + tf), "{counts:?}");
+    assert_eq!(counts[1].2 + counts[1].3, mg + tg, "{counts:?}");
+    assert_eq!(counts[2], (0, mf + tf, 0, mg + tg), "{counts:?}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -1178,6 +1306,33 @@ fn jit_calls_through_a_repointed_call_site() {
         .first()
         .unwrap_or_else(|| panic!("no count of ways out: {err}"));
     assert!(exits < 5000, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code calling JIT code through a `bl` (guests/c/jitcallee.c), the
+/// callee rewritten before each of 8 rounds of 50000 calls, signalled all
+/// along by another thread: every call reaches that round's callee with
+/// its return address in `x30` and the caller's `x16`, a signal in the
+/// callee's words sees that `x30`, and the call goes into fwe once a round
+/// (its `bl` linked to the callee's translation again), not at each call.
+#[test]
+fn jit_calls_into_jit_code_keep_x30_through_signals_and_rewrites() {
+    let prog = build_c("jitcallee", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitcallee");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout(&out),
+        "wrong calls: 0 of 400000\nsignals in the callee with another x30: 0, signals landed\n",
+        "{err}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let exits = *jit_counts(&err, " blocks translated, ")
+        .first()
+        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+    assert!(exits < 100, "{exits} ways out through fwe: {err}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

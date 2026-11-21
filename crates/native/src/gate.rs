@@ -10,9 +10,10 @@
 //! nothing but `x0` and no signal is to be delivered, the gate restores the
 //! registers and returns to the stub, which goes on past the site: no host
 //! exception, no signal, no change of the host's signal mask (the guest's
-//! is already in force). Every other outcome (a call that changes `pc`,
-//! `sp` or the mask, a signal to deliver, a traced or filtered call, and
-//! the calls fwe runs outside the kernel lock) takes the trap: the gate
+//! is already in force); so do the calls that may block, which run outside
+//! the kernel lock. Every other outcome (a call that changes `pc`, `sp` or
+//! the mask, a signal to deliver, a traced or filtered call) takes the
+//! trap: the gate
 //! executes `brk #GATE_IMM`, and the `SIGTRAP` handler takes the guest's
 //! state from the block and goes on as for a trapped `svc`.
 //!
@@ -79,6 +80,14 @@ const _: () = assert!(std::mem::offset_of!(Block, stack) == 832);
 #[unsafe(no_mangle)]
 static FWE_GATE_SLOT: AtomicU64 = AtomicU64::new(0);
 
+/// Byte offsets of the slots holding the program's `x16` and `x17` while
+/// translations use the registers ([`crate::parked_slots`]), for the exit
+/// gate.
+#[unsafe(no_mangle)]
+static FWE_PARK16: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+static FWE_PARK17: AtomicU64 = AtomicU64::new(0);
+
 fn key() -> libc::pthread_key_t {
     static KEY: std::sync::OnceLock<libc::pthread_key_t> = std::sync::OnceLock::new();
     *KEY.get_or_init(|| {
@@ -87,6 +96,9 @@ fn key() -> libc::pthread_key_t {
         let r = unsafe { libc::pthread_key_create(&mut key, None) };
         assert_eq!(r, 0, "pthread_key_create failed");
         FWE_GATE_SLOT.store(key as u64 * 8, SeqCst);
+        let (s16, s17) = crate::parked_slots();
+        FWE_PARK16.store(u64::from(s16), SeqCst);
+        FWE_PARK17.store(u64::from(s17), SeqCst);
         key
     })
 }
@@ -226,12 +238,12 @@ unsafe extern "C" {
     /// The end of the gate's instructions.
     fn fwe_gate_end();
     /// The exit gate: a translation's way out branches to it with the way
-    /// out's address in `x16` and the program's `x16` and `x17` saved at
-    /// `[sp]` and `[sp, #8]`. It saves the program's registers in the
+    /// out's address in `x16` and the program's `x16` and `x17` saved in
+    /// their slots ([`crate::parked_slots`]). It saves the program's registers in the
     /// block, as the gate does, and calls `fwe_exit_call`, which takes the
     /// way out as fwe's trap would (`jit::gate_exit`). Into a translation,
     /// its way out restores the registers and enters the translation as a
-    /// lookup does: the program's `x16` and `x17` saved below `sp` again,
+    /// lookup does: the program's `x16` and `x17` saved in their slots again,
     /// `x16` the program address, `x17` the translation's saved entry. Any
     /// other way on (code not translated, a signal to deliver) takes the
     /// trap, which finds the program's state in the block.
@@ -387,8 +399,8 @@ core::arch::global_asm!(
     ".p2align 4",
     ".globl _fwe_exit_gate",
     "_fwe_exit_gate:",
-    // x16: the way out's address; the program's x16 and x17 at [sp] and
-    // [sp, #8]. x0 and x1 go below them, two scratch registers.
+    // x16: the way out's address; the program's x16 and x17 in their
+    // slots. x0 and x1 go below sp, two scratch registers.
     "stp x0, x1, [sp, #-16]!",
     "mrs x0, tpidrro_el0",
     "and x0, x0, #0xfffffffffffffff8",
@@ -411,10 +423,17 @@ core::arch::global_asm!(
     "str x30, [x0, #240]",
     "ldp x2, x3, [sp]",
     "stp x2, x3, [x0, #0]",
-    "ldp x2, x3, [sp, #16]",
-    "stp x2, x3, [x0, #128]",
+    "mrs x2, tpidrro_el0",
+    "and x2, x2, #0xfffffffffffffff8",
+    "adrp x3, _FWE_PARK16@PAGE",
+    "ldr x3, [x3, _FWE_PARK16@PAGEOFF]",
+    "ldr x4, [x2, x3]",
+    "adrp x3, _FWE_PARK17@PAGE",
+    "ldr x3, [x3, _FWE_PARK17@PAGEOFF]",
+    "ldr x5, [x2, x3]",
+    "stp x4, x5, [x0, #128]",
     // The program's sp, above what was saved, and its pc: the way out.
-    "add x2, sp, #32",
+    "add x2, sp, #16",
     "str x2, [x0, #248]",
     "str x16, [x0, #256]",
     "mrs x2, nzcv",
@@ -489,12 +508,19 @@ core::arch::global_asm!(
     "3:",
     "ldr x3, [x0, #264]",
     "msr nzcv, x3",
-    // The program's x16 and x17 below its sp, as a lookup leaves them for
-    // the translation it enters.
+    // The program's x16 and x17 in their slots, as a lookup leaves them
+    // for the translation it enters.
     "ldr x3, [x0, #248]",
-    "sub sp, x3, #16",
+    "mov sp, x3",
+    "mrs x4, tpidrro_el0",
+    "and x4, x4, #0xfffffffffffffff8",
     "ldp x2, x3, [x0, #128]",
-    "stp x2, x3, [sp]",
+    "adrp x5, _FWE_PARK16@PAGE",
+    "ldr x5, [x5, _FWE_PARK16@PAGEOFF]",
+    "str x2, [x4, x5]",
+    "adrp x5, _FWE_PARK17@PAGE",
+    "ldr x5, [x5, _FWE_PARK17@PAGEOFF]",
+    "str x3, [x4, x5]",
     "ldr x30, [x0, #240]",
     "ldp x2, x3, [x0, #16]",
     "ldp x4, x5, [x0, #32]",

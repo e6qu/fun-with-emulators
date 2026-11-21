@@ -468,7 +468,7 @@ impl<P: Platform> Kernel<P> {
         specialfd::save(e);
         signalfd::save(e);
         synthdir::save(e);
-        pty::save(e);
+        pty::save(e, false);
         epoll::save(e);
         pidfd::save(e);
         // A tracer that follows the child ([`ptrace::fork_event`]).
@@ -923,6 +923,8 @@ impl<P: Platform> Kernel<P> {
         netlink::save(&mut e, true);
         mountapi::save(&mut e);
         inotify::save(&mut e);
+        // The ptys' masters, and fwe's holds of their slaves.
+        pty::save(&mut e, true);
         nsfd::save(&mut e);
         // Process descriptors, which the host exec closes (kqueues).
         pidfd::save(&mut e);
@@ -972,6 +974,7 @@ impl<P: Platform> Kernel<P> {
         netlink::load(&mut d);
         mountapi::load(&mut d);
         inotify::load(&mut d);
+        pty::restore(&mut d);
         nsfd::load(&mut d);
         pidfd::restore(&mut d, true);
         pdeath::restore(&mut d);
@@ -2135,6 +2138,10 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         // normal read/write falls through to the locked host path.
         n::READ => {
             let (fd, buf, len) = (a[0] as i32, a[1], a[2]);
+            // A pty's master whose slave hung up.
+            if let Some(r) = pty::before_read(fd) {
+                return Some(r);
+            }
             // SAFETY: caller guarantees the buffer spans the length.
             if let Some(r) = unsafe { specialfd::try_read(fd, buf, len) } {
                 return Some(r);
@@ -2242,6 +2249,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if fdmarks::is_ping(a[0] as i32) => net::ping_read(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, false),
             Ok(iov) => {
+                if let Some(r) = pty::before_read(a[0] as i32) {
+                    return Some(r);
+                }
                 // SAFETY: the iovecs are translated host buffers; the host
                 // checks them.
                 let r = unsafe { libc::readv(a[0] as i32, iov.as_ptr(), iov.len() as i32) };

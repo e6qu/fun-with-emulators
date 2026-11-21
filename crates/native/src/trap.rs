@@ -674,7 +674,7 @@ fn settle(regs: &mut Regs) {
         // holds the guest's state, as at the instruction it stands for, not
         // fwe's code, which may be gone when the handler returns.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-        if crate::jit::in_cache(regs.pc) {
+        if crate::jit::stands_for_program(regs.pc) {
             crate::jit::to_guest(regs);
         }
         k.deliver_pending(regs);
@@ -1048,7 +1048,7 @@ fn take_async(
     // In a translation: the guest's state as at the instruction it stands
     // for, which is what a tracer, a handler's frame or a core sees.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::jit::in_cache(regs.pc) {
+    if crate::jit::stands_for_program(regs.pc) {
         crate::jit::to_guest(&mut regs);
     }
     k.deliver_pending(&mut regs);
@@ -1412,7 +1412,14 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // Code the guest made executable after mapping it runs by translation:
     // a fetch from it goes on at its translation.
     let exec = (mc.es.esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER;
-    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr) {
+    let held = (0..31)
+        .filter(|&r| match r {
+            29 => mc.ss.fp,
+            30 => mc.ss.lr,
+            r => mc.ss.x[r],
+        } == addr)
+        .fold(0, |m, r| m | 1 << r);
+    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held) {
         mc.ss.pc = t;
         return;
     }

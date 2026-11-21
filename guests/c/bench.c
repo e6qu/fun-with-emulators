@@ -280,14 +280,17 @@ static double jit(const char *kind, long n) {
         return ns;
     }
     if (strcmp(kind, "made") == 0) {
-        /* Each function `add x0, x0, #k; ret`, 16 bytes apart. */
+        /* Each function `add x0, x0, #(k + salt)`, `ret`, 16 bytes apart,
+         * `salt` this process's own: words no earlier process wrote there,
+         * so their translations are made, not taken from those kept. */
         unsigned *f = c + (1 << 16);
         if (n > (1 << 16)) {
             return -1;
         }
+        long salt = (long)now_ns() >> 10;
         code_writable(1);
         for (long k = 0; k < n; k++) {
-            f[4 * k] = 0x91000000 | (unsigned)(k & 0xfff) << 10;
+            f[4 * k] = 0x91000000 | (unsigned)((k + salt) & 0xfff) << 10;
             f[4 * k + 1] = 0xd65f03c0;
         }
         code_ready(f, 4 * n);
@@ -299,7 +302,7 @@ static double jit(const char *kind, long n) {
         double us = (now_ns() - start) / n / 1e3;
         long want = 0;
         for (long k = 0; k < n; k++) {
-            want += k & 0xfff;
+            want += (k + salt) & 0xfff;
         }
         return v == want ? us : -1;
     }

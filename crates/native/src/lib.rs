@@ -672,6 +672,25 @@ pub fn x18_slot() -> u32 {
     })
 }
 
+/// The host TSD slots where translations keep the program's `x16` and
+/// `x17` while they use the registers themselves, as byte offsets from the
+/// TSD base: within reach of an `ldr`/`str` with an unsigned offset from it.
+pub fn parked_slots() -> (u32, u32) {
+    static SLOTS: OnceLock<(u32, u32)> = OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        let key = || {
+            let mut key: libc::pthread_key_t = 0;
+            // SAFETY: creating a key without destructor; it lives forever.
+            let r = unsafe { libc::pthread_key_create(&mut key, None) };
+            assert_eq!(r, 0, "pthread_key_create failed");
+            let off = (key as u32) * 8;
+            assert!(off < 4096 * 8, "TSD key {key} out of an ldr's reach");
+            off
+        };
+        (key(), key())
+    })
+}
+
 /// Host features that affect guest compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostSupport {

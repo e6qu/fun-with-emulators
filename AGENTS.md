@@ -84,6 +84,7 @@ Each document has one job; do not duplicate content across them.
 | [docs/jit.md](docs/jit.md) | Code made at run time (JIT compilers', self-modifying code): why and how it runs by translation, how changes are found, what it costs, the runtimes tested, how other translators do it |
 | [docs/hypervisor.md](docs/hypervisor.md) | The hypervisor backend, how to run it, and its CI arrangement |
 | `guests/*/README.md` | Provenance and licenses of vendored test fixtures |
+| `notes/research/*.md` | Research notes: dated, sourced surveys of other projects (Linux on macOS, Wine on Apple Silicon, terminals) and of what fwe could do in-process; kept as written, not maintained |
 
 A PR that changes behaviour updates them in the same PR: tick the roadmap
 item its tests prove, remove a lifted limitation from

@@ -558,7 +558,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
         })
     })
     .into_iter()
-    .filter(|&(fd, ..)| crate::fifo::is_reader(fd))
+    .filter(|&(fd, ..)| crate::fifo::watched(fd))
     .collect();
     let mounts: Vec<(i32, u64, u32)> = interest(|m| {
         m.get(&ep).map_or_else(Vec::new, |l| {
@@ -590,7 +590,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
         (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
     let slice = i64::from(crate::fifo::SLICE_MS) * 1_000_000;
     loop {
-        // FIFOs whose writers have gone, or with bytes a probe kept.
+        // FIFOs whose writers have gone, pty masters whose slave hung up.
         let mut ready: Vec<(i32, u32, u64)> = Vec::new();
         for &(fd, data, ev) in &fifos {
             // A one-shot entry already reported waits for EPOLL_CTL_MOD.
@@ -599,10 +599,7 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             }
             // Writers gone, nothing left to read: hung up, as Linux
             // reports a pipe.
-            let bits = match crate::fifo::probe(fd) {
-                crate::fifo::Probe::HungUp => EPOLLHUP,
-                _ => 0,
-            };
+            let bits = if crate::fifo::hung_up(fd) { EPOLLHUP } else { 0 };
             // Edge-triggered: once per change, as Linux reports it.
             if bits != 0 && (ev & EPOLLET == 0 || edge(ep, fd, bits)) {
                 ready.push((fd, bits, data));

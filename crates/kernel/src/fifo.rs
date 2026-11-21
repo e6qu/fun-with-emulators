@@ -96,6 +96,22 @@ use libc::select as select_any;
 /// How long a wait that watches FIFO readers sleeps between probes.
 pub const SLICE_MS: i32 = 20;
 
+/// Whether a wait for `fd` to be readable looks between slices for a
+/// hang-up the host does not report: a FIFO's read end's, or a pty
+/// master's ([`crate::pty::hung_up`]).
+pub fn watched(fd: i32) -> bool {
+    is_reader(fd) || crate::pty::is_master(fd)
+}
+
+/// Whether `fd`, a descriptor [`watched`] says is, has hung up (a pty
+/// master's slave may have left data to read, as Linux reports it).
+pub fn hung_up(fd: i32) -> bool {
+    if crate::pty::is_master(fd) {
+        return crate::pty::hung_up(fd);
+    }
+    probe(fd) == Probe::HungUp
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;

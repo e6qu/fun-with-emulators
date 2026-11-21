@@ -15,9 +15,13 @@
 //!
 //! With `FWE_JIT_COUNT` set: each block's entries count their runs (its
 //! words then differ: a few more at each entry, and every block with an
-//! entry for the program's own registers made with a second pass), and
-//! each way back after a call its returns; at the end, the report says
-//! which blocks ran, how often returns came back into generated code, and
+//! entry for the program's own registers made with a second pass), each
+//! way back after a call its returns, and each lookup of a branch or call
+//! through a register whether it goes where it went last; at the end, the
+//! report says which blocks ran, how often the program's `x16` and `x17`
+//! were taken back from their slots (by the instruction) and saved again,
+//! how often lookups went where they went last, how often returns came
+//! back into generated code, and
 //! which pages of generated code hold no word a translation would have to
 //! change (a system call, a thread-pointer access, a use of `x18`, a
 //! cache flush), with how often those ran and were flushed.
@@ -35,6 +39,33 @@ const ORIGINS: [&str; 2] = ["from files", "generated"];
 /// Blocks made, and the nanoseconds making them, by origin.
 pub(crate) static MADE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) static MAKE_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Making or taking a block, by step ([`STEPS`]): the nanoseconds and
+/// the times each ran.
+pub(crate) static STEP_NS: [AtomicU64; STEPS.len()] = [const { AtomicU64::new(0) }; STEPS.len()];
+pub(crate) static STEP_RUNS: [AtomicU64; STEPS.len()] = [const { AtomicU64::new(0) }; STEPS.len()];
+pub(crate) const STEP_SNAPSHOT: usize = 0;
+pub(crate) const STEP_LOOK: usize = 1;
+pub(crate) const STEP_TRANSLATE: usize = 2;
+pub(crate) const STEP_CHECK: usize = 3;
+pub(crate) const STEP_PACK: usize = 4;
+pub(crate) const STEP_KEEP: usize = 5;
+pub(crate) const STEP_ROOM: usize = 6;
+pub(crate) const STEP_EMIT: usize = 7;
+pub(crate) const STEP_INDEX: usize = 8;
+pub(crate) const STEP_LINK: usize = 9;
+const STEPS: [&str; 10] = [
+    "the words read",
+    "a kept one looked for",
+    "translated (the lock let go and taken again)",
+    "the words checked",
+    "packed",
+    "kept",
+    "room found and branches resolved",
+    "written and made ready to run",
+    "indexed",
+    "linked",
+];
+
 /// Blocks made with a second pass of their words, those words, and the
 /// blocks whose entry there was used.
 pub(crate) static SECOND: AtomicU64 = AtomicU64::new(0);
@@ -48,7 +79,16 @@ pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
 pub(crate) static TAKEN: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 pub(crate) static TAKE_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KEPT_OTHER: AtomicU64 = AtomicU64::new(0);
+/// Records read as a block was looked for: their keys matched its words'.
+pub(crate) static KEPT_READ: AtomicU64 = AtomicU64::new(0);
+/// Files of records mapped as their parts were first looked at, and the
+/// nanoseconds that took.
+pub(crate) static LOADED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static LOAD_NS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static KEPT_WRITTEN: AtomicU64 = AtomicU64::new(0);
+/// Generated blocks made where a past process made one from the same
+/// words (and so kept).
+pub(crate) static NOTED_AGAIN: AtomicU64 = AtomicU64::new(0);
 /// Blocks by how their words end ([`ENDS`]), and the program's words they
 /// hold (their first pass's).
 pub(crate) static ENDED: [AtomicU64; 6] = [const { AtomicU64::new(0) }; 6];
@@ -192,6 +232,43 @@ fn count(at: u64) -> u64 {
     unsafe { (*(at as *const AtomicU64)).load(Ordering::Relaxed) }
 }
 
+/// Counters of the program's `x16` and `x17` taken back from their slots
+/// for an instruction that names them, and saved there again.
+static MOVES: OnceLock<u64> = OnceLock::new();
+pub(crate) const RESTORE_NAMED: u64 = 0;
+pub(crate) const SAVED_AGAIN: u64 = 1;
+
+/// The counter of `x16` and `x17`'s moves of kind `k` ([`RESTORE_NAMED`]...).
+pub(crate) fn moves(k: u64) -> u64 {
+    *MOVES.get_or_init(|| units(2)) + 8 * k
+}
+
+/// Each place they are taken back for an instruction that names neither
+/// (one fwe does not translate with them saved): its counter and the
+/// instruction.
+static RESTORES: Mutex<Vec<(u64, u32)>> = Mutex::new(Vec::new());
+
+/// A counter for `x16` and `x17` taken back for the program's instruction
+/// `w`, which names neither: its address.
+pub(crate) fn restore(w: u32) -> u64 {
+    let at = units(1);
+    RESTORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((at, w));
+    at
+}
+
+/// Each lookup of a branch or a call through a register: its counters
+/// (the target it took last, its runs to that same target again, its
+/// runs), and whether it is a call.
+static LOOKUPS: Mutex<Vec<(u64, bool)>> = Mutex::new(Vec::new());
+
+/// Counters for a lookup of a branch (or a call, `call`) through a
+/// register: their address ([`LOOKUPS`]).
+pub(crate) fn lookup(call: bool) -> u64 {
+    let at = units(3);
+    LOOKUPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((at, call));
+    at
+}
+
 /// A way back after a call, counting its returns: its counter, the
 /// origin of the block that makes the call, and the call's target if it is
 /// direct.
@@ -309,12 +386,26 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&SECOND_USED),
         n(&AHEAD),
     );
+    out.push_str("; making a block, ns each step:");
+    for (k, name) in STEPS.iter().enumerate() {
+        let runs = n(&STEP_RUNS[k]);
+        out.push_str(&format!(" {name} {}", n(&STEP_NS[k]) / runs.max(1)));
+        out.push_str(if k + 1 < STEPS.len() { "," } else { "" });
+    }
     out.push_str(&format!(
-        "; taken from those kept {} {} ({} ms), {} records found made otherwise",
+        "; taken from those kept {} {}, {} {} ({} ms), {} records read for them, {} found made \
+         otherwise, {} files of them mapped ({} ms), {} generated made again where a past process \
+         made them (kept)",
         ORIGINS[FILE],
         n(&TAKEN[FILE]),
+        ORIGINS[GENERATED],
+        n(&TAKEN[GENERATED]),
         ms(&TAKE_NS),
+        n(&KEPT_READ),
         n(&KEPT_OTHER),
+        n(&LOADED),
+        ms(&LOAD_NS),
+        n(&NOTED_AGAIN),
     ));
     let made = n(&MADE[FILE]) + n(&MADE[GENERATED]);
     out.push_str(&format!(
@@ -382,6 +473,44 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         ahead,
         ahead_ran,
     ));
+    // The program's x16 and x17 taken back from their slots, by why, and
+    // saved there again; those for other instructions by the instruction.
+    let mut other: HashMap<u32, u64> = HashMap::new();
+    for &(at, w) in RESTORES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+        *other.entry(w).or_default() += count(at);
+    }
+    let mut other: Vec<(u32, u64)> = other.into_iter().filter(|&(_, n)| n > 0).collect();
+    other.sort_unstable_by_key(|&(w, n)| (std::cmp::Reverse(n), w));
+    let most: Vec<String> = other.iter().take(8).map(|(w, n)| format!("{w:08x} {n}")).collect();
+    out.push_str(&format!(
+        "; x16 and x17 taken back {} times for an instruction naming them, {} for another \
+         (most often: {}), saved again {} times",
+        count(moves(RESTORE_NAMED)),
+        other.iter().map(|&(_, n)| n).sum::<u64>(),
+        most.join(", "),
+        count(moves(SAVED_AGAIN)),
+    ));
+    // Lookups of branches and calls through a register: their runs, those
+    // to the target taken there last, and the runs at sites that went
+    // there at least 9 times in 10.
+    for call in [false, true] {
+        let (mut runs, mut same, mut steady) = (0, 0, 0);
+        for &(at, c) in LOOKUPS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            if c == call {
+                let (s, r) = (count(at + 8), count(at + 16));
+                runs += r;
+                same += s;
+                if 10 * s >= 9 * r {
+                    steady += r;
+                }
+            }
+        }
+        out.push_str(&format!(
+            "; {} through a register {runs} times, {same} of them to where the last went, {steady} \
+             at sites that went there 9 times in 10",
+            if call { "calls" } else { "branches" },
+        ));
+    }
     // Returns into each origin's code, by the call they come back from.
     let mut returns: HashMap<(usize, &str), u64> = HashMap::new();
     for p in PADS.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
