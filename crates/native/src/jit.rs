@@ -895,9 +895,10 @@ pub struct State {
     /// translated code, and whether they were linked to it
     /// ([`link_call_site`]).
     call_sites: BTreeMap<u64, bool>,
-    /// The stubs those sites call: each one's address -> its site and its
-    /// words ([`call_stub_to_guest`]).
-    call_stubs: BTreeMap<u64, (u64, Vec<u32>)>,
+    /// The stubs those sites call: each one's address -> its site, its
+    /// words ([`call_stub_to_guest`]), its call, and where in its words its
+    /// way out into fwe is ([`exit`]).
+    call_stubs: BTreeMap<u64, CallStub>,
     /// Program addresses not translated yet -> the direct ways out of
     /// translations that lead there (and their blocks), linked as the
     /// target is translated ([`link_waiting`]) rather than each through
@@ -939,6 +940,8 @@ static STATE: Mutex<State> = Mutex::new(State {
 /// gone on at a translation, and pages whose translations a write dropped.
 static TRANSLATED: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
+/// Of [`EXITS`]: from call stubs ([`link_call_site`]).
+static STUB_EXITS: AtomicU64 = AtomicU64::new(0);
 static ENTERED: AtomicU64 = AtomicU64::new(0);
 /// Of [`EXITS`]: direct branches to code not translated, and indirect
 /// ones (and lookup misses) to it; of [`ENTERED`]: returns (to `x30`).
@@ -1075,12 +1078,13 @@ pub fn counts() -> Option<String> {
     });
     (t > 0).then(|| {
         format!(
-            "JIT code: {t} blocks translated, {} exits through fwe ({} direct and {} \
+            "JIT code: {t} blocks translated, {} exits through fwe ({} from call stubs; {} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
              {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls through a register from code not translated, {} from code a direct call there led to, {} sites linked, {} whose return is followed), \
              {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
+            STUB_EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
             EXITS_KNOWN_DIRECT.load(Ordering::Relaxed),
@@ -1846,6 +1850,14 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
     Some(into)
 }
 
+/// A call site's stub ([`link_call_site`]).
+struct CallStub {
+    site: u64,
+    words: Vec<u32>,
+    call: CallSite,
+    out: usize,
+}
+
 /// A call site of code fwe prepared in place that a fetch may have come
 /// from ([`call_site`]).
 #[derive(Clone, Copy)]
@@ -1894,8 +1906,11 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
     };
     // As a translation's lookup ([`lookup`]): in place, or through `x16`.
     // Each entry of the target's pair in turn: a miss in the first goes to
-    // the second's look, found goes on to the translation, and a miss in
-    // the second and a target not translated make the call as it was.
+    // the second's look, found goes on to the translation, a target not
+    // translated makes the call as it was, and a miss in the second goes
+    // into fwe, as a translation's does ([`exit`]): its address in `x16`,
+    // the exit gate's in `x17` (a target to translate is not branched to
+    // only to fault).
     let (first, other, go) = if matches!(n, 16 | 17) {
         let at = |other: bool| {
             let mut w = vec![INDEX, SCALE, BASE];
@@ -1934,11 +1949,16 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
     words.extend(&other);
     // (Found in the second: on to the translation.)
     words.push(0x1400_0000 | ((go_at as u32).wrapping_sub(words.len() as u32) & 0x3ff_ffff));
+    let out = words.len();
+    words.push(OUT);
+    materialize(17, crate::gate::exit_address(), &mut words);
+    words.push(GO);
     let restore = words.len() as u32;
     for (k, w) in words.iter_mut().enumerate() {
         let to = match *w {
             MISS | MISS_X16 if k < go_at => other_at as u32,
-            MISS | MISS_X16 | OUTSIDE => restore,
+            MISS | MISS_X16 => out as u32,
+            OUTSIDE => restore,
             _ => continue,
         };
         *w |= (to - k as u32) << 5;
@@ -1950,7 +1970,7 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
     words.push(0xd61f_0000 | (n << 5)); // br xN
     let _stopped = crate::quiesce::stop_others(&mut |_| {});
     let Some(stub) = crate::prepare::call_stub(site, &words) else { return false };
-    s.call_stubs.insert(stub, (site, words));
+    s.call_stubs.insert(stub, CallStub { site, words, call, out });
     let Some(b) = rewrite::branch(site, stub) else { return false };
     let page = site & !(page_size() - 1);
     let prot = fwe_kernel::mm::host_prot_at(page);
@@ -2008,7 +2028,27 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     let at = regs.pc;
     let from = block_at(&s, at);
     let word = from.and_then(|i| s.blocks[i].word_at(at));
-    let Some(Word::Out { exit, saved, x18, .. }) = word else { return false };
+    let (exit, saved, x18) = match word {
+        Some(Word::Out { exit, saved, x18, .. }) => (exit, saved, x18),
+        _ => {
+            // A call stub's way out, a lookup's miss: into its call's
+            // target, as a translation's call through a register (a `bl`'s
+            // with its target in `x16`, as the stub branches to it).
+            let Some((&stub, c)) = s.call_stubs.range(..=at).next_back() else { return false };
+            if at != stub + 4 * c.out as u64 {
+                return false;
+            }
+            STUB_EXITS.fetch_add(1, Ordering::Relaxed);
+            let n = match c.call {
+                CallSite::Call(n) => n,
+                CallSite::Direct(to) => {
+                    regs.x[16] = to;
+                    16
+                }
+            };
+            (Exit::Reg { n, link: None }, true, false)
+        }
+    };
     // A wrong block's way out has the target in x16.
     let wrong_to = regs.x[16];
     if trapped && saved {
@@ -2217,7 +2257,8 @@ const IN_SLOT: u8 = 32;
 /// and `x17` in their registers at its first and last words, below `sp`
 /// in its save, and in their slots after. `false` if `regs.pc` is in none.
 fn call_stub_to_guest(s: &State, regs: &mut Regs) -> bool {
-    let Some((&stub, (site, words))) = s.call_stubs.range(..=regs.pc).next_back() else {
+    let Some((&stub, CallStub { site, words, .. })) = s.call_stubs.range(..=regs.pc).next_back()
+    else {
         return false;
     };
     let k = ((regs.pc - stub) / 4) as usize;

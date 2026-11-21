@@ -405,6 +405,10 @@ a processor that reports `DIC` clear.
   (`prepare::call_stub`), and the site becomes a `bl` to it. A `bl`'s
   stub puts its target in `x16` before the lookup and again before going
   to it untranslated, and its target is translated as it is linked. A
+  target the table knows to be code not translated is called as it is;
+  one it does not hold (a function a JIT made since) goes into fwe through
+  the exit gate, as a translation's lookup miss does: the stub's way out
+  in `x16`, which `jit::exit` finds in `State::call_stubs`. A
   thread stopped in such a stub is as at the site, which calls again
   (`jit::call_stub_to_guest`):
   a handler running translated code may save its own `x16` and `x17` in
@@ -455,7 +459,7 @@ a processor that reports `DIC` clear.
 | a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
-| a call or branch from native code into JIT code | a fault | once per call site, then linked (a branch no call leads to: followed) |
+| a call or branch from native code into JIT code | a fault, then a table lookup in the site's stub (a target not translated yet: a call through the exit gate) | a fault once per call site, then linked (a branch no call leads to: followed) |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
 

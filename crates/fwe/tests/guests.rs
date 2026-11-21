@@ -1115,6 +1115,34 @@ fn jit_code_branched_into_faults_once() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Functions made at run time, each called once through one call site of
+/// the program's own (guests/c/jitmade.c): each runs, the site faults into
+/// fwe once and is linked, and every later call to a function not
+/// translated yet goes into fwe from the site's stub rather than faulting.
+#[test]
+fn jit_functions_made_and_run_go_in_from_the_call_stub() {
+    let prog = build_c("jitmade", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitmade");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "sum: 7998000\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    // "..., N entries by fetch (..." and "... exits through fwe (S from
+    // call stubs; ...": for the one process.
+    let count = |after: &str| -> Vec<u64> {
+        err.lines()
+            .filter(|l| l.contains(after))
+            .filter_map(|l| l.split(after).next()?.rsplit([' ', '(']).next()?.parse().ok())
+            .collect()
+    };
+    assert_eq!(count(" entries by fetch ("), [1], "{err}");
+    let stubs = count(" from call stubs");
+    assert!(stubs.len() == 1 && stubs[0] >= 3999, "{stubs:?}: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code calling, in turn, functions 4 MiB apart (guests/c/jitpair.c),
 /// whose addresses pick the same entry of fwe's table of translations:
 /// each call reaches its own function, and two of them share the entry's
