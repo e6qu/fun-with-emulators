@@ -774,7 +774,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
             let addr = regs.pc;
             let delivered = kernel()
                 .as_mut()
-                .is_some_and(|k| k.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr));
+                .is_some_and(|k| k.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr, None));
             if delivered {
                 settle(&mut regs);
                 regs_to(mc, &regs);
@@ -1442,7 +1442,9 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     } else {
         linux_fault_signal(sig, allowed)
     };
-    let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr));
+    // The fault's syndrome, as the host had it from the processor.
+    let esr = Some(u64::from(mc.es.esr));
+    let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr, esr));
     if delivered {
         settle(&mut regs);
         regs_to(mc, &regs);

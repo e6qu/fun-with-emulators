@@ -9128,6 +9128,25 @@ fn proc_hidepid_and_subset_hide_as_linux() {
     );
 }
 
+/// A fault's syndrome in its handler's frame (guests/c/faultesr.c): the
+/// ESR record Linux adds after the FP/SIMD one, a data abort's, telling a
+/// write (WnR) from a read, as Wine reads it.
+#[test]
+fn fault_frames_hold_the_syndrome() {
+    let prog = build_c("faultesr", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "faultesr");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "read: syndrome found, data abort yes, write 0\nwrite: syndrome found, data abort yes, write 1\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
 /// names it; the tests skip without it, as on a development machine),
 /// listening on its Unix socket only, at a display number of its own.

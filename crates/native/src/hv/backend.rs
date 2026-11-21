@@ -1169,7 +1169,7 @@ fn stale_permissions(esr: u64, far: u64) -> bool {
 fn fault(regs: &mut Regs, sig: u64, addr: u64) {
     let mut guard = kernel();
     let Some(k) = guard.as_mut() else { fatal("fault before the kernel exists") };
-    if !k.deliver_fault(regs, sig, addr) {
+    if !k.deliver_fault(regs, sig, addr, None) {
         if k.tracer.enabled {
             k.tracer.note(&format!(
                 "guest fault: signal {sig} at pc {:#x}, address {addr:#x}",

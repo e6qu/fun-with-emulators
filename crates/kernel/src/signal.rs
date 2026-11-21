@@ -596,7 +596,7 @@ impl<P: Platform> Kernel<P> {
                     signal::Default::Ignore | signal::Default::Continue => {}
                 },
                 _ => {
-                    if self.deliver_to_handler(regs, sig, info, 0) {
+                    if self.deliver_to_handler(regs, sig, info, 0, None) {
                         break;
                     }
                     // No room for a frame, or a stack that cannot take one:
@@ -640,6 +640,7 @@ impl<P: Platform> Kernel<P> {
         sig: u64,
         info: SigInfo,
         fault_addr: u64,
+        esr: Option<u64>,
     ) -> bool {
         let action = self.sigactions[(sig - 1) as usize];
         if action.handler == signal::SIG_DFL || action.handler == signal::SIG_IGN {
@@ -700,8 +701,16 @@ impl<P: Platform> Kernel<P> {
         f.put(MC_SP_OFF, regs.sp);
         f.put(MC_PC_OFF, regs.pc);
         f.put(MC_PSTATE_OFF, regs.pstate);
-        // The FP/SIMD record, then the zero terminator (already zeroed).
+        // The FP/SIMD record, a fault's syndrome as Linux gives it (a
+        // handler tells a write from a read by it), then the zero
+        // terminator (already zeroed).
         let fp = MC_RESERVED_OFF;
+        if let Some(esr) = esr {
+            let at = fp + u64::from(signal::FPSIMD_CONTEXT_SIZE);
+            f.put32(at, signal::ESR_MAGIC as i32);
+            f.put32(at + 4, signal::ESR_CONTEXT_SIZE as i32);
+            f.put(at + 8, esr);
+        }
         f.put32(fp, signal::FPSIMD_MAGIC as i32);
         f.put32(fp + 4, signal::FPSIMD_CONTEXT_SIZE as i32);
         f.put32(fp + FPSIMD_FPSR_OFF, regs.fp.fpsr as i32);
@@ -749,10 +758,17 @@ impl<P: Platform> Kernel<P> {
         true
     }
 
-    /// Deliver synchronous fault signal `sig` (at `addr`) to a guest handler,
-    /// returning `true` if a handler was entered. When `false`, the caller
-    /// takes the default action (terminate).
-    pub fn deliver_fault(&mut self, regs: &mut Regs, sig: u64, addr: u64) -> bool {
+    /// Deliver synchronous fault signal `sig` (at `addr`, of syndrome `esr`
+    /// where the fault has one) to a guest handler, returning `true` if a
+    /// handler was entered. When `false`, the caller takes the default
+    /// action (terminate).
+    pub fn deliver_fault(
+        &mut self,
+        regs: &mut Regs,
+        sig: u64,
+        addr: u64,
+        esr: Option<u64>,
+    ) -> bool {
         // A breakpoint of a step a tracer asked for: the step's stop.
         if sig == signal::SIGTRAP && crate::ptrace::traced() && crate::ptrace::step_hit(regs.pc) {
             const TRAP_TRACE: i32 = 2;
@@ -776,7 +792,7 @@ impl<P: Platform> Kernel<P> {
                 Some(_) => {}
             }
         }
-        self.deliver_to_handler(regs, sig, info, addr)
+        self.deliver_to_handler(regs, sig, info, addr, esr)
     }
 
     /// Restore `regs` from the signal frame at `regs.sp` (the `rt_sigreturn`
@@ -1523,7 +1539,7 @@ mod tests {
         assert_eq!(peek32(fp), signal::FPSIMD_MAGIC);
         assert_eq!(peek32(fp + 4), signal::FPSIMD_CONTEXT_SIZE);
         assert_eq!(peek(fp + FPSIMD_VREGS_OFF + 16 * 3), saved.v[3] as u64);
-        // The record after it is the terminator.
+        // The record after it is the terminator: no fault, no syndrome.
         assert_eq!(peek(fp + signal::FPSIMD_CONTEXT_SIZE as u64), 0);
         // The handler clobbers the FP state.
         regs.fp = crate::FpRegs::default();
@@ -1531,6 +1547,25 @@ mod tests {
         k.enter_syscall(&mut regs);
         assert_eq!(regs.fp, saved);
         assert_eq!(regs.pc, 0x1000);
+    }
+
+    /// A fault's handler finds its syndrome after the FP/SIMD record, as
+    /// Linux gives it, then the terminator.
+    #[test]
+    fn a_fault_frame_holds_its_syndrome() {
+        let _held = crate::thread::signals_held();
+        let mut k = kernel();
+        k.sigactions[(signal::SIGSEGV - 1) as usize].handler = HANDLER;
+        let (_stack, top) = stack();
+        let mut regs = Regs { sp: top, pc: 0x1000, ..Regs::default() };
+        // A data abort from EL0, a write (WnR), a permission fault.
+        let esr = 0x9200_004f;
+        assert!(k.deliver_fault(&mut regs, signal::SIGSEGV, 0x5000, Some(esr)));
+        let at = regs.sp + MC_RESERVED_OFF + signal::FPSIMD_CONTEXT_SIZE as u64;
+        assert_eq!(uaccess::read::<u32>(at).unwrap(), signal::ESR_MAGIC);
+        assert_eq!(uaccess::read::<u32>(at + 4).unwrap(), signal::ESR_CONTEXT_SIZE);
+        assert_eq!(uaccess::read::<u64>(at + 8).unwrap(), esr);
+        assert_eq!(uaccess::read::<u64>(at + 16).unwrap(), 0);
     }
 
     /// A handler entered from `rt_sigsuspend` runs with the call's mask and

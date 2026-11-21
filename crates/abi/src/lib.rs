@@ -536,6 +536,10 @@ pub mod signal {
     /// `__reserved` area.
     pub const FPSIMD_MAGIC: u32 = 0x4650_8001;
     pub const FPSIMD_CONTEXT_SIZE: u32 = 528;
+    /// Magic and size of the `esr_context` record: a fault's syndrome
+    /// (whether it was a read or a write, what kind of fault).
+    pub const ESR_MAGIC: u32 = 0x4553_5201;
+    pub const ESR_CONTEXT_SIZE: u32 = 16;
 
     /// What a signal does when its handler is `SIG_DFL`.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
