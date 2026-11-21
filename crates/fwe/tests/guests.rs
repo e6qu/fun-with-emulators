@@ -10167,7 +10167,15 @@ impl Probe {
             self.settle(&mut r, 45);
             clients.push(r);
         }
-        let mut r = self.fwe("xeyes-xwayland", &root, "/usr/bin/xeyes", &[], &[("DISPLAY", ":0")]);
+        // Xwayland's display is the guest's own: fwe's `DISPLAY` stays the
+        // host's, the guest's names `:0`.
+        let mut r = self.fwe(
+            "xeyes-xwayland",
+            &root,
+            "/bin/sh",
+            &["-c", "DISPLAY=:0 exec /usr/bin/xeyes"],
+            &[],
+        );
         self.settle(&mut r, 60);
         clients.push(r);
         for r in clients {
@@ -10233,6 +10241,7 @@ impl Probe {
             "3da04c450fa682e3b80961e92a918a1c2a1a10796527a7e63dec7b8e466b6334",
             "electron",
         );
+        std::fs::create_dir_all(root.join("opt/electron")).unwrap();
         run_checked(
             Command::new("unzip").arg("-q").arg(&zip).arg("-d").arg(root.join("opt/electron")),
         );
