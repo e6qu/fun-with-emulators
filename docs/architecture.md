@@ -1257,6 +1257,21 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   `RTM_NEWLINK` and `RTM_NEWADDR` need `CAP_NET_ADMIN`. A socket's `SOL_NETLINK` options
   and the groups it joins are kept with it, and travel with it across
   `fork`, `execve` and `SCM_RIGHTS`.
+- The X display (`crates/kernel/src/x11.rs`): the display fwe's own
+  `DISPLAY` names (Xvfb's or Xorg's `/tmp/.X11-unix/XN`, or XQuartz's
+  launchd socket) is the guest's display `N`, which a guest `connect` to
+  `/tmp/.X11-unix/XN` or to the abstract name libxcb tries first reaches
+  (`net::root_unix_path`); the guest's `DISPLAY` is `:N`. Every other
+  display is the guest's own, in its root (an Xwayland a guest compositor
+  runs). On a connection to the host's display fwe follows the client's
+  bytes as it writes them: the setup (its authorization), then each
+  request's header and length. A `ShmAttach` names a System V segment,
+  which the server would look up among the host's; fwe's are files of its
+  own, so it is sent as `ShmAttachFd` with the segment's file, which the
+  server maps as the guest has it. Whether the server takes descriptors
+  (MIT-SHM 1.2) fwe asks it once, on a connection of its own with the
+  client's authorization; a server that does not gets the `ShmAttach` as
+  it was.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
   rootfs (`fwe --pull` writes the host's name servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
@@ -1817,6 +1832,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   can leave an identical event unmerged, or merge one with an event
   already read; a process started before anything was watched notices the
   first watch within a second.
+
+**Displays**
+- Only the display fwe's own `DISPLAY` names is the host's: another
+  display number a guest names is looked for in its root. A server
+  without MIT-SHM 1.2 sees a guest's `ShmAttach` name a segment it cannot
+  find, and the client draws without shared memory if it can.
+- No GPU: OpenGL is Mesa's software renderer, and Wayland programs need a
+  compositor run in the guest (Weston, drawing on the X display).
 
 **IPC and keys**
 - System V: `SHM_INFO` reports no resident pages; a segment stays

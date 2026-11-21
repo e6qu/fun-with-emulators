@@ -2135,6 +2135,22 @@ names macOS does not support:
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
 | interface requests (`SIOCGIFCONF`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCSIFMTU`, ...) | a 32-byte `ifreq`, other flag bits | in an fwe network namespace, answered for `lo`; elsewhere the host's interfaces, `lo0` as `lo`, their flags in Linux's numbering (`IFF_MULTICAST` moved, none for `lo`, `IFF_LOWER_UP` while running), which the guest cannot change |
 
+#### Displays
+
+A Linux program draws through an X server (or a Wayland compositor) it
+reaches by a Unix socket. macOS has no Linux display of its own, but runs
+X servers: XQuartz on the screen, Xvfb without one. fwe hands the guest
+the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
+
+| Linux | macOS | fwe |
+|---|---|---|
+| `DISPLAY=:N`, the server's socket `/tmp/.X11-unix/XN` and the abstract name `@/tmp/.X11-unix/XN` libxcb tries first | the host server's socket: Xvfb's or Xorg's `/tmp/.X11-unix/XN`, XQuartz's launchd socket `/private/tmp/com.apple.launchd.…/org.xquartz:N` | either name, in any root, reaches the host server's socket; the guest's `DISPLAY` is `:N` (XQuartz's path shortened to it) |
+| another display, its socket in the guest's `/tmp/.X11-unix` (an Xwayland a compositor starts) | — | the guest's own, a Unix socket in its root like any other |
+| MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
+| `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
+| Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
+| GPU rendering (`/dev/dri`) | Metal | none: Mesa's software renderer |
+
 ### Kernel-wide state
 
 What Linux keeps in one kernel for every process (mount tables,
