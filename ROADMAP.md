@@ -160,33 +160,25 @@ Done:
   natively (calls and returns, a switch through `br`, calls through a
   register, a loop, 4096 functions in turn), and of making a block (a
   function made and run once).
-
-Left, in this order:
-
-- [ ] **Cheaper blocks:** making a block costs about 5 µs on CI (javac
-  makes 40,000 of them: most of its overhead). What each word stands for
-  written in its compact form as it is made, per-block bookkeeping
-  (indexes, linking, cache maintenance) cut, measured by the time of a
-  function made and run and javac's time in ways out.
-- [ ] **Lookups without a load:** each address of the program's code that
-  runs by translation has a slot at an address computed from it, holding
-  a branch to its translation, so a branch or call through a register
-  reaches its target with no table to read first. Adopted if a prototype
-  brings 4096 functions in turn within 1.3× without slowing the other
-  benchmarks or using more memory than the table.
-- [ ] **Inline caches:** a `br` or `blr` first compares its target with
-  the one last taken there and branches straight to its translation (the
-  counts: lookups that go where they went last).
-- [ ] **Blocks made only when needed:** a block's entry with the
-  program's own `x16` and `x17` made on its first use; blocks made ahead
-  only as far as they are run (the counts: such entries made and used,
-  blocks made ahead and run).
-- [ ] **Traces:** chains of blocks the program runs hot made again as one
-  straight run of code, their cold paths out of line (the counts: blocks
-  a direct branch alone leads to).
+- [x] **Cheaper blocks:** a lookup reads a table entry whole and goes on
+  with no words to check its target at the block, and a block's entry
+  with the program's own `x16` and `x17` is made on its first use: a
+  function made and run takes 1.4 µs on CI.
+- [x] **Blocks made only when needed:** the entry with the program's own
+  `x16` and `x17` made when a branch first needs it (javac: 756 blocks
+  of 52,000). Blocks made ahead stay: 84% of javac's run (17,496 of
+  20,945; `java`'s 80%), each saving a way out.
+- [x] **Lookups in a near table first:** an entry for each 64 bytes of
+  the program's code, so the entries of thousands of functions stay in
+  the data cache; a switch's cases keep entries of their own (1.0× of
+  native).
+- [x] **A third run of each JIT runtime** in the benchmarks makes no block
+  of generated code that two earlier runs made at the same address from
+  the same words.
 
 **Done when:** the micro benchmarks of translated code at work hold 1.3×
-of the same code run natively; a function made and run takes at most
+of the same code run natively (but 4096 functions in turn, 1.6× on CI:
+19.1 ns against 12.0, its code twice native size; PR 2's); a function made and run takes at most
 2 µs (making a translation has no native counterpart to compare with);
 Node.js's and LuaJIT's benchmarks hold 1.5×; and a later run of a JIT
 runtime's workload takes, rather than makes, the blocks of generated
@@ -199,7 +191,8 @@ Both items are decided by the JDK's, Node.js's and LuaJIT's counts.
 - [ ] **Clean pages run natively:** a page of generated code none of
   whose words is a system call, a thread-pointer access or a use of `x18`
   runs as it is, translated again once written (the counts: such pages'
-  share of the time, and how often they are written).
+  share of the time, and how often they are written), bringing 4096
+  functions in turn within 1.3× of native.
 - [ ] **A library's code run natively when generated code calls it:** its
   return into generated code taken as a fetch (the counts: calls from
   translated code into a library against the work done there).
@@ -455,3 +448,16 @@ so programs that probe for them fall back.
   x86 code would need an x86 emulator (FEX or box64).
 - **kselftests and gVisor's system-call suite as gates:** LTP is the
   conformance gate.
+- **Lookups without a load** (a slot for each address of the program's
+  code holding a branch to its translation): a prototype took 4096
+  functions in turn 19.5–20.3 ns against the table's 19.7 (locally), and
+  its slots more memory than the table.
+- **Inline caches** (a `br` or `blr` comparing its target with the last
+  one's first): 40% of javac's 24.7 million lookups go where the last
+  went, 65% of `java`'s; where they do the processor predicts the branch
+  already, and a prototype's call through a register took 1.01 ns
+  against the table lookup's 1.02 (native 0.76).
+- **Traces** (blocks only one direct branch leads to made into the block
+  before them): such blocks run 1.03 million times of javac's 166
+  million block runs (0.6%), 0.82 million of `java`'s 756 million: a
+  branch each, under 2 ms.

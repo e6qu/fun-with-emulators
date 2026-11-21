@@ -5,13 +5,17 @@
 //! Always, under `FWE_TIMING`: the blocks made by where their code comes
 //! from (a file fwe prepared in place, or code the program generated) and
 //! the time making them; the blocks made with a second pass of their words
-//! for an entry with the program's own `x16` and `x17`, and those whose
-//! entry was ever used; the blocks made ahead of the program.
+//! for an entry with the program's own `x16` and `x17` (made again with it
+//! on that entry's first use), and those whose entry was ever used; the
+//! blocks made ahead of the program.
 //!
 //! With `FWE_JIT_SEEN` naming a directory: each process adds there the
-//! blocks it made (their program address and a hash of their words) as it
+//! blocks it made (their program address and a hash of the words their
+//! translation read) as it
 //! ends or replaces its program, and counts the blocks it made that an
-//! earlier one had: at the same address, or the same words elsewhere.
+//! earlier one had: at the same address (and of those, the ones two or
+//! more earlier processes made there, which it should have taken from
+//! those kept), or the same words elsewhere.
 //!
 //! With `FWE_JIT_COUNT` set: each block's entries count their runs (its
 //! words then differ: a few more at each entry, and every block with an
@@ -66,11 +70,13 @@ const STEPS: [&str; 10] = [
     "linked",
 ];
 
-/// Blocks made with a second pass of their words, those words, and the
-/// blocks whose entry there was used.
+/// Blocks made with a second pass of their words, those words, the
+/// blocks whose entry there was used, and the blocks made again with it
+/// (made first without, the pass made on its entry's first use).
 pub(crate) static SECOND: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECOND_WORDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECOND_USED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SECOND_REMADE: AtomicU64 = AtomicU64::new(0);
 /// Blocks made ahead of the program.
 pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
 /// Blocks taken from those kept ([`crate::jit`]'s `kept`), by origin, and
@@ -111,7 +117,8 @@ const ENDS: [&str; 6] = [
 /// The blocks earlier processes made ([`FWE_JIT_SEEN`]), and this one's.
 struct Seen {
     dir: std::path::PathBuf,
-    at: HashSet<(u64, u64)>,
+    /// By program address and hash, how many earlier processes made it.
+    at: HashMap<(u64, u64), u32>,
     words: HashSet<u64>,
     made: Vec<(u64, u64)>,
     writes: u32,
@@ -123,6 +130,8 @@ static SEEN_READ: OnceLock<bool> = OnceLock::new();
 /// same address, and those it made of the same words elsewhere.
 static REPEATED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 static MOVED: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+/// Of [`REPEATED`], those two or more earlier processes made.
+static TWICE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
 /// A hash of a block's words (FNV-1a).
 fn hash(words: &[u32]) -> u64 {
@@ -141,16 +150,25 @@ fn read_seen() -> bool {
     *SEEN_READ.get_or_init(|| {
         let Some(dir) = std::env::var_os("FWE_JIT_SEEN") else { return false };
         let dir = std::path::PathBuf::from(dir);
-        let (mut at, mut words) = (HashSet::new(), HashSet::new());
+        // Each process's blocks ("seen-<pid>-<k>", one file each time it
+        // added them), then how many processes made each.
+        let mut by_pid: HashMap<String, HashSet<(u64, u64)>> = HashMap::new();
+        let mut words = HashSet::new();
         for entry in std::fs::read_dir(&dir).into_iter().flatten().flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let pid = name.split('-').nth(1).unwrap_or_default().to_string();
             let Ok(text) = std::fs::read_to_string(entry.path()) else { continue };
             for line in text.lines() {
                 let mut parts = line.split(' ').map(|p| u64::from_str_radix(p, 16));
                 if let (Some(Ok(g)), Some(Ok(h))) = (parts.next(), parts.next()) {
-                    at.insert((g, h));
+                    by_pid.entry(pid.clone()).or_default().insert((g, h));
                     words.insert(h);
                 }
             }
+        }
+        let mut at: HashMap<(u64, u64), u32> = HashMap::new();
+        for block in by_pid.into_values().flatten() {
+            *at.entry(block).or_default() += 1;
         }
         *SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some(Seen { dir, at, words, made: Vec::new(), writes: 0 });
@@ -167,8 +185,11 @@ pub(crate) fn seen(g: u64, words: &[u32], origin: usize) {
     let h = hash(words);
     let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     let Some(s) = seen.as_mut() else { return };
-    if s.at.contains(&(g, h)) {
+    if let Some(&made) = s.at.get(&(g, h)) {
         REPEATED[origin].fetch_add(1, Ordering::Relaxed);
+        if made >= 2 {
+            TWICE[origin].fetch_add(1, Ordering::Relaxed);
+        }
     } else if s.words.contains(&h) {
         MOVED[origin].fetch_add(1, Ordering::Relaxed);
     }
@@ -330,15 +351,17 @@ pub(crate) enum Lead {
 
 /// Of the blocks in use, those an unconditional branch leads to (all of
 /// them), and of those the ones nothing else leads to directly, by
-/// [`Lead`] of their one branch: how many, and their program's words.
-fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64); 3]) {
+/// [`Lead`] of their one branch: how many, their program's words, and
+/// their runs (where blocks count them): each a branch from one block
+/// into the next that a trace, the two made as one, would not take.
+fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64, u64); 3]) {
     let mut by: HashMap<u64, [u32; 4]> = HashMap::new();
     for b in blocks.iter().filter(|b| b.live) {
         for &(to, lead) in &b.leads {
             by.entry(to).or_default()[lead as usize] += 1;
         }
     }
-    let (mut all, mut only) = (0, [(0u64, 0u64); 3]);
+    let (mut all, mut only) = (0, [(0u64, 0u64, 0u64); 3]);
     for b in blocks.iter().filter(|b| b.live) {
         let Some(&leads) = by.get(&b.g) else { continue };
         let branches: u32 = leads[..3].iter().sum();
@@ -350,6 +373,7 @@ fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64); 3]) {
             let k = leads.iter().position(|&n| n == 1).expect("one branch");
             only[k].0 += 1;
             only[k].1 += b.words as u64;
+            only[k].2 += b.counters.map_or(0, |c| count(c) + count(c + 8));
         }
     }
     (all, only)
@@ -374,7 +398,7 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
     let n = |n: &AtomicU64| n.load(Ordering::Relaxed);
     let mut out = format!(
         "blocks made {} {} ({} ms), {} {} ({} ms); {} with a second pass ({} words), {} of them \
-         entered there; {} made ahead",
+         entered there, {} made again for it; {} made ahead",
         ORIGINS[FILE],
         n(&MADE[FILE]),
         ms(&MAKE_NS[FILE]),
@@ -384,6 +408,7 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&SECOND),
         n(&SECOND_WORDS),
         n(&SECOND_USED),
+        n(&SECOND_REMADE),
         n(&AHEAD),
     );
     out.push_str("; making a block, ns each step:");
@@ -424,14 +449,20 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
          ({} words)",
         ahead.0, ahead.1, near.0, near.1, away.0, away.1
     ));
+    if counting() {
+        out.push_str(&format!(" (run {}, {} and {} times)", ahead.2, near.2, away.2));
+    }
     if *SEEN_READ.get().unwrap_or(&false) {
         out.push_str(&format!(
-            "; made before by another process: {} {} at the same address, {} elsewhere; {} {}, {}",
+            "; made before by another process: {} {} at the same address ({} by two or more), {} \
+             elsewhere; {} {} ({}), {}",
             ORIGINS[FILE],
             n(&REPEATED[FILE]),
+            n(&TWICE[FILE]),
             n(&MOVED[FILE]),
             ORIGINS[GENERATED],
             n(&REPEATED[GENERATED]),
+            n(&TWICE[GENERATED]),
             n(&MOVED[GENERATED]),
         ));
     }

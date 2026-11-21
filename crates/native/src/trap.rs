@@ -686,28 +686,6 @@ extern "C" fn on_sigtrap(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut
     let in_guest = IN_GUEST.with(Cell::get);
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let pc = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).ss.pc };
-    // A translated block's way out, told by what the hardware says
-    // trapped: another thread may have linked the word since (made it a
-    // branch). On at where it leads; in fwe's code from here, signals
-    // held, so a signal delivered meanwhile cannot take the translator's
-    // lock this thread holds.
-    if in_guest {
-        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
-        let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
-        let esr = mc.es.esr;
-        if (esr >> 26) & 0x3f == ESR_EC_BRK && esr & 0xffff == crate::jit::EXIT_IMM {
-            let _host = HostCode::enter_blocked();
-            let mut regs = regs_from(mc);
-            fwe_kernel::timing::trapped(fwe_kernel::timing::Trap::WayOut);
-            if crate::jit::exit(&mut regs, true) {
-                settle(&mut regs);
-                regs_to(mc, &regs);
-                // SAFETY: `ctx` is this handler's ucontext.
-                unsafe { return_with_guest_mask(ctx) };
-                return;
-            }
-        }
-    }
     // macOS's siginfo does not tell a trap from a sent SIGTRAP (both have
     // code 0), so look at the instruction: anything but a `brk` means the
     // signal was sent by another process, a signal for the guest.
@@ -1229,9 +1207,6 @@ fn stale_fault(addr: u64) -> bool {
 
 /// The `ESR_EL1` exception class of an instruction fetch fault at EL0.
 const ESR_EC_INSTRUCTION_ABORT_LOWER: u32 = 0x20;
-/// The exception class of a `brk` instruction (its immediate in the low 16
-/// bits of the syndrome).
-const ESR_EC_BRK: u32 = 0x3c;
 
 /// The pid of a process forking, from before its host `fork` until its
 /// child is set up (in the child) or the fork has returned (in the
@@ -1419,7 +1394,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             r => mc.ss.x[r],
         } == addr)
         .fold(0, |m, r| m | 1 << r);
-    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held) {
+    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held, (mc.ss.x[16], mc.ss.x[17])) {
         mc.ss.pc = t;
         return;
     }

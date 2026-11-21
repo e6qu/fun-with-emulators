@@ -345,13 +345,18 @@ pub(super) fn remapped(addr: u64, len: u64) {
 
 /// A record of part `part` for the block at `g` made from `source` (the
 /// program's words from `g`, as far as a block's translation may read
-/// them) with the calls in `known` made in other blocks' words: the block
-/// as made, its words' meanings packed, and where its words end.
+/// them) with the calls in `known` made in other blocks' words, and an
+/// entry with the program's own `x16` and `x17` if `unsaved`; one with
+/// that entry before one without it either way (a block a past process
+/// made again for that entry has a record of each, and the entry is
+/// likely wanted again): the block as made, its words' meanings packed,
+/// and where its words end.
 pub(super) fn take(
     part: Part,
     g: u64,
     source: &[u32],
     known: impl Fn(u64) -> Vec<u64>,
+    unsaved: bool,
 ) -> Option<(Made, Vec<Packed>)> {
     let mut k = kept();
     let k = begun(&mut k);
@@ -362,6 +367,7 @@ pub(super) fn take(
     // The keys of the program's words there, as many as each record was
     // made from.
     let mut keys = HashMap::new();
+    let mut without = None;
     for (seg, at) in loaded.segs.iter().rev().flat_map(|seg| seg.entries(g).map(move |e| (seg, e)))
     {
         let n = (at.key >> 48) as usize;
@@ -385,9 +391,16 @@ pub(super) fn take(
             jitcount::KEPT_OTHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
-        return decode(&mut r, end);
+        match decode(&mut r, end) {
+            Some((made, info)) if made.unsaved.is_none() => {
+                if !unsaved && without.is_none() {
+                    without = Some((made, info));
+                }
+            }
+            taken => return taken,
+        }
     }
-    None
+    without
 }
 
 /// Keep the block at `g` of part `part`, made from `source` (the words its
@@ -426,7 +439,12 @@ pub(super) fn keep(
     for &p in known {
         put64(w, p);
     }
-    for v in [made.entry, made.unsaved, made.x18, made.second.unwrap_or(usize::MAX)] {
+    for v in [
+        made.entry,
+        made.unsaved.unwrap_or(usize::MAX),
+        made.x18,
+        made.second.unwrap_or(usize::MAX),
+    ] {
         put32(w, v as u32);
     }
     // The gate its system calls' and flushes' stubs call, an address of
@@ -537,7 +555,7 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     let made = Made {
         room,
         entry: entry as usize,
-        unsaved: unsaved as usize,
+        unsaved: (unsaved != u32::MAX).then_some(unsaved as usize),
         x18: x18 as usize,
         end,
         second,
@@ -597,7 +615,7 @@ impl<'a> Reader<'a> {
 /// A file of records begins so, then its count of records and a table of
 /// them in address order, for each its program address, offset, length
 /// and key ([`key_of`]); their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept8";
+const MAGIC: &[u8; 8] = b"fwekept9";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],

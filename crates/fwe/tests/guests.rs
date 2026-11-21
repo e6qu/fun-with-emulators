@@ -1184,9 +1184,10 @@ fn jit_branches_within_a_block_stay_in_it() {
 }
 
 /// The translator's counts (guests/c/jitloop.c): its one block made from
-/// generated code, made again by a second process that sees the first's
-/// blocks (`FWE_JIT_SEEN`), and, with every block counting its runs
-/// (`FWE_JIT_COUNT`), counted as run, the program's output as ever.
+/// generated code, made again by a second and a third process that see
+/// the earlier ones' blocks (`FWE_JIT_SEEN`; the third's made by two of
+/// them, if at its address each time), and, with every block counting its
+/// runs (`FWE_JIT_COUNT`), counted as run, the program's output as ever.
 #[test]
 fn jit_counts_say_what_ran_and_what_was_made_before() {
     let prog = build_c("jitloop", Libc::Musl, true, true);
@@ -1194,7 +1195,8 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
     let seen = std::env::temp_dir().join(format!("fwe-jitseen-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&seen);
     std::fs::create_dir_all(&seen).unwrap();
-    for round in 0..2 {
+    let mut at: Vec<u64> = Vec::new();
+    for round in 0..3u64 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root).arg(&prog);
         cmd.env("FWE_TIMING", "1").env("FWE_JIT_SEEN", &seen).env("FWE_JIT_COUNT", "1");
@@ -1205,6 +1207,8 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
         assert!(err.contains("blocks made from files 0 (0 ms), generated 1 ("), "{err}");
         // An earlier process's block: at the same address, or elsewhere
         // (where the program's mapping landed).
+        // "generated R (T), M": at the same address (by two or more), and
+        // elsewhere.
         let before = err.split("made before by another process: ").nth(1).unwrap_or_default();
         let seen: Vec<u64> = before
             .split(';')
@@ -1212,11 +1216,23 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
             .unwrap_or_default()
             .trim()
             .trim_start_matches("generated ")
-            .split(", ")
-            .map(|n| n.trim().parse().unwrap_or(9))
+            .split([' ', ',', '(', ')'])
+            .filter(|n| !n.is_empty())
+            .take(3)
+            .map(|n| n.parse().unwrap_or(9))
             .collect();
-        assert!(before.starts_with("from files 0 at the same address, 0 elsewhere"), "{err}");
-        assert_eq!(seen.iter().sum::<u64>(), round, "{err}");
+        let [same, twice, elsewhere] = seen[..] else { panic!("{err}") };
+        assert!(
+            before.starts_with("from files 0 at the same address (0 by two or more), 0 elsewhere"),
+            "{err}"
+        );
+        assert_eq!(same + elsewhere, round.min(1), "{err}");
+        // (Made at one address by the first two and the third: by two.)
+        let both = round == 2 && same == 1 && at == [1];
+        assert_eq!(twice, u64::from(both), "{err}");
+        if round == 1 {
+            at.push(same);
+        }
         assert!(err.contains("blocks run from files 0 of 0, generated 1 of 1"), "{err}");
     }
     let _ = std::fs::remove_dir_all(&seen);
@@ -1333,6 +1349,49 @@ fn jit_calls_into_jit_code_keep_x30_through_signals_and_rewrites() {
         .first()
         .unwrap_or_else(|| panic!("no count of ways out: {err}"));
     assert!(exits < 100, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// JIT code keeping values in `x16` and `x17` across direct branches into
+/// blocks whose first words name neither (guests/c/jitunsaved.c): it
+/// computes what the same steps compute in C; each such block has an
+/// entry for the program's own `x16` and `x17`, entered there (one made
+/// first without, as a block made ahead, is made again with it as that
+/// branch first comes to it), and the branches are linked there (the
+/// loop's rounds do not go through fwe). Run three times (a copy of its
+/// own, whose generated code no other test's runs keep): the third makes
+/// no block, taking each as the second kept it, with that entry too (none
+/// then made again for it).
+#[test]
+fn jit_branches_holding_x16_x17_enter_blocks_made_again_for_them() {
+    let built = build_c("jitunsaved", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitunsaved");
+    let prog = root.join(format!("jitunsaved-{}", std::process::id()));
+    std::fs::copy(&built, &prog).unwrap();
+    for round in 0..3 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "computed as in C: yes\n", "{err}");
+        assert_eq!(out.status.code(), Some(0));
+        let remade = *jit_counts(&err, " entered there, ")
+            .first()
+            .unwrap_or_else(|| panic!("no count of blocks made again: {err}"));
+        if round == 0 {
+            assert!(remade >= 1, "blocks made again for the program's x16 and x17: {err}");
+            assert!(err.contains("; 2 with a second pass ("), "{err}");
+            assert!(err.contains(" words), 2 of them entered there, "), "{err}");
+            let exits = *jit_counts(&err, " blocks translated, ")
+                .first()
+                .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+            assert!(exits < 20, "{exits} ways out through fwe: {err}");
+        }
+        if round == 2 {
+            assert!(err.contains("blocks made from files 0 (0 ms), generated 0 ("), "{err}");
+            assert_eq!(remade, 0, "{err}");
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

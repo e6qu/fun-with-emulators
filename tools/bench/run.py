@@ -621,10 +621,12 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     `script` (tools/bench/workloads) under fwe, and Homebrew's build of the
     same release natively (BREW, by the program's name). Then where its
     time goes under fwe, by program counter, translated code named by the
-    code cache's map; and the translator's counts, the script run twice
-    into one directory of the blocks made (`FWE_JIT_SEEN`): how many the
-    second run made that the first had, of a file's code and generated;
-    then once with its blocks counting their runs (`FWE_JIT_COUNT`)."""
+    code cache's map; and the translator's counts, the script run three
+    times into one directory of the blocks made (`FWE_JIT_SEEN`): how many
+    each run made that an earlier one had, of a file's code and generated,
+    the third making none that two earlier made at the same address from
+    the same words (it takes them, kept); then once with its blocks
+    counting their runs (`FWE_JIT_COUNT`)."""
     root = alpine_root(manifest, a.cache)
     shutil.copytree(WORKLOADS, os.path.join(root, "tmp/wl"), dirs_exist_ok=True)
     ours = guest_env + fwe + ["--root", root, os.path.join(root, program.lstrip("/")),
@@ -638,6 +640,7 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     pcs(f"{name} natively", theirs, execname=os.path.basename(program))
     seen = tempfile.mkdtemp()
     for label, extra in [("", [f"FWE_JIT_SEEN={seen}"]), (" again", [f"FWE_JIT_SEEN={seen}"]),
+                         (" a third time", [f"FWE_JIT_SEEN={seen}"]),
                          (" with its blocks counting", ["FWE_JIT_COUNT=1"])]:
         r = run_limited(guest_env + ["FWE_TIMING=1"] + extra + ours[len(guest_env):],
                         f"{name}{label}")
@@ -645,6 +648,17 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
                 if "timing: exit" in line and ("JIT code: " in line or "system calls" in line)]
         print(f"{name}{label}, fwe's marks (exit {r.returncode}): " + " | ".join(said),
               file=sys.stderr)
+        if label == " a third time":
+            # Blocks of generated code two earlier runs made at the same
+            # address from the same words, made again: none (taken, kept).
+            twice = [int(m.group(1)) for m in
+                     (re.search(r"made before by another process: .*?; generated \d+ \((\d+)\)",
+                                s) for s in said) if m]
+            if not twice:
+                sys.exit(f"{name}: no count of blocks made before in {said!r}")
+            if sum(twice) != 0:
+                sys.exit(f"{name}: {sum(twice)} blocks of generated code two earlier runs "
+                         f"made, made again rather than taken: {said!r}")
     shutil.rmtree(seen, ignore_errors=True)
 
 

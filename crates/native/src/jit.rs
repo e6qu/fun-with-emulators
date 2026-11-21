@@ -98,9 +98,6 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// `brk #0x4a54` ("JT"): the wrong block entered, into fwe by its trap.
-pub const EXIT_IMM: u32 = 0x4a54;
-pub const EXIT: u32 = 0xd420_0000 | (EXIT_IMM << 5);
 /// `udf #0`: an instruction no translation can stand for (an
 /// authenticated branch fwe does not offer); it faults as `SIGILL` at the
 /// program's instruction.
@@ -244,7 +241,7 @@ fn reserve_table() {
     if TABLE_HELD.swap(true, Ordering::SeqCst) {
         return;
     }
-    for at in [TABLE, RETS] {
+    for at in [TABLE, RETS, NEAR] {
         let mut table = at;
         // SAFETY: fresh memory in this task, at the table's fixed place.
         unsafe {
@@ -278,6 +275,17 @@ pub const TABLE: u64 = 1 << 45;
 /// it (a return to one of many callers, as a tree walk's, missed most
 /// times).
 pub const RETS: u64 = TABLE | 1 << 44;
+/// The near table, a lookup's first look: laid out as [`TABLE`], but an
+/// address's entry picked by its bits 6 to 19, its bits 0 to 5 the
+/// index's top ([`near_entry`]), holding a translation only, the one
+/// of an address there published last. Targets a lookup goes to that are
+/// far apart in the program, as functions are, have their entries close
+/// together: the entries of thousands of them stay in the data cache,
+/// where the table's (one for each instruction of the program's) would
+/// not, and the branch through a register waits for that read. Targets
+/// close together (a switch's cases) have entries far apart. A target the
+/// near table does not hold is looked for in the table.
+pub const NEAR: u64 = 1 << 46;
 const TABLE_BITS: u32 = 20;
 const TABLE_SIZE: u64 = 16 << TABLE_BITS;
 
@@ -334,6 +342,22 @@ fn parked() -> (u64, u64) {
     }
 }
 
+/// Put the program's `x16` and `x17` in their slots, on this thread, as a
+/// translation's save does: fwe going on at a block's saved entry from a
+/// trap or a fetch ([`exit`], [`enter`]).
+fn park((x16, x17): (u64, u64)) {
+    let (s16, s17) = crate::parked_slots();
+    let area: u64;
+    // SAFETY: as [`parked`].
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) area, options(nomem, nostack)) };
+    let area = area & !7;
+    // SAFETY: this thread's own TSD slots.
+    unsafe {
+        ((area + u64::from(s16)) as *mut u64).write(x16);
+        ((area + u64::from(s17)) as *mut u64).write(x17);
+    }
+}
+
 /// [`save_words`] into `a`'s section `s`, its first word as `first` (the
 /// program's state as at `g`, or a way out), the rest [`Word::Stashed`].
 fn push_save(a: &mut Asm<Word>, s: Sec, first: Word, g: u64) -> Pos {
@@ -355,6 +379,8 @@ const SCALE: u32 = 0xd37c_ee31;
 const BASE: u32 = 0xb253_0231;
 /// `orr x17, x17, #RETS`
 const RETS_BASE: u32 = 0xb254_0631;
+/// `orr x17, x17, #NEAR`: the near table's base ([`near_look`]).
+const NEAR_BASE: u32 = 0xb252_0231;
 /// `ret x17`
 const RET_X17: u32 = 0xd65f_0220;
 /// `bl` (its offset added)
@@ -367,34 +393,26 @@ const H: Sec = Sec::Hot;
 const C: Sec = Sec::Cold;
 /// `eor x17, x17, #16`: an entry's address to the other's of its pair.
 const OTHER: u32 = 0xd27c_0231;
-/// `ldar x17, [x17]`: the entry's key, before its value.
-const KEY: u32 = 0xc8df_fe31;
 /// `ldp x16, x17, [x17]`: the entry's key and value at once.
 const ENTRY: u32 = 0xa940_4630;
 /// `cbnz x16, #off`
 const MISS_X16: u32 = 0xb500_0010;
-/// `sub x17, x17, #CHECK_WORDS * 4`: from a translation's saved entry
-/// back to its check.
-const TO_CHECK: u32 = 0xd100_0231 | ((4 * CHECK_WORDS as u32) << 10);
-/// Words of a translation's check that the target in `x16` is its own
-/// (its address in `x17`, padded to 3 words, `eor`, `cbnz`, then `x16`
-/// set to `x30`) and its call entry ([`CALLED`]), before its saved entry.
-const CHECK_WORDS: usize = 7;
+/// Where a translation's saved entry is, in words: past its call entry
+/// ([`CALLED`]), its first word.
+const ENTRY_AT: usize = 1;
 /// `mov x30, x16`: a translation's call entry, the word before its saved
 /// entry, where a direct call's `bl` comes with the program's return
-/// address in `x16` ([`Side::Call`]); the check before it leaves `x16`
-/// as `x30`, so a lookup goes on through it unchanged.
+/// address in `x16` ([`Side::Call`]).
 const CALLED: u32 = 0xaa10_03fe;
-/// `mov x16, x30`: the check's last word, before [`CALLED`].
-const X16_AS_X30: u32 = 0xaa1e_03f0;
-/// `nop`
-const NOP: u32 = 0xd503_201f;
-/// `eor x17, x17, x16`
+/// `eor x17, x17, x16`: the target read again against the entry's key.
 const CHECK: u32 = 0xca10_0231;
 /// `cbnz x17, #off`
 const MISS: u32 = 0xb500_0011;
-/// `ldr x17, [x17, #8]`: the entry's translation.
-const VALUE: u32 = 0xf940_0631;
+/// `stur x17, [sp, #-16]` and `ldur x17, [sp, #-16]`: an entry's
+/// translation set below `sp` while `x17` reads the target again
+/// ([`slot_look`]), and taken back.
+const STASH: u32 = 0xf81f_03f1;
+const UNSTASH: u32 = 0xf85f_03f1;
 /// `br x17`
 const GO: u32 = 0xd61f_0220;
 /// `isb`.
@@ -407,9 +425,59 @@ const fn index_of(n: u32) -> u32 {
     0xd342_5411 | (n << 5)
 }
 
+/// The near table's entry ([`near_entry`]) of the address in `x<n>`,
+/// into `x17`: the table's address into `x16` (`movz x16, #0x4000, lsl
+/// #32`, apart from the target, so the processor makes it early); `ubfx
+/// x17, x<n>, #6, #16`; `bfi x17, x<n>, #14, #6` (its bits 0 to 5 at the
+/// index's 14 to 19); `add x17, x16, x17, lsl #4`. Through `x16`, which
+/// holds the target ([`slot_look`]), [`near_look_x16`].
+const fn near_look(n: u32) -> [u32; 4] {
+    [0xd2c8_0010, 0xd346_5411 | (n << 5), 0xb372_1411 | (n << 5), 0x8b11_1211]
+}
+
+/// [`near_look`] of the address in `x16`: `ubfx x17, x16, #6, #16`; `bfi
+/// x17, x16, #14, #6`; `ubfiz x17, x17, #4, #20`; `orr x17, x17, #NEAR`.
+const fn near_look_x16() -> [u32; 4] {
+    [0xd346_5611, 0xb372_1611, 0xd37c_4e31, NEAR_BASE]
+}
+
 /// `eor x16, x16, x<n>`: an entry's key against the target in `x<n>`.
 const fn key_against(n: u32) -> u32 {
     0xca00_0210 | (n << 16)
+}
+
+/// A look in the table (in the entry its bits pick, or the `other` of its
+/// pair), or in the near table if `near` ([`NEAR`]; `other` then unused),
+/// for a target in the program's `x<n>` (16, 17 or 18), which its
+/// slot holds while the lookup has the registers: the target loaded into
+/// `x16`, the entry read whole (`x16` its address, `x17` its translation),
+/// the translation set below `sp` (as a save sets the registers there)
+/// while `x17` reads the target again, against the address. Then `x17` is
+/// 0 where the entry is the target's, and a [`MISS`] follows; found, the
+/// lookup takes the translation back ([`UNSTASH`]), `x16` the target.
+fn slot_look(n: u32, other: bool, near: bool) -> impl Iterator<Item = u32> {
+    let (s16, s17) = crate::parked_slots();
+    let slot = match n {
+        16 => s16,
+        17 => s17,
+        18 => crate::x18_slot(),
+        _ => panic!("a lookup through x{n} reads its register"),
+    };
+    let target = |r: u32| {
+        [
+            rewrite::MRS_TPIDRRO | r,
+            rewrite::AND_NOT7 | (r << 5) | r,
+            rewrite::LDR_UIMM | ((slot / 8) << 10) | (r << 5) | r,
+        ]
+    };
+    let (index, k) = if near { (near_look_x16(), 4) } else { ([INDEX, SCALE, BASE, 0], 3) };
+    target(16)
+        .into_iter()
+        .chain(index.into_iter().take(k))
+        .chain((other && !near).then_some(OTHER))
+        .chain([ENTRY, STASH])
+        .chain(target(17))
+        .chain([CHECK])
 }
 
 /// Where a block's way out leads.
@@ -420,10 +488,6 @@ enum Exit {
     /// To the address in register `n` (`x18`: the program's), `x30`
     /// becoming `link` first for a call.
     Reg { n: u32, link: Option<u64> },
-    /// A lookup that came to the wrong block (its entry was taken over as
-    /// it read it): on to the address in `x16`, the program's `x16` and
-    /// `x17` on the stack.
-    Retry,
     /// Into the call at this program address, made in another block's
     /// words ([`State::calls_made`]): linked there as the block is placed;
     /// through fwe once those words are dropped, then linked to the
@@ -481,8 +545,7 @@ enum Word {
     /// program's `x30` in `x16`.
     Called(u64),
     /// A way out, as at the branch at `g`; `saved`, with the program's
-    /// `x16` and `x17` in their slots (and for [`Exit::Retry`], as at the
-    /// target in `x16`), and `x18`, with its `x18` (back in its slot) in
+    /// `x16` and `x17` in their slots, and `x18`, with its `x18` (back in its slot) in
     /// `x17` too, the thread's area in `x16`; the taken way of the
     /// conditional branch `cond` words before it (0: none).
     Out { g: u64, exit: Exit, saved: bool, x18: bool, cond: u16 },
@@ -513,8 +576,8 @@ enum Packed {
         call: bool,
         to: Option<u8>,
     },
-    /// `exit`: 0 [`Exit::Jump`] to `to`, 1 [`Exit::Retry`], 2 [`Exit::Join`]
-    /// (into the call at `g`), 3 + 2n (+ 1 for a call) [`Exit::Reg`].
+    /// `exit`: 0 [`Exit::Jump`] to `to`, 1 [`Exit::Join`] (into the call at
+    /// `g`), 2 + 2n (+ 1 for a call) [`Exit::Reg`].
     Out {
         to: u64,
         g: u16,
@@ -555,12 +618,11 @@ impl Packed {
             Word::Out { g, exit, saved, x18, cond } => {
                 let (exit, to) = match exit {
                     Exit::Jump(to) => (0, to),
-                    Exit::Retry => (1, 0),
                     Exit::Join(at) => {
                         assert_eq!(at, g, "a join at {g:#x} into {at:#x}");
-                        (2, 0)
+                        (1, 0)
                     }
-                    Exit::Reg { n, link } => (3 + 2 * n as u8 + u8::from(next(g, link)), 0),
+                    Exit::Reg { n, link } => (2 + 2 * n as u8 + u8::from(next(g, link)), 0),
                 };
                 Packed::Out { to, g: off(g), cond, exit, saved, x18 }
             }
@@ -677,11 +739,10 @@ impl Packed {
                 let g = at(g);
                 let exit = match exit {
                     0 => Exit::Jump(to),
-                    1 => Exit::Retry,
-                    2 => Exit::Join(g),
+                    1 => Exit::Join(g),
                     e => Exit::Reg {
-                        n: u32::from((e - 3) / 2),
-                        link: ((e - 3) % 2 == 1).then_some(g + 4),
+                        n: u32::from((e - 2) / 2),
+                        link: ((e - 2) % 2 == 1).then_some(g + 4),
                     },
                 };
                 Word::Out { g, exit, saved, x18, cond }
@@ -694,9 +755,8 @@ impl Packed {
 struct Block {
     /// The program address it translates.
     g: u64,
-    /// Its translation's address in the executable view: its first words
-    /// check that a lookup read apart from the table reached the block it
-    /// looked for ([`CHECK_WORDS`], [`TO_CHECK`]); the entries follow.
+    /// Its translation's address in the executable view: its call entry
+    /// ([`CALLED`]), then its saved entry ([`ENTRY_AT`]).
     t: u64,
     /// What each word of the translation stands for: its hot words', then
     /// its cold ones' ([`crate::asm`]).
@@ -713,10 +773,12 @@ struct Block {
     /// Where a lookup or a direct branch enters it with the program's
     /// `x16` and `x17` saved: past its check (its saved entry).
     body: u64,
-    /// Where it is entered with the program's own registers: past its
-    /// first word where that takes them back, else its start, which saves
-    /// them.
-    unsaved: u64,
+    /// Where it is entered with the program's own registers, if it has
+    /// such an entry: past its first word where that takes them back, else
+    /// a second pass of its words made with them in their registers (or,
+    /// where those name `x18`, a save of them and a branch to the saved
+    /// entry), made only once a direct branch needs it ([`translation`]).
+    unsaved: Option<u64>,
     /// Where it is entered with them saved and its `x18` in `x17` (the
     /// thread's area in `x16`), past the words that load them, if it starts
     /// with them; else 0.
@@ -757,7 +819,7 @@ impl Block {
         if self.notes.second && !self.notes.used.replace(true) {
             jitcount::SECOND_USED.fetch_add(1, Ordering::Relaxed);
         }
-        self.unsaved
+        self.unsaved.unwrap_or_else(|| panic!("block {:#x} entered unsaved, no such entry", self.g))
     }
 
     /// What its word `k` stands for.
@@ -1416,7 +1478,7 @@ fn holding(table: u64, g: u64) -> Option<u64> {
 /// The value of an entry for the translation at `t`: its saved entry; 0
 /// (`t` 0) for code not translated.
 fn looked_up(t: u64) -> u64 {
-    if t == 0 { 0 } else { t + 4 * CHECK_WORDS as u64 }
+    if t == 0 { 0 } else { t + 4 * ENTRY_AT as u64 }
 }
 
 /// Make `g`'s entry say translation `t` (0: code not translated): the
@@ -1427,11 +1489,26 @@ fn looked_up(t: u64) -> u64 {
 /// in one of them as they move.
 fn publish(g: u64, t: u64) {
     publish_in(TABLE, g, looked_up(t));
+    // A translation's, in the near table too, in place of whatever address
+    // there it held.
+    if t != 0 {
+        write_entry(near_entry(g), g, looked_up(t));
+    }
 }
 
-/// Clear `g`'s entry if it says translation `t`.
+/// Clear `g`'s entry if it says translation `t`, and its near one.
 fn unpublish(g: u64, t: u64) {
     unpublish_in(TABLE, g, looked_up(t));
+    let e = near_entry(g);
+    if t != 0 && read_entry(e) == (g, looked_up(t)) {
+        write_entry(e, 0, 0);
+    }
+}
+
+/// `g`'s entry in the near table ([`NEAR`]): its bits 6 to 19 the index's
+/// 0 to 13, its bits 0 to 5 the index's 14 to 19 ([`near_look`]).
+fn near_entry(g: u64) -> u64 {
+    NEAR | ((((g >> 6) & 0x3fff) | ((g & 0x3f) << 14)) << 4)
 }
 
 /// [`publish`] in `table`: `g`'s entry says `value`.
@@ -1893,9 +1970,10 @@ fn remove(set: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 
 /// A fetch from the program's memory at `pc` (the thread's `x30` being
 /// `lr`, which tells a return; `held` a bit for each of `x0`..`x30` that
-/// holds `pc`): the translation to run instead, if `pc` holds code that
-/// runs by translation.
-pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
+/// holds `pc`; `x16_x17` the program's): the translation to run instead,
+/// if `pc` holds code that runs by translation, entered at its saved
+/// entry with the program's `x16` and `x17` put in their slots.
+pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
     let mut s = state_at(HOLD_ENTER);
     if !s.in_region(pc) {
         return None;
@@ -1912,8 +1990,11 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
         let mut spots = ENTRY_SPOTS.lock().unwrap_or_else(|e| e.into_inner());
         spots.entry((pc, lr)).or_insert((0, held)).0 += 1;
     }
-    let i = translation(&mut s, pc);
-    let into = s.blocks[i].unsaved_entry();
+    let i = translation(&mut s, pc, false);
+    // Entered at its saved entry, the program's `x16` and `x17` put in
+    // their slots.
+    let into = s.blocks[i].body;
+    park(x16_x17);
     if lr == pc {
         ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
         return Some(into);
@@ -1934,7 +2015,7 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
         if let CallSite::Direct(to) = site {
             // Its target translated, for the lookup to find (again, if
             // its translation went since).
-            translation(&mut s, to);
+            translation(&mut s, to, false);
         }
         linked = s.call_sites.get(&at) == Some(&true)
             || !s.call_sites.contains_key(&at) && link_call_site(&mut s, at, site);
@@ -2013,16 +2094,26 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
     // into fwe, as a translation's does ([`exit`]): its address in `x16`,
     // the exit gate's in `x17` (a target to translate is not branched to
     // only to fault).
-    let (first, other, go) = if matches!(n, 16 | 17) {
+    let (first, other, go) = if let CallSite::Direct(to) = call {
+        // A `bl`'s target, known: the entry's address and the target made
+        // in the words, the translation set below `sp` while `x17` holds
+        // the target, as [`slot_look`] does; found, `x16` the target.
         let at = |other: bool| {
-            let mut w = vec![INDEX, SCALE, BASE];
-            w.extend(other.then_some(OTHER));
-            w.extend([KEY, CHECK, MISS, INDEX, SCALE, BASE]);
-            w.extend(other.then_some(OTHER));
-            w.extend([VALUE, OUTSIDE]);
+            let e = entry(to) ^ if other { 16 } else { 0 };
+            let mut w: Vec<u32> = materialized(17, e).collect();
+            w.extend([ENTRY, STASH]);
+            w.extend(materialized(17, to));
+            w.extend([CHECK, MISS, UNSTASH, OUTSIDE]);
             w
         };
-        (at(false), at(true), vec![TO_CHECK, GO])
+        (at(false), at(true), vec![GO])
+    } else if matches!(n, 16 | 17) {
+        let at = |other: bool| {
+            let mut w: Vec<u32> = slot_look(n, other, false).collect();
+            w.extend([MISS, UNSTASH, OUTSIDE]);
+            w
+        };
+        (at(false), at(true), vec![GO])
     } else {
         let at = |other: bool| {
             let mut w = vec![index_of(n), SCALE, BASE];
@@ -2033,17 +2124,6 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
         (at(false), at(true), vec![GO])
     };
     let mut words = save_words().to_vec();
-    match call {
-        CallSite::Direct(to) => materialize(16, to, &mut words),
-        CallSite::Call(n) if matches!(n, 16 | 17) => {
-            // The target from its slot, the area's address in x17 after
-            // the save.
-            let (s16, s17) = crate::parked_slots();
-            let slot = if n == 16 { s16 } else { s17 };
-            words.push(rewrite::LDR_UIMM | ((slot / 8) << 10) | (17 << 5) | 16);
-        }
-        CallSite::Call(_) => {}
-    }
     words.extend(&first);
     let go_at = words.len();
     words.extend(&go);
@@ -2101,31 +2181,31 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
 }
 
 /// The way out at `regs.pc`, taken by the exit gate (outside a signal's
-/// handler): as [`exit`], and where it leads to a translation's start,
-/// that translation's saved entry and its program address, for the gate
-/// to enter it as a lookup does.
+/// handler): as [`exit`], and where it leads to a translation, that
+/// translation's saved entry and its program address, for the gate to
+/// enter it as a lookup does.
 pub fn gate_exit(regs: &mut Regs) -> Option<(u64, u64)> {
-    assert!(exit(regs, false), "the exit gate entered from no way out ({:#x})", regs.pc);
+    assert!(exit(regs), "the exit gate entered from no way out ({:#x})", regs.pc);
     let s = state_at(HOLD_GATE);
     let i = block_at(&s, regs.pc)?;
     let b = &s.blocks[i];
-    (b.unsaved == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.body, b.g))
+    (b.body == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.body, b.g))
 }
 
-/// The way out of a block at `regs.pc` (its trap (`trapped`), as the way
-/// out has the program's `x16` and `x17`, or the exit gate's call, which
-/// took them back): `regs`, the program's, go on at the translation of
-/// where it leads (entered with its registers), or at the address itself
-/// where that is not code run by translation; a direct branch is linked
-/// there. `false` if `pc` is no way out of fwe's.
-pub fn exit(regs: &mut Regs, trapped: bool) -> bool {
+/// The way out of a block at `regs.pc` (the exit gate's call, which took
+/// the program's `x16` and `x17` back from their slots): `regs`, the
+/// program's, go on at the translation of where it leads (at its saved
+/// entry, the program's `x16` and `x17` put in their slots), or at the
+/// address itself where that is not code run by translation; a direct
+/// branch is linked there. `false` if `pc` is no way out of fwe's.
+fn exit(regs: &mut Regs) -> bool {
     let began = Clock::now();
-    let r = exit_now(regs, trapped);
+    let r = exit_now(regs);
     began.add_to(&EXIT_NS);
     r
 }
 
-fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
+fn exit_now(regs: &mut Regs) -> bool {
     let mut s = state_at(HOLD_EXIT);
     let at = regs.pc;
     let from = block_at(&s, at);
@@ -2153,11 +2233,6 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             (Exit::Reg { n, link: None }, true, false)
         }
     };
-    // A wrong block's way out has the target in x16.
-    let wrong_to = regs.x[16];
-    if trapped && saved {
-        (regs.x[16], regs.x[17]) = parked();
-    }
     EXITS.fetch_add(1, Ordering::Relaxed);
     // A retired block's ways out are not linked: its room is had back once
     // nothing is in it, and a link from it would outlive it.
@@ -2172,13 +2247,12 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             }
             (to, false)
         }
-        Exit::Retry => (wrong_to, false),
         // Into a call whose words left (its block dropped: the program
         // changed the call, say): linked as a direct branch, to the
         // translation of the call.
         Exit::Join(to) => (to, true),
     };
-    let lookup = matches!(exit, Exit::Reg { .. } | Exit::Retry);
+    let lookup = matches!(exit, Exit::Reg { .. });
     // Code fwe prepared in place (a library's, the program's own) that a
     // translation calls or branches to is followed: translated too, so
     // what it calls and where it returns stay in translations. A return
@@ -2227,10 +2301,13 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             EXITS_KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let mut i = translation(&mut s, to);
+    // With an entry for the program's own `x16` and `x17` where the way
+    // out, a direct one, has them, to be linked there.
+    let unsaved = link_here && !saved;
+    let mut i = translation(&mut s, to, unsaved);
     // (The cache emptied as blocks were made ahead: its block anew.)
     if ahead(&mut s, i) {
-        i = translation(&mut s, to);
+        i = translation(&mut s, to, unsaved);
     }
     // Linked where the target is in reach (in the same chunk), unless the
     // cache was emptied meanwhile (`at` may be reused) or the block left
@@ -2249,7 +2326,10 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     } else if known && link_here {
         EXITS_KNOWN_UNLINKED.fetch_add(1, Ordering::Relaxed);
     }
-    regs.pc = s.blocks[i].unsaved_entry();
+    // On at its saved entry, the program's `x16` and `x17` in their slots
+    // (as the exit gate enters it too).
+    park((regs.x[16], regs.x[17]));
+    regs.pc = s.blocks[i].body;
     true
 }
 
@@ -2314,11 +2394,6 @@ fn as_guest(w: Word, regs: &mut Regs, parked: (u64, u64), word_at: impl Fn(u64) 
     // SAFETY: the stack below which a save put the program's registers.
     let below = |off: u64| unsafe { (sp.wrapping_sub(off) as *const u64).read() };
     match w {
-        Word::Out { exit: Exit::Retry, .. } => {
-            let to = regs.x[16];
-            (regs.x[16], regs.x[17]) = parked;
-            regs.pc = to;
-        }
         Word::At(g) => regs.pc = g,
         Word::Out { g, saved: false, .. } => regs.pc = g,
         Word::SavedX18(g) => {
@@ -2553,14 +2628,28 @@ fn entered(s: &State, i: usize, saved: bool, x18: bool) -> u64 {
 /// The translation of program address `g`, made if there is none:
 /// without the lock (it is let go a moment), from one look at the
 /// program's words, and placed if they are still as it saw them and no
-/// other thread placed one meanwhile (else it looks again).
-fn translation(s: &mut Held, g: u64) -> usize {
+/// other thread placed one meanwhile (else it looks again). With an entry
+/// for the program's own `x16` and `x17` if `unsaved`: one made without
+/// is dropped and made again with it, as a direct branch with them first
+/// needs it (most blocks are entered only with them saved: lookups,
+/// branches from words that never name them, fwe going on into one).
+fn translation(s: &mut Held, g: u64, unsaved: bool) -> usize {
     loop {
         if let Some(&i) = s.by_g.get(&g) {
-            // Its table entry may have gone to another address since (they
-            // share entries): it is its own again.
-            publish_block(&s.blocks[i]);
-            return i;
+            if !unsaved || s.blocks[i].unsaved.is_some() {
+                // Its table entry may have gone to another address since
+                // (they share entries): it is its own again.
+                publish_block(&s.blocks[i]);
+                return i;
+            }
+            // Dropped (the branches linked to it wait for the new one, a
+            // thread in its words goes on there), and made again.
+            let page = g & !(page_size() - 1);
+            if let Some(v) = s.pages.get_mut(&page) {
+                v.retain(|&k| k != i);
+            }
+            s.drop_block(i, false);
+            jitcount::SECOND_REMADE.fetch_add(1, Ordering::Relaxed);
         }
         if s.cache.is_none() {
             s.cache = Some(new_cache());
@@ -2568,7 +2657,7 @@ fn translation(s: &mut Held, g: u64) -> usize {
         }
         let page = g & !(page_size() - 1);
         let followed = !s.in_region(g);
-        if let Some(i) = revive(s, g, page) {
+        if let Some(i) = revive(s, g, page, unsaved) {
             return i;
         }
         let making = Clock::now();
@@ -2584,7 +2673,8 @@ fn translation(s: &mut Held, g: u64) -> usize {
             _ if followed => kept::part_of(g),
             _ => kept::generated(),
         };
-        let taken = part.and_then(|p| kept::take(p, g, &source, |end| calls_in(s, g, end)));
+        let taken =
+            part.and_then(|p| kept::take(p, g, &source, |end| calls_in(s, g, end), unsaved));
         lap.step(jitcount::STEP_LOOK);
         if let Some((mut made, info)) = taken {
             // Its ways into calls made in other blocks' words, to where
@@ -2606,7 +2696,7 @@ fn translation(s: &mut Held, g: u64) -> usize {
         // (Made at 0, its words standing anywhere; placed below.)
         let (made, looked) = s.unlocked(|| {
             let began = Clock::now();
-            let made = with_snapshot(g, &source, || translate(g, 0, followed, &known));
+            let made = with_snapshot(g, &source, || translate(g, 0, followed, &known, unsaved));
             began.add_to(&TRANSLATE_NS);
             made
         });
@@ -2627,6 +2717,9 @@ fn translation(s: &mut Held, g: u64) -> usize {
             kept::keep(p, g, &source[..looked], &calls, &made, &info);
             lap.step(jitcount::STEP_KEEP);
         }
+        // (By the words it was made from, as a record of it is.)
+        let origin = if followed { jitcount::FILE } else { jitcount::GENERATED };
+        jitcount::seen(g, &source[..looked], origin);
         let r = place(s, g, followed, made, info, source[..read_words].to_vec(), false);
         making.add_to(
             &jitcount::MAKE_NS[if followed { jitcount::FILE } else { jitcount::GENERATED }],
@@ -2664,7 +2757,7 @@ fn ahead(s: &mut Held, i: usize) -> bool {
                 continue;
             }
             MAKING_AHEAD.set(true);
-            let j = translation(s, to);
+            let j = translation(s, to, false);
             MAKING_AHEAD.set(false);
             made += 1;
             if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
@@ -2727,7 +2820,6 @@ fn place(
         if ahead {
             jitcount::AHEAD.fetch_add(1, Ordering::Relaxed);
         }
-        jitcount::seen(g, &source, origin);
     }
     let mut lap = Lap::now();
     let Room { asm, c: calls } = &mut room;
@@ -2765,7 +2857,7 @@ fn place(
         cold: cold_t,
         cold_len,
         body: t + 4 * entry as u64,
-        unsaved: t + 4 * unsaved as u64,
+        unsaved: unsaved.map(|k| t + 4 * k as u64),
         x18: if x18 == 0 { 0 } else { t + 4 * x18 as u64 },
         retired: false,
         source,
@@ -2812,11 +2904,15 @@ fn place(
 /// Take back the block at program address `g`, on page `p`, that a flush
 /// of its words dropped ([`State::dormant`]), if they were not changed: a
 /// JIT flushes code it wrote anew as the same (a method installed again,
-/// a patch undone). Only a block wanted again is taken back.
-fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
+/// a patch undone). Only a block wanted again is taken back, and with an
+/// entry for the program's own `x16` and `x17` if `unsaved`.
+fn revive(s: &mut State, g: u64, p: u64, unsaved: bool) -> Option<usize> {
     let i = s.dormant.remove(&g)?;
     let b = &s.blocks[i];
     if b.retired || b.followed == s.in_region(g) || b.g & !(page_size() - 1) != p {
+        return None;
+    }
+    if unsaved && b.unsaved.is_none() {
         return None;
     }
     if !b.unchanged() {
@@ -2901,6 +2997,12 @@ fn link_site(s: &mut State, from: usize, at: u64, j: usize) {
     let word = s.blocks[from].word_at(at);
     let Some(Word::Out { exit: Exit::Jump(x), saved, x18, .. }) = word else { return };
     if x != to || !unlinked(at) || s.blocks[from].retired || s.blocks[j].retired {
+        return;
+    }
+    // Into a block with no entry for the program's own `x16` and `x17`:
+    // left to its first run, whose way through fwe makes the block again
+    // with one ([`translation`]).
+    if !saved && s.blocks[j].unsaved.is_none() {
         return;
     }
     if s.link(from, at, entered(s, j, saved, x18)) {
@@ -3153,7 +3255,7 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         cold: 0,
         cold_len: 0,
         body: t,
-        unsaved: t,
+        unsaved: Some(t),
         x18: 0,
         retired: false,
         source: Vec::new(),
@@ -3421,9 +3523,9 @@ struct Made {
     /// they are placed) and its calls.
     room: Room,
     /// Its saved, unsaved and `x18` entries ([`Block`]), as indexes of its
-    /// hot words (the last 0 if none).
+    /// hot words (the unsaved one if made, the last 0 if none).
     entry: usize,
-    unsaved: usize,
+    unsaved: Option<usize>,
     x18: usize,
     /// The end of the program's words it read.
     end: u64,
@@ -3449,31 +3551,21 @@ thread_local! {
 }
 
 /// Translate the block at program address `g`, to be placed at `t`: its
-/// words, and what each stands for. A block ends at its page's end, so it
-/// is made from that page alone.
-fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
-    // A lookup that read an entry's address and translation at once, and a
-    // direct branch with the program's `x16` and `x17` saved in their
-    // slots (as a lookup saves them), enter at the saved entry ([`CHECK_WORDS`]
-    // in). A lookup that read them apart enters at the check, the target
-    // in `x16`, which goes on to the saved entry if the target is this
-    // block's (an entry can be taken over as such a lookup reads it).
+/// words, and what each stands for; with an entry for the program's own
+/// `x16` and `x17` if `unsaved` (or free: its first word takes them back).
+/// A block ends at its page's end, so it is made from that page alone.
+fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)], unsaved: bool) -> Made {
+    // A lookup, which read an entry's address and translation at once,
+    // and a direct branch with the program's `x16` and `x17` saved in their
+    // slots (as a lookup saves them), enter at the saved entry, past the
+    // call entry a direct call's `bl` comes to ([`CALLED`]).
     let mut room = ROOM.take().unwrap_or_else(|| Room { asm: Asm::new(), c: Calls::default() });
     room.c.clear();
     room.c.known.extend_from_slice(known);
     let Room { asm: a, c } = &mut room;
     a.clear();
-    let check = Word::Lookup { g, link: None, to: Some(16) };
-    let address = materialized(17, g).count();
-    assert!(address <= 3, "a program address of 48 bits: {g:#x}");
-    a.extend(H, std::iter::repeat_n(NOP, 3 - address), check);
-    a.extend(H, materialized(17, g), check);
-    a.push(H, CHECK, check);
-    let wrong = a.label();
-    a.branch(H, MISS, Field::Imm19, wrong, check);
-    a.push(H, X16_AS_X30, Word::Saved(g));
     a.push(H, CALLED, Word::Called(g));
-    debug_assert_eq!(a.len(H), CHECK_WORDS);
+    debug_assert_eq!(a.len(H), ENTRY_AT);
     // Counting its runs ([`jitcount`]): its saved entry's first, its
     // other entry's after a save of the program's `x16` and `x17` there.
     let counting = jitcount::counting();
@@ -3482,26 +3574,27 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
         a.extend(H, counter(at), Word::Saved(g));
     }
     let Body { end, restore, x18 } = body_of(g, t, followed, true, None, c, a);
-    // The wrong block's way out.
-    a.bind(wrong, C);
-    a.push(C, EXIT, Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 });
-    // A direct branch with the program's own registers, and fwe going on
-    // from a trap, enter where the block takes them back; if it does not
-    // at once, at its words up to there made again with them in their
-    // registers. Where those words name x18, which the saved ones keep in
+    // A direct branch with the program's own registers enters where the
+    // block takes them back; if it does not at once, at its words up to
+    // there made again with them in their registers. (fwe going on from a
+    // trap or a fetch enters at the saved entry, the registers put in
+    // their slots.) Where those words name x18, which the saved ones keep in
     // x17 (loaded once, [`load_x18`]) and these would load and store at
     // each use, the entry saves x16 and x17 and goes on into the saved
     // words instead.
     // (Counting, every such entry is made apart, to count its runs.)
     let mut second = None;
     let unsaved = match restore {
-        Some((at, k)) if at == g && !counting => k + RESTORE_WORDS,
+        Some((at, k)) if at == g && !counting => Some(k + RESTORE_WORDS),
+        // Made only once a direct branch with them needs it (`unsaved`),
+        // but where blocks count their runs.
+        _ if !unsaved && !counting => None,
         _ if x18.is_some() => {
             let start = a.len(H);
             push_save(a, H, Word::At(g), g);
-            let entry = a.label_at(Pos::hot(CHECK_WORDS));
+            let entry = a.label_at(Pos::hot(ENTRY_AT));
             a.branch(H, B, Field::Imm26, entry, Word::Saved(g));
-            start
+            Some(start)
         }
         _ => {
             let start = a.len(H);
@@ -3512,7 +3605,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
             }
             body_of(g, t, followed, false, restore, c, a);
             second = Some(a.len(H) - start);
-            start
+            Some(start)
         }
     };
     // Each conditional branch's distance back from its taken way, in the
@@ -3526,7 +3619,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // Counting, a link enters at its saved entry, never past its load of
     // `x18`, to count the run.
     let x18 = if counting { 0 } else { x18.unwrap_or(0) };
-    Made { room, entry: CHECK_WORDS, unsaved, x18, end, second, counters }
+    Made { room, entry: ENTRY_AT, unsaved, x18, end, second, counters }
 }
 
 /// The words adding 1 to the counter at `at` ([`jitcount::units`]), with
@@ -4546,40 +4639,52 @@ fn lookup(
             before,
         );
     }
+    // First the near table ([`NEAR`]), which holds translations only; not
+    // there, the table, out of the way: each entry of the target's pair in
+    // turn (the second's look in [`lookup_tail`]), then on as from the
+    // first look. (A lookup out of the way already, a return's after the
+    // table of returns, looks in the table alone.)
     let miss = a.label();
-    let to = if in_place {
-        a.extend(main, [index_of(n), SCALE, BASE, ENTRY, key_against(n)], before);
-        a.branch(main, MISS_X16, Field::Imm19, miss, before);
-        n as u8
-    } else {
-        // x16: the target, from its slot (x16's, x17's or x18's).
-        let (s16, s17) = crate::parked_slots();
-        let slot = match n {
-            16 => Some(s16),
-            17 => Some(s17),
-            18 => Some(crate::x18_slot()),
-            _ => None,
-        };
-        if let Some(slot) = slot {
-            let words = [
-                rewrite::MRS_TPIDRRO | 16,
-                rewrite::AND_NOT7 | (16 << 5) | 16,
-                rewrite::LDR_UIMM | ((slot / 8) << 10) | (16 << 5) | 16,
-            ];
-            a.extend(main, words, before);
+    let looks = |a: &mut Asm<Word>, s: Sec, near: bool, to: Label| {
+        if in_place || n == 30 {
+            // A call through x30, whose return address replaces the target
+            // there: found, the target in x16 as well.
+            if near {
+                a.extend(s, near_look(n), before);
+            } else {
+                a.extend(s, [index_of(n), SCALE, BASE], before);
+            }
+            a.extend(s, [ENTRY, key_against(n)], before);
+            a.branch(s, MISS_X16, Field::Imm19, to, before);
+            if !in_place {
+                a.push(s, 0xaa1e_03f0, before); // mov x16, x30
+            }
         } else {
-            a.push(main, 0xaa00_03f0 | (n << 16), before); // mov x16, xN
+            // Through x16, x17 or x18: the target in its slot.
+            a.extend(s, slot_look(n, false, near), before);
+            a.branch(s, MISS, Field::Imm19, to, before);
+            a.push(s, UNSTASH, before);
         }
-        a.extend(main, [INDEX, SCALE, BASE, KEY, CHECK], before);
-        a.branch(main, MISS, Field::Imm19, miss, before);
-        a.extend(main, [INDEX, SCALE, BASE, VALUE], before);
-        16
     };
+    let to = if in_place { n as u8 } else { 16 };
     let committed = Word::Lookup { g: pc, link, to: Some(to) };
-    // A target fwe does not translate has no translation in the table (0):
-    // the branch is made as the program made it, every register its own.
     let outside = a.label();
-    let outside_at = a.branch(main, OUTSIDE, Field::Imm19, outside, committed);
+    let outside_at = if main == H {
+        let far = a.label();
+        looks(a, main, true, far);
+        let found = a.label_at(a.here(main));
+        a.bind(far, cold);
+        looks(a, cold, false, miss);
+        // A target fwe does not translate has no translation in the table
+        // (0): the branch is made as the program made it, every register
+        // its own.
+        let at = a.branch(cold, OUTSIDE, Field::Imm19, outside, committed);
+        a.branch(cold, B, Field::Imm26, found, committed);
+        at
+    } else {
+        looks(a, main, false, miss);
+        a.branch(main, OUTSIDE, Field::Imm19, outside, committed)
+    };
     let mut tail = Tail {
         pc,
         n,
@@ -4638,9 +4743,6 @@ fn lookup_tail(t: &Tail, a: &mut Asm<Word>) {
     if let Some(link) = link {
         a.extend(main, materialized(30, link), committed);
     }
-    if !in_place {
-        a.push(main, TO_CHECK, committed);
-    }
     a.push(main, GO, committed);
     // Not translated: x16 and x17 back, x30 the program's return address
     // for a call, and the program's own branch through its register (whose
@@ -4670,13 +4772,16 @@ fn lookup_tail(t: &Tail, a: &mut Asm<Word>) {
     // of its pair, as the first; found, on as from the first.
     a.bind(miss, cold);
     let second_miss = a.label();
-    if in_place {
+    if in_place || n == 30 {
         a.extend(cold, [index_of(n), SCALE, BASE, OTHER, ENTRY, key_against(n)], before);
         a.branch(cold, MISS_X16, Field::Imm19, second_miss, before);
+        if !in_place {
+            a.push(cold, 0xaa1e_03f0, before); // mov x16, x30
+        }
     } else {
-        a.extend(cold, [INDEX, SCALE, BASE, OTHER, KEY, CHECK], before);
+        a.extend(cold, slot_look(n, true, false), before);
         a.branch(cold, MISS, Field::Imm19, second_miss, before);
-        a.extend(cold, [INDEX, SCALE, BASE, OTHER, VALUE], before);
+        a.push(cold, UNSTASH, before);
     }
     let back = a.label_at(outside_at);
     a.branch(cold, B, Field::Imm26, back, before);
@@ -4792,7 +4897,6 @@ mod tests {
             Word::Lookup { g, link: None, to: None },
             Word::Lookup { g, link: Some(g + 4), to: Some(30) },
             Word::Out { g, exit: Exit::Jump(0x5555_5555_8000), saved: true, x18: true, cond: 9 },
-            Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 },
             Word::Out { g, exit: Exit::Join(g), saved: true, x18: false, cond: 0 },
             Word::Out {
                 g,
@@ -4818,22 +4922,20 @@ mod tests {
             assert_eq!((p.word(g0, t), n), (w, b.len() - 1));
         }
     }
-    /// A translation's call entry is the word before its saved entry, past
-    /// its check, which leaves `x16` as `x30` for a lookup to go on through
-    /// it; a direct call sets `x16` to its return address before its `bl`,
-    /// whose way into fwe, until it is linked, sets `x30` from `x16` as the
-    /// entry does and names the `bl` to retarget.
+    /// A translation's call entry is its first word, before its saved
+    /// entry; a direct call sets `x16` to its return address before its
+    /// `bl`, whose way into fwe, until it is linked, sets `x30` from `x16`
+    /// as the entry does and names the `bl` to retarget.
     #[test]
-    fn a_call_comes_in_past_its_target_check() {
+    fn a_call_comes_in_at_the_word_before_its_target_entry() {
         let g = 0x0200_1976_c000;
         // add x0, x0, #1; bl +0x100; ret
         let mut words = vec![0x9100_0400, 0x9400_0040, 0xd65f_03c0];
         words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
-        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[]));
+        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[], true));
         let a = &made.room.asm;
-        assert_eq!(made.entry, CHECK_WORDS);
-        let k = CHECK_WORDS - 1;
-        assert_eq!((a.words(H)[k - 1], a.info(H)[k - 1]), (X16_AS_X30, Word::Saved(g)));
+        assert_eq!(made.entry, ENTRY_AT);
+        let k = ENTRY_AT - 1;
         assert_eq!((a.words(H)[k], a.info(H)[k]), (CALLED, Word::Called(g)));
         // The call's way out, in its words out of line after CALLED.
         let (hot, info) = (a.words(H), a.info(H));
@@ -4850,6 +4952,46 @@ mod tests {
         let ret: Vec<u32> = materialized(16, g + 8).collect();
         assert_eq!(&hot[bl - ret.len()..bl], &ret[..]);
         assert!(info[bl - ret.len()..=bl].iter().all(|&w| w == Word::Saved(g + 4)));
+    }
+
+    /// The near table's look in a lookup's words picks the entry
+    /// `near_entry` does; functions 64 bytes apart have entries next to
+    /// each other, and targets in one 64 bytes entries of their own.
+    #[test]
+    fn near_entries_dense_for_functions_apart_for_targets_close() {
+        #[cfg(target_arch = "aarch64")]
+        for g in [0x0200_1976_c000u64, 0x0200_1976_c0c8, 0x5555_5555_8a14, 0x7fff_ffff_fffc] {
+            let e: u64;
+            // SAFETY: arithmetic on registers alone (the words of
+            // `near_look(9)`).
+            unsafe {
+                std::arch::asm!(
+                    ".inst {a}", ".inst {b}", ".inst {c}", ".inst {d}",
+                    a = const near_look(9)[0], b = const near_look(9)[1],
+                    c = const near_look(9)[2], d = const near_look(9)[3],
+                    in("x9") g, out("x17") e, out("x16") _, options(nomem, nostack, preserves_flags),
+                );
+            }
+            assert_eq!(e, near_entry(g), "{g:#x}");
+            let e: u64;
+            // SAFETY: as above (`near_look_x16()`).
+            unsafe {
+                std::arch::asm!(
+                    ".inst {a}", ".inst {b}", ".inst {c}", ".inst {d}",
+                    a = const near_look_x16()[0], b = const near_look_x16()[1],
+                    c = const near_look_x16()[2], d = const near_look_x16()[3],
+                    in("x16") g, out("x17") e, options(nomem, nostack, preserves_flags),
+                );
+            }
+            assert_eq!(e, near_entry(g), "{g:#x} through x16");
+        }
+        let f = 0x0200_1976_c000u64;
+        for k in 0..4096 {
+            assert_eq!(near_entry(f + 64 * k), near_entry(f) + 16 * k, "function {k}");
+        }
+        let cases: std::collections::HashSet<u64> =
+            (0..16).map(|k| near_entry(f + 0x40 + 4 * k)).collect();
+        assert_eq!(cases.len(), 16);
     }
 
     /// A thread stopped at a call entry is at the target, its `x30` the
@@ -4880,7 +5022,7 @@ mod tests {
         let mut words = vec![0xb400_0041, 0xaa1203e0, 0x9400_0040, 0x9100_0400, 0xd65f_03c0];
         // As far as a block's look ahead reads ([`snapshot`]).
         words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
-        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[]));
+        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[], true));
         let pads = &made.room.c.pads;
         let mut rets: Vec<u64> = pads.iter().map(|p| p.0).collect();
         rets.dedup();

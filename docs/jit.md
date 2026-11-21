@@ -78,13 +78,17 @@ way.
   their target up in a table of translations by program address. One
   16-byte load reads an entry's address and translation together
   (single-copy atomic, as the table's writes are), so a match leads to
-  the target's own translation; through `x16` or `x17`, which hold the
-  target meanwhile, the two are read apart, and the translation checks
-  that the target is its own (an entry can be taken over as such a
-  lookup reads it). An address is looked for in the entry its bits pick,
-  then in the other of that one's pair, so two targets that pick one
-  entry do not push each other out at every turn. A miss goes through fwe
-  once and fills the table. An indirect branch into code that is not
+  the target's own translation; through `x16` or `x17`, which the lookup
+  takes for itself, the target is read again from its slot to compare,
+  the translation set below `sp` meanwhile. A lookup looks first in a
+  near table, one entry for each 64 bytes of the program's code, which
+  holds the entries of thousands of functions in the data cache, as the
+  table (an entry for each instruction) cannot: the branch through a
+  register waits for that read. Not there, an address is looked for,
+  out of line, in the table's entry its bits pick, then in the other of
+  that one's pair, so two targets that pick one entry do not push each
+  other out at every turn. A miss goes through fwe once and fills the
+  table. An indirect branch into code that is not
   translated (a library's) restores `x16` and `x17` and goes through the
   program's own register, so every register is as the program left it:
   code may count on more than the procedure call standard promises
@@ -106,7 +110,10 @@ way.
   restore is four. A block reached by a direct branch with the program's
   own registers is entered past its restore, or where it starts with
   code that runs either way, at a copy of that code made with them in
-  place, which joins the rest at the restore. A fault or signal anywhere
+  place, which joins the rest at the restore: made only once such a
+  branch first comes to it (most blocks are entered only with them
+  saved: by lookups, by branches from code that never names them, and
+  by fwe, which puts them in their slots as it goes on into a block). A fault or signal anywhere
   in between is delivered with the program's `x16` and `x17`.
 - **`x18` in `x17`.** macOS keeps `x18` for itself, and Linux code uses it
   like any other register (HotSpot's C2 allocates it), so outside
@@ -282,7 +289,9 @@ a processor that reports `DIC` clear.
 
 - **Entry:** `on_fault` passes an instruction fetch fault to
   `jit::enter`, which translates the block (`jit::translate`) and
-  resumes the thread in it. A block is translated with the translator's
+  resumes the thread at its saved entry, the program's `x16` and `x17`
+  put in their slots (`jit::park`), as `jit::exit` does at the block a
+  way out leads to. A block is translated with the translator's
   lock let go (`jit::translation`), from one look at the program's words
   (`jit::with_snapshot`), at no address in particular (its expansions'
   starts set, and its branches resolved, where it is placed,
@@ -305,9 +314,7 @@ a processor that reports `DIC` clear.
   thread's block, as the system-call gate does, and calls
   `jit::gate_exit` without a signal; anything else (code not translated,
   a signal to deliver) takes the gate's `brk`, whose handler goes on from
-  the block. A lookup that enters the wrong block (one whose entry
-  another address took as it read it) goes on at `brk #0x4a54`
-  (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`.
+  the block.
 - **Linking:** the target is translated and the way out patched to the
   entry for its state of `x16` and `x17` (`jit::entered`), as is the
   conditional branch it is the taken way of, where that reaches, and a
@@ -324,21 +331,25 @@ a processor that reports `DIC` clear.
   `x18` held in `x17` (`Word::Out`'s `x18`) is linked past the target's
   load of it (`Block::x18`, `jit::in_x17`, `jit::put_x18`). A `cbz` or
   `tbz` of `x18` loads it into `x16` and tests it there.
-- **Entries:** a block starts with the check a lookup that read the
-  table apart enters at (the target in `x16` against the block's
-  address, then `x16` set to `x30`), then its call entry
-  (`jit::CALLED`: `x30` set from `x16`, where a direct call's `bl` comes
-  in, `Word::Called`; a lookup goes on through it unchanged), then its
-  saved entry, where lookups and direct branches with `x16` and `x17`
-  saved come in (`Block::body`). `jit::keeps_saved`
+- **Entries:** a block starts with its call entry (`jit::CALLED`: `x30`
+  set from `x16`, where a direct call's `bl` comes in, `Word::Called`),
+  then its saved entry, where lookups and direct branches with `x16` and
+  `x17` saved come in (`Block::body`, `jit::ENTRY_AT`). A lookup through
+  `x16`, `x17` or `x18` (`jit::slot_look`), whose target is in its slot,
+  reads the entry whole, sets its translation below `sp`, and reads the
+  target again into `x17` to compare. `jit::keeps_saved`
   tells which instructions run with them saved; `jit::body_of` restores
-  them before any other. Its unsaved entry (`Block::unsaved`) is past
-  that restore when the block starts with it, or a copy of the words up
-  to it made with them in their registers, which branches into the rest,
-  or, at a call or a branch through a register the saved words make with
-  them saved, saves them and branches there; where those words name
-  `x18`, which the saved words keep in `x17`, a save of `x16` and `x17`
-  and a branch into the saved words.
+  them before any other. Its unsaved entry (`Block::unsaved`), for a
+  direct branch from words that hold the program's `x16` and `x17`, is
+  past that restore when the block starts with it; otherwise the block is
+  made without one, and dropped and made again with one when such a
+  branch first comes to it (`jit::translation`'s `unsaved`; a way out that
+  only `jit::link_waiting` would link is left to its first run): a copy of
+  the words up to the restore made with them in their registers, which
+  branches into the rest, or, at a call or a branch through a register
+  the saved words make with them saved, saves them and branches there;
+  where those words name `x18`, which the saved words keep in `x17`, a
+  save of `x16` and `x17` and a branch into the saved words.
 - **The table** of translations by guest address is 2^20 entries of
   (address, translation) at 2^45 (32 TiB, reachable with one `orr`),
   each 16 bytes aligned and written whole (`stp`) for lookups that read
@@ -348,7 +359,16 @@ a processor that reports `DIC` clear.
   entry its bits 2 to 21 pick, its earlier holder moving to the other of
   that one's 32-byte pair (`jit::publish`), where a lookup that misses
   the first looks next. A target outside run-time code (a library's)
-  gets translation 0; a dropped entry is cleared.
+  gets translation 0; a dropped entry is cleared. The near table
+  (`jit::NEAR`, at 2^46) is laid out alike, an address's entry picked by
+  its bits 6 to 19, its bits 0 to 5 the index's top six (`jit::near_entry`,
+  `jit::near_look`, three instructions from the target: functions 64 bytes
+  apart have entries side by side, a switch's cases close together have
+  their own),
+  and holds the translation of the address there published last; a
+  lookup through `x16`, `x17` or `x18` reads it as it reads the table.
+  The table of returns' tail, a return whose first look misses, and call
+  sites' stubs look in the table alone.
 - **The table of returns** at 2^45 + 2^44 is laid out as the table of
   translations: a call's return address and the words after its `bl`
   (`jit::RETS`; the call's words out of line are a `jit::Side`),
@@ -405,7 +425,9 @@ a processor that reports `DIC` clear.
   the records whose key its words match: no index is made, and a JIT that
   writes other code at the same addresses run after run costs no more
   reads. `jit::translation` looks for a record of
-  the code before it translates (`kept::take`), and places a block
+  the code before it translates (`kept::take`; of a block made again for
+  its entry with the program's own `x16` and `x17`, the record with that
+  entry first), and places a block
   taken (`Asm::restore`) as one just made, the literal of each system
   call's and flush's stub set to where the gate is in this process (fwe's
   image lands elsewhere in each, `kept::relocate`). Other builds' records
@@ -471,7 +493,7 @@ a processor that reports `DIC` clear.
 | a direct branch's first run | a call through the exit gate | once per branch, then linked |
 | a call | the return address set and a `bl` to the target (after a table lookup, and through words out of line, for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
-| an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
+| an indirect branch | an inline look in the near table, about ten instructions, and a save of `x16` and `x17` where the code before it named them; not there, the table's, out of line | each time; a miss in both goes through the exit gate |
 | a call or branch from native code into JIT code | a fault, then a table lookup in the site's stub (a target not translated yet: a call through the exit gate) | a fault once per call site, then linked (a branch no call leads to: followed) |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
@@ -487,15 +509,20 @@ What fwe counts, for the benchmarks to report
   took, the time of each step of making or taking one (reading its words,
   looking for a kept one, translating, checking, packing, keeping,
   finding room, writing, indexing, linking), the program's words a block holds and what ended it, blocks made
-  with a second pass for the program's own `x16` and `x17` and those
-  entered there, blocks made ahead, blocks taken from those kept (the records read and
+  with a second pass for the program's own `x16` and `x17`, those
+  entered there and those made again for it, blocks made ahead, blocks taken from those kept (the records read and
   the files mapped to find them), the generated blocks made again where a
   past process made them (and so kept), and the
   blocks in use that only a direct branch leads to, by where the branch
-  is.
+  is (and, with `FWE_JIT_COUNT`, how often they ran: each run a branch
+  from one block into the next that a trace would not take).
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
-  and a hash of their words) and counts those an earlier one made, at the
-  same address or elsewhere.
+  and a hash of the words their translation read, past their own too, as
+  a kept record is keyed) and counts those an earlier one made, at the
+  same address (and of those, the ones two or more earlier processes made
+  there, which kept translations should have given it) or elsewhere. The
+  benchmarks run each JIT runtime three times so and fail if the third
+  makes any block of generated code two earlier runs made.
 - **`FWE_JIT_COUNT=1`:** blocks count their runs, ways back their returns
   and lookups through a register whether they go where they went last
   (the words then differ). The report adds the blocks that ran, those
