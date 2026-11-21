@@ -8639,7 +8639,8 @@ fn cgroups_limits_freeze_and_delegation() {
 /// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
 /// `comm` and host name written as Linux writes them, another process's
 /// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
-/// a tracer reads, to one that may not trace it), and `/proc/net`.
+/// a tracer reads, to one that may not trace it), `/proc/net`, and the
+/// link counts of directories (a process's `task` 2 and its threads).
 #[test]
 fn proc_files_programs_read() {
     let out = run_c_guest("procfiles", &[], &[("FWE_PROC", "1")]);
@@ -8647,7 +8648,9 @@ fn proc_files_programs_read() {
     let (head, tail) = text.split_once("if_inet6: ").unwrap_or((&text, ""));
     assert_eq!(
         head,
-        "meminfo is sysinfo's: 1, procs counted: 1\n\
+        "task links, one thread: 3\ntask links, two threads: 4\n\
+         process directory has subdirectories: 1\n\
+         meminfo is sysinfo's: 1, procs counted: 1\n\
          cpuinfo: cpus 1, BogoMIPS 1, Features fp asimd 1, BHID 0\n\
          environ has FWE_PROC=1: 1\n\
          limits: Limit                    | open files 1\n\

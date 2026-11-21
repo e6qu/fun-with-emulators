@@ -2054,7 +2054,9 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   `synthdir.rs`); what of the host shows there is under
   [Host identity and machine state](#host-identity-and-machine-state).
 - `/proc/<pid>`, with its `task` directory, covers the processes of the
-  reader's pid namespace. Another process's `mem` (and a thread's,
+  reader's pid namespace. A directory there counts its links as Linux's
+  do: 2 and its subdirectories (`task`, 2 and the process's threads,
+  which sandboxes read to tell a process is single-threaded). Another process's `mem` (and a thread's,
   `task/<tid>/mem`) is read and written as `process_vm_readv` reaches it,
   or through a stopped tracee's mailbox, and its `auxv` is the vector
   its program started with (a fork child's, its parent's), its `environ`
