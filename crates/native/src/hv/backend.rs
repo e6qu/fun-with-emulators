@@ -519,6 +519,14 @@ fn place(elf: &Elf<'_>, bti: bool) -> Result<Placed, Error> {
     let guest = if elf.is_pie() {
         mem::map_anywhere(plan.len, rw).map_err(|e| mem_error("placing the image", e))?
     } else {
+        let end = plan.start.saturating_add(plan.len);
+        if end > vm::CODE_VA {
+            return Err(Error::Unsupported(format!(
+                "linked at {:#x}..{end:#x}, past the VM's address space (it ends at {:#x})",
+                plan.start,
+                vm::CODE_VA
+            )));
+        }
         mem::map_fixed(plan.start, plan.len, rw).map_err(|e| mem_error("placing the image", e))?;
         plan.start
     };

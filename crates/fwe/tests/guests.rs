@@ -5232,20 +5232,25 @@ fn asm_sp_off_alignment() {
 
 /// [`asm_sp_off_alignment`] in the VM: the SIGBUS at sp (the hardware's
 /// fault address is unknown for sp), and code made at run time run there.
+/// The stand-in has no sp alignment checks (nor has QEMU, under it): there
+/// the store goes through and the guest says so (1).
 #[test]
 fn hv_sp_off_alignment() {
+    let Some(out) = fwe_hv(&asm_guest("spalign-low"), &[]) else { return };
+    let want = if matches!(hv_mode(), Some(HvMode::Standin)) { 1 } else { 0 };
+    assert_eq!(out.status.code(), Some(want), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A program linked past the VM's address space (1 TiB, as far as its
+/// tables reach) is refused, saying so, under `--vm`.
+#[test]
+fn hv_a_program_past_the_vms_address_space_is_refused() {
     let Some(mut cmd) = hv_command() else { return };
-    // PROBE (temporary): the stand-in's events and the calls, the last of
-    // them shown if the run fails.
-    cmd.arg("--vm").env("FWE_STANDIN_DEBUG", "1").arg("--strace");
-    cmd.arg(asm_guest("spalign"));
-    let limit =
-        if matches!(hv_mode(), Some(HvMode::Standin)) { STANDIN_TIMEOUT } else { GUEST_TIMEOUT };
-    let out = run_hv_quietly(cmd, "spalign --vm", limit);
+    cmd.arg("--vm").arg(asm_guest("hello"));
+    let out = run_hv(cmd, "hello --vm");
     let err = String::from_utf8_lossy(&out.stderr);
-    let lines: Vec<&str> = err.lines().collect();
-    let tail = lines[lines.len().saturating_sub(80)..].join("\n");
-    assert_eq!(out.status.code(), Some(0), "{} lines, the last:\n{tail}", lines.len());
+    assert_eq!(out.status.code(), Some(126), "{err}");
+    assert!(err.contains("past the VM's address space"), "{err}");
 }
 
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the

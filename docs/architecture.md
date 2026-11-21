@@ -1614,6 +1614,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `MADV_DONTNEED` on a private file mapping keeps modified pages where
   Linux restores the file's.
 - VM: a program's main stack is 8 MiB whatever its `RLIMIT_STACK`.
+- VM: the guest's address space is 1 TiB (40 bits; Linux gives 256 TiB),
+  so a program linked past it is refused, and mappings stay below it.
 - Native: `PR_PAC_RESET_KEYS` fails with `EINVAL`: guest code runs with
   the host process's pointer-authentication keys, which macOS sets and no
   process may change.
