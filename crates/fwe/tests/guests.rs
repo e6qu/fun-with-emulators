@@ -9329,13 +9329,23 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
             }
             run_checked(Command::new("chmod").arg("700").arg(cached.join("tmp/xdg")));
             run_checked(Command::new("chmod").arg("1777").arg(cached.join("tmp/.X11-unix")));
-            for (prog, args) in [
-                ("usr/bin/gdk-pixbuf-query-loaders", &["--update-cache"][..]),
-                ("usr/bin/glib-compile-schemas", &["/usr/share/glib-2.0/schemas"][..]),
-                ("usr/bin/fc-cache", &["-f"][..]),
-                ("usr/bin/update-mime-database", &["/usr/share/mime"][..]),
+            // Each where its package's trigger would run: the program
+            // there, and what it works on.
+            for (prog, args, on) in [
+                (
+                    "usr/bin/gdk-pixbuf-query-loaders",
+                    &["--update-cache"][..],
+                    "usr/lib/gdk-pixbuf-2.0",
+                ),
+                (
+                    "usr/bin/glib-compile-schemas",
+                    &["/usr/share/glib-2.0/schemas"][..],
+                    "usr/share/glib-2.0/schemas",
+                ),
+                ("usr/bin/fc-cache", &["-f"][..], "etc/fonts"),
+                ("usr/bin/update-mime-database", &["/usr/share/mime"][..], "usr/share/mime"),
             ] {
-                if !cached.join(prog).exists() {
+                if !cached.join(prog).exists() || !cached.join(on).exists() {
                     continue;
                 }
                 let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
@@ -9609,9 +9619,12 @@ impl Xvfb {
         assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
     }
 
-    /// Keys (xdotool's names, `ctrl+q`) pressed in window `w`.
+    /// Keys (xdotool's names, `ctrl+q`) pressed in window `w`: pressed
+    /// only, as a program that ends on the press (a quit key) has no
+    /// window left for their release.
     fn key_into(&self, w: &Window, keys: &str) {
-        let out = self.xdotool(&["windowfocus", "--sync", &w.id, "key", "--window", &w.id, keys]);
+        let out =
+            self.xdotool(&["windowfocus", "--sync", &w.id, "keydown", "--window", &w.id, keys]);
         assert!(out.status.success(), "xdotool key: {}", String::from_utf8_lossy(&out.stderr));
     }
 }
