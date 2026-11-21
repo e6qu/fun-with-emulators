@@ -1539,11 +1539,21 @@ extern "C" fn on_tlb_fill(uc: Uc, va: u64, t: c_int, out: *mut TlbEntry, d: *mut
     };
     let fault = |fsc: u64| {
         // The instruction that faulted is at pc: for a fetch, the block
-        // QEMU was translating (none of it ran). The hook is given a fetch's
-        // address rounded down to QEMU's 1 KiB page; the instruction's own
-        // address is the fault address when it lies on the faulting page.
+        // QEMU was translating (none of it ran). The hook is given the
+        // address rounded down to QEMU's 1 KiB page: a fetch's own address
+        // is the fault address when it lies on the faulting page, and a
+        // load's or store's is worked out from its registers (the first
+        // byte of it on that page).
         let pc = read(uc, R_PC);
-        let far = if fetching && pc & !0xfff == va & !0xfff { pc } else { va };
+        let far = if fetching {
+            if pc & !0xfff == va & !0xfff { pc } else { va }
+        } else {
+            let reg = |n: u32| if n == 31 { read(uc, R_SP) } else { read(uc, xreg(n)) };
+            fetch(d, pc)
+                .and_then(|i| data_access(i, pc, reg))
+                .filter(|&(at, size)| at < (va | 0x3ff) + 1 && at + size > va)
+                .map_or(va, |(at, _)| at.max(va))
+        };
         let ec = if fetching { 0x20 } else { 0x24 };
         let wnr = if t == UC_MEM_WRITE { 1 << 6 } else { 0 };
         record(d, Event::El1 { esr: (ec << 26) | (1 << 25) | wnr | fsc, elr: pc, far });
@@ -1634,6 +1644,75 @@ extern "C" fn on_exception(uc: Uc, intno: u32, d: *mut c_void) {
 /// The address an exclusive or atomic instruction uses: its base register
 /// (they have no offset). Anything else gives 0, which the stand-in does
 /// not model.
+/// The address and size of the memory the load or store `insn` at `pc`
+/// accesses, its registers `reg(n)` (31: `sp` as a base): the forms by
+/// immediate, register offset, pair, literal, exclusive and atomic, and
+/// SIMD structure (at its base). `None` for any other instruction.
+fn data_access(insn: u32, pc: u64, reg: impl Fn(u32) -> u64) -> Option<(u64, u64)> {
+    let sext = |v: u32, bits: u32| i64::from(((v << (32 - bits)) as i32) >> (32 - bits));
+    let base = reg((insn >> 5) & 31);
+    let simd = (insn >> 26) & 1 == 1;
+    // Literal: pc-relative, 4, 8 or 16 bytes.
+    if insn & 0x3b00_0000 == 0x1800_0000 {
+        let size = match (insn >> 30, simd) {
+            (0, _) => 4,
+            (1, _) => 8,
+            (2, true) => 16,
+            (2, false) => 4,
+            _ => return None,
+        };
+        return Some((pc.wrapping_add_signed(sext((insn >> 5) & 0x7_ffff, 19) * 4), size));
+    }
+    // Exclusive, acquire and release: at the base.
+    if insn & 0x3f00_0000 == 0x0800_0000 {
+        return Some((base, 1 << (insn >> 30)));
+    }
+    // SIMD structures: from the base.
+    if insn & 0xbf00_0000 == 0x0c00_0000 || insn & 0xbf00_0000 == 0x0d00_0000 {
+        return Some((base, 1));
+    }
+    // Pairs.
+    if insn & 0x3a00_0000 == 0x2800_0000 {
+        let opc = insn >> 30;
+        let scale = if simd { 4 << opc } else { 4 << (opc >> 1) };
+        let off = sext((insn >> 15) & 0x7f, 7) * scale as i64;
+        let at = if (insn >> 23) & 3 == 1 { base } else { base.wrapping_add_signed(off) };
+        return Some((at, 2 * scale));
+    }
+    if insn & 0x3a00_0000 != 0x3800_0000 {
+        return None;
+    }
+    // Single registers: 16 bytes for a SIMD q register.
+    let size_bits = insn >> 30;
+    let size = if simd && size_bits == 0 && (insn >> 23) & 1 == 1 { 16 } else { 1 << size_bits };
+    if (insn >> 24) & 1 == 1 {
+        let off = u64::from((insn >> 10) & 0xfff) * size;
+        return Some((base.wrapping_add(off), size));
+    }
+    if (insn >> 21) & 1 == 1 {
+        match (insn >> 10) & 3 {
+            // Register offset, extended and shifted.
+            2 => {
+                let m = reg((insn >> 16) & 31);
+                let m = if (insn >> 16) & 31 == 31 { 0 } else { m };
+                let m = match (insn >> 13) & 7 {
+                    0b010 => m & 0xffff_ffff,
+                    0b110 => i64::from(m as i32) as u64,
+                    _ => m,
+                };
+                let shift = if (insn >> 12) & 1 == 1 { size.trailing_zeros() } else { 0 };
+                return Some((base.wrapping_add(m << shift), size));
+            }
+            // Atomics: at the base.
+            0 => return Some((base, size)),
+            _ => return None,
+        }
+    }
+    let off = sext((insn >> 12) & 0x1ff, 9);
+    let at = if (insn >> 10) & 3 == 1 { base } else { base.wrapping_add_signed(off) };
+    Some((at, size))
+}
+
 fn exclusive_or_atomic_base(uc: Uc, insn: u32) -> u64 {
     let exclusive = insn & 0x3f00_0000 == 0x0800_0000;
     let atomic = insn & 0x3f20_0c00 == 0x3820_0000;
@@ -2063,6 +2142,35 @@ pub fn watch(pid: &str) -> ! {
 
 #[cfg(test)]
 mod tests {
+    /// The address and size each form of load and store accesses.
+    #[test]
+    fn data_accesses_worked_out() {
+        use super::data_access;
+        let reg = |n: u32| 0x1000 * u64::from(n);
+        let at = |i| data_access(i, 0x8000, reg);
+        // ldrb w0, [x1, #300]; ldr x0, [x2, #16]; ldur x0, [x3, #-8]
+        assert_eq!(at(0x3944_b020), Some((0x1000 + 300, 1)));
+        assert_eq!(at(0xf940_0840), Some((0x2000 + 16, 8)));
+        assert_eq!(at(0xf85f_8060), Some((0x3000 - 8, 8)));
+        // ldr x0, [x1], #8 (at the base); ldr x0, [x1, #8]!
+        assert_eq!(at(0xf840_8420), Some((0x1000, 8)));
+        assert_eq!(at(0xf840_8c20), Some((0x1008, 8)));
+        // ldr x0, [x1, x2, lsl #3]; ldr w0, [x1, w2, uxtw]
+        assert_eq!(at(0xf862_7820), Some((0x1000 + (0x2000 << 3), 8)));
+        assert_eq!(at(0xb862_4820), Some((0x1000 + 0x2000, 4)));
+        // ldp x0, x1, [x2, #-16]; stp q0, q1, [x3, #32]
+        assert_eq!(at(0xa97f_0440), Some((0x2000 - 16, 16)));
+        assert_eq!(at(0xad01_0460), Some((0x3000 + 32, 32)));
+        // ldr q0, [x1, #16]; ldr x0, <pc + 8>; ldxr x0, [x1]; ldadd x2, x0, [x1]
+        assert_eq!(at(0x3dc0_0420), Some((0x1000 + 16, 16)));
+        assert_eq!(at(0x5800_0040), Some((0x8008, 8)));
+        assert_eq!(at(0xc85f_7c20), Some((0x1000, 8)));
+        assert_eq!(at(0xf822_0020), Some((0x1000, 8)));
+        // ld1 {v0.16b}, [x1]; an add: none.
+        assert_eq!(at(0x4c40_7020), Some((0x1000, 1)));
+        assert_eq!(at(0x9100_0420), None);
+    }
+
     use super::*;
 
     fn map(len: usize, prot: c_int, flags: c_int, fd: c_int) -> *mut c_void {
