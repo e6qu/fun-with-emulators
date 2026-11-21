@@ -9127,3 +9127,365 @@ fn proc_hidepid_and_subset_hide_as_linux() {
          hidepid=3: EINVAL\n"
     );
 }
+
+/// TEMPORARY (M7 probe, removed before merge): what of Linux's graphical
+/// programs runs on fwe today, against a headless X server (Xvfb, from
+/// Homebrew's xorg-server: `XVFB`, with `LIBX11` for screenshots), only
+/// where `FWE_DISPLAY_PROBE` names a set: `native` (X11 clients, Weston
+/// with Wayland clients and Xwayland, tkinter, GTK, Qt, Chromium) or
+/// `wine` (Wine's notepad through its X11 driver, in the VM). Each
+/// program's output, calls and a screenshot go to
+/// `target/tmp/display-probe`; nothing is asserted.
+#[test]
+fn alpine_display_probe() {
+    if !fetched_program_tests("FWE_DISPLAY_PROBE") {
+        return;
+    }
+    let set = std::env::var("FWE_DISPLAY_PROBE").unwrap();
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("display-probe");
+    let _ = std::fs::remove_dir_all(&out);
+    std::fs::create_dir_all(&out).unwrap();
+    let p = Probe::start(out);
+    if set == "wine" {
+        p.wine();
+    } else {
+        p.native();
+    }
+}
+
+struct Probe {
+    out: PathBuf,
+    xvfb: std::process::Child,
+}
+
+/// A program the probe started, in a process group of its own.
+struct Running {
+    name: String,
+    child: std::process::Child,
+    trace: PathBuf,
+}
+
+const PROBE_DISPLAY: &str = ":99";
+/// The display as a Linux client reaches it over TCP (fwe's sockets are
+/// the host's), without a Unix socket in the guest's root.
+const PROBE_TCP: &str = "127.0.0.1:99";
+
+impl Probe {
+    fn start(out: PathBuf) -> Probe {
+        let xvfb_path = std::env::var("XVFB").expect("XVFB: Homebrew's Xvfb");
+        let xvfb = Command::new(xvfb_path)
+            .args([PROBE_DISPLAY, "-screen", "0", "1280x800x24", "-listen", "tcp", "-ac"])
+            .stdout(std::fs::File::create(out.join("xvfb.log")).unwrap())
+            .stderr(std::fs::File::create(out.join("xvfb.err")).unwrap())
+            .spawn()
+            .unwrap();
+        let p = Probe { out, xvfb };
+        let began = Instant::now();
+        while !p.host("xdpyinfo", &["-display", PROBE_DISPLAY]).status.success() {
+            assert!(began.elapsed() < Duration::from_secs(60), "Xvfb did not start");
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let info = p.host("xdpyinfo", &["-display", PROBE_DISPLAY, "-queryExtensions"]);
+        std::fs::write(p.out.join("xdpyinfo-host.txt"), &info.stdout).unwrap();
+        eprintln!("=== host xdpyinfo:\n{}", stdout(&info));
+        p
+    }
+
+    fn host(&self, program: &str, args: &[&str]) -> Output {
+        Command::new(program).args(args).output_alone().unwrap()
+    }
+
+    /// A root of its own, copied from the fetched one.
+    fn root(&self, manifest: &str) -> PathBuf {
+        let cached = alpine_root(manifest);
+        let root =
+            std::env::temp_dir().join(format!("fwe-probe-{manifest}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
+        for d in ["root", "tmp", "tmp/xdg"] {
+            std::fs::create_dir_all(root.join(d)).unwrap();
+        }
+        run_checked(Command::new("chmod").arg("700").arg(root.join("tmp/xdg")));
+        root
+    }
+
+    fn spawn(&self, name: &str, mut cmd: Command) -> Running {
+        use std::os::unix::process::CommandExt;
+        cmd.stdin(Stdio::null())
+            .stdout(std::fs::File::create(self.out.join(format!("{name}.out"))).unwrap())
+            .stderr(std::fs::File::create(self.out.join(format!("{name}.err"))).unwrap())
+            .process_group(0);
+        eprintln!("=== {name}: starting");
+        let child = cmd.spawn().unwrap();
+        Running { name: name.into(), child, trace: self.out.join(format!("{name}.trace")) }
+    }
+
+    /// `program` (under `root`) with `args` and `env`, natively.
+    fn fwe(
+        &self,
+        name: &str,
+        root: &Path,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Running {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--strace")
+            .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
+            .arg("--root")
+            .arg(root)
+            .arg(root.join(program.trim_start_matches('/')))
+            .args(args)
+            .env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", "/tmp/xdg")
+            .env("LANG", "C.UTF-8")
+            .env("DISPLAY", PROBE_TCP);
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        self.spawn(name, cmd)
+    }
+
+    /// Wait up to `secs` for `r` to end or settle, then a screenshot.
+    fn settle(&self, r: &mut Running, secs: u64) {
+        let began = Instant::now();
+        while began.elapsed() < Duration::from_secs(secs) {
+            if let Ok(Some(s)) = r.child.try_wait() {
+                eprintln!("=== {}: ended by itself after {:?}: {s}", r.name, began.elapsed());
+                break;
+            }
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        self.shot(&r.name);
+    }
+
+    fn shot(&self, name: &str) {
+        let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
+        let png = self.out.join(format!("{name}.png"));
+        let tool = repo().join("tools/display/shot.py");
+        let o = Command::new("python3")
+            .arg(tool)
+            .arg(lib)
+            .arg(PROBE_DISPLAY)
+            .arg(&png)
+            .output_alone()
+            .unwrap();
+        let tree = self.host("xwininfo", &["-root", "-tree", "-display", PROBE_DISPLAY]);
+        std::fs::write(self.out.join(format!("{name}.windows.txt")), &tree.stdout).unwrap();
+        eprintln!(
+            "=== {name}: screenshot {}{}; windows:\n{}",
+            stdout(&o).trim(),
+            String::from_utf8_lossy(&o.stderr).trim(),
+            stdout(&tree)
+                .lines()
+                .filter(|l| l.contains('"'))
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    /// Stop `r`'s process group and print what it said.
+    fn stop(&self, mut r: Running) {
+        let pgid = r.child.id() as i32;
+        assert!(pgid > 1);
+        let running = matches!(r.child.try_wait(), Ok(None));
+        // SAFETY: signals to the process group this probe made (its
+        // leader is the child), never pid 0, 1 or -1.
+        unsafe { libc::kill(-pgid, libc::SIGTERM) };
+        std::thread::sleep(Duration::from_secs(2));
+        // SAFETY: as above.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let status = r.child.wait().unwrap();
+        let err =
+            std::fs::read_to_string(self.out.join(format!("{}.err", r.name))).unwrap_or_default();
+        let outp =
+            std::fs::read_to_string(self.out.join(format!("{}.out", r.name))).unwrap_or_default();
+        let tail = |s: &str| {
+            s.lines()
+                .rev()
+                .take(40)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        eprintln!(
+            "=== {}: {} ({status})\n--- stdout:\n{}\n--- stderr:\n{}",
+            r.name,
+            if running { "still running when stopped" } else { "had ended" },
+            tail(&outp),
+            tail(&err)
+        );
+        if !running {
+            print_last_calls(&r.trace);
+        }
+    }
+
+    fn native(&self) {
+        let root = self.root("display");
+        for (name, display) in [("xdpyinfo-tcp", PROBE_TCP), ("xdpyinfo-unix", PROBE_DISPLAY)] {
+            let mut r = self.fwe(
+                name,
+                &root,
+                "/usr/bin/xdpyinfo",
+                &["-queryExtensions"],
+                &[("DISPLAY", display)],
+            );
+            self.settle(&mut r, 60);
+            self.stop(r);
+        }
+        for prog in ["xeyes", "xclock"] {
+            let mut r = self.fwe(prog, &root, &format!("/usr/bin/{prog}"), &[], &[]);
+            self.settle(&mut r, 60);
+            self.stop(r);
+        }
+        // xterm, typed into from the host.
+        let mut r = self.fwe("xterm", &root, "/usr/bin/xterm", &["-e", "/bin/sh"], &[]);
+        self.settle(&mut r, 60);
+        let typed = self.host(
+            "xdotool",
+            &[
+                "search",
+                "--sync",
+                "--class",
+                "xterm",
+                "windowactivate",
+                "--sync",
+                "type",
+                "--delay",
+                "50",
+                "echo typed in > /tmp/typed\n",
+            ],
+        );
+        eprintln!("=== xdotool: {} {}", typed.status, String::from_utf8_lossy(&typed.stderr));
+        std::thread::sleep(Duration::from_secs(5));
+        self.shot("xterm-typed");
+        eprintln!(
+            "=== xterm: /tmp/typed holds {:?}",
+            std::fs::read_to_string(root.join("tmp/typed"))
+        );
+        self.stop(r);
+        // Weston on X11, Wayland clients and Xwayland in it.
+        let mut weston = self.fwe(
+            "weston",
+            &root,
+            "/usr/bin/weston",
+            &[
+                "--backend=x11",
+                "--renderer=pixman",
+                "--socket=wayland-1",
+                "--xwayland",
+                "--width=1000",
+                "--height=700",
+            ],
+            &[],
+        );
+        self.settle(&mut weston, 60);
+        let wl = [("WAYLAND_DISPLAY", "wayland-1")];
+        let mut clients = Vec::new();
+        for (name, prog) in [
+            ("weston-simple-shm", "/usr/bin/weston-simple-shm"),
+            ("foot", "/usr/bin/foot"),
+            ("weston-terminal", "/usr/bin/weston-terminal"),
+        ] {
+            let mut r = self.fwe(name, &root, prog, &[], &wl);
+            self.settle(&mut r, 45);
+            clients.push(r);
+        }
+        let mut r = self.fwe("xeyes-xwayland", &root, "/usr/bin/xeyes", &[], &[("DISPLAY", ":0")]);
+        self.settle(&mut r, 60);
+        clients.push(r);
+        for r in clients {
+            self.stop(r);
+        }
+        self.stop(weston);
+        let _ = std::fs::remove_dir_all(&root);
+        // Toolkits.
+        let root = self.root("toolkits");
+        std::fs::write(
+            root.join("tmp/tk.py"),
+            "import tkinter as tk\nw = tk.Tk()\nw.title('fwe tkinter')\ntk.Label(w, text='Hello from tkinter on fwe', font=('DejaVu Sans', 24)).pack(padx=40, pady=40)\ntk.Button(w, text='A button').pack(pady=20)\nw.mainloop()\n",
+        )
+        .unwrap();
+        std::fs::write(
+            root.join("tmp/qt.py"),
+            "import sys\nfrom PyQt6.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget\napp = QApplication(sys.argv)\nw = QWidget()\nw.setWindowTitle('fwe Qt')\nl = QVBoxLayout(w)\nl.addWidget(QLabel('Hello from Qt on fwe'))\nl.addWidget(QPushButton('A button'))\nw.resize(500, 300)\nw.show()\nprint('platform', app.platformName(), flush=True)\nsys.exit(app.exec())\n",
+        )
+        .unwrap();
+        for (name, prog, args, env) in [
+            ("tkinter", "/usr/bin/python3", vec!["/tmp/tk.py"], vec![]),
+            ("gtk3-demo", "/usr/bin/gtk3-demo", vec![], vec![("GDK_BACKEND", "x11")]),
+            (
+                "gtk4-demo",
+                "/usr/bin/gtk4-demo",
+                vec![],
+                vec![("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")],
+            ),
+            ("qt", "/usr/bin/python3", vec!["/tmp/qt.py"], vec![("QT_QPA_PLATFORM", "xcb")]),
+        ] {
+            let mut r = self.fwe(name, &root, prog, &args, &env);
+            self.settle(&mut r, 90);
+            self.stop(r);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+        // Chromium, the engine Electron embeds: its sandbox on, then off.
+        let root = self.root("chromium");
+        std::fs::write(
+            root.join("tmp/page.html"),
+            "<html><body style='background:#36c;color:white;font:48px sans-serif'><h1>Hello from Chromium on fwe</h1><p id=t></p><script>document.getElementById('t').textContent = 'script ran: ' + (6 * 7);</script></body></html>",
+        )
+        .unwrap();
+        for (name, extra) in [("chromium", vec![]), ("chromium-nosandbox", vec!["--no-sandbox"])] {
+            let mut args = vec![
+                "--ozone-platform=x11",
+                "--user-data-dir=/tmp/chrome",
+                "--no-first-run",
+                "--disable-gpu",
+            ];
+            args.extend(extra);
+            args.push("file:///tmp/page.html");
+            let mut r = self.fwe(name, &root, "/usr/lib/chromium/chromium", &args, &[]);
+            self.settle(&mut r, 180);
+            self.stop(r);
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn wine(&self) {
+        let root = self.root("wine-x11");
+        let wine = |name: &str, command: &str, secs: u64| {
+            let mut cmd = hv_command().expect("the stand-in");
+            cmd.arg("--vm")
+                .arg("--strace")
+                .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
+                .arg("--root")
+                .arg(&root)
+                .arg(root.join("bin/busybox"))
+                .args(["sh", "-c", command])
+                .env_clear()
+                .env("HOME", "/root")
+                .env("PATH", "/usr/bin:/bin")
+                .env("WINEPREFIX", "/root/.wine")
+                .env("WINEDEBUG", "err+all")
+                .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
+                .env("DISPLAY", PROBE_TCP);
+            let mut r = self.spawn(name, cmd);
+            self.settle(&mut r, secs);
+            self.stop(r);
+        };
+        wine("wineboot", "wine wineboot --init; wineserver -w", 2400);
+        wine("notepad", "wine notepad", 900);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+impl Drop for Probe {
+    fn drop(&mut self) {
+        let _ = self.xvfb.kill();
+        let _ = self.xvfb.wait();
+    }
+}
