@@ -1087,9 +1087,28 @@ pub fn load_image(
                     stats.syscalls, stats.stubs, stats.x18_deferred
                 ));
             }
-            Ok(())
+            Ok(stats.beyond)
         })
         .map_err(Error::Load)?;
+        // Code no stub space reaches (the middle of an image larger than a
+        // branch reaches across) runs by translation.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        for &(a, l) in &loaded.translated {
+            jit::code(a, l);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        if let Some(&(start, _)) = loaded.translated.first() {
+            return Err(Error::Load(loader::LoadError::Prepare {
+                start,
+                reason: "code beyond its stubs' reach, and no translation here".into(),
+            }));
+        }
+        if strace && !loaded.translated.is_empty() {
+            let kib: u64 = loaded.translated.iter().map(|r| r.1 >> 10).sum();
+            tracer.note(&format!(
+                "{what}: {kib} KiB of code beyond its stubs' reach, run by translation"
+            ));
+        }
         if strace && loaded.from_image {
             tracer.note(&format!("{what} from its prepared image"));
         }
@@ -1139,8 +1158,8 @@ pub fn load_image(
         }
         None => None,
     };
-    let entry = interp.map_or(loaded.entry, |i| i.entry);
-    let interp_base = interp.map_or(0, |i| i.load_base);
+    let entry = interp.as_ref().map_or(loaded.entry, |i| i.entry);
+    let interp_base = interp.as_ref().map_or(0, |i| i.load_base);
 
     // A fresh thread stack, as large as `RLIMIT_STACK` lets it grow, with
     // an inaccessible guard page below it, ending at `loader::STACK_TOP`

@@ -5,7 +5,7 @@ use fwe_elf::{Elf, LoadPlan, PF_R, PF_W, PF_X, Patch};
 use std::fmt;
 
 /// A loaded image.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Loaded {
     /// Difference between run-time and link-time addresses (0 for ET_EXEC).
     pub bias: u64,
@@ -22,6 +22,10 @@ pub struct Loaded {
     pub stub_arena: StubArena,
     /// Mapped from its prepared image (nothing copied or written).
     pub from_image: bool,
+    /// Its code that runs by translation (address, length): pages whose
+    /// sites no stub space reaches ([`crate::prepare::Prepared::beyond`]),
+    /// left readable but not executable.
+    pub translated: Vec<(u64, u64)>,
 }
 
 #[derive(Debug)]
@@ -124,11 +128,24 @@ pub fn moved(elf: &Elf<'_>, page_size: u64) -> Option<Result<Vec<(u64, Patch)>, 
 /// [`load`]'s preparation of code: `(address, length, known code, stub
 /// arena, cache key)`.
 pub trait PrepareFn:
-    FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena, Option<&[u8]>) -> Result<(), String>
+    FnMut(
+    u64,
+    u64,
+    Option<&[(u64, u64)]>,
+    &mut StubArena,
+    Option<&[u8]>,
+) -> Result<Vec<(u64, u64)>, String>
 {
 }
-impl<F: FnMut(u64, u64, Option<&[(u64, u64)]>, &mut StubArena, Option<&[u8]>) -> Result<(), String>>
-    PrepareFn for F
+impl<
+    F: FnMut(
+        u64,
+        u64,
+        Option<&[(u64, u64)]>,
+        &mut StubArena,
+        Option<&[u8]>,
+    ) -> Result<Vec<(u64, u64)>, String>,
+> PrepareFn for F
 {
 }
 
@@ -260,12 +277,12 @@ pub fn load(
     let runs: Vec<(u64, u64)> = plan.runs.iter().map(|r| (r.start + bias, r.len)).collect();
     let image = file.map(|id| cache::about(id, format!("image2-{page_size}").as_bytes()));
     if let Some(key) = &image
-        && let Some((next, front_end)) =
+        && let Some(m) =
             crate::prepare::map_load_image(key, base, (start, start + total), &runs, slots)
     {
-        arena.next = next;
-        arena.front_end = front_end;
-        return finish(elf, &plan, bias, arena, true);
+        arena.next = m.arena_next;
+        arena.front_end = m.front_end;
+        return finish(elf, &plan, bias, arena, true, m.translated);
     }
     if image.is_some() {
         crate::prepare::image_begin();
@@ -313,6 +330,7 @@ pub fn load(
     };
     let known: Option<Vec<(u64, u64)>> =
         unwind.as_ref().map(|r| r.iter().map(|&(a, l)| (a + bias, l)).collect());
+    let mut translated = Vec::new();
     for (vaddr, size) in elf.exec_ranges() {
         // Kept by the file and the code's place in the image, with the
         // known code as offsets from it.
@@ -327,18 +345,19 @@ pub fn load(
             });
             cache::code_key(id, vaddr | 1 << 63, size, k.as_deref())
         });
-        prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena, key.as_deref()).map_err(
-            |reason| {
-                crate::prepare::image_abandon();
-                LoadError::Prepare { start: vaddr + bias, reason }
-            },
-        )?;
+        translated.extend(
+            prepare_exec(vaddr + bias, size, known.as_deref(), &mut arena, key.as_deref())
+                .map_err(|reason| {
+                    crate::prepare::image_abandon();
+                    LoadError::Prepare { start: vaddr + bias, reason }
+                })?,
+        );
     }
     if let Some(key) = &image {
         // SAFETY: the runs, mapped readable and writable above.
-        unsafe { crate::prepare::keep_load_image(key, base, &runs, &arena) };
+        unsafe { crate::prepare::keep_load_image(key, base, &runs, &arena, &translated) };
     }
-    finish(elf, &plan, bias, arena, false)
+    finish(elf, &plan, bias, arena, false, translated)
 }
 
 /// The runs of a loaded image given their protections, and what was
@@ -349,6 +368,7 @@ fn finish(
     bias: u64,
     arena: StubArena,
     from_image: bool,
+    translated: Vec<(u64, u64)>,
 ) -> Result<Loaded, LoadError> {
     for run in &plan.runs {
         let addr = (run.start + bias) as *mut libc::c_void;
@@ -358,6 +378,18 @@ fn finish(
                 start: run.start + bias,
                 len: run.len,
                 prot: run.prot,
+                error: std::io::Error::last_os_error(),
+            });
+        }
+    }
+    // Code that runs by translation: read to be translated, never run.
+    for &(at, len) in &translated {
+        // SAFETY: pages of the runs just given their protections.
+        if unsafe { libc::mprotect(at as *mut libc::c_void, len as usize, libc::PROT_READ) } != 0 {
+            return Err(LoadError::Protect {
+                start: at,
+                len,
+                prot: PF_R,
                 error: std::io::Error::last_os_error(),
             });
         }
@@ -377,5 +409,6 @@ fn finish(
         end: hi + bias,
         load_base: lo + bias,
         from_image,
+        translated,
     })
 }

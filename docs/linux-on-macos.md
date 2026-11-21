@@ -650,10 +650,16 @@ one of these instructions, so:
 
 A stub must be within a `b` instruction's reach (128 MiB either way). For
 a loaded program, stub space follows the image, sized from a count of the
-sites; for code mapped later, fwe reserves regions near the code, and
-code the guest let fwe place that finds none is mapped again where there
-is room. Otherwise the preparation fails: the guest's `mmap` gets
-`ENOMEM`, and `--strace` notes why.
+sites, and an image larger than a branch reaches across has as much
+before it too. The middle of an image wider still (Chromium's is 266 MiB,
+its code 224 MiB) has nothing but the image itself in reach: a system
+call there keeps its trap, and the pages holding its other sites run by
+translation, as a JIT's code does ([docs/jit.md](jit.md)); native code's
+calls into them fault once and are then linked. `--strace` notes how
+much ("KiB of code beyond its stubs' reach"). For code mapped later, fwe
+reserves regions near the code, and code the guest let fwe place that
+finds none is mapped again where there is room. Otherwise the preparation
+fails: the guest's `mmap` gets `ENOMEM`, and `--strace` notes why.
 
 ### What is not translated
 
