@@ -2810,14 +2810,14 @@ gives and fills the gaps from notes fwe processes leave each other:
 
 | On macOS | What fwe does (`host::signal_info`) | What the guest sees |
 |---|---|---|
-| `si_code` of a sent signal (`SI_USER` = `0x10001`, `SI_QUEUE`, `SI_TIMER`, `SI_ASYNCIO`, `SI_MESGQ`) | translated (`host::si_code_to_linux`); the `SIGCHLD` and fault codes are the same on both | Linux's `si_code` (`SI_USER` = 0 …) |
+| `si_code` of a sent signal (`SI_USER` = `0x10001`, `SI_QUEUE`, `SI_TIMER`, `SI_ASYNCIO`, `SI_MESGQ`) | translated (`host::si_code_to_linux`); the `SIGCHLD` codes are the same on both | Linux's `si_code` (`SI_USER` = 0 …) |
 | `si_pid` of the sender, a host pid | mapped into the guest's pid namespace | the sender's pid there, 0 for one outside it |
 | `si_uid` of the sender | from an fwe process (this one too), its guest real uid, which it writes in its note; from any other, fwe's own host user → 0, any other → 65534; then through the receiver's user namespace | the sender's real uid as the receiver's user namespace has it |
 | `si_uid` of a child's `SIGCHLD` (and `waitid`) | the child's guest real uid, read from its record, which is kept until it is reaped | the child's real uid |
 | an fwe process sent it | the sender first wrote a note (pid, its guest uid, and for `SI_MESGQ` the code and value) into the target's mailbox, which the handler reads | the sender, even when macOS gave none |
 | a `siginfo` macOS emptied (a signal that arrived while an fwe handler ran) | the note, if an fwe process sent it; for `SIGCHLD`, a `waitid(WNOHANG \| WNOWAIT)` finds the child and how it changed | the sender or child, as Linux tells it; none for a non-fwe sender |
 | a `SIGIO` the host raised for a descriptor's readiness | no sender: `SI_KERNEL` | see [Network events](#network-events) |
-| a fault | the fault address | `si_addr` |
+| a fault | the fault address; the code as Linux decides it ([Faults in guest code](#faults-in-guest-code)) | `si_addr`, `si_code` |
 
 #### Signals with no counterpart
 
@@ -2886,13 +2886,21 @@ In the VM a fault is an exception the run loop reads from `ESR_EL1`
 
 | VM exception | What the guest sees |
 |---|---|
-| data or instruction abort, not a page still to fetch or a stale TLB entry | `SIGSEGV`, `si_addr` the faulting address |
+| data or instruction abort, not a page still to fetch or a stale TLB entry | `SIGSEGV`, `si_addr` the faulting address; a misaligned access `SIGBUS` |
 | stage-2 abort | `SIGSEGV` |
 | PC or SP alignment | `SIGBUS` |
 | `brk` | `SIGTRAP` |
 | BTI, unknown or other exception | `SIGILL` |
 | trapped `CNTPCT_EL0` read | the virtual counter's value |
 | `wfi`, `wfe` | stepped over |
+
+A fault's `si_code` is Linux's, decided as Linux decides it, not from
+the host's page tables (which keep nothing for a page with no access, so
+the processor reports every such fault as a translation fault):
+`SEGV_ACCERR` where the guest has a mapping without the access,
+`SEGV_MAPERR` where it has none; `BUS_ADRALN` for a misaligned pc, stack
+or access, `BUS_MCEERR_AR` for poisoned memory, `BUS_ADRERR` otherwise;
+`TRAP_BRKPT` for a breakpoint; `ILL_ILLOPC` for an unknown instruction.
 
 A fault with a guest handler enters it with Linux's frame. With none, the
 process dies of the signal (natively after a register and code dump under

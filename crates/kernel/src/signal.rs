@@ -441,6 +441,36 @@ pub(crate) fn raise_self(sig: u64) {
     thread::post_self(sig, own_info(signal::SI_KERNEL));
 }
 
+/// A fault's `si_code`, as Linux's arm64 fault handlers give it: for
+/// `SIGSEGV`, an address the guest has no mapping at or one mapped without
+/// the access (as Linux tells them by the mapping, not by the host's page
+/// tables, which keep nothing for a page with no access); for `SIGBUS`,
+/// poisoned memory (`MADV_HWPOISON`), a misaligned pc, stack or access
+/// (the syndrome `esr`'s exception class or abort status), or else an
+/// address past what is mapped there; a breakpoint's `SIGTRAP`; an unknown
+/// instruction's `SIGILL`.
+fn fault_code(sig: u64, addr: u64, esr: Option<u64>) -> i32 {
+    const EC_PC_ALIGN: u64 = 0x22;
+    const EC_SP_ALIGN: u64 = 0x26;
+    const FSC_ALIGNMENT: u64 = 0x21;
+    let ec = esr.map(|e| (e >> 26) & 0x3f);
+    let fsc = esr.map(|e| e & 0x3f);
+    match sig {
+        signal::SIGSEGV if crate::mm::mapped(addr, 1) => signal::SEGV_ACCERR,
+        signal::SIGSEGV => signal::SEGV_MAPERR,
+        signal::SIGBUS if crate::mm::poisoned(addr) => signal::BUS_MCEERR_AR,
+        signal::SIGBUS
+            if matches!(ec, Some(EC_PC_ALIGN | EC_SP_ALIGN)) || fsc == Some(FSC_ALIGNMENT) =>
+        {
+            signal::BUS_ADRALN
+        }
+        signal::SIGBUS => signal::BUS_ADRERR,
+        signal::SIGTRAP => signal::TRAP_BRKPT,
+        signal::SIGILL => signal::ILL_ILLOPC,
+        _ => signal::SI_KERNEL,
+    }
+}
+
 /// A signal this process sends itself: its own pid and guest user.
 fn own_info(code: i32) -> SigInfo {
     SigInfo { code, pid: host::pid(), uid: crate::creds::real_uid(), ..SigInfo::default() }
@@ -651,8 +681,14 @@ impl<P: Platform> Kernel<P> {
             // signal it came as.
             let (code, pid) =
                 crate::host::signal_to_host(sig).map_or((0, 0), crate::host::last_host_info);
+            // A fault's address and where the guest was.
+            let at = if fault_addr != 0 || esr.is_some() {
+                format!(", si_addr={fault_addr:#x}, pc {:#x}", regs.pc)
+            } else {
+                String::new()
+            };
             self.tracer.note(&format!(
-                "--- signal {sig} {{si_code={}, si_pid={}, si_uid={}, si_value={:#x}}} (host: code {code:#x}, pid {pid}) ---",
+                "--- signal {sig} {{si_code={}, si_pid={}, si_uid={}, si_value={:#x}{at}}} (host: code {code:#x}, pid {pid}) ---",
                 info.code, info.pid, info.uid, info.value
             ));
         }
@@ -778,7 +814,7 @@ impl<P: Platform> Kernel<P> {
             }
             return true;
         }
-        let info = SigInfo { code: signal::SI_KERNEL, ..SigInfo::default() };
+        let info = SigInfo { code: fault_code(sig, addr, esr), ..SigInfo::default() };
         // Traced: the tracer sees the fault first (a breakpoint's SIGTRAP,
         // say), and the guest goes on as it leaves the registers, or takes
         // the signal it chooses.

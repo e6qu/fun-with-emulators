@@ -1098,8 +1098,8 @@ impl Vcpu {
                 regs.pc = elr - 4;
                 syscall(self, &mut regs);
             }
-            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr, None),
-            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far, None),
+            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr, Some(esr)),
+            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far, Some(esr)),
             EC_DABT_LOWER | EC_IABT_LOWER => {
                 // A translation fault (DFSC/IFSC 0b0001xx) a vfork child
                 // takes on memory it has not fetched yet: fetched now, the
@@ -1121,11 +1121,14 @@ impl Vcpu {
                         k.tracer.note(&format!("guest abort: esr {esr:#x}, far {far:#x}"));
                     }
                     drop(k);
-                    fault(&mut regs, s::SIGSEGV, far, Some(esr))
+                    // A misaligned access (DFSC 0b100001) is a bus error,
+                    // as Linux's `do_alignment_fault` makes it.
+                    let sig = if esr & 0x3f == 0x21 { s::SIGBUS } else { s::SIGSEGV };
+                    fault(&mut regs, sig, far, Some(esr))
                 }
             }
-            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr, None),
-            _ => fault(&mut regs, s::SIGILL, elr, None),
+            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr, Some(esr)),
+            _ => fault(&mut regs, s::SIGILL, elr, Some(esr)),
         }
         regs
     }

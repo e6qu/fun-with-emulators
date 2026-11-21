@@ -526,6 +526,17 @@ pub mod signal {
     /// `si_code` values shared across signals.
     pub const SI_USER: i32 = 0;
     pub const SI_KERNEL: i32 = 0x80;
+    /// A fault's `si_code`: `SIGSEGV`'s address not mapped, or mapped
+    /// without the access; `SIGBUS`'s misaligned address, address past
+    /// the object, or poisoned memory; `SIGTRAP`'s breakpoint; `SIGILL`'s
+    /// unknown instruction.
+    pub const SEGV_MAPERR: i32 = 1;
+    pub const SEGV_ACCERR: i32 = 2;
+    pub const BUS_ADRALN: i32 = 1;
+    pub const BUS_ADRERR: i32 = 2;
+    pub const BUS_MCEERR_AR: i32 = 4;
+    pub const TRAP_BRKPT: i32 = 1;
+    pub const ILL_ILLOPC: i32 = 1;
     pub const SI_QUEUE: i32 = -1;
     pub const SI_TIMER: i32 = -2;
     pub const SI_MESGQ: i32 = -3;

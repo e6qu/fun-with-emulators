@@ -9199,7 +9199,10 @@ fn code_beyond_its_stubs_reach_runs_by_translation() {
 /// What guests/c/faultesr.c prints where a fault's frame holds its
 /// syndrome: the ESR record Linux adds after the FP/SIMD one, a data
 /// abort's, telling a write (WnR) from a read, as Wine reads it.
-const FAULT_ESR: &str = "read: syndrome found, data abort yes, write 0\nwrite: syndrome found, data abort yes, write 1\n";
+const FAULT_ESR: &str = "read: syndrome found, data abort yes, write 0\n\
+    write: syndrome found, data abort yes, write 1\n\
+    no access: code 2, at the address yes\nnot mapped: code 1, at the address yes\n\
+    breakpoint: code 1, at the instruction yes\n";
 
 /// A fault's syndrome in its handler's frame, natively.
 #[test]
