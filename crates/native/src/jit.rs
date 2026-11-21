@@ -2673,9 +2673,8 @@ fn translation(s: &mut Held, g: u64, unsaved: bool) -> usize {
             _ if followed => kept::part_of(g),
             _ => kept::generated(),
         };
-        let taken = part
-            .and_then(|p| kept::take(p, g, &source, |end| calls_in(s, g, end)))
-            .filter(|(made, _)| !unsaved || made.unsaved.is_some());
+        let taken =
+            part.and_then(|p| kept::take(p, g, &source, |end| calls_in(s, g, end), unsaved));
         lap.step(jitcount::STEP_LOOK);
         if let Some((mut made, info)) = taken {
             // Its ways into calls made in other blocks' words, to where

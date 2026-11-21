@@ -1358,27 +1358,38 @@ fn jit_calls_into_jit_code_keep_x30_through_signals_and_rewrites() {
 /// entry for the program's own `x16` and `x17`, entered there (one made
 /// first without, as a block made ahead, is made again with it as that
 /// branch first comes to it), and the branches are linked there (the
-/// loop's rounds do not go through fwe).
+/// loop's rounds do not go through fwe). Run three times (a copy of its
+/// own, whose generated code no other test's runs keep): the third makes
+/// no block, taking each as the second kept it, with that entry too.
 #[test]
 fn jit_branches_holding_x16_x17_enter_blocks_made_again_for_them() {
-    let prog = build_c("jitunsaved", Libc::Musl, true, true);
+    let built = build_c("jitunsaved", Libc::Musl, true, true);
     let root = libc_rootfs(Libc::Musl, "jitunsaved");
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
-    let out = run_bounded(cmd);
-    let err = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(stdout(&out), "computed as in C: yes\n", "{err}");
-    assert_eq!(out.status.code(), Some(0));
-    let remade = *jit_counts(&err, " entered there, ")
-        .first()
-        .unwrap_or_else(|| panic!("no count of blocks made again: {err}"));
-    assert!(err.contains("; 2 with a second pass ("), "{err}");
-    assert!(err.contains(" words), 2 of them entered there, "), "{err}");
-    assert!(remade >= 1, "blocks made again for the program's x16 and x17: {err}");
-    let exits = *jit_counts(&err, " blocks translated, ")
-        .first()
-        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
-    assert!(exits < 20, "{exits} ways out through fwe: {err}");
+    let prog = root.join(format!("jitunsaved-{}", std::process::id()));
+    std::fs::copy(&built, &prog).unwrap();
+    for round in 0..3 {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "computed as in C: yes\n", "{err}");
+        assert_eq!(out.status.code(), Some(0));
+        let remade = *jit_counts(&err, " entered there, ")
+            .first()
+            .unwrap_or_else(|| panic!("no count of blocks made again: {err}"));
+        assert!(remade >= 1, "blocks made again for the program's x16 and x17: {err}");
+        if round == 0 {
+            assert!(err.contains("; 2 with a second pass ("), "{err}");
+            assert!(err.contains(" words), 2 of them entered there, "), "{err}");
+            let exits = *jit_counts(&err, " blocks translated, ")
+                .first()
+                .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+            assert!(exits < 20, "{exits} ways out through fwe: {err}");
+        }
+        if round == 2 {
+            assert!(err.contains("blocks made from files 0 (0 ms), generated 0 ("), "{err}");
+        }
+    }
     let _ = std::fs::remove_dir_all(&root);
 }
 

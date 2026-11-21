@@ -345,13 +345,16 @@ pub(super) fn remapped(addr: u64, len: u64) {
 
 /// A record of part `part` for the block at `g` made from `source` (the
 /// program's words from `g`, as far as a block's translation may read
-/// them) with the calls in `known` made in other blocks' words: the block
-/// as made, its words' meanings packed, and where its words end.
+/// them) with the calls in `known` made in other blocks' words, and an
+/// entry with the program's own `x16` and `x17` if `unsaved` (a block a
+/// past process made again for that entry has a record of each): the
+/// block as made, its words' meanings packed, and where its words end.
 pub(super) fn take(
     part: Part,
     g: u64,
     source: &[u32],
     known: impl Fn(u64) -> Vec<u64>,
+    unsaved: bool,
 ) -> Option<(Made, Vec<Packed>)> {
     let mut k = kept();
     let k = begun(&mut k);
@@ -385,7 +388,10 @@ pub(super) fn take(
             jitcount::KEPT_OTHER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             continue;
         }
-        return decode(&mut r, end);
+        match decode(&mut r, end) {
+            Some((made, _)) if unsaved && made.unsaved.is_none() => continue,
+            taken => return taken,
+        }
     }
     None
 }
