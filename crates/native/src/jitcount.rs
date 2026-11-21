@@ -5,8 +5,9 @@
 //! Always, under `FWE_TIMING`: the blocks made by where their code comes
 //! from (a file fwe prepared in place, or code the program generated) and
 //! the time making them; the blocks made with a second pass of their words
-//! for an entry with the program's own `x16` and `x17`, and those whose
-//! entry was ever used; the blocks made ahead of the program.
+//! for an entry with the program's own `x16` and `x17` (made again with it
+//! on that entry's first use), and those whose entry was ever used; the
+//! blocks made ahead of the program.
 //!
 //! With `FWE_JIT_SEEN` naming a directory: each process adds there the
 //! blocks it made (their program address and a hash of their words) as it
@@ -66,11 +67,13 @@ const STEPS: [&str; 10] = [
     "linked",
 ];
 
-/// Blocks made with a second pass of their words, those words, and the
-/// blocks whose entry there was used.
+/// Blocks made with a second pass of their words, those words, the
+/// blocks whose entry there was used, and the blocks made again with it
+/// (made first without, the pass made on its entry's first use).
 pub(crate) static SECOND: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECOND_WORDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static SECOND_USED: AtomicU64 = AtomicU64::new(0);
+pub(crate) static SECOND_REMADE: AtomicU64 = AtomicU64::new(0);
 /// Blocks made ahead of the program.
 pub(crate) static AHEAD: AtomicU64 = AtomicU64::new(0);
 /// Blocks taken from those kept ([`crate::jit`]'s `kept`), by origin, and
@@ -374,7 +377,7 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
     let n = |n: &AtomicU64| n.load(Ordering::Relaxed);
     let mut out = format!(
         "blocks made {} {} ({} ms), {} {} ({} ms); {} with a second pass ({} words), {} of them \
-         entered there; {} made ahead",
+         entered there, {} made again for it; {} made ahead",
         ORIGINS[FILE],
         n(&MADE[FILE]),
         ms(&MAKE_NS[FILE]),
@@ -384,6 +387,7 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
         n(&SECOND),
         n(&SECOND_WORDS),
         n(&SECOND_USED),
+        n(&SECOND_REMADE),
         n(&AHEAD),
     );
     out.push_str("; making a block, ns each step:");

@@ -106,7 +106,10 @@ way.
   restore is four. A block reached by a direct branch with the program's
   own registers is entered past its restore, or where it starts with
   code that runs either way, at a copy of that code made with them in
-  place, which joins the rest at the restore. A fault or signal anywhere
+  place, which joins the rest at the restore: made only once such a
+  branch first comes to it (most blocks are entered only with them
+  saved: by lookups, by branches from code that never names them, and
+  by fwe, which puts them in their slots as it goes on into a block). A fault or signal anywhere
   in between is delivered with the program's `x16` and `x17`.
 - **`x18` in `x17`.** macOS keeps `x18` for itself, and Linux code uses it
   like any other register (HotSpot's C2 allocates it), so outside
@@ -334,13 +337,17 @@ a processor that reports `DIC` clear.
   saved entry, where lookups and direct branches with `x16` and `x17`
   saved come in (`Block::body`). `jit::keeps_saved`
   tells which instructions run with them saved; `jit::body_of` restores
-  them before any other. Its unsaved entry (`Block::unsaved`) is past
-  that restore when the block starts with it, or a copy of the words up
-  to it made with them in their registers, which branches into the rest,
-  or, at a call or a branch through a register the saved words make with
-  them saved, saves them and branches there; where those words name
-  `x18`, which the saved words keep in `x17`, a save of `x16` and `x17`
-  and a branch into the saved words.
+  them before any other. Its unsaved entry (`Block::unsaved`), for a
+  direct branch from words that hold the program's `x16` and `x17`, is
+  past that restore when the block starts with it; otherwise the block is
+  made without one, and dropped and made again with one when such a
+  branch first comes to it (`jit::translation`'s `unsaved`; a way out that
+  only `jit::link_waiting` would link is left to its first run): a copy of
+  the words up to the restore made with them in their registers, which
+  branches into the rest, or, at a call or a branch through a register
+  the saved words make with them saved, saves them and branches there;
+  where those words name `x18`, which the saved words keep in `x17`, a
+  save of `x16` and `x17` and a branch into the saved words.
 - **The table** of translations by guest address is 2^20 entries of
   (address, translation) at 2^45 (32 TiB, reachable with one `orr`),
   each 16 bytes aligned and written whole (`stp`) for lookups that read
@@ -489,8 +496,8 @@ What fwe counts, for the benchmarks to report
   took, the time of each step of making or taking one (reading its words,
   looking for a kept one, translating, checking, packing, keeping,
   finding room, writing, indexing, linking), the program's words a block holds and what ended it, blocks made
-  with a second pass for the program's own `x16` and `x17` and those
-  entered there, blocks made ahead, blocks taken from those kept (the records read and
+  with a second pass for the program's own `x16` and `x17`, those
+  entered there and those made again for it, blocks made ahead, blocks taken from those kept (the records read and
   the files mapped to find them), the generated blocks made again where a
   past process made them (and so kept), and the
   blocks in use that only a direct branch leads to, by where the branch

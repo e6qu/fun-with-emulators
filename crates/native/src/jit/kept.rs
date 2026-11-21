@@ -426,7 +426,12 @@ pub(super) fn keep(
     for &p in known {
         put64(w, p);
     }
-    for v in [made.entry, made.unsaved, made.x18, made.second.unwrap_or(usize::MAX)] {
+    for v in [
+        made.entry,
+        made.unsaved.unwrap_or(usize::MAX),
+        made.x18,
+        made.second.unwrap_or(usize::MAX),
+    ] {
         put32(w, v as u32);
     }
     // The gate its system calls' and flushes' stubs call, an address of
@@ -537,7 +542,7 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     let made = Made {
         room,
         entry: entry as usize,
-        unsaved: unsaved as usize,
+        unsaved: (unsaved != u32::MAX).then_some(unsaved as usize),
         x18: x18 as usize,
         end,
         second,
@@ -597,7 +602,7 @@ impl<'a> Reader<'a> {
 /// A file of records begins so, then its count of records and a table of
 /// them in address order, for each its program address, offset, length
 /// and key ([`key_of`]); their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept8";
+const MAGIC: &[u8; 8] = b"fwekept9";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],

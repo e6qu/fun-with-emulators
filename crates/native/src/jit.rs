@@ -729,10 +729,12 @@ struct Block {
     /// Where a lookup or a direct branch enters it with the program's
     /// `x16` and `x17` saved: past its check (its saved entry).
     body: u64,
-    /// Where it is entered with the program's own registers: past its
-    /// first word where that takes them back, else its start, which saves
-    /// them.
-    unsaved: u64,
+    /// Where it is entered with the program's own registers, if it has
+    /// such an entry: past its first word where that takes them back, else
+    /// a second pass of its words made with them in their registers (or,
+    /// where those name `x18`, a save of them and a branch to the saved
+    /// entry), made only once a direct branch needs it ([`translation`]).
+    unsaved: Option<u64>,
     /// Where it is entered with them saved and its `x18` in `x17` (the
     /// thread's area in `x16`), past the words that load them, if it starts
     /// with them; else 0.
@@ -773,7 +775,7 @@ impl Block {
         if self.notes.second && !self.notes.used.replace(true) {
             jitcount::SECOND_USED.fetch_add(1, Ordering::Relaxed);
         }
-        self.unsaved
+        self.unsaved.unwrap_or_else(|| panic!("block {:#x} entered unsaved, no such entry", self.g))
     }
 
     /// What its word `k` stands for.
@@ -1929,7 +1931,7 @@ pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
         let mut spots = ENTRY_SPOTS.lock().unwrap_or_else(|e| e.into_inner());
         spots.entry((pc, lr)).or_insert((0, held)).0 += 1;
     }
-    let i = translation(&mut s, pc);
+    let i = translation(&mut s, pc, false);
     // Entered at its saved entry, the program's `x16` and `x17` put in
     // their slots.
     let into = s.blocks[i].body;
@@ -1954,7 +1956,7 @@ pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
         if let CallSite::Direct(to) = site {
             // Its target translated, for the lookup to find (again, if
             // its translation went since).
-            translation(&mut s, to);
+            translation(&mut s, to, false);
         }
         linked = s.call_sites.get(&at) == Some(&true)
             || !s.call_sites.contains_key(&at) && link_call_site(&mut s, at, site);
@@ -2248,10 +2250,13 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
             EXITS_KNOWN_TAKEN.fetch_add(1, Ordering::Relaxed);
         }
     }
-    let mut i = translation(&mut s, to);
+    // With an entry for the program's own `x16` and `x17` where the way
+    // out, a direct one, has them, to be linked there.
+    let unsaved = link_here && !saved;
+    let mut i = translation(&mut s, to, unsaved);
     // (The cache emptied as blocks were made ahead: its block anew.)
     if ahead(&mut s, i) {
-        i = translation(&mut s, to);
+        i = translation(&mut s, to, unsaved);
     }
     // Linked where the target is in reach (in the same chunk), unless the
     // cache was emptied meanwhile (`at` may be reused) or the block left
@@ -2577,14 +2582,28 @@ fn entered(s: &State, i: usize, saved: bool, x18: bool) -> u64 {
 /// The translation of program address `g`, made if there is none:
 /// without the lock (it is let go a moment), from one look at the
 /// program's words, and placed if they are still as it saw them and no
-/// other thread placed one meanwhile (else it looks again).
-fn translation(s: &mut Held, g: u64) -> usize {
+/// other thread placed one meanwhile (else it looks again). With an entry
+/// for the program's own `x16` and `x17` if `unsaved`: one made without
+/// is dropped and made again with it, as a direct branch with them first
+/// needs it (most blocks are entered only with them saved: lookups,
+/// branches from words that never name them, fwe going on into one).
+fn translation(s: &mut Held, g: u64, unsaved: bool) -> usize {
     loop {
         if let Some(&i) = s.by_g.get(&g) {
-            // Its table entry may have gone to another address since (they
-            // share entries): it is its own again.
-            publish_block(&s.blocks[i]);
-            return i;
+            if !unsaved || s.blocks[i].unsaved.is_some() {
+                // Its table entry may have gone to another address since
+                // (they share entries): it is its own again.
+                publish_block(&s.blocks[i]);
+                return i;
+            }
+            // Dropped (the branches linked to it wait for the new one, a
+            // thread in its words goes on there), and made again.
+            let page = g & !(page_size() - 1);
+            if let Some(v) = s.pages.get_mut(&page) {
+                v.retain(|&k| k != i);
+            }
+            s.drop_block(i, false);
+            jitcount::SECOND_REMADE.fetch_add(1, Ordering::Relaxed);
         }
         if s.cache.is_none() {
             s.cache = Some(new_cache());
@@ -2592,7 +2611,7 @@ fn translation(s: &mut Held, g: u64) -> usize {
         }
         let page = g & !(page_size() - 1);
         let followed = !s.in_region(g);
-        if let Some(i) = revive(s, g, page) {
+        if let Some(i) = revive(s, g, page, unsaved) {
             return i;
         }
         let making = Clock::now();
@@ -2608,7 +2627,9 @@ fn translation(s: &mut Held, g: u64) -> usize {
             _ if followed => kept::part_of(g),
             _ => kept::generated(),
         };
-        let taken = part.and_then(|p| kept::take(p, g, &source, |end| calls_in(s, g, end)));
+        let taken = part
+            .and_then(|p| kept::take(p, g, &source, |end| calls_in(s, g, end)))
+            .filter(|(made, _)| !unsaved || made.unsaved.is_some());
         lap.step(jitcount::STEP_LOOK);
         if let Some((mut made, info)) = taken {
             // Its ways into calls made in other blocks' words, to where
@@ -2630,7 +2651,7 @@ fn translation(s: &mut Held, g: u64) -> usize {
         // (Made at 0, its words standing anywhere; placed below.)
         let (made, looked) = s.unlocked(|| {
             let began = Clock::now();
-            let made = with_snapshot(g, &source, || translate(g, 0, followed, &known));
+            let made = with_snapshot(g, &source, || translate(g, 0, followed, &known, unsaved));
             began.add_to(&TRANSLATE_NS);
             made
         });
@@ -2688,7 +2709,7 @@ fn ahead(s: &mut Held, i: usize) -> bool {
                 continue;
             }
             MAKING_AHEAD.set(true);
-            let j = translation(s, to);
+            let j = translation(s, to, false);
             MAKING_AHEAD.set(false);
             made += 1;
             if s.cache.as_ref().map_or(0, |c| c.flushes) != flushes {
@@ -2789,7 +2810,7 @@ fn place(
         cold: cold_t,
         cold_len,
         body: t + 4 * entry as u64,
-        unsaved: t + 4 * unsaved as u64,
+        unsaved: unsaved.map(|k| t + 4 * k as u64),
         x18: if x18 == 0 { 0 } else { t + 4 * x18 as u64 },
         retired: false,
         source,
@@ -2836,11 +2857,15 @@ fn place(
 /// Take back the block at program address `g`, on page `p`, that a flush
 /// of its words dropped ([`State::dormant`]), if they were not changed: a
 /// JIT flushes code it wrote anew as the same (a method installed again,
-/// a patch undone). Only a block wanted again is taken back.
-fn revive(s: &mut State, g: u64, p: u64) -> Option<usize> {
+/// a patch undone). Only a block wanted again is taken back, and with an
+/// entry for the program's own `x16` and `x17` if `unsaved`.
+fn revive(s: &mut State, g: u64, p: u64, unsaved: bool) -> Option<usize> {
     let i = s.dormant.remove(&g)?;
     let b = &s.blocks[i];
     if b.retired || b.followed == s.in_region(g) || b.g & !(page_size() - 1) != p {
+        return None;
+    }
+    if unsaved && b.unsaved.is_none() {
         return None;
     }
     if !b.unchanged() {
@@ -2925,6 +2950,12 @@ fn link_site(s: &mut State, from: usize, at: u64, j: usize) {
     let word = s.blocks[from].word_at(at);
     let Some(Word::Out { exit: Exit::Jump(x), saved, x18, .. }) = word else { return };
     if x != to || !unlinked(at) || s.blocks[from].retired || s.blocks[j].retired {
+        return;
+    }
+    // Into a block with no entry for the program's own `x16` and `x17`:
+    // left to its first run, whose way through fwe makes the block again
+    // with one ([`translation`]).
+    if !saved && s.blocks[j].unsaved.is_none() {
         return;
     }
     if s.link(from, at, entered(s, j, saved, x18)) {
@@ -3177,7 +3208,7 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
         cold: 0,
         cold_len: 0,
         body: t,
-        unsaved: t,
+        unsaved: Some(t),
         x18: 0,
         retired: false,
         source: Vec::new(),
@@ -3445,9 +3476,9 @@ struct Made {
     /// they are placed) and its calls.
     room: Room,
     /// Its saved, unsaved and `x18` entries ([`Block`]), as indexes of its
-    /// hot words (the last 0 if none).
+    /// hot words (the unsaved one if made, the last 0 if none).
     entry: usize,
-    unsaved: usize,
+    unsaved: Option<usize>,
     x18: usize,
     /// The end of the program's words it read.
     end: u64,
@@ -3473,9 +3504,10 @@ thread_local! {
 }
 
 /// Translate the block at program address `g`, to be placed at `t`: its
-/// words, and what each stands for. A block ends at its page's end, so it
-/// is made from that page alone.
-fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
+/// words, and what each stands for; with an entry for the program's own
+/// `x16` and `x17` if `unsaved` (or free: its first word takes them back).
+/// A block ends at its page's end, so it is made from that page alone.
+fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)], unsaved: bool) -> Made {
     // A lookup that read an entry's address and translation at once, and a
     // direct branch with the program's `x16` and `x17` saved in their
     // slots (as a lookup saves them), enter at the saved entry ([`CHECK_WORDS`]
@@ -3520,13 +3552,16 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // (Counting, every such entry is made apart, to count its runs.)
     let mut second = None;
     let unsaved = match restore {
-        Some((at, k)) if at == g && !counting => k + RESTORE_WORDS,
+        Some((at, k)) if at == g && !counting => Some(k + RESTORE_WORDS),
+        // Made only once a direct branch with them needs it (`unsaved`),
+        // but where blocks count their runs.
+        _ if !unsaved && !counting => None,
         _ if x18.is_some() => {
             let start = a.len(H);
             push_save(a, H, Word::At(g), g);
             let entry = a.label_at(Pos::hot(CHECK_WORDS));
             a.branch(H, B, Field::Imm26, entry, Word::Saved(g));
-            start
+            Some(start)
         }
         _ => {
             let start = a.len(H);
@@ -3537,7 +3572,7 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
             }
             body_of(g, t, followed, false, restore, c, a);
             second = Some(a.len(H) - start);
-            start
+            Some(start)
         }
     };
     // Each conditional branch's distance back from its taken way, in the
@@ -4854,7 +4889,7 @@ mod tests {
         // add x0, x0, #1; bl +0x100; ret
         let mut words = vec![0x9100_0400, 0x9400_0040, 0xd65f_03c0];
         words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
-        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[]));
+        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[], true));
         let a = &made.room.asm;
         assert_eq!(made.entry, CHECK_WORDS);
         let k = CHECK_WORDS - 1;
@@ -4905,7 +4940,7 @@ mod tests {
         let mut words = vec![0xb400_0041, 0xaa1203e0, 0x9400_0040, 0x9100_0400, 0xd65f_03c0];
         // As far as a block's look ahead reads ([`snapshot`]).
         words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
-        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[]));
+        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[], true));
         let pads = &made.room.c.pads;
         let mut rets: Vec<u64> = pads.iter().map(|p| p.0).collect();
         rets.dedup();
