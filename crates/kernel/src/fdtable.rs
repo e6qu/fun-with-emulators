@@ -472,8 +472,17 @@ pub fn over_limit(fds: &[i32]) -> bool {
 mod tests {
     use super::*;
 
+    /// One test at a time that sets the process's limits or places
+    /// descriptors by them: a soft limit another sets past the guest's
+    /// range would move a root into the reserved one.
+    fn alone() -> std::sync::MutexGuard<'static, ()> {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        ONE.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn reserved_descriptors_sit_above_the_guest_range() {
+        let _one = alone();
         init();
         let mut fds = [0; 2];
         // SAFETY: a 2-element array.
@@ -499,6 +508,7 @@ mod tests {
 
     #[test]
     fn the_root_sits_at_or_above_the_soft_limit_out_of_reach() {
+        let _one = alone();
         init();
         // SAFETY: opening a directory by path.
         let dir = unsafe { libc::open(c"/".as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY) };
@@ -523,6 +533,7 @@ mod tests {
 
     #[test]
     fn limit_is_virtual_and_bounded_by_nr_open() {
+        let _one = alone();
         init();
         let (_, hard) = limit();
         assert_eq!(hard, guest_max() as u64);
