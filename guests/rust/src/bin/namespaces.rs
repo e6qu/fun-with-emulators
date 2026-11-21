@@ -20,6 +20,9 @@ const MS_BIND: u64 = 4096;
 const MS_REC: u64 = 16384;
 const MS_PRIVATE: u64 = 1 << 18;
 const MS_REMOUNT: u64 = 32;
+const MS_NOSUID: u64 = 2;
+const MS_NOEXEC: u64 = 8;
+const MS_SILENT: u64 = 1 << 15;
 const MNT_DETACH: i32 = 2;
 const SIGKILL: i32 = 9;
 const SIGSTOP: i32 = 19;
@@ -77,6 +80,7 @@ unsafe extern "C" {
     fn socket(domain: i32, ty: i32, proto: i32) -> i32;
     fn ioctl(fd: i32, req: u64, ...) -> i32;
     fn close(fd: i32) -> i32;
+    fn open(path: *const std::ffi::c_char, flags: i32, ...) -> i32;
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
     fn write(fd: i32, buf: *const u8, len: usize) -> isize;
     fn __errno_location() -> *mut i32;
@@ -548,6 +552,13 @@ fn main() {
                         MS_BIND | MS_REC,
                         std::ptr::null(),
                     );
+                    mount(
+                        c"proc".as_ptr(),
+                        c"/newroot/proc".as_ptr(),
+                        c"proc".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    );
                     chdir(c"/newroot".as_ptr());
                     println!(
                         "pivot: {}",
@@ -560,6 +571,69 @@ fn main() {
                 println!("old root's /dev/null: {}", null.map(|_| "opened").unwrap_or("missing"));
                 let zero = std::fs::File::open("/oldroot/dev/zero").is_ok();
                 println!("old root's /dev/zero opened: {zero}");
+                // Its nodes bound into the new root and the binds remounted
+                // without devices' and programs' rights, as bubblewrap's
+                // `--dev` does: by path, and through a descriptor (one of
+                // the host's nodes, and one of fwe's own).
+                std::fs::create_dir_all("/box/dev").unwrap();
+                // SAFETY: NUL-terminated strings.
+                unsafe {
+                    mount(
+                        c"tmpfs".as_ptr(),
+                        c"/box/dev".as_ptr(),
+                        c"tmpfs".as_ptr(),
+                        0,
+                        std::ptr::null(),
+                    )
+                };
+                for (node, by_fd) in [("null", false), ("zero", true), ("full", true)] {
+                    let at = format!("/box/dev/{node}");
+                    std::fs::write(&at, b"").unwrap();
+                    // As bubblewrap opens it: `O_PATH`, in the old root.
+                    let held = {
+                        let name = std::ffi::CString::new(format!("/dev/{node}")).unwrap();
+                        // `struct open_how`: flags `O_PATH | O_CLOEXEC`, no
+                        // mode, `RESOLVE_IN_ROOT | RESOLVE_NO_MAGICLINKS`.
+                        let how: [u64; 3] = [0o10000000 | 0o2000000, 0, 0x10 | 0x02];
+                        // SAFETY: NUL-terminated strings, a valid `open_how`.
+                        unsafe {
+                            let root = open(c"/oldroot".as_ptr(), 0o200000 | 0o10000000, 0);
+                            let fd = syscall(437, root, name.as_ptr(), how.as_ptr(), 24);
+                            close(root);
+                            fd as i32
+                        }
+                    };
+                    let from = if by_fd {
+                        format!("/proc/self/fd/{held}")
+                    } else {
+                        format!("/oldroot/dev/{node}")
+                    };
+                    let from = std::ffi::CString::new(from).unwrap();
+                    let to = std::ffi::CString::new(at.clone()).unwrap();
+                    // SAFETY: NUL-terminated strings.
+                    let bound = unsafe {
+                        mount(from.as_ptr(), to.as_ptr(), std::ptr::null(), MS_BIND, std::ptr::null())
+                    };
+                    // SAFETY: as above.
+                    let remounted = unsafe {
+                        mount(
+                            c"none".as_ptr(),
+                            to.as_ptr(),
+                            std::ptr::null(),
+                            MS_REMOUNT | MS_BIND | MS_NOSUID | MS_NOEXEC | MS_SILENT,
+                            std::ptr::null(),
+                        )
+                    };
+                    let node_now = std::fs::metadata(&at).map(|m| {
+                        use std::os::unix::fs::FileTypeExt;
+                        m.file_type().is_char_device()
+                    });
+                    println!(
+                        "{node} by {}: bound {bound}, remounted {remounted}, a device there {}",
+                        if by_fd { "descriptor" } else { "path" },
+                        node_now.unwrap_or(false)
+                    );
+                }
                 0
             });
             println!("child exited {code}");

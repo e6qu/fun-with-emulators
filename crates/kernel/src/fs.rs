@@ -34,6 +34,29 @@ const MAX_SYMLINKS: u32 = 40;
 /// The loop devices' nodes are there too ([`crate::loopdev::node_named`]).
 const DEVICES: &[&[u8]] = &[b"null", b"zero", b"full", b"random", b"urandom", b"tty"];
 
+/// The standard device node `absolute` (a path in the view) names by its
+/// last two components (`…/dev/<name>`), if it names one.
+fn device_name(absolute: &[u8]) -> Option<&[u8]> {
+    let (parent, name) = absolute.split_at(absolute.iter().rposition(|&b| b == b'/')? + 1);
+    (parent.ends_with(b"/dev/")
+        && (DEVICES.contains(&name) || crate::loopdev::node_named(name).is_some()))
+    .then_some(name)
+}
+
+/// The standard device node `absolute` names in the rootfs's own /dev,
+/// wherever the rootfs is mounted (a sandbox's `pivot_root` puts it under
+/// the new root, its /dev at `<put_old>/dev`): `absolute` is in mount `m`
+/// at `rest` (inside it).
+fn rootfs_device<'a>(
+    absolute: &'a [u8],
+    m: &Mount,
+    rest: &[u8],
+    root_host: &[u8],
+) -> Option<&'a [u8]> {
+    let name = device_name(absolute)?;
+    (is_rootfs(m, root_host) && rest.strip_prefix(b"/dev/") == Some(name)).then_some(name)
+}
+
 /// `/dev` entries that are links into `/proc/self/fd`, as on Linux.
 fn dev_link(absolute: &[u8]) -> Option<Vec<u8>> {
     let fd = match absolute {
@@ -1891,11 +1914,13 @@ impl Fs {
             return device_of_fd(fd);
         }
         let absolute = self.absolute_path(fcntl::AT_FDCWD as i32, path)?;
-        let name = absolute.strip_prefix(b"/dev/")?;
-        if !DEVICES.contains(&name) && crate::loopdev::node_named(name).is_none() {
-            return None;
-        }
-        if !is_rootfs(&self.mount_of(&absolute).0, &self.root_host) {
+        device_name(&absolute)?;
+        let in_rootfs = {
+            let table = self.mnt.table();
+            let (m, rest) = table.locate(&self.to_ns(&absolute));
+            rootfs_device(&absolute, m, &rest, &self.root_host).is_some()
+        };
+        if !in_rootfs {
             return None;
         }
         let r = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
@@ -2331,18 +2356,11 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     // rootfs is mounted (a sandbox's `pivot_root` puts it under the new
     // root, its /dev at `<put_old>/dev`).
     let device = absolute.as_deref().and_then(|a| {
-        let (parent, name) = a.split_at(a.iter().rposition(|&b| b == b'/')? + 1);
-        if !parent.ends_with(b"/dev/") {
-            return None;
-        }
-        let own = crate::loopdev::node_named(name);
-        if !DEVICES.contains(&name) && own.is_none() {
-            return None;
-        }
+        device_name(a)?;
         let ns = to_ns(v.proc_root, a);
         let (m, rest) = table.locate(&ns);
-        (is_rootfs(m, v.root_host) && rest.strip_prefix(b"/dev/") == Some(name))
-            .then(|| (name.to_vec(), own, ns, m.flags, m.fstype, m.id))
+        let name = rootfs_device(a, m, &rest, v.root_host)?;
+        Some((name.to_vec(), crate::loopdev::node_named(name), ns, m.flags, m.fstype, m.id))
     });
     if let Some((name, own, ns, mount_flags, fstype, mount_id)) = device {
         // The host has no /dev/full and no loop devices: fwe's own nodes
@@ -2925,7 +2943,7 @@ fn through_magic_link(rel: &[u8]) -> Option<(MagicLink, Vec<u8>)> {
 /// (`full`, the loop devices), with node `name` (of `node`) made in it on
 /// first use.
 fn fwe_device(name: &[u8], node: crate::devnodes::Node) -> Result<Vec<u8>, i32> {
-    let dir = mounts::join(&shm::user_dir()?, format!("v{}-dev", crate::shared::FORMAT).as_bytes());
+    let dir = fwe_device_dir()?;
     let d = cstr(&dir)?;
     // SAFETY: a NUL-terminated path in fwe's private directory.
     unsafe { libc::mkdir(d.as_ptr(), 0o755) };
@@ -2937,6 +2955,11 @@ fn fwe_device(name: &[u8], node: crate::devnodes::Node) -> Result<Vec<u8>, i32> 
         Ok(()) | Err(errno::EEXIST) => Ok(dir),
         Err(e) => Err(e),
     }
+}
+
+/// fwe's directory of the device nodes Linux has and the host does not.
+fn fwe_device_dir() -> Result<Vec<u8>, i32> {
+    Ok(mounts::join(&shm::user_dir()?, format!("v{}-dev", crate::shared::FORMAT).as_bytes()))
 }
 
 /// `/dev/full`'s numbers.
@@ -3651,8 +3674,12 @@ fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
 /// one of them ([`DEVICES`]): what a bind mount or a clone of it shows.
 pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
     let p = fd_path(fd)?;
-    let name = p.strip_prefix(b"/dev/")?;
-    DEVICES.contains(&name).then_some(p)
+    if let Some(name) = p.strip_prefix(b"/dev/") {
+        return DEVICES.contains(&name).then_some(p);
+    }
+    // One of fwe's own nodes (`/dev/full`, a loop device).
+    let (dir, _) = split_host(&p);
+    (fwe_device_dir().ok()? == dir).then_some(p)
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever

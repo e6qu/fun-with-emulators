@@ -5691,7 +5691,7 @@ fn debian_bash_runs_trap_handlers() {
 fn namespaces(scenario: &str) -> String {
     let root = std::env::temp_dir().join(format!("fwe-ns-{}-{scenario}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    for d in ["mnt", "tmp", "newroot/etc", "newroot/proc", "newroot/oldroot"] {
+    for d in ["dev", "mnt", "tmp", "newroot/etc", "newroot/proc", "newroot/oldroot"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
     std::fs::write(root.join("newroot/etc/marker"), "new\n").unwrap();
@@ -5767,13 +5767,17 @@ fn pivot_root_makes_a_container_root() {
 }
 
 /// A sandbox's root, as bubblewrap makes it: `pivot_root` into a new root
-/// keeping the old one under it, whose standard devices are still there.
+/// keeping the old one under it, whose standard devices are still there,
+/// and bound into the new root (by path or descriptor) and remounted.
 #[test]
 fn pivot_root_keeps_the_old_roots_devices() {
     assert_eq!(
         namespaces("pivot-old"),
         "pivot: 0\nmarker: new\nold root's /dev/null: opened\n\
-         old root's /dev/zero opened: true\nchild exited 0\n"
+         old root's /dev/zero opened: true\n\
+         null by path: bound 0, remounted 0, a device there true\n\
+         zero by descriptor: bound 0, remounted 0, a device there true\n\
+         full by descriptor: bound 0, remounted 0, a device there true\nchild exited 0\n"
     );
 }
 
