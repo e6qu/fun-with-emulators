@@ -195,10 +195,27 @@ fn rss_kb() -> u64 {
     line.split_whitespace().nth(1).unwrap().parse().unwrap()
 }
 
+/// The program's own file mapped executable where it holds no code (its
+/// last page, past its code sections), as a loader maps part of a file.
+fn exec_tail() {
+    use std::os::fd::AsRawFd;
+    let f = std::fs::File::open("/proc/self/exe").unwrap();
+    let len = f.metadata().unwrap().len() as i64;
+    // SAFETY: a plain C library call.
+    let page = unsafe { getpagesize() } as i64;
+    let off = (len - 1) / page * page;
+    // SAFETY: a new mapping of an open file, unmapped below.
+    let p = unsafe { mmap(std::ptr::null_mut(), page as usize, 1 | 4, 2, f.as_raw_fd(), off) };
+    println!("past the code, mapped executable: {}", p as isize != -1);
+    // SAFETY: the mapping just made.
+    unsafe { munmap(p, page as usize) };
+}
+
 fn main() {
     match std::env::args().nth(1).as_deref() {
         Some("reserve") => return reserve_and_map_over(),
         Some("view") => return private_view(),
+        Some("exec-tail") => return exec_tail(),
         _ => {}
     }
     // SAFETY: plain C library calls with valid arguments, on memory this

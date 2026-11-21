@@ -2298,7 +2298,7 @@ impl<P: Platform> Kernel<P> {
                         .filter_map(|(foff, fsize)| {
                             let start = foff.max(offset);
                             let end = (foff + fsize).min(offset + len);
-                            (start < end).then_some((p + (start - offset), end - start))
+                            (start < end).then(|| (p + (start - offset), end - start))
                         })
                         .collect()
                 };
