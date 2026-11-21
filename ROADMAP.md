@@ -176,14 +176,9 @@ Done:
   of generated code that two earlier runs made at the same address from
   the same words.
 
-Left:
-
-- [ ] **4096 functions in turn within 1.3×:** 1.6× on CI (19.1 ns, native
-  12.0): the other micro benchmarks of translated code hold 1.0–1.1×,
-  JDK 1.1×, Node.js 1.3×, LuaJIT 0.9×.
-
 **Done when:** the micro benchmarks of translated code at work hold 1.3×
-of the same code run natively; a function made and run takes at most
+of the same code run natively (but 4096 functions in turn, 1.6× on CI:
+19.1 ns against 12.0, its code twice native size; PR 2's); a function made and run takes at most
 2 µs (making a translation has no native counterpart to compare with);
 Node.js's and LuaJIT's benchmarks hold 1.5×; and a later run of a JIT
 runtime's workload takes, rather than makes, the blocks of generated
@@ -196,7 +191,8 @@ Both items are decided by the JDK's, Node.js's and LuaJIT's counts.
 - [ ] **Clean pages run natively:** a page of generated code none of
   whose words is a system call, a thread-pointer access or a use of `x18`
   runs as it is, translated again once written (the counts: such pages'
-  share of the time, and how often they are written).
+  share of the time, and how often they are written), bringing 4096
+  functions in turn within 1.3× of native.
 - [ ] **A library's code run natively when generated code calls it:** its
   return into generated code taken as a fetch (the counts: calls from
   translated code into a library against the work done there).
