@@ -21,7 +21,7 @@ current limitations in detail.
 | M4 Compatibility | Done: every LTP system-call test that applies passes |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way |
-| M7 Graphical programs and sandboxes | Not started |
+| M7 Graphical programs and sandboxes | Under way: a display (PR 1) |
 | M8 Virtual networking | After 1.0 |
 
 What runs unmodified, with its output checked in CI:
@@ -38,6 +38,10 @@ What runs unmodified, with its output checked in CI:
   builds images, and Docker Compose brings up a project.
 - **Wine:** Alpine's arm64 Wine runs ARM64 Windows console programs in the
   VM (`fwe --vm`), on the stand-in.
+- **Graphical:** X11 clients (`xterm`, `xeyes`, `xclock`), GTK 3 and 4,
+  Qt, Tk and OpenGL by Mesa's software renderer, drawn on an X server on
+  the Mac; Weston with Wayland clients and Xwayland in it; Wine's Notepad
+  in the VM.
 
 ## Done
 
@@ -282,15 +286,18 @@ screenshot.
 
 #### PR 1 — A display
 
-- [ ] **A display for Linux programs:** X11 clients drawn by an X server
-  on the Mac (XQuartz), reached through the socket `DISPLAY` names, with
-  shared memory (`MIT-SHM`) where the server offers it; Wayland clients
-  through a compositor that speaks to the Mac, if one proves practical.
-- [ ] **Demo programs:** `xterm`, `xeyes`, `xclock`, GTK's and Qt's demo
-  programs.
-- [ ] **Benchmarks:** micro: a window's frame drawn through shared memory,
-  and an X request's round trip; macro: a demo program's frames per
-  second against the same program on Linux.
+- [x] **A display for Linux programs:** X11 clients drawn by an X server
+  on the Mac (XQuartz, Xvfb), reached through the socket fwe's `DISPLAY`
+  names, with shared memory (`MIT-SHM`) where the server takes it by
+  descriptor; Wayland clients through Weston, a compositor run in the
+  guest that draws on the X display, with Xwayland for X11 clients in it.
+- [x] **Demo programs:** `xterm`, `xeyes`, `xclock`, GTK 3's and 4's demo
+  programs, Qt (PyQt6), Tk (tkinter), `glxgears` by Mesa's software
+  renderer on the userland's own Xvfb, foot and `xeyes` in Weston, and
+  Wine's Notepad in the VM.
+- [x] **Benchmarks:** micro: a window's frame drawn through shared memory,
+  and an X request's round trip; macro: `glxgears`' time per frame
+  against the same programs in a Linux container.
 
 **Done when:** `xterm`, `xeyes`, `xclock` and GTK's and Qt's demo
 programs run under fwe in CI, driven and checked by what they draw.
