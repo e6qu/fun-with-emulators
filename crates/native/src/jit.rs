@@ -334,6 +334,22 @@ fn parked() -> (u64, u64) {
     }
 }
 
+/// Put the program's `x16` and `x17` in their slots, on this thread, as a
+/// translation's save does: fwe going on at a block's saved entry from a
+/// trap or a fetch ([`exit`], [`enter`]).
+fn park((x16, x17): (u64, u64)) {
+    let (s16, s17) = crate::parked_slots();
+    let area: u64;
+    // SAFETY: as [`parked`].
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) area, options(nomem, nostack)) };
+    let area = area & !7;
+    // SAFETY: this thread's own TSD slots.
+    unsafe {
+        ((area + u64::from(s16)) as *mut u64).write(x16);
+        ((area + u64::from(s17)) as *mut u64).write(x17);
+    }
+}
+
 /// [`save_words`] into `a`'s section `s`, its first word as `first` (the
 /// program's state as at `g`, or a way out), the rest [`Word::Stashed`].
 fn push_save(a: &mut Asm<Word>, s: Sec, first: Word, g: u64) -> Pos {
@@ -1893,9 +1909,10 @@ fn remove(set: &mut BTreeMap<u64, u64>, addr: u64, len: u64) {
 
 /// A fetch from the program's memory at `pc` (the thread's `x30` being
 /// `lr`, which tells a return; `held` a bit for each of `x0`..`x30` that
-/// holds `pc`): the translation to run instead, if `pc` holds code that
-/// runs by translation.
-pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
+/// holds `pc`; `x16_x17` the program's): the translation to run instead,
+/// if `pc` holds code that runs by translation, entered at its saved
+/// entry with the program's `x16` and `x17` put in their slots.
+pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
     let mut s = state_at(HOLD_ENTER);
     if !s.in_region(pc) {
         return None;
@@ -1913,7 +1930,10 @@ pub fn enter(pc: u64, lr: u64, held: u32) -> Option<u64> {
         spots.entry((pc, lr)).or_insert((0, held)).0 += 1;
     }
     let i = translation(&mut s, pc);
-    let into = s.blocks[i].unsaved_entry();
+    // Entered at its saved entry, the program's `x16` and `x17` put in
+    // their slots.
+    let into = s.blocks[i].body;
+    park(x16_x17);
     if lr == pc {
         ENTERED_RETURNS.fetch_add(1, Ordering::Relaxed);
         return Some(into);
@@ -2101,23 +2121,24 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
 }
 
 /// The way out at `regs.pc`, taken by the exit gate (outside a signal's
-/// handler): as [`exit`], and where it leads to a translation's start,
-/// that translation's saved entry and its program address, for the gate
-/// to enter it as a lookup does.
+/// handler): as [`exit`], and where it leads to a translation, that
+/// translation's saved entry and its program address, for the gate to
+/// enter it as a lookup does.
 pub fn gate_exit(regs: &mut Regs) -> Option<(u64, u64)> {
     assert!(exit(regs, false), "the exit gate entered from no way out ({:#x})", regs.pc);
     let s = state_at(HOLD_GATE);
     let i = block_at(&s, regs.pc)?;
     let b = &s.blocks[i];
-    (b.unsaved == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.body, b.g))
+    (b.body == regs.pc && !b.retired && s.by_g.get(&b.g) == Some(&i)).then_some((b.body, b.g))
 }
 
 /// The way out of a block at `regs.pc` (its trap (`trapped`), as the way
 /// out has the program's `x16` and `x17`, or the exit gate's call, which
 /// took them back): `regs`, the program's, go on at the translation of
-/// where it leads (entered with its registers), or at the address itself
-/// where that is not code run by translation; a direct branch is linked
-/// there. `false` if `pc` is no way out of fwe's.
+/// where it leads (at its saved entry, the program's `x16` and `x17` put
+/// in their slots), or at the address itself where that is not code run
+/// by translation; a direct branch is linked there. `false` if `pc` is no
+/// way out of fwe's.
 pub fn exit(regs: &mut Regs, trapped: bool) -> bool {
     let began = Clock::now();
     let r = exit_now(regs, trapped);
@@ -2249,7 +2270,10 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     } else if known && link_here {
         EXITS_KNOWN_UNLINKED.fetch_add(1, Ordering::Relaxed);
     }
-    regs.pc = s.blocks[i].unsaved_entry();
+    // On at its saved entry, the program's `x16` and `x17` in their slots
+    // (as the exit gate enters it too).
+    park((regs.x[16], regs.x[17]));
+    regs.pc = s.blocks[i].body;
     true
 }
 
@@ -3485,10 +3509,11 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     // The wrong block's way out.
     a.bind(wrong, C);
     a.push(C, EXIT, Word::Out { g, exit: Exit::Retry, saved: true, x18: false, cond: 0 });
-    // A direct branch with the program's own registers, and fwe going on
-    // from a trap, enter where the block takes them back; if it does not
-    // at once, at its words up to there made again with them in their
-    // registers. Where those words name x18, which the saved ones keep in
+    // A direct branch with the program's own registers enters where the
+    // block takes them back; if it does not at once, at its words up to
+    // there made again with them in their registers. (fwe going on from a
+    // trap or a fetch enters at the saved entry, the registers put in
+    // their slots.) Where those words name x18, which the saved ones keep in
     // x17 (loaded once, [`load_x18`]) and these would load and store at
     // each use, the entry saves x16 and x17 and goes on into the saved
     // words instead.

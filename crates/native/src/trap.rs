@@ -1419,7 +1419,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             r => mc.ss.x[r],
         } == addr)
         .fold(0, |m, r| m | 1 << r);
-    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held) {
+    if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held, (mc.ss.x[16], mc.ss.x[17])) {
         mc.ss.pc = t;
         return;
     }
