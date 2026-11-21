@@ -964,7 +964,13 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `/memfd:<name> (deleted)`; `F_SEAL_SHRINK`/`GROW` are checked by
   `ftruncate` and `fallocate`, `F_SEAL_EXEC` by `fchmod`; after
   `F_SEAL_WRITE` the host refuses writes and writable shared mappings,
-  reported as `EPERM`.
+  reported as `EPERM`. Opened again read-only through `/proc/self/fd`, it
+  is the same host description with a mark (`fdmarks::Mark::ReadOnly`)
+  that makes it read-only as Linux's new description is, and travels with
+  it through `fork`, `execve` and `SCM_RIGHTS`. A mapping of a file with no
+  name holds a descriptor of it (`maps::HeldFile`), so `mremap` and
+  `remap_file_pages` map more of it as Linux's mapping, which holds its
+  file, does.
 - **Programs run from a descriptor** (`execveat(fd, "", AT_EMPTY_PATH)`,
   `/dev/fd/N`, a `/proc/self/fd` path, as crun runs its sealed copy) are
   read through it; fwe keeps a descriptor of the program, which
@@ -1248,7 +1254,7 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   unreachable while the message is on its way.
 - Netlink (`crates/kernel/src/netlink.rs`): the guest's descriptor is one
   end of a host datagram pair; fwe writes each reply to the other.
-  `RTM_NEWLINK` needs `CAP_NET_ADMIN`. A socket's `SOL_NETLINK` options
+  `RTM_NEWLINK` and `RTM_NEWADDR` need `CAP_NET_ADMIN`. A socket's `SOL_NETLINK` options
   and the groups it joins are kept with it, and travel with it across
   `fork`, `execve` and `SCM_RIGHTS`.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
@@ -1662,7 +1668,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - memfd: `F_SEAL_GROW` does not stop a `writev` or `pwritev` past the end
   (`write` and `pwrite64` are checked); `F_SEAL_WRITE` does not reach
   another process's descriptors and changes the inode number; a memfd
-  reopened through `/proc/self/fd` shares the original's offset.
+  reopened through `/proc/self/fd` shares the original's offset and status
+  flags.
 - `tee` needs a write end of its input pipe (`EINVAL` otherwise); without
   one, `splice` from a pipe to a file or waiting socket that a signal or
   error cuts short loses what it took and did not write.

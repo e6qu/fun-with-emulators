@@ -277,6 +277,7 @@ impl<P: Platform> Kernel<P> {
                 dev: crate::devnodes::makedev(0, 1),
                 ino: id as u64,
                 offset: 0,
+                held: None,
             },
         );
         crate::maps::publish();

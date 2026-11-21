@@ -772,7 +772,7 @@ impl<P: Platform> Kernel<P> {
                         && flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
                         && crate::memfd::name(fd).is_some()
                     {
-                        crate::memfd::reopened_read_only(new as i32);
+                        crate::fdmarks::mark(new as i32, crate::fdmarks::Mark::ReadOnly);
                     }
                     new
                 }

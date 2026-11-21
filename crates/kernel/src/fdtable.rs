@@ -373,7 +373,8 @@ pub fn first_arg_is_fd(nr: u64) -> bool {
     )
 }
 
-/// `EBADF` if a call would name one of fwe's own descriptors.
+/// `EBADF` if a call would name one of fwe's own descriptors, or Linux's
+/// error for one a descriptor's mark refuses.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -389,6 +390,9 @@ pub fn check_args(nr: u64, a: &[u64; 6]) -> Result<(), i64> {
         || crate::fdmarks::refuses_path(nr, a)
     {
         return Err(fwe_abi::err(fwe_abi::errno::EBADF));
+    }
+    if let Some(e) = crate::fdmarks::refuses_read_only(nr, a) {
+        return Err(fwe_abi::err(e));
     }
     // An inotify descriptor is no socket to the guest.
     if let Some(e) = crate::inotify::refused(nr, a) {

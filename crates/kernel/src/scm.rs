@@ -11,7 +11,8 @@
 //! all whatever the buffer.
 //!
 //! A descriptor fwe stands in for (an eventfd, a timerfd, a signalfd, a
-//! netlink socket, a process descriptor) is more than its host object, so
+//! netlink socket, a process descriptor, a memfd opened again read-only)
+//! is more than its host object, so
 //! the sender adds a *bundle*: a host datagram socket, sent as the last
 //! descriptor, holding a manifest of what each such descriptor is and the
 //! host objects behind it (an eventfd's pipe end and counter file, a
@@ -50,6 +51,8 @@ pub(crate) mod kind {
     pub const NETLINK: u8 = 4;
     pub const PIDFD: u8 = 5;
     pub const NETNS: u8 = 6;
+    /// A memfd opened again read-only ([`crate::fdmarks::Mark::ReadOnly`]).
+    pub const READ_ONLY: u8 = 7;
 }
 
 /// What a descriptor fwe stands in for takes to another process: its kind,
@@ -254,6 +257,7 @@ fn export(fd: i32) -> Option<Export> {
         .or_else(|| crate::netlink::export(fd))
         .or_else(|| crate::pidfd::export(fd))
         .or_else(|| crate::netns::export(fd))
+        .or_else(|| crate::fdmarks::export(fd))
 }
 
 /// Take what a bundle describes for received descriptor `fd`: whether it
@@ -266,6 +270,7 @@ fn import(kind: u8, fd: i32, state: &[u8], companions: Vec<i32>) -> bool {
         kind::NETLINK => crate::netlink::import(fd, &mut d, companions),
         kind::PIDFD => crate::pidfd::import(fd, &mut d),
         kind::NETNS => crate::netns::import(fd, &mut d),
+        kind::READ_ONLY => crate::fdmarks::import(fd),
         _ => false,
     }
 }

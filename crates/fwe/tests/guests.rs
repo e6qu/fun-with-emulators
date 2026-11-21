@@ -6580,6 +6580,43 @@ fn memfd(scenario: &str) -> String {
     stdout(&out)
 }
 
+/// A shared mapping of a memfd, its descriptor closed, grows by mremap
+/// into the file grown since, moving past a neighbour; and a page of it
+/// is remapped to another page of the file: the mapping holds its file,
+/// which has no name, as Linux's holds it.
+#[test]
+fn a_mapping_of_a_memfd_grows_and_remaps_from_its_file() {
+    assert_eq!(
+        memfd("grow"),
+        "neighbour: true\ngrown: true\nmoved: true\nkept: a\n\
+         grown part is the file: c\nwritten to the file: d\nremapped: 0 c\n"
+    );
+}
+
+/// A memfd opened again read-only through `/proc/self/fd`, as Chromium
+/// makes read-only shared memory, is read-only as Linux's new description
+/// is: `F_GETFL` says so; writes, writable shared mappings, resizing and
+/// sealing are refused; it reads what the memfd holds; and it stays so
+/// passed to another process and after an exec. The memfd stays writable.
+#[test]
+fn a_memfd_opened_again_read_only_is_read_only() {
+    let line = |what: &str| {
+        format!(
+            "{what}: access 0 write -1 EBADF writable mapping -1 EACCES reads hello \
+             through a mapping hello made writable -1 EACCES truncate -1 EINVAL\n"
+        )
+    };
+    assert_eq!(
+        memfd("read-only"),
+        format!(
+            "{}sealing it: -1 EPERM\nthe memfd: access 2\n{}{}",
+            line("reopened"),
+            line("passed"),
+            line("after an exec")
+        )
+    );
+}
+
 /// What the `memfd` guest's `seals` scenario prints: a memfd named as
 /// Linux names it, and each seal holding.
 const MEMFD_SEALS: &str = "\
@@ -8309,8 +8346,9 @@ fn overlay_mounts() {
 /// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
 /// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
 /// is not attached; limits set with `prlimit` from outside; netlink of a
-/// network namespace's `lo`, and in the host's, the host's loopback, up
-/// and kept so.
+/// network namespace's `lo` (given its address, as bubblewrap gives it,
+/// and brought up), and in the host's, the host's loopback, up and kept
+/// so.
 #[test]
 fn container_runtime_calls() {
     assert_eq!(
@@ -8323,7 +8361,8 @@ fn container_runtime_calls() {
          shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
          linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
          attached as a device program: EINVAL\nnetlink outside: true lo flags 0x10049, set down -1\n\
-         netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
+         netlink inside: true\nlo flags: 0x8\naddress added: 0\nadded again: -17\n\
+         another address: -95\nset up: 0\nlo flags then: 0x10049\n"
     );
 }
 

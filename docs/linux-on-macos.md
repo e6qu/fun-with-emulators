@@ -1303,6 +1303,7 @@ sees the message:
 | netlink socket | the same socket, answered through the same host end, for the namespace it was made in |
 | process descriptor | a kqueue of its own watching the same process (a `PIDFD_THREAD` one of another process's thread watches that process) |
 | `SOCK_SEQPACKET` socket, memfd | itself: its buffer size or extended attributes say what it is |
+| memfd opened again read-only | itself, marked read-only again |
 
 The sender holds the bundle's end until the receiver has emptied it: the
 host collects descriptors in flight that no process holds, and a
@@ -1325,8 +1326,10 @@ file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 **`socket(AF_NETLINK)`**: the guest's descriptor is one end of a host
 datagram pair, so `recv`, `poll` and `epoll` are the host's; a request
 written to it is answered at once on the other end. In an fwe network
-namespace, `RTM_GETLINK`, `RTM_NEWLINK` (with `CAP_NET_ADMIN`) and
-`RTM_GETADDR` describe and change `lo` (its MTU as `SIOCSIFMTU` set it);
+namespace, `RTM_GETLINK`, `RTM_NEWLINK` and `RTM_NEWADDR` (with
+`CAP_NET_ADMIN`) and `RTM_GETADDR` describe and change `lo` (its MTU as
+`SIOCSIFMTU` set it; its addresses 127.0.0.1/8 and ::1, which bringing it
+up gives as Linux does, and `RTM_NEWADDR` gives as bubblewrap does);
 in the initial namespace they describe the host's interfaces and
 addresses (from `getifaddrs`, `lo0` as `lo`), as `SIOCGIFCONF` and the
 other interface requests do, so `getifaddrs` in the guest lists them;
@@ -1708,7 +1711,7 @@ them out on the slab and the guest's page tables:
 | `MAP_FIXED`, `MAP_FIXED_NOREPLACE` | replace / refuse to replace | host `MAP_FIXED`; `NOREPLACE` checks where macOS put it (`EEXIST`) | page-table edit; slab memory at its own address is reused, zeroed |
 | `munmap` | | host `munmap` | pages removed from stage 1, TLBs flushed; the slab range zeroed before reuse |
 | `mprotect` | | host `mprotect`; memory made executable runs by translation, never executable on the host ([Write+exec memory](#writeexec-memory)) | stage-1 permission edit |
-| `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part); move with `mach_vm_remap`, which takes the pages, contents and sharing along, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
+| `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part, the file reached by its name, or for a file with no name through the descriptor its mapping holds); move with `mach_vm_remap`, which takes the pages, contents and sharing along, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
 | `madvise(MADV_DONTNEED)` | private anonymous pages read as zero again | each private anonymous piece replaced by a fresh mapping (macOS's own keeps the data) | private pages read as zero again, or as the file for a private file mapping; shared memory keeps its contents |
 | `madvise` other advice | hints; `MADV_FREE`, `MADV_WIPEONFORK` | hints passed to the host, never failing for mapped memory; advice and mappings checked as Linux checks them; `MADV_WIPEONFORK` ranges zeroed in a fork child | advice and mappings checked as natively, nothing more: no hint reaches the host, `MADV_FREE` frees nothing, a fork child keeps `MADV_WIPEONFORK` memory, `MADV_DONTDUMP` changes no core |
 | `MADV_DONTFORK`, `MADV_DOFORK` | a fork child has nothing mapped in the range | the ranges kept; a fork child unmaps them as it starts (the host's `VM_INHERIT_NONE` would too, but fwe reads a region's inheritance to tell private memory from shared) | ignored |
@@ -1740,7 +1743,7 @@ without `MAP_JIT`, whose memory is switched per thread
 
 | Linux | macOS | fwe |
 |---|---|---|
-| `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone |
+| `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone; opened again read-only through `/proc/self/fd`, the same host description marked read-only (`F_GETFL` says so; writes, writable shared mappings, resizing and seals refused), the mark following it through `fork`, `execve` and `SCM_RIGHTS`; a mapping of it (or of any file with no name) holds a descriptor of the file, through which `mremap` grows it and `remap_file_pages` remaps it |
 | `/dev/shm` tmpfs (`shm_open`, `sem_open`) | no tmpfs at `/dev/shm` | a directory per rootfs in the user's temporary directory, shared by every fwe process on that root, a mount point to the resolver |
 | System V shared memory | own `shmget` | see [Other IPC calls](#other-ipc-calls) |
 

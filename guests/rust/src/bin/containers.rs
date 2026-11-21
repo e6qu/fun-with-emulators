@@ -1641,6 +1641,29 @@ fn main() {
                 let nl = socket(16, 3, 0);
                 println!("netlink inside: {}", nl >= 0);
                 println!("lo flags: {:#x}", link(nl, None));
+                // RTM_NEWADDR (NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK) of
+                // an address to lo, as bubblewrap gives it its own: the
+                // acknowledgement's error.
+                let addr = |nl: i32, a: [u8; 4]| -> i32 {
+                    let mut m = vec![0u8; 40];
+                    m[0..4].copy_from_slice(&40u32.to_ne_bytes());
+                    m[4..6].copy_from_slice(&20u16.to_ne_bytes());
+                    m[6..8].copy_from_slice(&0x605u16.to_ne_bytes());
+                    m[8..12].copy_from_slice(&2u32.to_ne_bytes());
+                    m[16..24].copy_from_slice(&[2, 8, 0x80, 254, 1, 0, 0, 0]);
+                    for (at, ty) in [(24, 2u16), (32, 1u16)] {
+                        m[at..at + 2].copy_from_slice(&8u16.to_ne_bytes());
+                        m[at + 2..at + 4].copy_from_slice(&ty.to_ne_bytes());
+                        m[at + 4..at + 8].copy_from_slice(&a);
+                    }
+                    send(nl, m.as_ptr(), m.len(), 0);
+                    let mut reply = [0u8; 512];
+                    recv(nl, reply.as_mut_ptr(), 512, 0);
+                    i32::from_ne_bytes(reply[16..20].try_into().unwrap())
+                };
+                println!("address added: {}", addr(nl, [127, 0, 0, 1]));
+                println!("added again: {}", addr(nl, [127, 0, 0, 1]));
+                println!("another address: {}", addr(nl, [10, 0, 0, 1]));
                 println!("set up: {}", link(nl, Some(true)) as i32);
                 println!("lo flags then: {:#x}", link(nl, None));
             }
