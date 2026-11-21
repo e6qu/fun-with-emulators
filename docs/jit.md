@@ -361,9 +361,10 @@ a processor that reports `DIC` clear.
   the first looks next. A target outside run-time code (a library's)
   gets translation 0; a dropped entry is cleared. The near table
   (`jit::NEAR`, at 2^46) is laid out alike, an address's entry picked by
-  its bits 6 to 25 with its bits 2 to 5 folded into the index's top four
-  (`jit::near_entry`, `jit::near_look`: functions 64 bytes apart have
-  entries side by side, a switch's cases close together have their own),
+  its bits 6 to 19, its bits 0 to 5 the index's top six (`jit::near_entry`,
+  `jit::near_look`, three instructions from the target: functions 64 bytes
+  apart have entries side by side, a switch's cases close together have
+  their own),
   and holds the translation of the address there published last; a
   lookup through `x16`, `x17` or `x18` reads it as it reads the table.
   The table of returns' tail, a return whose first look misses, and call

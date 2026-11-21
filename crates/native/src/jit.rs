@@ -276,8 +276,8 @@ pub const TABLE: u64 = 1 << 45;
 /// times).
 pub const RETS: u64 = TABLE | 1 << 44;
 /// The near table, a lookup's first look: laid out as [`TABLE`], but an
-/// address's entry picked by its bits 6 to 25, its bits 2 to 5 folded into
-/// the index's top ([`near_entry`]), holding a translation only, the one
+/// address's entry picked by its bits 6 to 19, its bits 0 to 5 the
+/// index's top ([`near_entry`]), holding a translation only, the one
 /// of an address there published last. Targets a lookup goes to that are
 /// far apart in the program, as functions are, have their entries close
 /// together: the entries of thousands of them stay in the data cache,
@@ -426,11 +426,19 @@ const fn index_of(n: u32) -> u32 {
 }
 
 /// The near table's entry ([`near_entry`]) of the address in `x<n>`,
-/// into `x17`: `ubfx x17, x<n>, #6, #20`; `eor x17, x17, x<n>, lsl #14`
-/// (its bits 2 to 5 at the index's 16 to 19); `ubfiz x17, x17, #4, #20`;
-/// `orr x17, x17, #NEAR`.
+/// into `x17`: the table's address into `x16` (`movz x16, #0x4000, lsl
+/// #32`, apart from the target, so the processor makes it early); `ubfx
+/// x17, x<n>, #6, #16`; `bfi x17, x<n>, #14, #6` (its bits 0 to 5 at the
+/// index's 14 to 19); `add x17, x16, x17, lsl #4`. Through `x16`, which
+/// holds the target ([`slot_look`]), [`near_look_x16`].
 const fn near_look(n: u32) -> [u32; 4] {
-    [0xd346_6411 | (n << 5), 0xca00_3a31 | (n << 16), 0xd37c_4e31, NEAR_BASE]
+    [0xd2c8_0010, 0xd346_5411 | (n << 5), 0xb372_1411 | (n << 5), 0x8b11_1211]
+}
+
+/// [`near_look`] of the address in `x16`: `ubfx x17, x16, #6, #16`; `bfi
+/// x17, x16, #14, #6`; `ubfiz x17, x17, #4, #20`; `orr x17, x17, #NEAR`.
+const fn near_look_x16() -> [u32; 4] {
+    [0xd346_5611, 0xb372_1611, 0xd37c_4e31, NEAR_BASE]
 }
 
 /// `eor x16, x16, x<n>`: an entry's key against the target in `x<n>`.
@@ -462,7 +470,7 @@ fn slot_look(n: u32, other: bool, near: bool) -> impl Iterator<Item = u32> {
             rewrite::LDR_UIMM | ((slot / 8) << 10) | (r << 5) | r,
         ]
     };
-    let (index, k) = if near { (near_look(16), 4) } else { ([INDEX, SCALE, BASE, 0], 3) };
+    let (index, k) = if near { (near_look_x16(), 4) } else { ([INDEX, SCALE, BASE, 0], 3) };
     target(16)
         .into_iter()
         .chain(index.into_iter().take(k))
@@ -1497,10 +1505,10 @@ fn unpublish(g: u64, t: u64) {
     }
 }
 
-/// `g`'s entry in the near table ([`NEAR`]): its bits 6 to 25, the index's
-/// 16 to 19 changed by its bits 2 to 5 ([`near_look`]).
+/// `g`'s entry in the near table ([`NEAR`]): its bits 6 to 19 the index's
+/// 0 to 13, its bits 0 to 5 the index's 14 to 19 ([`near_look`]).
 fn near_entry(g: u64) -> u64 {
-    NEAR | ((((g >> 6) ^ (g << 14)) & ((1 << TABLE_BITS) - 1)) << 4)
+    NEAR | ((((g >> 6) & 0x3fff) | ((g & 0x3f) << 14)) << 4)
 }
 
 /// [`publish`] in `table`: `g`'s entry says `value`.
@@ -4960,10 +4968,21 @@ mod tests {
                     ".inst {a}", ".inst {b}", ".inst {c}", ".inst {d}",
                     a = const near_look(9)[0], b = const near_look(9)[1],
                     c = const near_look(9)[2], d = const near_look(9)[3],
-                    in("x9") g, out("x17") e, options(nomem, nostack, preserves_flags),
+                    in("x9") g, out("x17") e, out("x16") _, options(nomem, nostack, preserves_flags),
                 );
             }
             assert_eq!(e, near_entry(g), "{g:#x}");
+            let e: u64;
+            // SAFETY: as above (`near_look_x16()`).
+            unsafe {
+                std::arch::asm!(
+                    ".inst {a}", ".inst {b}", ".inst {c}", ".inst {d}",
+                    a = const near_look_x16()[0], b = const near_look_x16()[1],
+                    c = const near_look_x16()[2], d = const near_look_x16()[3],
+                    in("x16") g, out("x17") e, options(nomem, nostack, preserves_flags),
+                );
+            }
+            assert_eq!(e, near_entry(g), "{g:#x} through x16");
         }
         let f = 0x0200_1976_c000u64;
         for k in 0..4096 {
