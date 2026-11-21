@@ -63,10 +63,13 @@ way.
   standard lets one clobber `x16` and `x17` on a direct branch to other
   code). A `cbz` or `tbz` of `x18` tests the program's `x18` inline.
 - **Calls and returns.** A call puts the program's own return address in
-  `x30`, so the stack holds only the program's addresses, from words out
-  of line that a `bl` goes to (for an indirect call, after its lookup's
-  first look); the block goes on after the `bl` with the code after the
-  call. A return looks its address up in a table of returns first and,
+  `x30`, so the stack holds only the program's addresses. A direct call
+  sets `x16` to it and its `bl` goes to the target's call entry, the word
+  before the target's saved entry, which moves it into `x30` (until the
+  call is linked, the `bl` goes to words out of line that do the same and
+  go into fwe); an indirect call sets `x30` in words out of line its
+  `bl` goes to, after its lookup's first look. The block goes on after
+  the `bl` with the code after the call. A return looks its address up in a table of returns first and,
   found, goes back to after the call's `bl` with `ret`, which the
   processor predicts from the `bl` as it predicts a native return. A call
   is made once: a block that comes to a call another block made already
@@ -307,9 +310,10 @@ a processor that reports `DIC` clear.
   (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`.
 - **Linking:** the target is translated and the way out patched to the
   entry for its state of `x16` and `x17` (`jit::entered`), as is the
-  conditional branch it is the taken way of, where that reaches
-  (`State::link`, undone by `State::unlink`, which puts the first word
-  back). The blocks the target goes on to whatever its conditions are
+  conditional branch it is the taken way of, where that reaches, and a
+  direct call's `bl`, to the target's call entry (`State::link`, undone
+  by `State::unlink`, which puts the first word back and the branch to
+  the way out again). The blocks the target goes on to whatever its conditions are
   made with it, a few deep (`jit::ahead`), and linked at once. Patched
   words have their instruction cache lines invalidated together, with
   one barrier for all (`State::sync_patched`), before the translator's
@@ -322,8 +326,11 @@ a processor that reports `DIC` clear.
   `tbz` of `x18` loads it into `x16` and tests it there.
 - **Entries:** a block starts with the check a lookup that read the
   table apart enters at (the target in `x16` against the block's
-  address), then its saved entry, where lookups and direct branches with
-  `x16` and `x17` saved come in (`Block::body`). `jit::keeps_saved`
+  address, then `x16` set to `x30`), then its call entry
+  (`jit::CALLED`: `x30` set from `x16`, where a direct call's `bl` comes
+  in, `Word::Called`; a lookup goes on through it unchanged), then its
+  saved entry, where lookups and direct branches with `x16` and `x17`
+  saved come in (`Block::body`). `jit::keeps_saved`
   tells which instructions run with them saved; `jit::body_of` restores
   them before any other. Its unsaved entry (`Block::unsaved`) is past
   that restore when the block starts with it, or a copy of the words up
@@ -462,7 +469,7 @@ a processor that reports `DIC` clear.
 |---|---|---|
 | a block's first run | a fault and a translation | once per block, and again after a flush that changed it |
 | a direct branch's first run | a call through the exit gate | once per branch, then linked |
-| a call | a `bl`, the return address set, and a branch to the target (after a table lookup for `blr`) | each time |
+| a call | the return address set and a `bl` to the target (after a table lookup, and through words out of line, for `blr`) | each time |
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline table lookup, about ten instructions, and a save of `x16` and `x17` where the code before it named them | each time; a miss goes through the exit gate |
 | a call or branch from native code into JIT code | a fault, then a table lookup in the site's stub (a target not translated yet: a call through the exit gate) | a fault once per call site, then linked (a branch no call leads to: followed) |

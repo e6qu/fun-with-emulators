@@ -377,9 +377,16 @@ const MISS_X16: u32 = 0xb500_0010;
 /// back to its check.
 const TO_CHECK: u32 = 0xd100_0231 | ((4 * CHECK_WORDS as u32) << 10);
 /// Words of a translation's check that the target in `x16` is its own
-/// (its address in `x17`, padded to 4 words, `eor`, `cbnz`), before its
-/// saved entry.
-const CHECK_WORDS: usize = 6;
+/// (its address in `x17`, padded to 3 words, `eor`, `cbnz`, then `x16`
+/// set to `x30`) and its call entry ([`CALLED`]), before its saved entry.
+const CHECK_WORDS: usize = 7;
+/// `mov x30, x16`: a translation's call entry, the word before its saved
+/// entry, where a direct call's `bl` comes with the program's return
+/// address in `x16` ([`Side::Call`]); the check before it leaves `x16`
+/// as `x30`, so a lookup goes on through it unchanged.
+const CALLED: u32 = 0xaa10_03fe;
+/// `mov x16, x30`: the check's last word, before [`CALLED`].
+const X16_AS_X30: u32 = 0xaa1e_03f0;
 /// `nop`
 const NOP: u32 = 0xd503_201f;
 /// `eor x17, x17, x16`
@@ -470,6 +477,9 @@ enum Word {
     /// As [`Word::Saved`], the program's `x18` held in `x17` (its slot not
     /// written yet).
     SavedX18(u64),
+    /// A translation's call entry ([`CALLED`]): as [`Word::Saved`], the
+    /// program's `x30` in `x16`.
+    Called(u64),
     /// A way out, as at the branch at `g`; `saved`, with the program's
     /// `x16` and `x17` in their slots (and for [`Exit::Retry`], as at the
     /// target in `x16`), and `x18`, with its `x18` (back in its slot) in
@@ -486,6 +496,7 @@ enum Word {
 enum Packed {
     At(u16),
     Saved(u16),
+    Called(u16),
     SavedX18(u16),
     Stashed(u16),
     Undo {
@@ -531,6 +542,7 @@ impl Packed {
         match w {
             Word::At(g) => Packed::At(off(g)),
             Word::Saved(g) => Packed::Saved(off(g)),
+            Word::Called(g) => Packed::Called(off(g)),
             Word::SavedX18(g) => Packed::SavedX18(off(g)),
             Word::Stashed(g) => Packed::Stashed(off(g)),
             Word::Undo { g, start, of } => Packed::Undo {
@@ -564,6 +576,7 @@ impl Packed {
             Packed::Saved(k) => w.extend_from_slice(&[1, k as u8, (k >> 8) as u8]),
             Packed::SavedX18(k) => w.extend_from_slice(&[2, k as u8, (k >> 8) as u8]),
             Packed::Stashed(k) => w.extend_from_slice(&[7, k as u8, (k >> 8) as u8]),
+            Packed::Called(k) => w.extend_from_slice(&[8, k as u8, (k >> 8) as u8]),
             Packed::Undo { g, start, of } => {
                 let s = start.to_le_bytes();
                 w.extend_from_slice(&[
@@ -612,6 +625,7 @@ impl Packed {
             1 => (Packed::Saved(u16_at(1)?), 3),
             2 => (Packed::SavedX18(u16_at(1)?), 3),
             7 => (Packed::Stashed(u16_at(1)?), 3),
+            8 => (Packed::Called(u16_at(1)?), 3),
             3 => {
                 let start = u32::from_le_bytes(b.get(3..7)?.try_into().ok()?);
                 (Packed::Undo { g: u16_at(1)?, start, of: of(byte(7)?)? }, 8)
@@ -649,6 +663,7 @@ impl Packed {
         match self {
             Packed::At(k) => Word::At(at(k)),
             Packed::Saved(k) => Word::Saved(at(k)),
+            Packed::Called(k) => Word::Called(at(k)),
             Packed::SavedX18(k) => Word::SavedX18(at(k)),
             Packed::Stashed(k) => Word::Stashed(at(k)),
             Packed::Undo { g, start, of } => {
@@ -783,10 +798,15 @@ impl Block {
     }
 
     /// Its direct ways out ([`Exit::Jump`]): where each is, its target,
-    /// and whether it is a conditional branch's taken way.
+    /// and whether it is a conditional branch's taken way (a call's way,
+    /// whose `bl` its `cond` names too, is not: the program's word there is
+    /// a `bl`).
     fn jumps(&self) -> impl Iterator<Item = (u64, u64, bool)> + '_ {
         self.words.iter().enumerate().filter_map(|(k, p)| match *p {
-            Packed::Out { to, exit: 0, cond, .. } => Some((self.addr(k), to, cond != 0)),
+            Packed::Out { to, exit: 0, cond, g, .. } => {
+                let call = self.source.get(usize::from(g)).is_some_and(|&w| is_call(w));
+                Some((self.addr(k), to, cond != 0 && !call))
+            }
             _ => None,
         })
     }
@@ -1081,6 +1101,7 @@ pub fn write_map() {
                 _ if restoring[k] => 'r',
                 Word::At(_) => 'a',
                 Word::Saved(_) => 's',
+                Word::Called(_) => 'c',
                 Word::SavedX18(_) => 'x',
                 Word::Lookup { to: None, .. } => 'l',
                 Word::Lookup { .. } => 'L',
@@ -1512,14 +1533,22 @@ impl State {
     /// Link way out `at` (a direct one, not linked yet) of block `from` to
     /// `into`, a translation's entry as the way out has the program's `x16`
     /// and `x17`: a branch there, and the conditional branch it is the
-    /// taken way of straight there too where that reaches. Whether it
-    /// reaches.
+    /// taken way of straight there too where that reaches, or the call's
+    /// `bl` it is the way of to the call entry before it ([`CALLED`]).
+    /// Whether it reaches.
     fn link(&self, from: usize, at: u64, into: u64) -> bool {
         let Some(b) = rewrite::branch(at, into) else { return false };
         self.patch(at, b);
         if let Some(c) = conditional(&self.blocks[from], at) {
-            // SAFETY: a word of fwe's code cache, readable.
-            if let Some(w) = retarget(unsafe { (c as *const u32).read() }, c, into) {
+            // SAFETY: words of fwe's code cache, readable.
+            let (w, entry) =
+                unsafe { ((c as *const u32).read(), ((into - 4) as *const u32).read()) };
+            if is_call(w) {
+                assert_eq!(entry, CALLED, "a call at {c:#x} linked to {into:#x}, no call entry");
+                if let Some(b) = rewrite::branch(c, into - 4) {
+                    self.patch(c, BL | (b & 0x03ff_ffff));
+                }
+            } else if let Some(w) = retarget(w, c, into) {
                 self.patch(c, w);
             }
         }
@@ -1536,7 +1565,16 @@ impl State {
         self.patch(at, if saved { OUT } else { SAVE });
         if let Some(c) = conditional(from, at) {
             // SAFETY: a word of fwe's code cache, readable.
-            let w = retarget(unsafe { (c as *const u32).read() }, c, at);
+            let w = unsafe { (c as *const u32).read() };
+            if is_call(w) {
+                // To its words out of line again, which set `x30` as a
+                // call entry does, then the way out.
+                let b = rewrite::branch(c, at - 4)
+                    .unwrap_or_else(|| panic!("way out {at:#x} out of reach of its call {c:#x}"));
+                self.patch(c, BL | (b & 0x03ff_ffff));
+                return;
+            }
+            let w = retarget(w, c, at);
             // In one segment with it ([`Chunk`]).
             self.patch(
                 c,
@@ -2231,6 +2269,7 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
     match word_at(&state(), pc)? {
         Word::At(g)
         | Word::Saved(g)
+        | Word::Called(g)
         | Word::SavedX18(g)
         | Word::Stashed(g)
         | Word::Out { g, .. }
@@ -2263,24 +2302,37 @@ pub fn to_guest(regs: &mut Regs) -> bool {
     }) else {
         return false;
     };
+    as_guest(w, regs, parked(), |at| word_at(&s, at));
+    true
+}
+
+/// `regs` stopped at a word of a translation that stands for `w`, made the
+/// program's state there: `parked`, the program's `x16` and `x17` as their
+/// slots hold them; `word_at`, what each word of the cache stands for.
+fn as_guest(w: Word, regs: &mut Regs, parked: (u64, u64), word_at: impl Fn(u64) -> Option<Word>) {
     let sp = regs.sp;
     // SAFETY: the stack below which a save put the program's registers.
     let below = |off: u64| unsafe { (sp.wrapping_sub(off) as *const u64).read() };
     match w {
         Word::Out { exit: Exit::Retry, .. } => {
             let to = regs.x[16];
-            (regs.x[16], regs.x[17]) = parked();
+            (regs.x[16], regs.x[17]) = parked;
             regs.pc = to;
         }
         Word::At(g) => regs.pc = g,
         Word::Out { g, saved: false, .. } => regs.pc = g,
         Word::SavedX18(g) => {
             regs.x[18] = regs.x[17];
-            (regs.x[16], regs.x[17]) = parked();
+            (regs.x[16], regs.x[17]) = parked;
+            regs.pc = g;
+        }
+        Word::Called(g) => {
+            regs.x[30] = regs.x[16];
+            (regs.x[16], regs.x[17]) = parked;
             regs.pc = g;
         }
         Word::Saved(g) | Word::Out { g, .. } => {
-            (regs.x[16], regs.x[17]) = parked();
+            (regs.x[16], regs.x[17]) = parked;
             regs.pc = g;
         }
         Word::Stashed(g) => {
@@ -2292,14 +2344,14 @@ pub fn to_guest(regs: &mut Regs) -> bool {
             regs.pc = g;
         }
         Word::Finish { g, .. } => {
-            finish(regs, |at| matches!(word_at(&s, at), Some(Word::Finish { g: o, .. }) if o == g));
+            finish(regs, |at| matches!(word_at(at), Some(Word::Finish { g: o, .. }) if o == g));
             regs.pc = g + 4;
         }
         Word::Lookup { g, link, to } => {
             // In a register of the lookup's, or the program's own, as its
             // slot holds it.
             let held = to.filter(|&r| r < IN_SLOT).map(|r| regs.x[usize::from(r)]);
-            (regs.x[16], regs.x[17]) = parked();
+            (regs.x[16], regs.x[17]) = parked;
             let target = match to {
                 Some(r) if r >= IN_SLOT => Some(regs.x[usize::from(r - IN_SLOT)]),
                 _ => held,
@@ -2314,7 +2366,6 @@ pub fn to_guest(regs: &mut Regs) -> bool {
             }
         }
     }
-    true
 }
 
 /// [`Word::Lookup`]'s `to` for a target in the program's own `x<n>`, which
@@ -2864,7 +2915,13 @@ fn unlinked(at: u64) -> bool {
     matches!(unsafe { (at as *const u32).read() }, SAVE | OUT)
 }
 
-/// The conditional branch whose taken way is way out `at` of block `b`.
+/// Whether `w` is a `bl`.
+fn is_call(w: u32) -> bool {
+    w & 0xfc00_0000 == BL
+}
+
+/// The conditional branch whose taken way is way out `at` of block `b`,
+/// or the `bl` of the call it is the way of ([`Side::Call`]).
 fn conditional(b: &Block, at: u64) -> Option<u64> {
     let k = b.index(at)?;
     match b.word(k) {
@@ -3408,11 +3465,14 @@ fn translate(g: u64, t: u64, followed: bool, known: &[(u64, u64)]) -> Made {
     a.clear();
     let check = Word::Lookup { g, link: None, to: Some(16) };
     let address = materialized(17, g).count();
-    a.extend(H, std::iter::repeat_n(NOP, CHECK_WORDS - 2 - address), check);
+    assert!(address <= 3, "a program address of 48 bits: {g:#x}");
+    a.extend(H, std::iter::repeat_n(NOP, 3 - address), check);
     a.extend(H, materialized(17, g), check);
     a.push(H, CHECK, check);
     let wrong = a.label();
     a.branch(H, MISS, Field::Imm19, wrong, check);
+    a.push(H, X16_AS_X30, Word::Saved(g));
+    a.push(H, CALLED, Word::Called(g));
     debug_assert_eq!(a.len(H), CHECK_WORDS);
     // Counting its runs ([`jitcount`]): its saved entry's first, its
     // other entry's after a save of the program's `x16` and `x17` there.
@@ -3726,10 +3786,11 @@ fn body_of(
                 let out = gate_out(g, Exit::Jump(target), saved, x18, s, a);
                 c.taken.push((out, at));
             }
-            Side::Call { to: label, g, target, ret } => {
+            Side::Call { at, to: label, g, target } => {
                 a.bind(label, H);
-                a.extend(H, materialized(30, ret), Word::Saved(g));
-                gate_out(g, Exit::Jump(target), true, false, H, a);
+                a.push(H, CALLED, Word::Saved(g));
+                let out = gate_out(g, Exit::Jump(target), true, false, H, a);
+                c.taken.push((out, at));
             }
             Side::Lookup(tail) => lookup_tail(&tail, a),
         }
@@ -3793,10 +3854,12 @@ enum Side {
     /// program address `g`, to `target`, the program's `x16` and `x17`
     /// saved there or not, and its `x18` held in `x17` or not.
     Taken { at: Pos, to: Label, g: u64, target: u64, saved: bool, x18: bool },
-    /// A direct call's way to its target: the `bl` at program address `g`
-    /// comes to `to`; `x30` is set to `ret`, the return address, and it
-    /// goes on to `target`, `x16` and `x17` saved.
-    Call { to: Label, g: u64, target: u64, ret: u64 },
+    /// A direct call's way to its target until it is linked: the `bl` at
+    /// `at` (program address `g`) comes to `to`, where `x30` is set from
+    /// `x16` (the return address) as a call entry sets it ([`CALLED`]),
+    /// and it goes on to `target`, `x16` and `x17` saved. Linked, the `bl`
+    /// goes to the target's call entry itself ([`State::link`]).
+    Call { at: Pos, to: Label, g: u64, target: u64 },
     /// An indirect call's lookup past its `bl` ([`lookup`]).
     Lookup(Tail),
 }
@@ -4133,16 +4196,18 @@ fn one(
         return true;
     }
     // bl: x16 and x17 saved (as a call's words are entered, [`body_of`]),
-    // a `bl` to the words that set the program's return address in x30
-    // and go on to the target, out of line ([`Side`]). Its return found in
-    // [`RETS`] comes back after the `bl` with `ret`, where the processor
-    // predicts it: the block goes on there, with x16 and x17 saved (x17
-    // no longer holding x18).
+    // the program's return address in x16 and a `bl` to the target's call
+    // entry once linked, until then to words out of line that set x30 from
+    // x16 as that entry does and go on to the target ([`Side`]). Its
+    // return found in [`RETS`] comes back after the `bl` with `ret`, where
+    // the processor predicts it: the block goes on there, with x16 and x17
+    // saved (x17 no longer holding x18).
     if w & 0xfc00_0000 == 0x9400_0000 {
         save(saved, a);
+        a.extend(H, materialized(16, pc + 4), at_pc(true));
         let to = a.label();
-        a.branch(H, BL, Field::Imm26, to, at_pc(true));
-        sides.push(Side::Call { to, g: pc, target: imm26(), ret: pc + 4 });
+        let at = a.branch(H, BL, Field::Imm26, to, at_pc(true));
+        sides.push(Side::Call { at, to, g: pc, target: imm26() });
         pads.push((pc + 4, a.len(H)));
         *x18 = None;
         return false;
@@ -4719,6 +4784,7 @@ mod tests {
         let words = [
             Word::At(g0),
             Word::Saved(g),
+            Word::Called(g0),
             Word::SavedX18(g),
             Word::Stashed(g),
             Word::Undo { g, start: t + 4 * 70, of: Of::X18 },
@@ -4752,6 +4818,58 @@ mod tests {
             assert_eq!((p.word(g0, t), n), (w, b.len() - 1));
         }
     }
+    /// A translation's call entry is the word before its saved entry, past
+    /// its check, which leaves `x16` as `x30` for a lookup to go on through
+    /// it; a direct call sets `x16` to its return address before its `bl`,
+    /// whose way into fwe, until it is linked, sets `x30` from `x16` as the
+    /// entry does and names the `bl` to retarget.
+    #[test]
+    fn a_call_comes_in_past_its_target_check() {
+        let g = 0x0200_1976_c000;
+        // add x0, x0, #1; bl +0x100; ret
+        let mut words = vec![0x9100_0400, 0x9400_0040, 0xd65f_03c0];
+        words.resize(BLOCK_INSNS + 16, 0xd65f_03c0);
+        let (made, _) = with_snapshot(g, &words, || translate(g, 0, false, &[]));
+        let a = &made.room.asm;
+        assert_eq!(made.entry, CHECK_WORDS);
+        let k = CHECK_WORDS - 1;
+        assert_eq!((a.words(H)[k - 1], a.info(H)[k - 1]), (X16_AS_X30, Word::Saved(g)));
+        assert_eq!((a.words(H)[k], a.info(H)[k]), (CALLED, Word::Called(g)));
+        // The call's way out, in its words out of line after CALLED.
+        let (hot, info) = (a.words(H), a.info(H));
+        let out = (0..hot.len())
+            .find(
+                |&k| matches!(info[k], Word::Out { exit: Exit::Jump(t), .. } if t == g + 4 + 0x100),
+            )
+            .expect("the call's way out");
+        assert_eq!(hot[out - 1], CALLED);
+        let Word::Out { cond, saved: true, .. } = info[out] else { panic!("{:?}", info[out]) };
+        let bl = out - usize::from(cond);
+        assert!(is_call(hot[bl]), "{:#x} at the call's word", hot[bl]);
+        // Its return address into x16 first, as at the call.
+        let ret: Vec<u32> = materialized(16, g + 8).collect();
+        assert_eq!(&hot[bl - ret.len()..bl], &ret[..]);
+        assert!(info[bl - ret.len()..=bl].iter().all(|&w| w == Word::Saved(g + 4)));
+    }
+
+    /// A thread stopped at a call entry is at the target, its `x30` the
+    /// return address the call left in `x16`, and its own `x16` and `x17`
+    /// those their slots hold.
+    #[test]
+    fn a_call_entry_stands_for_its_target_with_x30_set() {
+        let g = 0x0200_1976_c000;
+        let mut regs = Regs::default();
+        regs.x[16] = 0x0200_1976_d008;
+        regs.x[17] = 0x77;
+        regs.x[30] = 0x1_2261_0040;
+        regs.pc = 0x1_2262_0018;
+        as_guest(Word::Called(g), &mut regs, (0x1616, 0x1717), |_| None);
+        assert_eq!(
+            (regs.pc, regs.x[30], regs.x[16], regs.x[17]),
+            (g, 0x0200_1976_d008, 0x1616, 0x1717)
+        );
+    }
+
     /// A call is made once in a block, however its words are entered (here
     /// the first with `x18` held in `x17` from its load after a branch): one
     /// way back for each return address.

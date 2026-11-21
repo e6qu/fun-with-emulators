@@ -597,7 +597,7 @@ impl<'a> Reader<'a> {
 /// A file of records begins so, then its count of records and a table of
 /// them in address order, for each its program address, offset, length
 /// and key ([`key_of`]); their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept7";
+const MAGIC: &[u8; 8] = b"fwekept8";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],

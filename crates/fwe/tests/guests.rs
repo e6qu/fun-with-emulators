@@ -1309,6 +1309,33 @@ fn jit_calls_through_a_repointed_call_site() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// JIT code calling JIT code through a `bl` (guests/c/jitcallee.c), the
+/// callee rewritten before each of 8 rounds of 50000 calls, signalled all
+/// along by another thread: every call reaches that round's callee with
+/// its return address in `x30` and the caller's `x16`, a signal in the
+/// callee's words sees that `x30`, and the call goes into fwe once a round
+/// (its `bl` linked to the callee's translation again), not at each call.
+#[test]
+fn jit_calls_into_jit_code_keep_x30_through_signals_and_rewrites() {
+    let prog = build_c("jitcallee", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "jitcallee");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout(&out),
+        "wrong calls: 0 of 400000\nsignals in the callee with another x30: 0, signals landed\n",
+        "{err}"
+    );
+    assert_eq!(out.status.code(), Some(0));
+    let exits = *jit_counts(&err, " blocks translated, ")
+        .first()
+        .unwrap_or_else(|| panic!("no count of ways out: {err}"));
+    assert!(exits < 100, "{exits} ways out through fwe: {err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// JIT code reading a word of data in its own cache line, which the
 /// program changes and flushes before each of 2000 calls
 /// (guests/c/jitguard.c): each call reads the new word, and the
