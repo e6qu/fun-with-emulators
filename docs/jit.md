@@ -78,10 +78,9 @@ way.
   their target up in a table of translations by program address. One
   16-byte load reads an entry's address and translation together
   (single-copy atomic, as the table's writes are), so a match leads to
-  the target's own translation; through `x16` or `x17`, which hold the
-  target meanwhile, the two are read apart, and the translation checks
-  that the target is its own (an entry can be taken over as such a
-  lookup reads it). An address is looked for in the entry its bits pick,
+  the target's own translation; through `x16` or `x17`, which the lookup
+  takes for itself, the target is read again from its slot to compare,
+  the translation set below `sp` meanwhile. An address is looked for in the entry its bits pick,
   then in the other of that one's pair, so two targets that pick one
   entry do not push each other out at every turn. A miss goes through fwe
   once and fills the table. An indirect branch into code that is not
@@ -310,9 +309,7 @@ a processor that reports `DIC` clear.
   thread's block, as the system-call gate does, and calls
   `jit::gate_exit` without a signal; anything else (code not translated,
   a signal to deliver) takes the gate's `brk`, whose handler goes on from
-  the block. A lookup that enters the wrong block (one whose entry
-  another address took as it read it) goes on at `brk #0x4a54`
-  (`jit::EXIT`), which `on_sigtrap` passes to `jit::exit`.
+  the block.
 - **Linking:** the target is translated and the way out patched to the
   entry for its state of `x16` and `x17` (`jit::entered`), as is the
   conditional branch it is the taken way of, where that reaches, and a
@@ -329,13 +326,13 @@ a processor that reports `DIC` clear.
   `x18` held in `x17` (`Word::Out`'s `x18`) is linked past the target's
   load of it (`Block::x18`, `jit::in_x17`, `jit::put_x18`). A `cbz` or
   `tbz` of `x18` loads it into `x16` and tests it there.
-- **Entries:** a block starts with the check a lookup that read the
-  table apart enters at (the target in `x16` against the block's
-  address, then `x16` set to `x30`), then its call entry
-  (`jit::CALLED`: `x30` set from `x16`, where a direct call's `bl` comes
-  in, `Word::Called`; a lookup goes on through it unchanged), then its
-  saved entry, where lookups and direct branches with `x16` and `x17`
-  saved come in (`Block::body`). `jit::keeps_saved`
+- **Entries:** a block starts with its call entry (`jit::CALLED`: `x30`
+  set from `x16`, where a direct call's `bl` comes in, `Word::Called`),
+  then its saved entry, where lookups and direct branches with `x16` and
+  `x17` saved come in (`Block::body`, `jit::ENTRY_AT`). A lookup through
+  `x16`, `x17` or `x18` (`jit::slot_look`), whose target is in its slot,
+  reads the entry whole, sets its translation below `sp`, and reads the
+  target again into `x17` to compare. `jit::keeps_saved`
   tells which instructions run with them saved; `jit::body_of` restores
   them before any other. Its unsaved entry (`Block::unsaved`), for a
   direct branch from words that hold the program's `x16` and `x17`, is

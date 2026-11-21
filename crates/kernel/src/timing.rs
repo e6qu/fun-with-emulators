@@ -110,8 +110,6 @@ pub fn signal(sig: i32) {
 /// What a host `SIGTRAP` was for, counted by [`trapped`].
 #[derive(Clone, Copy)]
 pub enum Trap {
-    /// A translation's way out by its own trap.
-    WayOut,
     /// The exit gate's trap: on at code not translated, or a signal to
     /// deliver.
     ExitGate,
@@ -124,15 +122,10 @@ pub enum Trap {
     Call,
 }
 
-const TRAP_NAMES: [&str; 5] = [
-    "ways out",
-    "exit gate",
-    "gate after its call",
-    "gate before its call",
-    "system calls and others",
-];
+const TRAP_NAMES: [&str; 4] =
+    ["exit gate", "gate after its call", "gate before its call", "system calls and others"];
 
-static TRAPS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+static TRAPS: [AtomicU64; 4] = [const { AtomicU64::new(0) }; 4];
 
 /// A host `SIGTRAP` taken for `what`, if [`on`].
 #[inline]
