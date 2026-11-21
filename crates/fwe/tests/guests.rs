@@ -9128,9 +9128,27 @@ fn proc_hidepid_and_subset_hide_as_linux() {
     );
 }
 
-/// A fault's syndrome in its handler's frame (guests/c/faultesr.c): the
-/// ESR record Linux adds after the FP/SIMD one, a data abort's, telling a
-/// write (WnR) from a read, as Wine reads it.
+/// A program whose image is larger than a branch reaches across
+/// (guests/asm/bigimage.S): the code in its middle, which uses `x18` and
+/// the thread pointer, has no place for stubs in reach outside the image,
+/// and runs by translation; the rest runs prepared in place, calling into
+/// it a thousand times.
+#[test]
+fn code_beyond_its_stubs_reach_runs_by_translation() {
+    let prog = build_asm("bigimage", &["-pie", "--no-dynamic-linker"]);
+    let out = fwe(&prog, &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "big image: ok\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(err.contains("KiB of code beyond its stubs' reach, run by translation"), "{err}");
+}
+
+/// What guests/c/faultesr.c prints where a fault's frame holds its
+/// syndrome: the ESR record Linux adds after the FP/SIMD one, a data
+/// abort's, telling a write (WnR) from a read, as Wine reads it.
+const FAULT_ESR: &str = "read: syndrome found, data abort yes, write 0\nwrite: syndrome found, data abort yes, write 1\n";
+
+/// A fault's syndrome in its handler's frame, natively.
 #[test]
 fn fault_frames_hold_the_syndrome() {
     let prog = build_c("faultesr", Libc::Musl, true, true);
@@ -9138,13 +9156,20 @@ fn fault_frames_hold_the_syndrome() {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg(&prog);
     let out = run_bounded(cmd);
-    assert_eq!(
-        stdout(&out),
-        "read: syndrome found, data abort yes, write 0\nwrite: syndrome found, data abort yes, write 1\n",
-        "{}",
-        String::from_utf8_lossy(&out.stderr)
-    );
     let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), FAULT_ESR, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A fault's syndrome in its handler's frame, in the VM.
+#[test]
+fn hv_fault_frames_hold_the_syndrome() {
+    let prog = build_c("faultesr", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "vm-faultesr");
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg("--root").arg(&root).arg(&prog);
+    let out = run_hv(cmd, "faultesr --vm");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), FAULT_ESR, "{}", String::from_utf8_lossy(&out.stderr));
 }
 
 /// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
@@ -9290,10 +9315,11 @@ impl Probe {
             std::env::temp_dir().join(format!("fwe-probe-{manifest}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
-        for d in ["root", "tmp", "tmp/xdg"] {
+        for d in ["root", "tmp", "tmp/xdg", "tmp/.X11-unix"] {
             std::fs::create_dir_all(root.join(d)).unwrap();
         }
         run_checked(Command::new("chmod").arg("700").arg(root.join("tmp/xdg")));
+        run_checked(Command::new("chmod").arg("1777").arg(root.join("tmp/.X11-unix")));
         // What apk's triggers would have made: loader caches, schemas,
         // font and MIME databases.
         for (prog, args) in [
@@ -9473,7 +9499,7 @@ impl Probe {
                 "--sync",
                 "--class",
                 "xterm",
-                "windowactivate",
+                "windowfocus",
                 "--sync",
                 "type",
                 "--delay",
@@ -9577,30 +9603,6 @@ impl Probe {
 
     fn wine(&self) {
         let root = self.root("wine-x11");
-        // Natively first: Wine's own 4 KiB pages on fwe's 16 KiB ones.
-        for (name, command, secs) in [
-            ("wine-native-version", "wine --version", 120),
-            ("wineboot-native", "wine wineboot --init; wineserver -w", 900),
-            ("notepad-native", "wine notepad", 300),
-        ] {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-            cmd.arg("--strace")
-                .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
-                .arg("--root")
-                .arg(&root)
-                .arg(root.join("bin/busybox"))
-                .args(["sh", "-c", command])
-                .env_clear()
-                .env("HOME", "/root")
-                .env("PATH", "/usr/bin:/bin")
-                .env("WINEPREFIX", "/root/.wine-native")
-                .env("WINEDEBUG", "err+all")
-                .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
-                .env("DISPLAY", PROBE_DISPLAY);
-            let mut r = self.spawn(name, cmd);
-            self.settle(&mut r, secs);
-            self.stop(r);
-        }
         let wine = |name: &str, command: &str, secs: u64| {
             let mut cmd = hv_command().expect("the stand-in");
             cmd.arg("--vm")
