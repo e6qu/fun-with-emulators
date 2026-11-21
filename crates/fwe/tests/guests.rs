@@ -9661,6 +9661,39 @@ fn alpine_display_xterm_runs_what_is_typed() {
     assert!(after.count(0xcd0000) > 2000, "no red cells: {after:?}");
 }
 
+/// glxgears drawn by Mesa's software renderer (llvmpipe, whose shaders
+/// LLVM compiles at run time: fwe runs them by translation): its gears
+/// drawn and turning, and its frame rate reported.
+#[test]
+fn alpine_display_glxgears_turns_by_software() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("glxgears");
+    let env = [("LIBGL_ALWAYS_SOFTWARE", "1"), ("GALLIUM_DRIVER", "llvmpipe")];
+    let args = ["-geometry", "300x300+0+0"];
+    let mut gui = Gui::start(&x, "glxgears", &root, "/usr/bin/glxgears", &args, &env);
+    let w = x.window(&mut gui, &["--name", "glxgears"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "glxgears-first");
+    assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "glxgears-next", 10);
+    assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
+    let out = display_dir().join("glxgears.out");
+    let began = Instant::now();
+    let rate = loop {
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        let fps = text
+            .lines()
+            .find_map(|l| l.split(" = ").nth(1)?.strip_suffix(" FPS")?.trim().parse::<f64>().ok());
+        if let Some(fps) = fps {
+            break fps;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "no frame rate: {}", gui.report());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    eprintln!("glxgears: {rate} frames a second");
+    assert!(rate > 1.0, "{rate} frames a second: {}", gui.report());
+}
+
 /// The toolkits' root (`guests/alpine/fetch/toolkits.txt`: GTK 3 and 4
 /// and their demos, Python with tkinter and PyQt6), a root of its own for
 /// `test`.
