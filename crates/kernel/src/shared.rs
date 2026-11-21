@@ -167,11 +167,17 @@ pub fn lock_exclusive(fd: i32) {
     // SAFETY: plain host calls on the caller's descriptor.
     unsafe {
         while libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            if crate::host::last_errno() != libc::EWOULDBLOCK || now() - start > 1_000_000_000 {
-                libc::flock(fd, libc::LOCK_EX);
-                break;
-            }
-            libc::sched_yield();
+            match crate::host::last_errno() {
+                libc::EWOULDBLOCK if now() - start <= 1_000_000_000 => libc::sched_yield(),
+                // A signal came: the lock is still to take.
+                libc::EINTR => 0,
+                _ => {
+                    while libc::flock(fd, libc::LOCK_EX) != 0
+                        && crate::host::last_errno() == libc::EINTR
+                    {}
+                    break;
+                }
+            };
         }
     }
     crate::host::set_errno(saved);
