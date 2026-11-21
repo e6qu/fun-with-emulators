@@ -299,6 +299,8 @@ const ASM_GUESTS: &[&str] = &[
     "x18sig",
     "x18rare",
     "x18spsig",
+    "x18spalign",
+    "spalign",
     "x18partial",
     "svcimm",
     "fpsig",
@@ -5198,6 +5200,32 @@ fn asm_x18_sp_stub_survives_signals() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// x18 stored and loaded through another register while sp is 8 bytes off
+/// alignment (pixman's NEON functions), a thread-pointer write and a
+/// faulting store of x18 there, with a fast timer's signals landing
+/// throughout (guests/asm/x18spalign.S).
+#[test]
+fn asm_x18_used_while_sp_is_off_alignment() {
+    // Untraced, as the timer's signals come too often for a trace.
+    for name in ["x18spalign", "x18spalign-pie"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg(asm_guest(name));
+        let out = run_vm_bounded(cmd);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// An sp off alignment: the program's own store through it is a SIGBUS
+/// (BUS_ADRALN) at sp, as on Linux, and code made at run time runs with
+/// it (guests/asm/spalign.S).
+#[test]
+fn asm_sp_off_alignment() {
+    for name in ["spalign", "spalign-pie"] {
+        let out = fwe(&asm_guest(name), &[]);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
 /// thread that writes to the pipe could never make its own system call.
 #[test]
@@ -7707,6 +7735,16 @@ fn hv_pointer_authentication_and_bti() {
     assert_eq!(out.status.code(), Some(0), "{text}");
 }
 
+/// Part of a file mapped executable, none of its code sections in it (a
+/// loader mapping part of a binary).
+#[test]
+fn a_file_mapped_executable_past_its_code() {
+    let out = fwe(&rust_guest("maps"), &["exec-tail"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "past the code, mapped executable: true\n", "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
 /// MAP_FIXED over mapped memory replaces it, keeping the rest; a buffer
 /// across old and new is one buffer to the kernel; a widened page takes a
 /// write; a mapping over the program's own data (linked low, backed
@@ -7733,6 +7771,7 @@ fn hv_map_fixed_replaces_mapped_memory() {
     let want = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
                 writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
     assert_eq!(stdout(&fwe(&rust_guest("maps"), &["view"])), want);
+
     let out = fwe_hv(&rust_low_guest("maps"), &["view"]).unwrap();
     assert_eq!(stdout(&out), want);
     // Gigabytes reserved and mapped over take memory only where touched.
@@ -9235,10 +9274,13 @@ fn hv_fault_frames_hold_the_syndrome() {
 
 /// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
 /// names it; the tests skip without it, as on a development machine),
-/// listening on its Unix socket only, at a display number of its own.
+/// listening on its Unix socket only, at a display number of its own; or
+/// a root's own Xvfb run by fwe ([`Xvfb::in_root`]).
 struct Xvfb {
     number: u32,
     child: std::process::Child,
+    /// Run by fwe in a root: the host's tools reach it over TCP.
+    in_root: bool,
 }
 
 impl Xvfb {
@@ -9256,7 +9298,7 @@ impl Xvfb {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let x = Xvfb { number, child };
+        let x = Xvfb { number, child, in_root: false };
         let began = Instant::now();
         while !socket.exists() {
             assert!(began.elapsed() < Duration::from_secs(30), "Xvfb :{number} did not start");
@@ -9265,14 +9307,65 @@ impl Xvfb {
         Some(x)
     }
 
+    /// The root's own Xvfb (Alpine's, which has GLX, as Homebrew's has
+    /// not), run by fwe in `root`, in a process group of its own: the
+    /// root's programs reach it as `:N` (its socket in the root's
+    /// `/tmp/.X11-unix`), the host's tools over TCP ([`Xvfb::display`]).
+    fn in_root(root: &ScratchRoot) -> Xvfb {
+        use std::os::unix::process::CommandExt;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let number = 170 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = display_dir();
+        let name = format!("xvfb-{number}");
+        let child = Command::new(env!("CARGO_BIN_EXE_fwe"))
+            .arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.0.join("usr/bin/Xvfb"))
+            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-listen", "tcp", "-ac"])
+            .env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(dir.join(format!("{name}.out"))).unwrap())
+            .stderr(std::fs::File::create(dir.join(format!("{name}.err"))).unwrap())
+            .process_group(0)
+            .spawn_alone()
+            .unwrap();
+        let x = Xvfb { number, child, in_root: true };
+        let began = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", 6000 + number as u16)).is_err() {
+            let err = std::fs::read_to_string(dir.join(format!("{name}.err"))).unwrap_or_default();
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "Xvfb :{number} did not start: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        x
+    }
+
+    /// The display as the host's tools (and fwe's `DISPLAY`) name it.
     fn display(&self) -> String {
-        format!(":{}", self.number)
+        if self.in_root {
+            format!("127.0.0.1:{}", self.number)
+        } else {
+            format!(":{}", self.number)
+        }
     }
 }
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if self.in_root {
+            let pgid = self.child.id() as i32;
+            assert!(pgid > 1);
+            // SAFETY: signals to the process group this test made (its
+            // leader is the child), never pid 0, 1 or -1.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        } else {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }
@@ -9300,6 +9393,27 @@ fn display_x11_client_draws_through_shared_memory() {
     );
     assert_eq!(out.status.code(), Some(0), "{err}");
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// [`display_x11_client_draws_through_shared_memory`] in the VM, from a
+/// fork child (a new fwe process, which gets the host display from its
+/// parent's hand-off, not from an environment or its arguments).
+#[test]
+fn hv_display_x11_client_draws_from_a_fork_child() {
+    let prog = build_c("x11shm", Libc::Musl, true, true);
+    let Some(x) = Xvfb::start() else { return };
+    let root = libc_rootfs(Libc::Musl, "vm-x11shm");
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg("--root").arg(&root).arg(&prog).arg("fork").env("DISPLAY", x.display());
+    let out = run_hv(cmd, "x11shm fork --vm");
+    let _ = std::fs::remove_dir_all(&root);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout(&out),
+        "connected: depth 24\nput through shared memory: drawn\ngot through shared memory: filled\n",
+        "{err}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{err}");
 }
 
 /// Whether the tests of a fetched root's graphical programs run, and their
@@ -9342,6 +9456,9 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
                     &["/usr/share/glib-2.0/schemas"][..],
                     "usr/share/glib-2.0/schemas",
                 ),
+                // The X server's own fonts' indexes (its default, `fixed`).
+                ("usr/bin/mkfontscale", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
+                ("usr/bin/mkfontdir", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
                 ("usr/bin/fc-cache", &["-f"][..], "etc/fonts"),
                 ("usr/bin/update-mime-database", &["/usr/share/mime"][..], "usr/share/mime"),
             ] {
@@ -9703,15 +9820,19 @@ fn alpine_display_xterm_runs_what_is_typed() {
 }
 
 /// glxgears drawn by Mesa's software renderer (llvmpipe, whose shaders
-/// LLVM compiles at run time: fwe runs them by translation): its gears
-/// drawn and turning, and its frame rate reported.
+/// LLVM compiles at run time: fwe runs them by translation) on the root's
+/// own Xvfb, which fwe runs too (an X server with GLX: Homebrew's has
+/// none): its gears drawn and turning, and its frame rate reported.
 #[test]
 fn alpine_display_glxgears_turns_by_software() {
-    let Some(x) = display_tests() else { return };
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
     let root = x11_root("glxgears");
+    let x = Xvfb::in_root(&root);
     let env = [("LIBGL_ALWAYS_SOFTWARE", "1"), ("GALLIUM_DRIVER", "llvmpipe")];
-    let args = ["-geometry", "300x300+0+0"];
-    let mut gui = Gui::start(&x, "glxgears", &root, "/usr/bin/glxgears", &args, &env);
+    let command = format!("DISPLAY=:{} exec /usr/bin/glxgears -geometry 300x300+0+0", x.number);
+    let mut gui = Gui::start(&x, "glxgears", &root, "/bin/sh", &["-c", &command], &env);
     let w = x.window(&mut gui, &["--name", "glxgears"], 120);
     std::thread::sleep(Duration::from_secs(2));
     let first = x.shot(&w, "glxgears-first");
@@ -9862,6 +9983,8 @@ fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
     x.type_into(&w, "button");
     let after = x.changes(&w, &before, &format!("{name}-searched"), 30);
     assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
+    // The search closed first (GTK 3's is a popup that keeps the keys).
+    x.key_into(&w, "Escape");
     x.key_into(&w, "ctrl+q");
     let status = gui.exits(60);
     assert!(status.success(), "{name}: {status}: {}", gui.report());

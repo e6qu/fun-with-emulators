@@ -175,13 +175,16 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
 Images go to the server through shared memory (MIT-SHM) where the
 server takes it by descriptor (MIT-SHM 1.2, as Xvfb's does). X11
 clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way, and OpenGL
-through Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`); there is no
-GPU yet. Windows programs draw through Wine's X11 driver, in the VM, with
-`DISPLAY` set the same way.
+through Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`) on a server
+with GLX (Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
+has: start it, and give its programs `DISPLAY=:N` inside, as `sh -c
+'DISPLAY=:1 exec glxgears'`); there is no GPU yet. Windows programs draw
+through Wine's X11 driver, in the VM, with `DISPLAY` set the same way.
 
 CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
-`xterm`, glxgears, tkinter, PyQt6, GTK's demos and Wine's Notepad),
-driving each with keys and the pointer and checking what it draws.
+`xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
+against Alpine's, driving each with keys and the pointer and checking
+what it draws.
 
 ## Containers
 

@@ -283,10 +283,16 @@ GEARS = "glxgears frame (ms)"
 GEARS_ENV = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe", "LP_NUM_THREADS": "1"}
 
 
+# The display glxgears draws on: Alpine's Xvfb, an X server with GLX
+# (Homebrew's has none), beside it in its root or container.
+GEARS_DISPLAY = 9
+GEARS_CMD = f"DISPLAY=:{GEARS_DISPLAY} exec /usr/bin/glxgears -geometry 300x300+0+0"
+
+
 def gears_ms(cmd, env=None):
-    """glxgears' time per frame as `cmd` runs it on the benchmarks' X
-    server: it reports its frames every 5 seconds; the second report, the
-    first's taking its start too."""
+    """glxgears' time per frame as `cmd` runs it: it reports its frames
+    every 5 seconds; the second report, the first's taking its start
+    too."""
     err = tempfile.TemporaryFile()
     p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=err, text=True)
     timer = threading.Timer(120, p.kill)
@@ -308,6 +314,42 @@ def gears_ms(cmd, env=None):
         said = err.read().decode(errors="replace")[-4000:]
         sys.exit(f"glxgears gave no frame rate: {rates}, exit {p.returncode}; it said:\n{said}")
     return 1000.0 / rates[1]
+
+
+def gears_fwe(a, fwe, guest_env):
+    """glxgears under fwe, on Alpine's Xvfb run by fwe in the same root (a
+    display of the root's own); against the same two programs in a Linux
+    container, there being no macOS build of them."""
+    root = alpine_root("display", a.cache)
+    in_root = guest_env + fwe + ["--root", root]
+    x11 = os.path.join(root, "tmp/.X11-unix")
+    os.makedirs(x11, exist_ok=True)
+    os.chmod(x11, 0o1777)
+    # The X server's fonts' indexes, as their package's trigger makes them.
+    for prog in ("mkfontscale", "mkfontdir"):
+        subprocess.run(in_root + [os.path.join(root, "usr/bin", prog), "/usr/share/fonts/misc"],
+                       check=True, capture_output=True)
+    sock = os.path.join(x11, f"X{GEARS_DISPLAY}")
+    for stale in (sock, os.path.join(root, f"tmp/.X{GEARS_DISPLAY}-lock")):
+        if os.path.lexists(stale):
+            os.remove(stale)
+    err = tempfile.TemporaryFile()
+    xvfb = subprocess.Popen(
+        in_root + [os.path.join(root, "usr/bin/Xvfb"), f":{GEARS_DISPLAY}",
+                   "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+        stdout=subprocess.DEVNULL, stderr=err)
+    try:
+        deadline = time.monotonic() + 120
+        while not os.path.exists(sock):
+            if xvfb.poll() is not None or time.monotonic() > deadline:
+                err.seek(0)
+                sys.exit("Xvfb under fwe did not start: " + err.read().decode(errors="replace")[-4000:])
+            time.sleep(0.2)
+        return gears_ms(guest_env + [f"{k}={v}" for k, v in GEARS_ENV.items()] + fwe
+                        + ["--root", root, os.path.join(root, "bin/sh"), "-c", GEARS_CMD])
+    finally:
+        xvfb.kill()
+        xvfb.wait()
 
 
 def best(f, rounds=ROUNDS):
@@ -444,14 +486,20 @@ def linux(a):
                 subprocess.run(full, check=True, capture_output=True)
                 return time.perf_counter() - start
 
-            # glxgears, Alpine's, drawing on this host's X server.
+            # glxgears and Xvfb, Alpine's, in a container of their own,
+            # removed after (killing `docker run` leaves it running).
             env = [x for k, v in GEARS_ENV.items() for x in ("-e", f"{k}={v}")]
-            r[GEARS] = gears_ms(
-                ["docker", "run", "--rm", "-v", "/tmp/.X11-unix:/tmp/.X11-unix", "-e", "DISPLAY"]
-                + env
-                + [image, "sh", "-c",
-                   "apk add -q mesa-utils mesa-dri-gallium && exec glxgears -geometry 300x300+0+0"]
-            )
+            sock = f"/tmp/.X11-unix/X{GEARS_DISPLAY}"
+            try:
+                r[GEARS] = gears_ms(
+                    ["docker", "run", "--rm", "--name", "fwe-gears"] + env + [image, "sh", "-c",
+                     "apk add -q xvfb font-misc-misc mesa-utils mesa-dri-gallium"
+                     f" && (Xvfb :{GEARS_DISPLAY} -screen 0 1024x768x24 -nolisten tcp"
+                     " >/dev/null 2>&1 &)"
+                     f" && while [ ! -e {sock} ]; do sleep 0.1; done && {GEARS_CMD}"]
+                )
+            finally:
+                subprocess.run(["docker", "rm", "-f", "fwe-gears"], capture_output=True)
             for row, cmd in (
                 ("Lua script (s)", "/src/src/lua /src/wl/bench.lua"),
                 ("Python script (s)", "python3 /src/wl/bench.py"),
@@ -654,14 +702,7 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
-    # glxgears under fwe, drawing on the benchmarks' X server (the host's
-    # display fwe's `DISPLAY` names); against Linux's, there being no
-    # macOS build of the same program.
-    gears = alpine_root("display", a.cache)
-    results["fwe"][GEARS] = gears_ms(
-        guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + [f"{k}={v}" for k, v in GEARS_ENV.items()]
-        + fwe + ["--root", gears, os.path.join(gears, "usr/bin/glxgears"), "-geometry", "300x300+0+0"]
-    )
+    results["fwe"][GEARS] = gears_fwe(a, fwe, guest_env)
     jdk(a, fwe, guest_env, results)
     host_costs()
     for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
