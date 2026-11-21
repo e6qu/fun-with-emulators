@@ -226,20 +226,36 @@ jobs:
             target/tmp/wine-traces
             target/tmp/samples
 
-  # Linux's graphical programs on the host's display: X clients of fwe's
-  # tests against a headless X server (Homebrew's Xvfb, `XVFB`).
+  # Linux's graphical programs on the host's display, against a headless X
+  # server (Homebrew's Xvfb, `XVFB`): an X client of fwe's tests, and
+  # fetched roots' programs (FWE_DISPLAY_TESTS, not on a development
+  # machine) driven with xdotool and checked by what they draw (libX11,
+  # `LIBX11`, takes the screenshots).
   display:
     name: Display (macos-26)
     runs-on: macos-26
-    timeout-minutes: 45
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - run: brew install xorg-server
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: brew install xorg-server xdotool
       - name: The display tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
           cargo test -p fwe --test guests -- display_ --nocapture
+        env:
+          FWE_DISPLAY_TESTS: "1"
+      # What each program said, its calls and its screenshots.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: display
+          path: target/tmp/display
 
   # TEMPORARY (M7 probe, removed before merge): Linux's graphical programs
   # on fwe against a headless X server (Homebrew's Xvfb), natively, and

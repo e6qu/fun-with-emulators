@@ -9280,6 +9280,496 @@ fn display_x11_client_draws_through_shared_memory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Whether the tests of a fetched root's graphical programs run, and their
+/// X server: only where `FWE_DISPLAY_TESTS` is set (CI's `display` job,
+/// with Homebrew's Xvfb, xdotool and libX11: `XVFB`, `LIBX11`), never on a
+/// development machine.
+fn display_tests() -> Option<Xvfb> {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return None;
+    }
+    Some(Xvfb::start().expect("XVFB: the display tests need Xvfb"))
+}
+
+/// A root of its own for display test `test`, cloned from `cached` (a
+/// fetched root) once that is ready for graphical programs: what a
+/// package manager's triggers would have made (loader caches, schemas,
+/// font and MIME databases) made in it by its own programs, and the
+/// directories a session has (`/tmp/.X11-unix`, `XDG_RUNTIME_DIR`).
+fn display_root(cached: &Path, test: &str) -> ScratchRoot {
+    static PREPARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    {
+        let _one = PREPARING.lock().unwrap_or_else(|e| e.into_inner());
+        let stamp = cached.join(".fwe-display-ready");
+        if !stamp.exists() {
+            for d in ["root", "tmp/xdg", "tmp/.X11-unix"] {
+                std::fs::create_dir_all(cached.join(d)).unwrap();
+            }
+            run_checked(Command::new("chmod").arg("700").arg(cached.join("tmp/xdg")));
+            run_checked(Command::new("chmod").arg("1777").arg(cached.join("tmp/.X11-unix")));
+            for (prog, args) in [
+                ("usr/bin/gdk-pixbuf-query-loaders", &["--update-cache"][..]),
+                ("usr/bin/glib-compile-schemas", &["/usr/share/glib-2.0/schemas"][..]),
+                ("usr/bin/fc-cache", &["-f"][..]),
+                ("usr/bin/update-mime-database", &["/usr/share/mime"][..]),
+            ] {
+                if !cached.join(prog).exists() {
+                    continue;
+                }
+                let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+                    .arg("--root")
+                    .arg(cached)
+                    .arg(cached.join(prog))
+                    .args(args)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .output_alone()
+                    .unwrap();
+                assert!(out.status.success(), "{prog}: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            std::fs::write(&stamp, "").unwrap();
+        }
+    }
+    let root = std::env::temp_dir().join(format!("fwe-display-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cpR").arg(cached).arg(&root));
+    ScratchRoot(root)
+}
+
+/// A root a test made, removed when it is done.
+struct ScratchRoot(PathBuf);
+
+impl Drop for ScratchRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// A graphical program run by fwe on a test's X server, in a process
+/// group of its own (stopped when dropped), its output and calls kept in
+/// `target/tmp/display/<name>.{out,err,trace}` for a failure's report.
+struct Gui {
+    name: String,
+    child: std::process::Child,
+}
+
+/// Where the display tests keep what their programs said, and their
+/// screenshots.
+fn display_dir() -> PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("display");
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
+
+impl Gui {
+    fn start(
+        x: &Xvfb,
+        name: &str,
+        root: &ScratchRoot,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+    ) -> Gui {
+        use std::os::unix::process::CommandExt;
+        let dir = display_dir();
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.0.join(program.trim_start_matches('/')))
+            .args(args)
+            .env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("XDG_RUNTIME_DIR", "/tmp/xdg")
+            .env("LANG", "C.UTF-8")
+            .env("DISPLAY", x.display());
+        for (k, v) in env {
+            cmd.env(k, v);
+        }
+        let _ = std::fs::remove_file(dir.join(format!("{name}.trace")));
+        cmd.stdin(Stdio::null())
+            .stdout(std::fs::File::create(dir.join(format!("{name}.out"))).unwrap())
+            .stderr(std::fs::File::create(dir.join(format!("{name}.err"))).unwrap())
+            .process_group(0);
+        Gui { name: name.into(), child: cmd.spawn_alone().unwrap() }
+    }
+
+    /// What the program said and its last calls, for a failure.
+    fn report(&mut self) -> String {
+        let dir = display_dir();
+        let err = std::fs::read_to_string(dir.join(format!("{}.err", self.name)));
+        let err = err.unwrap_or_default();
+        let tail: Vec<&str> = err.lines().rev().take(30).collect();
+        print_last_calls(&dir.join(format!("{}.trace", self.name)));
+        let state = match self.child.try_wait() {
+            Ok(Some(s)) => format!("ended: {s}"),
+            _ => "running".to_string(),
+        };
+        format!(
+            "{}: {state}\n--- its last errors:\n{}",
+            self.name,
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        )
+    }
+
+    fn ended(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Its exit status once it ends, within `secs`.
+    fn exits(&mut self, secs: u64) -> std::process::ExitStatus {
+        let began = Instant::now();
+        loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                return s;
+            }
+            assert!(began.elapsed() < Duration::from_secs(secs), "{}", self.report());
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    }
+}
+
+impl Drop for Gui {
+    fn drop(&mut self) {
+        let pgid = self.child.id() as i32;
+        assert!(pgid > 1);
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // SAFETY: signals to the process group this test made (its
+            // leader is the child), never pid 0, 1 or -1.
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        // SAFETY: as above; the group's other processes may outlive it.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = self.child.wait();
+    }
+}
+
+/// A window on a test's X server: its id and where it is on the screen.
+#[derive(Debug, Clone)]
+struct Window {
+    id: String,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// What a window shows ([`Xvfb::shot`], from `tools/display/shot.py`).
+#[derive(Debug)]
+struct Shot {
+    /// How many of its pixels are not its most common colour.
+    drawn: u64,
+    /// How many pixels each colour has.
+    colours: Vec<(u32, u64)>,
+    /// A hash of every pixel.
+    digest: String,
+}
+
+impl Shot {
+    fn count(&self, rgb: u32) -> u64 {
+        self.colours.iter().filter(|(c, _)| *c == rgb).map(|(_, n)| n).sum()
+    }
+}
+
+impl Xvfb {
+    /// Homebrew's xdotool on this server.
+    fn xdotool(&self, args: &[&str]) -> Output {
+        Command::new("xdotool").args(args).env("DISPLAY", self.display()).output_alone().unwrap()
+    }
+
+    /// The visible window `search` finds (xdotool's search arguments), once
+    /// `gui` has made it, within `secs`: the largest, where there are more.
+    fn window(&self, gui: &mut Gui, search: &[&str], secs: u64) -> Window {
+        let began = Instant::now();
+        loop {
+            let mut args = vec!["search", "--onlyvisible"];
+            args.extend(search);
+            let found = self.xdotool(&args);
+            let best = stdout(&found)
+                .lines()
+                .map(|id| self.geometry(id.trim()))
+                .filter(|w| w.w > 1 && w.h > 1)
+                .max_by_key(|w| w.w * w.h);
+            if let Some(w) = best {
+                return w;
+            }
+            assert!(!gui.ended(), "no window {search:?}: {}", gui.report());
+            assert!(
+                began.elapsed() < Duration::from_secs(secs),
+                "no window {search:?} after {secs} s: {}",
+                gui.report()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn geometry(&self, id: &str) -> Window {
+        let out = self.xdotool(&["getwindowgeometry", "--shell", id]);
+        let text = stdout(&out);
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        Window { id: id.into(), x: get("X"), y: get("Y"), w: get("WIDTH"), h: get("HEIGHT") }
+    }
+
+    /// What window `w` shows now, its screenshot saved as `<name>.png`.
+    fn shot(&self, w: &Window, name: &str) -> Shot {
+        let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
+        let png = display_dir().join(format!("{name}.png"));
+        let (x, y, ww, hh) = (w.x.to_string(), w.y.to_string(), w.w.to_string(), w.h.to_string());
+        let out = Command::new("python3")
+            .arg(repo().join("tools/display/shot.py"))
+            .arg(lib)
+            .arg(self.display())
+            .arg(&png)
+            .args([&x, &y, &ww, &hh])
+            .output_alone()
+            .unwrap();
+        assert!(out.status.success(), "shot.py: {}", String::from_utf8_lossy(&out.stderr));
+        let text = stdout(&out);
+        let drawn = text
+            .lines()
+            .next()
+            .and_then(|l| l.split(", ").nth(2))
+            .and_then(|p| p.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        let colours = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("colour "))
+            .map(|l| {
+                let (c, n) = l.split_once(' ').unwrap();
+                (u32::from_str_radix(c, 16).unwrap(), n.parse().unwrap())
+            })
+            .collect();
+        let digest = text.lines().find_map(|l| l.strip_prefix("digest ")).unwrap().to_string();
+        Shot { drawn, colours, digest }
+    }
+
+    /// Wait up to `secs` for window `w` to show something other than
+    /// `before` (its digest): what it shows then.
+    fn changes(&self, w: &Window, before: &Shot, name: &str, secs: u64) -> Shot {
+        let began = Instant::now();
+        loop {
+            let now = self.shot(w, name);
+            if now.digest != before.digest || began.elapsed() > Duration::from_secs(secs) {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Keys typed into window `w` (focused first: there is no window
+    /// manager to give it the focus).
+    fn type_into(&self, w: &Window, text: &str) {
+        let out = self.xdotool(&[
+            "windowfocus",
+            "--sync",
+            &w.id,
+            "type",
+            "--delay",
+            "40",
+            "--window",
+            &w.id,
+            text,
+        ]);
+        assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Keys (xdotool's names, `ctrl+q`) pressed in window `w`.
+    fn key_into(&self, w: &Window, keys: &str) {
+        let out = self.xdotool(&["windowfocus", "--sync", &w.id, "key", "--window", &w.id, keys]);
+        assert!(out.status.success(), "xdotool key: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// The X11 clients of Alpine's display root (`guests/alpine/fetch/
+/// display.txt`), a root of their own for `test`.
+fn x11_root(test: &str) -> ScratchRoot {
+    display_root(&alpine_root("display"), test)
+}
+
+/// xeyes draws its eyes, and they follow the pointer: what its window
+/// shows changes as the pointer moves from one side of it to the other.
+#[test]
+fn alpine_display_xeyes_follows_the_pointer() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("xeyes");
+    let mut gui =
+        Gui::start(&x, "xeyes", &root, "/usr/bin/xeyes", &["-geometry", "300x200+0+0"], &[]);
+    let w = x.window(&mut gui, &["--class", "xeyes"], 120);
+    let pointer = |px: i32, py: i32| {
+        let o = x.xdotool(&["mousemove", &px.to_string(), &py.to_string()]);
+        assert!(o.status.success());
+    };
+    pointer(w.x + w.w + 200, w.y + w.h / 2);
+    std::thread::sleep(Duration::from_secs(1));
+    let right = x.shot(&w, "xeyes-right");
+    assert!(right.drawn > 1000, "xeyes drew {right:?}: {}", gui.report());
+    pointer(w.x, w.y + w.h + 200);
+    let down = x.changes(&w, &right, "xeyes-down", 30);
+    assert_ne!(down.digest, right.digest, "the eyes did not move: {}", gui.report());
+}
+
+/// xclock's analogue face, its second hand moving: what it shows changes
+/// from one second to the next.
+#[test]
+fn alpine_display_xclock_ticks() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("xclock");
+    let args = ["-update", "1", "-geometry", "200x200+0+0"];
+    let mut gui = Gui::start(&x, "xclock", &root, "/usr/bin/xclock", &args, &[]);
+    let w = x.window(&mut gui, &["--class", "xclock"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "xclock-first");
+    assert!(first.drawn > 500, "xclock drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "xclock-next", 10);
+    assert_ne!(next.digest, first.digest, "the clock did not tick: {}", gui.report());
+}
+
+/// xterm runs a shell, which runs what is typed into its window: a file
+/// written, and a block of red cells drawn (`\033[41m`, xterm's red,
+/// #cd0000).
+#[test]
+fn alpine_display_xterm_runs_what_is_typed() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("xterm");
+    let args = ["-fa", "monospace", "-fs", "11", "-geometry", "80x24+0+0", "-e", "/bin/sh"];
+    let mut gui = Gui::start(&x, "xterm", &root, "/usr/bin/xterm", &args, &[]);
+    let w = x.window(&mut gui, &["--class", "xterm"], 120);
+    std::thread::sleep(Duration::from_secs(1));
+    let before = x.shot(&w, "xterm-before");
+    x.type_into(&w, "echo typed in > /tmp/typed; printf '\\033[41m%40s\\033[0m\\n' ''\n");
+    let after = x.changes(&w, &before, "xterm-after", 30);
+    let typed = root.0.join("tmp/typed");
+    let began = Instant::now();
+    while !typed.exists() && began.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&typed).ok().as_deref(),
+        Some("typed in\n"),
+        "{}",
+        gui.report()
+    );
+    let after = x.changes(&w, &after, "xterm-red", 5);
+    assert!(after.count(0xcd0000) > 2000, "no red cells: {after:?}");
+}
+
+/// The toolkits' root (`guests/alpine/fetch/toolkits.txt`: GTK 3 and 4
+/// and their demos, Python with tkinter and PyQt6), a root of its own for
+/// `test`.
+fn toolkits_root(test: &str) -> ScratchRoot {
+    display_root(&alpine_root("toolkits"), test)
+}
+
+/// A program of a toolkit's that draws a 200×100 block of #3366cc and,
+/// when `q` is pressed, writes `/tmp/keyed` and ends: its window drawn,
+/// then the key taken.
+fn toolkit_draws_and_takes_a_key(x: &Xvfb, name: &str, root: &ScratchRoot, gui: Gui) {
+    let mut gui = gui;
+    let w = x.window(&mut gui, &["--name", "fwe-toolkit"], 180);
+    std::thread::sleep(Duration::from_secs(1));
+    let shot = x.shot(&w, name);
+    assert!(shot.count(0x3366cc) >= 18000, "{name} drew {shot:?}: {}", gui.report());
+    x.key_into(&w, "q");
+    let status = gui.exits(60);
+    assert!(status.success(), "{name}: {status}: {}", gui.report());
+    assert_eq!(std::fs::read_to_string(root.0.join("tmp/keyed")).ok().as_deref(), Some("q"));
+}
+
+/// tkinter (Python's Tk): a canvas drawn, a key bound.
+#[test]
+fn alpine_display_tkinter_draws_and_takes_a_key() {
+    let Some(x) = display_tests() else { return };
+    let root = toolkits_root("tkinter");
+    std::fs::write(
+        root.0.join("tmp/app.py"),
+        "import tkinter as tk\n\
+         w = tk.Tk()\n\
+         w.title('fwe-toolkit')\n\
+         c = tk.Canvas(w, width=240, height=140, highlightthickness=0, bg='white')\n\
+         c.create_rectangle(20, 20, 220, 120, fill='#3366cc', width=0)\n\
+         c.pack()\n\
+         def key(e):\n    open('/tmp/keyed', 'w').write(e.char)\n    w.destroy()\n\
+         w.bind('<Key-q>', key)\n\
+         w.mainloop()\n",
+    )
+    .unwrap();
+    let gui = Gui::start(&x, "tkinter", &root, "/usr/bin/python3", &["/tmp/app.py"], &[]);
+    toolkit_draws_and_takes_a_key(&x, "tkinter", &root, gui);
+}
+
+/// Qt (PyQt6, on X11 through xcb): a widget painted, a key taken.
+#[test]
+fn alpine_display_qt_draws_and_takes_a_key() {
+    let Some(x) = display_tests() else { return };
+    let root = toolkits_root("qt");
+    std::fs::write(
+        root.0.join("tmp/app.py"),
+        "import sys\n\
+         from PyQt6.QtCore import Qt\n\
+         from PyQt6.QtGui import QColor, QPainter\n\
+         from PyQt6.QtWidgets import QApplication, QWidget\n\
+         class W(QWidget):\n\
+         \x20   def paintEvent(self, e):\n\
+         \x20       p = QPainter(self)\n\
+         \x20       p.fillRect(self.rect(), QColor('white'))\n\
+         \x20       p.fillRect(20, 20, 200, 100, QColor('#3366cc'))\n\
+         \x20   def keyPressEvent(self, e):\n\
+         \x20       if e.key() == Qt.Key.Key_Q:\n\
+         \x20           open('/tmp/keyed', 'w').write('q')\n\
+         \x20           QApplication.quit()\n\
+         app = QApplication(sys.argv)\n\
+         w = W()\n\
+         w.setWindowTitle('fwe-toolkit')\n\
+         w.resize(240, 140)\n\
+         w.show()\n\
+         sys.exit(app.exec())\n",
+    )
+    .unwrap();
+    let env = [("QT_QPA_PLATFORM", "xcb"), ("QT_SCALE_FACTOR", "1")];
+    let gui = Gui::start(&x, "qt", &root, "/usr/bin/python3", &["/tmp/app.py"], &env);
+    toolkit_draws_and_takes_a_key(&x, "qt", &root, gui);
+}
+
+/// A GTK demo program (`gtk3-demo`, `gtk4-demo`): its window drawn, typing
+/// into it searching its list of demos (what it shows changes), and
+/// Ctrl+Q ending it.
+fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
+    let root = toolkits_root(name);
+    let mut gui = Gui::start(x, name, &root, &format!("/usr/bin/{name}"), &[], env);
+    let w = x.window(&mut gui, &["--class", name], 180);
+    std::thread::sleep(Duration::from_secs(2));
+    let before = x.shot(&w, &format!("{name}-before"));
+    assert!(before.drawn > 20_000, "{name} drew {before:?}: {}", gui.report());
+    x.type_into(&w, "button");
+    let after = x.changes(&w, &before, &format!("{name}-searched"), 30);
+    assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
+    x.key_into(&w, "ctrl+q");
+    let status = gui.exits(60);
+    assert!(status.success(), "{name}: {status}: {}", gui.report());
+}
+
+/// GTK 3's demo program.
+#[test]
+fn alpine_display_gtk3_demo_runs() {
+    let Some(x) = display_tests() else { return };
+    gtk_demo(&x, "gtk3-demo", &[("GDK_BACKEND", "x11")]);
+}
+
+/// GTK 4's demo program, drawn by its Cairo renderer (no GPU).
+#[test]
+fn alpine_display_gtk4_demo_runs() {
+    let Some(x) = display_tests() else { return };
+    gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
+}
+
 /// TEMPORARY (M7 probe, removed before merge): what of Linux's graphical
 /// programs runs on fwe today, against a headless X server (Xvfb, from
 /// Homebrew's xorg-server: `XVFB`, with `LIBX11` for screenshots), only
