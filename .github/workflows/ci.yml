@@ -229,12 +229,12 @@ jobs:
   # Linux's graphical programs on the host's display, against a headless X
   # server (Homebrew's Xvfb, `XVFB`): an X client of fwe's tests, and
   # fetched roots' programs (FWE_DISPLAY_TESTS, not on a development
-  # machine) driven with xdotool and checked by what they draw (libX11,
-  # `LIBX11`, takes the screenshots).
+  # machine), Wine's in the VM, driven with xdotool and checked by what
+  # they draw (libX11, `LIBX11`, takes the screenshots).
   display:
     name: Display (macos-26)
     runs-on: macos-26
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -242,7 +242,8 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: brew install xorg-server xdotool
+      # Unicorn: the hypervisor stand-in, Wine's VM.
+      - run: brew install xorg-server xdotool unicorn
       - name: The display tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"

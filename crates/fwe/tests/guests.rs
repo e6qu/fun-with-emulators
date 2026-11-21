@@ -9370,7 +9370,6 @@ impl Gui {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Gui {
-        use std::os::unix::process::CommandExt;
         let dir = display_dir();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
@@ -9388,6 +9387,13 @@ impl Gui {
             cmd.env(k, v);
         }
         let _ = std::fs::remove_file(dir.join(format!("{name}.trace")));
+        Gui::run(name, cmd)
+    }
+
+    /// `cmd` (an fwe command made ready) as program `name`.
+    fn run(name: &str, mut cmd: Command) -> Gui {
+        use std::os::unix::process::CommandExt;
+        let dir = display_dir();
         cmd.stdin(Stdio::null())
             .stdout(std::fs::File::create(dir.join(format!("{name}.out"))).unwrap())
             .stderr(std::fs::File::create(dir.join(format!("{name}.err"))).unwrap())
@@ -9692,6 +9698,43 @@ fn alpine_display_glxgears_turns_by_software() {
     };
     eprintln!("glxgears: {rate} frames a second");
     assert!(rate > 1.0, "{rate} frames a second: {}", gui.report());
+}
+
+/// Wine's Notepad, a Windows program, drawn through Wine's X11 driver in
+/// the VM (Wine needs 4 KiB pages: on the stand-in here): its window drawn,
+/// and what is typed into it shown.
+#[test]
+fn alpine_display_wine_notepad_in_the_vm() {
+    let Some(x) = display_tests() else { return };
+    let root = display_root(&alpine_root("wine-x11"), "wine");
+    let wine = |name: &str, command: &str| {
+        let mut cmd = hv_command().expect("the hypervisor stand-in");
+        cmd.arg("--vm")
+            .arg(format!("--strace-file={}", display_dir().join(format!("{name}.trace")).display()))
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.0.join("bin/busybox"))
+            .args(["sh", "-c", command])
+            .env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("WINEPREFIX", "/root/.wine")
+            .env("WINEDEBUG", "err+all")
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
+            .env("DISPLAY", x.display());
+        Gui::run(name, cmd)
+    };
+    let mut boot = wine("wineboot", "wine wineboot --init; wineserver -w");
+    let status = boot.exits(1800);
+    assert!(status.success(), "wineboot: {status}: {}", boot.report());
+    let mut notepad = wine("notepad", "wine notepad");
+    let w = x.window(&mut notepad, &["--name", "Notepad"], 1800);
+    std::thread::sleep(Duration::from_secs(5));
+    let before = x.shot(&w, "notepad-before");
+    assert!(before.drawn > 5000, "Notepad drew {before:?}: {}", notepad.report());
+    x.type_into(&w, "typed into Notepad");
+    let after = x.changes(&w, &before, "notepad-typed", 300);
+    assert_ne!(after.digest, before.digest, "typing showed nothing: {}", notepad.report());
 }
 
 /// The toolkits' root (`guests/alpine/fetch/toolkits.txt`: GTK 3 and 4
