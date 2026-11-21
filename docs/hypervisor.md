@@ -142,7 +142,8 @@ the same, and keeps these rules when the backend changes:
   `FWE_HV_TESTS=1`, which only a machine whose crash costs nothing sets.
 - **Every way out tears the VM down first:** `exit_group`, the last
   thread's `exit`, a fatal signal's default action, fwe's own fatal
-  errors, faults and panics, and `execve`. Teardown stops every vCPU, has
+  errors, faults and panics, a start that fails once the VM exists (a
+  program it cannot place), and `execve`. Teardown stops every vCPU, has
   each thread destroy its own (the framework requires that), then
   destroys the VM.
 - **Signals whose default action terminates are caught**, so the process

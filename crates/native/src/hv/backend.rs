@@ -631,7 +631,12 @@ pub fn run(
     record::event(mode, path.as_os_str().as_bytes());
     match start(path, data, args, env, options) {
         Ok(never) => match never {},
-        Err(e) => e,
+        Err(e) => {
+            // A start that failed once the VM exists (an image that cannot
+            // be placed, say): the VM goes before fwe exits with the error.
+            teardown();
+            e
+        }
     }
 }
 
