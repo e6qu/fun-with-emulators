@@ -5,7 +5,7 @@
  * the pixmap (ShmAttach, ShmPutImage), then reads the pixmap back
  * (GetImage); then has the server fill a rectangle of it and copy that
  * into the segment (ShmGetImage), and reads the segment. Each line says
- * what came back. */
+ * what came back. With "fork", a fork child does it. */
 #include <stddef.h>
 #include <stdint.h>
 
@@ -21,6 +21,8 @@ int shmctl(int id, int cmd, void *buf);
 void *memset(void *d, int c, unsigned long n);
 void *memcpy(void *d, const void *s, unsigned long n);
 unsigned long strlen(const char *s);
+int fork(void);
+int waitpid(int pid, int *status, int options);
 
 #define W 64
 #define H 32
@@ -99,7 +101,21 @@ static struct req start(uint8_t major, uint8_t data) {
     return r;
 }
 
-int main(void) {
+static int draw(void);
+
+/* With "fork", from a fork child, its parent waiting for it. */
+int main(int argc, char **argv) {
+    if (argc > 1 && argv[1][0] == 'f') {
+        int pid = fork();
+        if (pid == 0) return draw();
+        int status = 0;
+        if (waitpid(pid, &status, 0) != pid) return 1;
+        return (status >> 8) & 0xff;
+    }
+    return draw();
+}
+
+static int draw(void) {
     const char *display = getenv("DISPLAY");
     if (!display || display[0] != ':') {
         printf("DISPLAY is not :<n>\n");
