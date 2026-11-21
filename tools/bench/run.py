@@ -1879,6 +1879,15 @@ def workloads(a, fwe, guest_env, lua_src, results):
     loop = ("cd /tmp/w && i=0; while [ $i -lt 20 ]; do echo $i >> src/lua.c; "
             "/usr/bin/git commit -q -am $i; i=$((i+1)); done")
     pcs("git commit", under("/bin/sh", "-c", loop))
+    # Each git process's steps in fwe, and the loop's time on each side.
+    commit = under("/bin/sh", "-c", loop)
+    phases("git commit", commit[:2] + ["FWE_TIMING=1"] + commit[2:])
+    for side, cmd in (("fwe", commit), ("macOS", ["/bin/sh", "-c", loop.replace(
+            "/tmp/w", theirs_w).replace("/usr/bin/git", brew["git"])])):
+        t = time.perf_counter()
+        subprocess.run(cmd, capture_output=True, check=True)
+        print(f"git commit {side}: {(time.perf_counter() - t) * 50:.2f} ms each",
+              file=sys.stderr)
     pcs("git commit natively", ["/bin/sh", "-c", loop.replace("/tmp/w", theirs_w).replace(
         "/usr/bin/git", brew["git"])], execname="git")
     # Its history with patches, one process: where git's own code goes.
