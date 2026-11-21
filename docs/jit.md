@@ -511,7 +511,8 @@ What fwe counts, for the benchmarks to report
   the files mapped to find them), the generated blocks made again where a
   past process made them (and so kept), and the
   blocks in use that only a direct branch leads to, by where the branch
-  is.
+  is (and, with `FWE_JIT_COUNT`, how often they ran: each run a branch
+  from one block into the next that a trace would not take).
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
   and a hash of their words) and counts those an earlier one made, at the
   same address or elsewhere.

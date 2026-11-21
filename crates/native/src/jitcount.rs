@@ -333,15 +333,17 @@ pub(crate) enum Lead {
 
 /// Of the blocks in use, those an unconditional branch leads to (all of
 /// them), and of those the ones nothing else leads to directly, by
-/// [`Lead`] of their one branch: how many, and their program's words.
-fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64); 3]) {
+/// [`Lead`] of their one branch: how many, their program's words, and
+/// their runs (where blocks count them): each a branch from one block
+/// into the next that a trace, the two made as one, would not take.
+fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64, u64); 3]) {
     let mut by: HashMap<u64, [u32; 4]> = HashMap::new();
     for b in blocks.iter().filter(|b| b.live) {
         for &(to, lead) in &b.leads {
             by.entry(to).or_default()[lead as usize] += 1;
         }
     }
-    let (mut all, mut only) = (0, [(0u64, 0u64); 3]);
+    let (mut all, mut only) = (0, [(0u64, 0u64, 0u64); 3]);
     for b in blocks.iter().filter(|b| b.live) {
         let Some(&leads) = by.get(&b.g) else { continue };
         let branches: u32 = leads[..3].iter().sum();
@@ -353,6 +355,7 @@ fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64); 3]) {
             let k = leads.iter().position(|&n| n == 1).expect("one branch");
             only[k].0 += 1;
             only[k].1 += b.words as u64;
+            only[k].2 += b.counters.map_or(0, |c| count(c) + count(c + 8));
         }
     }
     (all, only)
@@ -428,6 +431,9 @@ pub(crate) fn report(blocks: &[Counted], is_file: impl Fn(u64) -> bool) -> Strin
          ({} words)",
         ahead.0, ahead.1, near.0, near.1, away.0, away.1
     ));
+    if counting() {
+        out.push_str(&format!(" (run {}, {} and {} times)", ahead.2, near.2, away.2));
+    }
     if *SEEN_READ.get().unwrap_or(&false) {
         out.push_str(&format!(
             "; made before by another process: {} {} at the same address, {} elsewhere; {} {}, {}",
