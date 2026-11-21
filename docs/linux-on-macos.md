@@ -2155,8 +2155,8 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 
 | Linux | macOS | fwe |
 |---|---|---|
-| `DISPLAY=:N`, the server's socket `/tmp/.X11-unix/XN` and the abstract name `@/tmp/.X11-unix/XN` libxcb tries first | the host server's socket: Xvfb's or Xorg's `/tmp/.X11-unix/XN`, XQuartz's launchd socket `/private/tmp/com.apple.launchd.…/org.xquartz:N` | either name, in any root, reaches the host server's socket; the guest's `DISPLAY` is `:N` (XQuartz's path shortened to it) |
-| another display, its socket in the guest's `/tmp/.X11-unix` (an Xwayland a compositor starts) | — | the guest's own, a Unix socket in its root like any other |
+| `DISPLAY=:N`, the server's socket `/tmp/.X11-unix/XN` and the abstract name `@/tmp/.X11-unix/XN` libxcb tries first | the host server's socket: Xvfb's or Xorg's `/tmp/.X11-unix/XN`, XQuartz's launchd socket `/private/tmp/com.apple.launchd.…/org.xquartz:N` | either name, in any root and from every process of the run (a VM's fork children too), reaches the host server's socket; the guest's `DISPLAY` is `:N` (XQuartz's path shortened to it) |
+| another display, its socket in the guest's `/tmp/.X11-unix` (an Xwayland a compositor starts, an Xvfb the guest runs) | — | the guest's own, a Unix socket in its root like any other (a server's TCP port is the host's) |
 | MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
 | `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
 | Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
