@@ -89,7 +89,7 @@
 
 mod kept;
 
-use crate::asm::{Asm, Field, Label, Pos, STUB, Sec};
+use crate::asm::{Asm, Field, Label, Pos, STUB, Sec, TAIL};
 use crate::jitcount;
 use crate::rewrite::{self, Site};
 use fwe_kernel::Regs;
@@ -111,6 +111,11 @@ const OUT: u32 = 0x1000_0010;
 /// The bytes at the start of each chunk that its ways out branch to on
 /// into the exit gate ([`exit_stub`]).
 const EXIT_STUB: u64 = 16;
+/// The bytes after them kept for the chunk's return tail ([`tail`]); its
+/// blocks start past both.
+const TAIL_ROOM: u64 = 256;
+/// The bytes at the start of each chunk before its blocks.
+const PREFIX: u64 = EXIT_STUB + TAIL_ROOM;
 
 /// Most instructions a block holds before it ends and goes on to the next.
 const BLOCK_INSNS: usize = 64;
@@ -142,6 +147,65 @@ pub fn stands_for_program(pc: u64) -> bool {
 fn in_exit_stub(pc: u64) -> bool {
     let n = CHUNK_COUNT.load(Ordering::Acquire) as usize;
     CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < EXIT_STUB)
+}
+
+/// The index of the word `pc` is in a chunk's return tail ([`tail`]), if it
+/// is in one.
+fn in_tail(pc: u64) -> Option<usize> {
+    let n = CHUNK_COUNT.load(Ordering::Acquire) as usize;
+    let len = 4 * tail().0.len() as u64;
+    CHUNK_RX[..n].iter().find_map(|c| {
+        let off = pc.wrapping_sub(c.load(Ordering::Relaxed) + EXIT_STUB);
+        (off < len).then_some((off / 4) as usize)
+    })
+}
+
+/// What every word of a chunk's return tail stands for: the return to
+/// `x30` under way, the program's `x16` and `x17` in their slots (once
+/// restored for a target not translated, in both).
+const TAIL_WORD: Word = Word::Lookup { g: 0, link: None, to: Some(30) };
+
+/// The words of a chunk's return tail, after its exit stub (the same in
+/// every chunk: their branches are to each other and to the stub), and
+/// the index of its way out. A return through `x30` whose first look in
+/// the table of returns ([`lookup`]) missed goes on there, as its own
+/// words would: the second entry of the pair in the table of returns, then
+/// the table of translations, the return made as it is to a target not
+/// translated, and the miss into fwe, a return's way out ([`exit`]).
+fn tail() -> &'static (Vec<u32>, usize) {
+    static TAIL_WORDS: std::sync::OnceLock<(Vec<u32>, usize)> = std::sync::OnceLock::new();
+    TAIL_WORDS.get_or_init(|| {
+        let w = TAIL_WORD;
+        let mut a: Asm<Word> = Asm::new();
+        a.extend(H, [index_of(30), SCALE, RETS_BASE, OTHER, ENTRY, key_against(30)], w);
+        let main = a.label();
+        a.branch(H, MISS_X16, Field::Imm19, main, w);
+        a.push(H, RET_X17, w);
+        a.bind(main, H);
+        a.extend(H, [index_of(30), SCALE, BASE, ENTRY, key_against(30)], w);
+        let miss = a.label();
+        a.branch(H, MISS_X16, Field::Imm19, miss, w);
+        let outside = a.label();
+        let outside_at = a.branch(H, OUTSIDE, Field::Imm19, outside, w);
+        a.push(H, GO, w);
+        a.bind(outside, H);
+        push_restore(&mut a, H, w);
+        a.push(H, 0xd65f_0000 | (30 << 5), w); // ret
+        a.bind(miss, H);
+        a.extend(H, [index_of(30), SCALE, BASE, OTHER, ENTRY, key_against(30)], w);
+        let second_miss = a.label();
+        a.branch(H, MISS_X16, Field::Imm19, second_miss, w);
+        let back = a.label_at(outside_at);
+        a.branch(H, B, Field::Imm26, back, w);
+        a.bind(second_miss, H);
+        let out = a.len(H);
+        a.push(H, OUT, w);
+        a.branch(H, B, Field::Imm26, STUB, w);
+        a.finish([EXIT_STUB, 0], [0, EXIT_STUB]);
+        let words = a.words(H).to_vec();
+        assert!(4 * words.len() as u64 <= TAIL_ROOM, "a return tail larger than its room");
+        (words, out)
+    })
 }
 
 /// The largest code cache chunk: what a branch reaches, so blocks in one
@@ -839,7 +903,7 @@ impl Chunk {
 
     /// Emptied: its first segment, past the exit stub, from the start.
     fn empty(&mut self) {
-        self.hot = EXIT_STUB;
+        self.hot = PREFIX;
         self.end = segment();
         self.cold = self.end;
     }
@@ -2030,6 +2094,8 @@ fn exit_now(regs: &mut Regs, trapped: bool) -> bool {
     let word = from.and_then(|i| s.blocks[i].word_at(at));
     let (exit, saved, x18) = match word {
         Some(Word::Out { exit, saved, x18, .. }) => (exit, saved, x18),
+        // A chunk's return tail's way out: a return through x30.
+        _ if in_tail(at) == Some(tail().1) => (Exit::Reg { n: 30, link: None }, true, false),
         _ => {
             // A call stub's way out, a lookup's miss: into its call's
             // target, as a translation's call through a register (a `bl`'s
@@ -2184,13 +2250,16 @@ pub fn to_guest(regs: &mut Regs) -> bool {
     }
     // On its way into the exit gate from the way out in `x16`, past its
     // first words: as at the words of the way out after them.
+    // In a chunk's return tail, or on the way from its way out: as at the
+    // return's target ([`TAIL_WORD`]).
+    let tail_word = |pc: u64| in_tail(pc).map(|_| TAIL_WORD);
     let Some(w) = (if in_exit_stub(regs.pc) {
         match word_at(&s, regs.x[16]) {
             Some(Word::Out { g, .. }) => Some(Word::Saved(g)),
-            _ => None,
+            _ => tail_word(regs.x[16]),
         }
     } else {
-        word_at(&s, regs.pc)
+        word_at(&s, regs.pc).or_else(|| tail_word(regs.pc))
     }) else {
         return false;
     };
@@ -2619,7 +2688,7 @@ fn place(
     note_aliases(s, page);
     // Its branches resolved where it goes, its ways out on into the exit
     // stub of its chunk.
-    asm.finish([at, at_cold], stub);
+    asm.finish([at, at_cold], [stub, stub + EXIT_STUB]);
     // Where its calls return is followed too, from code not translated
     // (a library's function the call went to): no longer branched to as
     // code not translated.
@@ -2968,16 +3037,18 @@ fn new_chunk() -> Chunk {
 /// Write the exit stub at the start of the chunk whose views are `rw` and
 /// `rx`: `ldr x17, #8; br x17` and the exit gate's address. Each way out
 /// of the chunk's blocks branches there, `x16` its own address
-/// ([`gate_out`]); the stub stays while the chunk does.
+/// ([`gate_out`]). The return tail follows it ([`tail`]); both stay while
+/// the chunk does.
 fn exit_stub(rw: u64, rx: u64) {
     let gate = crate::gate::exit_address();
     let words = [0x5800_0000 | (2 << 5) | 17, GO, gate as u32, (gate >> 32) as u32];
-    for (k, w) in words.into_iter().enumerate() {
-        // SAFETY: the start of the chunk's writable view, fresh.
+    for (k, w) in words.into_iter().chain(tail().0.iter().copied()).enumerate() {
+        // SAFETY: the start of the chunk's writable view, fresh, within
+        // its prefix.
         unsafe { ((rw + 4 * k as u64) as *mut u32).write(w) };
     }
     // SAFETY: the chunk's executable view, mapped.
-    unsafe { crate::prepare::flush_icache(rx, EXIT_STUB) };
+    unsafe { crate::prepare::flush_icache(rx, PREFIX) };
 }
 
 /// The code cache.
@@ -3059,7 +3130,7 @@ fn followable(to: u64) -> bool {
 fn cache_next(s: &mut State, hot: u64, cold: u64) -> (u64, u64, u64) {
     // The first segment holds the exit stub; each part may be aligned.
     assert!(
-        EXIT_STUB + hot + cold + 8 <= segment(),
+        PREFIX + hot + cold + 8 <= segment(),
         "a block of {hot} and {cold} bytes, larger than a segment"
     );
     let room = |k: &Chunk| !k.retired && k.fit(hot, cold).is_some();
@@ -4353,6 +4424,18 @@ fn lookup(
     let before = Word::Lookup { g: pc, link, to: None };
     let in_place = !matches!(n, 16..=18) && !(n == 30 && link.is_some());
     let cold = C;
+    // A return through x30: the first look in the table of returns here,
+    // the rest in the chunk's return tail ([`tail`]), which its miss
+    // branches to from a word out of the way.
+    if ret && n == 30 && link.is_none() {
+        a.extend(H, [index_of(30), SCALE, RETS_BASE, ENTRY, key_against(30)], before);
+        let next = a.label();
+        a.branch(H, MISS_X16, Field::Imm19, next, before);
+        a.push(H, RET_X17, Word::Lookup { g: pc, link: None, to: Some(30) });
+        a.bind(next, cold);
+        a.branch(cold, B, Field::Imm26, TAIL, before);
+        return None;
+    }
     // Where the look in the table of translations goes: past a return's
     // first look in the table of returns, out of the way.
     let main = if ret && in_place { cold } else { H };

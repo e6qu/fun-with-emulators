@@ -11,8 +11,8 @@
 //! A branch to a label is made with its offset field clear; finishing the
 //! block at the sections' addresses fills it in, and fails loudly where the
 //! label is not bound, the field is not clear or the target is out of the
-//! field's reach. One label stands outside the block, for the place its
-//! ways out go ([`STUB`]).
+//! field's reach. Two labels stand outside the block: the place its ways
+//! out go ([`STUB`]), and the return's tail its chunk shares ([`TAIL`]).
 
 /// A section of a block's words.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -41,6 +41,19 @@ pub(crate) struct Label(usize);
 /// The label of the place outside the block its ways out branch to,
 /// bound to its address as the block is finished ([`Asm::finish`]).
 pub(crate) const STUB: Label = Label(0);
+
+/// The label of the words outside the block a return's first look's miss
+/// goes on to, shared by the blocks of its chunk, bound as [`STUB`] is.
+pub(crate) const TAIL: Label = Label(1);
+
+/// Where a branch still to resolve goes: a word of the block, or one of the
+/// places outside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum To {
+    At(Pos),
+    Stub,
+    Tail,
+}
 
 /// Where a label is: a word of the block, or an address outside it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -110,7 +123,7 @@ impl<W: Copy> Asm<W> {
         Asm {
             words: [Vec::new(), Vec::new()],
             info: [Vec::new(), Vec::new()],
-            labels: vec![None],
+            labels: vec![None, None],
             fixups: Vec::new(),
         }
     }
@@ -123,7 +136,7 @@ impl<W: Copy> Asm<W> {
             self.info[s as usize].clear();
         }
         self.labels.clear();
-        self.labels.push(None);
+        self.labels.extend([None, None]);
         self.fixups.clear();
     }
 
@@ -230,20 +243,21 @@ impl<W: Copy> Asm<W> {
     }
 
     /// Its branches resolved for the sections placed at the byte addresses
-    /// `at` (hot, cold) and [`STUB`] at `stub`: each section's words are
-    /// then [`Asm::words`].
-    pub(crate) fn finish(&mut self, at: [u64; 2], stub: u64) {
-        self.labels[STUB.0] = Some(Target::Addr(stub));
+    /// `at` (hot, cold), [`STUB`] at `outside[0]` and [`TAIL`] at
+    /// `outside[1]`: each section's words are then [`Asm::words`].
+    pub(crate) fn finish(&mut self, at: [u64; 2], outside: [u64; 2]) {
+        self.labels[STUB.0] = Some(Target::Addr(outside[0]));
+        self.labels[TAIL.0] = Some(Target::Addr(outside[1]));
         self.resolve(at);
     }
 
-    /// Its branches still to resolve: each one's place, field and target
-    /// (a word of the block, or none for [`STUB`]).
-    pub(crate) fn fixups(&self) -> impl Iterator<Item = (Pos, Field, Option<Pos>)> + '_ {
+    /// Its branches still to resolve: each one's place, field and target.
+    pub(crate) fn fixups(&self) -> impl Iterator<Item = (Pos, Field, To)> + '_ {
         self.fixups.iter().map(|f| {
             let to = match self.labels[f.to.0] {
-                Some(Target::At(p)) => Some(p),
-                None if f.to == STUB => None,
+                Some(Target::At(p)) => To::At(p),
+                None if f.to == STUB => To::Stub,
+                None if f.to == TAIL => To::Tail,
                 t => panic!("a branch at {:?} to {t:?}, kept", f.at),
             };
             (f.at, f.field, to)
@@ -253,13 +267,14 @@ impl<W: Copy> Asm<W> {
     /// Made again as [`Asm::fixups`] and the words of each section
     /// (`words`) say, still to resolve: with no word's meaning (a block
     /// kept has them packed, apart).
-    pub(crate) fn restore(&mut self, words: [Vec<u32>; 2], fixups: &[(Pos, Field, Option<Pos>)]) {
+    pub(crate) fn restore(&mut self, words: [Vec<u32>; 2], fixups: &[(Pos, Field, To)]) {
         self.clear();
         self.words = words;
         for &(at, field, to) in fixups {
             let to = match to {
-                Some(p) => self.label_at(p),
-                None => STUB,
+                To::At(p) => self.label_at(p),
+                To::Stub => STUB,
+                To::Tail => TAIL,
             };
             self.fixups.push(Fixup { at, field, to });
         }
@@ -303,7 +318,7 @@ mod tests {
         a.branch(Sec::Cold, B, Field::Imm26, back, 0);
         a.branch(Sec::Cold, B, Field::Imm26, STUB, 0);
         // The cold words 100 words past the hot, the stub 50 before them.
-        a.finish([0x1000, 0x1000 + 4 * 100], 0x1000 - 4 * 50);
+        a.finish([0x1000, 0x1000 + 4 * 100], [0x1000 - 4 * 50, 0]);
         let w = [a.words(Sec::Hot), a.words(Sec::Cold)].concat();
         // Each branch back in two's complement: -101 is 2^26 - 101.
         let back = |n: u32| (1 << 26) - n;
@@ -332,7 +347,7 @@ mod tests {
         a.push(Sec::Cold, 2, 2);
         a.push(Sec::Hot, 3, 3);
         assert_eq!(a.flat(Pos { sec: Sec::Cold, k: 0 }), 2);
-        a.finish([0, 8], 0);
+        a.finish([0, 8], [0, 0]);
         assert_eq!((a.words(Sec::Hot), a.words(Sec::Cold)), (&[1, 3][..], &[2][..]));
         assert_eq!((a.info(Sec::Hot), a.info(Sec::Cold)), (&[1, 3][..], &[2][..]));
     }
@@ -362,6 +377,6 @@ mod tests {
             a.push(Sec::Hot, 0, 0);
         }
         a.bind(l, Sec::Hot);
-        a.finish([0, 0], 0);
+        a.finish([0, 0], [0, 0]);
     }
 }

@@ -345,7 +345,13 @@ a processor that reports `DIC` clear.
 - **The table of returns** at 2^45 + 2^44 is laid out as the table of
   translations: a call's return address and the words after its `bl`
   (`jit::RETS`; the call's words out of line are a `jit::Side`),
-  published and dropped with the block that holds the call. A call made in a block's words is noted (`State::calls_made`,
+  published and dropped with the block that holds the call. A return
+  through `x30` holds only its first look in the table; its miss goes on
+  in the return tail its chunk keeps after the exit stub (`jit::tail`,
+  the asm label `TAIL`): the pair's other entry, the table of
+  translations, the return made as it is to code not translated, and the
+  way into fwe, which `jit::exit` takes as a return. A thread stopped in
+  the tail is as at the return's target. A call made in a block's words is noted (`State::calls_made`,
   entered with `x16` and `x17` saved); a block translated later that
   comes to it ends in a way out linked into those words (`Exit::Join`),
   through fwe again if that block is dropped.

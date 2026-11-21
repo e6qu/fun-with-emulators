@@ -30,7 +30,7 @@
 //! where a past one noted it: from then on, later processes take it.
 
 use super::{Calls, Made, Packed, Room};
-use crate::asm::{Asm, Field, Pos, Sec};
+use crate::asm::{Asm, Field, Pos, Sec, To};
 use crate::jitcount;
 use std::collections::HashMap;
 use std::os::unix::ffi::OsStrExt;
@@ -144,7 +144,7 @@ impl Drop for Seg {
 #[derive(Default)]
 struct Loaded {
     segs: Vec<Seg>,
-    addresses: Option<std::collections::HashSet<u64>>,
+    addresses: Option<std::collections::HashSet<u64, Fast>>,
     seen: Option<Seen>,
 }
 
@@ -231,11 +231,15 @@ fn seen_file(notes: &[u64]) -> Vec<u8> {
 /// not from a file), and the records it made, by part, to add as it ends
 /// (made by process `owner`: a fork child does not add its parent's).
 struct Kept {
-    parts: HashMap<Part, Loaded>,
+    parts: HashMap<Part, Loaded, Fast>,
     last: Option<(u64, u64, Option<Part>)>,
-    new: HashMap<Part, New>,
+    new: HashMap<Part, New, Fast>,
     owner: i32,
 }
+
+/// The hashing of the maps looked in for each block made: an address's
+/// ([`super::AddrHash`]).
+type Fast = std::hash::BuildHasherDefault<super::AddrHash>;
 
 /// A part's records made in this process: each one's program address and
 /// its bytes' end, the bytes one after another; and the generated blocks
@@ -297,9 +301,9 @@ fn kept() -> std::sync::MutexGuard<'static, Option<Kept>> {
 /// [`KEPT`], begun if it was not.
 fn begun(k: &mut Option<Kept>) -> &mut Kept {
     k.get_or_insert_with(|| Kept {
-        parts: HashMap::new(),
+        parts: HashMap::default(),
         last: None,
-        new: HashMap::new(),
+        new: HashMap::default(),
         owner: fwe_kernel::host::pid(),
     })
 }
@@ -442,10 +446,16 @@ pub(super) fn keep(
     put32(w, 0);
     let mut fixups = 0u32;
     for (at, field, to) in asm.fixups() {
-        w.extend_from_slice(&[at.sec as u8, field as u8, u8::from(to.is_some())]);
-        w.push(to.map_or(0, |t| t.sec as u8));
+        // Where it goes: the exit stub (0), a word of the block (1), or
+        // the chunk's return tail (2).
+        let (kind, to) = match to {
+            To::Stub => (0, Pos::hot(0)),
+            To::At(p) => (1, p),
+            To::Tail => (2, Pos::hot(0)),
+        };
+        w.extend_from_slice(&[at.sec as u8, field as u8, kind, to.sec as u8]);
         put32(w, at.k as u32);
-        put32(w, to.map_or(0, |t| t.k as u32));
+        put32(w, to.k as u32);
         fixups += 1;
     }
     w[count..count + 4].copy_from_slice(&fixups.to_le_bytes());
@@ -496,10 +506,12 @@ fn decode(r: &mut Reader, end: u64) -> Option<(Made, Vec<Packed>)> {
     for _ in 0..r.u32()? {
         let b = r.take(4)?;
         let (at, to) = (r.u32()? as usize, r.u32()? as usize);
-        let target = (b[2] == 1).then(|| Some(Pos { sec: sec(b[3])?, k: to })).flatten();
-        if b[2] == 1 && target.is_none() {
-            return None;
-        }
+        let target = match b[2] {
+            0 => To::Stub,
+            1 => To::At(Pos { sec: sec(b[3])?, k: to }),
+            2 => To::Tail,
+            _ => return None,
+        };
         fixups.push((Pos { sec: sec(b[0])?, k: at }, field(b[1])?, target));
     }
     let mut room =
@@ -585,7 +597,7 @@ impl<'a> Reader<'a> {
 /// A file of records begins so, then its count of records and a table of
 /// them in address order, for each its program address, offset, length
 /// and key ([`key_of`]); their bytes follow.
-const MAGIC: &[u8; 8] = b"fwekept6";
+const MAGIC: &[u8; 8] = b"fwekept7";
 
 /// The directory of this build's records, with the thread's slots its
 /// translations name ([`crate::thread_pointer_slot`], [`crate::x18_slot`],
