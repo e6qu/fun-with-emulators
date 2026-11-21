@@ -187,7 +187,8 @@ and `fork`.
   to 4 GiB), with a guard page, and ends at `loader::STACK_TOP`, near the
   top of the host's 47 bits, above the image as on Linux.
 - `execve` of a script runs its `#!` interpreter (`Kernel::exec_target`)
-  in either backend, so no shell is needed.
+  in either backend, so no shell is needed; so does a script given to
+  fwe itself (`script_target`), its interpreter found in the root.
 - The auxiliary vector's ids and `AT_SECURE` are the guest's, as the
   exec leaves them (`AuxIds`): the kernel computes them before an
   in-place `execve` loads the program, and a re-executed fwe reads them

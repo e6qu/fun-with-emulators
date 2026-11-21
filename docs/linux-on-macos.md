@@ -1922,7 +1922,9 @@ path and is then `execve`. A script (`#!interpreter [argument]`) runs
 its interpreter as Linux's `binfmt_script` does, with the line's argument,
 the script's path (`/dev/fd/N` for a descriptor) and the rest of the
 arguments, nested up to five deep (`Kernel::exec_target`); the
-interpreter, not the script, decides what set-ID bits grant.
+interpreter, not the script, decides what set-ID bits grant. A script
+given to fwe on its command line runs the same way, its path in the
+guest's arguments the guest path inside the root.
 
 #### The ELF loader and dynamic linker
 

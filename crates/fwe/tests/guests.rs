@@ -485,9 +485,10 @@ fn programs_run_through_an_o_path_descriptor() {
 }
 
 /// A script run by `execve` with no shell between (as `apk` runs its
-/// packages' scripts, from a memfd through `fexecve`): its `#!` line's
-/// interpreter runs with the line's argument, the script's path
-/// (`/dev/fd/N` for a descriptor), then the rest of the arguments.
+/// packages' scripts, from a memfd through `fexecve`), or given to fwe
+/// itself: its `#!` line's interpreter runs with the line's argument, the
+/// script's path (`/dev/fd/N` for a descriptor), then the rest of the
+/// arguments.
 #[test]
 fn scripts_run_their_interpreter() {
     let dir = std::env::temp_dir().join(format!("fwe-script-{}", std::process::id()));
@@ -495,7 +496,6 @@ fn scripts_run_their_interpreter() {
     let dir = std::fs::canonicalize(&dir).unwrap();
     let me = rust_guest("args");
     let out = fwe(&me, &["script", dir.to_str().unwrap()]);
-    let _ = std::fs::remove_dir_all(&dir);
     let text = stdout(&out);
     let want = format!(
         "arg[0]={}\narg[1]=-a\narg[2]={}/script.sh\narg[3]=one\n",
@@ -503,6 +503,10 @@ fn scripts_run_their_interpreter() {
         dir.display()
     );
     assert!(text.starts_with(&want), "{text}");
+    // The same script given to fwe, with its arguments.
+    let out = fwe(&dir.join("script.sh"), &["one"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(stdout(&out).starts_with(&want), "{}", stdout(&out));
     let out = fwe(&me, &["memfd-script"]);
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().take(4).collect();
