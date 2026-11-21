@@ -1099,7 +1099,13 @@ impl Vcpu {
                 syscall(self, &mut regs);
             }
             EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr, Some(esr)),
-            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far, Some(esr)),
+            // At the misaligned pc (FAR holds it), or at sp (FAR is
+            // unknown for sp), as Linux reports them.
+            EC_PC_ALIGN => fault(&mut regs, s::SIGBUS, far, Some(esr)),
+            EC_SP_ALIGN => {
+                let sp = regs.sp;
+                fault(&mut regs, s::SIGBUS, sp, Some(esr));
+            }
             EC_DABT_LOWER | EC_IABT_LOWER => {
                 // A translation fault (DFSC/IFSC 0b0001xx) a vfork child
                 // takes on memory it has not fetched yet: fetched now, the

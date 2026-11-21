@@ -5226,6 +5226,16 @@ fn asm_sp_off_alignment() {
     }
 }
 
+/// [`asm_sp_off_alignment`] in the VM: the SIGBUS at sp (the hardware's
+/// fault address is unknown for sp), and code made at run time run there.
+#[test]
+fn hv_sp_off_alignment() {
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg(asm_guest("spalign"));
+    let out = run_hv(cmd, "spalign --vm");
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
 /// thread that writes to the pipe could never make its own system call.
 #[test]
