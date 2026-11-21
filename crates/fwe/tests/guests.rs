@@ -9205,7 +9205,8 @@ fn code_beyond_its_stubs_reach_runs_by_translation() {
 /// abort's, telling a write (WnR) from a read, as Wine reads it.
 const FAULT_ESR: &str = "read: syndrome found, data abort yes, write 0\n\
     write: syndrome found, data abort yes, write 1\n\
-    no access: code 2, at the address yes\nnot mapped: code 1, at the address yes\n\
+    no access: fault 3, code 2, at the address yes\n\
+    not mapped: fault 4, code 1, at the address yes\n\
     breakpoint: code 1, at the instruction yes\n";
 
 /// A fault's syndrome in its handler's frame, natively.

@@ -37,7 +37,7 @@ int sigaction(int sig, const struct sigaction *act, struct sigaction *old);
 #define ESR_MAGIC 0x45535201u
 
 static volatile char *page;
-static volatile int found, wnr, ec, code;
+static volatile int found, wnr, ec, code, faults;
 static volatile uint64_t addr;
 
 /* A signal's code and address (siginfo's si_code and si_addr). */
@@ -55,6 +55,7 @@ static void trapped(int sig, void *info, void *ctx) {
 
 static void handler(int sig, void *info, void *ctx) {
     (void)sig;
+    faults++;
     took(info);
     uint8_t *rec = (uint8_t *)ctx + RESERVED_OFF;
     found = 0;
@@ -88,10 +89,12 @@ int main(void) {
            ec == 0x24 ? "yes" : "no", wnr);
     mprotect((void *)page, 4096, PROT_NONE);
     c = page[300];
-    printf("no access: code %d, at the address %s\n", code, addr == (uint64_t)(page + 300) ? "yes" : "no");
+    printf("no access: fault %d, code %d, at the address %s\n", faults, code,
+           addr == (uint64_t)(page + 300) ? "yes" : "no");
     munmap((void *)page, 16384);
     c = page[400];
-    printf("not mapped: code %d, at the address %s\n", code, addr == (uint64_t)(page + 400) ? "yes" : "no");
+    printf("not mapped: fault %d, code %d, at the address %s\n", faults, code,
+           addr == (uint64_t)(page + 400) ? "yes" : "no");
     sa.sa_sigaction = trapped;
     sigaction(SIGTRAP, &sa, 0);
     uint64_t at;

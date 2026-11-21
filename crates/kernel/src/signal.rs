@@ -443,8 +443,9 @@ pub(crate) fn raise_self(sig: u64) {
 
 /// A fault's `si_code`, as Linux's arm64 fault handlers give it: for
 /// `SIGSEGV`, an address the guest has no mapping at or one mapped without
-/// the access (as Linux tells them by the mapping, not by the host's page
-/// tables, which keep nothing for a page with no access); for `SIGBUS`,
+/// the access (as Linux tells them, by the guest's mappings
+/// ([`crate::maps`]), not by page tables, which keep nothing for a page
+/// with no access); for `SIGBUS`,
 /// poisoned memory (`MADV_HWPOISON`), a misaligned pc, stack or access
 /// (the syndrome `esr`'s exception class or abort status), or else an
 /// address past what is mapped there; a breakpoint's `SIGTRAP`; an unknown
@@ -456,7 +457,7 @@ fn fault_code(sig: u64, addr: u64, esr: Option<u64>) -> i32 {
     let ec = esr.map(|e| (e >> 26) & 0x3f);
     let fsc = esr.map(|e| e & 0x3f);
     match sig {
-        signal::SIGSEGV if crate::mm::mapped(addr, 1) => signal::SEGV_ACCERR,
+        signal::SIGSEGV if crate::maps::record().span_at(addr).is_some() => signal::SEGV_ACCERR,
         signal::SIGSEGV => signal::SEGV_MAPERR,
         signal::SIGBUS if crate::mm::poisoned(addr) => signal::BUS_MCEERR_AR,
         signal::SIGBUS
