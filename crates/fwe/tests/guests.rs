@@ -9947,7 +9947,9 @@ fn alpine_display_weston_runs_wayland_and_xwayland_clients() {
         "--height=600",
     ];
     let mut weston = Gui::start(&x, "weston", &root, "/usr/bin/weston", &args, &[]);
-    let w = x.window(&mut weston, &["--name", "Weston Compositor"], 180);
+    // Found by its class: Weston names its window only in `_NET_WM_NAME`,
+    // which xdotool's `--name` does not read.
+    let w = x.window(&mut weston, &["--class", "Weston Compositor"], 180);
     std::thread::sleep(Duration::from_secs(3));
     let empty = x.shot(&w, "weston-empty");
     let wl = [("WAYLAND_DISPLAY", "wayland-1")];
@@ -10070,6 +10072,21 @@ fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
     x.key_into(&w, "Escape");
     x.shot(&w, &format!("{name}-escaped"));
     x.key_into(&w, "ctrl+q");
+    // PROBE (temporary): if it has not ended, whether keys reach it at all
+    // (a letter opens GTK 3's search again).
+    let began = Instant::now();
+    while !gui.ended() && began.elapsed() < Duration::from_secs(15) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !gui.ended() {
+        let stuck = x.shot(&w, &format!("{name}-not-quit"));
+        x.key_into(&w, "a");
+        let lettered = x.changes(&w, &stuck, &format!("{name}-lettered"), 10);
+        eprintln!(
+            "{name}: a letter after ctrl+q changed the window: {}",
+            lettered.digest != stuck.digest
+        );
+    }
     let status = gui.exits(60);
     assert!(status.success(), "{name}: {status}: {}", gui.report());
 }
