@@ -516,7 +516,10 @@ What fwe counts, for the benchmarks to report
   from one block into the next that a trace would not take).
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
   and a hash of their words) and counts those an earlier one made, at the
-  same address or elsewhere.
+  same address (and of those, the ones two or more earlier processes made
+  there, which kept translations should have given it) or elsewhere. The
+  benchmarks run each JIT runtime three times so and fail if the third
+  makes any block of generated code two earlier runs made.
 - **`FWE_JIT_COUNT=1`:** blocks count their runs, ways back their returns
   and lookups through a register whether they go where they went last
   (the words then differ). The report adds the blocks that ran, those

@@ -1184,9 +1184,10 @@ fn jit_branches_within_a_block_stay_in_it() {
 }
 
 /// The translator's counts (guests/c/jitloop.c): its one block made from
-/// generated code, made again by a second process that sees the first's
-/// blocks (`FWE_JIT_SEEN`), and, with every block counting its runs
-/// (`FWE_JIT_COUNT`), counted as run, the program's output as ever.
+/// generated code, made again by a second and a third process that see
+/// the earlier ones' blocks (`FWE_JIT_SEEN`; the third's made by two of
+/// them, if at its address each time), and, with every block counting its
+/// runs (`FWE_JIT_COUNT`), counted as run, the program's output as ever.
 #[test]
 fn jit_counts_say_what_ran_and_what_was_made_before() {
     let prog = build_c("jitloop", Libc::Musl, true, true);
@@ -1194,7 +1195,8 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
     let seen = std::env::temp_dir().join(format!("fwe-jitseen-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&seen);
     std::fs::create_dir_all(&seen).unwrap();
-    for round in 0..2 {
+    let mut at: Vec<u64> = Vec::new();
+    for round in 0..3u64 {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root).arg(&prog);
         cmd.env("FWE_TIMING", "1").env("FWE_JIT_SEEN", &seen).env("FWE_JIT_COUNT", "1");
@@ -1205,6 +1207,8 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
         assert!(err.contains("blocks made from files 0 (0 ms), generated 1 ("), "{err}");
         // An earlier process's block: at the same address, or elsewhere
         // (where the program's mapping landed).
+        // "generated R (T), M": at the same address (by two or more), and
+        // elsewhere.
         let before = err.split("made before by another process: ").nth(1).unwrap_or_default();
         let seen: Vec<u64> = before
             .split(';')
@@ -1212,11 +1216,23 @@ fn jit_counts_say_what_ran_and_what_was_made_before() {
             .unwrap_or_default()
             .trim()
             .trim_start_matches("generated ")
-            .split(", ")
-            .map(|n| n.trim().parse().unwrap_or(9))
+            .split([' ', ',', '(', ')'])
+            .filter(|n| !n.is_empty())
+            .take(3)
+            .map(|n| n.parse().unwrap_or(9))
             .collect();
-        assert!(before.starts_with("from files 0 at the same address, 0 elsewhere"), "{err}");
-        assert_eq!(seen.iter().sum::<u64>(), round, "{err}");
+        let [same, twice, elsewhere] = seen[..] else { panic!("{err}") };
+        assert!(
+            before.starts_with("from files 0 at the same address (0 by two or more), 0 elsewhere"),
+            "{err}"
+        );
+        assert_eq!(same + elsewhere, round.min(1), "{err}");
+        // (Made at one address by the first two and the third: by two.)
+        let both = round == 2 && same == 1 && at == [1];
+        assert_eq!(twice, u64::from(both), "{err}");
+        if round == 1 {
+            at.push(same);
+        }
         assert!(err.contains("blocks run from files 0 of 0, generated 1 of 1"), "{err}");
     }
     let _ = std::fs::remove_dir_all(&seen);
