@@ -41,6 +41,7 @@ pub mod inotify;
 pub mod ipcops;
 mod kept;
 pub mod keycrypto;
+pub mod keylock;
 pub mod keys;
 mod keytypes;
 pub mod klock;

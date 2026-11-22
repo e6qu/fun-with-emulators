@@ -9,86 +9,14 @@
 //! first. A write that does not wait (`O_NONBLOCK`) is written whole or
 //! not at all (`EAGAIN`), as Linux's is.
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
 /// Linux's `PIPE_BUF`, and the host's.
 const LINUX_PIPE_BUF: u64 = 4096;
 const HOST_PIPE_BUF: u64 = 512;
 
-/// Locks: pipes being written to so at once. A slot is the pipe's
-/// identity (its ends' host handles) and the pid holding it (0: free).
+/// Locks: pipes being written to so at once ([`crate::keylock`]).
 const SLOTS: usize = 256;
-const SLOT_WORDS: usize = 3;
 /// The table's size ([`crate::procstore::Area::PipeLocks`]).
-pub(crate) const BYTES: usize = SLOTS * SLOT_WORDS * 8;
-
-static TABLE: std::sync::OnceLock<Option<&'static [AtomicU64]>> = std::sync::OnceLock::new();
-
-/// The shared table, in memory every fwe process maps.
-fn table() -> Option<&'static [AtomicU64]> {
-    *TABLE.get_or_init(|| Some(crate::procstore::area(crate::procstore::Area::PipeLocks)))
-}
-
-/// Whether host process `pid`, a lock's holder, has ended.
-fn ended(pid: u64) -> bool {
-    // SAFETY: signal 0 only asks whether the process exists.
-    pid != 0
-        && unsafe { libc::kill(pid as i32, 0) } != 0
-        && crate::host::last_errno() == libc::ESRCH
-}
-
-/// Take the lock of the pipe with identity `(lo, hi)`: its slot, or `None`
-/// if the table has no room (the write then goes as the host makes it), or
-/// `Err` for a signal for the guest while waiting.
-fn lock(t: &'static [AtomicU64], (lo, hi): (u64, u64)) -> Result<Option<usize>, i32> {
-    let me = crate::host::pid() as u64;
-    let slot = |i: usize| &t[i * SLOT_WORDS..(i + 1) * SLOT_WORDS];
-    // The pipe's slot, made if it has none: under the making lock, so two
-    // writers of a pipe agree on one.
-    let i = {
-        let _make = crate::procstore::lock_area(crate::procstore::Area::PipeLocks);
-        let found = (0..SLOTS).find(|&i| {
-            let s = slot(i);
-            s[0].load(Ordering::Acquire) == lo && s[1].load(Ordering::Acquire) == hi
-        });
-        match found {
-            Some(i) => i,
-            None => {
-                // A free slot (or one whose holder has ended), taken now.
-                let Some(i) = (0..SLOTS).find(|&i| {
-                    let h = slot(i)[2].load(Ordering::Acquire);
-                    (h == 0 || ended(h))
-                        && slot(i)[2]
-                            .compare_exchange(h, me, Ordering::AcqRel, Ordering::Acquire)
-                            .is_ok()
-                }) else {
-                    return Ok(None);
-                };
-                slot(i)[0].store(lo, Ordering::Release);
-                slot(i)[1].store(hi, Ordering::Release);
-                return Ok(Some(i));
-            }
-        }
-    };
-    let s = slot(i);
-    loop {
-        let h = s[2].load(Ordering::Acquire);
-        if (h == 0 || ended(h))
-            && s[2].compare_exchange(h, me, Ordering::AcqRel, Ordering::Acquire).is_ok()
-        {
-            // Still this pipe's (a slot freed may be made another's).
-            if s[0].load(Ordering::Acquire) == lo && s[1].load(Ordering::Acquire) == hi {
-                return Ok(Some(i));
-            }
-            s[2].store(0, Ordering::Release);
-            return lock(t, (lo, hi));
-        }
-        if crate::thread::deliverable() != 0 {
-            return Err(fwe_abi::errno::EINTR);
-        }
-        crate::thread::nap_ns(200_000);
-    }
-}
+pub(crate) const BYTES: usize = crate::keylock::bytes(SLOTS);
 
 /// A write of `len` bytes to `fd` by `write(offset, count)`, if it is a
 /// pipe and a write Linux makes whole that the host may not: whole, the
@@ -98,10 +26,12 @@ pub fn whole_write(fd: i32, len: u64, mut write: impl FnMut(u64, u64) -> i64) ->
         return None;
     }
     let (end, peer) = crate::splice::pipe_ends(fd)?;
-    let t = table()?;
-    let i = match lock(t, (end.min(peer), end.max(peer))) {
-        Ok(Some(i)) => i,
-        Ok(None) => return None,
+    let held = match crate::keylock::lock(
+        crate::procstore::Area::PipeLocks,
+        (end.min(peer), end.max(peer)),
+        true,
+    ) {
+        Ok(h) => h,
         Err(e) => return Some(fwe_abi::err(e)),
     };
     // SAFETY: F_GETFL only queries the descriptor.
@@ -127,6 +57,6 @@ pub fn whole_write(fd: i32, len: u64, mut write: impl FnMut(u64, u64) -> i64) ->
         }
         done as i64
     })();
-    t[i * SLOT_WORDS + 2].store(0, Ordering::Release);
+    drop(held);
     Some(r)
 }

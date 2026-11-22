@@ -200,12 +200,20 @@ pub enum Area {
     PipeLocks = 2,
     /// Pipes watched by `EPOLLEXCLUSIVE` ([`crate::exclusive`]).
     Exclusive = 3,
+    /// Locks of `SOCK_SEQPACKET` sockets' sends and receives
+    /// ([`crate::seqpacket`]).
+    SeqPacketLocks = 4,
 }
-const AREAS: usize = 4;
+const AREAS: usize = 5;
 
 /// Each area's size in bytes.
-const AREA_BYTES: [usize; AREAS] =
-    [FUTEX_BYTES, crate::textbusy::BYTES, crate::pipelock::BYTES, crate::exclusive::BYTES];
+const AREA_BYTES: [usize; AREAS] = [
+    FUTEX_BYTES,
+    crate::textbusy::BYTES,
+    crate::pipelock::BYTES,
+    crate::exclusive::BYTES,
+    crate::seqpacket::LOCK_BYTES,
+];
 
 /// Shared futexes' table: the host's futexes on Linux need none.
 #[cfg(target_os = "macos")]
