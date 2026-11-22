@@ -1090,6 +1090,7 @@ fn shm_lock(
 
 /// The file of a new segment `id` of `size` bytes (zeroes).
 fn make_segment(r: &Record<Ipc>, id: i32, size: u64) -> Result<(), i32> {
+    crate::shared::host_dir(r.dir())?;
     let path = std::ffi::CString::new(ipc::segment_path(r, id)).map_err(|_| errno::EINVAL)?;
     // SAFETY: a NUL-terminated path in fwe's private directory; the
     // descriptor is closed again.

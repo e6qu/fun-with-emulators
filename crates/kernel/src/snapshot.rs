@@ -136,6 +136,10 @@ impl<'a> Dec<'a> {
         let n = self.count(16);
         (0..n).map(|_| (self.u64(), self.u64())).collect()
     }
+    /// How many bytes have been read.
+    pub fn position(&self) -> usize {
+        self.at
+    }
     /// Whether everything has been read.
     pub fn at_end(&self) -> bool {
         self.bad || self.at == self.buf.len()

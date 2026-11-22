@@ -25,6 +25,10 @@
 //!   whose main thread has gone into the program ([`entered`]).
 //! - **Tasks**, one word for each host pid: its real user, as its record
 //!   says, and its threads, as it counts them ([`user_tasks`]).
+//! - **Named records** ([`named`]): the state of Linux's kernel every
+//!   process shares ([`crate::shared::Record`]: namespaces, mount tables,
+//!   System V IPC...), each in a slot found by its name, its bytes in
+//!   blocks.
 //!
 //! A reader takes no lock: it reads the sequence number, the bytes and the
 //! number again, and reads again if a change came between. A writer holds
@@ -35,6 +39,8 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+
+pub mod named;
 
 /// Host pids with an entry: those below this (macOS's end at 99999).
 const PIDS: usize = 1 << 17;
@@ -169,7 +175,12 @@ pub const PAGE_WORDS: usize = 512;
 const PAGES_LOCK_AT: usize = CELLS_AT + CELLS * 32;
 const PAGE_TAGS_AT: usize = PAGES_LOCK_AT + 64;
 const PAGES_AT: usize = (PAGE_TAGS_AT + PAGES * 16).div_ceil(PAGE_WORDS * 8) * PAGE_WORDS * 8;
-const TAKEN_AT: usize = PAGES_AT + PAGES * PAGE_WORDS * 8;
+/// Named records ([`named`]): the lock under which one is made or
+/// removed, the count their identities are taken from, then their slots.
+const NAMED_LOCK_AT: usize = PAGES_AT + PAGES * PAGE_WORDS * 8;
+const NAMED_NEXT_AT: usize = NAMED_LOCK_AT + 64;
+const NAMED_AT: usize = NAMED_NEXT_AT + 64;
+const TAKEN_AT: usize = NAMED_AT + named::SLOTS * size_of::<named::Named>();
 const BLOCKS_AT: usize = (TAKEN_AT + BLOCKS / 8).div_ceil(BLOCK) * BLOCK;
 const SIZE: usize = BLOCKS_AT + BLOCKS * BLOCK;
 
@@ -559,6 +570,15 @@ impl Store {
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
     fn write_chain(&self, bytes: &[u8]) -> u32 {
+        self.write_chain_ends(bytes).0
+    }
+
+    /// [`Store::write_chain`], and the chain's last block.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    fn write_chain_ends(&self, bytes: &[u8]) -> (u32, u32) {
         let mut chunks: Vec<&[u8]> = bytes.chunks(ROOM).collect();
         if chunks.is_empty() {
             chunks.push(&[]);
@@ -576,7 +596,7 @@ impl Store {
             // SAFETY: a block this writer took, `ROOM` bytes from `room`.
             unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), room, chunk.len()) };
         }
-        blocks[0]
+        (blocks[0], blocks[blocks.len() - 1])
     }
 
     /// The `len` bytes of the chain from block `b`, as they read now (the

@@ -75,6 +75,9 @@ pub fn set(host: Option<&[u8]>) -> Result<(), i32> {
             Ok(())
         }
         Some(h) => {
+            if let Some(dir) = path.as_bytes().strip_suffix(b"/acct") {
+                crate::shared::host_dir(dir)?;
+            }
             if !std::fs::exists(p).unwrap_or(false) {
                 namespaces_on().fetch_add(1, Ordering::SeqCst);
             }

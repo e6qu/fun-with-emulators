@@ -272,7 +272,6 @@ fn unheld(dir: &[u8]) -> bool {
 /// Free the queues of namespace `t` (at `ns_dir`) that are unlinked and
 /// that nothing holds open. Whether any was.
 fn free_unheld(t: &mut Ipc, ns_dir: &[u8]) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     let named: std::collections::HashSet<&Vec<u8>> = t.mq_names.values().collect();
     let gone: Vec<Vec<u8>> = t
         .mq_live
@@ -284,7 +283,7 @@ fn free_unheld(t: &mut Ipc, ns_dir: &[u8]) -> bool {
     for d in &gone {
         t.mq_live.remove(d);
         let full = [ns_dir, b"/", d].concat();
-        let _ = std::fs::remove_dir_all(std::ffi::OsStr::from_bytes(&full));
+        crate::shared::remove(&full, true);
         QUEUES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().map(|m| m.remove(&full));
     }
     !gone.is_empty()
@@ -806,6 +805,7 @@ impl<P: Platform> Kernel<P> {
                         ..Queue::default()
                     };
                     let r = Arc::new(Record::at(full.clone(), || q)?);
+                    crate::shared::host_dir(&full)?;
                     let c = cstr(&file_of(&full))?;
                     // SAFETY: a NUL-terminated path in the record's
                     // directory; the descriptor is closed again.

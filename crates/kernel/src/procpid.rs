@@ -485,8 +485,6 @@ pub(crate) fn ns_link_of(kind: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
 /// namespaces whose records are `dirs`: the identity the record has
 /// ([`crate::shared::Record`]), or `init`'s when it is in the initial one.
 fn ns_link(kind: &[u8], dirs: &[Vec<u8>], init: u64) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
     let k: &[u8] = if kind == b"pid_for_children" { b"pid" } else { kind };
     let prefix = [format!("v{}-", crate::shared::FORMAT).as_bytes(), k, b"-"].concat();
     let init_mnt = [format!("v{}-mnt-init-", crate::shared::FORMAT).as_bytes()].concat();
@@ -498,9 +496,7 @@ fn ns_link(kind: &[u8], dirs: &[Vec<u8>], init: u64) -> Vec<u8> {
             if name.starts_with(&init_mnt) {
                 return Some(crate::mounts::store::INIT_ID);
             }
-            let generation = [&d[..], b"/generation"].concat();
-            let m = std::fs::metadata(std::ffi::OsStr::from_bytes(&generation)).ok()?;
-            Some(4026532000 + (m.ino() & 0xffff_ffff))
+            crate::shared::id_of(d)
         })
         .unwrap_or(init);
     [k, format!(":[{id}]").as_bytes()].concat()
