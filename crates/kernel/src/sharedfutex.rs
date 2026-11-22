@@ -337,6 +337,16 @@ pub fn leave(i: usize) -> bool {
 /// Wake up to `count` waiters of the futex at guest `uaddr` waiting for
 /// any of `bits`, oldest first: the number woken.
 pub fn wake(uaddr: u64, count: u32, bits: u32) -> i64 {
+    // No slot waiting: nothing to wake, and no key to work out (two looks
+    // at the host's regions). A waiter takes its slot before it looks at
+    // the word again, so one that comes after this look sees the word the
+    // waker changed.
+    if let Some(t) = table()
+        && !in_use(t).iter().any(|s| st(s.state.load(SeqCst)) == WAITING)
+        && !crate::futex::any_private_waiting()
+    {
+        return 0;
+    }
     let (Some(t), Some(key)) = (table(), key_of(host_of(uaddr))) else {
         return crate::futex::wake_private_bits(uaddr, count, bits);
     };

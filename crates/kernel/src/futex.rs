@@ -875,6 +875,12 @@ pub(crate) fn wake_private(uaddr: u64, count: u32) -> i64 {
 
 /// [`wake_private`] of the waiters for any of `bits`
 /// (`FUTEX_WAKE_BITSET`).
+/// Whether any of this process's private queues has a waiter.
+#[cfg(target_os = "macos")]
+pub(crate) fn any_private_waiting() -> bool {
+    table().lock().values().any(|q| !q.is_empty())
+}
+
 pub(crate) fn wake_private_bits(uaddr: u64, count: u32, bits: u32) -> i64 {
     let table = table();
     let mut queues = table.lock();
