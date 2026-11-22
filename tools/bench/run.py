@@ -860,6 +860,9 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
         sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
     for side in times:
         results[side][name] = min(times[side])
+    # Each round, both sides: how far a runner's noise moves each.
+    print(f"{name}: rounds under fwe " + ", ".join(f"{t:.2f}" for t in times["fwe"])
+          + ", natively " + ", ".join(f"{t:.2f}" for t in times["macOS"]), file=sys.stderr)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
