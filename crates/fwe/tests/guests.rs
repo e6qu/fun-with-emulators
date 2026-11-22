@@ -9319,16 +9319,25 @@ impl Xvfb {
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let number = 70 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        let err = display_dir().join(format!("xvfb-{number}.err"));
         let child = Command::new(xvfb)
             .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-nolisten", "tcp"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&err).unwrap())
             .spawn()
             .unwrap();
-        let x = Xvfb { number, child, in_root: false };
+        let mut x = Xvfb { number, child, in_root: false };
         let began = Instant::now();
         while !socket.exists() {
-            assert!(began.elapsed() < Duration::from_secs(30), "Xvfb :{number} did not start");
+            let said = || std::fs::read_to_string(&err).unwrap_or_default();
+            if let Some(status) = x.child.try_wait().unwrap() {
+                panic!("Xvfb :{number} ended ({status}): {}", said());
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "Xvfb :{number} did not start: {}",
+                said()
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
         Some(x)
