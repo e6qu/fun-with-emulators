@@ -38,7 +38,8 @@
  *                        frames of 512x512 written into a System V shared
  *                        memory segment and drawn into a window from it
  *                        (MIT-SHM's ShmPutImage), each waited for,
- *                        microseconds each
+ *                        microseconds each for the drawing (the writing of
+ *                        the pixels, the compiler's loop, not counted)
  *   bench exit           returns at once (for startup time)
  */
 #include <fcntl.h>
@@ -424,9 +425,13 @@ static double x11(const char *what, long n) {
         shmctl(id, IPC_RMID, 0);
         return -1;
     }
-    double start = now_ns();
+    /* Each frame's pixels are new, but only their trip is timed: the loop
+       that makes them is the compiler's (each side's build vectorizes it
+       differently), not the system's. */
+    double took = 0;
     for (long i = 0; i < n; i++) {
         for (unsigned k = 0; k < W * H; k++) pixels[k] = (k + (unsigned)i) * 2654435761u;
+        double start = now_ns();
         /* ShmPutImage: all of it, ZPixmap, at the window's origin. */
         unsigned put[10] = {shm | 3 << 8, win, gc, W | H << 16, 0, W | H << 16, 0,
                             depth | 2 << 8, seg, 0};
@@ -434,8 +439,9 @@ static double x11(const char *what, long n) {
             shmctl(id, IPC_RMID, 0);
             return -1;
         }
+        took += now_ns() - start;
     }
-    double us = (now_ns() - start) / n / 1e3;
+    double us = took / n / 1e3;
     shmctl(id, IPC_RMID, 0);
     return us;
 }

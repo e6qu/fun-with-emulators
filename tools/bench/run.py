@@ -532,18 +532,12 @@ def macos(a):
     phases("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
     faulted("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
     pcs("fork+exit+wait (micro)", fwe + [a.bench, "fork", "2000"])
-    # And an X frame drawn through shared memory: the program's page
-    # faults, where it and the X server (which reads each frame from the
-    # segment) spend their time, under fwe and natively.
+    # And an X frame drawn through shared memory: where the program spends
+    # its time, under fwe and natively.
     shm = ["x11", "shm", "2000"]
-    native = os.path.basename(a.native)[:16]
-    faulted("X frame through shared memory (micro)", fwe + [a.bench] + shm)
     pcs("X frame through shared memory (micro)", fwe + [a.bench] + shm)
-    pcs("X frame through shared memory (micro) natively", [a.native] + shm, execname=native)
-    pcs("X frame through shared memory (micro), the server", fwe + [a.bench] + shm,
-        execname="Xvfb")
-    pcs("X frame through shared memory (micro) natively, the server", [a.native] + shm,
-        execname="Xvfb")
+    pcs("X frame through shared memory (micro) natively", [a.native] + shm,
+        execname=os.path.basename(a.native)[:16])
     pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
         execname=os.path.basename(a.native)[:16])
     results = {"fwe": ours, "macOS": theirs}
