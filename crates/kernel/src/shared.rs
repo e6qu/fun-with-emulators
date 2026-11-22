@@ -126,6 +126,18 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// contents change.
 pub const FORMAT: u32 = 37;
 
+/// A number no other call of any process gives: for the names of host
+/// objects of fwe's (a System V segment's memory, an eventfd's counter).
+pub fn unique() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = crate::host::pid() as u64;
+    hash(&[now.to_le_bytes(), pid.to_le_bytes(), n.to_le_bytes()].concat())
+}
+
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
     static N: AtomicU64 = AtomicU64::new(0);

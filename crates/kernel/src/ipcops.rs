@@ -132,7 +132,7 @@ impl<P: Platform> Kernel<P> {
                 if flags & ipc::SHM_HUGETLB != 0 {
                     huge_segment(flags, &creds)?;
                 }
-                let nonce = ipc::new_nonce();
+                let nonce = crate::shared::unique();
                 ipc::make_segment(nonce, size)?;
                 made.set(Some(nonce));
                 Ok(Body::Shm(ipc::Shm { size, cpid: me, nonce, ..ipc::Shm::default() }))

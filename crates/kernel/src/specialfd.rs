@@ -265,7 +265,7 @@ pub fn anon_name(fd: i32) -> Option<&'static str> {
 }
 
 /// What eventfd or timerfd `fd` takes to another process it is passed
-/// to ([`crate::scm`]): an eventfd its pipe's write end and counter file,
+/// to ([`crate::scm`]): an eventfd its pipe's write end and counter memory,
 /// shared with the sender; a timerfd (a kqueue, which the host does not
 /// pass) its clock and schedule, for the receiver's own.
 #[cfg(not(target_os = "linux"))]
@@ -336,16 +336,16 @@ mod imp {
         /// Read end (the fd the guest holds) and write end of the readiness pipe.
         rfd: i32,
         wfd: i32,
-        /// The file holding its [`Shared`] counter (fwe's descriptor, which
-        /// passing the eventfd to another process passes too), and where
-        /// this process maps it.
+        /// The memory holding its [`Shared`] counter (fwe's descriptor,
+        /// which passing the eventfd to another process passes too), and
+        /// where this process maps it.
         mfd: i32,
         shared: usize,
         semaphore: bool,
         nonblock: bool,
     }
 
-    /// An eventfd's counter, in a file every process holding the eventfd
+    /// An eventfd's counter, in memory every process holding the eventfd
     /// maps (a fork child's mapping is its parent's), and the lock its
     /// changes, with the pipe's, are made under; and how many writes it
     /// has had, each a new edge to an edge-triggered `epoll` watcher, as
@@ -360,23 +360,20 @@ mod imp {
 
     const MAGIC: u64 = 0x6677_655f_6576_6664;
 
-    /// A new counter holding `count`: its file (a descriptor out of the
-    /// guest's reach, of a file with no name) and where it is mapped.
+    /// A new counter holding `count`: its memory (a descriptor out of the
+    /// guest's reach, of a host shared memory object with no name) and
+    /// where it is mapped.
     fn new_shared(count: u64) -> Result<(i32, usize), i32> {
-        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let mut path = crate::fs::shm::user_dir()?;
-        let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        path.extend_from_slice(format!("/eventfd-{}-{n}", crate::host::pid()).as_bytes());
-        let path = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-        let flags =
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC;
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe { libc::open(path.as_ptr(), flags, 0o600 as libc::c_uint) };
+        let name = format!("/fwe{}e{:x}", crate::host::euid(), crate::shared::unique());
+        let name = std::ffi::CString::new(name).map_err(|_| errno::EINVAL)?;
+        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+        // SAFETY: a NUL-terminated name.
+        let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600 as libc::c_uint) };
         if fd < 0 {
             return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
-        // SAFETY: fwe's own file, open above.
-        unsafe { libc::unlink(path.as_ptr()) };
+        // SAFETY: fwe's own object, open above, held by its descriptor.
+        unsafe { libc::shm_unlink(name.as_ptr()) };
         let fail = |fd: i32, e: i32| {
             // SAFETY: closing the descriptor opened above.
             unsafe { libc::close(fd) };
@@ -394,16 +391,16 @@ mod imp {
             Ok(at) => at,
             Err(e) => return fail(fd, e),
         };
-        // SAFETY: the file just mapped, zeroed, large enough for a `Shared`.
+        // SAFETY: the memory just mapped, zeroed, large enough for a `Shared`.
         let sh = unsafe { &*(at as *const Shared) };
         sh.count.store(count, std::sync::atomic::Ordering::SeqCst);
         sh.magic.store(MAGIC, std::sync::atomic::Ordering::SeqCst);
         Ok((fd, at))
     }
 
-    /// Map counter file `mfd`: where.
+    /// Map counter memory `mfd`: where.
     fn map_shared(mfd: i32) -> Result<usize, i32> {
-        // SAFETY: a shared mapping of fwe's own counter file.
+        // SAFETY: a shared mapping of fwe's own counter memory.
         let p = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),

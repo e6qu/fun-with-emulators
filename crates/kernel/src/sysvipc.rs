@@ -787,18 +787,6 @@ pub fn segment_name(nonce: u64) -> std::ffi::CString {
         .expect("a name without NUL")
 }
 
-/// A nonce no other segment has.
-pub fn new_nonce() -> u64 {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos() as u64);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    crate::shared::hash(
-        &[now.to_le_bytes(), (crate::host::pid() as u64).to_le_bytes(), n.to_le_bytes()].concat(),
-    )
-}
-
 /// Make the memory of a new segment of `size` bytes (zeroes) named by
 /// `nonce`: a descriptor of it, in fwe's range, kept ([`hold_segment`]).
 pub fn make_segment(nonce: u64, size: u64) -> Result<crate::maps::HeldFile, i32> {
