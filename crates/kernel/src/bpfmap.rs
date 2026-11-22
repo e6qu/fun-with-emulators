@@ -1,13 +1,15 @@
 //! eBPF maps (`BPF_MAP_CREATE` and the element commands): arrays and hash
 //! tables, which programs and their loaders share.
 //!
-//! A map is an unlinked file of fwe's that its descriptor is open on, so a
-//! fork child, or a program loaded with it, reaches the same elements. Its
-//! shape (type, key and value sizes, entries, flags, identity) is an
-//! attribute of the file. An array holds `max_entries` values, all there
-//! from the start, zero-filled; a hash table holds as many slots, each a
-//! used byte, the key and the value. A program's lookup returns a place in
-//! the file ([`Map::find`]), which it then reads and writes.
+//! A map is an object of fwe's in host shared memory
+//! ([`crate::memobj`]) that its descriptor is open on, so a fork child, a
+//! process it is passed to, or a program loaded with it, reaches the same
+//! elements. Its shape (type, key and value sizes, entries, identity) is
+//! in the object's first bytes, its elements after. An array holds
+//! `max_entries` values, all there from the start, zero-filled; a hash
+//! table holds as many slots, each a used byte, the key and the value. A
+//! program's lookup returns a place in the elements ([`Map::find`]), which
+//! it then reads and writes.
 
 use fwe_abi::errno;
 
@@ -28,13 +30,13 @@ const BPF_EXIST: u64 = 2;
 const MAX_KEY: u32 = 512;
 const MAX_BYTES: u64 = 64 << 20;
 
-#[cfg(target_os = "macos")]
-const MAP_ATTR: &std::ffi::CStr = c"org.fwe.bpf.map";
+/// Where the elements start, past the shape.
+const ELEMENTS: usize = 64;
 
-/// A map's shape, and the descriptor its elements are read through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A map's shape, and its memory.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Map {
-    pub fd: i32,
+    pub mem: std::sync::Arc<crate::memobj::Mapping>,
     pub ty: u32,
     pub key_size: u32,
     pub value_size: u32,
@@ -50,28 +52,16 @@ impl Map {
         }
     }
 
-    fn read(&self, at: u64, len: usize) -> Result<Vec<u8>, i32> {
-        let mut b = vec![0u8; len];
-        // SAFETY: a valid buffer of `len` bytes.
-        let n = unsafe { libc::pread(self.fd, b.as_mut_ptr().cast(), len, at as libc::off_t) };
-        if n < 0 {
-            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-        }
-        // Past the end of what was written: zeros.
-        Ok(b)
+    pub(crate) fn read(&self, at: u64, len: usize) -> Result<Vec<u8>, i32> {
+        self.mem.read(ELEMENTS + at as usize, len).ok_or(errno::EFAULT)
     }
 
-    fn write(&self, at: u64, data: &[u8]) -> Result<(), i32> {
-        // SAFETY: a valid buffer of its length.
-        let n =
-            unsafe { libc::pwrite(self.fd, data.as_ptr().cast(), data.len(), at as libc::off_t) };
-        if n != data.len() as isize {
-            return Err(errno::ENOMEM);
-        }
-        Ok(())
+    pub(crate) fn write(&self, at: u64, data: &[u8]) -> Result<(), i32> {
+        self.mem.write(ELEMENTS + at as usize, data).ok_or(errno::EFAULT)
     }
 
-    /// Where the value for `key` is in the file, if the map holds one.
+    /// Where the value for `key` is among the elements, if the map holds
+    /// one.
     pub fn find(&self, key: &[u8]) -> Result<Option<u64>, i32> {
         if self.ty == BPF_MAP_TYPE_ARRAY {
             let i = u32::from_le_bytes(key[..4].try_into().map_err(|_| errno::EINVAL)?);
@@ -171,21 +161,23 @@ impl Map {
 }
 
 /// The map `fd` is a descriptor of.
-#[cfg(target_os = "macos")]
 pub fn of(fd: i32) -> Option<Map> {
-    let mut b = [0u8; 20];
-    // SAFETY: a valid buffer of its length.
-    let n = unsafe { libc::fgetxattr(fd, MAP_ATTR.as_ptr(), b.as_mut_ptr().cast(), 20, 0, 0) };
-    if n != 20 {
+    let (kind, _, size) = crate::memobj::identify(fd)?;
+    if kind != crate::memobj::MAP {
         return None;
     }
-    let w = |i: usize| u32::from_le_bytes(b[i..i + 4].try_into().unwrap());
-    Some(Map { fd, ty: w(0), key_size: w(4), value_size: w(8), max_entries: w(12), id: w(16) })
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn of(_fd: i32) -> Option<Map> {
-    None
+    let mem = crate::memobj::Mapping::of(fd, size).ok()?;
+    let shape = mem.read(0, 20)?;
+    let w = |i: usize| u32::from_le_bytes(shape[i..i + 4].try_into().unwrap());
+    let m = Map {
+        mem: std::sync::Arc::new(mem),
+        ty: w(0),
+        key_size: w(4),
+        value_size: w(8),
+        max_entries: w(12),
+        id: w(16),
+    };
+    (ELEMENTS as u64 + m.slot_size() * u64::from(m.max_entries) <= size as u64).then_some(m)
 }
 
 /// `BPF_MAP_CREATE` with `attr`: a descriptor of a new map.
@@ -201,55 +193,30 @@ pub fn create(attr: &[u8]) -> Result<i64, i32> {
     if ty == BPF_MAP_TYPE_ARRAY && key_size != 4 {
         return Err(errno::EINVAL);
     }
-    let shape =
-        Map { fd: -1, ty, key_size, value_size, max_entries, id: crate::bpf::fresh_map_id() };
-    if shape.slot_size().saturating_mul(u64::from(max_entries)) > MAX_BYTES {
+    let slot = match ty {
+        BPF_MAP_TYPE_ARRAY => u64::from(value_size),
+        _ => 1 + u64::from(key_size) + u64::from(value_size),
+    };
+    let bytes = slot.saturating_mul(u64::from(max_entries));
+    if bytes > MAX_BYTES {
         return Err(errno::ENOMEM);
     }
-    make(shape).map(i64::from)
+    let shape = [ty, key_size, value_size, max_entries, crate::bpf::fresh_map_id()];
+    make(&shape, ELEMENTS + bytes as usize).map(i64::from)
 }
 
+/// A new map of `shape` (type, key and value sizes, entries, identity),
+/// `len` bytes in all: its descriptor.
 #[cfg(target_os = "macos")]
-fn make(m: Map) -> Result<i32, i32> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let last = || crate::host::errno_to_linux(crate::host::last_errno());
-    let mut path = crate::fs::shm::user_dir()?;
-    let pid = crate::host::pid();
-    path.extend_from_slice(
-        format!("/bpf-map-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
-    );
-    let p = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    let fd = unsafe {
-        libc::open(p.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600)
-    };
-    if fd < 0 {
-        return Err(last());
-    }
-    // SAFETY: fwe's own file, its name no longer needed.
-    unsafe { libc::unlink(p.as_ptr()) };
-    let mut b = Vec::with_capacity(20);
-    for v in [m.ty, m.key_size, m.value_size, m.max_entries, m.id] {
-        b.extend_from_slice(&v.to_le_bytes());
-    }
-    let size = m.slot_size() * u64::from(m.max_entries);
-    // SAFETY: valid buffers; the file is fwe's own.
-    let ok = unsafe {
-        libc::fsetxattr(fd, MAP_ATTR.as_ptr(), b.as_ptr().cast(), b.len(), 0, 0) == 0
-            && libc::ftruncate(fd, size as libc::off_t) == 0
-    };
-    if !ok {
-        let e = last();
-        // SAFETY: closing the descriptor just made.
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
+fn make(shape: &[u32; 5], len: usize) -> Result<i32, i32> {
+    let (fd, mem) = crate::memobj::make(crate::memobj::MAP, u64::from(shape[4]), len)?;
+    let b: Vec<u8> = shape.iter().flat_map(|v| v.to_le_bytes()).collect();
+    mem.write(0, &b).ok_or(errno::EFAULT)?;
     Ok(fd)
 }
 
 #[cfg(not(target_os = "macos"))]
-fn make(_m: Map) -> Result<i32, i32> {
+fn make(_shape: &[u32; 5], _len: usize) -> Result<i32, i32> {
     Err(errno::ENOSYS)
 }
 

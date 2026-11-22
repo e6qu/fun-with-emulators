@@ -347,12 +347,8 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if unsafe { libc::fstat(fd, &mut out) } < 0 {
         return Err(host::errno_to_linux(host::last_errno()));
     }
-    // A program or map of bpf's is one of fwe's unlinked files.
-    let bpf = || {
-        out.st_mode & libc::S_IFMT == libc::S_IFREG
-            && out.st_nlink == 0
-            && crate::bpf::is_bpf_fd(fd)
-    };
+    // A program or map of bpf's is an object of fwe's in host shared memory.
+    let bpf = || crate::memobj::may_be(&out) && crate::bpf::is_bpf_fd(fd);
     if crate::mountapi::is_context(fd) || bpf() {
         // An anonymous inode: owner read and write, of no file type.
         out.st_mode = 0o600;

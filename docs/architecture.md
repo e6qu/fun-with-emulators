@@ -1404,8 +1404,11 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   a library's probe); `/proc/self/fdinfo` shows a program's type, id and
   tag (the first 8 bytes of its instructions' SHA-1).
 - **eBPF maps and socket filters** (`crates/kernel/src/bpfmap.rs`,
-  `bpf.rs`, `bpfcheck.rs`): array and hash maps, each an unlinked file of
-  fwe's its descriptors share. A socket filter is checked as it loads:
+  `bpf.rs`, `bpfcheck.rs`, `memobj.rs`): array and hash maps, and loaded
+  programs, each an object of fwe's in host shared memory its descriptors
+  share, unlinked once made and told apart by the name it was made with
+  (which the host keeps, and tells for a descriptor); a program reaches a
+  map's elements in memory. A socket filter is checked as it loads:
   each path is followed with what is known of each register, and a map
   access at a known offset outside the value is refused, as Linux's
   verifier refuses it; one at an offset only the run knows is checked by

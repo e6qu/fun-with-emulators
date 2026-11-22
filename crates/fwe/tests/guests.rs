@@ -8327,6 +8327,27 @@ fn socket_filters_read_packets_on_every_send() {
     );
 }
 
+/// An eBPF array map: a socket filter counts messages in it through the
+/// pointer its lookup returns; the map's descriptor, a duplicate of it and
+/// a fork child's all reach the same element, which the parent sees the
+/// child change. The map and the program are anonymous inodes.
+#[test]
+fn bpf_maps_are_shared_by_programs_duplicates_and_children() {
+    assert_eq!(
+        containers("bpf-map"),
+        "map: true anon_inode:bpf-map mode 600
+program: true anon_inode:bpf-prog
+\
+         attached: ok
+counted: ok 3
+through a duplicate: ok 3
+child sees 3
+\
+         after the child: ok 10
+"
+    );
+}
+
 /// A program only the VM can run (linked below 4 GiB), where there is no
 /// VM (no stand-in, no entitlement): `execve` fails with `ENOEXEC` while the
 /// caller is intact, and the caller goes on.

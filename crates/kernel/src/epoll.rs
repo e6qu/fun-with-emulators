@@ -231,9 +231,9 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         // A mounts file polls (for its namespace's changes); other files
         // and directories are always ready, so cannot be watched.
         let mounts = crate::mountwatch::is(target);
-        // A program or map of bpf's (an unlinked file of fwe's) polls, as
-        // an error ([`bpf_watched`]).
-        let bpf = kind == libc::S_IFREG && st.st_nlink == 0 && crate::bpf::is_bpf_fd(target);
+        // A program or map of bpf's (an object of fwe's in host shared
+        // memory) polls, as an error ([`bpf_watched`]).
+        let bpf = crate::memobj::may_be(&st) && crate::bpf::is_bpf_fd(target);
         if (kind == libc::S_IFREG && !mounts && !bpf) || kind == libc::S_IFDIR {
             return err(errno::EPERM);
         }

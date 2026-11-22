@@ -882,6 +882,84 @@ fn main() {
                 }
                 println!("received: {}", got.join(" "));
             }
+            // An array map a socket filter counts messages in, through the
+            // pointer its lookup returns: read back through the map's
+            // descriptor, a duplicate of it and a fork child's, which the
+            // parent then sees change.
+            Some("bpf-map") => {
+                let ins = |code: u8, dst: u8, src: u8, off: i16, imm: i32| -> u64 {
+                    u64::from(code)
+                        | u64::from(dst | src << 4) << 8
+                        | u64::from(off as u16) << 16
+                        | u64::from(imm as u32) << 32
+                };
+                let bpf = |cmd: i64, attr: &[u8]| syscall(280, cmd, attr.as_ptr(), attr.len());
+                let mut attr = [0u8; 128];
+                for (i, v) in [2u32, 4, 8, 1].iter().enumerate() {
+                    attr[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                }
+                let map = bpf(0, &attr) as i32;
+                let elem = |fd: i32, cmd: i64, value: &mut u64| {
+                    let key = 0u32;
+                    let mut a = [0u8; 128];
+                    a[0..4].copy_from_slice(&fd.to_ne_bytes());
+                    a[8..16].copy_from_slice(&(&key as *const u32 as u64).to_ne_bytes());
+                    a[16..24].copy_from_slice(&(value as *mut u64 as u64).to_ne_bytes());
+                    res(bpf(cmd, &a))
+                };
+                let link = std::fs::read_link(format!("/proc/self/fd/{map}")).unwrap();
+                let file = std::mem::ManuallyDrop::new(unsafe {
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(map)
+                });
+                let mode = std::os::unix::fs::PermissionsExt::mode(&file.metadata().unwrap().permissions());
+                println!("map: {} {} mode {mode:o}", map >= 0, link.display());
+                let insns = [
+                    ins(0x18, 1, 1, 0, map), // r1 = map
+                    ins(0, 0, 0, 0, 0),
+                    ins(0xb7, 2, 0, 0, 0),   // r2 = 0
+                    ins(0x63, 10, 2, -4, 0), // *(u32 *)(fp - 4) = r2
+                    ins(0xbf, 2, 10, 0, 0),  // r2 = fp
+                    ins(0x07, 2, 0, 0, -4),  // r2 -= 4
+                    ins(0x85, 0, 0, 0, 1),   // r0 = lookup(r1, r2)
+                    ins(0x15, 0, 0, 3, 0),   // if r0 == 0 goto out
+                    ins(0x79, 1, 0, 0, 0),   // r1 = *(u64 *)r0
+                    ins(0x07, 1, 0, 0, 1),   // r1 += 1
+                    ins(0x7b, 0, 1, 0, 0),   // *(u64 *)r0 = r1
+                    ins(0xb7, 0, 0, 0, 0xffff), // out: keep it all
+                    ins(0x95, 0, 0, 0, 0),
+                ];
+                let lic = c("GPL");
+                let mut attr = [0u8; 128];
+                attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // SOCKET_FILTER
+                attr[4..8].copy_from_slice(&(insns.len() as u32).to_ne_bytes());
+                attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+                attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
+                let prog = bpf(5, &attr) as i32;
+                let link = std::fs::read_link(format!("/proc/self/fd/{prog}")).unwrap();
+                println!("program: {} {}", prog >= 0, link.display());
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, 2, 0, sv.as_mut_ptr());
+                println!("attached: {}", res(syscall(208, sv[1], 1, 50, &prog as *const i32, 4)));
+                for _ in 0..3 {
+                    write(sv[0], b"m".as_ptr(), 1);
+                }
+                let mut v = 0u64;
+                println!("counted: {} {v}", elem(map, 1, &mut v));
+                let dup = syscall(23, map) as i32;
+                let mut v = 0u64;
+                println!("through a duplicate: {} {v}", elem(dup, 1, &mut v));
+                if fork() == 0 {
+                    let mut v = 0u64;
+                    elem(map, 1, &mut v);
+                    println!("child sees {v}");
+                    let mut ten = 10u64;
+                    elem(map, 2, &mut ten);
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                let mut v = 0u64;
+                println!("after the child: {} {v}", elem(map, 1, &mut v));
+            }
             // A program only the VM runs, on a host without one: the exec
 
             // fails and the caller goes on, as podman's pause process does

@@ -52,6 +52,7 @@ pub mod leases;
 pub mod loopdev;
 pub mod maps;
 pub mod memfd;
+pub mod memobj;
 pub mod mm;
 pub mod modes;
 pub mod mountapi;
