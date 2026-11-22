@@ -57,8 +57,11 @@ pub enum Kind {
     /// Its mount namespace, root, working directory and resource limits,
     /// for `/proc/<pid>/{cwd,root,mountinfo,limits}` ([`crate::fs::Fs::share`]).
     View = 4,
+    /// Its Landlock domain's layers, for whether it may signal or trace
+    /// another ([`crate::landlock`]).
+    Landlock = 5,
 }
-const KINDS: usize = 5;
+const KINDS: usize = 6;
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).

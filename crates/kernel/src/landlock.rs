@@ -1,8 +1,8 @@
 //! Landlock: a process restricting itself (`landlock_create_ruleset`,
 //! `landlock_add_rule`, `landlock_restrict_self`).
 //!
-//! A ruleset is the process's, kept against its descriptor (a file of
-//! fwe's, by its host identity). `landlock_restrict_self` adds it to the
+//! A ruleset is the process's, kept against its descriptor (one standing
+//! for it, [`crate::anonfd`], marked with its number). `landlock_restrict_self` adds it to the
 //! process's domain as a layer; the domain goes with the process across
 //! `fork` and `execve` and can only grow. Every layer is checked:
 //!
@@ -19,8 +19,9 @@
 //! - **Scopes:** a signal, or a connection or datagram to an abstract
 //!   socket, to a process outside a scoping layer's domain is `EPERM`, and
 //!   so is tracing one ([`may_trace`]). Each layer has an id, and a
-//!   process restricted publishes its chain of ids (a file beside the
-//!   process records) for others to compare with theirs.
+//!   process restricted publishes its chain of ids (in its entry in the
+//!   process store, [`crate::procstore::Kind::Landlock`]) for others to
+//!   compare with theirs.
 //!
 //! Nothing is looked at while the process has no domain: one flag.
 
@@ -263,14 +264,6 @@ fn chain() -> Vec<u64> {
     DOMAIN.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.0).collect()
 }
 
-fn chain_file(pid: i32) -> Option<std::path::PathBuf> {
-    let dir = crate::procreg::records_dir()?;
-    Some(
-        std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&dir))
-            .join(format!("landlock-domain-{pid}")),
-    )
-}
-
 /// Publish this process's chain for others ([`within`]); called as it is
 /// restricted and as a restricted process starts (a fork child, a program
 /// run).
@@ -283,24 +276,22 @@ pub fn publish() {
         return;
     }
     let me = crate::host::pid();
-    let Some(p) = chain_file(me) else { return };
+    // After when the process started: a reader tells its chain from an
+    // earlier process's of the same pid.
     let mut b = Vec::new();
-    if let Some(start) = crate::procreg::start_time(me) {
-        b.extend_from_slice(&start.to_ne_bytes());
-    }
+    b.extend_from_slice(&crate::procreg::start_time(me).unwrap_or(0).to_ne_bytes());
     for id in chain() {
         b.extend_from_slice(&id.to_ne_bytes());
     }
-    let tmp = p.with_extension("new");
-    if std::fs::write(&tmp, b).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
-    }
+    crate::procstore::put_own(crate::procstore::Kind::Landlock, Some(&b));
 }
 
-/// Host process `pid`'s chain (none if it is not restricted, or the file
-/// is a former process's).
+/// Host process `pid`'s chain (none if it is not restricted, or the one
+/// kept is a former process's).
 fn chain_of(pid: i32) -> Vec<u64> {
-    let Some(b) = chain_file(pid).and_then(|p| std::fs::read(p).ok()) else { return Vec::new() };
+    let Some(b) = crate::procstore::get_of(crate::procstore::Kind::Landlock, pid) else {
+        return Vec::new();
+    };
     let words: Vec<u64> = b.as_chunks::<8>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
     match (words.split_first(), crate::procreg::start_time(pid)) {
         (Some((&start, rest)), Some(now)) if start == now => rest.to_vec(),
