@@ -1111,12 +1111,22 @@ def inclusive(name, execname, cmd, ustacks, busiest, samples, looks, base, where
           file=sys.stderr)
 
 
+def trace_file(name, kind):
+    """A new file for a trace of the work `name`: DTrace's `-o` adds to a
+    file that is there, and a tracer that fails leaves the last one's, so a
+    trace of the same work run before would be read as this one's."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.{kind}")
+    if os.path.exists(out):
+        os.remove(out)
+    return out
+
+
 def callers(name, cmd, funcs):
     """The call stacks into the host library functions `funcs` (pairs of
     library and function, DTrace's pid-provider patterns) while `cmd` (one
     fwe process) runs, by the time spent in the calls (microseconds), most
     first, named by DTrace from the process it holds."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.callers")
+    out = trace_file(name, "callers")
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -1267,7 +1277,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     With `jit_map`, the directory fwe writes its code cache's map to as the
     process ends (`FWE_JIT_MAP`, which `cmd` sets), the samples in
     translations are named too ([`translated`])."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
+    out = trace_file(name, "pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
     # then runs `cmd` in its place. Once it exits, DTrace is interrupted
@@ -1470,7 +1480,7 @@ def faulted(name, cmd):
     starts with no page mapped, so every page of fwe's it touches, code or
     data, is a fault, and every page either process writes after the fork
     is a copy. For reading only: a failure is said and the run goes on."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.faults")
+    out = trace_file(name, "faults")
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -1604,7 +1614,7 @@ def sampled(name, cmd):
     its time went by the top of the stack: the guest's own code (no
     symbols), or fwe's and the host libraries' functions. The sample is
     kept beside the results."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.sample")
+    out = trace_file(name, "sample")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Once it has run its exec (`env -i`; Homebrew's python3 runs the
     # Python.app inside its framework): an exec ends the sampler's hold.
