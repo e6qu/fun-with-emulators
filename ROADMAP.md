@@ -109,7 +109,9 @@ against 0.8 µs natively.
   or another System V user at work.
 
 **Done when:** nothing fwe keeps for the guest's kernel state is a file on
-disk; System V semaphores and messages hold 3× macOS and segments 1.5×;
+disk; System V semaphores, messages and segments hold 3× macOS (a
+segment is a host shared memory object of its own, whose host cycle alone
+is 1.2–1.5× macOS's segment);
 each mechanism's choice is documented with its numbers.
 
 #### PR 3 — Generated code run as it is, where it is sound

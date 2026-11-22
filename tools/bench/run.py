@@ -223,7 +223,12 @@ BUDGETS = {
     # it (ROADMAP.md M6 PR 2).
     "System V semaphore up+down (ns)": 3.0,
     "System V message send+receive (ns)": 3.0,
-    "System V segment made and removed (ns)": 1.5,
+    # Each segment is a host shared memory object of its own (one MIT-SHM
+    # shares without a copy, freed when removed): the host's own cycle of
+    # one ("POSIX shared memory object made and removed", natively) is
+    # 1.2-1.5x macOS's System V segment, and fwe's four calls' work comes
+    # on top of it (docs/linux-on-macos.md).
+    "System V segment made and removed (ns)": 3.0,
 }
 
 # The most fwe's figure may be, in the row's own unit: making a
@@ -593,6 +598,14 @@ def macos(a):
         execname=os.path.basename(a.native)[:16])
     pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
         execname=os.path.basename(a.native)[:16])
+    # And a System V segment's cycle: the host's calls under fwe, and
+    # natively for macOS's own segment and for a shared memory object.
+    seg = ["ipc", "shm", "20000"]
+    pcs("System V segment made and removed (micro)", fwe + [a.bench] + seg)
+    pcs("System V segment made and removed (micro) natively", [a.native] + seg,
+        execname=os.path.basename(a.native)[:16])
+    pcs("POSIX shared memory object made and removed (micro) natively",
+        [a.native, "ipc", "pshm", "20000"], execname=os.path.basename(a.native)[:16])
     results = {"fwe": ours, "macOS": theirs}
     # The benchmark program alone, and forking and running itself.
     ran = backends(fwe + [a.bench, "forkexec", "2", a.bench])
