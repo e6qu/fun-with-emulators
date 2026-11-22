@@ -932,9 +932,9 @@ def git_commands(ours, theirs, fresh, root):
         top = ", ".join(f"{n} {count[n]}x {t * 1e3:.0f} ms" for n, t in took.most_common(10))
         print(f"git (s) {side}, by command: {sum(took.values()) * 1e3:.0f} ms in git: {top}",
               file=sys.stderr)
-        # And the regions git marks in its slowest commands (a region holds
-        # the regions inside it).
-        for n, _ in took.most_common(3):
+        # And the regions git marks in the commands that take longest, the
+        # same on both sides (a region holds the regions inside it).
+        for n in ("commit", "status", "gc"):
             inside = sorted(((t, c, l) for (cn, c, l), t in regions.items() if cn == n), reverse=True)
             print(f"git (s) {side}, {n}'s regions: "
                   + ", ".join(f"{c}/{l} {t * 1e3:.0f} ms" for t, c, l in inside[:10]), file=sys.stderr)
