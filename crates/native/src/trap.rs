@@ -423,7 +423,6 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let plain = fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls()
         && !matches!(nr, EXIT | EXECVE | EXECVEAT | WAIT4 | WAITID | PIDFD_GETFD | RT_SIGTIMEDWAIT)
-        && !fwe_kernel::ipcops::waits(nr)
         && (!matches!(nr, CLONE | CLONE3) || thread_clone);
     // A thread that is not the last ends here, as the trap would end it,
     // with every host signal blocked first: one for the process is then
@@ -464,6 +463,13 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
             Ok(a) => crate::threads::do_clone(regs, a),
             Err(e) => fwe_abi::err(e),
         };
+        KERNEL.finish(regs, nr, &args, r);
+    } else if fwe_kernel::ipcops::waits(nr) {
+        // A semaphore or message queue wait: what it needs of the kernel is
+        // taken under the lock, and it waits without it (a guest signal
+        // ends the wait as it looks between slices).
+        let ctx = kernel().as_ref().unwrap().ipc_context();
+        let r = fwe_kernel::ipcops::blocking(ctx, nr, args);
         KERNEL.finish(regs, nr, &args, r);
     // SAFETY: guest pointers in `args` reference guest memory.
     } else if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
