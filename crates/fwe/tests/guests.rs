@@ -10085,9 +10085,56 @@ fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
     // The search closed first (GTK 3's is a popup whose grab keeps a
     // close request from its window), then the window closed as a window
     // manager's close button closes it.
+    // PROBE (temporary): which window gtk3-demo's ctrl+q reaches, and how.
+    let watch = (name == "gtk3-demo").then(|| {
+        let log = std::env::temp_dir().join(format!("gtk3-watch-{}", std::process::id()));
+        let child = Command::new("python3")
+            .arg(repo().join("tools/display/watch.py"))
+            .arg(std::env::var("LIBX11").expect("LIBX11"))
+            .arg(x.display())
+            .arg(&w.id)
+            .arg("30")
+            .stdout(std::fs::File::create(&log).unwrap())
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        (child, log)
+    });
+    let state = |when: &str| {
+        let text = |o: Output| {
+            String::from_utf8_lossy(&o.stdout).split_whitespace().collect::<Vec<_>>().join(" ")
+        };
+        let shown = text(x.xdotool(&["search", "--onlyvisible", "--maxdepth", "1", ""]));
+        let focus = text(x.xdotool(&["getwindowfocus"]));
+        let names: Vec<String> = shown
+            .split(' ')
+            .filter(|id| !id.is_empty())
+            .map(|id| format!("{id}={}", text(x.xdotool(&["getwindowname", id]))))
+            .collect();
+        eprintln!("=== {name} {when}: window {} focus {focus} shown {}", w.id, names.join(", "));
+    };
     x.key_into(&w, "Escape");
     std::thread::sleep(Duration::from_secs(1));
-    x.close(&w);
+    if watch.is_some() {
+        state("after Escape");
+        x.key_into(&w, "ctrl+q");
+        let began = Instant::now();
+        while !gui.ended() && began.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        eprintln!("=== {name}: ended after ctrl+q: {}", gui.ended());
+        if !gui.ended() {
+            state("after ctrl+q");
+        }
+    }
+    if !gui.ended() {
+        x.close(&w);
+    }
+    if let Some((mut child, log)) = watch {
+        let _ = child.kill();
+        let _ = child.wait();
+        eprintln!("=== {name} events:\n{}", std::fs::read_to_string(&log).unwrap_or_default());
+    }
     let status = gui.exits(60);
     assert!(status.success(), "{name}: {status}: {}", gui.report());
 }
