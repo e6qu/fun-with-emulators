@@ -8734,8 +8734,10 @@ fn namespaces_owners_unshare_and_cgroup_paths() {
 /// threads as well as forks, `pids.events` counting the refusals;
 /// `cgroup.threads` lists threads; a freeze holds the cgroups below and
 /// whoever joins or is forked into one; moves need write access to the
-/// common ancestor's `cgroup.procs` and stay in the cgroup namespace; and
-/// there is no cgroup v1 (`ENODEV`).
+/// common ancestor's `cgroup.procs` and stay in the cgroup namespace;
+/// a cgroup's directory takes no file and loses none but by the kernel,
+/// and is never renamed (`EACCES`, `EPERM`), an open to cut cuts nothing,
+/// and the mount is cgroup2's; and there is no cgroup v1 (`ENODEV`).
 #[test]
 fn cgroups_limits_freeze_and_delegation() {
     let out = run_c_guest("cgroups", &[], &[]);
@@ -8747,6 +8749,11 @@ fn cgroups_limits_freeze_and_delegation() {
          mkdir past descendants: 11\n\
          cgroup.type: domain\n\
          type threaded: -95, type junk: -22\n\
+         file made: 13\n\
+         file removed: 1\n\
+         cgroup renamed: 1\n\
+         cgroup.max.depth: 7\n\
+         filesystem: 63677270\n\
          cgroup.threads lists the threads: 2\n\
          thread past pids.max: 11\n\
          fork past pids.max: 11\n\

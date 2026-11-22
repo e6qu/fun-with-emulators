@@ -19,6 +19,18 @@ const FS_APPEND_FL: u32 = 0x20;
 /// (`F_SEAL_SEAL`), as Linux's tmpfs makes its files.
 const TMPFS_SEALS: u32 = fcntl::F_SEAL_SEAL;
 
+/// Whether directory `d` is a cgroup's ([`crate::cgroupfs`]): its names
+/// are the kernel's to make, but for the cgroups `mkdir` makes.
+fn in_cgroups(d: &StoreDir) -> bool {
+    d.fs.id == crate::cgroupfs::tree_id()
+}
+
+/// The cgroup named `name` in cgroup directory `d`.
+fn cgroup_named(d: &StoreDir, name: &[u8]) -> Result<Vec<u8>, i32> {
+    let parent = crate::cgroupfs::cgroup_at(d.fs.id, d.ino).ok_or(errno::ENOENT)?;
+    Ok(crate::mounts::join(&parent, name))
+}
+
 /// What an open's flags ask of the file: `R_OK`, `W_OK` bits.
 fn wants(flags: u64) -> u32 {
     let mut want = match flags & fcntl::O_ACCMODE {
@@ -133,6 +145,12 @@ impl<P: Platform> Kernel<P> {
         mode: u64,
         slash: bool,
     ) -> i64 {
+        // What a cgroup's file reports is what is so as it is opened.
+        if in_cgroups(d)
+            && let Some(cg) = crate::cgroupfs::cgroup_at(d.fs.id, d.ino)
+        {
+            crate::cgroupfs::refresh(&cg, &r.name);
+        }
         let found = match d.find(&r.name) {
             Ok(f) => Some(f),
             Err(errno::ENOENT) => None,
@@ -211,9 +229,12 @@ impl<P: Platform> Kernel<P> {
             }
         }
         let fd = self.store_descriptor(r, file, flags, false);
+        // A cgroup's interface file is not cut (Linux's kernfs takes the
+        // size and changes nothing).
         if fd >= 0
             && kind == S_IFREG
             && flags & fcntl::O_TRUNC != 0
+            && !in_cgroups(d)
             && let Some(e) = crate::filestore::io::ftruncate(fd as i32, 0).filter(|&e| e < 0)
         {
             let _ = self.syscall(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
@@ -328,6 +349,10 @@ impl<P: Platform> Kernel<P> {
         if slash {
             return err(errno::EISDIR);
         }
+        // A cgroup has only the files the kernel makes.
+        if in_cgroups(d) {
+            return err(errno::EACCES);
+        }
         let dir = match self.store_may_change(r, d) {
             Ok(st) => st,
             Err(e) => return err(e),
@@ -361,6 +386,9 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         mode: u64,
     ) -> i64 {
+        if in_cgroups(d) {
+            return err(errno::EOPNOTSUPP);
+        }
         let dir = match self.store_may_change(r, d) {
             Ok(st) => st,
             Err(e) => return err(e),
@@ -417,15 +445,41 @@ impl<P: Platform> Kernel<P> {
             Ok(st) => st,
             Err(e) => return err(e),
         };
+        // A new cgroup, within the limits of those above it, made whole
+        // under the hierarchy's lock (no removal of its parent between),
+        // its name one Linux's `cgroup_mkdir` takes.
+        let cgroup = if in_cgroups(d) {
+            if r.name.contains(&b'\n') {
+                return err(errno::EINVAL);
+            }
+            let held = match crate::cgroupfs::lock_tree() {
+                Ok(l) => l,
+                Err(e) => return err(e),
+            };
+            let made = cgroup_named(d, &r.name);
+            let parent = crate::cgroupfs::cgroup_at(d.fs.id, d.ino).ok_or(errno::ENOENT);
+            if let Err(e) = parent.and_then(|p| crate::cgroupfs::may_make(&p)).and(made.clone()) {
+                return err(e);
+            }
+            made.ok().map(|cg| (cg, held))
+        } else {
+            None
+        };
         let perm = self.fs().apply_umask(mode & 0o7777) & 0o1777;
         let (uid, gid, perm) = self.store_owner(&dir, perm, mode, true);
         let made = d.fs.lock().and_then(|mut t| {
             t.create(d.ino, &r.name, &New { mode: S_IFDIR | perm, uid, gid, rdev: 0 })
         });
-        match made {
-            Ok(_) => 0,
-            Err(e) => err(e),
+        if let Err(e) = made {
+            return err(e);
         }
+        // Its interface files.
+        if let Some((cg, _held)) = cgroup
+            && let Err(e) = crate::cgroupfs::made(&cg)
+        {
+            return err(e);
+        }
+        0
     }
 
     /// `mknodat` of what was resolved in directory `d` of fwe's store: a
@@ -446,6 +500,10 @@ impl<P: Platform> Kernel<P> {
             Ok(st) => st,
             Err(e) => return err(e),
         };
+        // A cgroup's directory takes no other file (no `mknod` of kernfs's).
+        if in_cgroups(d) {
+            return err(errno::EPERM);
+        }
         if matches!(kind, tree::S_IFCHR | tree::S_IFBLK) {
             let node = crate::devnodes::Node {
                 kind,
@@ -501,6 +559,9 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = self.store_may_change(r, d) {
             return err(e);
         }
+        if in_cgroups(d) {
+            return err(errno::EPERM);
+        }
         let (uid, gid) = (self.creds.fsuid, {
             let dir = d.fs.lock().and_then(|t| t.stat(d.ino));
             match dir {
@@ -544,6 +605,20 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EBUSY);
         }
+        // A cgroup goes with its files when empty; its files stay (no
+        // `unlink` of kernfs's).
+        if in_cgroups(d) {
+            if !rmdir {
+                return err(errno::EPERM);
+            }
+            if st.mode & S_IFMT != S_IFDIR {
+                return err(errno::ENOTDIR);
+            }
+            return match cgroup_named(d, &r.name).and_then(|cg| crate::cgroupfs::remove(&cg)) {
+                Ok(()) => 0,
+                Err(e) => err(e),
+            };
+        }
         let gone = d.fs.lock().and_then(|mut t| t.unlink(d.ino, &r.name, rmdir));
         match gone {
             Ok(gone) => {
@@ -577,6 +652,9 @@ impl<P: Platform> Kernel<P> {
         }
         if let Err(e) = self.store_may_change(new, nd) {
             return err(e);
+        }
+        if in_cgroups(nd) {
+            return err(errno::EPERM);
         }
         let st = match nd.fs.lock().and_then(|t| t.stat(ino)) {
             Ok(st) => st,
@@ -645,6 +723,11 @@ impl<P: Platform> Kernel<P> {
         }
         if od.fs.id != nd.fs.id {
             return err(errno::EXDEV);
+        }
+        // A cgroup is not renamed on the unified hierarchy (Linux's has no
+        // `rename` for kernfs to call).
+        if in_cgroups(od) {
+            return err(errno::EPERM);
         }
         if old.mount_root || new.mount_root {
             return err(errno::EBUSY);

@@ -367,15 +367,10 @@ impl<P: Platform> Kernel<P> {
         let cgroup = match a.cgroup {
             None => None,
             Some(fd) => {
-                let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
-                match crate::cgroupfs::locate(&host) {
-                    Some((cg, None)) => {
-                        crate::cgroupfs::may_move(&crate::cgroupfs::current(), &cg)?;
-                        crate::cgroupfs::may_join(&cg)?;
-                        Some(cg)
-                    }
-                    _ => return Err(errno::EBADF),
-                }
+                let cg = crate::cgroupfs::of_fd(fd).map_err(|_| errno::EBADF)?;
+                crate::cgroupfs::may_move(&crate::cgroupfs::current(), &cg)?;
+                crate::cgroupfs::may_join(&cg)?;
+                Some(cg)
             }
         };
         // Within the cgroup's `pids.max`; frozen with it.

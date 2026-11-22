@@ -1,10 +1,13 @@
 //! The cgroup v2 hierarchy (`/sys/fs/cgroup`).
 //!
 //! Every fwe process of the user is somewhere in one tree, as a machine's
-//! processes are, so the tree is shared: its cgroups are real directories in
-//! fwe's private directory ([`tree_dir`]), which a `cgroup2` mount shows,
-//! and a cgroup's interface files are files there. What a process's cgroup
-//! is lives in fwe's record of the process ([`crate::procreg`]).
+//! processes are, so the tree is shared: a filesystem of fwe's store
+//! ([`tree`]), in memory every fwe process of the user maps, which a
+//! `cgroup2` mount shows. Its cgroups are directories there, a cgroup's
+//! interface files are files in them, and the device programs attached to
+//! a cgroup are attributes of its directory that no listing shows. What a
+//! process's cgroup is lives in fwe's record of the process
+//! ([`crate::procreg`]).
 //!
 //! fwe does what the files say where it can:
 //!
@@ -36,18 +39,20 @@
 //!   Linux parses it (`pids.max` a whole number, a memory limit a size
 //!   kept in whole pages).
 
+use crate::filestore::data;
+use crate::filestore::fs::Fs;
+use crate::filestore::tree::{Gone, Ino, New, S_IFDIR, S_IFMT, S_IFREG, Tx};
 use crate::procreg;
 use fwe_abi::{err, errno};
-use std::ffi::OsStr;
-use std::os::unix::ffi::OsStrExt;
+use std::sync::Arc;
 
 /// The controllers fwe's hierarchy offers.
 pub const CONTROLLERS: &[&str] =
     &["cpuset", "cpu", "io", "memory", "hugetlb", "pids", "rdma", "misc"];
 
-/// Where fwe keeps what is attached to a cgroup (device programs); hidden
-/// from the guest.
-pub const PRIVATE: &[u8] = b".fwe-bpf";
+/// The attributes of a cgroup's directory holding the device programs
+/// attached to it, `<this><id>`: a name no guest can give an attribute.
+const PROGRAM: &[u8] = b"\0bpf.";
 
 /// The files every non-root cgroup has, with what they start with.
 const CORE_FILES: &[(&str, &str, bool)] = &[
@@ -119,59 +124,43 @@ const CONTROLLER_FILES: &[(&str, &str, &str, bool)] = &[
     ("misc", "misc.current", "", false),
 ];
 
-fn os(p: &[u8]) -> &OsStr {
-    OsStr::from_bytes(p)
+/// The hierarchy's filesystem of fwe's store: the user's, of this layout.
+pub fn tree_id() -> u64 {
+    0x6367_0000_0000_0000 | crate::shared::FORMAT as u64
 }
 
-/// Make interface file `name` of the cgroup at host directory `dir`, if it
-/// is not there, with `content`, owned by the caller (its filesystem ids),
-/// as Linux's `cgroup_kn_set_ugid` gives a cgroup's files to whoever makes
-/// them: the cgroup's creator, or for a controller's files whoever enables
-/// the controller.
-fn put(dir: &[u8], name: &str, content: &str, writable: bool) {
-    let p = [dir, b"/", name.as_bytes()].concat();
-    if std::fs::symlink_metadata(os(&p)).is_err() && std::fs::write(os(&p), content).is_ok() {
-        let a = crate::creds::access();
-        if (a.fsuid, a.fsgid) != (0, 0)
-            && let Ok(f) = std::fs::File::open(os(&p))
-        {
-            use std::os::fd::AsRawFd;
-            let _ = crate::owners::keep_fd(f.as_raw_fd(), (a.fsuid, a.fsgid));
+/// The hierarchy, its root's files made on first use: a root directory
+/// root's that only it may change, as Linux makes a hierarchy's root.
+pub fn tree() -> Result<Arc<Fs>, i32> {
+    static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let f = crate::filestore::fs::lasting(tree_id(), 0o555)?;
+    if !READY.load(std::sync::atomic::Ordering::Acquire) {
+        let mut t = f.lock()?;
+        let root = t.root();
+        if t.lookup(root, b"cgroup.procs").is_err() {
+            let all = CONTROLLERS.join(" ") + "\n";
+            let cpus = all_cpus();
+            for name in ROOT_FILES {
+                let content = match *name {
+                    "cgroup.controllers" => all.as_str(),
+                    "cpuset.cpus.effective" => cpus.as_str(),
+                    "cpuset.mems.effective" => "0\n",
+                    _ => "",
+                };
+                let writable = !matches!(
+                    *name,
+                    "cgroup.controllers"
+                        | "cgroup.stat"
+                        | "cpuset.cpus.effective"
+                        | "cpuset.mems.effective"
+                );
+                put_new(&mut t, root, name, content, writable, (0, 0))?;
+            }
         }
+        drop(t);
+        READY.store(true, std::sync::atomic::Ordering::Release);
     }
-    let mode = if writable { 0o644 } else { 0o444 };
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(os(&p), std::fs::Permissions::from_mode(mode));
-}
-
-/// The hierarchy's root, on the host, made on first use.
-pub fn tree_dir() -> Result<Vec<u8>, i32> {
-    let mut dir = crate::fs::shm::user_dir()?;
-    dir.extend_from_slice(format!("/v{}-cgroup", crate::shared::FORMAT).as_bytes());
-    if std::fs::create_dir(os(&dir)).is_ok()
-        || !std::path::Path::new(os(&dir)).join("cgroup.procs").exists()
-    {
-        let all = CONTROLLERS.join(" ") + "\n";
-        let cpus = all_cpus();
-        for name in ROOT_FILES {
-            // Written as they are made: the read-only ones cannot be after.
-            let content = match *name {
-                "cgroup.controllers" => all.as_str(),
-                "cpuset.cpus.effective" => cpus.as_str(),
-                "cpuset.mems.effective" => "0\n",
-                _ => "",
-            };
-            let writable = !matches!(
-                *name,
-                "cgroup.controllers"
-                    | "cgroup.stat"
-                    | "cpuset.cpus.effective"
-                    | "cpuset.mems.effective"
-            );
-            put(&dir, name, content, writable);
-        }
-    }
-    Ok(dir)
+    Ok(f)
 }
 
 /// The hierarchy's lock, held while a cgroup is made or removed or a
@@ -190,34 +179,151 @@ pub fn lock_tree() -> Result<TreeLock, i32> {
     Ok(TreeLock { _held: crate::procstore::lock_area(crate::procstore::Area::CgroupTree) })
 }
 
-/// The host directory of cgroup `cg` (a path from the root).
-pub fn host_dir(cg: &[u8]) -> Result<Vec<u8>, i32> {
-    Ok(crate::mounts::join(&tree_dir()?, cg))
+/// `f` with the hierarchy held.
+fn in_tree<R>(f: impl FnOnce(&mut Tx) -> Result<R, i32>) -> Result<R, i32> {
+    let fs = tree()?;
+    let mut t = fs.lock()?;
+    f(&mut t)
 }
 
-/// The cgroup a host path in the tree is (or is in), and the file it names
-/// there, if any.
-pub fn locate(host: &[u8]) -> Option<(Vec<u8>, Option<Vec<u8>>)> {
-    let top = tree_dir().ok()?;
-    let rest = crate::mounts::under(host, &top)?;
-    let p = if rest.is_empty() { b"/".to_vec() } else { rest.to_vec() };
-    if std::path::Path::new(os(host)).is_dir() {
-        return Some((p, None));
+/// The directory of cgroup `cg` (a path from the root).
+fn dir_in(t: &Tx, cg: &[u8]) -> Result<Ino, i32> {
+    let mut at = t.root();
+    for c in cg.split(|&b| b == b'/').filter(|c| !c.is_empty()) {
+        at = t.lookup(at, c)?;
+        if t.stat(at)?.mode & S_IFMT != S_IFDIR {
+            return Err(errno::ENOTDIR);
+        }
     }
-    let (dir, name) = match p.iter().rposition(|&b| b == b'/') {
-        Some(0) => (b"/".to_vec(), p[1..].to_vec()),
-        Some(i) => (p[..i].to_vec(), p[i + 1..].to_vec()),
-        None => return None,
-    };
-    Some((dir, Some(name)))
+    Ok(at)
 }
 
-fn read_words(path: &[u8]) -> Vec<String> {
-    std::fs::read_to_string(os(path))
-        .unwrap_or_default()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect()
+/// Its data object goes with an inode that went.
+fn drop_gone(g: Gone) {
+    if let Some(o) = g.data.filter(|&o| o != 0) {
+        data::remove(o);
+    }
+}
+
+/// What regular file `ino` holds.
+fn content(t: &mut Tx, ino: Ino) -> Result<Vec<u8>, i32> {
+    let size = t.stat(ino)?.size;
+    let (object, n) = t.readable(ino, 0, size)?;
+    let mut buf = vec![0u8; n as usize];
+    if n > 0 {
+        data::read(object, 0, &mut buf)?;
+    }
+    Ok(buf)
+}
+
+/// Make `content` what file `name` of directory `dir` holds: a new file in
+/// its place (a descriptor of the one there keeps what it read, as a
+/// reader of a cgroup's file on Linux keeps what it was shown), with
+/// permission bits `perm` and `owner`.
+fn put(
+    t: &mut Tx,
+    dir: Ino,
+    name: &[u8],
+    content: &[u8],
+    perm: u32,
+    owner: (u32, u32),
+) -> Result<(), i32> {
+    // Made under a name no one sees: the filesystem is held throughout
+    // (one a process that ended while holding it left goes first).
+    const NEW: &[u8] = b".fwe-new";
+    if t.lookup(dir, NEW).is_ok() {
+        drop_gone(t.unlink(dir, NEW, false)?);
+    }
+    let ino =
+        t.create(dir, NEW, &New { mode: S_IFREG | perm, uid: owner.0, gid: owner.1, rdev: 0 })?;
+    if !content.is_empty() {
+        let w = t.writable(ino, 0, content.len() as u64, false)?;
+        data::write(w.object, 0, &content[..w.fits as usize])?;
+        t.wrote(ino, w.fits)?;
+    }
+    if let Some(g) = t.rename(dir, NEW, dir, name, 0)? {
+        drop_gone(g);
+    }
+    Ok(())
+}
+
+/// Make interface file `name` of directory `dir`, if it is not there, with
+/// `content`, owned by `owner`, as Linux's `cgroup_kn_set_ugid` gives a
+/// cgroup's files to whoever makes them: the cgroup's creator, or for a
+/// controller's files whoever enables the controller.
+fn put_new(
+    t: &mut Tx,
+    dir: Ino,
+    name: &str,
+    content: &str,
+    writable: bool,
+    owner: (u32, u32),
+) -> Result<(), i32> {
+    if t.lookup(dir, name.as_bytes()).is_ok() {
+        return Ok(());
+    }
+    put(t, dir, name.as_bytes(), content.as_bytes(), if writable { 0o644 } else { 0o444 }, owner)
+}
+
+/// The caller's file-system user and group: who owns what it makes.
+fn maker() -> (u32, u32) {
+    let a = crate::creds::access();
+    (a.fsuid, a.fsgid)
+}
+
+/// What file `name` of cgroup `cg` holds (nothing where it has none).
+fn read_file(cg: &[u8], name: &[u8]) -> String {
+    let bytes = in_tree(|t| {
+        let ino = t.lookup(dir_in(t, cg)?, name)?;
+        content(t, ino)
+    });
+    String::from_utf8(bytes.unwrap_or_default()).unwrap_or_default()
+}
+
+fn read_words(cg: &[u8], name: &[u8]) -> Vec<String> {
+    read_file(cg, name).split_whitespace().map(str::to_owned).collect()
+}
+
+/// Make `content` what the existing file `name` of cgroup `cg` holds, its
+/// owner and mode kept (a runtime delegates a cgroup by giving its files
+/// away).
+fn set(cg: &[u8], name: &[u8], content: &[u8]) -> Result<(), i32> {
+    in_tree(|t| {
+        let dir = dir_in(t, cg).map_err(|_| errno::ENODEV)?;
+        let st = t.stat(t.lookup(dir, name)?)?;
+        put(t, dir, name, content, st.mode & 0o7777, (st.uid, st.gid))
+    })
+}
+
+/// The cgroup directory `ino` of store filesystem `fs` is, if it is one: its
+/// path from the root.
+pub fn cgroup_at(fs: u64, ino: Ino) -> Option<Vec<u8>> {
+    if fs != tree_id() {
+        return None;
+    }
+    tree().ok()?.lock().ok()?.path(ino)
+}
+
+/// The cgroup whose directory `fd` is open on: `EBADF` for no descriptor,
+/// `EINVAL` for one of another file.
+pub fn of_fd(fd: i32) -> Result<Vec<u8>, i32> {
+    // SAFETY: plain host call.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(errno::EBADF);
+    }
+    let file = crate::filestore::desc::of(fd).ok_or(errno::EINVAL)?;
+    cgroup_at(file.fs, file.ino).ok_or(errno::EINVAL)
+}
+
+/// The cgroup and the name of the interface file `fd` is open on, if it is
+/// one.
+pub fn file_of(fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
+    let file = crate::filestore::desc::of(fd)?;
+    if file.fs != tree_id() {
+        return None;
+    }
+    let (dir, name) = crate::filestore::desc::place(fd)?;
+    Some((cgroup_at(file.fs, dir)?, name))
 }
 
 /// The controllers cgroup `cg` may use: all at the root, else those its
@@ -226,29 +332,35 @@ pub fn controllers(cg: &[u8]) -> Vec<String> {
     if cg == b"/" {
         return CONTROLLERS.iter().map(|c| c.to_string()).collect();
     }
-    let parent = crate::fs::normalize(cg, b"..");
-    match host_dir(&parent) {
-        Ok(d) => read_words(&[&d[..], b"/cgroup.subtree_control"].concat()),
-        Err(_) => Vec::new(),
-    }
+    read_words(&crate::fs::normalize(cg, b".."), b"cgroup.subtree_control")
 }
 
-/// A new cgroup's files, after the `mkdir` that made it at host path `dir`.
-pub fn made(dir: &[u8]) {
-    let Some((cg, None)) = locate(dir) else { return };
-    for (name, content, writable) in CORE_FILES {
-        put(dir, name, content, *writable);
-    }
-    let enabled = controllers(&cg);
-    let _ = std::fs::write(os(&[dir, b"/cgroup.controllers"].concat()), enabled.join(" ") + "\n");
-    let cpus = all_cpus();
-    for (ctl, name, content, writable) in CONTROLLER_FILES {
-        if enabled.iter().any(|e| e == ctl) {
-            // Every CPU is the cgroup's: none is held back.
-            let content = if *name == "cpuset.cpus.effective" { cpus.as_str() } else { content };
-            put(dir, name, content, *writable);
+/// A new cgroup `cg`'s files, made by the caller after the `mkdir` that
+/// made its directory.
+pub fn made(cg: &[u8]) -> Result<(), i32> {
+    let enabled = controllers(cg);
+    let owner = maker();
+    in_tree(|t| {
+        let dir = dir_in(t, cg)?;
+        for (name, content, writable) in CORE_FILES {
+            let content = if *name == "cgroup.controllers" {
+                enabled.join(" ") + "\n"
+            } else {
+                content.to_string()
+            };
+            put_new(t, dir, name, &content, *writable, owner)?;
         }
-    }
+        let cpus = all_cpus();
+        for (ctl, name, content, writable) in CONTROLLER_FILES {
+            if enabled.iter().any(|e| e == ctl) {
+                // Every CPU is the cgroup's: none is held back.
+                let content =
+                    if *name == "cpuset.cpus.effective" { cpus.as_str() } else { content };
+                put_new(t, dir, name, content, *writable, owner)?;
+            }
+        }
+        Ok(())
+    })
 }
 
 /// The processes in cgroup `cg` (host pids), or in it and every cgroup
@@ -263,32 +375,39 @@ pub fn members(cg: &[u8], subtree: bool) -> Vec<i32> {
         .collect()
 }
 
-fn children(dir: &[u8]) -> Vec<Vec<u8>> {
-    let Ok(entries) = std::fs::read_dir(os(dir)) else { return Vec::new() };
-    entries
-        .flatten()
-        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()) && e.file_name().as_bytes() != PRIVATE)
-        .map(|e| e.file_name().as_bytes().to_vec())
+/// The names of the cgroups directly below directory `dir`.
+fn children(t: &Tx, dir: Ino) -> Vec<Vec<u8>> {
+    t.list(dir, 0, usize::MAX, 0)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|e| e.kind == S_IFDIR && e.name != b"." && e.name != b"..")
+        .map(|e| e.name)
         .collect()
 }
 
-/// `rmdir` of the cgroup at host path `dir`: `EBUSY` while it has processes
-/// or children, else it and its files go.
-pub fn remove(dir: &[u8]) -> Result<(), i32> {
-    let Some((cg, None)) = locate(dir) else { return Err(errno::ENOTDIR) };
+/// `rmdir` of cgroup `cg`: `EBUSY` while it has processes or children
+/// (the root always), else it and its files go.
+pub fn remove(cg: &[u8]) -> Result<(), i32> {
     if cg == b"/" {
         return Err(errno::EBUSY);
     }
     let _held = lock_tree()?;
-    if !std::path::Path::new(os(dir)).is_dir() {
-        // Removed meanwhile, by another.
-        return Err(errno::ENOENT);
-    }
-    if !children(dir).is_empty() || !members(&cg, false).is_empty() {
-        return Err(errno::EBUSY);
-    }
-    std::fs::remove_dir_all(os(dir))
-        .map_err(|e| e.raw_os_error().map_or(errno::EIO, crate::host::errno_to_linux))
+    let members = members(cg, false);
+    in_tree(|t| {
+        let dir = dir_in(t, cg)?;
+        if !children(t, dir).is_empty() || !members.is_empty() {
+            return Err(errno::EBUSY);
+        }
+        for e in t.list(dir, 0, usize::MAX, 0)? {
+            if e.kind != S_IFDIR {
+                drop_gone(t.unlink(dir, &e.name, false)?);
+            }
+        }
+        let parent = dir_in(t, &crate::fs::normalize(cg, b".."))?;
+        let name = cg.rsplit(|&b| b == b'/').next().unwrap_or_default();
+        drop_gone(t.unlink(parent, name, true)?);
+        Ok(())
+    })
 }
 
 /// The task count, resident memory and CPU time (in microseconds) of host
@@ -327,10 +446,21 @@ fn usage(pid: i32) -> (u64, u64, u64, u64) {
     }
 }
 
-/// Bring the file `name` of cgroup `cg` (host directory `dir`) up to date
-/// before it is opened, for the files whose content is what is so now.
-pub fn refresh(dir: &[u8], cg: &[u8], name: &[u8]) {
-    let write = |content: String| replace(&[dir, b"/", name].concat(), content);
+/// Bring the file `name` of cgroup `cg` up to date before it is opened,
+/// for the files whose content is what is so now: a new file where what
+/// it holds changed.
+pub fn refresh(cg: &[u8], name: &[u8]) {
+    let write = |now: String| {
+        let _ = in_tree(|t| {
+            let dir = dir_in(t, cg)?;
+            let ino = t.lookup(dir, name)?;
+            if content(t, ino)? == now.as_bytes() {
+                return Ok(());
+            }
+            let st = t.stat(ino)?;
+            put(t, dir, name, now.as_bytes(), st.mode & 0o7777, (st.uid, st.gid))
+        });
+    };
     let lines = |pids: Vec<i32>| {
         let mut v: Vec<i32> =
             pids.into_iter().map(crate::pidns::to_guest).filter(|&p| p != 0).collect();
@@ -365,7 +495,7 @@ pub fn refresh(dir: &[u8], cg: &[u8], name: &[u8]) {
             write(format!("populated {}\nfrozen {}\n", u8::from(populated), u8::from(f)));
         }
         b"cgroup.stat" => {
-            let n = count_descendants(dir);
+            let n = in_tree(|t| Ok(count_descendants(t, dir_in(t, cg)?))).unwrap_or(0);
             write(format!("nr_descendants {n}\nnr_dying_descendants 0\n"));
         }
         b"pids.current" => {
@@ -387,46 +517,24 @@ pub fn refresh(dir: &[u8], cg: &[u8], name: &[u8]) {
     }
 }
 
-/// Make `content` what the interface file at host path `p` holds,
-/// through a fresh file: the guest's descriptor of the old one, if it
-/// holds one, keeps what it read. The file keeps the owner and mode the
-/// guest gave it (a runtime delegates a cgroup by giving its files away).
-fn replace(p: &[u8], content: String) {
-    let tmp = [p, b".fwe-new"].concat();
-    let old = guest_stat(p);
-    if std::fs::write(os(&tmp), content).is_err() {
-        return;
-    }
-    if let Ok(f) = std::fs::File::open(os(&tmp)) {
-        use std::os::fd::AsRawFd;
-        let (owner, perm) =
-            old.map_or(((0, 0), 0o444), |st| ((st.st_uid, st.st_gid), crate::modes::perm_of(&st)));
-        let _ = crate::owners::keep_fd(f.as_raw_fd(), owner);
-        let _ = crate::modes::keep_fd(f.as_raw_fd(), perm);
-    }
-    let _ = std::fs::rename(os(&tmp), os(p));
+fn count_descendants(t: &Tx, dir: Ino) -> usize {
+    children(t, dir)
+        .iter()
+        .map(|c| 1 + t.lookup(dir, c).map_or(0, |d| count_descendants(t, d)))
+        .sum()
 }
 
-fn count_descendants(dir: &[u8]) -> usize {
-    children(dir).iter().map(|c| 1 + count_descendants(&[dir, b"/", c].concat())).sum()
-}
-
-/// A write of `data` to file `name` of cgroup `cg` (host directory `dir`):
-/// what the write does, as Linux does it.
-pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
+/// A write of `data` to file `name` of cgroup `cg`: what the write does,
+/// as Linux does it.
+pub fn write(cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
     let text = std::str::from_utf8(data).map_err(|_| errno::EINVAL)?;
-    let store = |content: String| -> Result<(), i32> {
-        std::fs::write(os(&[dir, b"/", name].concat()), content)
-            .map_err(|e| e.raw_os_error().map_or(errno::EIO, crate::host::errno_to_linux))
-    };
+    let store = |content: String| set(cg, name, content.as_bytes());
     match name {
         b"cgroup.procs" | b"cgroup.threads" => {
             let threads = name == b"cgroup.threads";
             // (Not into a cgroup being removed.)
             let _held = lock_tree()?;
-            if !std::path::Path::new(os(dir)).is_dir() {
-                return Err(errno::ENODEV);
-            }
+            in_tree(|t| dir_in(t, cg)).map_err(|_| errno::ENODEV)?;
             for word in text.split_whitespace() {
                 let id: i32 = word.parse().map_err(|_| errno::EINVAL)?;
                 let host = if threads { thread_process(id)? } else { process(id)? };
@@ -465,62 +573,80 @@ pub fn write(dir: &[u8], cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32>
             store(format!("{v}\n"))
         }
         b"cgroup.subtree_control" => {
-            let mut enabled = read_words(&[dir, b"/cgroup.subtree_control"].concat());
+            let mut enabled = read_words(cg, b"cgroup.subtree_control");
             let changes = subtree_changes(text, &enabled, &controllers(cg))?;
-            let kids = children(dir);
-            for &(on, ctl) in &changes {
-                if !on
-                    && kids.iter().any(|k| {
-                        read_words(&[dir, b"/", k, b"/cgroup.subtree_control"].concat())
-                            .iter()
-                            .any(|c| c == ctl)
-                    })
-                {
+            let members = members(cg, false);
+            let owner = maker();
+            in_tree(|t| {
+                let dir = dir_in(t, cg).map_err(|_| errno::ENODEV)?;
+                let kids: Vec<Ino> =
+                    children(t, dir).iter().filter_map(|k| t.lookup(dir, k).ok()).collect();
+                for &(on, ctl) in &changes {
+                    if !on
+                        && kids.iter().any(|&k| {
+                            t.lookup(k, b"cgroup.subtree_control")
+                                .and_then(|f| content(t, f))
+                                .is_ok_and(|c| {
+                                    String::from_utf8_lossy(&c).split_whitespace().any(|c| c == ctl)
+                                })
+                        })
+                    {
+                        return Err(errno::EBUSY);
+                    }
+                }
+                if changes.iter().any(|&(on, _)| on) && cg != b"/" && !members.is_empty() {
                     return Err(errno::EBUSY);
                 }
-            }
-            if changes.iter().any(|&(on, _)| on) && cg != b"/" && !members(cg, false).is_empty() {
-                return Err(errno::EBUSY);
-            }
-            for (on, ctl) in changes {
-                if on {
-                    enabled.push(ctl.to_string());
-                } else {
-                    enabled.retain(|c| c != ctl);
-                }
-                // The children's files for it come and go.
-                for k in &kids {
-                    let child = [dir, b"/", &k[..]].concat();
-                    for (c, file, content, writable) in CONTROLLER_FILES {
-                        if *c != ctl {
-                            continue;
-                        }
-                        if on {
-                            let cpus = all_cpus();
-                            let content = if *file == "cpuset.cpus.effective" {
-                                cpus.as_str()
-                            } else {
-                                content
-                            };
-                            put(&child, file, content, *writable);
-                        } else {
-                            let _ = std::fs::remove_file(os(
-                                &[&child[..], b"/", file.as_bytes()].concat()
-                            ));
+                let cpus = all_cpus();
+                for (on, ctl) in changes {
+                    if on {
+                        enabled.push(ctl.to_string());
+                    } else {
+                        enabled.retain(|c| c != ctl);
+                    }
+                    // The children's files for it come and go.
+                    for &k in &kids {
+                        for (c, file, content, writable) in CONTROLLER_FILES {
+                            if *c != ctl {
+                                continue;
+                            }
+                            if on {
+                                let content = if *file == "cpuset.cpus.effective" {
+                                    cpus.as_str()
+                                } else {
+                                    content
+                                };
+                                put_new(t, k, file, content, *writable, owner)?;
+                            } else if t.lookup(k, file.as_bytes()).is_ok() {
+                                drop_gone(t.unlink(k, file.as_bytes(), false)?);
+                            }
                         }
                     }
                 }
-            }
-            enabled.sort_by_key(|c| CONTROLLERS.iter().position(|k| k == c));
-            store(enabled.join(" ") + "\n")?;
-            for k in children(dir) {
-                let child = [dir, b"/", &k].concat();
-                let _ = std::fs::write(
-                    os(&[&child[..], b"/cgroup.controllers"].concat()),
-                    enabled.join(" ") + "\n",
-                );
-            }
-            Ok(())
+                enabled.sort_by_key(|c| CONTROLLERS.iter().position(|k| k == c));
+                let line = enabled.join(" ") + "\n";
+                let st = t.stat(t.lookup(dir, b"cgroup.subtree_control")?)?;
+                put(
+                    t,
+                    dir,
+                    b"cgroup.subtree_control",
+                    line.as_bytes(),
+                    st.mode & 0o7777,
+                    (st.uid, st.gid),
+                )?;
+                for &k in &kids {
+                    let st = t.stat(t.lookup(k, b"cgroup.controllers")?)?;
+                    put(
+                        t,
+                        k,
+                        b"cgroup.controllers",
+                        line.as_bytes(),
+                        st.mode & 0o7777,
+                        (st.uid, st.gid),
+                    )?;
+                }
+                Ok(())
+            })
         }
         b"cgroup.freeze" => {
             let on = match text.trim() {
@@ -700,8 +826,7 @@ fn memory_limit(v: &str) -> Result<String, i32> {
 /// Whether a process may join cgroup `cg`: not one that enables
 /// controllers for its children, but at the root (`EBUSY`).
 pub fn may_join(cg: &[u8]) -> Result<(), i32> {
-    let dir = host_dir(cg)?;
-    if cg != b"/" && !read_words(&[&dir[..], b"/cgroup.subtree_control"].concat()).is_empty() {
+    if cg != b"/" && !read_words(cg, b"cgroup.subtree_control").is_empty() {
         return Err(errno::EBUSY);
     }
     Ok(())
@@ -727,11 +852,7 @@ fn below_root(cg: &[u8]) -> impl Iterator<Item = Vec<u8>> {
 /// Whether cgroup `cg` is frozen: its own `cgroup.freeze`, or one above
 /// it, says so.
 pub fn frozen(cg: &[u8]) -> bool {
-    below_root(cg).any(|c| {
-        host_dir(&c).is_ok_and(|d| {
-            read_words(&[&d[..], b"/cgroup.freeze"].concat()).first().is_some_and(|w| w == "1")
-        })
-    })
+    below_root(cg).any(|c| read_words(&c, b"cgroup.freeze").first().is_some_and(|w| w == "1"))
 }
 
 /// Whether one more task in cgroup `cg` stays within the `pids.max` of
@@ -739,13 +860,12 @@ pub fn frozen(cg: &[u8]) -> bool {
 /// `pids.events` of the cgroup whose limit it is).
 pub fn fork_allowed(cg: &[u8]) -> Result<(), i32> {
     for at in below_root(cg) {
-        let Ok(dir) = host_dir(&at) else { continue };
-        if let Some(max) = read_words(&[&dir[..], b"/pids.max"].concat()).first()
+        if let Some(max) = read_words(&at, b"pids.max").first()
             && let Ok(max) = max.parse::<u64>()
         {
             let n: u64 = members(&at, true).into_iter().map(|p| usage(p).0).sum();
             if n >= max {
-                count_max_event(&dir);
+                count_max_event(&at);
                 return Err(errno::EAGAIN);
             }
         }
@@ -753,12 +873,11 @@ pub fn fork_allowed(cg: &[u8]) -> Result<(), i32> {
     Ok(())
 }
 
-/// One more task refused for the `pids.max` of the cgroup at `dir`.
-fn count_max_event(dir: &[u8]) {
-    let p = [dir, b"/pids.events"].concat();
-    let words = read_words(&p);
+/// One more task refused for the `pids.max` of cgroup `cg`.
+fn count_max_event(cg: &[u8]) {
+    let words = read_words(cg, b"pids.events");
     let n: u64 = words.get(1).and_then(|w| w.parse().ok()).unwrap_or(0);
-    replace(&p, format!("max {}\n", n + 1));
+    let _ = set(cg, b"pids.events", format!("max {}\n", n + 1).as_bytes());
 }
 
 /// A record whose generation moves whenever a process changes cgroup, or
@@ -795,13 +914,8 @@ fn looked() -> (bool, bool) {
     use std::sync::atomic::Ordering;
     let look = || {
         let cg = current();
-        let limited = below_root(&cg).any(|c| {
-            host_dir(&c).is_ok_and(|d| {
-                read_words(&[&d[..], b"/pids.max"].concat())
-                    .first()
-                    .is_some_and(|w| w.parse::<u64>().is_ok())
-            })
-        });
+        let limited = below_root(&cg)
+            .any(|c| read_words(&c, b"pids.max").first().is_some_and(|w| w.parse::<u64>().is_ok()));
         (limited, frozen(&cg))
     };
     let Some(r) = moves() else { return look() };
@@ -924,52 +1038,26 @@ pub fn may_move(from: &[u8], to: &[u8]) -> Result<(), i32> {
     }
     let a = ancestors(from);
     let common = ancestors(to).into_iter().find(|c| a.contains(c)).unwrap_or(b"/".to_vec());
-    let file = [&host_dir(&common)?[..], b"/cgroup.procs"].concat();
-    match guest_stat(&file) {
-        Some(st) if crate::creds::access().permits(&st, 2) => Ok(()),
+    let st = in_tree(|t| {
+        let ino = t.lookup(dir_in(t, &common)?, b"cgroup.procs")?;
+        Ok(crate::filestore::io::host_stat(t.dev(), &t.stat(ino)?))
+    });
+    match st {
+        Ok(st) if crate::creds::access().permits(&st, 2) => Ok(()),
         _ => Err(errno::EACCES),
     }
 }
 
-/// The metadata the guest sees of the host file at `path`: its owner and
-/// mode as fwe keeps them.
-fn guest_stat(path: &[u8]) -> Option<libc::stat> {
-    let c = std::ffi::CString::new(path).ok()?;
-    // SAFETY: a NUL-terminated path; the descriptor is closed below.
-    let fd = unsafe { libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
-    if fd < 0 {
-        return None;
-    }
-    // SAFETY: zeroed bytes are a valid `stat`, which the call fills.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: a valid out-parameter for the descriptor just opened.
-    let ok = unsafe { libc::fstat(fd, &mut st) } == 0;
-    if ok {
-        let owner = crate::owners::of_fd(fd, &st);
-        let perm = crate::modes::guest_perm_fd(fd, &st);
-        crate::owners::apply(&mut st, owner);
-        crate::modes::apply(&mut st, perm);
-    }
-    // SAFETY: closing the descriptor opened above.
-    unsafe { libc::close(fd) };
-    ok.then_some(st)
-}
-
-/// Whether a cgroup may be made in the cgroup at host directory `parent`:
-/// within the `cgroup.max.descendants` and `cgroup.max.depth` of it and
-/// every cgroup above it (`EAGAIN` otherwise).
+/// Whether a cgroup may be made in cgroup `parent`: within the
+/// `cgroup.max.descendants` and `cgroup.max.depth` of it and every cgroup
+/// above it (`EAGAIN` otherwise).
 pub fn may_make(parent: &[u8]) -> Result<(), i32> {
-    let Some((cg, None)) = locate(parent) else { return Ok(()) };
-    for (level, at) in ancestors(&cg).iter().enumerate() {
-        let dir = host_dir(at)?;
+    for (level, at) in ancestors(parent).iter().enumerate() {
         let limit = |name: &[u8]| {
-            read_words(&[&dir[..], b"/", name].concat())
-                .first()
-                .and_then(|w| w.parse::<usize>().ok())
-                .unwrap_or(usize::MAX)
+            read_words(at, name).first().and_then(|w| w.parse::<usize>().ok()).unwrap_or(usize::MAX)
         };
-        if count_descendants(&dir) >= limit(b"cgroup.max.descendants")
-            || level + 1 > limit(b"cgroup.max.depth")
+        let descendants = in_tree(|t| Ok(count_descendants(t, dir_in(t, at)?)))?;
+        if descendants >= limit(b"cgroup.max.descendants") || level + 1 > limit(b"cgroup.max.depth")
         {
             return Err(errno::EAGAIN);
         }
@@ -1012,67 +1100,78 @@ fn relative(cg: &[u8], root: &[u8]) -> Vec<u8> {
 
 // --- device programs ---------------------------------------------------------
 
+/// The attribute holding device program `id`.
+fn program(id: u32) -> Vec<u8> {
+    [PROGRAM, id.to_string().as_bytes()].concat()
+}
+
 /// Attach device program `prog` (its instructions), with identity `id`, to
-/// the cgroup at host directory `dir`.
-pub fn attach(dir: &[u8], id: u32, prog: &[u8]) -> Result<(), i32> {
-    let d = [dir, b"/", PRIVATE].concat();
-    let _ = std::fs::create_dir(os(&d));
-    std::fs::write(os(&[&d[..], format!("/{id}").as_bytes()].concat()), prog)
-        .map_err(|e| e.raw_os_error().map_or(errno::EIO, crate::host::errno_to_linux))
+/// cgroup `cg`.
+pub fn attach(cg: &[u8], id: u32, prog: &[u8]) -> Result<(), i32> {
+    in_tree(|t| {
+        let dir = dir_in(t, cg)?;
+        t.set_xattr(dir, &program(id), Some(prog))
+    })
 }
 
-/// Detach the device program `id` from the cgroup at `dir`.
-pub fn detach(dir: &[u8], id: u32) -> Result<(), i32> {
-    let p = [dir, b"/", PRIVATE, format!("/{id}").as_bytes()].concat();
-    std::fs::remove_file(os(&p)).map_err(|_| errno::ENOENT)
+/// Detach the device program `id` from cgroup `cg`.
+pub fn detach(cg: &[u8], id: u32) -> Result<(), i32> {
+    in_tree(|t| {
+        let dir = dir_in(t, cg)?;
+        t.xattr(dir, &program(id)).map_err(|_| errno::ENOENT)?;
+        t.set_xattr(dir, &program(id), None)
+    })
 }
 
-/// The device programs attached to the cgroup at `dir`: their identities.
-pub fn attached(dir: &[u8]) -> Vec<u32> {
-    let d = [dir, b"/", PRIVATE].concat();
-    let Ok(entries) = std::fs::read_dir(os(&d)) else { return Vec::new() };
-    let mut ids: Vec<u32> =
-        entries.flatten().filter_map(|e| e.file_name().to_str()?.parse().ok()).collect();
-    ids.sort_unstable();
-    ids
+/// The device programs attached to directory `dir`: their identities and
+/// instructions, by identity.
+fn programs(t: &Tx, dir: Ino) -> Vec<(u32, Vec<u8>)> {
+    let mut out: Vec<(u32, Vec<u8>)> = t
+        .xattrs(dir)
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(name, prog)| {
+            let id = std::str::from_utf8(name.strip_prefix(PROGRAM)?).ok()?.parse().ok()?;
+            Some((id, prog))
+        })
+        .collect();
+    out.sort_unstable_by_key(|&(id, _)| id);
+    out
+}
+
+/// The device programs attached to cgroup `cg`: their identities.
+pub fn attached(cg: &[u8]) -> Vec<u32> {
+    in_tree(|t| Ok(programs(t, dir_in(t, cg)?).into_iter().map(|(id, _)| id).collect()))
+        .unwrap_or_default()
 }
 
 /// The program with identity `id`, wherever in the tree it is attached.
 pub fn find(id: u32) -> Option<Vec<u8>> {
-    fn walk(dir: &[u8], id: u32) -> Option<Vec<u8>> {
-        let p = [dir, b"/", PRIVATE, format!("/{id}").as_bytes()].concat();
-        if let Ok(b) = std::fs::read(os(&p)) {
-            return Some(b);
-        }
-        children(dir).iter().find_map(|c| walk(&[dir, b"/", c].concat(), id))
-    }
-    walk(&tree_dir().ok()?, id)
+    in_tree(|t| Ok(t.inodes().into_iter().find_map(|ino| t.xattr(ino, &program(id)).ok())))
+        .ok()
+        .flatten()
 }
 
 /// Whether this process may make the device access `access`
 /// (`BPF_DEVCG_ACC_*`) to device `major:minor` of type `dev_type`: every
 /// device program attached to its cgroup or one above it must allow it.
 pub fn device_allowed(access: u32, dev_type: u32, major: u32, minor: u32) -> bool {
-    let mut at = current();
-    loop {
-        if let Ok(dir) = host_dir(&at) {
-            for id in attached(&dir) {
-                let p = [&dir[..], b"/", PRIVATE, format!("/{id}").as_bytes()].concat();
-                let Ok(bytes) = std::fs::read(os(&p)) else { continue };
-                let allowed = crate::bpf::load(&bytes)
-                    .ok()
-                    .and_then(|prog| crate::bpf::run(&prog, access, dev_type, major, minor))
-                    .is_some_and(|v| v != 0);
-                if !allowed {
-                    return false;
-                }
+    let progs: Vec<Vec<u8>> = in_tree(|t| {
+        let mut out = Vec::new();
+        for at in ancestors(&current()) {
+            if let Ok(dir) = dir_in(t, &at) {
+                out.extend(programs(t, dir).into_iter().map(|(_, p)| p));
             }
         }
-        if at == b"/" {
-            return true;
-        }
-        at = crate::fs::normalize(&at, b"..");
-    }
+        Ok(out)
+    })
+    .unwrap_or_default();
+    progs.iter().all(|bytes| {
+        crate::bpf::load(bytes)
+            .ok()
+            .and_then(|prog| crate::bpf::run(&prog, access, dev_type, major, minor))
+            .is_some_and(|v| v != 0)
+    })
 }
 
 /// `EPERM` unless [`device_allowed`].
@@ -1084,16 +1183,14 @@ pub fn check_device(access: u32, dev_type: u32, major: u32, minor: u32) -> Resul
 /// cgroup's interface file, what the write does (`Some` result); `None`
 /// for any other descriptor ([`crate::specialwrite`]).
 pub fn try_write(fd: i32, data: &[u8], len: u64) -> Option<i64> {
-    let host = crate::fdmarks::cgroup_file(fd)?;
-    let (cg, Some(name)) = locate(&host)? else { return None };
+    let (cg, name) = crate::fdmarks::cgroup_file(fd)?;
     // Writable only if opened so.
     // SAFETY: plain host call.
     let fl = unsafe { libc::fcntl(fd, libc::F_GETFL) };
     if fl & libc::O_ACCMODE == libc::O_RDONLY {
         return Some(err(errno::EBADF));
     }
-    let dir = host_dir(&cg).ok()?;
-    Some(match write(&dir, &cg, &name, data) {
+    Some(match write(&cg, &name, data) {
         Ok(()) => len as i64,
         Err(e) => err(e),
     })
@@ -1127,14 +1224,40 @@ mod tests {
         assert_eq!(memory_limit("8E"), Ok("max".to_string()));
     }
 
-    /// A new cgroup's interface files are its creator's (kept in an
-    /// attribute only macOS's fwe writes).
-    #[cfg(target_os = "macos")]
+    /// A cgroup of the test's own, below the root: made with its files.
+    fn make(cg: &[u8]) {
+        in_tree(|t| {
+            let parent = dir_in(t, &crate::fs::normalize(cg, b".."))?;
+            let name = cg.rsplit(|&b| b == b'/').next().unwrap();
+            t.create(parent, name, &New { mode: S_IFDIR | 0o755, uid: 0, gid: 0, rdev: 0 })
+        })
+        .unwrap();
+        made(cg).unwrap();
+    }
+
+    /// Cgroup `cg` and those below it go.
+    fn unmake(cg: &[u8]) {
+        let kids = in_tree(|t| Ok(children(t, dir_in(t, cg)?))).unwrap_or_default();
+        for k in kids {
+            unmake(&[cg, b"/", &k].concat());
+        }
+        remove(cg).unwrap();
+    }
+
+    /// The owner of file `name` of cgroup `cg`.
+    fn owner(cg: &[u8], name: &[u8]) -> (u32, u32) {
+        in_tree(|t| {
+            let st = t.stat(t.lookup(dir_in(t, cg)?, name)?)?;
+            Ok((st.uid, st.gid))
+        })
+        .unwrap()
+    }
+
+    /// A new cgroup's interface files are its creator's; a removed cgroup
+    /// takes its files and device programs with it.
     #[test]
     fn a_new_cgroups_files_are_its_creators() {
         let cg = format!("/fwe-unit-owner-{}", std::process::id()).into_bytes();
-        let dir = host_dir(&cg).unwrap();
-        std::fs::create_dir(os(&dir)).unwrap();
         let creator = crate::creds::Access {
             fsuid: 1000,
             fsgid: 1001,
@@ -1143,16 +1266,37 @@ mod tests {
             dac_read_search: false,
             scoped: false,
         };
-        crate::creds::walking_as(creator, || made(&dir));
+        crate::creds::walking_as(creator, || make(&cg));
         for name in ["cgroup.procs", "cgroup.controllers", "cgroup.stat"] {
-            let p = std::ffi::CString::new([&dir[..], b"/", name.as_bytes()].concat()).unwrap();
-            // SAFETY: zeroed bytes are a valid `stat`, which the call fills.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: a NUL-terminated path and a `stat` to fill.
-            assert_eq!(unsafe { libc::stat(p.as_ptr(), &mut st) }, 0, "{name}");
-            assert_eq!(crate::owners::of_path(&p, &st), (1000, 1001), "{name}");
+            assert_eq!(owner(&cg, name.as_bytes()), (1000, 1001), "{name}");
         }
-        let _ = std::fs::remove_dir_all(os(&dir));
+        attach(&cg, 0xfeed_0001, b"prog").unwrap();
+        assert_eq!(attached(&cg), vec![0xfeed_0001]);
+        assert_eq!(find(0xfeed_0001).as_deref(), Some(&b"prog"[..]));
+        let procs = in_tree(|t| t.lookup(dir_in(t, &cg)?, b"cgroup.procs")).unwrap();
+        unmake(&cg);
+        assert_eq!(find(0xfeed_0001), None);
+        assert_eq!(in_tree(|t| t.stat(procs).map(|_| ())), Err(errno::ENOENT));
+        assert_eq!(in_tree(|t| dir_in(t, &cg)), Err(errno::ENOENT));
+    }
+
+    /// A file's content is replaced by a new file: a descriptor of the old
+    /// one keeps what it read, and a refresh that changes nothing makes
+    /// none.
+    #[test]
+    fn a_refresh_makes_a_new_file_only_for_new_content() {
+        let cg = format!("/fwe-unit-refresh-{}", std::process::id()).into_bytes();
+        make(&cg);
+        let ino = |name: &[u8]| in_tree(|t| t.lookup(dir_in(t, &cg)?, name)).unwrap();
+        let first = ino(b"cgroup.events");
+        refresh(&cg, b"cgroup.events");
+        assert_eq!(ino(b"cgroup.events"), first);
+        write(&cg, b"cgroup.freeze", b"1").unwrap();
+        refresh(&cg, b"cgroup.events");
+        assert_ne!(ino(b"cgroup.events"), first);
+        assert_eq!(read_file(&cg, b"cgroup.events"), "populated 0\nfrozen 1\n");
+        assert_eq!(read_file(&cg, b"cgroup.freeze"), "1\n");
+        unmake(&cg);
     }
 
     /// `cgroup.subtree_control` refuses an unknown controller (`EINVAL`)
@@ -1186,19 +1330,15 @@ mod tests {
     }
 
     /// A cgroup of the test's own, with `children` below it: its path and
-    /// host directory, and theirs.
-    fn made_tree(tag: &str, children: &[&str]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    /// theirs.
+    fn made_tree(tag: &str, children: &[&str]) -> Vec<Vec<u8>> {
         let cg = format!("/fwe-unit-{tag}-{}", std::process::id()).into_bytes();
         let mut out = vec![cg.clone()];
         out.extend(children.iter().map(|c| [&cg[..], b"/", c.as_bytes()].concat()));
-        out.into_iter()
-            .map(|c| {
-                let dir = host_dir(&c).unwrap();
-                std::fs::create_dir(os(&dir)).unwrap();
-                made(&dir);
-                (c, dir)
-            })
-            .collect()
+        for c in &out {
+            make(c);
+        }
+        out
     }
 
     /// `cgroup.max.depth` and `cgroup.max.descendants` hold a new cgroup
@@ -1207,18 +1347,18 @@ mod tests {
     #[test]
     fn hierarchy_limits_and_type() {
         let t = made_tree("limits", &["a"]);
-        let ((cg, dir), (_, a)) = (&t[0], &t[1]);
-        assert_eq!(write(dir, cg, b"cgroup.type", b"threaded"), Err(errno::EOPNOTSUPP));
-        assert_eq!(write(dir, cg, b"cgroup.type", b"domain"), Err(errno::EINVAL));
-        assert_eq!(write(dir, cg, b"cgroup.max.depth", b"-1"), Err(errno::EINVAL));
+        let (cg, a) = (&t[0], &t[1]);
+        assert_eq!(write(cg, b"cgroup.type", b"threaded"), Err(errno::EOPNOTSUPP));
+        assert_eq!(write(cg, b"cgroup.type", b"domain"), Err(errno::EINVAL));
+        assert_eq!(write(cg, b"cgroup.max.depth", b"-1"), Err(errno::EINVAL));
         assert_eq!(may_make(a), Ok(()));
-        write(dir, cg, b"cgroup.max.depth", b"1").unwrap();
-        assert_eq!(may_make(dir), Ok(()));
+        write(cg, b"cgroup.max.depth", b"1").unwrap();
+        assert_eq!(may_make(cg), Ok(()));
         assert_eq!(may_make(a), Err(errno::EAGAIN));
-        write(dir, cg, b"cgroup.max.depth", b"max").unwrap();
-        write(dir, cg, b"cgroup.max.descendants", b"1").unwrap();
-        assert_eq!(may_make(dir), Err(errno::EAGAIN));
-        let _ = std::fs::remove_dir_all(os(dir));
+        write(cg, b"cgroup.max.depth", b"max").unwrap();
+        write(cg, b"cgroup.max.descendants", b"1").unwrap();
+        assert_eq!(may_make(cg), Err(errno::EAGAIN));
+        unmake(cg);
     }
 
     /// A cgroup is frozen while it or one above it freezes it, which its
@@ -1226,16 +1366,15 @@ mod tests {
     #[test]
     fn freezing_is_hierarchical() {
         let t = made_tree("freeze", &["k"]);
-        let ((cg, dir), (k, kdir)) = (&t[0], &t[1]);
-        write(dir, cg, b"cgroup.freeze", b"1").unwrap();
+        let (cg, k) = (&t[0], &t[1]);
+        write(cg, b"cgroup.freeze", b"1").unwrap();
         assert!(frozen(k));
-        write(kdir, k, b"cgroup.freeze", b"0").unwrap();
+        write(k, b"cgroup.freeze", b"0").unwrap();
         assert!(frozen(k));
-        refresh(kdir, k, b"cgroup.events");
-        let events = std::fs::read(os(&[&kdir[..], b"/cgroup.events"].concat())).unwrap();
-        assert_eq!(events, b"populated 0\nfrozen 1\n");
-        write(dir, cg, b"cgroup.freeze", b"0").unwrap();
+        refresh(k, b"cgroup.events");
+        assert_eq!(read_file(k, b"cgroup.events"), "populated 0\nfrozen 1\n");
+        write(cg, b"cgroup.freeze", b"0").unwrap();
         assert!(!frozen(k));
-        let _ = std::fs::remove_dir_all(os(dir));
+        unmake(cg);
     }
 }

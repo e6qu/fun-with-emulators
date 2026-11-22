@@ -185,9 +185,9 @@ impl<P: Platform> Kernel<P> {
             }
             FsType::Cgroup2 => {
                 // The hierarchy from the cgroup namespace's root.
-                let dir = crate::cgroupfs::tree_dir()?;
+                let id = crate::cgroupfs::tree()?.id;
                 root = self.fs().ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
-                Source::Host(dir)
+                Source::Store(id)
             }
             FsType::Overlay => {
                 let layers = self.overlay_layers(data)?;

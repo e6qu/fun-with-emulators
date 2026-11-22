@@ -1105,21 +1105,6 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         let host_mode = crate::modes::made_file_perm(mode);
-        if resolved.fstype == crate::mounts::FsType::Cgroup2
-            && let Some(host) = crate::fs::host_path_in(resolved.dir.as_raw_fd(), &resolved.name)
-            && let Some((cg, Some(file))) = crate::cgroupfs::locate(&host)
-        {
-            // What the file reports is what is so as it is opened.
-            let dir = crate::cgroupfs::host_dir(&cg).unwrap_or_default();
-            crate::cgroupfs::refresh(&dir, &cg, &file);
-            use std::os::unix::ffi::OsStrExt;
-            if flags & fcntl::O_CREAT != 0
-                && !std::path::Path::new(std::ffi::OsStr::from_bytes(&host)).exists()
-            {
-                // A cgroup has only the files the kernel makes.
-                return err(errno::EACCES);
-            }
-        }
         let dirfd = resolved.dir.as_raw_fd();
         // SAFETY: `dir` is a live directory fd.
         let open = || unsafe { host::openat(dirfd, &name, host_flags, host_mode as libc::c_uint) };
@@ -2192,23 +2177,6 @@ impl<P: Platform> Kernel<P> {
         let mode = self.fs().apply_umask(mode as u32) & 0o1777;
         let host_mode = crate::modes::host_perm(mode, true);
         let dir = r.dir.as_raw_fd();
-        // A new cgroup, within the limits of those above it, made whole
-        // under the hierarchy's lock (no removal of its parent between).
-        let _cgroups = if r.fstype == crate::mounts::FsType::Cgroup2 {
-            match crate::cgroupfs::lock_tree() {
-                Ok(l) => Some(l),
-                Err(e) => return err(e),
-            }
-        } else {
-            None
-        };
-        if r.fstype == crate::mounts::FsType::Cgroup2
-            && stat_at(dir, &name).is_err()
-            && let Some(parent) = crate::fs::host_path_in(dir, b".")
-            && let Err(e) = crate::cgroupfs::may_make(&parent)
-        {
-            return err(e);
-        }
         let made = self.change_in(dir, || {
             // SAFETY: `name` NUL-terminated; `dir` live.
             ret(unsafe { libc::mkdirat(dir, name.as_ptr(), host_mode as libc::mode_t) })
@@ -2223,12 +2191,6 @@ impl<P: Platform> Kernel<P> {
             && made == 0
         {
             return err(e);
-        }
-        if made == 0 && r.fstype == crate::mounts::FsType::Cgroup2 {
-            // A new cgroup, with its interface files.
-            if let Some(host) = crate::fs::host_path_in(r.dir.as_raw_fd(), &r.name) {
-                crate::cgroupfs::made(&host);
-            }
         }
         made
     }
@@ -2347,21 +2309,6 @@ impl<P: Platform> Kernel<P> {
     /// `unlinkat` of guest path `path`.
     pub(crate) fn unlink_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64) -> i64 {
         let found = self.fs().resolve_entry(dirfd as i32, &path);
-        if let Ok(r) = &found
-            && r.fstype == crate::mounts::FsType::Cgroup2
-        {
-            // A cgroup goes with its files when empty; its files stay.
-            let Some(host) = crate::fs::host_path_in(r.dir.as_raw_fd(), &r.name) else {
-                return err(errno::ENOENT);
-            };
-            if flags & fcntl::AT_REMOVEDIR == 0 {
-                return err(errno::EPERM);
-            }
-            return match crate::cgroupfs::remove(&host) {
-                Ok(()) => 0,
-                Err(e) => err(e),
-            };
-        }
         let r = match found.and_then(|r| Self::changeable(r, false, Change::Remove)) {
             Ok(r) => r,
             Err(e) => return err(e),
@@ -3098,7 +3045,7 @@ impl<P: Platform> Kernel<P> {
                 crate::overlay::list(&crate::overlay::open(&l, &path)?)
             });
         }
-        getdents64(fd as i32, buf, count as usize, &listing_hides(fd as i32))
+        getdents64(fd as i32, buf, count as usize, &listing_hides())
     }
 
     pub(crate) fn sys_utimensat(&mut self, dirfd: u64, path: u64, times: u64, flags: u64) -> i64 {
@@ -4775,16 +4722,10 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
     }
 }
 
-/// What a listing of the host directory open as `fd` leaves out: the
-/// hidden names of `O_TMPFILE` files, and what fwe keeps in a cgroup's
-/// directory.
-fn listing_hides(fd: i32) -> impl Fn(&[u8]) -> bool {
-    let cgroup =
-        crate::fdmarks::origin(fd).is_some_and(|o| o.fstype == crate::mounts::FsType::Cgroup2);
-    move |name: &[u8]| {
-        (cgroup && (name == crate::cgroupfs::PRIVATE || name.ends_with(b".fwe-new")))
-            || name.starts_with(crate::tmpfile::PREFIX)
-    }
+/// What a listing of a host directory leaves out: the
+/// hidden names of `O_TMPFILE` files.
+fn listing_hides() -> impl Fn(&[u8]) -> bool {
+    |name: &[u8]| name.starts_with(crate::tmpfile::PREFIX)
 }
 
 /// `lseek` of a host directory `getdents64` listed (`None` for any other
@@ -4812,7 +4753,7 @@ pub(crate) fn dir_lseek(fd: i32, off: i64, whence: i32) -> Option<i64> {
     if unsafe { libc::lseek(fd, 0, libc::SEEK_SET) } < 0 {
         return Some(last_error());
     }
-    if let Err(e) = skip_entries(fd, to as u64, &listing_hides(fd)) {
+    if let Err(e) = skip_entries(fd, to as u64, &listing_hides()) {
         return Some(err(e));
     }
     set_listed(fd, to as u64);

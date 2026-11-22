@@ -384,7 +384,7 @@ pub enum Propagation {
 impl Table {
     /// The table a namespace starts with when nothing was mounted in it:
     /// the rootfs at `root_host` and what Linux always has mounted.
-    pub fn initial(root_host: &[u8], shm: Option<u64>, cgroup_host: Option<&[u8]>) -> Table {
+    pub fn initial(root_host: &[u8], shm: Option<u64>, cgroup: Option<u64>) -> Table {
         let mut t = Table {
             mounts: Vec::new(),
             next_id: 1,
@@ -430,14 +430,14 @@ impl Table {
         };
         add(&mut t, root, b"/proc", FsType::Proc, b"rw");
         let sys = add(&mut t, root, b"/sys", FsType::Sysfs, b"rw");
-        if let Some(cg) = cgroup_host {
+        if let Some(cg) = cgroup {
             let id = t.alloc();
             t.mounts.push(Mount {
                 id,
                 parent: sys,
                 point: b"/sys/fs/cgroup".to_vec(),
                 fstype: FsType::Cgroup2,
-                source: Source::Host(cg.to_vec()),
+                source: Source::Store(cg),
                 root: b"/".to_vec(),
                 flags: ms::NOSUID | ms::NODEV | ms::NOEXEC | ms::RELATIME,
                 propagation: ms::PRIVATE,
@@ -1516,9 +1516,8 @@ pub mod store {
         /// machine starts in one. Made with [`Table::initial`] when new.
         pub fn initial(root_host: &[u8], shm: Option<u64>) -> Result<Ns, i32> {
             let name = format!("mnt-init-{:016x}", crate::shared::hash(root_host));
-            let cgroup = crate::cgroupfs::tree_dir().ok();
-            Record::named(&name, INIT_ID, || Table::initial(root_host, shm, cgroup.as_deref()))
-                .map(Ns)
+            let cgroup = crate::cgroupfs::tree().ok().map(|f| f.id);
+            Record::named(&name, INIT_ID, || Table::initial(root_host, shm, cgroup)).map(Ns)
         }
 
         /// A new namespace holding a copy of this one's mounts
@@ -1738,7 +1737,7 @@ mod tests {
     use super::*;
 
     fn table() -> Table {
-        Table::initial(b"/host/root", Some(0x5348), Some(b"/host/cgroup"))
+        Table::initial(b"/host/root", Some(0x5348), Some(0x6367))
     }
 
     fn tmpfs(t: &mut Table, at: &[u8]) -> u32 {

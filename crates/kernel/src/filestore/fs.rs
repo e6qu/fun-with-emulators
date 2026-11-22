@@ -79,13 +79,33 @@ pub fn make_as(
     let mut t = f.lock_with(|| New { mode: tree::S_IFDIR | (mode & 0o7777), uid, gid, rdev: 0 })?;
     if t.dev() == 0 {
         t.set_limits(bytes, inodes);
-        // An anonymous device's number, as Linux gives a tmpfs: one of its
-        // own for each filesystem (past those fwe numbers mounts with).
-        let minor = 0x1000 + (crate::shared::hash(&id.to_le_bytes()) % 0xf_f000) as u32;
-        t.set_dev(crate::devnodes::makedev(0, minor));
+        t.set_dev(anonymous_dev(id));
     }
     drop(t);
     Ok(f)
+}
+
+/// Filesystem `id`, one of the user's that lasts (never collected, as
+/// [`make`]'s are once nothing shows them): made if it is not there, its
+/// root directory root's with `mode`, holding as much as memory allows, on
+/// a device of its own.
+pub fn lasting(id: u64, mode: u32) -> Result<Arc<Fs>, i32> {
+    let f = get(id, true)?;
+    let mut t =
+        f.lock_with(|| New { mode: tree::S_IFDIR | (mode & 0o7777), uid: 0, gid: 0, rdev: 0 })?;
+    if t.dev() == 0 {
+        t.set_dev(anonymous_dev(id));
+    }
+    drop(t);
+    Ok(f)
+}
+
+/// An anonymous device's number for filesystem `id`, as Linux gives a
+/// tmpfs one: of its own for each filesystem (past those fwe numbers
+/// mounts with).
+fn anonymous_dev(id: u64) -> u64 {
+    let minor = 0x1000 + (crate::shared::hash(&id.to_le_bytes()) % 0xf_f000) as u32;
+    crate::devnodes::makedev(0, minor)
 }
 
 /// Whether a live process holds a file of filesystem `id` (open, or

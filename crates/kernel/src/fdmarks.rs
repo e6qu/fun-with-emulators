@@ -234,8 +234,8 @@ pub fn tmpfs_mount(fd: i32, dev: u64, ino: u64) -> Option<u32> {
 }
 
 /// Whether `fd` is a file in a cgroup filesystem (which a write acts on,
-/// see [`crate::cgroupfs`]): its host path, if so.
-pub fn cgroup_file(fd: i32) -> Option<Vec<u8>> {
+/// see [`crate::cgroupfs`]): its cgroup and name, if so.
+pub fn cgroup_file(fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
     if CGROUP_FILES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return None;
     }
@@ -243,7 +243,7 @@ pub fn cgroup_file(fd: i32) -> Option<Vec<u8>> {
     if o.fstype != FsType::Cgroup2 {
         return None;
     }
-    crate::fs::host_path_of(fd)
+    crate::cgroupfs::file_of(fd)
 }
 
 fn records() -> std::sync::MutexGuard<'static, BTreeMap<i32, Record>> {

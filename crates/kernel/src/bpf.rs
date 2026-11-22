@@ -708,13 +708,9 @@ pub fn filter_send(fd: i32, data: &[u8]) -> Option<u64> {
     Some(keep.min(len))
 }
 
-/// The cgroup directory `fd` is open on, on the host.
+/// The cgroup whose directory `fd` is open on.
 fn cgroup_dir(fd: i32) -> Result<Vec<u8>, i32> {
-    let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
-    match crate::cgroupfs::locate(&host) {
-        Some((_, None)) => Ok(host),
-        _ => Err(errno::EINVAL),
-    }
+    crate::cgroupfs::of_fd(fd)
 }
 
 fn word(a: &[u8], at: usize) -> u32 {

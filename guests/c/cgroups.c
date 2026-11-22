@@ -256,12 +256,35 @@ static void delegation(void) {
     rmdir(at("d2"));
 }
 
+/* A cgroup's directory is kernfs's: no file is made or removed but by the
+ * kernel, no cgroup renamed, a file opened to cut is not cut, and the
+ * filesystem is cgroup2's. */
+static void kernfs(void) {
+    int fd = open(at("made"), O_WRONLY | O_CREAT, 0644);
+    printf("file made: %d\n", fd < 0 ? errno : 0);
+    printf("file removed: %d\n", unlink(at("cgroup.max.depth")) == 0 ? 0 : errno);
+    mk("r");
+    char to[256];
+    snprintf(to, sizeof to, "%s/s", top);
+    printf("cgroup renamed: %d\n", syscall(38, -100, at("r"), -100, to, 0) == 0 ? 0 : errno);
+    rmdir(at("r"));
+    put_at("cgroup.max.depth", "7");
+    fd = open(at("cgroup.max.depth"), O_WRONLY | O_TRUNC);
+    close(fd);
+    show("cgroup.max.depth");
+    put_at("cgroup.max.depth", "max");
+    long st[15] = {0};
+    syscall(43, "/sys/fs/cgroup", st);
+    printf("filesystem: %lx\n", st[0]);
+}
+
 int main(void) {
     snprintf(top, sizeof top, "/sys/fs/cgroup/fwe-cgroups-%d", getpid());
     put("/sys/fs/cgroup/cgroup.subtree_control", "+pids");
     mkdir(top, 0755);
     put_at("cgroup.subtree_control", "+pids");
     limits();
+    kernfs();
     pids();
     freeze();
     delegation();

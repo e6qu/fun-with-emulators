@@ -154,6 +154,11 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
     let fd = a[0] as i32;
     let file = desc::of(fd)?;
     let write = matches!(nr, n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2);
+    // A write to a cgroup's interface file acts ([`crate::specialwrite`]),
+    // and is not kept as written.
+    if write && file.fs == crate::cgroupfs::tree_id() {
+        return None;
+    }
     let pos = match nr {
         n::READ | n::WRITE | n::READV | n::WRITEV => None,
         n::PREADV2 | n::PWRITEV2 if a[3] as i64 == -1 => None,
@@ -348,7 +353,13 @@ pub fn ftruncate(fd: i32, len: i64) -> Option<i64> {
         if !access(fd)?.1 {
             return Err(errno::EINVAL);
         }
-        truncate_file(desc::of(fd).ok_or(errno::EBADF)?, len as u64)
+        let file = desc::of(fd).ok_or(errno::EBADF)?;
+        // A cgroup's interface file keeps what it holds: Linux's kernfs
+        // takes a new size and changes nothing.
+        if file.fs == crate::cgroupfs::tree_id() {
+            return Ok(());
+        }
+        truncate_file(file, len as u64)
     })();
     Some(r.map_or_else(err, |()| 0))
 }
@@ -674,8 +685,14 @@ pub fn statfs_file(file: File) -> Result<fwe_abi::Statfs, i32> {
         let (blocks, free) =
             if bytes == 0 { (0, 0) } else { (bytes / bsize, bytes.saturating_sub(used) / bsize) };
         let ffree = if inodes == 0 { 0 } else { inodes.saturating_sub(files) };
+        // The cgroup hierarchy's is a filesystem of its own kind.
+        let kind = if file.fs == crate::cgroupfs::tree_id() {
+            crate::mounts::FsType::Cgroup2
+        } else {
+            crate::mounts::FsType::Tmpfs
+        };
         Ok(fwe_abi::Statfs {
-            f_type: crate::mounts::FsType::Tmpfs.magic(),
+            f_type: kind.magic(),
             f_bsize: bsize as i64,
             f_blocks: blocks,
             f_bfree: free,
@@ -858,6 +875,10 @@ pub fn read_into(fd: i32, buf: &mut [u8], pos: Option<u64>) -> Option<i64> {
 /// (`None` for a descriptor not the store's).
 pub fn write_at_pos(fd: i32, buf: &[u8], pos: Option<u64>) -> Option<i64> {
     let file = desc::of(fd)?;
+    // One to a cgroup's interface file acts.
+    if file.fs == crate::cgroupfs::tree_id() {
+        return crate::cgroupfs::try_write(fd, buf, buf.len() as u64);
+    }
     let iov = libc::iovec { iov_base: buf.as_ptr() as *mut _, iov_len: buf.len() };
     Some(transfer(fd, file, &[iov], pos, true, false).map_or_else(err, |n| n as i64))
 }
