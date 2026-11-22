@@ -40,6 +40,13 @@
  *                        (MIT-SHM's ShmPutImage), each waited for,
  *                        microseconds each for the drawing (the writing of
  *                        the pixels, the compiler's loop, not counted)
+ *   bench ipc OP N       N rounds of OP, nanoseconds each: `sem` (a System
+ *                        V semaphore raised and lowered), `msg` (a message
+ *                        of 64 bytes sent and received), `shm` (a segment of
+ *                        64 KiB made, attached, written, detached and
+ *                        removed), and on Linux `eventfd` (written and
+ *                        read) and `futex` (a process-shared wake, none
+ *                        waiting, on memory mapped shared)
  *   bench exit           returns at once (for startup time)
  */
 #include <fcntl.h>
@@ -54,6 +61,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/msg.h>
+#include <sys/sem.h>
 #include <sys/shm.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -63,6 +72,10 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef __linux__
+#include <linux/futex.h>
+#include <sys/eventfd.h>
+#endif
 
 static double now_ns(void) {
     struct timespec ts;
@@ -446,6 +459,78 @@ static double x11(const char *what, long n) {
     return us;
 }
 
+/* `bench ipc OP N`: nanoseconds a round, or -1 if OP failed or is not
+   offered here. */
+static double ipc(const char *op, long n) {
+    double start;
+    if (strcmp(op, "sem") == 0) {
+        int id = semget(IPC_PRIVATE, 1, IPC_CREAT | 0600);
+        if (id < 0) return -1;
+        struct sembuf up = {0, 1, 0}, down = {0, -1, 0};
+        start = now_ns();
+        for (long i = 0; i < n; i++)
+            if (semop(id, &up, 1) != 0 || semop(id, &down, 1) != 0) {
+                semctl(id, 0, IPC_RMID);
+                return -1;
+            }
+        double each = (now_ns() - start) / n;
+        semctl(id, 0, IPC_RMID);
+        return each;
+    }
+    if (strcmp(op, "msg") == 0) {
+        int id = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+        if (id < 0) return -1;
+        struct { long type; char text[64]; } m = {1, {0}};
+        start = now_ns();
+        for (long i = 0; i < n; i++)
+            if (msgsnd(id, &m, sizeof m.text, 0) != 0 ||
+                msgrcv(id, &m, sizeof m.text, 0, 0) != (ssize_t)sizeof m.text) {
+                msgctl(id, IPC_RMID, NULL);
+                return -1;
+            }
+        double each = (now_ns() - start) / n;
+        msgctl(id, IPC_RMID, NULL);
+        return each;
+    }
+    if (strcmp(op, "shm") == 0) {
+        start = now_ns();
+        for (long i = 0; i < n; i++) {
+            int id = shmget(IPC_PRIVATE, 65536, IPC_CREAT | 0600);
+            if (id < 0) return -1;
+            volatile char *p = shmat(id, NULL, 0);
+            if (p == (void *)-1) return -1;
+            p[0] = (char)i;
+            shmdt((void *)p);
+            shmctl(id, IPC_RMID, NULL);
+        }
+        return (now_ns() - start) / n;
+    }
+#ifdef __linux__
+    if (strcmp(op, "eventfd") == 0) {
+        int fd = eventfd(0, 0);
+        if (fd < 0) return -1;
+        uint64_t v = 1;
+        start = now_ns();
+        for (long i = 0; i < n; i++)
+            if (write(fd, &v, 8) != 8 || read(fd, &v, 8) != 8) return -1;
+        double each = (now_ns() - start) / n;
+        close(fd);
+        return each;
+    }
+    if (strcmp(op, "futex") == 0) {
+        int *w = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+        if (w == MAP_FAILED) return -1;
+        start = now_ns();
+        for (long i = 0; i < n; i++)
+            if (syscall(SYS_futex, w, FUTEX_WAKE, 1, NULL, NULL, 0) < 0) return -1;
+        double each = (now_ns() - start) / n;
+        munmap(w, 4096);
+        return each;
+    }
+#endif
+    return -1;
+}
+
 /* A fault's handler: on past the faulting load. */
 static void step_past(int sig, siginfo_t *si, void *ctx) {
     (void)sig;
@@ -584,6 +669,13 @@ int main(int argc, char **argv) {
         printf("%.1f\n", (now_ns() - start) / n);
         close(fd);
         unlink(path);
+    } else if (strcmp(argv[1], "ipc") == 0) {
+        double each = ipc(argv[2], argc > 3 ? atol(argv[3]) : 1000);
+        if (each < 0) {
+            fprintf(stderr, "ipc %s: failed, or not offered here\n", argv[2]);
+            return 1;
+        }
+        printf("%.1f\n", each);
     } else if (strcmp(argv[1], "x11") == 0) {
         double each = x11(argv[2], argc > 3 ? atol(argv[3]) : 1000);
         if (each < 0) {

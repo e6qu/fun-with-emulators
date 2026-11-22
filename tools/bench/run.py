@@ -156,6 +156,21 @@ MICRO = [
     # request waited for, and a window's frame drawn through shared memory.
     ("X request round trip", ["x11", "rtt", "20000"], "us"),
     ("X frame through shared memory", ["x11", "shm", "300"], "us"),
+    # System V IPC, which programs that share memory between processes use
+    # (databases, X's MIT-SHM): a semaphore raised and lowered, a message
+    # sent and received, a segment's life (made, attached, written,
+    # detached, removed).
+    ("System V semaphore up+down", ["ipc", "sem", "10000"], "ns"),
+    ("System V message send+receive", ["ipc", "msg", "10000"], "ns"),
+    ("System V segment made and removed", ["ipc", "shm", "1000"], "ns"),
+]
+
+# Micro-benchmarks of what macOS has no counterpart of: under fwe and on
+# Linux only.
+MICRO_LINUX = [
+    ("eventfd write+read", ["ipc", "eventfd", "200000"], "ns"),
+    # A wake of a futex in memory processes share, no one waiting.
+    ("shared futex wake", ["ipc", "futex", "200000"], "ns"),
 ]
 
 
@@ -194,6 +209,11 @@ BUDGETS = {
     # A graphical program's calls to its X server, as a system call is.
     "X request round trip (us)": 1.5,
     "X frame through shared memory (us)": 1.5,
+    # Kernel state every process shares, kept in memory as a kernel keeps
+    # it (ROADMAP.md M6 PR 2).
+    "System V semaphore up+down (ns)": 3.0,
+    "System V message send+receive (ns)": 3.0,
+    "System V segment made and removed (ns)": 1.5,
 }
 
 # The most fwe's figure may be, in the row's own unit: making a
@@ -378,7 +398,7 @@ def startup_ms(cmd, n=30):
 def micro(prefix, bench):
     """The micro-benchmarks, with `prefix` (fwe and its options, or none)."""
     r = {"startup (ms)": startup_ms(prefix + [bench, "exit"])}
-    for name, args, unit in MICRO:
+    for name, args, unit in MICRO + MICRO_LINUX:
         r[f"{name} ({unit})"] = best(lambda: run_bench(prefix, bench, args))
     # fork + exec of the benchmark itself (under fwe without a root, the
     # guest sees host paths).
@@ -410,6 +430,12 @@ def micro_pair(fwe, guest, native):
     ours, theirs = {}, {}
     for name, f in runs:
         ours[name], theirs[name] = pair(name, lambda: f(fwe, guest), lambda: f([], native))
+    # What macOS has no counterpart of, under fwe alone.
+    for name, args, unit in MICRO_LINUX:
+        took = [run_bench(fwe, guest, args) for _ in range(MICRO_ROUNDS)]
+        print(f"{name} ({unit}): rounds under fwe " + ", ".join(f"{t:.4g}" for t in took),
+              file=sys.stderr)
+        ours[f"{name} ({unit})"] = min(took)
     return ours, theirs
 
 
