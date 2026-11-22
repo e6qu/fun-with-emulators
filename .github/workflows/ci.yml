@@ -409,27 +409,19 @@ jobs:
         if: steps.ltp-cache.outputs.cache-hit != 'true'
         run: tools/ltp/build.sh target/ltp
       - run: cargo build
-      - name: lstat03 under load, traced, with fs_usage watching
+      - name: lstat03 in .noindex work directories, with fs_usage watching
         run: |
           sudo fs_usage -w -f filesys > "$RUNNER_TEMP/fsu.txt" 2>&1 &
           F=$!
           sleep 3
-          R=$PWD/target/ltp/root
-          one() {
-            t=$(mktemp -d "$R/tmp/l03.XXXX"); chmod 1777 "$t"; g=/${t#$R/}
-            env -i PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=$g LTPROOT=/opt/ltp \
-              LTP_COLORIZE_OUTPUT=0 LTP_DEV_FS_TYPE=tmpfs LTP_TIMEOUT_MUL=8 HOME=$g LANG=C \
-              target/debug/fwe --strace --strace-file="$t.trace" --root "$R" "$R/opt/ltp/testcases/bin/lstat03" > "$t.out" 2>&1
-            if grep -q "TFAIL" "$t.out"; then echo "FAIL $t"; else echo "pass $t"; fi
-          }
-          for k in 1 2 3; do one & one & one & wait; done | tee "$RUNNER_TEMP/runs.txt"
+          for k in 1 2 3; do
+            python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
+              --jobs 2 --only '^lstat03' --show 2>&1 | grep -E "\] lstat03|st_atime" || true
+          done
           sudo kill -INT $F; sleep 2
-          python3 tools/probe/window.py "$RUNNER_TEMP/fsu.txt" | head -150
-          f=$(grep -m1 FAIL "$RUNNER_TEMP/runs.txt" | cut -d' ' -f2)
-          if [ -n "$f" ]; then
-            cat "$f.out"
-            grep -n -E "file\.txt|file_symlink|utimensat|nanosleep|clock_nanosleep|read|lstat|fstatat|statx|mount|fork|clone|wait" "$f.trace" | head -150
-          fi
+          echo "Spotlight's calls on the tests' files:"
+          grep -E "fwe-ltp" "$RUNNER_TEMP/fsu.txt" | grep -E "mds|mdworker" | wc -l
+          grep -E "fwe-ltp" "$RUNNER_TEMP/fsu.txt" | grep -E "mds|mdworker" | head -5
 
   ltp:
     name: LTP system calls (macos-26)
