@@ -97,9 +97,8 @@ pub fn add_seals(fd: i32, add: u64) -> i64 {
     if add & !(ALL_SEALS as u64) != 0 {
         return err(errno::EINVAL);
     }
-    if ANY_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed)
-        && READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)
-    {
+    // Sealing needs a descriptor open for writing.
+    if crate::fdmarks::read_only(fd) {
         return err(errno::EPERM);
     }
     match imp::add_seals(fd, add as u32) {
@@ -126,25 +125,6 @@ pub fn check_resize(fd: i32, len: i64) -> Result<(), i32> {
     let refused = (len < size && seals & fcntl::F_SEAL_SHRINK != 0)
         || (len > size && seals & fcntl::F_SEAL_GROW != 0);
     if refused { Err(errno::EPERM) } else { Ok(()) }
-}
-
-/// Memfd descriptors opened read-only again (through `/proc/self/fd`),
-/// which the host made sharing a writable description: no seals through
-/// them, as Linux's need one open for writing. With whether any is.
-pub(crate) static READ_ONLY: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
-static ANY_READ_ONLY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// Memfd descriptor `fd` was opened again read-only.
-pub fn reopened_read_only(fd: i32) {
-    READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).push(fd);
-    ANY_READ_ONLY.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Descriptor `fd` was closed.
-pub fn closed(fd: i32) {
-    if ANY_READ_ONLY.load(std::sync::atomic::Ordering::Relaxed) {
-        READ_ONLY.lock().unwrap_or_else(|e| e.into_inner()).retain(|&f| f != fd);
-    }
 }
 
 /// Whether a memfd of this process was sealed against growing (until then

@@ -187,7 +187,8 @@ and `fork`.
   to 4 GiB), with a guard page, and ends at `loader::STACK_TOP`, near the
   top of the host's 47 bits, above the image as on Linux.
 - `execve` of a script runs its `#!` interpreter (`Kernel::exec_target`)
-  in either backend, so no shell is needed.
+  in either backend, so no shell is needed; so does a script given to
+  fwe itself (`script_target`), its interpreter found in the root.
 - The auxiliary vector's ids and `AT_SECURE` are the guest's, as the
   exec leaves them (`AuxIds`): the kernel computes them before an
   in-place `execve` loads the program, and a re-executed fwe reads them
@@ -248,6 +249,20 @@ The pieces:
   - large data (a heap, an arena) fills upwards with the rest: adjacent
     mappings are one host region, and a host fork's cost grows with the
     regions.
+- A Linux program may keep `sp` off 16-byte alignment while it addresses
+  memory through other registers (pixman's NEON functions do), and the
+  host's alignment check faults any access through such an `sp`. Where
+  the access is fwe's (a stub's or call stub's push or pop, a
+  translation's save of `x16` and `x17`), and the program's own
+  instruction there is not addressed through `sp`, the fault handler
+  makes it as the host copies and goes on past it, with those right
+  after it (`unaligned_sp_access` in `crates/native/src/trap.rs`,
+  decoded by `rewrite::sp_access`): a stub's pushes cost one fault, its
+  pops another. A flush stub's call into the gate, which works below the
+  program's `sp`, is replaced by the flush made in the handler
+  (`unaligned_flush`); a system call's stub takes the trap. The exit
+  gate saves through `x17`, not `sp`. The program's own access through
+  such an `sp` is a `SIGBUS` (`BUS_ADRALN`) at `sp`, as on Linux.
 - The stub for an instruction writing `sp` from `x18` sets `sp` before it
   reloads its two scratch registers from below the old `sp`; a signal
   delivered on those loads has them done first (`finish_sp_stub` in
@@ -964,7 +979,13 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   `/memfd:<name> (deleted)`; `F_SEAL_SHRINK`/`GROW` are checked by
   `ftruncate` and `fallocate`, `F_SEAL_EXEC` by `fchmod`; after
   `F_SEAL_WRITE` the host refuses writes and writable shared mappings,
-  reported as `EPERM`.
+  reported as `EPERM`. Opened again read-only through `/proc/self/fd`, it
+  is the same host description with a mark (`fdmarks::Mark::ReadOnly`)
+  that makes it read-only as Linux's new description is, and travels with
+  it through `fork`, `execve` and `SCM_RIGHTS`. A mapping of a file with no
+  name holds a descriptor of it (`maps::HeldFile`), so `mremap` and
+  `remap_file_pages` map more of it as Linux's mapping, which holds its
+  file, does.
 - **Programs run from a descriptor** (`execveat(fd, "", AT_EMPTY_PATH)`,
   `/dev/fd/N`, a `/proc/self/fd` path, as crun runs its sealed copy) are
   read through it; fwe keeps a descriptor of the program, which
@@ -1248,9 +1269,24 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   unreachable while the message is on its way.
 - Netlink (`crates/kernel/src/netlink.rs`): the guest's descriptor is one
   end of a host datagram pair; fwe writes each reply to the other.
-  `RTM_NEWLINK` needs `CAP_NET_ADMIN`. A socket's `SOL_NETLINK` options
+  `RTM_NEWLINK` and `RTM_NEWADDR` need `CAP_NET_ADMIN`. A socket's `SOL_NETLINK` options
   and the groups it joins are kept with it, and travel with it across
   `fork`, `execve` and `SCM_RIGHTS`.
+- The X display (`crates/kernel/src/x11.rs`): the display fwe's own
+  `DISPLAY` names (Xvfb's or Xorg's `/tmp/.X11-unix/XN`, or XQuartz's
+  launchd socket) is the guest's display `N`, which a guest `connect` to
+  `/tmp/.X11-unix/XN` or to the abstract name libxcb tries first reaches
+  (`net::root_unix_path`); the guest's `DISPLAY` is `:N`. Every other
+  display is the guest's own, in its root (an Xwayland a guest compositor
+  runs). On a connection to the host's display fwe follows the client's
+  bytes as it writes them: the setup (its authorization), then each
+  request's header and length. A `ShmAttach` names a System V segment,
+  which the server would look up among the host's; fwe's are files of its
+  own, so it is sent as `ShmAttachFd` with the segment's file, which the
+  server maps as the guest has it. Whether the server takes descriptors
+  (MIT-SHM 1.2) fwe asks it once, on a connection of its own with the
+  client's authorization; a server that does not gets the `ShmAttach` as
+  it was.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
   rootfs (`fwe --pull` writes the host's name servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
@@ -1314,7 +1350,9 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   (`ELOOP`); `noatime`, `nodiratime` and `strictatime` set a read file's
   access time as Linux would, its change time left alone
   (`crates/kernel/src/atime.rs`), `relatime`
-  is left to the host.
+  is left to the host, whose own programs' reads set access times too
+  (Spotlight indexes a file soon after it is written, outside a
+  `*.noindex` directory).
 - **Busy mounts and roots:** a mount is busy while something is mounted
   under it, the caller's working directory or root is in it, or a file
   opened through it is open in this process or (by host path) in another
@@ -1484,6 +1522,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   forms fault (`SIGILL`). A binary with neither section headers nor an
   unwind table has its whole executable segment taken as code, and an
   inline jump table in code the unwind table covers could be patched.
+- Native: a program reading its own code where fwe rewrote it (a system
+  call, a thread-pointer access, a use of `x18`) reads fwe's branch to
+  the stub, not its instruction; code it copies from there runs that
+  branch.
 
 **Processes**
 - A process may hold descriptors below 16384 only: root may raise
@@ -1574,6 +1616,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   `MADV_DONTNEED` on a private file mapping keeps modified pages where
   Linux restores the file's.
 - VM: a program's main stack is 8 MiB whatever its `RLIMIT_STACK`.
+- VM: the guest's address space is 1 TiB (40 bits; Linux gives 256 TiB),
+  so a program linked past it is refused, and mappings stay below it.
 - Native: `PR_PAC_RESET_KEYS` fails with `EINVAL`: guest code runs with
   the host process's pointer-authentication keys, which macOS sets and no
   process may change.
@@ -1662,7 +1706,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - memfd: `F_SEAL_GROW` does not stop a `writev` or `pwritev` past the end
   (`write` and `pwrite64` are checked); `F_SEAL_WRITE` does not reach
   another process's descriptors and changes the inode number; a memfd
-  reopened through `/proc/self/fd` shares the original's offset.
+  reopened through `/proc/self/fd` shares the original's offset and status
+  flags.
 - `tee` needs a write end of its input pipe (`EINVAL` otherwise); without
   one, `splice` from a pipe to a file or waiting socket that a signal or
   error cuts short loses what it took and did not write.
@@ -1810,6 +1855,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   can leave an identical event unmerged, or merge one with an event
   already read; a process started before anything was watched notices the
   first watch within a second.
+
+**Displays**
+- Only the display fwe's own `DISPLAY` names is the host's: another
+  display number a guest names is looked for in its root. A server
+  without MIT-SHM 1.2 sees a guest's `ShmAttach` name a segment it cannot
+  find, and the client draws without shared memory if it can.
+- No GPU: OpenGL is Mesa's software renderer, and Wayland programs need a
+  compositor run in the guest (Weston, drawing on the X display).
 
 **IPC and keys**
 - System V: `SHM_INFO` reports no resident pages; a segment stays

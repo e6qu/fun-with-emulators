@@ -189,10 +189,14 @@ impl<P: Pool> PageTables<P> {
     }
 
     /// Map `[va, va + len)` to `[ipa, ipa + len)` with `p`, replacing what
-    /// was there. `p.none()` unmaps instead. Fails if the pool is full.
+    /// was there. `p.none()` unmaps instead. Fails if the pool is full, or
+    /// for a range past [`VA_LIMIT`], which the walks never reach.
     pub fn map(&mut self, va: u64, len: u64, ipa: u64, p: Perms) -> Result<Change, ()> {
         if p.none() {
             return Ok(self.unmap(va, len));
+        }
+        if va.checked_add(len).is_none_or(|end| end > VA_LIMIT) {
+            return Err(());
         }
         let mut change = Change::default();
         let mut at = va;
@@ -289,6 +293,9 @@ impl<P: Pool> PageTables<P> {
 
     /// What `va` translates to, as the hardware would walk it.
     pub fn translate(&self, va: u64) -> Option<(u64, Perms)> {
+        if va >= VA_LIMIT {
+            return None;
+        }
         let mut table = self.root;
         for level in 0..3 {
             let d = self.read(table, Self::index(va, level));
@@ -370,6 +377,11 @@ mod tests {
         // A page at the top of the 40-bit space.
         let _ = t.map(VA_LIMIT - PAGE, PAGE, 0x2000_0000, RW).unwrap();
         assert_eq!(t.translate(VA_LIMIT - 8), Some((0x2000_0ff8, RW)));
+        // Past the limit, which the hardware never walks to: refused, and
+        // nothing there.
+        assert!(t.map(VA_LIMIT, PAGE, 0x2000_0000, RW).is_err());
+        assert!(t.map(VA_LIMIT - PAGE, 2 * PAGE, 0x2000_0000, RW).is_err());
+        assert_eq!(t.translate(VA_LIMIT + 0x10158), None);
     }
 
     #[test]

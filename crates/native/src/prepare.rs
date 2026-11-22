@@ -15,7 +15,7 @@ const STUB_TAG: i32 = 241 << 24;
 const STUB_TAG: i32 = -1;
 
 /// Statistics of one preparation.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct Prepared {
     pub syscalls: usize,
     pub stubs: usize,
@@ -23,6 +23,11 @@ pub struct Prepared {
     /// (the forms [`crate::decode`] does not cover). Non-zero means the code
     /// can misbehave under preemption; reported under `--strace`.
     pub x18_deferred: usize,
+    /// Host pages (address, length) of a loaded image holding sites no
+    /// stub space reaches: the middle of an image larger than a branch
+    /// reaches across, all of it the image's own. Their code is to run by
+    /// translation ([`crate::jit::code`]); their other sites have stubs.
+    pub beyond: Vec<(u64, u64)>,
 }
 
 /// No stub region could be placed within branch range of some sites.
@@ -65,6 +70,12 @@ impl StubArena {
             self.front_end = at;
             at
         })
+    }
+
+    /// Whether `[lo, hi)` lies within the arena's reservation (from before
+    /// the image to after it).
+    fn covers(&self, lo: u64, hi: u64) -> bool {
+        self.front_start <= lo && hi <= self.end
     }
 }
 
@@ -282,22 +293,35 @@ pub fn stub_region(pc: u64) -> Option<(u64, u64)> {
     (pc < end).then_some((start, end))
 }
 
+/// Whether `pc` is in a region of call stubs ([`call_stub`]), which are
+/// packed one after another rather than in slots.
+pub fn in_call_stubs(pc: u64) -> bool {
+    CALL_STUBS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .any(|&(s, e, _)| (s..e).contains(&pc))
+}
+
+/// The stub slot `pc` is in, if any: its start and its words. A call
+/// stub has none ([`in_call_stubs`]).
+pub fn stub_slot(pc: u64) -> Option<(u64, &'static [u32])> {
+    if in_call_stubs(pc) {
+        return None;
+    }
+    let (start, _) = stub_region(pc)?;
+    let slot = (STUB_WORDS * 4) as u64;
+    let stub = start + (pc - start) / slot * slot;
+    // SAFETY: a slot of a stub region, mapped and readable while fwe runs
+    // (stub regions are never unmapped).
+    Some((stub, unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) }))
+}
+
 /// A fault at `pc` with the stack at `sp`, as if at the site of the stub
 /// `pc` is in, if it is in one ([`rewrite::rewind`]): the program's own
 /// instruction faulted, and its handler sees it there, with its registers.
 pub fn rewind_fault(pc: u64, sp: u64) -> Option<rewrite::Rewound> {
-    let (start, end) = {
-        let regions = STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner());
-        let (&start, &end) = regions.range(..=pc).next_back()?;
-        (start, end)
-    };
-    if pc >= end {
-        return None;
-    }
-    let slot = (STUB_WORDS * 4) as u64;
-    let stub = start + (pc - start) / slot * slot;
-    // SAFETY: a slot of a stub region, mapped and readable.
-    let words = unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) };
+    let (stub, words) = stub_slot(pc)?;
     rewrite::rewind(words, stub, pc, sp, |off| {
         // SAFETY: the stack the stub pushed to, below which it faulted.
         Some(unsafe { ((sp + off) as *const u64).read() })
@@ -470,13 +494,33 @@ pub unsafe fn prepare(
             _ => Some((off, site)),
         })
         .collect();
-    let mut stats =
-        Prepared { syscalls: patched.syscalls, stubs: 0, x18_deferred: patched.x18_deferred };
+    let mut stats = Prepared {
+        syscalls: patched.syscalls,
+        x18_deferred: patched.x18_deferred,
+        ..Prepared::default()
+    };
 
     let mut sites = all.as_slice();
+    let mut beyond = Vec::new();
     while let Some(&(first, _)) = sites.first() {
         let n = sites.iter().take_while(|(off, _)| off - first < GROUP_SPAN).count();
         let (group, rest) = sites.split_at(n);
+        if let Some(arena) = arena.as_deref_mut() {
+            // SAFETY: the sites lie inside the caller's range.
+            stats.stubs += unsafe {
+                place_in_image(
+                    start,
+                    group,
+                    (slot, x18_slot),
+                    page,
+                    (start, start + len),
+                    arena,
+                    &mut beyond,
+                )
+            };
+            sites = rest;
+            continue;
+        }
         // SAFETY: the sites lie inside the caller's range.
         let placed = unsafe {
             redirect(
@@ -485,7 +529,7 @@ pub unsafe fn prepare(
                 (slot, x18_slot),
                 page,
                 (start, start + len),
-                arena.as_deref_mut(),
+                None,
                 defer.as_mut(),
             )
         };
@@ -511,7 +555,7 @@ pub unsafe fn prepare(
                             (slot, x18_slot),
                             page,
                             (start, start + len),
-                            arena.as_deref_mut(),
+                            None,
                             defer.as_mut(),
                         )
                     }?;
@@ -520,6 +564,16 @@ pub unsafe fn prepare(
             }
         }
         sites = rest;
+    }
+    // The host pages of the sites beyond reach, runs of them together.
+    let host_page = fwe_kernel::mm::host_page_size();
+    for at in beyond {
+        let p = (start + at) & !(host_page - 1);
+        match stats.beyond.last_mut() {
+            Some((a, l)) if *a + *l >= p + host_page => {}
+            Some((a, l)) if *a + *l == p => *l += host_page,
+            _ => stats.beyond.push((p, host_page)),
+        }
     }
     if let Some(d) = defer {
         // The pages earlier runs wrote as they first ran are written now,
@@ -592,6 +646,42 @@ unsafe fn flush_pages(addrs: impl IntoIterator<Item = u64>) {
     }
 }
 
+/// Stubs for `group` (offsets from `base`) of a loaded image's code, whose
+/// arena is `arena`: the number placed. A group no stub space reaches as a
+/// whole is halved until its parts are placed; a site no stub space
+/// reaches alone (in the middle of an image larger than a branch reaches
+/// across) is a system call that keeps its trap, or goes into `beyond`
+/// (its offset), its code to run by translation.
+///
+/// # Safety
+/// As [`redirect`]'s.
+unsafe fn place_in_image(
+    base: u64,
+    group: &[(u64, Site)],
+    slots: (u32, u32),
+    page: u64,
+    near: (u64, u64),
+    arena: &mut StubArena,
+    beyond: &mut Vec<u64>,
+) -> usize {
+    // SAFETY: the caller's guarantee.
+    if unsafe { redirect(base, group, slots, page, near, Some(arena), None) }.is_ok() {
+        return group.len();
+    }
+    if let [(off, site)] = group {
+        if !matches!(site, Site::Syscall { .. }) {
+            beyond.push(*off);
+        }
+        return 0;
+    }
+    let (a, b) = group.split_at(group.len() / 2);
+    // SAFETY: as above.
+    unsafe {
+        place_in_image(base, a, slots, page, near, arena, beyond)
+            + place_in_image(base, b, slots, page, near, arena, beyond)
+    }
+}
+
 /// Write stubs for `group` (offsets from `base`) into a new region near
 /// `[lo, hi)` and point each site at its stub.
 ///
@@ -615,8 +705,22 @@ unsafe fn redirect(
     let size = used + page;
     let reachable =
         |region: u64| region + size <= first + BRANCH_RANGE && region + BRANCH_RANGE > last + size;
-    let region = match arena.and_then(|a| a.take(size, reachable)) {
-        Some(r) => r,
+    let region = match arena {
+        Some(a) => match a.take(size, reachable) {
+            Some(r) => r,
+            // Every place in reach is in the arena's reservation, the
+            // image's own or stubs' already: no room.
+            None if a.covers(
+                (last + size + 1).saturating_sub(BRANCH_RANGE),
+                (first + BRANCH_RANGE).saturating_sub(size) + size,
+            ) =>
+            {
+                let last_error = String::from("in reach is only the image itself");
+                return Err(NoStubSpace { near: first, last_error });
+            }
+            None => find_region(size, page, lo, hi, reachable)
+                .map_err(|last_error| NoStubSpace { near: first, last_error })?,
+        },
         None => find_region(size, page, lo, hi, reachable)
             .map_err(|last_error| NoStubSpace { near: first, last_error })?,
     };
@@ -924,15 +1028,27 @@ pub fn map_image(
 
 /// The loader's image of a program (see [`crate::loader::load`]): its runs
 /// of pages `runs` (address and length), loaded from `base` with the stub
-/// arena `arena` as its stubs left it, kept under `key` once prepared.
+/// arena `arena` as its stubs left it and its code `translated` to run by
+/// translation, kept under `key` once prepared.
 ///
 /// # Safety
 /// The runs must be readable memory.
-pub unsafe fn keep_load_image(key: &[u8], base: u64, runs: &[(u64, u64)], arena: &StubArena) {
+pub unsafe fn keep_load_image(
+    key: &[u8],
+    base: u64,
+    runs: &[(u64, u64)],
+    arena: &StubArena,
+    translated: &[(u64, u64)],
+) {
     let Some(regions) = image_regions() else { return };
     let mut e = fwe_kernel::snapshot::Enc::new();
     e.u64(arena.next - base);
     e.u64(arena.front_end.wrapping_sub(base));
+    e.u64(translated.len() as u64);
+    for &(at, len) in translated {
+        e.u64(at - base);
+        e.u64(len);
+    }
     put_regions(&mut e, &regions, base);
     let mut image = Vec::with_capacity(runs.iter().map(|r| r.1 as usize).sum());
     for &(at, len) in runs {
@@ -944,25 +1060,36 @@ pub unsafe fn keep_load_image(key: &[u8], base: u64, runs: &[(u64, u64)], arena:
     fwe_kernel::prepcache::store_image(key, &e.into_bytes(), &image);
 }
 
+/// Where a kept image's stubs left its arenas ([`map_load_image`]).
+pub struct MappedImage {
+    /// The arena's next free place after the image.
+    pub arena_next: u64,
+    /// The end of what is free of the arena before the image.
+    pub front_end: u64,
+    /// Its code that runs by translation.
+    pub translated: Vec<(u64, u64)>,
+}
+
 /// Map the loader's image kept under `key`, loaded from `base`, over runs
 /// `runs` of fwe's own reservation `[start, end)` (mapped writable), with
 /// its stubs where they were (in the reservation's arenas, or, where they
 /// ran out, wherever nothing is): the arenas' next free places (after the
-/// image, and the end of what is free before it), or `None` if there is
-/// no such image or a place is taken (the runs may then hold some of it,
-/// to be written over).
+/// image, and the end of what is free before it) and the code to run by
+/// translation, or `None` if there is no such image or a place is taken
+/// (the runs may then hold some of it, to be written over).
 pub fn map_load_image(
     key: &[u8],
     base: u64,
     (start, end): (u64, u64),
     runs: &[(u64, u64)],
     slots: (u32, u32),
-) -> Option<(u64, u64)> {
+) -> Option<MappedImage> {
     let total = runs.iter().map(|r| r.1).sum();
     let (layout, file) = fwe_kernel::prepcache::open_image(key, total)?;
     let mut d = fwe_kernel::snapshot::Dec::new(&layout);
     let arena_next = base + d.u64();
     let front_end = base.wrapping_add(d.u64());
+    let translated: Vec<(u64, u64)> = (0..d.count(16)).map(|_| (base + d.u64(), d.u64())).collect();
     let regions = get_regions(&mut d, base)?;
     d.finish().ok()?;
     let mut offset = 0;
@@ -983,7 +1110,7 @@ pub fn map_load_image(
         }
     }
     finish_regions(&regions);
-    Some((arena_next, front_end))
+    Some(MappedImage { arena_next, front_end, translated })
 }
 
 /// Reserve `size` bytes near `[lo, hi)` satisfying `reachable`.
@@ -1121,7 +1248,7 @@ mod tests {
         // The system call has a stub where there is a gate to call.
         let gate = crate::syscall_gate();
         let stubs = if gate == 0 { 2 } else { 3 };
-        assert_eq!(stats, Prepared { syscalls: 1, stubs, x18_deferred: 0 });
+        assert_eq!(stats, Prepared { syscalls: 1, stubs, ..Prepared::default() });
         // SAFETY: reading the rewritten code.
         let read = |a: u64| unsafe { (a as *const u32).read() };
         let stub_of = |site: u64| {

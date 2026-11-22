@@ -3,9 +3,9 @@
 //! records of its namespaces (which keep them from being collected, see
 //! [`crate::shared::collect`]), and its line of ancestors and whether it
 //! is a child subreaper (who takes its children if it ends, see
-//! [`crate::reaper`]). A file per host pid in fwe's private directory, with
-//! the process's start time, so the record of a process that has gone is
-//! never taken for a new one with its pid.
+//! [`crate::reaper`]). One for each host pid, in the process store's memory
+//! ([`crate::procstore`]), with the process's start time, so the record of
+//! a process that has gone is never taken for a new one with its pid.
 //!
 //! A process that ends where a reaper might adopt it leaves an [`Ended`]
 //! record of how it ended, which its parent's `wait` removes, or else the

@@ -400,8 +400,11 @@ core::arch::global_asm!(
     ".globl _fwe_exit_gate",
     "_fwe_exit_gate:",
     // x16: the way out's address; the program's x16 and x17 in their
-    // slots. x0 and x1 go below sp, two scratch registers.
-    "stp x0, x1, [sp, #-16]!",
+    // slots. x0 and x1 go below sp, two scratch registers, through x17
+    // (free here): the program may keep sp off 16-byte alignment, where
+    // an access through sp faults.
+    "sub x17, sp, #16",
+    "stp x0, x1, [x17]",
     "mrs x0, tpidrro_el0",
     "and x0, x0, #0xfffffffffffffff8",
     "adrp x1, _FWE_GATE_SLOT@PAGE",
@@ -421,7 +424,7 @@ core::arch::global_asm!(
     "stp x26, x27, [x0, #208]",
     "stp x28, x29, [x0, #224]",
     "str x30, [x0, #240]",
-    "ldp x2, x3, [sp]",
+    "ldp x2, x3, [x17]",
     "stp x2, x3, [x0, #0]",
     "mrs x2, tpidrro_el0",
     "and x2, x2, #0xfffffffffffffff8",
@@ -432,8 +435,8 @@ core::arch::global_asm!(
     "ldr x3, [x3, _FWE_PARK17@PAGEOFF]",
     "ldr x5, [x2, x3]",
     "stp x4, x5, [x0, #128]",
-    // The program's sp, above what was saved, and its pc: the way out.
-    "add x2, sp, #16",
+    // The program's sp and its pc: the way out.
+    "mov x2, sp",
     "str x2, [x0, #248]",
     "str x16, [x0, #256]",
     "mrs x2, nzcv",

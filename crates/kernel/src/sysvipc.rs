@@ -891,6 +891,11 @@ impl Ipc {
         self.index().used[kind as usize % 3].0
     }
 
+    /// Whether [`Ipc::reap`] has something to do.
+    pub fn needs_reap(&self) -> bool {
+        self.index().holders.iter().any(|k| self.objs.get(k).is_some_and(stale))
+    }
+
     /// What processes that have gone left: their attachments and undo
     /// adjustments (applied, as Linux applies them as a process ends), and
     /// a segment marked for removal whose last attachment that was.
@@ -900,19 +905,7 @@ impl Ipc {
         // Only objects that name processes, or are marked for removal.
         let holders: Vec<(u8, i32)> = self.index().holders.iter().copied().collect();
         for k in holders {
-            let Some(o) = self.objs.get(&k) else { continue };
-            let stale = match &o.body {
-                Body::Shm(s) => {
-                    (o.removed && s.attached.is_empty())
-                        || s.attached.iter().any(|&(p, _)| !alive(p))
-                }
-                Body::Sem(s) => {
-                    s.waiting.iter().any(|&(p, _, _)| !alive(p))
-                        || s.undo.iter().any(|(p, _)| !alive(*p))
-                }
-                Body::Msg(_) => false,
-            };
-            let Some(o) = self.objs.get_mut(&k).filter(|_| stale) else { continue };
+            let Some(o) = self.objs.get_mut(&k).filter(|o| stale(o)) else { continue };
             match &mut o.body {
                 Body::Shm(s) => {
                     s.attached.retain(|&(p, _)| alive(p));
@@ -939,6 +932,20 @@ impl Ipc {
             changed = true;
         }
         changed
+    }
+}
+
+/// Whether object `o` names a process that has gone, or is a segment
+/// marked for removal with nothing attached.
+fn stale(o: &Obj) -> bool {
+    match &o.body {
+        Body::Shm(s) => {
+            (o.removed && s.attached.is_empty()) || s.attached.iter().any(|&(p, _)| !alive(p))
+        }
+        Body::Sem(s) => {
+            s.waiting.iter().any(|&(p, _, _)| !alive(p)) || s.undo.iter().any(|(p, _)| !alive(*p))
+        }
+        Body::Msg(_) => false,
     }
 }
 

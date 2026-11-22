@@ -226,30 +226,13 @@ jobs:
             target/tmp/wine-traces
             target/tmp/samples
 
-  # Linux's graphical programs on the host's display: X clients of fwe's
-  # tests against a headless X server (Homebrew's Xvfb, `XVFB`).
+  # Linux's graphical programs on the host's display, against a headless X
+  # server (Homebrew's Xvfb, `XVFB`): an X client of fwe's tests, and
+  # fetched roots' programs (FWE_DISPLAY_TESTS, not on a development
+  # machine), Wine's in the VM, driven with xdotool and checked by what
+  # they draw (libX11, `LIBX11`, takes the screenshots).
   display:
     name: Display (macos-26)
-    runs-on: macos-26
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - run: brew install xorg-server
-      - name: The display tests
-        run: |
-          export XVFB="$(brew --prefix)/bin/Xvfb"
-          cargo test -p fwe --test guests -- display_ --nocapture
-
-  # TEMPORARY (M7 probe, removed before merge): Linux's graphical programs
-  # on fwe against a headless X server (Homebrew's Xvfb), natively, and
-  # Wine's notepad in the VM; screenshots, outputs and calls kept.
-  display-probe:
-    name: Display probe ${{ matrix.set }} (macos-26)
-    strategy:
-      fail-fast: false
-      matrix:
-        set: [native, wine]
     runs-on: macos-26
     timeout-minutes: 120
     steps:
@@ -259,19 +242,21 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: brew install xorg-server xdpyinfo xwininfo xdotool unicorn
-      - name: The probe
+      # Unicorn: the hypervisor stand-in, Wine's VM.
+      - run: brew install xorg-server xdotool unicorn
+      - name: The display tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
           export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
-          cargo test -p fwe --test guests -- alpine_display_probe --nocapture
+          cargo test -p fwe --test guests -- display_ --nocapture
         env:
-          FWE_DISPLAY_PROBE: ${{ matrix.set }}
-      - if: always()
+          FWE_DISPLAY_TESTS: "1"
+      # What each program said, its calls and its screenshots.
+      - if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: display-probe-${{ matrix.set }}
-          path: target/tmp/display-probe
+          name: display
+          path: target/tmp/display
 
   # Alpine's OpenJDK (fetched) compiling and running a multi-threaded
   # application natively: HotSpot's JIT, threads and garbage collector.
@@ -336,7 +321,9 @@ jobs:
           path: /tmp/bench-cache
           key: bench-linux-cache-${{ hashFiles('tools/bench/run.py') }}
       - run: gcc -O2 -static-pie -o bench guests/c/bench.c
-      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --out linux.json
+      # An X server for the X benchmarks.
+      - run: sudo apt-get update -q && sudo apt-get install -qy xvfb
+      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --xvfb /usr/bin/Xvfb --out linux.json
       - uses: actions/upload-artifact@v4
         with:
           name: bench-linux
@@ -358,16 +345,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/bench-cache
-          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'tools/bench/run.py') }}
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'tools/bench/run.py') }}
       - uses: actions/download-artifact@v4
         with:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
       # The native side's programs: the clang release Alpine's root has, and
-      # the workloads' programs (tools/bench/run.py, BREW).
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit
-      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --linux linux.json --out macos.json
+      # the workloads' programs (tools/bench/run.py, BREW), and an X server.
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit xorg-server
+      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --linux linux.json --out macos.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:

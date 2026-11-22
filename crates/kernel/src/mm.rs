@@ -1447,13 +1447,32 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: F_GETFL only queries the descriptor.
         let nowrite = flags & mman::MAP_ANONYMOUS == 0
             && flags & mman::MAP_TYPE != mman::MAP_PRIVATE
-            && unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE == libc::O_RDONLY;
+            && (unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE
+                == libc::O_RDONLY
+                || crate::fdmarks::read_only(fd as i32));
         // `/dev/zero` maps new memory, shared between the processes that
         // share the mapping (the host has no mapping of the device).
         let flags = if flags & mman::MAP_ANONYMOUS == 0 && is_dev_zero(fd as i32) {
             flags | mman::MAP_ANONYMOUS
         } else {
             flags
+        };
+        // The file's metadata, and the file itself held where it has no
+        // name (`maps::HeldFile`); with no room for it, the mapping fails
+        // as for want of memory.
+        let st = (flags & mman::MAP_ANONYMOUS == 0)
+            .then(|| crate::fsops::linux_fstat(fd as i32).ok())
+            .flatten();
+        let held = match &st {
+            Some(st) if st.st_nlink == 0 => match crate::fdtable::dup_reserved(fd as i32) {
+                // SAFETY: a descriptor just made, owned here.
+                Ok(d) => Some(crate::maps::HeldFile(std::sync::Arc::new(unsafe {
+                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(d)
+                }))),
+                Err(errno::EMFILE) => return err(errno::ENOMEM),
+                Err(e) => return err(e),
+            },
+            _ => None,
         };
         let r = match &source {
             Some(Ok((file, start))) => match offset.checked_add(*start) {
@@ -1470,13 +1489,10 @@ impl<P: Platform> Kernel<P> {
         if r < 0 {
             return r;
         }
-        let object = (flags & mman::MAP_ANONYMOUS == 0)
-            .then(|| {
-                let st = crate::fsops::linux_fstat(fd as i32).ok()?;
-                let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
-                Some(crate::maps::Object::file(path, &st, offset))
-            })
-            .flatten();
+        let object = st.map(|st| {
+            let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
+            crate::maps::Object { held, ..crate::maps::Object::file(path, &st, offset) }
+        });
         let shared = flags & mman::MAP_TYPE != mman::MAP_PRIVATE;
         let len = self.page_up(len);
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
@@ -1621,26 +1637,14 @@ impl<P: Platform> Kernel<P> {
         if !matches!(area.object.name, crate::maps::Name::Exe | crate::maps::Name::Path(_)) {
             return err(errno::EINVAL);
         }
-        let Some(file) = region_file(crate::uaccess::g2h(start)) else {
-            return err(errno::EINVAL);
+        let fd = match mapped_file(&area, crate::uaccess::g2h(start)) {
+            Ok(fd) => fd,
+            Err(e) => return err(e),
         };
-        let write = area.prot & mman::PROT_WRITE != 0;
-        let Ok(c) = std::ffi::CString::new(file) else { return err(errno::EINVAL) };
-        // SAFETY: a NUL-terminated path; the descriptor is closed below.
-        let fd = unsafe {
-            libc::open(
-                c.as_ptr(),
-                if write { libc::O_RDWR } else { libc::O_RDONLY } | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return crate::host::last_error();
-        }
         let locked = if area.locked { mman::MAP_LOCKED } else { 0 };
         let flags = mman::MAP_SHARED | mman::MAP_FIXED | mman::MAP_POPULATE | locked;
-        let r = self.sys_mmap(start, size, area.prot, flags, fd as u64, offset);
-        // SAFETY: the descriptor opened above.
-        unsafe { libc::close(fd) };
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        let r = self.sys_mmap(start, size, area.prot, flags, raw as u64, offset);
         if r < 0 { r } else { 0 }
     }
 
@@ -2294,7 +2298,7 @@ impl<P: Platform> Kernel<P> {
                         .filter_map(|(foff, fsize)| {
                             let start = foff.max(offset);
                             let end = (foff + fsize).min(offset + len);
-                            (start < end).then_some((p + (start - offset), end - start))
+                            (start < end).then(|| (p + (start - offset), end - start))
                         })
                         .collect()
                 };
@@ -3107,11 +3111,7 @@ impl<P: Platform> Kernel<P> {
         }
         let prot = host_prot(area.prot);
         let share = if area.shared { libc::MAP_SHARED } else { libc::MAP_PRIVATE };
-        let file = match &area.object.name {
-            crate::maps::Name::Path(_) | crate::maps::Name::Exe => region_file(end_of - 1),
-            _ => None,
-        };
-        let Some(path) = file else {
+        if !matches!(area.object.name, crate::maps::Name::Path(_) | crate::maps::Name::Exe) {
             // SAFETY: a fixed mapping over a range the caller found free.
             let p = unsafe {
                 libc::mmap(
@@ -3124,31 +3124,21 @@ impl<P: Platform> Kernel<P> {
                 )
             };
             return p as u64 == at;
-        };
-        let Ok(c) = std::ffi::CString::new(path) else { return false };
-        let mode = if area.shared && area.prot & mman::PROT_WRITE != 0 {
-            libc::O_RDWR
-        } else {
-            libc::O_RDONLY
-        };
-        // SAFETY: a NUL-terminated path; the descriptor is closed below,
-        // the mapping keeping the file.
-        unsafe {
-            let fd = libc::open(c.as_ptr(), mode | libc::O_CLOEXEC);
-            if fd < 0 {
-                return false;
-            }
-            let p = libc::mmap(
+        }
+        let Ok(fd) = mapped_file(area, end_of - 1) else { return false };
+        // SAFETY: a fixed mapping over a range the caller found free, of a
+        // descriptor closed when it drops, the mapping keeping the file.
+        let p = unsafe {
+            libc::mmap(
                 at as *mut libc::c_void,
                 len as usize,
                 prot,
                 share | libc::MAP_FIXED,
-                fd,
+                std::os::fd::AsRawFd::as_raw_fd(&fd),
                 area.object.offset as libc::off_t,
-            );
-            libc::close(fd);
-            p as u64 == at
-        }
+            )
+        };
+        p as u64 == at
     }
 }
 
@@ -3167,6 +3157,33 @@ fn is_dev_zero(fd: i32) -> bool {
 fn too_many_maps(extra: usize) -> bool {
     let n = crate::maps::count() + extra;
     n >= 1024 && crate::sysctl::number(b"vm/max_map_count").is_some_and(|max| n as i64 > max.max(0))
+}
+
+/// A descriptor of the file `area` maps, whose host mapping is at host
+/// address `addr`, to map more of it by: the one the mapping holds for a
+/// file with no name, or the file opened again by its name, for reading
+/// and for writing too if a shared mapping of it is writable.
+fn mapped_file(area: &crate::maps::Area, addr: u64) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    if let Some(held) = &area.object.held {
+        let d = crate::fdtable::dup_transient(held.0.as_raw_fd())?;
+        // SAFETY: a descriptor just made, owned by the result.
+        return Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) });
+    }
+    let path = region_file(addr).ok_or(errno::EINVAL)?;
+    let c = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
+    let mode = if area.shared && area.prot & mman::PROT_WRITE != 0 {
+        libc::O_RDWR
+    } else {
+        libc::O_RDONLY
+    };
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { libc::open(c.as_ptr(), mode | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    // SAFETY: a descriptor just opened, owned by the result.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
 }
 
 /// The host path of the file mapped at host address `addr`.

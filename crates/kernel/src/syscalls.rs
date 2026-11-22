@@ -388,7 +388,6 @@ impl<P: Platform> Kernel<P> {
                 crate::epoll::closed(fd);
                 crate::mountwatch::closed(fd);
                 crate::atime::closed(fd);
-                crate::memfd::closed(fd);
                 crate::tmpfile::closed(fd);
                 // A port bound in a network namespace is free once its
                 // socket is.
@@ -1401,6 +1400,9 @@ impl<P: Platform> Kernel<P> {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
+                    } else if crate::fdmarks::read_only(fd) {
+                        let r = (r & !libc::O_ACCMODE) | libc::O_RDONLY;
+                        host::status_flags_to_linux(r) as i64
                     } else if r & libc::O_ACCMODE == libc::O_RDONLY
                         && crate::memfd::write_refused(fd)
                     {
@@ -2038,7 +2040,7 @@ impl<P: Platform> Kernel<P> {
         let net = crate::netns::of(fd);
         if req == SIOCGIFCONF {
             let addrs = match &net {
-                Some(n) if n.get().lo_up => vec![(b"lo".to_vec(), [127, 0, 0, 1], [255, 0, 0, 0])],
+                Some(n) if n.get().lo_v4 => vec![(b"lo".to_vec(), [127, 0, 0, 1], [255, 0, 0, 0])],
                 Some(_) => Vec::new(),
                 None => host_ipv4_addrs(),
             };
@@ -2087,7 +2089,7 @@ impl<P: Platform> Kernel<P> {
                     }
                     let flags = u16::from_ne_bytes(ifr[16..18].try_into().unwrap());
                     match net.update(|n| {
-                        n.lo_up = flags & IFF_UP != 0;
+                        n.set_lo_up(flags & IFF_UP != 0);
                         Ok(())
                     }) {
                         Ok(()) => 0,
@@ -2123,8 +2125,9 @@ impl<P: Platform> Kernel<P> {
                         Err(e) => err(e),
                     }
                 }
-                // An interface down has no address.
-                SIOCGIFADDR | SIOCGIFNETMASK if !net.get().lo_up => err(errno::EADDRNOTAVAIL),
+                // Before its first time up, and unless given one, `lo` has
+                // no address.
+                SIOCGIFADDR | SIOCGIFNETMASK if !net.get().lo_v4 => err(errno::EADDRNOTAVAIL),
                 SIOCGIFADDR => {
                     guest!(put_addr([127, 0, 0, 1]));
                     0

@@ -202,6 +202,14 @@ def stacks(sid, work):
 TRACED = re.compile(r"^open12$")
 
 
+def work_dir(root):
+    """A new directory for the tests' own, in the root's `/tmp`, named so
+    that Spotlight leaves it alone (`.noindex`): its indexer reads a file
+    soon after it is written, which sets the file's access time as a read
+    of the test's own would, unseen by it or by fwe (lstat03's, open12's)."""
+    return tempfile.mkdtemp(prefix="fwe-ltp.", suffix=".noindex", dir=prepare(root))
+
+
 def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """Run one test; (name, outcome, seconds, output tail)."""
     bindir = "/opt/ltp/testcases/bin"
@@ -409,12 +417,6 @@ def main():
     if os.getpriority(os.PRIO_PROCESS, 0) < 0:
         os.setpriority(os.PRIO_PROCESS, 0, 0)
 
-    # Whether Spotlight indexes the volume the tests' files are on (a
-    # reader of theirs fwe does not see; open12's access times).
-    if shutil.which("mdutil"):
-        indexing = subprocess.run(["mdutil", "-s", tempfile.gettempdir()], capture_output=True, text=True)
-        print("Spotlight: " + " ".join((indexing.stdout + indexing.stderr).split()), flush=True)
-
     fwe = os.path.abspath(args.fwe)
     root = os.path.abspath(args.root)
     tests = entries(os.path.join(root, "opt", "ltp"))
@@ -440,7 +442,7 @@ def main():
         return args.hard_limit if name in passing else min(args.failing_limit, args.hard_limit)
 
     tests = [t for t in tests if t[0] not in excepted]
-    work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+    work = work_dir(root)
     os.chmod(work, 0o1777)
     try:
         done = 0
@@ -518,7 +520,7 @@ def main():
         # Once more, alone: a test timed against a loaded machine may have
         # missed its moment. One that passes so is named, not failed.
         argv_of = dict(tests)
-        work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+        work = work_dir(root)
         os.chmod(work, 0o1777)
         try:
             end_leftovers(fwe, root)
@@ -536,7 +538,7 @@ def main():
         # time as LTP asks (a CI runner, a virtual machine, is late now and
         # then by milliseconds), so it is named with the evidence, not
         # failed. One the host meets is fwe's to fix.
-        work = tempfile.mkdtemp(prefix="fwe-ltp.", dir=prepare(root))
+        work = work_dir(root)
         try:
             host_late = {n: host_timers_late(work, again[n][3]) for n in regressed}
         finally:

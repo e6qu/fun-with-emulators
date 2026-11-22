@@ -8,10 +8,11 @@
 //! the other end, where the guest receives it, as the kernel queues
 //! replies on the socket. The namespace has one interface, `lo` (index
 //! 1), which `RTM_GETLINK` describes (with the MTU `SIOCSIFMTU` gave it),
-//! `RTM_NEWLINK` brings up or down (with `CAP_NET_ADMIN`), and whose
-//! addresses `RTM_GETADDR` lists once it is up; any other request is
-//! answered with `EOPNOTSUPP`, as the kernel answers one it has no handler
-//! for.
+//! `RTM_NEWLINK` brings up or down and `RTM_NEWADDR` gives its own
+//! addresses, 127.0.0.1/8 and ::1/128 (both with `CAP_NET_ADMIN`; bringing
+//! it up gives them too, as Linux does), and whose addresses `RTM_GETADDR`
+//! lists; any other request, or address, is answered with `EOPNOTSUPP`, as
+//! the kernel answers one it has no handler for.
 //!
 //! In the initial network namespace, whose interfaces are the host's, fwe
 //! describes each of them ([`crate::host::interfaces`], the host's `lo0`
@@ -60,6 +61,9 @@ const RTM_GETADDR: u16 = 22;
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
 const NLM_F_DUMP: u16 = 0x300;
+/// A new request's flags: replace what is there, or fail if it is there.
+const NLM_F_REPLACE: u16 = 0x100;
+const NLM_F_EXCL: u16 = 0x200;
 
 const IFF_UP: u32 = 0x1;
 const IFF_LOOPBACK: u32 = 0x8;
@@ -729,22 +733,27 @@ fn interfaces(
     net: &Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
 ) -> Vec<Interface> {
     let Some(net) = net else { return crate::host::interfaces() };
-    let n = net.get();
-    vec![lo(n.lo_up, n.lo_mtu)]
+    vec![lo(&net.get())]
 }
 
-/// A namespace's `lo`: up or not, its MTU (0: Linux's 65536).
-fn lo(up: bool, mtu: u32) -> Interface {
-    let addrs = if up {
-        let mut one = vec![0u8; 16];
-        one[15] = 1;
-        vec![
-            IfAddr { addr: vec![127, 0, 0, 1], prefix: 8, broadcast: None },
-            IfAddr { addr: one, prefix: 128, broadcast: None },
-        ]
-    } else {
-        Vec::new()
-    };
+/// `::1`.
+const LOOPBACK_V6: [u8; 16] = {
+    let mut a = [0u8; 16];
+    a[15] = 1;
+    a
+};
+
+/// A namespace's `lo`: up or not, with the addresses it has, its MTU
+/// (0: Linux's 65536).
+fn lo(n: &crate::ns::Net) -> Interface {
+    let (up, mtu) = (n.lo_up, n.lo_mtu);
+    let mut addrs = Vec::new();
+    if n.lo_v4 {
+        addrs.push(IfAddr { addr: vec![127, 0, 0, 1], prefix: 8, broadcast: None });
+    }
+    if n.lo_v6 {
+        addrs.push(IfAddr { addr: LOOPBACK_V6.to_vec(), prefix: 128, broadcast: None });
+    }
     Interface {
         name: b"lo".to_vec(),
         index: 1,
@@ -899,7 +908,7 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
                     match &net {
                         Some(net) => net
                             .update(|n| {
-                                n.lo_up = want & IFF_UP != 0;
+                                n.set_lo_up(want & IFF_UP != 0);
                                 Ok(())
                             })
                             .map(|()| Vec::new()),
@@ -921,6 +930,7 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
                 out.push(done());
                 Ok(out)
             }
+            RTM_NEWADDR => new_addr(&net, admin, flags, body),
             _ => Err(errno::EOPNOTSUPP),
         };
         match result {
@@ -942,6 +952,49 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
     data.len() as i64
 }
 
+/// `RTM_NEWADDR`, its `ifaddrmsg` body `body`: one of `lo`'s own addresses
+/// given to it in one of fwe's namespaces, as Linux gives an address:
+/// `EEXIST` if it has it, unless replaced (`NLM_F_REPLACE` without
+/// `NLM_F_EXCL`). Another address is one fwe's `lo` cannot serve
+/// (`EOPNOTSUPP`); the host's interfaces are not the guest's to change.
+fn new_addr(
+    net: &Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
+    admin: bool,
+    flags: u16,
+    body: &[u8],
+) -> Result<Vec<Vec<u8>>, i32> {
+    if body.len() < 8 {
+        return Err(errno::EINVAL);
+    }
+    let Some(net) = net.as_ref().filter(|_| admin) else { return Err(errno::EPERM) };
+    if u32::from_ne_bytes(body[4..8].try_into().unwrap()) != 1 {
+        return Err(errno::ENODEV);
+    }
+    let all = attrs(body, 8);
+    let local = all
+        .iter()
+        .find(|(t, _)| *t == IFA_LOCAL)
+        .or_else(|| all.iter().find(|(t, _)| *t == IFA_ADDRESS));
+    let v4 = match (body[0], body[1], local.map(|(_, a)| *a)) {
+        (2, 8, Some([127, 0, 0, 1])) => true,
+        (10, 128, Some(a)) if a == LOOPBACK_V6 => false,
+        _ => return Err(errno::EOPNOTSUPP),
+    };
+    net.update(|n| {
+        let has = if v4 { n.lo_v4 } else { n.lo_v6 };
+        if has && (flags & NLM_F_EXCL != 0 || flags & NLM_F_REPLACE == 0) {
+            return Err(errno::EEXIST);
+        }
+        if v4 {
+            n.lo_v4 = true;
+        } else {
+            n.lo_v6 = true;
+        }
+        Ok(())
+    })
+    .map(|()| Vec::new())
+}
+
 /// Whether an `ifinfomsg` request body names `lo`: its index 1, or the
 /// name `lo` with no index.
 fn named<'a>(links: &'a [Interface], body: &[u8]) -> Option<&'a Interface> {
@@ -961,9 +1014,16 @@ fn named<'a>(links: &'a [Interface], body: &[u8]) -> Option<&'a Interface> {
 mod tests {
     use super::*;
 
+    /// A namespace's `lo`, brought up, of MTU `mtu`.
+    fn lo_up(mtu: u32) -> Interface {
+        let mut n = crate::ns::Net { lo_mtu: mtu, ..Default::default() };
+        n.set_lo_up(true);
+        lo(&n)
+    }
+
     #[test]
     fn finds_lo_by_index_or_name() {
-        let links = [lo(true, 0)];
+        let links = [lo_up(0)];
         let mut body = vec![0u8; 16];
         body[4..8].copy_from_slice(&1i32.to_ne_bytes());
         assert!(named(&links, &body).is_some());
@@ -977,7 +1037,7 @@ mod tests {
 
     #[test]
     fn link_message_parses_back() {
-        let b = link_body(&lo(true, 1280));
+        let b = link_body(&lo_up(1280));
         let a = attrs(&b, 16);
         assert!(a.iter().any(|(t, v)| *t == IFLA_IFNAME && *v == b"lo\0"));
         // The MTU `SIOCSIFMTU` set.

@@ -1051,10 +1051,14 @@ fn last_errno() -> i32 {
 
 /// Make private memory at `[addr, addr + len)` with `prot`, for the loader
 /// (images, the stack, the trampoline): its host address, to fill.
+/// `ENOMEM` for a range past the guest's address space, as `mmap` fails it.
 pub fn map_fixed(addr: u64, len: u64, prot: u64) -> Result<u64, i32> {
+    let len = page_up(len);
+    if addr.checked_add(len).is_none_or(|e| e > vm::CODE_VA) {
+        return Err(errno::ENOMEM);
+    }
     let mut g = mem();
     let m = g.as_mut().ok_or(errno::ENOMEM)?;
-    let len = page_up(len);
     let kept = m.remove_keeping(addr, addr + len);
     m.map_private(addr, len, prot, None, kept)?;
     Ok(uaccess::g2h(addr))

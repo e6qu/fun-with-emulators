@@ -565,6 +565,17 @@ for the stub's push). `casp` with `x18` in a pair, a load or store of
 `x18` written back onto `sp`, and `sp` written from `x18` have stubs of
 their own.
 
+The stub's pushes go through `sp`, which the hardware checks for 16-byte
+alignment (Linux and macOS both turn the check on). Linux programs may
+keep `sp` off alignment while they address memory through other
+registers (pixman's NEON functions take `sub sp, sp, #0xe8` and save
+`x18` through `x29`); there the push faults, and fwe's fault handler
+makes the pushes itself and lets the stub run on, as it does the pops
+after it: each such use costs two faults. The same holds for every save
+fwe's words make below `sp` (call stubs, translations of code made at
+run time). The program's own access through such an `sp` faults as on
+Linux: `SIGBUS`, `BUS_ADRALN`, at `sp`.
+
 A system call or signal frame sees the guest's real `x18`, `rt_sigreturn`
 restores it, and a new thread starts with its creator's. A fault or
 signal in a stub is delivered as at its site: the frame has the program's
@@ -650,10 +661,16 @@ one of these instructions, so:
 
 A stub must be within a `b` instruction's reach (128 MiB either way). For
 a loaded program, stub space follows the image, sized from a count of the
-sites; for code mapped later, fwe reserves regions near the code, and
-code the guest let fwe place that finds none is mapped again where there
-is room. Otherwise the preparation fails: the guest's `mmap` gets
-`ENOMEM`, and `--strace` notes why.
+sites, and an image larger than a branch reaches across has as much
+before it too. The middle of an image wider still (Chromium's is 266 MiB,
+its code 224 MiB) has nothing but the image itself in reach: a system
+call there keeps its trap, and the pages holding its other sites run by
+translation, as a JIT's code does ([docs/jit.md](jit.md)); native code's
+calls into them fault once and are then linked. `--strace` notes how
+much ("KiB of code beyond its stubs' reach"). For code mapped later, fwe
+reserves regions near the code, and code the guest let fwe place that
+finds none is mapped again where there is room. Otherwise the preparation
+fails: the guest's `mmap` gets `ENOMEM`, and `--strace` notes why.
 
 ### What is not translated
 
@@ -1297,6 +1314,7 @@ sees the message:
 | netlink socket | the same socket, answered through the same host end, for the namespace it was made in |
 | process descriptor | a kqueue of its own watching the same process (a `PIDFD_THREAD` one of another process's thread watches that process) |
 | `SOCK_SEQPACKET` socket, memfd | itself: its buffer size or extended attributes say what it is |
+| memfd opened again read-only | itself, marked read-only again |
 
 The sender holds the bundle's end until the receiver has emptied it: the
 host collects descriptors in flight that no process holds, and a
@@ -1319,8 +1337,10 @@ file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 **`socket(AF_NETLINK)`**: the guest's descriptor is one end of a host
 datagram pair, so `recv`, `poll` and `epoll` are the host's; a request
 written to it is answered at once on the other end. In an fwe network
-namespace, `RTM_GETLINK`, `RTM_NEWLINK` (with `CAP_NET_ADMIN`) and
-`RTM_GETADDR` describe and change `lo` (its MTU as `SIOCSIFMTU` set it);
+namespace, `RTM_GETLINK`, `RTM_NEWLINK` and `RTM_NEWADDR` (with
+`CAP_NET_ADMIN`) and `RTM_GETADDR` describe and change `lo` (its MTU as
+`SIOCSIFMTU` set it; its addresses 127.0.0.1/8 and ::1, which bringing it
+up gives as Linux does, and `RTM_NEWADDR` gives as bubblewrap does);
 in the initial namespace they describe the host's interfaces and
 addresses (from `getifaddrs`, `lo0` as `lo`), as `SIOCGIFCONF` and the
 other interface requests do, so `getifaddrs` in the guest lists them;
@@ -1368,7 +1388,11 @@ all three on shared records ([Kernel-wide state](#kernel-wide-state)):
 one set per IPC namespace for System V objects and queues, one record for
 every key. A change is made under the record's `flock`; a call that must
 wait sleeps on the record's mapped generation word until another process
-changes it. What a process that has gone leaves (attachments, `SEM_UNDO`
+changes it. Any change wakes every waiter in the namespace; a waiter
+woken tries its operation on the data read without the lock first, and
+takes the lock only if it can now go on, so a change costs the lock once
+for each waiter it lets go, not for every waiter. What a process that has
+gone leaves (attachments, `SEM_UNDO`
 adjustments) is cleaned up by the next process that looks. The initial
 namespace's records last until the host reboots
 (`crates/kernel/src/sysvipc.rs`, `ipcops.rs`, `mqueue.rs`, `keys.rs`).
@@ -1702,7 +1726,7 @@ them out on the slab and the guest's page tables:
 | `MAP_FIXED`, `MAP_FIXED_NOREPLACE` | replace / refuse to replace | host `MAP_FIXED`; `NOREPLACE` checks where macOS put it (`EEXIST`) | page-table edit; slab memory at its own address is reused, zeroed |
 | `munmap` | | host `munmap` | pages removed from stage 1, TLBs flushed; the slab range zeroed before reuse |
 | `mprotect` | | host `mprotect`; memory made executable runs by translation, never executable on the host ([Write+exec memory](#writeexec-memory)) | stage-1 permission edit |
-| `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part); move with `mach_vm_remap`, which takes the pages, contents and sharing along, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
+| `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part, the file reached by its name, or for a file with no name through the descriptor its mapping holds); move with `mach_vm_remap`, which takes the pages, contents and sharing along, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
 | `madvise(MADV_DONTNEED)` | private anonymous pages read as zero again | each private anonymous piece replaced by a fresh mapping (macOS's own keeps the data) | private pages read as zero again, or as the file for a private file mapping; shared memory keeps its contents |
 | `madvise` other advice | hints; `MADV_FREE`, `MADV_WIPEONFORK` | hints passed to the host, never failing for mapped memory; advice and mappings checked as Linux checks them; `MADV_WIPEONFORK` ranges zeroed in a fork child | advice and mappings checked as natively, nothing more: no hint reaches the host, `MADV_FREE` frees nothing, a fork child keeps `MADV_WIPEONFORK` memory, `MADV_DONTDUMP` changes no core |
 | `MADV_DONTFORK`, `MADV_DOFORK` | a fork child has nothing mapped in the range | the ranges kept; a fork child unmaps them as it starts (the host's `VM_INHERIT_NONE` would too, but fwe reads a region's inheritance to tell private memory from shared) | ignored |
@@ -1734,7 +1758,7 @@ without `MAP_JIT`, whose memory is switched per thread
 
 | Linux | macOS | fwe |
 |---|---|---|
-| `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone |
+| `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone; opened again read-only through `/proc/self/fd`, the same host description marked read-only (`F_GETFL` says so; writes, writable shared mappings, resizing and seals refused), the mark following it through `fork`, `execve` and `SCM_RIGHTS`; a mapping of it (or of any file with no name) holds a descriptor of the file, through which `mremap` grows it and `remap_file_pages` remaps it |
 | `/dev/shm` tmpfs (`shm_open`, `sem_open`) | no tmpfs at `/dev/shm` | a directory per rootfs in the user's temporary directory, shared by every fwe process on that root, a mount point to the resolver |
 | System V shared memory | own `shmget` | see [Other IPC calls](#other-ipc-calls) |
 
@@ -1898,7 +1922,9 @@ path and is then `execve`. A script (`#!interpreter [argument]`) runs
 its interpreter as Linux's `binfmt_script` does, with the line's argument,
 the script's path (`/dev/fd/N` for a descriptor) and the rest of the
 arguments, nested up to five deep (`Kernel::exec_target`); the
-interpreter, not the script, decides what set-ID bits grant.
+interpreter, not the script, decides what set-ID bits grant. A script
+given to fwe on its command line runs the same way, its path in the
+guest's arguments the guest path inside the root.
 
 #### The ELF loader and dynamic linker
 
@@ -2045,7 +2071,9 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   `synthdir.rs`); what of the host shows there is under
   [Host identity and machine state](#host-identity-and-machine-state).
 - `/proc/<pid>`, with its `task` directory, covers the processes of the
-  reader's pid namespace. Another process's `mem` (and a thread's,
+  reader's pid namespace. A directory there counts its links as Linux's
+  do: 2 and its subdirectories (`task`, 2 and the process's threads,
+  which sandboxes read to tell a process is single-threaded). Another process's `mem` (and a thread's,
   `task/<tid>/mem`) is read and written as `process_vm_readv` reaches it,
   or through a stopped tracee's mailbox, and its `auxv` is the vector
   its program started with (a fork child's, its parent's), its `environ`
@@ -2064,7 +2092,9 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   The sockets are fwe's processes' in the namespace, as the host reports
   each (`PROC_PIDFDSOCKETINFO`), with the namespace's port numbers.
 - `/proc/self/fd/N`, `cwd` and `root` behave as magic links.
-- `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's;
+- `/dev/null`, `zero`, `random`, `urandom` and `tty` are the host's,
+  wherever the root filesystem's `/dev` is (a sandbox's `pivot_root`
+  keeps the old root under the new one, and binds its nodes from there);
   `full`, `loop-control` and `loopN` are fwe's; `/dev/ptmx` and
   `/dev/pts` are fwe's pty layer; `/dev/fd`, `stdin`, `stdout`, `stderr`
   link into `/proc/self/fd`; `/dev/shm` and `/dev/mqueue` are fwe's
@@ -2117,6 +2147,22 @@ names macOS does not support:
 | `IPV6_ADDRFORM` | none | an IPv6 socket with an IPv4-mapped peer reports its names as IPv4, and a reset makes it an IPv4 socket |
 | `socket`, `bind`, `connect` arguments | checked by the BSD stack | checked first in Linux's order: family, type and protocol; an address's length and family against the socket's (an IPv4 address to an IPv6 datagram socket is its IPv4-mapped one); a port below `ip_unprivileged_port_start` without `CAP_NET_BIND_SERVICE` |
 | interface requests (`SIOCGIFCONF`, `SIOCGIFFLAGS`, `SIOCGIFADDR`, `SIOCSIFMTU`, ...) | a 32-byte `ifreq`, other flag bits | in an fwe network namespace, answered for `lo`; elsewhere the host's interfaces, `lo0` as `lo`, their flags in Linux's numbering (`IFF_MULTICAST` moved, none for `lo`, `IFF_LOWER_UP` while running), which the guest cannot change |
+
+#### Displays
+
+A Linux program draws through an X server (or a Wayland compositor) it
+reaches by a Unix socket. macOS has no Linux display of its own, but runs
+X servers: XQuartz on the screen, Xvfb without one. fwe hands the guest
+the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
+
+| Linux | macOS | fwe |
+|---|---|---|
+| `DISPLAY=:N`, the server's socket `/tmp/.X11-unix/XN` and the abstract name `@/tmp/.X11-unix/XN` libxcb tries first | the host server's socket: Xvfb's or Xorg's `/tmp/.X11-unix/XN`, XQuartz's launchd socket `/private/tmp/com.apple.launchd.…/org.xquartz:N` | either name, in any root and from every process of the run (a VM's fork children too), reaches the host server's socket; the guest's `DISPLAY` is `:N` (XQuartz's path shortened to it) |
+| another display, its socket in the guest's `/tmp/.X11-unix` (an Xwayland a compositor starts, an Xvfb the guest runs) | — | the guest's own, a Unix socket in its root like any other (a server's TCP port is the host's) |
+| MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
+| `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
+| Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
+| GPU rendering (`/dev/dri`) | Metal | none: Mesa's software renderer |
 
 ### Kernel-wide state
 
@@ -2540,7 +2586,7 @@ where fwe falls short of Linux in detail is in
 | overlay, bind, move | **emulated** | Linux's layering and copy-up; binds keep their flags |
 | cgroup v1, ext4, btrfs, XFS, FUSE, NFS and other types | **refused** | `ENODEV`, as without them |
 | `ro`, `nosuid`, `nodev`, `noexec`, `nosymfollow` | **enforced** | `EROFS`, no gain, `EACCES`, `EACCES`/`EPERM`, `ELOOP` |
-| Access-time modes | **emulated** | `noatime`, `nodiratime`, `strictatime` by fwe; `relatime` the host's |
+| Access-time modes | **emulated** | `noatime`, `nodiratime`, `strictatime` by fwe; `relatime` the host's, so a Mac program's read of a file (Spotlight indexing one soon after it is written) sets its access time as a read in the guest would; a directory named `*.noindex` is not indexed |
 | `sync`, `dirsync`, `lazytime`, `mand` | **ignored** | `mand` as Linux since 5.15 |
 | Idmapped mounts | **refused** | `MOUNT_ATTR_IDMAP` `EINVAL` |
 | Propagation | **emulated** | shared, slave, private, unbindable, across namespaces |
@@ -2797,14 +2843,14 @@ gives and fills the gaps from notes fwe processes leave each other:
 
 | On macOS | What fwe does (`host::signal_info`) | What the guest sees |
 |---|---|---|
-| `si_code` of a sent signal (`SI_USER` = `0x10001`, `SI_QUEUE`, `SI_TIMER`, `SI_ASYNCIO`, `SI_MESGQ`) | translated (`host::si_code_to_linux`); the `SIGCHLD` and fault codes are the same on both | Linux's `si_code` (`SI_USER` = 0 …) |
+| `si_code` of a sent signal (`SI_USER` = `0x10001`, `SI_QUEUE`, `SI_TIMER`, `SI_ASYNCIO`, `SI_MESGQ`) | translated (`host::si_code_to_linux`); the `SIGCHLD` codes are the same on both | Linux's `si_code` (`SI_USER` = 0 …) |
 | `si_pid` of the sender, a host pid | mapped into the guest's pid namespace | the sender's pid there, 0 for one outside it |
 | `si_uid` of the sender | from an fwe process (this one too), its guest real uid, which it writes in its note; from any other, fwe's own host user → 0, any other → 65534; then through the receiver's user namespace | the sender's real uid as the receiver's user namespace has it |
 | `si_uid` of a child's `SIGCHLD` (and `waitid`) | the child's guest real uid, read from its record, which is kept until it is reaped | the child's real uid |
 | an fwe process sent it | the sender first wrote a note (pid, its guest uid, and for `SI_MESGQ` the code and value) into the target's mailbox, which the handler reads | the sender, even when macOS gave none |
 | a `siginfo` macOS emptied (a signal that arrived while an fwe handler ran) | the note, if an fwe process sent it; for `SIGCHLD`, a `waitid(WNOHANG \| WNOWAIT)` finds the child and how it changed | the sender or child, as Linux tells it; none for a non-fwe sender |
 | a `SIGIO` the host raised for a descriptor's readiness | no sender: `SI_KERNEL` | see [Network events](#network-events) |
-| a fault | the fault address | `si_addr` |
+| a fault | the fault address; the code as Linux decides it ([Faults in guest code](#faults-in-guest-code)) | `si_addr`, `si_code` |
 
 #### Signals with no counterpart
 
@@ -2873,13 +2919,24 @@ In the VM a fault is an exception the run loop reads from `ESR_EL1`
 
 | VM exception | What the guest sees |
 |---|---|
-| data or instruction abort, not a page still to fetch or a stale TLB entry | `SIGSEGV`, `si_addr` the faulting address |
+| data or instruction abort, not a page still to fetch or a stale TLB entry | `SIGSEGV`, `si_addr` the faulting address; a misaligned access `SIGBUS` |
 | stage-2 abort | `SIGSEGV` |
 | PC or SP alignment | `SIGBUS` |
 | `brk` | `SIGTRAP` |
 | BTI, unknown or other exception | `SIGILL` |
 | trapped `CNTPCT_EL0` read | the virtual counter's value |
 | `wfi`, `wfe` | stepped over |
+
+A fault's `si_code` is Linux's, decided as Linux decides it, not from
+the host's page tables (which keep nothing for a page with no access, so
+the processor reports every such fault as a translation fault):
+`SEGV_ACCERR` where the guest has a mapping without the access,
+`SEGV_MAPERR` where it has none; `BUS_ADRALN` for a misaligned pc, stack
+or access, `BUS_MCEERR_AR` for poisoned memory, `BUS_ADRERR` otherwise;
+`TRAP_BRKPT` for a breakpoint; `ILL_ILLOPC` for an unknown instruction.
+A misaligned `sp` or `pc` is a `SIGBUS` with the `sp` or `pc` for its
+address, as Linux gives it (macOS gives a `SIGSEGV` without an address
+for `sp`).
 
 A fault with a guest handler enters it with Linux's frame. With none, the
 process dies of the signal (natively after a register and code dump under

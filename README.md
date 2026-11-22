@@ -46,10 +46,14 @@ What runs unmodified, its output checked in CI:
   Docker Engine runs and builds images (BuildKit) and brings up Docker
   Compose projects.
 - **Windows:** Wine runs ARM64 Windows console programs in the VM
-  (`fwe --vm`, on the stand-in).
+  (`fwe --vm`, on the stand-in), and Notepad on an X display.
+- **Graphical, natively:** X11 clients, GTK, Qt, Tk and software OpenGL
+  drawn on an X server on the Mac, and Weston with Wayland clients and
+  Xwayland.
 - **Conformance:** every LTP system-call test that applies passes.
 
-Native speed, graphical programs and gVisor are the work left to 1.0;
+Native speed, the GPU, browsers, graphical Wine natively and gVisor are
+the work left to 1.0;
 [ROADMAP.md](ROADMAP.md) has the details.
 
 ## Documentation

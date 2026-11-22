@@ -50,12 +50,34 @@ pub struct Object {
     pub ino: u64,
     /// The offset into it of the mapping's start, in bytes.
     pub offset: u64,
+    /// The file itself, where it has no name to be found by.
+    pub held: Option<HeldFile>,
 }
 
 impl Object {
     /// A file mapped from `offset`, named `path`, whose metadata is `st`.
     pub fn file(path: Vec<u8>, st: &fwe_abi::Stat, offset: u64) -> Object {
-        Object { name: Name::Path(path.into()), dev: st.st_dev, ino: st.st_ino, offset }
+        Object { name: Name::Path(path.into()), dev: st.st_dev, ino: st.st_ino, offset, held: None }
+    }
+
+    /// Anonymous memory, `name`d.
+    fn anonymous(name: Name) -> Object {
+        Object { name, dev: 0, ino: 0, offset: 0, held: None }
+    }
+}
+
+/// A host descriptor of a mapped file with no name (a memfd, a file
+/// deleted or made with `O_TMPFILE`), in fwe's reserved range, held while
+/// a mapping of it lasts as Linux's mapping holds its file: what grows or
+/// remaps the mapping maps more of the file through it (a file with a name
+/// is opened again by it). Not carried to a fork child that is a fresh
+/// process. Any two of the same file are alike.
+#[derive(Debug, Clone)]
+pub struct HeldFile(pub Arc<std::os::fd::OwnedFd>);
+
+impl PartialEq for HeldFile {
+    fn eq(&self, _: &HeldFile) -> bool {
+        true
     }
 }
 
@@ -133,7 +155,7 @@ impl Area {
             noexec: false,
             nowrite: false,
             sealed: false,
-            object: Object { name, dev: 0, ino: 0, offset: 0 },
+            object: Object::anonymous(name),
             label: None,
         }
     }
@@ -252,7 +274,7 @@ impl Record {
                 4 => Name::Path(d.bytes().into()),
                 _ => Name::Anonymous,
             };
-            let object = Object { name, dev, ino, offset };
+            let object = Object { name, dev, ino, offset, held: None };
             let label = Some(d.bytes()).filter(|l| !l.is_empty()).map(Into::into);
             let area = Area { prot, shared, locked, noexec, nowrite, sealed, object, label };
             r.any_sealed |= sealed;
@@ -274,7 +296,7 @@ impl Record {
         object: Option<Object>,
     ) -> bool {
         let locked = self.lock_future;
-        let object = object.unwrap_or(Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 });
+        let object = object.unwrap_or(Object::anonymous(Name::Anonymous));
         let area = Area {
             prot,
             shared,
@@ -469,6 +491,7 @@ impl Record {
                 dev: id.0,
                 ino: id.1,
                 offset: ph.offset.saturating_sub(ph.vaddr + bias - start),
+                held: None,
             };
             if file_end > start {
                 let area = Area {
@@ -1060,7 +1083,13 @@ mod tests {
     }
 
     fn file(path: &str, offset: u64) -> Option<Object> {
-        Some(Object { name: Name::Path(path.as_bytes().into()), dev: 0x803, ino: 42, offset })
+        Some(Object {
+            name: Name::Path(path.as_bytes().into()),
+            dev: 0x803,
+            ino: 42,
+            offset,
+            held: None,
+        })
     }
 
     /// `continues` tells what comparing with `at` tells, for every field
@@ -1078,10 +1107,7 @@ mod tests {
             object: file("/lib/x.so", 0x1000).unwrap(),
             label: None,
         };
-        let anon = Area {
-            object: Object { name: Name::Anonymous, dev: 0, ino: 0, offset: 0 },
-            ..base.clone()
-        };
+        let anon = Area { object: Object::anonymous(Name::Anonymous), ..base.clone() };
         let mut others = vec![base.at(0x4000), base.at(0x8000), anon.clone(), anon.at(0x4000)];
         for change in [
             |a: &mut Area| a.prot = mman::PROT_READ | mman::PROT_WRITE,

@@ -136,7 +136,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 33;
+pub const FORMAT: u32 = 34;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -167,11 +167,17 @@ pub fn lock_exclusive(fd: i32) {
     // SAFETY: plain host calls on the caller's descriptor.
     unsafe {
         while libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            if crate::host::last_errno() != libc::EWOULDBLOCK || now() - start > 1_000_000_000 {
-                libc::flock(fd, libc::LOCK_EX);
-                break;
-            }
-            libc::sched_yield();
+            match crate::host::last_errno() {
+                libc::EWOULDBLOCK if now() - start <= 1_000_000_000 => libc::sched_yield(),
+                // A signal came: the lock is still to take.
+                libc::EINTR => 0,
+                _ => {
+                    while libc::flock(fd, libc::LOCK_EX) != 0
+                        && crate::host::last_errno() == libc::EINTR
+                    {}
+                    break;
+                }
+            };
         }
     }
     crate::host::set_errno(saved);

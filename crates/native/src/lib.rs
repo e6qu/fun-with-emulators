@@ -94,7 +94,7 @@ use fwe_kernel::{Brk, Kernel, Platform, Tracer};
 use std::ffi::OsString;
 use std::fmt;
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 /// Size of the guest's main thread stack in the hypervisor backend.
@@ -412,6 +412,38 @@ fn read_program(
             .map_err(|e| Error::Read(std::io::Error::from_raw_os_error(e)))?;
         Ok((data, fwe_kernel::prepcache::FileId::of_fd(f.as_raw_fd())))
     }
+}
+
+/// The program to run, its arguments and options, and its file: the
+/// program at `path` itself, or for a script the interpreter its `#!` line
+/// names, as Linux's `execve` runs one ([`fwe_kernel::Kernel::exec_target`]):
+/// a guest path, given the line's argument if it has one, then the script's
+/// path (its guest path inside the root, otherwise as given), then `args`
+/// but the first; an interpreter may be a script too, five deep.
+fn script_target(
+    path: &Path,
+    args: &[OsString],
+    options: &Options,
+    fs: &fwe_kernel::Fs,
+) -> Result<(PathBuf, Vec<OsString>, Options, fwe_kernel::ExecFile), Error> {
+    let errno = |e| Error::Read(std::io::Error::from_raw_os_error(e));
+    let (mut path, mut args, mut options) = (path.to_path_buf(), args.to_vec(), options.clone());
+    for _ in 0..=5 {
+        let file = read_program(&path, &options, fs)?;
+        let head = &file.0[..file.0.len().min(256)];
+        let Some((interp, arg)) = fwe_kernel::script_interpreter(head).map_err(errno)? else {
+            return Ok((path, args, options, file));
+        };
+        let script = guest_path_in_root(&path, &options)
+            .unwrap_or_else(|| path.as_os_str().as_bytes().to_vec());
+        let mut new = vec![OsString::from_vec(interp.clone())];
+        new.extend(arg.map(OsString::from_vec));
+        new.push(OsString::from_vec(script));
+        new.extend(args.into_iter().skip(1));
+        (path, args) = (PathBuf::from(OsString::from_vec(interp)), new);
+        options = Options { guest_path: true, argv0: None, ..options };
+    }
+    Err(errno(fwe_abi::errno::ELOOP))
 }
 
 /// The guest's arguments, with `argv[0]` replaced if asked. Otherwise an
@@ -1087,9 +1119,28 @@ pub fn load_image(
                     stats.syscalls, stats.stubs, stats.x18_deferred
                 ));
             }
-            Ok(())
+            Ok(stats.beyond)
         })
         .map_err(Error::Load)?;
+        // Code no stub space reaches (the middle of an image larger than a
+        // branch reaches across) runs by translation.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        for &(a, l) in &loaded.translated {
+            jit::code(a, l);
+        }
+        #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+        if let Some(&(start, _)) = loaded.translated.first() {
+            return Err(Error::Load(loader::LoadError::Prepare {
+                start,
+                reason: "code beyond its stubs' reach, and no translation here".into(),
+            }));
+        }
+        if strace && !loaded.translated.is_empty() {
+            let kib: u64 = loaded.translated.iter().map(|r| r.1 >> 10).sum();
+            tracer.note(&format!(
+                "{what}: {kib} KiB of code beyond its stubs' reach, run by translation"
+            ));
+        }
         if strace && loaded.from_image {
             tracer.note(&format!("{what} from its prepared image"));
         }
@@ -1139,8 +1190,8 @@ pub fn load_image(
         }
         None => None,
     };
-    let entry = interp.map_or(loaded.entry, |i| i.entry);
-    let interp_base = interp.map_or(0, |i| i.load_base);
+    let entry = interp.as_ref().map_or(loaded.entry, |i| i.entry);
+    let interp_base = interp.as_ref().map_or(0, |i| i.load_base);
 
     // A fresh thread stack, as large as `RLIMIT_STACK` lets it grow, with
     // an inaccessible guard page below it, ending at `loader::STACK_TOP`
@@ -1234,7 +1285,8 @@ fn start(
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
     fwe_kernel::timing::mark("open_fs");
-    let (data, data_id) = read_program(path, options, &fs)?;
+    let (path, args, options, (data, data_id)) = script_target(path, args, options, &fs)?;
+    let (path, args, options) = (path.as_path(), &args, &options);
     fwe_kernel::timing::mark("read_program");
     // A non-PIE executable linked into the low 4 GiB cannot be mapped in
     // this process: it runs in a VM instead.

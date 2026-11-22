@@ -135,8 +135,30 @@ pub fn trapped(what: Trap) {
     }
 }
 
+/// System V IPC waits: a waiter woken by a change of its namespace's
+/// objects, and a waiter woken that tried its operation again under the
+/// namespace's lock (one the change let go on). Counted always: a wake
+/// costs a wait already.
+static IPC_WOKEN: AtomicU64 = AtomicU64::new(0);
+static IPC_RETRIED: AtomicU64 = AtomicU64::new(0);
+
+/// An IPC waiter woken; `retried` if it took the lock to try again.
+#[inline]
+pub fn ipc_woken(retried: bool) {
+    IPC_WOKEN.fetch_add(1, Relaxed);
+    if retried {
+        IPC_RETRIED.fetch_add(1, Relaxed);
+    }
+}
+
+/// IPC waiters woken, and those that tried again under the lock.
+pub fn ipc_wakes() -> (u64, u64) {
+    (IPC_WOKEN.load(Relaxed), IPC_RETRIED.load(Relaxed))
+}
+
 /// The calls that took longest (number, count, milliseconds), the signals
-/// taken (number, count) and what the traps among them were for, as text.
+/// taken (number, count), what the traps among them were for, and the
+/// IPC waiters woken, as text.
 pub fn calls_and_signals() -> String {
     let mut calls: Vec<(usize, u64, u64)> = (0..CALLS.len())
         .map(|i| (i, CALLS[i].load(Relaxed), CALL_NS[i].load(Relaxed)))
@@ -159,8 +181,10 @@ pub fn calls_and_signals() -> String {
         .filter(|t| t.1 > 0)
         .map(|(name, n)| format!("{name} {n}"))
         .collect();
+    let (woken, retried) = ipc_wakes();
     format!(
-        "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}",
+        "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}; \
+         IPC waiters woken {woken}, of them tried again under the lock {retried}",
         calls.join(", "),
         signals.join(", "),
         traps.join(", ")

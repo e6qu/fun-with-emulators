@@ -78,15 +78,15 @@ struct Iface {
 fn ifaces(net: Option<&Record<Net>>) -> Vec<Iface> {
     match net {
         Some(n) => {
-            let up = n.get().lo_up;
+            let n = n.get();
             let mut v6 = [0u8; 16];
             v6[15] = 1;
             vec![Iface {
                 name: b"lo".to_vec(),
                 index: 1,
-                up,
-                v4: if up { vec![([127, 0, 0, 1], [255, 0, 0, 0])] } else { Vec::new() },
-                v6: if up { vec![(v6, 128)] } else { Vec::new() },
+                up: n.lo_up,
+                v4: if n.lo_v4 { vec![([127, 0, 0, 1], [255, 0, 0, 0])] } else { Vec::new() },
+                v6: if n.lo_v6 { vec![(v6, 128)] } else { Vec::new() },
                 counters: [0; 8],
             }]
         }

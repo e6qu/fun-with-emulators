@@ -1117,12 +1117,12 @@ impl<P: Platform> Kernel<P> {
 }
 
 /// A script's interpreter and its optional argument.
-type Interpreter = (Vec<u8>, Option<Vec<u8>>);
+pub type Interpreter = (Vec<u8>, Option<Vec<u8>>);
 
 /// The interpreter and its optional argument a script's first bytes
 /// `head` name (`#!interpreter [argument]`), or `None` for a file that is
 /// no script. `ENOEXEC` for a `#!` line with no interpreter.
-fn script_interpreter(head: &[u8]) -> Result<Option<Interpreter>, i32> {
+pub fn script_interpreter(head: &[u8]) -> Result<Option<Interpreter>, i32> {
     let Some(rest) = head.strip_prefix(b"#!") else { return Ok(None) };
     let line = &rest[..rest.iter().position(|&c| c == b'\n').unwrap_or(rest.len())];
     let blank = |c: &u8| *c == b' ' || *c == b'\t';

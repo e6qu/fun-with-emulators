@@ -299,6 +299,8 @@ const ASM_GUESTS: &[&str] = &[
     "x18sig",
     "x18rare",
     "x18spsig",
+    "x18spalign",
+    "spalign",
     "x18partial",
     "svcimm",
     "fpsig",
@@ -483,9 +485,10 @@ fn programs_run_through_an_o_path_descriptor() {
 }
 
 /// A script run by `execve` with no shell between (as `apk` runs its
-/// packages' scripts, from a memfd through `fexecve`): its `#!` line's
-/// interpreter runs with the line's argument, the script's path
-/// (`/dev/fd/N` for a descriptor), then the rest of the arguments.
+/// packages' scripts, from a memfd through `fexecve`), or given to fwe
+/// itself: its `#!` line's interpreter runs with the line's argument, the
+/// script's path (`/dev/fd/N` for a descriptor), then the rest of the
+/// arguments.
 #[test]
 fn scripts_run_their_interpreter() {
     let dir = std::env::temp_dir().join(format!("fwe-script-{}", std::process::id()));
@@ -493,7 +496,6 @@ fn scripts_run_their_interpreter() {
     let dir = std::fs::canonicalize(&dir).unwrap();
     let me = rust_guest("args");
     let out = fwe(&me, &["script", dir.to_str().unwrap()]);
-    let _ = std::fs::remove_dir_all(&dir);
     let text = stdout(&out);
     let want = format!(
         "arg[0]={}\narg[1]=-a\narg[2]={}/script.sh\narg[3]=one\n",
@@ -501,6 +503,10 @@ fn scripts_run_their_interpreter() {
         dir.display()
     );
     assert!(text.starts_with(&want), "{text}");
+    // The same script given to fwe, with its arguments.
+    let out = fwe(&dir.join("script.sh"), &["one"]);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(stdout(&out).starts_with(&want), "{}", stdout(&out));
     let out = fwe(&me, &["memfd-script"]);
     let text = stdout(&out);
     let lines: Vec<&str> = text.lines().take(4).collect();
@@ -5198,6 +5204,55 @@ fn asm_x18_sp_stub_survives_signals() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// x18 stored and loaded through another register while sp is 8 bytes off
+/// alignment (pixman's NEON functions), a thread-pointer write and a
+/// faulting store of x18 there, with a fast timer's signals landing
+/// throughout (guests/asm/x18spalign.S).
+#[test]
+fn asm_x18_used_while_sp_is_off_alignment() {
+    // Untraced, as the timer's signals come too often for a trace.
+    for name in ["x18spalign", "x18spalign-pie"] {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg(asm_guest(name));
+        let out = run_vm_bounded(cmd);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// An sp off alignment: the program's own store through it is a SIGBUS
+/// (BUS_ADRALN) at sp, as on Linux, and code made at run time runs with
+/// it (guests/asm/spalign.S).
+#[test]
+fn asm_sp_off_alignment() {
+    for name in ["spalign", "spalign-pie"] {
+        let out = fwe(&asm_guest(name), &[]);
+        assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// [`asm_sp_off_alignment`] in the VM: the SIGBUS at sp (the hardware's
+/// fault address is unknown for sp), and code made at run time run there.
+/// The stand-in has no sp alignment checks (nor has QEMU, under it): there
+/// the store goes through and the guest says so (1).
+#[test]
+fn hv_sp_off_alignment() {
+    let Some(out) = fwe_hv(&asm_guest("spalign-low"), &[]) else { return };
+    let want = if matches!(hv_mode(), Some(HvMode::Standin)) { 1 } else { 0 };
+    assert_eq!(out.status.code(), Some(want), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A program linked past the VM's address space (1 TiB, as far as its
+/// tables reach) is refused, saying so, under `--vm`.
+#[test]
+fn hv_a_program_past_the_vms_address_space_is_refused() {
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg(asm_guest("hello"));
+    let out = run_hv(cmd, "hello --vm");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(126), "{err}");
+    assert!(err.contains("past the VM's address space"), "{err}");
+}
+
 /// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
 /// thread that writes to the pipe could never make its own system call.
 #[test]
@@ -5691,7 +5746,7 @@ fn debian_bash_runs_trap_handlers() {
 fn namespaces(scenario: &str) -> String {
     let root = std::env::temp_dir().join(format!("fwe-ns-{}-{scenario}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    for d in ["mnt", "tmp", "newroot/etc", "newroot/proc"] {
+    for d in ["dev", "mnt", "tmp", "newroot/etc", "newroot/proc", "newroot/oldroot"] {
         std::fs::create_dir_all(root.join(d)).unwrap();
     }
     std::fs::write(root.join("newroot/etc/marker"), "new\n").unwrap();
@@ -5763,6 +5818,21 @@ fn pivot_root_makes_a_container_root() {
         namespaces("pivot"),
         "pivot: 0\numount old root: 0\nmarker: new\nold root gone: true\nproc: true\n\
          mounts: / /proc\nchild exited 0\n"
+    );
+}
+
+/// A sandbox's root, as bubblewrap makes it: `pivot_root` into a new root
+/// keeping the old one under it, whose standard devices are still there,
+/// and bound into the new root (by path or descriptor) and remounted.
+#[test]
+fn pivot_root_keeps_the_old_roots_devices() {
+    assert_eq!(
+        namespaces("pivot-old"),
+        "pivot: 0\nmarker: new\nold root's /dev/null: opened\n\
+         old root's /dev/zero opened: true\n\
+         null by path: bound 0, remounted 0, a device there true\n\
+         zero by descriptor: bound 0, remounted 0, a device there true\n\
+         full by descriptor: bound 0, remounted 0, a device there true\nchild exited 0\n"
     );
 }
 
@@ -6578,6 +6648,43 @@ fn memfd(scenario: &str) -> String {
     eprintln!("--- memfd {scenario} stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0), "{scenario}");
     stdout(&out)
+}
+
+/// A shared mapping of a memfd, its descriptor closed, grows by mremap
+/// into the file grown since, moving past a neighbour; and a page of it
+/// is remapped to another page of the file: the mapping holds its file,
+/// which has no name, as Linux's holds it.
+#[test]
+fn a_mapping_of_a_memfd_grows_and_remaps_from_its_file() {
+    assert_eq!(
+        memfd("grow"),
+        "neighbour: true\ngrown: true\nmoved: true\nkept: a\n\
+         grown part is the file: c\nwritten to the file: d\nremapped: 0 c\n"
+    );
+}
+
+/// A memfd opened again read-only through `/proc/self/fd`, as Chromium
+/// makes read-only shared memory, is read-only as Linux's new description
+/// is: `F_GETFL` says so; writes, writable shared mappings, resizing and
+/// sealing are refused; it reads what the memfd holds; and it stays so
+/// passed to another process and after an exec. The memfd stays writable.
+#[test]
+fn a_memfd_opened_again_read_only_is_read_only() {
+    let line = |what: &str| {
+        format!(
+            "{what}: access 0 write -1 EBADF writable mapping -1 EACCES reads hello \
+             through a mapping hello made writable -1 EACCES truncate -1 EINVAL\n"
+        )
+    };
+    assert_eq!(
+        memfd("read-only"),
+        format!(
+            "{}sealing it: -1 EPERM\nthe memfd: access 2\n{}{}",
+            line("reopened"),
+            line("passed"),
+            line("after an exec")
+        )
+    );
 }
 
 /// What the `memfd` guest's `seals` scenario prints: a memfd named as
@@ -7655,6 +7762,16 @@ fn hv_pointer_authentication_and_bti() {
     assert_eq!(out.status.code(), Some(0), "{text}");
 }
 
+/// Part of a file mapped executable, none of its code sections in it (a
+/// loader mapping part of a binary).
+#[test]
+fn a_file_mapped_executable_past_its_code() {
+    let out = fwe(&rust_guest("maps"), &["exec-tail"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "past the code, mapped executable: true\n", "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
 /// MAP_FIXED over mapped memory replaces it, keeping the rest; a buffer
 /// across old and new is one buffer to the kernel; a widened page takes a
 /// write; a mapping over the program's own data (linked low, backed
@@ -7681,6 +7798,7 @@ fn hv_map_fixed_replaces_mapped_memory() {
     let want = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
                 writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
     assert_eq!(stdout(&fwe(&rust_guest("maps"), &["view"])), want);
+
     let out = fwe_hv(&rust_low_guest("maps"), &["view"]).unwrap();
     assert_eq!(stdout(&out), want);
     // Gigabytes reserved and mapped over take memory only where touched.
@@ -8309,8 +8427,9 @@ fn overlay_mounts() {
 /// procfs to `fstatfs`; `SO_PEERCRED`; `shutdown` once the peer has gone;
 /// `CLONE_PARENT`; `AT_EMPTY_PATH`; a BPF program of another type loads but
 /// is not attached; limits set with `prlimit` from outside; netlink of a
-/// network namespace's `lo`, and in the host's, the host's loopback, up
-/// and kept so.
+/// network namespace's `lo` (given its address, as bubblewrap gives it,
+/// and brought up), and in the host's, the host's loopback, up and kept
+/// so.
 #[test]
 fn container_runtime_calls() {
     assert_eq!(
@@ -8323,7 +8442,8 @@ fn container_runtime_calls() {
          shutdown after the peer: ok\nCLONE_PARENT's parent is the grandparent: true\n\
          linkat AT_EMPTY_PATH: ok\nfchownat AT_EMPTY_PATH: ok\nskb program loads: true type 8: true\n\
          attached as a device program: EINVAL\nnetlink outside: true lo flags 0x10049, set down -1\n\
-         netlink inside: true\nlo flags: 0x8\nset up: 0\nlo flags then: 0x10049\n"
+         netlink inside: true\nlo flags: 0x8\naddress added: 0\nadded again: -17\n\
+         another address: -95\nset up: 0\nlo flags then: 0x10049\n"
     );
 }
 
@@ -8589,7 +8709,8 @@ fn cgroups_limits_freeze_and_delegation() {
 /// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
 /// `comm` and host name written as Linux writes them, another process's
 /// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
-/// a tracer reads, to one that may not trace it), and `/proc/net`.
+/// a tracer reads, to one that may not trace it), `/proc/net`, and the
+/// link counts of directories (a process's `task` 2 and its threads).
 #[test]
 fn proc_files_programs_read() {
     let out = run_c_guest("procfiles", &[], &[("FWE_PROC", "1")]);
@@ -8597,7 +8718,9 @@ fn proc_files_programs_read() {
     let (head, tail) = text.split_once("if_inet6: ").unwrap_or((&text, ""));
     assert_eq!(
         head,
-        "meminfo is sysinfo's: 1, procs counted: 1\n\
+        "task links, one thread: 3\ntask links, two threads: 4\n\
+         process directory has subdirectories: 1\n\
+         meminfo is sysinfo's: 1, procs counted: 1\n\
          cpuinfo: cpus 1, BogoMIPS 1, Features fp asimd 1, BHID 0\n\
          environ has FWE_PROC=1: 1\n\
          limits: Limit                    | open files 1\n\
@@ -9128,12 +9251,63 @@ fn proc_hidepid_and_subset_hide_as_linux() {
     );
 }
 
+/// A program whose image is larger than a branch reaches across
+/// (guests/asm/bigimage.S): the code in its middle, which uses `x18` and
+/// the thread pointer, has no place for stubs in reach outside the image,
+/// and runs by translation; the rest runs prepared in place, calling into
+/// it a thousand times.
+#[test]
+fn code_beyond_its_stubs_reach_runs_by_translation() {
+    let prog = build_asm("bigimage", &["-pie", "--no-dynamic-linker"]);
+    let out = fwe(&prog, &[]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "big image: ok\n", "{err}");
+    assert_eq!(out.status.code(), Some(0));
+    assert!(err.contains("KiB of code beyond its stubs' reach, run by translation"), "{err}");
+}
+
+/// What guests/c/faultesr.c prints where a fault's frame holds its
+/// syndrome: the ESR record Linux adds after the FP/SIMD one, a data
+/// abort's, telling a write (WnR) from a read, as Wine reads it.
+const FAULT_ESR: &str = "read: syndrome found, data abort yes, write 0\n\
+    write: syndrome found, data abort yes, write 1\n\
+    no access: fault 3, code 2, at the address yes\n\
+    not mapped: fault 4, code 1, at the address yes\n\
+    breakpoint: code 1, at the instruction yes\n";
+
+/// A fault's syndrome in its handler's frame, natively.
+#[test]
+fn fault_frames_hold_the_syndrome() {
+    let prog = build_c("faultesr", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "faultesr");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), FAULT_ESR, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A fault's syndrome in its handler's frame, in the VM.
+#[test]
+fn hv_fault_frames_hold_the_syndrome() {
+    let prog = build_c("faultesr", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "vm-faultesr");
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg("--root").arg(&root).arg(&prog);
+    let out = run_hv(cmd, "faultesr --vm");
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), FAULT_ESR, "{}", String::from_utf8_lossy(&out.stderr));
+}
+
 /// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
 /// names it; the tests skip without it, as on a development machine),
-/// listening on its Unix socket only, at a display number of its own.
+/// listening on its Unix socket only, at a display number of its own; or
+/// a root's own Xvfb run by fwe ([`Xvfb::in_root`]).
 struct Xvfb {
     number: u32,
     child: std::process::Child,
+    /// Run by fwe in a root: the host's tools reach it over TCP.
+    in_root: bool,
 }
 
 impl Xvfb {
@@ -9142,32 +9316,105 @@ impl Xvfb {
             eprintln!("skipped: set XVFB to an Xvfb to run the display tests");
             return None;
         };
+        // The servers' socket directory, made once before any starts, as a
+        // system makes it at boot: an X server not run as root that finds
+        // it made by another starting at the same moment gives up
+        // (`mkdir` fails with `EEXIST` and it may not make it itself).
+        static SOCKETS: OnceLock<()> = OnceLock::new();
+        SOCKETS.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = Path::new("/tmp/.X11-unix");
+            if std::fs::create_dir(dir).is_ok() {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            }
+            assert!(dir.is_dir(), "{} is not a directory", dir.display());
+        });
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let number = 70 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        let err = display_dir().join(format!("xvfb-{number}.err"));
         let child = Command::new(xvfb)
             .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-nolisten", "tcp"])
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&err).unwrap())
             .spawn()
             .unwrap();
-        let x = Xvfb { number, child };
+        let mut x = Xvfb { number, child, in_root: false };
         let began = Instant::now();
         while !socket.exists() {
-            assert!(began.elapsed() < Duration::from_secs(30), "Xvfb :{number} did not start");
+            let said = || std::fs::read_to_string(&err).unwrap_or_default();
+            if let Some(status) = x.child.try_wait().unwrap() {
+                panic!("Xvfb :{number} ended ({status}): {}", said());
+            }
+            assert!(
+                began.elapsed() < Duration::from_secs(30),
+                "Xvfb :{number} did not start: {}",
+                said()
+            );
             std::thread::sleep(Duration::from_millis(100));
         }
         Some(x)
     }
 
+    /// The root's own Xvfb (Alpine's, which has GLX, as Homebrew's has
+    /// not), run by fwe in `root`, in a process group of its own: the
+    /// root's programs reach it as `:N` (its socket in the root's
+    /// `/tmp/.X11-unix`), the host's tools over TCP ([`Xvfb::display`]).
+    fn in_root(root: &ScratchRoot) -> Xvfb {
+        use std::os::unix::process::CommandExt;
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let number = 170 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = display_dir();
+        let name = format!("xvfb-{number}");
+        let child = Command::new(env!("CARGO_BIN_EXE_fwe"))
+            .arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.0.join("usr/bin/Xvfb"))
+            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-listen", "tcp", "-ac"])
+            .env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(dir.join(format!("{name}.out"))).unwrap())
+            .stderr(std::fs::File::create(dir.join(format!("{name}.err"))).unwrap())
+            .process_group(0)
+            .spawn_alone()
+            .unwrap();
+        let x = Xvfb { number, child, in_root: true };
+        let began = Instant::now();
+        while std::net::TcpStream::connect(("127.0.0.1", 6000 + number as u16)).is_err() {
+            let err = std::fs::read_to_string(dir.join(format!("{name}.err"))).unwrap_or_default();
+            assert!(
+                began.elapsed() < Duration::from_secs(120),
+                "Xvfb :{number} did not start: {err}"
+            );
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        x
+    }
+
+    /// The display as the host's tools (and fwe's `DISPLAY`) name it.
     fn display(&self) -> String {
-        format!(":{}", self.number)
+        if self.in_root {
+            format!("127.0.0.1:{}", self.number)
+        } else {
+            format!(":{}", self.number)
+        }
     }
 }
 
 impl Drop for Xvfb {
     fn drop(&mut self) {
-        let _ = self.child.kill();
+        if self.in_root {
+            let pgid = self.child.id() as i32;
+            assert!(pgid > 1);
+            // SAFETY: signals to the process group this test made (its
+            // leader is the child), never pid 0, 1 or -1.
+            unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        } else {
+            let _ = self.child.kill();
+        }
         let _ = self.child.wait();
     }
 }
@@ -9197,420 +9444,687 @@ fn display_x11_client_draws_through_shared_memory() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// TEMPORARY (M7 probe, removed before merge): what of Linux's graphical
-/// programs runs on fwe today, against a headless X server (Xvfb, from
-/// Homebrew's xorg-server: `XVFB`, with `LIBX11` for screenshots), only
-/// where `FWE_DISPLAY_PROBE` names a set: `native` (X11 clients, Weston
-/// with Wayland clients and Xwayland, tkinter, GTK, Qt, Chromium) or
-/// `wine` (Wine's notepad through its X11 driver, in the VM). Each
-/// program's output, calls and a screenshot go to
-/// `target/tmp/display-probe`; nothing is asserted.
+/// [`display_x11_client_draws_through_shared_memory`] in the VM, from a
+/// fork child (a new fwe process, which gets the host display from its
+/// parent's hand-off, not from an environment or its arguments).
 #[test]
-fn alpine_display_probe() {
-    if !fetched_program_tests("FWE_DISPLAY_PROBE") {
-        return;
+fn display_x11_client_draws_from_a_fork_child_in_the_vm() {
+    let prog = build_c("x11shm", Libc::Musl, true, true);
+    let Some(x) = Xvfb::start() else { return };
+    let root = libc_rootfs(Libc::Musl, "vm-x11shm");
+    let Some(mut cmd) = hv_command() else { return };
+    cmd.arg("--vm").arg("--root").arg(&root).arg(&prog).arg("fork").env("DISPLAY", x.display());
+    let out = run_hv(cmd, "x11shm fork --vm");
+    let _ = std::fs::remove_dir_all(&root);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(
+        stdout(&out),
+        "connected: depth 24\nput through shared memory: drawn\ngot through shared memory: filled\n",
+        "{err}"
+    );
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
+/// Whether the tests of a fetched root's graphical programs run, and their
+/// X server: only where `FWE_DISPLAY_TESTS` is set (CI's `display` job,
+/// with Homebrew's Xvfb, xdotool and libX11: `XVFB`, `LIBX11`), never on a
+/// development machine.
+fn display_tests() -> Option<Xvfb> {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return None;
     }
-    let set = std::env::var("FWE_DISPLAY_PROBE").unwrap();
-    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).join("display-probe");
-    let _ = std::fs::remove_dir_all(&out);
-    std::fs::create_dir_all(&out).unwrap();
-    let p = Probe::start(out);
-    if set == "wine" {
-        p.wine();
-    } else {
-        p.native();
+    Some(Xvfb::start().expect("XVFB: the display tests need Xvfb"))
+}
+
+/// A root of its own for display test `test`, cloned from `cached` (a
+/// fetched root) once that is ready for graphical programs: what a
+/// package manager's triggers would have made (loader caches, schemas,
+/// font and MIME databases) made in it by its own programs, and the
+/// directories a session has (`/tmp/.X11-unix`, `XDG_RUNTIME_DIR`).
+fn display_root(cached: &Path, test: &str) -> ScratchRoot {
+    static PREPARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    {
+        let _one = PREPARING.lock().unwrap_or_else(|e| e.into_inner());
+        let stamp = cached.join(".fwe-display-ready");
+        if !stamp.exists() {
+            for d in ["root", "tmp/xdg", "tmp/.X11-unix"] {
+                std::fs::create_dir_all(cached.join(d)).unwrap();
+            }
+            run_checked(Command::new("chmod").arg("700").arg(cached.join("tmp/xdg")));
+            run_checked(Command::new("chmod").arg("1777").arg(cached.join("tmp/.X11-unix")));
+            // Each where its package's trigger would run: the program
+            // there, and what it works on.
+            for (prog, args, on) in [
+                (
+                    "usr/bin/gdk-pixbuf-query-loaders",
+                    &["--update-cache"][..],
+                    "usr/lib/gdk-pixbuf-2.0",
+                ),
+                (
+                    "usr/bin/glib-compile-schemas",
+                    &["/usr/share/glib-2.0/schemas"][..],
+                    "usr/share/glib-2.0/schemas",
+                ),
+                // The X server's own fonts' indexes (its default, `fixed`).
+                ("usr/bin/mkfontscale", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
+                ("usr/bin/mkfontdir", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
+                ("usr/bin/fc-cache", &["-f"][..], "etc/fonts"),
+                ("usr/bin/update-mime-database", &["/usr/share/mime"][..], "usr/share/mime"),
+            ] {
+                if !cached.join(prog).exists() || !cached.join(on).exists() {
+                    continue;
+                }
+                let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+                    .arg("--root")
+                    .arg(cached)
+                    .arg(cached.join(prog))
+                    .args(args)
+                    .env_clear()
+                    .env("PATH", "/usr/bin:/bin")
+                    .output_alone()
+                    .unwrap();
+                assert!(out.status.success(), "{prog}: {}", String::from_utf8_lossy(&out.stderr));
+            }
+            std::fs::write(&stamp, "").unwrap();
+        }
+    }
+    let root = std::env::temp_dir().join(format!("fwe-display-{test}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cpR").arg(cached).arg(&root));
+    ScratchRoot(root)
+}
+
+/// A root a test made, removed when it is done.
+struct ScratchRoot(PathBuf);
+
+impl Drop for ScratchRoot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 
-struct Probe {
-    out: PathBuf,
-    xvfb: std::process::Child,
-}
-
-/// A program the probe started, in a process group of its own.
-struct Running {
+/// A graphical program run by fwe on a test's X server, in a process
+/// group of its own (stopped when dropped), its output and calls kept in
+/// `target/tmp/display/<name>.{out,err,trace}` for a failure's report.
+struct Gui {
     name: String,
     child: std::process::Child,
-    trace: PathBuf,
 }
 
-const PROBE_DISPLAY: &str = ":99";
-/// The display as a Linux client reaches it over TCP (fwe's sockets are
-/// the host's), without a Unix socket in the guest's root.
-const PROBE_TCP: &str = "127.0.0.1:99";
+/// Where the display tests keep what their programs said, and their
+/// screenshots.
+fn display_dir() -> PathBuf {
+    let d = Path::new(env!("CARGO_TARGET_TMPDIR")).join("display");
+    std::fs::create_dir_all(&d).unwrap();
+    d
+}
 
-impl Probe {
-    fn start(out: PathBuf) -> Probe {
-        let xvfb_path = std::env::var("XVFB").expect("XVFB: Homebrew's Xvfb");
-        let xvfb = Command::new(xvfb_path)
-            .args([PROBE_DISPLAY, "-screen", "0", "1280x800x24", "-listen", "tcp", "-ac"])
-            .stdout(std::fs::File::create(out.join("xvfb.log")).unwrap())
-            .stderr(std::fs::File::create(out.join("xvfb.err")).unwrap())
-            .spawn()
-            .unwrap();
-        let p = Probe { out, xvfb };
-        let began = Instant::now();
-        while !p.host("xdpyinfo", &["-display", PROBE_DISPLAY]).status.success() {
-            assert!(began.elapsed() < Duration::from_secs(60), "Xvfb did not start");
-            std::thread::sleep(Duration::from_millis(500));
-        }
-        let info = p.host("xdpyinfo", &["-display", PROBE_DISPLAY, "-queryExtensions"]);
-        std::fs::write(p.out.join("xdpyinfo-host.txt"), &info.stdout).unwrap();
-        eprintln!("=== host xdpyinfo:\n{}", stdout(&info));
-        p
-    }
-
-    fn host(&self, program: &str, args: &[&str]) -> Output {
-        Command::new(program).args(args).env("DISPLAY", PROBE_DISPLAY).output_alone().unwrap()
-    }
-
-    /// A root of its own, copied from the fetched one.
-    fn root(&self, manifest: &str) -> PathBuf {
-        let cached = alpine_root(manifest);
-        let root =
-            std::env::temp_dir().join(format!("fwe-probe-{manifest}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
-        for d in ["root", "tmp", "tmp/xdg"] {
-            std::fs::create_dir_all(root.join(d)).unwrap();
-        }
-        run_checked(Command::new("chmod").arg("700").arg(root.join("tmp/xdg")));
-        // What apk's triggers would have made: loader caches, schemas,
-        // font and MIME databases.
-        for (prog, args) in [
-            ("/usr/bin/gdk-pixbuf-query-loaders", vec!["--update-cache"]),
-            ("/usr/bin/glib-compile-schemas", vec!["/usr/share/glib-2.0/schemas"]),
-            ("/usr/bin/fc-cache", vec!["-f"]),
-            ("/usr/bin/update-mime-database", vec!["/usr/share/mime"]),
-        ] {
-            if !root.join(prog.trim_start_matches('/')).exists() {
-                continue;
-            }
-            let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
-                .arg("--root")
-                .arg(&root)
-                .arg(root.join(prog.trim_start_matches('/')))
-                .args(&args)
-                .env_clear()
-                .env("PATH", "/usr/bin:/bin")
-                .output_alone()
-                .unwrap();
-            eprintln!(
-                "=== {manifest}: {prog}: {}{}",
-                out.status,
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-        root
-    }
-
-    fn spawn(&self, name: &str, mut cmd: Command) -> Running {
-        use std::os::unix::process::CommandExt;
-        cmd.stdin(Stdio::null())
-            .stdout(std::fs::File::create(self.out.join(format!("{name}.out"))).unwrap())
-            .stderr(std::fs::File::create(self.out.join(format!("{name}.err"))).unwrap())
-            .process_group(0);
-        eprintln!("=== {name}: starting");
-        let child = cmd.spawn().unwrap();
-        Running { name: name.into(), child, trace: self.out.join(format!("{name}.trace")) }
-    }
-
-    /// `program` (under `root`) with `args` and `env`, natively.
-    fn fwe(
-        &self,
+impl Gui {
+    fn start(
+        x: &Xvfb,
         name: &str,
-        root: &Path,
+        root: &ScratchRoot,
         program: &str,
         args: &[&str],
         env: &[(&str, &str)],
-    ) -> Running {
+    ) -> Gui {
+        let dir = display_dir();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-        cmd.arg("--strace")
-            .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
+        cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
             .arg("--root")
-            .arg(root)
-            .arg(root.join(program.trim_start_matches('/')))
+            .arg(&root.0)
+            .arg(root.0.join(program.trim_start_matches('/')))
             .args(args)
             .env_clear()
             .env("HOME", "/root")
             .env("PATH", "/usr/bin:/bin")
             .env("XDG_RUNTIME_DIR", "/tmp/xdg")
             .env("LANG", "C.UTF-8")
-            .env("DISPLAY", PROBE_DISPLAY);
+            .env("DISPLAY", x.display());
         for (k, v) in env {
             cmd.env(k, v);
         }
-        self.spawn(name, cmd)
+        let _ = std::fs::remove_file(dir.join(format!("{name}.trace")));
+        Gui::run(name, cmd)
     }
 
-    /// Wait up to `secs` for `r` to end or settle, then a screenshot.
-    fn settle(&self, r: &mut Running, secs: u64) {
+    /// `cmd` (an fwe command made ready) as program `name`.
+    fn run(name: &str, mut cmd: Command) -> Gui {
+        use std::os::unix::process::CommandExt;
+        let dir = display_dir();
+        cmd.stdin(Stdio::null())
+            .stdout(std::fs::File::create(dir.join(format!("{name}.out"))).unwrap())
+            .stderr(std::fs::File::create(dir.join(format!("{name}.err"))).unwrap())
+            .process_group(0);
+        Gui { name: name.into(), child: cmd.spawn_alone().unwrap() }
+    }
+
+    /// What the program said and its last calls, for a failure.
+    fn report(&mut self) -> String {
+        let dir = display_dir();
+        let err = std::fs::read_to_string(dir.join(format!("{}.err", self.name)));
+        let err = err.unwrap_or_default();
+        let tail: Vec<&str> = err.lines().rev().take(30).collect();
+        print_last_calls(&dir.join(format!("{}.trace", self.name)));
+        let state = match self.child.try_wait() {
+            Ok(Some(s)) => format!("ended: {s}"),
+            _ => "running".to_string(),
+        };
+        format!(
+            "{}: {state}\n--- its last errors:\n{}",
+            self.name,
+            tail.into_iter().rev().collect::<Vec<_>>().join("\n")
+        )
+    }
+
+    fn ended(&mut self) -> bool {
+        matches!(self.child.try_wait(), Ok(Some(_)))
+    }
+
+    /// Its exit status once it ends, within `secs`.
+    fn exits(&mut self, secs: u64) -> std::process::ExitStatus {
         let began = Instant::now();
-        while began.elapsed() < Duration::from_secs(secs) {
-            if let Ok(Some(s)) = r.child.try_wait() {
-                eprintln!("=== {}: ended by itself after {:?}: {s}", r.name, began.elapsed());
-                break;
+        loop {
+            if let Some(s) = self.child.try_wait().unwrap() {
+                return s;
             }
-            std::thread::sleep(Duration::from_secs(1));
+            assert!(began.elapsed() < Duration::from_secs(secs), "{}", self.report());
+            std::thread::sleep(Duration::from_millis(200));
         }
-        self.shot(&r.name);
-    }
-
-    fn shot(&self, name: &str) {
-        let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
-        let png = self.out.join(format!("{name}.png"));
-        let tool = repo().join("tools/display/shot.py");
-        let o = Command::new("python3")
-            .arg(tool)
-            .arg(lib)
-            .arg(PROBE_DISPLAY)
-            .arg(&png)
-            .output_alone()
-            .unwrap();
-        let tree = self.host("xwininfo", &["-root", "-tree", "-display", PROBE_DISPLAY]);
-        std::fs::write(self.out.join(format!("{name}.windows.txt")), &tree.stdout).unwrap();
-        eprintln!(
-            "=== {name}: screenshot {}{}; windows:\n{}",
-            stdout(&o).trim(),
-            String::from_utf8_lossy(&o.stderr).trim(),
-            stdout(&tree)
-                .lines()
-                .filter(|l| l.contains('"'))
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    /// Stop `r`'s process group and print what it said.
-    fn stop(&self, mut r: Running) {
-        let pgid = r.child.id() as i32;
-        assert!(pgid > 1);
-        let running = matches!(r.child.try_wait(), Ok(None));
-        // SAFETY: signals to the process group this probe made (its
-        // leader is the child), never pid 0, 1 or -1.
-        unsafe { libc::kill(-pgid, libc::SIGTERM) };
-        std::thread::sleep(Duration::from_secs(2));
-        // SAFETY: as above.
-        unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        let status = r.child.wait().unwrap();
-        let err =
-            std::fs::read_to_string(self.out.join(format!("{}.err", r.name))).unwrap_or_default();
-        let outp =
-            std::fs::read_to_string(self.out.join(format!("{}.out", r.name))).unwrap_or_default();
-        let tail = |s: &str| {
-            s.lines()
-                .rev()
-                .take(40)
-                .collect::<Vec<_>>()
-                .into_iter()
-                .rev()
-                .collect::<Vec<_>>()
-                .join("\n")
-        };
-        eprintln!(
-            "=== {}: {} ({status})\n--- stdout:\n{}\n--- stderr:\n{}",
-            r.name,
-            if running { "still running when stopped" } else { "had ended" },
-            tail(&outp),
-            tail(&err)
-        );
-        if !running {
-            print_last_calls(&r.trace);
-        }
-    }
-
-    fn native(&self) {
-        let root = self.root("display");
-        for (name, display) in [("xdpyinfo-tcp", PROBE_TCP), ("xdpyinfo-unix", PROBE_DISPLAY)] {
-            let mut r = self.fwe(
-                name,
-                &root,
-                "/usr/bin/xdpyinfo",
-                &["-queryExtensions"],
-                &[("DISPLAY", display)],
-            );
-            self.settle(&mut r, 60);
-            self.stop(r);
-        }
-        for prog in ["xeyes", "xclock"] {
-            let mut r = self.fwe(prog, &root, &format!("/usr/bin/{prog}"), &[], &[]);
-            self.settle(&mut r, 60);
-            self.stop(r);
-        }
-        // xterm, typed into from the host.
-        let mut r = self.fwe(
-            "xterm",
-            &root,
-            "/usr/bin/xterm",
-            &["-fa", "monospace", "-fs", "11", "-e", "/bin/sh"],
-            &[],
-        );
-        self.settle(&mut r, 60);
-        let typed = self.host(
-            "xdotool",
-            &[
-                "search",
-                "--sync",
-                "--class",
-                "xterm",
-                "windowactivate",
-                "--sync",
-                "type",
-                "--delay",
-                "50",
-                "echo typed in > /tmp/typed\n",
-            ],
-        );
-        eprintln!("=== xdotool: {} {}", typed.status, String::from_utf8_lossy(&typed.stderr));
-        std::thread::sleep(Duration::from_secs(5));
-        self.shot("xterm-typed");
-        eprintln!(
-            "=== xterm: /tmp/typed holds {:?}",
-            std::fs::read_to_string(root.join("tmp/typed"))
-        );
-        self.stop(r);
-        // Weston on X11, Wayland clients and Xwayland in it.
-        let mut weston = self.fwe(
-            "weston",
-            &root,
-            "/usr/bin/weston",
-            &[
-                "--backend=x11",
-                "--renderer=pixman",
-                "--socket=wayland-1",
-                "--xwayland",
-                "--width=1000",
-                "--height=700",
-            ],
-            &[],
-        );
-        self.settle(&mut weston, 60);
-        let wl = [("WAYLAND_DISPLAY", "wayland-1")];
-        let mut clients = Vec::new();
-        for (name, prog) in [
-            ("weston-simple-shm", "/usr/bin/weston-simple-shm"),
-            ("foot", "/usr/bin/foot"),
-            ("weston-terminal", "/usr/bin/weston-terminal"),
-        ] {
-            let mut r = self.fwe(name, &root, prog, &[], &wl);
-            self.settle(&mut r, 45);
-            clients.push(r);
-        }
-        let mut r = self.fwe("xeyes-xwayland", &root, "/usr/bin/xeyes", &[], &[("DISPLAY", ":0")]);
-        self.settle(&mut r, 60);
-        clients.push(r);
-        for r in clients {
-            self.stop(r);
-        }
-        self.stop(weston);
-        let _ = std::fs::remove_dir_all(&root);
-        // Toolkits.
-        let root = self.root("toolkits");
-        std::fs::write(
-            root.join("tmp/tk.py"),
-            "import tkinter as tk\nw = tk.Tk()\nw.title('fwe tkinter')\ntk.Label(w, text='Hello from tkinter on fwe', font=('DejaVu Sans', 24)).pack(padx=40, pady=40)\ntk.Button(w, text='A button').pack(pady=20)\nw.mainloop()\n",
-        )
-        .unwrap();
-        std::fs::write(
-            root.join("tmp/qt.py"),
-            "import sys\nfrom PyQt6.QtWidgets import QApplication, QLabel, QPushButton, QVBoxLayout, QWidget\napp = QApplication(sys.argv)\nw = QWidget()\nw.setWindowTitle('fwe Qt')\nl = QVBoxLayout(w)\nl.addWidget(QLabel('Hello from Qt on fwe'))\nl.addWidget(QPushButton('A button'))\nw.resize(500, 300)\nw.show()\nprint('platform', app.platformName(), flush=True)\nsys.exit(app.exec())\n",
-        )
-        .unwrap();
-        for (name, prog, args, env) in [
-            ("tkinter", "/usr/bin/python3", vec!["/tmp/tk.py"], vec![]),
-            ("gtk3-demo", "/usr/bin/gtk3-demo", vec![], vec![("GDK_BACKEND", "x11")]),
-            (
-                "gtk4-demo",
-                "/usr/bin/gtk4-demo",
-                vec![],
-                vec![("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")],
-            ),
-            ("qt", "/usr/bin/python3", vec!["/tmp/qt.py"], vec![("QT_QPA_PLATFORM", "xcb")]),
-        ] {
-            let mut r = self.fwe(name, &root, prog, &args, &env);
-            self.settle(&mut r, 90);
-            self.stop(r);
-        }
-        let _ = std::fs::remove_dir_all(&root);
-        // Chromium, the engine Electron embeds: its sandbox on, then off.
-        let root = self.root("chromium");
-        std::fs::write(
-            root.join("tmp/page.html"),
-            "<html><body style='background:#36c;color:white;font:48px sans-serif'><h1>Hello from Chromium on fwe</h1><p id=t></p><script>document.getElementById('t').textContent = 'script ran: ' + (6 * 7);</script></body></html>",
-        )
-        .unwrap();
-        for (name, extra) in [("chromium", vec![]), ("chromium-nosandbox", vec!["--no-sandbox"])] {
-            let mut args = vec![
-                "--ozone-platform=x11",
-                "--user-data-dir=/tmp/chrome",
-                "--no-first-run",
-                "--disable-gpu",
-            ];
-            args.extend(extra);
-            args.push("file:///tmp/page.html");
-            let mut r = self.fwe(name, &root, "/usr/lib/chromium/chromium", &args, &[]);
-            self.settle(&mut r, 180);
-            self.stop(r);
-        }
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    fn wine(&self) {
-        let root = self.root("wine-x11");
-        // Natively first: Wine's own 4 KiB pages on fwe's 16 KiB ones.
-        for (name, command, secs) in [
-            ("wine-native-version", "wine --version", 120),
-            ("wineboot-native", "wine wineboot --init; wineserver -w", 900),
-            ("notepad-native", "wine notepad", 300),
-        ] {
-            let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-            cmd.arg("--strace")
-                .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
-                .arg("--root")
-                .arg(&root)
-                .arg(root.join("bin/busybox"))
-                .args(["sh", "-c", command])
-                .env_clear()
-                .env("HOME", "/root")
-                .env("PATH", "/usr/bin:/bin")
-                .env("WINEPREFIX", "/root/.wine-native")
-                .env("WINEDEBUG", "err+all")
-                .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
-                .env("DISPLAY", PROBE_DISPLAY);
-            let mut r = self.spawn(name, cmd);
-            self.settle(&mut r, secs);
-            self.stop(r);
-        }
-        let wine = |name: &str, command: &str, secs: u64| {
-            let mut cmd = hv_command().expect("the stand-in");
-            cmd.arg("--vm")
-                .arg("--strace")
-                .arg(format!("--strace-file={}", self.out.join(format!("{name}.trace")).display()))
-                .arg("--root")
-                .arg(&root)
-                .arg(root.join("bin/busybox"))
-                .args(["sh", "-c", command])
-                .env_clear()
-                .env("HOME", "/root")
-                .env("PATH", "/usr/bin:/bin")
-                .env("WINEPREFIX", "/root/.wine")
-                .env("WINEDEBUG", "err+all")
-                .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
-                .env("DISPLAY", PROBE_DISPLAY);
-            let mut r = self.spawn(name, cmd);
-            self.settle(&mut r, secs);
-            self.stop(r);
-        };
-        wine("wineboot", "wine wineboot --init; wineserver -w", 2400);
-        wine("notepad", "wine notepad", 900);
-        let _ = std::fs::remove_dir_all(&root);
     }
 }
 
-impl Drop for Probe {
+impl Drop for Gui {
     fn drop(&mut self) {
-        let _ = self.xvfb.kill();
-        let _ = self.xvfb.wait();
+        let pgid = self.child.id() as i32;
+        assert!(pgid > 1);
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // SAFETY: signals to the process group this test made (its
+            // leader is the child), never pid 0, 1 or -1.
+            unsafe { libc::kill(-pgid, libc::SIGTERM) };
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        // SAFETY: as above; the group's other processes may outlive it.
+        unsafe { libc::kill(-pgid, libc::SIGKILL) };
+        let _ = self.child.wait();
     }
+}
+
+/// A window on a test's X server: its id and where it is on the screen.
+#[derive(Debug, Clone)]
+struct Window {
+    id: String,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+}
+
+/// What a window shows ([`Xvfb::shot`], from `tools/display/shot.py`).
+#[derive(Debug)]
+struct Shot {
+    /// How many of its pixels are not its most common colour.
+    drawn: u64,
+    /// How many pixels each colour has.
+    colours: Vec<(u32, u64)>,
+    /// A hash of every pixel.
+    digest: String,
+}
+
+impl Shot {
+    fn count(&self, rgb: u32) -> u64 {
+        self.colours.iter().filter(|(c, _)| *c == rgb).map(|(_, n)| n).sum()
+    }
+}
+
+impl Xvfb {
+    /// Homebrew's xdotool on this server.
+    fn xdotool(&self, args: &[&str]) -> Output {
+        Command::new("xdotool").args(args).env("DISPLAY", self.display()).output_alone().unwrap()
+    }
+
+    /// The visible window `search` finds (xdotool's search arguments), once
+    /// `gui` has made it, within `secs`: the largest, where there are more.
+    fn window(&self, gui: &mut Gui, search: &[&str], secs: u64) -> Window {
+        let began = Instant::now();
+        loop {
+            let mut args = vec!["search", "--onlyvisible"];
+            args.extend(search);
+            let found = self.xdotool(&args);
+            let best = stdout(&found)
+                .lines()
+                .map(|id| self.geometry(id.trim()))
+                .filter(|w| w.w > 1 && w.h > 1)
+                .max_by_key(|w| w.w * w.h);
+            if let Some(w) = best {
+                return w;
+            }
+            assert!(!gui.ended(), "no window {search:?}: {}", gui.report());
+            assert!(
+                began.elapsed() < Duration::from_secs(secs),
+                "no window {search:?} after {secs} s: {}",
+                gui.report()
+            );
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    fn geometry(&self, id: &str) -> Window {
+        let out = self.xdotool(&["getwindowgeometry", "--shell", id]);
+        let text = stdout(&out);
+        let get = |k: &str| {
+            text.lines()
+                .find_map(|l| l.strip_prefix(&format!("{k}=")))
+                .and_then(|v| v.trim().parse().ok())
+                .unwrap_or(0)
+        };
+        Window { id: id.into(), x: get("X"), y: get("Y"), w: get("WIDTH"), h: get("HEIGHT") }
+    }
+
+    /// What window `w` shows now, its screenshot saved as `<name>.png`.
+    fn shot(&self, w: &Window, name: &str) -> Shot {
+        let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
+        let png = display_dir().join(format!("{name}.png"));
+        let (x, y, ww, hh) = (w.x.to_string(), w.y.to_string(), w.w.to_string(), w.h.to_string());
+        let out = Command::new("python3")
+            .arg(repo().join("tools/display/shot.py"))
+            .arg(lib)
+            .arg(self.display())
+            .arg(&png)
+            .args([&x, &y, &ww, &hh])
+            .output_alone()
+            .unwrap();
+        assert!(out.status.success(), "shot.py: {}", String::from_utf8_lossy(&out.stderr));
+        let text = stdout(&out);
+        let drawn = text
+            .lines()
+            .next()
+            .and_then(|l| l.split(", ").nth(2))
+            .and_then(|p| p.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        let colours = text
+            .lines()
+            .filter_map(|l| l.strip_prefix("colour "))
+            .map(|l| {
+                let (c, n) = l.split_once(' ').unwrap();
+                (u32::from_str_radix(c, 16).unwrap(), n.parse().unwrap())
+            })
+            .collect();
+        let digest = text.lines().find_map(|l| l.strip_prefix("digest ")).unwrap().to_string();
+        Shot { drawn, colours, digest }
+    }
+
+    /// Wait up to `secs` for window `w` to show something other than
+    /// `before` (its digest): what it shows then.
+    fn changes(&self, w: &Window, before: &Shot, name: &str, secs: u64) -> Shot {
+        let began = Instant::now();
+        loop {
+            let now = self.shot(w, name);
+            if now.digest != before.digest || began.elapsed() > Duration::from_secs(secs) {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Keys typed into window `w` (focused first: there is no window
+    /// manager to give it the focus).
+    fn type_into(&self, w: &Window, text: &str) {
+        let out = self.xdotool(&[
+            "windowfocus",
+            "--sync",
+            &w.id,
+            "type",
+            "--delay",
+            "40",
+            "--window",
+            &w.id,
+            text,
+        ]);
+        assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Window `w` asked to close, as a window manager's close button asks
+    /// (`tools/display/close.py`: there is no window manager to).
+    fn close(&self, w: &Window) {
+        let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
+        let out = Command::new("python3")
+            .arg(repo().join("tools/display/close.py"))
+            .arg(lib)
+            .arg(self.display())
+            .arg(&w.id)
+            .output_alone()
+            .unwrap();
+        assert!(out.status.success(), "close.py: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    /// Keys (xdotool's names, `ctrl+q`) pressed and released with window
+    /// `w` focused, through the server as a keyboard's are (XTEST): a
+    /// popup's grab gets them first, as it would a user's.
+    fn key_into(&self, w: &Window, keys: &str) {
+        let out = self.xdotool(&["windowfocus", "--sync", &w.id, "key", keys]);
+        assert!(out.status.success(), "xdotool key: {}", String::from_utf8_lossy(&out.stderr));
+    }
+}
+
+/// The X11 clients of Alpine's display root (`guests/alpine/fetch/
+/// display.txt`), a root of their own for `test`.
+fn x11_root(test: &str) -> ScratchRoot {
+    display_root(&alpine_root("display"), test)
+}
+
+/// xeyes draws its eyes, and they follow the pointer: what its window
+/// shows changes as the pointer moves from one side of it to the other.
+#[test]
+fn alpine_display_xeyes_follows_the_pointer() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("xeyes");
+    let mut gui =
+        Gui::start(&x, "xeyes", &root, "/usr/bin/xeyes", &["-geometry", "300x200+0+0"], &[]);
+    let w = x.window(&mut gui, &["--class", "xeyes"], 120);
+    let pointer = |px: i32, py: i32| {
+        let o = x.xdotool(&["mousemove", &px.to_string(), &py.to_string()]);
+        assert!(o.status.success());
+    };
+    pointer(w.x + w.w + 200, w.y + w.h / 2);
+    std::thread::sleep(Duration::from_secs(1));
+    let right = x.shot(&w, "xeyes-right");
+    assert!(right.drawn > 1000, "xeyes drew {right:?}: {}", gui.report());
+    pointer(w.x, w.y + w.h + 200);
+    let down = x.changes(&w, &right, "xeyes-down", 30);
+    assert_ne!(down.digest, right.digest, "the eyes did not move: {}", gui.report());
+}
+
+/// xclock's analogue face, its second hand moving: what it shows changes
+/// from one second to the next.
+#[test]
+fn alpine_display_xclock_ticks() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("xclock");
+    let args = ["-update", "1", "-geometry", "200x200+0+0"];
+    let mut gui = Gui::start(&x, "xclock", &root, "/usr/bin/xclock", &args, &[]);
+    let w = x.window(&mut gui, &["--class", "xclock"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "xclock-first");
+    assert!(first.drawn > 500, "xclock drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "xclock-next", 10);
+    assert_ne!(next.digest, first.digest, "the clock did not tick: {}", gui.report());
+}
+
+/// xterm runs a shell, which runs what is typed into its window: a file
+/// written, and a block of red cells drawn (`\033[41m`, xterm's red,
+/// #cd0000).
+#[test]
+fn alpine_display_xterm_runs_what_is_typed() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("xterm");
+    let args = ["-fa", "monospace", "-fs", "11", "-geometry", "80x24+0+0", "-e", "/bin/sh"];
+    let mut gui = Gui::start(&x, "xterm", &root, "/usr/bin/xterm", &args, &[]);
+    let w = x.window(&mut gui, &["--class", "xterm"], 120);
+    std::thread::sleep(Duration::from_secs(1));
+    let before = x.shot(&w, "xterm-before");
+    x.type_into(&w, "echo typed in > /tmp/typed; printf '\\033[41m%40s\\033[0m\\n' ''\n");
+    let after = x.changes(&w, &before, "xterm-after", 30);
+    let typed = root.0.join("tmp/typed");
+    let began = Instant::now();
+    while !typed.exists() && began.elapsed() < Duration::from_secs(30) {
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(
+        std::fs::read_to_string(&typed).ok().as_deref(),
+        Some("typed in\n"),
+        "{}",
+        gui.report()
+    );
+    let after = x.changes(&w, &after, "xterm-red", 5);
+    assert!(after.count(0xcd0000) > 2000, "no red cells: {after:?}");
+}
+
+/// glxgears drawn by Mesa's software renderer (llvmpipe, whose shaders
+/// LLVM compiles at run time: fwe runs them by translation) on the root's
+/// own Xvfb, which fwe runs too (an X server with GLX: Homebrew's has
+/// none): its gears drawn and turning, and its frame rate reported.
+#[test]
+fn alpine_display_glxgears_turns_by_software() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    let root = x11_root("glxgears");
+    let x = Xvfb::in_root(&root);
+    let env = [("LIBGL_ALWAYS_SOFTWARE", "1"), ("GALLIUM_DRIVER", "llvmpipe")];
+    let command = format!("DISPLAY=:{} exec /usr/bin/glxgears -geometry 300x300+0+0", x.number);
+    let mut gui = Gui::start(&x, "glxgears", &root, "/bin/sh", &["-c", &command], &env);
+    let w = x.window(&mut gui, &["--name", "glxgears"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "glxgears-first");
+    assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "glxgears-next", 10);
+    assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
+    let out = display_dir().join("glxgears.out");
+    let began = Instant::now();
+    let rate = loop {
+        let text = std::fs::read_to_string(&out).unwrap_or_default();
+        let fps = text
+            .lines()
+            .find_map(|l| l.split(" = ").nth(1)?.strip_suffix(" FPS")?.trim().parse::<f64>().ok());
+        if let Some(fps) = fps {
+            break fps;
+        }
+        assert!(began.elapsed() < Duration::from_secs(30), "no frame rate: {}", gui.report());
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    eprintln!("glxgears: {rate} frames a second");
+    assert!(rate > 1.0, "{rate} frames a second: {}", gui.report());
+}
+
+/// Wine's Notepad, a Windows program, drawn through Wine's X11 driver in
+/// the VM (Wine needs 4 KiB pages: on the stand-in here): its window drawn,
+/// and what is typed into it shown.
+#[test]
+fn alpine_display_wine_notepad_in_the_vm() {
+    let Some(x) = display_tests() else { return };
+    let root = display_root(&alpine_root("wine-x11"), "wine");
+    let wine = |name: &str, command: &str| {
+        let mut cmd = hv_command().expect("the hypervisor stand-in");
+        cmd.arg("--vm")
+            .arg(format!("--strace-file={}", display_dir().join(format!("{name}.trace")).display()))
+            .arg("--root")
+            .arg(&root.0)
+            .arg(root.0.join("bin/busybox"))
+            .args(["sh", "-c", command])
+            .env_clear()
+            .env("HOME", "/root")
+            .env("PATH", "/usr/bin:/bin")
+            .env("WINEPREFIX", "/root/.wine")
+            .env("WINEDEBUG", "err+all")
+            .env("WINEDLLOVERRIDES", "mscoree,mshtml=")
+            .env("DISPLAY", x.display());
+        Gui::run(name, cmd)
+    };
+    let mut boot = wine("wineboot", "wine wineboot --init; wineserver -w");
+    let status = boot.exits(1800);
+    assert!(status.success(), "wineboot: {status}: {}", boot.report());
+    let mut notepad = wine("notepad", "wine notepad");
+    let w = x.window(&mut notepad, &["--name", "Notepad"], 1800);
+    std::thread::sleep(Duration::from_secs(5));
+    let before = x.shot(&w, "notepad-before");
+    assert!(before.drawn > 5000, "Notepad drew {before:?}: {}", notepad.report());
+    x.type_into(&w, "typed into Notepad");
+    let after = x.changes(&w, &before, "notepad-typed", 300);
+    assert_ne!(after.digest, before.digest, "typing showed nothing: {}", notepad.report());
+}
+
+/// Wayland: Weston, drawing on the X display (its X11 back end, Pixman's
+/// renderer), with a Wayland client and an X11 one in it. foot (a Wayland
+/// terminal) is drawn in Weston's window and runs what is typed into it
+/// (the keys going from the X server through Weston to foot); then xeyes,
+/// on the display of Weston's Xwayland (the guest's own `:0`), is drawn
+/// there too.
+#[test]
+fn alpine_display_weston_runs_wayland_and_xwayland_clients() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("weston");
+    // No panel (its clock would change what the window shows), and a
+    // background of one colour: what changes is the clients'.
+    let config = root.0.join("root/.config");
+    std::fs::create_dir_all(&config).unwrap();
+    std::fs::write(
+        config.join("weston.ini"),
+        "[shell]\npanel-position=none\nbackground-color=0xff204060\n",
+    )
+    .unwrap();
+    let args = [
+        "--backend=x11",
+        "--renderer=pixman",
+        "--socket=wayland-1",
+        "--xwayland",
+        "--width=800",
+        "--height=600",
+    ];
+    let mut weston = Gui::start(&x, "weston", &root, "/usr/bin/weston", &args, &[]);
+    // Found by its class: Weston names its window only in `_NET_WM_NAME`,
+    // which xdotool's `--name` does not read.
+    let w = x.window(&mut weston, &["--class", "Weston Compositor"], 180);
+    std::thread::sleep(Duration::from_secs(3));
+    let empty = x.shot(&w, "weston-empty");
+    let wl = [("WAYLAND_DISPLAY", "wayland-1")];
+    let mut foot = Gui::start(&x, "foot", &root, "/usr/bin/foot", &[], &wl);
+    let with_foot = x.changes(&w, &empty, "weston-foot", 120);
+    assert!(
+        with_foot.drawn > empty.drawn + 10_000,
+        "foot drew {with_foot:?} on {empty:?}: {}\n{}",
+        foot.report(),
+        weston.report()
+    );
+    std::thread::sleep(Duration::from_secs(2));
+    x.type_into(&w, "echo typed in foot > /tmp/typed\n");
+    let typed = root.0.join("tmp/typed");
+    let began = Instant::now();
+    while std::fs::read_to_string(&typed).unwrap_or_default() != "typed in foot\n" {
+        assert!(began.elapsed() < Duration::from_secs(60), "foot ran nothing: {}", foot.report());
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    // Xwayland's display is the guest's own: fwe's `DISPLAY` stays the
+    // host's, the guest's names `:0`.
+    let before = x.shot(&w, "weston-before-xeyes");
+    let xeyes = ["-c", "DISPLAY=:0 exec /usr/bin/xeyes"];
+    let mut eyes = Gui::start(&x, "xeyes-xwayland", &root, "/bin/sh", &xeyes, &[]);
+    let with_eyes = x.changes(&w, &before, "weston-xeyes", 180);
+    assert_ne!(with_eyes.digest, before.digest, "xeyes drew nothing: {}", eyes.report());
+}
+
+/// The toolkits' root (`guests/alpine/fetch/toolkits.txt`: GTK 3 and 4
+/// and their demos, Python with tkinter and PyQt6), a root of its own for
+/// `test`.
+fn toolkits_root(test: &str) -> ScratchRoot {
+    display_root(&alpine_root("toolkits"), test)
+}
+
+/// A program of a toolkit's that draws a 200×100 block of #3366cc and,
+/// when `q` is pressed, writes `/tmp/keyed` and ends: its window drawn,
+/// then the key taken.
+fn toolkit_draws_and_takes_a_key(x: &Xvfb, name: &str, root: &ScratchRoot, gui: Gui) {
+    let mut gui = gui;
+    let w = x.window(&mut gui, &["--name", "fwe-toolkit"], 180);
+    std::thread::sleep(Duration::from_secs(1));
+    let shot = x.shot(&w, name);
+    assert!(shot.count(0x3366cc) >= 18000, "{name} drew {shot:?}: {}", gui.report());
+    x.key_into(&w, "q");
+    let status = gui.exits(60);
+    assert!(status.success(), "{name}: {status}: {}", gui.report());
+    assert_eq!(std::fs::read_to_string(root.0.join("tmp/keyed")).ok().as_deref(), Some("q"));
+}
+
+/// tkinter (Python's Tk): a canvas drawn, a key bound.
+#[test]
+fn alpine_display_tkinter_draws_and_takes_a_key() {
+    let Some(x) = display_tests() else { return };
+    let root = toolkits_root("tkinter");
+    std::fs::write(
+        root.0.join("tmp/app.py"),
+        "import tkinter as tk\n\
+         w = tk.Tk()\n\
+         w.title('fwe-toolkit')\n\
+         c = tk.Canvas(w, width=240, height=140, highlightthickness=0, bg='white')\n\
+         c.create_rectangle(20, 20, 220, 120, fill='#3366cc', width=0)\n\
+         c.pack()\n\
+         def key(e):\n    open('/tmp/keyed', 'w').write(e.char)\n    w.destroy()\n\
+         w.bind('<Key-q>', key)\n\
+         w.mainloop()\n",
+    )
+    .unwrap();
+    let gui = Gui::start(&x, "tkinter", &root, "/usr/bin/python3", &["/tmp/app.py"], &[]);
+    toolkit_draws_and_takes_a_key(&x, "tkinter", &root, gui);
+}
+
+/// Qt (PyQt6, on X11 through xcb): a widget painted, a key taken.
+#[test]
+fn alpine_display_qt_draws_and_takes_a_key() {
+    let Some(x) = display_tests() else { return };
+    let root = toolkits_root("qt");
+    std::fs::write(
+        root.0.join("tmp/app.py"),
+        "import sys\n\
+         from PyQt6.QtCore import Qt\n\
+         from PyQt6.QtGui import QColor, QPainter\n\
+         from PyQt6.QtWidgets import QApplication, QWidget\n\
+         class W(QWidget):\n\
+         \x20   def paintEvent(self, e):\n\
+         \x20       p = QPainter(self)\n\
+         \x20       p.fillRect(self.rect(), QColor('white'))\n\
+         \x20       p.fillRect(20, 20, 200, 100, QColor('#3366cc'))\n\
+         \x20   def keyPressEvent(self, e):\n\
+         \x20       if e.key() == Qt.Key.Key_Q:\n\
+         \x20           open('/tmp/keyed', 'w').write('q')\n\
+         \x20           QApplication.quit()\n\
+         app = QApplication(sys.argv)\n\
+         w = W()\n\
+         w.setWindowTitle('fwe-toolkit')\n\
+         w.resize(240, 140)\n\
+         w.show()\n\
+         sys.exit(app.exec())\n",
+    )
+    .unwrap();
+    let env = [("QT_QPA_PLATFORM", "xcb"), ("QT_SCALE_FACTOR", "1")];
+    let gui = Gui::start(&x, "qt", &root, "/usr/bin/python3", &["/tmp/app.py"], &env);
+    toolkit_draws_and_takes_a_key(&x, "qt", &root, gui);
+}
+
+/// A GTK demo program (`gtk3-demo`, `gtk4-demo`): its window drawn, typing
+/// into it searching its list of demos (what it shows changes), and
+/// Ctrl+Q ending it.
+fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
+    let root = toolkits_root(name);
+    let mut gui = Gui::start(x, name, &root, &format!("/usr/bin/{name}"), &[], env);
+    let w = x.window(&mut gui, &["--class", name], 180);
+    std::thread::sleep(Duration::from_secs(2));
+    let before = x.shot(&w, &format!("{name}-before"));
+    assert!(before.drawn > 20_000, "{name} drew {before:?}: {}", gui.report());
+    x.type_into(&w, "button");
+    let after = x.changes(&w, &before, &format!("{name}-searched"), 30);
+    assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
+    // The search closed first (GTK 3's is a popup whose grab keeps a
+    // close request from its window), then the window closed as a window
+    // manager's close button closes it: on a bare Xvfb, gtk3-demo does not
+    // quit on ctrl+q, under Linux itself either.
+    x.key_into(&w, "Escape");
+    std::thread::sleep(Duration::from_secs(1));
+    x.close(&w);
+    let status = gui.exits(60);
+    assert!(status.success(), "{name}: {status}: {}", gui.report());
+}
+
+/// GTK 3's demo program.
+#[test]
+fn alpine_display_gtk3_demo_runs() {
+    let Some(x) = display_tests() else { return };
+    gtk_demo(&x, "gtk3-demo", &[("GDK_BACKEND", "x11")]);
+}
+
+/// GTK 4's demo program, drawn by its Cairo renderer (no GPU).
+#[test]
+fn alpine_display_gtk4_demo_runs() {
+    let Some(x) = display_tests() else { return };
+    gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }

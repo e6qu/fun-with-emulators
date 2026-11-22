@@ -3,8 +3,8 @@
 `fwe` runs Linux programs built for arm64 on a Mac with Apple Silicon,
 without a Linux VM: the program's own code runs on the Mac's processor,
 and `fwe` plays the Linux kernel for it. This guide covers installing
-`fwe`, a Linux userland, running programs, Windows programs and
-containers, and what does not work.
+`fwe`, a Linux userland, running programs, Windows programs, programs
+with windows and containers, and what does not work.
 
 CI runs the blocks marked as tested as they are written
 (`user_guide_recipes` in `crates/fwe/tests/guests.rs`); each is followed
@@ -155,8 +155,36 @@ env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/
 ```
 
 CI's `wine` job runs `guests/windows/winprog.c` (built with
-`zig cc -target aarch64-windows-gnu`) this way. Programs with windows do
-not run yet (see below).
+`zig cc -target aarch64-windows-gnu`) this way. Programs with windows
+draw through an X server, as Linux's do (below).
+
+### Programs with windows
+
+Linux programs draw their windows through an X server on the Mac:
+XQuartz (`brew install --cask xquartz`), or any X server listening on a
+Unix socket. `fwe` gives a program the display its own `DISPLAY` names,
+which XQuartz sets for every program you start once it is installed; the
+program sees it as Linux's display `:0` (`:N` for the Mac's `:N`):
+
+```sh
+linux ~/alpine /bin/sh -c 'apk add -q xeyes xterm font-dejavu'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
+  "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/xterm -fa monospace
+```
+
+Images go to the server through shared memory (MIT-SHM) where the
+server takes it by descriptor (MIT-SHM 1.2, as Xvfb's does). X11
+clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way, and OpenGL
+through Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`) on a server
+with GLX (Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
+has: start it, and give its programs `DISPLAY=:N` inside, as `sh -c
+'DISPLAY=:1 exec glxgears'`); there is no GPU yet. Windows programs draw
+through Wine's X11 driver, in the VM, with `DISPLAY` set the same way.
+
+CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
+`xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
+against Alpine's, driving each with keys and the pointer and checking
+what it draws.
 
 ## Containers
 
@@ -223,8 +251,8 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **Graphical programs**, Linux's or Windows' through Wine: there is no
-  display yet ([roadmap](../ROADMAP.md#m7--graphical-programs-and-sandboxes)).
+- **The GPU**: programs with windows draw by software
+  ([roadmap](../ROADMAP.md#m7--graphical-programs-and-sandboxes)).
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are

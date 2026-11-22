@@ -772,7 +772,7 @@ impl<P: Platform> Kernel<P> {
                         && flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
                         && crate::memfd::name(fd).is_some()
                     {
-                        crate::memfd::reopened_read_only(new as i32);
+                        crate::fdmarks::mark(new as i32, crate::fdmarks::Mark::ReadOnly);
                     }
                     new
                 }
@@ -1589,7 +1589,9 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
                 Entry::Fd { fd, .. } if follow => {
                     if crate::synthdir::fstat_is_dir(fd) {
-                        return Ok((synth_stat(st::S_IFDIR | 0o555, 0), Extra::default()));
+                        let path = crate::synthdir::path_of(fd).unwrap_or_default();
+                        let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
+                        return Ok((stat, Extra::default()));
                     }
                     let s = stat_fd(fd)?;
                     let node =
@@ -1598,7 +1600,7 @@ impl<P: Platform> Kernel<P> {
                     return Ok((as_node(stat_to_linux(&s), node), extra));
                 }
                 Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
-                Entry::Dir => synth_stat(st::S_IFDIR | 0o555, 0),
+                Entry::Dir => self.synth_dir_stat(dirfd, path),
                 Entry::Missing => return Err(errno::ENOENT),
             };
             return Ok((self.proc_owned(dirfd, path, st), Extra::default()));
@@ -1658,10 +1660,11 @@ impl<P: Platform> Kernel<P> {
             return 0;
         }
         if crate::synthdir::fstat_is_dir(fd as i32) {
-            use fwe_abi::stat as st;
-            let mut stat = synth_stat(st::S_IFDIR | 0o555, 0);
+            let path = crate::synthdir::path_of(fd as i32);
+            let mut stat =
+                self.synth_dir_stat(fcntl::AT_FDCWD as i32, path.as_deref().unwrap_or(b""));
             // A process's directory is its user's (newuidmap checks so).
-            if let Some(path) = crate::synthdir::path_of(fd as i32) {
+            if let Some(path) = path {
                 stat = self.proc_owned(fcntl::AT_FDCWD as i32, &path, stat);
             }
             guest!(uaccess::write(buf, stat));
@@ -1729,8 +1732,9 @@ impl<P: Platform> Kernel<P> {
         let (host, node) = if empty {
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {
-                use fwe_abi::stat as st;
-                let x = with_mount(statx_of(&synth_stat(st::S_IFDIR | 0o555, 0)));
+                let path = crate::synthdir::path_of(dirfd as i32).unwrap_or_default();
+                let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
+                let x = with_mount(statx_of(&stat));
                 guest!(uaccess::write(buf, x));
                 return 0;
             }
@@ -4563,6 +4567,22 @@ fn skip_entries(fd: i32, mut n: u64, hide: &dyn Fn(&[u8]) -> bool) -> Result<(),
         n -= walk(&bsd, again as usize, None).1;
     }
     Ok(())
+}
+
+impl<P: Platform> Kernel<P> {
+    /// A synthetic `/proc` or `/sys` directory's status: links as Linux
+    /// counts a directory's, its `.`, its entry in its parent and each
+    /// subdirectory's `..` (a process's `task` directory 2 and its threads,
+    /// which sandboxes read to tell a process is single-threaded).
+    fn synth_dir_stat(&self, dirfd: i32, path: &[u8]) -> Stat {
+        let subdirs = self.fs().synth_children(dirfd, path).map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|(n, t)| *t == crate::procfs::DT_DIR && n != b"." && n != b"..")
+                .count()
+        });
+        Stat { st_nlink: 2 + subdirs as u32, ..synth_stat(fwe_abi::stat::S_IFDIR | 0o555, 0) }
+    }
 }
 
 /// Build a synthetic `struct stat` for a `/proc` or `/sys` entry.

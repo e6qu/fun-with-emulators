@@ -54,6 +54,20 @@ pub struct Net {
     pub sysctls: std::collections::BTreeMap<String, String>,
     /// `lo`'s MTU set (`SIOCSIFMTU`; 0: Linux's 65536).
     pub lo_mtu: u32,
+    /// Whether `lo` has its IPv4 address, 127.0.0.1/8, and its IPv6 one,
+    /// ::1/128 ([`Net::set_lo_up`], `RTM_NEWADDR`).
+    pub lo_v4: bool,
+    pub lo_v6: bool,
+}
+
+impl Net {
+    /// `lo` brought up or down, as Linux's is: brought up, it has both its
+    /// addresses; down, it keeps the IPv4 one and loses ::1.
+    pub fn set_lo_up(&mut self, up: bool) {
+        self.lo_up = up;
+        self.lo_v4 |= up;
+        self.lo_v6 = up;
+    }
 }
 
 impl Data for Net {
@@ -71,6 +85,8 @@ impl Data for Net {
             e.bytes(v.as_bytes());
         }
         e.u32(self.lo_mtu);
+        e.bool(self.lo_v4);
+        e.bool(self.lo_v6);
     }
     fn decode(d: &mut Dec) -> Self {
         let lo_up = d.bool();
@@ -80,7 +96,8 @@ impl Data for Net {
         let text = |d: &mut Dec| String::from_utf8_lossy(&d.bytes()).into_owned();
         let sysctls = (0..n).map(|_| (text(d), text(d))).collect();
         let lo_mtu = d.u32();
-        Net { lo_up, ports, sysctls, lo_mtu }
+        let (lo_v4, lo_v6) = (d.bool(), d.bool());
+        Net { lo_up, ports, sysctls, lo_mtu, lo_v4, lo_v6 }
     }
 }
 

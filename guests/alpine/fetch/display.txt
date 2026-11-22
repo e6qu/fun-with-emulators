@@ -1,9 +1,10 @@
 # Alpine Linux 3.24 aarch64 files the display tests fetch from
 # https://dl-cdn.alpinelinux.org/alpine/: the minirootfs, X11 clients
 # (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, and
-# Weston with its X11 back end, its clients, foot and Xwayland, with every
-# package they depend on. Each line is a path under that URL and the
-# file's SHA-256.
+# Weston with its X11 back end, its clients, foot and Xwayland, and
+# glxgears with Mesa's software renderer and Xvfb (an X server with GLX),
+# with every package they depend on. Each line is a path under that URL
+# and the file's SHA-256.
 v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 v3.24/main/aarch64/abseil-cpp-raw-logging-internal-20250814.1-r0.apk 30679288b05533c12cd7ccffe2949d852b6df66ed87505af72a4240652cb87dd
 v3.24/main/aarch64/abseil-cpp-strings-20250814.1-r0.apk 8ab707d857ba0953413a2ea07195d1d8aac59f65edbe6fb779534b2549409830
@@ -18,6 +19,7 @@ v3.24/main/aarch64/encodings-1.1.0-r0.apk 184b072668ca132fa59caf6a5902f1c229dd89
 v3.24/main/aarch64/eudev-libs-3.2.14-r6.apk 330022dcf23de371d8df9b08f9bf9c9e98ced062b7352b518ee977dcaf977956
 v3.24/community/aarch64/fcft-3.3.3-r0.apk 5834a25acbc0a5f09195fdd145bfad11237152ffbf114e1a5c7e54ce5cef5032
 v3.24/main/aarch64/font-alias-1.0.6-r0.apk 129b6c1c1b8dc896cc671fd3198d7b28878f1bcb8078ce489b91d47a616d962c
+v3.24/main/aarch64/font-cursor-misc-1.0.4-r1.apk 8eb12fdb2a239e981cd07b8ef6947352a175613c2a1795641506012f79339001
 v3.24/main/aarch64/font-dejavu-2.37-r6.apk 786ad1bca0938ebb59e52894102cc31e2e8ef7a940f97d0e0b97d7a0caa5790e
 v3.24/main/aarch64/font-misc-misc-1.1.3-r1.apk db2cdb0a1ba8336e0021b26ad3ce6df00ba7e2acdbb8864d5c36e4a73f03c8ff
 v3.24/main/aarch64/fontconfig-2.17.1-r1.apk e4fc46de2fa0dc64ef948aab0798500f784eef15d75c9a2e8952a0e3017dacfc
@@ -101,10 +103,12 @@ v3.24/main/aarch64/libxxf86vm-1.1.7-r0.apk a85a4f82da77bef6055fe27adf01772acfcdf
 v3.24/main/aarch64/libyuv-0.0.1928-r0.apk d16c6f425629de40bb307fc582d5985bed7043e5ef82ffee6816556eb03a0f8b
 v3.24/main/aarch64/llvm22-libs-22.1.3-r1.apk 6b1b25fdc82cd6d0e2fb57594d08d405569d4776e4b9c56012bd81f8dd90805a
 v3.24/main/aarch64/mesa-26.1.6-r0.apk 081ea0a54f57373442b539e353a296f178af39a9e5e11da6b571424c398275e5
+v3.24/main/aarch64/mesa-dri-gallium-26.1.6-r0.apk 62cfd817a66b7bf3991e3c5b11c381f6e452e0261b757de9a91e3470d47dc65f
 v3.24/main/aarch64/mesa-egl-26.1.6-r0.apk 6b49e6f263427218289aa19b83aae533d79bda984a430964e2ed21592b4b65eb
 v3.24/main/aarch64/mesa-gbm-26.1.6-r0.apk 3a5487b688e3f072f134133b8a6538d552c9ebc86dedb5f0d54e2566f110f5da
 v3.24/main/aarch64/mesa-gl-26.1.6-r0.apk 580a5cd3e8d31b8774e78ad7a3d5798f667d0ee98d07e8afd0765daf6d450720
 v3.24/main/aarch64/mesa-gles-26.1.6-r0.apk 1553461ee9e91a4d6fad5941d6a98f43e14b0d920c302b5e21504a6411b2183f
+v3.24/community/aarch64/mesa-utils-9.0.0-r6.apk 1a820cf7aff7dacdf959b8295893147ffbdb23df055c7e2b1d4921ba4f10a6b2
 v3.24/main/aarch64/mkfontscale-1.2.4-r0.apk c373d5c19283b41dbb5661dbc3c40ad95368040a848562c673044b8b2462be97
 v3.24/community/aarch64/mtdev-1.1.7-r0.apk f8b79dcbb4f761147ea12bdcc078383ebbd6c94399c76ae73ef79ee3e4ca6ed5
 v3.24/main/aarch64/ncurses-terminfo-6.6_p20260516-r0.apk 41471352cac0d4f3db44146280c4c0836770f190c153a920d70c9812ef6ba884
@@ -142,6 +146,7 @@ v3.24/main/aarch64/xkbcomp-1.5.0-r0.apk 84d08397381113a4bbfe1c68050bc8640f019a8f
 v3.24/main/aarch64/xkeyboard-config-2.47-r0.apk a78c94324d215f874a6e6f29c3aa889f0755596ea952865f98ef64c06806a1c1
 v3.24/community/aarch64/xorg-server-common-21.1.26-r0.apk 978c50410baf8d9584a2316415fcfb14f0c132af141799b998a52a742e71a404
 v3.24/community/aarch64/xterm-410-r0.apk 3d131ef2ccbdbe25d373e99b83728dbd4f5c85a2b33388114e172c6099eb0142
+v3.24/community/aarch64/xvfb-21.1.26-r0.apk deca95de0e4adcf3a9fbb5049e0b0994ed63d6f8198ab4ea17c6ebfba7462dcf
 v3.24/community/aarch64/xwayland-24.1.15-r0.apk e428430d129d033e9aade5fca95dc8cb64c7b2809961916b9b06f77186670e65
 v3.24/community/aarch64/xwd-1.0.9-r2.apk 2f482f15b8248d1bd1462567b8a996eebd80446e824d70735d349ca56f843b1b
 v3.24/community/aarch64/xwininfo-1.1.6-r0.apk bd6df066680bacd790f9b97d2d089b05db6d0aa60e9c1ff48c974c6d316eaf32

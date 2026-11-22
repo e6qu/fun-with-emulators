@@ -3,13 +3,14 @@
 project's build and programs' realistic workloads, under fwe, natively on
 macOS and natively on Linux.
 
-    run.py linux --bench BENCH --cache DIR --out linux.json
+    run.py linux --bench BENCH --cache DIR --xvfb XVFB --out linux.json
         On arm64 Linux: BENCH (guests/c/bench.c, built static-pie) runs
         natively; Lua is built, and the workloads run, in an Alpine 3.24
         container (docker).
 
     run.py macos --fwe FWE --bench BENCH --native NATIVE --brew PREFIX
-                 --cache DIR [--linux linux.json] [--no-build] --out macos.json
+                 --cache DIR --xvfb XVFB [--linux linux.json] [--no-build]
+                 --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
         source built for macOS) runs natively. Lua is built with clang under
         FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched into
@@ -28,15 +29,21 @@ macOS and natively on Linux.
         its own limit (LIMITS), or a computing program's share of fwe's its
         own (SHARE_BUDGETS).
 
+The X benchmarks talk to an X server run here (XVFB, an Xvfb), the same
+one for fwe's side and the native one.
+
 Each figure is the best of several runs: the machines are shared, and the
 best is the least disturbed.
 """
 
 import argparse
+import atexit
 import bisect
 import collections
+import contextlib
 import ctypes
 import hashlib
+import io
 import json
 import os
 import re
@@ -47,6 +54,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 ROUNDS = 9
@@ -144,6 +152,10 @@ MICRO = [
     ("JIT code: a loop", ["jit", "loop", "10000000"], "ns"),
     ("JIT code: 4096 functions in turn", ["jit", "functions", "2000000"], "ns"),
     ("JIT code: a function made and run", ["jit", "made", "2000"], "us"),
+    # A graphical program's traffic with its X server ([`x_server`]): a
+    # request waited for, and a window's frame drawn through shared memory.
+    ("X request round trip", ["x11", "rtt", "20000"], "us"),
+    ("X frame through shared memory", ["x11", "shm", "300"], "us"),
 ]
 
 
@@ -179,6 +191,9 @@ BUDGETS = {
     "JIT code: a switch through br (ns)": 1.3,
     "JIT code: calls through a register (ns)": 1.3,
     "JIT code: a loop (ns)": 1.3,
+    # A graphical program's calls to its X server, as a system call is.
+    "X request round trip (us)": 1.5,
+    "X frame through shared memory (us)": 1.5,
 }
 
 # The most fwe's figure may be, in the row's own unit: making a
@@ -194,6 +209,8 @@ LIMITS = {
 # that also measures the builds' differences (Alpine's compiler and C
 # library against Homebrew's), not only fwe.
 SHARE = "fwe's share"
+# The runs a share is counted over ([`profile`]).
+SHARE_RUNS = 5
 # Which of fwe's backends ran each benchmark's programs ([`backends`]).
 BACKEND = "fwe's backend"
 # The results of the same benchmarks in a Linux VM on the same Mac
@@ -249,6 +266,96 @@ def backends(cmd, fresh=()):
     return f"native {n['native']}, VM {n['vm']}"
 
 
+def x_server(xvfb):
+    """A headless X server (`xvfb`, an Xvfb) for the X benchmarks, at a
+    display of its own on its Unix socket only: `DISPLAY` names it to every
+    program run here. Stopped when this ends."""
+    n = 57
+    p = subprocess.Popen([xvfb, f":{n}", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    atexit.register(lambda: (p.terminate(), p.wait()))
+    deadline = time.monotonic() + 30
+    while not os.path.exists(f"/tmp/.X11-unix/X{n}"):
+        if p.poll() is not None or time.monotonic() > deadline:
+            sys.exit(f"{xvfb} :{n} did not start")
+        time.sleep(0.1)
+    os.environ["DISPLAY"] = f":{n}"
+
+
+GEARS = "glxgears frame (ms)"
+# Mesa's software renderer, on one thread: the runners' cores differ.
+GEARS_ENV = {"LIBGL_ALWAYS_SOFTWARE": "1", "GALLIUM_DRIVER": "llvmpipe", "LP_NUM_THREADS": "1"}
+
+
+# The display glxgears draws on: Alpine's Xvfb, an X server with GLX
+# (Homebrew's has none), beside it in its root or container.
+GEARS_DISPLAY = 9
+GEARS_CMD = f"DISPLAY=:{GEARS_DISPLAY} exec /usr/bin/glxgears -geometry 300x300+0+0"
+
+
+def gears_ms(cmd, env=None):
+    """glxgears' time per frame as `cmd` runs it: it reports its frames
+    every 5 seconds; the second report, the first's taking its start
+    too."""
+    err = tempfile.TemporaryFile()
+    p = subprocess.Popen(cmd, env=env, stdout=subprocess.PIPE, stderr=err, text=True)
+    timer = threading.Timer(120, p.kill)
+    timer.start()
+    rates = []
+    try:
+        for line in p.stdout:
+            m = re.search(r"= ([0-9.]+) FPS", line)
+            if m:
+                rates.append(float(m.group(1)))
+            if len(rates) == 2:
+                break
+    finally:
+        timer.cancel()
+        p.kill()
+        p.wait()
+    if len(rates) < 2 or rates[1] <= 0:
+        err.seek(0)
+        said = err.read().decode(errors="replace")[-4000:]
+        sys.exit(f"glxgears gave no frame rate: {rates}, exit {p.returncode}; it said:\n{said}")
+    return 1000.0 / rates[1]
+
+
+def gears_fwe(a, fwe, guest_env):
+    """glxgears under fwe, on Alpine's Xvfb run by fwe in the same root (a
+    display of the root's own); against the same two programs in a Linux
+    container, there being no macOS build of them."""
+    root = alpine_root("display", a.cache)
+    in_root = guest_env + fwe + ["--root", root]
+    x11 = os.path.join(root, "tmp/.X11-unix")
+    os.makedirs(x11, exist_ok=True)
+    os.chmod(x11, 0o1777)
+    # The X server's fonts' indexes, as their package's trigger makes them.
+    for prog in ("mkfontscale", "mkfontdir"):
+        subprocess.run(in_root + [os.path.join(root, "usr/bin", prog), "/usr/share/fonts/misc"],
+                       check=True, capture_output=True)
+    sock = os.path.join(x11, f"X{GEARS_DISPLAY}")
+    for stale in (sock, os.path.join(root, f"tmp/.X{GEARS_DISPLAY}-lock")):
+        if os.path.lexists(stale):
+            os.remove(stale)
+    err = tempfile.TemporaryFile()
+    xvfb = subprocess.Popen(
+        in_root + [os.path.join(root, "usr/bin/Xvfb"), f":{GEARS_DISPLAY}",
+                   "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+        stdout=subprocess.DEVNULL, stderr=err)
+    try:
+        deadline = time.monotonic() + 120
+        while not os.path.exists(sock):
+            if xvfb.poll() is not None or time.monotonic() > deadline:
+                err.seek(0)
+                sys.exit("Xvfb under fwe did not start: " + err.read().decode(errors="replace")[-4000:])
+            time.sleep(0.2)
+        return gears_ms(guest_env + [f"{k}={v}" for k, v in GEARS_ENV.items()] + fwe
+                        + ["--root", root, os.path.join(root, "bin/sh"), "-c", GEARS_CMD])
+    finally:
+        xvfb.kill()
+        xvfb.wait()
+
+
 def best(f, rounds=ROUNDS):
     return min(f() for _ in range(rounds))
 
@@ -283,11 +390,13 @@ def micro_pair(fwe, guest, native):
     """The micro-benchmarks under fwe (`fwe` its command, `guest` the Linux
     build) and natively (`native`), their rounds taken in turn: a runner's
     load comes and goes, and so it falls on both alike."""
-    def pair(f, g, rounds=MICRO_ROUNDS):
+    def pair(name, f, g, rounds=MICRO_ROUNDS):
         a, b = [], []
         for _ in range(rounds):
             a.append(f())
             b.append(g())
+        print(f"{name}: rounds under fwe " + ", ".join(f"{t:.4g}" for t in a)
+              + ", natively " + ", ".join(f"{t:.4g}" for t in b), file=sys.stderr)
         return min(a), min(b)
 
     runs = [("startup (ms)", lambda p, b: startup_ms_once(p + [b, "exit"]))]
@@ -300,7 +409,7 @@ def micro_pair(fwe, guest, native):
     )
     ours, theirs = {}, {}
     for name, f in runs:
-        ours[name], theirs[name] = pair(lambda: f(fwe, guest), lambda: f([], native))
+        ours[name], theirs[name] = pair(name, lambda: f(fwe, guest), lambda: f([], native))
     return ours, theirs
 
 
@@ -348,6 +457,7 @@ def lua_build_once(cmd_for, cc, retrace=None):
 
 
 def linux(a):
+    x_server(a.xvfb)
     r = micro([], a.bench)
     lua = fetch(*LUA, a.cache)
     with tempfile.TemporaryDirectory() as d:
@@ -382,6 +492,20 @@ def linux(a):
                 subprocess.run(full, check=True, capture_output=True)
                 return time.perf_counter() - start
 
+            # glxgears and Xvfb, Alpine's, in a container of their own,
+            # removed after (killing `docker run` leaves it running).
+            env = [x for k, v in GEARS_ENV.items() for x in ("-e", f"{k}={v}")]
+            sock = f"/tmp/.X11-unix/X{GEARS_DISPLAY}"
+            try:
+                r[GEARS] = gears_ms(
+                    ["docker", "run", "--rm", "--name", "fwe-gears"] + env + [image, "sh", "-c",
+                     "apk add -q xvfb font-misc-misc mesa-utils mesa-dri-gallium"
+                     f" && (Xvfb :{GEARS_DISPLAY} -screen 0 1024x768x24 -nolisten tcp"
+                     " >/dev/null 2>&1 &)"
+                     f" && while [ ! -e {sock} ]; do sleep 0.1; done && {GEARS_CMD}"]
+                )
+            finally:
+                subprocess.run(["docker", "rm", "-f", "fwe-gears"], capture_output=True)
             for row, cmd in (
                 ("Lua script (s)", "/src/src/lua /src/wl/bench.lua"),
                 ("Python script (s)", "python3 /src/wl/bench.py"),
@@ -396,6 +520,7 @@ def linux(a):
 
 
 def macos(a):
+    x_server(a.xvfb)
     fwe = [a.fwe]
     # Where a start's time goes (FWE_TIMING), for the log.
     for args in (["exit"], ["forkexec", "2", a.bench]):
@@ -408,11 +533,23 @@ def macos(a):
         if args[0] == "file":
             sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
             pcs(f"{name} (micro)", fwe + [a.bench, "file", args[1], "300000"])
+    # And calls made side by side by threads: where they wait, under fwe
+    # and natively.
+    par = ["par", "fstat", "3", "300000"]
+    pcs("fstat, 3 threads (micro)", fwe + [a.bench] + par)
+    pcs("fstat, 3 threads (micro) natively", [a.native] + par,
+        execname=os.path.basename(a.native)[:16])
     # And a fork's: its steps in fwe, the host's calls and the kernel's
     # work in both processes, under fwe and natively.
     phases("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
     faulted("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
     pcs("fork+exit+wait (micro)", fwe + [a.bench, "fork", "2000"])
+    # And an X frame drawn through shared memory: where the program spends
+    # its time, under fwe and natively.
+    shm = ["x11", "shm", "2000"]
+    pcs("X frame through shared memory (micro)", fwe + [a.bench] + shm)
+    pcs("X frame through shared memory (micro) natively", [a.native] + shm,
+        execname=os.path.basename(a.native)[:16])
     pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
         execname=os.path.basename(a.native)[:16])
     results = {"fwe": ours, "macOS": theirs}
@@ -583,6 +720,7 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    results["fwe"][GEARS] = gears_fwe(a, fwe, guest_env)
     jdk(a, fwe, guest_env, results)
     host_costs()
     for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
@@ -734,6 +872,9 @@ def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False
         sys.exit(f"{name}: fwe printed {outs['fwe']!r}, macOS {outs['macOS']!r}")
     for side in times:
         results[side][name] = min(times[side])
+    # Each round, both sides: how far a runner's noise moves each.
+    print(f"{name}: rounds under fwe " + ", ".join(f"{t:.2f}" for t in times["fwe"])
+          + ", natively " + ", ".join(f"{t:.2f}" for t in times["macOS"]), file=sys.stderr)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
@@ -772,6 +913,7 @@ def git_commands(ours, theirs, fresh, root):
         subprocess.run(cmd, capture_output=True)
         names, took = {}, collections.Counter()
         count = collections.Counter()
+        regions = collections.Counter()
         with open(logs[side], errors="replace") as f:
             for line in f:
                 try:
@@ -784,9 +926,18 @@ def git_commands(ours, theirs, fresh, root):
                     n = names.get(ev["sid"], "?")
                     took[n] += ev["t_abs"]
                     count[n] += 1
+                elif ev.get("event") == "region_leave" and "t_rel" in ev:
+                    n = names.get(ev["sid"], "?")
+                    regions[(n, ev.get("category", ""), ev.get("label", ""))] += ev["t_rel"]
         top = ", ".join(f"{n} {count[n]}x {t * 1e3:.0f} ms" for n, t in took.most_common(10))
         print(f"git (s) {side}, by command: {sum(took.values()) * 1e3:.0f} ms in git: {top}",
               file=sys.stderr)
+        # And the regions git marks in the commands that take longest, the
+        # same on both sides (a region holds the regions inside it).
+        for n in ("commit", "status", "gc"):
+            inside = sorted(((t, c, l) for (cn, c, l), t in regions.items() if cn == n), reverse=True)
+            print(f"git (s) {side}, {n}'s regions: "
+                  + ", ".join(f"{c}/{l} {t * 1e3:.0f} ms" for t, c, l in inside[:10]), file=sys.stderr)
 
 
 # A process's regions, as `vmmap` lists them but in milliseconds, not the
@@ -960,12 +1111,22 @@ def inclusive(name, execname, cmd, ustacks, busiest, samples, looks, base, where
           file=sys.stderr)
 
 
+def trace_file(name, kind):
+    """A new file for a trace of the work `name`: DTrace's `-o` adds to a
+    file that is there, and a tracer that fails leaves the last one's, so a
+    trace of the same work run before would be read as this one's."""
+    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.{kind}")
+    if os.path.exists(out):
+        os.remove(out)
+    return out
+
+
 def callers(name, cmd, funcs):
     """The call stacks into the host library functions `funcs` (pairs of
     library and function, DTrace's pid-provider patterns) while `cmd` (one
     fwe process) runs, by the time spent in the calls (microseconds), most
     first, named by DTrace from the process it holds."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.callers")
+    out = trace_file(name, "callers")
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -1116,7 +1277,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     With `jit_map`, the directory fwe writes its code cache's map to as the
     process ends (`FWE_JIT_MAP`, which `cmd` sets), the samples in
     translations are named too ([`translated`])."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.pcs")
+    out = trace_file(name, "pcs")
     # The process is made first, held until DTrace has started (DTrace
     # grabbing a running process by its pid fails while it starts), and
     # then runs `cmd` in its place. Once it exits, DTrace is interrupted
@@ -1319,7 +1480,7 @@ def faulted(name, cmd):
     starts with no page mapped, so every page of fwe's it touches, code or
     data, is a fault, and every page either process writes after the fork
     is a copy. For reading only: a failure is said and the run goes on."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.faults")
+    out = trace_file(name, "faults")
     proc = subprocess.Popen(["/bin/sh", "-c", 'read _; exec "$0" "$@"'] + cmd,
                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
                             stderr=subprocess.DEVNULL)
@@ -1453,7 +1614,7 @@ def sampled(name, cmd):
     its time went by the top of the stack: the guest's own code (no
     symbols), or fwe's and the host libraries' functions. The sample is
     kept beside the results."""
-    out = os.path.abspath(f"bench-{re.sub(r'[^a-z0-9]+', '-', name.lower()).strip('-')}.sample")
+    out = trace_file(name, "sample")
     proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     # Once it has run its exec (`env -i`; Homebrew's python3 runs the
     # Python.app inside its framework): an exec ends the sampler's hold.
@@ -1526,6 +1687,27 @@ def profile(name, cmd, theirs, fresh, share=False):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     mine = pcs(name, cmd, share)
+    if share and mine:
+        # A share is a ratio of samples, a second's run some hundreds of
+        # them: more runs, their samples summed, so that it is known to a
+        # hundredth, not to the few hundredths one run's count leaves.
+        own, all_ = mine
+        for _ in range(SHARE_RUNS - 1):
+            for d in fresh:
+                shutil.rmtree(d, ignore_errors=True)
+                os.makedirs(d)
+            said = io.StringIO()
+            with contextlib.redirect_stderr(said):
+                more = pcs(name, cmd, share)
+            # Each run's split, to see that the runs agree.
+            for line in said.getvalue().splitlines():
+                if "samples by program counter" in line or "the program's own code" in line:
+                    print(line[:400], file=sys.stderr)
+            if more:
+                own, all_ = own + more[0], all_ + more[1]
+        print(f"{name}: fwe's share over {SHARE_RUNS} runs: {all_ / max(own, 1):.3f} "
+              f"({own} of {all_} samples the program's own)", file=sys.stderr)
+        mine = (own, all_)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
@@ -1759,6 +1941,15 @@ def workloads(a, fwe, guest_env, lua_src, results):
     loop = ("cd /tmp/w && i=0; while [ $i -lt 20 ]; do echo $i >> src/lua.c; "
             "/usr/bin/git commit -q -am $i; i=$((i+1)); done")
     pcs("git commit", under("/bin/sh", "-c", loop))
+    # Each git process's steps in fwe, and the loop's time on each side.
+    commit = under("/bin/sh", "-c", loop)
+    phases("git commit", commit[:2] + ["FWE_TIMING=1"] + commit[2:])
+    for side, cmd in (("fwe", commit), ("macOS", ["/bin/sh", "-c", loop.replace(
+            "/tmp/w", theirs_w).replace("/usr/bin/git", brew["git"])])):
+        t = time.perf_counter()
+        subprocess.run(cmd, capture_output=True, check=True)
+        print(f"git commit {side}: {(time.perf_counter() - t) * 50:.2f} ms each",
+              file=sys.stderr)
     pcs("git commit natively", ["/bin/sh", "-c", loop.replace("/tmp/w", theirs_w).replace(
         "/usr/bin/git", brew["git"])], execname="git")
     # Its history with patches, one process: where git's own code goes.
@@ -1842,6 +2033,7 @@ def main():
     lx.add_argument("--bench", required=True)
     lx.add_argument("--cache", required=True)
     lx.add_argument("--out", required=True)
+    lx.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
     mc = sub.add_parser("macos")
     mc.add_argument("--fwe", required=True)
     mc.add_argument("--bench", required=True)
@@ -1853,6 +2045,7 @@ def main():
     mc.add_argument("--no-build", action="store_true")
     mc.add_argument("--brew", required=True, help="Homebrew's prefix: the native programs")
     mc.add_argument("--out", required=True)
+    mc.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)
 

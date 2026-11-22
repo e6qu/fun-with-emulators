@@ -519,6 +519,14 @@ fn place(elf: &Elf<'_>, bti: bool) -> Result<Placed, Error> {
     let guest = if elf.is_pie() {
         mem::map_anywhere(plan.len, rw).map_err(|e| mem_error("placing the image", e))?
     } else {
+        let end = plan.start.saturating_add(plan.len);
+        if end > vm::CODE_VA {
+            return Err(Error::Unsupported(format!(
+                "linked at {:#x}..{end:#x}, past the VM's address space (it ends at {:#x})",
+                plan.start,
+                vm::CODE_VA
+            )));
+        }
         mem::map_fixed(plan.start, plan.len, rw).map_err(|e| mem_error("placing the image", e))?;
         plan.start
     };
@@ -623,7 +631,12 @@ pub fn run(
     record::event(mode, path.as_os_str().as_bytes());
     match start(path, data, args, env, options) {
         Ok(never) => match never {},
-        Err(e) => e,
+        Err(e) => {
+            // A start that failed once the VM exists (an image that cannot
+            // be placed, say): the VM goes before fwe exits with the error.
+            teardown();
+            e
+        }
     }
 }
 
@@ -1011,10 +1024,12 @@ impl Vcpu {
                         // not mapped (or not for this access).
                         EC_DABT_LOWER | EC_IABT_LOWER => {
                             regs = self.regs(self.get(HV_REG_PC), self.get(HV_REG_CPSR));
+                            // (A lower level's abort, as EL1 would see it.)
                             fault(
                                 &mut regs,
                                 fwe_abi::signal::SIGSEGV,
                                 exit.exception.virtual_address,
+                                Some(syndrome),
                             );
                         }
                         // `wfi`/`wfe`, which Linux lets EL0 execute: the
@@ -1076,7 +1091,7 @@ impl Vcpu {
             regs.pc = pc + 4;
             return regs;
         }
-        fault(&mut regs, fwe_abi::signal::SIGILL, pc);
+        fault(&mut regs, fwe_abi::signal::SIGILL, pc, None);
         regs
     }
 
@@ -1096,8 +1111,14 @@ impl Vcpu {
                 regs.pc = elr - 4;
                 syscall(self, &mut regs);
             }
-            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr),
-            EC_PC_ALIGN | EC_SP_ALIGN => fault(&mut regs, s::SIGBUS, far),
+            EC_BRK64 => fault(&mut regs, s::SIGTRAP, elr, Some(esr)),
+            // At the misaligned pc (FAR holds it), or at sp (FAR is
+            // unknown for sp), as Linux reports them.
+            EC_PC_ALIGN => fault(&mut regs, s::SIGBUS, far, Some(esr)),
+            EC_SP_ALIGN => {
+                let sp = regs.sp;
+                fault(&mut regs, s::SIGBUS, sp, Some(esr));
+            }
             EC_DABT_LOWER | EC_IABT_LOWER => {
                 // A translation fault (DFSC/IFSC 0b0001xx) a vfork child
                 // takes on memory it has not fetched yet: fetched now, the
@@ -1119,11 +1140,14 @@ impl Vcpu {
                         k.tracer.note(&format!("guest abort: esr {esr:#x}, far {far:#x}"));
                     }
                     drop(k);
-                    fault(&mut regs, s::SIGSEGV, far)
+                    // A misaligned access (DFSC 0b100001) is a bus error,
+                    // as Linux's `do_alignment_fault` makes it.
+                    let sig = if esr & 0x3f == 0x21 { s::SIGBUS } else { s::SIGSEGV };
+                    fault(&mut regs, sig, far, Some(esr))
                 }
             }
-            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr),
-            _ => fault(&mut regs, s::SIGILL, elr),
+            EC_UNKNOWN => fault(&mut regs, s::SIGILL, elr, Some(esr)),
+            _ => fault(&mut regs, s::SIGILL, elr, Some(esr)),
         }
         regs
     }
@@ -1165,11 +1189,12 @@ fn stale_permissions(esr: u64, far: u64) -> bool {
     true
 }
 
-/// Deliver synchronous fault `sig` at `addr`, or die of it.
-fn fault(regs: &mut Regs, sig: u64, addr: u64) {
+/// Deliver synchronous fault `sig` at `addr` (an abort's syndrome `esr`,
+/// which its handler's frame holds), or die of it.
+fn fault(regs: &mut Regs, sig: u64, addr: u64, esr: Option<u64>) {
     let mut guard = kernel();
     let Some(k) = guard.as_mut() else { fatal("fault before the kernel exists") };
-    if !k.deliver_fault(regs, sig, addr) {
+    if !k.deliver_fault(regs, sig, addr, esr) {
         if k.tracer.enabled {
             k.tracer.note(&format!(
                 "guest fault: signal {sig} at pc {:#x}, address {addr:#x}",

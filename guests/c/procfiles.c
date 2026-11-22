@@ -2,8 +2,10 @@
  * cpuinfo in Linux's arm64 format, the process's environ, limits, statm
  * and io, comm and the host name written, another process's cwd, environ,
  * limits and mounts (and EACCES for those only a tracer may read to one
- * that may not trace it), and /proc/net. Runs as root with FWE_PROC=1 in
- * its environment.
+ * that may not trace it), /proc/net, and a directory's link count (the
+ * task directory's 2 and its threads, which sandboxes read to tell a
+ * process is single-threaded). Runs as root with FWE_PROC=1 in its
+ * environment.
  *
  * Built freestanding and linked against the target libc's shared library
  * (no system headers), as the other dynamic guests. */
@@ -211,7 +213,36 @@ static void net(void) {
     printf("route: %s", buf);
 }
 
+/* A directory's link count, by newfstatat (Linux arm64's `struct stat`
+ * has it at byte 20). */
+static unsigned links(const char *path) {
+    unsigned char st[128];
+    if (syscall(79, -100, path, st, 0) != 0) return 0;
+    return *(unsigned *)(st + 20);
+}
+
+static volatile int go_on;
+
+static void *waits(void *arg) {
+    (void)arg;
+    while (!go_on) usleep(1000);
+    return 0;
+}
+
+static void counts(void) {
+    printf("task links, one thread: %u\n", links("/proc/self/task/"));
+    pthread_t t;
+    pthread_create(&t, 0, waits, 0);
+    printf("task links, two threads: %u\n", links("/proc/self/task/"));
+    go_on = 1;
+    pthread_join(t, 0);
+    char path[64];
+    snprintf(path, sizeof path, "/proc/%d", getpid());
+    printf("process directory has subdirectories: %d\n", links(path) > 2);
+}
+
 int main(void) {
+    counts();
     memory();
     own();
     hostname();
