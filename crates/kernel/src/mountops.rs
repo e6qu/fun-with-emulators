@@ -130,6 +130,9 @@ impl<P: Platform> Kernel<P> {
                     if crate::synthdir::path_of(fd).is_some() {
                         return Ok((ns, true));
                     }
+                    if let Some(st) = crate::filestore::io::stat(fd) {
+                        return Ok((ns, st?.st_mode & libc::S_IFMT == libc::S_IFDIR));
+                    }
                     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
                     let mut st: libc::stat = unsafe { std::mem::zeroed() };
                     // SAFETY: a valid out-parameter.
@@ -175,8 +178,8 @@ impl<P: Platform> Kernel<P> {
                     o.mode.unwrap_or(0o1777),
                     o.uid.unwrap_or(self.creds.fsuid),
                     o.gid.unwrap_or(self.creds.fsgid),
-                    o.size.unwrap_or(0),
-                    o.inodes.unwrap_or(0),
+                    o.size.unwrap_or_else(crate::tmpfs::default_size),
+                    o.inodes.unwrap_or_else(crate::tmpfs::default_inodes),
                 )?;
                 Source::Store(id)
             }

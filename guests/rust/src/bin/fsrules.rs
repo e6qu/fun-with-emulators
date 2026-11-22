@@ -1715,6 +1715,17 @@ fn store_scenario() {
         String::from_utf8_lossy(&v[..n.max(0) as usize]),
         fs[0] == 0x0102_1994
     );
+
+    // A mount on a directory of the store named by a descriptor's link,
+    // as a container runtime mounts inside a root it holds open.
+    // SAFETY: NUL-terminated paths.
+    let dir = unsafe {
+        mkdir(c("/tmp/s/pts").as_ptr(), 0o755);
+        open(c("/tmp/s/pts").as_ptr(), O_PATH | O_DIRECTORY)
+    };
+    let on = mount_new("tmpfs", &format!("/proc/self/fd/{dir}"), 0, "");
+    let other = stat_words("/tmp/s/pts")[0] != stat_words("/tmp/s")[0];
+    println!("mount by descriptor: {on}, another filesystem {other}");
 }
 
 /// The names in directory `p`.

@@ -529,8 +529,13 @@ impl<P: Platform> Kernel<P> {
         crate::fs::drop_fifo();
         // An `O_PATH` descriptor, whatever kind of file it names (one of
         // `/proc` or `/sys` too), is open for nothing but naming it (one of
-        // a `/proc` link is marked as that already).
-        if r >= 0 && flags & fcntl::O_PATH != 0 && crate::fdmarks::proc_link(r as i32).is_none() {
+        // a `/proc` link is marked as that already, one of fwe's store's
+        // file by its description).
+        if r >= 0
+            && flags & fcntl::O_PATH != 0
+            && crate::fdmarks::proc_link(r as i32).is_none()
+            && crate::filestore::desc::of(r as i32).is_none()
+        {
             crate::fdmarks::mark(r as i32, crate::fdmarks::Mark::Path);
         }
         r

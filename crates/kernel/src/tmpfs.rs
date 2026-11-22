@@ -91,6 +91,18 @@ fn memparse(s: &str) -> Result<u64, i32> {
     n.checked_mul(1 << shift).ok_or(errno::EINVAL)
 }
 
+/// The size a tmpfs has when its options give none: half the memory, as
+/// Linux's `shmem_default_max_blocks`.
+pub fn default_size() -> u64 {
+    memory_bytes() / 2
+}
+
+/// The inodes a tmpfs has when its options give no number: one for each
+/// two pages of memory, as Linux's `shmem_default_max_inodes`.
+pub fn default_inodes() -> u64 {
+    memory_bytes() / 4096 / 2
+}
+
 /// The host's memory, in bytes.
 fn memory_bytes() -> u64 {
     // SAFETY: plain host calls.

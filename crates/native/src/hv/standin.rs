@@ -1420,15 +1420,25 @@ fn sync(v: &Vcpu) -> Result<(), String> {
         }
     }
     if vmr.first_run.is_none() {
-        // The stage 2 the VM runs with: fixed from now on, and none of it
-        // shared with another process.
+        // The stage 2 the VM runs with: fixed from now on, and none of its
+        // private memory shared with another process. The segments, in
+        // their own window of guest-physical space, are the memory the
+        // guest shares on purpose (a file's pages, or a memory object of
+        // fwe's: a System V segment, a file of fwe's store), which another
+        // process's VM maps too.
         vmr.first_run = Some(vmr.maps.iter().map(|(&s, m)| (s, m.end)).collect());
-        let ranges: Vec<(u64, u64)> = vmr.maps.iter().map(|(&s, m)| (m.host, m.end - s)).collect();
+        let segments = super::vm::layout().map(|l| (l.seg_base, l.seg_end));
+        let ranges: Vec<(u64, u64)> = vmr
+            .maps
+            .iter()
+            .filter(|&(&s, m)| !segments.as_ref().is_ok_and(|&(lo, hi)| s >= lo && m.end <= hi))
+            .map(|(&s, m)| (m.host, m.end - s))
+            .collect();
         for (host, len) in ranges {
             for (a, b, _, share, file) in host_regions(host, len) {
                 // SM_SHARED, SM_TRUESHARED, SM_SHARED_ALIASED, of memory
-                // that is not a file's: anonymous memory in two processes'
-                // VMs at once (a file's pages are what `MAP_SHARED` shares).
+                // that is not a file's: private memory in two processes'
+                // VMs at once.
                 if matches!(share, 4 | 5 | 7) && !file {
                     violation(&format!(
                         "anonymous host memory {a:#x}..{b:#x} behind the VM's stage 2 is \
