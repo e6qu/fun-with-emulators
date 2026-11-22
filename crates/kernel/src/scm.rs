@@ -11,7 +11,7 @@
 //! all whatever the buffer.
 //!
 //! A descriptor fwe stands in for (an eventfd, a timerfd, a signalfd, a
-//! netlink socket, a process descriptor, a memfd opened again read-only)
+//! netlink socket, a process descriptor, a file of fwe's file store)
 //! is more than its host object, so
 //! the sender adds a *bundle*: a host datagram socket, sent as the last
 //! descriptor, holding a manifest of what each such descriptor is and the
@@ -51,8 +51,8 @@ pub(crate) mod kind {
     pub const NETLINK: u8 = 4;
     pub const PIDFD: u8 = 5;
     pub const NETNS: u8 = 6;
-    /// A memfd opened again read-only ([`crate::fdmarks::Mark::ReadOnly`]).
-    pub const READ_ONLY: u8 = 7;
+    /// A file of fwe's file store ([`crate::filestore::desc`]).
+    pub const STORE: u8 = 7;
 }
 
 /// What a descriptor fwe stands in for takes to another process: its kind,
@@ -138,14 +138,22 @@ pub fn parse(ctl: &[u8]) -> Result<Outgoing, i32> {
 pub struct Prepared {
     pub buf: Vec<u8>,
     bundle: Option<[i32; 2]>,
+    /// What the store's files described hold them by
+    /// ([`crate::filestore::desc::export`]), let go of if the message does
+    /// not go.
+    stored: Vec<Vec<u8>>,
 }
 
 impl Prepared {
-    /// The message did not go: its bundle is closed at once.
+    /// The message did not go: its bundle is closed at once, and what it
+    /// held of the store's files goes.
     pub fn unsent(mut self) {
         for fd in self.bundle.take().into_iter().flatten() {
             // SAFETY: the bundle's ends, made by `prepare`.
             unsafe { libc::close(fd) };
+        }
+        for state in self.stored.drain(..) {
+            crate::filestore::desc::unsent(&state);
         }
     }
 }
@@ -198,11 +206,27 @@ fn sweep(p: &mut Vec<i32>) {
 pub fn prepare(fds: &[i32], creds: Option<Creds>) -> Result<Prepared, i32> {
     let exports: Vec<Option<Export>> = fds.iter().map(|&fd| export(fd)).collect();
     let mut host: Vec<i32> = fds.to_vec();
-    let mut p = Prepared { buf: Vec::new(), bundle: None };
+    let stored = exports
+        .iter()
+        .flatten()
+        .filter(|x| x.kind == kind::STORE)
+        .map(|x| x.state.clone())
+        .collect();
+    let mut p = Prepared { buf: Vec::new(), bundle: None, stored };
     if creds.is_some() || exports.iter().any(Option::is_some) {
-        let ends = make_bundle()?;
+        let ends = match make_bundle() {
+            Ok(ends) => ends,
+            Err(e) => {
+                p.unsent();
+                return Err(e);
+            }
+        };
         p.bundle = Some(ends);
-        fill_bundle(ends[0], &exports, creds)?;
+        if let Err(e) = fill_bundle(ends[0], &exports, creds) {
+            // Nothing went: the bundle and what it held go.
+            p.unsent();
+            return Err(e);
+        }
         for (slot, x) in host.iter_mut().zip(&exports) {
             if x.as_ref().is_some_and(|x| x.placeholder) {
                 *slot = ends[1];
@@ -257,7 +281,7 @@ fn export(fd: i32) -> Option<Export> {
         .or_else(|| crate::netlink::export(fd))
         .or_else(|| crate::pidfd::export(fd))
         .or_else(|| crate::netns::export(fd))
-        .or_else(|| crate::fdmarks::export(fd))
+        .or_else(|| crate::filestore::desc::export(fd))
 }
 
 /// Take what a bundle describes for received descriptor `fd`: whether it
@@ -270,7 +294,7 @@ fn import(kind: u8, fd: i32, state: &[u8], companions: Vec<i32>) -> bool {
         kind::NETLINK => crate::netlink::import(fd, &mut d, companions),
         kind::PIDFD => crate::pidfd::import(fd, &mut d),
         kind::NETNS => crate::netns::import(fd, &mut d),
-        kind::READ_ONLY => crate::fdmarks::import(fd),
+        kind::STORE => crate::filestore::desc::import(fd, &mut d),
         _ => false,
     }
 }

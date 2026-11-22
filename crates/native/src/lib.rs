@@ -297,6 +297,17 @@ pub struct Options {
     /// A descriptor fwe was handed the program on, for a program with no
     /// path (a memfd) that a guest `execve` ran.
     pub exe_fd: Option<i32>,
+    /// The file of fwe's store that descriptor is of (a memfd's), and its
+    /// description's id.
+    pub exe_store: Option<(fwe_kernel::filestore::desc::File, u64)>,
+}
+
+/// What `--exe-store` names: a file of fwe's store and a description's id,
+/// `<filesystem>:<inode>:<id>` in hex.
+pub fn parse_exe_store(v: &str) -> Option<(fwe_kernel::filestore::desc::File, u64)> {
+    let mut parts = v.split(':').map(|p| u64::from_str_radix(p, 16).ok());
+    let (fs, ino, id) = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some((fwe_kernel::filestore::desc::File { fs, ino }, id))
 }
 
 /// Hex-encode `bytes`.
@@ -346,6 +357,10 @@ fn apply_exec_state<P: fwe_kernel::Platform>(
         fwe_kernel::fdmarks::duplicated(n, held);
     }
     fwe_kernel::fdmarks::forget_closed();
+    // The files of fwe's store the host `execve` closed (close-on-exec)
+    // are no longer this process's to hold; the program's, run by
+    // descriptor, is, through fwe's own.
+    fwe_kernel::filestore::desc::sync(&[]);
     Ok(())
 }
 
@@ -365,6 +380,10 @@ fn open_fs(options: &Options) -> Result<fwe_kernel::Fs, Error> {
         // fwe's own from here on, out of the guest's reach.
         // SAFETY: plain host call on the descriptor fwe was handed.
         unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        // A file of fwe's store, which the descriptor stands in for.
+        if let Some((file, id)) = options.exe_store {
+            fwe_kernel::filestore::desc::adopt_exe(fd, file, id);
+        }
         fs.set_exe_fd(Some(fd));
     }
     if let Some(cwd) = &options.cwd {
@@ -590,6 +609,14 @@ pub(crate) fn reexec(
             unsafe { libc::fcntl(held, libc::F_SETFD, 0) };
             argv.push(b"--exe-fd".to_vec());
             argv.push(held.to_string().into_bytes());
+            // A file of fwe's store: which, for the new fwe to read it by.
+            let fd = fs.exec_fd(path).expect("a descriptor");
+            if let (Some(file), Some(id)) =
+                (fwe_kernel::filestore::desc::of(fd), fwe_kernel::filestore::desc::description(fd))
+            {
+                argv.push(b"--exe-store".to_vec());
+                argv.push(format!("{:x}:{:x}:{id:x}", file.fs, file.ino).into_bytes());
+            }
             Some(held)
         }
         Some(Err(e)) => return err(e),

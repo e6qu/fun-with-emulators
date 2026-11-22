@@ -344,6 +344,9 @@ fn named_by_pid(p: &[u8]) -> Vec<u8> {
 /// stand-in names), with the guest's permission bits ([`crate::modes`])
 /// and owner ([`crate::owners`]).
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
+    if let Some(st) = crate::filestore::io::stat(fd) {
+        return st;
+    }
     if let Some(host) = crate::fdmarks::stand_in(fd) {
         // A stand-in `O_PATH` descriptor: the file it names.
         let c = CString::new(host).map_err(|_| errno::EINVAL)?;
@@ -780,37 +783,19 @@ impl<P: Platform> Kernel<P> {
                         }
                         return reopen(fd, flags);
                     }
-                    // A memfd opened to truncate: emptied first, as its
-                    // seals allow (one whose contents are frozen too).
-                    if flags & fcntl::O_TRUNC != 0 && crate::memfd::name(fd).is_some() {
-                        if let Err(e) = crate::memfd::check_resize(fd, 0) {
-                            return err(e);
-                        }
-                        let r = match crate::memfd::truncate_frozen(fd, 0) {
-                            Some(r) => r,
-                            // SAFETY: plain host call on an open guest descriptor.
-                            None => ret(unsafe { libc::ftruncate(fd, 0) }),
-                        };
-                        if r < 0 {
-                            return r;
-                        }
+                    // A file of fwe's store (a memfd's): a new description
+                    // of it, as Linux opens the file again.
+                    if let Some(file) = crate::filestore::desc::of(fd) {
+                        return self.reopen_stored(fd, file, flags);
                     }
-                    // A pipe, socket, memfd or the like: a new descriptor
-                    // for it.
+                    // A pipe, socket or the like: a new descriptor for it.
                     let cmd = if flags & fcntl::O_CLOEXEC != 0 {
                         libc::F_DUPFD_CLOEXEC
                     } else {
                         libc::F_DUPFD
                     };
                     // SAFETY: plain host call on an open guest descriptor.
-                    let new = ret(unsafe { libc::fcntl(fd, cmd, 0) });
-                    if new >= 0
-                        && flags & fcntl::O_ACCMODE == fcntl::O_RDONLY
-                        && crate::memfd::name(fd).is_some()
-                    {
-                        crate::fdmarks::mark(new as i32, crate::fdmarks::Mark::ReadOnly);
-                    }
-                    new
+                    ret(unsafe { libc::fcntl(fd, cmd, 0) })
                 }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
                     Some(mut entries) => {
@@ -1443,6 +1428,15 @@ impl<P: Platform> Kernel<P> {
     /// `fstatfs(fd, buf)`.
     pub(crate) fn sys_fstatfs(&mut self, fd: u64, buf: u64) -> i64 {
         let fd = fd as i32;
+        if let Some(r) = crate::filestore::io::statfs(fd) {
+            return match r {
+                Ok(out) => {
+                    guest!(uaccess::write(buf, out));
+                    0
+                }
+                Err(e) => err(e),
+            };
+        }
         // A pipe's or socket's filesystem is the kernel's own (pipefs,
         // sockfs), which the host does not report.
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -2039,6 +2033,12 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_fchdir(&mut self, fd: u64) -> i64 {
+        // (A file of fwe's store that is no directory.)
+        if crate::filestore::io::stat(fd as i32)
+            .is_some_and(|st| st.is_ok_and(|st| st.st_mode & libc::S_IFMT != libc::S_IFDIR))
+        {
+            return err(errno::ENOTDIR);
+        }
         if let Ok(st) = stat_fd(fd as i32)
             && st.st_mode & libc::S_IFMT == libc::S_IFDIR
             && !self.permits(&st, 1)
@@ -2663,8 +2663,11 @@ impl<P: Platform> Kernel<P> {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         let at = fcntl::AT_FDCWD as u64;
         match self.fs().synthetic(at as i32, &path) {
-            // A memfd's `/proc/self/fd` link: its seals hold.
-            Some(crate::procfs::Entry::Fd { fd, .. }) if crate::memfd::name(fd).is_some() => {
+            // A link of `/proc/self/fd` to a file of fwe's store (a
+            // memfd's): its own truncation, as its seals allow.
+            Some(crate::procfs::Entry::Fd { fd, .. })
+                if crate::filestore::desc::of(fd).is_some() =>
+            {
                 if let Err(e) = self.permitted_fd(fd, 2) {
                     return err(e);
                 }
@@ -2759,10 +2762,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = crate::loopdev::ftruncate(fd as i32) {
             return r;
         }
-        if let Err(e) = crate::memfd::check_resize(fd as i32, len as i64) {
-            return err(e);
-        }
-        if let Some(r) = crate::memfd::truncate_frozen(fd as i32, len as i64) {
+        if let Some(r) = crate::filestore::io::ftruncate(fd as i32, len as i64) {
             return r;
         }
         // Opened in a Landlock domain that let it not truncate the file,
@@ -2825,17 +2825,8 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = crate::loopdev::fallocate(fd as i32, mode, offset, len) {
             return r;
         }
-        if mode & fwe_abi::falloc::FALLOC_FL_KEEP_SIZE == 0 {
-            let end = (offset as i64).saturating_add(len as i64);
-            // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: `st` is a valid out-parameter.
-            let size = if unsafe { libc::fstat(fd as i32, &mut st) } == 0 { st.st_size } else { 0 };
-            if end > size
-                && let Err(e) = crate::memfd::check_resize(fd as i32, end)
-            {
-                return err(e);
-            }
+        if let Some(r) = crate::filestore::io::fallocate(fd as i32, mode, offset, len) {
+            return r;
         }
         // What a tmpfs with a size has no room for (punching a hole frees).
         if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE == 0
@@ -2843,15 +2834,7 @@ impl<P: Platform> Kernel<P> {
         {
             return err(e);
         }
-        if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0
-            && crate::memfd::write_refused(fd as i32)
-        {
-            return err(errno::EPERM);
-        }
-        // A memfd whose contents are frozen grows through fwe's own
-        // writable descriptor of it.
-        let target = crate::memfd::frozen_resizer(fd as i32).unwrap_or(fd as i32);
-        match crate::host::fallocate(target, mode, offset as i64, len as i64) {
+        match crate::host::fallocate(fd as i32, mode, offset as i64, len as i64) {
             Ok(()) => {
                 if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0 {
                     crate::tmpfs::freed(fd as i32);
@@ -2905,6 +2888,9 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_getdents64(&mut self, fd: u64, buf: u64, count: u64) -> i64 {
         // SAFETY: the guest passed a buffer of `count` bytes.
         if let Some(r) = unsafe { crate::synthdir::getdents64(fd as i32, buf, count) } {
+            return r;
+        }
+        if let Some(r) = crate::filestore::io::getdents64(fd as i32, buf, count) {
             return r;
         }
         // Not a directory (`ENOTDIR`), or one removed since it was opened
@@ -3638,6 +3624,16 @@ impl<P: Platform> Kernel<P> {
 
     /// What kind of file open descriptor `fd` is of.
     fn xattr_fd(fd: i32) -> Result<crate::xattr::Kind, i32> {
+        // A file of fwe's store keeps its own mode and owner.
+        if let Some(st) = crate::filestore::io::stat(fd) {
+            let st = st?;
+            return Ok(crate::xattr::Kind::of(
+                &st,
+                #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+                (st.st_mode as u32 & 0o7777),
+                (st.st_uid, st.st_gid),
+            ));
+        }
         let mut st: libc::stat = zeroed_stat();
         // SAFETY: `st` an out-parameter.
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -3984,12 +3980,37 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
+    /// The open of `/proc/self/fd/<fd>` with Linux `flags`, `fd` a file of
+    /// fwe's store: a new description of the file, as its mode allows the
+    /// caller, emptied first with `O_TRUNC` as its seals allow.
+    fn reopen_stored(&mut self, fd: i32, file: crate::filestore::desc::File, flags: u64) -> i64 {
+        let st = match stat_fd(fd) {
+            Ok(st) => st,
+            Err(e) => return err(e),
+        };
+        if flags & fcntl::O_DIRECTORY != 0 && st.st_mode & libc::S_IFMT != libc::S_IFDIR {
+            return err(errno::ENOTDIR);
+        }
+        if !self.permits(&st, open_wants(flags)) {
+            return err(errno::EACCES);
+        }
+        let new = match crate::filestore::desc::open(file, flags) {
+            Ok(new) => new,
+            Err(e) => return err(e),
+        };
+        if flags & fcntl::O_TRUNC != 0 && flags & fcntl::O_ACCMODE != fcntl::O_RDONLY {
+            let r = crate::filestore::io::ftruncate(new, 0).unwrap_or(0);
+            if r < 0 {
+                let _ = self.syscall(fwe_abi::nr::CLOSE, [new as u64, 0, 0, 0, 0, 0]);
+                return r;
+            }
+        }
+        new as i64
+    }
+
     /// `fchmod(fd, mode)`.
     pub(crate) fn sys_fchmod(&mut self, fd: u64, mode: u64) -> i64 {
         let fd = fd as i32;
-        if crate::memfd::chmod_sealed(fd) {
-            return err(errno::EPERM);
-        }
         if let Err(e) = self.fd_change(fd) {
             return err(e);
         }
@@ -4004,6 +4025,10 @@ impl<P: Platform> Kernel<P> {
             Ok(m) => m,
             Err(e) => return err(e),
         };
+        // A file of fwe's store keeps its own, as its seals allow.
+        if let Some(r) = crate::filestore::io::fchmod(fd, mode) {
+            return r;
+        }
         // A mode that denies the owner is kept apart (see `modes`); an
         // `O_PATH` stand-in's is its file's.
         let kept = match stand_in_at(fd) {
@@ -4032,6 +4057,9 @@ impl<P: Platform> Kernel<P> {
             Ok(v) => v,
             Err(e) => return err(e),
         };
+        if let Some(r) = crate::filestore::io::fchown(fd, owner, mode) {
+            return r;
+        }
         // An `O_PATH` stand-in's owner is its file's (a link's own).
         let kept = match stand_in_at(fd) {
             Some(Ok((dir, name))) => crate::owners::keep_at(dir.as_raw_fd(), &name, owner)
@@ -4791,6 +4819,11 @@ fn touch_append_only(path: &std::ffi::CStr, times: *const libc::timespec) -> i64
 /// (`touch`), and no other way; the host refuses any (`EPERM`), so for a
 /// touch the flag is taken off the file for the change, by its owner.
 fn set_times_fd(fd: i32, times: *const libc::timespec, touch: bool) -> i64 {
+    // SAFETY: `times` is null or the caller's array of two.
+    let both = (!times.is_null()).then(|| unsafe { [*times, *times.add(1)] });
+    if let Some(r) = crate::filestore::io::set_times(fd, both, touch) {
+        return r;
+    }
     // SAFETY: valid timespec array pointer or null.
     let r = unsafe { libc::futimens(fd, times) };
     #[cfg(target_os = "macos")]

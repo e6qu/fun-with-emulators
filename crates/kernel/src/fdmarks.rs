@@ -117,15 +117,9 @@ pub enum Mark {
     /// An ICMP datagram ("ping") socket whose host receives come with the
     /// IP header, which Linux's do not ([`crate::net`]).
     Ping,
-    /// A memfd opened again for reading only (through `/proc/self/fd`).
-    /// Linux makes a new open file description, read-only; the host can
-    /// reopen no file without a name, so this is the memfd's writable
-    /// description again, which fwe makes read-only as Linux's is
-    /// ([`read_only`], [`refuses_read_only`]): `F_GETFL` says so, and
-    /// writes, writable shared mappings, resizing and sealing through it
-    /// are refused. It shares the writable description's offset and status
-    /// flags.
-    ReadOnly,
+    /// A file of fwe's file store, by its description's number
+    /// ([`crate::filestore::desc`]).
+    Store(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -422,57 +416,6 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
     }
 }
 
-/// Whether `fd` is a memfd opened again read-only ([`Mark::ReadOnly`]).
-pub fn read_only(fd: i32) -> bool {
-    any_marks() && marked(fd) == Some(Mark::ReadOnly)
-}
-
-/// The error system call `nr` (arguments `a`) fails with, as Linux fails
-/// it, where it would write, resize or map writable and shared a
-/// descriptor of [`Mark::ReadOnly`]: `EBADF` for writes and `fallocate`,
-/// `EINVAL` for `ftruncate`, `EACCES` for a mapping.
-pub fn refuses_read_only(nr: u64, a: &[u64; 6]) -> Option<i32> {
-    use fwe_abi::{errno, mman, nr as n};
-    if !any_marks() {
-        return None;
-    }
-    let ro = |fd: u64| read_only(fd as i32);
-    match nr {
-        n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2 | n::FALLOCATE => {
-            ro(a[0]).then_some(errno::EBADF)
-        }
-        n::FTRUNCATE => ro(a[0]).then_some(errno::EINVAL),
-        n::SENDFILE => ro(a[0]).then_some(errno::EBADF),
-        n::SPLICE | n::COPY_FILE_RANGE => ro(a[2]).then_some(errno::EBADF),
-        n::MMAP => (a[3] & mman::MAP_ANONYMOUS == 0
-            && a[3] & mman::MAP_TYPE != mman::MAP_PRIVATE
-            && a[2] & mman::PROT_WRITE != 0
-            && ro(a[4]))
-        .then_some(errno::EACCES),
-        _ => None,
-    }
-}
-
-/// What a descriptor of a mark that is fwe's alone takes to another
-/// process through `SCM_RIGHTS` ([`crate::scm`]): a read-only memfd's
-/// mark, which the receiver gives its descriptor ([`import`]).
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
-    read_only(fd).then(|| crate::scm::Export {
-        kind: crate::scm::kind::READ_ONLY,
-        state: Vec::new(),
-        companions: Vec::new(),
-        placeholder: false,
-    })
-}
-
-/// A descriptor received with the mark [`export`] sent: marked so here.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn import(fd: i32) -> bool {
-    mark(fd, Mark::ReadOnly);
-    true
-}
-
 /// Record `fd` as a file opened in mount `mount` of a detached tree, with
 /// `flags` and `fstype` (a file reopened through the tree's descriptor, as
 /// `/proc/self/exe` of a program run through one): an ordinary open file
@@ -619,21 +562,24 @@ pub fn duplicated(old: i32, new: i32) {
     crate::procfile::duplicated(old, new);
     crate::synthdir::duplicated(old, new);
     let mut r = records();
-    let queue = match r.get(&old).cloned() {
+    let mark = match r.get(&old).cloned() {
         Some(rec) => {
-            let queue = matches!(rec.mark, Some(Mark::Mq(_)));
+            let mark = rec.mark;
             insert(&mut r, new, rec);
-            queue
+            mark
         }
         None => {
             take(&mut r, new);
-            false
+            None
         }
     };
     drop(r);
-    // One more descriptor of a message queue: its holders count it.
-    if queue {
-        crate::mqueue::sync_holdings(&[]);
+    // One more descriptor of a message queue or a file of fwe's store: its
+    // holders count it.
+    match mark {
+        Some(Mark::Mq(_)) => crate::mqueue::sync_holdings(&[]),
+        Some(Mark::Store(_)) => crate::filestore::desc::sync(&[]),
+        _ => {}
     }
 }
 
@@ -688,7 +634,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Comm { .. }) => 23,
             Some(Mark::UtsName { .. }) => 24,
             Some(Mark::Ping) => 25,
-            Some(Mark::ReadOnly) => 26,
+            Some(Mark::Store(_)) => 26,
             Some(Mark::Landlock(_)) => 27,
         });
         if let Some(Mark::Comm { tid }) = rec.mark {
@@ -711,6 +657,7 @@ pub fn save(e: &mut Enc) {
             | Mark::Ns(n)
             | Mark::Inotify(n)
             | Mark::Landlock(n)
+            | Mark::Store(n)
             | Mark::Mq(n),
         ) = rec.mark
         {
@@ -792,7 +739,7 @@ pub fn load(d: &mut Dec) {
             23 => Some(Mark::Comm { tid: d.i32() }),
             24 => Some(Mark::UtsName { domain: d.bool() }),
             25 => Some(Mark::Ping),
-            26 => Some(Mark::ReadOnly),
+            26 => Some(Mark::Store(d.u32())),
             27 => Some(Mark::Landlock(d.u32())),
             _ => None,
         };

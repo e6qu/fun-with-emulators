@@ -196,7 +196,8 @@ impl<P: Platform> Kernel<P> {
         if !matches!(st.st_mode & S_IFMT, S_IFREG | S_IFBLK | S_IFDIR | S_IFLNK) {
             return err(errno::ESPIPE);
         }
-        if flags != 0 {
+        // A file of fwe's store is in memory: nothing to write back.
+        if flags != 0 && crate::filestore::desc::of(fd).is_none() {
             // SAFETY: plain host call on the guest's descriptor.
             unsafe { libc::fsync(fd) };
         }

@@ -404,8 +404,14 @@ impl<P: Platform> Kernel<P> {
                 crate::dnotify::closed(fd);
                 crate::loopdev::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
+                let stored = crate::filestore::desc::closing(fd);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
+                    // SAFETY: plain host call.
+                    let r = ret(unsafe { libc::close(fd) });
+                    after();
+                    r
+                } else if let Some(after) = stored {
                     // SAFETY: plain host call.
                     let r = ret(unsafe { libc::close(fd) });
                     after();
@@ -443,7 +449,7 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: the host validates the epoll_event pointer.
             nr::EPOLL_CTL => unsafe { crate::epoll::ctl(a[0], a[1], a[2], a[3]) },
             nr::MEMFD_CREATE => match uaccess::read_cstr(a[0], fwe_abi::memfd::NAME_MAX) {
-                Ok(name) => crate::memfd::create(&name, a[1]),
+                Ok(name) => crate::memfd::create(&name, a[1], &self.creds),
                 Err(errno::ENAMETOOLONG) => err(errno::EINVAL),
                 Err(e) => err(e),
             },
@@ -606,6 +612,8 @@ impl<P: Platform> Kernel<P> {
                 unsafe { libc::sync() };
                 0
             }
+            // A file of fwe's store is in memory: nothing to write back.
+            nr::FSYNC | nr::FDATASYNC if crate::filestore::desc::of(a[0] as i32).is_some() => 0,
             nr::FSYNC | nr::FDATASYNC => match crate::loopdev::fsync(a[0] as i32) {
                 Some(r) => r,
                 None => {
@@ -1045,6 +1053,10 @@ impl<P: Platform> Kernel<P> {
                 } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
                     r
+                } else if let Some(r) =
+                    crate::filestore::io::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    r
                 } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
                     && is_dir_fd(a[0] as i32)
                 {
@@ -1403,16 +1415,6 @@ impl<P: Platform> Kernel<P> {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
-                    } else if crate::fdmarks::read_only(fd) {
-                        let r = (r & !libc::O_ACCMODE) | libc::O_RDONLY;
-                        host::status_flags_to_linux(r) as i64
-                    } else if r & libc::O_ACCMODE == libc::O_RDONLY
-                        && crate::memfd::write_refused(fd)
-                    {
-                        // Read-only on the host since it was sealed (see
-                        // `memfd`), but open for writing as far as Linux goes.
-                        let r = (r & !libc::O_ACCMODE) | libc::O_RDWR;
-                        host::status_flags_to_linux(r) as i64
                     } else {
                         host::status_flags_to_linux(r) as i64
                     }
@@ -1627,6 +1629,9 @@ impl<P: Platform> Kernel<P> {
             return err(e);
         }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = crate::filestore::io::ioctl(fd, req, arg, &self.creds) {
             return r;
         }
         if let Some(r) = self.ns_ioctl(fd, req, arg) {

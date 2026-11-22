@@ -250,7 +250,9 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         // A program or map of bpf's (an object of fwe's in host shared
         // memory) polls, as an error ([`bpf_watched`]).
         let bpf = crate::memobj::may_be(&st) && crate::bpf::is_bpf_fd(target);
-        let file = kind == libc::S_IFREG || crate::procfile::is(target);
+        let file = kind == libc::S_IFREG
+            || crate::procfile::is(target)
+            || crate::filestore::desc::of(target).is_some();
         if (file && !mounts && !bpf)
             || kind == libc::S_IFDIR
             || crate::synthdir::is_synth(target)

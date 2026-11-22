@@ -25,6 +25,18 @@ pub fn memfd_id() -> u64 {
     0x6d66_0000_0000_0000 | crate::shared::FORMAT as u64
 }
 
+/// The filesystem of memfds, on Linux's device of its internal mount of
+/// them (`0:1`).
+pub fn memfds() -> Result<Arc<Fs>, i32> {
+    let f = get(memfd_id(), true)?;
+    let mut t = f.lock()?;
+    if t.dev() == 0 {
+        t.set_dev(crate::devnodes::makedev(0, 1));
+    }
+    drop(t);
+    Ok(f)
+}
+
 /// Filesystem `id`, made if `make` and it is not there.
 pub fn get(id: u64, make: bool) -> Result<Arc<Fs>, i32> {
     let mut mapped = MAPPED.lock().unwrap_or_else(|e| e.into_inner());
@@ -75,17 +87,9 @@ impl Fs {
     /// many (none at or past its end).
     pub fn read(&self, ino: Ino, off: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let mut t = self.lock()?;
-        let st = t.stat(ino)?;
-        if st.mode & tree::S_IFMT == tree::S_IFDIR {
-            return Err(errno::EISDIR);
-        }
-        if off >= st.size {
-            return Ok(0);
-        }
-        let n = buf.len().min((st.size - off) as usize);
-        data::read(t.data(ino)?, off, &mut buf[..n])?;
-        t.touch_accessed(ino)?;
-        Ok(n)
+        let (object, n) = t.readable(ino, off, buf.len() as u64)?;
+        data::read(object, off, &mut buf[..n as usize])?;
+        Ok(n as usize)
     }
 
     /// Write `bytes` at `off` of regular file `ino` (at its end if
@@ -99,64 +103,17 @@ impl Fs {
         append: bool,
     ) -> Result<(usize, u64), i32> {
         let mut t = self.lock()?;
-        let st = t.stat(ino)?;
-        let off = if append { st.size } else { off };
-        if bytes.is_empty() {
-            return Ok((0, off));
-        }
-        let end =
-            off.checked_add(bytes.len() as u64).filter(|&e| e <= data::SIZE).ok_or(errno::EFBIG)?;
-        let page = data::PAGE;
-        let first = off / page;
-        let room = t.allocate(ino, first, end.div_ceil(page))?;
-        // What fits: up to the end of the pages that hold memory.
-        let fits = ((first * page + room).min(end) - off) as usize;
-        if fits == 0 {
-            return Err(errno::ENOSPC);
-        }
-        let object = match t.data(ino)? {
-            0 => {
-                let o = data::make()?;
-                t.set_data(ino, o)?;
-                o
-            }
-            o => o,
-        };
-        data::write(object, off, &bytes[..fits])?;
-        let ended = off + fits as u64;
-        if ended > st.size {
-            t.set_size(ino, ended)?;
-        }
-        t.touch_modified(ino)?;
-        Ok((fits, ended))
+        let w = t.writable(ino, off, bytes.len() as u64, append)?;
+        data::write(w.object, w.off, &bytes[..w.fits as usize])?;
+        let end = w.off + w.fits;
+        t.wrote(ino, end)?;
+        Ok((w.fits as usize, end))
     }
 
-    /// Regular file `ino` made `size` long: what is cut off gives its
-    /// memory back (and reads as zeroes if it grows again).
     pub fn truncate(&self, ino: Ino, size: u64) -> Result<(), i32> {
-        if size > data::SIZE {
-            return Err(errno::EFBIG);
-        }
-        let mut t = self.lock()?;
-        let st = t.stat(ino)?;
-        if st.mode & tree::S_IFMT != tree::S_IFREG {
-            return Err(errno::EINVAL);
-        }
-        if size < st.size {
-            let object = t.data(ino)?;
-            data::zero(object, size, st.size)?;
-            let page = data::PAGE;
-            t.release(ino, size.div_ceil(page), st.size.div_ceil(page))?;
-        }
-        if size != st.size {
-            t.set_size(ino, size)?;
-        }
-        t.touch_modified(ino)
+        self.lock()?.truncate(ino, size)
     }
 
-    /// `fallocate` of regular file `ino`: `[off, off + len)` holds memory
-    /// (and the file grows to it unless `keep_size`), or with `punch` reads
-    /// as zeroes and gives its memory back.
     pub fn allocate(
         &self,
         ino: Ino,
@@ -165,38 +122,7 @@ impl Fs {
         keep_size: bool,
         punch: bool,
     ) -> Result<(), i32> {
-        let end = off.checked_add(len).filter(|&e| e <= data::SIZE).ok_or(errno::EFBIG)?;
-        let mut t = self.lock()?;
-        let st = t.stat(ino)?;
-        if st.mode & tree::S_IFMT != tree::S_IFREG {
-            return Err(errno::ENODEV);
-        }
-        let page = data::PAGE;
-        if punch {
-            let end = end.min(st.size);
-            if end > off {
-                data::zero(t.data(ino)?, off, end)?;
-                // Only the pages wholly inside give their memory back.
-                t.release(ino, off.div_ceil(page), end / page)?;
-                t.touch_modified(ino)?;
-            }
-            return Ok(());
-        }
-        let (first, past) = (off / page, end.div_ceil(page));
-        let room = t.allocate(ino, first, past)?;
-        if room < (past - first) * page {
-            // All or nothing: what was taken goes back.
-            t.release(ino, first, past)?;
-            return Err(errno::ENOSPC);
-        }
-        if t.data(ino)? == 0 {
-            let o = data::make()?;
-            t.set_data(ino, o)?;
-        }
-        if !keep_size && end > st.size {
-            t.set_size(ino, end)?;
-        }
-        t.touch_modified(ino)
+        self.lock()?.allocate_data(ino, off, len, keep_size, punch)
     }
 
     pub fn stat(&self, ino: Ino) -> Result<Stat, i32> {
@@ -204,7 +130,142 @@ impl Fs {
     }
 }
 
+/// Where a write goes: the file's data object, the offset (its end for an
+/// append) and how many of the bytes fit.
+pub struct Writable {
+    pub object: u64,
+    pub off: u64,
+    pub fits: u64,
+}
+
 impl Tx<'_> {
+    /// For a read of up to `len` bytes at `off` of regular file `ino`: its
+    /// data object and how many of the bytes there are (none at or past its
+    /// end).
+    pub fn readable(&mut self, ino: Ino, off: u64, len: u64) -> Result<(u64, u64), i32> {
+        let st = self.stat(ino)?;
+        if st.mode & tree::S_IFMT == tree::S_IFDIR {
+            return Err(errno::EISDIR);
+        }
+        if off >= st.size || len == 0 {
+            return Ok((0, 0));
+        }
+        let n = len.min(st.size - off);
+        self.touch_accessed(ino)?;
+        Ok((self.data(ino)?, n))
+    }
+
+    /// For a write of `len` bytes at `off` of regular file `ino` (at its end
+    /// if `append`): where it goes, its data object made if it had none, its
+    /// pages' memory taken (`EFBIG` past the largest file, `ENOSPC` if
+    /// none of it fits). The writer then copies the bytes and says where it
+    /// ended ([`Tx::wrote`]).
+    pub fn writable(
+        &mut self,
+        ino: Ino,
+        off: u64,
+        len: u64,
+        append: bool,
+    ) -> Result<Writable, i32> {
+        let st = self.stat(ino)?;
+        let off = if append { st.size } else { off };
+        if len == 0 {
+            return Ok(Writable { object: self.data(ino)?, off, fits: 0 });
+        }
+        let end = off.checked_add(len).filter(|&e| e <= data::SIZE).ok_or(errno::EFBIG)?;
+        let page = data::PAGE;
+        let first = off / page;
+        let room = self.allocate(ino, first, end.div_ceil(page))?;
+        // What fits: up to the end of the pages that hold memory.
+        let fits = (first * page + room).min(end) - off;
+        if fits == 0 {
+            return Err(errno::ENOSPC);
+        }
+        let object = match self.data(ino)? {
+            0 => {
+                let o = data::make()?;
+                self.set_data(ino, o)?;
+                o
+            }
+            o => o,
+        };
+        Ok(Writable { object, off, fits })
+    }
+
+    /// A write of `ino` ended at `end`: the file grows to it.
+    pub fn wrote(&mut self, ino: Ino, end: u64) -> Result<(), i32> {
+        if end > self.stat(ino)?.size {
+            self.set_size(ino, end)?;
+        }
+        self.touch_modified(ino)
+    }
+
+    /// Regular file `ino` made `size` long: what is cut off gives its
+    /// memory back (and reads as zeroes if it grows again).
+    pub fn truncate(&mut self, ino: Ino, size: u64) -> Result<(), i32> {
+        if size > data::SIZE {
+            return Err(errno::EFBIG);
+        }
+        let st = self.stat(ino)?;
+        if st.mode & tree::S_IFMT != tree::S_IFREG {
+            return Err(errno::EINVAL);
+        }
+        if size < st.size {
+            data::zero(self.data(ino)?, size, st.size)?;
+            let page = data::PAGE;
+            self.release(ino, size.div_ceil(page), st.size.div_ceil(page))?;
+        }
+        if size != st.size {
+            self.set_size(ino, size)?;
+        }
+        self.touch_modified(ino)
+    }
+
+    /// `fallocate` of regular file `ino`: `[off, off + len)` holds memory
+    /// (and the file grows to it unless `keep_size`), or with `punch` reads
+    /// as zeroes and gives its memory back.
+    pub fn allocate_data(
+        &mut self,
+        ino: Ino,
+        off: u64,
+        len: u64,
+        keep_size: bool,
+        punch: bool,
+    ) -> Result<(), i32> {
+        let end = off.checked_add(len).filter(|&e| e <= data::SIZE).ok_or(errno::EFBIG)?;
+        let st = self.stat(ino)?;
+        if st.mode & tree::S_IFMT != tree::S_IFREG {
+            return Err(errno::ENODEV);
+        }
+        let page = data::PAGE;
+        if punch {
+            let end = end.min(st.size);
+            if end > off {
+                data::zero(self.data(ino)?, off, end)?;
+                // Only the pages wholly inside give their memory back.
+                self.release(ino, off.div_ceil(page), end / page)?;
+                self.touch_modified(ino)?;
+            }
+            return Ok(());
+        }
+        let (first, past) = (off / page, end.div_ceil(page));
+        let before = self.ranges_of(ino)?;
+        let room = self.allocate(ino, first, past)?;
+        if room < (past - first) * page {
+            // All or nothing: what this call took goes back.
+            self.restore_ranges(ino, &before)?;
+            return Err(errno::ENOSPC);
+        }
+        if self.data(ino)? == 0 {
+            let o = data::make()?;
+            self.set_data(ino, o)?;
+        }
+        if !keep_size && end > st.size {
+            self.set_size(ino, end)?;
+        }
+        self.touch_modified(ino)
+    }
+
     /// Every data object of the filesystem's files.
     pub fn data_objects(&self) -> Vec<u64> {
         self.inodes().into_iter().filter_map(|i| self.data(i).ok().filter(|&o| o != 0)).collect()

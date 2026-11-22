@@ -2,7 +2,7 @@
 //! holds any, sized once to [`SIZE`] (the host gives memory only to the
 //! pages written), named by an id no other object has. The host refuses
 //! `read`, `write` and `lseek` on such an object's descriptor, so fwe
-//! reads and writes it through a mapping of its own ([`Object`]), kept
+//! reads and writes it through a mapping of its own ([`View`]), kept
 //! while this process holds the file open; a guest's shared mapping of the
 //! file maps the object itself.
 //!
@@ -105,7 +105,8 @@ impl Drop for View {
 }
 
 /// The views this process keeps, by object, each while it holds the file
-/// open ([`keep`], [`let_go`]) or while a call uses it.
+/// open ([`keep`], [`let_go`]); a call on a file it does not hold maps the
+/// data for the call alone.
 static VIEWS: Mutex<BTreeMap<u64, (Arc<View>, u32)>> = Mutex::new(BTreeMap::new());
 
 /// A view of object `id` of at least `end` bytes.
@@ -136,8 +137,9 @@ fn view(id: u64, end: u64) -> Result<Arc<View>, i32> {
         return Err(last());
     }
     let v = Arc::new(View { base: p as usize, len });
-    let holds = views.get(&id).map_or(0, |(_, n)| *n);
-    views.insert(id, (v.clone(), holds));
+    if let Some(kept) = views.get_mut(&id) {
+        kept.0 = v.clone();
+    }
     Ok(v)
 }
 
@@ -150,19 +152,20 @@ pub fn keep(id: u64) {
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, n)) = views.get_mut(&id) {
         *n += 1;
-    } else {
-        // Made at its first use, already held once.
-        drop(views);
-        if let Ok(v) = view(id, LEAST_VIEW) {
-            let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
-            views.insert(id, (v, 1));
-        }
+        return;
+    }
+    drop(views);
+    if let Ok(v) = view(id, LEAST_VIEW) {
+        VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(id).or_insert((v, 0)).1 += 1;
     }
 }
 
 /// This process holds the file of object `id` open once less: with no
 /// holding left, its view goes.
 pub fn let_go(id: u64) {
+    if id == 0 {
+        return;
+    }
     let mut views = VIEWS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some((_, n)) = views.get_mut(&id) {
         *n = n.saturating_sub(1);
@@ -170,6 +173,13 @@ pub fn let_go(id: u64) {
             views.remove(&id);
         }
     }
+}
+
+/// `f` given the address of bytes `[off, off + len)` of object `id` in a
+/// mapping of it that lasts the call.
+pub fn with_bytes<R>(id: u64, off: u64, len: u64, f: impl FnOnce(*mut u8) -> R) -> Result<R, i32> {
+    let v = view(id, off + len)?;
+    Ok(f((v.base + off as usize) as *mut u8))
 }
 
 /// Copy `buf.len()` bytes at `off` of object `id` into `buf` (the caller

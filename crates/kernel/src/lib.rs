@@ -421,6 +421,7 @@ impl<P: Platform> Kernel<P> {
         inotify::save(e);
         nsfd::save(e);
         mqueue::save(e);
+        filestore::desc::save(e);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
@@ -499,6 +500,7 @@ impl<P: Platform> Kernel<P> {
         inotify::load(d);
         nsfd::load(d);
         mqueue::load(d);
+        filestore::desc::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
@@ -778,7 +780,7 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: a fresh descriptor this owns.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         let st = fs::guest_stat(fd.as_raw_fd()).ok_or(errno::EACCES)?;
-        self.exec_checks(&st, &r, &name)?;
+        self.exec_checks(&st, r.mount_flags, || file_caps(r.dir.as_raw_fd(), &name))?;
         let id = prepcache::FileId::of_fd(fd.as_raw_fd());
         fs::read_all_fd(fd.as_raw_fd()).map(|d| Some((d, id)))
     }
@@ -795,29 +797,45 @@ impl<P: Platform> Kernel<P> {
             self.landlock_exec(path)?;
         }
         let Some(fs) = self.fs_opt() else { return Ok(()) };
+        // A file of fwe's store, through its descriptor (`/dev/fd/N`).
+        if let Some(procfs::Entry::Fd { fd, .. }) = fs.synthetic(fcntl::AT_FDCWD as i32, path)
+            && let Some(file) = filestore::desc::of(fd)
+        {
+            let st = filestore::io::stat(fd).ok_or(fwe_abi::errno::EBADF)??;
+            let caps = || {
+                let v =
+                    file.fs().ok()?.lock().ok()?.xattr(file.ino, b"security.capability").ok()?;
+                caps::parse_file_caps(&v).and_then(|(f, rootid)| match rootid {
+                    Some(r) if r != 0 && userns::to_ns(r, false) != 0 => None,
+                    _ => Some(f),
+                })
+            };
+            return self.exec_checks(&st, 0, caps);
+        }
         if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
             && let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
         {
-            self.exec_checks(&st, &r, &name)?;
+            self.exec_checks(&st, r.mount_flags, || file_caps(r.dir.as_raw_fd(), &name))?;
         }
         Ok(())
     }
 
-    /// [`Kernel::may_exec`]'s checks of the file `name` in `r`'s directory,
-    /// whose guest status is `st`, noting what it grants.
+    /// [`Kernel::may_exec`]'s checks of a file whose guest status is `st`,
+    /// on a mount of `mount_flags`, with the file capabilities `caps` gives,
+    /// noting what it grants.
     fn exec_checks(
         &self,
         st: &libc::stat,
-        r: &fs::Resolved,
-        name: &std::ffi::CStr,
+        mount_flags: u64,
+        caps: impl FnOnce() -> Option<caps::FileCaps>,
     ) -> Result<(), i32> {
         use fwe_abi::errno;
         // Not a regular file, not to be run by the caller, or on a
         // `noexec` mount, before any writer is looked for.
         if st.st_mode & libc::S_IFMT != libc::S_IFREG
             || !self.permits(st, 1)
-            || r.mount_flags & mounts::ms::NOEXEC != 0
+            || mount_flags & mounts::ms::NOEXEC != 0
         {
             return Err(errno::EACCES);
         }
@@ -829,7 +847,7 @@ impl<P: Platform> Kernel<P> {
         // memory would show the program).
         let unreadable = !self.permits(st, 4);
         // A `nosuid` mount grants nothing, as Linux's `mnt_may_suid`.
-        if r.mount_flags & mounts::ms::NOSUID != 0 {
+        if mount_flags & mounts::ms::NOSUID != 0 {
             EXEC_PRIVS.with(|p| p.set(ExecPrivs { unreadable, ..ExecPrivs::default() }));
             return Ok(());
         }
@@ -846,7 +864,7 @@ impl<P: Platform> Kernel<P> {
             uid: (ids && st.st_mode & libc::S_ISUID != 0).then_some(st.st_uid),
             gid: (ids && st.st_mode & libc::S_ISGID != 0 && st.st_mode & libc::S_IXGRP != 0)
                 .then_some(st.st_gid),
-            caps: file_caps(r.dir.as_raw_fd(), name),
+            caps: caps(),
             cap_limit: unsafe_exec.then_some(self.creds.caps.permitted),
             unreadable,
         };
@@ -937,6 +955,7 @@ impl<P: Platform> Kernel<P> {
         pty::save(&mut e, true);
         nsfd::save(&mut e);
         mqueue::save(&mut e);
+        filestore::desc::save(&mut e);
         // Process descriptors, which the host exec closes (kqueues).
         pidfd::save(&mut e);
         // The parent-death signal, whose watch the exec ends.
@@ -988,6 +1007,7 @@ impl<P: Platform> Kernel<P> {
         pty::restore(&mut d);
         nsfd::load(&mut d);
         mqueue::load(&mut d);
+        filestore::desc::load(&mut d);
         pidfd::restore(&mut d, true);
         pdeath::restore(&mut d);
         seccomp::load_state(&mut d);
@@ -1568,7 +1588,7 @@ pub(crate) fn after_write(nr: u64, a: &[u64; 6], r: i64) {
 }
 
 /// The result of system call `nr` as Linux reports it where the host's
-/// differs: a write refused to a sealed memfd, a socket that stands in for
+/// differs: a socket that stands in for
 /// another kind, a read of an unconnected Unix socket, and the `SIGPIPE` a
 /// socket write to a closed peer raises.
 #[cfg_attr(
@@ -1580,7 +1600,7 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     if r > 0 && matches!(nr, fwe_abi::nr::WRITE | fwe_abi::nr::WRITEV) {
         exclusive::wrote(a[0] as i32);
     }
-    let r = fdmarks::linux_result(nr, a, memfd::linux_write_error(nr, a, r));
+    let r = fdmarks::linux_result(nr, a, r);
     let r = net::linux_read_error(nr, a[0] as i32, r);
     let r = net::linux_send_error(nr, a[0] as i32, r);
     if r == fwe_abi::err(fwe_abi::errno::EPIPE) {
@@ -1604,6 +1624,21 @@ fn is_regular(fd: i32) -> bool {
 /// The input must be a regular file or a block device (a loop device), as
 /// Linux has it; `copy_file_range` needs both to be regular files. Returns
 /// the bytes copied, or an errno when none were.
+/// The host status of the file open as `fd` (a file of fwe's store's as
+/// the store keeps it).
+fn file_stat(fd: i32) -> Result<libc::stat, i32> {
+    if let Some(st) = filestore::io::stat(fd) {
+        return st;
+    }
+    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return Err(host::errno_to_linux(host::last_errno()));
+    }
+    Ok(st)
+}
+
 /// Whether the file of host status `st` is open for writing.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 pub(crate) fn host_file_busy(st: &libc::stat) -> bool {
@@ -1626,12 +1661,7 @@ fn copy_range_checks(
     flags: u64,
 ) -> Result<u64, i32> {
     use fwe_abi::errno;
-    let stat = |fd: i32| {
-        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out-parameter.
-        if unsafe { libc::fstat(fd, &mut st) } != 0 { Err(errno::EBADF) } else { Ok(st) }
-    };
+    let stat = |fd: i32| file_stat(fd).map_err(|_| errno::EBADF);
     let (si, so) = (stat(input)?, stat(output)?);
     let offset = |fd: i32, p: u64| -> Result<u64, i32> {
         if p != 0 {
@@ -1686,15 +1716,7 @@ fn copy_between(
 ) -> i64 {
     use fwe_abi::{err, errno};
     let regular = |fd: i32| {
-        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: a valid out-parameter.
-        let r = unsafe { libc::fstat(fd, &mut st) };
-        if r != 0 {
-            Err(host::errno_to_linux(host::last_errno()))
-        } else {
-            Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG || procfile::is(fd))
-        }
+        file_stat(fd).map(|st| st.st_mode & libc::S_IFMT == libc::S_IFREG || procfile::is(fd))
     };
     // A loop device reads and writes as a block device: `sendfile` takes
     // one, `copy_file_range` only regular files.
@@ -1755,6 +1777,14 @@ fn copy_between(
                 }
                 r => r.unwrap_or(0) as isize,
             }
+        } else if let Some(r) =
+            filestore::io::read_into(input, &mut buf[..want], ipos.map(|p| p as u64))
+        {
+            if r < 0 {
+                failure = -r as i32;
+                break;
+            }
+            r as isize
         } else if let Some(r) = procfile::read_into(input, &mut buf[..want], ipos.map(|p| p as u64))
         {
             match r {
@@ -1786,6 +1816,18 @@ fn copy_between(
         let limit = bpf::filter_send(output, &buf[..n as usize]).map_or(n as usize, |k| k as usize);
         let mut sent = 0usize;
         while sent < limit {
+            if let Some(w) = filestore::io::write_at_pos(
+                output,
+                &buf[sent..limit],
+                opos.map(|p| (p + sent as i64) as u64),
+            ) {
+                if w > 0 {
+                    sent += w as usize;
+                    continue;
+                }
+                failure = if w < 0 { -w as i32 } else { errno::EIO };
+                break;
+            }
             if out_dev {
                 match loopdev::write_at_pos(output, &buf[sent..limit], None) {
                     Some(w) if w > 0 => {
@@ -2099,6 +2141,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
     if let Some(r) = loopdev::io(nr, &a) {
         return Some(r);
     }
+    if let Some(r) = filestore::io::io(nr, &a) {
+        return Some(r);
+    }
     if let Some(r) = procmem::io(nr, &a) {
         return Some(r);
     }
@@ -2240,9 +2285,6 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     unsafe { net::sendto(fd as u64, buf, len, 0, 0, 0) }
                 }));
             }
-            if memfd::grow_refused(fd, None, len) {
-                return Some(fwe_abi::err(fwe_abi::errno::EPERM));
-            }
             // A socket whose peer filters what arrives: none of it (dropped
             // as if sent), or its first part.
             let filtered = if bpf::filtering() {
@@ -2359,9 +2401,6 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             let special = specialwrite::Source::Guest(a[1]);
             match specialwrite::write(a[0] as i32, special, a[2]) {
                 Some(r) => r,
-                None if memfd::grow_refused(a[0] as i32, Some(a[3]), a[2]) => {
-                    fwe_abi::err(fwe_abi::errno::EPERM)
-                }
                 // A file of a tmpfs with a size: as much as fits.
                 None => match tmpfs::room(a[0] as i32, Some(a[3]), a[2]) {
                     Ok(n) => {

@@ -1436,20 +1436,31 @@ impl<P: Platform> Kernel<P> {
         if flags & mman::MAP_FIXED != 0 && self.sealed(addr, len) {
             return err(errno::EPERM);
         }
-        // A loop device maps the file it shows.
-        let source = if flags & mman::MAP_ANONYMOUS == 0 {
-            crate::loopdev::map_source(fd as i32, self.page_size)
+        // A file of fwe's store maps its data (a host shared memory object),
+        // which may never be made writable once its contents are sealed; a
+        // loop device maps the file it shows.
+        let stored = if flags & mman::MAP_ANONYMOUS == 0 {
+            crate::filestore::io::map_source(fd as i32, prot, flags)
         } else {
             None
+        };
+        let object = stored.is_some();
+        let (source, sealed) = match stored {
+            Some(Ok((f, sealed))) => (Some(Ok((f, 0))), sealed),
+            Some(Err(e)) => (Some(Err(e)), false),
+            None if flags & mman::MAP_ANONYMOUS == 0 => {
+                (crate::loopdev::map_source(fd as i32, self.page_size), false)
+            }
+            None => (None, false),
         };
         // A shared mapping of a file open only for reading may not be made
         // writable later.
         // SAFETY: F_GETFL only queries the descriptor.
         let nowrite = flags & mman::MAP_ANONYMOUS == 0
             && flags & mman::MAP_TYPE != mman::MAP_PRIVATE
-            && (unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE
-                == libc::O_RDONLY
-                || crate::fdmarks::read_only(fd as i32));
+            && (sealed
+                || unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE
+                    == libc::O_RDONLY);
         // `/dev/zero` maps new memory, shared between the processes that
         // share the mapping (the host has no mapping of the device).
         let flags = if flags & mman::MAP_ANONYMOUS == 0 && is_dev_zero(fd as i32) {
@@ -1463,8 +1474,14 @@ impl<P: Platform> Kernel<P> {
         let st = (flags & mman::MAP_ANONYMOUS == 0)
             .then(|| crate::fsops::linux_fstat(fd as i32).ok())
             .flatten();
+        // (A file of the store: its data, which has no name to map it by
+        // again.)
+        let held_fd = match &source {
+            Some(Ok((f, _))) if object => std::os::fd::AsRawFd::as_raw_fd(f),
+            _ => fd as i32,
+        };
         let held = match &st {
-            Some(st) if st.st_nlink == 0 => match crate::fdtable::dup_reserved(fd as i32) {
+            Some(st) if st.st_nlink == 0 || object => match crate::fdtable::dup_reserved(held_fd) {
                 // SAFETY: a descriptor just made, owned here.
                 Ok(d) => Some(crate::maps::HeldFile(std::sync::Arc::new(unsafe {
                     <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(d)
@@ -1478,12 +1495,12 @@ impl<P: Platform> Kernel<P> {
             Some(Ok((file, start))) => match offset.checked_add(*start) {
                 Some(at) => {
                     let file = std::os::fd::AsRawFd::as_raw_fd(file) as u64;
-                    self.mmap_call(addr, len, prot, flags, file, at)
+                    self.mmap_call(addr, len, prot, flags, file, at, object)
                 }
                 None => err(errno::EOVERFLOW),
             },
             Some(Err(e)) => err(*e),
-            None => self.mmap_call(addr, len, prot, flags, fd, offset),
+            None => self.mmap_call(addr, len, prot, flags, fd, offset, false),
         };
         drop(source);
         if r < 0 {
@@ -1565,7 +1582,7 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EAGAIN);
             }
         }
-        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0);
+        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0, false);
         if r < 0 {
             return r;
         }
@@ -2113,6 +2130,10 @@ impl<P: Platform> Kernel<P> {
         self.brk.current as i64
     }
 
+    /// The host's `mmap` for a guest's, `object` if `fd` is a host shared
+    /// memory object (a file of fwe's store's data), which the host maps
+    /// only shared.
+    #[allow(clippy::too_many_arguments)]
     fn mmap_call(
         &mut self,
         addr: u64,
@@ -2121,6 +2142,7 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         fd: u64,
         offset: u64,
+        object: bool,
     ) -> i64 {
         let call = MemCall::Mmap { addr, len, prot, flags, fd: fd as i32, offset };
         if let Some(r) = self.platform.memory(call, &mut self.brk) {
@@ -2233,7 +2255,14 @@ impl<P: Platform> Kernel<P> {
             host_prot(prot)
         };
 
-        let host_fd = if anonymous { -1 } else { fd as i32 };
+        // A private mapping of an object (to run: one not to run is a view,
+        // above) is memory of its own, a copy of the object's pages.
+        let copied = object && hflags & libc::MAP_PRIVATE != 0;
+        if copied {
+            hflags |= libc::MAP_ANON;
+        }
+        let (host_fd, host_offset) =
+            if anonymous || copied { (-1, 0) } else { (fd as i32, offset) };
         if flags & mman::MAP_FIXED != 0 {
             // A fixed mapping replaces what is there: the VM lets go of it
             // before the host frees it, and translations of code there go
@@ -2253,7 +2282,7 @@ impl<P: Platform> Kernel<P> {
                     initial_prot,
                     hflags,
                     host_fd,
-                    offset as libc::off_t,
+                    host_offset as libc::off_t,
                 )
             };
             if p == libc::MAP_FAILED {
@@ -2272,6 +2301,11 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: unmapping the mapping just created.
                 self.unmap_host(p, len);
                 return err(errno::EEXIST);
+            }
+            if copied && let Err(e) = copy_object(fd as i32, offset, p, len, initial_prot) {
+                // SAFETY: unmapping the mapping just created.
+                self.unmap_host(p, len);
+                return err(e);
             }
             let guest = if p == haddr && fixed { addr } else { p };
             // What was owed to the pages replaced goes with them.
@@ -3189,6 +3223,39 @@ impl<P: Platform> Kernel<P> {
         };
         p as u64 == at
     }
+}
+
+/// Fill new private memory `[at, at + len)`, of host protections `prot`,
+/// with the pages of host shared memory object `fd` from `offset`.
+fn copy_object(fd: i32, offset: u64, at: u64, len: u64, prot: i32) -> Result<(), i32> {
+    // SAFETY: a new shared read-only mapping of the object, unmapped below.
+    let src = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len as usize,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            offset as libc::off_t,
+        )
+    };
+    if src == libc::MAP_FAILED {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    // SAFETY: `[at, at + len)` is the caller's new memory, made writable
+    // for the copy and given its protections after; `src` maps `len` bytes.
+    unsafe {
+        let writable = prot & libc::PROT_WRITE != 0;
+        if !writable {
+            libc::mprotect(at as *mut libc::c_void, len as usize, prot | libc::PROT_WRITE);
+        }
+        std::ptr::copy_nonoverlapping(src as *const u8, at as *mut u8, len as usize);
+        if !writable {
+            libc::mprotect(at as *mut libc::c_void, len as usize, prot);
+        }
+        libc::munmap(src, len as usize);
+    }
+    Ok(())
 }
 
 /// Whether `fd` is `/dev/zero`.

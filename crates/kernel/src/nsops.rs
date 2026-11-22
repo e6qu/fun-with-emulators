@@ -533,6 +533,7 @@ impl<P: Platform> Kernel<P> {
         }
         if child > 0 {
             crate::mqueue::forked(child);
+            crate::filestore::desc::forked(child);
         }
         if child > 0 && t.child_writes.is_none() {
             // It starts in this process's cgroup, in its namespaces.

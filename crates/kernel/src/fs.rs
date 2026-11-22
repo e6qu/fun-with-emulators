@@ -1749,12 +1749,7 @@ impl Fs {
                 Entry::File(data) => Ok((data, None)),
                 Entry::Fd { fd, .. } => {
                     // Through the descriptor: only a regular file is run.
-                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                    // SAFETY: a valid out-parameter.
-                    if unsafe { libc::fstat(fd, &mut st) } != 0
-                        || st.st_mode & libc::S_IFMT != libc::S_IFREG
-                    {
+                    if !regular_fd(fd) {
                         return Err(errno::EACCES);
                     }
                     read_all(fd).map(|d| (d, crate::prepcache::FileId::of_fd(fd)))
@@ -1802,12 +1797,7 @@ impl Fs {
                     Ok(data)
                 }
                 Entry::Fd { fd, .. } => {
-                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                    // SAFETY: a valid out-parameter.
-                    if unsafe { libc::fstat(fd, &mut st) } != 0
-                        || st.st_mode & libc::S_IFMT != libc::S_IFREG
-                    {
+                    if !regular_fd(fd) {
                         return Err(errno::EACCES);
                     }
                     pread_head(fd, len)
@@ -3655,9 +3645,18 @@ pub(crate) fn has_path(fd: i32, target: &[u8]) -> bool {
     target.starts_with(b"/") && crate::memfd::name(fd).is_none()
 }
 
+/// Whether `fd` is open on a regular file (as the guest sees it).
+fn regular_fd(fd: i32) -> bool {
+    crate::fsops::linux_fstat(fd)
+        .is_ok_and(|st| st.st_mode & fwe_abi::stat::S_IFMT == fwe_abi::stat::S_IFREG)
+}
+
 /// The first `len` bytes of the file open as `fd` (fewer at its end), read
 /// from its start without moving its offset.
 fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
+    if let Some(r) = crate::filestore::io::read_at(fd, 0, len as u64) {
+        return r;
+    }
     let mut out = vec![0u8; len];
     let mut at = 0;
     while at < len {
@@ -3711,6 +3710,9 @@ pub fn read_all_path(path: &[u8]) -> Result<Vec<u8>, i32> {
 /// program's bytes, grown as they were read, were copied at every
 /// doubling).
 fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
+    if let Some(r) = crate::filestore::io::read_at(fd, 0, u64::MAX) {
+        return r;
+    }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.

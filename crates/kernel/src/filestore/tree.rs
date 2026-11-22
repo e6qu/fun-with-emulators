@@ -41,6 +41,7 @@ const R_ROOT: usize = 5;
 const R_LIMIT_BYTES: usize = 6;
 const R_LIMIT_INODES: usize = 7;
 const R_BYTES: usize = 8;
+const R_DEV: usize = 9;
 /// The first owner word [`super`] may use for itself.
 pub const R_OWNER: usize = 16;
 
@@ -901,6 +902,15 @@ impl Tx<'_> {
         self.m.set_root(R_LIMIT_INODES, inodes);
     }
 
+    /// The device number (Linux's) its files are on.
+    pub fn dev(&self) -> u64 {
+        self.m.root(R_DEV)
+    }
+
+    pub fn set_dev(&mut self, dev: u64) {
+        self.m.set_root(R_DEV, dev);
+    }
+
     /// What it uses: bytes of data and inodes.
     pub fn usage(&self) -> (u64, u64) {
         (self.m.root(R_BYTES), self.m.root(R_USED))
@@ -938,6 +948,23 @@ impl Tx<'_> {
         };
         self.m.set_u64(at + I_RANGES, new);
         self.set_u32_raw(at + I_RANGES_LEN, ranges.len() as u32);
+        Ok(())
+    }
+
+    /// The ranges of pages of `ino`'s data that hold memory.
+    pub fn ranges_of(&self, ino: Ino) -> Result<Vec<(u64, u64)>, i32> {
+        self.ranges(ino)
+    }
+
+    /// `ino`'s ranges as [`Tx::ranges_of`] gave them before: what was taken
+    /// since goes back to the filesystem.
+    pub fn restore_ranges(&mut self, ino: Ino, before: &[(u64, u64)]) -> Result<(), i32> {
+        let count = |r: &[(u64, u64)]| r.iter().map(|(s, e)| e - s).sum::<u64>();
+        let now = count(&self.ranges(ino)?);
+        self.set_ranges(ino, before)?;
+        let used = self.m.root(R_BYTES);
+        let taken = now.saturating_sub(count(before)) * super::data::PAGE;
+        self.m.set_root(R_BYTES, used.saturating_sub(taken));
         Ok(())
     }
 
@@ -1118,6 +1145,18 @@ impl Tx<'_> {
         }
         self.set_holder_list(ino, &list)?;
         self.drop_if_gone(ino)
+    }
+
+    /// Process `p` holds `ino` with `count` descriptors unless it counted
+    /// itself already: a fork child counted from its parent's side, which
+    /// knows better once it counted itself.
+    pub fn hold_unless_counted(&mut self, ino: Ino, p: (i32, u64), count: u32) -> Result<(), i32> {
+        let mut list = self.holder_list(ino)?;
+        if count == 0 || list.iter().any(|&(pid, start, _)| (pid, start) == p) {
+            return Ok(());
+        }
+        list.push((p.0, p.1, count));
+        self.set_holder_list(ino, &list)
     }
 
     /// Forget the holders `alive` says have ended, of `ino`: whether it

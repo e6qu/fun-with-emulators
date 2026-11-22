@@ -4,5 +4,7 @@
 
 pub mod arena;
 pub mod data;
+pub mod desc;
 pub mod fs;
+pub mod io;
 pub mod tree;

@@ -554,10 +554,11 @@ impl Record {
         self.areas.get(addr).map(|p| (p.start, p.end))
     }
 
-    /// Whether the file with inode `ino` is mapped shared and writable.
-    pub fn shared_writable(&self, ino: u64) -> bool {
+    /// Whether file `dev`, `ino` is mapped shared and writable.
+    pub fn shared_writable(&self, dev: u64, ino: u64) -> bool {
         self.areas.iter().any(|p| {
-            p.value.shared && p.value.prot & mman::PROT_WRITE != 0 && p.value.object.ino == ino
+            let o = &p.value.object;
+            p.value.shared && p.value.prot & mman::PROT_WRITE != 0 && (o.dev, o.ino) == (dev, ino)
         })
     }
 

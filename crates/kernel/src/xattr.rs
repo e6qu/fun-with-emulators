@@ -236,11 +236,36 @@ impl Who {
 }
 
 /// What an attribute call acts on on the host: a file by path (never
-/// followed: the caller resolved what is to be), or an open descriptor.
+/// followed: the caller resolved what is to be), or an open descriptor (a
+/// file of fwe's store's is the store's: [`stored`]).
 pub enum Target<'a> {
     Path(&'a CStr),
     Fd(i32),
 }
+
+/// The file of fwe's store `t` is a descriptor of, if it is one: its
+/// attributes are the store's.
+fn stored(t: &Target) -> Option<crate::filestore::desc::File> {
+    match t {
+        Target::Fd(fd) => crate::filestore::desc::of(*fd),
+        Target::Path(_) => None,
+    }
+}
+
+/// `f` on the store's filesystem of `file`, held.
+fn in_store<R>(
+    file: crate::filestore::desc::File,
+    f: impl FnOnce(&mut crate::filestore::tree::Tx) -> Result<R, i32>,
+) -> Result<R, i32> {
+    let fs = file.fs()?;
+    let mut t = fs.lock()?;
+    f(&mut t)
+}
+
+/// The Linux inode flags that leave a file's attributes unchangeable
+/// (`FS_IMMUTABLE_FL`, `FS_APPEND_FL`).
+#[cfg(target_os = "macos")]
+const FROZEN_FLAGS: u32 = 0x10 | 0x20;
 
 fn host_name(name: &[u8]) -> Result<CString, i32> {
     CString::new(name).map_err(|_| errno::EINVAL)
@@ -252,6 +277,9 @@ fn fail<T>() -> Result<T, i32> {
 
 /// The value of attribute `name` of `t`.
 pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.xattr(file.ino, name));
+    }
     let n = host_name(name)?;
     loop {
         let size = raw_get(t, &n, std::ptr::null_mut(), 0);
@@ -275,6 +303,9 @@ pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
 /// attributes Linux lets no one change (the host does).
 #[cfg(target_os = "macos")]
 fn frozen(t: &Target) -> bool {
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.stat(file.ino)).is_ok_and(|st| st.flags & FROZEN_FLAGS != 0);
+    }
     // SAFETY: an all-zero `stat` is a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid path or descriptor, and the out-parameter above.
@@ -302,6 +333,18 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
     }
     if value.len() > SIZE_MAX {
         return Err(errno::E2BIG);
+    }
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| {
+            let had = s.xattr(file.ino, name).is_ok();
+            if flags & CREATE != 0 && had {
+                return Err(errno::EEXIST);
+            }
+            if flags & REPLACE != 0 && !had {
+                return Err(errno::ENODATA);
+            }
+            s.set_xattr(file.ino, name, Some(value))
+        });
     }
     let mut host_flags = 0;
     if flags & CREATE != 0 {
@@ -357,6 +400,9 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
     if frozen(t) {
         return Err(errno::EPERM);
     }
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.set_xattr(file.ino, name, None));
+    }
     let n = host_name(name)?;
     // SAFETY: a valid name.
     let raw = || unsafe {
@@ -377,7 +423,27 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
 /// The names of `t`'s attributes `who` sees, each NUL-terminated, as
 /// `listxattr` returns them.
 pub fn list(t: &Target, who: &Who) -> Result<Vec<u8>, i32> {
-    let all = loop {
+    let all = if let Some(file) = stored(t) {
+        // (Not fwe's own, which start with a NUL no guest's name has.)
+        in_store(file, |s| s.xattrs(file.ino))?
+            .into_iter()
+            .filter(|(n, _)| n.first() != Some(&0))
+            .flat_map(|(n, _)| n.into_iter().chain([0]))
+            .collect()
+    } else {
+        list_raw(t)?
+    };
+    let mut out = Vec::new();
+    for name in all.split(|&b| b == 0).filter(|n| !n.is_empty() && who.shows(n)) {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    Ok(out)
+}
+
+/// Every host attribute name of `t`, each NUL-terminated.
+fn list_raw(t: &Target) -> Result<Vec<u8>, i32> {
+    Ok(loop {
         let size = raw_list(t, std::ptr::null_mut(), 0);
         if size < 0 {
             return fail();
@@ -391,13 +457,7 @@ pub fn list(t: &Target, who: &Who) -> Result<Vec<u8>, i32> {
         if crate::host::last_errno() != libc::ERANGE {
             return fail();
         }
-    };
-    let mut out = Vec::new();
-    for name in all.split(|&b| b == 0).filter(|n| !n.is_empty() && who.shows(n)) {
-        out.extend_from_slice(name);
-        out.push(0);
-    }
-    Ok(out)
+    })
 }
 
 fn raw_get(t: &Target, n: &CStr, buf: *mut u8, len: usize) -> isize {

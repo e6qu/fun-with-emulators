@@ -140,8 +140,8 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--user-dir"
-            | b"--host-display" => {
+            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
+            | b"--user-dir" | b"--host-display" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
@@ -161,6 +161,12 @@ fn main() -> ExitCode {
                         return ExitCode::from(2);
                     };
                     options.exe_fd = Some(fd);
+                } else if flag == "--exe-store" {
+                    let Some(file) = value.to_str().and_then(fwe_native::parse_exe_store) else {
+                        eprintln!("fwe: --exe-store needs a file of the store\n{USAGE}");
+                        return ExitCode::from(2);
+                    };
+                    options.exe_store = Some(file);
                 } else {
                     options.argv0 = Some(value);
                 }
@@ -284,8 +290,8 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
             b"--vm" | b"--hv-standin" | b"--hv-record" => {
                 return Some(a.to_string_lossy().into_owned());
             }
-            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--probe"
-            | b"--host-display" => i += 2,
+            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
+            | b"--probe" | b"--host-display" => i += 2,
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
             _ => return None,
