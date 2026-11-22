@@ -1,5 +1,5 @@
 //! Where the process records ([`crate::procreg`]) are kept: memory every
-//! fwe process of the user maps, a file in fwe's private directory. A
+//! fwe process of the user maps, a POSIX shared memory object ([`name`]). A
 //! record read or written is memory read or written, where a file of its
 //! own each cost the host a file's making, opening and removal (tens of
 //! microseconds each, more than the rest of a `fork`).
@@ -122,7 +122,7 @@ pub enum Count {
 /// Room for the counts.
 const COUNTS: usize = 8;
 
-/// The store's layout: where each part starts in the file.
+/// The store's layout: where each part starts in the object.
 const COUNTS_AT: usize = 0;
 /// The CPU's features as `AT_HWCAP` and `AT_HWCAP2` report them
 /// ([`hwcap`]), then whether they are set, past the counts.
@@ -282,7 +282,7 @@ pub fn init() {
 }
 
 /// While one lives, the calling thread, if it is its process's main
-/// thread, is in fwe's own work (a record's file read or written under
+/// thread, is in fwe's own work (a shared record read or written under
 /// its lock), which the host may make it wait for, as a Linux thread
 /// doing its kernel's work is not asleep in a wait of the guest's:
 /// `/proc` shows it running ([`busy`]), where a program waiting for it
