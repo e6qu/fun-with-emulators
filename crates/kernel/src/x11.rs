@@ -417,24 +417,20 @@ fn attach_fd(fd: i32, major: u8, req: &[u8], big_endian: bool) -> bool {
     };
     let (seg, shmid, read_only) = (u32_at(4), u32_at(8) as i32, req[12]);
     let Some(record) = crate::sysvipc::current() else { return false };
-    let Ok(path) = std::ffi::CString::new(crate::sysvipc::segment_path(&record, shmid)) else {
-        return false;
+    let nonce = match record.get().objs.get(&(crate::sysvipc::Kind::Shm as u8, shmid)) {
+        Some(crate::sysvipc::Obj { body: crate::sysvipc::Body::Shm(s), .. }) => s.nonce,
+        _ => return false,
     };
-    let flags = if read_only != 0 { libc::O_RDONLY } else { libc::O_RDWR };
-    // SAFETY: a NUL-terminated path of fwe's.
-    let file = unsafe { libc::open(path.as_ptr(), flags | libc::O_CLOEXEC) };
-    if file < 0 {
-        return false;
-    }
+    let Ok(held) = crate::sysvipc::segment(nonce, read_only != 0) else { return false };
+    let file = std::os::fd::AsRawFd::as_raw_fd(&*held.0);
     let words: u16 = 3;
     let mut out = vec![major, SHM_ATTACH_FD];
     out.extend(if big_endian { words.to_be_bytes() } else { words.to_le_bytes() });
     out.extend(if big_endian { seg.to_be_bytes() } else { seg.to_le_bytes() });
     out.extend([read_only, 0, 0, 0]);
-    let ok = send_with_fd(fd, &out, file);
-    // SAFETY: our own descriptor, passed on (the server holds its copy).
-    unsafe { libc::close(file) };
-    ok
+    // (The server holds its own copy; this one is kept or let go with
+    // `held`.)
+    send_with_fd(fd, &out, file)
 }
 
 /// Send `data` on `fd` whole, descriptor `pass` with its first byte,

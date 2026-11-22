@@ -1537,6 +1537,55 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
+    /// Map `len` bytes of the memory `object` holds (`object.held`), shared,
+    /// at `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
+    /// with `prot`, `nowrite` if it may not be made writable: a System V
+    /// segment's attachment, which needs none of what a guest's mapping of
+    /// a file of its own looks at.
+    pub(crate) fn map_held(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        nowrite: bool,
+        object: crate::maps::Object,
+    ) -> i64 {
+        let Some(held) = object.held.clone() else { return err(errno::EINVAL) };
+        if too_many_maps(0) {
+            return err(errno::ENOMEM);
+        }
+        if flags & mman::MAP_FIXED != 0 && (!self.may_map_at(addr) || self.sealed(addr, len)) {
+            return err(errno::EPERM);
+        }
+        if crate::maps::locks_future() && !self.creds.has(crate::caps::CAP_IPC_LOCK) {
+            let soft = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
+            if crate::maps::record().locked_bytes().saturating_add(self.page_up(len)) > soft {
+                return err(errno::EAGAIN);
+            }
+        }
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&*held.0) as u64;
+        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd, 0);
+        if r < 0 {
+            return r;
+        }
+        let len = self.page_up(len);
+        let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
+        let locked = crate::maps::record().mapped(r as u64, len, prot, true, Some(object));
+        if nowrite {
+            crate::maps::record().no_write(r as u64, len);
+        }
+        if self.platform.translates_jit() {
+            self.platform.jit_mapped(crate::uaccess::g2h(r as u64), len);
+        }
+        if locked {
+            populate(r as u64, len, self.page_size);
+            wire(r as u64, len, true);
+        }
+        crate::maps::publish();
+        r
+    }
+
     /// Whether `[addr, addr + len)` (page-aligned `addr`) has a sealed
     /// mapping (`mseal`), which most changes may not touch (`EPERM`).
     fn sealed(&self, addr: u64, len: u64) -> bool {

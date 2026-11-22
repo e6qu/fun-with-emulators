@@ -804,6 +804,10 @@ fn collect_in(base: &[u8]) {
 /// directory (`dir`) or file.
 pub fn remove(path: &[u8], dir: bool) {
     use std::os::unix::ffi::OsStrExt;
+    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+    if name.starts_with(format!("v{FORMAT}-ipc-").as_bytes()) {
+        crate::sysvipc::forget(path);
+    }
     let inside = [path, b"/"].concat();
     for (name, _) in named::all() {
         if name.starts_with(&inside) {

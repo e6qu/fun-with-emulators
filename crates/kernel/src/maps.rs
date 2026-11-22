@@ -827,7 +827,8 @@ pub fn publish() {
 }
 
 /// Before system call `nr`: publish the mappings if they changed, unless
-/// `nr` is a memory call (one that only changes them again).
+/// `nr` is a memory call (one that only changes them again: a System V
+/// segment's attachment or detachment too).
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -846,6 +847,8 @@ pub fn flush_before(nr: u64) {
             | n::MLOCK2
             | n::MUNLOCK
             | n::MINCORE
+            | n::SHMAT
+            | n::SHMDT
     ) {
         flush();
     }

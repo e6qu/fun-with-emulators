@@ -136,6 +136,9 @@ pub struct Shm {
     /// to, against that user's `RLIMIT_MEMLOCK`, as Linux's
     /// `user_shm_lock` charges them.
     pub locked: Option<u32>,
+    /// Its memory's name ([`segment_name`]): this segment's alone, as an id
+    /// comes back once its sequence number wraps.
+    pub nonce: u64,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -372,6 +375,7 @@ fn put_obj(e: &mut Enc, id: i32, o: &Obj) {
             e.u64(s.dtime as u64);
             e.bool(s.locked.is_some());
             e.u32(s.locked.unwrap_or(0));
+            e.u64(s.nonce);
             e.u64(s.attached.len() as u64);
             for &(p, n) in &s.attached {
                 put_proc(e, p);
@@ -426,9 +430,10 @@ fn get_obj(d: &mut Dec) -> (i32, Obj) {
                 (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64);
             let locked = (d.bool(), d.u32());
             let locked = locked.0.then_some(locked.1);
+            let nonce = d.u64();
             let n = d.count(16);
             let attached = (0..n).map(|_| (get_proc(d), d.u32())).collect();
-            Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked })
+            Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked, nonce })
         }
         1 => {
             let otime = d.u64() as i64;
@@ -773,15 +778,147 @@ pub fn current() -> Option<Arc<Record<Ipc>>> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(initial)
 }
 
-/// The file of segment `id` in namespace record `r`.
-pub fn segment_path(r: &Record<Ipc>, id: i32) -> Vec<u8> {
-    [r.dir(), format!("/shm-{id}").as_bytes()].concat()
+/// The memory of the segment whose nonce is `nonce` ([`Shm::nonce`]): a
+/// POSIX shared memory object of the host's (memory, which any process,
+/// the host's X server among them, maps by its descriptor). (macOS's names
+/// are 31 bytes at most.)
+pub fn segment_name(nonce: u64) -> std::ffi::CString {
+    std::ffi::CString::new(format!("/fwe{}s{nonce:x}", crate::host::euid()))
+        .expect("a name without NUL")
 }
 
-fn remove_segment_file(r: &Record<Ipc>, id: i32) {
-    if let Ok(p) = std::ffi::CString::new(segment_path(r, id)) {
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        unsafe { libc::unlink(p.as_ptr()) };
+/// A nonce no other segment has.
+pub fn new_nonce() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    crate::shared::hash(
+        &[now.to_le_bytes(), (crate::host::pid() as u64).to_le_bytes(), n.to_le_bytes()].concat(),
+    )
+}
+
+/// Make the memory of a new segment of `size` bytes (zeroes) named by
+/// `nonce`: a descriptor of it, in fwe's range, kept ([`hold_segment`]).
+pub fn make_segment(nonce: u64, size: u64) -> Result<crate::maps::HeldFile, i32> {
+    let name = segment_name(nonce);
+    // SAFETY: a NUL-terminated name; the descriptor is moved into fwe's
+    // range (or closed) and kept.
+    unsafe {
+        let fd = libc::shm_open(
+            name.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+            0o600,
+        );
+        if fd < 0 {
+            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+        }
+        if libc::ftruncate(fd, size as libc::off_t) != 0 {
+            libc::close(fd);
+            libc::shm_unlink(name.as_ptr());
+            return Err(errno::ENOMEM);
+        }
+        match crate::fdtable::reserve(fd) {
+            Ok(fd) => {
+                let held = held_file(fd);
+                hold_segment(nonce, held.clone());
+                Ok(held)
+            }
+            Err(e) => {
+                libc::shm_unlink(name.as_ptr());
+                Err(e)
+            }
+        }
+    }
+}
+
+fn held_file(fd: i32) -> crate::maps::HeldFile {
+    // SAFETY: a descriptor of fwe's, owned from here on.
+    crate::maps::HeldFile(Arc::new(unsafe {
+        <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd)
+    }))
+}
+
+/// The memory of the segment named by `nonce`: the descriptor this process
+/// keeps of it, or a new one, opened read-only when `read_only`, kept if
+/// it can write (`ENOENT`: it was removed).
+pub fn segment(nonce: u64, read_only: bool) -> Result<crate::maps::HeldFile, i32> {
+    if let Some(held) = held_segment(nonce) {
+        return Ok(held);
+    }
+    let name = segment_name(nonce);
+    let flags = if read_only { libc::O_RDONLY } else { libc::O_RDWR };
+    // SAFETY: a NUL-terminated name.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), flags | libc::O_CLOEXEC, 0) };
+    if fd < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    let held = held_file(crate::fdtable::reserve(fd)?);
+    if !read_only {
+        hold_segment(nonce, held.clone());
+    }
+    Ok(held)
+}
+
+/// The descriptors this process keeps of segments' memory: of those it
+/// made, until it first detaches them, and of those it has attached, so
+/// that an attachment needs no lookup of the host's.
+static HELD: Mutex<Vec<(u64, crate::maps::HeldFile)>> = Mutex::new(Vec::new());
+
+fn held_segment(nonce: u64) -> Option<crate::maps::HeldFile> {
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    held.iter().find(|(n, _)| *n == nonce).map(|(_, h)| h.clone())
+}
+
+fn hold_segment(nonce: u64, h: crate::maps::HeldFile) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if !held.iter().any(|(n, _)| *n == nonce) {
+        held.push((nonce, h));
+    }
+}
+
+/// This process keeps no descriptor of the segment named by `nonce` (its
+/// mappings hold theirs).
+pub fn let_go_segment(nonce: u64) {
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).retain(|(n, _)| *n != nonce);
+}
+
+/// This process keeps no descriptor of a segment `t` no longer has (one
+/// another process removed): its memory goes once nothing maps it.
+pub fn let_go_removed(t: &Ipc) {
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    if held.is_empty() {
+        return;
+    }
+    let live: std::collections::HashSet<u64> = t
+        .objs
+        .values()
+        .filter_map(|o| match &o.body {
+            Body::Shm(s) => Some(s.nonce),
+            _ => None,
+        })
+        .collect();
+    held.retain(|(n, _)| live.contains(n));
+}
+
+/// The segment named by `nonce` goes: its memory once nothing maps it.
+pub fn remove_segment(nonce: u64) {
+    let_go_segment(nonce);
+    let name = segment_name(nonce);
+    // SAFETY: a NUL-terminated name.
+    unsafe { libc::shm_unlink(name.as_ptr()) };
+}
+
+/// The namespace whose record is named `dir` goes
+/// ([`crate::shared::collect`]): its segments' memory with it.
+pub fn forget(dir: &[u8]) {
+    if let Ok(r) = Record::<Ipc>::join(dir, 0) {
+        for o in r.get().objs.values() {
+            if let Body::Shm(s) = &o.body {
+                remove_segment(s.nonce);
+            }
+        }
     }
 }
 
@@ -899,7 +1036,7 @@ impl Ipc {
     /// What processes that have gone left: their attachments and undo
     /// adjustments (applied, as Linux applies them as a process ends), and
     /// a segment marked for removal whose last attachment that was.
-    pub fn reap(&mut self, r: &Record<Ipc>) -> bool {
+    pub fn reap(&mut self) -> bool {
         let mut changed = false;
         let mut gone_segments = Vec::new();
         // Only objects that name processes, or are marked for removal.
@@ -927,8 +1064,9 @@ impl Ipc {
             changed = true;
         }
         for id in gone_segments {
-            self.objs.remove(&(Kind::Shm as u8, id));
-            remove_segment_file(r, id);
+            if let Some(Obj { body: Body::Shm(s), .. }) = self.objs.remove(&(Kind::Shm as u8, id)) {
+                remove_segment(s.nonce);
+            }
             changed = true;
         }
         changed
@@ -1092,6 +1230,11 @@ pub fn note_detached(addr: u64) {
     ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
 }
 
+/// Whether this process has segment `id` attached anywhere.
+pub fn attached_here(id: i32) -> bool {
+    ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).values().any(|&(i, _)| i == id)
+}
+
 /// Count `n` more attachments of segment `id` for process `p` (`n` may be
 /// negative).
 pub fn attach_count(t: &mut Ipc, id: i32, p: Proc, n: i64) {
@@ -1159,7 +1302,7 @@ pub fn process_leaving(exec: bool) {
                 false
             });
         }
-        t.reap(&r);
+        t.reap();
         Ok(())
     });
 }
