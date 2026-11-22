@@ -2586,7 +2586,7 @@ where fwe falls short of Linux in detail is in
 | overlay, bind, move | **emulated** | Linux's layering and copy-up; binds keep their flags |
 | cgroup v1, ext4, btrfs, XFS, FUSE, NFS and other types | **refused** | `ENODEV`, as without them |
 | `ro`, `nosuid`, `nodev`, `noexec`, `nosymfollow` | **enforced** | `EROFS`, no gain, `EACCES`, `EACCES`/`EPERM`, `ELOOP` |
-| Access-time modes | **emulated** | `noatime`, `nodiratime`, `strictatime` by fwe; `relatime` the host's |
+| Access-time modes | **emulated** | `noatime`, `nodiratime`, `strictatime` by fwe; `relatime` the host's, so a Mac program's read of a file (Spotlight indexing one soon after it is written) sets its access time as a read in the guest would; a directory named `*.noindex` is not indexed |
 | `sync`, `dirsync`, `lazytime`, `mand` | **ignored** | `mand` as Linux since 5.15 |
 | Idmapped mounts | **refused** | `MOUNT_ATTR_IDMAP` `EINVAL` |
 | Propagation | **emulated** | shared, slave, private, unbindable, across namespaces |

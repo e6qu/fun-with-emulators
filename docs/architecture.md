@@ -1350,7 +1350,9 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   (`ELOOP`); `noatime`, `nodiratime` and `strictatime` set a read file's
   access time as Linux would, its change time left alone
   (`crates/kernel/src/atime.rs`), `relatime`
-  is left to the host.
+  is left to the host, whose own programs' reads set access times too
+  (Spotlight indexes a file soon after it is written, outside a
+  `*.noindex` directory).
 - **Busy mounts and roots:** a mount is busy while something is mounted
   under it, the caller's working directory or root is in it, or a file
   opened through it is open in this process or (by host path) in another
