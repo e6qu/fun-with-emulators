@@ -40,8 +40,10 @@ import argparse
 import atexit
 import bisect
 import collections
+import contextlib
 import ctypes
 import hashlib
+import io
 import json
 import os
 import re
@@ -207,6 +209,8 @@ LIMITS = {
 # that also measures the builds' differences (Alpine's compiler and C
 # library against Homebrew's), not only fwe.
 SHARE = "fwe's share"
+# The runs a share is counted over ([`profile`]).
+SHARE_RUNS = 5
 # Which of fwe's backends ran each benchmark's programs ([`backends`]).
 BACKEND = "fwe's backend"
 # The results of the same benchmarks in a Linux VM on the same Mac
@@ -909,6 +913,7 @@ def git_commands(ours, theirs, fresh, root):
         subprocess.run(cmd, capture_output=True)
         names, took = {}, collections.Counter()
         count = collections.Counter()
+        regions = collections.Counter()
         with open(logs[side], errors="replace") as f:
             for line in f:
                 try:
@@ -921,9 +926,18 @@ def git_commands(ours, theirs, fresh, root):
                     n = names.get(ev["sid"], "?")
                     took[n] += ev["t_abs"]
                     count[n] += 1
+                elif ev.get("event") == "region_leave" and "t_rel" in ev:
+                    n = names.get(ev["sid"], "?")
+                    regions[(n, ev.get("category", ""), ev.get("label", ""))] += ev["t_rel"]
         top = ", ".join(f"{n} {count[n]}x {t * 1e3:.0f} ms" for n, t in took.most_common(10))
         print(f"git (s) {side}, by command: {sum(took.values()) * 1e3:.0f} ms in git: {top}",
               file=sys.stderr)
+        # And the regions git marks in its slowest commands (a region holds
+        # the regions inside it).
+        for n, _ in took.most_common(3):
+            inside = sorted(((t, c, l) for (cn, c, l), t in regions.items() if cn == n), reverse=True)
+            print(f"git (s) {side}, {n}'s regions: "
+                  + ", ".join(f"{c}/{l} {t * 1e3:.0f} ms" for t, c, l in inside[:10]), file=sys.stderr)
 
 
 # A process's regions, as `vmmap` lists them but in milliseconds, not the
@@ -1663,6 +1677,22 @@ def profile(name, cmd, theirs, fresh, share=False):
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
     mine = pcs(name, cmd, share)
+    if share and mine:
+        # A share is a ratio of samples, a second's run some hundreds of
+        # them: more runs, their samples summed, so that it is known to a
+        # hundredth, not to the few hundredths one run's count leaves.
+        own, all_ = mine
+        for _ in range(SHARE_RUNS - 1):
+            for d in fresh:
+                shutil.rmtree(d, ignore_errors=True)
+                os.makedirs(d)
+            with contextlib.redirect_stderr(io.StringIO()):
+                more = pcs(name, cmd, share)
+            if more:
+                own, all_ = own + more[0], all_ + more[1]
+        print(f"{name}: fwe's share over {SHARE_RUNS} runs: {all_ / max(own, 1):.3f} "
+              f"({own} of {all_} samples the program's own)", file=sys.stderr)
+        mine = (own, all_)
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
