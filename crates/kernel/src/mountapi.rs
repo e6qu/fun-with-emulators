@@ -153,23 +153,6 @@ fn set_cloexec(fd: i32, cloexec: bool) {
     unsafe { libc::fcntl(fd, libc::F_SETFD, if cloexec { libc::FD_CLOEXEC } else { 0 }) };
 }
 
-/// A descriptor of a new anonymous file, open to read and write: what a
-/// context's descriptor is on the host.
-fn anon_file() -> Result<i32, i32> {
-    let mut dir = crate::fs::shm::user_dir()?;
-    dir.extend_from_slice(b"/fsctx-XXXXXX\0");
-    // SAFETY: a NUL-terminated template in fwe's private directory; the
-    // file is unlinked at once, its descriptor kept.
-    unsafe {
-        let fd = libc::mkstemp(dir.as_mut_ptr().cast());
-        if fd < 0 {
-            return Err(last());
-        }
-        libc::unlink(dir.as_ptr().cast());
-        Ok(fd)
-    }
-}
-
 /// An `O_PATH`-like descriptor of a detached tree's root: its directory,
 /// or for a filesystem with nothing on the host, an empty directory of
 /// fwe's (so nothing outside the guest's files is reached through it).
@@ -420,11 +403,10 @@ fn read_id_req(req: u64) -> Result<(u64, u64, u64), i32> {
 impl<P: Platform> Kernel<P> {
     /// A new descriptor of context `c`, close-on-exec as asked.
     fn context_fd(&mut self, c: Context, cloexec: bool) -> i64 {
-        let fd = match anon_file() {
+        let fd = match crate::anonfd::new(cloexec) {
             Ok(fd) => fd,
             Err(e) => return err(e),
         };
-        set_cloexec(fd, cloexec);
         let k = NEXT.fetch_add(1, Ordering::Relaxed);
         with(&CONTEXTS, |m| m.insert(k, c));
         fdmarks::mark(fd, Mark::FsContext(k));

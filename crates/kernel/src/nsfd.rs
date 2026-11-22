@@ -4,9 +4,9 @@
 //! A descriptor names a namespace by kind, identity and the directory of
 //! its shared record ([`crate::shared::Record`]; none for an initial
 //! namespace other than the mount namespace, whose initial table is a
-//! record too). The process keeps that against a descriptor of an
-//! anonymous file ([`Mark::Ns`]), which `fstat` shows as nsfs shows a
-//! namespace: its identity is the inode. `setns` joins the namespace the
+//! record too). The process keeps that against a descriptor standing for
+//! it ([`crate::anonfd`], [`Mark::Ns`]), which `fstat` shows as nsfs shows
+//! a namespace: its identity is the inode. `setns` joins the namespace the
 //! descriptor names, as `unshare` moves to a new one.
 
 use crate::fdmarks::{self, Mark};
@@ -94,28 +94,7 @@ pub fn of(fd: i32) -> Option<NsRef> {
 /// A read, write or copy of a namespace descriptor: refused (`EINVAL`),
 /// as nsfs has neither. `None` for another descriptor.
 pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
-    use fwe_abi::nr as n;
-    let rw = matches!(
-        nr,
-        n::READ
-            | n::PREAD64
-            | n::READV
-            | n::PREADV
-            | n::PREADV2
-            | n::WRITE
-            | n::PWRITE64
-            | n::WRITEV
-            | n::PWRITEV
-            | n::PWRITEV2
-    );
-    // Copied from or to one, by `sendfile` (in, out), `splice` and
-    // `copy_file_range` (in, out at 0 and 2).
-    let copy = match nr {
-        n::SENDFILE => of(a[0] as i32).is_some() || of(a[1] as i32).is_some(),
-        n::SPLICE | n::COPY_FILE_RANGE => of(a[0] as i32).is_some() || of(a[2] as i32).is_some(),
-        _ => false,
-    };
-    ((rw && of(a[0] as i32).is_some()) || copy).then(|| err(errno::EINVAL))
+    crate::anonfd::refuse_io(nr, a, |fd| of(fd).is_some())
 }
 
 /// What `/proc/self/fd/<fd>` links to for a namespace descriptor.
@@ -137,24 +116,10 @@ pub fn closed(fd: i32) {
 
 /// A new descriptor of namespace `n`, close-on-exec if `cloexec`.
 pub fn open(n: NsRef, cloexec: bool) -> i64 {
-    let mut path = match crate::fs::shm::user_dir() {
-        Ok(d) => d,
+    let fd = match crate::anonfd::new(cloexec) {
+        Ok(fd) => fd,
         Err(e) => return err(e),
     };
-    path.extend_from_slice(b"/nsfd-XXXXXX\0");
-    // SAFETY: a NUL-terminated template in fwe's private directory; the
-    // file is unlinked at once, its descriptor kept.
-    let fd = unsafe {
-        let fd = libc::mkstemp(path.as_mut_ptr().cast());
-        if fd >= 0 {
-            libc::unlink(path.as_ptr().cast());
-            libc::fcntl(fd, libc::F_SETFD, if cloexec { libc::FD_CLOEXEC } else { 0 });
-        }
-        fd
-    };
-    if fd < 0 {
-        return crate::host::last_error();
-    }
     let k = NEXT.fetch_add(1, Ordering::Relaxed);
     with(|m| m.insert(k, n));
     fdmarks::mark(fd, Mark::Ns(k));

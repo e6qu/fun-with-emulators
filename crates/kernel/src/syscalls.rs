@@ -2853,12 +2853,17 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             .iter()
             .map(|p| p.events & libc::POLLOUT != 0 && crate::specialfd::eventfd_writable(p.fd))
             .collect();
-        // A synthetic file or directory, whose host descriptor (`/dev/null`)
-        // the host cannot wait on: ready to read and write, as Linux
-        // reports a file with no wait of its own, and not asked the host.
+        // A synthetic file or directory, or an object of fwe's own, whose
+        // host descriptor (`/dev/null`, a pipe's read end) says nothing of
+        // it: ready to read and write, as Linux reports a file with no wait
+        // of its own, and not asked the host.
         let synthetic: Vec<bool> = set
             .iter()
-            .map(|p| crate::procfile::is(p.fd) || crate::synthdir::is_synth(p.fd))
+            .map(|p| {
+                crate::procfile::is(p.fd)
+                    || crate::synthdir::is_synth(p.fd)
+                    || crate::anonfd::is(p.fd)
+            })
             .collect();
         for (p, &s) in ask.iter_mut().zip(&synthetic) {
             if s {

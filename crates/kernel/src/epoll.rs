@@ -235,7 +235,11 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         // memory) polls, as an error ([`bpf_watched`]).
         let bpf = crate::memobj::may_be(&st) && crate::bpf::is_bpf_fd(target);
         let file = kind == libc::S_IFREG || crate::procfile::is(target);
-        if (file && !mounts && !bpf) || kind == libc::S_IFDIR || crate::synthdir::is_synth(target) {
+        if (file && !mounts && !bpf)
+            || kind == libc::S_IFDIR
+            || crate::synthdir::is_synth(target)
+            || crate::anonfd::is(target)
+        {
             return err(errno::EPERM);
         }
         if ep == target || !is_epoll(ep) {

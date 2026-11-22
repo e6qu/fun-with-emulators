@@ -6410,6 +6410,7 @@ fn proc_is_read_through_a_detached_mount() {
 
 /// What the `nsfd` guest prints.
 const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
+    seek refused true, poll 1 revents 0x5, epoll refused true\n\
     nstype 0x4000000, parent of a UTS namespace refused true\n\
     setns: 0, own name true, back true\n\
     wrong type refused true\n\
@@ -6539,6 +6540,7 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     msg_next_id: id true, then -1\n\
     process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n\
     landlock: abi 6, restricted true, inside read true, outside EACCES true\n\
+    landlock ruleset: named true, mode 0600 true, read refused true\n\
     low port: named true, reached true true, accepted true, bound again true\n";
 
 /// More calls: native AIO (a poll that waits, an eventfd signalled),
@@ -8746,6 +8748,7 @@ fn proc_files_programs_read() {
          environ has FWE_PROC=1: 1\n\
          limits: Limit                    | open files 1\n\
          statm words: 7\n\
+         open statm's link is its pid's: 1\n\
          io read_bytes: 1\n\
          comm write: 0\n\
          comm now: renamed\nname: renamed\n\

@@ -95,6 +95,8 @@ pub enum Mark {
     Ns(u32),
     /// An inotify instance, by its number ([`crate::inotify`]).
     Inotify(u32),
+    /// A Landlock ruleset, by its number ([`crate::landlock`]).
+    Landlock(u32),
     /// An `O_PATH | O_NOFOLLOW` descriptor of a link of fwe's `/proc` (a
     /// stand-in, its origin's path the link's), which names the link.
     ProcLink,
@@ -674,6 +676,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::UtsName { .. }) => 24,
             Some(Mark::Ping) => 25,
             Some(Mark::ReadOnly) => 26,
+            Some(Mark::Landlock(_)) => 27,
         });
         if let Some(Mark::Comm { tid }) = rec.mark {
             e.i32(tid);
@@ -689,8 +692,13 @@ pub fn save(e: &mut Enc) {
         if let Some(Mark::TimerSlack { host } | Mark::RemoteMem { id: host }) = rec.mark {
             e.i32(host);
         }
-        if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
-            rec.mark
+        if let Some(
+            Mark::FsContext(n)
+            | Mark::Detached(n)
+            | Mark::Ns(n)
+            | Mark::Inotify(n)
+            | Mark::Landlock(n),
+        ) = rec.mark
         {
             e.u32(n);
         }
@@ -771,6 +779,7 @@ pub fn load(d: &mut Dec) {
             24 => Some(Mark::UtsName { domain: d.bool() }),
             25 => Some(Mark::Ping),
             26 => Some(Mark::ReadOnly),
+            27 => Some(Mark::Landlock(d.u32())),
             _ => None,
         };
         let net = crate::shared::load_opt(d).ok().flatten().map(Net);

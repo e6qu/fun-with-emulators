@@ -1298,6 +1298,12 @@ impl Fs {
         if let Some(p) = crate::synthdir::path_of(fd) {
             return p;
         }
+        if let Some(p) = crate::procfile::path_of(fd) {
+            return p;
+        }
+        if crate::landlock::is_ruleset(fd) {
+            return b"anon_inode:[landlock-ruleset]".to_vec();
+        }
         if let Some(name) = crate::specialfd::anon_name(fd) {
             return format!("anon_inode:{name}").into_bytes();
         }

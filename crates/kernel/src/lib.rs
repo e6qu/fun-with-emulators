@@ -12,6 +12,7 @@
 
 pub mod acct;
 pub mod aio;
+pub mod anonfd;
 pub mod atime;
 pub mod bpf;
 pub mod bpfcheck;
@@ -2103,6 +2104,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         return Some(r);
     }
     if let Some(r) = nsfd::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = landlock::io(nr, &a) {
         return Some(r);
     }
     if let Some(r) = inotify::io(nr, &a) {

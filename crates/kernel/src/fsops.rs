@@ -324,6 +324,22 @@ fn on_tmpfs(st: &mut Stat, id: u32) {
     st.st_blksize = crate::maps::page_size().max(4096) as i32;
 }
 
+/// `/proc` path `p` as Linux names the file it opens (`/proc/self/fd`'s
+/// links): `self` as the process's pid, `thread-self` as its pid's task
+/// of the thread.
+fn named_by_pid(p: &[u8]) -> Vec<u8> {
+    let under =
+        |dir: &[u8]| p.strip_prefix(dir).filter(|rest| rest.is_empty() || rest.starts_with(b"/"));
+    if let Some(rest) = under(b"/proc/self") {
+        return [format!("/proc/{}", crate::thread::tgid()).as_bytes(), rest].concat();
+    }
+    if let Some(rest) = under(b"/proc/thread-self") {
+        let task = format!("/proc/{}/task/{}", crate::thread::tgid(), crate::thread::tid());
+        return [task.as_bytes(), rest].concat();
+    }
+    p.to_vec()
+}
+
 /// Host metadata of open descriptor `fd` (of the file an `O_PATH`
 /// stand-in names), with the guest's permission bits ([`crate::modes`])
 /// and owner ([`crate::owners`]).
@@ -349,7 +365,7 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     }
     // A program or map of bpf's is an object of fwe's in host shared memory.
     let bpf = || crate::memobj::may_be(&out) && crate::bpf::is_bpf_fd(fd);
-    if crate::mountapi::is_context(fd) || bpf() {
+    if crate::mountapi::is_context(fd) || crate::landlock::is_ruleset(fd) || bpf() {
         // An anonymous inode: owner read and write, of no file type.
         out.st_mode = 0o600;
         let owner = crate::owners::host_owner(&out);
@@ -3072,7 +3088,7 @@ impl<P: Platform> Kernel<P> {
     /// `contents`, as the guest's open `flags` ask ([`crate::procfile`]).
     fn proc_file(&self, dirfd: i32, path: &[u8], contents: Vec<u8>, flags: u64) -> i64 {
         let at = self.fs().absolute_path(dirfd, path).unwrap_or_else(|| path.to_vec());
-        crate::procfile::open(&at, contents, flags)
+        crate::procfile::open(&named_by_pid(&at), contents, flags)
     }
 
     fn synthetic_fd(&self, fd: i64, dirfd: i32, path: &[u8]) -> i64 {

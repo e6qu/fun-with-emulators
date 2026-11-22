@@ -26,7 +26,7 @@
 
 use fwe_abi::errno;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The ABI fwe implements: Linux 6.12's.
 pub const ABI: i64 = 6;
@@ -79,7 +79,29 @@ pub struct Ruleset {
 }
 
 /// The process's rulesets, by their descriptors' host identity.
-pub(crate) static RULESETS: Mutex<Vec<((u64, u64), Ruleset)>> = Mutex::new(Vec::new());
+pub(crate) static RULESETS: Mutex<Vec<(u32, Ruleset)>> = Mutex::new(Vec::new());
+
+/// The number the next ruleset takes ([`crate::fdmarks::Mark::Landlock`]).
+static NEXT_RULESET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The number of the ruleset `fd` is a descriptor of, if it is one.
+fn ruleset_key(fd: i32) -> Option<u32> {
+    match crate::fdmarks::any_marks().then(|| crate::fdmarks::marked(fd)).flatten() {
+        Some(crate::fdmarks::Mark::Landlock(k)) => Some(k),
+        _ => None,
+    }
+}
+
+/// Whether `fd` is a ruleset's descriptor.
+pub fn is_ruleset(fd: i32) -> bool {
+    ruleset_key(fd).is_some()
+}
+
+/// A read, write or copy of a ruleset's descriptor: refused (`EINVAL`),
+/// as Linux's ruleset has neither. `None` for another descriptor.
+pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
+    crate::anonfd::refuse_io(nr, a, is_ruleset)
+}
 
 /// The process's domain: each layer's id and ruleset.
 pub(crate) static DOMAIN: Mutex<Vec<(u64, Ruleset)>> = Mutex::new(Vec::new());
@@ -108,11 +130,14 @@ fn fd_identity(fd: i32) -> Option<(libc::stat, (u64, u64))> {
 }
 
 fn ruleset_of(fd: i32) -> Result<Ruleset, i32> {
-    let (_, id) = fd_identity(fd).ok_or(errno::EBADF)?;
+    // SAFETY: F_GETFD only queries the descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(errno::EBADF);
+    }
+    let k = ruleset_key(fd).ok_or(errno::EBADFD)?;
     let r = RULESETS.lock().unwrap_or_else(|e| e.into_inner());
-    r.iter().find(|(i, _)| *i == id).map(|(_, rs)| rs.clone()).ok_or(errno::EBADFD)
+    r.iter().find(|(i, _)| *i == k).map(|(_, rs)| rs.clone()).ok_or(errno::EBADFD)
 }
-
 /// `landlock_create_ruleset(attr, size, flags)`.
 pub fn create_ruleset(attr: u64, size: u64, flags: u64) -> Result<i64, i32> {
     if flags != 0 {
@@ -140,35 +165,12 @@ pub fn create_ruleset(attr: u64, size: u64, flags: u64) -> Result<i64, i32> {
     if rs.fs == 0 && rs.net == 0 && rs.scoped == 0 {
         return Err(errno::ENOMSG);
     }
-    let fd = anon_file()?;
-    let (_, id) = fd_identity(fd).ok_or(errno::EBADF)?;
-    RULESETS.lock().unwrap_or_else(|e| e.into_inner()).push((id, rs));
+    // (Linux makes a ruleset's descriptor close-on-exec.)
+    let fd = crate::anonfd::new(true)?;
+    let k = NEXT_RULESET.fetch_add(1, Ordering::Relaxed);
+    RULESETS.lock().unwrap_or_else(|e| e.into_inner()).push((k, rs));
+    crate::fdmarks::mark(fd, crate::fdmarks::Mark::Landlock(k));
     Ok(i64::from(fd))
-}
-
-/// A fresh file of fwe's, unnamed, standing for a ruleset.
-fn anon_file() -> Result<i32, i32> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mut path = crate::procreg::records_dir().ok_or(errno::ENOMEM)?;
-    let pid = crate::host::pid();
-    path.extend_from_slice(
-        format!("/landlock-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
-    );
-    let p = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory, unlinked
-    // once open.
-    unsafe {
-        let fd = libc::open(
-            p.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-            0o600,
-        );
-        if fd < 0 {
-            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-        }
-        libc::unlink(p.as_ptr());
-        Ok(fd)
-    }
 }
 
 /// `landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags)`.
@@ -211,9 +213,9 @@ pub fn add_rule(fd: i32, ty: u64, attr: u64, flags: u64) -> Result<i64, i32> {
         }
         _ => return Err(errno::EINVAL),
     };
-    let (_, id) = fd_identity(fd).ok_or(errno::EBADF)?;
+    let k = ruleset_key(fd).ok_or(errno::EBADFD)?;
     let mut r = RULESETS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, rs)) = r.iter_mut().find(|(i, _)| *i == id) {
+    if let Some((_, rs)) = r.iter_mut().find(|(i, _)| *i == k) {
         match rule {
             Rule::Path(obj, access, dir) => match rs.paths.iter_mut().find(|p| p.0 == obj) {
                 Some(p) => p.1 |= access,
