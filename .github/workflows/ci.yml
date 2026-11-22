@@ -40,7 +40,7 @@ jobs:
           for how in plain searched; do
             gtk3-demo 2>/tmp/demo-$how.err & P=$!
             W=
-            for i in $(seq 60); do W=$(xdotool search --class gtk3-demo | tail -1); [ -n "$W" ] && break; sleep 1; done
+            for i in $(seq 60); do W=$(xdotool search --onlyvisible --class gtk3-demo | tail -1); [ -n "$W" ] && break; sleep 1; done
             echo "$how: window $W"
             sleep 3
             if [ $how = searched ]; then
