@@ -24,6 +24,10 @@ fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
 /// `flock(fd, op)`. Waiting for the lock blocks, so the backends run it
 /// without the kernel lock ([`crate::blocking_syscall`]).
 pub(crate) fn flock(fd: u64, op: u64) -> i64 {
+    // A file of fwe's store: its locks are the store's.
+    if let Some(r) = crate::filestore::locks::flock(fd as i32, op) {
+        return r;
+    }
     // A message queue's descriptor stands on `/dev/null`
     // ([`crate::mqueue`]), which the host locks not: the guest's lock is
     // not taken there.
@@ -48,6 +52,9 @@ pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
     let lock: fwe_abi::Flock = guest!(uaccess::read(arg));
     if matches!(cmd, fcntl::F_OFD_SETLK | fcntl::F_OFD_SETLKW) && lock.l_pid != 0 {
         return err(errno::EINVAL);
+    }
+    if let Some(r) = crate::filestore::locks::set(fd, cmd, &lock) {
+        return r;
     }
     let lock = match host::flock_to_host(&lock) {
         Ok(l) => l,
@@ -1434,6 +1441,15 @@ impl<P: Platform> Kernel<P> {
                     let asked: fwe_abi::Flock = guest!(uaccess::read(arg));
                     if cmd == fcntl::F_OFD_GETLK && asked.l_pid != 0 {
                         return err(errno::EINVAL);
+                    }
+                    if let Some(r) = crate::filestore::locks::get(fd, cmd, &asked) {
+                        return match r {
+                            Ok(answer) => {
+                                guest!(uaccess::write(arg, answer));
+                                0
+                            }
+                            Err(e) => err(e),
+                        };
                     }
                     let mut lock = match host::flock_to_host(&asked) {
                         Ok(l) => l,

@@ -7,4 +7,6 @@ pub mod data;
 pub mod desc;
 pub mod fs;
 pub mod io;
+pub mod locks;
 pub mod tree;
+pub mod wait;

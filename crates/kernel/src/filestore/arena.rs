@@ -35,6 +35,10 @@ struct Header {
     magic: AtomicU64,
     lock: AtomicU32,
     changing: AtomicU32,
+    /// Bumped as what processes wait for changes (a file lock let go), for
+    /// them to wait on ([`Arena::changes`]).
+    changes: AtomicU32,
+    _pad: u32,
     bump: AtomicU64,
     free: [AtomicU64; CLASSES],
     /// Free runs of whole pages, by address: each holds the next run's
@@ -43,7 +47,7 @@ struct Header {
     roots: [AtomicU64; ROOTS],
 }
 
-const MAGIC: u64 = u64::from_le_bytes(*b"fwefsar1");
+const MAGIC: u64 = u64::from_le_bytes(*b"fwefsar2");
 
 /// Where the allocator starts: past the header, on a page.
 const START: u64 = PAGE;
@@ -116,7 +120,13 @@ impl Arena {
         {
             let (_held, _) = crate::procstore::hold_word(a.static_word(&h.lock));
             if h.magic.load(SeqCst) != MAGIC {
+                // New, or another layout's: begun afresh, all of it.
+                h.changing.store(0, SeqCst);
+                h.changes.store(0, SeqCst);
                 h.bump.store(START, SeqCst);
+                for w in h.free.iter().chain(h.roots.iter()).chain([&h.runs]) {
+                    w.store(0, SeqCst);
+                }
                 h.magic.store(MAGIC, SeqCst);
             }
         }
@@ -141,6 +151,12 @@ impl Arena {
         // SAFETY: the mapping outlives every lock taken through `self`
         // (held only within a `Mem` borrowing `self`).
         unsafe { &*(w as *const AtomicU32) }
+    }
+
+    /// The word waiters on the arena's changes sleep on: bumped, and its
+    /// waiters woken, by [`Mem::changed`].
+    pub fn changes(&self) -> &AtomicU32 {
+        &self.header().changes
     }
 
     /// The arena to read and change, for this process alone, while the
@@ -173,6 +189,14 @@ impl Mem<'_> {
     /// be made again.
     pub fn repairs(&self) -> bool {
         self.half_made
+    }
+
+    /// What waiters on the arena wait for changed: they are woken (once
+    /// the lock is let go, they look again).
+    pub fn changed(&mut self) {
+        let w = &self.arena.header().changes;
+        w.fetch_add(1, SeqCst);
+        crate::filestore::wait::wake_all(w);
     }
 
     /// Owner word `i`.

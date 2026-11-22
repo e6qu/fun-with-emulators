@@ -74,6 +74,13 @@ pub fn remove(id: u64) {
 }
 
 impl Fs {
+    /// The word to wait on for what the filesystem's waiters wait for (a
+    /// lock let go): read while the filesystem is held, then waited on
+    /// once it is not ([`super::wait::wait`]).
+    pub fn changes(&self) -> &std::sync::atomic::AtomicU32 {
+        self.arena.changes()
+    }
+
     /// The filesystem held, to read and change.
     pub fn lock(&self) -> Result<Tx<'_>, i32> {
         self.lock_with(|| New { mode: tree::S_IFDIR | 0o1777, uid: 0, gid: 0, rdev: 0 })

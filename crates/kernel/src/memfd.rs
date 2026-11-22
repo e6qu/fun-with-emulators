@@ -138,6 +138,7 @@ mod imp {
         creds: &Creds,
     ) -> Result<i32, i32> {
         let fs = sfs::memfds()?;
+        let id = desc::new_id();
         let ino = {
             let mut t = fs.lock()?;
             let files = t.usage().1;
@@ -157,20 +158,20 @@ mod imp {
             // Held from the start, so no sweep takes it before its
             // descriptor counts.
             let made = t
-                .hold(ino, crate::sysvipc::me(), 1)
+                .hold(ino, crate::sysvipc::me(), &[(id, 1)])
                 .and_then(|_| t.set_seals(ino, seals))
                 .and_then(|()| t.set_xattr(ino, NAME, Some(name)));
             if let Err(e) = made {
-                let _ = t.hold(ino, crate::sysvipc::me(), 0);
+                let _ = t.hold(ino, crate::sysvipc::me(), &[]);
                 return Err(e);
             }
             ino
         };
         let flags = fcntl::O_RDWR | if cloexec { fcntl::O_CLOEXEC } else { 0 };
         let file = File { fs: fs.id, ino };
-        desc::open(file, flags).inspect_err(|_| {
+        desc::open(file, flags, id).inspect_err(|_| {
             if let Ok(mut t) = fs.lock()
-                && let Ok(gone) = t.hold(ino, crate::sysvipc::me(), 0)
+                && let Ok(gone) = t.hold(ino, crate::sysvipc::me(), &[])
                 && let Some(o) = gone.data
             {
                 crate::filestore::data::remove(o);

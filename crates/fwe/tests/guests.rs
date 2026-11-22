@@ -6692,6 +6692,44 @@ fn a_memfd_opened_again_read_only_is_read_only() {
     );
 }
 
+/// What the `memfd` guest's `locks` scenario prints.
+const MEMFD_LOCKS: &str = "\
+flock: 0
+another description: -1 EAGAIN
+a duplicate: 0
+unlocked: 0
+the child took it: true
+held by the shared description: -1 EAGAIN
+that description closed: 0
+unlock: 0
+record lock: 0
+  child sees: 0 type 1 start 0 len 10 parent's true
+  child in the way: -1 EAGAIN
+  child beside it: 0
+closing a duplicate let the child in: true
+the child's went as it ended: 0 type 2
+deadlock: -1 EDEADLK
+unlocked: 0
+the child took it: true
+ofd lock: 0
+another description: -1 EAGAIN
+a duplicate: 0
+the process's: -1 EAGAIN
+seen: 0 type 1 start 1 len 4 pid -1
+";
+
+/// A memfd's locks, kept by fwe's file store, hold between processes as
+/// Linux's: `flock` locks are an open file description's (shared by its
+/// duplicates and a fork child, gone with its last descriptor), a
+/// process's record locks conflict with others', show their holder, go
+/// when the process closes any descriptor of the file or ends, and a wait
+/// that would never end is refused; a description's record locks conflict
+/// with another description's and with the process's own.
+#[test]
+fn memfd_locks_hold_between_processes() {
+    assert_eq!(memfd("locks"), MEMFD_LOCKS);
+}
+
 /// What the `memfd` guest's `seals` scenario prints: a memfd named as
 /// Linux names it, and each seal holding.
 const MEMFD_SEALS: &str = "\

@@ -59,9 +59,13 @@ static NEXT_KEY: AtomicU32 = AtomicU32::new(1);
 /// a call asking about a descriptor looks no further.
 static ANY: AtomicBool = AtomicBool::new(false);
 
-/// How many descriptors of each file the process has, as the file was
-/// last told ([`sync`]), and the data object it keeps mapped for each.
-pub(crate) static HELD: Mutex<BTreeMap<File, (u32, u64)>> = Mutex::new(BTreeMap::new());
+/// The open file descriptions of a file the process has descriptors of,
+/// and how many of each.
+type Counts = Vec<(u64, u32)>;
+
+/// The descriptions of each file the process has, as the file was last
+/// told ([`sync`]), and the data object it keeps mapped for each.
+pub(crate) static HELD: Mutex<BTreeMap<File, (Counts, u64)>> = Mutex::new(BTreeMap::new());
 
 fn descs<R>(f: impl FnOnce(&mut BTreeMap<u32, Desc>) -> R) -> R {
     f(&mut DESCS.lock().unwrap_or_else(|e| e.into_inner()))
@@ -108,10 +112,15 @@ fn host_flags(flags: u64) -> i32 {
     h
 }
 
-/// A new description of `file`, open with Linux's `flags` (its access
-/// mode, `O_APPEND`, `O_NONBLOCK`, `O_CLOEXEC`): its descriptor, the
-/// lowest free (`EMFILE` past the limit).
-pub fn open(file: File, flags: u64) -> Result<i32, i32> {
+/// An id for a new open file description, which no other has.
+pub fn new_id() -> u64 {
+    crate::shared::unique()
+}
+
+/// A new description of `file`, `id` ([`new_id`]), open with Linux's
+/// `flags` (its access mode, `O_APPEND`, `O_NONBLOCK`, `O_CLOEXEC`): its
+/// descriptor, the lowest free (`EMFILE` past the limit).
+pub fn open(file: File, flags: u64, id: u64) -> Result<i32, i32> {
     // SAFETY: a NUL-terminated path; the descriptor is this call's.
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), host_flags(flags)) };
     if fd < 0 {
@@ -122,7 +131,7 @@ pub fn open(file: File, flags: u64) -> Result<i32, i32> {
         unsafe { libc::close(fd) };
         return Err(errno::EMFILE);
     }
-    adopt(fd, file, crate::shared::unique());
+    adopt(fd, file, id);
     sync(&[]);
     Ok(fd)
 }
@@ -153,12 +162,14 @@ fn adopt(fd: i32, file: File, id: u64) {
 /// Tell each file whose count of this process's descriptors changed what
 /// it is now: every open descriptor marked as the store's but those in
 /// `skip` (which an `exec` closes). The numbers no descriptor has any more
-/// are forgotten, and the mappings of files no longer held go.
+/// are forgotten, and the mappings of files no longer held go. A file the
+/// process has fewer descriptors of than before (one was closed) is no
+/// longer locked by the process's record locks, as on Linux.
 pub fn sync(skip: &[i32]) {
     if !ANY.load(Ordering::Relaxed) {
         return;
     }
-    let mut now: BTreeMap<File, u32> = BTreeMap::new();
+    let mut now: BTreeMap<File, BTreeMap<u64, u32>> = BTreeMap::new();
     let mut keys = BTreeSet::new();
     for (fd, mark) in fdmarks::marks() {
         let Mark::Store(k) = mark else { continue };
@@ -167,7 +178,7 @@ pub fn sync(skip: &[i32]) {
         }
         keys.insert(k);
         if let Some(d) = descs(|m| m.get(&k).copied()) {
-            *now.entry(d.file).or_default() += 1;
+            *now.entry(d.file).or_default().entry(d.id).or_default() += 1;
         }
     }
     descs(|m| m.retain(|k, _| keys.contains(k)));
@@ -175,18 +186,24 @@ pub fn sync(skip: &[i32]) {
     let me = crate::sysvipc::me();
     let files: BTreeSet<File> = held.keys().chain(now.keys()).copied().collect();
     for file in files {
-        let n = now.get(&file).copied().unwrap_or(0);
-        let (before, kept) = held.get(&file).copied().unwrap_or((0, 0));
+        let n: Counts =
+            now.get(&file).map(|m| m.iter().map(|(&d, &c)| (d, c)).collect()).unwrap_or_default();
+        let (before, kept) = held.get(&file).cloned().unwrap_or_default();
         if before == n {
             continue;
         }
+        let total = |c: &Counts| c.iter().map(|e| e.1 as u64).sum::<u64>();
+        let closed = total(&n) < total(&before);
         let Ok(fs) = file.fs() else {
             held.remove(&file);
             continue;
         };
         let told = fs.lock().and_then(|mut t| {
             let object = t.data(file.ino)?;
-            let gone = t.hold(file.ino, me, n)?;
+            if closed {
+                t.drop_record_locks(file.ino, me)?;
+            }
+            let gone = t.hold(file.ino, me, &n)?;
             Ok((object, gone))
         });
         let object = match told {
@@ -198,7 +215,7 @@ pub fn sync(skip: &[i32]) {
             }
             Err(_) => 0,
         };
-        if n == 0 {
+        if n.is_empty() {
             super::data::let_go(kept);
             held.remove(&file);
         } else {
@@ -228,12 +245,40 @@ pub fn made_data(file: File, object: u64) {
 /// The host pid of a message's holding: its start is the message's token.
 const IN_FLIGHT: i32 = 0;
 
+/// Whether holder `p` (a process, or a message: [`IN_FLIGHT`]) is still
+/// there.
+pub(super) fn alive(p: (i32, u64)) -> bool {
+    p.0 == IN_FLIGHT || crate::procreg::alive(p)
+}
+
+/// This process is ending: it holds none of its files any more, nor their
+/// locks (its descriptions' go too where no other process holds them).
+pub fn exiting() {
+    if !ANY.load(Ordering::Relaxed) {
+        return;
+    }
+    let me = crate::sysvipc::me();
+    let held = std::mem::take(&mut *HELD.lock().unwrap_or_else(|e| e.into_inner()));
+    for (file, (_, kept)) in held {
+        if let Ok(fs) = file.fs()
+            && let Ok(mut t) = fs.lock()
+        {
+            let _ = t.drop_record_locks(file.ino, me);
+            if let Ok(gone) = t.hold(file.ino, me, &[])
+                && let Some(o) = gone.data
+            {
+                super::data::remove(o);
+            }
+        }
+        super::data::let_go(kept);
+    }
+}
+
 /// Forget the holders of `fs`'s files with no names that have ended: the
 /// files only they held go.
 pub fn sweep(fs: &Fs) {
     let Ok(mut t) = fs.lock() else { return };
     for ino in t.unnamed() {
-        let alive = |p: (i32, u64)| p.0 == IN_FLIGHT || crate::procreg::alive(p);
         if let Ok(gone) = t.reap(ino, alive)
             && let Some(o) = gone.data
         {
@@ -266,13 +311,17 @@ pub fn forked_child() {
 }
 
 fn hand_on(p: (i32, u64)) {
-    let held: Vec<(File, u32)> =
-        HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(f, e)| (*f, e.0)).collect();
+    let held: Vec<(File, Counts)> = HELD
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .map(|(f, e)| (*f, e.0.clone()))
+        .collect();
     for (file, n) in held {
         if let Ok(fs) = file.fs()
             && let Ok(mut t) = fs.lock()
         {
-            let _ = t.hold_unless_counted(file.ino, p, n);
+            let _ = t.hold_unless_counted(file.ino, p, &n);
         }
     }
 }
@@ -295,7 +344,11 @@ pub(crate) fn save(e: &mut Enc) {
     for (f, (n, _)) in h.iter() {
         e.u64(f.fs);
         e.u64(f.ino);
-        e.u32(*n);
+        e.u64(n.len() as u64);
+        for &(id, c) in n {
+            e.u64(id);
+            e.u32(c);
+        }
     }
 }
 
@@ -310,11 +363,13 @@ pub(crate) fn load(d: &mut Dec) {
         let file = File { fs: d.u64(), ino: d.u64() };
         descs.insert(k, Desc { file, id: d.u64() });
     }
-    let n = d.count(20);
+    let n = d.count(24);
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..n {
         let file = File { fs: d.u64(), ino: d.u64() };
-        held.insert(file, (d.u32(), 0));
+        let m = d.count(12);
+        let counts = (0..m).map(|_| (d.u64(), d.u32())).collect();
+        held.insert(file, (counts, 0));
     }
 }
 
@@ -325,7 +380,8 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
     let k = key_of(fd)?;
     let d = descs(|m| m.get(&k).copied())?;
     let token = crate::shared::unique();
-    let held = d.file.fs().and_then(|fs| fs.lock()?.hold(d.file.ino, (IN_FLIGHT, token), 1));
+    let held =
+        d.file.fs().and_then(|fs| fs.lock()?.hold(d.file.ino, (IN_FLIGHT, token), &[(d.id, 1)]));
     if held.is_err() {
         return None;
     }
@@ -360,7 +416,7 @@ pub(crate) fn import(fd: i32, d: &mut Dec) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn let_go_in_flight(fs: &Fs, ino: Ino, token: u64) {
     if let Ok(mut t) = fs.lock()
-        && let Ok(gone) = t.hold(ino, (IN_FLIGHT, token), 0)
+        && let Ok(gone) = t.hold(ino, (IN_FLIGHT, token), &[])
         && let Some(o) = gone.data
     {
         super::data::remove(o);

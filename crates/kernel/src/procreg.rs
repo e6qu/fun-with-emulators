@@ -1808,6 +1808,8 @@ pub fn exiting(status: i32) {
     crate::textbusy::exiting();
     // Its `O_TMPFILE` files' hidden names, as their descriptors close.
     crate::tmpfile::exiting();
+    // Its files of fwe's store, and their locks.
+    crate::filestore::desc::exiting();
     crate::ptrace::exiting(status);
     crate::thread::process_ending();
     // Its System V IPC attachments and undo adjustments, as it ends.

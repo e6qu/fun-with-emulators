@@ -42,10 +42,13 @@ const R_LIMIT_BYTES: usize = 6;
 const R_LIMIT_INODES: usize = 7;
 const R_BYTES: usize = 8;
 const R_DEV: usize = 9;
+/// The processes waiting for a record lock, and for whose ([`Tx::waiters`]).
+const R_WAIT: usize = 10;
+const R_WAIT_LEN: usize = 11;
 /// The first owner word [`super`] may use for itself.
 pub const R_OWNER: usize = 16;
 
-const INODE: u64 = 128;
+const INODE: u64 = 144;
 
 /// Fields of an inode slot, by offset.
 const I_GEN: u64 = 0;
@@ -74,6 +77,9 @@ const I_HOLDERS_LEN: u64 = 112;
 /// numbers, start and end); their count at `I_RANGES_LEN`.
 const I_RANGES: u64 = 116;
 const I_RANGES_LEN: u64 = 124;
+/// The file's locks ([`Lock`]), and their bytes.
+const I_LOCKS: u64 = 128;
+const I_LOCKS_LEN: u64 = 136;
 
 /// What `stat` reports of an inode.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -319,8 +325,10 @@ impl Tx<'_> {
         }
         let (x, xl) = (self.m.u64_at(at + I_XATTRS), self.u32_raw(at + I_XATTRS_LEN));
         self.m.free(x, xl as usize);
-        let (h, hl) = (self.m.u64_at(at + I_HOLDERS), self.u32_raw(at + I_HOLDERS_LEN));
-        self.m.free(h, hl as usize * HOLDER as usize);
+        for (f, fl) in [(I_HOLDERS, I_HOLDERS_LEN), (I_LOCKS, I_LOCKS_LEN)] {
+            let (b, len) = (self.m.u64_at(at + f), self.u32_raw(at + fl));
+            self.m.free(b, len as usize);
+        }
         let generation = self.u32_raw(at + I_GEN);
         let slot = self.m.bytes_mut(at, INODE as usize);
         slot.fill(0);
@@ -1097,77 +1105,182 @@ impl Tx<'_> {
         self.touch_changed(ino)
     }
 
-    /// How many descriptors hold `ino` open, in every process.
-    pub fn holders(&self, ino: Ino) -> Result<u64, i32> {
-        Ok(self.holder_list(ino)?.iter().map(|h| h.2 as u64).sum())
+    /// The bytes kept at `ino`'s fields `f` (where) and `fl` (how many).
+    fn blob(&self, ino: Ino, f: u64, fl: u64) -> Result<Vec<u8>, i32> {
+        let at = self.slot(ino)?;
+        let (b, len) = (self.m.u64_at(at + f), self.u32_raw(at + fl));
+        Ok(if b == 0 { Vec::new() } else { self.m.bytes(b, len as usize).to_vec() })
     }
 
-    fn holder_list(&self, ino: Ino) -> Result<Vec<(i32, u64, u32)>, i32> {
+    fn set_blob(&mut self, ino: Ino, f: u64, fl: u64, bytes: &[u8]) -> Result<(), i32> {
         let at = self.slot(ino)?;
-        let (h, n) = (self.m.u64_at(at + I_HOLDERS), self.u32_raw(at + I_HOLDERS_LEN));
-        Ok((0..n as u64)
-            .map(|i| {
-                let e = h + i * HOLDER;
-                (self.u32_raw(e) as i32, self.m.u64_at(e + 8), self.u32_raw(e + 16))
-            })
-            .collect())
-    }
-
-    fn set_holder_list(&mut self, ino: Ino, list: &[(i32, u64, u32)]) -> Result<(), i32> {
-        let at = self.slot(ino)?;
-        let (h, n) = (self.m.u64_at(at + I_HOLDERS), self.u32_raw(at + I_HOLDERS_LEN));
-        let new = if list.is_empty() {
-            self.m.free(h, n as usize * HOLDER as usize);
+        let (b, len) = (self.m.u64_at(at + f), self.u32_raw(at + fl));
+        let new = if bytes.is_empty() {
+            self.m.free(b, len as usize);
             0
         } else {
-            let new =
-                self.m.realloc(h, n as usize * HOLDER as usize, list.len() * HOLDER as usize)?;
-            for (i, &(pid, start, count)) in list.iter().enumerate() {
-                let e = new + i as u64 * HOLDER;
-                self.set_u32_raw(e, pid as u32);
-                self.m.set_u64(e + 8, start);
-                self.set_u32_raw(e + 16, count);
-            }
-            new
+            let n = self.m.realloc(b, len as usize, bytes.len())?;
+            self.m.bytes_mut(n, bytes.len()).copy_from_slice(bytes);
+            n
         };
-        self.m.set_u64(at + I_HOLDERS, new);
-        self.set_u32_raw(at + I_HOLDERS_LEN, list.len() as u32);
+        self.m.set_u64(at + f, new);
+        self.set_u32_raw(at + fl, bytes.len() as u32);
         Ok(())
     }
 
-    /// Process `p` (host pid, start) holds `ino` with `count` descriptors
-    /// now (0: none): with none left anywhere and no names, it goes.
-    pub fn hold(&mut self, ino: Ino, p: (i32, u64), count: u32) -> Result<Gone, i32> {
-        let mut list = self.holder_list(ino)?;
-        list.retain(|&(pid, start, _)| (pid, start) != p);
-        if count > 0 {
-            list.push((p.0, p.1, count));
+    /// How many descriptors hold `ino` open, in every process.
+    pub fn holders(&self, ino: Ino) -> Result<u64, i32> {
+        Ok(self.holder_list(ino)?.iter().map(|h| h.count as u64).sum())
+    }
+
+    fn holder_list(&self, ino: Ino) -> Result<Vec<Holder>, i32> {
+        let b = self.blob(ino, I_HOLDERS, I_HOLDERS_LEN)?;
+        Ok(b.as_chunks::<HOLDER>().0.iter().map(|c| Holder::decode(c)).collect())
+    }
+
+    fn set_holder_list(&mut self, ino: Ino, list: &[Holder]) -> Result<(), i32> {
+        let bytes: Vec<u8> = list.iter().flat_map(Holder::encode).collect();
+        self.set_blob(ino, I_HOLDERS, I_HOLDERS_LEN, &bytes)
+    }
+
+    /// `ino`'s locks.
+    pub fn locks(&self, ino: Ino) -> Result<Vec<Lock>, i32> {
+        let b = self.blob(ino, I_LOCKS, I_LOCKS_LEN)?;
+        Ok(b.as_chunks::<LOCK>().0.iter().map(|c| Lock::decode(c)).collect())
+    }
+
+    /// `ino`'s locks are `locks` now; with fewer than before, the arena's
+    /// waiters are woken to look again.
+    pub fn set_locks(&mut self, ino: Ino, locks: &[Lock]) -> Result<(), i32> {
+        let before = self.locks(ino)?;
+        let bytes: Vec<u8> = locks.iter().flat_map(Lock::encode).collect();
+        self.set_blob(ino, I_LOCKS, I_LOCKS_LEN, &bytes)?;
+        if before.iter().any(|l| !locks.contains(l)) {
+            self.m.changed();
         }
+        Ok(())
+    }
+
+    /// Let go of the locks of `ino` `gone` says are no longer anyone's.
+    fn drop_locks(&mut self, ino: Ino, gone: impl Fn(&Lock) -> bool) -> Result<(), i32> {
+        let locks = self.locks(ino)?;
+        if locks.iter().any(&gone) {
+            let kept: Vec<Lock> = locks.into_iter().filter(|l| !gone(l)).collect();
+            self.set_locks(ino, &kept)?;
+        }
+        Ok(())
+    }
+
+    /// The processes waiting for a record lock of the filesystem, each with
+    /// the process that holds the lock in its way (host pids and starts):
+    /// what finds a wait that would never end ([`super::locks`]).
+    pub fn waiters(&self) -> Vec<[(i32, u64); 2]> {
+        let (b, len) = (self.m.root(R_WAIT), self.m.root(R_WAIT_LEN));
+        if b == 0 {
+            return Vec::new();
+        }
+        self.m
+            .bytes(b, len as usize)
+            .as_chunks::<24>()
+            .0
+            .iter()
+            .map(|c| [(le32(c, 0) as i32, le64(c, 8)), (le32(c, 4) as i32, le64(c, 16))])
+            .collect()
+    }
+
+    pub fn set_waiters(&mut self, list: &[[(i32, u64); 2]]) -> Result<(), i32> {
+        let mut bytes = Vec::with_capacity(list.len() * 24);
+        for [(p, ps), (q, qs)] in list {
+            bytes.extend_from_slice(&p.to_le_bytes());
+            bytes.extend_from_slice(&q.to_le_bytes());
+            bytes.extend_from_slice(&ps.to_le_bytes());
+            bytes.extend_from_slice(&qs.to_le_bytes());
+        }
+        let (b, len) = (self.m.root(R_WAIT), self.m.root(R_WAIT_LEN));
+        let new = if bytes.is_empty() {
+            self.m.free(b, len as usize);
+            0
+        } else {
+            let n = self.m.realloc(b, len as usize, bytes.len())?;
+            self.m.bytes_mut(n, bytes.len()).copy_from_slice(&bytes);
+            n
+        };
+        self.m.set_root(R_WAIT, new);
+        self.m.set_root(R_WAIT_LEN, bytes.len() as u64);
+        Ok(())
+    }
+
+    /// Process `p` (host pid, start) no longer holds record locks of `ino`
+    /// (`F_SETLK`'s: it closed a descriptor of the file, or ended).
+    pub fn drop_record_locks(&mut self, ino: Ino, p: (i32, u64)) -> Result<(), i32> {
+        self.drop_locks(ino, |l| l.kind == LockKind::Posix && (l.pid, l.owner) == p)
+    }
+
+    /// Process `p` (host pid, start) holds `ino` with `descs`, the open file
+    /// descriptions it has of it and how many descriptors of each (none:
+    /// it holds it no more). A description no process holds any more lets
+    /// go of its locks (`flock`'s, `F_OFD_SETLK`'s); with no descriptor
+    /// left anywhere and no names, the file goes.
+    pub fn hold(&mut self, ino: Ino, p: (i32, u64), descs: &[(u64, u32)]) -> Result<Gone, i32> {
+        let before = self.holder_list(ino)?;
+        let mut list: Vec<Holder> =
+            before.iter().copied().filter(|h| (h.pid, h.start) != p).collect();
+        list.extend(descs.iter().filter(|d| d.1 > 0).map(|&(desc, count)| Holder {
+            pid: p.0,
+            start: p.1,
+            desc,
+            count,
+        }));
         self.set_holder_list(ino, &list)?;
+        self.released(ino, &before, &list)?;
         self.drop_if_gone(ino)
     }
 
-    /// Process `p` holds `ino` with `count` descriptors unless it counted
-    /// itself already: a fork child counted from its parent's side, which
-    /// knows better once it counted itself.
-    pub fn hold_unless_counted(&mut self, ino: Ino, p: (i32, u64), count: u32) -> Result<(), i32> {
-        let mut list = self.holder_list(ino)?;
-        if count == 0 || list.iter().any(|&(pid, start, _)| (pid, start) == p) {
+    /// The descriptions held in `before` and in no holder of `now` let go of
+    /// their locks.
+    fn released(&mut self, ino: Ino, before: &[Holder], now: &[Holder]) -> Result<(), i32> {
+        let gone: Vec<u64> =
+            before.iter().map(|h| h.desc).filter(|d| !now.iter().any(|h| h.desc == *d)).collect();
+        if gone.is_empty() {
             return Ok(());
         }
-        list.push((p.0, p.1, count));
+        self.drop_locks(ino, |l| l.kind != LockKind::Posix && gone.contains(&l.owner))
+    }
+
+    /// Process `p` holds `ino` with `descs` unless it counted itself
+    /// already: a fork child counted from its parent's side, which knows
+    /// better once it counted itself.
+    pub fn hold_unless_counted(
+        &mut self,
+        ino: Ino,
+        p: (i32, u64),
+        descs: &[(u64, u32)],
+    ) -> Result<(), i32> {
+        let mut list = self.holder_list(ino)?;
+        if list.iter().any(|h| (h.pid, h.start) == p) {
+            return Ok(());
+        }
+        list.extend(descs.iter().filter(|d| d.1 > 0).map(|&(desc, count)| Holder {
+            pid: p.0,
+            start: p.1,
+            desc,
+            count,
+        }));
         self.set_holder_list(ino, &list)
     }
 
-    /// Forget the holders `alive` says have ended, of `ino`: whether it
-    /// has gone.
+    /// Forget the holders `alive` says have ended, of `ino`, and the record
+    /// locks they owned; the descriptions only they held let go of theirs:
+    /// whether the file has gone.
     pub fn reap(&mut self, ino: Ino, alive: impl Fn((i32, u64)) -> bool) -> Result<Gone, i32> {
-        let mut list = self.holder_list(ino)?;
-        let before = list.len();
-        list.retain(|&(pid, start, _)| alive((pid, start)));
-        if list.len() != before {
+        let before = self.holder_list(ino)?;
+        let list: Vec<Holder> =
+            before.iter().copied().filter(|h| alive((h.pid, h.start))).collect();
+        if list.len() != before.len() {
             self.set_holder_list(ino, &list)?;
+            self.released(ino, &before, &list)?;
         }
+        self.drop_locks(ino, |l| l.kind == LockKind::Posix && !alive((l.pid, l.owner)))?;
         self.drop_if_gone(ino)
     }
 
@@ -1220,8 +1333,98 @@ impl Tx<'_> {
     }
 }
 
-/// A holder: pid, its start, its count.
-const HOLDER: u64 = 24;
+fn le32(b: &[u8], at: usize) -> u32 {
+    u32::from_le_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+fn le64(b: &[u8], at: usize) -> u64 {
+    u64::from_le_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+/// A process's holding of a file through one open file description: the
+/// process (its host pid and start), the description, how many of its
+/// descriptors are of it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Holder {
+    pid: i32,
+    start: u64,
+    desc: u64,
+    count: u32,
+}
+
+const HOLDER: usize = 24;
+
+impl Holder {
+    fn encode(&self) -> [u8; HOLDER] {
+        let mut b = [0u8; HOLDER];
+        b[0..4].copy_from_slice(&self.pid.to_le_bytes());
+        b[4..8].copy_from_slice(&self.count.to_le_bytes());
+        b[8..16].copy_from_slice(&self.start.to_le_bytes());
+        b[16..24].copy_from_slice(&self.desc.to_le_bytes());
+        b
+    }
+
+    fn decode(b: &[u8]) -> Holder {
+        Holder { pid: le32(b, 0) as i32, count: le32(b, 4), start: le64(b, 8), desc: le64(b, 16) }
+    }
+}
+
+/// Whose a lock is: an open file description's (`flock`, apart from the
+/// rest; `F_OFD_SETLK`), or a process's (`F_SETLK`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockKind {
+    Flock,
+    Posix,
+    Ofd,
+}
+
+/// A lock of a file: its kind, whether it excludes all others (a write
+/// lock) or only writers (a read lock), its owner (a description's id, or
+/// for a process's its start, with its host pid), and its range of bytes,
+/// `[start, end)` (`u64::MAX`: to the end of the file, however far).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Lock {
+    pub kind: LockKind,
+    pub write: bool,
+    pub pid: i32,
+    pub owner: u64,
+    pub start: u64,
+    pub end: u64,
+}
+
+const LOCK: usize = 32;
+
+impl Lock {
+    fn encode(&self) -> [u8; LOCK] {
+        let mut b = [0u8; LOCK];
+        b[0] = match self.kind {
+            LockKind::Flock => 1,
+            LockKind::Posix => 2,
+            LockKind::Ofd => 3,
+        };
+        b[1] = self.write as u8;
+        b[4..8].copy_from_slice(&self.pid.to_le_bytes());
+        b[8..16].copy_from_slice(&self.owner.to_le_bytes());
+        b[16..24].copy_from_slice(&self.start.to_le_bytes());
+        b[24..32].copy_from_slice(&self.end.to_le_bytes());
+        b
+    }
+
+    fn decode(b: &[u8]) -> Lock {
+        Lock {
+            kind: match b[0] {
+                1 => LockKind::Flock,
+                2 => LockKind::Posix,
+                _ => LockKind::Ofd,
+            },
+            write: b[1] != 0,
+            pid: le32(b, 4) as i32,
+            owner: le64(b, 8),
+            start: le64(b, 16),
+            end: le64(b, 24),
+        }
+    }
+}
 
 /// What a call left of an inode: gone, its data object to remove too.
 #[derive(Debug, PartialEq, Eq)]
@@ -1339,11 +1542,11 @@ mod tests {
         let root = t.root();
         let f = t.create(root, b"f", &file(0o644)).unwrap();
         t.set_data(f, 7).unwrap();
-        t.hold(f, (1, 10), 2).unwrap();
+        t.hold(f, (1, 10), &[(100, 2)]).unwrap();
         assert_eq!(t.unlink(root, b"f", false).unwrap().data, None);
         assert_eq!(t.unnamed(), vec![f]);
-        assert_eq!(t.hold(f, (2, 20), 1).unwrap().data, None);
-        assert_eq!(t.hold(f, (1, 10), 0).unwrap().data, None);
+        assert_eq!(t.hold(f, (2, 20), &[(100, 1)]).unwrap().data, None);
+        assert_eq!(t.hold(f, (1, 10), &[]).unwrap().data, None);
         assert_eq!(t.reap(f, |p| p != (2, 20)).unwrap().data, Some(7));
         assert!(t.unnamed().is_empty());
         drop(t);

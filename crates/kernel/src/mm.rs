@@ -3226,8 +3226,9 @@ impl<P: Platform> Kernel<P> {
 }
 
 /// Fill new private memory `[at, at + len)`, of host protections `prot`,
-/// with the pages of host shared memory object `fd` from `offset`.
-fn copy_object(fd: i32, offset: u64, at: u64, len: u64, prot: i32) -> Result<(), i32> {
+/// with the pages of host shared memory object `fd` from `offset` (the host
+/// reads such an object only through a mapping).
+pub fn copy_object(fd: i32, offset: u64, at: u64, len: u64, prot: i32) -> Result<(), i32> {
     // SAFETY: a new shared read-only mapping of the object, unmapped below.
     let src = unsafe {
         libc::mmap(

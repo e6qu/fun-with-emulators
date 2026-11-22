@@ -3994,7 +3994,8 @@ impl<P: Platform> Kernel<P> {
         if !self.permits(&st, open_wants(flags)) {
             return err(errno::EACCES);
         }
-        let new = match crate::filestore::desc::open(file, flags) {
+        let new = match crate::filestore::desc::open(file, flags, crate::filestore::desc::new_id())
+        {
             Ok(new) => new,
             Err(e) => return err(e),
         };

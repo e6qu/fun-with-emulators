@@ -967,9 +967,24 @@ pub fn view_fault(va: u64) -> bool {
     ok && m.own_view_pages(page, page + PAGE).is_ok()
 }
 
+/// Whether host descriptor `fd` is a host shared memory object's.
+fn is_object(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) == 0 };
+    ok && fwe_kernel::memobj::may_be(&st)
+}
+
 /// Copy `len` bytes of `source`'s file into slab memory at `host` (short
 /// of the file's end, the rest stays zero).
 fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
+    // A host shared memory object (a file of fwe's store's data), which the
+    // host reads only through a mapping.
+    if is_object(s.file.as_raw_fd()) {
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        return fwe_kernel::mm::copy_object(s.file.as_raw_fd(), s.offset, host, len, rw);
+    }
     let mut done = 0u64;
     while done < len {
         // SAFETY: slab memory backing the mapping; the file is the guest's.
