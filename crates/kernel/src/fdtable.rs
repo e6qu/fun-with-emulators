@@ -37,8 +37,6 @@ pub const RESERVED: i32 = 64;
 static GUEST_MAX: AtomicI32 = AtomicI32::new(1024);
 /// The guest's virtual `RLIMIT_NOFILE`.
 pub(crate) static LIMIT: Mutex<(u64, u64)> = Mutex::new((1024, 1024));
-/// Where the next reserved descriptor is looked for.
-static NEXT: AtomicI32 = AtomicI32::new(0);
 /// The process's root directory descriptor (-1 for none), out of the
 /// guest's reach wherever it is ([`reserve_root`]).
 static ROOT: AtomicI32 = AtomicI32::new(-1);
@@ -103,15 +101,33 @@ pub fn init() {
     let reserved = (host / 4).max(RESERVED).min(host - DEFAULT_SOFT as i32).max(RESERVED);
     let guest_max = (host - reserved).min(GUEST_CAP);
     GUEST_MAX.store(guest_max, Ordering::SeqCst);
-    NEXT.store(guest_max, Ordering::SeqCst);
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) =
         (DEFAULT_SOFT.min(guest_max as u64), guest_max as u64);
+    hold_floor(guest_max);
+}
+
+/// Hold a descriptor at `floor`, the reserved range's first, for the
+/// process's life. The host's `close` of a process's highest descriptor
+/// looks down, slot by slot, for the next one open: without it, closing
+/// one of fwe's (the guest's are far below) costs the host microseconds
+/// for every thousand slots between. (fwe's own are each taken at the
+/// lowest number free above it, so they stay close to it too.)
+fn hold_floor(floor: i32) {
+    // SAFETY: plain host calls; the descriptor is kept, close-on-exec (the
+    // next fwe holds its own).
+    unsafe {
+        let null = libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
+        if null < 0 {
+            return;
+        }
+        libc::fcntl(null, libc::F_DUPFD_CLOEXEC, floor);
+        libc::close(null);
+    }
 }
 
 /// Write the descriptor-table limits into a fork snapshot.
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     e.i32(GUEST_MAX.load(Ordering::SeqCst));
-    e.i32(NEXT.load(Ordering::SeqCst));
     let (soft, hard) = limit();
     e.u64(soft);
     e.u64(hard);
@@ -121,7 +137,6 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 /// parent's host limit, so its reserved range is the parent's).
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     GUEST_MAX.store(d.i32(), Ordering::SeqCst);
-    NEXT.store(d.i32(), Ordering::SeqCst);
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = (d.u64(), d.u64());
 }
 
@@ -202,25 +217,18 @@ pub fn dup_transient(fd: i32) -> Result<i32, i32> {
     if high < 0 { Err(fwe_abi::errno::EMFILE) } else { Ok(high) }
 }
 
-/// A close-on-exec duplicate of `fd` in the reserved range, or `EMFILE`
-/// when the range is full (`EBADF` if `fd` is not open).
+/// A close-on-exec duplicate of `fd` at the lowest free number of the
+/// reserved range, or `EMFILE` when the range is full (`EBADF` if `fd` is
+/// not open).
 pub fn dup_reserved(fd: i32) -> Result<i32, i32> {
-    let floor = NEXT.load(Ordering::SeqCst).max(guest_max());
-    // SAFETY: plain host calls on a descriptor the caller holds.
-    unsafe {
-        if libc::fcntl(fd, libc::F_GETFD) < 0 {
-            return Err(fwe_abi::errno::EBADF);
-        }
-        let mut high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, floor);
-        if high < 0 {
-            // The range above `floor` is full; reuse any freed slot.
-            high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, guest_max());
-        }
-        if high < 0 {
-            return Err(fwe_abi::errno::EMFILE);
-        }
-        NEXT.store(high + 1, Ordering::SeqCst);
+    // SAFETY: a plain host call on a descriptor the caller holds.
+    let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, guest_max()) };
+    if high >= 0 {
         Ok(high)
+    } else if crate::host::last_errno() == libc::EBADF {
+        Err(fwe_abi::errno::EBADF)
+    } else {
+        Err(fwe_abi::errno::EMFILE)
     }
 }
 
