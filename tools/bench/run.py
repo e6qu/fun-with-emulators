@@ -175,6 +175,14 @@ MICRO_LINUX = [
     ("/proc file open+read+close", ["file", "proc", "20000"], "ns"),
 ]
 
+# What only macOS is measured at: the host's own cost of what fwe does for
+# a Linux call, beside the row of that call.
+MICRO_NATIVE = [
+    # A segment of its own (a POSIX shared memory object made, mapped and
+    # removed): what each System V segment costs the host under fwe.
+    ("POSIX shared memory object made and removed", ["ipc", "pshm", "3000"], "ns"),
+]
+
 
 # How many times native macOS's figure fwe's may be, on the same runner
 # (PLAN.md, "Native speed"): system calls 1.5x, the process and thread
@@ -438,6 +446,11 @@ def micro_pair(fwe, guest, native):
         print(f"{name} ({unit}): rounds under fwe " + ", ".join(f"{t:.4g}" for t in took),
               file=sys.stderr)
         ours[f"{name} ({unit})"] = min(took)
+    for name, args, unit in MICRO_NATIVE:
+        took = [run_bench([], native, args) for _ in range(MICRO_ROUNDS)]
+        print(f"{name} ({unit}): rounds natively " + ", ".join(f"{t:.4g}" for t in took),
+              file=sys.stderr)
+        theirs[f"{name} ({unit})"] = min(took)
     return ours, theirs
 
 
@@ -2027,7 +2040,9 @@ def workloads(a, fwe, guest_env, lua_src, results):
 def render(results):
     cols = [c for c in ("fwe", FWE_VM, "macOS", "Linux", VM) if c in results]
     against = [c for c in ("macOS", VM) if c in results]
+    # (And what only macOS is measured at, MICRO_NATIVE.)
     rows = list(results["fwe"].keys())
+    rows += [r for r in results.get("macOS", {}) if r not in results["fwe"]]
     shares = results.get(SHARE, {})
     ran = results.get(BACKEND, {})
     lines = [
@@ -2037,7 +2052,8 @@ def render(results):
     ]
     for row in rows:
         vals = [results[c].get(row) for c in cols]
-        ratios = [f"{results['fwe'][row] / results[c][row]:.1f}x" if results[c].get(row) else ""
+        ratios = [f"{results['fwe'][row] / results[c][row]:.1f}x"
+                  if results[c].get(row) and row in results["fwe"] else ""
                   for c in against]
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
         share = f"{shares[row]:.2f}x" if row in shares else ""

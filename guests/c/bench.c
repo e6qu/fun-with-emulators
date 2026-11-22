@@ -505,6 +505,26 @@ static double ipc(const char *op, long n) {
         }
         return (now_ns() - start) / n;
     }
+    if (strcmp(op, "pshm") == 0) {
+        /* What a segment of its own costs the host at least: a POSIX
+           shared memory object made, sized, mapped, touched, unmapped and
+           removed, as fwe makes each System V segment. */
+        char name[32];
+        snprintf(name, sizeof name, "/fwe-bench-%d", (int)getpid());
+        start = now_ns();
+        for (long i = 0; i < n; i++) {
+            int fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, 0600);
+            if (fd < 0) return -1;
+            if (ftruncate(fd, 65536) != 0) return -1;
+            volatile char *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            close(fd);
+            if (p == MAP_FAILED) return -1;
+            p[0] = (char)i;
+            munmap((void *)p, 65536);
+            shm_unlink(name);
+        }
+        return (now_ns() - start) / n;
+    }
 #ifdef __linux__
     if (strcmp(op, "eventfd") == 0) {
         int fd = eventfd(0, 0);
