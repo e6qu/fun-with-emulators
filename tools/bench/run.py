@@ -386,11 +386,13 @@ def micro_pair(fwe, guest, native):
     """The micro-benchmarks under fwe (`fwe` its command, `guest` the Linux
     build) and natively (`native`), their rounds taken in turn: a runner's
     load comes and goes, and so it falls on both alike."""
-    def pair(f, g, rounds=MICRO_ROUNDS):
+    def pair(name, f, g, rounds=MICRO_ROUNDS):
         a, b = [], []
         for _ in range(rounds):
             a.append(f())
             b.append(g())
+        print(f"{name}: rounds under fwe " + ", ".join(f"{t:.4g}" for t in a)
+              + ", natively " + ", ".join(f"{t:.4g}" for t in b), file=sys.stderr)
         return min(a), min(b)
 
     runs = [("startup (ms)", lambda p, b: startup_ms_once(p + [b, "exit"]))]
@@ -403,7 +405,7 @@ def micro_pair(fwe, guest, native):
     )
     ours, theirs = {}, {}
     for name, f in runs:
-        ours[name], theirs[name] = pair(lambda: f(fwe, guest), lambda: f([], native))
+        ours[name], theirs[name] = pair(name, lambda: f(fwe, guest), lambda: f([], native))
     return ours, theirs
 
 
@@ -527,6 +529,12 @@ def macos(a):
         if args[0] == "file":
             sampled(f"{name} (micro)", fwe + [a.bench, "file", args[1], "3000000"])
             pcs(f"{name} (micro)", fwe + [a.bench, "file", args[1], "300000"])
+    # And calls made side by side by threads: where they wait, under fwe
+    # and natively.
+    par = ["par", "fstat", "3", "300000"]
+    pcs("fstat, 3 threads (micro)", fwe + [a.bench] + par)
+    pcs("fstat, 3 threads (micro) natively", [a.native] + par,
+        execname=os.path.basename(a.native)[:16])
     # And a fork's: its steps in fwe, the host's calls and the kernel's
     # work in both processes, under fwe and natively.
     phases("fork+exit+wait (micro)", fwe + [a.bench, "fork", "300"])
