@@ -409,18 +409,27 @@ jobs:
         if: steps.ltp-cache.outputs.cache-hit != 'true'
         run: tools/ltp/build.sh target/ltp
       - run: cargo build
-      - name: lstat03 with and without fwe's caches, and its steps
+      - name: lstat03 under load, traced, with fs_usage watching
         run: |
-          C="${TMPDIR:-/tmp}/fwe-$(id -u)"
-          one() { python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
-              --jobs 1 --only '^lstat03$' --show 2>&1 | grep -E "\] lstat03|st_atime" || true; }
-          for i in 1 2 3 4; do echo "cleared:"; ls "$C" | tr '\n' ' '; echo; rm -rf "$C"/v*-prepared "$C"/v*-translations "$C"/v*-jit*; one; done
-          for i in 1 2 3; do echo "kept:"; one; done
-          clang -O2 --target=aarch64-linux-gnu -fno-stack-protector -fPIC -ffreestanding -c -o at.o tools/probe/at.c
-          L=$(rustc --print sysroot)/lib/rustlib/$(rustc --print host-tuple)/bin/rust-lld
-          $L -flavor gnu -pie --dynamic-linker=/lib/ld-musl-aarch64.so.1 -rpath=/lib -o target/ltp/root/at \
-            guests/musl/lib/Scrt1.o guests/musl/lib/crti.o at.o guests/musl/lib/ld-musl-aarch64.so.1 guests/musl/lib/crtn.o
-          for i in 1 2 3; do d=$(mktemp -d target/ltp/root/tmp/at.XXXX); target/debug/fwe --root target/ltp/root target/ltp/root/at /tmp/$(basename $d) tmpfs; done
+          sudo fs_usage -w -f filesys > "$RUNNER_TEMP/fsu.txt" 2>&1 &
+          F=$!
+          sleep 3
+          R=$PWD/target/ltp/root
+          one() {
+            t=$(mktemp -d "$R/tmp/l03.XXXX"); chmod 1777 "$t"; g=/${t#$R/}
+            env -i PATH=/opt/ltp/testcases/bin:/usr/sbin:/usr/bin:/sbin:/bin TMPDIR=$g LTPROOT=/opt/ltp \
+              LTP_COLORIZE_OUTPUT=0 LTP_DEV_FS_TYPE=tmpfs LTP_TIMEOUT_MUL=8 HOME=$g LANG=C \
+              target/debug/fwe --strace --strace-file="$t.trace" --root "$R" "$R/opt/ltp/testcases/bin/lstat03" > "$t.out" 2>&1
+            if grep -q "TFAIL" "$t.out"; then echo "FAIL $t"; else echo "pass $t"; fi
+          }
+          for k in 1 2 3; do one & one & one & wait; done | tee "$RUNNER_TEMP/runs.txt"
+          sudo kill -INT $F; sleep 2
+          python3 tools/probe/window.py "$RUNNER_TEMP/fsu.txt" | head -150
+          f=$(grep -m1 FAIL "$RUNNER_TEMP/runs.txt" | cut -d' ' -f2)
+          if [ -n "$f" ]; then
+            cat "$f.out"
+            grep -n -E "file\.txt|file_symlink|utimensat|nanosleep|clock_nanosleep|read|lstat|fstatat|statx|mount|fork|clone|wait" "$f.trace" | head -150
+          fi
 
   ltp:
     name: LTP system calls (macos-26)
