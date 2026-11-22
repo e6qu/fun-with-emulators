@@ -896,6 +896,57 @@ pub fn segment_name(nonce: u64) -> std::ffi::CString {
 /// filesystem's, whose inode is the segment's id).
 pub const SEGMENT_DEV: u64 = crate::devnodes::makedev(0, 1);
 
+/// Segment `id` attached by process `p`, its memory made if it was not:
+/// a descriptor of the memory, for reading and writing unless
+/// `read_only`, and what [`detach_failed`] takes back if mapping it
+/// fails. One update of the namespace's record does it all, so a removal
+/// never comes between the memory's making and the attachment it is made
+/// for.
+pub fn attach(
+    r: &Record<Ipc>,
+    id: i32,
+    p: Proc,
+    read_only: bool,
+) -> Result<(std::os::fd::OwnedFd, Attached), i32> {
+    r.update_maybe(|t| {
+        let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) else {
+            return Err(errno::EIDRM);
+        };
+        let fd = if s.made {
+            open_segment(s.nonce, read_only)?
+        } else {
+            let fd = make_segment(s.nonce, s.size)?;
+            s.made = true;
+            fd
+        };
+        let before = Attached { atime: s.atime, lpid: s.lpid };
+        s.atime = crate::ipcops::now();
+        s.lpid = p.0;
+        attach_count(t, id, p, 1);
+        Ok(((fd, before), true))
+    })
+}
+
+/// A segment's times and last process before an attachment
+/// ([`attach`]).
+pub struct Attached {
+    atime: i64,
+    lpid: i32,
+}
+
+/// An attachment [`attach`] counted whose mapping failed: taken back, the
+/// segment's time and last process as they were.
+pub fn detach_failed(r: &Record<Ipc>, id: i32, p: Proc, before: Attached) {
+    let _ = r.update(|t| {
+        attach_count(t, id, p, -1);
+        if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {
+            s.atime = before.atime;
+            s.lpid = before.lpid;
+        }
+        Ok(())
+    });
+}
+
 /// A descriptor of segment `s`'s memory, for reading and writing unless
 /// `read_only`, made if it was not (`ENOENT`: it was removed). A segment is
 /// made under its namespace's lock ([`Record::update_maybe`]), so that two

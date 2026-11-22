@@ -232,8 +232,9 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let read_only = flags & ipc::SHM_RDONLY != 0;
-        let memory = match ipc::segment_of(&r, id, read_only) {
-            Ok(fd) => fd,
+        let me = ipc::me();
+        let (memory, before) = match ipc::attach(&r, id, me, read_only) {
+            Ok(m) => m,
             Err(e) => return err(e),
         };
         // Listed as Linux lists a segment: a deleted file of the shared
@@ -249,22 +250,14 @@ impl<P: Platform> Kernel<P> {
         let mapped = self.map_shared_memory(at, size, prot, map, read_only, fd, object);
         drop(memory);
         if mapped < 0 {
+            ipc::detach_failed(&r, id, me, before);
             return mapped;
         }
-        let me = ipc::me();
         ipc::note_attached(mapped as u64, id, size);
         // A locked segment's pages are kept in memory.
         if locked {
             crate::mm::wire_segment(id, true);
         }
-        let _ = r.update(|t| {
-            ipc::attach_count(t, id, me, 1);
-            if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {
-                s.atime = now();
-                s.lpid = me.0;
-            }
-            Ok(())
-        });
         mapped
     }
 
@@ -977,7 +970,7 @@ pub fn blocking(ctx: Result<IpcContext, i32>, nr: u64, a: [u64; 6]) -> i64 {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
