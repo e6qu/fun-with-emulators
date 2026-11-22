@@ -25,6 +25,38 @@ jobs:
       - run: cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
       - run: cargo test
 
+  # PROBE (temporary): gtk3-demo's ctrl+q on Linux itself, beside the
+  # display test's run of it under fwe.
+  gtk3-probe:
+    name: PROBE gtk3-demo ctrl+q on Linux
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - run: |
+          sudo apt-get update -q && sudo apt-get install -yq xvfb xdotool gtk-3-examples >/dev/null
+          dpkg -l gtk-3-examples | tail -1
+          Xvfb :9 -screen 0 1280x1024x24 & sleep 3
+          export DISPLAY=:9 GDK_BACKEND=x11
+          for how in plain searched; do
+            gtk3-demo 2>/tmp/demo-$how.err & P=$!
+            W=
+            for i in $(seq 60); do W=$(xdotool search --class gtk3-demo | tail -1); [ -n "$W" ] && break; sleep 1; done
+            echo "$how: window $W"
+            sleep 3
+            if [ $how = searched ]; then
+              xdotool windowfocus --sync $W type --delay 40 --window $W button; sleep 2
+              xdotool windowfocus --sync $W key Escape; sleep 1
+            fi
+            xdotool windowfocus --sync $W key ctrl+q
+            sleep 5
+            if kill -0 $P 2>/dev/null; then
+              echo "$how: still running after ctrl+q"; kill $P
+            else
+              echo "$how: quit on ctrl+q"
+            fi
+            cat /tmp/demo-$how.err | tail -5
+          done
+
   macos:
     name: Test (${{ matrix.os }})
     strategy:
