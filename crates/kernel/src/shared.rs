@@ -19,7 +19,7 @@ use crate::host::errno_to_linux;
 use crate::procstore::named::{self, Slot};
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 /// What a record holds.
@@ -65,9 +65,9 @@ unsafe extern "C" {
     fn __ulock_wake(op: u32, addr: *mut libc::c_void, wake_value: u64) -> libc::c_int;
 }
 
-/// Sleep up to `slice` while the generation word reads `seen` (its low
-/// half, which every change changes), a shared host address wait any
-/// process's change ends ([`wake_all`]).
+/// Sleep up to `slice` while shared word `word` reads `seen` (its low half,
+/// which every change changes), a shared host address wait any process's
+/// change ends ([`wake_all`]).
 fn wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
     #[cfg(target_os = "macos")]
     // SAFETY: a shared word of the store's; the host sleeps while its low
@@ -124,7 +124,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 35;
+pub const FORMAT: u32 = 37;
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -288,7 +288,7 @@ impl<T: Data> Record<T> {
                 let mut enc = Enc::new();
                 t.encode(&mut enc);
                 let epoch = r.slot.write_whole(held, at, &enc.into_bytes());
-                r.advance(at);
+                r.slot.advance(held, at);
                 *r.cache.lock().unwrap_or_else(|e| e.into_inner()) =
                     Copy { at, data: Arc::new(t), journal: Some((epoch, 0)) };
             }
@@ -390,16 +390,6 @@ impl<T: Data> Record<T> {
         last
     }
 
-    /// Under the lock: the generation moves to `at`, for every process,
-    /// and those waiting for it are woken.
-    fn advance(&self, at: u64) {
-        let generation = self.slot.generation();
-        generation.store(at, Ordering::SeqCst);
-        if self.slot.waiters().load(Ordering::SeqCst) != 0 {
-            wake_all(generation);
-        }
-    }
-
     /// Under the lock: the data as it is now, the cached copy taken when
     /// it is current (no other process changed it since), else read.
     fn take_locked(&self) -> Result<(T, Option<(u32, u32)>), i32> {
@@ -429,7 +419,7 @@ impl<T: Data> Record<T> {
             t.encode(&mut enc);
             (self.slot.write_whole(held, at, &enc.into_bytes()), 0)
         };
-        self.advance(at);
+        self.slot.advance(held, at);
         *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
             Copy { at, data: Arc::new(t), journal: Some(journal) };
     }
@@ -453,22 +443,13 @@ impl<T: Data> Record<T> {
 
     /// The record's generation: it changes with every change of its data.
     pub fn generation(&self) -> u64 {
-        self.slot.generation().load(Ordering::SeqCst)
+        self.slot.generation()
     }
 
     /// Wait until the data changes from generation `seen`, `until` passes
     /// (`EAGAIN`) or a signal comes for the guest (`EINTR`), in slices as
     /// a futex wait does.
     pub fn wait_change(&self, seen: u64, until: Option<std::time::Instant>) -> Result<(), i32> {
-        struct Waiting(&'static AtomicU32);
-        impl Drop for Waiting {
-            fn drop(&mut self) {
-                self.0.fetch_sub(1, Ordering::SeqCst);
-            }
-        }
-        let waiters = self.slot.waiters();
-        waiters.fetch_add(1, Ordering::SeqCst);
-        let _waiting = Waiting(waiters);
         loop {
             if self.generation() != seen {
                 return Ok(());
@@ -482,7 +463,7 @@ impl<T: Data> Record<T> {
                 Some(d) => (d - now).min(crate::futex::SIGNAL_CHECK),
                 None => crate::futex::SIGNAL_CHECK,
             };
-            wait_word(self.slot.generation(), seen, slice);
+            self.slot.wait(seen, slice.as_nanos().max(1) as u64);
         }
     }
 

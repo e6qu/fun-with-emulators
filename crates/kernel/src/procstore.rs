@@ -1173,6 +1173,22 @@ fn wait(word: &AtomicU32, value: u32, timeout_ns: u64) {
     }
 }
 
+/// [`wait`] on a 64-bit word: while its low half reads `value`'s (every
+/// change of the words this waits on changes it).
+fn wait64(word: &AtomicU64, value: u64, timeout_ns: u64) {
+    // SAFETY: the word's low half, at its address (little-endian), an
+    // atomic of its own size inside it.
+    let low = unsafe { &*(word.as_ptr() as *const AtomicU32) };
+    wait(low, value as u32, timeout_ns);
+}
+
+/// Wake whoever [`wait64`]s on `word`.
+fn wake_all64(word: &AtomicU64) {
+    // SAFETY: as in [`wait64`].
+    let low = unsafe { &*(word.as_ptr() as *const AtomicU32) };
+    wake(low);
+}
+
 /// Wake whoever [`wait`]s on `word`.
 fn wake(word: &AtomicU32) {
     #[cfg(target_os = "macos")]

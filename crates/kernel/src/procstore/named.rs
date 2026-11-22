@@ -9,8 +9,9 @@
 //!   holding it is taken over), with a bit its waiters set so that its
 //!   holder wakes them as it lets go, and makes no host call otherwise;
 //! - a **generation**, counted by every change, which processes wait on
-//!   for a change, and a count of those waiting, so that a change wakes
-//!   them only when there are some;
+//!   for a change, with a bit a waiter sets before it sleeps: a change
+//!   wakes waiters only when it finds the bit set, and clears it (one that
+//!   died waiting costs one wake, not every one after);
 //! - its **data** written whole, and the generation it is at;
 //! - a **journal** of the changes since, each appended to it as it is
 //!   made: a change costs what it holds, not what the record does;
@@ -38,8 +39,9 @@ pub(super) struct Named {
     lock: AtomicU32,
     /// Odd while a writer replaces the data or the journal.
     seq: AtomicU32,
-    /// How many wait for the generation to change.
-    waiters: AtomicU32,
+    /// Unused.
+    spare: AtomicU32,
+    /// The generation, shifted up past [`WAITING`].
     generation: AtomicU64,
     id: AtomicU64,
     /// The name's hash (never 0).
@@ -73,6 +75,9 @@ const DEAD: u32 = 3;
 
 /// The lock bit of a holder's waiters.
 const WAITED: u32 = 1 << 31;
+
+/// The generation word's bit of a process waiting for it to change.
+const WAITING: u64 = 1;
 
 /// Whether host process `pid` lives (a zombie died holding what it held).
 fn holder_live(pid: u32) -> bool {
@@ -187,7 +192,7 @@ pub fn find_or_make(name: &[u8]) -> Slot {
             continue;
         }
         n.state.store(MAKING, SeqCst);
-        for w in [&n.lock, &n.seq, &n.waiters, &n.journal_len, &n.journal_tail, &n.note_len] {
+        for w in [&n.lock, &n.seq, &n.spare, &n.journal_len, &n.journal_tail, &n.note_len] {
             w.store(0, SeqCst);
         }
         for w in [&n.data_head, &n.data_len, &n.journal_head, &n.note_head] {
@@ -274,13 +279,30 @@ impl Drop for Held {
 
 impl Slot {
     /// The generation, counted by every change.
-    pub fn generation(&self) -> &'static AtomicU64 {
-        &self.n.generation
+    pub fn generation(&self) -> u64 {
+        self.n.generation.load(SeqCst) >> 1
     }
 
-    /// How many wait for the generation to change.
-    pub fn waiters(&self) -> &'static AtomicU32 {
-        &self.n.waiters
+    /// Under the lock: the generation moves to `at`, and those waiting for
+    /// it to change are woken.
+    pub fn advance(&self, _held: &Held, at: u64) {
+        if self.n.generation.swap(at << 1, SeqCst) & WAITING != 0 {
+            super::wake_all64(&self.n.generation);
+        }
+    }
+
+    /// Sleep up to `slice_ns` while the generation is `seen`.
+    pub fn wait(&self, seen: u64, slice_ns: u64) {
+        let word = &self.n.generation;
+        let cur = word.load(SeqCst);
+        if cur >> 1 != seen {
+            return;
+        }
+        if cur & WAITING == 0 && word.compare_exchange(cur, cur | WAITING, SeqCst, SeqCst).is_err()
+        {
+            return;
+        }
+        super::wait64(word, cur | WAITING, slice_ns);
     }
 
     /// The record's identity.
@@ -354,7 +376,7 @@ impl Slot {
         for round in 0..100_000u32 {
             let seq = n.seq.load(SeqCst);
             if seq.is_multiple_of(2) {
-                let generation = n.generation.load(SeqCst);
+                let generation = n.generation.load(SeqCst) >> 1;
                 let epoch = n.journal_epoch.load(SeqCst);
                 let (head, len) = (n.journal_head.load(SeqCst), n.journal_len.load(SeqCst));
                 let after = from.filter(|&(e, o)| e == epoch && o <= len);
