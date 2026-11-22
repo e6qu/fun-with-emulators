@@ -203,8 +203,10 @@ pub enum Area {
     /// Locks of `SOCK_SEQPACKET` sockets' sends and receives
     /// ([`crate::seqpacket`]).
     SeqPacketLocks = 4,
+    /// The cgroup hierarchy's lock alone ([`crate::cgroupfs::lock_tree`]).
+    CgroupTree = 5,
 }
-const AREAS: usize = 5;
+const AREAS: usize = 6;
 
 /// Each area's size in bytes.
 const AREA_BYTES: [usize; AREAS] = [
@@ -213,6 +215,7 @@ const AREA_BYTES: [usize; AREAS] = [
     crate::pipelock::BYTES,
     crate::exclusive::BYTES,
     crate::seqpacket::LOCK_BYTES,
+    0,
 ];
 
 /// Shared futexes' table: the host's futexes on Linux need none.

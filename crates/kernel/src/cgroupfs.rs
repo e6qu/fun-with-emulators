@@ -177,28 +177,17 @@ pub fn tree_dir() -> Result<Vec<u8>, i32> {
 /// The hierarchy's lock, held while a cgroup is made or removed or a
 /// process moved, as Linux's `cgroup_mutex` holds them apart: a removal's
 /// look for children and members stands until it is done, so no `mkdir`
-/// below it or move into it comes between (a file beside the hierarchy,
-/// which no guest sees). Every fwe process of the user takes it.
+/// below it or move into it comes between. Every fwe process of the user
+/// takes it: a lock in the process store
+/// ([`crate::procstore::Area::CgroupTree`]), taken over from a holder that
+/// ended.
 pub struct TreeLock {
-    _fd: std::os::fd::OwnedFd,
+    _held: crate::procstore::Held,
 }
 
 /// Take the hierarchy's lock ([`TreeLock`]).
 pub fn lock_tree() -> Result<TreeLock, i32> {
-    use std::os::fd::FromRawFd;
-    let mut path = tree_dir()?;
-    path.extend_from_slice(b".lock\0");
-    // SAFETY: a NUL-terminated path.
-    let fd = unsafe {
-        libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-    };
-    if fd < 0 {
-        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-    }
-    crate::shared::lock_exclusive(fd);
-    // SAFETY: the descriptor just opened, owned here; closing it lets the
-    // lock go.
-    Ok(TreeLock { _fd: unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) } })
+    Ok(TreeLock { _held: crate::procstore::lock_area(crate::procstore::Area::CgroupTree) })
 }
 
 /// The host directory of cgroup `cg` (a path from the root).
