@@ -1686,8 +1686,13 @@ def profile(name, cmd, theirs, fresh, share=False):
             for d in fresh:
                 shutil.rmtree(d, ignore_errors=True)
                 os.makedirs(d)
-            with contextlib.redirect_stderr(io.StringIO()):
+            said = io.StringIO()
+            with contextlib.redirect_stderr(said):
                 more = pcs(name, cmd, share)
+            # Each run's split, to see that the runs agree.
+            for line in said.getvalue().splitlines():
+                if "samples by program counter" in line or "the program's own code" in line:
+                    print(line[:400], file=sys.stderr)
             if more:
                 own, all_ = own + more[0], all_ + more[1]
         print(f"{name}: fwe's share over {SHARE_RUNS} runs: {all_ / max(own, 1):.3f} "
