@@ -138,6 +138,9 @@ pub fn parse(ctl: &[u8]) -> Result<Outgoing, i32> {
 pub struct Prepared {
     pub buf: Vec<u8>,
     bundle: Option<[i32; 2]>,
+    /// The host objects sent in place of descriptors to a process of the
+    /// host's ([`prepare`]), closed once sent.
+    objects: Vec<std::os::fd::OwnedFd>,
     /// What the store's files described hold them by
     /// ([`crate::filestore::desc::export`]), let go of if the message does
     /// not go.
@@ -148,6 +151,7 @@ impl Prepared {
     /// The message did not go: its bundle is closed at once, and what it
     /// held of the store's files goes.
     pub fn unsent(mut self) {
+        self.objects.clear();
         for fd in self.bundle.take().into_iter().flatten() {
             // SAFETY: the bundle's ends, made by `prepare`.
             unsafe { libc::close(fd) };
@@ -202,17 +206,30 @@ fn sweep(p: &mut Vec<i32>) {
 
 /// Make the host control data for `fds` and the credentials `creds`
 /// (already checked): `fds` with each descriptor fwe stands in for
-/// described in a bundle, and the credentials in its manifest.
-pub fn prepare(fds: &[i32], creds: Option<Creds>) -> Result<Prepared, i32> {
-    let exports: Vec<Option<Export>> = fds.iter().map(|&fd| export(fd)).collect();
+/// described in a bundle, and the credentials in its manifest. To a
+/// process of the host's (`host_peer`), which reads no bundle, a file of
+/// fwe's store goes as the host object that holds its data
+/// ([`crate::filestore::io::host_object`]).
+pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Prepared, i32> {
     let mut host: Vec<i32> = fds.to_vec();
+    let mut objects = Vec::new();
+    if host_peer {
+        for slot in host.iter_mut() {
+            if let Some(object) = crate::filestore::io::host_object(*slot) {
+                let object = object?;
+                *slot = std::os::fd::AsRawFd::as_raw_fd(&object);
+                objects.push(object);
+            }
+        }
+    }
+    let exports: Vec<Option<Export>> = host.iter().map(|&fd| export(fd)).collect();
     let stored = exports
         .iter()
         .flatten()
         .filter(|x| x.kind == kind::STORE)
         .map(|x| x.state.clone())
         .collect();
-    let mut p = Prepared { buf: Vec::new(), bundle: None, stored };
+    let mut p = Prepared { buf: Vec::new(), bundle: None, objects, stored };
     if creds.is_some() || exports.iter().any(Option::is_some) {
         let ends = match make_bundle() {
             Ok(ends) => ends,

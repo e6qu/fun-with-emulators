@@ -3220,7 +3220,8 @@ fn send_control(
     to: Option<&[u8]>,
 ) -> Result<Option<crate::scm::Prepared>, i32> {
     if len == 0 {
-        return creds_for(fd, to).map_or(Ok(None), |c| crate::scm::prepare(&[], Some(c)).map(Some));
+        return creds_for(fd, to)
+            .map_or(Ok(None), |c| crate::scm::prepare(&[], Some(c), false).map(Some));
     }
     let ctl = uaccess::read_bytes(control, (len as usize).min(64 * 1024))?;
     if !is_unix(fd) {
@@ -3234,7 +3235,15 @@ fn send_control(
     if out.fds.is_empty() && creds.is_none() {
         return Ok(None);
     }
-    crate::scm::prepare(&out.fds, creds).map(Some)
+    crate::scm::prepare(&out.fds, creds, host_peer(fd)).map(Some)
+}
+
+/// Whether the peer of connected Unix socket `fd` is a process of the
+/// host's, not fwe's (an X server, say): it reads no bundle
+/// ([`crate::scm::prepare`]).
+#[cfg(not(target_os = "linux"))]
+fn host_peer(fd: i32) -> bool {
+    host_peercred(fd).is_ok_and(|(pid, _, _)| pid > 0 && crate::procreg::read(pid).is_none())
 }
 
 #[cfg(test)]

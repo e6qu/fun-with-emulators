@@ -90,6 +90,7 @@ unsafe extern "C" {
     fn listen(fd: i32, n: i32) -> i32;
     fn umask(m: u32) -> u32;
     fn sendto(fd: i32, b: *const u8, n: usize, f: i32, a: *const u8, l: u32) -> isize;
+    fn sendmsg(fd: i32, m: *const MsgHdr, f: i32) -> isize;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -708,6 +709,58 @@ fn unix_addr(p: &str) -> [u8; 110] {
     addr
 }
 
+/// musl's `struct msghdr` on a 64-bit target (each 32-bit length padded).
+#[repr(C)]
+struct MsgHdr {
+    name: *const u8,
+    namelen: usize,
+    iov: *const [usize; 2],
+    iovlen: usize,
+    control: *const u8,
+    controllen: usize,
+    flags: i32,
+}
+
+/// A memfd sent to a process of the host's (the test, at socket `path`),
+/// as a program hands an X server the memory it draws in: the host maps
+/// what the guest wrote, and says what it read there.
+fn host_peer_scenario(path: &str) {
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    const SYS_MEMFD_CREATE: i64 = 279;
+    // SAFETY: plain calls on this program's own descriptors and buffers.
+    unsafe {
+        let s = socket(AF_UNIX, SOCK_STREAM, 0);
+        let addr = unix_addr(path);
+        assert_eq!(connect(s, addr.as_ptr(), 110), 0, "connect: {}", errno());
+        let m = syscall(SYS_MEMFD_CREATE, c("drawn").as_ptr(), 0) as i32;
+        let text = b"drawn by the guest";
+        write(m, text.as_ptr(), text.len());
+        // One byte, with the memfd: a control message of one descriptor
+        // (`SOL_SOCKET`, `SCM_RIGHTS`).
+        let byte = [b'x'];
+        let iov = [byte.as_ptr() as usize, 1];
+        let mut ctl = [0u8; 24];
+        ctl[0..8].copy_from_slice(&20u64.to_ne_bytes());
+        ctl[8..12].copy_from_slice(&1i32.to_ne_bytes());
+        ctl[12..16].copy_from_slice(&1i32.to_ne_bytes());
+        ctl[16..20].copy_from_slice(&m.to_ne_bytes());
+        let msg = MsgHdr {
+            name: std::ptr::null(),
+            namelen: 0,
+            iov: &iov,
+            iovlen: 1,
+            control: ctl.as_ptr(),
+            controllen: ctl.len(),
+            flags: 0,
+        };
+        println!("sent: {}", res(sendmsg(s, &msg, 0) as i64));
+        let mut buf = [0u8; 64];
+        let n = read(s, buf.as_mut_ptr(), buf.len());
+        println!("the host read: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+    }
+}
+
 /// Connecting or sending to a Unix socket's node needs write permission
 /// on it, by the caller's ids against its owner and mode, as `open`
 /// checks; making one needs write permission on its directory.
@@ -1217,6 +1270,7 @@ fn main() {
         "tmpfsopts" => tmpfs_options_scenario(),
         "procopts" => proc_options_scenario(),
         "store" => store_scenario(),
+        "host-peer" => host_peer_scenario(&std::env::args().nth(2).unwrap()),
         // A program run from a tmpfs ([`store_scenario`]): its exit code.
         "exit" => std::process::exit(7),
         s => panic!("unknown scenario {s}"),

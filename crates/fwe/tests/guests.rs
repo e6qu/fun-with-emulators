@@ -9323,6 +9323,82 @@ fn tmpfs_files_work_by_path() {
     );
 }
 
+/// A memfd a guest sends a process of the host's (as a program hands an X
+/// server the memory it draws in) reaches it as memory it maps: the data
+/// of the file, not fwe's stand-in for its descriptor.
+#[test]
+fn a_host_process_maps_a_memfd_it_is_sent() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let root = std::env::temp_dir().join(format!("fwe-hp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("fsrules"), root.join("fsrules")).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(root.join("tmp/h.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let host = std::thread::spawn(move || -> Result<String, String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let (mut conn, _) = loop {
+            match listener.accept() {
+                Ok(c) => break c,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => return Err(format!("no connection: {e}")),
+            }
+        };
+        conn.set_nonblocking(false).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let mut ctl = [0u8; 64];
+        // SAFETY: zeroed bytes are a valid `msghdr`, given valid buffers.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctl.as_mut_ptr().cast();
+        msg.msg_controllen = ctl.len() as libc::socklen_t;
+        // SAFETY: a receive into the buffers above.
+        if unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) } != 1 {
+            return Err("no message".into());
+        }
+        // SAFETY: the control data the host wrote: its first message.
+        let fds: Vec<i32> = unsafe {
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            if c.is_null() || (*c).cmsg_type != libc::SCM_RIGHTS {
+                return Err("no descriptor".into());
+            }
+            let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
+            let data = libc::CMSG_DATA(c).cast::<i32>();
+            (0..n).map(|i| data.add(i).read_unaligned()).collect()
+        };
+        let [fd] = fds[..] else { return Err(format!("{} descriptors", fds.len())) };
+        // SAFETY: a shared mapping of the descriptor received, read and
+        // unmapped here.
+        let text = unsafe {
+            let p =
+                libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
+            if p == libc::MAP_FAILED {
+                return Err(format!("mmap: {}", std::io::Error::last_os_error()));
+            }
+            let b = std::slice::from_raw_parts(p.cast::<u8>(), 18).to_vec();
+            libc::munmap(p, 4096);
+            libc::close(fd);
+            b
+        };
+        conn.write_all(&text).unwrap();
+        Ok(String::from_utf8_lossy(&text).into_owned())
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("fsrules")).args(["host-peer", "/tmp/h.sock"]);
+    let out = run_bounded(cmd);
+    let host = host.join().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(host, Ok("drawn by the guest".to_string()));
+    assert_eq!(stdout(&out), "sent: ok\nthe host read: drawn by the guest\n");
+}
+
 /// `proc`'s `hidepid=invisible` hides another user's process from one who
 /// may not trace it, `noaccess` keeps them out of it (`EPERM`), and
 /// `subset=pid` shows the processes alone; `hidepid=3` is `EINVAL`.

@@ -463,11 +463,44 @@ pub fn add_seals(fd: i32, add: u64) -> Option<i64> {
     Some(r.map_or_else(err, |()| 0))
 }
 
+/// What a process of the host's (not fwe's) is handed for `fd`, a
+/// descriptor of a regular file of the store sent to it (`SCM_RIGHTS`):
+/// the file's data, a host shared memory object it maps as the guest does
+/// (an X server, a memfd's pages), opened as the description is, for
+/// reading and for writing if it may write. `None` for another descriptor.
+pub fn host_object(fd: i32) -> Option<Result<std::os::fd::OwnedFd, i32>> {
+    let file = desc::of(fd)?;
+    if desc::is_path(fd) {
+        return None;
+    }
+    Some((|| {
+        let (_, writes) = access(fd)?;
+        let fs = file.fs()?;
+        let mut t = fs.lock()?;
+        if t.stat(file.ino)?.mode & tree::S_IFMT != tree::S_IFREG {
+            return Err(errno::EINVAL);
+        }
+        let object = match t.data(file.ino)? {
+            0 => {
+                let o = data::make()?;
+                t.set_data(file.ino, o)?;
+                o
+            }
+            o => o,
+        };
+        drop(t);
+        desc::made_data(file, object, None);
+        data::open(object, !writes)
+    })())
+}
+
 /// For `mmap` of a descriptor of the store (`None` for another), with
 /// Linux's `prot` and `flags`: the host descriptor of the file's data to
 /// map (its object, made if the file had none), open for writing only for a
 /// shared mapping of a descriptor that may write, and whether a shared
 /// mapping may never be made writable (the contents are sealed).
+///
+/// See [`host_object`] for what a host process is handed.
 pub fn map_source(
     fd: i32,
     prot: u64,
