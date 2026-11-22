@@ -322,22 +322,16 @@ pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
 
 /// `fstat` of `fd` in Linux's layout, with the guest's mode and owner.
 pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
-    stat_fd(fd).map(|s| stat_to_linux_fd(fd, &s))
+    stat_fd_of(fd).map(|(s, stored)| stat_to_linux_fd(fd, &s, stored))
 }
 
-/// The Linux status of the file open as `fd`, whose host status is `s`:
-/// that of a tmpfs's file if it was opened in one.
-fn stat_to_linux_fd(fd: i32, s: &libc::stat) -> Stat {
+/// The Linux status of the file open as `fd`, whose host status is `s`
+/// (`stored`: a file of fwe's store's, [`stat_fd_of`]): that of a tmpfs's
+/// file if it was opened in one.
+fn stat_to_linux_fd(fd: i32, s: &libc::stat, stored: bool) -> Stat {
     // A file of fwe's store has its own numbers (a FIFO's too, open on
     // its node).
-    if crate::filestore::desc::of(fd).is_some()
-        || (s.st_mode & libc::S_IFMT == libc::S_IFIFO && {
-            let mut host = zeroed_stat();
-            // SAFETY: plain host call with a valid out-parameter.
-            let got = unsafe { libc::fstat(fd, &mut host) == 0 };
-            got && crate::storenodes::fifo_file(fd, &host).is_some()
-        })
-    {
+    if stored {
         return store_stat_result(s).0;
     }
     let mut out = stat_to_linux(s);
@@ -381,8 +375,14 @@ fn named_by_pid(p: &[u8]) -> Vec<u8> {
 /// stand-in names), with the guest's permission bits ([`crate::modes`])
 /// and owner ([`crate::owners`]).
 fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
+    stat_fd_of(fd).map(|(st, _)| st)
+}
+
+/// [`stat_fd`], and whether the file is one of fwe's store's (a FIFO's
+/// too, open on its node).
+fn stat_fd_of(fd: i32) -> Result<(libc::stat, bool), i32> {
     if let Some(st) = crate::filestore::io::stat(fd) {
-        return st;
+        return st.map(|st| (st, true));
     }
     if let Some(host) = crate::fdmarks::stand_in(fd) {
         // A stand-in `O_PATH` descriptor: the file it names.
@@ -396,7 +396,7 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
         let owner = crate::owners::of_path(&c, &out);
         crate::modes::apply(&mut out, perm);
         crate::owners::apply(&mut out, owner);
-        return Ok(out);
+        return Ok((out, false));
     }
     let mut out = zeroed_stat();
     // SAFETY: plain host call with a valid out-parameter.
@@ -407,7 +407,7 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     if let Some(file) = crate::storenodes::fifo_file(fd, &out) {
         let fs = file.fs()?;
         let t = fs.lock()?;
-        return Ok(crate::filestore::io::host_stat(t.dev(), &t.stat(file.ino)?));
+        return Ok((crate::filestore::io::host_stat(t.dev(), &t.stat(file.ino)?), true));
     }
     // A program or map of bpf's is an object of fwe's in host shared memory.
     let bpf = || crate::memobj::may_be(&out) && crate::bpf::is_bpf_fd(fd);
@@ -416,7 +416,7 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
         out.st_mode = 0o600;
         let owner = crate::owners::host_owner(&out);
         crate::owners::apply(&mut out, owner);
-        return Ok(out);
+        return Ok((out, false));
     }
     // A socket's own inode: its maker's, every bit allowed until an
     // `fchmod` (the host keeps neither).
@@ -425,13 +425,13 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
         let owner = s.and_then(|s| s.owner).unwrap_or_else(|| crate::owners::host_owner(&out));
         crate::modes::apply(&mut out, s.map_or(0o777, |s| s.perm));
         crate::owners::apply(&mut out, owner);
-        return Ok(out);
+        return Ok((out, false));
     }
     let perm = crate::modes::guest_perm_fd(fd, &out);
     let owner = crate::owners::of_fd(fd, &out);
     crate::modes::apply(&mut out, perm);
     crate::owners::apply(&mut out, owner);
-    Ok(out)
+    Ok((out, false))
 }
 
 /// What a path names, as a walk sees it ([`Kernel::link_kind`]).
@@ -1800,13 +1800,13 @@ impl<P: Platform> Kernel<P> {
             guest!(uaccess::write(buf, stat));
             return 0;
         }
-        let out = match stat_fd(fd as i32) {
+        let (out, stored) = match stat_fd_of(fd as i32) {
             Ok(s) => s,
             Err(e) => return err(e),
         };
         let node =
             crate::devnodes::marked(&out).then(|| crate::devnodes::node_of(fd as i32)).flatten();
-        let mut st = as_node(stat_to_linux_fd(fd as i32, &out), node);
+        let mut st = as_node(stat_to_linux_fd(fd as i32, &out, stored), node);
         if let Some((mode, uid, gid)) = crate::mqueue::owner_of(fd as i32) {
             // A message queue's descriptor: the queue's owner and mode.
             (st.st_mode, st.st_uid, st.st_gid) = (fwe_abi::stat::S_IFREG | mode, uid, gid);
