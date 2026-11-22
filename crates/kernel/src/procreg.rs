@@ -266,8 +266,9 @@ fn made_dir(cell: &'static std::sync::OnceLock<Vec<u8>>, name: &str) -> Option<V
     Some(cell.get_or_init(|| d).clone())
 }
 
-/// The directory of the files kept beside the process records (signal
-/// reply sockets, memory requests, Landlock domains).
+/// The directory beside the process records where the sockets a process
+/// is sent descriptors on are bound ([`crate::signote`]), and whose name
+/// the initial pid namespace's records are named under.
 pub fn records_dir() -> Option<Vec<u8>> {
     static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     made_dir(&DIR, "procs")
@@ -565,11 +566,10 @@ pub fn remove(held: &crate::procstore::Held, pid: i32) {
     crate::signote::remove(pid);
 }
 
-/// Remove the files kept beside the records for processes that are gone
-/// (their mailbox, lock, mappings, thread ids and how they ended), older
-/// than `young`: a process whose record was taken away ([`remove`])
-/// without them, as when its pid had been given to another process by
-/// then, or whose parent was not fwe's to reap it.
+/// Remove what is kept beside the records for processes that are gone,
+/// older than `young`: the reply sockets a process left bound
+/// (`<pid>.fd<n>`, [`crate::signote`]), as when it was killed waiting for
+/// a descriptor.
 pub fn collect_leftovers(young: std::time::Duration) {
     let Some(d) = records_dir() else { return };
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return };
@@ -577,11 +577,12 @@ pub fn collect_leftovers(young: std::time::Duration) {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         let pid = match name.split_once('.') {
-            Some((p, "sig" | "lock" | "maps")) => p,
-            _ => match name.strip_prefix("tids-").or_else(|| name.strip_prefix("threads-")) {
-                Some(p) => p.strip_suffix(".new").unwrap_or(p),
-                None => continue,
-            },
+            Some((p, token))
+                if token.strip_prefix("fd").is_some_and(|n| n.parse::<u64>().is_ok()) =>
+            {
+                p
+            }
+            _ => continue,
         };
         let Ok(pid) = pid.parse::<i32>() else { continue };
         if pid <= 0 || start_time(pid).is_some() || read(pid).is_some() {

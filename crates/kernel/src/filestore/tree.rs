@@ -254,6 +254,24 @@ impl Tx<'_> {
         })
     }
 
+    /// One more of the filesystem's inodes in use, if its limit allows
+    /// (`ENOSPC`): an inode's, or a file's name past its first, which
+    /// Linux's tmpfs counts as one (`shmem_link`: each name holds memory
+    /// until it goes).
+    fn reserve_inode(&mut self) -> Result<(), i32> {
+        let limit = self.m.root(R_LIMIT_INODES);
+        if limit != 0 && self.m.root(R_USED) >= limit {
+            return Err(errno::ENOSPC);
+        }
+        self.m.set_root(R_USED, self.m.root(R_USED) + 1);
+        Ok(())
+    }
+
+    /// A file's name past its first went ([`Self::reserve_inode`]).
+    fn release_name(&mut self) {
+        self.m.set_root(R_USED, self.m.root(R_USED).saturating_sub(1));
+    }
+
     /// A new inode like `n`, with no names: its number.
     fn new_inode(&mut self, n: &New) -> Result<Ino, i32> {
         let limit = self.m.root(R_LIMIT_INODES);
@@ -658,7 +676,17 @@ impl Tx<'_> {
             return Err(errno::EEXIST);
         }
         let links = self.get_u32(ino, I_NLINK)?;
-        self.add_entry(d, name, ino, mode & S_IFMT)?;
+        // A name past the first counts as an inode (not an `O_TMPFILE`
+        // file's first).
+        if links > 0 {
+            self.reserve_inode()?;
+        }
+        if let Err(e) = self.add_entry(d, name, ino, mode & S_IFMT) {
+            if links > 0 {
+                self.release_name();
+            }
+            return Err(e);
+        }
         self.set_u32(ino, I_NLINK, links + 1)?;
         self.touch_changed(ino)?;
         self.touch_changed(dir)
@@ -693,6 +721,9 @@ impl Tx<'_> {
             let parent_links = self.get_u32(dir, I_NLINK)?;
             self.set_u32(dir, I_NLINK, parent_links.saturating_sub(1))?;
         } else {
+            if links > 1 {
+                self.release_name();
+            }
             self.set_u32(ino, I_NLINK, links.saturating_sub(1))?;
             self.touch_changed(ino)?;
         }
@@ -828,6 +859,9 @@ impl Tx<'_> {
                 self.set_u32(ndir, I_NLINK, l.saturating_sub(1))?;
             } else {
                 let l = self.get_u32(other, I_NLINK)?;
+                if l > 1 {
+                    self.release_name();
+                }
                 self.set_u32(other, I_NLINK, l.saturating_sub(1))?;
                 self.touch_changed(other)?;
             }
@@ -1742,6 +1776,29 @@ mod tests {
         t.release(f, 1, 5).unwrap();
         assert_eq!(t.usage().0, 2 * page);
         assert_eq!(t.allocate(f, 2, 3), Ok(page));
+        drop(t);
+        Arena::remove(id);
+    }
+
+    /// A file's names past its first count as inodes, as Linux's tmpfs
+    /// counts them: a link past the limit is refused, and a name removed
+    /// is room again.
+    #[test]
+    fn extra_names_count_as_inodes() {
+        let (id, a) = fresh();
+        let mut t = lock(&a, root_dir).unwrap();
+        // The root, a file and one more name.
+        t.set_limits(0, 3);
+        let f = t.create(t.root(), b"f", &file(0o644)).unwrap();
+        t.link(f, t.root(), b"g").unwrap();
+        assert_eq!(t.usage().1, 3);
+        assert_eq!(t.link(f, t.root(), b"h"), Err(errno::ENOSPC));
+        t.unlink(t.root(), b"g", false).unwrap();
+        assert_eq!(t.usage().1, 2);
+        t.link(f, t.root(), b"h").unwrap();
+        t.unlink(t.root(), b"f", false).unwrap();
+        t.unlink(t.root(), b"h", false).unwrap();
+        assert_eq!(t.usage().1, 1);
         drop(t);
         Arena::remove(id);
     }
