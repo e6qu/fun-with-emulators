@@ -66,6 +66,10 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
     if crate::loopdev::device_of(fd).is_some() {
         return Ok((Kind::Block, reads, writes, fl));
     }
+    // A synthetic `/proc` file, read from fwe's memory ([`read_from`]).
+    if crate::procfile::is(fd) {
+        return Ok((Kind::File, reads, writes, fl));
+    }
     let special = crate::loopdev::is_control(fd)
         || crate::specialfd::anon_name(fd).is_some()
         || crate::signalfd::is_signalfd(fd)
@@ -213,6 +217,9 @@ fn read_from(fd: i32, k: Kind, buf: &mut [u8], pos: Option<u64>) -> Result<usize
     if k == Kind::Block {
         let r = crate::loopdev::read_into(fd, buf, pos).unwrap_or(err(errno::EBADF));
         return if r < 0 { Err(-r as i32) } else { Ok(r as usize) };
+    }
+    if let Some(r) = crate::procfile::read_into(fd, buf, pos) {
+        return r;
     }
     let iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
     if crate::seqpacket::is(fd) {

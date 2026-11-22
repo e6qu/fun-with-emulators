@@ -171,6 +171,8 @@ MICRO_LINUX = [
     ("eventfd write+read", ["ipc", "eventfd", "200000"], "ns"),
     # A wake of a futex in memory processes share, no one waiting.
     ("shared futex wake", ["ipc", "futex", "200000"], "ns"),
+    # A synthetic file (/proc/self/stat) opened, read whole and closed.
+    ("/proc file open+read+close", ["file", "proc", "20000"], "ns"),
 ]
 
 

@@ -600,14 +600,22 @@ impl<P: Platform> Kernel<P> {
                     if self.fs().proc_path(dirfd as i32, &path).as_deref()
                         == Some(b"/proc/self/status") =>
                 {
-                    self.synthetic_fd(anon_fd(&self.self_status(), flags), dirfd as i32, &path)
+                    self.synthetic_fd(
+                        self.proc_file(dirfd as i32, &path, self.self_status(), flags),
+                        dirfd as i32,
+                        &path,
+                    )
                 }
                 crate::procfs::Entry::File(_)
                     if self.fs().proc_path(dirfd as i32, &path).as_deref()
                         == Some(b"/proc/keys") =>
                 {
                     let text = crate::keys::proc_keys(&self.key_caller());
-                    self.synthetic_fd(anon_fd(&text, flags), dirfd as i32, &path)
+                    self.synthetic_fd(
+                        self.proc_file(dirfd as i32, &path, text, flags),
+                        dirfd as i32,
+                        &path,
+                    )
                 }
                 // Another process's memory (`crate::procmem`).
                 crate::procfs::Entry::File(_)
@@ -615,7 +623,11 @@ impl<P: Platform> Kernel<P> {
                 {
                     match id {
                         Ok(id) => {
-                            let fd = self.synthetic_fd(anon_fd(&[], flags), dirfd as i32, &path);
+                            let fd = self.synthetic_fd(
+                                self.proc_file(dirfd as i32, &path, Vec::new(), flags),
+                                dirfd as i32,
+                                &path,
+                            );
                             if fd >= 0 {
                                 crate::fdmarks::mark(
                                     fd as i32,
@@ -633,7 +645,11 @@ impl<P: Platform> Kernel<P> {
                         std::str::from_utf8(t).ok()?.parse::<i32>().ok()
                     }) =>
                 {
-                    self.synthetic_fd(anon_fd(&self.task_status(tid), flags), dirfd as i32, &path)
+                    self.synthetic_fd(
+                        self.proc_file(dirfd as i32, &path, self.task_status(tid), flags),
+                        dirfd as i32,
+                        &path,
+                    )
                 }
                 crate::procfs::Entry::File(_)
                     if let Some(pagemap) =
@@ -652,7 +668,11 @@ impl<P: Platform> Kernel<P> {
                     {
                         return err(errno::EROFS);
                     }
-                    let fd = self.synthetic_fd(anon_fd(&[], flags), dirfd as i32, &path);
+                    let fd = self.synthetic_fd(
+                        self.proc_file(dirfd as i32, &path, Vec::new(), flags),
+                        dirfd as i32,
+                        &path,
+                    );
                     if fd >= 0 {
                         crate::procmem::opened(fd as i32, pagemap);
                     }
@@ -688,7 +708,7 @@ impl<P: Platform> Kernel<P> {
                     });
                     match mark {
                         Ok(mark) => {
-                            let fd = anon_fd(&content, flags);
+                            let fd = self.proc_file(dirfd as i32, &path, content, flags);
                             if fd >= 0 {
                                 crate::fdmarks::mark(fd as i32, mark);
                             }
@@ -698,7 +718,11 @@ impl<P: Platform> Kernel<P> {
                     }
                 }
                 crate::procfs::Entry::File(content) => {
-                    let fd = self.synthetic_fd(anon_fd(&content, flags), dirfd as i32, &path);
+                    let fd = self.synthetic_fd(
+                        self.proc_file(dirfd as i32, &path, content, flags),
+                        dirfd as i32,
+                        &path,
+                    );
                     // A mounts file reports its namespace's changes.
                     let p = self.fs().proc_path(dirfd as i32, &path).unwrap_or_default();
                     if fd >= 0 && matches!(&p[..], b"/proc/self/mounts" | b"/proc/self/mountinfo") {
@@ -1584,6 +1608,14 @@ impl<P: Platform> Kernel<P> {
                 }
                 Entry::Symlink(t) => synth_stat(st::S_IFLNK | 0o777, t.len() as u64),
                 Entry::Fd { fd, .. } if follow => {
+                    if let Some(path) = crate::procfile::path_of(fd) {
+                        return self.linux_stat_attrs(
+                            fcntl::AT_FDCWD as i32,
+                            &path,
+                            true,
+                            depth + 1,
+                        );
+                    }
                     if crate::synthdir::fstat_is_dir(fd) {
                         let path = crate::synthdir::path_of(fd).unwrap_or_default();
                         let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
@@ -1654,6 +1686,16 @@ impl<P: Platform> Kernel<P> {
         if let Some(t) = crate::pidfd::of(fd as i32) {
             guest!(uaccess::write(buf, pidfd_stat(t.host)));
             return 0;
+        }
+        // A synthetic file: what its path is.
+        if let Some(path) = crate::procfile::path_of(fd as i32) {
+            return match self.linux_stat(fcntl::AT_FDCWD as i32, &path, true, 0) {
+                Ok(st) => {
+                    guest!(uaccess::write(buf, st));
+                    0
+                }
+                Err(e) => err(e),
+            };
         }
         if crate::synthdir::fstat_is_dir(fd as i32) {
             let path = crate::synthdir::path_of(fd as i32);
@@ -1726,6 +1768,16 @@ impl<P: Platform> Kernel<P> {
             return 0;
         }
         let (host, node) = if empty {
+            // A synthetic file's descriptor: what its path is.
+            if let Some(path) = crate::procfile::path_of(dirfd as i32) {
+                return match self.linux_stat(fcntl::AT_FDCWD as i32, &path, true, 0) {
+                    Ok(st) => {
+                        guest!(uaccess::write(buf, with_mount(statx_of(&st))));
+                        0
+                    }
+                    Err(e) => err(e),
+                };
+            }
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {
                 let path = crate::synthdir::path_of(dirfd as i32).unwrap_or_default();
@@ -3016,6 +3068,13 @@ impl<P: Platform> Kernel<P> {
     /// `fd` (or an error), just opened on a file of fwe's `/proc` or `/sys`
     /// at `path`: recorded as of that mount, so `fstatfs` reports `proc`
     /// or `sysfs` as runtimes check, not what stands in for it on the host.
+    /// A descriptor of the synthetic file at `path` (from `dirfd`) holding
+    /// `contents`, as the guest's open `flags` ask ([`crate::procfile`]).
+    fn proc_file(&self, dirfd: i32, path: &[u8], contents: Vec<u8>, flags: u64) -> i64 {
+        let at = self.fs().absolute_path(dirfd, path).unwrap_or_else(|| path.to_vec());
+        crate::procfile::open(&at, contents, flags)
+    }
+
     fn synthetic_fd(&self, fd: i64, dirfd: i32, path: &[u8]) -> i64 {
         if fd >= 0
             && let Some(absolute) = self.fs().absolute_path(dirfd, path)
@@ -4591,51 +4650,6 @@ fn synth_stat(mode: u32, size: u64) -> Stat {
         st_blocks: size.div_ceil(512) as i64,
         ..Stat::default()
     }
-}
-
-/// An anonymous, seekable fd preloaded with `content`, open for what the
-/// guest's open `flags` ask (reading, writing or both), to serve a
-/// synthetic `/proc` or `/sys` file. Backed by an unlinked temporary file
-/// so it works on both Linux and macOS.
-fn anon_fd(content: &[u8], flags: u64) -> i64 {
-    let mut template = *b"/tmp/fwe-proc-XXXXXX\0";
-    // SAFETY: `template` is a NUL-terminated mutable buffer for mkstemp.
-    let fd = unsafe { libc::mkstemp(template.as_mut_ptr().cast()) };
-    if fd < 0 {
-        return last_error();
-    }
-    let mut off = 0usize;
-    while off < content.len() {
-        // SAFETY: writing the remaining content to the temp fd.
-        let n = unsafe { libc::write(fd, content[off..].as_ptr().cast(), content.len() - off) };
-        if n <= 0 {
-            // SAFETY: closing and removing the file we created.
-            unsafe {
-                libc::close(fd);
-                libc::unlink(template.as_ptr().cast());
-            }
-            return last_error();
-        }
-        off += n as usize;
-    }
-    // Opened again as the guest asked, to read or write only, so a read
-    // or write it was not opened for fails with `EBADF`, as on Linux.
-    let mode = match flags & fcntl::O_ACCMODE {
-        fcntl::O_WRONLY => libc::O_WRONLY,
-        fcntl::O_RDWR => libc::O_RDWR,
-        _ => libc::O_RDONLY,
-    };
-    // SAFETY: `template` names the file just made; plain host calls.
-    let guest = unsafe {
-        let g = libc::open(template.as_ptr().cast(), mode);
-        libc::close(fd);
-        libc::unlink(template.as_ptr().cast());
-        g
-    };
-    if guest < 0 {
-        return last_error();
-    }
-    guest as i64
 }
 
 /// Write back and drop from the host's cache the pages of the regular file

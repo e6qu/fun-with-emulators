@@ -76,6 +76,7 @@ pub mod pipelock;
 pub mod posixtimer;
 pub mod prepcache;
 pub mod prmm;
+pub mod procfile;
 pub mod procfs;
 pub mod procmem;
 pub mod procnet;
@@ -470,6 +471,7 @@ impl<P: Platform> Kernel<P> {
         specialfd::save(e);
         signalfd::save(e);
         synthdir::save(e);
+        procfile::save(e);
         pty::save(e, false);
         epoll::save(e);
         pidfd::save(e);
@@ -542,6 +544,7 @@ impl<P: Platform> Kernel<P> {
         specialfd::restore(d);
         signalfd::restore(d);
         synthdir::restore(d);
+        procfile::restore(d);
         pty::restore(d);
         epoll::restore(d);
         pidfd::restore(d, false);
@@ -1455,15 +1458,17 @@ pub fn fork_locked(fork: impl FnOnce() -> libc::pid_t) -> libc::pid_t {
         signalfd::hold(|| {
             specialfd::hold(|| {
                 synthdir::hold(|| {
-                    overlay::hold(|| {
-                        pty::hold(|| {
-                            fs::hold(|| {
-                                futex::hold(|| {
-                                    mm::hold(|| {
-                                        maps::hold(|| {
-                                            thread::hold(|| {
-                                                threadfs::hold(|| {
-                                                    seqpacket::hold(|| forklock::hold(fork))
+                    procfile::hold(|| {
+                        overlay::hold(|| {
+                            pty::hold(|| {
+                                fs::hold(|| {
+                                    futex::hold(|| {
+                                        mm::hold(|| {
+                                            maps::hold(|| {
+                                                thread::hold(|| {
+                                                    threadfs::hold(|| {
+                                                        seqpacket::hold(|| forklock::hold(fork))
+                                                    })
                                                 })
                                             })
                                         })
@@ -1681,7 +1686,7 @@ fn copy_between(
         if r != 0 {
             Err(host::errno_to_linux(host::last_errno()))
         } else {
-            Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG)
+            Ok(st.st_mode & libc::S_IFMT == libc::S_IFREG || procfile::is(fd))
         }
     };
     // A loop device reads and writes as a block device: `sendfile` takes
@@ -1742,6 +1747,15 @@ fn copy_between(
                     break;
                 }
                 r => r.unwrap_or(0) as isize,
+            }
+        } else if let Some(r) = procfile::read_into(input, &mut buf[..want], ipos.map(|p| p as u64))
+        {
+            match r {
+                Ok(n) => n as isize,
+                Err(e) => {
+                    failure = e;
+                    break;
+                }
             }
         } else {
             // SAFETY: `buf` holds at least `want` bytes.
@@ -2079,6 +2093,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         return Some(r);
     }
     if let Some(r) = procmem::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = procfile::io(nr, &a) {
         return Some(r);
     }
     if let Some(r) = mqueue::io(nr, &a) {

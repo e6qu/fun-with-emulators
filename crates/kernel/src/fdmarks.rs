@@ -576,6 +576,7 @@ pub fn closed(fd: i32) {
     take(&mut records(), fd);
     crate::overlay::closed(fd);
     crate::fdstate::closed(fd);
+    crate::procfile::closed(fd);
 }
 
 /// Whether a descriptor of this process other than `fd` is open on the
@@ -612,6 +613,8 @@ pub fn forget_closed() {
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
     crate::fdstate::duplicated(old, new);
+    crate::procfile::duplicated(old, new);
+    crate::synthdir::duplicated(old, new);
     let mut r = records();
     match r.get(&old).cloned() {
         Some(rec) => insert(&mut r, new, rec),

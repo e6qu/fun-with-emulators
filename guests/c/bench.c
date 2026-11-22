@@ -659,6 +659,11 @@ int main(int argc, char **argv) {
             } else if (strcmp(op, "open") == 0) {
                 int f = open(path, O_RDONLY);
                 sink += close(f);
+            } else if (strcmp(op, "proc") == 0) {
+                /* A synthetic file: opened, read whole, closed. */
+                int f = open("/proc/self/stat", O_RDONLY);
+                sink += read(f, buf, 4096);
+                sink += close(f);
             } else if (strcmp(op, "mmap") == 0) {
                 void *m = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
                 sink += munmap(m, 65536);

@@ -1037,7 +1037,11 @@ impl<P: Platform> Kernel<P> {
     fn shared_call(&self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             nr::LSEEK => {
-                if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
+                if let Some(r) = crate::procfile::lseek(a[0] as i32, a[2]) {
+                    r
+                } else if let Some(r) =
+                    crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
                     r
                 } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
@@ -2849,6 +2853,21 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             .iter()
             .map(|p| p.events & libc::POLLOUT != 0 && crate::specialfd::eventfd_writable(p.fd))
             .collect();
+        // A synthetic file or directory, whose host descriptor (`/dev/null`)
+        // the host cannot wait on: ready to read and write, as Linux
+        // reports a file with no wait of its own, and not asked the host.
+        let synthetic: Vec<bool> = set
+            .iter()
+            .map(|p| crate::procfile::is(p.fd) || crate::synthdir::is_synth(p.fd))
+            .collect();
+        for (p, &s) in ask.iter_mut().zip(&synthetic) {
+            if s {
+                p.fd = -1;
+            }
+        }
+        let always = libc::POLLIN | libc::POLLOUT | libc::POLLRDNORM | libc::POLLWRNORM;
+        let ready_now =
+            set.iter().zip(&synthetic).any(|(p, &s)| s && p.events & (always | libc::POLLPRI) != 0);
         for p in &mut ask {
             if p.events & libc::POLLOUT != 0 && crate::fdstate::pipe_full(p.fd) {
                 p.events &= !libc::POLLOUT;
@@ -2863,7 +2882,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         }
         let left =
             deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_nanos() as i64);
-        let wait = if writable.contains(&true) {
+        let wait = if writable.contains(&true) || ready_now {
             0
         } else if full && !(0..1_000_000).contains(&left) {
             1_000_000
@@ -2871,8 +2890,9 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             left
         };
         crate::thread::wait_ready_ns(&mut ask, wait)?;
-        for ((p, a), &w) in set.iter_mut().zip(&ask).zip(&writable) {
-            p.revents = a.revents | if w { libc::POLLOUT } else { 0 };
+        for (((p, a), &w), &s) in set.iter_mut().zip(&ask).zip(&writable).zip(&synthetic) {
+            p.revents =
+                if s { p.events & always } else { a.revents | if w { libc::POLLOUT } else { 0 } };
             linux_revents(p);
             if crate::mountwatch::changed(p.fd) == Some(true) {
                 p.revents |= libc::POLLERR | (p.events & libc::POLLPRI);
