@@ -5,7 +5,7 @@
 //! `fstat` and `close` on it are served from an in-memory entry list rather
 //! than the host. A real `/dev/null` descriptor is opened to reserve a unique
 //! fd number (so the guest sees an ordinary descriptor and `close` works),
-//! whose position the host keeps (`lseek`): the next entry to list, shared
+//! whose position macOS keeps (`lseek`): the next entry to list, shared
 //! by every duplicate and fork child of it, as a directory's is.
 
 use crate::host::last_error;
@@ -202,7 +202,8 @@ pub fn try_close(fd: i32) -> Option<i64> {
     Some(0)
 }
 
-#[cfg(test)]
+// (macOS's `/dev/null` keeps a position, which Linux's does not.)
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::procfs::{DT_DIR, DT_REG};
