@@ -50,7 +50,7 @@ _start:
     svc     #0
     add     sp, sp, #32
 
-    mov     x28, #20000             // rounds
+    mov     x28, #5000              // rounds
 round:
     stp     x29, x30, [sp, #-16]!
     mov     x29, sp
