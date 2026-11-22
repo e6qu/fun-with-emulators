@@ -32,6 +32,7 @@ pub mod fdmarks;
 pub mod fdstate;
 pub mod fdtable;
 pub mod fifo;
+pub mod filestore;
 mod forklock;
 pub mod fs;
 mod fsops;

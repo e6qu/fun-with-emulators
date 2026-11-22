@@ -968,15 +968,26 @@ pub fn lock(pid: i32) -> Option<Held> {
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
 fn hold(word: &'static AtomicU32) -> Held {
+    hold_word(word).0
+}
+
+/// Hold the lock `word` of shared memory of fwe's (its holder's host pid,
+/// 0: free) while the result lives, and whether it was taken over from a
+/// holder that died holding it (which may have left a change half made).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub(crate) fn hold_word(word: &'static AtomicU32) -> (Held, bool) {
     let me = crate::host::pid() as u32;
     loop {
         match word.compare_exchange(0, me, SeqCst, SeqCst) {
-            Ok(_) => return Held { word },
+            Ok(_) => return (Held { word }, false),
             Err(holder) => {
                 // Gone, or a zombie (it died holding the lock): taken over.
                 let live = crate::procreg::host_info(holder as i32).is_some_and(|(_, _, z)| !z);
                 if !live && word.compare_exchange(holder, me, SeqCst, SeqCst).is_ok() {
-                    return Held { word };
+                    return (Held { word }, true);
                 }
                 // Woken as it is let go; a while at most, to look at the
                 // holder again.
