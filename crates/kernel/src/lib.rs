@@ -419,6 +419,7 @@ impl<P: Platform> Kernel<P> {
         mountapi::save(e);
         inotify::save(e);
         nsfd::save(e);
+        mqueue::save(e);
         seccomp::save(e);
         e.bool(syscalls::NO_NEW_PRIVS.load(std::sync::atomic::Ordering::Relaxed));
         e.u32(syscalls::PERSONALITY.load(std::sync::atomic::Ordering::Relaxed));
@@ -496,6 +497,7 @@ impl<P: Platform> Kernel<P> {
         mountapi::load(d);
         inotify::load(d);
         nsfd::load(d);
+        mqueue::load(d);
         seccomp::load_state(d);
         syscalls::NO_NEW_PRIVS.store(d.bool(), std::sync::atomic::Ordering::Relaxed);
         syscalls::PERSONALITY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
@@ -933,6 +935,7 @@ impl<P: Platform> Kernel<P> {
         // The ptys' masters, and fwe's holds of their slaves.
         pty::save(&mut e, true);
         nsfd::save(&mut e);
+        mqueue::save(&mut e);
         // Process descriptors, which the host exec closes (kqueues).
         pidfd::save(&mut e);
         // The parent-death signal, whose watch the exec ends.
@@ -983,6 +986,7 @@ impl<P: Platform> Kernel<P> {
         inotify::load(&mut d);
         pty::restore(&mut d);
         nsfd::load(&mut d);
+        mqueue::load(&mut d);
         pidfd::restore(&mut d, true);
         pdeath::restore(&mut d);
         seccomp::load_state(&mut d);

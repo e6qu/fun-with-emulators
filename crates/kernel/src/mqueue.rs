@@ -11,12 +11,17 @@
 //! send or receive is one change of it, under its lock; one that must wait
 //! (a full or empty queue) waits for the record to change and tries again.
 //!
-//! The guest's descriptor is a host descriptor of a file in the queue's
-//! directory, opened with the guest's access mode, which holds a shared
-//! `flock` on it: the lock lasts as long as any descriptor of that open
-//! (through `dup`, `fork` and an `exec` that keeps it), so a queue that is
-//! unlinked is freed once nothing holds its file, as Linux frees one with
-//! its last descriptor. A descriptor is close-on-exec, as Linux makes it.
+//! The guest's descriptor stands on `/dev/null`, opened with the guest's
+//! access mode, marked with its number ([`Mark::Mq`]), which names the
+//! queue: memory only, its read position (`lseek`) kept by the host and
+//! shared by its duplicates and fork children, as an open file's is. A
+//! queue is held while any process has a descriptor of it: each process
+//! keeps its count of its descriptors of each queue in the queue's record
+//! (set as it opens, duplicates and closes them, and as `exec` closes
+//! them), a fork child's written by its parent before the child goes on,
+//! and a process that has gone holds nothing. So a queue that is unlinked
+//! is freed once no process holds it, as Linux frees one with its last
+//! descriptor. A descriptor is close-on-exec, as Linux makes it.
 //! Reading one gives the queue's status line; writing one is refused. The
 //! mqueue filesystem (`/dev/mqueue`) lists the namespace's queues, each
 //! file reading as its status line.
@@ -31,7 +36,8 @@
 //! it ([`crate::netlink::bind_for_notify`]).
 //!
 //! Not kept: `poll`, `select` and `epoll` see a queue's descriptor as
-//! always ready (its readiness is the queue's, not the host file's), a
+//! always ready (its readiness is the queue's, which the host does not
+//! know: `epoll` reports it by an event of fwe's always triggered), a
 //! queue's file in the mqueue filesystem is read, not opened as the queue
 //! or removed (see `docs/architecture.md`).
 
@@ -83,6 +89,9 @@ pub struct Queue {
     /// them, and no notification is sent).
     pub receivers: Vec<(Proc, i32)>,
     pub notify: Option<Notify>,
+    /// Each process's count of its descriptors of the queue (one that
+    /// counted itself keeps its entry, at 0 too, until it has gone).
+    pub holders: Vec<(Proc, u32)>,
 }
 
 impl Queue {
@@ -100,13 +109,19 @@ impl Queue {
     /// Drop what processes that are gone left: a registration and waiting
     /// receivers. Whether anything was.
     fn reap(&mut self) -> bool {
-        let before = self.receivers.len();
+        let before = (self.receivers.len(), self.holders.len());
         self.receivers.retain(|&(p, _)| alive(p));
+        self.holders.retain(|&(p, _)| alive(p));
         let gone = self.notify.as_ref().is_some_and(|n| !alive(n.owner));
         if gone {
             self.notify = None;
         }
-        gone || self.receivers.len() != before
+        gone || (self.receivers.len(), self.holders.len()) != before
+    }
+
+    /// Whether a live process has a descriptor of it.
+    fn held(&self) -> bool {
+        self.holders.iter().any(|&(p, n)| n > 0 && alive(p))
     }
 }
 
@@ -142,6 +157,12 @@ impl Data for Queue {
             e.bytes(&n.path);
             e.bytes(&n.cookie);
         }
+        e.u64(self.holders.len() as u64);
+        for &((pid, start), n) in &self.holders {
+            e.i32(pid);
+            e.u64(start);
+            e.u32(n);
+        }
     }
 
     fn decode(d: &mut Dec) -> Self {
@@ -159,7 +180,9 @@ impl Data for Queue {
             path: d.bytes(),
             cookie: d.bytes(),
         });
-        Queue { uid, gid, mode, maxmsg, msgsize, msgs, receivers, notify }
+        let n = d.count(16);
+        let holders = (0..n).map(|_| ((d.i32(), d.u64()), d.u32())).collect();
+        Queue { uid, gid, mode, maxmsg, msgsize, msgs, receivers, notify, holders }
     }
 
     fn valid(&self) -> bool {
@@ -194,48 +217,153 @@ fn queue_at(dir: &[u8]) -> Result<Arc<Record<Queue>>, i32> {
     cached(&QUEUES, dir, || Record::join(dir, 0))
 }
 
+/// Each queue descriptor's queue (its record's name), by its mark's number
+/// ([`Mark::Mq`]).
+pub(crate) static DESCRIPTORS: Mutex<Option<HashMap<u32, Vec<u8>>>> = Mutex::new(None);
+static NEXT_KEY: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+fn descriptors<R>(f: impl FnOnce(&mut HashMap<u32, Vec<u8>>) -> R) -> R {
+    f(DESCRIPTORS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new))
+}
+
+/// The number of the queue descriptor `fd` is, if it is one.
+fn key_of(fd: i32) -> Option<u32> {
+    match fdmarks::any_marks().then(|| fdmarks::marked(fd)).flatten() {
+        Some(Mark::Mq(k)) => Some(k),
+        _ => None,
+    }
+}
+
+/// Whether `fd` is a queue's descriptor.
+pub fn is_queue(fd: i32) -> bool {
+    fd >= 0 && key_of(fd).is_some()
+}
+
 /// The directory of the queue `fd` is a descriptor of (`EBADF` for one of
 /// anything else).
 fn dir_of(fd: i32) -> Result<Vec<u8>, i32> {
-    if fd < 0 || !fdmarks::any_marks() || fdmarks::marked(fd) != Some(Mark::Mq) {
-        return Err(errno::EBADF);
-    }
-    let file = host_path(fd).ok_or(errno::EBADF)?;
-    let slash = file.iter().rposition(|&b| b == b'/').ok_or(errno::EBADF)?;
-    Ok(file[..slash].to_vec())
+    let k = if fd < 0 { None } else { key_of(fd) };
+    let k = k.ok_or(errno::EBADF)?;
+    descriptors(|m| m.get(&k).cloned()).ok_or(errno::EBADF)
 }
 
-/// The host path of the file `fd` is open on.
-fn host_path(fd: i32) -> Option<Vec<u8>> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut buf = [0u8; libc::PATH_MAX as usize];
-        // SAFETY: a buffer of `PATH_MAX` bytes, as `F_GETPATH` needs.
-        if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } != 0 {
-            return None;
+/// The count of this process's descriptors of each queue its holders were
+/// last told ([`sync_holdings`]).
+pub(crate) static HELD: Mutex<Option<HashMap<Vec<u8>, u32>>> = Mutex::new(None);
+
+/// Tell each queue whose count of this process's descriptors changed
+/// what it is now: every open descriptor marked as a queue's but those in
+/// `skip` (which an `exec` closes). The numbers no descriptor has any
+/// more are forgotten.
+pub fn sync_holdings(skip: &[i32]) {
+    let mut now: HashMap<Vec<u8>, u32> = HashMap::new();
+    let mut keys = std::collections::HashSet::new();
+    for (fd, mark) in fdmarks::marks() {
+        let Mark::Mq(k) = mark else { continue };
+        // Still open, and still the queue's.
+        if skip.contains(&fd) || key_of(fd) != Some(k) {
+            continue;
         }
-        let end = buf.iter().position(|&b| b == 0)?;
-        Some(buf[..end].to_vec())
+        keys.insert(k);
+        if let Some(dir) = descriptors(|m| m.get(&k).cloned()) {
+            *now.entry(dir).or_default() += 1;
+        }
     }
-    #[cfg(not(target_os = "macos"))]
-    {
-        use std::os::unix::ffi::OsStrExt;
-        let p = std::fs::read_link(format!("/proc/self/fd/{fd}")).ok()?;
-        Some(p.as_os_str().as_bytes().to_vec())
+    descriptors(|m| m.retain(|k, _| keys.contains(k)));
+    let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let before = held.take().unwrap_or_default();
+    let me = ipc::me();
+    let dirs: std::collections::HashSet<&Vec<u8>> = before.keys().chain(now.keys()).collect();
+    for dir in dirs {
+        let n = now.get(dir).copied().unwrap_or(0);
+        if before.get(dir).copied() == Some(n) {
+            continue;
+        }
+        if let Ok(r) = queue_at(dir) {
+            let _ = r.update_maybe(|q| Ok(((), set_holder(q, me, n, true))));
+        }
+    }
+    *held = Some(now);
+}
+
+/// Process `p` holds `n` descriptors of `q`: its entry set (`own`), or,
+/// for a fork child counted from its parent's, made only if it has none (a
+/// child that counted itself already knows better). Whether `q` changed.
+fn set_holder(q: &mut Queue, p: Proc, n: u32, own: bool) -> bool {
+    match q.holders.iter_mut().find(|(h, _)| *h == p) {
+        Some(e) if own && e.1 != n => {
+            e.1 = n;
+            true
+        }
+        Some(_) => false,
+        None => {
+            q.holders.push((p, n));
+            true
+        }
     }
 }
 
-/// Directory `dir` as the host names it (its links resolved), as a
-/// descriptor's path reads: the one key for a queue's records.
-fn canonical(dir: &[u8]) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    std::fs::canonicalize(std::ffi::OsStr::from_bytes(dir))
-        .map_or_else(|_| dir.to_vec(), |p| p.as_os_str().as_bytes().to_vec())
+/// In the parent, after the host `fork` made `child`: the queues this
+/// process holds are held by the child as many times (unless it counted
+/// itself already), so that this process closing its own or ending frees
+/// none the child has.
+pub fn forked(child: i32) {
+    if let Some(start) = crate::procreg::start_time(child) {
+        hand_on((child, start));
+    }
 }
 
-/// The queue's file in its directory, which each descriptor is open on.
-fn file_of(dir: &[u8]) -> Vec<u8> {
-    [dir, b"/q"].concat()
+/// In a fork child, as it starts: the same, from its side, should it go on
+/// before its parent counted it.
+pub fn forked_child() {
+    hand_on(ipc::me());
+}
+
+/// Process `p` holds each queue this process holds as many times as it
+/// does, unless it counted itself already.
+fn hand_on(p: Proc) {
+    let held: Vec<(Vec<u8>, u32)> = match HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+        Some(h) => h.iter().filter(|e| *e.1 > 0).map(|(d, n)| (d.clone(), *n)).collect(),
+        None => return,
+    };
+    for (dir, n) in held {
+        if let Ok(r) = queue_at(&dir) {
+            let _ = r.update_maybe(|q| Ok(((), set_holder(q, p, n, false))));
+        }
+    }
+}
+
+/// Write the process's queue descriptors into a fork snapshot or exec
+/// state (the descriptors go with it: [`crate::fdmarks`]).
+pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    e.u32(NEXT_KEY.load(std::sync::atomic::Ordering::Relaxed));
+    descriptors(|m| {
+        e.u64(m.len() as u64);
+        for (&k, dir) in m.iter() {
+            e.u32(k);
+            e.bytes(dir);
+        }
+    });
+    let held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+    let held = held.as_ref();
+    e.u64(held.map_or(0, |h| h.len()) as u64);
+    for (dir, &n) in held.into_iter().flatten() {
+        e.bytes(dir);
+        e.u32(n);
+    }
+}
+
+/// What [`save`] wrote, in the new process.
+pub(crate) fn load(d: &mut crate::snapshot::Dec) {
+    NEXT_KEY.store(d.u32(), std::sync::atomic::Ordering::Relaxed);
+    let n = d.count(12);
+    for _ in 0..n {
+        let (k, dir) = (d.u32(), d.bytes());
+        descriptors(|m| m.insert(k, dir));
+    }
+    let n = d.count(12);
+    let held: HashMap<Vec<u8>, u32> = (0..n).map(|_| (d.bytes(), d.u32())).collect();
+    *HELD.lock().unwrap_or_else(|e| e.into_inner()) = Some(held);
 }
 
 /// The namespace record a queue directory is in.
@@ -245,28 +373,13 @@ fn namespace_of(dir: &[u8]) -> Result<Arc<Record<Ipc>>, i32> {
     cached(&NAMESPACES, ns, || Record::join(ns, 0))
 }
 
-fn cstr(p: &[u8]) -> Result<std::ffi::CString, i32> {
-    std::ffi::CString::new(p).map_err(|_| errno::EINVAL)
-}
-
 fn last() -> i32 {
     crate::host::errno_to_linux(crate::host::last_errno())
 }
 
-/// Whether nothing holds queue `dir`'s file open.
+/// Whether no live process holds queue `dir`.
 fn unheld(dir: &[u8]) -> bool {
-    let Ok(c) = cstr(&file_of(dir)) else { return false };
-    // SAFETY: a NUL-terminated path in fwe's private directory; the
-    // descriptor is closed again.
-    unsafe {
-        let fd = libc::open(c.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC);
-        if fd < 0 {
-            return true;
-        }
-        let free = libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) == 0;
-        libc::close(fd);
-        free
-    }
+    queue_at(dir).map_or(true, |r| !r.get().held())
 }
 
 /// Free the queues of namespace `t` (at `ns_dir`) that are unlinked and
@@ -579,7 +692,7 @@ pub fn names() -> Vec<Vec<u8>> {
 pub fn status_of(name: &[u8]) -> Option<Vec<u8>> {
     let ns = ipc::current()?;
     let dir = ns.get().mq_names.get(name)?.clone();
-    let q = queue_at(&[&canonical(ns.dir())[..], b"/", &dir].concat()).ok()?;
+    let q = queue_at(&[ns.dir(), b"/", &dir].concat()).ok()?;
     Some(status(&q.get()))
 }
 
@@ -595,7 +708,7 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
         return None;
     }
     let fd = a[0] as i32;
-    if fdmarks::marked(fd) != Some(Mark::Mq) {
+    if !is_queue(fd) {
         return None;
     }
     let dir = match dir_of(fd) {
@@ -657,7 +770,7 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
 /// removed), then, once it is closed, the queue freed if it is unlinked
 /// and nothing holds it. Returns what to do after the close.
 pub fn closing(fd: i32, creds: &Creds) -> Option<impl FnOnce()> {
-    if !fdmarks::any_marks() || fdmarks::marked(fd) != Some(Mark::Mq) {
+    if !is_queue(fd) {
         return None;
     }
     let dir = dir_of(fd).ok()?;
@@ -672,6 +785,8 @@ pub fn closing(fd: i32, creds: &Creds) -> Option<impl FnOnce()> {
         }
     }
     Some(move || {
+        // One descriptor fewer (its mark went with it).
+        sync_holdings(&[]);
         if let Ok(ns) = namespace_of(&dir) {
             let ns_dir = ns.dir().to_vec();
             let _ = ns.update_maybe(|t| Ok(((), free_unheld(t, &ns_dir))));
@@ -686,13 +801,18 @@ pub fn exec_closing(creds: &Creds) {
     if !fdmarks::any_marks() {
         return;
     }
+    let mut closed = Vec::new();
     for fd in crate::fdtable::open_fds() {
         // SAFETY: plain host call on an open descriptor.
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 {
+        if flags >= 0 && flags & libc::FD_CLOEXEC != 0 && is_queue(fd) {
             // The queue's freeing is left to the next look, once it is closed.
             let _ = closing(fd, creds);
+            closed.push(fd);
         }
+    }
+    if !closed.is_empty() {
+        sync_holdings(&closed);
     }
 }
 
@@ -701,7 +821,7 @@ impl<P: Platform> Kernel<P> {
     fn mq_namespace(&self) -> Result<(Arc<Record<Ipc>>, Vec<u8>), i32> {
         let r = self.fs().ns.ipc.clone().or_else(ipc::initial).ok_or(errno::ENOMEM)?;
         ipc::set_current(&r);
-        let dir = canonical(r.dir());
+        let dir = r.dir().to_vec();
         Ok((r, dir))
     }
 
@@ -805,22 +925,6 @@ impl<P: Platform> Kernel<P> {
                         ..Queue::default()
                     };
                     let r = Arc::new(Record::at(full.clone(), || q)?);
-                    crate::shared::host_dir(&full)?;
-                    let c = cstr(&file_of(&full))?;
-                    // SAFETY: a NUL-terminated path in the record's
-                    // directory; the descriptor is closed again.
-                    let fd = unsafe {
-                        libc::open(
-                            c.as_ptr(),
-                            libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC,
-                            0o600,
-                        )
-                    };
-                    if fd < 0 {
-                        return Err(last());
-                    }
-                    // SAFETY: the descriptor just opened.
-                    unsafe { libc::close(fd) };
                     QUEUES
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -832,18 +936,18 @@ impl<P: Platform> Kernel<P> {
                     (full, true)
                 }
             };
-            let c = cstr(&file_of(&dir))?;
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            let fd = unsafe { libc::open(c.as_ptr(), host_flags) };
+            // The descriptor: `/dev/null` with the guest's access mode.
+            // SAFETY: a NUL-terminated path; the descriptor is the call's.
+            let fd = unsafe { libc::open(c"/dev/null".as_ptr(), host_flags) };
             if fd < 0 {
                 return Err(last());
             }
-            // SAFETY: the descriptor just opened: its shared lock says the
-            // queue is held.
-            unsafe { libc::flock(fd, libc::LOCK_SH) };
+            let k = NEXT_KEY.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            descriptors(|m| m.insert(k, dir.clone()));
+            let fd = (fd, k);
             Ok((fd, made || freed))
         });
-        let fd = match opened {
+        let (fd, k) = match opened {
             Ok(fd) => fd,
             Err(e) => {
                 // SAFETY: the descriptor taken above.
@@ -859,7 +963,8 @@ impl<P: Platform> Kernel<P> {
             // `dup2` clears the flag: a queue's descriptor is close-on-exec.
             libc::fcntl(slot, libc::F_SETFD, libc::FD_CLOEXEC);
         }
-        fdmarks::mark(slot, Mark::Mq);
+        fdmarks::mark(slot, Mark::Mq(k));
+        sync_holdings(&[]);
         slot as i64
     }
 
@@ -929,6 +1034,8 @@ impl<P: Platform> Kernel<P> {
             }
             let path = if how == SIGEV_THREAD {
                 let ns_dir = &dir[..dir.iter().rposition(|&b| b == b'/').unwrap_or(0)];
+                // (A socket's node: in the namespace's host directory.)
+                crate::shared::host_dir(ns_dir)?;
                 let path = notify_path(ns_dir);
                 crate::netlink::bind_for_notify(signo, &path)?
             } else {
@@ -1080,6 +1187,7 @@ mod tests {
                 path: b"/x/n".to_vec(),
                 cookie: vec![1; NOTIFY_COOKIE_LEN],
             }),
+            holders: vec![((10, 20), 2), ((12, 30), 0)],
         };
         let mut e = Enc::new();
         q.encode(&mut e);
@@ -1094,6 +1202,7 @@ mod tests {
         assert_eq!(back.msgs, q.msgs);
         assert_eq!(back.receivers, q.receivers);
         assert_eq!(back.notify, q.notify);
+        assert_eq!(back.holders, q.holders);
     }
 
     #[test]

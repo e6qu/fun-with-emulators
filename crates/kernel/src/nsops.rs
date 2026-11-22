@@ -531,6 +531,9 @@ impl<P: Platform> Kernel<P> {
             fs.set_mount_ns(mnt);
             fs.ns = ns;
         }
+        if child > 0 {
+            crate::mqueue::forked(child);
+        }
         if child > 0 && t.child_writes.is_none() {
             // It starts in this process's cgroup, in its namespaces.
             crate::procreg::forked(

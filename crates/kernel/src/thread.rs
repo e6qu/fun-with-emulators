@@ -85,6 +85,7 @@ pub fn init_main(pid: i32) {
     crate::pdeath::forked();
     crate::futex::forked_child();
     crate::sysvipc::forked_child();
+    crate::mqueue::forked_child();
     crate::textbusy::forked_child();
     crate::reclocks::forked_child();
     crate::tmpfile::forked_child();

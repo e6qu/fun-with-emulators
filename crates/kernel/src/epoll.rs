@@ -75,6 +75,22 @@ pub fn closed(fd: i32) {
         if let Some(mut w) = WRITES.if_used() {
             w.retain(|k| k.0 != fd && k.1 != fd);
         }
+        // An event of fwe's for it goes from each set that has one.
+        if let Some(mut a) = ALWAYS.if_used() {
+            for &(ep, _) in a.iter().filter(|k| k.1 == fd && k.0 != fd) {
+                let gone = libc::kevent {
+                    ident: fd as libc::uintptr_t,
+                    filter: libc::EVFILT_USER,
+                    flags: libc::EV_DELETE,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                // SAFETY: one change on a set of the process's.
+                unsafe { libc::kevent(ep, &gone, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
+            }
+            a.retain(|k| k.0 != fd && k.1 != fd);
+        }
     }
 }
 
@@ -470,6 +486,11 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
     let hangup_only = events & EPOLLRDHUP != 0 && !want_read && is_socket(fd as i32);
     let extra = (if events & EPOLLONESHOT != 0 { libc::EV_ONESHOT } else { 0 })
         | (if events & EPOLLET != 0 { libc::EV_CLEAR } else { 0 });
+    if crate::mqueue::is_queue(fd as i32) {
+        let on = op != EPOLL_CTL_DEL && (want_read || want_write);
+        // SAFETY: the caller's guarantee, passed on.
+        return unsafe { ctl_always(epfd as i32, fd as i32, on, extra, data) };
+    }
 
     // Build one change per filter. For ADD/MOD a wanted filter is (re)added and
     // enabled; an unwanted one is deleted so a MOD that drops a direction takes
@@ -540,6 +561,55 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
                 return -(crate::host::errno_to_linux(e) as i64);
             }
         }
+    }
+    0
+}
+
+/// The sets that watch a descriptor fwe reports always ready, by an event
+/// of fwe's ([`ctl_always`]): `(set, descriptor)`.
+#[cfg(not(target_os = "linux"))]
+pub(crate) static ALWAYS: crate::kept::Kept<Vec<(i32, i32)>> = crate::kept::Kept::new(Vec::new());
+
+/// Watch (`on`) or stop watching descriptor `fd`, whose readiness the host
+/// does not know and fwe reports as always ready to read and write (a
+/// message queue's, [`crate::mqueue`]), in set `epfd`: an event of fwe's
+/// (`EVFILT_USER`, the descriptor its ident), always triggered, in place of
+/// the host's filters; `extra` its edge (`EV_CLEAR`: reported once) or
+/// one-shot flag. The kqueue drops it only when told, as the descriptor
+/// closes ([`closed`]).
+///
+/// # Safety
+/// `epfd` is an epoll descriptor (a kqueue) of the process's.
+#[cfg(not(target_os = "linux"))]
+unsafe fn ctl_always(epfd: i32, fd: i32, on: bool, extra: u16, data: u64) -> i64 {
+    let change = libc::kevent {
+        ident: fd as libc::uintptr_t,
+        filter: libc::EVFILT_USER,
+        flags: if on {
+            libc::EV_ADD | libc::EV_ENABLE | libc::EV_RECEIPT | extra
+        } else {
+            libc::EV_DELETE | libc::EV_RECEIPT
+        },
+        fflags: if on { libc::NOTE_TRIGGER } else { 0 },
+        data: 0,
+        udata: data as *mut libc::c_void,
+    };
+    let mut out = change;
+    // SAFETY: one change and room for its receipt; no timeout.
+    let n = unsafe { libc::kevent(epfd, &change, 1, &mut out, 1, std::ptr::null()) };
+    if n < 0 {
+        return crate::host::last_error();
+    }
+    if n == 1 && out.flags & libc::EV_ERROR != 0 {
+        let e = out.data as i32;
+        if e != 0 && !(!on && e == libc::ENOENT) {
+            return -(crate::host::errno_to_linux(e) as i64);
+        }
+    }
+    let mut a = ALWAYS.lock();
+    a.retain(|&k| k != (epfd, fd));
+    if on {
+        a.push((epfd, fd));
     }
     0
 }
@@ -1067,6 +1137,8 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             libc::EVFILT_WRITE => bits |= WRITE | if is_socket(fd) { EPOLLWRBAND } else { 0 },
             // Urgent data waits.
             libc::EVFILT_EXCEPT => bits |= EPOLLPRI,
+            // A descriptor fwe reports always ready ([`ctl_always`]).
+            libc::EVFILT_USER => bits |= READ | WRITE,
             _ => {}
         }
         if ev.flags & libc::EV_ERROR != 0 {

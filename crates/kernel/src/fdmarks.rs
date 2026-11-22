@@ -82,8 +82,9 @@ pub enum Mark {
     /// An `O_PATH` descriptor: it names a file, which is not open to
     /// read, write or act on ([`refuses_path`]).
     Path,
-    /// A POSIX message queue's descriptor ([`crate::mqueue`]).
-    Mq,
+    /// A POSIX message queue's descriptor, by its number
+    /// ([`crate::mqueue`]).
+    Mq(u32),
     /// A filesystem context of the new mount API (`fsopen`, `fspick`),
     /// by its number ([`crate::mountapi`]).
     FsContext(u32),
@@ -618,9 +619,21 @@ pub fn duplicated(old: i32, new: i32) {
     crate::procfile::duplicated(old, new);
     crate::synthdir::duplicated(old, new);
     let mut r = records();
-    match r.get(&old).cloned() {
-        Some(rec) => insert(&mut r, new, rec),
-        None => take(&mut r, new),
+    let queue = match r.get(&old).cloned() {
+        Some(rec) => {
+            let queue = matches!(rec.mark, Some(Mark::Mq(_)));
+            insert(&mut r, new, rec);
+            queue
+        }
+        None => {
+            take(&mut r, new);
+            false
+        }
+    };
+    drop(r);
+    // One more descriptor of a message queue: its holders count it.
+    if queue {
+        crate::mqueue::sync_holdings(&[]);
     }
 }
 
@@ -661,7 +674,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Loop(_)) => 9,
             Some(Mark::LoopControl) => 10,
             Some(Mark::Path) => 11,
-            Some(Mark::Mq) => 12,
+            Some(Mark::Mq(_)) => 12,
             Some(Mark::FsContext(_)) => 13,
             Some(Mark::Detached(_)) => 14,
             Some(Mark::Ns(_)) => 15,
@@ -697,7 +710,8 @@ pub fn save(e: &mut Enc) {
             | Mark::Detached(n)
             | Mark::Ns(n)
             | Mark::Inotify(n)
-            | Mark::Landlock(n),
+            | Mark::Landlock(n)
+            | Mark::Mq(n),
         ) = rec.mark
         {
             e.u32(n);
@@ -764,7 +778,7 @@ pub fn load(d: &mut Dec) {
             9 => Some(Mark::Loop(d.u32())),
             10 => Some(Mark::LoopControl),
             11 => Some(Mark::Path),
-            12 => Some(Mark::Mq),
+            12 => Some(Mark::Mq(d.u32())),
             13 => Some(Mark::FsContext(d.u32())),
             14 => Some(Mark::Detached(d.u32())),
             15 => Some(Mark::Ns(d.u32())),

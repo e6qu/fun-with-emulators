@@ -24,11 +24,10 @@ fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
 /// `flock(fd, op)`. Waiting for the lock blocks, so the backends run it
 /// without the kernel lock ([`crate::blocking_syscall`]).
 pub(crate) fn flock(fd: u64, op: u64) -> i64 {
-    // A message queue's descriptor holds the host lock that keeps the
-    // queue alive ([`crate::mqueue`]): the guest's lock is not taken there.
-    if crate::fdmarks::any_marks()
-        && crate::fdmarks::marked(fd as i32) == Some(crate::fdmarks::Mark::Mq)
-    {
+    // A message queue's descriptor stands on `/dev/null`
+    // ([`crate::mqueue`]), which the host locks not: the guest's lock is
+    // not taken there.
+    if crate::mqueue::is_queue(fd as i32) {
         return match host::flock_op_to_host(op) {
             Some(_) => 0,
             None => err(errno::EINVAL),
@@ -2863,6 +2862,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
                 crate::procfile::is(p.fd)
                     || crate::synthdir::is_synth(p.fd)
                     || crate::anonfd::is(p.fd)
+                    || crate::mqueue::is_queue(p.fd)
             })
             .collect();
         for (p, &s) in ask.iter_mut().zip(&synthetic) {

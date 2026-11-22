@@ -6006,6 +6006,8 @@ fn kernel_calls_move_data_and_keep_settings() {
 /// What the `mqueue` guest prints.
 const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-exec true\n\
     status: QSIZE:14         NOTIFY:0     SIGNO:0     NOTIFY_PID:0\n\
+    position: then 0, duplicate 0, rewound 0, read again true\n\
+    epoll: added 0, ready 1, events 0x5, data 7\n\
     listed: true, file the same: true\n\
     received: high/9 mid/5 low/1 low2/1\n\
     empty: true\n\
@@ -6013,7 +6015,8 @@ const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-ex
     real-time signal: registered 0, came true, mesgq true, from the sender true, value 0x7e47\n\
     thread: registered 0, came true, value 0x7ead\n\
     unlinked: name gone true, still sends 0, receives kept\n\
-    made again: true, empty true\n";
+    made again: true, empty true\n\
+    held by a child: still works true\n";
 
 const PIDFD: &str = "self: cloexec true, link anon_inode:[pidfd], fdinfo pid true\n\
     errors: -1 true, flags true, none true\n\

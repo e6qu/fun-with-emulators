@@ -79,7 +79,7 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
         || matches!(
             crate::fdmarks::any_marks().then(|| crate::fdmarks::marked(fd)).flatten(),
             Some(
-                crate::fdmarks::Mark::Mq
+                crate::fdmarks::Mark::Mq(_)
                     | crate::fdmarks::Mark::FsContext(_)
                     | crate::fdmarks::Mark::Ns(_)
                     | crate::fdmarks::Mark::Inotify(_)
