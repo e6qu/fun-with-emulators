@@ -409,19 +409,18 @@ jobs:
         if: steps.ltp-cache.outputs.cache-hit != 'true'
         run: tools/ltp/build.sh target/ltp
       - run: cargo build
-      - name: lstat03 with fs_usage watching
+      - name: lstat03 with and without fwe's caches, and its steps
         run: |
-          sudo fs_usage -w -f filesys > "$RUNNER_TEMP/fsu.txt" 2>&1 &
-          F=$!
-          sleep 3
-          for i in 1 2 3 4 5 6; do
-            python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
-              --jobs 1 --only '^lstat03$' --show 2>&1 | grep -E "lstat03|st_atime" || true
-          done
-          sudo kill -INT $F; sleep 2
-          grep -E "file\.txt|file_symlink" "$RUNNER_TEMP/fsu.txt" | head -200
-          echo "--- by process"
-          grep -E "file\.txt|file_symlink" "$RUNNER_TEMP/fsu.txt" | awk '{print $NF}' | sort | uniq -c
+          C="${TMPDIR:-/tmp}/fwe-$(id -u)"
+          one() { python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
+              --jobs 1 --only '^lstat03$' --show 2>&1 | grep -E "\] lstat03|st_atime" || true; }
+          for i in 1 2 3 4; do echo "cleared:"; ls "$C" | tr '\n' ' '; echo; rm -rf "$C"/v*-prepared "$C"/v*-translations "$C"/v*-jit*; one; done
+          for i in 1 2 3; do echo "kept:"; one; done
+          clang -O2 --target=aarch64-linux-gnu -fno-stack-protector -fPIC -ffreestanding -c -o at.o tools/probe/at.c
+          L=$(rustc --print sysroot)/lib/rustlib/$(rustc --print host-tuple)/bin/rust-lld
+          $L -flavor gnu -pie --dynamic-linker=/lib/ld-musl-aarch64.so.1 -rpath=/lib -o target/ltp/root/at \
+            guests/musl/lib/Scrt1.o guests/musl/lib/crti.o at.o guests/musl/lib/ld-musl-aarch64.so.1 guests/musl/lib/crtn.o
+          for i in 1 2 3; do d=$(mktemp -d target/ltp/root/tmp/at.XXXX); target/debug/fwe --root target/ltp/root target/ltp/root/at /tmp/$(basename $d) tmpfs; done
 
   ltp:
     name: LTP system calls (macos-26)
