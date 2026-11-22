@@ -19,77 +19,14 @@ const HOST_PIPE_BUF: u64 = 512;
 /// identity (its ends' host handles) and the pid holding it (0: free).
 const SLOTS: usize = 256;
 const SLOT_WORDS: usize = 3;
+/// The table's size ([`crate::procstore::Area::PipeLocks`]).
+pub(crate) const BYTES: usize = SLOTS * SLOT_WORDS * 8;
 
 static TABLE: std::sync::OnceLock<Option<&'static [AtomicU64]>> = std::sync::OnceLock::new();
 
-/// The shared page, mapped on first use.
+/// The shared table, in memory every fwe process maps.
 fn table() -> Option<&'static [AtomicU64]> {
-    *TABLE.get_or_init(|| {
-        let mut path = crate::fs::shm::user_dir().ok()?;
-        path.extend_from_slice(b"/pipe-locks");
-        let c = std::ffi::CString::new(path).ok()?;
-        let len = SLOTS * SLOT_WORDS * 8;
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: plain host calls on the descriptor just opened; a file
-        // shorter than the table is grown with zeros.
-        let map = unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            if libc::fstat(fd, &mut st) == 0 && (st.st_size as usize) < len {
-                libc::ftruncate(fd, len as libc::off_t);
-            }
-            let m = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            libc::close(fd);
-            m
-        };
-        if map == libc::MAP_FAILED {
-            return None;
-        }
-        // SAFETY: the mapping is `len` bytes, page-aligned, shared and never
-        // unmapped; every access is atomic.
-        Some(unsafe { std::slice::from_raw_parts(map as *const AtomicU64, len / 8) })
-    })
-}
-
-/// The lock that makes a pipe's slot, held only while it is looked for
-/// or made (never while waiting for a pipe).
-struct MakeLock(i32);
-
-impl MakeLock {
-    fn take() -> Option<MakeLock> {
-        let mut path = crate::fs::shm::user_dir().ok()?;
-        path.extend_from_slice(b"/pipe-locks.lock");
-        let c = std::ffi::CString::new(path).ok()?;
-        // SAFETY: a NUL-terminated path; the lock goes with the descriptor.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: plain host call on the descriptor just opened.
-        crate::shared::lock_exclusive(fd);
-        Some(MakeLock(fd))
-    }
-}
-
-impl Drop for MakeLock {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor `take` opened; closing it lets go.
-        unsafe { libc::close(self.0) };
-    }
+    *TABLE.get_or_init(|| Some(crate::procstore::area(crate::procstore::Area::PipeLocks)))
 }
 
 /// Whether host process `pid`, a lock's holder, has ended.
@@ -109,7 +46,7 @@ fn lock(t: &'static [AtomicU64], (lo, hi): (u64, u64)) -> Result<Option<usize>, 
     // The pipe's slot, made if it has none: under the making lock, so two
     // writers of a pipe agree on one.
     let i = {
-        let _make = MakeLock::take();
+        let _make = crate::procstore::lock_area(crate::procstore::Area::PipeLocks);
         let found = (0..SLOTS).find(|&i| {
             let s = slot(i);
             s[0].load(Ordering::Acquire) == lo && s[1].load(Ordering::Acquire) == hi

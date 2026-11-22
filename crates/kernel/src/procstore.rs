@@ -180,9 +180,68 @@ const PAGES_AT: usize = (PAGE_TAGS_AT + PAGES * 16).div_ceil(PAGE_WORDS * 8) * P
 const NAMED_LOCK_AT: usize = PAGES_AT + PAGES * PAGE_WORDS * 8;
 const NAMED_NEXT_AT: usize = NAMED_LOCK_AT + 64;
 const NAMED_AT: usize = NAMED_NEXT_AT + 64;
-const TAKEN_AT: usize = NAMED_AT + named::SLOTS * size_of::<named::Named>();
+/// Tables other parts of fwe lay out ([`area`]), each on pages of its own,
+/// and each's lock.
+const AREA_LOCKS_AT: usize = NAMED_AT + named::SLOTS * size_of::<named::Named>();
+const AREAS_AT: usize = (AREA_LOCKS_AT + AREAS * 64).div_ceil(BLOCK) * BLOCK;
+const TAKEN_AT: usize = area_at(AREAS);
 const BLOCKS_AT: usize = (TAKEN_AT + BLOCKS / 8).div_ceil(BLOCK) * BLOCK;
 const SIZE: usize = BLOCKS_AT + BLOCKS * BLOCK;
+
+/// Tables of shared words that other parts of fwe lay out themselves, each
+/// a part of the store of its own size ([`area`]).
+#[derive(Clone, Copy)]
+pub enum Area {
+    /// Waiters on futexes in memory processes share ([`crate::sharedfutex`]).
+    Futexes = 0,
+    /// Programs run and files open for writing ([`crate::textbusy`]).
+    TextBusy = 1,
+    /// Locks of whole writes to pipes ([`crate::pipelock`]).
+    PipeLocks = 2,
+    /// Pipes watched by `EPOLLEXCLUSIVE` ([`crate::exclusive`]).
+    Exclusive = 3,
+}
+const AREAS: usize = 4;
+
+/// Each area's size in bytes.
+const AREA_BYTES: [usize; AREAS] =
+    [FUTEX_BYTES, crate::textbusy::BYTES, crate::pipelock::BYTES, crate::exclusive::BYTES];
+
+/// Shared futexes' table: the host's futexes on Linux need none.
+#[cfg(target_os = "macos")]
+const FUTEX_BYTES: usize = crate::sharedfutex::BYTES;
+#[cfg(not(target_os = "macos"))]
+const FUTEX_BYTES: usize = 0;
+
+/// Where area `i` starts: past those before it, each on pages of its own.
+const fn area_at(i: usize) -> usize {
+    let mut at = AREAS_AT;
+    let mut k = 0;
+    while k < i {
+        at += AREA_BYTES[k].div_ceil(BLOCK) * BLOCK;
+        k += 1;
+    }
+    at
+}
+
+/// Area `a`'s words, zeroes until written, for the process's life.
+pub fn area(a: Area) -> &'static [AtomicU64] {
+    let s = store();
+    // SAFETY: the area's bytes, inside the mapping, kept for the process's
+    // life; atomics only (every bit pattern valid).
+    unsafe {
+        std::slice::from_raw_parts(
+            (s.base + area_at(a as usize)) as *const AtomicU64,
+            AREA_BYTES[a as usize] / 8,
+        )
+    }
+}
+
+/// Hold area `a`'s lock while the result lives (taken over from a holder
+/// that died holding it).
+pub fn lock_area(a: Area) -> Held {
+    hold(store().at(AREA_LOCKS_AT + a as usize * 64))
+}
 
 /// The store, mapped once per process.
 struct Store {
