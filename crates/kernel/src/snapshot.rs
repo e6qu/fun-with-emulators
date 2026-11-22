@@ -22,6 +22,20 @@ impl Enc {
     pub fn new() -> Enc {
         Enc::default()
     }
+    /// One with room for `n` bytes before it grows.
+    pub fn with_capacity(n: usize) -> Enc {
+        Enc(Vec::with_capacity(n))
+    }
+    /// What `f` writes, as [`Enc::bytes`] would write it (its length,
+    /// then it), written in place.
+    pub fn section<R>(&mut self, f: impl FnOnce(&mut Enc) -> R) -> R {
+        let at = self.0.len();
+        self.u64(0);
+        let r = f(self);
+        let len = (self.0.len() - at - 8) as u64;
+        self.0[at..at + 8].copy_from_slice(&len.to_le_bytes());
+        r
+    }
     pub fn u8(&mut self, v: u8) {
         self.0.push(v);
     }

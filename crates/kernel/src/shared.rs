@@ -37,6 +37,11 @@ pub trait Data: Clone + Default + Send + Sync + 'static {
     fn changes(&mut self, _e: &mut Enc) -> bool {
         false
     }
+    /// Forget the changes made since the data was read or last asked
+    /// (they are what it is, not changes of it).
+    fn forget_changes(&mut self) {
+        self.changes(&mut Enc::new());
+    }
     /// Apply changes [`Data::changes`] encoded (keeping none of them as
     /// changes of its own).
     fn apply(&mut self, _d: &mut Dec) {}
@@ -222,12 +227,6 @@ struct Copy<T> {
     journal: Option<(u32, u32)>,
 }
 
-impl<T: Default> Copy<T> {
-    fn none() -> Copy<T> {
-        Copy { at: u64::MAX, data: Arc::new(T::default()), journal: None }
-    }
-}
-
 /// One record, as this process sees it.
 pub struct Record<T: Data> {
     /// The record's name.
@@ -235,8 +234,9 @@ pub struct Record<T: Data> {
     /// Its identity (a namespace's number in `/proc/self/ns`).
     id: u64,
     slot: Slot,
-    /// The data as last read.
-    cache: Mutex<Copy<T>>,
+    /// The data as last read (none while a change is being made, or before
+    /// it is first read).
+    cache: Mutex<Option<Copy<T>>>,
 }
 
 impl<T: Data> std::fmt::Debug for Record<T> {
@@ -276,33 +276,33 @@ impl<T: Data> Record<T> {
             return Err(errno::ENOENT);
         }
         let r = Record::with(dir.to_vec(), id, slot);
-        let copy = r.read_current(&Copy::none()).map_err(|_| errno::ENOENT)?;
-        *r.cache.lock().unwrap_or_else(|e| e.into_inner()) = copy;
+        let copy = r.read_current(None).map_err(|_| errno::ENOENT)?;
+        *r.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
         Ok(r)
     }
 
     fn with(dir: Vec<u8>, id: u64, slot: Slot) -> Record<T> {
         let id = if id != 0 { id } else { slot.id() };
-        Record { dir, id, slot, cache: Mutex::new(Copy::none()) }
+        Record { dir, id, slot, cache: Mutex::new(None) }
     }
 
     fn open_or_make(dir: Vec<u8>, id: u64, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
         let r = Record::with(dir.clone(), id, named::find_or_make(&dir));
         r.with_lock(|held| {
             if r.slot.has_data() {
-                let copy = r.read_current(&Copy::none())?;
-                *r.cache.lock().unwrap_or_else(|e| e.into_inner()) = copy;
+                let copy = r.read_current(None)?;
+                *r.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
             } else {
                 let at = r.generation() + 1;
                 let mut t = initial();
                 // (What it holds now is not a change of it.)
-                t.changes(&mut Enc::new());
+                t.forget_changes();
                 let mut enc = Enc::new();
                 t.encode(&mut enc);
                 let epoch = r.slot.write_whole(held, at, &enc.into_bytes());
                 r.slot.advance(held, at);
                 *r.cache.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Copy { at, data: Arc::new(t), journal: Some((epoch, 0)) };
+                    Some(Copy { at, data: Arc::new(t), journal: Some((epoch, 0)) });
             }
             Ok(())
         })?;
@@ -342,13 +342,13 @@ impl<T: Data> Record<T> {
         (out, end)
     }
 
-    /// The data as it is now: `copy` brought up to date from the journal
-    /// when it holds every change since, else read whole. What a change
-    /// made meanwhile tore is read again.
-    fn read_current(&self, copy: &Copy<T>) -> Result<Copy<T>, i32> {
+    /// The data as it is now: `copy` (if any) brought up to date from the
+    /// journal when it holds every change since, else read whole. What a
+    /// change made meanwhile tore is read again.
+    fn read_current(&self, copy: Option<&Copy<T>>) -> Result<Copy<T>, i32> {
         let mut last = Err(errno::EIO);
         for _ in 0..100 {
-            let from = if copy.at == u64::MAX { None } else { copy.journal };
+            let from = copy.and_then(|c| c.journal);
             let Some(read) = self.slot.read(from) else {
                 std::thread::yield_now();
                 continue;
@@ -364,7 +364,14 @@ impl<T: Data> Record<T> {
                     }
                     (at, Arc::new(t))
                 }
-                None => (copy.at, copy.data.clone()),
+                // (Read whole when there is no copy.)
+                None => match copy {
+                    Some(c) => (c.at, c.data.clone()),
+                    None => {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                },
             };
             let (changes, end) =
                 Self::changes_in(&read.journal, read.start, base_at, read.generation);
@@ -406,9 +413,11 @@ impl<T: Data> Record<T> {
     /// it is current (no other process changed it since), else read.
     fn take_locked(&self) -> Result<(T, Option<(u32, u32)>), i32> {
         let now = self.generation();
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let held = std::mem::replace(&mut *cache, Copy::none());
-        let copy = if held.at == now { held } else { self.read_current(&held)? };
+        let held = self.cache.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let copy = match held {
+            Some(c) if c.at == now => c,
+            held => self.read_current(held.as_ref())?,
+        };
         Ok((Arc::try_unwrap(copy.data).unwrap_or_else(|a| (*a).clone()), copy.journal))
     }
 
@@ -417,11 +426,9 @@ impl<T: Data> Record<T> {
     /// is written whole once the journal outgrows it.
     fn put_locked(&self, held: &named::Held, mut t: T) {
         let at = self.generation() + 1;
-        let mut changes = Enc::new();
-        let kept = t.changes(&mut changes);
-        let mut entry = Enc::new();
+        let mut entry = Enc::with_capacity(256);
         entry.u64(at);
-        entry.bytes(&changes.into_bytes());
+        let kept = entry.section(|e| t.changes(e));
         let entry = entry.into_bytes();
         let (whole, journal) = self.slot.sizes();
         let journal = if kept && whole > 0 && journal + entry.len() <= whole.max(JOURNAL_MIN) {
@@ -433,15 +440,15 @@ impl<T: Data> Record<T> {
         };
         self.slot.advance(held, at);
         *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            Copy { at, data: Arc::new(t), journal: Some(journal) };
+            Some(Copy { at, data: Arc::new(t), journal: Some(journal) });
     }
 
     /// Under the lock: `t`, which `f` left as it was, is the cached copy
     /// again.
     fn restore_locked(&self, mut t: T, journal: Option<(u32, u32)>) {
-        t.changes(&mut Enc::new());
+        t.forget_changes();
         *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            Copy { at: self.generation(), data: Arc::new(t), journal };
+            Some(Copy { at: self.generation(), data: Arc::new(t), journal });
     }
 
     /// Run `f` holding the record's lock.
@@ -483,12 +490,20 @@ impl<T: Data> Record<T> {
     pub fn get(&self) -> Arc<T> {
         let now = self.generation();
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.at != now
-            && let Ok(fresh) = self.read_current(&cache)
+        if let Some(c) = &*cache
+            && c.at == now
         {
-            *cache = fresh;
+            return c.data.clone();
         }
-        cache.data.clone()
+        match self.read_current(cache.as_ref()) {
+            Ok(fresh) => {
+                let data = fresh.data.clone();
+                *cache = Some(fresh);
+                data
+            }
+            // Torn by changes each time it was read: the copy as it was.
+            Err(_) => cache.as_ref().map_or_else(|| Arc::new(T::default()), |c| c.data.clone()),
+        }
     }
 
     /// Change the data with `f`, for every process.

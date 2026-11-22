@@ -228,9 +228,8 @@ impl Record {
         e.bytes(&self.exe);
         e.u64(self.exe_id.0);
         e.u64(self.exe_id.1);
-        let all: Vec<_> = self.areas.iter().collect();
-        e.u64(all.len() as u64);
-        for p in all {
+        e.u64(self.areas.len() as u64);
+        for p in self.areas.iter() {
             let a = p.value;
             for v in [p.start, p.end, a.prot, a.object.dev, a.object.ino, a.object.offset] {
                 e.u64(v);
@@ -788,11 +787,22 @@ pub(crate) static OUTBOX: Mutex<()> = Mutex::new(());
 
 /// This process's mappings encoded as [`publish`] publishes them.
 pub fn snapshot() -> Vec<u8> {
+    let mut e = crate::snapshot::Enc::with_capacity(LAST_SIZE.load(Relaxed));
+    snapshot_into(&mut e);
+    let bytes = e.into_bytes();
+    LAST_SIZE.store(bytes.len(), Relaxed);
+    bytes
+}
+
+/// The size of the mappings last encoded: room to encode them again in.
+static LAST_SIZE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// [`snapshot`], written into `e`.
+fn snapshot_into(e: &mut crate::snapshot::Enc) {
     // The host's view first: its lock comes before the record's.
     let tracked = crate::mm::tracked();
     let translations = crate::uaccess::translations();
-    let mut e = crate::snapshot::Enc::new();
-    record().encode(&mut e);
+    record().encode(e);
     e.u64(page_size());
     e.u64(tracked.len() as u64);
     for (start, len) in tracked {
@@ -805,7 +815,6 @@ pub fn snapshot() -> Vec<u8> {
             e.u64(v);
         }
     }
-    e.into_bytes()
 }
 
 /// In a fork child: its mappings, which are its parent's, for the record
@@ -870,8 +879,11 @@ pub fn publish_now() {
     // process's of the same pid that was killed before it could take its
     // own away.
     let me = crate::host::pid();
-    let mut body = crate::procreg::start_time(me).unwrap_or(0).to_le_bytes().to_vec();
-    body.extend(snapshot());
+    let mut e = crate::snapshot::Enc::with_capacity(8 + LAST_SIZE.load(Relaxed));
+    e.u64(crate::procreg::start_time(me).unwrap_or(0));
+    snapshot_into(&mut e);
+    let body = e.into_bytes();
+    LAST_SIZE.store(body.len(), Relaxed);
     let _turn = OUTBOX.lock().unwrap_or_else(|e| e.into_inner());
     if ENDED.load(std::sync::atomic::Ordering::SeqCst) {
         return;

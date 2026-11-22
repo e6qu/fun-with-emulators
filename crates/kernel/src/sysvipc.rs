@@ -219,15 +219,44 @@ pub struct Ipc {
     index: Lazy,
 }
 
+/// A hash of an index's small integer keys: their bits mixed by a
+/// multiply (no keyed hash: a guest that picks colliding keys slows only
+/// its own namespace's lookups).
+#[derive(Default)]
+struct IntHash(u64);
+
+impl std::hash::Hasher for IntHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(u64::from(v));
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.write_u64(v as u32 as u64);
+    }
+    fn write_u64(&mut self, v: u64) {
+        let h = (self.0.rotate_left(5) ^ v).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
+type IntMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<IntHash>>;
+
 /// The objects by key, the slots in use, and those that hold processes.
 #[derive(Clone, Debug, Default)]
 struct Index {
     /// (kind, key) to id, of objects with a key not marked for removal.
-    by_key: HashMap<(u8, i32), i32>,
+    by_key: IntMap<(u8, i32), i32>,
     /// (kind, id) to the key it is found by above.
-    key_of: HashMap<(u8, i32), i32>,
+    key_of: IntMap<(u8, i32), i32>,
     /// (kind, slot) to the id in it.
-    slots: HashMap<(u8, i32), i32>,
+    slots: IntMap<(u8, i32), i32>,
     /// Each kind's count of slots in use, and the lowest that may be free.
     used: [(usize, i32); 3],
     /// Objects that name processes (attachments, waiters, undo
@@ -245,16 +274,39 @@ impl Clone for Lazy {
     }
 }
 
+/// Whether `o` names processes (attachments, waiters, undo adjustments)
+/// or is marked for removal: what [`Ipc::reap`] looks at.
+fn holds(o: &Obj) -> bool {
+    o.removed
+        || match &o.body {
+            Body::Shm(s) => !s.attached.is_empty(),
+            Body::Sem(s) => !s.waiting.is_empty() || !s.undo.is_empty(),
+            Body::Msg(_) => false,
+        }
+}
+
 impl Index {
     /// Object `(kind, id)` is now `o` (or gone).
     fn reindex(&mut self, kind: u8, id: i32, o: Option<&Obj>) {
+        let slot = (kind, id % IPCMNI);
+        // An object whose key, slot and holding are as indexed (its values
+        // changed): nothing to do.
+        if let Some(o) = o {
+            let key = (o.key != IPC_PRIVATE && !o.removed).then_some(o.key);
+            if self.slots.get(&slot) == Some(&id)
+                && self.key_of.get(&(kind, id)).copied() == key
+                && key.is_none_or(|k| self.by_key.get(&(kind, k)) == Some(&id))
+                && self.holders.contains(&(kind, id)) == holds(o)
+            {
+                return;
+            }
+        }
         if let Some(key) = self.key_of.remove(&(kind, id))
             && self.by_key.get(&(kind, key)) == Some(&id)
         {
             self.by_key.remove(&(kind, key));
         }
         self.holders.remove(&(kind, id));
-        let slot = (kind, id % IPCMNI);
         let used = &mut self.used[kind as usize % 3];
         match o {
             Some(o) => {
@@ -265,13 +317,7 @@ impl Index {
                     self.by_key.insert((kind, o.key), id);
                     self.key_of.insert((kind, id), o.key);
                 }
-                let holds = o.removed
-                    || match &o.body {
-                        Body::Shm(s) => !s.attached.is_empty(),
-                        Body::Sem(s) => !s.waiting.is_empty() || !s.undo.is_empty(),
-                        Body::Msg(_) => false,
-                    };
-                if holds {
+                if holds(o) {
                     self.holders.insert((kind, id));
                 }
             }
@@ -550,35 +596,42 @@ impl Data for Ipc {
     /// the rest whole.
     fn changes(&mut self, e: &mut Enc) -> bool {
         self.put_rest(e);
-        let seqs = self.seqs.take_changed();
-        e.u64(seqs.len() as u64);
-        for (k, slot) in seqs {
-            e.u8(k);
-            e.i32(slot);
-            match self.seqs.get(&(k, slot)) {
-                Some(&seq) => {
-                    e.bool(true);
-                    e.u32(seq as u32);
-                }
-                None => e.bool(false),
-            }
-        }
-        let objs = self.objs.take_changed();
-        e.u64(objs.len() as u64);
-        for (k, id) in objs {
-            e.u8(k);
-            match self.objs.get(&(k, id)) {
-                Some(o) => {
-                    e.bool(true);
-                    put_obj(e, id, o);
-                }
-                None => {
-                    e.bool(false);
-                    e.i32(id);
+        self.seqs.take_changed(|keys, seqs| {
+            e.u64(keys.len() as u64);
+            for &(k, slot) in keys {
+                e.u8(k);
+                e.i32(slot);
+                match seqs.get(&(k, slot)) {
+                    Some(&seq) => {
+                        e.bool(true);
+                        e.u32(seq as u32);
+                    }
+                    None => e.bool(false),
                 }
             }
-        }
+        });
+        self.objs.take_changed(|keys, objs| {
+            e.u64(keys.len() as u64);
+            for &(k, id) in keys {
+                e.u8(k);
+                match objs.get(&(k, id)) {
+                    Some(o) => {
+                        e.bool(true);
+                        put_obj(e, id, o);
+                    }
+                    None => {
+                        e.bool(false);
+                        e.i32(id);
+                    }
+                }
+            }
+        });
         true
+    }
+
+    fn forget_changes(&mut self) {
+        self.seqs.forget_changed();
+        self.objs.forget_changed();
     }
 
     fn apply(&mut self, d: &mut Dec) {
@@ -608,15 +661,16 @@ impl Data for Ipc {
 #[derive(Debug)]
 pub struct Tracked<K, V> {
     map: BTreeMap<K, V>,
-    changed: BTreeSet<K>,
+    /// The keys changed, each perhaps more than once.
+    changed: Vec<K>,
     /// The keys set since an index over the map last looked
-    /// ([`Tracked::take_unindexed`]).
-    unindexed: Mutex<BTreeSet<K>>,
+    /// ([`Tracked::each_unindexed`]), each perhaps more than once.
+    unindexed: Mutex<Vec<K>>,
 }
 
 impl<K, V> Default for Tracked<K, V> {
     fn default() -> Self {
-        Tracked { map: BTreeMap::new(), changed: BTreeSet::new(), unindexed: Mutex::default() }
+        Tracked { map: BTreeMap::new(), changed: Vec::new(), unindexed: Mutex::default() }
     }
 }
 
@@ -630,11 +684,22 @@ impl<K: Clone, V: Clone> Clone for Tracked<K, V> {
     }
 }
 
+/// Add `k` to `keys`, which holds each key at most twice over the map's
+/// count before it is cut back to one of each.
+fn note<K: Ord + Clone>(keys: &mut Vec<K>, k: &K, count: usize) {
+    keys.push(k.clone());
+    if keys.len() > 2 * count + 16 {
+        keys.sort_unstable();
+        keys.dedup();
+    }
+}
+
 impl<K: Ord + Clone, V> Tracked<K, V> {
     /// `k` changed: for the record's change, and for indexes.
     fn mark(&mut self, k: &K) {
-        self.changed.insert(k.clone());
-        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).insert(k.clone());
+        let n = self.map.len();
+        note(&mut self.changed, k, n);
+        note(self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()), k, n);
     }
     pub fn get(&self, k: &K) -> Option<&V> {
         self.map.get(k)
@@ -682,30 +747,45 @@ impl<K: Ord + Clone, V> Tracked<K, V> {
     }
     /// Run `f` on each entry: those it says it changed count as changed.
     pub fn each_mut(&mut self, mut f: impl FnMut(&K, &mut V) -> bool) {
+        let n = self.map.len();
         let unindexed = self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner());
         for (k, v) in self.map.iter_mut() {
             if f(k, v) {
-                self.changed.insert(k.clone());
-                unindexed.insert(k.clone());
+                note(&mut self.changed, k, n);
+                note(unindexed, k, n);
             }
         }
     }
     /// Set `k` to `v` (or none) without counting it as changed: for data
     /// read, or changes applied.
     pub fn set(&mut self, k: K, v: Option<V>) {
-        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).insert(k.clone());
+        let n = self.map.len();
+        note(self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()), &k, n);
         match v {
             Some(v) => self.map.insert(k, v),
             None => self.map.remove(&k),
         };
     }
-    /// The keys changed since last asked.
-    pub fn take_changed(&mut self) -> Vec<K> {
-        std::mem::take(&mut self.changed).into_iter().collect()
+    /// The keys changed since last asked, once each, in order, with what
+    /// each holds now (none: removed), given to `f`; then forgotten.
+    pub fn take_changed(&mut self, f: impl FnOnce(&[K], &BTreeMap<K, V>)) {
+        self.changed.sort_unstable();
+        self.changed.dedup();
+        f(&self.changed, &self.map);
+        self.changed.clear();
     }
-    /// The keys set since an index last asked.
-    fn take_unindexed(&self) -> BTreeSet<K> {
-        std::mem::take(&mut *self.unindexed.lock().unwrap_or_else(|e| e.into_inner()))
+    /// Forget the keys changed.
+    fn forget_changed(&mut self) {
+        self.changed.clear();
+    }
+    /// Each key set since an index last looked, with what it holds now,
+    /// given to `f`; then forgotten.
+    fn each_unindexed(&self, mut f: impl FnMut(&K, Option<&V>)) {
+        let mut keys = self.unindexed.lock().unwrap_or_else(|e| e.into_inner());
+        for k in keys.iter() {
+            f(k, self.map.get(k));
+        }
+        keys.clear();
     }
 }
 
@@ -787,8 +867,29 @@ pub fn current() -> Option<Arc<Record<Ipc>>> {
 /// the host's X server among them, maps by its descriptor). (macOS's names
 /// are 31 bytes at most.)
 pub fn segment_name(nonce: u64) -> std::ffi::CString {
-    std::ffi::CString::new(format!("/fwe{}s{nonce:x}", crate::host::euid()))
-        .expect("a name without NUL")
+    // `/fwe<euid>s<nonce in hex>`, written without the formatter (a
+    // segment's attachment and removal each name it).
+    let mut name = Vec::with_capacity(32);
+    name.extend_from_slice(b"/fwe");
+    let euid = crate::host::euid();
+    let mut digits = [0u8; 10];
+    let mut n = 0;
+    let mut v = euid;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    name.extend(digits[..n].iter().rev());
+    name.push(b's');
+    let hex = 16 - (nonce.leading_zeros() as usize / 4).min(15);
+    for i in (0..hex).rev() {
+        name.push(b"0123456789abcdef"[(nonce >> (i * 4)) as usize & 15]);
+    }
+    std::ffi::CString::new(name).expect("a name without NUL")
 }
 
 /// The device a segment's mappings are of (Linux's shared memory
@@ -800,9 +901,15 @@ pub const SEGMENT_DEV: u64 = crate::devnodes::makedev(0, 1);
 /// made under its namespace's lock ([`Record::update_maybe`]), so that two
 /// processes attaching it at once agree on one.
 pub fn segment_of(r: &Record<Ipc>, id: i32, read_only: bool) -> Result<std::os::fd::OwnedFd, i32> {
-    let nonce = match r.get().objs.get(&(Kind::Shm as u8, id)) {
-        Some(Obj { body: Body::Shm(s), .. }) if s.made => s.nonce,
-        Some(Obj { body: Body::Shm(_), .. }) => {
+    // (Read apart, the copy let go before the update below, which would
+    // otherwise find it shared and copy it whole.)
+    let made = match r.get().objs.get(&(Kind::Shm as u8, id)) {
+        Some(Obj { body: Body::Shm(s), .. }) => Some(s.made.then_some(s.nonce)),
+        _ => None,
+    };
+    let nonce = match made {
+        Some(Some(nonce)) => nonce,
+        Some(None) => {
             return r.update_maybe(|t| match t.objs.get_mut(&(Kind::Shm as u8, id)) {
                 Some(Obj { body: Body::Shm(s), .. }) if s.made => {
                     Ok((open_segment(s.nonce, read_only)?, false))
@@ -815,7 +922,7 @@ pub fn segment_of(r: &Record<Ipc>, id: i32, read_only: bool) -> Result<std::os::
                 _ => Err(errno::EIDRM),
             });
         }
-        _ => return Err(errno::EIDRM),
+        None => return Err(errno::EIDRM),
     };
     open_segment(nonce, read_only).map_err(|e| if e == errno::ENOENT { errno::EIDRM } else { e })
 }
@@ -947,9 +1054,7 @@ impl Ipc {
     /// last looked.
     fn index(&self) -> std::sync::MutexGuard<'_, Index> {
         let mut idx = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
-        for (kind, id) in self.objs.take_unindexed() {
-            idx.reindex(kind, id, self.objs.get(&(kind, id)));
-        }
+        self.objs.each_unindexed(|&(kind, id), o| idx.reindex(kind, id, o));
         idx
     }
 
@@ -1330,6 +1435,15 @@ pub fn proc_listing(r: &Record<Ipc>, kind: Kind) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn segment_names_are_the_euid_and_the_nonce_in_hex() {
+        let euid = crate::host::euid();
+        for nonce in [0u64, 1, 0xa, 0x1234_abcd, u64::MAX] {
+            let want = format!("/fwe{euid}s{nonce:x}");
+            assert_eq!(segment_name(nonce).to_bytes(), want.as_bytes());
+        }
+    }
 
     /// Changes reach another process's copy through the journal, and the
     /// data written whole when the journal outgrows it, in order.
