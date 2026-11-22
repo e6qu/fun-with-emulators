@@ -136,11 +136,9 @@ fn copy_out(object: u64, off: u64, to: u64, n: u64) -> Result<(), i32> {
 
 /// Copy `n` bytes of the guest's memory at host address `from` to `off` of
 /// `object`.
-fn copy_in(object: u64, off: u64, from: u64, n: u64) -> Result<(), i32> {
-    data::with_bytes(object, off, n, |p| {
-        // SAFETY: `n` bytes of the object's mapping, kept for the call.
-        uaccess::read_host(from, unsafe { std::slice::from_raw_parts_mut(p, n as usize) })
-    })?
+fn copy_in(m: &data::Mapped, off: u64, from: u64, n: u64) -> Result<(), i32> {
+    // SAFETY: `n` bytes of the object's mapping, which `m` keeps.
+    uaccess::read_host(from, unsafe { std::slice::from_raw_parts_mut(m.at(off), n as usize) })
 }
 
 /// The read and write calls (`read`, `pwrite64`, `readv`, `pwritev2`, ...)
@@ -208,7 +206,7 @@ fn transfer(
     };
     let fs = file.fs()?;
     let mut t = fs.lock()?;
-    let (done, end, object) = if write {
+    let (done, end, object, mapped) = if write {
         write_locked(&mut t, file.ino, start, iov, total, append)?
     } else {
         let (object, n) = t.readable(file.ino, start, total)?;
@@ -229,11 +227,11 @@ fn transfer(
             }
             done += k;
         }
-        (done, start + done, object)
+        (done, start + done, object, None)
     };
     drop(t);
     if object != 0 {
-        desc::made_data(file, object);
+        desc::made_data(file, object, mapped);
     }
     if pos.is_none() {
         set_position(fd, end);
@@ -251,7 +249,7 @@ fn write_locked(
     iov: &[libc::iovec],
     total: u64,
     append: bool,
-) -> Result<(u64, u64, u64), i32> {
+) -> Result<(u64, u64, u64, Option<data::Mapped>), i32> {
     unchangeable(t, ino, append)?;
     let seals = t.seals(ino)?;
     if seals & WRITE_SEALS != 0 {
@@ -268,16 +266,17 @@ fn write_locked(
         }
     }
     if total == 0 {
-        return Ok((0, start, t.data(ino)?));
+        return Ok((0, start, t.data(ino)?, None));
     }
     let Writable { object, off, fits } = t.writable(ino, start, total, false)?;
+    let m = data::mapped(object, off + fits)?;
     let mut done = 0;
     for v in iov.iter().filter(|v| v.iov_len > 0) {
         let k = (v.iov_len as u64).min(fits - done);
         if k == 0 {
             break;
         }
-        if let Err(e) = copy_in(object, off + done, v.iov_base as u64, k) {
+        if let Err(e) = copy_in(&m, off + done, v.iov_base as u64, k) {
             if done == 0 {
                 return Err(e);
             }
@@ -288,7 +287,7 @@ fn write_locked(
     if done > 0 {
         t.wrote(ino, off + done)?;
     }
-    Ok((done, off + done, object))
+    Ok((done, off + done, object, Some(m)))
 }
 
 /// `lseek` on a descriptor of the store (`None` for another).
@@ -507,7 +506,7 @@ pub fn map_source(
             o => o,
         };
         drop(t);
-        desc::made_data(file, object);
+        desc::made_data(file, object, None);
         let host = data::open(object, !(shared && writes))?;
         Ok((host, shared && sealed))
     })())

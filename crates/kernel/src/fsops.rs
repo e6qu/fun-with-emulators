@@ -2346,7 +2346,8 @@ impl<P: Platform> Kernel<P> {
 
     /// `unlinkat` of guest path `path`.
     pub(crate) fn unlink_path(&mut self, dirfd: u64, path: Vec<u8>, flags: u64) -> i64 {
-        if let Ok(r) = self.fs().resolve(dirfd as i32, &path, false)
+        let found = self.fs().resolve_entry(dirfd as i32, &path);
+        if let Ok(r) = &found
             && r.fstype == crate::mounts::FsType::Cgroup2
         {
             // A cgroup goes with its files when empty; its files stay.
@@ -2361,7 +2362,7 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => err(e),
             };
         }
-        let r = match self.resolve_p(dirfd, &path, false, false, Change::Remove) {
+        let r = match found.and_then(|r| Self::changeable(r, false, Change::Remove)) {
             Ok(r) => r,
             Err(e) => return err(e),
         };
@@ -4375,10 +4376,16 @@ impl<P: Platform> Kernel<P> {
     ) -> Result<Resolved, i32> {
         // A name made or removed is never followed; a trailing slash on it
         // is the caller's to judge ([`crate::fs::Fs::resolve_entry`]).
-        let mut r = match how {
+        let r = match how {
             Change::Create | Change::Remove => self.fs().resolve_entry(dirfd as i32, path)?,
             Change::Modify => self.fs().resolve(dirfd as i32, path, follow)?,
         };
+        Self::changeable(r, mount_root_ok, how)
+    }
+
+    /// What [`Self::resolve_p`] resolved, checked and made ready for
+    /// change `how`.
+    fn changeable(mut r: Resolved, mount_root_ok: bool, how: Change) -> Result<Resolved, i32> {
         // A mount's root is busy whatever the mount: the change is the
         // directory's above it (a read-only mount's root too).
         if r.mount_root && !mount_root_ok {

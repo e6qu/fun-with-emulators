@@ -2376,11 +2376,13 @@ enum Step {
 
 /// An empty directory nothing can be made in: what a name an overlay
 /// does not show is resolved in, so that it is found nowhere, and a call
-/// that would make it there without [`Resolved::prepare`] fails.
+/// that would make it there without [`Resolved::prepare`] fails; and what
+/// a name in fwe's store stands in (its own directory is the store's).
+/// Opened once, out of the guest's reach, and handed out as a duplicate.
 fn empty_dir() -> Result<OwnedFd, i32> {
-    static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let path = match PATH.get() {
-        Some(p) => p.clone(),
+    static FD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let fd = match FD.get() {
+        Some(&fd) => fd,
         None => {
             let p = mounts::join(&shm::user_dir()?, b"empty");
             let c = cstr(&p)?;
@@ -2389,10 +2391,12 @@ fn empty_dir() -> Result<OwnedFd, i32> {
                 libc::mkdir(c.as_ptr(), 0o500);
                 libc::chmod(c.as_ptr(), 0o500);
             }
-            PATH.get_or_init(|| p).clone()
+            let d = open_host_dir(&p)?;
+            let held = crate::fdtable::dup_reserved(d.as_raw_fd())?;
+            *FD.get_or_init(|| held)
         }
     };
-    open_host_dir(&path)
+    dup_cloexec(fd)
 }
 
 /// Whether host metadata `st` is of [`empty_dir`], which nothing may
@@ -4229,11 +4233,12 @@ pub(crate) mod shm {
 
     /// The filesystem of fwe's store for the root at `root_host`, made on
     /// first use: what the initial namespace mounts at `/dev/shm`, every
-    /// fwe process on that root sharing it. World-writable and sticky, as
-    /// Linux's.
+    /// fwe process on that root sharing it. World-writable and sticky, of
+    /// a tmpfs's default size, as Linux's.
     pub(crate) fn store(root_host: &[u8]) -> Result<u64, i32> {
         let id = crate::shared::hash(&[b"shm:", root_host].concat()) & !(0xff << 56) | 0x73 << 56;
-        crate::filestore::fs::make_as(id, 0o1777, 0, 0, 0, 0)?;
+        let (size, inodes) = (crate::tmpfs::default_size(), crate::tmpfs::default_inodes());
+        crate::filestore::fs::make_as(id, 0o1777, 0, 0, size, inodes)?;
         Ok(id)
     }
 }

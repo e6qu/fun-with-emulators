@@ -299,6 +299,7 @@ impl<P: Platform> Kernel<P> {
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
     fn dispatch_counted(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        let _call = crate::fdmarks::Call::begin();
         // Limits another process set for this one take effect now.
         if crate::procreg::take_limits_left() {
             self.take_pending_limits();

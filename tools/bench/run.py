@@ -163,6 +163,9 @@ MICRO = [
     ("System V semaphore up+down", ["ipc", "sem", "10000"], "ns"),
     ("System V message send+receive", ["ipc", "msg", "10000"], "ns"),
     ("System V segment made and removed", ["ipc", "shm", "1000"], "ns"),
+    # A small file's life on the disk (fwe's /tmp is the host's): made,
+    # 4 KiB written and read back, closed and removed.
+    ("file's life in /tmp", ["mem", "life", "/tmp", "2000"], "us"),
 ]
 
 # Micro-benchmarks of what macOS has no counterpart of: under fwe and on
@@ -173,6 +176,14 @@ MICRO_LINUX = [
     ("shared futex wake", ["ipc", "futex", "200000"], "ns"),
     # A synthetic file (/proc/self/stat) opened, read whole and closed.
     ("/proc file open+read+close", ["file", "proc", "20000"], "ns"),
+    # Files in memory (fwe's store; Linux's tmpfs), beside the same on the
+    # disk above: a small file's life in /dev/shm, a POSIX shared memory
+    # object's (made, sized to 64 KiB, mapped, written, removed: as
+    # `shm_open` makes one there), and a memfd's (made, 4 KiB written and
+    # read back, closed).
+    ("file's life in /dev/shm", ["mem", "life", "/dev/shm", "3000"], "us"),
+    ("shared memory object's life in /dev/shm", ["mem", "segment", "/dev/shm", "3000"], "us"),
+    ("memfd's life", ["mem", "memfd", "-", "3000"], "us"),
 ]
 
 # What only macOS is measured at: the host's own cost of what fwe does for

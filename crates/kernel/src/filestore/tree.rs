@@ -720,11 +720,12 @@ impl Tx<'_> {
     /// Inode `ino` goes if it has no names and no holders.
     fn drop_if_gone(&mut self, ino: Ino) -> Result<Gone, i32> {
         if self.get_u32(ino, I_NLINK)? != 0 || self.holders(ino)? != 0 {
-            return Ok(Gone { ino, data: None });
+            return Ok(Gone { ino, data: None, node: false });
         }
+        let node = matches!(self.get_u32(ino, I_MODE)? & S_IFMT, S_IFIFO | S_IFSOCK);
         let data = self.data(ino)?;
         self.free_inode(ino)?;
-        Ok(Gone { ino, data: Some(data) })
+        Ok(Gone { ino, data: Some(data), node })
     }
 
     /// Rename `oname` in `odir` to `nname` in `ndir`, as `renameat2`
@@ -1598,6 +1599,9 @@ pub struct Gone {
     pub ino: Ino,
     /// The inode went: its data object (0: it had none).
     pub data: Option<u64>,
+    /// It went, and was a FIFO or a socket: the host's node behind it goes
+    /// too ([`crate::storenodes`]).
+    pub node: bool,
 }
 
 #[cfg(all(test, target_os = "macos"))]
@@ -1643,7 +1647,7 @@ mod tests {
         let gone = t.unlink(root, b"f", false).unwrap();
         assert_eq!(gone.data, None);
         let gone = t.unlink(d, b"g", false).unwrap();
-        assert_eq!(gone, Gone { ino: f, data: Some(0) });
+        assert_eq!(gone, Gone { ino: f, data: Some(0), node: false });
         assert_eq!(t.stat(f), Err(errno::ENOENT));
         // A slot used again is another inode number.
         let f2 = t.create(root, b"f2", &file(0o600)).unwrap();

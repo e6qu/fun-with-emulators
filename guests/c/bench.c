@@ -47,8 +47,21 @@
  *                        removed), and on Linux `eventfd` (written and
  *                        read) and `futex` (a process-shared wake, none
  *                        waiting, on memory mapped shared)
+ *   bench mem WHAT DIR N N rounds of a file's life, microseconds each:
+ *                        `life` (a file made in DIR, 4 KiB written and
+ *                        read back, closed and removed), `segment` (a file
+ *                        made in DIR, sized to 64 KiB, mapped shared,
+ *                        written, unmapped, closed and removed: a POSIX
+ *                        shared memory object's life, as `shm_open` makes
+ *                        it in /dev/shm), and on Linux `tmpfile` (a file
+ *                        with no name made in DIR, `O_TMPFILE`, 4 KiB
+ *                        written and read back, closed) and `memfd` (the
+ *                        same of a memfd; DIR unused)
  *   bench exit           returns at once (for startup time)
  */
+#ifdef __linux__
+#define _GNU_SOURCE /* memfd_create, O_TMPFILE */
+#endif
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -551,6 +564,45 @@ static double ipc(const char *op, long n) {
     return -1;
 }
 
+/* `bench mem WHAT DIR N`: microseconds a round, or -1 if WHAT failed or
+   is not offered here. */
+static double mem(const char *what, const char *dir, long n) {
+    static char page[4096];
+    char path[256];
+    snprintf(path, sizeof path, "%s/fwe-bench-%d", dir, (int)getpid());
+    double start = now_ns();
+    for (long i = 0; i < n; i++) {
+        int fd;
+        if (strcmp(what, "life") == 0 || strcmp(what, "segment") == 0) {
+            fd = open(path, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+#ifdef __linux__
+        } else if (strcmp(what, "tmpfile") == 0) {
+            fd = open(dir, O_RDWR | O_TMPFILE | O_CLOEXEC, 0600);
+        } else if (strcmp(what, "memfd") == 0) {
+            fd = memfd_create("fwe-bench", MFD_CLOEXEC);
+#endif
+        } else {
+            return -1;
+        }
+        if (fd < 0) return -1;
+        if (strcmp(what, "segment") == 0) {
+            if (ftruncate(fd, 65536) != 0) return -1;
+            volatile char *p = mmap(NULL, 65536, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+            if (p == MAP_FAILED) return -1;
+            p[0] = (char)i;
+            munmap((void *)p, 65536);
+        } else {
+            page[0] = (char)i;
+            if (write(fd, page, sizeof page) != (long)sizeof page) return -1;
+            if (pread(fd, page, sizeof page, 0) != (long)sizeof page) return -1;
+        }
+        close(fd);
+        if ((strcmp(what, "life") == 0 || strcmp(what, "segment") == 0) && unlink(path) != 0)
+            return -1;
+    }
+    return (now_ns() - start) / n / 1e3;
+}
+
 /* A fault's handler: on past the faulting load. */
 static void step_past(int sig, siginfo_t *si, void *ctx) {
     (void)sig;
@@ -694,6 +746,13 @@ int main(int argc, char **argv) {
         printf("%.1f\n", (now_ns() - start) / n);
         close(fd);
         unlink(path);
+    } else if (strcmp(argv[1], "mem") == 0) {
+        double each = mem(argv[2], argc > 3 ? argv[3] : "/tmp", argc > 4 ? atol(argv[4]) : 1000);
+        if (each < 0) {
+            fprintf(stderr, "mem %s: failed, or not offered here\n", argv[2]);
+            return 1;
+        }
+        printf("%.2f\n", each);
     } else if (strcmp(argv[1], "ipc") == 0) {
         double each = ipc(argv[2], argc > 3 ? atol(argv[3]) : 1000);
         if (each < 0) {

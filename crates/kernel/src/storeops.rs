@@ -549,6 +549,8 @@ impl<P: Platform> Kernel<P> {
             Ok(gone) => {
                 if let Some(o) = gone.data {
                     crate::filestore::data::remove(o);
+                }
+                if gone.node {
                     crate::storenodes::gone(d.fs.id, ino);
                 }
                 0
@@ -718,11 +720,13 @@ impl<P: Platform> Kernel<P> {
         });
         match renamed {
             Ok(gone) => {
-                if let Some(g) = gone
-                    && let Some(o) = g.data
-                {
-                    crate::filestore::data::remove(o);
-                    crate::storenodes::gone(od.fs.id, g.ino);
+                if let Some(g) = gone {
+                    if let Some(o) = g.data {
+                        crate::filestore::data::remove(o);
+                    }
+                    if g.node {
+                        crate::storenodes::gone(od.fs.id, g.ino);
+                    }
                 }
                 0
             }

@@ -150,6 +150,12 @@ fn view(id: u64, end: u64) -> Result<Arc<View>, i32> {
 /// This process holds a file whose data is object `id` open once more:
 /// its view is kept until it lets go of the last ([`let_go`]).
 pub fn keep(id: u64) {
+    keep_mapped(id, None);
+}
+
+/// [`keep`], the view `made` if there is none yet (a mapping a call made
+/// of it: not mapped again).
+pub fn keep_mapped(id: u64, made: Option<Mapped>) {
     if id == 0 {
         return;
     }
@@ -159,7 +165,11 @@ pub fn keep(id: u64) {
         return;
     }
     drop(views);
-    if let Ok(v) = view(id, LEAST_VIEW) {
+    let v = match made {
+        Some(Mapped(v)) => Ok(v),
+        None => view(id, LEAST_VIEW),
+    };
+    if let Ok(v) = v {
         VIEWS.lock().unwrap_or_else(|e| e.into_inner()).entry(id).or_insert((v, 0)).1 += 1;
     }
 }
@@ -177,6 +187,23 @@ pub fn let_go(id: u64) {
             views.remove(&id);
         }
     }
+}
+
+/// A mapping of an object this process made for a call: kept on as the
+/// process's view of it if the process holds its file ([`keep_mapped`]).
+pub struct Mapped(Arc<View>);
+
+impl Mapped {
+    /// The address of byte `off` of the object (the caller keeps within
+    /// the mapping's length).
+    pub fn at(&self, off: u64) -> *mut u8 {
+        (self.0.base + off as usize) as *mut u8
+    }
+}
+
+/// A mapping of the first `end` bytes of object `id` at least.
+pub fn mapped(id: u64, end: u64) -> Result<Mapped, i32> {
+    view(id, end).map(Mapped)
 }
 
 /// `f` given the address of bytes `[off, off + len)` of object `id` in a

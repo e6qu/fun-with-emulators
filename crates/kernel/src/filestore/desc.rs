@@ -261,13 +261,14 @@ pub fn sync(skip: &[i32]) {
 }
 
 /// `file`'s data is object `object` now (its first write made it): kept
-/// mapped if this process holds the file.
-pub fn made_data(file: File, object: u64) {
+/// mapped if this process holds the file, by `mapped` if the call that
+/// wrote it mapped it.
+pub fn made_data(file: File, object: u64, mapped: Option<super::data::Mapped>) {
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(e) = held.get_mut(&file)
         && e.1 == 0
     {
-        super::data::keep(object);
+        super::data::keep_mapped(object, mapped);
         e.1 = object;
     }
 }

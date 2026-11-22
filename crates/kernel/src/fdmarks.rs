@@ -212,11 +212,13 @@ fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
     if rec.net.is_some() {
         NETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    forget_identity(fd);
     count(Some(&rec), true);
     count(r.insert(fd, rec).as_ref(), false);
 }
 
 fn take(r: &mut BTreeMap<i32, Record>, fd: i32) {
+    forget_identity(fd);
     count(r.remove(&fd).as_ref(), false);
 }
 
@@ -248,11 +250,86 @@ fn records() -> std::sync::MutexGuard<'static, BTreeMap<i32, Record>> {
     RECORDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The host identity (device, inode) of the file `fd` names. Within one
+/// system call ([`Call`]) a descriptor names the file it named when the
+/// call first asked, as Linux holds a call's files for its length: the
+/// host is asked once, and again only once fwe changes what it knows of
+/// `fd` ([`insert`], [`take`]).
 fn identity(fd: i32) -> Option<(u64, u64)> {
+    let (depth, seq) = CALL.get();
+    let slot = fd as usize % SEEN_SLOTS;
+    if depth > 0
+        && let (s, f, dev, ino) = SEEN.with(|m| m.get()[slot])
+        && (s, f) == (seq, fd)
+    {
+        return Some((dev, ino));
+    }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    let id = (st.st_dev as u64, st.st_ino as u64);
+    if depth > 0 {
+        SEEN.with(|m| {
+            let mut all = m.get();
+            all[slot] = (seq, fd, id.0, id.1);
+            m.set(all);
+        });
+    }
+    Some(id)
+}
+
+/// The host identity of the file `fd` names now, asked of the host: what
+/// a record of it is made with (fwe may have put another file there in
+/// this call).
+fn identity_now(fd: i32) -> Option<(u64, u64)> {
+    forget_identity(fd);
+    identity(fd)
+}
+
+/// How many descriptors' identities one call keeps ([`identity`]).
+const SEEN_SLOTS: usize = 4;
+
+thread_local! {
+    /// This thread's system call: how deeply it is in one, and a number
+    /// that changes as each begins and ends.
+    static CALL: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Identities asked of the host in this thread's call: (call number,
+    /// descriptor, device, inode), by descriptor.
+    static SEEN: std::cell::Cell<[(u64, i32, u64, u64); SEEN_SLOTS]> =
+        const { std::cell::Cell::new([(0, -1, 0, 0); SEEN_SLOTS]) };
+}
+
+/// A system call of the guest's, for its length ([`identity`]).
+pub struct Call(());
+
+impl Call {
+    pub fn begin() -> Call {
+        let (depth, seq) = CALL.get();
+        CALL.set((depth + 1, seq + 1));
+        Call(())
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        let (depth, seq) = CALL.get();
+        CALL.set((depth - 1, seq + 1));
+    }
+}
+
+/// What this thread's call knows of `fd`'s identity is forgotten.
+fn forget_identity(fd: i32) {
+    let slot = fd as usize % SEEN_SLOTS;
+    SEEN.with(|m| {
+        let mut all = m.get();
+        if all[slot].1 == fd {
+            all[slot] = (0, -1, 0, 0);
+            m.set(all);
+        }
+    });
 }
 
 /// The record of `fd`, if fwe made one and `fd` still names that file.
@@ -271,7 +348,7 @@ pub fn opened(
     fstype: FsType,
     ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 ) {
-    let Some(id) = identity(fd) else { return };
+    let Some(id) = identity_now(fd) else { return };
     opened_as(fd, id, ns_path, mount, flags, fstype, ovl);
 }
 
@@ -421,7 +498,7 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
 /// `/proc/self/exe` of a program run through one): an ordinary open file
 /// there, not the tree's own descriptor.
 pub fn opened_in_tree(fd: i32, mount: u32, flags: u64, fstype: FsType) {
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some((dev, ino)) = identity_now(fd) else { return };
     let origin =
         Some(Origin { mount, flags, fstype, ns_path: Vec::new(), ovl: None, stand_in: None });
     insert(&mut records(), fd, Record { dev, ino, origin, mark: None, net: None });
@@ -441,7 +518,7 @@ pub fn rebase(moved: impl Fn(&[u8]) -> Vec<u8>) {
 
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some((dev, ino)) = identity_now(fd) else { return };
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
     let (origin, net) = had.map_or((None, None), |rec| (rec.origin, rec.net));
@@ -458,7 +535,7 @@ pub fn pin_net(fd: i32, net: Option<std::sync::Arc<crate::shared::Record<crate::
     if net.is_none() && NETS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return;
     }
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some((dev, ino)) = identity_now(fd) else { return };
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
     let (origin, mark) = had.map_or((None, None), |rec| (rec.origin, rec.mark));

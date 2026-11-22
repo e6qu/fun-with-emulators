@@ -1586,6 +1586,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
     if syscalls::shares(nr) || syscalls::plain_memory(nr, &a) {
         return None;
     }
+    let _call = fdmarks::Call::begin();
     // What other processes may look at, current before this one waits.
     maps::flush_before(nr);
     let noted = atime::before(nr, &a);
