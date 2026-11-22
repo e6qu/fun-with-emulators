@@ -135,14 +135,24 @@ fn ticks_since_boot(started: f64) -> u64 {
 /// fwe's record of it; another's is the first the host lists, the one
 /// created first. One in fwe's own work, waiting for the host or not, is
 /// running ([`crate::procstore::Busy`]), as a Linux thread doing its
-/// kernel's work is.
+/// kernel's work is: the mark is read after the host's state, so a wait
+/// the host shows began after the mark was set, and is fwe's if the mark is
+/// still there.
 #[cfg(target_os = "macos")]
 fn threads_state(pid: i32) -> u8 {
-    /// `PROC_PIDLISTTHREADS`: the process's thread handles.
-    const PROC_PIDLISTTHREADS: i32 = 6;
-    if crate::procstore::busy(pid) {
+    let host = host_thread_state(pid);
+    if host != b'R' && crate::procstore::busy(pid) {
         return b'R';
     }
+    host
+}
+
+/// What the host shows of process `pid`'s main thread, as Linux's state
+/// letter ([`threads_state`]).
+#[cfg(target_os = "macos")]
+fn host_thread_state(pid: i32) -> u8 {
+    /// `PROC_PIDLISTTHREADS`: the process's thread handles.
+    const PROC_PIDLISTTHREADS: i32 = 6;
     if pid == crate::host::pid() {
         return match crate::thread::host_state(crate::thread::tgid()) {
             Some((_, _, true)) | None => b'R',
