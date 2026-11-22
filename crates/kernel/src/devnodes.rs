@@ -31,7 +31,7 @@ pub fn minor(dev: u64) -> u32 {
 }
 
 /// A Linux `dev_t`.
-pub fn makedev(major: u32, minor: u32) -> u64 {
+pub const fn makedev(major: u32, minor: u32) -> u64 {
     let (ma, mi) = (major as u64, minor as u64);
     (ma & 0xfff) << 8 | (ma & !0xfff) << 32 | (mi & 0xff) | (mi & !0xff) << 12
 }

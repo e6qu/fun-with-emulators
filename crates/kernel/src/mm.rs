@@ -1537,21 +1537,22 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Map `len` bytes of the memory `object` holds (`object.held`), shared,
-    /// at `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
+    /// Map `len` bytes of host shared memory `fd`, `object`, shared, at
+    /// `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
     /// with `prot`, `nowrite` if it may not be made writable: a System V
     /// segment's attachment, which needs none of what a guest's mapping of
     /// a file of its own looks at.
-    pub(crate) fn map_held(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_shared_memory(
         &mut self,
         addr: u64,
         len: u64,
         prot: u64,
         flags: u64,
         nowrite: bool,
+        fd: i32,
         object: crate::maps::Object,
     ) -> i64 {
-        let Some(held) = object.held.clone() else { return err(errno::EINVAL) };
         if too_many_maps(0) {
             return err(errno::ENOMEM);
         }
@@ -1564,8 +1565,7 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EAGAIN);
             }
         }
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&*held.0) as u64;
-        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd, 0);
+        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0);
         if r < 0 {
             return r;
         }
@@ -3210,8 +3210,9 @@ fn too_many_maps(extra: usize) -> bool {
 
 /// A descriptor of the file `area` maps, whose host mapping is at host
 /// address `addr`, to map more of it by: the one the mapping holds for a
-/// file with no name, or the file opened again by its name, for reading
-/// and for writing too if a shared mapping of it is writable.
+/// file with no name, a System V segment's memory found by its id, or the
+/// file opened again by its name, for reading and for writing too if a
+/// shared mapping of it is writable.
 fn mapped_file(area: &crate::maps::Area, addr: u64) -> Result<std::os::fd::OwnedFd, i32> {
     use std::os::fd::{AsRawFd, FromRawFd};
     if let Some(held) = &area.object.held {
@@ -3219,13 +3220,15 @@ fn mapped_file(area: &crate::maps::Area, addr: u64) -> Result<std::os::fd::Owned
         // SAFETY: a descriptor just made, owned by the result.
         return Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) });
     }
+    let writable = area.shared && area.prot & mman::PROT_WRITE != 0;
+    if area.object.dev == crate::sysvipc::SEGMENT_DEV
+        && let Some(r) = crate::sysvipc::current()
+    {
+        return crate::sysvipc::segment_of(&r, area.object.ino as i32, !writable);
+    }
     let path = region_file(addr).ok_or(errno::EINVAL)?;
     let c = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-    let mode = if area.shared && area.prot & mman::PROT_WRITE != 0 {
-        libc::O_RDWR
-    } else {
-        libc::O_RDONLY
-    };
+    let mode = if writable { libc::O_RDWR } else { libc::O_RDONLY };
     // SAFETY: a NUL-terminated path.
     let fd = unsafe { libc::open(c.as_ptr(), mode | libc::O_CLOEXEC) };
     if fd < 0 {

@@ -100,11 +100,7 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_shmget(&mut self, key: u64, size: u64, flags: u64) -> i64 {
         let me = crate::host::pid();
         let creds = self.creds.clone();
-        // A new segment's memory, made as its object is (under the
-        // namespace's lock, so that no process finds the one without the
-        // other), and removed again if the object was not made.
-        let made = std::cell::Cell::new(None);
-        let r = self.ipc_get(
+        self.ipc_get(
             Kind::Shm,
             key as i32,
             flags,
@@ -133,15 +129,9 @@ impl<P: Platform> Kernel<P> {
                     huge_segment(flags, &creds)?;
                 }
                 let nonce = crate::shared::unique();
-                ipc::make_segment(nonce, size)?;
-                made.set(Some(nonce));
                 Ok(Body::Shm(ipc::Shm { size, cpid: me, nonce, ..ipc::Shm::default() }))
             },
-        );
-        if let (true, Some(nonce)) = (r < 0, made.get()) {
-            ipc::remove_segment(nonce);
-        }
-        r
+        )
     }
 
     pub(crate) fn sys_semget(&mut self, key: u64, nsems: u64, flags: u64) -> i64 {
@@ -224,7 +214,6 @@ impl<P: Platform> Kernel<P> {
         let size = (s.size + self.page_size - 1) & !(self.page_size - 1);
         let key = o.key;
         let locked = s.locked.is_some();
-        let nonce = s.nonce;
         drop(t);
         let mut at = addr;
         if at & (ipc::SHMLBA - 1) != 0 {
@@ -243,22 +232,22 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let read_only = flags & ipc::SHM_RDONLY != 0;
-        let held = match ipc::segment(nonce, read_only) {
-            Ok(h) => h,
-            // Removed meanwhile.
-            Err(errno::ENOENT) => return err(errno::EIDRM),
+        let memory = match ipc::segment_of(&r, id, read_only) {
+            Ok(fd) => fd,
             Err(e) => return err(e),
         };
         // Listed as Linux lists a segment: a deleted file of the shared
         // memory filesystem's, named by its key, whose inode is its id.
         let object = crate::maps::Object {
             name: crate::maps::Name::Path(format!("/SYSV{key:08x} (deleted)").into_bytes().into()),
-            dev: crate::devnodes::makedev(0, 1),
+            dev: ipc::SEGMENT_DEV,
             ino: id as u64,
             offset: 0,
-            held: Some(held),
+            held: None,
         };
-        let mapped = self.map_held(at, size, prot, map, read_only, object);
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&memory);
+        let mapped = self.map_shared_memory(at, size, prot, map, read_only, fd, object);
+        drop(memory);
         if mapped < 0 {
             return mapped;
         }
@@ -293,24 +282,15 @@ impl<P: Platform> Kernel<P> {
         }
         ipc::note_detached(addr);
         let me = ipc::me();
-        let nonce = r.update(|t| {
+        let _ = r.update(|t| {
             ipc::attach_count(t, id, me, -1);
-            let mut nonce = None;
             if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {
                 s.dtime = now();
                 s.lpid = me.0;
-                nonce = Some(s.nonce);
             }
             t.reap();
-            ipc::let_go_removed(t);
-            Ok(nonce)
+            Ok(())
         });
-        // Its descriptor is kept no longer than its last attachment here.
-        if let Ok(Some(nonce)) = nonce
-            && !ipc::attached_here(id)
-        {
-            ipc::let_go_segment(nonce);
-        }
         0
     }
 
@@ -393,7 +373,7 @@ impl<P: Platform> Kernel<P> {
                             if let Some(Obj { body: Body::Shm(s), .. }) =
                                 t.objs.remove(&(kind as u8, id))
                             {
-                                ipc::remove_segment(s.nonce);
+                                ipc::remove_segment(&s);
                             }
                         }
                     }
