@@ -382,31 +382,6 @@ jobs:
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
-  xvfb-probe:
-    # TEMPORARY probe: Homebrew's Xvfbs started at once on a fresh runner.
-    name: Probe Xvfb starts (macos-26)
-    runs-on: macos-26
-    timeout-minutes: 20
-    steps:
-      - run: brew install xorg-server
-      - name: Six Xvfbs at once, twice
-        run: |
-          X="$(brew --prefix)/bin/Xvfb"
-          ls -ld /tmp/.X11-unix || true
-          for round in 1 2; do
-            for n in 1 2 3 4 5 6; do
-              ( "$X" ":$((round * 10 + n))" -screen 0 1024x768x24 -nolisten tcp > "$RUNNER_TEMP/x$round$n.err" 2>&1 & echo $! > "$RUNNER_TEMP/x$round$n.pid" ) &
-            done
-            wait
-            sleep 5
-            for n in 1 2 3 4 5 6; do
-              d=$((round * 10 + n)); p=$(cat "$RUNNER_TEMP/x$round$n.pid")
-              if [ -S "/tmp/.X11-unix/X$d" ]; then echo ":$d up"; else echo ":$d DOWN"; cat "$RUNNER_TEMP/x$round$n.err"; fi
-              if [ "$p" -gt 1 ]; then kill "$p" 2>/dev/null || true; fi
-            done
-            ls -ld /tmp/.X11-unix
-          done
-
   ltp:
     name: LTP system calls (macos-26)
     runs-on: macos-26

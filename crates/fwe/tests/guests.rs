@@ -9316,6 +9316,19 @@ impl Xvfb {
             eprintln!("skipped: set XVFB to an Xvfb to run the display tests");
             return None;
         };
+        // The servers' socket directory, made once before any starts, as a
+        // system makes it at boot: an X server not run as root that finds
+        // it made by another starting at the same moment gives up
+        // (`mkdir` fails with `EEXIST` and it may not make it itself).
+        static SOCKETS: OnceLock<()> = OnceLock::new();
+        SOCKETS.get_or_init(|| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = Path::new("/tmp/.X11-unix");
+            if std::fs::create_dir(dir).is_ok() {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o1777)).unwrap();
+            }
+            assert!(dir.is_dir(), "{} is not a directory", dir.display());
+        });
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let number = 70 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
