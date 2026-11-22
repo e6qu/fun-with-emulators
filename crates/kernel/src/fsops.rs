@@ -128,7 +128,7 @@ fn statx_from(s: &libc::stat) -> Statx {
 /// What `statx` reports of a file beyond `stat`'s: its attributes and,
 /// where the host keeps one, its birth time.
 #[derive(Default)]
-struct Extra {
+pub(crate) struct Extra {
     attrs: u64,
     btime: Option<fwe_abi::StatxTimestamp>,
 }
@@ -242,6 +242,10 @@ fn stat_at(dir: i32, name: &CString) -> Result<libc::stat, i32> {
 /// [`stat_at`] of what `r` resolved to, the host's view taken from the
 /// lookup where it looked.
 fn resolved_stat(r: &crate::fs::Resolved) -> Option<libc::stat> {
+    // A file of fwe's store keeps the guest's mode and owner.
+    if r.store.is_some() {
+        return r.lstat();
+    }
     let mut out = r.lstat()?;
     let name = r.name_c().ok()?;
     let dir = r.dir.as_raw_fd();
@@ -250,6 +254,16 @@ fn resolved_stat(r: &crate::fs::Resolved) -> Option<libc::stat> {
     crate::modes::apply(&mut out, perm);
     crate::owners::apply(&mut out, owner);
     Some(out)
+}
+
+/// The guest's status of what `r` resolved to, not following a link:
+/// [`stat_at`], or a file of fwe's store's own.
+fn resolved_guest_stat(r: &crate::fs::Resolved) -> Result<libc::stat, i32> {
+    if let Some(d) = &r.store {
+        let (ino, _) = d.find(&r.name)?;
+        return d.host_stat(ino);
+    }
+    stat_at(r.dir.as_raw_fd(), &r.name_c()?)
 }
 
 /// [`stat_at`] with `fstatat` flags `flags`.
@@ -287,6 +301,17 @@ fn stat_result(
     (out, Extra::of(s, nodump))
 }
 
+/// The Linux status of a file of fwe's store whose host-laid status is
+/// `s` ([`crate::filestore::io::host_stat`]): its device and numbers its
+/// own, with its `statx` attributes.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+pub(crate) fn store_stat_result(s: &libc::stat) -> (Stat, Extra) {
+    let mut out = stat_to_linux(s);
+    out.st_rdev = s.st_rdev as u64;
+    out.st_nlink = s.st_nlink as u32;
+    (out, Extra::of(s, false))
+}
+
 /// The host device and inode of the file open as `fd`.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
@@ -303,6 +328,18 @@ pub(crate) fn linux_fstat(fd: i32) -> Result<Stat, i32> {
 /// The Linux status of the file open as `fd`, whose host status is `s`:
 /// that of a tmpfs's file if it was opened in one.
 fn stat_to_linux_fd(fd: i32, s: &libc::stat) -> Stat {
+    // A file of fwe's store has its own numbers (a FIFO's too, open on
+    // its node).
+    if crate::filestore::desc::of(fd).is_some()
+        || (s.st_mode & libc::S_IFMT == libc::S_IFIFO && {
+            let mut host = zeroed_stat();
+            // SAFETY: plain host call with a valid out-parameter.
+            let got = unsafe { libc::fstat(fd, &mut host) == 0 };
+            got && crate::storenodes::fifo_file(fd, &host).is_some()
+        })
+    {
+        return store_stat_result(s).0;
+    }
     let mut out = stat_to_linux(s);
     if let Some(m) = tmpfs_of(fd, s) {
         on_tmpfs(&mut out, m);
@@ -365,6 +402,12 @@ fn stat_fd(fd: i32) -> Result<libc::stat, i32> {
     // SAFETY: plain host call with a valid out-parameter.
     if unsafe { libc::fstat(fd, &mut out) } < 0 {
         return Err(host::errno_to_linux(host::last_errno()));
+    }
+    // A FIFO of fwe's store, open on its node: the store's file.
+    if let Some(file) = crate::storenodes::fifo_file(fd, &out) {
+        let fs = file.fs()?;
+        let t = fs.lock()?;
+        return Ok(crate::filestore::io::host_stat(t.dev(), &t.stat(file.ino)?));
     }
     // A program or map of bpf's is an object of fwe's in host shared memory.
     let bpf = || crate::memobj::may_be(&out) && crate::bpf::is_bpf_fd(fd);
@@ -907,6 +950,28 @@ impl<P: Platform> Kernel<P> {
                 Ok(r) => r,
                 Err(e) => return err(e),
             };
+            // In fwe's store: a file of it with no name.
+            if let Some(d) = &dir.store {
+                let d = match d.find(&dir.name) {
+                    Ok((ino, st))
+                        if st.mode & crate::filestore::tree::S_IFMT
+                            == crate::filestore::tree::S_IFDIR =>
+                    {
+                        crate::fs::StoreDir { fs: d.fs.clone(), ino }
+                    }
+                    Ok(_) => return err(errno::ENOTDIR),
+                    Err(e) => return err(e),
+                };
+                let mut at = dir;
+                at.store = Some(d);
+                at.name = b".".to_vec();
+                return self.store_tmpfile(
+                    &at,
+                    &at.store.clone().expect("in the store"),
+                    flags,
+                    mode,
+                );
+            }
             match dir.name_c().ok().and_then(|n| stat_at(dir.dir.as_raw_fd(), &n).ok()) {
                 Some(st) if st.st_mode & libc::S_IFMT == libc::S_IFDIR => {}
                 Some(_) => return err(errno::ENOTDIR),
@@ -937,6 +1002,11 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // A file of fwe's store (a tmpfs's).
+        if let Some(d) = resolved.store.clone() {
+            let slash = path.last() == Some(&b'/');
+            return self.store_open(&resolved, &d, flags, mode, slash);
+        }
         // O_TMPFILE includes O_DIRECTORY's bit: all of it, or not at all.
         let writes = flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
             || flags & fcntl::O_TRUNC != 0
@@ -1266,15 +1336,11 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        let name = match r.name_c() {
-            Ok(n) => n,
-            Err(e) => return err(e),
-        };
-        let st = match stat_at(r.dir.as_raw_fd(), &name) {
+        let st = match resolved_guest_stat(&r) {
             Ok(s) => s,
             Err(e) => return err(e),
         };
-        let special = crate::devnodes::marked(&st);
+        let special = r.store.is_none() && crate::devnodes::marked(&st);
         self.access_result(&st, mode, &a, special, r.writable().is_err())
     }
 
@@ -1417,6 +1483,17 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // In fwe's store (a tmpfs).
+        if let Some(d) = &r.store {
+            return match d.find(&r.name) {
+                Ok((ino, _)) => store_statfs(
+                    crate::filestore::desc::File { fs: d.fs.id, ino },
+                    r.mount_flags,
+                    buf,
+                ),
+                Err(e) => err(e),
+            };
+        }
         // What the path names must be there (`ENOENT`, `ENOTDIR`).
         if let Err(e) = r.name_c().and_then(|n| stat_at(r.dir.as_raw_fd(), &n)) {
             return err(e);
@@ -1428,14 +1505,9 @@ impl<P: Platform> Kernel<P> {
     /// `fstatfs(fd, buf)`.
     pub(crate) fn sys_fstatfs(&mut self, fd: u64, buf: u64) -> i64 {
         let fd = fd as i32;
-        if let Some(r) = crate::filestore::io::statfs(fd) {
-            return match r {
-                Ok(out) => {
-                    guest!(uaccess::write(buf, out));
-                    0
-                }
-                Err(e) => err(e),
-            };
+        if let Some(file) = crate::filestore::desc::of(fd) {
+            let flags = crate::fdmarks::origin(fd).map_or(0, |o| o.flags);
+            return store_statfs(file, flags, buf);
         }
         // A pipe's or socket's filesystem is the kernel's own (pipefs,
         // sockfs), which the host does not report.
@@ -1644,6 +1716,11 @@ impl<P: Platform> Kernel<P> {
             return Ok((self.proc_owned(dirfd, path, st), Extra::default()));
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
+        // In fwe's store (a tmpfs).
+        if let Some(d) = &r.store {
+            let (ino, _) = d.find(&r.name)?;
+            return Ok(store_stat_result(&d.host_stat(ino)?));
+        }
         let name = r.name_c()?;
         let s = stat_at(r.dir.as_raw_fd(), &name)?;
         let fstype = if r.ns_path.is_some() { r.fstype } else { crate::mounts::FsType::Ext4 };
@@ -1901,23 +1978,8 @@ impl<P: Platform> Kernel<P> {
         if st.st_mode & fwe_abi::stat::S_IFMT != fwe_abi::stat::S_IFLNK {
             return Ok(LinkKind::None);
         }
-        let (dir, name) = self.resolve_c(cwd as u64, abs, false)?;
-        let mut target = vec![0u8; uaccess::PATH_MAX];
-        // SAFETY: a NUL-terminated name in an open directory, and a buffer
-        // of its length.
-        let n = unsafe {
-            libc::readlinkat(
-                dir.as_raw_fd(),
-                name.as_ptr(),
-                target.as_mut_ptr().cast(),
-                target.len(),
-            )
-        };
-        if n < 0 {
-            return Err(host::errno_to_linux(host::last_errno()));
-        }
-        target.truncate(n as usize);
-        Ok(LinkKind::Symlink(target))
+        let r = self.fs().resolve(cwd, abs, false)?;
+        Ok(LinkKind::Symlink(r.readlink()?))
     }
 
     /// Whether the caller may follow the symbolic link at `abs` as the
@@ -1927,8 +1989,13 @@ impl<P: Platform> Kernel<P> {
         if !crate::sysctl::protected_links().0 {
             return Ok(());
         }
-        let (dir, name) = self.resolve_c(fcntl::AT_FDCWD as u64, abs, false)?;
-        crate::fs::may_follow(dir.as_raw_fd(), &name, dir.as_raw_fd(), self.creds.fsuid)
+        let r = self.fs().resolve(fcntl::AT_FDCWD as i32, abs, false)?;
+        if let Some(d) = &r.store {
+            let Ok((_, link)) = d.find(&r.name) else { return Ok(()) };
+            return crate::fs::may_follow_in_store(d, &link, self.creds.fsuid);
+        }
+        let name = r.name_c()?;
+        crate::fs::may_follow(r.dir.as_raw_fd(), &name, r.dir.as_raw_fd(), self.creds.fsuid)
     }
 
     pub(crate) fn sys_readlinkat(&self, dirfd: u64, path: u64, buf: u64, size: u64) -> i64 {
@@ -1950,6 +2017,21 @@ impl<P: Platform> Kernel<P> {
                     n as i64
                 }
                 _ => err(errno::ENOENT),
+            };
+        }
+        if path.is_empty()
+            && let Some(file) = crate::filestore::desc::of(dirfd as i32)
+        {
+            // A link of fwe's store an O_PATH | O_NOFOLLOW descriptor names.
+            let target = file.fs().and_then(|fs| fs.lock()?.readlink(file.ino));
+            return match target {
+                Ok(t) => {
+                    let n = t.len().min(size as usize);
+                    guest!(uaccess::write_from(buf, &t[..n]));
+                    n as i64
+                }
+                Err(errno::EINVAL) => err(errno::ENOENT),
+                Err(e) => err(e),
             };
         }
         if path.is_empty() {
@@ -1985,10 +2067,23 @@ impl<P: Platform> Kernel<P> {
                 crate::procfs::Entry::Missing => err(errno::ENOENT),
             };
         }
-        let (dir, name) = match self.resolve_c(dirfd, &path, false) {
-            Ok(v) => v,
+        let r = match self.fs().resolve(dirfd as i32, &path, false) {
+            Ok(r) => r,
             Err(e) => return err(e),
         };
+        // A link of fwe's store (a tmpfs's).
+        if let Some(d) = &r.store {
+            return match Self::store_readlink(&r, d) {
+                Ok(t) => {
+                    let n = t.len().min(size as usize);
+                    guest!(uaccess::write_from(buf, &t[..n]));
+                    n as i64
+                }
+                Err(e) => err(e),
+            };
+        }
+        let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
+        let dir = r.dir;
         // SAFETY: the guest passed a buffer of `size` bytes; `name` NUL-terminated.
         ret(unsafe {
             libc::readlinkat(
@@ -2018,8 +2113,7 @@ impl<P: Platform> Kernel<P> {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         // The directory itself must be searchable by the caller.
         if let Ok(r) = self.fs().resolve(fcntl::AT_FDCWD as i32, &path, true)
-            && let Ok(name) = r.name_c()
-            && let Ok(st) = stat_at(r.dir.as_raw_fd(), &name)
+            && let Ok(st) = resolved_guest_stat(&r)
             && st.st_mode & libc::S_IFMT == libc::S_IFDIR
             && !self.permits(&st, 1)
         {
@@ -2073,6 +2167,10 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // In fwe's store (a tmpfs).
+        if let Some(d) = r.store.clone() {
+            return self.store_mkdir(&r, &d, mode as u32);
+        }
         if let Err(e) = r.writable() {
             return err(e);
         }
@@ -2145,6 +2243,14 @@ impl<P: Platform> Kernel<P> {
         };
         if let Err(e) = made_not_dir(&r, &path) {
             return err(e);
+        }
+        // In fwe's store (a tmpfs).
+        if let Some(sd) = r.store.clone() {
+            let kind = if kind == 0 { 0o100000 } else { kind };
+            if !matches!(kind, 0o100000 | 0o010000 | S_IFCHR | S_IFBLK | 0o140000) {
+                return err(errno::EINVAL);
+            }
+            return self.store_mknod(&r, &sd, kind, asked, dev);
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let d = r.dir.as_raw_fd();
@@ -2257,6 +2363,10 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = removed_dir_only(&r, crate::fs::trailing_slash(&path)) {
             return err(e);
         }
+        // In fwe's store (a tmpfs).
+        if let Some(d) = r.store.clone() {
+            return self.store_unlink(&r, &d, flags & fcntl::AT_REMOVEDIR != 0);
+        }
         if let Some(o) = &r.ovl {
             if let Err(e) = self.may_remove_in_overlay(o, &r.name) {
                 return err(e);
@@ -2322,6 +2432,10 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = made_not_dir(&r, &path) {
             return err(e);
         }
+        // In fwe's store (a tmpfs).
+        if let Some(d) = r.store.clone() {
+            return self.store_symlink(&r, &d, target.as_bytes());
+        }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let d = r.dir.as_raw_fd();
         let made = self.change_in(d, || {
@@ -2379,6 +2493,18 @@ impl<P: Platform> Kernel<P> {
         if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
+        }
+        // In fwe's store (a tmpfs): both, or not one filesystem.
+        if old.store.is_some() || new.store.is_some() {
+            let (Some(od), Some(nd)) = (&old.store, &new.store) else { return err(errno::EXDEV) };
+            let ino = match od.find(&old.name) {
+                Ok((ino, _)) => ino,
+                Err(e) => return err(e),
+            };
+            if new.mount_root {
+                return err(errno::EEXIST);
+            }
+            return self.store_link(od.fs.id, ino, &new, nd, false);
         }
         if crate::sysctl::protected_links().1
             && let Err(e) = self.may_hardlink(&old)
@@ -2504,6 +2630,11 @@ impl<P: Platform> Kernel<P> {
             // place): not one filesystem.
             return err(errno::EXDEV);
         }
+        // In fwe's store (a tmpfs): both, or not one filesystem.
+        if old.store.is_some() || new.store.is_some() {
+            let (Some(od), Some(nd)) = (&old.store, &new.store) else { return err(errno::EXDEV) };
+            return self.store_rename(&old, od, &new, nd, flags);
+        }
         if let (Some(a), Some(b)) = (&old.ovl, &new.ovl) {
             if flags & RENAME_WHITEOUT != 0 {
                 return err(errno::EINVAL);
@@ -2569,6 +2700,23 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // In fwe's store (a tmpfs).
+        if let Some(d) = &r.store {
+            let (ino, st) = match d.find(&r.name).and_then(|(i, _)| Ok((i, d.host_stat(i)?))) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+            if st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+                return err(errno::EOPNOTSUPP);
+            }
+            return match self.chmod_to(&st, mode as u32) {
+                Ok(m) => crate::filestore::io::chmod_file(
+                    crate::filestore::desc::File { fs: d.fs.id, ino },
+                    m,
+                ),
+                Err(e) => err(e),
+            };
+        }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let dir = r.dir;
         if !follow {
@@ -2618,6 +2766,21 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // In fwe's store (a tmpfs).
+        if let Some(d) = &r.store {
+            let (ino, st) = match d.find(&r.name).and_then(|(i, _)| Ok((i, d.host_stat(i)?))) {
+                Ok(v) => v,
+                Err(e) => return err(e),
+            };
+            return match self.chown_to(&st, uid as u32, gid as u32) {
+                Ok((owner, mode)) => crate::filestore::io::chown_file(
+                    crate::filestore::desc::File { fs: d.fs.id, ino },
+                    owner,
+                    mode,
+                ),
+                Err(e) => err(e),
+            };
+        }
         let name = match r.name_c() {
             Ok(n) => n,
             Err(e) => return err(e),
@@ -2703,6 +2866,21 @@ impl<P: Platform> Kernel<P> {
         }
         if let Err(e) = crate::leases::break_for(dev, st.st_ino, true, false) {
             return err(e);
+        }
+        // In fwe's store (a tmpfs).
+        if let Some(d) = &r.store {
+            #[allow(clippy::unnecessary_cast)] // `ino_t` differs by host
+            let file = crate::filestore::desc::File { fs: d.fs.id, ino: st.st_ino as u64 };
+            let r = crate::filestore::io::truncate_file(file, len).map_or_else(err, |()| 0);
+            // A set-ID file cut by a caller without `CAP_FSETID` loses its
+            // bits, as one written does.
+            #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+            let perm = st.st_mode as u32 & 0o7777;
+            let kept = crate::modes::written_perm(perm);
+            if r == 0 && kept != perm && !self.creds.has(crate::caps::CAP_FSETID) {
+                let _ = crate::filestore::io::chmod_file(file, kept);
+            }
+            return r;
         }
         let mut r = r;
         if let Err(e) = r.prepare(crate::fs::Change::Modify) {
@@ -2828,17 +3006,8 @@ impl<P: Platform> Kernel<P> {
         if let Some(r) = crate::filestore::io::fallocate(fd as i32, mode, offset, len) {
             return r;
         }
-        // What a tmpfs with a size has no room for (punching a hole frees).
-        if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE == 0
-            && let Err(e) = crate::tmpfs::allocate(fd as i32, offset, len)
-        {
-            return err(e);
-        }
         match crate::host::fallocate(fd as i32, mode, offset as i64, len as i64) {
             Ok(()) => {
-                if mode & fwe_abi::falloc::FALLOC_FL_PUNCH_HOLE != 0 {
-                    crate::tmpfs::freed(fd as i32);
-                }
                 // A set-ID file changed loses its bits, as one written does.
                 crate::modes::wrote(fd as i32);
                 0
@@ -3027,6 +3196,18 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        // In fwe's store (a tmpfs).
+        if let Some(d) = &r.store {
+            let ino = match d.find(&r.name) {
+                Ok((ino, _)) => ino,
+                Err(e) => return err(e),
+            };
+            if let Err(e) = d.host_stat(ino).and_then(|st| may(&st)) {
+                return err(e);
+            }
+            let file = crate::filestore::desc::File { fs: d.fs.id, ino };
+            return crate::filestore::io::set_times_file(file, host_times, touch);
+        }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let dir = r.dir;
         if let Err(e) = stat_at(dir.as_raw_fd(), &name).and_then(|st| may(&st)) {
@@ -3331,12 +3512,11 @@ impl<P: Platform> Kernel<P> {
         }
         let r = self.resolve_p(dirfd as u64, &path, follow, true, Change::Modify).and_then(|r| {
             Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
-            let n = r.name_c()?;
-            let (host, plain) = Self::xattr_file(&r.dir, &n)?;
+            let (file, plain) = Self::xattr_resolved(&r)?;
             let space = crate::xattr::space(&name)?;
             self.xattr_who(plain).may_write(&name, space)?;
             let value = Self::xattr_stored(&name, value)?;
-            crate::xattr::set(&crate::xattr::Target::Path(&host), &name, &value, flags)
+            crate::xattr::set(&file.target(), &name, &value, flags)
         });
         match r {
             Ok(()) => 0,
@@ -3460,11 +3640,10 @@ impl<P: Platform> Kernel<P> {
                 }
                 self.resolve_p(dirfd as u64, &path, follow, true, Change::Modify).and_then(|r| {
                     Self::overlay_own(r.ovl.as_ref().map(|o| &*o.layers), &name)?;
-                    let n = r.name_c()?;
-                    let (host, plain) = Self::xattr_file(&r.dir, &n)?;
+                    let (file, plain) = Self::xattr_resolved(&r)?;
                     let space = crate::xattr::space(&name)?;
                     self.xattr_who(plain).may_write(&name, space)?;
-                    crate::xattr::remove(&crate::xattr::Target::Path(&host), &name)
+                    crate::xattr::remove(&file.target(), &name)
                 })
             }
         };
@@ -3515,10 +3694,8 @@ impl<P: Platform> Kernel<P> {
                     return Err(SYNTHETIC);
                 }
                 let r = self.fs().resolve(dirfd, &path, follow)?;
-                let n = r.name_c()?;
-                let (host, plain) = Self::xattr_file(&r.dir, &n)?;
-                let t = crate::xattr::Target::Path(&host);
-                f(&t, &self.xattr_who(plain), r.ovl.as_ref().map(|o| &*o.layers))
+                let (file, plain) = Self::xattr_resolved(&r)?;
+                f(&file.target(), &self.xattr_who(plain), r.ovl.as_ref().map(|o| &*o.layers))
             }
         }
     }
@@ -3620,6 +3797,20 @@ impl<P: Platform> Kernel<P> {
         host.extend_from_slice(name.as_bytes());
         let kind = crate::xattr::Kind::of(&st, perm, owner);
         Ok((CString::new(host).map_err(|_| errno::EINVAL)?, kind))
+    }
+
+    /// The file `r` resolved to, for its attributes, and its kind: its
+    /// host path, or a file of fwe's store.
+    fn xattr_resolved(r: &crate::fs::Resolved) -> Result<(XattrFile, crate::xattr::Kind), i32> {
+        if let Some(file) = r.store_file()? {
+            let st = r.lstat().ok_or(errno::ENOENT)?;
+            #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
+            let kind =
+                crate::xattr::Kind::of(&st, st.st_mode as u32 & 0o7777, (st.st_uid, st.st_gid));
+            return Ok((XattrFile::Store(file), kind));
+        }
+        let (host, kind) = Self::xattr_file(&r.dir, &r.name_c()?)?;
+        Ok((XattrFile::Path(host), kind))
     }
 
     /// What kind of file open descriptor `fd` is of.
@@ -3869,6 +4060,19 @@ impl<P: Platform> Kernel<P> {
         if !self.creds.has(crate::caps::CAP_DAC_READ_SEARCH) {
             return err(errno::ENOENT);
         }
+        // A file of fwe's store (an `O_TMPFILE` of a tmpfs, say): named
+        // there, in its own filesystem.
+        if let Some(file) = crate::filestore::desc::of(fd) {
+            let new = match self.fs().resolve(newdirfd as i32, newpath, false) {
+                Ok(r) => r,
+                Err(e) => return err(e),
+            };
+            let Some(nd) = new.store.clone() else { return err(errno::EXDEV) };
+            if new.mount_root {
+                return err(errno::EEXIST);
+            }
+            return self.store_link(file.fs, file.ino, &new, &nd, true);
+        }
         let Some(host) = crate::fs::host_path_of(fd) else { return err(errno::ENOENT) };
         let Ok(src) = CString::new(host) else { return err(errno::EINVAL) };
         let mut new = match self.fs().resolve(newdirfd as i32, newpath, false) {
@@ -3994,8 +4198,11 @@ impl<P: Platform> Kernel<P> {
         if !self.permits(&st, open_wants(flags)) {
             return err(errno::EACCES);
         }
-        let new = match crate::filestore::desc::open(file, flags, crate::filestore::desc::new_id())
-        {
+        let new = match crate::filestore::desc::open(
+            file,
+            flags,
+            crate::filestore::desc::new_id(flags),
+        ) {
             Ok(new) => new,
             Err(e) => return err(e),
         };
@@ -4176,17 +4383,20 @@ impl<P: Platform> Kernel<P> {
         r.prepare(how)?;
         Ok(r)
     }
+}
 
-    /// Resolve and return the parent dir fd plus a C name.
-    fn resolve_c(
-        &self,
-        dirfd: u64,
-        path: &[u8],
-        follow: bool,
-    ) -> Result<(std::os::fd::OwnedFd, CString), i32> {
-        let r = self.fs().resolve(dirfd as i32, path, follow)?;
-        let name = r.name_c()?;
-        Ok((r.dir, name))
+/// A file an attribute call by path acts on ([`crate::xattr::Target`]).
+enum XattrFile {
+    Path(CString),
+    Store(crate::filestore::desc::File),
+}
+
+impl XattrFile {
+    fn target(&self) -> crate::xattr::Target<'_> {
+        match self {
+            XattrFile::Path(p) => crate::xattr::Target::Path(p),
+            XattrFile::Store(f) => crate::xattr::Target::Store(*f),
+        }
     }
 }
 
@@ -4195,7 +4405,7 @@ impl<P: Platform> Kernel<P> {
 const SYNTHETIC: i32 = -1;
 
 /// A zeroed `stat`, an out-parameter.
-fn zeroed_stat() -> libc::stat {
+pub(crate) fn zeroed_stat() -> libc::stat {
     // SAFETY: zeroed bytes are a valid `stat`.
     unsafe { std::mem::zeroed() }
 }
@@ -4214,7 +4424,12 @@ fn as_node(mut s: Stat, node: Option<crate::devnodes::Node>) -> Stat {
 /// device programs, then, for one of fwe's nodes (`node_file`, open on
 /// `fd`), the host device its numbers name, or `fd` itself for a loop
 /// device.
-fn open_device(fd: i32, node: crate::devnodes::Node, flags: u64, node_file: bool) -> i64 {
+pub(crate) fn open_device(
+    fd: i32,
+    node: crate::devnodes::Node,
+    flags: u64,
+    node_file: bool,
+) -> i64 {
     use crate::bpf::{BPF_DEVCG_ACC_READ, BPF_DEVCG_ACC_WRITE};
     let access = match flags & fcntl::O_ACCMODE {
         fcntl::O_RDONLY => BPF_DEVCG_ACC_READ,
@@ -4256,7 +4471,7 @@ fn open_device(fd: i32, node: crate::devnodes::Node, flags: u64, node_file: bool
 /// open file description of it, as opening `/proc/self/fd/N` makes.
 /// A FIFO opened ahead ([`crate::fs::take_fifo`]), close-on-exec as the
 /// guest's Linux `flags` ask.
-fn fifo_flags(fd: i32, flags: u64) -> i32 {
+pub(crate) fn fifo_flags(fd: i32, flags: u64) -> i32 {
     if flags & fcntl::O_CLOEXEC == 0 {
         // SAFETY: plain host call on the descriptor.
         unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
@@ -4307,38 +4522,47 @@ fn statfs_fd(fd: i32, buf: u64, mount: Option<(crate::mounts::FsType, u64)>) -> 
         return last_error();
     }
     let mut out = host::statfs_to_linux(&s);
-    // A tmpfs with a size: that, and what is left of it.
-    if let Some((size, left)) = crate::fs::fd_path(fd).and_then(|p| crate::tmpfs::space(&p)) {
-        let b = out.f_bsize.max(1) as u64;
-        (out.f_blocks, out.f_bfree, out.f_bavail) = (size / b, left / b, left / b);
-    }
-    // One with a number of inodes: that, and how many are free.
-    if let Some((files, free)) = crate::fs::fd_path(fd).and_then(|p| crate::tmpfs::inodes(&p)) {
-        (out.f_files, out.f_ffree) = (files, free);
-    }
     if let Some((fstype, flags)) = mount {
-        use crate::mounts::ms;
-        use fwe_abi::statfs::*;
         out.f_type = fstype.magic();
-        let mut f = ST_VALID;
-        for (m, st) in [
-            (ms::RDONLY, ST_RDONLY),
-            (ms::NOSUID, ST_NOSUID),
-            (ms::NODEV, ST_NODEV),
-            (ms::NOEXEC, ST_NOEXEC),
-            (ms::NOATIME, ST_NOATIME),
-            (ms::NODIRATIME, ST_NODIRATIME),
-            (ms::RELATIME, ST_RELATIME),
-            (ms::NOSYMFOLLOW, ST_NOSYMFOLLOW),
-        ] {
-            if flags & m != 0 {
-                f |= st;
-            }
-        }
-        out.f_flags = f;
+        out.f_flags = statfs_flags(flags);
     }
     guest!(uaccess::write(buf, out));
     0
+}
+
+/// `statfs`'s `f_flags` of a mount with `flags`.
+fn statfs_flags(flags: u64) -> i64 {
+    use crate::mounts::ms;
+    use fwe_abi::statfs::*;
+    let mut f = ST_VALID;
+    for (m, st) in [
+        (ms::RDONLY, ST_RDONLY),
+        (ms::NOSUID, ST_NOSUID),
+        (ms::NODEV, ST_NODEV),
+        (ms::NOEXEC, ST_NOEXEC),
+        (ms::NOATIME, ST_NOATIME),
+        (ms::NODIRATIME, ST_NODIRATIME),
+        (ms::RELATIME, ST_RELATIME),
+        (ms::NOSYMFOLLOW, ST_NOSYMFOLLOW),
+    ] {
+        if flags & m != 0 {
+            f |= st;
+        }
+    }
+    f
+}
+
+/// `statfs` of the filesystem of fwe's store `file` is in, through a mount
+/// with `flags`, into guest `buf`.
+fn store_statfs(file: crate::filestore::desc::File, flags: u64, buf: u64) -> i64 {
+    match crate::filestore::io::statfs_file(file) {
+        Ok(mut out) => {
+            out.f_flags = statfs_flags(flags);
+            guest!(uaccess::write(buf, out));
+            0
+        }
+        Err(e) => err(e),
+    }
 }
 
 /// `renameat2`'s flags.

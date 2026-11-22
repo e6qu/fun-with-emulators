@@ -472,8 +472,28 @@ pub fn subject_at(dir: i32, name: &[u8]) -> Option<Subject> {
     })
 }
 
+/// The subject `name` in directory `d` of fwe's store is.
+pub fn store_subject(d: &crate::fs::StoreDir, name: &[u8]) -> Option<Subject> {
+    let t = d.fs.lock().ok()?;
+    let ino = t.lookup(d.ino, name).ok()?;
+    let st = t.stat(ino).ok()?;
+    let dev = t.dev();
+    let own = name == b".";
+    Some(Subject {
+        dev,
+        ino,
+        dir: st.mode & crate::filestore::tree::S_IFMT == crate::filestore::tree::S_IFDIR,
+        nlink: st.nlink as u64,
+        parent: (!own).then_some((dev, d.ino)),
+        name: if own { Vec::new() } else { name.to_vec() },
+    })
+}
+
 /// The subject what `r` resolved is (as an overlay shows it, in one).
 fn resolved_subject(r: &crate::fs::Resolved) -> Option<Subject> {
+    if let Some(d) = &r.store {
+        return store_subject(d, &r.name);
+    }
     let dir = std::os::fd::AsRawFd::as_raw_fd(&r.dir);
     let s = subject_at(dir, &r.name)?;
     Some(match &r.ovl {
@@ -485,6 +505,22 @@ fn resolved_subject(r: &crate::fs::Resolved) -> Option<Subject> {
 /// The subject a descriptor's file is, and where it is (its host path's
 /// directory and name), as an overlay shows it if it was opened in one.
 pub fn subject_of_fd(fd: i32) -> Option<Subject> {
+    // A file of fwe's store: where it was opened, if it was by a name.
+    if let Some(file) = crate::filestore::desc::of(fd) {
+        let fs = file.fs().ok()?;
+        let t = fs.lock().ok()?;
+        let st = t.stat(file.ino).ok()?;
+        let dev = t.dev();
+        let place = crate::filestore::desc::place(fd);
+        return Some(Subject {
+            dev,
+            ino: file.ino,
+            dir: st.mode & crate::filestore::tree::S_IFMT == crate::filestore::tree::S_IFDIR,
+            nlink: st.nlink as u64,
+            parent: place.as_ref().map(|p| (dev, p.0)),
+            name: place.map(|p| p.1).unwrap_or_default(),
+        });
+    }
     let mut s = host_subject_of_fd(fd)?;
     if let Some(l) = fdmarks::origin(fd).and_then(|o| o.ovl) {
         let dev = overlay_dev(&l);
@@ -978,6 +1014,15 @@ impl<P: Platform> Kernel<P> {
                 let (from, to) = (path(a[1])?, path(a[3])?);
                 let s = self.subject_path(a[0] as i32, &from, false)?;
                 let r = self.fs().resolve(a[2] as i32, &to, false).ok()?;
+                if let Some(d) = &r.store {
+                    let dev = d.fs.lock().ok()?.dev();
+                    return Some(Plan::Rename {
+                        s,
+                        to: Some((dev, d.ino)),
+                        to_name: r.name.clone(),
+                        over: store_subject(d, &r.name),
+                    });
+                }
                 let dir = std::os::fd::AsRawFd::as_raw_fd(&r.dir);
                 // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
                 let mut ds: libc::stat = unsafe { std::mem::zeroed() };

@@ -481,7 +481,13 @@ pub fn origin(fd: i32) -> Option<Origin> {
 
 /// Whether `fd` is an `O_PATH` descriptor (a detached mount's is one).
 pub fn is_path(fd: i32) -> bool {
-    any_marks() && matches!(marked(fd), Some(Mark::Path | Mark::Detached(_) | Mark::ProcLink))
+    any_marks()
+        && match marked(fd) {
+            Some(Mark::Path | Mark::Detached(_) | Mark::ProcLink) => true,
+            // A file of fwe's store opened `O_PATH`.
+            Some(Mark::Store(_)) => crate::filestore::desc::is_path(fd),
+            _ => false,
+        }
 }
 
 /// The namespace path of the `/proc` link `fd` names, if it is an

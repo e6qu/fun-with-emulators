@@ -2,8 +2,9 @@
 //! a file by the host file system it is on and its inode there, which the
 //! host turns back into a path (`fsgetpath`), so a handle outlives renames
 //! of the file, as a Linux handle does, and goes stale once the file is
-//! gone. A file fwe makes up (under `/proc`) has an identifier handle
-//! (`AT_HANDLE_FID`) only, which opens nothing.
+//! gone. A file of fwe's store (a tmpfs's) is named by its filesystem and
+//! inode there. A file fwe makes up (under `/proc`) has an identifier
+//! handle (`AT_HANDLE_FID`) only, which opens nothing.
 //!
 //! `open_by_handle_at` opens the file at a path the caller sees it at:
 //! where its host path falls under the host directory of `mount_fd`'s
@@ -25,6 +26,9 @@ const HANDLE_BYTES: u32 = 16;
 const HANDLE_TYPE: i32 = 1;
 /// The type of an identifier handle of a file fwe makes up.
 const FID_TYPE: i32 = 0xfe;
+/// The type of a handle of a file of fwe's store: its filesystem's id and
+/// its inode (whose generation makes a handle of a file gone stale).
+const STORE_TYPE: i32 = 2;
 
 const AT_HANDLE_MNT_ID_UNIQUE: u64 = 0x1;
 const AT_HANDLE_CONNECTABLE: u64 = 0x2;
@@ -90,8 +94,9 @@ impl<P: Platform> Kernel<P> {
         }
         let path = crate::guest!(crate::uaccess::read_cstr(path, crate::uaccess::PATH_MAX));
         let follow = flags & AT_SYMLINK_FOLLOW != 0;
-        // What it names: (host file system, inode, mount), or a file fwe
-        // makes up, by its path.
+        // What it names: (host file system, inode, mount), a file of fwe's
+        // store, or a file fwe makes up, by its path.
+        let mut stored: Option<(crate::filestore::desc::File, u64)> = None;
         let target: Result<([i32; 2], u64, u64), Vec<u8>> = if path.is_empty() {
             if flags & AT_EMPTY_PATH == 0 {
                 return err(errno::ENOENT);
@@ -101,6 +106,11 @@ impl<P: Platform> Kernel<P> {
             let fd = if dirfd as i32 as i64 == fwe_abi::fcntl::AT_FDCWD {
                 match self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, b".", true) {
                     Ok(r) => {
+                        match r.store_file() {
+                            Ok(Some(f)) => stored = Some((f, u64::from(r.mount_id))),
+                            Ok(None) => {}
+                            Err(e) => return err(e),
+                        }
                         cwd = r.dir;
                         std::os::fd::AsRawFd::as_raw_fd(&cwd)
                     }
@@ -110,7 +120,11 @@ impl<P: Platform> Kernel<P> {
                 dirfd as i32
             };
             let mount = crate::fdmarks::origin(fd).map_or(0, |o| u64::from(o.mount));
+            if let Some(f) = crate::filestore::desc::of(fd) {
+                stored = Some((f, mount));
+            }
             match crate::fdmarks::stand_in(fd) {
+                _ if stored.is_some() => Ok(([0; 2], 0, 0)),
                 // A stand-in `O_PATH` descriptor: the file it names.
                 Some(host) => match identity_at(&host) {
                     Some((fsid, ino)) => Ok((fsid, ino, mount)),
@@ -131,6 +145,14 @@ impl<P: Platform> Kernel<P> {
                 Ok(r) => r,
                 Err(e) => return err(e),
             };
+            match r.store_file() {
+                Ok(Some(f)) => stored = Some((f, u64::from(r.mount_id))),
+                Ok(None) => {}
+                Err(e) => return err(e),
+            }
+            if stored.is_some() {
+                return self.put_handle(handle, mount_id, flags, stored, Ok(([0; 2], 0, 0)));
+            }
             let name = match r.name_c() {
                 Ok(n) => n,
                 Err(e) => return err(e),
@@ -150,8 +172,27 @@ impl<P: Platform> Kernel<P> {
             };
             Ok((fsid, st.st_ino, u64::from(r.mount_id)))
         };
-        let mnt = target.as_ref().map_or(0, |t| t.2);
+        self.put_handle(handle, mount_id, flags, stored, target)
+    }
+
+    /// Write the handle of `target` (or of `stored`, a file of fwe's store,
+    /// and its mount) for `name_to_handle_at`.
+    fn put_handle(
+        &self,
+        handle: u64,
+        mount_id: u64,
+        flags: u64,
+        stored: Option<(crate::filestore::desc::File, u64)>,
+        target: Result<([i32; 2], u64, u64), Vec<u8>>,
+    ) -> i64 {
+        let mnt = stored.map_or_else(|| target.as_ref().map_or(0, |t| t.2), |s| s.1);
         let (bytes, kind, data) = match target {
+            _ if let Some((f, _)) = stored => {
+                let mut d = [0u8; 16];
+                d[0..8].copy_from_slice(&f.fs.to_ne_bytes());
+                d[8..16].copy_from_slice(&f.ino.to_ne_bytes());
+                (HANDLE_BYTES, STORE_TYPE, d)
+            }
             Ok((fsid, ino, _)) => {
                 let mut d = [0u8; 16];
                 d[0..4].copy_from_slice(&fsid[0].to_ne_bytes());
@@ -228,6 +269,23 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let data = crate::guest!(crate::uaccess::read_bytes(handle + 8, head[0] as usize));
+        if head[1] as i32 == STORE_TYPE && data.len() == HANDLE_BYTES as usize {
+            let fs = u64::from_ne_bytes(data[0..8].try_into().unwrap());
+            let ino = u64::from_ne_bytes(data[8..16].try_into().unwrap());
+            let file = crate::filestore::desc::File { fs, ino };
+            let Some(path) = self.store_handle_path(&anchor, file) else {
+                return err(errno::ESTALE);
+            };
+            let flags =
+                flags & !(fcntl::O_CREAT | fcntl::O_EXCL | fcntl::O_TMPFILE) | fcntl::O_NOFOLLOW;
+            let fd = self.open_with(fcntl::AT_FDCWD as u64, path, flags, 0);
+            // Replaced at the path between the look and the open: stale.
+            if fd >= 0 && crate::filestore::desc::of(fd as i32) != Some(file) {
+                let _ = self.syscall(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+                return err(errno::ESTALE);
+            }
+            return fd;
+        }
         if head[1] as i32 != HANDLE_TYPE || data.len() != HANDLE_BYTES as usize {
             return err(errno::ESTALE);
         }
@@ -249,6 +307,29 @@ impl<P: Platform> Kernel<P> {
             return err(errno::ESTALE);
         }
         fd
+    }
+
+    /// The path, from the caller's root, of `file` of fwe's store in the
+    /// mount at namespace path `anchor` (a `mount_fd`'s): its path in its
+    /// filesystem, under the mount's root, at the mount's place, where the
+    /// caller finds that same file. `None` for a file the caller cannot
+    /// reach so.
+    fn store_handle_path(
+        &self,
+        anchor: &[u8],
+        file: crate::filestore::desc::File,
+    ) -> Option<Vec<u8>> {
+        let table = self.fs().mounts();
+        let (m, _) = table.locate(anchor);
+        if m.source != crate::mounts::Source::Store(file.fs) {
+            return None;
+        }
+        let inner = file.fs().ok()?.lock().ok()?.any_path(file.ino)?;
+        let rest = crate::mounts::under(&inner, &m.root)?.to_vec();
+        let ns = crate::mounts::join(&m.point, &rest);
+        let path = self.fs().from_ns(&ns)?;
+        let r = self.fs().resolve(fwe_abi::fcntl::AT_FDCWD as i32, &path, false).ok()?;
+        (r.store_file().ok()? == Some(file)).then_some(path)
     }
 
     /// The path, from the caller's root, of inode `ino` of host file system

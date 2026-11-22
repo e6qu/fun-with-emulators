@@ -159,6 +159,9 @@ pub enum Source {
     /// A namespace, its file bound to the mount point: what opening it
     /// gives, and what it keeps from being freed.
     Ns(crate::nsfd::NsRef),
+    /// A filesystem of fwe's file store, by its id ([`crate::filestore`]):
+    /// a tmpfs.
+    Store(u64),
 }
 
 /// One mount.
@@ -272,6 +275,10 @@ impl Mount {
     /// device it is on; anything else fwe makes up one of its own.
     pub fn device_numbers(&self) -> (u32, u32) {
         let own = (0, 20 + self.id);
+        if let Source::Store(id) = self.source {
+            let dev = crate::filestore::fs::get(id, false).and_then(|f| Ok(f.lock()?.dev()));
+            return dev.map_or(own, |d| (crate::fsops::major(d), crate::fsops::minor(d)));
+        }
         if self.fstype == FsType::Tmpfs {
             return own;
         }
@@ -377,7 +384,7 @@ pub enum Propagation {
 impl Table {
     /// The table a namespace starts with when nothing was mounted in it:
     /// the rootfs at `root_host` and what Linux always has mounted.
-    pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>, cgroup_host: Option<&[u8]>) -> Table {
+    pub fn initial(root_host: &[u8], shm: Option<u64>, cgroup_host: Option<&[u8]>) -> Table {
         let mut t = Table {
             mounts: Vec::new(),
             next_id: 1,
@@ -443,14 +450,14 @@ impl Table {
         }
         add(&mut t, root, b"/dev/pts", FsType::Devpts, b"rw,gid=5,mode=620,ptmxmode=000");
         add(&mut t, root, b"/dev/mqueue", FsType::Mqueue, b"rw");
-        if let Some(shm) = shm_host {
+        if let Some(shm) = shm {
             let id = t.alloc();
             t.mounts.push(Mount {
                 id,
                 parent: root,
                 point: b"/dev/shm".to_vec(),
                 fstype: FsType::Tmpfs,
-                source: Source::Host(shm.to_vec()),
+                source: Source::Store(shm),
                 root: b"/".to_vec(),
                 flags: ms::NOSUID | ms::NODEV,
                 propagation: ms::PRIVATE,
@@ -1411,6 +1418,10 @@ impl Table {
                     l.encode(e);
                 }
                 Source::Synthetic => e.u8(0),
+                Source::Store(id) => {
+                    e.u8(4);
+                    e.u64(*id);
+                }
                 Source::Ns(n) => {
                     e.u8(3);
                     e.u64(n.kind);
@@ -1453,6 +1464,7 @@ impl Table {
                         let dir = d.bytes();
                         Source::Ns(crate::nsfd::NsRef { kind, id, dir: has.then_some(dir) })
                     }
+                    4 => Source::Store(d.u64()),
                     _ => Source::Synthetic,
                 },
                 root: d.bytes(),
@@ -1502,10 +1514,10 @@ pub mod store {
         /// The initial namespace of the rootfs at `root_host`: every fwe
         /// process started on that root is in it, as every process on a
         /// machine starts in one. Made with [`Table::initial`] when new.
-        pub fn initial(root_host: &[u8], shm_host: Option<&[u8]>) -> Result<Ns, i32> {
+        pub fn initial(root_host: &[u8], shm: Option<u64>) -> Result<Ns, i32> {
             let name = format!("mnt-init-{:016x}", crate::shared::hash(root_host));
             let cgroup = crate::cgroupfs::tree_dir().ok();
-            Record::named(&name, INIT_ID, || Table::initial(root_host, shm_host, cgroup.as_deref()))
+            Record::named(&name, INIT_ID, || Table::initial(root_host, shm, cgroup.as_deref()))
                 .map(Ns)
         }
 
@@ -1726,7 +1738,7 @@ mod tests {
     use super::*;
 
     fn table() -> Table {
-        Table::initial(b"/host/root", Some(b"/host/shm"), Some(b"/host/cgroup"))
+        Table::initial(b"/host/root", Some(0x5348), Some(b"/host/cgroup"))
     }
 
     fn tmpfs(t: &mut Table, at: &[u8]) -> u32 {
@@ -1754,7 +1766,8 @@ mod tests {
         let (m, _) = t.locate(b"/sys/fs");
         assert_eq!(m.fstype, FsType::Sysfs);
         let (m, rest) = t.locate(b"/dev/shm/x");
-        assert_eq!(m.host_path(&rest).unwrap(), b"/host/shm/x");
+        assert_eq!((&m.source, rest.as_slice()), (&Source::Store(0x5348), &b"/x"[..]));
+        assert_eq!(m.host_path(&rest), None);
     }
 
     /// Peer groups as Linux keeps them: a bind of a shared mount is its

@@ -23,9 +23,13 @@ pub const SIZE: u64 = 1 << 44;
 const LEAST_VIEW: u64 = 2 << 20;
 
 /// The host name of object `id`.
+/// The kind letter of a data object's name ([`crate::memobj::identify`]).
+pub const KIND: u8 = b'd';
+
 fn name(id: u64) -> std::ffi::CString {
     // (macOS allows names of 31 bytes: "/fwe" and a uid, "d", 16 digits.)
-    std::ffi::CString::new(format!("/fwe{}d{id:x}", crate::host::euid())).expect("no NUL")
+    let n = format!("/fwe{}{}{id:x}", crate::host::euid(), KIND as char);
+    std::ffi::CString::new(n).expect("no NUL")
 }
 
 fn last() -> i32 {

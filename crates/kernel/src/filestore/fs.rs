@@ -48,15 +48,58 @@ pub fn get(id: u64, make: bool) -> Result<Arc<Fs>, i32> {
     Ok(f)
 }
 
+/// The name a filesystem is registered under, for fwe's collection of
+/// what no process uses ([`crate::shared::collect`]).
+fn registered(id: u64) -> Result<Vec<u8>, i32> {
+    let base = crate::fs::shm::user_dir()?;
+    Ok(format!("{}/v{}-store-{id:x}", String::from_utf8_lossy(&base), crate::shared::FORMAT)
+        .into_bytes())
+}
+
 /// A new filesystem, its root directory owned by `uid` and `gid` with
 /// `mode`, holding at most `bytes` of data and `inodes` inodes (0: no
-/// limit): its id.
+/// limit), on a device of its own: its id.
 pub fn make(mode: u32, uid: u32, gid: u32, bytes: u64, inodes: u64) -> Result<u64, i32> {
     let id = crate::shared::unique();
+    make_as(id, mode, uid, gid, bytes, inodes)?;
+    Ok(id)
+}
+
+/// Filesystem `id`, made as [`make`] makes one if it is not there.
+pub fn make_as(
+    id: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    bytes: u64,
+    inodes: u64,
+) -> Result<Arc<Fs>, i32> {
+    crate::procstore::named::find_or_make(&registered(id)?);
     let f = get(id, true)?;
     let mut t = f.lock_with(|| New { mode: tree::S_IFDIR | (mode & 0o7777), uid, gid, rdev: 0 })?;
-    t.set_limits(bytes, inodes);
-    Ok(id)
+    if t.dev() == 0 {
+        t.set_limits(bytes, inodes);
+        // An anonymous device's number, as Linux gives a tmpfs: one of its
+        // own for each filesystem (past those fwe numbers mounts with).
+        let minor = 0x1000 + (crate::shared::hash(&id.to_le_bytes()) % 0xf_f000) as u32;
+        t.set_dev(crate::devnodes::makedev(0, minor));
+    }
+    drop(t);
+    Ok(f)
+}
+
+/// Whether a live process holds a file of filesystem `id` (open, or
+/// mapped through a descriptor it holds).
+pub fn in_use(id: u64) -> bool {
+    let Ok(f) = get(id, false) else { return false };
+    let Ok(mut t) = f.lock() else { return false };
+    for ino in t.inodes() {
+        let _ = t.reap(ino, super::desc::alive);
+        if t.holders(ino).unwrap_or(0) > 0 {
+            return true;
+        }
+    }
+    false
 }
 
 /// Filesystem `id` goes: its metadata, and the data of every file in it
@@ -67,6 +110,14 @@ pub fn remove(id: u64) {
     {
         for object in t.data_objects() {
             data::remove(object);
+        }
+        // The host's nodes behind its FIFOs and sockets.
+        for ino in t.inodes() {
+            if t.stat(ino)
+                .is_ok_and(|s| matches!(s.mode & tree::S_IFMT, tree::S_IFIFO | tree::S_IFSOCK))
+            {
+                crate::storenodes::gone(id, ino);
+            }
         }
     }
     MAPPED.lock().unwrap_or_else(|e| e.into_inner()).remove(&id);
@@ -95,6 +146,7 @@ impl Fs {
     pub fn read(&self, ino: Ino, off: u64, buf: &mut [u8]) -> Result<usize, i32> {
         let mut t = self.lock()?;
         let (object, n) = t.readable(ino, off, buf.len() as u64)?;
+        t.accessed(ino, 0)?;
         data::read(object, off, &mut buf[..n as usize])?;
         Ok(n as usize)
     }
@@ -148,7 +200,7 @@ pub struct Writable {
 impl Tx<'_> {
     /// For a read of up to `len` bytes at `off` of regular file `ino`: its
     /// data object and how many of the bytes there are (none at or past its
-    /// end).
+    /// end). The reader notes the access ([`Tx::accessed`]).
     pub fn readable(&mut self, ino: Ino, off: u64, len: u64) -> Result<(u64, u64), i32> {
         let st = self.stat(ino)?;
         if st.mode & tree::S_IFMT == tree::S_IFDIR {
@@ -158,7 +210,6 @@ impl Tx<'_> {
             return Ok((0, 0));
         }
         let n = len.min(st.size - off);
-        self.touch_accessed(ino)?;
         Ok((self.data(ino)?, n))
     }
 

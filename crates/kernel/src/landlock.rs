@@ -124,6 +124,11 @@ fn identity(st: &libc::stat) -> (u64, u64) {
 }
 
 fn fd_identity(fd: i32) -> Option<(libc::stat, (u64, u64))> {
+    // A file of fwe's store: its own device and inode.
+    if let Some(st) = crate::filestore::io::stat(fd) {
+        let st = st.ok()?;
+        return Some((st, identity(&st)));
+    }
     // SAFETY: an all-zero `stat` is a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
@@ -361,9 +366,13 @@ pub fn may_connect_abstract(owner: i32) -> Result<(), i32> {
     if !active() || within(owner, SCOPE_ABSTRACT_UNIX_SOCKET) { Ok(()) } else { Err(errno::EPERM) }
 }
 
+/// The identities (device, inode) of a file and of every directory above
+/// it, nearest first, as a rule names them ([`check`]).
+pub type Ids = Vec<(u64, u64)>;
+
 /// The host identities of what is at host path `path` and of every
 /// directory above it.
-fn ancestry(path: &[u8]) -> Vec<(u64, u64)> {
+pub fn ancestry(path: &[u8]) -> Ids {
     let mut out = Vec::new();
     let mut p = path.to_vec();
     loop {
@@ -385,14 +394,13 @@ fn ancestry(path: &[u8]) -> Vec<(u64, u64)> {
     out
 }
 
-/// Check access `need` to what is at host path `path` (`file`: the file
+/// Check access `need` to what `ids` are of ([`Ids`]; `file`: the file
 /// itself, whose own rule counts as well as its directories'; else a
 /// directory, for what is made or removed in it).
-pub fn check_path(path: &[u8], need: u64, file: bool) -> Result<(), i32> {
+pub fn check(ids: &[(u64, u64)], need: u64, file: bool) -> Result<(), i32> {
     if !active() || need == 0 {
         return Ok(());
     }
-    let ids = ancestry(path);
     let d = DOMAIN.lock().unwrap_or_else(|e| e.into_inner());
     for (_, layer) in d.iter() {
         let want = need & layer.fs;
@@ -415,13 +423,12 @@ pub fn check_path(path: &[u8], need: u64, file: bool) -> Result<(), i32> {
     Ok(())
 }
 
-/// The rights a layer gives what is at host path `path`, per layer: for a
-/// move between directories, which needs `REFER` in both.
-pub fn check_refer(from_dir: &[u8], to_dir: &[u8]) -> Result<(), i32> {
-    if !active() || from_dir == to_dir {
+/// The rights a layer gives the directories `a` and `b` are of ([`Ids`]),
+/// per layer: for a move between directories, which needs `REFER` in both.
+pub fn check_refer(a: &[(u64, u64)], b: &[(u64, u64)]) -> Result<(), i32> {
+    if !active() || a.first() == b.first() {
         return Ok(());
     }
-    let (a, b) = (ancestry(from_dir), ancestry(to_dir));
     let d = DOMAIN.lock().unwrap_or_else(|e| e.into_inner());
     for (_, layer) in d.iter() {
         if layer.fs == 0 {
@@ -435,7 +442,7 @@ pub fn check_refer(from_dir: &[u8], to_dir: &[u8]) -> Result<(), i32> {
         let grants = |ids: &[(u64, u64)]| {
             layer.paths.iter().filter(|p| p.2 && ids.contains(&p.0)).fold(0, |g, p| g | p.1)
         };
-        if grants(&a) & REFER == 0 || grants(&b) & REFER == 0 {
+        if grants(a) & REFER == 0 || grants(b) & REFER == 0 {
             return Err(errno::EXDEV);
         }
     }
@@ -536,10 +543,10 @@ pub fn may_ioctl(fd: i32, req: u64) -> Result<(), i32> {
 
 /// What some layer handles without granting it to the file at host path
 /// `path`, opened for writing if `write` (truncation is a writer's).
-pub fn withheld(path: &[u8], write: bool) -> Withheld {
+pub fn withheld(ids: &[(u64, u64)], write: bool) -> Withheld {
     Withheld {
-        truncate: write && check_path(path, TRUNCATE, true).is_err(),
-        ioctl: check_path(path, IOCTL_DEV, true).is_err(),
+        truncate: write && check(ids, TRUNCATE, true).is_err(),
+        ioctl: check(ids, IOCTL_DEV, true).is_err(),
     }
 }
 

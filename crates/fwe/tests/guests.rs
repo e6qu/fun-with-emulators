@@ -9301,6 +9301,27 @@ fn tmpfs_owner_and_inode_options_hold() {
     );
 }
 
+/// A tmpfs, a filesystem of fwe's store in memory, does by path what
+/// Linux's does: sockets bound and connected there, FIFOs, programs run
+/// from it (`ETXTBSY` while open to write), file handles, `/proc/self/fd`
+/// links of files renamed and removed, listings in the order names were
+/// made, and attribute calls by path.
+#[test]
+fn tmpfs_files_work_by_path() {
+    assert_eq!(
+        fsrules("store"),
+        "mount: ok\n\
+         socket: bind ok again EADDRINUSE connect ok peer /tmp/s/sock a socket true\n\
+         not a socket: ECONNREFUSED unlinked: ENOENT\n\
+         fifo: read hi the file's status true\n\
+         exec: exit 7, while open to write ETXTBSY\n\
+         handle: held, renamed held, removed ESTALE\n\
+         fd link: /tmp/s/a, /tmp/s/b, /tmp/s/b (deleted)\n\
+         listing: . .. z a m\n\
+         by path: ok ok ok ok; mode 640 size 10 atime 1000 mtime 2000 attribute v tmpfs true\n"
+    );
+}
+
 /// `proc`'s `hidepid=invisible` hides another user's process from one who
 /// may not trace it, `noaccess` keeps them out of it (`EPERM`), and
 /// `subset=pid` shows the processes alone; `hidepid=3` is `EINVAL`.

@@ -138,7 +138,10 @@ mod imp {
         creds: &Creds,
     ) -> Result<i32, i32> {
         let fs = sfs::memfds()?;
-        let id = desc::new_id();
+        // Not counted as open for writing, as Linux's `alloc_file_pseudo`
+        // counts no writer: a program runs from it (`fexecve`) while it is
+        // held to write (a reopen of it to write is counted).
+        let id = desc::new_id(fcntl::O_RDONLY);
         let ino = {
             let mut t = fs.lock()?;
             let files = t.usage().1;

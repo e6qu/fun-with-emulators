@@ -740,8 +740,10 @@ impl Mem {
             return err(errno::ENOMEM);
         }
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC | mman::PROT_BTI);
-        // A shared mapping of a file opened read-only stays read-only.
+        // A shared mapping of a file opened read-only stays read-only (a
+        // private view's pages become copies as they are written).
         let read_only = |p: &Piece<Area>| match p.value.back {
+            _ if is_view(&p.value) => false,
             Back::Segment { id, .. } => self.segments.get(&id).is_some_and(|s| !s.writable),
             Back::Slab { .. } => false,
         };
@@ -1011,9 +1013,23 @@ fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
 }
 
 /// `file` opened again for reading and writing, if the user may (by its
-/// path, checked to be the same file); `ENOMEM` when fwe has no descriptor
-/// left to keep it in.
+/// path, checked to be the same file; a file of fwe's store's data, by
+/// its object's name); `ENOMEM` when fwe has no descriptor left to keep
+/// it in.
 fn reopen_writable(file: &OwnedFd) -> Result<Option<OwnedFd>, i32> {
+    if is_object(file.as_raw_fd()) {
+        let Some((fwe_kernel::filestore::data::KIND, id, _)) =
+            fwe_kernel::memobj::identify(file.as_raw_fd())
+        else {
+            return Ok(None);
+        };
+        let Ok(fd) = fwe_kernel::filestore::data::open(id, false) else { return Ok(None) };
+        let fd = fwe_kernel::fdtable::reserve(std::os::fd::IntoRawFd::into_raw_fd(fd))
+            .map_err(|_| errno::ENOMEM)?;
+        // SAFETY: a descriptor just made, owned here, out of the guest's
+        // range.
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
     let mut path = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH fills `path` (PATH_MAX bytes) with a C string.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {

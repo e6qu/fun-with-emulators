@@ -3123,12 +3123,14 @@ impl<P: Platform> Kernel<P> {
         };
         let resolved;
         let cname;
+        let stored;
         // A change of the file: not through a read-only mount (`EROFS`), an
         // overlay's lower file copied up first.
         let file = if name.is_empty() && at & fcntl::AT_EMPTY_PATH != 0 {
             if set && let Err(e) = self.fd_change(dfd) {
                 return err(e);
             }
+            stored = crate::filestore::desc::of(dfd);
             FlagFile::Fd(dfd)
         } else {
             let follow = at & fcntl::AT_SYMLINK_NOFOLLOW == 0;
@@ -3141,6 +3143,10 @@ impl<P: Platform> Kernel<P> {
                 }
                 Err(e) => return err(e),
             };
+            stored = match resolved.store_file() {
+                Ok(f) => f,
+                Err(e) => return err(e),
+            };
             cname = match resolved.name_c() {
                 Ok(c) => c,
                 Err(e) => return err(e),
@@ -3148,6 +3154,22 @@ impl<P: Platform> Kernel<P> {
             FlagFile::At(std::os::fd::AsRawFd::as_raw_fd(&resolved.dir), &cname)
         };
         let r = (|| {
+            // A file of fwe's store keeps its own flags.
+            if let Some(f) = stored {
+                if let Some((x, extra)) = wanted {
+                    if extra {
+                        return Err(errno::EOPNOTSUPP);
+                    }
+                    let creds = &self.creds;
+                    return crate::filestore::io::set_flags_of(f, xflags_to_flags(x), creds)
+                        .map(|()| 0);
+                }
+                let x = flags_to_xflags(crate::filestore::io::flags_of(f)?);
+                let mut out = vec![0u8; size as usize];
+                out[..8].copy_from_slice(&x.to_ne_bytes());
+                uaccess::write_from(attr, &out)?;
+                return Ok(0);
+            }
             if let Some((x, extra)) = wanted {
                 return self.set_flags_of(file, xflags_to_flags(x), extra).map(|()| 0);
             }

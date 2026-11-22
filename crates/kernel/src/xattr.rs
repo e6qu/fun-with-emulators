@@ -98,6 +98,9 @@ pub fn show_file_caps(v: Vec<u8>) -> Result<Vec<u8>, i32> {
 
 /// Whether the file `t` names has file capabilities.
 pub fn has_file_caps(t: &Target) -> bool {
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.xattr(file.ino, CAPABILITY)).is_ok();
+    }
     let Ok(n) = host_name(CAPABILITY) else { return false };
     raw_get(t, &n, std::ptr::null_mut(), 0) >= 0
 }
@@ -241,6 +244,8 @@ impl Who {
 pub enum Target<'a> {
     Path(&'a CStr),
     Fd(i32),
+    /// A file of fwe's store, found by its path (a tmpfs's).
+    Store(crate::filestore::desc::File),
 }
 
 /// The file of fwe's store `t` is a descriptor of, if it is one: its
@@ -248,6 +253,7 @@ pub enum Target<'a> {
 fn stored(t: &Target) -> Option<crate::filestore::desc::File> {
     match t {
         Target::Fd(fd) => crate::filestore::desc::of(*fd),
+        Target::Store(file) => Some(*file),
         Target::Path(_) => None,
     }
 }
@@ -313,6 +319,8 @@ fn frozen(t: &Target) -> bool {
         match t {
             Target::Path(p) => libc::lstat(p.as_ptr(), &mut st),
             Target::Fd(fd) => libc::fstat(*fd, &mut st),
+            // (Taken above.)
+            Target::Store(_) => -1,
         }
     };
     r == 0 && st.st_flags & (libc::UF_IMMUTABLE | libc::UF_APPEND) != 0
@@ -368,6 +376,8 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
             Target::Path(p) => libc::lsetxattr(p.as_ptr(), n.as_ptr(), v, len, host_flags),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::fsetxattr(*fd, n.as_ptr(), v, len, host_flags),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     };
     owned(t, raw)
@@ -388,6 +398,7 @@ fn owned(t: &Target, raw: impl Fn() -> i32) -> Result<(), i32> {
     let kept = match t {
         Target::Path(p) => crate::modes::own_path(p),
         Target::Fd(fd) => crate::modes::own_fd(*fd),
+        Target::Store(_) => Err(errno::EACCES),
     };
     if kept.is_err() {
         return e;
@@ -415,6 +426,8 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
             Target::Path(p) => libc::lremovexattr(p.as_ptr(), n.as_ptr()),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::fremovexattr(*fd, n.as_ptr()),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     };
     owned(t, raw)
@@ -474,6 +487,8 @@ fn raw_get(t: &Target, n: &CStr, buf: *mut u8, len: usize) -> isize {
             Target::Path(p) => libc::lgetxattr(p.as_ptr(), n.as_ptr(), buf.cast(), len),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::fgetxattr(*fd, n.as_ptr(), buf.cast(), len),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     }
 }
@@ -521,6 +536,8 @@ fn raw_list(t: &Target, buf: *mut u8, len: usize) -> isize {
             Target::Path(p) => libc::llistxattr(p.as_ptr(), buf.cast(), len),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::flistxattr(*fd, buf.cast(), len),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     }
 }

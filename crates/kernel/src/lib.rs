@@ -111,6 +111,8 @@ pub mod sockopt;
 pub mod specialfd;
 pub mod specialwrite;
 pub mod splice;
+pub mod storenodes;
+mod storeops;
 pub mod synthdir;
 mod syscalls;
 pub mod sysctl;
@@ -725,14 +727,7 @@ impl<P: Platform> Kernel<P> {
         };
         if flags & fcntl::AT_SYMLINK_NOFOLLOW != 0 && !path.is_empty() {
             let r = fs.resolve(fcntl::AT_FDCWD as i32, &target, false)?;
-            let name = r.name_c()?;
-            // SAFETY: an all-zero stat is a valid out-parameter.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            // SAFETY: a valid directory descriptor, name and out-parameter.
-            let ok = unsafe {
-                libc::fstatat(r.dir.as_raw_fd(), name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW)
-            } == 0;
-            if ok && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            if r.lstat().is_some_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFLNK) {
                 return Err(errno::ELOOP);
             }
         }
@@ -763,6 +758,19 @@ impl<P: Platform> Kernel<P> {
             self.landlock_exec(path)?;
         }
         let r = fs.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        // A file of fwe's store (a tmpfs's).
+        if let Some(d) = &r.store {
+            let (ino, _) = d.find(&r.name)?;
+            let file = filestore::desc::File { fs: d.fs.id, ino };
+            let st = d.host_stat(ino)?;
+            self.exec_checks(
+                &st,
+                r.mount_flags,
+                || filestore::io::written(file),
+                || store_caps(file),
+            )?;
+            return filestore::io::read_file(file, r.mount_flags).map(|d| Some((d, None)));
+        }
         let name = r.name_c()?;
         // Not waiting for a writer, should it be a FIFO (refused below).
         // SAFETY: a NUL-terminated name in a live directory; the result is
@@ -780,7 +788,12 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: a fresh descriptor this owns.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
         let st = fs::guest_stat(fd.as_raw_fd()).ok_or(errno::EACCES)?;
-        self.exec_checks(&st, r.mount_flags, || file_caps(r.dir.as_raw_fd(), &name))?;
+        self.exec_checks(
+            &st,
+            r.mount_flags,
+            || host_file_busy(&st),
+            || file_caps(r.dir.as_raw_fd(), &name),
+        )?;
         let id = prepcache::FileId::of_fd(fd.as_raw_fd());
         fs::read_all_fd(fd.as_raw_fd()).map(|d| Some((d, id)))
     }
@@ -802,32 +815,47 @@ impl<P: Platform> Kernel<P> {
             && let Some(file) = filestore::desc::of(fd)
         {
             let st = filestore::io::stat(fd).ok_or(fwe_abi::errno::EBADF)??;
-            let caps = || {
-                let v =
-                    file.fs().ok()?.lock().ok()?.xattr(file.ino, b"security.capability").ok()?;
-                caps::parse_file_caps(&v).and_then(|(f, rootid)| match rootid {
-                    Some(r) if r != 0 && userns::to_ns(r, false) != 0 => None,
-                    _ => Some(f),
-                })
-            };
-            return self.exec_checks(&st, 0, caps);
+            let flags = fdmarks::origin(fd).map_or(0, |o| o.flags);
+            return self.exec_checks(
+                &st,
+                flags,
+                || filestore::io::written(file),
+                || store_caps(file),
+            );
         }
-        if let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true)
-            && let Ok(name) = r.name_c()
+        let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true) else { return Ok(()) };
+        if let Some(d) = &r.store {
+            let (ino, _) = d.find(&r.name)?;
+            let file = filestore::desc::File { fs: d.fs.id, ino };
+            let st = d.host_stat(ino)?;
+            return self.exec_checks(
+                &st,
+                r.mount_flags,
+                || filestore::io::written(file),
+                || store_caps(file),
+            );
+        }
+        if let Ok(name) = r.name_c()
             && let Some(st) = fs::guest_stat_at(r.dir.as_raw_fd(), &name)
         {
-            self.exec_checks(&st, r.mount_flags, || file_caps(r.dir.as_raw_fd(), &name))?;
+            self.exec_checks(
+                &st,
+                r.mount_flags,
+                || host_file_busy(&st),
+                || file_caps(r.dir.as_raw_fd(), &name),
+            )?;
         }
         Ok(())
     }
 
     /// [`Kernel::may_exec`]'s checks of a file whose guest status is `st`,
-    /// on a mount of `mount_flags`, with the file capabilities `caps` gives,
-    /// noting what it grants.
+    /// on a mount of `mount_flags`, open for writing as `written` tells,
+    /// with the file capabilities `caps` gives, noting what it grants.
     fn exec_checks(
         &self,
         st: &libc::stat,
         mount_flags: u64,
+        written: impl FnOnce() -> bool,
         caps: impl FnOnce() -> Option<caps::FileCaps>,
     ) -> Result<(), i32> {
         use fwe_abi::errno;
@@ -840,7 +868,7 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EACCES);
         }
         // Not a file open for writing.
-        if host_file_busy(st) {
+        if written() {
             return Err(errno::ETXTBSY);
         }
         // A program its caller may not read leaves it undumpable (its
@@ -1639,6 +1667,15 @@ fn file_stat(fd: i32) -> Result<libc::stat, i32> {
     Ok(st)
 }
 
+/// The file capabilities of `file` of fwe's store that an exec grants.
+fn store_caps(file: filestore::desc::File) -> Option<caps::FileCaps> {
+    let v = file.fs().ok()?.lock().ok()?.xattr(file.ino, b"security.capability").ok()?;
+    caps::parse_file_caps(&v).and_then(|(f, rootid)| match rootid {
+        Some(r) if r != 0 && userns::to_ns(r, false) != 0 => None,
+        _ => Some(f),
+    })
+}
+
 /// Whether the file of host status `st` is open for writing.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 pub(crate) fn host_file_busy(st: &libc::stat) -> bool {
@@ -1756,19 +1793,6 @@ fn copy_between(
     let mut failure = 0;
     while done < count {
         let want = (count - done).min(buf.len() as u64) as usize;
-        // A file of a tmpfs with a size: as much as fits, asked before it
-        // is read.
-        let want = if out_dev {
-            want
-        } else {
-            match tmpfs::room(output, opos.map(|p| p as u64), want as u64) {
-                Ok(fits) => fits as usize,
-                Err(e) => {
-                    failure = e;
-                    break;
-                }
-            }
-        };
         let n = if in_dev {
             match loopdev::read_into(input, &mut buf[..want], ipos.map(|p| p as u64)) {
                 Some(r) if r < 0 => {
@@ -1954,19 +1978,7 @@ fn vectored_at(
             return err(errno::EAGAIN);
         }
     }
-    // A file of a tmpfs with a size: as much as fits.
     let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
-    let iov = if write {
-        let total = specialwrite::total(&iov);
-        let at = (offset >= 0 && flags & rwf::APPEND == 0 && !appends).then_some(offset as u64);
-        match tmpfs::room(fd, at, total) {
-            Ok(fits) if fits < total => iovecs_part(&iov, 0, fits),
-            Ok(_) => iov,
-            Err(e) => return err(e),
-        }
-    } else {
-        iov
-    };
     let n = iov.len() as i32;
     // Linux appends to a file opened to append whatever the offset, as
     // its `pwrite` does.
@@ -2300,11 +2312,6 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 Some(keep) => (len, keep),
                 None => (len, len),
             };
-            // A file of a tmpfs with a size: as much as fits.
-            let len = match tmpfs::room(fd, None, len) {
-                Ok(n) => n,
-                Err(e) => return Some(fwe_abi::err(e)),
-            };
             // A pipe holding less than the host's: as much as it has room for.
             let write = |at: u64, n: u64| {
                 // SAFETY: the host validates the guest buffer; `at + n` is
@@ -2363,13 +2370,6 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                 if total == 0 && dropped > 0 {
                     return Some(dropped as i64);
                 }
-                // A file of a tmpfs with a size: as much as fits.
-                let fits = match tmpfs::room(a[0] as i32, None, total) {
-                    Ok(n) => n,
-                    Err(e) => return Some(fwe_abi::err(e)),
-                };
-                let iov = if fits < total { iovecs_part(&iov, 0, fits) } else { iov };
-                let total = fits;
                 let special = specialwrite::Source::Host(&iov);
                 let capped = |at: u64, n: u64| {
                     let part = iovecs_part(&iov, at, n);
@@ -2401,35 +2401,30 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             let special = specialwrite::Source::Guest(a[1]);
             match specialwrite::write(a[0] as i32, special, a[2]) {
                 Some(r) => r,
-                // A file of a tmpfs with a size: as much as fits.
-                None => match tmpfs::room(a[0] as i32, Some(a[3]), a[2]) {
-                    Ok(n) => {
-                        let fd = a[0] as i32;
-                        // SAFETY: F_GETFL only queries the descriptor.
-                        let append =
-                            unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_APPEND != 0;
-                        if append && is_regular(fd) {
-                            // Linux appends whatever the offset, leaving the
-                            // file's own offset where it was.
-                            // SAFETY: plain host calls; the host validates the
-                            // guest buffer.
-                            unsafe {
-                                let at = libc::lseek(fd, 0, libc::SEEK_CUR);
-                                let r = libc::write(fd, a[1] as *const _, n as usize);
-                                if at >= 0 {
-                                    libc::lseek(fd, at, libc::SEEK_SET);
-                                }
-                                host::ret(r as i64)
+                None => {
+                    let fd = a[0] as i32;
+                    // SAFETY: F_GETFL only queries the descriptor.
+                    let append = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_APPEND != 0;
+                    if append && is_regular(fd) {
+                        // Linux appends whatever the offset, leaving the
+                        // file's own offset where it was.
+                        // SAFETY: plain host calls; the host validates the
+                        // guest buffer.
+                        unsafe {
+                            let at = libc::lseek(fd, 0, libc::SEEK_CUR);
+                            let r = libc::write(fd, a[1] as *const _, a[2] as usize);
+                            if at >= 0 {
+                                libc::lseek(fd, at, libc::SEEK_SET);
                             }
-                        } else {
-                            // SAFETY: the host validates the guest buffer.
-                            host::ret(unsafe {
-                                libc::pwrite(fd, a[1] as *const _, n as usize, a[3] as libc::off_t)
-                            } as i64)
+                            host::ret(r as i64)
                         }
+                    } else {
+                        // SAFETY: the host validates the guest buffer.
+                        host::ret(unsafe {
+                            libc::pwrite(fd, a[1] as *const _, a[2] as usize, a[3] as libc::off_t)
+                        } as i64)
                     }
-                    Err(e) => fwe_abi::err(e),
-                },
+                }
             }
         }
         n::PREADV => vectored_at(a[0] as i32, a[1], a[2], a[3] as i64, 0, false, false),

@@ -163,6 +163,13 @@ impl Arena {
     /// result lives.
     pub fn lock(&self) -> Mem<'_> {
         let h = self.header();
+        // A thread that holds it already would wait for itself for ever.
+        let me = self.header() as *const Header as usize;
+        LOCKED.with(|l| {
+            let mut l = l.borrow_mut();
+            assert!(!l.contains(&me), "a store's arena locked twice by one thread");
+            l.push(me);
+        });
         let (held, taken_over) = crate::procstore::hold_word(self.static_word(&h.lock));
         let half_made = taken_over && h.changing.load(SeqCst) != 0;
         h.changing.store(1, SeqCst);
@@ -180,7 +187,15 @@ pub struct Mem<'a> {
 impl Drop for Mem<'_> {
     fn drop(&mut self) {
         self.arena.header().changing.store(0, SeqCst);
+        let me = self.arena.header() as *const Header as usize;
+        LOCKED.with(|l| l.borrow_mut().retain(|&a| a != me));
     }
+}
+
+thread_local! {
+    /// The arenas this thread holds ([`Arena::lock`]), by their header's
+    /// address.
+    static LOCKED: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
 impl Mem<'_> {

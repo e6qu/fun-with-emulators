@@ -30,6 +30,18 @@ pub const S_IFMT: u32 = 0o170000;
 pub const S_IFDIR: u32 = 0o040000;
 pub const S_IFREG: u32 = 0o100000;
 pub const S_IFLNK: u32 = 0o120000;
+pub const S_IFCHR: u32 = 0o020000;
+pub const S_IFBLK: u32 = 0o060000;
+pub const S_IFIFO: u32 = 0o010000;
+pub const S_IFSOCK: u32 = 0o140000;
+
+/// The hidden attribute marking a file with no names that may be named
+/// (`linkat`): an `O_TMPFILE` made without `O_EXCL`.
+const LINKABLE: &[u8] = b"\0linkable";
+
+/// The hidden attribute of a held file with no names: the directory and
+/// name it last had ([`Tx::last_name`]).
+const LAST_NAME: &[u8] = b"\0last";
 
 /// Owner words of the arena.
 const R_TABLE: usize = 0;
@@ -388,6 +400,76 @@ impl Tx<'_> {
         }
     }
 
+    /// Directory `ino`'s path from the root (`/` for the root), its names
+    /// as they are now: `None` for a directory removed, or no directory.
+    pub fn path(&self, ino: Ino) -> Option<Vec<u8>> {
+        let root = self.m.root(R_ROOT);
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        let mut at = ino;
+        while at != root {
+            self.dir(at).ok()?;
+            if self.get_u32(at, I_NLINK).ok()? == 0 {
+                return None;
+            }
+            let parent = self.get_u64(at, I_B).ok()?;
+            let d = self.dir(parent).ok()?;
+            let (entries, len) = (self.m.u64_at(d + D_ENTRIES), self.m.u64_at(d + D_LEN));
+            let name = (0..len).find_map(|n| {
+                let e = entries + n * ENTRY;
+                (self.m.u64_at(e + E_INO) == at).then(|| {
+                    let (nm, l) = (self.m.u64_at(e + E_NAME), self.u32_raw(e + E_LEN));
+                    self.m.bytes(nm, l as usize).to_vec()
+                })
+            })?;
+            names.push(name);
+            at = parent;
+        }
+        let mut path = Vec::new();
+        for n in names.iter().rev() {
+            path.push(b'/');
+            path.extend_from_slice(n);
+        }
+        if path.is_empty() {
+            path.push(b'/');
+        }
+        Some(path)
+    }
+
+    /// A path from the filesystem's root of `ino`, of any type: a
+    /// directory's own ([`Tx::path`]), another's first name found, the
+    /// directories searched from the root (`None` for one with no name).
+    pub fn any_path(&self, ino: Ino) -> Option<Vec<u8>> {
+        if self.get_u32(ino, I_MODE).ok()? & S_IFMT == S_IFDIR {
+            return self.path(ino);
+        }
+        if self.get_u32(ino, I_NLINK).ok()? == 0 {
+            return None;
+        }
+        let mut todo = vec![(self.m.root(R_ROOT), Vec::new())];
+        while let Some((dir, path)) = todo.pop() {
+            let d = self.dir(dir).ok()?;
+            let (entries, len) = (self.m.u64_at(d + D_ENTRIES), self.m.u64_at(d + D_LEN));
+            for n in 0..len {
+                let e = entries + n * ENTRY;
+                let at = self.m.u64_at(e + E_INO);
+                if at == 0 {
+                    continue;
+                }
+                let (nm, l) = (self.m.u64_at(e + E_NAME), self.u32_raw(e + E_LEN));
+                let mut p: Vec<u8> = path.clone();
+                p.push(b'/');
+                p.extend_from_slice(self.m.bytes(nm, l as usize));
+                if at == ino {
+                    return Some(p);
+                }
+                if self.u32_raw(e + E_KIND) == S_IFDIR {
+                    todo.push((at, p));
+                }
+            }
+        }
+        None
+    }
+
     /// The inode named `name` in directory `dir` (`.` and `..` too).
     pub fn lookup(&self, dir: Ino, name: &[u8]) -> Result<Ino, i32> {
         let d = self.dir(dir)?;
@@ -614,7 +696,25 @@ impl Tx<'_> {
             self.set_u32(ino, I_NLINK, links.saturating_sub(1))?;
             self.touch_changed(ino)?;
         }
+        self.note_last(ino, dir, name)?;
         self.drop_if_gone(ino)
+    }
+
+    /// File `ino`, held, lost its last name, `name` in `dir`: kept with it
+    /// ([`Tx::last_name`]).
+    fn note_last(&mut self, ino: Ino, dir: Ino, name: &[u8]) -> Result<(), i32> {
+        if self.get_u32(ino, I_NLINK)? != 0 || self.holders(ino)? == 0 {
+            return Ok(());
+        }
+        let v = [&dir.to_le_bytes()[..], name].concat();
+        self.set_xattr(ino, LAST_NAME, Some(&v))
+    }
+
+    /// The last name a file that has none had, and the directory it was
+    /// in, as Linux's `/proc/<pid>/fd` links show it once removed.
+    pub fn last_name(&self, ino: Ino) -> Option<(Ino, Vec<u8>)> {
+        let v = self.xattr(ino, LAST_NAME).ok()?;
+        Some((u64::from_le_bytes(v.get(..8)?.try_into().ok()?), v[8..].to_vec()))
     }
 
     /// Inode `ino` goes if it has no names and no holders.
@@ -730,6 +830,7 @@ impl Tx<'_> {
                 self.set_u32(other, I_NLINK, l.saturating_sub(1))?;
                 self.touch_changed(other)?;
             }
+            self.note_last(other, ndir, nname)?;
             replaced = Some(other);
         }
         // The entry looked up again: removing the target may have moved
@@ -855,9 +956,33 @@ impl Tx<'_> {
         self.touch_changed(ino)
     }
 
-    /// The file was read: its access time is now.
-    pub fn touch_accessed(&mut self, ino: Ino) -> Result<(), i32> {
-        self.set_u64(ino, I_ATIME, now_ns() as u64)
+    /// The file was read through a mount with `flags`: its access time
+    /// moved as Linux moves it (`touch_atime`), never on a `noatime` mount
+    /// (nor a directory's on a `nodiratime` one), always on a
+    /// `strictatime` one, and otherwise (`relatime`) when it is not after
+    /// the file's last modification or change, or is a day old.
+    pub fn accessed(&mut self, ino: Ino, flags: u64) -> Result<(), i32> {
+        use crate::mounts::ms;
+        let st = self.stat(ino)?;
+        let dir = st.mode & S_IFMT == S_IFDIR;
+        // (A file of `FS_NOATIME_FL` as one on a `noatime` mount.)
+        const FS_NOATIME_FL: u32 = 0x80;
+        if flags & ms::NOATIME != 0
+            || st.flags & FS_NOATIME_FL != 0
+            || (dir && flags & ms::NODIRATIME != 0)
+        {
+            return Ok(());
+        }
+        let now = now_ns();
+        const DAY: i64 = 86_400 * 1_000_000_000;
+        if flags & ms::STRICTATIME == 0
+            && st.atime > st.mtime
+            && st.atime > st.ctime
+            && now - st.atime < DAY
+        {
+            return Ok(());
+        }
+        self.set_u64(ino, I_ATIME, now as u64)
     }
 
     /// The file's data changed: its modification and change times are
@@ -903,6 +1028,26 @@ impl Tx<'_> {
     /// The filesystem's limits: bytes of data and inodes (0: none).
     pub fn limits(&self) -> (u64, u64) {
         (self.m.root(R_LIMIT_BYTES), self.m.root(R_LIMIT_INODES))
+    }
+
+    /// A remount's new size and number of inodes (`None`: as they are; 0:
+    /// none), as Linux's tmpfs takes them: no limit set where there was
+    /// none, and none below what is in use (`EINVAL`).
+    pub fn limit(&mut self, bytes: Option<u64>, inodes: Option<u64>) -> Result<(), i32> {
+        let (had_bytes, had_inodes) = self.limits();
+        let (used_bytes, used_inodes) = self.usage();
+        if let Some(b) = bytes.filter(|&b| b != 0)
+            && (had_bytes == 0 || b < used_bytes)
+        {
+            return Err(errno::EINVAL);
+        }
+        if let Some(n) = inodes.filter(|&n| n != 0)
+            && (had_inodes == 0 || n < used_inodes)
+        {
+            return Err(errno::EINVAL);
+        }
+        self.set_limits(bytes.unwrap_or(had_bytes), inodes.unwrap_or(had_inodes));
+        Ok(())
     }
 
     pub fn set_limits(&mut self, bytes: u64, inodes: u64) {
@@ -1128,6 +1273,18 @@ impl Tx<'_> {
         Ok(())
     }
 
+    /// Whether `ino`, with no names, may be named ([`LINKABLE`]).
+    pub fn linkable(&self, ino: Ino) -> Result<bool, i32> {
+        Ok(self.xattrs(ino)?.iter().any(|(n, _)| n == LINKABLE))
+    }
+
+    pub fn set_linkable(&mut self, ino: Ino, linkable: bool) -> Result<(), i32> {
+        if linkable == self.linkable(ino)? {
+            return Ok(());
+        }
+        self.set_xattr(ino, LINKABLE, linkable.then_some(&b""[..]))
+    }
+
     /// How many descriptors hold `ino` open, in every process.
     pub fn holders(&self, ino: Ino) -> Result<u64, i32> {
         Ok(self.holder_list(ino)?.iter().map(|h| h.count as u64).sum())
@@ -1272,6 +1429,12 @@ impl Tx<'_> {
     /// Forget the holders `alive` says have ended, of `ino`, and the record
     /// locks they owned; the descriptions only they held let go of theirs:
     /// whether the file has gone.
+    /// Whether a description open for writing ([`WRITER`]) holds `ino`,
+    /// in a process `alive` says lives: running it is `ETXTBSY`.
+    pub fn written(&self, ino: Ino, alive: impl Fn((i32, u64)) -> bool) -> Result<bool, i32> {
+        Ok(self.holder_list(ino)?.iter().any(|h| h.desc & WRITER != 0 && alive((h.pid, h.start))))
+    }
+
     pub fn reap(&mut self, ino: Ino, alive: impl Fn((i32, u64)) -> bool) -> Result<Gone, i32> {
         let before = self.holder_list(ino)?;
         let list: Vec<Holder> =
@@ -1353,6 +1516,9 @@ struct Holder {
 }
 
 const HOLDER: usize = 24;
+
+/// The bit of a description's id that marks it open for writing.
+pub const WRITER: u64 = 1 << 63;
 
 impl Holder {
     fn encode(&self) -> [u8; HOLDER] {

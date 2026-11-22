@@ -23,7 +23,7 @@
 //! data ([`super::data::keep`]), so reads and writes map nothing.
 
 use super::fs::{self as sfs, Fs};
-use super::tree::Ino;
+use super::tree::{self, Ino};
 use crate::fdmarks::{self, Mark};
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
@@ -44,15 +44,22 @@ impl File {
     }
 }
 
-/// An open file description: its file, and its id.
+/// An open file description: its file, its id, and whether it only
+/// names the file (`O_PATH`).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Desc {
     file: File,
     id: u64,
+    path: bool,
 }
 
 /// The process's descriptions, by their marks' numbers.
 pub(crate) static DESCS: Mutex<BTreeMap<u32, Desc>> = Mutex::new(BTreeMap::new());
+
+/// Where each description opened by a name was opened: the directory and
+/// the name, by its mark's number (what inotify tells a watched directory
+/// of its file's use).
+pub(crate) static PLACES: Mutex<BTreeMap<u32, (Ino, Vec<u8>)>> = Mutex::new(BTreeMap::new());
 static NEXT_KEY: AtomicU32 = AtomicU32::new(1);
 
 /// Whether the process ever had a descriptor of the store: until it has,
@@ -87,6 +94,26 @@ pub fn of(fd: i32) -> Option<File> {
     descs(|m| m.get(&k).map(|d| d.file))
 }
 
+/// Whether `fd` is a descriptor of the store that only names its file
+/// (`O_PATH`).
+pub fn is_path(fd: i32) -> bool {
+    key_of(fd).is_some_and(|k| descs(|m| m.get(&k).is_some_and(|d| d.path)))
+}
+
+/// Descriptor `fd` of the store was opened as `name` in directory `dir`.
+pub fn set_place(fd: i32, dir: Ino, name: &[u8]) {
+    if let Some(k) = key_of(fd) {
+        PLACES.lock().unwrap_or_else(|e| e.into_inner()).insert(k, (dir, name.to_vec()));
+    }
+}
+
+/// Where descriptor `fd` of the store was opened, if by a name: the
+/// directory and the name.
+pub fn place(fd: i32) -> Option<(Ino, Vec<u8>)> {
+    let k = key_of(fd)?;
+    PLACES.lock().unwrap_or_else(|e| e.into_inner()).get(&k).cloned()
+}
+
 /// The id of the open file description `fd` is, if it is one of the
 /// store's.
 pub fn description(fd: i32) -> Option<u64> {
@@ -112,9 +139,11 @@ fn host_flags(flags: u64) -> i32 {
     h
 }
 
-/// An id for a new open file description, which no other has.
-pub fn new_id() -> u64 {
-    crate::shared::unique()
+/// An id for a new open file description, which no other has, open with
+/// Linux's `flags`: one open for writing is marked so ([`tree::WRITER`]).
+pub fn new_id(flags: u64) -> u64 {
+    let writes = flags & fwe_abi::fcntl::O_ACCMODE != 0 && flags & fwe_abi::fcntl::O_PATH == 0;
+    crate::shared::unique() & !tree::WRITER | if writes { tree::WRITER } else { 0 }
 }
 
 /// A new description of `file`, `id` ([`new_id`]), open with Linux's
@@ -131,7 +160,7 @@ pub fn open(file: File, flags: u64, id: u64) -> Result<i32, i32> {
         unsafe { libc::close(fd) };
         return Err(errno::EMFILE);
     }
-    adopt(fd, file, id);
+    adopt(fd, file, id, flags & fwe_abi::fcntl::O_PATH != 0);
     sync(&[]);
     Ok(fd)
 }
@@ -146,16 +175,16 @@ const EXE_KEY: u32 = u32::MAX;
 /// counts carry over the host `execve`).
 pub fn adopt_exe(fd: i32, file: File, id: u64) {
     ANY.store(true, Ordering::Relaxed);
-    descs(|m| m.insert(EXE_KEY, Desc { file, id }));
+    descs(|m| m.insert(EXE_KEY, Desc { file, id, path: false }));
     fdmarks::mark(fd, Mark::Store(EXE_KEY));
 }
 
 /// Host descriptor `fd` (a `/dev/null`) is description `id` of `file`
 /// (the caller then counts it: [`sync`]).
-fn adopt(fd: i32, file: File, id: u64) {
+fn adopt(fd: i32, file: File, id: u64, path: bool) {
     ANY.store(true, Ordering::Relaxed);
     let k = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    descs(|m| m.insert(k, Desc { file, id }));
+    descs(|m| m.insert(k, Desc { file, id, path }));
     fdmarks::mark(fd, Mark::Store(k));
 }
 
@@ -182,6 +211,7 @@ pub fn sync(skip: &[i32]) {
         }
     }
     descs(|m| m.retain(|k, _| keys.contains(k)));
+    PLACES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keys.contains(k));
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     let me = crate::sysvipc::me();
     let files: BTreeSet<File> = held.keys().chain(now.keys()).copied().collect();
@@ -338,6 +368,14 @@ pub(crate) fn save(e: &mut Enc) {
         e.u64(desc.file.fs);
         e.u64(desc.file.ino);
         e.u64(desc.id);
+        e.bool(desc.path);
+    }
+    let p = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+    e.u64(p.len() as u64);
+    for (&k, (dir, name)) in p.iter() {
+        e.u32(k);
+        e.u64(*dir);
+        e.bytes(name);
     }
     let h = HELD.lock().unwrap_or_else(|e| e.into_inner());
     e.u64(h.len() as u64);
@@ -356,12 +394,20 @@ pub(crate) fn save(e: &mut Enc) {
 pub(crate) fn load(d: &mut Dec) {
     ANY.store(d.bool(), Ordering::Relaxed);
     NEXT_KEY.store(d.u32(), Ordering::Relaxed);
-    let n = d.count(28);
+    let n = d.count(29);
     let mut descs = DESCS.lock().unwrap_or_else(|e| e.into_inner());
     for _ in 0..n {
         let k = d.u32();
         let file = File { fs: d.u64(), ino: d.u64() };
-        descs.insert(k, Desc { file, id: d.u64() });
+        let (id, path) = (d.u64(), d.bool());
+        descs.insert(k, Desc { file, id, path });
+    }
+    let n = d.count(20);
+    let mut places = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+    for _ in 0..n {
+        let k = d.u32();
+        let dir = d.u64();
+        places.insert(k, (dir, d.bytes()));
     }
     let n = d.count(24);
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
@@ -389,6 +435,7 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
     e.u64(d.file.fs);
     e.u64(d.file.ino);
     e.u64(d.id);
+    e.bool(d.path);
     e.u64(token);
     Some(crate::scm::Export {
         kind: crate::scm::kind::STORE,
@@ -403,9 +450,9 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn import(fd: i32, d: &mut Dec) -> bool {
     let file = File { fs: d.u64(), ino: d.u64() };
-    let (id, token) = (d.u64(), d.u64());
+    let (id, path, token) = (d.u64(), d.bool(), d.u64());
     let Ok(fs) = file.fs() else { return false };
-    adopt(fd, file, id);
+    adopt(fd, file, id, path);
     sync(&[]);
     let_go_in_flight(&fs, file.ino, token);
     true
@@ -429,7 +476,7 @@ fn let_go_in_flight(fs: &Fs, ino: Ino, token: u64) {
 pub(crate) fn unsent(state: &[u8]) {
     let mut d = Dec::new(state);
     let file = File { fs: d.u64(), ino: d.u64() };
-    let (_, token) = (d.u64(), d.u64());
+    let (_, _, token) = (d.u64(), d.bool(), d.u64());
     if let Ok(fs) = file.fs() {
         let_go_in_flight(&fs, file.ino, token);
     }

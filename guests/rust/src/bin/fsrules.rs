@@ -123,7 +123,10 @@ fn name(e: i32) -> String {
         28 => "ENOSPC",
         30 => "EROFS",
         40 => "ELOOP",
+        26 => "ETXTBSY",
         61 => "ENODATA",
+        98 => "EADDRINUSE",
+        111 => "ECONNREFUSED",
         95 => "EOPNOTSUPP",
         116 => "ESTALE",
         e => return format!("errno {e}"),
@@ -1213,6 +1216,9 @@ fn main() {
         "noatimeflag" => noatime_flag_scenario(),
         "tmpfsopts" => tmpfs_options_scenario(),
         "procopts" => proc_options_scenario(),
+        "store" => store_scenario(),
+        // A program run from a tmpfs ([`store_scenario`]): its exit code.
+        "exit" => std::process::exit(7),
         s => panic!("unknown scenario {s}"),
     }
 }
@@ -1506,6 +1512,208 @@ fn tmpfs_options_scenario() {
         "bad size: {} bad uid: {}",
         mount_new("tmpfs", "/tmp/n", 0, "size=lots"),
         mount_new("tmpfs", "/tmp/n", 0, "uid=-1")
+    );
+}
+
+unsafe extern "C" {
+    fn execv(p: *const c_char, argv: *const *const c_char) -> i32;
+    fn getpeername(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+    fn readlink(p: *const c_char, b: *mut u8, n: usize) -> isize;
+    fn accept(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+}
+
+/// arm64's `struct stat` of `p` (not following a link), as words.
+fn stat_words(p: &str) -> [u64; 16] {
+    let mut st = [0u64; 16];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+    unsafe { lstat(c(p).as_ptr(), st.as_mut_ptr().cast()) };
+    st
+}
+
+/// What `/proc/self/fd/<fd>` reads.
+fn fd_link(fd: i32) -> String {
+    let mut b = [0u8; 256];
+    // SAFETY: a NUL-terminated path; a buffer of its length.
+    let n = unsafe { readlink(c(&format!("/proc/self/fd/{fd}")).as_ptr(), b.as_mut_ptr(), 256) };
+    String::from_utf8_lossy(&b[..n.max(0) as usize]).into_owned()
+}
+
+/// A tmpfs (a filesystem of fwe's store, in memory) does what a Linux
+/// tmpfs does by path: a socket bound there is connected to and named; a
+/// FIFO made there passes data between processes and its descriptor shows
+/// the file; a program copied there runs (not while open to write); a
+/// file's handle opens it until it is gone; `/proc/self/fd` follows a
+/// file renamed and removed; a directory lists in the order its names
+/// were made; mode, size, times, attributes and the filesystem's type by
+/// path.
+fn store_scenario() {
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    // SAFETY: a plain call; NUL-terminated paths.
+    unsafe {
+        unshare(CLONE_NEWNS_FLAG);
+        mkdir(c("/tmp/s").as_ptr(), 0o755);
+    }
+    println!("mount: {}", mount_new("tmpfs", "/tmp/s", 0, "size=64m"));
+
+    // A socket.
+    let (addr, len) = (unix_addr("/tmp/s/sock"), 110);
+    // SAFETY: plain socket calls on an address of its length.
+    let (bound, again, connected, peer) = unsafe {
+        let srv = socket(AF_UNIX, SOCK_STREAM, 0);
+        let bound = bind_socket(srv, addr.as_ptr(), len);
+        listen(srv, 1);
+        let other = socket(AF_UNIX, SOCK_STREAM, 0);
+        let again = bind_socket(other, addr.as_ptr(), len);
+        let cl = socket(AF_UNIX, SOCK_STREAM, 0);
+        let connected = connect(cl, addr.as_ptr(), len);
+        let mut pa = [0u8; 110];
+        let mut pl = 110u32;
+        getpeername(cl, pa.as_mut_ptr(), &mut pl);
+        let a = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+        write(cl, b"x".as_ptr(), 1);
+        let mut x = [0u8; 1];
+        read(a, x.as_mut_ptr(), 1);
+        let end = pa[2..].iter().position(|&b| b == 0).map_or(pl as usize, |e| e + 2);
+        (bound, again, connected, String::from_utf8_lossy(&pa[2..end]).into_owned())
+    };
+    let kind = stat_words("/tmp/s/sock")[2] as u32 & 0o170000;
+    println!(
+        "socket: bind {} again {} connect {} peer {peer} a socket {}",
+        res(bound.into()),
+        res(again.into()),
+        res(connected.into()),
+        kind == 0o140000
+    );
+    make("/tmp/s/plain", 0o644);
+    let (pa, pl) = (unix_addr("/tmp/s/plain"), 110);
+    // SAFETY: as above.
+    let refused = res(unsafe { connect(socket(AF_UNIX, SOCK_STREAM, 0), pa.as_ptr(), pl) }.into());
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(c("/tmp/s/sock").as_ptr()) };
+    // SAFETY: as above.
+    let gone = unsafe { connect(socket(AF_UNIX, SOCK_STREAM, 0), addr.as_ptr(), len) };
+    println!("not a socket: {refused} unlinked: {}", res(gone.into()));
+
+    // A FIFO.
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkfifo(c("/tmp/s/fifo").as_ptr(), 0o600) };
+    // SAFETY: fork; the child writes and leaves.
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        // SAFETY: a NUL-terminated path; two bytes.
+        unsafe {
+            let w = open(c("/tmp/s/fifo").as_ptr(), O_WRONLY);
+            write(w, b"hi".as_ptr(), 2);
+            _exit(0);
+        }
+    }
+    // SAFETY: a NUL-terminated path.
+    let r = unsafe { open(c("/tmp/s/fifo").as_ptr(), O_RDONLY) };
+    let got = read_all(r.into());
+    let mut st = [0u64; 16];
+    // SAFETY: a buffer as big as a `struct stat`.
+    unsafe { fstat(r, st.as_mut_ptr().cast()) };
+    let same = st[1] == stat_words("/tmp/s/fifo")[1] && st[2] as u32 & 0o170000 == 0o10000;
+    // SAFETY: the child above.
+    unsafe { waitpid(pid, std::ptr::null_mut(), 0) };
+    println!("fifo: read {got} the file's status {same}");
+
+    // A program.
+    let prog = std::fs::read("/fsrules").unwrap();
+    std::fs::write("/tmp/s/prog", &prog).unwrap();
+    // SAFETY: a NUL-terminated path.
+    unsafe { chmod(c("/tmp/s/prog").as_ptr(), 0o755) };
+    let run = || {
+        // SAFETY: fork; the child runs the program.
+        let pid = unsafe { fork() };
+        if pid == 0 {
+            let (p, a) = (c("/tmp/s/prog"), c("exit"));
+            let argv = [p.as_ptr(), a.as_ptr(), std::ptr::null()];
+            // SAFETY: a NUL-terminated path and argument vector.
+            unsafe {
+                execv(p.as_ptr(), argv.as_ptr());
+                _exit(100 + errno());
+            }
+        }
+        let mut status = 0;
+        // SAFETY: the child above.
+        unsafe { waitpid(pid, &mut status, 0) };
+        (status >> 8) & 0xff
+    };
+    let ran = run();
+    // SAFETY: a NUL-terminated path.
+    let writer = unsafe { open(c("/tmp/s/prog").as_ptr(), O_WRONLY) };
+    let busy = run();
+    // SAFETY: the descriptor just opened.
+    unsafe { close(writer) };
+    println!("exec: exit {ran}, while open to write {}", name(busy - 100));
+
+    // A handle.
+    std::fs::write("/tmp/s/h", b"held").unwrap();
+    let h = handle_of("/tmp/s/h");
+    let first = read_all(open_handle("/tmp/s", &h, O_RDONLY));
+    // SAFETY: NUL-terminated paths.
+    unsafe { rename(c("/tmp/s/h").as_ptr(), c("/tmp/s/h2").as_ptr()) };
+    let moved = read_all(open_handle("/tmp/s", &h, O_RDONLY));
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(c("/tmp/s/h2").as_ptr()) };
+    println!(
+        "handle: {first}, renamed {moved}, removed {}",
+        res(open_handle("/tmp/s", &h, O_RDONLY))
+    );
+
+    // `/proc/self/fd`.
+    make("/tmp/s/a", 0o644);
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/s/a").as_ptr(), O_RDONLY) };
+    let opened = fd_link(fd);
+    // SAFETY: NUL-terminated paths.
+    unsafe { rename(c("/tmp/s/a").as_ptr(), c("/tmp/s/b").as_ptr()) };
+    let renamed = fd_link(fd);
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(c("/tmp/s/b").as_ptr()) };
+    println!("fd link: {opened}, {renamed}, {}", fd_link(fd));
+
+    // A listing.
+    // SAFETY: NUL-terminated paths.
+    unsafe { mkdir(c("/tmp/s/d").as_ptr(), 0o755) };
+    for n in ["z", "a", "m"] {
+        make(&format!("/tmp/s/d/{n}"), 0o644);
+    }
+    println!("listing: {}", names_in("/tmp/s/d").join(" "));
+
+    // Attributes by path.
+    std::fs::write("/tmp/s/f", b"0123456789abcdef").unwrap();
+    let times = [1000i64, 0, 2000, 0];
+    // SAFETY: NUL-terminated paths and values of their lengths.
+    let (m, t, u, x) = unsafe {
+        (
+            chmod(c("/tmp/s/f").as_ptr(), 0o640),
+            truncate(c("/tmp/s/f").as_ptr(), 10),
+            utimensat(AT_FDCWD, c("/tmp/s/f").as_ptr(), &times, 0),
+            setxattr(c("/tmp/s/f").as_ptr(), c("user.k").as_ptr(), b"v".as_ptr(), 1, 0),
+        )
+    };
+    let st = stat_words("/tmp/s/f");
+    let mut v = [0u8; 8];
+    // SAFETY: NUL-terminated names; a buffer of its length.
+    let n = unsafe { getxattr(c("/tmp/s/f").as_ptr(), c("user.k").as_ptr(), v.as_mut_ptr(), 8) };
+    let mut fs = [0u64; 15];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct statfs`.
+    unsafe { statfs(c("/tmp/s/f").as_ptr(), fs.as_mut_ptr().cast()) };
+    println!(
+        "by path: {} {} {} {}; mode {:o} size {} atime {} mtime {} attribute {} tmpfs {}",
+        res(m.into()),
+        res(t.into()),
+        res(u.into()),
+        res(x.into()),
+        st[2] as u32 & 0o7777,
+        st[6],
+        st[9],
+        st[11],
+        String::from_utf8_lossy(&v[..n.max(0) as usize]),
+        fs[0] == 0x0102_1994
     );
 }
 

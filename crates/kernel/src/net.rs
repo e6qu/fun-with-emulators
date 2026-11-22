@@ -121,6 +121,13 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
         return Ok(());
     }
     let access = crate::creds::access();
+    // A socket's file in fwe's store: its own owner and mode.
+    if let Some(st) = node_path(hb, a).and_then(|p| crate::storenodes::stat_of(&p)) {
+        if access.dac_override && !access.scoped {
+            return Ok(());
+        }
+        return if access.permits(&st, 2) { Ok(()) } else { Err(errno::EACCES) };
+    }
     // `CAP_DAC_OVERRIDE` passes every node, but in a user namespace of
     // fwe's only a node mapped there ([`crate::creds::Access::permits`]).
     if access.dac_override && !access.scoped {
@@ -149,6 +156,20 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
         return Ok(());
     }
     if access.permits(&st, 2) { Ok(()) } else { Err(errno::EACCES) }
+}
+
+/// The host path of the node Unix host address `hb` names (`a`'s): its
+/// path, or its name in `a`'s directory.
+fn node_path(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Option<Vec<u8>> {
+    let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
+    let name = &hb[2..end];
+    match &a.dir {
+        Some(d) => {
+            use std::os::fd::AsRawFd;
+            Some(crate::mounts::join(&crate::fs::fd_path(d.as_raw_fd())?, name))
+        }
+        None => Some(name.to_vec()),
+    }
 }
 
 /// The file abstract name `name` (without its leading NUL) stands as.
@@ -1039,7 +1060,17 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     if r == 0 && kept_value(fd as i32, SO_PASSCRED) != 0 {
         passcred_bound(fd as i32, true);
     }
-    if r == 0 && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
+    // A socket's file in fwe's store takes the socket's mode, or goes
+    // with a bind that failed.
+    let stored = (family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0)
+        .then(|| node_path(&hb, &a))
+        .flatten()
+        .filter(|p| crate::storenodes::file_of(p).is_some());
+    if let Some(p) = &stored {
+        let mode = socket_inode(fd as i32).map_or(0o777, |s| s.perm) & !umask;
+        crate::storenodes::bound(p, (r == 0).then_some(mode));
+    }
+    if r == 0 && stored.is_none() && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
         // The node takes the socket's mode (its `fchmod`, or every bit),
         // less the umask, as on Linux.
         let mode = socket_inode(fd as i32).map_or(0o777, |s| s.perm) & !umask;

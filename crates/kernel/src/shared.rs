@@ -129,7 +129,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 43;
+pub const FORMAT: u32 = 44;
 
 /// A number no other call of any process gives: for the names of host
 /// objects of fwe's (a System V segment's memory, an eventfd's counter).
@@ -704,6 +704,8 @@ fn collect_in(base: &[u8]) {
     }
     // What the live mount tables show.
     let mut shown: HashSet<Vec<u8>> = HashSet::new();
+    // The filesystems of fwe's store they show.
+    let mut stores: HashSet<u64> = HashSet::new();
     let kind_of = |d: &[u8]| -> Vec<u8> {
         let name = d.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
         let rest = name.strip_prefix(format!("v{FORMAT}-").as_bytes()).unwrap_or(&[]);
@@ -742,6 +744,9 @@ fn collect_in(base: &[u8]) {
                                 shown.insert([&base[..], b"/", top].concat());
                             }
                         }
+                    }
+                    crate::mounts::Source::Store(id) => {
+                        stores.insert(*id);
                     }
                     crate::mounts::Source::Synthetic => {}
                 }
@@ -802,16 +807,21 @@ fn collect_in(base: &[u8]) {
                         kind != b"cgroup" || rest.starts_with(b"cgroup-")
                     }
                 }
+                // A filesystem of fwe's store no table shows and no live
+                // process holds a file of.
+                b"store" => {
+                    let id = rest.get(6..).and_then(|h| std::str::from_utf8(h).ok());
+                    match id.and_then(|h| u64::from_str_radix(h, 16).ok()) {
+                        Some(id) => !stores.contains(&id) && !crate::filestore::fs::in_use(id),
+                        None => true,
+                    }
+                }
                 _ => false,
             }
-        } else if let Some(dir) =
-            name.strip_prefix(b"tmpfs-").and_then(|n| n.strip_suffix(b".limit"))
-        {
-            // A tmpfs's size limit goes with it.
-            !shown.contains(&[&base[..], b"/tmpfs-", dir].concat())
         } else if name.starts_with(b"tmpfs-") || name.starts_with(b"shm-") {
-            // A tmpfs, or a rootfs's `/dev/shm`, that no table shows.
-            !shown.contains(&path)
+            // Another fwe build's directory of a tmpfs or of a `/dev/shm`
+            // (this one keeps them in its store) and their limits' files.
+            true
         } else if name.starts_with(b"ptrace-") {
             // ptrace's pages are the process store's.
             true
@@ -834,6 +844,13 @@ pub fn remove(path: &[u8], dir: bool) {
     let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
     if name.starts_with(format!("v{FORMAT}-ipc-").as_bytes()) {
         crate::sysvipc::forget(path);
+    }
+    if let Some(id) = name
+        .strip_prefix(format!("v{FORMAT}-store-").as_bytes())
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+    {
+        crate::filestore::fs::remove(id);
     }
     let inside = [path, b"/"].concat();
     for (name, _) in named::all() {
