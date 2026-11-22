@@ -794,11 +794,9 @@ pub fn make_segment(nonce: u64, size: u64) -> Result<crate::maps::HeldFile, i32>
     // SAFETY: a NUL-terminated name; the descriptor is moved into fwe's
     // range (or closed) and kept.
     unsafe {
-        let fd = libc::shm_open(
-            name.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-            0o600,
-        );
+        // (No `O_CLOEXEC`, which macOS 26 refuses: the descriptor moves into
+        // fwe's range, close-on-exec, below.)
+        let fd = libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL, 0o600);
         if fd < 0 {
             return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
@@ -838,7 +836,7 @@ pub fn segment(nonce: u64, read_only: bool) -> Result<crate::maps::HeldFile, i32
     let name = segment_name(nonce);
     let flags = if read_only { libc::O_RDONLY } else { libc::O_RDWR };
     // SAFETY: a NUL-terminated name.
-    let fd = unsafe { libc::shm_open(name.as_ptr(), flags | libc::O_CLOEXEC, 0) };
+    let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0) };
     if fd < 0 {
         return Err(crate::host::errno_to_linux(crate::host::last_errno()));
     }

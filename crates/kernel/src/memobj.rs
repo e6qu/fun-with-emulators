@@ -106,12 +106,16 @@ pub fn make(kind: u8, id: u64, len: usize) -> Result<(i32, Mapping), i32> {
     let last = || crate::host::errno_to_linux(crate::host::last_errno());
     let name = format!("/fwe{}{}{id:x}", crate::host::euid(), kind as char);
     let name = std::ffi::CString::new(name).map_err(|_| fwe_abi::errno::EINVAL)?;
-    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+    // `O_CLOEXEC` is set after: macOS 26 refuses it here.
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
     // SAFETY: a NUL-terminated name.
     let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600 as libc::c_uint) };
     if fd < 0 {
         return Err(last());
     }
+    // SAFETY: a plain host call on the descriptor just opened. (Linux's
+    // `bpf` makes its descriptors close-on-exec.)
+    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
     // SAFETY: fwe's own object, open above, held by its descriptor.
     unsafe { libc::shm_unlink(name.as_ptr()) };
     // SAFETY: a plain host call on the object just made.

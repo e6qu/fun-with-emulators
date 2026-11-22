@@ -366,7 +366,9 @@ mod imp {
     fn new_shared(count: u64) -> Result<(i32, usize), i32> {
         let name = format!("/fwe{}e{:x}", crate::host::euid(), crate::shared::unique());
         let name = std::ffi::CString::new(name).map_err(|_| errno::EINVAL)?;
-        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC;
+        // (No `O_CLOEXEC`, which macOS 26 refuses: the descriptor moves into
+        // fwe's range, close-on-exec, below.)
+        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
         // SAFETY: a NUL-terminated name.
         let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600 as libc::c_uint) };
         if fd < 0 {
