@@ -5,7 +5,8 @@
 //! the namespace's own record, or for the initial namespace a named one):
 //! each object's key, owner, permissions and times, a semaphore set's
 //! values and undo adjustments, a queue's messages. A segment's memory is
-//! a file beside the record, which `shmat` maps shared. Every operation is
+//! a host shared memory object named for the segment ([`segment_name`]),
+//! which `shmat` maps shared. Every operation is
 //! one change of the record, under its lock, so a semaphore operation or a
 //! message is all or nothing across processes; an operation that must wait
 //! (a semaphore that would go below zero, a full or empty queue) waits for

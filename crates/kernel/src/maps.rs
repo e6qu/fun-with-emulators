@@ -17,11 +17,11 @@
 //! often is, never costs the list a change.
 //!
 //! Each process publishes its record once it changed, before its next
-//! system call that is not a memory call and before a fork, in a shared
-//! file beside its process record ([`publish`]), which another process reads
-//! for `/proc/<pid>/maps` ([`of_process`]). A fork child, until its first
+//! system call that is not a memory call and before a fork, in its entry
+//! of the process store ([`publish`]), which another process reads for
+//! `/proc/<pid>/maps` ([`of_process`]). A fork child, until its first
 //! change, is described by what it inherited, kept in its process record
-//! ([`forked`]), so a fork makes no file.
+//! ([`forked`]), so a fork writes no list.
 
 use crate::vmas::{Mapping, Piece, Vmas};
 use fwe_abi::mman;

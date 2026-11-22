@@ -442,11 +442,9 @@ const TID_FIRST: i32 = 100_000;
 const TID_END: i32 = 4_194_304;
 
 /// A thread id outside a pid namespace of fwe's: the next of a counter
-/// every fwe process shares (a file beside the process records, taken in
-/// turn with `flock`), so no two live threads have the same one. They are
-/// taken [`TID_BLOCK`] at a time, the block marked this process's, and
-/// given out from the block (a slot of the robust lists' file is a thread's
-/// only once it is written after the process started).
+/// every fwe process shares (in the process store), so no two live threads
+/// have the same one. They are taken [`TID_BLOCK`] at a time, the block
+/// marked this process's, and given out from the block.
 fn shared_tid() -> i32 {
     let me = crate::host::pid();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
