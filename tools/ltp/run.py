@@ -506,11 +506,15 @@ def run_guarded_inner(fwe, root, work, name, argv, hard_limit):
 # another's is in force; and those that measure time (how late a sleep or a
 # timeout ends, timer slack) or need the host's processors (fork14's 16384
 # forks of a process with as many mappings, quadratic on the host), which a
-# loaded machine makes miss.
+# loaded machine makes miss; and those that need many of the user's
+# processes at once (futex_cmp_requeue01's thousand waiters), of the
+# host's limit a user's processes share, which the tests beside them
+# would take.
 SERIAL = re.compile(
     r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13"
     r"|fork14|prctl09|select02|poll02|pselect01|epoll_pwait03|epoll_wait02"
-    r"|clock_gettime04|clock_nanosleep02|nanosleep01|futex_wait05|pipe15)(_64)?$"
+    r"|clock_gettime04|clock_nanosleep02|nanosleep01|futex_wait05|pipe15"
+    r"|futex_cmp_requeue01)(_64)?$"
 )
 
 
