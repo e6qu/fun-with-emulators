@@ -2315,6 +2315,12 @@ impl<P: Platform> Kernel<P> {
                     major: crate::devnodes::major(dev),
                     minor: crate::devnodes::minor(dev),
                 };
+                // A whiteout (a 0:0 character device) needs no CAP_MKNOD,
+                // as on Linux since 5.8: rootless overlay storage makes one.
+                let whiteout = kind == S_IFCHR && node.major == 0 && node.minor == 0;
+                if !whiteout && !self.creds.has(crate::caps::CAP_MKNOD) {
+                    return err(errno::EPERM);
+                }
                 if r.ovl.is_some() && kind == S_IFCHR && node.major == 0 && node.minor == 0 {
                     // A whiteout is the overlay's own, as on Linux.
                     return err(errno::EPERM);
