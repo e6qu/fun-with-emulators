@@ -3233,34 +3233,45 @@ impl<P: Platform> Kernel<P> {
 
 /// Fill new private memory `[at, at + len)`, of host protections `prot`,
 /// with the pages of host shared memory object `fd` from `offset` (the host
-/// reads such an object only through a mapping).
+/// reads such an object only through a mapping). `offset` need not be a
+/// multiple of the host's page (the VM's guest pages are smaller): the
+/// object is mapped from the host page holding it.
 pub fn copy_object(fd: i32, offset: u64, at: u64, len: u64, prot: i32) -> Result<(), i32> {
+    // SAFETY: sysconf only reads a value.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let delta = offset % page;
+    let span = (delta + len) as usize;
     // SAFETY: a new shared read-only mapping of the object, unmapped below.
     let src = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            len as usize,
+            span,
             libc::PROT_READ,
             libc::MAP_SHARED,
             fd,
-            offset as libc::off_t,
+            (offset - delta) as libc::off_t,
         )
     };
     if src == libc::MAP_FAILED {
         return Err(crate::host::errno_to_linux(crate::host::last_errno()));
     }
     // SAFETY: `[at, at + len)` is the caller's new memory, made writable
-    // for the copy and given its protections after; `src` maps `len` bytes.
+    // for the copy and given its protections after; `src` maps `span`
+    // bytes, `len` of them from `delta`.
     unsafe {
         let writable = prot & libc::PROT_WRITE != 0;
         if !writable {
             libc::mprotect(at as *mut libc::c_void, len as usize, prot | libc::PROT_WRITE);
         }
-        std::ptr::copy_nonoverlapping(src as *const u8, at as *mut u8, len as usize);
+        std::ptr::copy_nonoverlapping(
+            (src as *const u8).add(delta as usize),
+            at as *mut u8,
+            len as usize,
+        );
         if !writable {
             libc::mprotect(at as *mut libc::c_void, len as usize, prot);
         }
-        libc::munmap(src, len as usize);
+        libc::munmap(src, span);
     }
     Ok(())
 }
