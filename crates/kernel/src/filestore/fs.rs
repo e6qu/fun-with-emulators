@@ -261,7 +261,7 @@ impl Tx<'_> {
         }
         let object = match self.data(ino)? {
             0 => {
-                let o = data::make()?;
+                let o = data::make(st.size.max(end))?;
                 self.set_data(ino, o)?;
                 o
             }
@@ -335,7 +335,7 @@ impl Tx<'_> {
             return Err(errno::ENOSPC);
         }
         if self.data(ino)? == 0 {
-            let o = data::make()?;
+            let o = data::make(st.size.max(end))?;
             self.set_data(ino, o)?;
         }
         if !keep_size && end > st.size {

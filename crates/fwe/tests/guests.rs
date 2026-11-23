@@ -6765,6 +6765,22 @@ fn a_mapping_of_a_memfd_grows_and_remaps_from_its_file() {
     );
 }
 
+/// A memfd grown well past what it first held lies in several host
+/// objects (its extents, sized to it so that the host's memory compressor
+/// keeps a small index of each): read across their boundaries, mapped
+/// whole (one line in `/proc/self/maps`, as on Linux), written through the
+/// mapping, by a fork child too, mapped privately, grown into by `mremap`
+/// and remapped by `remap_file_pages`, every byte where the file has it.
+#[test]
+fn a_memfd_larger_than_its_first_extent_reads_maps_and_grows_as_one() {
+    assert_eq!(
+        memfd("extents"),
+        "read across: .xy.\nmapped: a xy z f\nlines in maps: 1\n\
+         written through the mapping: m\nfrom a child: k (status 0)\n\
+         privately: y P file f\ngrown: y ar\nremapped: 0 a\n"
+    );
+}
+
 /// A memfd opened again read-only through `/proc/self/fd`, as Chromium
 /// makes read-only shared memory, is read-only as Linux's new description
 /// is: `F_GETFL` says so; writes, writable shared mappings, resizing and

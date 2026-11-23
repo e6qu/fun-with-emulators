@@ -470,6 +470,88 @@ fn main() {
                 println!("remapped: {r} {}", g.read() as char);
             }
         }
+        // A file grown well past what it held when it was first written,
+        // which fwe keeps in several host objects (its extents, of 2, 2
+        // and 4 MiB here): read, mapped, grown into, remapped, mapped
+        // privately and shared with a child across their boundaries.
+        Some("extents") => {
+            const MIB: usize = 1 << 20;
+            // SAFETY: plain calls on memory and descriptors of this scenario.
+            unsafe {
+                let page = getpagesize() as usize;
+                let fd = memfd_create(c"big".as_ptr(), MFD_CLOEXEC);
+                let chunk = vec![b'.'; 64 << 10];
+                for _ in 0..(7 * MIB) / chunk.len() {
+                    write(fd, chunk.as_ptr(), chunk.len());
+                }
+                // Marks on both sides of the first boundaries, and far on.
+                for (at, b) in [(0, b'a'), (2 * MIB - 1, b'x'), (2 * MIB, b'y'), (4 * MIB - 1, b'z')] {
+                    pwrite(fd, &b, 1, at as i64);
+                }
+                pwrite(fd, b"far".as_ptr(), 3, (5 * MIB) as i64);
+                let mut across = [0u8; 4];
+                pread(fd, across.as_mut_ptr(), 4, (2 * MIB - 2) as i64);
+                println!("read across: {}", String::from_utf8_lossy(&across));
+                let len = 8 * MIB;
+                let m = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                let at = |o: usize| m.add(o).read() as char;
+                println!(
+                    "mapped: {} {}{} {} {}",
+                    at(0),
+                    at(2 * MIB - 1),
+                    at(2 * MIB),
+                    at(4 * MIB - 1),
+                    at(5 * MIB)
+                );
+                // The mapping's lines in /proc/self/maps: one, as Linux has.
+                let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+                let lines = maps
+                    .lines()
+                    .filter(|l| {
+                        let start = l.split('-').next().unwrap();
+                        let start = usize::from_str_radix(start, 16).unwrap();
+                        start >= m as usize && start < m as usize + len
+                    })
+                    .count();
+                println!("lines in maps: {lines}");
+                m.add(6 * MIB).write(b'm');
+                let mut b = [0u8; 1];
+                pread(fd, b.as_mut_ptr(), 1, (6 * MIB) as i64);
+                println!("written through the mapping: {}", b[0] as char);
+                // A child writes through the mapping it inherits.
+                if fork() == 0 {
+                    m.add(3 * MIB).write(b'k');
+                    std::process::exit(if at(5 * MIB) == 'f' { 0 } else { 1 });
+                }
+                let mut status = 0;
+                waitpid(-1, &mut status, 0);
+                pread(fd, b.as_mut_ptr(), 1, (3 * MIB) as i64);
+                println!("from a child: {} (status {status})", b[0] as char);
+                // Privately: the same bytes, its own writes its own.
+                let p = mmap(std::ptr::null_mut(), len, PROT_READ | PROT_WRITE, MAP_PRIVATE, fd, 0);
+                p.add(5 * MIB).write(b'P');
+                pread(fd, b.as_mut_ptr(), 1, (5 * MIB) as i64);
+                println!("privately: {} {} file {}", p.add(2 * MIB).read() as char, p.add(5 * MIB).read() as char, b[0] as char);
+                // Grown into a later extent by mremap, from one page.
+                let one = mmap(std::ptr::null_mut(), page, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+                let g = mremap(one, page, 6 * MIB, MREMAP_MAYMOVE);
+                println!(
+                    "grown: {} {}",
+                    g.add(2 * MIB).read() as char,
+                    String::from_utf8_lossy(std::slice::from_raw_parts(g.add(5 * MIB + 1), 2))
+                );
+                // Its first page made the page of the file 5 MiB on.
+                let r = syscall(
+                    SYS_REMAP_FILE_PAGES,
+                    g as i64,
+                    page as i64,
+                    0i64,
+                    ((5 * MIB) / page) as i64,
+                    0i64,
+                );
+                println!("remapped: {r} {}", g.add(1).read() as char);
+            }
+        }
         // A memfd opened again for reading only, as Chromium makes its
         // read-only shared memory: read-only in this process, in another
         // it is passed to, and after an exec.

@@ -128,17 +128,19 @@ fn copy_out(object: u64, off: u64, to: u64, n: u64) -> Result<(), i32> {
         }
         return Ok(());
     }
-    data::with_bytes(object, off, n, |p| {
-        // SAFETY: `n` bytes of the object's mapping, kept for the call.
-        uaccess::write_host(to, unsafe { std::slice::from_raw_parts(p, n as usize) })
-    })?
+    data::each_read(object, off, n, |done, bytes| match bytes {
+        Some(b) => uaccess::write_host(to + done, b),
+        None => copy_out(0, 0, to + done, n - done).map(|_| ()),
+    })
 }
 
 /// Copy `n` bytes of the guest's memory at host address `from` to `off` of
 /// `object`.
 fn copy_in(m: &data::Mapped, off: u64, from: u64, n: u64) -> Result<(), i32> {
-    // SAFETY: `n` bytes of the object's mapping, which `m` keeps.
-    uaccess::read_host(from, unsafe { std::slice::from_raw_parts_mut(m.at(off), n as usize) })
+    m.each(off, n, |done, p, k| {
+        // SAFETY: `k` bytes of the data's views, which `m` keeps.
+        uaccess::read_host(from + done, unsafe { std::slice::from_raw_parts_mut(p, k as usize) })
+    })
 }
 
 /// The read and write calls (`read`, `pwrite64`, `readv`, `pwritev2`, ...)
@@ -477,7 +479,11 @@ pub fn add_seals(fd: i32, add: u64) -> Option<i64> {
 /// descriptor of a regular file of the store sent to it (`SCM_RIGHTS`):
 /// the file's data, a host shared memory object it maps as the guest does
 /// (an X server, a memfd's pages), opened as the description is, for
-/// reading and for writing if it may write. `None` for another descriptor.
+/// reading and for writing if it may write: the file's first extent, which
+/// holds all it holds if it was sized before it held data
+/// ([`data::make`]); one that grew past it lies in more than one object,
+/// which no single descriptor hands over (`EOPNOTSUPP`). `None` for
+/// another descriptor.
 pub fn host_object(fd: i32) -> Option<Result<std::os::fd::OwnedFd, i32>> {
     let file = desc::of(fd)?;
     if desc::is_path(fd) {
@@ -487,12 +493,13 @@ pub fn host_object(fd: i32) -> Option<Result<std::os::fd::OwnedFd, i32>> {
         let (_, writes) = access(fd)?;
         let fs = file.fs()?;
         let mut t = fs.lock()?;
-        if t.stat(file.ino)?.mode & tree::S_IFMT != tree::S_IFREG {
+        let st = t.stat(file.ino)?;
+        if st.mode & tree::S_IFMT != tree::S_IFREG {
             return Err(errno::EINVAL);
         }
         let object = match t.data(file.ino)? {
             0 => {
-                let o = data::make()?;
+                let o = data::make(st.size)?;
                 t.set_data(file.ino, o)?;
                 o
             }
@@ -500,22 +507,26 @@ pub fn host_object(fd: i32) -> Option<Result<std::os::fd::OwnedFd, i32>> {
         };
         drop(t);
         desc::made_data(file, object, None);
-        data::open(object, !writes)
+        data::whole(object, st.size, !writes)?.ok_or(errno::EOPNOTSUPP)
     })())
 }
 
-/// For `mmap` of a descriptor of the store (`None` for another), with
-/// Linux's `prot` and `flags`: the host descriptor of the file's data to
-/// map (its object, made if the file had none), open for writing only for a
-/// shared mapping of a descriptor that may write, and whether a shared
-/// mapping may never be made writable (the contents are sealed).
+/// For `mmap` of `len` bytes from `offset` of a descriptor of the store
+/// (`None` for another), with Linux's `prot` and `flags`: the host
+/// descriptors of the file's data to map, each with the range of the file
+/// it holds there, mapped at the file's own offsets (its extents' objects,
+/// made if the file had none), open for writing only for a shared mapping
+/// of a descriptor that may write, and whether a shared mapping may never
+/// be made writable (the contents are sealed).
 ///
 /// See [`host_object`] for what a host process is handed.
 pub fn map_source(
     fd: i32,
     prot: u64,
     flags: u64,
-) -> Option<Result<(std::os::fd::OwnedFd, bool), i32>> {
+    offset: u64,
+    len: u64,
+) -> Option<Result<MapPieces, i32>> {
     use fwe_abi::mman;
     let file = desc::of(fd)?;
     Some((|| {
@@ -532,7 +543,8 @@ pub fn map_source(
         }
         let fs = file.fs()?;
         let mut t = fs.lock()?;
-        if t.stat(file.ino)?.mode & tree::S_IFMT != tree::S_IFREG {
+        let st = t.stat(file.ino)?;
+        if st.mode & tree::S_IFMT != tree::S_IFREG {
             return Err(errno::ENODEV);
         }
         let seals = t.seals(file.ino)?;
@@ -542,7 +554,7 @@ pub fn map_source(
         }
         let object = match t.data(file.ino)? {
             0 => {
-                let o = data::make()?;
+                let o = data::make(st.size.max(offset.saturating_add(len)))?;
                 t.set_data(file.ino, o)?;
                 o
             }
@@ -550,10 +562,15 @@ pub fn map_source(
         };
         drop(t);
         desc::made_data(file, object, None);
-        let host = data::open(object, !(shared && writes))?;
-        Ok((host, shared && sealed))
+        let pieces = data::pieces(object, offset, len, !(shared && writes))?;
+        Ok((pieces, shared && sealed))
     })())
 }
+
+/// What [`map_source`] maps: the objects holding the file's data, each
+/// with the range of the file `[start, end)` it holds there, and whether a
+/// shared mapping may never be made writable.
+pub type MapPieces = (Vec<(std::os::fd::OwnedFd, u64, u64)>, bool);
 
 /// `fchmod` of a descriptor of the store (`None` for another) to `mode`,
 /// the bits the caller may give: refused (`EPERM`) where it changes the

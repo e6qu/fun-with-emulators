@@ -1436,20 +1436,37 @@ impl<P: Platform> Kernel<P> {
         if flags & mman::MAP_FIXED != 0 && self.sealed(addr, len) {
             return err(errno::EPERM);
         }
-        // A file of fwe's store maps its data (a host shared memory object),
-        // which may never be made writable once its contents are sealed; a
-        // loop device maps the file it shows.
+        // A file of fwe's store maps its data (host shared memory objects,
+        // each at the file's own offsets), which may never be made writable
+        // once its contents are sealed; a loop device maps the file it
+        // shows.
         let stored = if flags & mman::MAP_ANONYMOUS == 0 {
-            crate::filestore::io::map_source(fd as i32, prot, flags)
+            crate::filestore::io::map_source(fd as i32, prot, flags, offset, self.page_up(len))
         } else {
             None
         };
         let object = stored.is_some();
         let (source, sealed) = match stored {
-            Some(Ok((f, sealed))) => (Some(Ok((f, 0))), sealed),
+            Some(Ok((pieces, sealed))) => {
+                let pieces = pieces
+                    .into_iter()
+                    .map(|(fd, start, end)| FilePart {
+                        fd,
+                        from: start,
+                        len: end - start,
+                        at: start,
+                    })
+                    .collect();
+                (Some(Ok(pieces)), sealed)
+            }
             Some(Err(e)) => (Some(Err(e)), false),
             None if flags & mman::MAP_ANONYMOUS == 0 => {
-                (crate::loopdev::map_source(fd as i32, self.page_size), false)
+                let shown = crate::loopdev::map_source(fd as i32, self.page_size).map(|r| {
+                    let (fd, start) = r?;
+                    let at = offset.checked_add(start).ok_or(errno::EOVERFLOW)?;
+                    Ok(vec![FilePart { fd, from: offset, len: self.page_up(len), at }])
+                });
+                (shown, false)
             }
             None => (None, false),
         };
@@ -1469,53 +1486,76 @@ impl<P: Platform> Kernel<P> {
             flags
         };
         // The file's metadata, and the file itself held where it has no
-        // name (`maps::HeldFile`); with no room for it, the mapping fails
-        // as for want of memory.
+        // name (`maps::HeldFile`): each piece's object for a file of the
+        // store, whose data has no name to map it by again; with no room
+        // for it, the mapping fails as for want of memory.
         let st = (flags & mman::MAP_ANONYMOUS == 0)
             .then(|| crate::fsops::linux_fstat(fd as i32).ok())
             .flatten();
-        // (A file of the store: its data, which has no name to map it by
-        // again.)
-        let held_fd = match &source {
-            Some(Ok((f, _))) if object => std::os::fd::AsRawFd::as_raw_fd(f),
-            _ => fd as i32,
+        let hold = |held_fd: i32| -> Result<Option<crate::maps::HeldFile>, i32> {
+            match &st {
+                Some(st) if st.st_nlink == 0 || object => {
+                    match crate::fdtable::dup_reserved(held_fd) {
+                        // SAFETY: a descriptor just made, owned here.
+                        Ok(d) => Ok(Some(crate::maps::HeldFile(std::sync::Arc::new(unsafe {
+                            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(d)
+                        })))),
+                        Err(errno::EMFILE) => Err(errno::ENOMEM),
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => Ok(None),
+            }
         };
-        let held = match &st {
-            Some(st) if st.st_nlink == 0 || object => match crate::fdtable::dup_reserved(held_fd) {
-                // SAFETY: a descriptor just made, owned here.
-                Ok(d) => Some(crate::maps::HeldFile(std::sync::Arc::new(unsafe {
-                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(d)
-                }))),
-                Err(errno::EMFILE) => return err(errno::ENOMEM),
+        let held: Vec<Option<crate::maps::HeldFile>> = match &source {
+            Some(Ok(pieces)) => {
+                let mut held = Vec::with_capacity(pieces.len());
+                for p in pieces {
+                    let source_fd =
+                        if object { std::os::fd::AsRawFd::as_raw_fd(&p.fd) } else { fd as i32 };
+                    match hold(source_fd) {
+                        Ok(h) => held.push(h),
+                        Err(e) => return err(e),
+                    }
+                }
+                held
+            }
+            _ => match hold(fd as i32) {
+                Ok(h) => vec![h],
                 Err(e) => return err(e),
             },
-            _ => None,
         };
         let r = match &source {
-            Some(Ok((file, start))) => match offset.checked_add(*start) {
-                Some(at) => {
-                    let file = std::os::fd::AsRawFd::as_raw_fd(file) as u64;
-                    self.mmap_call(addr, len, prot, flags, file, at, object)
-                }
-                None => err(errno::EOVERFLOW),
-            },
+            Some(Ok(pieces)) => self.map_pieces(addr, len, prot, flags, offset, pieces, object),
             Some(Err(e)) => err(*e),
             None => self.mmap_call(addr, len, prot, flags, fd, offset, false),
         };
-        drop(source);
+        let pieces = match source {
+            Some(Ok(pieces)) => pieces.into_iter().map(|p| (p.from, p.len)).collect(),
+            _ => vec![(offset, self.page_up(len))],
+        };
         if r < 0 {
             return r;
         }
-        let object = st.map(|st| {
-            let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
-            crate::maps::Object { held, ..crate::maps::Object::file(path, &st, offset) }
-        });
         let shared = flags & mman::MAP_TYPE != mman::MAP_PRIVATE;
         let len = self.page_up(len);
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
-        let locked = match object {
+        let locked = match st {
             None => crate::maps::mapped_plain(r as u64, len, prot, shared),
-            object => crate::maps::record().mapped(r as u64, len, prot, shared, object),
+            Some(st) => {
+                let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
+                let mut record = crate::maps::record();
+                let mut locked = false;
+                for ((from, plen), held) in pieces.into_iter().zip(held) {
+                    let object = crate::maps::Object {
+                        held,
+                        ..crate::maps::Object::file(path.clone(), &st, from)
+                    };
+                    let at = r as u64 + (from - offset);
+                    locked = record.mapped(at, plen, prot, shared, Some(object));
+                }
+                locked
+            }
         };
         if noexec {
             crate::maps::record().no_exec(r as u64, len);
@@ -1550,6 +1590,43 @@ impl<P: Platform> Kernel<P> {
         }
         if r >= 0 {
             crate::maps::publish();
+        }
+        r
+    }
+
+    /// Map `len` bytes of a file from `offset` at `addr` (as `mmap` would,
+    /// with Linux's `prot` and `flags`) from `pieces`, each a host
+    /// descriptor holding a part of the range: one mapped as it is, several
+    /// over a range reserved for them where the mapping goes.
+    #[allow(clippy::too_many_arguments)]
+    fn map_pieces(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        offset: u64,
+        pieces: &[FilePart],
+        object: bool,
+    ) -> i64 {
+        use std::os::fd::AsRawFd;
+        if let [p] = pieces {
+            return self.mmap_call(addr, len, prot, flags, p.fd.as_raw_fd() as u64, p.at, object);
+        }
+        let place = mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE;
+        let reserve = mman::MAP_PRIVATE | mman::MAP_ANONYMOUS | (flags & place);
+        let r = self.mmap_call(addr, len, mman::PROT_NONE, reserve, u64::MAX, 0, false);
+        if r < 0 {
+            return r;
+        }
+        for p in pieces {
+            let at = r as u64 + (p.from - offset);
+            let each = (flags & !place) | mman::MAP_FIXED;
+            let m = self.mmap_call(at, p.len, prot, each, p.fd.as_raw_fd() as u64, p.at, object);
+            if m < 0 {
+                self.munmap_call(r as u64, len);
+                return m;
+            }
         }
         r
     }
@@ -1703,15 +1780,31 @@ impl<P: Platform> Kernel<P> {
         if !matches!(area.object.name, crate::maps::Name::Exe | crate::maps::Name::Path(_)) {
             return err(errno::EINVAL);
         }
-        let fd = match mapped_file(&area, crate::uaccess::g2h(start)) {
-            Ok(fd) => fd,
-            Err(e) => return err(e),
-        };
         let locked = if area.locked { mman::MAP_LOCKED } else { 0 };
         let flags = mman::MAP_SHARED | mman::MAP_FIXED | mman::MAP_POPULATE | locked;
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-        let r = self.sys_mmap(start, size, area.prot, flags, raw as u64, offset);
-        if r < 0 { r } else { 0 }
+        // A file of fwe's store: each part from the object of its extent.
+        let parts = match store_data(&area) {
+            Some(id) => {
+                let read_only = area.prot & mman::PROT_WRITE == 0;
+                match crate::filestore::data::pieces(id, offset, size, read_only) {
+                    Ok(p) => p,
+                    Err(e) => return err(e),
+                }
+            }
+            None => match mapped_file(&area, crate::uaccess::g2h(start)) {
+                Ok(fd) => vec![(fd, offset, offset + size)],
+                Err(e) => return err(e),
+            },
+        };
+        for (fd, from, to) in &parts {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+            let at = start + (from - offset);
+            let r = self.sys_mmap(at, to - from, area.prot, flags, raw as u64, *from);
+            if r < 0 {
+                return r;
+            }
+        }
+        0
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
@@ -3214,20 +3307,37 @@ impl<P: Platform> Kernel<P> {
             };
             return p as u64 == at;
         }
-        let Ok(fd) = mapped_file(area, end_of - 1) else { return false };
-        // SAFETY: a fixed mapping over a range the caller found free, of a
-        // descriptor closed when it drops, the mapping keeping the file.
-        let p = unsafe {
-            libc::mmap(
-                at as *mut libc::c_void,
-                len as usize,
-                prot,
-                share | libc::MAP_FIXED,
-                std::os::fd::AsRawFd::as_raw_fd(&fd),
-                area.object.offset as libc::off_t,
-            )
+        // A file of fwe's store: each part from the object of its extent.
+        let parts = match store_data(area) {
+            Some(id) => {
+                let read_only = !(area.shared && area.prot & mman::PROT_WRITE != 0);
+                match crate::filestore::data::pieces(id, area.object.offset, len, read_only) {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                }
+            }
+            None => match mapped_file(area, end_of - 1) {
+                Ok(fd) => vec![(fd, area.object.offset, area.object.offset + len)],
+                Err(_) => return false,
+            },
         };
-        p as u64 == at
+        parts.iter().all(|(fd, from, to)| {
+            let here = at + (from - area.object.offset);
+            // SAFETY: a fixed mapping over a range the caller found free,
+            // of a descriptor closed when it drops, the mapping keeping
+            // the file.
+            let p = unsafe {
+                libc::mmap(
+                    here as *mut libc::c_void,
+                    (to - from) as usize,
+                    prot,
+                    share | libc::MAP_FIXED,
+                    std::os::fd::AsRawFd::as_raw_fd(fd),
+                    *from as libc::off_t,
+                )
+            };
+            p as u64 == here
+        })
     }
 }
 
@@ -3276,6 +3386,16 @@ pub fn copy_object(fd: i32, offset: u64, at: u64, len: u64, prot: i32) -> Result
     Ok(())
 }
 
+/// A part of a file mapping's range and what maps it: a host descriptor,
+/// the part `[from, from + len)` of the file, and where in the descriptor
+/// it starts.
+struct FilePart {
+    fd: std::os::fd::OwnedFd,
+    from: u64,
+    len: u64,
+    at: u64,
+}
+
 /// Whether `fd` is `/dev/zero`.
 fn is_dev_zero(fd: i32) -> bool {
     // SAFETY: an all-zero `stat` is a valid out-parameter.
@@ -3291,6 +3411,18 @@ fn is_dev_zero(fd: i32) -> bool {
 fn too_many_maps(extra: usize) -> bool {
     let n = crate::maps::count() + extra;
     n >= 1024 && crate::sysctl::number(b"vm/max_map_count").is_some_and(|max| n as i64 > max.max(0))
+}
+
+/// The data id of the file of fwe's store that `area` maps, if it maps
+/// one (its held descriptor is an object of the file's data).
+fn store_data(area: &crate::maps::Area) -> Option<u64> {
+    let held = area.object.held.as_ref()?;
+    match crate::memobj::identify(std::os::fd::AsRawFd::as_raw_fd(&*held.0))? {
+        (crate::filestore::data::KIND, object, _) => {
+            Some(crate::filestore::data::of_object(object).0)
+        }
+        _ => None,
+    }
 }
 
 /// A descriptor of the file `area` maps, whose host mapping is at host

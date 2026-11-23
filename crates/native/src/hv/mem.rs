@@ -1023,7 +1023,7 @@ fn reopen_writable(file: &OwnedFd) -> Result<Option<OwnedFd>, i32> {
         else {
             return Ok(None);
         };
-        let Ok(fd) = fwe_kernel::filestore::data::open(id, false) else { return Ok(None) };
+        let Ok(fd) = fwe_kernel::filestore::data::open_object(id) else { return Ok(None) };
         let fd = fwe_kernel::fdtable::reserve(std::os::fd::IntoRawFd::into_raw_fd(fd))
             .map_err(|_| errno::ENOMEM)?;
         // SAFETY: a descriptor just made, owned here, out of the guest's

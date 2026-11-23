@@ -1022,10 +1022,17 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   of the cgroup tree. A filesystem's names, inodes, owners, modes, times,
   attributes, flags, seals, holders and locks are in a shared memory arena
   of its own (`arena.rs`, `tree.rs`), changed under its lock; a regular
-  file's data is a host shared memory object (`data.rs`), made at the
-  first write, sparse up to 16 TiB, mapped by each process that reads or
-  writes it, its pages counted against the filesystem's size as they are
-  first written. A guest's descriptor of a store file stands on
+  file's data lies in host shared memory objects, its extents
+  (`data.rs`): the first sized to the file when it first holds data (at
+  least 2 MiB), each further one as long as all before it, up to 16 TiB in
+  all. Each extent's object is sized to the end of its range and holds
+  only that range, so a mapping maps it at the file's own offsets, and
+  macOS's memory compressor, which keeps a wired index of each object's
+  pages sized to the object, keeps it small (one object of 16 TiB a file
+  would cost 64 MiB of it; that allocation fails and the compressor then
+  panics the host). Each process that reads or writes the file maps the
+  extents it needs; the pages are counted against the filesystem's size
+  as they are first written. A guest's descriptor of a store file stands on
   `/dev/null`, which keeps the description's offset and status flags; the
   store keeps which process holds which file through which description
   (`desc.rs`), so a file with no names goes once its last holder lets go,
@@ -1777,8 +1784,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - `F_SEAL_WRITE` is refused (`EBUSY`) for a writable shared mapping of
   this process only: another process's goes unseen.
 - A file of fwe's store holds memory in 16 KiB pages: what a truncation or
-  punched hole frees stays the data object's (zeroed) until the file goes,
-  though the filesystem counts it free.
+  punched hole frees stays the data's (zeroed, the first memory macOS takes
+  back when it runs short) until the file goes, though the filesystem
+  counts it free.
+- A file of fwe's store sent to a process of the host's (`SCM_RIGHTS`) is
+  handed over as one shared memory object, which a file that grew past
+  its first extent (its size when it first held data, at least 2 MiB) is
+  not: sending one is refused (`EOPNOTSUPP`).
 - `tee` needs a write end of its input pipe (`EINVAL` otherwise); without
   one, `splice` from a pipe to a file or waiting socket that a signal or
   error cuts short loses what it took and did not write.
