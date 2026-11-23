@@ -543,8 +543,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `cachestat(fd, range, cstat, flags)`: how many of a file's pages in
-    /// `range` the host has in memory (`mincore` of a mapping of them);
-    /// none for any other kind of file.
+    /// `range` the host has in memory (`mincore` of a mapping of them), or
+    /// of a file of fwe's store hold memory; none for any other kind of
+    /// file.
     pub(crate) fn sys_cachestat(&mut self, fd: u64, range: u64, out: u64, flags: u64) -> i64 {
         let fd = fd as i32;
         if !crate::fdtable::guest_visible(fd)
@@ -559,6 +560,13 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let page = self.page_size;
+        // A file of fwe's store: its pages that hold memory, every one
+        // dirty, as a tmpfs file's are on Linux.
+        if let Some(n) = crate::filestore::io::cached_pages(fd, r[0], r[1], page) {
+            let n = guest!(n);
+            guest!(uaccess::write(out, [n, n, 0u64, 0, 0]));
+            return 0;
+        }
         // SAFETY: an all-zero `stat` is a valid out-parameter.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: as above.

@@ -66,6 +66,7 @@ unsafe extern "C" {
     fn pipe(fds: *mut i32) -> i32;
     fn dup(fd: i32) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
+    fn getpagesize() -> i32;
     fn fallocate(fd: i32, mode: i32, off: i64, len: i64) -> i32;
     fn mmap(a: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn sleep(s: u32) -> u32;
@@ -1780,6 +1781,29 @@ fn store_scenario() {
     let on = mount_new("tmpfs", &format!("/proc/self/fd/{dir}"), 0, "");
     let other = stat_words("/tmp/s/pts")[0] != stat_words("/tmp/s")[0];
     println!("mount by descriptor: {on}, another filesystem {other}");
+
+    // The pages of a file in memory are the page cache's, dirty: three
+    // written, of the five its size spans.
+    const SYS_CACHESTAT: i64 = 451;
+    // SAFETY: a NUL-terminated path; buffers of the sizes given.
+    let (cache, dirty, half) = unsafe {
+        let fd = open(c("/tmp/s/cached").as_ptr(), 0o102, 0o644);
+        let size = getpagesize() as usize;
+        let page = vec![7u8; size];
+        for _ in 0..3 {
+            write(fd, page.as_ptr(), page.len());
+        }
+        ftruncate(fd, 5 * size as i64);
+        let mut cs = [0u64; 5];
+        let all = [0u64, 0];
+        syscall(SYS_CACHESTAT, fd as i64, all.as_ptr(), cs.as_mut_ptr(), 0);
+        let (cache, dirty) = (cs[0], cs[1]);
+        let range = [size as u64, size as u64];
+        syscall(SYS_CACHESTAT, fd as i64, range.as_ptr(), cs.as_mut_ptr(), 0);
+        close(fd);
+        (cache, dirty, cs[0])
+    };
+    println!("cachestat: cached {cache} dirty {dirty}, of one page {half}");
 }
 
 /// The names in directory `p`.

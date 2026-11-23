@@ -870,6 +870,28 @@ pub fn read_into(fd: i32, buf: &mut [u8], pos: Option<u64>) -> Option<i64> {
     Some(transfer(fd, file, &[iov], pos, false, false).map_or_else(err, |n| n as i64))
 }
 
+/// For `cachestat` of a descriptor of the store (`None` for another): how
+/// many pages of `page` bytes of `[off, off + len)` (to the file's end;
+/// `len` 0: to its end) hold memory, as many as Linux's page cache holds
+/// of a tmpfs file (its pages, written to memory, are never written
+/// back). The store holds memory in pages of its own ([`data::PAGE`]): a
+/// smaller page (the VM's 4 KiB) is held when the store's page around it
+/// is.
+pub fn cached_pages(fd: i32, off: u64, len: u64, page: u64) -> Option<Result<u64, i32>> {
+    let file = desc::of(fd)?;
+    Some(in_file(file, |file, t| {
+        let st = t.stat(file.ino)?;
+        let first = off / page * page;
+        let end = if len == 0 { st.size } else { off.saturating_add(len).min(st.size) };
+        if end <= first || st.mode & tree::S_IFMT != tree::S_IFREG {
+            return Ok(0);
+        }
+        let ranges = t.ranges_of(file.ino)?;
+        let held = |at: u64| ranges.iter().any(|&(s, e)| (s..e).contains(&(at / data::PAGE)));
+        Ok((first..end).step_by(page as usize).filter(|&at| held(at)).count() as u64)
+    }))
+}
+
 /// For `sendfile`, `splice` and `copy_file_range`: write fwe's `buf` to the
 /// file `fd` is a descriptor of, at `pos` or at the descriptor's position
 /// (`None` for a descriptor not the store's).
