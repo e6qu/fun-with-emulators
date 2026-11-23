@@ -324,7 +324,7 @@ fn map() -> Result<Store, String> {
 /// size: another process making it at once sizes it, and its size is 0
 /// until that process's `ftruncate` is done (this one's is refused
 /// meanwhile). `None` if it cannot be looked at.
-fn sized(fd: i32) -> Option<libc::stat> {
+pub(crate) fn sized(fd: i32) -> Option<libc::stat> {
     // SAFETY: zeroed bytes are a valid `stat`.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     for _ in 0..1000 {

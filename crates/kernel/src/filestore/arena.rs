@@ -90,30 +90,38 @@ impl Arena {
         if fd < 0 {
             return Err(last());
         }
-        // SAFETY: plain host calls on the descriptor just opened; its size
-        // is set once (refused if made already, which `fstat` checks).
+        // SAFETY: the descriptor just opened, owned from here on.
+        let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
+        // Its size is set once: refused if it was made already, or while
+        // another process making it at once sizes it, which `sized` waits
+        // for.
+        // SAFETY: a plain host call on the descriptor.
+        unsafe { libc::ftruncate(raw, SIZE as libc::off_t) };
+        let st = crate::procstore::sized(raw).ok_or_else(last)?;
+        if st.st_uid != crate::host::euid() {
+            return Err(fwe_abi::errno::EACCES);
+        }
+        if (st.st_size as usize) < SIZE {
+            eprintln!("fwe: a store's arena {name:?} is {} bytes, not {SIZE}", st.st_size);
+            return Err(fwe_abi::errno::EIO);
+        }
+        // SAFETY: a new shared mapping of the object, where the host
+        // places it.
         let mapped = unsafe {
-            libc::ftruncate(fd, SIZE as libc::off_t);
-            let mut st: libc::stat = std::mem::zeroed();
-            let sized = libc::fstat(fd, &mut st) == 0 && st.st_size as usize >= SIZE;
-            let p = if sized && st.st_uid == crate::host::euid() {
-                libc::mmap(
-                    std::ptr::null_mut(),
-                    SIZE,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                )
-            } else {
-                libc::MAP_FAILED
-            };
-            libc::close(fd);
-            p
+            libc::mmap(
+                std::ptr::null_mut(),
+                SIZE,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                raw,
+                0,
+            )
         };
         if mapped == libc::MAP_FAILED {
-            return Err(fwe_abi::errno::ENOMEM);
+            return Err(last());
         }
+        drop(fd);
         let a = Arena { base: mapped as usize };
         let h = a.header();
         // The first to get here sets it up; another waits under the lock.
