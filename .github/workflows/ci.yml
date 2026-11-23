@@ -353,7 +353,7 @@ jobs:
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
       # The native side's programs: the clang release Alpine's root has, and
       # the workloads' programs (tools/bench/run.py, BREW), and an X server.
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit xorg-server
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server
       - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --linux linux.json --out macos.json
       - if: always()
         uses: actions/upload-artifact@v4

@@ -1,0 +1,29 @@
+# Alpine Linux 3.24 aarch64 files the benchmarks fetch from
+# https://dl-cdn.alpinelinux.org/alpine/: the minirootfs with PostgreSQL 18
+# (the server, its client programs, pgbench among them) and what they need,
+# for the benchmarks' System V user at work (tools/bench/workloads/postgres.sh).
+# Each line is a path under that URL and the file's SHA-256.
+v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
+v3.24/main/aarch64/postgresql18-18.7-r0.apk f812090cc09c32b8328a6f58ee6ef6424074d784928b54738e2819ed9ae480a6
+v3.24/main/aarch64/postgresql18-client-18.7-r0.apk 8e78f7ad203d3d3636d8a87f277ef8166803f7d6833b1f4021be77dd73baa233
+v3.24/main/aarch64/postgresql-common-1.3-r0.apk ecddbd6272f5034f30d78ff59634c07f862a13a2ad3d29078c0e7985b827fc73
+v3.24/main/aarch64/tzdata-2026f-r0.apk e439d40c8fc0bcbe5ccefc7f031e775979596c1a092200faa23136c1cb4c7116
+v3.24/main/aarch64/libcrypto3-3.5.9-r1.apk 58ea027d8bd64fffac7d2106a9034341d6735387298a5e01b551429c73a13c71
+v3.24/main/aarch64/icu-libs-78.1-r0.apk 2393882dcf1e3f5be98696665c3468dd0d2a85cd568d50abd232729863df9738
+v3.24/main/aarch64/libldap-2.6.15-r0.apk 2cb81082866cc8571a89fd9c29c8d3cf0bde83d604275492a24bb9563c9466bf
+v3.24/main/aarch64/lz4-libs-1.10.0-r1.apk af6cbe553adda941e04ac40cf0123455b714d65392472389113e7d6dcebbd8d8
+v3.24/main/aarch64/libpq-18.7-r0.apk 4d02ac1cdb14e783c6b943a73f23b032afb8ef932aa675c83f81be4a9ff1dcef
+v3.24/main/aarch64/libssl3-3.5.9-r1.apk 4aff30f84e7ac922b026f8b2dd574d91bb3bb01d22767a8a9a0a10c5ef64a44b
+v3.24/main/aarch64/liburing-2.14-r0.apk 388e70b040b6ec26bd8d171e514ac68626b00a1871a0134c53de22ed059c2627
+v3.24/main/aarch64/libxml2-2.13.9-r3.apk 3e12146a2f15e27a22d70d21f8f52be29966105ce304c55bab2bfe75604981a9
+v3.24/main/aarch64/zlib-1.4-r0.apk d3e30d012a3445222b0b4a28f1d4d97ce67387f8b48561921111696da174f0de
+v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818
+v3.24/main/aarch64/readline-8.3.3-r1.apk 9f0ae0923c02b0d6aba62e9173542b65396ba3f0efefcbf087ea32f1120e7b34
+v3.24/main/aarch64/icu-data-en-78.1-r0.apk 3fa1dfb91a081f73c32a46f6ec054196caa37c9fd9569c433ddf6b29415dcf13
+v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
+v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
+v3.24/main/aarch64/libsasl-2.1.28-r9.apk 0be9020fdb51705c6f393bad6e533bbcd70f68c148ab0b88d35ef39a4ce8959f
+v3.24/main/aarch64/xz-libs-5.8.4-r0.apk 9be375832e747afe14f98e400e8b55d8f6fde25e41663090c81600628daab093
+v3.24/main/aarch64/libncursesw-6.6_p20260516-r0.apk 51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6
+v3.24/main/aarch64/gdbm-1.26-r0.apk bad50eb26533e2f58e014fbcd3c1744f2fdb79954af6e3c188ccd059251c7790
+v3.24/main/aarch64/ncurses-terminfo-base-6.6_p20260516-r0.apk e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d

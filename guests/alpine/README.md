@@ -27,6 +27,7 @@ package there fails its checksum.
 | `fetch/clang.txt` | The 3.24.4 minirootfs and clang 22 with LLVM's libraries, binutils 2.45, musl's headers, make 4.4 and GCC 15.2 (whose start files and libgcc clang links with; GCC's own compilers are not position-independent and are not run), and their libraries (gmp, mpfr, mpc, isl, jansson, libstdc++, libgcc, libatomic, libgomp, libffi, libxml2, xz, zlib, zstd), for the benchmarks' C build (`tools/bench/run.py`, which also fetches Lua 5.4.7's source from lua.org, MIT) | 170 MB |
 | `fetch/jdk.txt` | The 3.24.4 minirootfs and OpenJDK 25.0.5: the headless runtime (HotSpot, and the module image, the compiler's module among them) and the JDK's tools (`javac`), for the JDK test and the benchmarks' JDK workload (`tools/bench/workloads/jdk`) | 88 MB |
 | `fetch/workloads.txt` | The 3.24.4 minirootfs with SQLite 3.53, git 2.54, xz 5.8 and Python 3.14, and their libraries (libcurl, OpenSSL, nghttp2, c-ares, brotli, libidn2, libunistring, libpsl, pcre2, zlib, zstd, expat, bzip2, libffi, gdbm, mpdecimal, readline, ncurses, libgcc, libstdc++, ca-certificates), for the benchmarks' workloads (`tools/bench/run.py`) | 25 MB |
+| `fetch/postgres.txt` | The 3.24.4 minirootfs and PostgreSQL 18 (the server, and its client programs, `psql` and `pgbench` among them) with its libraries (ICU with its English data, libpq, OpenLDAP's libldap and Cyrus SASL, liburing, lz4, zstd, libxml2, OpenSSL, readline, ncurses, xz, gdbm, libstdc++, libgcc), postgresql-common and tzdata, for the benchmarks' System V user at work (`tools/bench/workloads/postgres.sh`) | 17 MB |
 | `fetch/nodejs.txt` | The 3.24.4 minirootfs and Node.js 24 (V8's compilers, regular expressions and WebAssembly), ICU's full locale data, and their libraries (zstd, libstdc++, libgcc, sqlite, simdutf, simdjson, nghttp2, c-ares, brotli, ada, ca-certificates) | 40 MB |
 | `fetch/luajit.txt` | The 3.24.4 minirootfs and LuaJIT 2.1 with libgcc | 5 MB |
 | `fetch/sbcl.txt` | The 3.24.4 minirootfs and Steel Bank Common Lisp 2.6 (linked at `0x400000`, so run in the VM) with zstd | 18 MB |
@@ -73,5 +74,8 @@ or GPL-2.0-or-later; xz-libs GPL-2.0-or-later, 0BSD, public domain and
 LGPL-2.1-or-later; bzip2 bzip2-1.0.6; git GPL-2.0-only; libcurl curl;
 nghttp2, c-ares, brotli and libpsl MIT; libidn2 and libunistring
 GPL-2.0-or-later or LGPL-3.0-or-later; ca-certificates MPL-2.0 and MIT;
+PostgreSQL and libpq the PostgreSQL License; postgresql-common MIT; tzdata
+public domain; libldap OLDAP-2.8; Cyrus SASL BSD-3-Clause-Attribution and
+BSD-4-Clause; liburing LGPL-2.1-or-later or MIT;
 the minirootfs's packages (BusyBox GPL-2.0-only, musl MIT, and others) their
 own.

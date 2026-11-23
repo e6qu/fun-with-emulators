@@ -290,6 +290,7 @@ BREW = {
     "jdk": "opt/openjdk@25/bin",
     "node": "opt/node@24/bin/node",
     "luajit": "opt/luajit/bin/luajit",
+    "postgres": "opt/postgresql@18/bin",
 }
 
 
@@ -542,7 +543,8 @@ def linux(a):
             # The workloads, with the Lua just built and Alpine's programs.
             shutil.copytree(WORKLOADS, os.path.join(src, "wl"))
             subprocess.run(
-                ["docker", "exec", name, "apk", "add", "-q", "sqlite", "git", "xz", "python3"],
+                ["docker", "exec", name, "apk", "add", "-q", "sqlite", "git", "xz", "python3",
+                 "postgresql18", "postgresql18-client"],
                 check=True,
             )
 
@@ -572,6 +574,9 @@ def linux(a):
                 ("SQLite (s)", "sqlite3 /tmp/w/db '.read /src/wl/bench.sql'"),
                 ("git (s)", "sh /src/wl/git.sh /src/src /usr/bin/git"),
                 ("xz (s)", "sh /src/wl/xz.sh /src/src /usr/bin/xz"),
+                # As PostgreSQL's own user: it refuses to run as root.
+                ("PostgreSQL (s)", "chown postgres /tmp/w && su postgres -s /bin/sh -c "
+                 "'cd /tmp/w && sh /src/wl/postgres.sh /usr/libexec/postgresql18'"),
             ):
                 r[row] = best(lambda cmd=cmd: timed(cmd), 3)
         finally:
@@ -788,6 +793,7 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    postgres(a, fwe, guest_env, results)
     results["fwe"][GEARS] = gears_fwe(a, fwe, guest_env)
     jdk(a, fwe, guest_env, results)
     host_costs()
@@ -1938,6 +1944,23 @@ def jdk(a, fwe, guest_env, results):
         subprocess.run(cmd, capture_output=True)
         took.append(time.perf_counter() - start)
     print(f"JDK java -version: {took[0]:.2f} s under fwe, {took[1]:.2f} s natively", file=sys.stderr)
+    shutil.rmtree(native, ignore_errors=True)
+
+
+def postgres(a, fwe, guest_env, results):
+    """PostgreSQL at work, a System V user (`workloads/postgres.sh`: its
+    segment, its shared memory and semaphores, a process for each client):
+    under fwe in its Alpine root, natively with Homebrew's build of the
+    same release."""
+    root = alpine_root("postgres", a.cache)
+    shutil.copy(os.path.join(WORKLOADS, "postgres.sh"), os.path.join(root, "tmp"))
+    native = tempfile.mkdtemp()
+    ours_w, theirs_w = os.path.join(root, "tmp", "w"), os.path.join(native, "w")
+    ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
+                              "cd /tmp/w && sh /tmp/postgres.sh /usr/libexec/postgresql18"]
+    bin_dir = os.path.join(a.brew, BREW["postgres"])
+    theirs = ["/bin/sh", "-c", f"cd {theirs_w} && sh {WORKLOADS}/postgres.sh {bin_dir}"]
+    workload(results, "PostgreSQL (s)", ours, theirs, (ours_w, theirs_w), len(guest_env) + 1)
     shutil.rmtree(native, ignore_errors=True)
 
 
