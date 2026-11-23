@@ -9159,6 +9159,19 @@ fn nodump_is_apart_from_kept_owners() {
     );
 }
 
+/// A user outside a set-group-ID directory's group makes an `O_TMPFILE`
+/// file there asking for set-group-ID: the file takes the directory's
+/// group without the bit, is the user's, and links in through
+/// `/proc/self/fd`, on the host's files and on a tmpfs (LTP openat04).
+#[test]
+fn a_tmpfile_in_another_groups_set_group_id_directory_links_in() {
+    assert_eq!(
+        fsrules("tmpfile-sgid"),
+        "/tmp/sgid: made ok mode 755 65534:8, linked ok\n\
+         /dev/shm/sgid: made ok mode 755 65534:8, linked ok\n"
+    );
+}
+
 /// `open_by_handle_at` opens as `openat` does, in the guest's own view:
 /// read through a handle, `O_PATH` for naming only, `EROFS` to write
 /// through a read-only mount, the file's mode for a caller without

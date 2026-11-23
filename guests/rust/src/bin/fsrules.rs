@@ -279,6 +279,50 @@ fn nodump_scenario() {
     println!("on a tmpfs: {:?}", nodump("/dev/shm/flagged"));
 }
 
+/// LTP's openat04: in a set-group-ID directory of another group, a user
+/// not in it makes an `O_TMPFILE` file asking for set-group-ID, and links
+/// it in through `/proc/self/fd`.
+fn tmpfile_sgid_scenario() {
+    for dir in ["/tmp/sgid", "/dev/shm/sgid"] {
+        // SAFETY: NUL-terminated paths.
+        unsafe {
+            mkdir(c(dir).as_ptr(), 0o777);
+            chown(c(dir).as_ptr(), 0, 8);
+            chmod(c(dir).as_ptr(), 0o2777);
+        }
+        // SAFETY: plain calls; the child only makes calls and exits.
+        if unsafe { fork() } == 0 {
+            unsafe {
+                setgid(65534);
+                setresuid(65534, 65534, 65534);
+            }
+            // SAFETY: a NUL-terminated path.
+            let d = unsafe { open(c(dir).as_ptr(), 0o40000) };
+            // O_TMPFILE | O_RDWR, asking for set-group-ID.
+            let fd = unsafe { openat(d, c(".").as_ptr(), 0o20040000 | 2, 0o2777) };
+            let mut st = [0u64; 16];
+            // SAFETY: a buffer as big as a `struct stat`.
+            unsafe { fstat(fd, st.as_mut_ptr().cast()) };
+            let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
+            let path = format!("/proc/self/fd/{fd}");
+            // SAFETY: NUL-terminated paths; linkat is call 37.
+            let r = unsafe { syscall(37, -100i64, c(&path).as_ptr(), d as i64, c("open.tmp").as_ptr(), 0x400i64) };
+            println!(
+                "{dir}: made {} mode {:o} {}:{}, linked {}",
+                res(fd as i64),
+                word(4) & 0o7777,
+                word(6),
+                word(7),
+                res(r)
+            );
+            std::process::exit(0);
+        }
+        let mut status = 0;
+        // SAFETY: a valid out-parameter.
+        unsafe { waitpid(-1, &mut status, 0) };
+    }
+}
+
 /// A device node made outside `/dev` opens as the device, also to read by
 /// an absolute path and from the working directory.
 fn devnode_scenario() {
@@ -1270,6 +1314,7 @@ fn main() {
         "devnode" => devnode_scenario(),
         "access" => access_scenario(),
         "nodump" => nodump_scenario(),
+        "tmpfile-sgid" => tmpfile_sgid_scenario(),
         "linkrules" => link_rules_scenario(),
         "stickyxattr" => sticky_xattr_scenario(),
         "noatimeflag" => noatime_flag_scenario(),

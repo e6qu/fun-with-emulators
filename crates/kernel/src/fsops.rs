@@ -2509,6 +2509,16 @@ impl<P: Platform> Kernel<P> {
             // A name for the descriptor's own file (an O_TMPFILE one, say).
             return self.link_fd(olddirfd as i32, newdirfd, &newpath);
         }
+        // A descriptor's link followed (`/proc/self/fd/N`): the
+        // descriptor's own file, which for one of fwe's store (an
+        // `O_TMPFILE` of a tmpfs) has no name to be found by.
+        if follow
+            && let Some(crate::procfs::Entry::Fd { fd, .. }) =
+                self.fs().synthetic(olddirfd as i32, &oldpath)
+            && let Some(file) = crate::filestore::desc::of(fd)
+        {
+            return self.link_store_file(file, newdirfd, &newpath);
+        }
         let old = match self.fs().resolve(olddirfd as i32, &oldpath, follow) {
             Ok(r) => r,
             Err(e) => return err(e),
@@ -4204,6 +4214,36 @@ impl<P: Platform> Kernel<P> {
         ));
     }
 
+    /// Give `file`, a file of fwe's store open as a descriptor (an
+    /// `O_TMPFILE` of a tmpfs, say), the name `newpath`, in its own
+    /// filesystem.
+    fn link_store_file(
+        &self,
+        file: crate::filestore::desc::File,
+        newdirfd: u64,
+        newpath: &[u8],
+    ) -> i64 {
+        let mut new = match self.fs().resolve(newdirfd as i32, newpath, false) {
+            Ok(r) => r,
+            Err(e) => return err(e),
+        };
+        if new.mount_root {
+            return err(errno::EEXIST);
+        }
+        // In an overlay whose upper layer is the file's filesystem.
+        if new.ovl.is_some()
+            && let Err(e) = new.prepare(Change::Create)
+        {
+            return err(e);
+        }
+        let Some(nd) = new.store.clone() else { return err(errno::EXDEV) };
+        let made = self.store_link(file.fs, file.ino, &new, &nd, true);
+        match new.finish(made == 0) {
+            Err(e) if made == 0 => err(e),
+            _ => made,
+        }
+    }
+
     /// `linkat(fd, "", newdirfd, newpath, AT_EMPTY_PATH)`: give the file
     /// open as `fd` the name `newpath`, in the same mount (`EXDEV`) and as
     /// `fs.protected_hardlinks` allows, as for a path.
@@ -4211,28 +4251,8 @@ impl<P: Platform> Kernel<P> {
         if !self.creds.has(crate::caps::CAP_DAC_READ_SEARCH) {
             return err(errno::ENOENT);
         }
-        // A file of fwe's store (an `O_TMPFILE` of a tmpfs, say): named
-        // there, in its own filesystem.
         if let Some(file) = crate::filestore::desc::of(fd) {
-            let mut new = match self.fs().resolve(newdirfd as i32, newpath, false) {
-                Ok(r) => r,
-                Err(e) => return err(e),
-            };
-            if new.mount_root {
-                return err(errno::EEXIST);
-            }
-            // In an overlay whose upper layer is the file's filesystem.
-            if new.ovl.is_some()
-                && let Err(e) = new.prepare(Change::Create)
-            {
-                return err(e);
-            }
-            let Some(nd) = new.store.clone() else { return err(errno::EXDEV) };
-            let made = self.store_link(file.fs, file.ino, &new, &nd, true);
-            return match new.finish(made == 0) {
-                Err(e) if made == 0 => err(e),
-                _ => made,
-            };
+            return self.link_store_file(file, newdirfd, newpath);
         }
         let Some(host) = crate::fs::host_path_of(fd) else { return err(errno::ENOENT) };
         let Ok(src) = CString::new(host) else { return err(errno::EINVAL) };
