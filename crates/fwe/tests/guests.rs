@@ -9666,7 +9666,7 @@ fn display_x11_client_draws_through_shared_memory() {
     let Some(x) = Xvfb::start() else { return };
     let root = libc_rootfs(Libc::Musl, "x11shm");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--strace=failures").arg("--root").arg(&root).arg(&prog).env("DISPLAY", x.display()); // PROBE
+    cmd.arg("--root").arg(&root).arg(&prog).env("DISPLAY", x.display());
     let out = run_bounded(cmd);
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(
@@ -9804,8 +9804,7 @@ impl Gui {
     ) -> Gui {
         let dir = display_dir();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-        cmd.arg("--strace=failures") // PROBE
-            .arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
+        cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
             .arg("--root")
             .arg(&root.0)
             .arg(root.0.join(program.trim_start_matches('/')))
