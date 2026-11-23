@@ -720,10 +720,36 @@ impl<P: Platform> Kernel<P> {
                 crate::signote::note(host, libc::SIGKILL);
                 return crate::host::kill_process(host, libc::SIGKILL);
             }
+            // A SIGCONT for any of its threads continues the process.
+            if s == fwe_abi::signal::SIGCONT {
+                crate::signote::continuing(host, true);
+            }
             if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
                 return err(e);
             }
-            return crate::host::kill_process(host, crate::host::WAKE_SIGNAL);
+            return match crate::host::kill_process(host, crate::host::WAKE_SIGNAL) {
+                0 if s == fwe_abi::signal::SIGCONT => crate::signal::resume_process(host),
+                r => r,
+            };
+        }
+        // A stop or a continue of another of fwe's processes goes through
+        // its mailbox, as `kill`'s does: a stop it takes where it holds
+        // nothing shared, a continue that ends its stop
+        // ([`crate::signal::resume_process`]).
+        if crate::host::is_fwe(host)
+            && matches!(s, fwe_abi::signal::SIGSTOP | fwe_abi::signal::SIGCONT)
+        {
+            if s == fwe_abi::signal::SIGCONT {
+                crate::signote::continuing(host, true);
+            } else {
+                crate::reaper::stop_signal_sent(host);
+            }
+            let r = crate::signal::send_unhosted_from(host, s, code, value, (pid, uid));
+            return if r == 0 && s == fwe_abi::signal::SIGCONT {
+                crate::signal::resume_process(host)
+            } else {
+                r
+            };
         }
         // One the host lacks, or SIGTRAP (which the host would merge with
         // the target's next system-call trap): through the mailbox.

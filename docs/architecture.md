@@ -702,7 +702,20 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   holds none taking none meanwhile (`procstore::stop_holding_nothing`).
   `SIGSTOP` between fwe's processes goes through the mailbox for this,
   dated by the target's count of `SIGCONT`s, so a stop sent before the
-  latest `SIGCONT` is not taken.
+  latest `SIGCONT` is not taken. The stop itself is the host's (its
+  parent's `waitpid` and the reapers see it), and the host does not always
+  end it: a process that stops itself and gets a `SIGCONT` as it stops can
+  be left suspended though shown as running (reproduced with macOS alone).
+  So the process counts its stop in its mailbox before it looks a last
+  time whether a `SIGCONT` came, and counts its return from it; a
+  `SIGCONT` from another of fwe's processes moves the target's count of
+  continues on, sends the guest's `SIGCONT` through the mailbox, and the
+  host's to end the stop, again every 2 ms until the target is seen back
+  (`signal::resume_process`). The host's `SIGCONT` is never caught: it
+  only ends stops (the host can hand a caught one over long after, where
+  a resend could not be told from a `SIGCONT` of the guest's). A stop no
+  process of fwe's ended was ended by one of the host's (a shell's `fg`),
+  whose `SIGCONT` the guest takes as it comes back (`signal::came_back`).
 - **Signals the host lacks, between processes:** queued in the target's
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets. One
@@ -1622,6 +1635,10 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   (none, 0).
 - A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
   process ends (Linux sends it when the parent thread does).
+- A `SIGCONT` a process of the host's (not fwe's) sends a running fwe
+  process reaches no guest handler: the host's `SIGCONT` is never caught
+  (it only ends stops), and one ending a stop is the guest's only when
+  none of fwe's processes continued it (a shell's `fg`).
 
 **Resources**
 - The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),

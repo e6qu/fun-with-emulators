@@ -294,7 +294,7 @@ pub fn stop_sent_now() {
 
 /// Whether the stop signal pending for this process is still to be taken:
 /// the process was not continued since it was sent.
-fn stop_stands() -> bool {
+pub(crate) fn stop_stands() -> bool {
     STOP_SENT_AT.load(std::sync::atomic::Ordering::SeqCst)
         >= crate::signote::continued(host::pid_now())
 }
@@ -314,13 +314,56 @@ pub(crate) fn stop_process(target: i32, sig: u64) -> i64 {
     send_unhosted(target, sig, signal::SI_USER, 0)
 }
 
-/// Continue fwe process `target` (`SIGCONT`): the stop signals sent to it
-/// before are not taken, and the host's `SIGCONT` continues it if it is
-/// stopped.
+/// Continue fwe process `target` with no `SIGCONT` for it to take (a
+/// frozen cgroup's thaw): the stop signals sent to it before are not
+/// taken, and it comes back from its stop ([`resume_process`]).
 pub(crate) fn continue_process(target: i32) -> i64 {
-    crate::reaper::stop_signal_sent(target);
     crate::signote::continuing(target, true);
-    host::kill_process(target, libc::SIGCONT)
+    resume_process(target)
+}
+
+/// Bring fwe process `target` back from its stop, the continue counted
+/// ([`crate::signote::continuing`]): only the host's `SIGCONT` ends a host
+/// stop, so it is sent; the host never catches it for the guest
+/// ([`Kernel::sync_host_signal`]), whose `SIGCONT`, if any, comes through
+/// the mailbox. A process that was in its stop is seen to come back from
+/// it, the `SIGCONT` sent again every 2 ms until it does: macOS can leave
+/// a process that stops itself suspended, though shown as running, when a
+/// `SIGCONT` comes as it stops, and another `SIGCONT` then resumes it.
+/// Waits no longer than the process lives.
+pub(crate) fn resume_process(target: i32) -> i64 {
+    crate::reaper::stop_signal_sent(target);
+    let r = host::kill_process(target, libc::SIGCONT);
+    if r != 0 {
+        return r;
+    }
+    let Some(n) = crate::signote::in_stop(target) else { return 0 };
+    let mut sent = std::time::Instant::now();
+    while !crate::signote::resumed_from(target, n) {
+        if !crate::procreg::host_info(target).is_some_and(|(_, _, zombie)| !zombie) {
+            break;
+        }
+        if sent.elapsed() >= std::time::Duration::from_millis(2) {
+            host::kill_process(target, libc::SIGCONT);
+            sent = std::time::Instant::now();
+        }
+        std::thread::sleep(std::time::Duration::from_micros(100));
+    }
+    0
+}
+
+/// This process came back from a stop with its count of continues at
+/// `continues` when it stopped ([`crate::signote::continued`]): if none of
+/// fwe's processes continued it meanwhile, a process of the host's did (a
+/// shell's `fg`), whose `SIGCONT` is the guest's now (the host's, never
+/// caught, only ended the stop). Async-signal-safe.
+pub fn came_back(continues: u64) {
+    if crate::signote::continued(host::pid_now()) == continues {
+        thread::post_process(
+            signal::SIGCONT,
+            thread::SigInfo { code: signal::SI_USER, ..Default::default() },
+        );
+    }
 }
 
 /// Whether Linux signal `sig` is relayed through the host: it has a host
@@ -409,11 +452,17 @@ fn me_host() -> i64 {
 
 fn owned(sig: u64) -> bool {
     // A traced process stops for each signal it takes ([`crate::ptrace`]):
-    // even SIGSTOP comes to it as fwe's, not the host's.
+    // even SIGSTOP comes to it as fwe's, not the host's. SIGCONT is fwe's:
+    // the host's only ends a stop ([`resume_process`]).
     crate::ptrace::any_traced() && sig != signal::SIGKILL
         || matches!(
             sig,
-            signal::SIGTRAP | signal::SIGSEGV | signal::SIGBUS | signal::SIGILL | signal::SIGFPE
+            signal::SIGTRAP
+                | signal::SIGSEGV
+                | signal::SIGBUS
+                | signal::SIGILL
+                | signal::SIGFPE
+                | signal::SIGCONT
         )
 }
 
@@ -577,6 +626,12 @@ impl<P: Platform> Kernel<P> {
         );
         let traced = crate::ptrace::any_traced();
         let how = match action.handler {
+            // The host's SIGCONT only ends a stop, which it does whatever
+            // its disposition: the guest's comes as fwe's
+            // ([`resume_process`], [`came_back`]). Caught, the host's could
+            // not be told from a resend of fwe's, which the host may hand
+            // over long after.
+            _ if sig == signal::SIGCONT => HostSignal::Default,
             // A traced process stops for every signal, ignored ones too.
             _ if watched || traced => HostSignal::Catch { flags: action.flags },
             signal::SIG_DFL if !fwe_default => HostSignal::Default,
@@ -1038,8 +1093,15 @@ impl<P: Platform> Kernel<P> {
         if sig == signal::SIGSTOP && (to_self || host::is_fwe(target)) {
             return stop_process(target, sig);
         }
-        if sig == signal::SIGCONT && host::is_fwe(target) {
+        if sig == signal::SIGCONT && (to_self || host::is_fwe(target)) {
             crate::signote::continuing(target, true);
+            if to_self {
+                return post_own(sig);
+            }
+            // Another of fwe's: its SIGCONT through its mailbox, its stop
+            // ended by the host's ([`resume_process`]).
+            let r = send_unhosted(target, sig, signal::SI_USER, 0);
+            return if r != 0 { r } else { resume_process(target) };
         }
         // SIGTRAP to another of fwe's processes goes through its mailbox:
         // the host would merge it with the trap of that process's next
@@ -1175,6 +1237,17 @@ impl<P: Platform> Kernel<P> {
                 crate::signote::note(owner, libc::SIGKILL);
                 host::kill_process(owner, libc::SIGKILL)
             }
+            // A SIGCONT for any of its threads continues the process.
+            signal::SIGCONT => {
+                crate::signote::continuing(owner, true);
+                match crate::signote::queue_thread(owner, tid, sig, signal::SI_TKILL, 0) {
+                    Ok(()) => match host::kill_process(owner, host::WAKE_SIGNAL) {
+                        0 => resume_process(owner),
+                        r => r,
+                    },
+                    Err(e) => err(e),
+                }
+            }
             _ => match crate::signote::queue_thread(owner, tid, sig, signal::SI_TKILL, 0) {
                 Ok(()) => host::kill_process(owner, host::WAKE_SIGNAL),
                 Err(e) => err(e),
@@ -1219,6 +1292,11 @@ impl<P: Platform> Kernel<P> {
         }
         if !thread::may_queue(sig, signal::SI_TKILL) {
             return err(errno::EAGAIN);
+        }
+        // SIGCONT for any thread continues the process: a stop signal sent
+        // before is not taken.
+        if sig == signal::SIGCONT {
+            crate::signote::continuing(host::pid(), true);
         }
         // A signal the backend's handler catches is posted to the thread
         // directly, with the wake signal to interrupt it: sent as a host

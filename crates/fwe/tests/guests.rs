@@ -1872,6 +1872,26 @@ fn getppid_follows_the_parents_end() {
 /// A thread made after another ended starts as a new one, whatever host
 /// thread runs it: no signal stack, and its creator's name, signal mask
 /// and floating-point rounding mode, round after round.
+/// A process that stops itself, continued by its parent the moment the
+/// parent sees it stopped, again and again while its other threads run:
+/// every stop and continue is reported, and each SIGCONT is taken once by
+/// its handler, as on Linux (macOS on its own can leave such a process
+/// suspended though shown as running).
+#[test]
+fn a_process_that_stops_itself_is_always_continued() {
+    for libc in [Libc::Musl, Libc::Glibc] {
+        let prog = build_c_dynamic("stopself", libc, true);
+        let root = libc_rootfs(libc, "stopself");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "ok\n", "{libc:?}: {err}");
+        assert_eq!(out.status.code(), Some(0), "{libc:?}: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
 #[test]
 fn a_thread_after_another_ended_starts_afresh() {
     let prog = build_c_dynamic("threadreuse", Libc::Glibc, true);

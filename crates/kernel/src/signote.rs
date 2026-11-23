@@ -267,7 +267,12 @@ pub fn queue_thread_from(
 /// The mailbox's count of the `SIGCONT`s sent to its process ([`continuing`]),
 /// after the queue.
 const CONTINUED_AT: usize = QUEUE_AT + QUEUE_LEN * ENTRY;
-const _: () = assert!(CONTINUED_AT < crate::procstore::MAILBOX_WORDS - 1);
+/// The mailbox's count of the times its process stopped itself on the host
+/// ([`stopping`]), and the last of those stops it came back from
+/// ([`resumed`]): what tells another process that it is in a stop.
+const STOPPED_AT: usize = CONTINUED_AT + 1;
+const RESUMED_AT: usize = CONTINUED_AT + 2;
+const _: () = assert!(RESUMED_AT < crate::procstore::MAILBOX_WORDS - 1);
 
 /// How many times host process `pid` has been continued ([`continuing`]): 0
 /// while it has no mailbox. Async-signal-safe once the store is mapped.
@@ -286,6 +291,42 @@ pub fn continuing(pid: i32, make: bool) {
     if let Some(w) = crate::procstore::mailbox(pid, make).and_then(|mb| mb.get(CONTINUED_AT)) {
         w.fetch_add(1, SeqCst);
     }
+}
+
+/// This process is about to stop itself on the host: the stop's number,
+/// counted before the stop is looked at a last time, so that a `SIGCONT`
+/// sent meanwhile either keeps it from stopping or finds it in its stop
+/// ([`in_stop`]). Its mailbox is made if it has none. Async-signal-safe
+/// once the store is mapped, as every process starts (0 before).
+pub fn stopping() -> u64 {
+    crate::procstore::mailbox(crate::host::pid_now(), crate::procstore::is_mapped())
+        .and_then(|mb| mb.get(STOPPED_AT))
+        .map_or(0, |w| w.fetch_add(1, SeqCst) + 1)
+}
+
+/// This process came back from its stop `n` ([`stopping`]).
+/// Async-signal-safe.
+pub fn resumed(n: u64) {
+    if let Some(w) =
+        crate::procstore::mailbox(crate::host::pid_now(), false).and_then(|mb| mb.get(RESUMED_AT))
+    {
+        w.fetch_max(n, SeqCst);
+    }
+}
+
+/// The stop host process `pid` is in, made and not yet come back from
+/// ([`stopping`]), if any.
+pub fn in_stop(pid: i32) -> Option<u64> {
+    let mb = crate::procstore::mailbox(pid, false)?;
+    let (stopped, resumed) = (mb.get(STOPPED_AT)?.load(SeqCst), mb.get(RESUMED_AT)?.load(SeqCst));
+    (stopped > resumed).then_some(stopped)
+}
+
+/// Whether host process `pid` came back from its stop `n` ([`in_stop`]).
+pub fn resumed_from(pid: i32, n: u64) -> bool {
+    crate::procstore::mailbox(pid, false)
+        .and_then(|mb| mb.get(RESUMED_AT))
+        .is_none_or(|w| w.load(SeqCst) >= n)
 }
 
 /// What a queue entry holds in place of a signal for a request of a

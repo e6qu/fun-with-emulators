@@ -641,8 +641,9 @@ impl<P: Platform> Kernel<P> {
         crate::cgroupfs::forked();
         if t.frozen {
             // As a task forked into a frozen cgroup, it runs only once
-            // the cgroup thaws.
-            crate::host::kill_process(crate::host::pid(), libc::SIGSTOP);
+            // the cgroup thaws ([`crate::signal::continue_process`]).
+            crate::signal::stop_sent_now();
+            crate::host::stop_with(libc::SIGSTOP);
         }
         FILES_SHARED.store(t.files, std::sync::atomic::Ordering::SeqCst);
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);

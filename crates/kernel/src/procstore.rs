@@ -352,6 +352,12 @@ fn mapped() -> Option<&'static Store> {
     STORE.get()
 }
 
+/// Whether the store is mapped ([`init`]): a mailbox may then be made from
+/// a signal handler ([`mailbox`]).
+pub fn is_mapped() -> bool {
+    STORE.get().is_some()
+}
+
 /// End the process: the store cannot do what it must.
 fn fatal(why: &str) -> ! {
     eprintln!("fwe: {why}");

@@ -606,8 +606,26 @@ pub fn host_mask_for(mask: u64) -> libc::sigset_t {
 /// Stop the process with host stop signal `sig` (`SIGTSTP`, `SIGTTIN`,
 /// `SIGTTOU`, `SIGSTOP`) until it is continued, so the parent's `waitpid`
 /// reports that signal, as on Linux: raised on this thread with its default
-/// action and unblocked for the moment, then put back.
+/// action and unblocked for the moment, then put back. Not if a `SIGCONT`
+/// came since the stop signal was sent ([`crate::signal::stop_stands`]),
+/// looked at once the stop is counted ([`crate::signote::stopping`]): a
+/// `SIGCONT` sent meanwhile either keeps the process from stopping, or
+/// finds it in its stop and sees it come back
+/// ([`crate::signal::resume_process`]), which macOS does not always make
+/// it do (a process that stops itself can be left suspended, though shown
+/// as running, by a `SIGCONT` that comes as it stops).
 pub fn stop_with(sig: libc::c_int) {
+    let n = crate::signote::stopping();
+    if crate::signal::stop_stands() {
+        let continues = crate::signote::continued(pid_now());
+        raise_stop(sig);
+        crate::signal::came_back(continues);
+    }
+    crate::signote::resumed(n);
+}
+
+/// [`stop_with`]'s stop.
+fn raise_stop(sig: libc::c_int) {
     // SAFETY: plain host calls on initialized values; the disposition and
     // the mask are restored as they were.
     unsafe {
