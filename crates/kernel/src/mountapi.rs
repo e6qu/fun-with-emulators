@@ -164,16 +164,8 @@ fn tree_fd(root: &Mount) -> Result<i32, i32> {
         }
         Source::Synthetic | Source::Ns(_) | Source::Store(_) => None,
     };
-    let path = match host {
-        Some(p) => p,
-        None => {
-            let mut d = crate::fs::shm::user_dir()?;
-            d.extend_from_slice(b"/empty-dir");
-            let c = std::ffi::CString::new(d.clone()).map_err(|_| errno::EINVAL)?;
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            unsafe { libc::mkdir(c.as_ptr(), 0o500) };
-            d
-        }
+    let Some(path) = host else {
+        return crate::fs::empty_dir().map(std::os::fd::IntoRawFd::into_raw_fd);
     };
     let c = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
     // SAFETY: a NUL-terminated host path; the descriptor is the caller's.

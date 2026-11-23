@@ -2379,7 +2379,7 @@ enum Step {
 /// that would make it there without [`Resolved::prepare`] fails; and what
 /// a name in fwe's store stands in (its own directory is the store's).
 /// Opened once, out of the guest's reach, and handed out as a duplicate.
-fn empty_dir() -> Result<OwnedFd, i32> {
+pub(crate) fn empty_dir() -> Result<OwnedFd, i32> {
     static FD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
     let fd = match FD.get() {
         Some(&fd) => fd,
