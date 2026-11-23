@@ -677,13 +677,6 @@ impl Mem {
         let view = !shared
             && prot & mman::PROT_EXEC == 0
             && file.as_ref().is_some_and(|f| fwe_kernel::host::unlinked(f.as_raw_fd()));
-        if !shared && let Some(f) = &file {
-            eprintln!(
-                "PROBE mmap private fd {} unlinked {} view {view} prot {prot:#x}",
-                fd,
-                fwe_kernel::host::unlinked(f.as_raw_fd())
-            );
-        }
         // A fixed mapping replaces what is there.
         let kept = self.remove_keeping(at, at + len);
         let r = if view {
@@ -755,23 +748,6 @@ impl Mem {
             Back::Slab { .. } => false,
         };
         if prot & mman::PROT_WRITE != 0 && self.vmas.pieces(addr, end).iter().any(read_only) {
-            for p in self.vmas.pieces(addr, end) {
-                let seg = match p.value.back {
-                    Back::Segment { id, .. } => {
-                        self.segments.get(&id).map(|s| (s.writable, s.private, s.len))
-                    }
-                    Back::Slab { .. } => None,
-                };
-                eprintln!(
-                    "PROBE mprotect EACCES piece {:#x}..{:#x} prot {:#x} back {:?} source {} seg {:?}",
-                    p.start,
-                    p.end,
-                    p.value.prot,
-                    p.value.back,
-                    p.value.source.is_some(),
-                    seg
-                );
-            }
             return err(errno::EACCES);
         }
         // A private view of a file made executable becomes a copy of the
