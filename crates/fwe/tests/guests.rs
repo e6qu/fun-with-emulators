@@ -1949,6 +1949,15 @@ fn tracers_side_by_side_continue_only_their_own_tracees() {
     c_guest_prints("tracestorm", &[], "workers broken: 0, tracees not stopped or continued: 0\n");
 }
 
+/// Two processes of a user other than root make the same directory, file
+/// and FIFO at once (as PostgreSQL's parallel workers make their temporary
+/// directories): neither is refused in what the other made, which is never
+/// seen before its owner and mode are set, and no hidden name is listed.
+#[test]
+fn files_made_at_once_by_another_user_are_seen_whole() {
+    c_guest_prints("makerace", &[], "failed: 0, listed clean\n");
+}
+
 /// A process `/proc` shows sleeping in a semaphore wait is counted as
 /// waiting: fwe's own work on the way there is not shown as a sleep.
 #[test]

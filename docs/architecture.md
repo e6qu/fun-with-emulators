@@ -964,7 +964,14 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   root (fwe's user) keeps it in `org.fwe.owner`, under the same flag;
   `stat` reports it. A new file is its maker's (its file-system user, and
   group or a set-group-ID directory's), and `chown` changes the record
-  under Linux's rules. A Unix socket node takes no extended attribute on
+  under Linux's rules. A new file, directory, node or link given more
+  than the host gives it as it is made (an owner other than root, a mode
+  kept) is made under a hidden name (`.fwe-making-`, left out of listings
+  as `O_TMPFILE`'s are), given its owner and mode there, and renamed onto
+  its name only if none is there (`RENAME_EXCL`): Linux never shows a
+  name before its owner is set, and another process of the user making
+  the same name, or making something in it, would otherwise find it
+  root's and be refused (`fsops::make_whole`). A Unix socket node takes no extended attribute on
   macOS: its owner is a file in fwe's directory for the user, named by
   the node's device, inode and birth time (`socketowners.rs`), removed
   with the leftovers once the node is gone.

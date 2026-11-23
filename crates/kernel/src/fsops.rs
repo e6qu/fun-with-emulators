@@ -1116,29 +1116,42 @@ impl<P: Platform> Kernel<P> {
             None if flags & fcntl::O_CREAT != 0 => {
                 // Made here, or found made meanwhile, whose mode is its own.
                 let made = std::cell::Cell::new(true);
+                let new = self.new_owner(dirfd, false, mode, asked);
+                let more = Self::made_with_more(new, mode, host_mode);
                 let r = self.change_in(dirfd, || {
-                    // SAFETY: `dir` is a live directory fd.
-                    let fd = unsafe {
-                        host::openat(
-                            dirfd,
-                            &name,
-                            host_flags | libc::O_EXCL,
-                            host_mode as libc::c_uint,
-                        )
-                    };
-                    if fd < 0 && host::last_errno() == libc::EEXIST && flags & fcntl::O_EXCL == 0 {
+                    made.set(true);
+                    let fd = self.make_whole(
+                        dirfd,
+                        &name,
+                        more,
+                        false,
+                        true,
+                        &|n| {
+                            // SAFETY: `dir` is a live directory fd.
+                            let fd = unsafe {
+                                host::openat(
+                                    dirfd,
+                                    n,
+                                    host_flags | libc::O_EXCL,
+                                    host_mode as libc::c_uint,
+                                )
+                            };
+                            if fd < 0 { last_error() } else { fd as i64 }
+                        },
+                        &|n, fd| {
+                            if host_mode != mode & 0o7777 {
+                                let _ = crate::modes::keep_fd(fd as i32, mode);
+                            }
+                            self.own_new(dirfd, n, Some(fd as i32), mode, new);
+                        },
+                    );
+                    if fd == err(errno::EEXIST) && flags & fcntl::O_EXCL == 0 {
                         made.set(false);
                         let fd = open();
                         return if fd < 0 { last_error() } else { fd as i64 };
                     }
-                    if fd < 0 { last_error() } else { fd as i64 }
+                    fd
                 });
-                if r >= 0 && made.get() && host_mode != mode & 0o7777 {
-                    let _ = crate::modes::keep_fd(r as i32, mode);
-                }
-                if r >= 0 && made.get() {
-                    self.own_new(dirfd, &name, Some(r as i32), false, mode, asked);
-                }
                 if r >= 0 {
                     crate::fdstate::update(r as i32, |s| s.created = made.get());
                 }
@@ -2177,16 +2190,25 @@ impl<P: Platform> Kernel<P> {
         let mode = self.fs().apply_umask(mode as u32) & 0o1777;
         let host_mode = crate::modes::host_perm(mode, true);
         let dir = r.dir.as_raw_fd();
+        let new = self.new_owner(dir, true, mode, mode);
+        let more = Self::made_with_more(new, mode, host_mode);
         let made = self.change_in(dir, || {
-            // SAFETY: `name` NUL-terminated; `dir` live.
-            ret(unsafe { libc::mkdirat(dir, name.as_ptr(), host_mode as libc::mode_t) })
+            self.make_whole(
+                dir,
+                &name,
+                more,
+                true,
+                false,
+                // SAFETY: `n` NUL-terminated; `dir` live.
+                &|n| ret(unsafe { libc::mkdirat(dir, n.as_ptr(), host_mode as libc::mode_t) }),
+                &|n, _| {
+                    if host_mode != mode & 0o7777 {
+                        let _ = crate::modes::keep_at(dir, n, mode);
+                    }
+                    self.own_new(dir, n, None, mode, new);
+                },
+            )
         });
-        if made == 0 && host_mode != mode & 0o7777 {
-            let _ = crate::modes::keep_at(dir, &name, mode);
-        }
-        if made == 0 {
-            self.own_new(dir, &name, None, true, mode, mode);
-        }
         if let Err(e) = r.finish(made == 0)
             && made == 0
         {
@@ -2222,28 +2244,35 @@ impl<P: Platform> Kernel<P> {
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let d = r.dir.as_raw_fd();
         let host_perm = crate::modes::host_perm(perm, false);
-        let made = match kind {
-            0 | 0o100000 => self.change_in(d, || {
-                // SAFETY: a NUL-terminated name; `dir` live.
-                let fd = unsafe {
-                    libc::openat(
-                        d,
-                        name.as_ptr(),
-                        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-                        host_perm as libc::c_uint,
-                    )
-                };
-                if fd < 0 {
-                    return last_error();
-                }
-                // SAFETY: closing the descriptor just made.
-                unsafe { libc::close(fd) };
-                0
-            }),
-            0o010000 => self.change_in(d, || {
-                // SAFETY: a NUL-terminated name; `dir` live.
-                ret(unsafe { libc::mkfifoat(d, name.as_ptr(), host_perm as libc::mode_t) })
-            }),
+        let regular = |n: &std::ffi::CStr| {
+            // SAFETY: a NUL-terminated name; `d` live.
+            let fd = unsafe {
+                libc::openat(
+                    d,
+                    n.as_ptr(),
+                    libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                    host_perm as libc::c_uint,
+                )
+            };
+            if fd < 0 {
+                return last_error();
+            }
+            // SAFETY: closing the descriptor just made.
+            unsafe { libc::close(fd) };
+            0
+        };
+        let fifo = |n: &std::ffi::CStr| {
+            // SAFETY: a NUL-terminated name; `d` live.
+            ret(unsafe { libc::mkfifoat(d, n.as_ptr(), host_perm as libc::mode_t) })
+        };
+        let device;
+        let socket = |n: &std::ffi::CStr| match crate::net::make_socket_node(d, n, host_perm) {
+            Ok(()) => 0,
+            Err(e) => err(e),
+        };
+        let make: &dyn Fn(&std::ffi::CStr) -> i64 = match kind {
+            0 | 0o100000 => &regular,
+            0o010000 => &fifo,
             S_IFCHR | S_IFBLK => {
                 // The directory's permission first, as Linux checks it.
                 if stat_fd(d).is_ok_and(|st| !self.permits(&st, 2 | 1)) {
@@ -2254,12 +2283,6 @@ impl<P: Platform> Kernel<P> {
                     major: crate::devnodes::major(dev),
                     minor: crate::devnodes::minor(dev),
                 };
-                // A whiteout (a 0:0 character device) needs no CAP_MKNOD,
-                // as on Linux since 5.8: rootless overlay storage makes one.
-                let whiteout = kind == S_IFCHR && node.major == 0 && node.minor == 0;
-                if !whiteout && !self.creds.has(crate::caps::CAP_MKNOD) {
-                    return err(errno::EPERM);
-                }
                 if r.ovl.is_some() && kind == S_IFCHR && node.major == 0 && node.minor == 0 {
                     // A whiteout is the overlay's own, as on Linux.
                     return err(errno::EPERM);
@@ -2272,26 +2295,34 @@ impl<P: Platform> Kernel<P> {
                 ) {
                     return err(e);
                 }
-                self.change_in(d, || match crate::devnodes::make(d, &name, node, host_perm) {
-                    Ok(()) => 0,
-                    Err(e) => err(e),
-                })
+                device =
+                    move |n: &std::ffi::CStr| match crate::devnodes::make(d, n, node, host_perm) {
+                        Ok(()) => 0,
+                        Err(e) => err(e),
+                    };
+                &device
             }
             // A socket node, as binding a socket there leaves one.
-            0o140000 => {
-                self.change_in(d, || match crate::net::make_socket_node(d, &name, host_perm) {
-                    Ok(()) => 0,
-                    Err(e) => err(e),
-                })
-            }
+            0o140000 => &socket,
             _ => return err(errno::EINVAL),
         };
-        if made == 0 && host_perm != perm {
-            let _ = crate::modes::keep_at(d, &name, perm);
-        }
-        if made == 0 {
-            self.own_new(d, &name, None, false, perm, asked);
-        }
+        let new = self.new_owner(d, false, perm, asked);
+        let made = self.change_in(d, || {
+            self.make_whole(
+                d,
+                &name,
+                Self::made_with_more(new, perm, host_perm),
+                false,
+                false,
+                make,
+                &|n, _| {
+                    if host_perm != perm {
+                        let _ = crate::modes::keep_at(d, n, perm);
+                    }
+                    self.own_new(d, n, None, perm, new);
+                },
+            )
+        });
         match r.finish(made == 0) {
             Err(e) if made == 0 => err(e),
             _ => made,
@@ -2391,13 +2422,19 @@ impl<P: Platform> Kernel<P> {
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let d = r.dir.as_raw_fd();
+        let new = self.new_owner(d, false, 0o777, 0o777);
         let made = self.change_in(d, || {
-            // SAFETY: both strings NUL-terminated; `dir` live.
-            ret(unsafe { libc::symlinkat(target.as_ptr(), d, name.as_ptr()) })
+            self.make_whole(
+                d,
+                &name,
+                Self::made_with_more(new, 0o777, 0o777),
+                false,
+                false,
+                // SAFETY: both strings NUL-terminated; `d` live.
+                &|n| ret(unsafe { libc::symlinkat(target.as_ptr(), d, n.as_ptr()) }),
+                &|n, _| self.own_new(d, n, None, 0o777, new),
+            )
         });
-        if made == 0 {
-            self.own_new(d, &name, None, false, 0o777, 0o777);
-        }
         match r.finish(made == 0) {
             Err(e) if made == 0 => err(e),
             _ => made,
@@ -3821,21 +3858,44 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// A file `name` made in directory `dir` (open as `fd`, if it is),
-    /// with permission bits `perm`, a directory if `is_dir`: its owner is
-    /// the caller's file-system user, its group the caller's or, in a
-    /// set-group-ID directory, the directory's, whose bit a directory made
-    /// there inherits; a file made set-group-ID for a group the caller is
-    /// not in loses the bit (without `CAP_FSETID`), judged by the mode
-    /// `asked` before the umask, as Linux makes one.
-    pub(crate) fn own_new(
+    /// with permission bits `perm`, is given its owner and bits `new`
+    /// ([`Self::new_owner`]).
+    fn own_new(
         &self,
         dir: i32,
         name: &std::ffi::CStr,
         fd: Option<i32>,
-        is_dir: bool,
         perm: u32,
-        asked: u32,
+        new: ((u32, u32), u32),
     ) {
+        let (owner, kept) = new;
+        match fd {
+            // The set-ID and sticky bits are given again: the host drops
+            // them from a new file of a group it is not in, and from a new
+            // directory.
+            Some(fd) => {
+                let _ = crate::owners::keep_fd(fd, owner);
+                if kept != perm & 0o7777 || kept & 0o7000 != 0 {
+                    let _ = crate::modes::keep_fd(fd, kept);
+                }
+            }
+            None => {
+                let _ = crate::owners::keep_at(dir, name, owner);
+                if kept != perm & 0o7777 || kept & 0o7000 != 0 {
+                    let _ = crate::modes::keep_at(dir, name, kept);
+                }
+            }
+        }
+    }
+
+    /// The owner and the permission bits of a file made in directory
+    /// `dir` with permission bits `perm`, a directory if `is_dir`: its
+    /// owner is the caller's file-system user, its group the caller's or,
+    /// in a set-group-ID directory, the directory's, whose bit a directory
+    /// made there inherits; a file made set-group-ID for a group the caller
+    /// is not in loses the bit (without `CAP_FSETID`), judged by the mode
+    /// `asked` before the umask, as Linux makes one.
+    fn new_owner(&self, dir: i32, is_dir: bool, perm: u32, asked: u32) -> ((u32, u32), u32) {
         let c = &self.creds;
         let parent = stat_fd(dir).ok();
         let setgid_dir = parent.as_ref().is_some_and(|p| p.st_mode & 0o2000 != 0);
@@ -3855,23 +3915,75 @@ impl<P: Platform> Kernel<P> {
         {
             kept &= !0o2000;
         }
-        let owner = (c.fsuid, gid);
-        match fd {
-            // The set-ID and sticky bits are given again: the host drops
-            // them from a new file of a group it is not in, and from a new
-            // directory.
-            Some(fd) => {
-                let _ = crate::owners::keep_fd(fd, owner);
-                if kept != perm & 0o7777 || kept & 0o7000 != 0 {
-                    let _ = crate::modes::keep_fd(fd, kept);
-                }
+        ((c.fsuid, gid), kept)
+    }
+
+    /// Whether a file made with permission bits `perm` (`host` on the
+    /// host) and given owner and bits `new` ([`Self::new_owner`]) is given
+    /// more than the host gives it as it is made: an owner other than
+    /// root, set-ID or sticky bits, bits the host does not take.
+    fn made_with_more(new: ((u32, u32), u32), perm: u32, host: u32) -> bool {
+        let (owner, kept) = new;
+        owner != (0, 0) || kept != perm & 0o7777 || kept & 0o7000 != 0 || host != perm & 0o7777
+    }
+
+    /// Make the new file `name` in directory `dir` whole before any other
+    /// process can see it, as Linux sets a file's owner and mode before
+    /// its name is seen: one given more than the host gives it as it is
+    /// made (`more`, [`Self::made_with_more`]) would otherwise be seen as
+    /// root's, with the host's bits, and another process of its user
+    /// refused in it (`EACCES`). `make` makes the file under the name it is
+    /// given (an open's descriptor, where `opened`, or 0), refusing to make
+    /// one where one is; `give` gives it, under that name, what the host did
+    /// not. With more to give, it is made under a hidden name
+    /// ([`crate::tmpfile::making_name`]), given it, then renamed onto `name`
+    /// only if none is there (`EEXIST` otherwise, the hidden one removed).
+    /// A filesystem that cannot rename so (`EINVAL`) has it made under its
+    /// name and given it after.
+    #[allow(clippy::too_many_arguments)]
+    fn make_whole(
+        &self,
+        dir: i32,
+        name: &std::ffi::CStr,
+        more: bool,
+        is_dir: bool,
+        opened: bool,
+        make: &dyn Fn(&std::ffi::CStr) -> i64,
+        give: &dyn Fn(&std::ffi::CStr, i64),
+    ) -> i64 {
+        let direct = || {
+            let r = make(name);
+            if r >= 0 {
+                give(name, r);
             }
-            None => {
-                let _ = crate::owners::keep_at(dir, name, owner);
-                if kept != perm & 0o7777 || kept & 0o7000 != 0 {
-                    let _ = crate::modes::keep_at(dir, name, kept);
-                }
-            }
+            r
+        };
+        if !more {
+            return direct();
+        }
+        let Ok(hidden) = CString::new(crate::tmpfile::making_name()) else {
+            return err(errno::EINVAL);
+        };
+        let r = make(&hidden);
+        if r < 0 {
+            return r;
+        }
+        give(&hidden, r);
+        let placed = host::rename_at(dir, &hidden, dir, name, host::Rename::NoReplace);
+        if placed.is_ok() {
+            return r;
+        }
+        if opened {
+            // SAFETY: the descriptor `make` just opened.
+            unsafe { libc::close(r as i32) };
+        }
+        let flags = if is_dir { libc::AT_REMOVEDIR } else { 0 };
+        // SAFETY: a NUL-terminated name of the file just made in `dir`.
+        unsafe { libc::unlinkat(dir, hidden.as_ptr(), flags) };
+        match placed {
+            Err(errno::EINVAL) => direct(),
+            Err(e) => err(e),
+            Ok(()) => unreachable!(),
         }
     }
 
@@ -4722,10 +4834,10 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
     }
 }
 
-/// What a listing of a host directory leaves out: the
-/// hidden names of `O_TMPFILE` files.
+/// What a listing of a host directory leaves out: the hidden names of
+/// `O_TMPFILE` files and of files being made ([`crate::tmpfile`]).
 fn listing_hides() -> impl Fn(&[u8]) -> bool {
-    |name: &[u8]| name.starts_with(crate::tmpfile::PREFIX)
+    crate::tmpfile::hidden_name
 }
 
 /// `lseek` of a host directory `getdents64` listed (`None` for any other

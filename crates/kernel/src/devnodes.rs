@@ -143,14 +143,9 @@ fn make_node(
 ) -> Result<(), i32> {
     #[cfg(target_os = "macos")]
     {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static N: AtomicU64 = AtomicU64::new(0);
-        let pid = crate::host::pid();
-        let tmp = std::ffi::CString::new(format!(
-            ".fwe-node-{pid}-{}",
-            N.fetch_add(1, Ordering::Relaxed)
-        ))
-        .map_err(|_| errno::EINVAL)?;
+        // Hidden while it is made ([`crate::tmpfile::making_name`]).
+        let tmp =
+            std::ffi::CString::new(crate::tmpfile::making_name()).map_err(|_| errno::EINVAL)?;
         // SAFETY: a NUL-terminated name; the file is fwe's to make.
         let fd = unsafe {
             libc::openat(

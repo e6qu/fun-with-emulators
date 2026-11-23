@@ -5,12 +5,23 @@
 //! the process's descriptors of it is closed, or the process ends; one
 //! made with `O_EXCL`, which can never be given a name, loses it at once.
 //! The name is its maker's: a fork child's descriptors leave it.
+//!
+//! A file being made is hidden the same way, under a name of its own
+//! ([`making_name`]), until it is whole and renamed onto its name
+//! ([`crate::fsops`]'s `make_whole`).
 
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// The prefix of the hidden names.
 pub const PREFIX: &[u8] = b".fwe-tmpfile-";
+/// The prefix of the hidden names of files being made.
+pub const MAKING: &[u8] = b".fwe-making-";
+
+/// Whether `name` is a hidden one, which a listing leaves out.
+pub fn hidden_name(name: &[u8]) -> bool {
+    name.starts_with(PREFIX) || name.starts_with(MAKING)
+}
 
 /// A hidden file: the descriptor it is held by, its host path and its
 /// host identity (device, inode).
@@ -50,9 +61,18 @@ pub fn forked_child() {
 
 /// A hidden name for a new file.
 pub fn fresh_name() -> Vec<u8> {
+    unique(PREFIX)
+}
+
+/// A hidden name for a file being made.
+pub fn making_name() -> Vec<u8> {
+    unique(MAKING)
+}
+
+fn unique(prefix: &[u8]) -> Vec<u8> {
     static N: AtomicU64 = AtomicU64::new(0);
     let pid = crate::host::pid();
-    let mut name = PREFIX.to_vec();
+    let mut name = prefix.to_vec();
     name.extend_from_slice(format!("{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes());
     name
 }
@@ -120,7 +140,7 @@ pub fn clear_hidden(parent: i32, name: &std::ffi::CStr) -> bool {
         let n = unsafe { std::ffi::CStr::from_ptr((*e).d_name.as_ptr()) }.to_owned();
         match n.as_bytes() {
             b"." | b".." => {}
-            b if b.starts_with(PREFIX) => names.push(n),
+            b if hidden_name(b) => names.push(n),
             _ => only_hidden = false,
         }
     }
@@ -131,8 +151,12 @@ pub fn clear_hidden(parent: i32, name: &std::ffi::CStr) -> bool {
     let cleared = only_hidden && !names.is_empty();
     if cleared {
         for n in &names {
-            // SAFETY: a NUL-terminated name in the directory open as `dir`.
-            unsafe { libc::unlinkat(dir, n.as_ptr(), 0) };
+            // SAFETY: a NUL-terminated name in the directory open as `dir`;
+            // one being made may be a directory.
+            if unsafe { libc::unlinkat(dir, n.as_ptr(), 0) } != 0 {
+                // SAFETY: as above.
+                unsafe { libc::unlinkat(dir, n.as_ptr(), libc::AT_REMOVEDIR) };
+            }
         }
     }
     // SAFETY: closing the descriptor opened above.
