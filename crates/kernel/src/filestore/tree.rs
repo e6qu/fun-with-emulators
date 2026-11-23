@@ -490,6 +490,7 @@ impl Tx<'_> {
 
     /// The inode named `name` in directory `dir` (`.` and `..` too).
     pub fn lookup(&self, dir: Ino, name: &[u8]) -> Result<Ino, i32> {
+        named(name)?;
         let d = self.dir(dir)?;
         match name {
             b"." => Ok(dir),
@@ -622,6 +623,7 @@ impl Tx<'_> {
     /// A new inode like `n` named `name` in directory `dir`: `EEXIST` if
     /// the name is taken.
     pub fn create(&mut self, dir: Ino, name: &[u8], n: &New) -> Result<Ino, i32> {
+        named(name)?;
         let d = self.dir(dir)?;
         if self.find(d, name).is_some() || matches!(name, b"." | b"..") {
             return Err(errno::EEXIST);
@@ -678,6 +680,7 @@ impl Tx<'_> {
 
     /// Another name, `name` in `dir`, for `ino` (no directory).
     pub fn link(&mut self, ino: Ino, dir: Ino, name: &[u8]) -> Result<(), i32> {
+        named(name)?;
         let mode = self.get_u32(ino, I_MODE)?;
         if mode & S_IFMT == S_IFDIR {
             return Err(errno::EPERM);
@@ -709,6 +712,7 @@ impl Tx<'_> {
     /// names and no holders: its data object is then to be removed, as
     /// the returned `data` says).
     pub fn unlink(&mut self, dir: Ino, name: &[u8], rmdir: bool) -> Result<Gone, i32> {
+        named(name)?;
         let d = self.dir(dir)?;
         if matches!(name, b"." | b"..") {
             return Err(if rmdir { errno::EINVAL } else { errno::EISDIR });
@@ -783,6 +787,8 @@ impl Tx<'_> {
     ) -> Result<Option<Gone>, i32> {
         const NOREPLACE: u32 = 1;
         const EXCHANGE: u32 = 2;
+        named(oname)?;
+        named(nname)?;
         let (od, nd) = (self.dir(odir)?, self.dir(ndir)?);
         if matches!(oname, b"." | b"..") || matches!(nname, b"." | b"..") {
             return Err(errno::EBUSY);
@@ -1649,6 +1655,14 @@ pub struct Gone {
     pub node: bool,
 }
 
+/// The longest name a directory holds, in bytes (Linux's `NAME_MAX`).
+pub const NAME_MAX: usize = 255;
+
+/// `ENAMETOOLONG` for a name longer than [`NAME_MAX`].
+fn named(name: &[u8]) -> Result<(), i32> {
+    if name.len() > NAME_MAX { Err(errno::ENAMETOOLONG) } else { Ok(()) }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
@@ -1683,6 +1697,14 @@ mod tests {
         assert_eq!(t.lookup(root, b"f"), Ok(f));
         assert_eq!(t.lookup(d, b".."), Ok(root));
         assert_eq!(t.lookup(f, b"x"), Err(errno::ENOTDIR));
+        // A name longer than NAME_MAX is refused by every call naming it.
+        let (long, longest) = ([b'n'; NAME_MAX + 1], [b'n'; NAME_MAX]);
+        assert_eq!(t.lookup(root, &long), Err(errno::ENAMETOOLONG));
+        assert_eq!(t.create(root, &long, &file(0o644)), Err(errno::ENAMETOOLONG));
+        assert_eq!(t.link(f, root, &long), Err(errno::ENAMETOOLONG));
+        assert_eq!(t.rename(root, b"f", root, &long, 0).err(), Some(errno::ENAMETOOLONG));
+        assert_eq!(t.unlink(root, &long, false).err(), Some(errno::ENAMETOOLONG));
+        assert_eq!(t.lookup(root, &longest), Err(errno::ENOENT));
         t.link(f, d, b"g").unwrap();
         assert_eq!(t.stat(f).unwrap().nlink, 2);
         assert_eq!(t.unlink(root, b"d", true), Err(errno::ENOTEMPTY));

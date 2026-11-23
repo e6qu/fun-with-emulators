@@ -3044,6 +3044,12 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             }
             continue;
         }
+        // A name too long for the store's directories is refused by its
+        // lookup, before any check of what is done with it (as tmpfs's
+        // `simple_lookup`).
+        if here.store.is_some() && !here.phantom && comp.len() > crate::filestore::tree::NAME_MAX {
+            return Err(errno::ENAMETOOLONG);
+        }
         if is_last && !follow_final {
             return done(here, comp, false);
         }

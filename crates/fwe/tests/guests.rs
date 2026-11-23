@@ -9421,7 +9421,8 @@ fn tmpfs_files_work_by_path() {
          by path: ok ok ok ok; mode 640 size 10 atime 1000 mtime 2000 attribute v tmpfs true\n\
          mount by descriptor: ok, another filesystem true\n\
          cachestat: cached 3 dirty 3, of one page 1\n\
-         read at the end: 0 bytes, access time touched true\n"
+         read at the end: 0 bytes, access time touched true\n\
+         rename to a 256-byte name: -1 errno 36\n"
     );
 }
 

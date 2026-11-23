@@ -1818,6 +1818,11 @@ fn store_scenario() {
         (n, times_of("/tmp/s/at-end").0)
     };
     println!("read at the end: {n} bytes, access time touched {}", atime > 1000);
+    // A name longer than 255 bytes is refused, by the lookup.
+    let long = format!("/tmp/s/{}", "n".repeat(256));
+    // SAFETY: NUL-terminated paths.
+    let (r, e) = unsafe { (rename(c("/tmp/s/at-end").as_ptr(), c(&long).as_ptr()), errno()) };
+    println!("rename to a 256-byte name: {r} errno {e}");
 }
 
 /// The names in directory `p`.
