@@ -7463,7 +7463,8 @@ fn hv_debian_python_runs_a_workload() {
     let script = format!("/tmp/fwe-python-{}.py", std::process::id());
     std::fs::write(root.join(script.trim_start_matches('/')), PYTHON_WORKLOAD).unwrap();
     let Some(mut cmd) = hv_command() else { return };
-    cmd.arg("--root")
+    cmd.arg("--strace=failures") // PROBE
+        .arg("--root")
         .arg(&root)
         .arg(root.join("usr/bin/python3.11"))
         .arg("-B")
