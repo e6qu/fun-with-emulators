@@ -273,21 +273,47 @@ pub fn zero(id: u64, start: u64, end: u64) -> Result<(), i32> {
 }
 
 /// The whole pages at `at`, `len` bytes of a shared mapping, read as
-/// zeroes and hold no memory now.
+/// zeroes. On Linux their memory goes back to the host. On macOS each
+/// page that ever held anything (in memory, compressed or paged out, as
+/// `mincore` tells) is written with zeroes in place, and one that never
+/// did is left alone, holding no memory still; what a page held stays the
+/// object's until it goes. (macOS's calls that would take a shared
+/// object's pages back, `MADV_ZERO` then `MADV_FREE_REUSABLE`, are not
+/// made: their use was followed by a panic of the host's memory
+/// compressor.)
 ///
 /// # Safety
 /// Pages of a shared mapping no one else uses as memory of their own.
 pub(super) unsafe fn give_back(at: *mut libc::c_void, len: usize) {
-    // SAFETY: guaranteed by the caller.
-    unsafe {
-        #[cfg(target_os = "macos")]
-        {
-            // Zeroed in place (the object's pages are its contents), then
-            // their memory given back until written again.
-            libc::madvise(at, len, libc::MADV_ZERO);
-            libc::madvise(at, len, libc::MADV_FREE_REUSABLE);
+    #[cfg(target_os = "macos")]
+    {
+        // A few thousand pages' states at a time; what says a page is of
+        // anonymous memory alone says nothing of what it holds.
+        const CHUNK: usize = 4096 * PAGE as usize;
+        const MINCORE_ANONYMOUS: libc::c_char = 0x80u8 as libc::c_char;
+        let mut states = vec![0 as libc::c_char; CHUNK / PAGE as usize];
+        let mut done = 0;
+        while done < len {
+            let n = (len - done).min(CHUNK);
+            let base = at as usize + done;
+            // SAFETY: inside the caller's mapping; one byte a page.
+            let known =
+                unsafe { libc::mincore(base as *mut libc::c_void, n, states.as_mut_ptr()) } == 0;
+            for (i, &state) in states[..n.div_ceil(PAGE as usize)].iter().enumerate() {
+                if known && state & !MINCORE_ANONYMOUS == 0 {
+                    continue;
+                }
+                let page = base + i * PAGE as usize;
+                let size = (PAGE as usize).min(base + n - page);
+                // SAFETY: a page of the caller's mapping, guaranteed unused.
+                unsafe { std::ptr::write_bytes(page as *mut u8, 0, size) };
+            }
+            done += n;
         }
-        #[cfg(not(target_os = "macos"))]
+    }
+    // SAFETY: guaranteed by the caller.
+    #[cfg(not(target_os = "macos"))]
+    unsafe {
         libc::madvise(at, len, libc::MADV_REMOVE);
     }
 }
@@ -333,5 +359,26 @@ mod tests {
         unsafe { libc::munmap(p, 16384) };
         remove(id);
         assert_eq!(open(id, true).err(), Some(fwe_abi::errno::ENOENT));
+    }
+
+    /// Zeroed whole pages read as zeroes; those that never held anything
+    /// are not brought into memory by it.
+    #[test]
+    fn zeroing_touches_only_pages_that_held_data() {
+        let id = make().unwrap();
+        write(id, PAGE + 1, &[9u8; 100]).unwrap();
+        zero(id, 0, 64 * PAGE).unwrap();
+        let mut b = [1u8; 100];
+        read(id, PAGE + 1, &mut b).unwrap();
+        assert_eq!(b, [0u8; 100]);
+        let v = view(id, 64 * PAGE).unwrap();
+        let mut states = [0 as libc::c_char; 64];
+        let len = 64 * PAGE as usize;
+        // SAFETY: inside the view; one byte a page.
+        let r = unsafe { libc::mincore(v.base as *mut libc::c_void, len, states.as_mut_ptr()) };
+        assert_eq!(r, 0);
+        let held = states.iter().filter(|&&s| s as u8 & !0x80 != 0).count();
+        assert_eq!(held, 1, "{states:?}");
+        remove(id);
     }
 }
