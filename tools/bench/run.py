@@ -1954,10 +1954,20 @@ def postgres(a, fwe, guest_env, results):
     same release."""
     root = alpine_root("postgres", a.cache)
     shutil.copy(os.path.join(WORKLOADS, "postgres.sh"), os.path.join(root, "tmp"))
+    # PostgreSQL runs as no root: its user, as the package's install script
+    # (not run when the root is unpacked) makes it, and the workload run as
+    # it, as on Linux.
+    for name, entry in (("passwd", "postgres:x:70:70:PostgreSQL user:/var/lib/postgresql:/bin/sh"),
+                        ("group", "postgres:x:70:")):
+        path = os.path.join(root, "etc", name)
+        if not any(l.startswith("postgres:") for l in open(path)):
+            with open(path, "a") as f:
+                f.write(entry + "\n")
     native = tempfile.mkdtemp()
     ours_w, theirs_w = os.path.join(root, "tmp", "w"), os.path.join(native, "w")
     ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
-                              "cd /tmp/w && sh /tmp/postgres.sh /usr/libexec/postgresql18"]
+                              "chown postgres /tmp/w && su postgres -s /bin/sh -c "
+                              "'cd /tmp/w && sh /tmp/postgres.sh /usr/libexec/postgresql18'"]
     bin_dir = os.path.join(a.brew, BREW["postgres"])
     theirs = ["/bin/sh", "-c", f"cd {theirs_w} && sh {WORKLOADS}/postgres.sh {bin_dir}"]
     workload(results, "PostgreSQL (s)", ours, theirs, (ours_w, theirs_w), len(guest_env) + 1)
