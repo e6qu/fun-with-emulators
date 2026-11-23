@@ -534,7 +534,7 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
 }
 
 /// A vendored real libc the dynamic C guests are built and run against.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Libc {
     /// musl: the dynamic linker is itself the shared libc, one self-contained
     /// file (`guests/musl`).
@@ -1771,6 +1771,29 @@ fn a_library_longer_than_a_branch_gets_its_stubs() {
         let _ = std::fs::remove_dir_all(&root);
     }
     assert_eq!(run.status.code(), Some(0));
+}
+
+/// What `semopen` prints: a named semaphore made, made again (`EEXIST`),
+/// posted by a fork child, unlinked, then not found (`ENOENT`).
+const SEMOPEN: &str = "made; made again: errno 17; posts of a child taken, left 0; unlinked 0; \
+                       opened after: errno 2\n";
+
+/// Named POSIX semaphores, as Python's `multiprocessing` makes its locks,
+/// through each C library's `sem_open`: a file of `/dev/shm` made under a
+/// temporary name, mapped and linked to its name.
+#[test]
+fn named_semaphores_live_in_dev_shm() {
+    for libc in [Libc::Musl, Libc::Glibc] {
+        let prog = build_c_dynamic("semopen", libc, true);
+        let root = libc_rootfs(libc, "semopen");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), SEMOPEN, "{libc:?}: {err}");
+        assert_eq!(out.status.code(), Some(0), "{libc:?}: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// Threads that first run the same pages of the shared libc at once, with
@@ -7437,6 +7460,18 @@ fn hv_runs_dynamic_non_pie_glibc_program() {
     let root = libc_rootfs(Libc::Glibc, "glibc-nopie");
     let Some(out) = fwe_hv_in(&root, &prog, &["fun-with-emulators"]) else { return };
     assert_eq!(stdout(&out), "dynamic hello, fun-with-emulators\n");
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Named POSIX semaphores in the VM, as Debian's `python3`'s
+/// `multiprocessing` makes them ([`named_semaphores_live_in_dev_shm`]).
+#[test]
+fn hv_named_semaphores_live_in_dev_shm() {
+    let prog = build_c("semopen", Libc::Glibc, true, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-semopen-nopie");
+    let Some(out) = fwe_hv_in(&root, &prog, &[]) else { return };
+    assert_eq!(stdout(&out), SEMOPEN);
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
 }
