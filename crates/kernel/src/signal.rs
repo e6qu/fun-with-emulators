@@ -373,29 +373,11 @@ fn job_stop(platform: &mut impl crate::Platform, sig: u64) {
         if !stop_stands() {
             return;
         }
+        crate::signote::job_stopped(sig);
         // Every other thread into fwe, where it waits for this one: one in
         // the program's code takes its signals under the kernel lock, one
-        // in a host call ends it to take them so. The stop is the
-        // process's, shown and told to its parent, once the last of them
-        // waits there, as Linux's group stop is once its last thread
-        // stops; continued or killed before then, there is none.
+        // in a host call ends it to take them so.
         thread::wake_others(host::WAKE_SIGNAL);
-        let mut woken = std::time::Instant::now();
-        while crate::klock::guests_waiting() < thread::others_started() {
-            if crate::signote::continued(host::pid_now()) != at
-                || thread::pending() & bit(signal::SIGKILL) != 0
-            {
-                return;
-            }
-            // A thread the wake found in fwe's work takes it as that ends;
-            // one it missed (sent as the thread began) is woken again.
-            if woken.elapsed() >= std::time::Duration::from_millis(10) {
-                thread::wake_others(host::WAKE_SIGNAL);
-                woken = std::time::Instant::now();
-            }
-            std::thread::sleep(std::time::Duration::from_micros(100));
-        }
-        crate::signote::job_stopped(sig);
         notify_parent(fwe_abi::wait::CLD_STOPPED, sig as i32);
         loop {
             let seen = word.load(std::sync::atomic::Ordering::SeqCst);

@@ -1566,14 +1566,6 @@ pub fn wake_others(sig: libc::c_int) {
     }
 }
 
-/// How many of the guest's threads other than this one run (their host
-/// threads started), as [`wake_others`] wakes them.
-pub fn others_started() -> usize {
-    let me = tid();
-    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-    threads.iter().filter(|r| r.tid != me && r.host != 0).count()
-}
-
 /// The host thread running guest thread `tid` of this process: `Some(0)`
 /// while it is still being created.
 pub fn host_thread(tid: i32) -> Option<libc::pthread_t> {
