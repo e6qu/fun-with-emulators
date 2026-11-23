@@ -730,25 +730,17 @@ pub fn host_mask_for(mask: u64) -> libc::sigset_t {
     host_sigset(mask & !(crate::signal::caught() | crate::signalfd::watched()))
 }
 
-/// Stop the process with host stop signal `sig` (`SIGTSTP`, `SIGTTIN`,
-/// `SIGTTOU`, `SIGSTOP`) until it is continued, so the parent's `waitpid`
-/// reports that signal, as on Linux: raised on this thread with its default
-/// action and unblocked for the moment, then put back. Not if a `SIGCONT`
-/// came since the stop signal was sent ([`crate::signal::stop_stands`]),
-/// looked at once the stop is counted ([`crate::signote::stopping`]): a
-/// `SIGCONT` sent meanwhile either keeps the process from stopping, or
-/// finds it in its stop and sees it come back
-/// ([`crate::signal::resume_process`]), which macOS does not always make
-/// it do (a process that stops itself can be left suspended, though shown
-/// as running, by a `SIGCONT` that comes as it stops).
+/// Stop the process on the host with host stop signal `sig` (`SIGTSTP`,
+/// `SIGTTIN`, `SIGTTOU`, `SIGSTOP`) until it is continued, so that its
+/// parent, a process that is not fwe's (a shell), sees it stop: raised on
+/// this thread with its default action and unblocked for the moment, then
+/// put back. Not if a `SIGCONT` came since the stop signal was sent
+/// ([`crate::signal::stop_stands`]). The host's `SIGCONT` that ends it is
+/// caught as it does ([`crate::signal::host_continued`]).
 pub fn stop_with(sig: libc::c_int) {
-    let n = crate::signote::stopping();
     if crate::signal::stop_stands() {
-        let continues = crate::signote::continued(pid_now());
         raise_stop(sig);
-        crate::signal::came_back(continues);
     }
-    crate::signote::resumed(n);
 }
 
 /// [`stop_with`]'s stop.
@@ -849,6 +841,22 @@ pub fn signal_is_ignored(sig: u64) -> bool {
 
 /// Whether the host's `SIGCHLD` action has `SA_NOCLDSTOP` (the guest's
 /// does): no `SIGCHLD` for a child that stops or continues.
+/// This process's parent on the host. Async-signal-safe.
+pub fn parent_pid() -> i32 {
+    // SAFETY: plain host call.
+    unsafe { libc::getppid() }
+}
+
+/// Whether this process ignores `SIGCHLD` on the host (as the guest
+/// does). Async-signal-safe.
+pub fn sigchld_ignored() -> bool {
+    // SAFETY: zeroed bytes are a valid `sigaction`; the call only reads.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter; no new action.
+    unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) };
+    old.sa_sigaction == libc::SIG_IGN
+}
+
 pub fn sigchld_nocldstop() -> bool {
     // SAFETY: zeroed bytes are a valid `sigaction`; the call only reads.
     let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -1024,14 +1032,18 @@ pub fn last_host_info(sig: libc::c_int) -> (i32, i32) {
 /// fault signal, which comes with the receiving thread's last fault in its
 /// siginfo instead (macOS fills a sent `SIGSEGV`, `SIGBUS`, `SIGILL` or
 /// `SIGFPE` so).
-pub fn sent_info(note: crate::signote::Note) -> crate::thread::SigInfo {
+pub fn sent_info(sig: u64, note: crate::signote::Note) -> crate::thread::SigInfo {
     let code = if note.code != 0 { note.code } else { signal::SI_USER };
+    // A child's stop or continue ([`crate::signal::take_notes`]): its
+    // status the value.
+    let child = sig == signal::SIGCHLD
+        && matches!(code, fwe_abi::wait::CLD_STOPPED | fwe_abi::wait::CLD_CONTINUED);
     crate::thread::SigInfo {
         code,
         pid: note.pid,
         uid: note.uid,
-        status: 0,
-        value: note.value,
+        status: if child { note.value as i32 } else { 0 },
+        value: if child { 0 } else { note.value },
         poll: None,
     }
 }

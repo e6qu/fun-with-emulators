@@ -979,14 +979,7 @@ fn take_async(
     let record = || {
         if sig == host::WAKE_SIGNAL {
             // Signals the host lacks, queued by another process.
-            fwe_kernel::signote::drain(|lsig, note| {
-                // One for a thread of this process goes to it, if it is there.
-                if note.tid != 0 {
-                    thread::post_directed(note.tid, lsig, host::sent_info(note));
-                } else {
-                    thread::post_landed(lsig, host::sent_info(note));
-                }
-            });
+            fwe_kernel::signal::take_notes();
         } else {
             let info = sent();
             let lsig = host::signal_to_linux(sig);
@@ -994,6 +987,10 @@ fn take_async(
             // as the host's, is pending as of now.
             if fwe_kernel::signal::stops(lsig) {
                 fwe_kernel::signal::stop_sent_now();
+            }
+            // The host's SIGCONT is the guest's only from outside fwe.
+            if lsig == fwe_abi::signal::SIGCONT && !fwe_kernel::signal::host_continued(info.pid) {
+                return;
             }
             if in_fork_child() {
                 // Kept until the child forgets its parent's signals.
@@ -1446,7 +1443,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // signal for the guest, whatever this thread was running. (A genuine
     // fault that coincides with a note faults again, without one.)
     if let Some(note) = fwe_kernel::signote::take(sig) {
-        take_async(sig, || host::sent_info(note), ctx, guest_interrupted(ctx));
+        let lsig = host::signal_to_linux(sig);
+        take_async(sig, || host::sent_info(lsig, note), ctx, guest_interrupted(ctx));
         return;
     }
     // A fault signal whose syndrome is no abort of the instruction it

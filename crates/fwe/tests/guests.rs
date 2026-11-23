@@ -1869,9 +1869,6 @@ fn getppid_follows_the_parents_end() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// A thread made after another ended starts as a new one, whatever host
-/// thread runs it: no signal stack, and its creator's name, signal mask
-/// and floating-point rounding mode, round after round.
 /// A process that stops itself, continued by its parent the moment the
 /// parent sees it stopped, again and again while its other threads run:
 /// every stop and continue is reported, and each SIGCONT is taken once by
@@ -1892,6 +1889,36 @@ fn a_process_that_stops_itself_is_always_continued() {
     }
 }
 
+/// Job-control stops of a child with threads, as Linux makes them: every
+/// thread stands still, `/proc` shows `T`, each stop and continue is
+/// reported once to `wait` and told with `SIGCHLD` (none with
+/// `SA_NOCLDSTOP`), a storm of them is all reported, and `SIGKILL` ends a
+/// stopped child at once.
+#[test]
+fn a_stop_halts_every_thread_and_is_told_to_the_parent() {
+    for libc in [Libc::Musl, Libc::Glibc] {
+        let prog = build_c_dynamic("jobstop", libc, true);
+        let root = libc_rootfs(libc, "jobstop");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stdout(&out),
+            "stop: reported 1, threads still 1, state T; continue: reported 1, threads on 1\n\
+             SIGCHLD: stopped 1 (status 19), continued 1 (status 18), from the child 1\n\
+             SIGTSTP: 1\nstorm: 300 of 300\nSA_NOCLDSTOP: reported 1, SIGCHLDs 0\n\
+             killed while stopped: 1\n",
+            "{libc:?}: {err}"
+        );
+        assert_eq!(out.status.code(), Some(0), "{libc:?}: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A thread made after another ended starts as a new one, whatever host
+/// thread runs it: no signal stack, and its creator's name, signal mask
+/// and floating-point rounding mode, round after round.
 #[test]
 fn a_thread_after_another_ended_starts_afresh() {
     let prog = build_c_dynamic("threadreuse", Libc::Glibc, true);

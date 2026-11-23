@@ -19,7 +19,8 @@
 //!   the adopter's `wait` takes it ([`take_adopted`]).
 //! - A reaper (a subreaper, or a pid namespace's init) runs a watcher
 //!   thread that follows its descendants on the host (`kqueue` process
-//!   events), so it sees an adopted one end, stop or continue: it then
+//!   events, and the stops of fwe's their mailboxes show), so it sees an
+//!   adopted one end, stop or continue: it then
 //!   raises `SIGCHLD` in the reaper, and wakes its threads waiting in
 //!   `wait`, which report the stop or continue as Linux reports a
 //!   child's ([`take_change`]).
@@ -395,6 +396,65 @@ pub fn take_change(sel: Select, peek: bool, stopped: bool, continued: bool) -> O
     Some(if peek { c[i].clone() } else { c.remove(i) })
 }
 
+/// A stop (`stopped`) or continue (`continued`) of fwe's
+/// ([`crate::signote::take_job_change`]) of one of this process's own
+/// children that `sel` matches, not yet reported: taken, unless `peek`.
+/// (A foster child, its creator's child on the host, is its parent's.)
+pub fn take_own_change(sel: Select, peek: bool, stopped: bool, continued: bool) -> Option<Ended> {
+    for pid in own_children() {
+        // SAFETY: plain host call.
+        let pgid = unsafe { libc::getpgid(pid) };
+        if !sel.matches(pid, pgid) {
+            continue;
+        }
+        let Some(r) = procreg::read(pid).filter(|r| !r.foster) else { continue };
+        let Some((code, status)) = crate::signote::take_job_change(pid, stopped, continued, peek)
+        else {
+            continue;
+        };
+        let status =
+            if code == fwe_abi::wait::CLD_CONTINUED { CONTINUED } else { (status << 8) | 0x7f };
+        return Some(Ended {
+            pid,
+            start: r.start,
+            status,
+            pgid,
+            lineage: r.lineage,
+            bound: r.bound,
+            numbers: procreg::numbers_in(&r.ns, pid),
+            foster: false,
+        });
+    }
+    None
+}
+
+/// This process's children on the host.
+fn own_children() -> Vec<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut pids = vec![0i32; 256];
+        loop {
+            let size = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
+            // SAFETY: a valid buffer of `size` bytes.
+            let n = unsafe { libc::proc_listchildpids(me(), pids.as_mut_ptr().cast(), size) };
+            if n < 0 {
+                return Vec::new();
+            }
+            let n = n as usize;
+            if n < pids.len() {
+                pids.truncate(n);
+                pids.retain(|&p| p > 0);
+                return pids;
+            }
+            pids.resize(pids.len() * 2, 0);
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
 /// Adopted process `pid` stopped (by Linux signal `sig`) or continued
 /// (`None`): kept for `wait`, and told with `SIGCHLD` unless the guest
 /// asked not to be (`SA_NOCLDSTOP`).
@@ -459,8 +519,15 @@ pub fn active() -> bool {
 /// The adopted processes whose end the watcher has raised `SIGCHLD` for.
 static NOTIFIED: Mutex<Option<HashSet<(i32, u64)>>> = Mutex::new(None);
 
-/// Host threads waiting in `wait`, which the watcher wakes.
-static WAITERS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
+/// Host threads waiting in `wait` (0: a free slot), which the watcher and
+/// a child's stop or continue wake ([`wake_waiters`]): taken and let go
+/// without a lock, as a signal handler wakes them.
+static WAITERS: [std::sync::atomic::AtomicUsize; 1024] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 1024];
+
+/// Wakes of the waiters under way: a waiter that leaves waits until there
+/// are none, so that no wake goes to a thread that has ended.
+static WAKING: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Held by the watcher while it acts on what it saw, and by a `wait` while
 /// it looks at the records: a host `fork` takes it ([`hold`]), so neither
@@ -476,7 +543,6 @@ static BUSY: Mutex<()> = Mutex::new(());
 )]
 pub fn hold<R>(f: impl FnOnce() -> R) -> R {
     let _busy = BUSY.lock().unwrap_or_else(|e| e.into_inner());
-    let _waiters = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
     let _notified = NOTIFIED.lock().unwrap_or_else(|e| e.into_inner());
     let _changes = CHANGES.lock().unwrap_or_else(|e| e.into_inner());
     let _inits = INITS.lock().unwrap_or_else(|e| e.into_inner());
@@ -501,7 +567,10 @@ pub fn forked_child() {
     for (pid, _) in &EXIT_SIGNALS {
         pid.store(0, SeqCst);
     }
-    WAITERS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+    for w in &WAITERS {
+        w.store(0, SeqCst);
+    }
+    WAKING.store(0, SeqCst);
     *NOTIFIED.lock().unwrap_or_else(|e| e.into_inner()) = None;
     CHANGES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     // The parent's inits are not this process's children, and its kqueue
@@ -650,19 +719,29 @@ pub fn start_if_reaper() {
     }
 }
 
-/// A thread's wait in `wait4` or `waitid` while this process is a reaper:
-/// registered for the watcher to wake, with every signal blocked while it
-/// checks for a child to report, so none is missed before [`Waiter::sleep`].
+/// A thread's wait in `wait4` or `waitid` for what the host does not
+/// report (an adopted child's end, stop or continue, an own child's stop
+/// or continue of fwe's): registered to be woken, with every signal
+/// blocked while it checks for a child to report, so none is missed
+/// before [`Waiter::sleep`].
 pub struct Waiter {
     old: libc::sigset_t,
-    me: usize,
+    slot: usize,
 }
 
 impl Waiter {
     pub fn new() -> Waiter {
         // SAFETY: pthread_self cannot fail.
         let me = unsafe { libc::pthread_self() } as usize;
-        WAITERS.lock().unwrap_or_else(|e| e.into_inner()).push(me);
+        let Some(slot) =
+            WAITERS.iter().position(|w| w.compare_exchange(0, me, SeqCst, SeqCst).is_ok())
+        else {
+            eprintln!(
+                "fwe: more than {} threads of a process wait in `wait` at once",
+                WAITERS.len()
+            );
+            std::process::exit(1)
+        };
         let mut all = crate::host::host_sigset(u64::MAX);
         let mut old = crate::host::empty_sigset();
         // SAFETY: plain host calls on valid signal sets.
@@ -670,11 +749,11 @@ impl Waiter {
             libc::sigaddset(&mut all, crate::host::WAKE_SIGNAL);
             libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
         }
-        Waiter { old, me }
+        Waiter { old, slot }
     }
 
-    /// Wait until a signal arrives: the watcher's wake, or one for the
-    /// guest.
+    /// Wait until a signal arrives: a wake ([`wake_waiters`]), a child's
+    /// `SIGCHLD`, or one for the guest.
     pub fn sleep(&self) {
         let wait = crate::host::host_mask_for(crate::thread::mask());
         // SAFETY: a valid signal set; returns after a host handler ran.
@@ -692,22 +771,25 @@ impl Drop for Waiter {
     fn drop(&mut self) {
         // SAFETY: restoring the mask saved in `new`.
         unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
-        let mut w = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(i) = w.iter().position(|&t| t == self.me) {
-            w.swap_remove(i);
+        WAITERS[self.slot].store(0, SeqCst);
+        while WAKING.load(SeqCst) != 0 {
+            std::hint::spin_loop();
         }
     }
 }
 
-/// Wake every thread waiting in `wait`.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn wake_waiters() {
-    let w = WAITERS.lock().unwrap_or_else(|e| e.into_inner());
-    for &t in w.iter() {
-        // SAFETY: a registered thread is live until it unregisters, which
-        // needs this lock.
-        unsafe { libc::pthread_kill(t as libc::pthread_t, crate::host::WAKE_SIGNAL) };
+/// Wake every thread waiting in `wait`. Async-signal-safe.
+pub fn wake_waiters() {
+    WAKING.fetch_add(1, SeqCst);
+    for w in &WAITERS {
+        let t = w.load(SeqCst);
+        if t != 0 {
+            // SAFETY: a thread in its slot lives until it has left it and
+            // seen no wake under way.
+            unsafe { libc::pthread_kill(t as libc::pthread_t, crate::host::WAKE_SIGNAL) };
+        }
     }
+    WAKING.fetch_sub(1, SeqCst);
 }
 
 /// The last adopted process the reaper reported, and its former parent

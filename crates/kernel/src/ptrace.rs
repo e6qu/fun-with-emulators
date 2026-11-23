@@ -907,9 +907,12 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
 /// signals ([`host_pending`]), and delivered once the stop is over.
 fn listen(mb: &Page, tracer: i32) -> bool {
     let cont = 1u64 << (fwe_abi::signal::SIGCONT - 1);
+    let me = crate::host::pid_now();
+    let continues = crate::signote::continued(me);
     loop {
         if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) == 1
             || crate::thread::pending() & cont != 0
+            || crate::signote::continued(me) != continues
             || host_pending(libc::SIGCONT)
             || killed()
         {
@@ -1653,9 +1656,10 @@ impl<P: crate::Platform> crate::Kernel<P> {
     }
 
     /// A stop signal `sig` (with `info`) whose default action stops a
-    /// seized thread: a group-stop, which its tracer sees as
-    /// `PTRACE_EVENT_STOP` with the signal, and which ends as the tracer
-    /// says (or, listened to, at `SIGCONT`).
+    /// traced thread: a group-stop, which its tracer sees, as
+    /// `PTRACE_EVENT_STOP` with the signal if it seized the thread, else as
+    /// the signal's stop, and which ends as the tracer says (or, listened
+    /// to, at `SIGCONT`).
     pub fn ptrace_group_stop(
         &mut self,
         regs: &mut crate::Regs,
@@ -1663,7 +1667,8 @@ impl<P: crate::Platform> crate::Kernel<P> {
         info: crate::thread::SigInfo,
     ) {
         let si = crate::signal::siginfo_bytes(sig, info);
-        let r = self.stop_with_tls(regs, stop_status(sig, PTRACE_EVENT_STOP), &si, 0, 0);
+        let event = if seized() { PTRACE_EVENT_STOP } else { 0 };
+        let r = self.stop_with_tls(regs, stop_status(sig, event), &si, 0, 0);
         if r.signal() != 0 {
             let info =
                 crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };

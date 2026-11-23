@@ -9,7 +9,9 @@
 //! process, the terminal, a timer, a child exiting — is caught by the backend
 //! and recorded pending for the guest, with its sender, or takes the host's
 //! action where that is ignoring it or continuing. A default action that
-//! ends or stops the process is fwe's to take. The host never blocks a
+//! ends or stops the process is fwe's to take: a stop is fwe's, its parent
+//! told through its mailbox ([`job_stop`]), unless the parent is a process
+//! that is not fwe's and must see it stop on the host. The host never blocks a
 //! caught signal ([`caught`]): fwe keeps it pending while the guest blocks
 //! it. Signals with no host equivalent (`SIGSTKFLT`, `SIGPWR`, the
 //! real-time signals), and caught ones sent with `tgkill`, are recorded
@@ -323,47 +325,114 @@ pub(crate) fn continue_process(target: i32) -> i64 {
 }
 
 /// Bring fwe process `target` back from its stop, the continue counted
-/// ([`crate::signote::continuing`]): only the host's `SIGCONT` ends a host
-/// stop, so it is sent; the host never catches it for the guest
-/// ([`Kernel::sync_host_signal`]), whose `SIGCONT`, if any, comes through
-/// the mailbox. A process that was in its stop is seen to come back from
-/// it, the `SIGCONT` sent again every 2 ms until it does: macOS can leave
-/// a process that stops itself suspended, though shown as running, when a
-/// `SIGCONT` comes as it stops, and another `SIGCONT` then resumes it.
-/// Waits no longer than the process lives.
+/// ([`crate::signote::continuing`], which ends a stop of fwe's): a stop on
+/// the host (of a process whose parent is not fwe's, or one the host
+/// stopped) ends only at the host's `SIGCONT`, which is sent then; its
+/// handler takes it for fwe's ([`host_continued`]). The guest's `SIGCONT`,
+/// if any, comes through the mailbox.
 pub(crate) fn resume_process(target: i32) -> i64 {
     crate::reaper::stop_signal_sent(target);
-    let r = host::kill_process(target, libc::SIGCONT);
-    if r != 0 {
-        return r;
-    }
-    let Some(n) = crate::signote::in_stop(target) else { return 0 };
-    let mut sent = std::time::Instant::now();
-    while !crate::signote::resumed_from(target, n) {
-        if !crate::procreg::host_info(target).is_some_and(|(_, _, zombie)| !zombie) {
-            break;
-        }
-        if sent.elapsed() >= std::time::Duration::from_millis(2) {
-            host::kill_process(target, libc::SIGCONT);
-            sent = std::time::Instant::now();
-        }
-        std::thread::sleep(std::time::Duration::from_micros(100));
+    if crate::procreg::host_stopped(target) {
+        return host::kill_process(target, libc::SIGCONT);
     }
     0
 }
 
-/// This process came back from a stop with its count of continues at
-/// `continues` when it stopped ([`crate::signote::continued`]): if none of
-/// fwe's processes continued it meanwhile, a process of the host's did (a
-/// shell's `fg`), whose `SIGCONT` is the guest's now (the host's, never
-/// caught, only ended the stop). Async-signal-safe.
-pub fn came_back(continues: u64) {
-    if crate::signote::continued(host::pid_now()) == continues {
-        thread::post_process(
-            signal::SIGCONT,
-            thread::SigInfo { code: signal::SI_USER, ..Default::default() },
-        );
+/// The host's `SIGCONT` came, from host process `sender`: one of fwe's
+/// sends it only to end a stop on the host, and the continue with it (as
+/// the guest's `SIGCONT`, if any) through the mailbox; any other's (a
+/// shell's `fg`, a host `kill -CONT`) is the guest's `SIGCONT` now, which
+/// discards its pending stops and ends its stop. Whether it is the
+/// guest's. Async-signal-safe.
+pub fn host_continued(sender: i32) -> bool {
+    if sender > 0 && crate::procstore::recorded(sender) {
+        return false;
     }
+    crate::signote::continuing(host::pid_now(), false);
+    true
+}
+
+/// This process's job-control stop of signal `sig`, its default action
+/// ([`Kernel::deliver_pending`]), taken where it holds nothing every
+/// process shares. fwe stops it here ([`crate::procreg::stops_in_fwe`]):
+/// every other thread waits for the kernel lock this one holds, this one
+/// sleeps until it is continued or killed, and its parent learns of it
+/// through fwe (an adopter, through its watcher). One whose parent is a
+/// living process that is not fwe's (the first process of a run, under a
+/// shell that must see it stop) stops on the host.
+fn job_stop(platform: &mut impl crate::Platform, sig: u64) {
+    if !crate::procreg::stops_in_fwe() {
+        if let Some(h) = host::signal_to_host(sig) {
+            crate::procstore::stop_holding_nothing(|| platform.stop_self(h));
+        }
+        return;
+    }
+    crate::procstore::stop_holding_nothing(|| {
+        let word = crate::signote::park_word();
+        let at = crate::signote::continued(host::pid_now());
+        if !stop_stands() {
+            return;
+        }
+        crate::signote::job_stopped(sig);
+        // Every other thread into fwe, where it waits for this one: one in
+        // the program's code takes its signals under the kernel lock, one
+        // in a host call ends it to take them so.
+        thread::wake_others(host::WAKE_SIGNAL);
+        notify_parent(fwe_abi::wait::CLD_STOPPED, sig as i32);
+        loop {
+            let seen = word.load(std::sync::atomic::Ordering::SeqCst);
+            if seen != at || thread::pending() & bit(signal::SIGKILL) != 0 {
+                break;
+            }
+            crate::shared::wait_word_for(word, seen, std::time::Duration::from_secs(60));
+        }
+        crate::signote::job_continued();
+        // Killed: no continue to tell of.
+        if crate::signote::continued(host::pid_now()) != at {
+            notify_parent(fwe_abi::wait::CLD_CONTINUED, signal::SIGCONT as i32);
+        }
+    });
+}
+
+/// Tell this process's parent (one of fwe's) that it stopped or continued
+/// (`code`, with `status`): `SIGCHLD` through its mailbox, which it takes
+/// as Linux's parent takes one ([`take_notes`]), and its `wait` looks.
+fn notify_parent(code: i32, status: i32) {
+    let parent = host::parent_pid();
+    // A foster child's parent follows it as a reaper does
+    // ([`crate::reaper`]): its host parent is not told.
+    if parent <= 1 || !host::is_fwe(parent) || crate::procreg::own_foster() {
+        return;
+    }
+    let me = (host::pid_now(), crate::creds::real_uid());
+    if crate::signote::queue_from(parent, signal::SIGCHLD, code, status as u64, me).is_ok() {
+        host::kill_process(parent, host::WAKE_SIGNAL);
+    }
+}
+
+/// Take what other processes queued in this process's mailbox: a signal
+/// each (one for a thread of this process to it, if it is there), and a
+/// child's stop or continue (`SIGCHLD` with `CLD_STOPPED` or
+/// `CLD_CONTINUED`) for its `wait`, which is woken, as a signal unless the
+/// process asked for none of those ([`host::sigchld_nocldstop`]) or
+/// ignores `SIGCHLD`. Async-signal-safe.
+pub fn take_notes() {
+    crate::signote::drain(|lsig, note| {
+        let info = host::sent_info(lsig, note);
+        if lsig == signal::SIGCHLD
+            && matches!(info.code, fwe_abi::wait::CLD_STOPPED | fwe_abi::wait::CLD_CONTINUED)
+        {
+            crate::reaper::wake_waiters();
+            if host::sigchld_nocldstop() || host::sigchld_ignored() {
+                return;
+            }
+        }
+        if note.tid != 0 {
+            thread::post_directed(note.tid, lsig, info);
+        } else {
+            thread::post_landed(lsig, info);
+        }
+    });
 }
 
 /// Whether Linux signal `sig` is relayed through the host: it has a host
@@ -453,7 +522,7 @@ fn me_host() -> i64 {
 fn owned(sig: u64) -> bool {
     // A traced process stops for each signal it takes ([`crate::ptrace`]):
     // even SIGSTOP comes to it as fwe's, not the host's. SIGCONT is fwe's:
-    // the host's only ends a stop ([`resume_process`]).
+    // the host's only ends a stop on the host ([`resume_process`]).
     crate::ptrace::any_traced() && sig != signal::SIGKILL
         || matches!(
             sig,
@@ -626,12 +695,10 @@ impl<P: Platform> Kernel<P> {
         );
         let traced = crate::ptrace::any_traced();
         let how = match action.handler {
-            // The host's SIGCONT only ends a stop, which it does whatever
-            // its disposition: the guest's comes as fwe's
-            // ([`resume_process`], [`came_back`]). Caught, the host's could
-            // not be told from a resend of fwe's, which the host may hand
-            // over long after.
-            _ if sig == signal::SIGCONT => HostSignal::Default,
+            // The host's SIGCONT is caught whatever the guest's
+            // disposition: one from outside fwe is the guest's
+            // ([`host_continued`]), and ends a stop of fwe's.
+            _ if sig == signal::SIGCONT => HostSignal::Catch { flags: action.flags },
             // A traced process stops for every signal, ignored ones too.
             _ if watched || traced => HostSignal::Catch { flags: action.flags },
             signal::SIG_DFL if !fwe_default => HostSignal::Default,
@@ -737,19 +804,15 @@ impl<P: Platform> Kernel<P> {
                 signal::SIG_DFL if unkillable_init() && !forced_fault(sig, &info) => {}
                 signal::SIG_DFL => match signal::default_action(sig) {
                     signal::Default::Terminate => self.terminate_with(sig, Some(regs)),
-                    // A seized thread's group-stop is its tracer's to end.
-                    signal::Default::Stop if crate::ptrace::seized() => {
+                    // A traced thread's group-stop is its tracer's to see
+                    // and end.
+                    signal::Default::Stop if crate::ptrace::traced() => {
                         self.ptrace_group_stop(regs, sig, info);
                     }
                     // One sent before the process was last continued is
                     // gone.
                     signal::Default::Stop if !stop_stands() => {}
-                    signal::Default::Stop => {
-                        if let Some(h) = host::signal_to_host(sig) {
-                            let platform = &mut self.platform;
-                            crate::procstore::stop_holding_nothing(|| platform.stop_self(h));
-                        }
-                    }
+                    signal::Default::Stop => job_stop(&mut self.platform, sig),
                     signal::Default::Ignore | signal::Default::Continue => {}
                 },
                 _ => {
@@ -1098,8 +1161,9 @@ impl<P: Platform> Kernel<P> {
             if to_self {
                 return post_own(sig);
             }
-            // Another of fwe's: its SIGCONT through its mailbox, its stop
-            // ended by the host's ([`resume_process`]).
+            // Another of fwe's: its SIGCONT through its mailbox, which with
+            // the count ends a stop of fwe's; a stop on the host ended by
+            // the host's ([`resume_process`]).
             let r = send_unhosted(target, sig, signal::SI_USER, 0);
             return if r != 0 { r } else { resume_process(target) };
         }

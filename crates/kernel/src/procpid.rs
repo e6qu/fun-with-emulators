@@ -82,6 +82,8 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         let start = b.pbi_start_tvsec * 1_000_000 + b.pbi_start_tvusec;
         let state = match b.pbi_status {
             4 => b'T', // SSTOP
+            // In a stop of fwe's.
+            2 | 3 if crate::signote::job_stop_of(pid).is_some() => b'T',
             5 => b'Z', // SZOMB
             // Not yet in the program: whatever waits the host shows it in
             // are its making's ([`crate::procstore::entered`]).

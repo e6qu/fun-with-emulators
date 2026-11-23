@@ -1362,6 +1362,9 @@ fn start(
         // pid namespace, for a process exec'd in one.
         fwe_kernel::thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
         fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+        if options.exec_state.is_none() {
+            fwe_kernel::signote::job_reset();
+        }
     });
     fwe_kernel::timing::mark("published");
     // A subreaper stays one across execve; a namespace's init is one.

@@ -129,7 +129,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 47;
+pub const FORMAT: u32 = 48;
 
 /// A number no other call of any process gives: for the names of host
 /// objects of fwe's (a System V segment's memory, an eventfd's counter).

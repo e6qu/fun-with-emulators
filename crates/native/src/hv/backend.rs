@@ -375,14 +375,7 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
     thread::poke_wait();
     if sig == host::WAKE_SIGNAL {
         // Signals the host lacks, queued by another process.
-        fwe_kernel::signote::drain(|lsig, note| {
-            // One for a thread of this process goes to it, if it is there.
-            if note.tid != 0 {
-                thread::post_directed(note.tid, lsig, host::sent_info(note));
-            } else {
-                thread::post_landed(lsig, host::sent_info(note));
-            }
-        });
+        fwe_kernel::signal::take_notes();
     } else {
         // The host's own SIGINFO (Ctrl-T), no relay: nothing on Linux.
         // Before the note is looked at for the siginfo.
@@ -402,7 +395,10 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         if fwe_kernel::signal::stops(lsig) {
             fwe_kernel::signal::stop_sent_now();
         }
-        thread::post_landed(lsig, info);
+        // The host's SIGCONT is the guest's only from outside fwe.
+        if lsig != fwe_abi::signal::SIGCONT || fwe_kernel::signal::host_continued(info.pid) {
+            thread::post_landed(lsig, info);
+        }
     }
     if let Some(mut vcpu) = VCPU.with(Cell::get) {
         // SAFETY: stopping this thread's own vCPU, if it is running.
@@ -804,6 +800,9 @@ fn start(
     fs.publish();
     thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
     fwe_kernel::procreg::own_namespaces(fs.ns_dirs());
+    if options.exec_state.is_none() {
+        fwe_kernel::signote::job_reset();
+    }
     // A subreaper stays one across execve; a namespace's init is one.
     fwe_kernel::reaper::start_if_reaper();
     let mut k = Kernel::new(HvPlatform, page, brk, Some(fs), tracer);

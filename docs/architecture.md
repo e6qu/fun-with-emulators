@@ -702,20 +702,27 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   holds none taking none meanwhile (`procstore::stop_holding_nothing`).
   `SIGSTOP` between fwe's processes goes through the mailbox for this,
   dated by the target's count of `SIGCONT`s, so a stop sent before the
-  latest `SIGCONT` is not taken. The stop itself is the host's (its
-  parent's `waitpid` and the reapers see it), and the host does not always
-  end it: a process that stops itself and gets a `SIGCONT` as it stops can
-  be left suspended though shown as running (reproduced with macOS alone).
-  So the process counts its stop in its mailbox before it looks a last
-  time whether a `SIGCONT` came, and counts its return from it; a
-  `SIGCONT` from another of fwe's processes moves the target's count of
-  continues on, sends the guest's `SIGCONT` through the mailbox, and the
-  host's to end the stop, again every 2 ms until the target is seen back
-  (`signal::resume_process`). The host's `SIGCONT` is never caught: it
-  only ends stops (the host can hand a caught one over long after, where
-  a resend could not be told from a `SIGCONT` of the guest's). A stop no
-  process of fwe's ended was ended by one of the host's (a shell's `fg`),
-  whose `SIGCONT` the guest takes as it comes back (`signal::came_back`).
+  latest `SIGCONT` is not taken. The stop is fwe's (`signal::job_stop`):
+  the stopping thread wakes the others, which then wait for the kernel
+  lock it keeps (a thread in the program's code takes its wake under that
+  lock, one in a host call ends the call to), notes the stop in its
+  mailbox (its signal, and a count of stops and of continues, which a
+  `wait` takes each once), tells its parent with `SIGCHLD` through the
+  parent's mailbox, and sleeps on its count of `SIGCONT`s, which every
+  continue moves on and wakes; a `SIGKILL` ends it there as anywhere. A
+  parent's `wait` for stops or continues (`WUNTRACED`, `WSTOPPED`,
+  `WCONTINUED`) looks at its children's mailboxes beside what the host
+  reports, woken by that `SIGCHLD` (`reaper::take_own_change`); an
+  adopter's watcher sees an adopted one's. Only a process whose parent is
+  a living process that is not fwe's (the first of a run, under a shell
+  that must see it stop) stops on the host, which then ends the stop at
+  the host's `SIGCONT` alone: macOS's own stop, which a `SIGCONT` coming
+  as it stops can leave suspended though shown as running, as it can any
+  process (macOS sets the process stopped before it suspends it). The
+  host's `SIGCONT` is caught: one from a process that is not fwe's (a
+  shell's `fg`, a host `kill -CONT`) is the guest's `SIGCONT`, and ends a
+  stop of fwe's too; fwe's own sends the guest's through the mailbox
+  (`signal::host_continued`).
 - **Signals the host lacks, between processes:** queued in the target's
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets. One
@@ -792,11 +799,12 @@ memory or threads, so a tracee does its tracer's work itself:
   sees, ending a wait it is in (the call restarts) so it starts being
   traced without stopping. `PTRACE_INTERRUPT` sets a word and nudges it
   the same way: it stops with `PTRACE_EVENT_STOP` and `SIGTRAP`, at once
-  or as soon as its current stop ends. A seized tracee's group-stop is an
-  event stop with the stop signal; under `PTRACE_LISTEN` it stays stopped
-  until `SIGCONT` comes (looked for among the host's pending signals, as
-  a stop is served with them blocked) or the tracer interrupts it, then
-  reports `PTRACE_EVENT_STOP` with `SIGTRAP`. A process or thread a seized
+  or as soon as its current stop ends. A tracee's group-stop is its
+  tracer's: an event stop with the stop signal for a seized tracee, the
+  signal's stop for an attached one, ended as the tracer restarts it;
+  under `PTRACE_LISTEN` a seized one stays stopped until `SIGCONT` comes
+  (its count of continues moves on, or one is pending) or the tracer
+  interrupts it, then reports `PTRACE_EVENT_STOP` with `SIGTRAP`. A process or thread a seized
   tracee starts begins with that stop instead of `SIGSTOP`, and an
   `execve` stops it only for the exec event. A pending guest `SIGKILL`
   ends any stop.
@@ -1642,10 +1650,6 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   (none, 0).
 - A parent-death signal (`PR_SET_PDEATHSIG`) is sent when the parent
   process ends (Linux sends it when the parent thread does).
-- A `SIGCONT` a process of the host's (not fwe's) sends a running fwe
-  process reaches no guest handler: the host's `SIGCONT` is never caught
-  (it only ends stops), and one ending a stop is the guest's only when
-  none of fwe's processes continued it (a shell's `fg`).
 
 **Resources**
 - The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),

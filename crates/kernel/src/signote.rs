@@ -27,6 +27,7 @@
 //! and takes notes whatever its thread was doing.
 
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{self, SeqCst};
 
 /// The directory of the process records, made once as the process starts
@@ -264,15 +265,21 @@ pub fn queue_thread_from(
     put_from(target, tid, sig, code, value, (pid as u32, uid))
 }
 
-/// The mailbox's count of the `SIGCONT`s sent to its process ([`continuing`]),
-/// after the queue.
+/// The mailbox's count of the `SIGCONT`s sent to its process
+/// ([`continuing`]), after the queue: also the word a process in a stop of
+/// fwe's sleeps on ([`park_word`]).
 const CONTINUED_AT: usize = QUEUE_AT + QUEUE_LEN * ENTRY;
-/// The mailbox's count of the times its process stopped itself on the host
-/// ([`stopping`]), and the last of those stops it came back from
-/// ([`resumed`]): what tells another process that it is in a stop.
-const STOPPED_AT: usize = CONTINUED_AT + 1;
-const RESUMED_AT: usize = CONTINUED_AT + 2;
-const _: () = assert!(RESUMED_AT < crate::procstore::MAILBOX_WORDS - 1);
+/// The process's job-control stop, as its parent's `wait` sees it: the
+/// number of its stops so far times 256, plus the signal of the one it is
+/// in (none while it runs) ([`job_stopped`], [`job_continued`]).
+const STOP_AT: usize = CONTINUED_AT + 1;
+/// The latest of those stops a `wait` reported.
+const STOP_SEEN_AT: usize = CONTINUED_AT + 2;
+/// How many times it came back from a stop; and the latest of those a
+/// `wait` reported.
+const CONT_AT: usize = CONTINUED_AT + 3;
+const CONT_SEEN_AT: usize = CONTINUED_AT + 4;
+const _: () = assert!(CONT_SEEN_AT < crate::procstore::MAILBOX_WORDS - 1);
 
 /// How many times host process `pid` has been continued ([`continuing`]): 0
 /// while it has no mailbox. Async-signal-safe once the store is mapped.
@@ -284,49 +291,90 @@ pub fn continued(pid: i32) -> u64 {
 
 /// Host process `pid` is sent `SIGCONT`: a stop signal sent to it before,
 /// still queued or pending, is not taken, as Linux discards a pending stop
-/// signal as `SIGCONT` is sent (`prepare_signal`). Made a mailbox if `make`
-/// (a sender's), else async-signal-safe (the process's own handler, with
-/// nothing queued for it without one).
+/// signal as `SIGCONT` is sent (`prepare_signal`), and a stop of fwe's it
+/// is in ends ([`park_word`]). Made a mailbox if `make` (a sender's), else
+/// async-signal-safe (the process's own handler, with nothing queued for
+/// it without one).
 pub fn continuing(pid: i32, make: bool) {
     if let Some(w) = crate::procstore::mailbox(pid, make).and_then(|mb| mb.get(CONTINUED_AT)) {
         w.fetch_add(1, SeqCst);
+        crate::shared::wake_word(w);
     }
 }
 
-/// This process is about to stop itself on the host: the stop's number,
-/// counted before the stop is looked at a last time, so that a `SIGCONT`
-/// sent meanwhile either keeps it from stopping or finds it in its stop
-/// ([`in_stop`]). Its mailbox is made if it has none. Async-signal-safe
-/// once the store is mapped, as every process starts (0 before).
-pub fn stopping() -> u64 {
-    crate::procstore::mailbox(crate::host::pid_now(), crate::procstore::is_mapped())
-        .and_then(|mb| mb.get(STOPPED_AT))
-        .map_or(0, |w| w.fetch_add(1, SeqCst) + 1)
+/// The word this process sleeps on in a stop of fwe's, which every
+/// continue changes and wakes ([`continuing`]); its mailbox made if it has
+/// none.
+pub fn park_word() -> &'static AtomicU64 {
+    let mb = crate::procstore::mailbox(crate::host::pid_now(), true);
+    mb.and_then(|mb| mb.get(CONTINUED_AT)).expect("a mailbox has its words")
 }
 
-/// This process came back from its stop `n` ([`stopping`]).
-/// Async-signal-safe.
-pub fn resumed(n: u64) {
+/// This process is new (a fork child, or a program fwe starts, not one an
+/// `execve` ran): what an earlier process of its number left of its stops
+/// in a mailbox it may share is not its. Async-signal-safe.
+pub fn job_reset() {
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    for i in [STOP_AT, STOP_SEEN_AT, CONT_AT, CONT_SEEN_AT] {
+        if let Some(w) = mb.get(i) {
+            w.store(0, SeqCst);
+        }
+    }
+}
+
+/// This process enters a job-control stop of fwe's, of signal `sig`.
+pub fn job_stopped(sig: u64) {
     if let Some(w) =
-        crate::procstore::mailbox(crate::host::pid_now(), false).and_then(|mb| mb.get(RESUMED_AT))
+        crate::procstore::mailbox(crate::host::pid_now(), true).and_then(|mb| mb.get(STOP_AT))
     {
-        w.fetch_max(n, SeqCst);
+        let seq = w.load(SeqCst) >> 8;
+        w.store((seq + 1) << 8 | (sig & 0xff), SeqCst);
     }
 }
 
-/// The stop host process `pid` is in, made and not yet come back from
-/// ([`stopping`]), if any.
-pub fn in_stop(pid: i32) -> Option<u64> {
-    let mb = crate::procstore::mailbox(pid, false)?;
-    let (stopped, resumed) = (mb.get(STOPPED_AT)?.load(SeqCst), mb.get(RESUMED_AT)?.load(SeqCst));
-    (stopped > resumed).then_some(stopped)
+/// This process comes back from its job-control stop.
+pub fn job_continued() {
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    if let (Some(stop), Some(cont)) = (mb.get(STOP_AT), mb.get(CONT_AT)) {
+        stop.fetch_and(!0xff, SeqCst);
+        cont.fetch_add(1, SeqCst);
+    }
 }
 
-/// Whether host process `pid` came back from its stop `n` ([`in_stop`]).
-pub fn resumed_from(pid: i32, n: u64) -> bool {
-    crate::procstore::mailbox(pid, false)
-        .and_then(|mb| mb.get(RESUMED_AT))
-        .is_none_or(|w| w.load(SeqCst) >= n)
+/// The signal of the job-control stop of fwe's host process `pid` is in,
+/// if any. Async-signal-safe.
+pub fn job_stop_of(pid: i32) -> Option<u64> {
+    let w = crate::procstore::mailbox(pid, false)?.get(STOP_AT)?.load(SeqCst);
+    (w & 0xff != 0).then_some(w & 0xff)
+}
+
+/// What a `wait` of host process `pid`'s parent reports of its
+/// job-control stops: the stop it is in, if `stopped` and none reported it
+/// yet, as `(CLD_STOPPED, signal)`; else, if `continued`, its coming back
+/// from one since none reported, as `(CLD_CONTINUED, SIGCONT)`. Taken
+/// (reported once), unless `peek`.
+pub fn take_job_change(pid: i32, stopped: bool, continued: bool, peek: bool) -> Option<(i32, i32)> {
+    let mb = crate::procstore::mailbox(pid, false)?;
+    let (stop, stop_seen) = (mb.get(STOP_AT)?, mb.get(STOP_SEEN_AT)?);
+    let (cont, cont_seen) = (mb.get(CONT_AT)?, mb.get(CONT_SEEN_AT)?);
+    // Claimed by one `wait` alone, however many look at once.
+    let claim = |word: &AtomicU64, from: u64, to: u64| {
+        peek || word.compare_exchange(from, to, SeqCst, SeqCst).is_ok()
+    };
+    let now = stop.load(SeqCst);
+    if stopped && now & 0xff != 0 {
+        let seen = stop_seen.load(SeqCst);
+        if now >> 8 > seen && claim(stop_seen, seen, now >> 8) {
+            return Some((fwe_abi::wait::CLD_STOPPED, (now & 0xff) as i32));
+        }
+    }
+    if continued && now & 0xff == 0 {
+        let (n, seen) = (cont.load(SeqCst), cont_seen.load(SeqCst));
+        if n > seen && claim(cont_seen, seen, n) {
+            return Some((fwe_abi::wait::CLD_CONTINUED, fwe_abi::signal::SIGCONT as i32));
+        }
+    }
+    None
 }
 
 /// What a queue entry holds in place of a signal for a request of a

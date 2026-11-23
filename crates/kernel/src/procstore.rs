@@ -940,6 +940,12 @@ pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
     None
 }
 
+/// Whether host pid `pid` has a record (is one of fwe's processes).
+/// Async-signal-safe once the store is mapped (false before).
+pub fn recorded(pid: i32) -> bool {
+    mapped().and_then(|s| s.entry(pid)).is_some_and(|e| e.head.load(SeqCst) != 0)
+}
+
 /// Which version of host pid `pid`'s record there is: it changes with
 /// every write ([`put`], [`remove`]).
 pub fn version(pid: i32) -> Option<u32> {
