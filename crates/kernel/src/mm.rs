@@ -2561,26 +2561,32 @@ impl<P: Platform> Kernel<P> {
         } else {
             final_prot(prot)
         };
-        // SAFETY: guest-requested protection change of guest memory.
-        let r = ret(unsafe { libc::mprotect(a, len as usize, host) });
+        // A file view's pages (none once made executable) never writable on
+        // the host: its object may be open only for reading, which the host
+        // refuses to map writable (`EACCES`).
+        let mut views = if prot & mman::PROT_EXEC == 0 { views } else { Vec::new() };
+        views.sort_unstable();
+        let mut r = 0;
+        let mut at = a as u64;
+        let end = a as u64 + self.page_up(len);
+        for (s, e) in views.iter().copied().chain([(end, end)]) {
+            for (from, to, p) in [(at, s, host), (s, e, host & !libc::PROT_WRITE)] {
+                if r == 0 && to > from {
+                    // SAFETY: guest-requested protection change of guest
+                    // memory, a piece of the range asked for.
+                    r = ret(unsafe {
+                        libc::mprotect(from as *mut libc::c_void, (to - from) as usize, p)
+                    });
+                }
+            }
+            at = e;
+        }
         if r == 0 && translated && prot & mman::PROT_EXEC != 0 {
             self.platform.jit_code(a as u64, self.page_up(len));
         }
         if r == 0 {
             // Code with writes owed: made writable, they are made first.
             crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
-        }
-        if r == 0 && prot & mman::PROT_EXEC == 0 {
-            for &(s, e) in &views {
-                // SAFETY: as above, for the file view's pages in the range.
-                unsafe {
-                    libc::mprotect(
-                        s as *mut libc::c_void,
-                        (e - s) as usize,
-                        final_prot(prot) & !libc::PROT_WRITE,
-                    )
-                };
-            }
         }
         if r == 0 {
             self.platform.protect_guest(addr, self.page_up(len), prot);

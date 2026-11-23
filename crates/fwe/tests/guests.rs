@@ -7816,6 +7816,21 @@ fn a_file_mapped_executable_past_its_code() {
     assert_eq!(out.status.code(), Some(0), "{err}");
 }
 
+/// What `maps view` prints: see [`a_private_mapping_of_a_memfd_follows_the_file`].
+const VIEW: &str = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
+                    writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
+
+/// A private mapping of a memfd follows the file in each page until that
+/// page is written (by the program, or by a system call for it), made
+/// writable later too.
+#[test]
+fn a_private_mapping_of_a_memfd_follows_the_file() {
+    let out = fwe(&rust_guest("maps"), &["view"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), VIEW, "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
 /// MAP_FIXED over mapped memory replaces it, keeping the rest; a buffer
 /// across old and new is one buffer to the kernel; a widened page takes a
 /// write; a mapping over the program's own data (linked low, backed
@@ -7839,12 +7854,8 @@ fn hv_map_fixed_replaces_mapped_memory() {
     assert_eq!(out.status.code(), Some(0));
     // A private mapping of a memfd follows the file in each page until that
     // page is written (by the program, or by a system call for it).
-    let want = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
-                writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
-    assert_eq!(stdout(&fwe(&rust_guest("maps"), &["view"])), want);
-
     let out = fwe_hv(&rust_low_guest("maps"), &["view"]).unwrap();
-    assert_eq!(stdout(&out), want);
+    assert_eq!(stdout(&out), VIEW);
     // Gigabytes reserved and mapped over take memory only where touched.
     let out = fwe_hv(&rust_low_guest("maps"), &["reserve"]).unwrap();
     assert_eq!(
