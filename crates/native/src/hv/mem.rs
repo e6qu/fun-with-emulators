@@ -520,12 +520,10 @@ impl Mem {
         // SAFETY: F_GETFL only reads the descriptor's flags.
         let mode = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) } & libc::O_ACCMODE;
         if mode == libc::O_WRONLY {
-            eprintln!("PROBE map_shared EACCES write-only {addr:#x}"); // PROBE
             return Err(errno::EACCES);
         }
         let writable = mode == libc::O_RDWR;
         if prot & mman::PROT_WRITE != 0 && !writable {
-            eprintln!("PROBE map_shared EACCES read-only file {addr:#x} prot {prot:#x}"); // PROBE
             return Err(errno::EACCES);
         }
         // The framework maps only host memory that may be written (see
@@ -741,24 +739,6 @@ impl Mem {
     }
 
     pub fn mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
-        let r = self.mprotect_probed(addr, len, prot); // PROBE
-        if r < 0 {
-            for p in self.vmas.pieces(addr, addr.saturating_add(page_up(len))) {
-                eprintln!(
-                    "PROBE mprotect {addr:#x}+{len:#x} {prot:#x} = {r}: piece {:#x}..{:#x} prot {:#x} back {:?} source {} view {}",
-                    p.start,
-                    p.end,
-                    p.value.prot,
-                    p.value.back,
-                    p.value.source.is_some(),
-                    is_view(&p.value)
-                );
-            }
-        }
-        r
-    }
-
-    fn mprotect_probed(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
         if addr & (PAGE - 1) != 0 {
             return err(errno::EINVAL);
         }
