@@ -272,6 +272,11 @@ fn nodump_scenario() {
     inode_flags("/tmp/owned", Some(FS_NODUMP_FL));
     let (uid, gid, _) = stat_of("/tmp/owned");
     println!("set: {:?} owner {uid}:{gid}", nodump("/tmp/owned"));
+    // A directory of a tmpfs (fwe's store), as LTP's statx08 flags one.
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/dev/shm/flagged").as_ptr(), 0o755) };
+    inode_flags("/dev/shm/flagged", Some(FS_NODUMP_FL));
+    println!("on a tmpfs: {:?}", nodump("/dev/shm/flagged"));
 }
 
 /// A device node made outside `/dev` opens as the device, also to read by

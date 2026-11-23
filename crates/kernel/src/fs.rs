@@ -528,9 +528,17 @@ impl StoreDir {
     /// The status of `ino` of its filesystem, as the host's `stat` lays it
     /// out (the guest's owner and mode).
     pub fn host_stat(&self, ino: crate::filestore::tree::Ino) -> Result<libc::stat, i32> {
+        self.host_stat_flags(ino).map(|(s, _)| s)
+    }
+
+    /// [`Self::host_stat`], with the inode's flags (`FS_*_FL`).
+    pub fn host_stat_flags(
+        &self,
+        ino: crate::filestore::tree::Ino,
+    ) -> Result<(libc::stat, u32), i32> {
         let t = self.fs.lock()?;
         let st = t.stat(ino)?;
-        Ok(crate::filestore::io::host_stat(t.dev(), &st))
+        Ok((crate::filestore::io::host_stat(t.dev(), &st), st.flags))
     }
 
     /// What `name` is in it: its inode and status (`.` and `..` too).

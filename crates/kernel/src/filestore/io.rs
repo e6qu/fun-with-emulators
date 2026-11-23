@@ -621,7 +621,7 @@ pub fn chown_file(file: File, owner: (u32, u32), mode: Option<u32>) -> i64 {
 /// its tmpfs does: immutable, append-only, no-dump, no-access-time.
 const FS_IMMUTABLE_FL: u32 = 0x10;
 const FS_APPEND_FL: u32 = 0x20;
-const FS_NODUMP_FL: u32 = 0x40;
+pub const FS_NODUMP_FL: u32 = 0x40;
 const FS_NOATIME_FL: u32 = 0x80;
 const KEPT_FLAGS: u32 = FS_IMMUTABLE_FL | FS_APPEND_FL | FS_NODUMP_FL | FS_NOATIME_FL;
 
@@ -788,6 +788,13 @@ pub fn flags_of(file: File) -> Result<u32, i32> {
         }
         Ok(st.flags)
     })
+}
+
+/// Whether the file `fd` is a descriptor of has the no-dump flag
+/// (`FS_NODUMP_FL`), if it is one of the store's.
+pub fn nodump(fd: i32) -> Option<bool> {
+    let file = desc::of(fd)?;
+    Some(in_file(file, |file, t| Ok(t.stat(file.ino)?.flags & FS_NODUMP_FL != 0)).unwrap_or(false))
 }
 
 /// Set the inode flags of `file` to `f` ([`set_flags`]; `ENOTTY` for a

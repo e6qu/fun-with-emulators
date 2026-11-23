@@ -305,11 +305,11 @@ fn stat_result(
 /// `s` ([`crate::filestore::io::host_stat`]): its device and numbers its
 /// own, with its `statx` attributes.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
-pub(crate) fn store_stat_result(s: &libc::stat) -> (Stat, Extra) {
+pub(crate) fn store_stat_result(s: &libc::stat, nodump: bool) -> (Stat, Extra) {
     let mut out = stat_to_linux(s);
     out.st_rdev = s.st_rdev as u64;
     out.st_nlink = s.st_nlink as u32;
-    (out, Extra::of(s, false))
+    (out, Extra::of(s, nodump))
 }
 
 /// The host device and inode of the file open as `fd`.
@@ -332,7 +332,7 @@ fn stat_to_linux_fd(fd: i32, s: &libc::stat, stored: bool) -> Stat {
     // A file of fwe's store has its own numbers (a FIFO's too, open on
     // its node).
     if stored {
-        return store_stat_result(s).0;
+        return store_stat_result(s, false).0;
     }
     let mut out = stat_to_linux(s);
     if let Some(m) = tmpfs_of(fd, s) {
@@ -1736,7 +1736,8 @@ impl<P: Platform> Kernel<P> {
         // In fwe's store (a tmpfs).
         if let Some(d) = &r.store {
             let (ino, _) = d.find(&r.name)?;
-            return Ok(store_stat_result(&d.host_stat(ino)?));
+            let (s, flags) = d.host_stat_flags(ino)?;
+            return Ok(store_stat_result(&s, flags & crate::filestore::io::FS_NODUMP_FL != 0));
         }
         let name = r.name_c()?;
         let s = stat_at(r.dir.as_raw_fd(), &name)?;
@@ -1918,7 +1919,13 @@ impl<P: Platform> Kernel<P> {
             };
         };
         let mut x = statx_from(&host);
-        x.stx_attributes = statx_attributes(&host, crate::modes::nodump_fd(dirfd as i32, &host));
+        // A file of fwe's store keeps its flags itself; a host file's
+        // no-dump flag is fwe's own record.
+        let nodump = match crate::filestore::io::nodump(dirfd as i32) {
+            Some(n) => n,
+            None => crate::modes::nodump_fd(dirfd as i32, &host),
+        };
+        x.stx_attributes = statx_attributes(&host, nodump);
         if self.mount_root(dirfd as i32, &path, true) {
             x.stx_attributes |= STATX_ATTR_MOUNT_ROOT;
         }
