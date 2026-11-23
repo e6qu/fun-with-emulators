@@ -197,6 +197,10 @@ impl<P: Platform> Kernel<P> {
         }
         let hst = match Self::store_stat(d, ino) {
             Ok(s) => s,
+            // Gone since it was found (removed, or another put in its
+            // place): what the name names now is opened, as Linux's open
+            // finds what is there.
+            Err(errno::ENOENT) => return self.store_open(r, d, flags, mode, slash),
             Err(e) => return err(e),
         };
         if !self.permits(&hst, wants(flags)) {
@@ -229,6 +233,12 @@ impl<P: Platform> Kernel<P> {
             }
         }
         let fd = self.store_descriptor(r, file, flags, false);
+        // Held from here on: one gone before its descriptor held it is
+        // looked up again.
+        if fd >= 0 && d.fs.lock().and_then(|t| t.stat(ino)).is_err() {
+            let _ = self.syscall(fwe_abi::nr::CLOSE, [fd as u64, 0, 0, 0, 0, 0]);
+            return self.store_open(r, d, flags, mode, slash);
+        }
         // A cgroup's interface file is not cut (Linux's kernfs takes the
         // size and changes nothing).
         if fd >= 0
