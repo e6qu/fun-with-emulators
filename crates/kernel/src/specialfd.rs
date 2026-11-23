@@ -364,35 +364,9 @@ mod imp {
     /// guest's reach, of a host shared memory object with no name) and
     /// where it is mapped.
     fn new_shared(count: u64) -> Result<(i32, usize), i32> {
-        let name = format!("/fwe{}e{:x}", crate::host::euid(), crate::shared::unique());
-        let name = std::ffi::CString::new(name).map_err(|_| errno::EINVAL)?;
-        // (No `O_CLOEXEC`, which macOS 26 refuses: the descriptor moves into
-        // fwe's range, close-on-exec, below.)
-        let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
-        // SAFETY: a NUL-terminated name.
-        let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600 as libc::c_uint) };
-        if fd < 0 {
-            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-        }
-        // SAFETY: fwe's own object, open above, held by its descriptor.
-        unsafe { libc::shm_unlink(name.as_ptr()) };
-        let fail = |fd: i32, e: i32| {
-            // SAFETY: closing the descriptor opened above.
-            unsafe { libc::close(fd) };
-            Err(e)
-        };
-        // SAFETY: plain host call on the file just made.
-        if unsafe { libc::ftruncate(fd, std::mem::size_of::<Shared>() as libc::off_t) } != 0 {
-            return fail(fd, crate::host::errno_to_linux(crate::host::last_errno()));
-        }
-        let fd = match crate::fdtable::reserve(fd) {
-            Ok(fd) => fd,
-            Err(e) => return fail(fd, e),
-        };
-        let at = match map_shared(fd) {
-            Ok(at) => at,
-            Err(e) => return fail(fd, e),
-        };
+        let fd = crate::memobj::nameless(std::mem::size_of::<Shared>() as u64)?;
+        let at = map_shared(std::os::fd::AsRawFd::as_raw_fd(&fd))?;
+        let fd = std::os::fd::IntoRawFd::into_raw_fd(fd);
         // SAFETY: the memory just mapped, zeroed, large enough for a `Shared`.
         let sh = unsafe { &*(at as *const Shared) };
         sh.count.store(count, std::sync::atomic::Ordering::SeqCst);

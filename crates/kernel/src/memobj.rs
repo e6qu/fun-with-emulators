@@ -98,6 +98,38 @@ impl Drop for Mapping {
     }
 }
 
+/// A host shared memory object of `len` bytes (zeroes) with no name (made
+/// unlinked): memory a fork child maps as its parent does, as Linux's
+/// shared anonymous memory is, never a file's pages to be written back to
+/// the disk. Its descriptor, out of the guest's range (close-on-exec).
+#[cfg(not(target_os = "linux"))]
+pub fn nameless(len: u64) -> Result<std::os::fd::OwnedFd, i32> {
+    use std::os::fd::FromRawFd;
+    let last = || crate::host::errno_to_linux(crate::host::last_errno());
+    let name = format!("/fwe{}a{:x}", crate::host::euid(), crate::shared::unique());
+    let name = std::ffi::CString::new(name).map_err(|_| fwe_abi::errno::EINVAL)?;
+    // (No `O_CLOEXEC`, which macOS 26 refuses: the descriptor moves into
+    // fwe's range, close-on-exec, below.)
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+    // SAFETY: a NUL-terminated name.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600 as libc::c_uint) };
+    if fd < 0 {
+        return Err(last());
+    }
+    // SAFETY: fwe's own object, open above, held by its descriptor.
+    unsafe { libc::shm_unlink(name.as_ptr()) };
+    // SAFETY: a descriptor just opened, owned from here on.
+    let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) };
+    use std::os::fd::AsRawFd;
+    // SAFETY: a plain host call on the object just made.
+    if unsafe { libc::ftruncate(fd.as_raw_fd(), len as libc::off_t) } != 0 {
+        return Err(last());
+    }
+    let moved = crate::fdtable::reserve(std::os::fd::IntoRawFd::into_raw_fd(fd))?;
+    // SAFETY: the descriptor `reserve` moved it to, owned from here on.
+    Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(moved) })
+}
+
 /// A new object of `kind` with identity `id`, of `len` bytes (zeroes): a
 /// descriptor of it (the guest's, at the lowest free number), and a
 /// mapping of it.

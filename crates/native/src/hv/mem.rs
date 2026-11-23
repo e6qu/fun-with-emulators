@@ -1078,25 +1078,10 @@ fn reopen_writable(file: &OwnedFd) -> Result<Option<OwnedFd>, i32> {
     Ok(same.then_some(fd))
 }
 
-/// An unlinked file of `len` bytes to back anonymous shared memory, so a
-/// fork child can map the same pages.
+/// A host shared memory object of `len` bytes with no name to back
+/// anonymous shared memory, so a fork child can map the same pages.
 fn anonymous_file(len: u64) -> Result<OwnedFd, i32> {
-    let mut path = *b"/tmp/fwe-shared-XXXXXX\0";
-    // SAFETY: a NUL-terminated template; the file is unlinked at once.
-    let fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast()) };
-    if fd < 0 {
-        return Err(last_errno());
-    }
-    // SAFETY: the template now names the file just made.
-    unsafe { libc::unlink(path.as_ptr().cast()) };
-    let fd = fwe_kernel::fdtable::reserve(fd).map_err(|_| errno::ENOMEM)?;
-    // SAFETY: a descriptor just made, owned here.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: sizing the file just made.
-    if unsafe { libc::ftruncate(owned.as_raw_fd(), len as i64) } != 0 {
-        return Err(last_errno());
-    }
-    Ok(owned)
+    fwe_kernel::memobj::nameless(len)
 }
 
 /// The host's last error as a Linux errno.

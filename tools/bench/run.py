@@ -164,8 +164,11 @@ MICRO = [
     ("System V message send+receive", ["ipc", "msg", "10000"], "ns"),
     ("System V segment made and removed", ["ipc", "shm", "1000"], "ns"),
     # A small file's life on the disk (fwe's /tmp is the host's): made,
-    # 4 KiB written and read back, closed and removed.
+    # 4 KiB written and read back, closed and removed; and a file used as
+    # shared memory there (made, sized to 64 KiB, mapped, written,
+    # removed), as a program that keeps its shared memory in a file does.
     ("file's life in /tmp", ["mem", "life", "/tmp", "2000"], "us"),
+    ("shared memory file's life in /tmp", ["mem", "segment", "/tmp", "2000"], "us"),
 ]
 
 # Micro-benchmarks of what macOS has no counterpart of: under fwe and on
