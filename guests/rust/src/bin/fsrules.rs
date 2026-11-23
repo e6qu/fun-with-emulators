@@ -1804,6 +1804,20 @@ fn store_scenario() {
         (cache, dirty, cs[0])
     };
     println!("cachestat: cached {cache} dirty {dirty}, of one page {half}");
+    // A read at the end of a file touches its access time too, as tmpfs's
+    // does (`relatime`: the access time is not past the change).
+    let old = [1000i64, 0, 1000, 0];
+    // SAFETY: a NUL-terminated path; buffers of the sizes given.
+    let (n, atime) = unsafe {
+        let fd = open(c("/tmp/s/at-end").as_ptr(), 0o102, 0o644);
+        write(fd, b"x".as_ptr(), 1);
+        utimensat(AT_FDCWD, c("/tmp/s/at-end").as_ptr(), &old, 0);
+        let mut b = [0u8; 8];
+        let n = read(fd, b.as_mut_ptr(), b.len());
+        close(fd);
+        (n, times_of("/tmp/s/at-end").0)
+    };
+    println!("read at the end: {n} bytes, access time touched {}", atime > 1000);
 }
 
 /// The names in directory `p`.

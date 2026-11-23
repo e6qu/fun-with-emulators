@@ -215,9 +215,8 @@ fn transfer(
         write_locked(&mut t, file.ino, start, iov, total, append)?
     } else {
         let (object, n) = t.readable(file.ino, start, total)?;
-        if n > 0 {
-            t.accessed(file.ino, atime_flags(fd))?;
-        }
+        // Read at all, even at the end (as tmpfs's `shmem_file_read_iter`).
+        t.accessed(file.ino, atime_flags(fd))?;
         let mut done = 0;
         for v in iov.iter().filter(|v| v.iov_len > 0) {
             let k = (v.iov_len as u64).min(n - done);
@@ -628,9 +627,8 @@ pub fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
         let pos = position(fd)?;
         // Each takes its fixed part, its name and a NUL, rounded up to 8.
         let entries = t.list(file.ino, pos, count as usize, HEAD + 1 + 7)?;
-        if !entries.is_empty() {
-            t.accessed(file.ino, atime_flags(fd))?;
-        }
+        // Listed at all, even past its end (as Linux's `iterate_dir`).
+        t.accessed(file.ino, atime_flags(fd))?;
         Ok(entries)
     })?;
     let entries = match r {
@@ -832,9 +830,7 @@ fn set_flags(
 pub fn read_at(fd: i32, off: u64, len: u64) -> Option<Result<Vec<u8>, i32>> {
     with_file(fd, |file, t| {
         let (object, n) = t.readable(file.ino, off, len)?;
-        if n > 0 {
-            t.accessed(file.ino, atime_flags(fd))?;
-        }
+        t.accessed(file.ino, atime_flags(fd))?;
         let mut out = vec![0u8; n as usize];
         data::read(object, off, &mut out)?;
         Ok(out)
@@ -846,9 +842,7 @@ pub fn read_at(fd: i32, off: u64, len: u64) -> Option<Result<Vec<u8>, i32>> {
 pub fn read_file(file: File, flags: u64) -> Result<Vec<u8>, i32> {
     in_file(file, |file, t| {
         let (object, n) = t.readable(file.ino, 0, u64::MAX)?;
-        if n > 0 {
-            t.accessed(file.ino, flags)?;
-        }
+        t.accessed(file.ino, flags)?;
         let mut out = vec![0u8; n as usize];
         data::read(object, 0, &mut out)?;
         Ok(out)
