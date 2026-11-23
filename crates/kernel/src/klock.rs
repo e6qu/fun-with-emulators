@@ -40,6 +40,39 @@ struct Shard(AtomicUsize);
 /// The next counter a thread is given.
 static NEXT_SHARD: AtomicUsize = AtomicUsize::new(0);
 
+/// The guest's threads waiting for the kernel lock, on either side (a
+/// process has one kernel, so one lock: [`guests_waiting`]).
+static GUESTS_WAITING: AtomicUsize = AtomicUsize::new(0);
+
+/// How many of the guest's threads wait for the kernel lock, held by
+/// another: none of them runs the program's code until it is let go
+/// (fwe's own threads are not counted).
+pub fn guests_waiting() -> usize {
+    GUESTS_WAITING.load(SeqCst)
+}
+
+/// While one lives, the calling thread, if it is one of the guest's, is
+/// counted waiting for the kernel lock.
+struct Waiting(bool);
+
+impl Waiting {
+    fn new() -> Waiting {
+        let guest = thread::tid() != 0;
+        if guest {
+            GUESTS_WAITING.fetch_add(1, SeqCst);
+        }
+        Waiting(guest)
+    }
+}
+
+impl Drop for Waiting {
+    fn drop(&mut self) {
+        if self.0 {
+            GUESTS_WAITING.fetch_sub(1, SeqCst);
+        }
+    }
+}
+
 thread_local! {
     /// This thread's counter, its index plus one (0 until it has one).
     static SHARD: Cell<usize> = const { Cell::new(0) };
@@ -149,6 +182,7 @@ impl<T> Lock<T> {
             Ok(w) => w,
             Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) => {
+                let _waiting = Waiting::new();
                 self.writers_waiting.fetch_add(1, SeqCst);
                 let w = self.writers.lock().unwrap_or_else(|e| e.into_inner());
                 self.writers_waiting.fetch_sub(1, Release);
@@ -197,11 +231,13 @@ impl<T> Lock<T> {
         // writers' mutex, when no writer is in. The next writer then waits
         // for this reader, so readers get their turns with writers that
         // follow one another.
+        let waiting = Waiting::new();
         self.waiting.fetch_add(1, SeqCst);
         count.fetch_sub(1, Release);
         let _writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
         count.fetch_add(1, SeqCst);
         self.waiting.fetch_sub(1, Release);
+        drop(waiting);
         Shared { lock: self, shard }
     }
 
@@ -217,6 +253,7 @@ impl<T> Lock<T> {
         }
         self.waiting.store(0, SeqCst);
         self.writers_waiting.store(0, SeqCst);
+        GUESTS_WAITING.store(0, SeqCst);
     }
 }
 
