@@ -386,9 +386,9 @@ jobs:
     name: LTP system calls (macos-26, part ${{ matrix.shard }} of 8)
     runs-on: macos-26
     timeout-minutes: 60
-    # PROBE: in parts, each on a runner of its own with the host's memory
-    # watched, to find what takes the runners down (a part whose runner is
-    # lost names its tests).
+    # In parts, each on a runner of its own, the host's memory watched
+    # (tools/hostmem.py): a part that stops names its tests and what held
+    # the memory.
     strategy:
       fail-fast: false
       matrix:

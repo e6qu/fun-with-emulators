@@ -171,9 +171,74 @@ fn sample_strays(cmd: &Command) {
     }
 }
 
+/// Below this share of the host's memory available (macOS's
+/// `kern.memorystatus_level`, in percent), no guest starts and a running
+/// one is ended: a Mac out of memory can panic (its compressor), taking
+/// the machine with it.
+const MEMORY_FLOOR: i64 = 20;
+
+/// Above this share of the host's memory wired (percent), likewise: wired
+/// memory is never compressed or paged out, and it grew so before each of
+/// the host panics fwe's data objects once caused.
+const WIRED_CEILING: i64 = 50;
+
+/// Why the host is too short of memory to run a guest, if it is.
+fn host_short_of_memory() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let number = |name: &std::ffi::CStr| -> i64 {
+            let mut v = 0u64;
+            let mut len = std::mem::size_of::<u64>();
+            // SAFETY: a NUL-terminated name and an out-buffer of `len`
+            // bytes, which the call fills with as many as the value has.
+            let r = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    (&mut v as *mut u64).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(r, 0, "sysctl {name:?}");
+            // (Little-endian: a 4-byte value fills the low bytes.)
+            v as i64
+        };
+        let level = number(c"kern.memorystatus_level");
+        let total = number(c"hw.memsize");
+        // SAFETY: zeroed bytes are a valid `vm_statistics64`, which the
+        // call fills with `n` words at most.
+        let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut n = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: as above, for this host.
+        let r = unsafe {
+            #[allow(deprecated)]
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                (&mut stats as *mut libc::vm_statistics64).cast(),
+                &mut n,
+            )
+        };
+        assert_eq!(r, 0, "host_statistics64");
+        let wired = i64::from(stats.wire_count) * number(c"hw.pagesize");
+        let wired_share = wired * 100 / total;
+        if level < MEMORY_FLOOR || wired_share > WIRED_CEILING {
+            return Some(format!(
+                "the host is short of memory: {level}% available (floor {MEMORY_FLOOR}%), \
+                 {wired_share}% wired (ceiling {WIRED_CEILING}%)"
+            ));
+        }
+    }
+    None
+}
+
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
+    if let Some(why) = host_short_of_memory() {
+        panic!("{why}: not starting {cmd:?}");
+    }
     // Its own process group, so a timeout reaches the processes it starts.
     cmd.process_group(0);
     let feed = !input.is_empty();
@@ -204,12 +269,18 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut short = None;
+    let mut looked = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if start.elapsed() > limit {
-            timed_out = true;
+        if looked.elapsed() > Duration::from_millis(500) {
+            looked = Instant::now();
+            short = host_short_of_memory();
+        }
+        if start.elapsed() > limit || short.is_some() {
+            timed_out = short.is_none();
             // What is left of the guest's processes, and what each waits in.
             if let Ok(ps) = Command::new("ps")
                 .args(["-o", "pid,ppid,stat,wchan,command", "-g"])
@@ -248,6 +319,9 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
     };
     if timed_out {
         eprintln!("--- guest timed out after {limit:?} (killed)");
+    }
+    if let Some(why) = short {
+        panic!("{why}: the guest was ended");
     }
     // Readers finish once the pipes close: at the exit of the last process
     // holding them, which may have left the group. One still holding them

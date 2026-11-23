@@ -57,6 +57,9 @@ import tempfile
 import threading
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import hostmem  # noqa: E402
+
 ROUNDS = 9
 # The micro-benchmarks', each a fraction of a second: more rounds, so a
 # runner's passing load spoils none of the best of them.
@@ -586,6 +589,16 @@ def linux(a):
 
 
 def macos(a):
+    # The host's memory watched throughout (tools/hostmem.py): short of it,
+    # the run says what holds it, ends fwe's processes and fails.
+    def short(why):
+        print(f"\n{why}", flush=True)
+        hostmem.report()
+        ended = hostmem.end_processes("^" + re.escape(a.fwe) + " ")
+        print(f"ended {ended} fwe processes; the run stops here", flush=True)
+        os._exit(3)
+
+    hostmem.Guard(short).start()
     x_server(a.xvfb)
     fwe = [a.fwe]
     # Where a start's time goes (FWE_TIMING), for the log.
