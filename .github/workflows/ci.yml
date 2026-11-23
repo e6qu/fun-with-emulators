@@ -383,9 +383,16 @@ jobs:
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
   ltp:
-    name: LTP system calls (macos-26)
+    name: LTP system calls (macos-26, part ${{ matrix.shard }} of 8)
     runs-on: macos-26
     timeout-minutes: 60
+    # PROBE: in parts, each on a runner of its own with the host's memory
+    # watched, to find what takes the runners down (a part whose runner is
+    # lost names its tests).
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -425,7 +432,8 @@ jobs:
           set +e
           # Four at once: most of a test's time is spent waiting.
           python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
-            --jobs 4 --results ltp-results.txt --show
+            --jobs 4 --results ltp-results.txt --show --shard ${{ matrix.shard }}/8 \
+            --memory-log ltp-memory.log
           s=$?
           echo "--- host signals refused:"
           cat "$FWE_REFUSED_LOG" 2>/dev/null || echo none
@@ -433,9 +441,10 @@ jobs:
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ltp-results
+          name: ltp-results-${{ matrix.shard }}
           path: |
             ltp-results.txt
+            ltp-memory.log
             ${{ runner.temp }}/refused.log
           if-no-files-found: ignore
 

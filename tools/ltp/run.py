@@ -44,6 +44,8 @@ import sys
 import tempfile
 import threading
 import time
+import threading
+import time
 
 # LTP's IPC tests: System V's messages, semaphores and segments, and POSIX
 # message queues.
@@ -406,10 +408,72 @@ def host_timers_late(work, tail):
     return found
 
 
+# PROBE: the tests running now, and the host's memory as they ran.
+RUNNING = set()
+RUNNING_LOCK = threading.Lock()
+MEMORY = []
+
+
+def host_memory():
+    """The host's memory available (macOS's level, a percentage), free and
+    compressed (MB) and the swap in use (MB)."""
+    out = subprocess.run(["vm_stat"], capture_output=True, text=True).stdout
+    page = int(re.search(r"page size of (\d+)", out).group(1))
+    pages = {k.strip(): int(v.strip().rstrip(".")) for k, v in
+             (l.split(":", 1) for l in out.splitlines()[1:] if ":" in l)}
+    swap = subprocess.run(["sysctl", "-n", "vm.swapusage"], capture_output=True, text=True).stdout
+    used = re.search(r"used = ([\d.]+)M", swap)
+    mb = lambda n: n * page // (1 << 20)
+    level = subprocess.run(["sysctl", "-n", "kern.memorystatus_level"], capture_output=True,
+                           text=True).stdout.strip()
+    return (int(level or 0), mb(pages.get("Pages free", 0) + pages.get("Pages speculative", 0)),
+            mb(pages.get("Pages occupied by compressor", 0)), float(used.group(1)) if used else 0.0)
+
+
+def watch_memory(log, stop):
+    """Every two seconds, the host's memory and the tests running, kept and
+    written to `log` as they are taken (flushed: a runner that dies keeps
+    what was written)."""
+    with open(log, "w") as f:
+        while not stop.wait(2):
+            level, free, compressed, swap = host_memory()
+            with RUNNING_LOCK:
+                now = sorted(RUNNING)
+            MEMORY.append((level, free, compressed, swap, now))
+            f.write(f"{time.strftime('%H:%M:%S')} available {level}%, free {free} MB, compressed "
+                    f"{compressed} MB, swap {swap:.0f} MB: {' '.join(now)}\n")
+            f.flush()
+
+
+def memory_report():
+    """The samples with the least memory available, and each test's least."""
+    if not MEMORY:
+        return
+    print("\nleast memory available (%, MB free, compressed, swap: tests running):")
+    for level, free, compressed, swap, now in sorted(MEMORY, key=lambda m: m[0])[:12]:
+        print(f"    {level}%, {free}, {compressed}, {swap:.0f}: {' '.join(now)}")
+    least = {}
+    for level, _, _, _, now in MEMORY:
+        for n in now:
+            least[n] = min(least.get(n, level), level)
+    print("tests with the least memory available while they ran: " +
+          ", ".join(f"{n} {v}%" for n, v in sorted(least.items(), key=lambda x: x[1])[:25]))
+
+
 def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """`run_one`, a failure of the runner itself (starting a test while
     another has the host short of processes, say) retried once, then
     reported as the outcome."""
+    with RUNNING_LOCK:
+        RUNNING.add(name)
+    try:
+        return run_guarded_inner(fwe, root, work, name, argv, hard_limit)
+    finally:
+        with RUNNING_LOCK:
+            RUNNING.discard(name)
+
+
+def run_guarded_inner(fwe, root, work, name, argv, hard_limit):
     for attempt in range(2):
         try:
             return run_one(fwe, root, work, name, argv, hard_limit)
@@ -447,6 +511,9 @@ def main():
     ap.add_argument("--update", action="store_true", help="rewrite the baseline from this run")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--only", help="run only the tests whose name matches")
+    # PROBE: one of n parts of the tests, by their names' order.
+    ap.add_argument("--shard", help="k/n: run only the k-th of n parts of the tests")
+    ap.add_argument("--memory-log", help="PROBE: the host's memory every two seconds, to this file")
     ap.add_argument("--results", help="write every outcome to this file")
     ap.add_argument("--show", action="store_true", help="print the output of each test that does not pass")
     ap.add_argument("--hard-limit", type=int, default=HARD_LIMIT, help="seconds before a test is ended")
@@ -469,6 +536,9 @@ def main():
     tests = entries(os.path.join(root, "opt", "ltp"))
     if args.only:
         tests = [t for t in tests if re.search(args.only, t[0])]
+    if args.shard:
+        k, n = (int(x) for x in args.shard.split("/"))
+        tests = [t for i, t in enumerate(sorted(tests)) if i % n == k - 1]
     # The exceptions are not run (some wait out their whole timeout).
     excepted = set()
     if os.path.exists(args.exceptions):
@@ -513,6 +583,10 @@ def main():
         # (fork14's thousands of large address spaces torn down) would
         # disturb the timing of the next.
         serial.sort(key=lambda t: bool(SLOW.match(t[0])))
+        stop_watch = threading.Event()
+        if args.memory_log:
+            threading.Thread(target=watch_memory, args=(args.memory_log, stop_watch),
+                             daemon=True).start()
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, limit(n)) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
@@ -522,6 +596,8 @@ def main():
             print(f"ended {left} processes tests left running")
         for n, a in serial:
             report(*run_guarded(fwe, root, work, n, a, limit(n)))
+        stop_watch.set()
+        memory_report()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
