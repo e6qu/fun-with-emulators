@@ -264,6 +264,30 @@ pub fn queue_thread_from(
     put_from(target, tid, sig, code, value, (pid as u32, uid))
 }
 
+/// The mailbox's count of the `SIGCONT`s sent to its process ([`continuing`]),
+/// after the queue.
+const CONTINUED_AT: usize = QUEUE_AT + QUEUE_LEN * ENTRY;
+const _: () = assert!(CONTINUED_AT < crate::procstore::MAILBOX_WORDS - 1);
+
+/// How many times host process `pid` has been continued ([`continuing`]): 0
+/// while it has no mailbox. Async-signal-safe once the store is mapped.
+pub fn continued(pid: i32) -> u64 {
+    crate::procstore::mailbox(pid, false)
+        .and_then(|mb| mb.get(CONTINUED_AT))
+        .map_or(0, |w| w.load(SeqCst))
+}
+
+/// Host process `pid` is sent `SIGCONT`: a stop signal sent to it before,
+/// still queued or pending, is not taken, as Linux discards a pending stop
+/// signal as `SIGCONT` is sent (`prepare_signal`). Made a mailbox if `make`
+/// (a sender's), else async-signal-safe (the process's own handler, with
+/// nothing queued for it without one).
+pub fn continuing(pid: i32, make: bool) {
+    if let Some(w) = crate::procstore::mailbox(pid, make).and_then(|mb| mb.get(CONTINUED_AT)) {
+        w.fetch_add(1, SeqCst);
+    }
+}
+
 /// What a queue entry holds in place of a signal for a request of a
 /// descriptor ([`request_fd`]): above every signal number.
 const FD_REQUEST: u64 = 0x1_0000;
@@ -441,12 +465,20 @@ fn put_from(
 ) -> Result<(), i32> {
     let mb = crate::procstore::mailbox(target, true).ok_or(fwe_abi::errno::ESRCH)?;
     let q = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY).ok_or(fwe_abi::errno::ESRCH)?;
+    // A stop signal is dated by the target's continuations in place of a
+    // value (it carries none): one sent before the next is not taken.
+    let stop = crate::signal::stops(sig);
+    let value = if stop { mb.get(CONTINUED_AT).map_or(0, |w| w.load(SeqCst)) } else { value };
     let sig_of = |e: &[crate::procstore::Word]| e[0].load(SeqCst) & 0xffff_ffff;
     // A standard signal already queued for the process is not queued
-    // again, as Linux keeps one.
+    // again, as Linux keeps one (a stop signal that is to be taken).
     if sig < fwe_abi::signal::SIGRTMIN
         && tid == 0
-        && q.chunks(ENTRY).any(|e| sig_of(e) == sig && (e[2].load(SeqCst) >> 32) as i32 == 0)
+        && q.chunks(ENTRY).any(|e| {
+            sig_of(e) == sig
+                && (e[2].load(SeqCst) >> 32) as i32 == 0
+                && (!stop || e[3].load(SeqCst) >= value)
+        })
     {
         return Ok(());
     }
@@ -527,6 +559,23 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
             answer_mem(pid, value);
         } else if sig == FD_REQUEST {
             answer_fd(pid, code_tid as u32 as i32, value);
+        } else if crate::signal::stops(sig) && value < continued(crate::host::pid_now()) {
+            // A stop signal sent before the process was last continued:
+            // gone, as on Linux.
+        } else if crate::signal::stops(sig) {
+            // Pending as of its sending ([`put_from`]); the value only
+            // dated it, a stop signal carries none.
+            crate::signal::stop_sent_at(value);
+            post(
+                sig,
+                Note {
+                    pid,
+                    uid: (ids >> 32) as u32,
+                    code: code_tid as u32 as i32,
+                    value: 0,
+                    tid: (code_tid >> 32) as i32,
+                },
+            );
         } else {
             post(
                 sig,

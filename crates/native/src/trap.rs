@@ -990,6 +990,11 @@ fn take_async(
         } else {
             let info = sent();
             let lsig = host::signal_to_linux(sig);
+            // A stop signal from the host (its terminal's), or one fwe sends
+            // as the host's, is pending as of now.
+            if fwe_kernel::signal::stops(lsig) {
+                fwe_kernel::signal::stop_sent_now();
+            }
             if in_fork_child() {
                 // Kept until the child forgets its parent's signals.
                 keep_early(lsig, info);

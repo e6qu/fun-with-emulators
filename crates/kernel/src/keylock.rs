@@ -26,9 +26,11 @@ pub(crate) const fn bytes(slots: usize) -> usize {
 /// a wake: it may have ended).
 const NAP_NS: i64 = 200_000;
 
-/// A key's lock, held until dropped.
+/// A key's lock, held until dropped; counted for this process's stops
+/// ([`crate::procstore::Holding`]).
 pub struct Held {
     holder: &'static AtomicU64,
+    _holding: crate::procstore::Holding,
 }
 
 impl Drop for Held {
@@ -59,6 +61,7 @@ pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
             && holder.compare_exchange(h, me, Ordering::AcqRel, Ordering::Acquire).is_ok()
     };
     loop {
+        let holding = crate::procstore::Holding::enter();
         // The key's slot, or a free one made the key's, under the making
         // lock.
         let found = {
@@ -75,7 +78,7 @@ pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
                     if let Some(i) = free {
                         slot(i)[0].store(key.0, Ordering::Release);
                         slot(i)[1].store(key.1, Ordering::Release);
-                        return Ok(Held { holder: &slot(i)[2] });
+                        return Ok(Held { holder: &slot(i)[2], _holding: holding });
                     }
                     None
                 }
@@ -87,7 +90,7 @@ pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
                 // Still the key's (a slot let go may have been made
                 // another's meanwhile).
                 if s[0].load(Ordering::Acquire) == key.0 && s[1].load(Ordering::Acquire) == key.1 {
-                    return Ok(Held { holder: &s[2] });
+                    return Ok(Held { holder: &s[2], _holding: holding });
                 }
                 s[2].store(0, Ordering::Release);
                 continue;
@@ -99,6 +102,9 @@ pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
         if crate::thread::deliverable() != 0 {
             return Err(errno::EINTR);
         }
+        // Not counted while it waits: a stop of this process need not wait
+        // for another's lock.
+        drop(holding);
         crate::thread::nap_ns(NAP_NS);
     }
 }

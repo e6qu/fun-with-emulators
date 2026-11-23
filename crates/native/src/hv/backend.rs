@@ -397,6 +397,11 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         } else {
             host::signal_to_linux(sig)
         };
+        // A stop signal from the host (its terminal's), or one fwe sends
+        // as the host's, is pending as of now.
+        if fwe_kernel::signal::stops(lsig) {
+            fwe_kernel::signal::stop_sent_now();
+        }
         thread::post_landed(lsig, info);
     }
     if let Some(mut vcpu) = VCPU.with(Cell::get) {

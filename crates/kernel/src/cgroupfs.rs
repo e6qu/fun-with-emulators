@@ -555,7 +555,7 @@ pub fn write(cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
                 // one thawed.
                 let (was, is) = (frozen(&from), frozen(cg));
                 if was != is {
-                    crate::host::kill_process(host, if is { libc::SIGSTOP } else { libc::SIGCONT });
+                    freeze(host, is);
                 }
             }
             Ok(())
@@ -664,7 +664,7 @@ pub fn write(cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
                     continue;
                 }
                 let f = *known.entry(r.cgroup().to_vec()).or_insert_with(|| frozen(r.cgroup()));
-                crate::host::kill_process(pid, if f { libc::SIGSTOP } else { libc::SIGCONT });
+                freeze(pid, f);
             }
             Ok(())
         }
@@ -847,6 +847,17 @@ fn ancestors(cg: &[u8]) -> Vec<Vec<u8>> {
 /// of them).
 fn below_root(cg: &[u8]) -> impl Iterator<Item = Vec<u8>> {
     ancestors(cg).into_iter().filter(|c| c != b"/")
+}
+
+/// Freeze (`SIGSTOP`) or thaw (`SIGCONT`) host process `pid`: a frozen
+/// member is a stopped process, which stops where it holds nothing shared
+/// ([`crate::signal::stop_process`]).
+fn freeze(pid: i32, frozen: bool) {
+    if frozen {
+        crate::signal::stop_process(pid, fwe_abi::signal::SIGSTOP);
+    } else {
+        crate::signal::continue_process(pid);
+    }
 }
 
 /// Whether cgroup `cg` is frozen: its own `cgroup.freeze`, or one above

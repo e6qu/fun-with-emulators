@@ -940,9 +940,112 @@ pub fn version(pid: i32) -> Option<u32> {
     Some(store().entry(pid)?.seq.load(SeqCst))
 }
 
+/// The locks of fwe's shared memory (every process's) this process's
+/// threads hold or are taking ([`Holding`]).
+static HOLDING: AtomicU32 = AtomicU32::new(0);
+
+/// The threads of this process stopping it ([`stop_holding_nothing`]):
+/// while there are any, a thread that holds no lock of shared memory waits
+/// before it takes one.
+static STOPPING: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// The [`Holding`]s of this thread.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A lock of fwe's shared memory this thread holds or is taking, counted
+/// so that the process stops holding none ([`stop_holding_nothing`]): as
+/// Linux stops a task only on its way back to user mode, never with a
+/// kernel lock held, which would leave every other process that needs it
+/// waiting until the stopped one is continued.
+pub(crate) struct Holding(());
+
+impl Holding {
+    /// One more lock this thread holds or takes: while the process stops,
+    /// a thread that holds none waits until it is continued first (one that
+    /// holds one goes on, to let it go).
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    pub(crate) fn enter() -> Holding {
+        let outer = DEPTH.with(|d| d.get()) == 0;
+        loop {
+            if outer {
+                loop {
+                    let s = STOPPING.load(SeqCst);
+                    if s == 0 {
+                        break;
+                    }
+                    wait(&STOPPING, s, 10_000_000);
+                }
+            }
+            HOLDING.fetch_add(1, SeqCst);
+            // A stop that began meanwhile goes first.
+            if outer && STOPPING.load(SeqCst) != 0 {
+                leave();
+                continue;
+            }
+            DEPTH.with(|d| d.set(d.get() + 1));
+            return Holding(());
+        }
+    }
+}
+
+impl Drop for Holding {
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        leave();
+    }
+}
+
+/// One lock fewer held or being taken: a stop waiting for none is woken.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn leave() {
+    if HOLDING.fetch_sub(1, SeqCst) == 1 && STOPPING.load(SeqCst) != 0 {
+        wake(&HOLDING);
+    }
+}
+
+/// Stop this process with `stop` (the host's stop signal raised), from a
+/// thread that holds no lock of shared memory, once no other thread holds
+/// one: until it is continued and `stop` returns, a thread that holds none
+/// waits before taking one, and one that holds one goes on to let it go.
+pub fn stop_holding_nothing(stop: impl FnOnce()) {
+    debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "a stop with a shared lock held");
+    STOPPING.fetch_add(1, SeqCst);
+    loop {
+        let held = HOLDING.load(SeqCst);
+        if held == 0 {
+            break;
+        }
+        wait(&HOLDING, held, 10_000_000);
+    }
+    stop();
+    if STOPPING.fetch_sub(1, SeqCst) == 1 {
+        wake(&STOPPING);
+    }
+}
+
+/// In a fork child: the locks held are the forking thread's alone (the
+/// others' threads are not the child's), and nothing stops it.
+pub(crate) fn forked_child_holds() {
+    HOLDING.store(DEPTH.with(|d| d.get()), SeqCst);
+    STOPPING.store(0, SeqCst);
+}
+
 /// A held record lock ([`lock`]), let go when dropped.
 pub struct Held {
     word: &'static AtomicU32,
+    _holding: Holding,
 }
 
 impl Drop for Held {
@@ -981,16 +1084,19 @@ fn hold(word: &'static AtomicU32) -> Held {
 pub(crate) fn hold_word(word: &'static AtomicU32) -> (Held, bool) {
     let me = crate::host::pid() as u32;
     loop {
+        let holding = Holding::enter();
         match word.compare_exchange(0, me, SeqCst, SeqCst) {
-            Ok(_) => return (Held { word }, false),
+            Ok(_) => return (Held { word, _holding: holding }, false),
             Err(holder) => {
                 // Gone, or a zombie (it died holding the lock): taken over.
                 let live = crate::procreg::host_info(holder as i32).is_some_and(|(_, _, z)| !z);
                 if !live && word.compare_exchange(holder, me, SeqCst, SeqCst).is_ok() {
-                    return (Held { word }, true);
+                    return (Held { word, _holding: holding }, true);
                 }
-                // Woken as it is let go; a while at most, to look at the
-                // holder again.
+                // Not counted while it waits (a stop of this process need
+                // not wait for another's lock). Woken as it is let go; a
+                // while at most, to look at the holder again.
+                drop(holding);
                 wait(word, holder, 10_000_000);
             }
         }
@@ -1092,8 +1198,10 @@ fn put_of(kind: Kind, pid: i32, bytes: Option<&[u8]>) {
 /// Make the chain from `head` of `len` bytes entry `e`'s record, under its
 /// lock: the old chain and its length. The sequence number is set, not
 /// counted on, so one left odd by a writer that died between its two
-/// changes is put right.
+/// changes is put right. Counted as a lock held ([`Holding`]): readers
+/// wait while it is odd.
 fn replace(e: &Entry, head: u32, len: u32) -> (u32, u32) {
+    let _holding = Holding::enter();
     let odd = e.seq.load(SeqCst) | 1;
     e.seq.store(odd, SeqCst);
     let old = (e.head.swap(head, SeqCst), e.len.swap(len, SeqCst));

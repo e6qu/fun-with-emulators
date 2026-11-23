@@ -256,6 +256,64 @@ fn align_down(x: u64, a: u64) -> u64 {
     x & !(a - 1)
 }
 
+/// Whether Linux signal `sig` stops a process by default (`SIGSTOP`,
+/// `SIGTSTP`, `SIGTTIN`, `SIGTTOU`).
+pub fn stops(sig: u64) -> bool {
+    matches!(sig, signal::SIGSTOP | signal::SIGTSTP | signal::SIGTTIN | signal::SIGTTOU)
+}
+
+/// How many times this process had been continued
+/// ([`crate::signote::continued`]) when the latest stop signal pending for
+/// it was sent: one sent before the process was last continued is not
+/// taken, as Linux discards a pending stop signal as `SIGCONT` is sent.
+static STOP_SENT_AT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// A stop signal pending for this process was sent when it had been
+/// continued `count` times. Async-signal-safe.
+pub fn stop_sent_at(count: u64) {
+    STOP_SENT_AT.fetch_max(count, std::sync::atomic::Ordering::SeqCst);
+    // A `SIGCONT` pending goes, as Linux discards one as a stop signal is
+    // sent.
+    thread::discard_process(signal::SIGCONT);
+}
+
+/// A stop signal pending for this process was sent now (by the host's
+/// terminal, or by this process). Async-signal-safe.
+pub fn stop_sent_now() {
+    stop_sent_at(crate::signote::continued(host::pid_now()));
+}
+
+/// Whether the stop signal pending for this process is still to be taken:
+/// the process was not continued since it was sent.
+fn stop_stands() -> bool {
+    STOP_SENT_AT.load(std::sync::atomic::Ordering::SeqCst)
+        >= crate::signote::continued(host::pid_now())
+}
+
+/// Stop fwe process `target` with stop signal `sig` (`SIGSTOP` above all,
+/// which the host cannot catch): sent through its mailbox, so that it
+/// stops itself where it holds nothing every process shares
+/// ([`Kernel::deliver_pending`]), as Linux stops a task only on its way
+/// back to user mode; the host's would stop it wherever it was, a lock of
+/// fwe's held. This process posts it to itself.
+pub(crate) fn stop_process(target: i32, sig: u64) -> i64 {
+    crate::reaper::stop_signal_sent(target);
+    if target == host::pid() {
+        stop_sent_now();
+        return post_own(sig);
+    }
+    send_unhosted(target, sig, signal::SI_USER, 0)
+}
+
+/// Continue fwe process `target` (`SIGCONT`): the stop signals sent to it
+/// before are not taken, and the host's `SIGCONT` continues it if it is
+/// stopped.
+pub(crate) fn continue_process(target: i32) -> i64 {
+    crate::reaper::stop_signal_sent(target);
+    crate::signote::continuing(target, true);
+    host::kill_process(target, libc::SIGCONT)
+}
+
 /// Whether Linux signal `sig` is relayed through the host: it has a host
 /// equivalent and is not one the backend itself owns. `SIGKILL` and
 /// `SIGSTOP` cannot be caught; `SIGTRAP`, `SIGSEGV`, `SIGBUS`, `SIGILL` and
@@ -619,9 +677,13 @@ impl<P: Platform> Kernel<P> {
                     signal::Default::Stop if crate::ptrace::seized() => {
                         self.ptrace_group_stop(regs, sig, info);
                     }
+                    // One sent before the process was last continued is
+                    // gone.
+                    signal::Default::Stop if !stop_stands() => {}
                     signal::Default::Stop => {
                         if let Some(h) = host::signal_to_host(sig) {
-                            self.platform.stop_self(h);
+                            let platform = &mut self.platform;
+                            crate::procstore::stop_holding_nothing(|| platform.stop_self(h));
                         }
                     }
                     signal::Default::Ignore | signal::Default::Continue => {}
@@ -961,10 +1023,14 @@ impl<P: Platform> Kernel<P> {
         {
             return 0;
         }
-        // A traced process takes SIGSTOP as fwe's: the host's would stop it
-        // where it cannot answer its tracer.
-        if sig == signal::SIGSTOP && !to_self && crate::ptrace::is_traced(target) {
-            return send_unhosted(target, sig, signal::SI_USER, 0);
+        // SIGSTOP to a process of fwe's goes as fwe's, which it takes where
+        // it holds nothing shared ([`stop_process`]); a traced one answers
+        // its tracer there.
+        if sig == signal::SIGSTOP && (to_self || host::is_fwe(target)) {
+            return stop_process(target, sig);
+        }
+        if sig == signal::SIGCONT && host::is_fwe(target) {
+            crate::signote::continuing(target, true);
         }
         // SIGTRAP to another of fwe's processes goes through its mailbox:
         // the host would merge it with the trap of that process's next
@@ -1137,8 +1203,9 @@ impl<P: Platform> Kernel<P> {
         if sig == 0 {
             return 0;
         }
-        if sig == signal::SIGKILL {
-            // It ends the whole process, whichever thread it names.
+        if sig == signal::SIGKILL || sig == signal::SIGSTOP {
+            // It ends, or stops, the whole process, whichever thread it
+            // names.
             return self.sys_kill(me, sig);
         }
         if !thread::may_queue(sig, signal::SI_TKILL) {

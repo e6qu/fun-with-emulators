@@ -82,6 +82,7 @@ pub fn init_main(pid: i32) {
         d.pending.store(std::ptr::null_mut(), Ordering::Release);
     }
     forget_wait_pipes();
+    crate::procstore::forked_child_holds();
     crate::pdeath::forked();
     crate::futex::forked_child();
     crate::sysvipc::forked_child();
@@ -1514,6 +1515,11 @@ pub fn wake_others_if_asked(sig: libc::c_int) {
     if HOT.with(|h| h.wake_others.replace(false)) {
         wake_others(sig);
     }
+}
+
+/// Drop `sig` if it is pending for the process. Async-signal-safe.
+pub fn discard_process(sig: u64) {
+    let _ = PROCESS.take(sig);
 }
 
 /// Record `sig` as pending against the process; any thread that does not

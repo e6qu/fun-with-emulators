@@ -2019,6 +2019,8 @@ recorded by fwe and the target woken with the wake signal:
 | `kill(pid, sig)` to another process, a signal the host has | pid mapped out of the pid namespace; permission checked as on Linux; a sender note left in the target's mailbox if it is an fwe process (`crates/kernel/src/signote.rs`) | `kill(<host pid>, <host signal>)` |
 | `kill`/`rt_sigqueueinfo` with `SIGTRAP` to another fwe process | queued in its mailbox, as a signal the host lacks is: the host would merge a host `SIGTRAP` with the target's next system-call trap (fwe's `brk`, a `SIGTRAP` too), and it would be lost | `SIGEMT` to wake the target |
 | `kill` with `SIGKILL` | the same | an fwe target is sent `SIGINFO` (the kill relay), so a VM process can tear its VM down first; any other process the real `SIGKILL` |
+| `kill`/`tgkill` with `SIGSTOP` to an fwe process, this one too | queued in its mailbox (this one's pending set), dated by how many times it was continued; the process stops itself when it takes it, at the end of a call or in its handler, once none of its threads holds a lock of the memory fwe's processes share, and a thread that holds none takes none until it is continued: as Linux stops a task only on its way back to user mode. The host's `SIGSTOP` would stop it wherever it was, a lock every other process needs held | `SIGEMT` to wake the target; the target raises `SIGSTOP` on itself, so its parent's `wait` sees the stop |
+| `kill` with `SIGCONT` to an fwe process | its count of continuations moved on first: a stop signal sent to it before is not taken, queued or pending, as Linux discards one as `SIGCONT` is sent; a stop signal sent drops a pending `SIGCONT` | `kill(<host pid>, SIGCONT)` |
 | `kill` of itself with a fault signal (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | recorded directly, since macOS's `siginfo` cannot tell a sent one from a fault | none |
 | `kill`/`tgkill`/`rt_sigqueueinfo` with a real-time signal (or `SIGSTKFLT`, `SIGPWR`) | recorded directly within the process; to another fwe process queued in its mailbox with the sender, code and value; to a process that is not fwe's `EINVAL` | `SIGEMT` to wake the target |
 | `tgkill(tgid, tid, sig)`, a signal the guest catches or a fault signal | posted to that thread directly, which a relayed host signal could not target | `SIGEMT` to wake it |
@@ -2255,7 +2257,7 @@ is a host process, native or running the VM alike.
 | `cgroup.type`, `cgroup.threads` | only domain cgroups: `threaded` is `EOPNOTSUPP`, and a thread moves only to the cgroup it is in | none |
 | `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
 | `pids.max` | `max` or a whole number up to Linux's 4194304, with no suffix (`EINVAL`); enforced on `fork` and on a new thread natively, not on a VM thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
-| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too; a frozen member is a stopped process, so a `SIGCONT` thaws it and its parent sees the stop | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
+| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too; a frozen member is a stopped process, so a `SIGCONT` thaws it and its parent sees the stop | fwe's `SIGSTOP` to each, which it takes where it holds nothing other processes wait for, then the host's; `SIGCONT` (a VM's vCPUs stop with their process) |
 | `cgroup.kill` | kills the members | `SIGKILL`, relayed so a process running the VM takes it down first |
 | device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`); kept with the cgroup's directory, where no listing shows them | none |
 | `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back (a memory limit in whole pages, as Linux keeps it), not enforced | none: macOS has no such limit for a process |
@@ -2536,7 +2538,8 @@ where fwe falls short of Linux in detail is in
 | Signal permission | **enforced** | `CAP_KILL` in the target's user namespace or Linux's uid match, `SIGCONT` within the session, each member of a group; `kill(-1)` reaches the caller's pid namespace, or the processes of its run of fwe, never other host processes |
 | Signals the host lacks (`SIGSTKFLT`, `SIGPWR`, 32–64) | **emulated** | fwe's pending sets, another fwe process's mailbox; to a process fwe did not start `EINVAL` ([Sending a signal](#sending-a-signal)) |
 | siginfo sender | **emulated** | the sender's pid and guest uid in the receiver's namespaces |
-| `SIGKILL`, `SIGSTOP` | **host** | `SIGKILL` to an fwe process relayed so a VM goes down first |
+| `SIGKILL` | **host** | to an fwe process relayed so a VM goes down first |
+| `SIGSTOP` | **emulated** | to an fwe process fwe's own, which it takes where it holds nothing other processes wait for, then stops with the host's ([Sending a signal](#sending-a-signal)); from outside fwe the host's |
 | `RLIMIT_CPU` | **enforced** | `SIGXCPU` at the soft limit (the host's), `SIGKILL` at the hard limit (fwe's) |
 | `RLIMIT_FSIZE` | **host** | `SIGXFSZ`, `EFBIG`; never above the host's hard limit |
 | `RLIMIT_DATA` | **host** | set on the fwe process; the guest's `brk` is not held to it |
@@ -2699,7 +2702,7 @@ where fwe falls short of Linux in detail is in
 | `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.controllers`, `cgroup.max.*` | **enforced** | Linux's delegation and no-internal-process rules; a new cgroup's files are its creator's, a controller's files whoever enabled it; an unknown controller `EINVAL` |
 | `cgroup.type`, `cgroup.threads` | **refused** | `threaded` `EOPNOTSUPP`; a thread moves only where it is |
 | `cgroup.events`, `cgroup.stat` | **emulated** | |
-| `cgroup.freeze`, `cgroup.kill` | **emulated** | host `SIGSTOP`, `SIGCONT`, `SIGKILL` to the members |
+| `cgroup.freeze`, `cgroup.kill` | **emulated** | fwe's `SIGSTOP` ([Sending a signal](#sending-a-signal)), host `SIGCONT`, `SIGKILL` to the members |
 | `pids.max` | **enforced** | at `fork` and a native thread's creation, up the tree (`EAGAIN`), not for a VM thread; `max` or a whole number up to 4194304 (`EINVAL` otherwise, a suffix too) |
 | `pids.current`, `memory.current`, `cpu.stat` | **host** | the members' threads, resident memory and times |
 | `memory.max`, `high`, `low`, `min`, `swap.max`, `oom.group`, `cpu.max`, `cpu.weight`, `cpuset.*`, `io.*`, `hugetlb.*`, `rdma.*`, `misc.*` | **kept** | macOS bounds no process's memory or CPU; a memory limit is parsed as Linux parses it (suffixes `K` to `E`) and kept in whole pages; `memory.stat`, `memory.events`, `io.stat` read zeros |
@@ -2800,7 +2803,7 @@ the host takes as Linux would (`Kernel::sync_host_signal`):
 | default, and the default ignores (`SIGCHLD`, `SIGURG`, `SIGWINCH`) | caught by fwe, which drops it unless the guest blocks it | macOS discards such a signal even while it is blocked; Linux keeps a blocked one pending |
 | default `SIGCONT` | host default | the host does the same |
 | ignored | host `SIG_IGN` | the host does the same, and keeps it ignored across `execve` |
-| `SIGKILL`, `SIGSTOP` | the host's | they cannot be caught |
+| `SIGKILL`, `SIGSTOP` | the host's | they cannot be caught; fwe's processes send `SIGSTOP` to each other as fwe's ([Sending a signal](#sending-a-signal)) |
 | fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | fwe's fault handlers, always | see [Faults in guest code](#faults-in-guest-code) |
 
 A guest thread runs under a host mask holding only the guest-blocked

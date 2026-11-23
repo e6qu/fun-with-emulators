@@ -1796,6 +1796,23 @@ fn named_semaphores_live_in_dev_shm() {
     }
 }
 
+/// A process stopped while busy with state every process shares (the files
+/// of `/dev/shm`, its threads making and removing them) stops holding none
+/// of it, as Linux stops a task only on its way back to user mode: its
+/// parent uses `/dev/shm` while it is stopped.
+#[test]
+fn a_stopped_process_holds_no_shared_state() {
+    let prog = build_c_dynamic("stoplock", Libc::Musl, true);
+    let root = libc_rootfs(Libc::Musl, "stoplock");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "ok\n", "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Threads that first run the same pages of the shared libc at once, with
 /// the libc's preparation kept from the run before: each page's code is
 /// written as it first runs, and a thread that runs it meanwhile runs on.

@@ -267,13 +267,19 @@ pub struct Read {
 /// The record's lock, held ([`Slot::lock`]), let go when dropped.
 pub struct Held {
     n: &'static Named,
+    _holding: super::Holding,
 }
 
 impl Drop for Held {
     fn drop(&mut self) {
-        if self.n.lock.swap(0, SeqCst) & WAITED != 0 {
-            wake(&self.n.lock);
-        }
+        let_go(self.n);
+    }
+}
+
+/// Let `n`'s lock go, its waiters woken.
+fn let_go(n: &Named) {
+    if n.lock.swap(0, SeqCst) & WAITED != 0 {
+        wake(&n.lock);
     }
 }
 
@@ -329,8 +335,9 @@ impl Slot {
         let word = &self.n.lock;
         let mut spins = 0;
         loop {
+            let holding = super::Holding::enter();
             let cur = match word.compare_exchange(0, me, SeqCst, SeqCst) {
-                Ok(_) => return Held { n: self.n },
+                Ok(_) => return Held { n: self.n, _holding: holding },
                 Err(cur) => cur,
             };
             // A short wait for a holder at work, before a host wait.
@@ -344,8 +351,11 @@ impl Slot {
             {
                 continue;
             }
-            // Woken as it is let go; a while at most, to look at the
-            // holder again: still held by the same, it may have died.
+            // Not counted while it waits (a stop of this process need not
+            // wait for another's lock). Woken as it is let go; a while at
+            // most, to look at the holder again: still held by the same, it
+            // may have died.
+            drop(holding);
             wait(word, cur | WAITED, 10_000_000);
             if word.load(SeqCst) == cur | WAITED && !holder_live(cur & !WAITED) {
                 self.take_over(cur | WAITED, me);
@@ -362,7 +372,7 @@ impl Slot {
             }
             // Let go at once: the waiters (this one among them) take it in
             // turn.
-            drop(Held { n: self.n });
+            let_go(self.n);
         }
     }
 

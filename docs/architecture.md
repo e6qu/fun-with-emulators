@@ -100,7 +100,10 @@ or, for a call that may block, without it:
   readers use: it counts itself in one of 32 counters, each on its own
   cache line, and checks a flag only writers set. A writer sets the flag
   and waits for the counters to drain; readers that find it set enter when
-  it is done, ahead of the next writer.
+  it is done, ahead of the next writer, and a writer lets the writers
+  already waiting go first: the host's mutex goes to whichever thread asks
+  first, often the one that just let it go, which kept a thread out of
+  every call while others made one exclusive call after another.
 - **Blocking calls run without it**, so a waiting thread never stalls the
   thread meant to wake it: `futex`, the sleeps, `epoll_pwait`, `ppoll`,
   `pselect6`, `rt_sigsuspend`, `rt_sigtimedwait`, `wait4`, `waitid`, the
@@ -690,6 +693,16 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   by a kqueue timer of the thread's with `NOTE_CRITICAL`, which the host
   does not coalesce. A futex wait close to its deadline sleeps the same
   way, a wake writing to its pipe.
+- **Stops** take no lock with them: a process stops (`SIGSTOP`, the
+  default action of `SIGTSTP`, `SIGTTIN`, `SIGTTOU`, `cgroup.freeze`)
+  only where it takes the signal, at the end of a call or in its handler,
+  and only once none of its threads holds a lock of shared memory
+  (`procstore::Holding`: the process store's records and areas, the file
+  store's arenas, the shared records, the seqpacket locks), a thread that
+  holds none taking none meanwhile (`procstore::stop_holding_nothing`).
+  `SIGSTOP` between fwe's processes goes through the mailbox for this,
+  dated by the target's count of `SIGCONT`s, so a stop sent before the
+  latest `SIGCONT` is not taken.
 - **Signals the host lacks, between processes:** queued in the target's
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets. One
