@@ -611,9 +611,11 @@ pub fn closed(fd: i32) {
 /// Whether a descriptor of this process other than `fd` is open on the
 /// file `fd` is (as a `dup` of it would be).
 pub fn shared_elsewhere(fd: i32) -> bool {
-    // An inet socket has no identity the host reports (every one is 0:0):
-    // a bound one's duplicates carry its mark.
-    if let Some(m @ Mark::NetBound { .. }) = marked(fd) {
+    // An inet socket has no identity the host reports (every one is 0:0),
+    // and a descriptor of fwe's store stands on the host's `/dev/null`, as
+    // all its others do: a bound socket's and a store descriptor's
+    // duplicates carry its mark.
+    if let Some(m @ (Mark::NetBound { .. } | Mark::Store(_))) = marked(fd) {
         let others: Vec<i32> = records()
             .iter()
             .filter(|(o, r)| **o != fd && r.mark == Some(m))

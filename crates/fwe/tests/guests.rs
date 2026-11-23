@@ -8617,7 +8617,7 @@ fn overlay_files_are_watched_across_copy_up() {
     for scenario in ["overlay-inotify", "overlay-inotify-tmpfs"] {
         assert_eq!(
             containers(scenario),
-            "mount: ok\nevents: dir 0x4 x, file 0x2 \nlower: f upper: g\n",
+            "mount: ok\nevents: dir 0x4 x, file 0x2 , h 0x4 , h 0x20 , h 0x8 , h 0x20 , h 0x8 \nlower: f upper: g\n",
             "{scenario}"
         );
     }

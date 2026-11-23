@@ -1436,6 +1436,7 @@ fn main() {
                 }
                 std::fs::write("/tmp/l/d/x", "x").unwrap();
                 std::fs::write("/tmp/l/f", "f").unwrap();
+                std::fs::write("/tmp/l/h", "").unwrap();
                 let opts = b"lowerdir=/tmp/l,upperdir=/tmp/u,workdir=/tmp/w\0";
                 let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
                 println!("mount: {}", res(r as i64));
@@ -1444,10 +1445,24 @@ fn main() {
                 let ino = syscall(26, 0o4000i64) as i32;
                 let wd_dir = syscall(27, ino as i64, c("/tmp/m/d").as_ptr(), (IN_ATTRIB | IN_MODIFY) as i64);
                 let wd_file = syscall(27, ino as i64, c("/tmp/m/f").as_ptr(), (IN_ATTRIB | IN_MODIFY) as i64);
+                // As LTP's inotify08: a lower file watched for its
+                // attributes, opens and closes, copied up by a chmod, then
+                // written whole.
+                const IN_CLOSE_WRITE: u32 = 0x8;
+                const IN_OPEN: u32 = 0x20;
+                let wd_h = syscall(27, ino as i64, c("/tmp/m/h").as_ptr(), (IN_ATTRIB | IN_OPEN | IN_CLOSE_WRITE) as i64);
                 chmod(c("/tmp/m/d/x").as_ptr(), 0o600);
                 let fd = open(c("/tmp/m/f").as_ptr(), 1);
                 write(fd, b"g".as_ptr(), 1);
                 close(fd);
+                chmod(c("/tmp/m/h").as_ptr(), 0o600);
+                chmod(c("/tmp/m/h").as_ptr(), 0o644);
+                std::fs::write("/tmp/m/h", "1").unwrap();
+                // Closed while a duplicate is open: no event until the last.
+                let fd = open(c("/tmp/m/h").as_ptr(), 1);
+                let again = syscall(23, fd as i64) as i32;
+                close(fd);
+                close(again);
                 let mut buf = [0u8; 4096];
                 let n = read(ino, buf.as_mut_ptr(), buf.len());
                 let mut events = Vec::new();
@@ -1459,7 +1474,15 @@ fn main() {
                     let name = std::ffi::CStr::from_bytes_until_nul(&buf[at + 16..at + 16 + len])
                         .map(|n| n.to_string_lossy().into_owned())
                         .unwrap_or_default();
-                    let who = if wd as i64 == wd_dir { "dir" } else if wd as i64 == wd_file { "file" } else { "?" };
+                    let who = if wd as i64 == wd_dir {
+                        "dir"
+                    } else if wd as i64 == wd_file {
+                        "file"
+                    } else if wd as i64 == wd_h {
+                        "h"
+                    } else {
+                        "?"
+                    };
                     events.push(format!("{who} {mask:#x} {name}"));
                     at += 16 + len;
                 }
