@@ -380,11 +380,17 @@ pub fn init() {
 /// host wait of fwe's for that.
 pub struct Busy(bool);
 
+/// A busy mark's depth (the [`Busy`] alive) is its low half; its high half
+/// counts each one made, so a look that reads the mark before and after
+/// another of the host's sees whether fwe's work began or ended between.
+const BUSY_DEPTH: u32 = 0xffff;
+const BUSY_ENTRY: u32 = 1 << 16;
+
 impl Busy {
     pub fn new() -> Busy {
         let main = crate::thread::tid() == crate::thread::tgid();
         if main && let Some(w) = busy_word(crate::host::pid()) {
-            w.fetch_add(1, SeqCst);
+            busy_enter(w);
         }
         Busy(main)
     }
@@ -401,14 +407,22 @@ impl Drop for Busy {
         if self.0
             && let Some(w) = busy_word(crate::host::pid())
         {
-            // (Not below zero: a fork child starts with none.)
-            let mut n = w.load(SeqCst);
-            while n > 0 {
-                match w.compare_exchange(n, n - 1, SeqCst, SeqCst) {
-                    Ok(_) => break,
-                    Err(now) => n = now,
-                }
-            }
+            busy_leave(w);
+        }
+    }
+}
+
+fn busy_enter(w: &AtomicU32) {
+    w.fetch_add(BUSY_ENTRY | 1, SeqCst);
+}
+
+fn busy_leave(w: &AtomicU32) {
+    // (Not below zero: a fork child starts with none.)
+    let mut n = w.load(SeqCst);
+    while n & BUSY_DEPTH != 0 {
+        match w.compare_exchange(n, n - 1, SeqCst, SeqCst) {
+            Ok(_) => break,
+            Err(now) => n = now,
         }
     }
 }
@@ -418,9 +432,17 @@ fn busy_word(pid: i32) -> Option<&'static AtomicU32> {
     Some(store().at(BUSY_AT + i * 4))
 }
 
-/// Whether host pid `pid`'s main thread is in fwe's own work ([`Busy`]).
-pub fn busy(pid: i32) -> bool {
-    busy_word(pid).is_some_and(|w| w.load(SeqCst) != 0)
+/// Host pid `pid`'s busy mark as it is now ([`Busy`]), for
+/// [`busy_between`].
+pub fn busy_mark(pid: i32) -> u32 {
+    busy_word(pid).map_or(0, |w| w.load(SeqCst))
+}
+
+/// Whether a process whose busy mark read `before` and then `after` was
+/// in fwe's own work at some time between: in it at either look, or its
+/// work begun or ended between them.
+pub fn busy_between(before: u32, after: u32) -> bool {
+    before != after || after & BUSY_DEPTH != 0
 }
 
 /// This process's main thread goes into the program: its first
@@ -1417,6 +1439,25 @@ mod tests {
 
     /// A store another process is making is waited for until it has its
     /// size.
+    #[test]
+    fn fwes_work_begun_or_ended_between_two_looks_is_seen() {
+        let w = AtomicU32::new(0);
+        let idle = w.load(SeqCst);
+        assert!(!busy_between(idle, w.load(SeqCst)));
+        busy_enter(&w);
+        let inside = w.load(SeqCst);
+        assert!(busy_between(idle, inside), "begun between");
+        assert!(busy_between(inside, inside), "in it at both");
+        busy_leave(&w);
+        let after = w.load(SeqCst);
+        assert!(busy_between(inside, after), "ended between");
+        assert!(busy_between(idle, after), "begun and ended between");
+        assert!(!busy_between(after, w.load(SeqCst)));
+        // A leave with none (a fork child's) keeps the mark as it is.
+        busy_leave(&w);
+        assert_eq!(w.load(SeqCst), after);
+    }
+
     #[test]
     fn a_store_being_sized_elsewhere_is_waited_for() {
         let name = std::ffi::CString::new(format!("/fwe-t{}", std::process::id())).unwrap();
