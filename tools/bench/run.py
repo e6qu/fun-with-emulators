@@ -575,8 +575,8 @@ def linux(a):
                 ("git (s)", "sh /src/wl/git.sh /src/src /usr/bin/git"),
                 ("xz (s)", "sh /src/wl/xz.sh /src/src /usr/bin/xz"),
                 # As PostgreSQL's own user: it refuses to run as root.
-                ("PostgreSQL (s)", "chown postgres /tmp/w && su postgres -s /bin/sh -c "
-                 "'cd /tmp/w && sh /src/wl/postgres.sh /usr/libexec/postgresql18'"),
+                ("PostgreSQL (s)", "chown postgres /tmp/w && su -s /bin/sh -c "
+                 "'cd /tmp/w && sh /src/wl/postgres.sh /usr/libexec/postgresql18' postgres"),
             ):
                 r[row] = best(lambda cmd=cmd: timed(cmd), 3)
         finally:
@@ -1966,8 +1966,8 @@ def postgres(a, fwe, guest_env, results):
     native = tempfile.mkdtemp()
     ours_w, theirs_w = os.path.join(root, "tmp", "w"), os.path.join(native, "w")
     ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
-                              "chown postgres /tmp/w && su postgres -s /bin/sh -c "
-                              "'cd /tmp/w && sh /tmp/postgres.sh /usr/libexec/postgresql18'"]
+                              "chown postgres /tmp/w && su -s /bin/sh -c "
+                              "'cd /tmp/w && sh /tmp/postgres.sh /usr/libexec/postgresql18' postgres"]
     bin_dir = os.path.join(a.brew, BREW["postgres"])
     theirs = ["/bin/sh", "-c", f"cd {theirs_w} && sh {WORKLOADS}/postgres.sh {bin_dir}"]
     workload(results, "PostgreSQL (s)", ours, theirs, (ours_w, theirs_w), len(guest_env) + 1)
