@@ -425,19 +425,11 @@ jobs:
           sudo sysctl -w kern.maxfiles=184320 kern.maxfilesperproc=92160
           echo "hard limit: $(ulimit -Hn)"
       - name: Run LTP's system-call tests under fwe
-        env:
-          # PROBE: host signals fwe refused to send (to a process not its own).
-          FWE_REFUSED_LOG: ${{ runner.temp }}/refused.log
         run: |
-          set +e
           # Four at once: most of a test's time is spent waiting.
           python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
             --jobs 4 --results ltp-results.txt --show --shard ${{ matrix.shard }}/8 \
             --memory-log ltp-memory.log
-          s=$?
-          echo "--- host signals refused:"
-          cat "$FWE_REFUSED_LOG" 2>/dev/null || echo none
-          exit $s
       - if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -445,7 +437,6 @@ jobs:
           path: |
             ltp-results.txt
             ltp-memory.log
-            ${{ runner.temp }}/refused.log
           if-no-files-found: ignore
 
   # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs

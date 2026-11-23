@@ -1480,38 +1480,6 @@ impl<P: Platform> Kernel<P> {
     /// (a rootfs has no mount points within it, so it is the same one).
     pub(crate) fn sys_statfs(&mut self, path: u64, buf: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        let r = self.statfs_inner(&path, buf);
-        // PROBE: what a statfs of the cgroup tree's path answers.
-        if path.windows(6).any(|w| w == b"cgroup") && crate::trace::file().is_some() {
-            let mut b = [0u8; 8];
-            let _ = uaccess::read_into(buf, &mut b);
-            let synthetic = self.fs().synthetic(fcntl::AT_FDCWD as i32, &path).is_some();
-            let resolved = self.fs().resolve(fcntl::AT_FDCWD as i32, &path, true);
-            let (store, fstype, ns) = match &resolved {
-                Ok(x) => (
-                    x.store.as_ref().map(|d| d.fs.id),
-                    format!("{:?}", x.fstype),
-                    x.ns_path.as_ref().map(|p| String::from_utf8_lossy(p).into_owned()),
-                ),
-                Err(e) => (None, format!("err {e}"), None),
-            };
-            let (m, rest) = self.fs().mount_of(&crate::fs::normalize(self.fs().cwd(), &path));
-            crate::trace::note_to_file(&format!(
-                "PROBE statfs {:?} = {r}: type {:#x}, synthetic {synthetic}, store {store:x?} \
-                 (cgroup tree {:x}), resolved type {fstype}, ns path {ns:?}, mount {:?} at {:?} rest {:?}",
-                String::from_utf8_lossy(&path),
-                u64::from_ne_bytes(b),
-                crate::cgroupfs::tree_id(),
-                m.fstype,
-                String::from_utf8_lossy(&m.point),
-                String::from_utf8_lossy(&rest),
-            ));
-        }
-        r
-    }
-
-    fn statfs_inner(&mut self, path: &[u8], buf: u64) -> i64 {
-        let path = path.to_vec();
         if let Some(entry) = self.fs().synthetic(fcntl::AT_FDCWD as i32, &path) {
             if matches!(entry, crate::procfs::Entry::Missing) {
                 return err(errno::ENOENT);

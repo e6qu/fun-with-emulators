@@ -547,11 +547,6 @@ pub fn signal_named(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     if pid <= 0 {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
-    // PROBE: a guest's signal to a process not fwe's, kept (not refused).
-    #[cfg(target_os = "macos")]
-    if sig != 0 && !is_fwe(pid) {
-        probe_log(pid, sig, std::panic::Location::caller(), b"fwe: a guest's host signal ");
-    }
     kill(pid, sig)
 }
 
@@ -561,8 +556,6 @@ fn refused_signal(pid: libc::pid_t, sig: libc::c_int, from: &std::panic::Locatio
     let line = signal_line(b"fwe: host signal ", pid, sig, from, b", not one of fwe's, refused");
     // SAFETY: a valid buffer of the length given.
     unsafe { libc::write(2, line.buf.as_ptr().cast(), line.len) };
-    #[cfg(target_os = "macos")]
-    probe_log(pid, sig, from, b"fwe: host signal ");
 }
 
 /// "`what` `sig` to host process `pid``why` (sent from `from`)", a line.
@@ -585,38 +578,6 @@ fn signal_line(
     line.num(u64::from(from.line()));
     line.put(b")\n");
     line
-}
-
-/// PROBE: a signal to a host process not fwe's, with the process's
-/// program, appended to the file `FWE_REFUSED_LOG` names, if it is set.
-/// Async-signal-safe.
-#[cfg(target_os = "macos")]
-fn probe_log(pid: libc::pid_t, sig: libc::c_int, from: &std::panic::Location<'_>, what: &[u8]) {
-    // SAFETY: a NUL-terminated name; the environment is not changed while
-    // fwe runs.
-    let path = unsafe { libc::getenv(c"FWE_REFUSED_LOG".as_ptr()) };
-    if path.is_null() {
-        return;
-    }
-    let line = signal_line(what, pid, sig, from, b"");
-    let mut exe = [0u8; 1024];
-    // SAFETY: a valid out-buffer of its length.
-    let n = unsafe { libc::proc_pidpath(pid, exe.as_mut_ptr().cast(), exe.len() as u32) };
-    // SAFETY: a NUL-terminated path; plain host calls on valid buffers.
-    unsafe {
-        let fd = libc::open(
-            path,
-            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
-            0o644 as libc::c_uint,
-        );
-        if fd >= 0 {
-            libc::write(fd, line.buf.as_ptr().cast(), line.len - 1);
-            libc::write(fd, b" exe ".as_ptr().cast(), 5);
-            libc::write(fd, exe.as_ptr().cast(), n.max(0) as usize);
-            libc::write(fd, b"\n".as_ptr().cast(), 1);
-            libc::close(fd);
-        }
-    }
 }
 
 /// A line put together without allocating (in a signal handler, say).
