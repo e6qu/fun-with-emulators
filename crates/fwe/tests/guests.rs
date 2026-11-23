@@ -6310,7 +6310,8 @@ const DEBUGGER: &str = "exec: alternate true, entry then event then exit true\n\
     auxv: entry true\n\
     syscall info: size true, entry true, number 173, exit true\n\
     group stop: delivery true, event true, listen 0, stays true, continued true\n\
-    killed: true\n";
+    killed: true\n\
+    stopped then seized: stopped true, seize 0, calls seen true, exit 0\n";
 
 /// What debuggers ask of ptrace beyond its basics: a seized child runs
 /// on until interrupted, which stops it with an event stop; the system

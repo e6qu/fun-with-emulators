@@ -262,6 +262,15 @@ pub fn stops(sig: u64) -> bool {
     matches!(sig, signal::SIGSTOP | signal::SIGTSTP | signal::SIGTTIN | signal::SIGTTOU)
 }
 
+/// Whether `sig`, queued with `code`, is a stop signal a later `SIGCONT`
+/// discards: not fwe's nudge of a seized tracee
+/// ([`crate::ptrace::POKE_CODE`]), which stands for Linux's
+/// `PTRACE_INTERRUPT`, no signal (a tracer seizes a process stopped on
+/// its own, then continues it).
+pub fn discarded_by_continue(sig: u64, code: i32) -> bool {
+    stops(sig) && code != crate::ptrace::POKE_CODE
+}
+
 /// How many times this process had been continued
 /// ([`crate::signote::continued`]) when the latest stop signal pending for
 /// it was sent: one sent before the process was last continued is not

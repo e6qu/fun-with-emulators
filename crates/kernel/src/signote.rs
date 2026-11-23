@@ -481,7 +481,7 @@ fn put_from(
     let q = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY).ok_or(fwe_abi::errno::ESRCH)?;
     // A stop signal is dated by the target's continuations in place of a
     // value (it carries none): one sent before the next is not taken.
-    let stop = crate::signal::stops(sig);
+    let stop = crate::signal::discarded_by_continue(sig, code);
     let value = if stop { mb.get(CONTINUED_AT).map_or(0, |w| w.load(SeqCst)) } else { value };
     let sig_of = |e: &[crate::procstore::Word]| e[0].load(SeqCst) & 0xffff_ffff;
     // A standard signal already queued for the process is not queued
@@ -573,10 +573,12 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
             answer_mem(pid, value);
         } else if sig == FD_REQUEST {
             answer_fd(pid, code_tid as u32 as i32, value);
-        } else if crate::signal::stops(sig) && value < continued(crate::host::pid_now()) {
+        } else if crate::signal::discarded_by_continue(sig, code_tid as u32 as i32)
+            && value < continued(crate::host::pid_now())
+        {
             // A stop signal sent before the process was last continued:
             // gone, as on Linux.
-        } else if crate::signal::stops(sig) {
+        } else if crate::signal::discarded_by_continue(sig, code_tid as u32 as i32) {
             // Pending as of its sending ([`put_from`]); the value only
             // dated it, a stop signal carries none.
             crate::signal::stop_sent_at(value);
