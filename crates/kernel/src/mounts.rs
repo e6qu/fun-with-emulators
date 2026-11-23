@@ -304,7 +304,10 @@ impl Mount {
         });
         #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
         st.map_or(own, |st| {
-            (crate::fsops::major(st.st_dev as u64), crate::fsops::minor(st.st_dev as u64))
+            (
+                crate::fsops::major(crate::host::dev_of(&st)),
+                crate::fsops::minor(crate::host::dev_of(&st)),
+            )
         })
     }
 }

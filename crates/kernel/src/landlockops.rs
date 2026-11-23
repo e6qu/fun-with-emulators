@@ -166,7 +166,7 @@ impl<P: Platform> Kernel<P> {
         // In fwe's store: up its directories to the mount's root, then on
         // from the directory the mount is on, as Linux's walk goes past a
         // mount point it hides.
-        let dev = d.host_stat(d.ino)?.st_dev as u64;
+        let dev = crate::host::dev_of(&d.host_stat(d.ino)?);
         let table = self.fs().mounts();
         let m = table.get(r.mount_id).ok_or(errno::EACCES)?;
         let top = crate::fs::StoreDir::at(d.fs.id, &m.root)?.ino;

@@ -2005,7 +2005,7 @@ impl Fs {
         if let Some(d) = &resolved.store {
             let st = d.host_stat(d.find(&resolved.name).ok()?.0).ok()?;
             #[allow(clippy::unnecessary_cast)] // the field types differ by host
-            return Some((st.st_dev as u64, st.st_ino as u64));
+            return Some((crate::host::dev_of(&st), st.st_ino as u64));
         }
         let name = resolved.name_c().ok()?;
         // SAFETY: zeroed bytes are a valid `stat`.
@@ -2014,7 +2014,7 @@ impl Fs {
         // out-parameter.
         let ok = unsafe { libc::fstatat(resolved.dir.as_raw_fd(), name.as_ptr(), &mut st, 0) } == 0;
         #[allow(clippy::unnecessary_cast)] // the field types differ by host
-        ok.then_some((st.st_dev as u64, st.st_ino as u64))
+        ok.then_some((crate::host::dev_of(&st), st.st_ino as u64))
     }
 
     /// Make this the view the socket calls resolve `AF_UNIX` paths in (see
@@ -2453,7 +2453,7 @@ pub(crate) fn empty_dir() -> Result<OwnedFd, i32> {
 pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
     static ID: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
     #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
-    let id = |s: &libc::stat| (s.st_dev as u64, s.st_ino as u64);
+    let id = |s: &libc::stat| (crate::host::dev_of(s), s.st_ino as u64);
     let empty = ID.get_or_init(|| {
         let d = empty_dir().ok()?;
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.

@@ -20,7 +20,11 @@ fn linux_mode(mode: u32) -> u32 {
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 fn nlink(s: &libc::stat) -> u32 {
     let n = s.st_nlink as u32;
-    if crate::tmpfile::hidden((s.st_dev as u64, s.st_ino as u64)) { n.saturating_sub(1) } else { n }
+    if crate::tmpfile::hidden((crate::host::dev_of(s), s.st_ino as u64)) {
+        n.saturating_sub(1)
+    } else {
+        n
+    }
 }
 
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
@@ -29,7 +33,7 @@ fn stat_to_linux(s: &libc::stat) -> Stat {
     let rdev = crate::devnodes::linux_numbers_of_host(s)
         .map_or(s.st_rdev as u64, |n| crate::devnodes::makedev(n.major, n.minor));
     Stat {
-        st_dev: s.st_dev as u64,
+        st_dev: crate::host::dev_of(s),
         st_ino: s.st_ino as u64,
         st_mode: linux_mode(s.st_mode as u32),
         st_nlink: nlink(s),
@@ -116,8 +120,8 @@ fn statx_from(s: &libc::stat) -> Statx {
         stx_mtime: ts(s.st_mtime as i64, s.st_mtime_nsec as i64),
         stx_rdev_major: crate::devnodes::major(rdev),
         stx_rdev_minor: crate::devnodes::minor(rdev),
-        stx_dev_major: major(s.st_dev as u64),
-        stx_dev_minor: minor(s.st_dev as u64),
+        stx_dev_major: major(crate::host::dev_of(s)),
+        stx_dev_minor: minor(crate::host::dev_of(s)),
         stx_mnt_id: 0,
         stx_dio_mem_align: 0,
         stx_dio_offset_align: 0,
@@ -317,7 +321,8 @@ pub(crate) fn store_stat_result(s: &libc::stat, nodump: bool) -> (Stat, Extra) {
 pub(crate) fn host_identity(fd: i32) -> Option<(u64, u64)> {
     let mut st = zeroed_stat();
     // SAFETY: plain host call with a valid out-parameter.
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+    (unsafe { libc::fstat(fd, &mut st) } == 0)
+        .then_some((crate::host::dev_of(&st), st.st_ino as u64))
 }
 
 /// `fstat` of `fd` in Linux's layout, with the guest's mode and owner.
@@ -344,7 +349,7 @@ fn stat_to_linux_fd(fd: i32, s: &libc::stat, stored: bool) -> Stat {
 /// The tmpfs mount the file open as `fd` (host status `s`) was opened in.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 fn tmpfs_of(fd: i32, s: &libc::stat) -> Option<u32> {
-    crate::fdmarks::tmpfs_mount(fd, s.st_dev as u64, s.st_ino as u64)
+    crate::fdmarks::tmpfs_mount(fd, crate::host::dev_of(s), s.st_ino as u64)
 }
 
 /// A file of the tmpfs mounted as mount `id`: on a device of its own, the
@@ -934,7 +939,7 @@ impl<P: Platform> Kernel<P> {
             return None;
         }
         #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
-        let file = (st.st_dev as u64, st.st_ino as u64);
+        let file = (crate::host::dev_of(&st), st.st_ino as u64);
         // Where it is in the mount namespace: the root's place, and the
         // way below it.
         let ns = crate::mounts::join(self.fs().proc_root(), d.name.to_bytes());
@@ -1091,7 +1096,7 @@ impl<P: Platform> Kernel<P> {
             let nonblock = flags & fcntl::O_NONBLOCK != 0;
             // `st_dev` is narrower on macOS.
             #[allow(clippy::unnecessary_cast)]
-            let dev = st.st_dev as u64;
+            let dev = crate::host::dev_of(st);
             // A running program's file is not to be written.
             if write && crate::textbusy::is_running(dev, st.st_ino) {
                 return err(errno::ETXTBSY);
@@ -1243,7 +1248,7 @@ impl<P: Platform> Kernel<P> {
                 && flags & fcntl::O_ACCMODE != fcntl::O_RDONLY
             {
                 #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
-                crate::textbusy::opened_for_writing(st.st_dev as u64, st.st_ino);
+                crate::textbusy::opened_for_writing(crate::host::dev_of(&st), st.st_ino);
                 crate::modes::opened_for_writing(fd, &st);
             }
             let node = if crate::devnodes::marked(&st) {
@@ -1293,7 +1298,7 @@ impl<P: Platform> Kernel<P> {
             let (id, flags, fstype) = (resolved.mount_id, resolved.mount_flags, resolved.fstype);
             if looked {
                 #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
-                let file = (st.st_dev as u64, st.st_ino as u64);
+                let file = (crate::host::dev_of(&st), st.st_ino as u64);
                 crate::fdmarks::opened_as(fd, file, ns, id, flags, fstype, layers);
             } else {
                 crate::fdmarks::opened(fd, ns, id, flags, fstype, layers);
@@ -2900,7 +2905,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EACCES);
         }
         #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
-        let dev = st.st_dev as u64;
+        let dev = crate::host::dev_of(&st);
         if crate::textbusy::is_running(dev, st.st_ino) {
             return err(errno::ETXTBSY);
         }
@@ -3077,7 +3082,8 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: an all-zero `stat` is a valid out-parameter.
             let mut st: libc::stat = unsafe { std::mem::zeroed() };
             // SAFETY: as above, on the pipe just made.
-            (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino))
+            (unsafe { libc::fstat(fd, &mut st) } == 0)
+                .then_some((crate::host::dev_of(&st), st.st_ino))
         };
         if let (Some(read), Some(write)) = (id(fds[0]), id(fds[1])) {
             crate::fdstate::pipe_made(read, write);

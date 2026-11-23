@@ -270,7 +270,7 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
     if unsafe { libc::fstat(fd, &mut st) } != 0 {
         return None;
     }
-    let id = (st.st_dev as u64, st.st_ino as u64);
+    let id = (crate::host::dev_of(&st), st.st_ino as u64);
     if depth > 0 {
         SEEN.with(|m| {
             let mut all = m.get();

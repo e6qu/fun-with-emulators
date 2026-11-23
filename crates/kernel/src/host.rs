@@ -514,6 +514,18 @@ fn markable(fd: i32) -> bool {
     ok && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFCHR | libc::S_IFBLK)
 }
 
+/// A host `stat`'s device number as Linux's: macOS's `dev_t` is a signed
+/// 32-bit word, and a number of Linux's encoding with a minor of `0x80000`
+/// or more (a tmpfs's of fwe's store) has its top bit set, which widened
+/// as a signed number would be no device's.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+pub fn dev_of(st: &libc::stat) -> u64 {
+    #[cfg(target_os = "macos")]
+    return st.st_dev as u32 as u64;
+    #[cfg(not(target_os = "macos"))]
+    return st.st_dev as u64;
+}
+
 /// `kill` of one host process `pid` for fwe's own ends (a pid it keeps:
 /// a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a
 /// message queue's notice, a wake): a pid that is not one (0, or negative,
@@ -2155,6 +2167,21 @@ pub fn at_path<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device number with its top bit set (a store tmpfs's `0:minor` of
+    /// `0x80000` or more) is read back as the number it was made from.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_device_number_with_its_top_bit_is_kept_whole() {
+        let dev = crate::devnodes::makedev(0, 0xf_9741);
+        assert!(dev & (1 << 31) != 0);
+        // SAFETY: an all-zero `stat` is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_dev = dev as libc::dev_t;
+        assert_eq!(dev_of(&st), dev);
+        assert_eq!(crate::fsops::major(dev_of(&st)), 0);
+        assert_eq!(crate::fsops::minor(dev_of(&st)), 0xf_9741);
+    }
 
     /// The BSD's interface flags as Linux's: the loopback `lo` with its
     /// carrier up and no multicast; another interface's multicast moved.

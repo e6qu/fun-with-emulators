@@ -251,7 +251,7 @@ impl<P: Platform> Kernel<P> {
                 if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
                     return Err(crate::host::errno_to_linux(crate::host::last_errno()));
                 }
-                Ok(st.st_dev as u64)
+                Ok(crate::host::dev_of(&st))
             };
             if !u.same_fs(w, dev)? || u.nested(w) {
                 return Err(errno::EINVAL);

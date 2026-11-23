@@ -120,7 +120,7 @@ pub fn handles_fs() -> bool {
 
 #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
 fn identity(st: &libc::stat) -> (u64, u64) {
-    (st.st_dev as u64, st.st_ino as u64)
+    (crate::host::dev_of(st), st.st_ino as u64)
 }
 
 fn fd_identity(fd: i32) -> Option<(libc::stat, (u64, u64))> {

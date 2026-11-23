@@ -373,7 +373,7 @@ const STORE_ORIGIN: &[u8] = b"\0overlay.origin";
 #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
 fn id_bytes(st: &libc::stat) -> [u8; 16] {
     let mut b = [0u8; 16];
-    b[..8].copy_from_slice(&(st.st_dev as u64).to_le_bytes());
+    b[..8].copy_from_slice(&crate::host::dev_of(st).to_le_bytes());
     b[8..].copy_from_slice(&(st.st_ino as u64).to_le_bytes());
     b
 }
@@ -1810,7 +1810,7 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
     if let Some(file) = crate::filestore::desc::of(fd) {
         return Some((file.fs, file.ino));
     }
-    stat_fd(fd).ok().map(|st| (st.st_dev as u64, st.st_ino as u64))
+    stat_fd(fd).ok().map(|st| (crate::host::dev_of(&st), st.st_ino as u64))
 }
 
 static CURSORS: crate::kept::Kept<Option<std::collections::HashMap<i32, Cursor>>> =

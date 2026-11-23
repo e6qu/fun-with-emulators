@@ -166,7 +166,7 @@ pub(crate) fn room(fd: i32) -> u64 {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
     unsafe { libc::fstat(fd, &mut st) };
-    let capacity = crate::fdstate::pipe_size((st.st_dev as u64, st.st_ino)).min(HOST_PIPE);
+    let capacity = crate::fdstate::pipe_size((crate::host::dev_of(&st), st.st_ino)).min(HOST_PIPE);
     capacity.saturating_sub(st.st_size.max(0) as u64)
 }
 

@@ -1604,7 +1604,7 @@ impl<P: Platform> Kernel<P> {
         if unsafe { libc::fstat(fd, &mut host) } != 0 {
             return last_error();
         }
-        match crate::leases::set(fd, host.st_dev as u64, host.st_ino, kind) {
+        match crate::leases::set(fd, crate::host::dev_of(&host), host.st_ino, kind) {
             Ok(()) => 0,
             Err(e) => err(e),
         }
@@ -1620,7 +1620,7 @@ impl<P: Platform> Kernel<P> {
         if unsafe { libc::fstat(fd, &mut st) } < 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
             return err(errno::EBADF);
         }
-        let id = (st.st_dev as u64, st.st_ino);
+        let id = (crate::host::dev_of(&st), st.st_ino);
         if cmd == fcntl::F_GETPIPE_SZ {
             return crate::fdstate::pipe_size(id) as i64;
         }

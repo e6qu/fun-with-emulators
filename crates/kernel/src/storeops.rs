@@ -259,7 +259,7 @@ impl<P: Platform> Kernel<P> {
         if kind == S_IFREG {
             // A running program's file is not to be written; a lease the
             // open conflicts with is broken first.
-            let dev = hst.st_dev as u64;
+            let dev = crate::host::dev_of(&hst);
             if changes && crate::textbusy::is_running(dev, ino) {
                 return err(errno::ETXTBSY);
             }

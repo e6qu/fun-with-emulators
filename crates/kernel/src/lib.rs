@@ -1680,7 +1680,7 @@ fn store_caps(file: filestore::desc::File) -> Option<caps::FileCaps> {
 /// Whether the file of host status `st` is open for writing.
 #[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
 pub(crate) fn host_file_busy(st: &libc::stat) -> bool {
-    textbusy::is_being_written(st.st_dev as u64, st.st_ino as u64)
+    textbusy::is_being_written(crate::host::dev_of(st), st.st_ino as u64)
 }
 
 /// `copy_file_range`'s checks, in Linux's order: the descriptors

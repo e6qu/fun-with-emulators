@@ -387,7 +387,7 @@ const CHILD_EVENTS: u32 = IN_ACCESS
 #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
 fn identity(st: &libc::stat) -> (u64, u64, bool, u64) {
     (
-        st.st_dev as u64,
+        crate::host::dev_of(st),
         st.st_ino as u64,
         st.st_mode & libc::S_IFMT == libc::S_IFDIR,
         st.st_nlink as u64,
