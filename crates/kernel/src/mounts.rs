@@ -1513,11 +1513,19 @@ pub mod store {
     impl Ns {
         /// The initial namespace of the rootfs at `root_host`: every fwe
         /// process started on that root is in it, as every process on a
-        /// machine starts in one. Made with [`Table::initial`] when new.
+        /// machine starts in one. Made with [`Table::initial`] when new,
+        /// with the rootfs's `/dev/shm` (`shm`, its store) and the cgroup
+        /// hierarchy mounted, as Linux always has them: one that cannot be
+        /// had is an error, told, not a table without it, which would be
+        /// kept for every later fwe on the root.
         pub fn initial(root_host: &[u8], shm: Option<u64>) -> Result<Ns, i32> {
             let name = format!("mnt-init-{:016x}", crate::shared::hash(root_host));
-            let cgroup = crate::cgroupfs::tree().ok().map(|f| f.id);
-            Record::named(&name, INIT_ID, || Table::initial(root_host, shm, cgroup)).map(Ns)
+            let cgroup = crate::cgroupfs::tree().inspect_err(|&e| {
+                let name = fwe_abi::errno_name(e).unwrap_or("?");
+                eprintln!("fwe: the cgroup hierarchy cannot be had: {name} ({e})");
+            })?;
+            Record::named(&name, INIT_ID, || Table::initial(root_host, shm, Some(cgroup.id)))
+                .map(Ns)
         }
 
         /// A new namespace holding a copy of this one's mounts

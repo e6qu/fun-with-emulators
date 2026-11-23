@@ -603,8 +603,11 @@ impl Fs {
             Ok(ns) => Arc::new(ns),
             // The parent is in it, so it exists; failing that, the rootfs's.
             Err(_) => Arc::new(
-                Ns::initial(&root_host, shm::store(&root_host).ok())
-                    .expect("the initial mount namespace"),
+                Ns::initial(
+                    &root_host,
+                    Some(shm::store(&root_host).expect("the rootfs's /dev/shm")),
+                )
+                .expect("the initial mount namespace"),
             ),
         };
         Fs {
@@ -687,8 +690,11 @@ impl Fs {
         // SAFETY: `root` is a fresh owned directory descriptor.
         let root = unsafe { OwnedFd::from_raw_fd(root?) };
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
-        let shm = shm::store(&root_host).ok();
-        let mnt = Arc::new(Ns::initial(&root_host, shm)?);
+        let shm = shm::store(&root_host).inspect_err(|&e| {
+            let name = fwe_abi::errno_name(e).unwrap_or("?");
+            eprintln!("fwe: the rootfs's /dev/shm cannot be had: {name} ({e})");
+        })?;
+        let mnt = Arc::new(Ns::initial(&root_host, Some(shm))?);
         Ok(Fs {
             root,
             cwd: b"/".to_vec(),
