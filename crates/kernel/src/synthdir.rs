@@ -4,19 +4,20 @@
 //! host, so an opened directory fd is tracked here and `getdents64`, `lseek`,
 //! `fstat` and `close` on it are served from an in-memory entry list rather
 //! than the host. A real `/dev/null` descriptor is opened to reserve a unique
-//! fd number (so the guest sees an ordinary descriptor and `close` works).
+//! fd number (so the guest sees an ordinary descriptor and `close` works),
+//! whose position macOS keeps (`lseek`): the next entry to list, shared
+//! by every duplicate and fork child of it, as a directory's is.
 
 use crate::host::last_error;
 use fwe_abi::{err, errno};
 use std::collections::HashMap;
 
+#[derive(Clone)]
 struct Dir {
     /// Its guest path, for paths relative to it.
     path: Vec<u8>,
     /// `(name, d_type)` entries, including `.` and `..`.
     entries: Vec<(Vec<u8>, u8)>,
-    /// Index of the next entry `getdents64` will emit.
-    offset: usize,
 }
 
 static REG: crate::kept::Kept<Option<HashMap<i32, Dir>>> = crate::kept::Kept::new(None);
@@ -50,7 +51,6 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 e.bytes(name);
                 e.u8(*t);
             }
-            e.u64(dir.offset as u64);
         })
     })
 }
@@ -61,7 +61,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
         let path = d.bytes();
         let n = d.count(9);
         let entries = (0..n).map(|_| (d.bytes(), d.u8())).collect();
-        Dir { path, entries, offset: d.u64() as usize }
+        Dir { path, entries }
     });
     with(|m| *m = reg);
 }
@@ -76,7 +76,7 @@ pub fn open(path: Vec<u8>, entries: Vec<(Vec<u8>, u8)>) -> i64 {
         return last_error();
     }
     ANY.store(true, std::sync::atomic::Ordering::SeqCst);
-    with(|m| m.insert(fd, Dir { path, entries, offset: 0 }));
+    with(|m| m.insert(fd, Dir { path, entries }));
     fd as i64
 }
 
@@ -89,20 +89,40 @@ pub fn add(fd: i32, name: Vec<u8>, dtype: u8) {
     });
 }
 
+/// `new` is a duplicate of `old` now.
+pub fn duplicated(old: i32, new: i32) {
+    if !ANY.load(std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    with(|m| match m.get(&old).cloned() {
+        Some(dir) => {
+            m.insert(new, dir);
+        }
+        None => {
+            m.remove(&new);
+        }
+    });
+}
+
 /// The guest path of synthetic directory `fd`.
 pub fn path_of(fd: i32) -> Option<Vec<u8>> {
-    if !ANY.load(std::sync::atomic::Ordering::SeqCst) {
+    if !is_synth(fd) {
         return None;
     }
     with(|m| m.get(&fd).map(|d| d.path.clone()))
 }
 
-/// Whether `fd` is a synthetic directory.
+/// Whether `fd` is a synthetic directory (a record whose descriptor is no
+/// longer its stand-in, closed behind fwe's back, is dropped).
 pub fn is_synth(fd: i32) -> bool {
-    if !ANY.load(std::sync::atomic::Ordering::SeqCst) {
+    if !ANY.load(std::sync::atomic::Ordering::SeqCst) || !with(|m| m.contains_key(&fd)) {
         return false;
     }
-    with(|m| m.contains_key(&fd))
+    if !crate::procfile::null_stand_in(fd) {
+        with(|m| m.remove(&fd));
+        return false;
+    }
+    true
 }
 
 /// Serve `getdents64` for a synthetic directory. `Some` if `fd` is one of ours.
@@ -111,10 +131,18 @@ pub fn is_synth(fd: i32) -> bool {
 /// `buf` must point to `count` writable bytes.
 pub unsafe fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
     const HEADER: usize = fwe_abi::DIRENT64_HEADER; // 19
+    if !is_synth(fd) {
+        return None;
+    }
     with(|m| {
-        let dir = m.get_mut(&fd)?;
+        let dir = m.get(&fd)?;
+        // SAFETY: plain host call on the guest's descriptor.
+        let at = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        if at < 0 {
+            return Some(last_error());
+        }
         let mut out = Vec::new();
-        let mut offset = dir.offset;
+        let mut offset = at as usize;
         while offset < dir.entries.len() {
             let (name, dtype) = &dir.entries[offset];
             // d_ino(8) d_off(8) d_reclen(2) d_type(1) name + NUL, padded to 8.
@@ -140,7 +168,8 @@ pub unsafe fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
         if let Err(e) = crate::uaccess::write_from(buf, &out) {
             return Some(err(e));
         }
-        dir.offset = offset;
+        // SAFETY: plain host call on the guest's descriptor.
+        unsafe { libc::lseek(fd, offset as libc::off_t, libc::SEEK_SET) };
         Some(out.len() as i64)
     })
 }
@@ -148,16 +177,15 @@ pub unsafe fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
 /// Serve `lseek` for a synthetic directory (only rewind to 0 is meaningful).
 /// `Some` if `fd` is one of ours.
 pub fn lseek(fd: i32, offset: i64, whence: i32) -> Option<i64> {
-    with(|m| {
-        let dir = m.get_mut(&fd)?;
-        match whence {
-            libc::SEEK_SET if offset == 0 => {
-                dir.offset = 0;
-                Some(0)
-            }
-            libc::SEEK_CUR if offset == 0 => Some(dir.offset as i64),
-            _ => Some(err(errno::EINVAL)),
+    if !is_synth(fd) {
+        return None;
+    }
+    Some(match (whence, offset) {
+        (libc::SEEK_SET | libc::SEEK_CUR, 0) => {
+            // SAFETY: plain host call on the guest's descriptor.
+            crate::host::ret(unsafe { libc::lseek(fd, 0, whence) } as i64)
         }
+        _ => err(errno::EINVAL),
     })
 }
 
@@ -174,7 +202,8 @@ pub fn try_close(fd: i32) -> Option<i64> {
     Some(0)
 }
 
-#[cfg(test)]
+// (macOS's `/dev/null` keeps a position, which Linux's does not.)
+#[cfg(all(test, target_os = "macos"))]
 mod tests {
     use super::*;
     use crate::procfs::{DT_DIR, DT_REG};

@@ -66,6 +66,7 @@ unsafe extern "C" {
     fn pipe(fds: *mut i32) -> i32;
     fn dup(fd: i32) -> i32;
     fn ftruncate(fd: i32, len: i64) -> i32;
+    fn getpagesize() -> i32;
     fn fallocate(fd: i32, mode: i32, off: i64, len: i64) -> i32;
     fn mmap(a: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64) -> *mut u8;
     fn sleep(s: u32) -> u32;
@@ -90,6 +91,7 @@ unsafe extern "C" {
     fn listen(fd: i32, n: i32) -> i32;
     fn umask(m: u32) -> u32;
     fn sendto(fd: i32, b: *const u8, n: usize, f: i32, a: *const u8, l: u32) -> isize;
+    fn sendmsg(fd: i32, m: *const MsgHdr, f: i32) -> isize;
     fn _exit(code: i32) -> !;
     fn __errno_location() -> *mut i32;
 }
@@ -123,7 +125,10 @@ fn name(e: i32) -> String {
         28 => "ENOSPC",
         30 => "EROFS",
         40 => "ELOOP",
+        26 => "ETXTBSY",
         61 => "ENODATA",
+        98 => "EADDRINUSE",
+        111 => "ECONNREFUSED",
         95 => "EOPNOTSUPP",
         116 => "ESTALE",
         e => return format!("errno {e}"),
@@ -267,6 +272,55 @@ fn nodump_scenario() {
     inode_flags("/tmp/owned", Some(FS_NODUMP_FL));
     let (uid, gid, _) = stat_of("/tmp/owned");
     println!("set: {:?} owner {uid}:{gid}", nodump("/tmp/owned"));
+    // A directory of a tmpfs (fwe's store), as LTP's statx08 flags one.
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkdir(c("/dev/shm/flagged").as_ptr(), 0o755) };
+    inode_flags("/dev/shm/flagged", Some(FS_NODUMP_FL));
+    println!("on a tmpfs: {:?}", nodump("/dev/shm/flagged"));
+}
+
+/// LTP's openat04: in a set-group-ID directory of another group, a user
+/// not in it makes an `O_TMPFILE` file asking for set-group-ID, and links
+/// it in through `/proc/self/fd`.
+fn tmpfile_sgid_scenario() {
+    for dir in ["/tmp/sgid", "/dev/shm/sgid"] {
+        // SAFETY: NUL-terminated paths.
+        unsafe {
+            mkdir(c(dir).as_ptr(), 0o777);
+            chown(c(dir).as_ptr(), 0, 8);
+            chmod(c(dir).as_ptr(), 0o2777);
+        }
+        // SAFETY: plain calls; the child only makes calls and exits.
+        if unsafe { fork() } == 0 {
+            unsafe {
+                setgid(65534);
+                setresuid(65534, 65534, 65534);
+            }
+            // SAFETY: a NUL-terminated path.
+            let d = unsafe { open(c(dir).as_ptr(), 0o40000) };
+            // O_TMPFILE | O_RDWR, asking for set-group-ID.
+            let fd = unsafe { openat(d, c(".").as_ptr(), 0o20040000 | 2, 0o2777) };
+            let mut st = [0u64; 16];
+            // SAFETY: a buffer as big as a `struct stat`.
+            unsafe { fstat(fd, st.as_mut_ptr().cast()) };
+            let word = |i: usize| (st[i / 2] >> (32 * (i % 2))) as u32;
+            let path = format!("/proc/self/fd/{fd}");
+            // SAFETY: NUL-terminated paths; linkat is call 37.
+            let r = unsafe { syscall(37, -100i64, c(&path).as_ptr(), d as i64, c("open.tmp").as_ptr(), 0x400i64) };
+            println!(
+                "{dir}: made {} mode {:o} {}:{}, linked {}",
+                res(fd as i64),
+                word(4) & 0o7777,
+                word(6),
+                word(7),
+                res(r)
+            );
+            std::process::exit(0);
+        }
+        let mut status = 0;
+        // SAFETY: a valid out-parameter.
+        unsafe { waitpid(-1, &mut status, 0) };
+    }
 }
 
 /// A device node made outside `/dev` opens as the device, also to read by
@@ -703,6 +757,58 @@ fn unix_addr(p: &str) -> [u8; 110] {
     addr[0] = 1;
     addr[2..2 + p.len()].copy_from_slice(p.as_bytes());
     addr
+}
+
+/// musl's `struct msghdr` on a 64-bit target (each 32-bit length padded).
+#[repr(C)]
+struct MsgHdr {
+    name: *const u8,
+    namelen: usize,
+    iov: *const [usize; 2],
+    iovlen: usize,
+    control: *const u8,
+    controllen: usize,
+    flags: i32,
+}
+
+/// A memfd sent to a process of the host's (the test, at socket `path`),
+/// as a program hands an X server the memory it draws in: the host maps
+/// what the guest wrote, and says what it read there.
+fn host_peer_scenario(path: &str) {
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    const SYS_MEMFD_CREATE: i64 = 279;
+    // SAFETY: plain calls on this program's own descriptors and buffers.
+    unsafe {
+        let s = socket(AF_UNIX, SOCK_STREAM, 0);
+        let addr = unix_addr(path);
+        assert_eq!(connect(s, addr.as_ptr(), 110), 0, "connect: {}", errno());
+        let m = syscall(SYS_MEMFD_CREATE, c("drawn").as_ptr(), 0) as i32;
+        let text = b"drawn by the guest";
+        write(m, text.as_ptr(), text.len());
+        // One byte, with the memfd: a control message of one descriptor
+        // (`SOL_SOCKET`, `SCM_RIGHTS`).
+        let byte = [b'x'];
+        let iov = [byte.as_ptr() as usize, 1];
+        let mut ctl = [0u8; 24];
+        ctl[0..8].copy_from_slice(&20u64.to_ne_bytes());
+        ctl[8..12].copy_from_slice(&1i32.to_ne_bytes());
+        ctl[12..16].copy_from_slice(&1i32.to_ne_bytes());
+        ctl[16..20].copy_from_slice(&m.to_ne_bytes());
+        let msg = MsgHdr {
+            name: std::ptr::null(),
+            namelen: 0,
+            iov: &iov,
+            iovlen: 1,
+            control: ctl.as_ptr(),
+            controllen: ctl.len(),
+            flags: 0,
+        };
+        println!("sent: {}", res(sendmsg(s, &msg, 0) as i64));
+        let mut buf = [0u8; 64];
+        let n = read(s, buf.as_mut_ptr(), buf.len());
+        println!("the host read: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+    }
 }
 
 /// Connecting or sending to a Unix socket's node needs write permission
@@ -1208,11 +1314,16 @@ fn main() {
         "devnode" => devnode_scenario(),
         "access" => access_scenario(),
         "nodump" => nodump_scenario(),
+        "tmpfile-sgid" => tmpfile_sgid_scenario(),
         "linkrules" => link_rules_scenario(),
         "stickyxattr" => sticky_xattr_scenario(),
         "noatimeflag" => noatime_flag_scenario(),
         "tmpfsopts" => tmpfs_options_scenario(),
         "procopts" => proc_options_scenario(),
+        "store" => store_scenario(),
+        "host-peer" => host_peer_scenario(&std::env::args().nth(2).unwrap()),
+        // A program run from a tmpfs ([`store_scenario`]): its exit code.
+        "exit" => std::process::exit(7),
         s => panic!("unknown scenario {s}"),
     }
 }
@@ -1507,6 +1618,275 @@ fn tmpfs_options_scenario() {
         mount_new("tmpfs", "/tmp/n", 0, "size=lots"),
         mount_new("tmpfs", "/tmp/n", 0, "uid=-1")
     );
+}
+
+unsafe extern "C" {
+    fn execv(p: *const c_char, argv: *const *const c_char) -> i32;
+    fn getpeername(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+    fn readlink(p: *const c_char, b: *mut u8, n: usize) -> isize;
+    fn accept(fd: i32, a: *mut u8, l: *mut u32) -> i32;
+}
+
+/// arm64's `struct stat` of `p` (not following a link), as words.
+fn stat_words(p: &str) -> [u64; 16] {
+    let mut st = [0u64; 16];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct stat`.
+    unsafe { lstat(c(p).as_ptr(), st.as_mut_ptr().cast()) };
+    st
+}
+
+/// What `/proc/self/fd/<fd>` reads.
+fn fd_link(fd: i32) -> String {
+    let mut b = [0u8; 256];
+    // SAFETY: a NUL-terminated path; a buffer of its length.
+    let n = unsafe { readlink(c(&format!("/proc/self/fd/{fd}")).as_ptr(), b.as_mut_ptr(), 256) };
+    String::from_utf8_lossy(&b[..n.max(0) as usize]).into_owned()
+}
+
+/// A tmpfs (a filesystem of fwe's store, in memory) does what a Linux
+/// tmpfs does by path: a socket bound there is connected to and named; a
+/// FIFO made there passes data between processes and its descriptor shows
+/// the file; a program copied there runs (not while open to write); a
+/// file's handle opens it until it is gone; `/proc/self/fd` follows a
+/// file renamed and removed; a directory lists in the order its names
+/// were made; mode, size, times, attributes and the filesystem's type by
+/// path.
+fn store_scenario() {
+    const AF_UNIX: i32 = 1;
+    const SOCK_STREAM: i32 = 1;
+    // SAFETY: a plain call; NUL-terminated paths.
+    unsafe {
+        unshare(CLONE_NEWNS_FLAG);
+        mkdir(c("/tmp/s").as_ptr(), 0o755);
+    }
+    println!("mount: {}", mount_new("tmpfs", "/tmp/s", 0, "size=64m"));
+
+    // A socket.
+    let (addr, len) = (unix_addr("/tmp/s/sock"), 110);
+    // SAFETY: plain socket calls on an address of its length.
+    let (bound, again, connected, peer) = unsafe {
+        let srv = socket(AF_UNIX, SOCK_STREAM, 0);
+        let bound = bind_socket(srv, addr.as_ptr(), len);
+        listen(srv, 1);
+        let other = socket(AF_UNIX, SOCK_STREAM, 0);
+        let again = bind_socket(other, addr.as_ptr(), len);
+        let cl = socket(AF_UNIX, SOCK_STREAM, 0);
+        let connected = connect(cl, addr.as_ptr(), len);
+        let mut pa = [0u8; 110];
+        let mut pl = 110u32;
+        getpeername(cl, pa.as_mut_ptr(), &mut pl);
+        let a = accept(srv, std::ptr::null_mut(), std::ptr::null_mut());
+        write(cl, b"x".as_ptr(), 1);
+        let mut x = [0u8; 1];
+        read(a, x.as_mut_ptr(), 1);
+        let end = pa[2..].iter().position(|&b| b == 0).map_or(pl as usize, |e| e + 2);
+        (bound, again, connected, String::from_utf8_lossy(&pa[2..end]).into_owned())
+    };
+    let kind = stat_words("/tmp/s/sock")[2] as u32 & 0o170000;
+    println!(
+        "socket: bind {} again {} connect {} peer {peer} a socket {}",
+        res(bound.into()),
+        res(again.into()),
+        res(connected.into()),
+        kind == 0o140000
+    );
+    make("/tmp/s/plain", 0o644);
+    let (pa, pl) = (unix_addr("/tmp/s/plain"), 110);
+    // SAFETY: as above.
+    let refused = res(unsafe { connect(socket(AF_UNIX, SOCK_STREAM, 0), pa.as_ptr(), pl) }.into());
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(c("/tmp/s/sock").as_ptr()) };
+    // SAFETY: as above.
+    let gone = unsafe { connect(socket(AF_UNIX, SOCK_STREAM, 0), addr.as_ptr(), len) };
+    println!("not a socket: {refused} unlinked: {}", res(gone.into()));
+
+    // A FIFO.
+    // SAFETY: a NUL-terminated path.
+    unsafe { mkfifo(c("/tmp/s/fifo").as_ptr(), 0o600) };
+    // SAFETY: fork; the child writes and leaves.
+    let pid = unsafe { fork() };
+    if pid == 0 {
+        // SAFETY: a NUL-terminated path; two bytes.
+        unsafe {
+            let w = open(c("/tmp/s/fifo").as_ptr(), O_WRONLY);
+            write(w, b"hi".as_ptr(), 2);
+            _exit(0);
+        }
+    }
+    // SAFETY: a NUL-terminated path.
+    let r = unsafe { open(c("/tmp/s/fifo").as_ptr(), O_RDONLY) };
+    let got = read_all(r.into());
+    let mut st = [0u64; 16];
+    // SAFETY: a buffer as big as a `struct stat`.
+    unsafe { fstat(r, st.as_mut_ptr().cast()) };
+    let same = st[1] == stat_words("/tmp/s/fifo")[1] && st[2] as u32 & 0o170000 == 0o10000;
+    // SAFETY: the child above.
+    unsafe { waitpid(pid, std::ptr::null_mut(), 0) };
+    println!("fifo: read {got} the file's status {same}");
+
+    // A program.
+    let prog = std::fs::read("/fsrules").unwrap();
+    std::fs::write("/tmp/s/prog", &prog).unwrap();
+    // SAFETY: a NUL-terminated path.
+    unsafe { chmod(c("/tmp/s/prog").as_ptr(), 0o755) };
+    let run = || {
+        // SAFETY: fork; the child runs the program.
+        let pid = unsafe { fork() };
+        if pid == 0 {
+            let (p, a) = (c("/tmp/s/prog"), c("exit"));
+            let argv = [p.as_ptr(), a.as_ptr(), std::ptr::null()];
+            // SAFETY: a NUL-terminated path and argument vector.
+            unsafe {
+                execv(p.as_ptr(), argv.as_ptr());
+                _exit(100 + errno());
+            }
+        }
+        let mut status = 0;
+        // SAFETY: the child above.
+        unsafe { waitpid(pid, &mut status, 0) };
+        (status >> 8) & 0xff
+    };
+    let ran = run();
+    // SAFETY: a NUL-terminated path.
+    let writer = unsafe { open(c("/tmp/s/prog").as_ptr(), O_WRONLY) };
+    let busy = run();
+    // SAFETY: the descriptor just opened.
+    unsafe { close(writer) };
+    println!("exec: exit {ran}, while open to write {}", name(busy - 100));
+
+    // A handle.
+    std::fs::write("/tmp/s/h", b"held").unwrap();
+    let h = handle_of("/tmp/s/h");
+    let first = read_all(open_handle("/tmp/s", &h, O_RDONLY));
+    // SAFETY: NUL-terminated paths.
+    unsafe { rename(c("/tmp/s/h").as_ptr(), c("/tmp/s/h2").as_ptr()) };
+    let moved = read_all(open_handle("/tmp/s", &h, O_RDONLY));
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(c("/tmp/s/h2").as_ptr()) };
+    println!(
+        "handle: {first}, renamed {moved}, removed {}",
+        res(open_handle("/tmp/s", &h, O_RDONLY))
+    );
+
+    // `/proc/self/fd`.
+    make("/tmp/s/a", 0o644);
+    // SAFETY: a NUL-terminated path.
+    let fd = unsafe { open(c("/tmp/s/a").as_ptr(), O_RDONLY) };
+    let opened = fd_link(fd);
+    // SAFETY: NUL-terminated paths.
+    unsafe { rename(c("/tmp/s/a").as_ptr(), c("/tmp/s/b").as_ptr()) };
+    let renamed = fd_link(fd);
+    // SAFETY: a NUL-terminated path.
+    unsafe { unlink(c("/tmp/s/b").as_ptr()) };
+    println!("fd link: {opened}, {renamed}, {}", fd_link(fd));
+
+    // A listing.
+    // SAFETY: NUL-terminated paths.
+    unsafe { mkdir(c("/tmp/s/d").as_ptr(), 0o755) };
+    for n in ["z", "a", "m"] {
+        make(&format!("/tmp/s/d/{n}"), 0o644);
+    }
+    println!("listing: {}", names_in("/tmp/s/d").join(" "));
+
+    // Attributes by path.
+    std::fs::write("/tmp/s/f", b"0123456789abcdef").unwrap();
+    let times = [1000i64, 0, 2000, 0];
+    // SAFETY: NUL-terminated paths and values of their lengths.
+    let (m, t, u, x) = unsafe {
+        (
+            chmod(c("/tmp/s/f").as_ptr(), 0o640),
+            truncate(c("/tmp/s/f").as_ptr(), 10),
+            utimensat(AT_FDCWD, c("/tmp/s/f").as_ptr(), &times, 0),
+            setxattr(c("/tmp/s/f").as_ptr(), c("user.k").as_ptr(), b"v".as_ptr(), 1, 0),
+        )
+    };
+    let st = stat_words("/tmp/s/f");
+    let mut v = [0u8; 8];
+    // SAFETY: NUL-terminated names; a buffer of its length.
+    let n = unsafe { getxattr(c("/tmp/s/f").as_ptr(), c("user.k").as_ptr(), v.as_mut_ptr(), 8) };
+    let mut fs = [0u64; 15];
+    // SAFETY: a NUL-terminated path and a buffer as big as a `struct statfs`.
+    unsafe { statfs(c("/tmp/s/f").as_ptr(), fs.as_mut_ptr().cast()) };
+    println!(
+        "by path: {} {} {} {}; mode {:o} size {} atime {} mtime {} attribute {} tmpfs {}",
+        res(m.into()),
+        res(t.into()),
+        res(u.into()),
+        res(x.into()),
+        st[2] as u32 & 0o7777,
+        st[6],
+        st[9],
+        st[11],
+        String::from_utf8_lossy(&v[..n.max(0) as usize]),
+        fs[0] == 0x0102_1994
+    );
+
+    // A mount on a directory of the store named by a descriptor's link,
+    // as a container runtime mounts inside a root it holds open.
+    // SAFETY: NUL-terminated paths.
+    let dir = unsafe {
+        mkdir(c("/tmp/s/pts").as_ptr(), 0o755);
+        open(c("/tmp/s/pts").as_ptr(), O_PATH | O_DIRECTORY)
+    };
+    let on = mount_new("tmpfs", &format!("/proc/self/fd/{dir}"), 0, "");
+    let other = stat_words("/tmp/s/pts")[0] != stat_words("/tmp/s")[0];
+    println!("mount by descriptor: {on}, another filesystem {other}");
+
+    // The pages of a file in memory are the page cache's, dirty: three
+    // written, of the five its size spans.
+    const SYS_CACHESTAT: i64 = 451;
+    // SAFETY: a NUL-terminated path; buffers of the sizes given.
+    let (cache, dirty, half) = unsafe {
+        let fd = open(c("/tmp/s/cached").as_ptr(), 0o102, 0o644);
+        let size = getpagesize() as usize;
+        let page = vec![7u8; size];
+        for _ in 0..3 {
+            write(fd, page.as_ptr(), page.len());
+        }
+        ftruncate(fd, 5 * size as i64);
+        let mut cs = [0u64; 5];
+        let all = [0u64, 0];
+        syscall(SYS_CACHESTAT, fd as i64, all.as_ptr(), cs.as_mut_ptr(), 0);
+        let (cache, dirty) = (cs[0], cs[1]);
+        let range = [size as u64, size as u64];
+        syscall(SYS_CACHESTAT, fd as i64, range.as_ptr(), cs.as_mut_ptr(), 0);
+        close(fd);
+        (cache, dirty, cs[0])
+    };
+    println!("cachestat: cached {cache} dirty {dirty}, of one page {half}");
+    // A read at the end of a file touches its access time too, as tmpfs's
+    // does (`relatime`: the access time is not past the change).
+    let old = [1000i64, 0, 1000, 0];
+    // SAFETY: a NUL-terminated path; buffers of the sizes given.
+    let (n, atime) = unsafe {
+        let fd = open(c("/tmp/s/at-end").as_ptr(), 0o102, 0o644);
+        write(fd, b"x".as_ptr(), 1);
+        utimensat(AT_FDCWD, c("/tmp/s/at-end").as_ptr(), &old, 0);
+        let mut b = [0u8; 8];
+        let n = read(fd, b.as_mut_ptr(), b.len());
+        close(fd);
+        (n, times_of("/tmp/s/at-end").0)
+    };
+    println!("read at the end: {n} bytes, access time touched {}", atime > 1000);
+    // A name longer than 255 bytes is refused, by the lookup.
+    let long = format!("/tmp/s/{}", "n".repeat(256));
+    // SAFETY: NUL-terminated paths.
+    let (r, e) = unsafe { (rename(c("/tmp/s/at-end").as_ptr(), c(&long).as_ptr()), errno()) };
+    println!("rename to a 256-byte name: {r} errno {e}");
+    // Both times omitted: nothing done, on an immutable file and on a
+    // path that names nothing alike.
+    const FS_IMMUTABLE_FL: u32 = 0x10;
+    let omit = [0i64, (1 << 30) - 2, 0, (1 << 30) - 2];
+    let set = try_set_flags("/tmp/s/cached", FS_IMMUTABLE_FL);
+    // SAFETY: NUL-terminated paths; the times array.
+    let (immutable, missing) = unsafe {
+        (
+            utimensat(AT_FDCWD, c("/tmp/s/cached").as_ptr(), &omit, 0),
+            utimensat(AT_FDCWD, c("/tmp/s/none/x").as_ptr(), &omit, 0),
+        )
+    };
+    let unset = try_set_flags("/tmp/s/cached", 0);
+    println!("times omitted: immutable ({set}) {immutable}, missing {missing} ({unset})");
 }
 
 /// The names in directory `p`.

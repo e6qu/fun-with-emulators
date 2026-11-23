@@ -1436,20 +1436,48 @@ impl<P: Platform> Kernel<P> {
         if flags & mman::MAP_FIXED != 0 && self.sealed(addr, len) {
             return err(errno::EPERM);
         }
-        // A loop device maps the file it shows.
-        let source = if flags & mman::MAP_ANONYMOUS == 0 {
-            crate::loopdev::map_source(fd as i32, self.page_size)
+        // A file of fwe's store maps its data (host shared memory objects,
+        // each at the file's own offsets), which may never be made writable
+        // once its contents are sealed; a loop device maps the file it
+        // shows.
+        let stored = if flags & mman::MAP_ANONYMOUS == 0 {
+            crate::filestore::io::map_source(fd as i32, prot, flags, offset, self.page_up(len))
         } else {
             None
+        };
+        let object = stored.is_some();
+        let (source, sealed) = match stored {
+            Some(Ok((pieces, sealed))) => {
+                let pieces = pieces
+                    .into_iter()
+                    .map(|(fd, start, end)| FilePart {
+                        fd,
+                        from: start,
+                        len: end - start,
+                        at: start,
+                    })
+                    .collect();
+                (Some(Ok(pieces)), sealed)
+            }
+            Some(Err(e)) => (Some(Err(e)), false),
+            None if flags & mman::MAP_ANONYMOUS == 0 => {
+                let shown = crate::loopdev::map_source(fd as i32, self.page_size).map(|r| {
+                    let (fd, start) = r?;
+                    let at = offset.checked_add(start).ok_or(errno::EOVERFLOW)?;
+                    Ok(vec![FilePart { fd, from: offset, len: self.page_up(len), at }])
+                });
+                (shown, false)
+            }
+            None => (None, false),
         };
         // A shared mapping of a file open only for reading may not be made
         // writable later.
         // SAFETY: F_GETFL only queries the descriptor.
         let nowrite = flags & mman::MAP_ANONYMOUS == 0
             && flags & mman::MAP_TYPE != mman::MAP_PRIVATE
-            && (unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE
-                == libc::O_RDONLY
-                || crate::fdmarks::read_only(fd as i32));
+            && (sealed
+                || unsafe { libc::fcntl(fd as i32, libc::F_GETFL) } & libc::O_ACCMODE
+                    == libc::O_RDONLY);
         // `/dev/zero` maps new memory, shared between the processes that
         // share the mapping (the host has no mapping of the device).
         let flags = if flags & mman::MAP_ANONYMOUS == 0 && is_dev_zero(fd as i32) {
@@ -1458,47 +1486,79 @@ impl<P: Platform> Kernel<P> {
             flags
         };
         // The file's metadata, and the file itself held where it has no
-        // name (`maps::HeldFile`); with no room for it, the mapping fails
-        // as for want of memory.
+        // name (`maps::HeldFile`): each piece's object for a file of the
+        // store, whose data has no name to map it by again; with no room
+        // for it, the mapping fails as for want of memory.
         let st = (flags & mman::MAP_ANONYMOUS == 0)
             .then(|| crate::fsops::linux_fstat(fd as i32).ok())
             .flatten();
-        let held = match &st {
-            Some(st) if st.st_nlink == 0 => match crate::fdtable::dup_reserved(fd as i32) {
-                // SAFETY: a descriptor just made, owned here.
-                Ok(d) => Some(crate::maps::HeldFile(std::sync::Arc::new(unsafe {
-                    <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(d)
-                }))),
-                Err(errno::EMFILE) => return err(errno::ENOMEM),
+        let hold = |held_fd: i32| -> Result<Option<crate::maps::HeldFile>, i32> {
+            match &st {
+                Some(st) if st.st_nlink == 0 || object => {
+                    match crate::fdtable::dup_reserved(held_fd) {
+                        // SAFETY: a descriptor just made, owned here.
+                        Ok(d) => Ok(Some(crate::maps::HeldFile(std::sync::Arc::new(unsafe {
+                            <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(d)
+                        })))),
+                        Err(errno::EMFILE) => Err(errno::ENOMEM),
+                        Err(e) => Err(e),
+                    }
+                }
+                _ => Ok(None),
+            }
+        };
+        // Memory of no file has nothing to hold or record by piece.
+        let held: Vec<Option<crate::maps::HeldFile>> = match &source {
+            _ if st.is_none() => Vec::new(),
+            Some(Ok(pieces)) => {
+                let mut held = Vec::with_capacity(pieces.len());
+                for p in pieces {
+                    let source_fd =
+                        if object { std::os::fd::AsRawFd::as_raw_fd(&p.fd) } else { fd as i32 };
+                    match hold(source_fd) {
+                        Ok(h) => held.push(h),
+                        Err(e) => return err(e),
+                    }
+                }
+                held
+            }
+            _ => match hold(fd as i32) {
+                Ok(h) => vec![h],
                 Err(e) => return err(e),
             },
-            _ => None,
         };
         let r = match &source {
-            Some(Ok((file, start))) => match offset.checked_add(*start) {
-                Some(at) => {
-                    let file = std::os::fd::AsRawFd::as_raw_fd(file) as u64;
-                    self.mmap_call(addr, len, prot, flags, file, at)
-                }
-                None => err(errno::EOVERFLOW),
-            },
+            Some(Ok(pieces)) => self.map_pieces(addr, len, prot, flags, offset, pieces, object),
             Some(Err(e)) => err(*e),
-            None => self.mmap_call(addr, len, prot, flags, fd, offset),
+            None => self.mmap_call(addr, len, prot, flags, fd, offset, false),
         };
-        drop(source);
+        let pieces: Vec<(u64, u64)> = match source {
+            _ if st.is_none() => Vec::new(),
+            Some(Ok(pieces)) => pieces.into_iter().map(|p| (p.from, p.len)).collect(),
+            _ => vec![(offset, self.page_up(len))],
+        };
         if r < 0 {
             return r;
         }
-        let object = st.map(|st| {
-            let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
-            crate::maps::Object { held, ..crate::maps::Object::file(path, &st, offset) }
-        });
         let shared = flags & mman::MAP_TYPE != mman::MAP_PRIVATE;
         let len = self.page_up(len);
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
-        let locked = match object {
+        let locked = match st {
             None => crate::maps::mapped_plain(r as u64, len, prot, shared),
-            object => crate::maps::record().mapped(r as u64, len, prot, shared, object),
+            Some(st) => {
+                let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
+                let mut record = crate::maps::record();
+                let mut locked = false;
+                for ((from, plen), held) in pieces.into_iter().zip(held) {
+                    let object = crate::maps::Object {
+                        held,
+                        ..crate::maps::Object::file(path.clone(), &st, from)
+                    };
+                    let at = r as u64 + (from - offset);
+                    locked = record.mapped(at, plen, prot, shared, Some(object));
+                }
+                locked
+            }
         };
         if noexec {
             crate::maps::record().no_exec(r as u64, len);
@@ -1534,6 +1594,92 @@ impl<P: Platform> Kernel<P> {
         if r >= 0 {
             crate::maps::publish();
         }
+        r
+    }
+
+    /// Map `len` bytes of a file from `offset` at `addr` (as `mmap` would,
+    /// with Linux's `prot` and `flags`) from `pieces`, each a host
+    /// descriptor holding a part of the range: one mapped as it is, several
+    /// over a range reserved for them where the mapping goes.
+    #[allow(clippy::too_many_arguments)]
+    fn map_pieces(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        offset: u64,
+        pieces: &[FilePart],
+        object: bool,
+    ) -> i64 {
+        use std::os::fd::AsRawFd;
+        if let [p] = pieces {
+            return self.mmap_call(addr, len, prot, flags, p.fd.as_raw_fd() as u64, p.at, object);
+        }
+        let place = mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE;
+        let reserve = mman::MAP_PRIVATE | mman::MAP_ANONYMOUS | (flags & place);
+        let r = self.mmap_call(addr, len, mman::PROT_NONE, reserve, u64::MAX, 0, false);
+        if r < 0 {
+            return r;
+        }
+        for p in pieces {
+            let at = r as u64 + (p.from - offset);
+            let each = (flags & !place) | mman::MAP_FIXED;
+            let m = self.mmap_call(at, p.len, prot, each, p.fd.as_raw_fd() as u64, p.at, object);
+            if m < 0 {
+                self.munmap_call(r as u64, len);
+                return m;
+            }
+        }
+        r
+    }
+
+    /// Map `len` bytes of host shared memory `fd`, `object`, shared, at
+    /// `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
+    /// with `prot`, `nowrite` if it may not be made writable: a System V
+    /// segment's attachment, which needs none of what a guest's mapping of
+    /// a file of its own looks at.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn map_shared_memory(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        nowrite: bool,
+        fd: i32,
+        object: crate::maps::Object,
+    ) -> i64 {
+        if too_many_maps(0) {
+            return err(errno::ENOMEM);
+        }
+        if flags & mman::MAP_FIXED != 0 && (!self.may_map_at(addr) || self.sealed(addr, len)) {
+            return err(errno::EPERM);
+        }
+        if crate::maps::locks_future() && !self.creds.has(crate::caps::CAP_IPC_LOCK) {
+            let soft = crate::syscalls::own_limit_of(fwe_abi::resource::RLIMIT_MEMLOCK);
+            if crate::maps::record().locked_bytes().saturating_add(self.page_up(len)) > soft {
+                return err(errno::EAGAIN);
+            }
+        }
+        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0, false);
+        if r < 0 {
+            return r;
+        }
+        let len = self.page_up(len);
+        let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
+        let locked = crate::maps::record().mapped(r as u64, len, prot, true, Some(object));
+        if nowrite {
+            crate::maps::record().no_write(r as u64, len);
+        }
+        if self.platform.translates_jit() {
+            self.platform.jit_mapped(crate::uaccess::g2h(r as u64), len);
+        }
+        if locked {
+            populate(r as u64, len, self.page_size);
+            wire(r as u64, len, true);
+        }
+        crate::maps::publish();
         r
     }
 
@@ -1637,15 +1783,31 @@ impl<P: Platform> Kernel<P> {
         if !matches!(area.object.name, crate::maps::Name::Exe | crate::maps::Name::Path(_)) {
             return err(errno::EINVAL);
         }
-        let fd = match mapped_file(&area, crate::uaccess::g2h(start)) {
-            Ok(fd) => fd,
-            Err(e) => return err(e),
-        };
         let locked = if area.locked { mman::MAP_LOCKED } else { 0 };
         let flags = mman::MAP_SHARED | mman::MAP_FIXED | mman::MAP_POPULATE | locked;
-        let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-        let r = self.sys_mmap(start, size, area.prot, flags, raw as u64, offset);
-        if r < 0 { r } else { 0 }
+        // A file of fwe's store: each part from the object of its extent.
+        let parts = match store_data(&area) {
+            Some(id) => {
+                let read_only = area.prot & mman::PROT_WRITE == 0;
+                match crate::filestore::data::pieces(id, offset, size, read_only) {
+                    Ok(p) => p,
+                    Err(e) => return err(e),
+                }
+            }
+            None => match mapped_file(&area, crate::uaccess::g2h(start)) {
+                Ok(fd) => vec![(fd, offset, offset + size)],
+                Err(e) => return err(e),
+            },
+        };
+        for (fd, from, to) in &parts {
+            let raw = std::os::fd::AsRawFd::as_raw_fd(fd);
+            let at = start + (from - offset);
+            let r = self.sys_mmap(at, to - from, area.prot, flags, raw as u64, *from);
+            if r < 0 {
+                return r;
+            }
+        }
+        0
     }
 
     pub(crate) fn sys_munmap(&mut self, addr: u64, len: u64) -> i64 {
@@ -2064,6 +2226,10 @@ impl<P: Platform> Kernel<P> {
         self.brk.current as i64
     }
 
+    /// The host's `mmap` for a guest's, `object` if `fd` is a host shared
+    /// memory object (a file of fwe's store's data), which the host maps
+    /// only shared.
+    #[allow(clippy::too_many_arguments)]
     fn mmap_call(
         &mut self,
         addr: u64,
@@ -2072,6 +2238,7 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         fd: u64,
         offset: u64,
+        object: bool,
     ) -> i64 {
         let call = MemCall::Mmap { addr, len, prot, flags, fd: fd as i32, offset };
         if let Some(r) = self.platform.memory(call, &mut self.brk) {
@@ -2184,7 +2351,14 @@ impl<P: Platform> Kernel<P> {
             host_prot(prot)
         };
 
-        let host_fd = if anonymous { -1 } else { fd as i32 };
+        // A private mapping of an object (to run: one not to run is a view,
+        // above) is memory of its own, a copy of the object's pages.
+        let copied = object && hflags & libc::MAP_PRIVATE != 0;
+        if copied {
+            hflags |= libc::MAP_ANON;
+        }
+        let (host_fd, host_offset) =
+            if anonymous || copied { (-1, 0) } else { (fd as i32, offset) };
         if flags & mman::MAP_FIXED != 0 {
             // A fixed mapping replaces what is there: the VM lets go of it
             // before the host frees it, and translations of code there go
@@ -2204,7 +2378,7 @@ impl<P: Platform> Kernel<P> {
                     initial_prot,
                     hflags,
                     host_fd,
-                    offset as libc::off_t,
+                    host_offset as libc::off_t,
                 )
             };
             if p == libc::MAP_FAILED {
@@ -2223,6 +2397,11 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: unmapping the mapping just created.
                 self.unmap_host(p, len);
                 return err(errno::EEXIST);
+            }
+            if copied && let Err(e) = copy_object(fd as i32, offset, p, len, initial_prot) {
+                // SAFETY: unmapping the mapping just created.
+                self.unmap_host(p, len);
+                return err(e);
             }
             let guest = if p == haddr && fixed { addr } else { p };
             // What was owed to the pages replaced goes with them.
@@ -2478,26 +2657,32 @@ impl<P: Platform> Kernel<P> {
         } else {
             final_prot(prot)
         };
-        // SAFETY: guest-requested protection change of guest memory.
-        let r = ret(unsafe { libc::mprotect(a, len as usize, host) });
+        // A file view's pages (none once made executable) never writable on
+        // the host: its object may be open only for reading, which the host
+        // refuses to map writable (`EACCES`).
+        let mut views = if prot & mman::PROT_EXEC == 0 { views } else { Vec::new() };
+        views.sort_unstable();
+        let mut r = 0;
+        let mut at = a as u64;
+        let end = a as u64 + self.page_up(len);
+        for (s, e) in views.iter().copied().chain([(end, end)]) {
+            for (from, to, p) in [(at, s, host), (s, e, host & !libc::PROT_WRITE)] {
+                if r == 0 && to > from {
+                    // SAFETY: guest-requested protection change of guest
+                    // memory, a piece of the range asked for.
+                    r = ret(unsafe {
+                        libc::mprotect(from as *mut libc::c_void, (to - from) as usize, p)
+                    });
+                }
+            }
+            at = e;
+        }
         if r == 0 && translated && prot & mman::PROT_EXEC != 0 {
             self.platform.jit_code(a as u64, self.page_up(len));
         }
         if r == 0 {
             // Code with writes owed: made writable, they are made first.
             crate::lazycode::protected(a as u64, self.page_up(len), final_prot(prot));
-        }
-        if r == 0 && prot & mman::PROT_EXEC == 0 {
-            for &(s, e) in &views {
-                // SAFETY: as above, for the file view's pages in the range.
-                unsafe {
-                    libc::mprotect(
-                        s as *mut libc::c_void,
-                        (e - s) as usize,
-                        final_prot(prot) & !libc::PROT_WRITE,
-                    )
-                };
-            }
         }
         if r == 0 {
             self.platform.protect_guest(addr, self.page_up(len), prot);
@@ -3125,21 +3310,93 @@ impl<P: Platform> Kernel<P> {
             };
             return p as u64 == at;
         }
-        let Ok(fd) = mapped_file(area, end_of - 1) else { return false };
-        // SAFETY: a fixed mapping over a range the caller found free, of a
-        // descriptor closed when it drops, the mapping keeping the file.
-        let p = unsafe {
-            libc::mmap(
-                at as *mut libc::c_void,
-                len as usize,
-                prot,
-                share | libc::MAP_FIXED,
-                std::os::fd::AsRawFd::as_raw_fd(&fd),
-                area.object.offset as libc::off_t,
-            )
+        // A file of fwe's store: each part from the object of its extent.
+        let parts = match store_data(area) {
+            Some(id) => {
+                let read_only = !(area.shared && area.prot & mman::PROT_WRITE != 0);
+                match crate::filestore::data::pieces(id, area.object.offset, len, read_only) {
+                    Ok(p) => p,
+                    Err(_) => return false,
+                }
+            }
+            None => match mapped_file(area, end_of - 1) {
+                Ok(fd) => vec![(fd, area.object.offset, area.object.offset + len)],
+                Err(_) => return false,
+            },
         };
-        p as u64 == at
+        parts.iter().all(|(fd, from, to)| {
+            let here = at + (from - area.object.offset);
+            // SAFETY: a fixed mapping over a range the caller found free,
+            // of a descriptor closed when it drops, the mapping keeping
+            // the file.
+            let p = unsafe {
+                libc::mmap(
+                    here as *mut libc::c_void,
+                    (to - from) as usize,
+                    prot,
+                    share | libc::MAP_FIXED,
+                    std::os::fd::AsRawFd::as_raw_fd(fd),
+                    *from as libc::off_t,
+                )
+            };
+            p as u64 == here
+        })
     }
+}
+
+/// Fill new private memory `[at, at + len)`, of host protections `prot`,
+/// with the pages of host shared memory object `fd` from `offset` (the host
+/// reads such an object only through a mapping). `offset` need not be a
+/// multiple of the host's page (the VM's guest pages are smaller): the
+/// object is mapped from the host page holding it.
+pub fn copy_object(fd: i32, offset: u64, at: u64, len: u64, prot: i32) -> Result<(), i32> {
+    // SAFETY: sysconf only reads a value.
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+    let delta = offset % page;
+    let span = (delta + len) as usize;
+    // SAFETY: a new shared read-only mapping of the object, unmapped below.
+    let src = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            span,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            (offset - delta) as libc::off_t,
+        )
+    };
+    if src == libc::MAP_FAILED {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    // SAFETY: `[at, at + len)` is the caller's new memory, made writable
+    // for the copy and given its protections after; `src` maps `span`
+    // bytes, `len` of them from `delta`.
+    unsafe {
+        let writable = prot & libc::PROT_WRITE != 0;
+        if !writable {
+            libc::mprotect(at as *mut libc::c_void, len as usize, prot | libc::PROT_WRITE);
+        }
+        std::ptr::copy_nonoverlapping(
+            (src as *const u8).add(delta as usize),
+            at as *mut u8,
+            len as usize,
+        );
+        if !writable {
+            libc::mprotect(at as *mut libc::c_void, len as usize, prot);
+        }
+        libc::munmap(src, span);
+    }
+    Ok(())
+}
+
+/// A part of a file mapping's range and what maps it: a host descriptor,
+/// the part `[from, from + len)` of the file, and where in the descriptor
+/// it starts.
+struct FilePart {
+    fd: std::os::fd::OwnedFd,
+    from: u64,
+    len: u64,
+    at: u64,
 }
 
 /// Whether `fd` is `/dev/zero`.
@@ -3159,10 +3416,23 @@ fn too_many_maps(extra: usize) -> bool {
     n >= 1024 && crate::sysctl::number(b"vm/max_map_count").is_some_and(|max| n as i64 > max.max(0))
 }
 
+/// The data id of the file of fwe's store that `area` maps, if it maps
+/// one (its held descriptor is an object of the file's data).
+fn store_data(area: &crate::maps::Area) -> Option<u64> {
+    let held = area.object.held.as_ref()?;
+    match crate::memobj::identify(std::os::fd::AsRawFd::as_raw_fd(&*held.0))? {
+        (crate::filestore::data::KIND, object, _) => {
+            Some(crate::filestore::data::of_object(object).0)
+        }
+        _ => None,
+    }
+}
+
 /// A descriptor of the file `area` maps, whose host mapping is at host
 /// address `addr`, to map more of it by: the one the mapping holds for a
-/// file with no name, or the file opened again by its name, for reading
-/// and for writing too if a shared mapping of it is writable.
+/// file with no name, a System V segment's memory found by its id, or the
+/// file opened again by its name, for reading and for writing too if a
+/// shared mapping of it is writable.
 fn mapped_file(area: &crate::maps::Area, addr: u64) -> Result<std::os::fd::OwnedFd, i32> {
     use std::os::fd::{AsRawFd, FromRawFd};
     if let Some(held) = &area.object.held {
@@ -3170,13 +3440,15 @@ fn mapped_file(area: &crate::maps::Area, addr: u64) -> Result<std::os::fd::Owned
         // SAFETY: a descriptor just made, owned by the result.
         return Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(d) });
     }
+    let writable = area.shared && area.prot & mman::PROT_WRITE != 0;
+    if area.object.dev == crate::sysvipc::SEGMENT_DEV
+        && let Some(r) = crate::sysvipc::current()
+    {
+        return crate::sysvipc::segment_of(&r, area.object.ino as i32, !writable);
+    }
     let path = region_file(addr).ok_or(errno::EINVAL)?;
     let c = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-    let mode = if area.shared && area.prot & mman::PROT_WRITE != 0 {
-        libc::O_RDWR
-    } else {
-        libc::O_RDONLY
-    };
+    let mode = if writable { libc::O_RDWR } else { libc::O_RDONLY };
     // SAFETY: a NUL-terminated path.
     let fd = unsafe { libc::open(c.as_ptr(), mode | libc::O_CLOEXEC) };
     if fd < 0 {

@@ -266,8 +266,9 @@ fn made_dir(cell: &'static std::sync::OnceLock<Vec<u8>>, name: &str) -> Option<V
     Some(cell.get_or_init(|| d).clone())
 }
 
-/// The directory of the files kept beside the process records (signal
-/// reply sockets, memory requests, Landlock domains).
+/// The directory beside the process records where the sockets a process
+/// is sent descriptors on are bound ([`crate::signote`]), and whose name
+/// the initial pid namespace's records are named under.
 pub fn records_dir() -> Option<Vec<u8>> {
     static DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
     made_dir(&DIR, "procs")
@@ -565,11 +566,10 @@ pub fn remove(held: &crate::procstore::Held, pid: i32) {
     crate::signote::remove(pid);
 }
 
-/// Remove the files kept beside the records for processes that are gone
-/// (their mailbox, lock, mappings, thread ids and how they ended), older
-/// than `young`: a process whose record was taken away ([`remove`])
-/// without them, as when its pid had been given to another process by
-/// then, or whose parent was not fwe's to reap it.
+/// Remove what is kept beside the records for processes that are gone,
+/// older than `young`: the reply sockets a process left bound
+/// (`<pid>.fd<n>`, [`crate::signote`]), as when it was killed waiting for
+/// a descriptor.
 pub fn collect_leftovers(young: std::time::Duration) {
     let Some(d) = records_dir() else { return };
     let Ok(entries) = std::fs::read_dir(OsStr::from_bytes(&d)) else { return };
@@ -577,11 +577,12 @@ pub fn collect_leftovers(young: std::time::Duration) {
         let name = e.file_name();
         let Some(name) = name.to_str() else { continue };
         let pid = match name.split_once('.') {
-            Some((p, "sig" | "lock" | "maps")) => p,
-            _ => match name.strip_prefix("tids-").or_else(|| name.strip_prefix("threads-")) {
-                Some(p) => p.strip_suffix(".new").unwrap_or(p),
-                None => continue,
-            },
+            Some((p, token))
+                if token.strip_prefix("fd").is_some_and(|n| n.parse::<u64>().is_ok()) =>
+            {
+                p
+            }
+            _ => continue,
         };
         let Ok(pid) = pid.parse::<i32>() else { continue };
         if pid <= 0 || start_time(pid).is_some() || read(pid).is_some() {
@@ -1488,8 +1489,38 @@ pub fn own_subreaper() -> bool {
 }
 
 /// Whether host process `pid` is stopped, and by which signal (the
-/// host's): `None` if it runs or is gone.
+/// host's): in a stop of fwe's ([`crate::signote::job_stop_of`]) or the
+/// host's. `None` if it runs or is gone.
 pub fn stopped_by(pid: i32) -> Option<i32> {
+    if let Some(sig) = crate::signote::job_stop_of(pid) {
+        return crate::host::signal_to_host(sig).or(Some(libc::SIGSTOP));
+    }
+    host_stopped_by(pid)
+}
+
+/// Whether host process `pid` is stopped on the host (a stop only the
+/// host's `SIGCONT` ends).
+pub fn host_stopped(pid: i32) -> bool {
+    host_stopped_by(pid).is_some()
+}
+
+/// Whether this process stops in fwe: its parent is one of fwe's, which
+/// learns of its stops through fwe (a foster child's, `CLONE_PARENT`,
+/// follows it as a reaper does), or it has none on the host (an orphan,
+/// `launchd`'s, which a reaper of fwe's may have adopted). Not where a
+/// living process that is not fwe's (a shell) must see it stop.
+pub fn stops_in_fwe() -> bool {
+    let parent = crate::host::parent_pid();
+    parent == 1 || crate::host::is_fwe(parent)
+}
+
+/// Whether this process is a foster child ([`ProcRecord::foster`]).
+pub fn own_foster() -> bool {
+    with_own(|r| r.foster) == Some(true)
+}
+
+/// [`stopped_by`] of the host's stop alone.
+fn host_stopped_by(pid: i32) -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: zeroed bytes are a valid `proc_bsdinfo`, which the call fills.
@@ -1808,6 +1839,8 @@ pub fn exiting(status: i32) {
     crate::textbusy::exiting();
     // Its `O_TMPFILE` files' hidden names, as their descriptors close.
     crate::tmpfile::exiting();
+    // Its files of fwe's store, and their locks.
+    crate::filestore::desc::exiting();
     crate::ptrace::exiting(status);
     crate::thread::process_ending();
     // Its System V IPC attachments and undo adjustments, as it ends.

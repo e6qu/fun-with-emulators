@@ -66,6 +66,11 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
     if crate::loopdev::device_of(fd).is_some() {
         return Ok((Kind::Block, reads, writes, fl));
     }
+    // A synthetic `/proc` file, read from fwe's memory, or a file of fwe's
+    // store ([`read_from`]).
+    if crate::procfile::is(fd) || crate::filestore::desc::of(fd).is_some() {
+        return Ok((Kind::File, reads, writes, fl));
+    }
     let special = crate::loopdev::is_control(fd)
         || crate::specialfd::anon_name(fd).is_some()
         || crate::signalfd::is_signalfd(fd)
@@ -75,7 +80,7 @@ fn kind(fd: i32) -> Result<(Kind, bool, bool, i32), i32> {
         || matches!(
             crate::fdmarks::any_marks().then(|| crate::fdmarks::marked(fd)).flatten(),
             Some(
-                crate::fdmarks::Mark::Mq
+                crate::fdmarks::Mark::Mq(_)
                     | crate::fdmarks::Mark::FsContext(_)
                     | crate::fdmarks::Mark::Ns(_)
                     | crate::fdmarks::Mark::Inotify(_)
@@ -161,7 +166,7 @@ pub(crate) fn room(fd: i32) -> u64 {
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
     unsafe { libc::fstat(fd, &mut st) };
-    let capacity = crate::fdstate::pipe_size((st.st_dev as u64, st.st_ino)).min(HOST_PIPE);
+    let capacity = crate::fdstate::pipe_size((crate::host::dev_of(&st), st.st_ino)).min(HOST_PIPE);
     capacity.saturating_sub(st.st_size.max(0) as u64)
 }
 
@@ -214,6 +219,12 @@ fn read_from(fd: i32, k: Kind, buf: &mut [u8], pos: Option<u64>) -> Result<usize
         let r = crate::loopdev::read_into(fd, buf, pos).unwrap_or(err(errno::EBADF));
         return if r < 0 { Err(-r as i32) } else { Ok(r as usize) };
     }
+    if let Some(r) = crate::procfile::read_into(fd, buf, pos) {
+        return r;
+    }
+    if let Some(r) = crate::filestore::io::read_into(fd, buf, pos) {
+        return if r < 0 { Err(-r as i32) } else { Ok(r as usize) };
+    }
     let iov = libc::iovec { iov_base: buf.as_mut_ptr().cast(), iov_len: buf.len() };
     if crate::seqpacket::is(fd) {
         let r = crate::seqpacket::read(fd, &[iov]);
@@ -237,6 +248,9 @@ fn write_to(fd: i32, k: Kind, buf: &[u8], pos: Option<u64>) -> Result<usize, i32
     use fwe_abi::nr;
     if k == Kind::Block {
         let r = crate::loopdev::write_at_pos(fd, buf, pos).unwrap_or(err(errno::EBADF));
+        return if r < 0 { Err(-r as i32) } else { Ok(r as usize) };
+    }
+    if let Some(r) = crate::filestore::io::write_at_pos(fd, buf, pos) {
         return if r < 0 { Err(-r as i32) } else { Ok(r as usize) };
     }
     // A socket whose peer filters what arrives: what it lets in is
@@ -343,10 +357,6 @@ fn splice_inner(
                 return Err(errno::EINVAL);
             }
             let socket_nonblock = flags & SPLICE_F_NONBLOCK != 0 && ko == Kind::Socket;
-            // A file of a tmpfs with a size: as much as fits, asked before
-            // the pipe is taken from.
-            let len =
-                if ko == Kind::File { crate::tmpfs::room(fd_out, pos_out, len)? } else { len };
             let w =
                 from_pipe(fd_in, nonblock_of(fl_in), fd_out, ko, socket_nonblock, pos_out, len)?;
             if let Some(p) = pos_out {

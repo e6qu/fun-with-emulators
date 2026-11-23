@@ -1,8 +1,8 @@
 //! Landlock: a process restricting itself (`landlock_create_ruleset`,
 //! `landlock_add_rule`, `landlock_restrict_self`).
 //!
-//! A ruleset is the process's, kept against its descriptor (a file of
-//! fwe's, by its host identity). `landlock_restrict_self` adds it to the
+//! A ruleset is the process's, kept against its descriptor (one standing
+//! for it, [`crate::anonfd`], marked with its number). `landlock_restrict_self` adds it to the
 //! process's domain as a layer; the domain goes with the process across
 //! `fork` and `execve` and can only grow. Every layer is checked:
 //!
@@ -19,14 +19,15 @@
 //! - **Scopes:** a signal, or a connection or datagram to an abstract
 //!   socket, to a process outside a scoping layer's domain is `EPERM`, and
 //!   so is tracing one ([`may_trace`]). Each layer has an id, and a
-//!   process restricted publishes its chain of ids (a file beside the
-//!   process records) for others to compare with theirs.
+//!   process restricted publishes its chain of ids (in its entry in the
+//!   process store, [`crate::procstore::Kind::Landlock`]) for others to
+//!   compare with theirs.
 //!
 //! Nothing is looked at while the process has no domain: one flag.
 
 use fwe_abi::errno;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// The ABI fwe implements: Linux 6.12's.
 pub const ABI: i64 = 6;
@@ -79,7 +80,29 @@ pub struct Ruleset {
 }
 
 /// The process's rulesets, by their descriptors' host identity.
-pub(crate) static RULESETS: Mutex<Vec<((u64, u64), Ruleset)>> = Mutex::new(Vec::new());
+pub(crate) static RULESETS: Mutex<Vec<(u32, Ruleset)>> = Mutex::new(Vec::new());
+
+/// The number the next ruleset takes ([`crate::fdmarks::Mark::Landlock`]).
+static NEXT_RULESET: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+/// The number of the ruleset `fd` is a descriptor of, if it is one.
+fn ruleset_key(fd: i32) -> Option<u32> {
+    match crate::fdmarks::any_marks().then(|| crate::fdmarks::marked(fd)).flatten() {
+        Some(crate::fdmarks::Mark::Landlock(k)) => Some(k),
+        _ => None,
+    }
+}
+
+/// Whether `fd` is a ruleset's descriptor.
+pub fn is_ruleset(fd: i32) -> bool {
+    ruleset_key(fd).is_some()
+}
+
+/// A read, write or copy of a ruleset's descriptor: refused (`EINVAL`),
+/// as Linux's ruleset has neither. `None` for another descriptor.
+pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
+    crate::anonfd::refuse_io(nr, a, is_ruleset)
+}
 
 /// The process's domain: each layer's id and ruleset.
 pub(crate) static DOMAIN: Mutex<Vec<(u64, Ruleset)>> = Mutex::new(Vec::new());
@@ -97,10 +120,15 @@ pub fn handles_fs() -> bool {
 
 #[allow(clippy::unnecessary_cast)] // `libc::stat` field types differ by host
 fn identity(st: &libc::stat) -> (u64, u64) {
-    (st.st_dev as u64, st.st_ino as u64)
+    (crate::host::dev_of(st), st.st_ino as u64)
 }
 
 fn fd_identity(fd: i32) -> Option<(libc::stat, (u64, u64))> {
+    // A file of fwe's store: its own device and inode.
+    if let Some(st) = crate::filestore::io::stat(fd) {
+        let st = st.ok()?;
+        return Some((st, identity(&st)));
+    }
     // SAFETY: an all-zero `stat` is a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: as above.
@@ -108,11 +136,14 @@ fn fd_identity(fd: i32) -> Option<(libc::stat, (u64, u64))> {
 }
 
 fn ruleset_of(fd: i32) -> Result<Ruleset, i32> {
-    let (_, id) = fd_identity(fd).ok_or(errno::EBADF)?;
+    // SAFETY: F_GETFD only queries the descriptor.
+    if unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(errno::EBADF);
+    }
+    let k = ruleset_key(fd).ok_or(errno::EBADFD)?;
     let r = RULESETS.lock().unwrap_or_else(|e| e.into_inner());
-    r.iter().find(|(i, _)| *i == id).map(|(_, rs)| rs.clone()).ok_or(errno::EBADFD)
+    r.iter().find(|(i, _)| *i == k).map(|(_, rs)| rs.clone()).ok_or(errno::EBADFD)
 }
-
 /// `landlock_create_ruleset(attr, size, flags)`.
 pub fn create_ruleset(attr: u64, size: u64, flags: u64) -> Result<i64, i32> {
     if flags != 0 {
@@ -140,35 +171,12 @@ pub fn create_ruleset(attr: u64, size: u64, flags: u64) -> Result<i64, i32> {
     if rs.fs == 0 && rs.net == 0 && rs.scoped == 0 {
         return Err(errno::ENOMSG);
     }
-    let fd = anon_file()?;
-    let (_, id) = fd_identity(fd).ok_or(errno::EBADF)?;
-    RULESETS.lock().unwrap_or_else(|e| e.into_inner()).push((id, rs));
+    // (Linux makes a ruleset's descriptor close-on-exec.)
+    let fd = crate::anonfd::new(true)?;
+    let k = NEXT_RULESET.fetch_add(1, Ordering::Relaxed);
+    RULESETS.lock().unwrap_or_else(|e| e.into_inner()).push((k, rs));
+    crate::fdmarks::mark(fd, crate::fdmarks::Mark::Landlock(k));
     Ok(i64::from(fd))
-}
-
-/// A fresh file of fwe's, unnamed, standing for a ruleset.
-fn anon_file() -> Result<i32, i32> {
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mut path = crate::procreg::records_dir().ok_or(errno::ENOMEM)?;
-    let pid = crate::host::pid();
-    path.extend_from_slice(
-        format!("/landlock-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
-    );
-    let p = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory, unlinked
-    // once open.
-    unsafe {
-        let fd = libc::open(
-            p.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
-            0o600,
-        );
-        if fd < 0 {
-            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-        }
-        libc::unlink(p.as_ptr());
-        Ok(fd)
-    }
 }
 
 /// `landlock_add_rule(ruleset_fd, rule_type, rule_attr, flags)`.
@@ -211,9 +219,9 @@ pub fn add_rule(fd: i32, ty: u64, attr: u64, flags: u64) -> Result<i64, i32> {
         }
         _ => return Err(errno::EINVAL),
     };
-    let (_, id) = fd_identity(fd).ok_or(errno::EBADF)?;
+    let k = ruleset_key(fd).ok_or(errno::EBADFD)?;
     let mut r = RULESETS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, rs)) = r.iter_mut().find(|(i, _)| *i == id) {
+    if let Some((_, rs)) = r.iter_mut().find(|(i, _)| *i == k) {
         match rule {
             Rule::Path(obj, access, dir) => match rs.paths.iter_mut().find(|p| p.0 == obj) {
                 Some(p) => p.1 |= access,
@@ -261,14 +269,6 @@ fn chain() -> Vec<u64> {
     DOMAIN.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|l| l.0).collect()
 }
 
-fn chain_file(pid: i32) -> Option<std::path::PathBuf> {
-    let dir = crate::procreg::records_dir()?;
-    Some(
-        std::path::Path::new(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&dir))
-            .join(format!("landlock-domain-{pid}")),
-    )
-}
-
 /// Publish this process's chain for others ([`within`]); called as it is
 /// restricted and as a restricted process starts (a fork child, a program
 /// run).
@@ -281,24 +281,22 @@ pub fn publish() {
         return;
     }
     let me = crate::host::pid();
-    let Some(p) = chain_file(me) else { return };
+    // After when the process started: a reader tells its chain from an
+    // earlier process's of the same pid.
     let mut b = Vec::new();
-    if let Some(start) = crate::procreg::start_time(me) {
-        b.extend_from_slice(&start.to_ne_bytes());
-    }
+    b.extend_from_slice(&crate::procreg::start_time(me).unwrap_or(0).to_ne_bytes());
     for id in chain() {
         b.extend_from_slice(&id.to_ne_bytes());
     }
-    let tmp = p.with_extension("new");
-    if std::fs::write(&tmp, b).is_ok() {
-        let _ = std::fs::rename(&tmp, &p);
-    }
+    crate::procstore::put_own(crate::procstore::Kind::Landlock, Some(&b));
 }
 
-/// Host process `pid`'s chain (none if it is not restricted, or the file
-/// is a former process's).
+/// Host process `pid`'s chain (none if it is not restricted, or the one
+/// kept is a former process's).
 fn chain_of(pid: i32) -> Vec<u64> {
-    let Some(b) = chain_file(pid).and_then(|p| std::fs::read(p).ok()) else { return Vec::new() };
+    let Some(b) = crate::procstore::get_of(crate::procstore::Kind::Landlock, pid) else {
+        return Vec::new();
+    };
     let words: Vec<u64> = b.as_chunks::<8>().0.iter().map(|c| u64::from_ne_bytes(*c)).collect();
     match (words.split_first(), crate::procreg::start_time(pid)) {
         (Some((&start, rest)), Some(now)) if start == now => rest.to_vec(),
@@ -368,9 +366,13 @@ pub fn may_connect_abstract(owner: i32) -> Result<(), i32> {
     if !active() || within(owner, SCOPE_ABSTRACT_UNIX_SOCKET) { Ok(()) } else { Err(errno::EPERM) }
 }
 
+/// The identities (device, inode) of a file and of every directory above
+/// it, nearest first, as a rule names them ([`check`]).
+pub type Ids = Vec<(u64, u64)>;
+
 /// The host identities of what is at host path `path` and of every
 /// directory above it.
-fn ancestry(path: &[u8]) -> Vec<(u64, u64)> {
+pub fn ancestry(path: &[u8]) -> Ids {
     let mut out = Vec::new();
     let mut p = path.to_vec();
     loop {
@@ -392,14 +394,13 @@ fn ancestry(path: &[u8]) -> Vec<(u64, u64)> {
     out
 }
 
-/// Check access `need` to what is at host path `path` (`file`: the file
+/// Check access `need` to what `ids` are of ([`Ids`]; `file`: the file
 /// itself, whose own rule counts as well as its directories'; else a
 /// directory, for what is made or removed in it).
-pub fn check_path(path: &[u8], need: u64, file: bool) -> Result<(), i32> {
+pub fn check(ids: &[(u64, u64)], need: u64, file: bool) -> Result<(), i32> {
     if !active() || need == 0 {
         return Ok(());
     }
-    let ids = ancestry(path);
     let d = DOMAIN.lock().unwrap_or_else(|e| e.into_inner());
     for (_, layer) in d.iter() {
         let want = need & layer.fs;
@@ -422,13 +423,12 @@ pub fn check_path(path: &[u8], need: u64, file: bool) -> Result<(), i32> {
     Ok(())
 }
 
-/// The rights a layer gives what is at host path `path`, per layer: for a
-/// move between directories, which needs `REFER` in both.
-pub fn check_refer(from_dir: &[u8], to_dir: &[u8]) -> Result<(), i32> {
-    if !active() || from_dir == to_dir {
+/// The rights a layer gives the directories `a` and `b` are of ([`Ids`]),
+/// per layer: for a move between directories, which needs `REFER` in both.
+pub fn check_refer(a: &[(u64, u64)], b: &[(u64, u64)]) -> Result<(), i32> {
+    if !active() || a.first() == b.first() {
         return Ok(());
     }
-    let (a, b) = (ancestry(from_dir), ancestry(to_dir));
     let d = DOMAIN.lock().unwrap_or_else(|e| e.into_inner());
     for (_, layer) in d.iter() {
         if layer.fs == 0 {
@@ -442,7 +442,7 @@ pub fn check_refer(from_dir: &[u8], to_dir: &[u8]) -> Result<(), i32> {
         let grants = |ids: &[(u64, u64)]| {
             layer.paths.iter().filter(|p| p.2 && ids.contains(&p.0)).fold(0, |g, p| g | p.1)
         };
-        if grants(&a) & REFER == 0 || grants(&b) & REFER == 0 {
+        if grants(a) & REFER == 0 || grants(b) & REFER == 0 {
             return Err(errno::EXDEV);
         }
     }
@@ -543,10 +543,10 @@ pub fn may_ioctl(fd: i32, req: u64) -> Result<(), i32> {
 
 /// What some layer handles without granting it to the file at host path
 /// `path`, opened for writing if `write` (truncation is a writer's).
-pub fn withheld(path: &[u8], write: bool) -> Withheld {
+pub fn withheld(ids: &[(u64, u64)], write: bool) -> Withheld {
     Withheld {
-        truncate: write && check_path(path, TRUNCATE, true).is_err(),
-        ioctl: check_path(path, IOCTL_DEV, true).is_err(),
+        truncate: write && check(ids, TRUNCATE, true).is_err(),
+        ioctl: check(ids, IOCTL_DEV, true).is_err(),
     }
 }
 

@@ -25,6 +25,10 @@
 //!   whose main thread has gone into the program ([`entered`]).
 //! - **Tasks**, one word for each host pid: its real user, as its record
 //!   says, and its threads, as it counts them ([`user_tasks`]).
+//! - **Named records** ([`named`]): the state of Linux's kernel every
+//!   process shares ([`crate::shared::Record`]: namespaces, mount tables,
+//!   System V IPC...), each in a slot found by its name, its bytes in
+//!   blocks.
 //!
 //! A reader takes no lock: it reads the sequence number, the bytes and the
 //! number again, and reads again if a change came between. A writer holds
@@ -35,6 +39,8 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
+
+pub mod named;
 
 /// Host pids with an entry: those below this (macOS's end at 99999).
 const PIDS: usize = 1 << 17;
@@ -51,8 +57,11 @@ pub enum Kind {
     /// Its mount namespace, root, working directory and resource limits,
     /// for `/proc/<pid>/{cwd,root,mountinfo,limits}` ([`crate::fs::Fs::share`]).
     View = 4,
+    /// Its Landlock domain's layers, for whether it may signal or trace
+    /// another ([`crate::landlock`]).
+    Landlock = 5,
 }
-const KINDS: usize = 5;
+const KINDS: usize = 6;
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).
@@ -169,9 +178,84 @@ pub const PAGE_WORDS: usize = 512;
 const PAGES_LOCK_AT: usize = CELLS_AT + CELLS * 32;
 const PAGE_TAGS_AT: usize = PAGES_LOCK_AT + 64;
 const PAGES_AT: usize = (PAGE_TAGS_AT + PAGES * 16).div_ceil(PAGE_WORDS * 8) * PAGE_WORDS * 8;
-const TAKEN_AT: usize = PAGES_AT + PAGES * PAGE_WORDS * 8;
+/// Named records ([`named`]): the lock under which one is made or
+/// removed, the count their identities are taken from, then their slots.
+const NAMED_LOCK_AT: usize = PAGES_AT + PAGES * PAGE_WORDS * 8;
+const NAMED_NEXT_AT: usize = NAMED_LOCK_AT + 64;
+const NAMED_AT: usize = NAMED_NEXT_AT + 64;
+/// Tables other parts of fwe lay out ([`area`]), each on pages of its own,
+/// and each's lock.
+const AREA_LOCKS_AT: usize = NAMED_AT + named::SLOTS * size_of::<named::Named>();
+const AREAS_AT: usize = (AREA_LOCKS_AT + AREAS * 64).div_ceil(BLOCK) * BLOCK;
+const TAKEN_AT: usize = area_at(AREAS);
 const BLOCKS_AT: usize = (TAKEN_AT + BLOCKS / 8).div_ceil(BLOCK) * BLOCK;
 const SIZE: usize = BLOCKS_AT + BLOCKS * BLOCK;
+
+/// Tables of shared words that other parts of fwe lay out themselves, each
+/// a part of the store of its own size ([`area`]).
+#[derive(Clone, Copy)]
+pub enum Area {
+    /// Waiters on futexes in memory processes share ([`crate::sharedfutex`]).
+    Futexes = 0,
+    /// Programs run and files open for writing ([`crate::textbusy`]).
+    TextBusy = 1,
+    /// Locks of whole writes to pipes ([`crate::pipelock`]).
+    PipeLocks = 2,
+    /// Pipes watched by `EPOLLEXCLUSIVE` ([`crate::exclusive`]).
+    Exclusive = 3,
+    /// Locks of `SOCK_SEQPACKET` sockets' sends and receives
+    /// ([`crate::seqpacket`]).
+    SeqPacketLocks = 4,
+    /// The cgroup hierarchy's lock alone ([`crate::cgroupfs::lock_tree`]).
+    CgroupTree = 5,
+}
+const AREAS: usize = 6;
+
+/// Each area's size in bytes.
+const AREA_BYTES: [usize; AREAS] = [
+    FUTEX_BYTES,
+    crate::textbusy::BYTES,
+    crate::pipelock::BYTES,
+    crate::exclusive::BYTES,
+    crate::seqpacket::LOCK_BYTES,
+    0,
+];
+
+/// Shared futexes' table: the host's futexes on Linux need none.
+#[cfg(target_os = "macos")]
+const FUTEX_BYTES: usize = crate::sharedfutex::BYTES;
+#[cfg(not(target_os = "macos"))]
+const FUTEX_BYTES: usize = 0;
+
+/// Where area `i` starts: past those before it, each on pages of its own.
+const fn area_at(i: usize) -> usize {
+    let mut at = AREAS_AT;
+    let mut k = 0;
+    while k < i {
+        at += AREA_BYTES[k].div_ceil(BLOCK) * BLOCK;
+        k += 1;
+    }
+    at
+}
+
+/// Area `a`'s words, zeroes until written, for the process's life.
+pub fn area(a: Area) -> &'static [AtomicU64] {
+    let s = store();
+    // SAFETY: the area's bytes, inside the mapping, kept for the process's
+    // life; atomics only (every bit pattern valid).
+    unsafe {
+        std::slice::from_raw_parts(
+            (s.base + area_at(a as usize)) as *const AtomicU64,
+            AREA_BYTES[a as usize] / 8,
+        )
+    }
+}
+
+/// Hold area `a`'s lock while the result lives (taken over from a holder
+/// that died holding it).
+pub fn lock_area(a: Area) -> Held {
+    hold(store().at(AREA_LOCKS_AT + a as usize * 64))
+}
 
 /// The store, mapped once per process.
 struct Store {
@@ -240,7 +324,7 @@ fn map() -> Result<Store, String> {
 /// size: another process making it at once sizes it, and its size is 0
 /// until that process's `ftruncate` is done (this one's is refused
 /// meanwhile). `None` if it cannot be looked at.
-fn sized(fd: i32) -> Option<libc::stat> {
+pub(crate) fn sized(fd: i32) -> Option<libc::stat> {
     // SAFETY: zeroed bytes are a valid `stat`.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     for _ in 0..1000 {
@@ -266,6 +350,12 @@ fn store() -> &'static Store {
 /// ([`init`], as every process starts), else `None`.
 fn mapped() -> Option<&'static Store> {
     STORE.get()
+}
+
+/// Whether the store is mapped ([`init`]): a mailbox may then be made from
+/// a signal handler ([`mailbox`]).
+pub fn is_mapped() -> bool {
+    STORE.get().is_some()
 }
 
 /// End the process: the store cannot do what it must.
@@ -559,6 +649,15 @@ impl Store {
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
     fn write_chain(&self, bytes: &[u8]) -> u32 {
+        self.write_chain_ends(bytes).0
+    }
+
+    /// [`Store::write_chain`], and the chain's last block.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    fn write_chain_ends(&self, bytes: &[u8]) -> (u32, u32) {
         let mut chunks: Vec<&[u8]> = bytes.chunks(ROOM).collect();
         if chunks.is_empty() {
             chunks.push(&[]);
@@ -576,7 +675,7 @@ impl Store {
             // SAFETY: a block this writer took, `ROOM` bytes from `room`.
             unsafe { std::ptr::copy_nonoverlapping(chunk.as_ptr(), room, chunk.len()) };
         }
-        blocks[0]
+        (blocks[0], blocks[blocks.len() - 1])
     }
 
     /// The `len` bytes of the chain from block `b`, as they read now (the
@@ -841,15 +940,124 @@ pub fn get_of(kind: Kind, pid: i32) -> Option<Vec<u8>> {
     None
 }
 
+/// Whether host pid `pid` has a record (is one of fwe's processes).
+/// Async-signal-safe once the store is mapped (false before).
+pub fn recorded(pid: i32) -> bool {
+    mapped().and_then(|s| s.entry(pid)).is_some_and(|e| e.head.load(SeqCst) != 0)
+}
+
 /// Which version of host pid `pid`'s record there is: it changes with
 /// every write ([`put`], [`remove`]).
 pub fn version(pid: i32) -> Option<u32> {
     Some(store().entry(pid)?.seq.load(SeqCst))
 }
 
+/// The locks of fwe's shared memory (every process's) this process's
+/// threads hold or are taking ([`Holding`]).
+static HOLDING: AtomicU32 = AtomicU32::new(0);
+
+/// The threads of this process stopping it ([`stop_holding_nothing`]):
+/// while there are any, a thread that holds no lock of shared memory waits
+/// before it takes one.
+static STOPPING: AtomicU32 = AtomicU32::new(0);
+
+thread_local! {
+    /// The [`Holding`]s of this thread.
+    static DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// A lock of fwe's shared memory this thread holds or is taking, counted
+/// so that the process stops holding none ([`stop_holding_nothing`]): as
+/// Linux stops a task only on its way back to user mode, never with a
+/// kernel lock held, which would leave every other process that needs it
+/// waiting until the stopped one is continued.
+pub(crate) struct Holding(());
+
+impl Holding {
+    /// One more lock this thread holds or takes: while the process stops,
+    /// a thread that holds none waits until it is continued first (one that
+    /// holds one goes on, to let it go).
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    pub(crate) fn enter() -> Holding {
+        let outer = DEPTH.with(|d| d.get()) == 0;
+        loop {
+            if outer {
+                loop {
+                    let s = STOPPING.load(SeqCst);
+                    if s == 0 {
+                        break;
+                    }
+                    wait(&STOPPING, s, 10_000_000);
+                }
+            }
+            HOLDING.fetch_add(1, SeqCst);
+            // A stop that began meanwhile goes first.
+            if outer && STOPPING.load(SeqCst) != 0 {
+                leave();
+                continue;
+            }
+            DEPTH.with(|d| d.set(d.get() + 1));
+            return Holding(());
+        }
+    }
+}
+
+impl Drop for Holding {
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    fn drop(&mut self) {
+        DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+        leave();
+    }
+}
+
+/// One lock fewer held or being taken: a stop waiting for none is woken.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn leave() {
+    if HOLDING.fetch_sub(1, SeqCst) == 1 && STOPPING.load(SeqCst) != 0 {
+        wake(&HOLDING);
+    }
+}
+
+/// Stop this process with `stop` (the host's stop signal raised), from a
+/// thread that holds no lock of shared memory, once no other thread holds
+/// one: until it is continued and `stop` returns, a thread that holds none
+/// waits before taking one, and one that holds one goes on to let it go.
+pub fn stop_holding_nothing(stop: impl FnOnce()) {
+    debug_assert_eq!(DEPTH.with(|d| d.get()), 0, "a stop with a shared lock held");
+    STOPPING.fetch_add(1, SeqCst);
+    loop {
+        let held = HOLDING.load(SeqCst);
+        if held == 0 {
+            break;
+        }
+        wait(&HOLDING, held, 10_000_000);
+    }
+    stop();
+    if STOPPING.fetch_sub(1, SeqCst) == 1 {
+        wake(&STOPPING);
+    }
+}
+
+/// In a fork child: the locks held are the forking thread's alone (the
+/// others' threads are not the child's), and nothing stops it.
+pub(crate) fn forked_child_holds() {
+    HOLDING.store(DEPTH.with(|d| d.get()), SeqCst);
+    STOPPING.store(0, SeqCst);
+}
+
 /// A held record lock ([`lock`]), let go when dropped.
 pub struct Held {
     word: &'static AtomicU32,
+    _holding: Holding,
 }
 
 impl Drop for Held {
@@ -875,18 +1083,32 @@ pub fn lock(pid: i32) -> Option<Held> {
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
 fn hold(word: &'static AtomicU32) -> Held {
+    hold_word(word).0
+}
+
+/// Hold the lock `word` of shared memory of fwe's (its holder's host pid,
+/// 0: free) while the result lives, and whether it was taken over from a
+/// holder that died holding it (which may have left a change half made).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub(crate) fn hold_word(word: &'static AtomicU32) -> (Held, bool) {
     let me = crate::host::pid() as u32;
     loop {
+        let holding = Holding::enter();
         match word.compare_exchange(0, me, SeqCst, SeqCst) {
-            Ok(_) => return Held { word },
+            Ok(_) => return (Held { word, _holding: holding }, false),
             Err(holder) => {
                 // Gone, or a zombie (it died holding the lock): taken over.
                 let live = crate::procreg::host_info(holder as i32).is_some_and(|(_, _, z)| !z);
                 if !live && word.compare_exchange(holder, me, SeqCst, SeqCst).is_ok() {
-                    return Held { word };
+                    return (Held { word, _holding: holding }, true);
                 }
-                // Woken as it is let go; a while at most, to look at the
-                // holder again.
+                // Not counted while it waits (a stop of this process need
+                // not wait for another's lock). Woken as it is let go; a
+                // while at most, to look at the holder again.
+                drop(holding);
                 wait(word, holder, 10_000_000);
             }
         }
@@ -988,8 +1210,10 @@ fn put_of(kind: Kind, pid: i32, bytes: Option<&[u8]>) {
 /// Make the chain from `head` of `len` bytes entry `e`'s record, under its
 /// lock: the old chain and its length. The sequence number is set, not
 /// counted on, so one left odd by a writer that died between its two
-/// changes is put right.
+/// changes is put right. Counted as a lock held ([`Holding`]): readers
+/// wait while it is odd.
 fn replace(e: &Entry, head: u32, len: u32) -> (u32, u32) {
+    let _holding = Holding::enter();
     let odd = e.seq.load(SeqCst) | 1;
     e.seq.store(odd, SeqCst);
     let old = (e.head.swap(head, SeqCst), e.len.swap(len, SeqCst));
@@ -1151,6 +1375,22 @@ fn wait(word: &AtomicU32, value: u32, timeout_ns: u64) {
             libc::syscall(libc::SYS_futex, word.as_ptr(), libc::FUTEX_WAIT, value, &t);
         }
     }
+}
+
+/// [`wait`] on a 64-bit word: while its low half reads `value`'s (every
+/// change of the words this waits on changes it).
+fn wait64(word: &AtomicU64, value: u64, timeout_ns: u64) {
+    // SAFETY: the word's low half, at its address (little-endian), an
+    // atomic of its own size inside it.
+    let low = unsafe { &*(word.as_ptr() as *const AtomicU32) };
+    wait(low, value as u32, timeout_ns);
+}
+
+/// Wake whoever [`wait64`]s on `word`.
+fn wake_all64(word: &AtomicU64) {
+    // SAFETY: as in [`wait64`].
+    let low = unsafe { &*(word.as_ptr() as *const AtomicU32) };
+    wake(low);
 }
 
 /// Wake whoever [`wait`]s on `word`.

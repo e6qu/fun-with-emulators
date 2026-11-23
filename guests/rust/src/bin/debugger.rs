@@ -37,6 +37,7 @@ const SIGCONT: c_int = 18;
 const SIGSTOP: c_int = 19;
 const WALL: c_int = 0x4000_0000;
 const WNOHANG: c_int = 1;
+const WUNTRACED: c_int = 2;
 const O_RDWR: c_int = 2;
 /// `AUDIT_ARCH_AARCH64`.
 const ARCH: u32 = 0xc000_00b7;
@@ -55,6 +56,8 @@ unsafe extern "C" {
     fn pipe(fds: *mut c_int) -> c_int;
     fn read(fd: c_int, buf: *mut u8, n: usize) -> isize;
     fn write(fd: c_int, buf: *const u8, n: usize) -> isize;
+    #[link_name = "_exit"]
+    fn libc_exit(status: c_int) -> !;
 }
 
 /// A word the parent reads and writes in the child through its `mem`.
@@ -283,4 +286,49 @@ fn main() {
     unsafe { kill(child, SIGKILL) };
     let st = wait(child, 0).unwrap_or(0);
     println!("killed: {}", st & 0x7f == SIGKILL);
+    stopped_then_seized();
+}
+
+/// As strace starts a program: the child stops itself, the tracer seizes
+/// and interrupts it stopped and continues it (`SIGCONT`), then follows
+/// its system calls to its end.
+fn stopped_then_seized() {
+    // SAFETY: plain calls; the child stops itself, makes calls and exits.
+    let child = unsafe { fork() };
+    if child == 0 {
+        // SAFETY: plain calls.
+        unsafe {
+            kill(syscall(SYS_GETPID) as c_int, SIGSTOP);
+            syscall(SYS_GETPPID);
+            libc_exit(0);
+        }
+    }
+    let st = wait(child, WUNTRACED).unwrap_or(0);
+    let stopped = stopsig(st) == SIGSTOP;
+    // (strace seizes, then interrupts: a seize alone stops nothing.)
+    let seized = ptrace(PTRACE_SEIZE, child, 0, PTRACE_O_TRACESYSGOOD)
+        | ptrace(PTRACE_INTERRUPT, child, 0, 0);
+    // SAFETY: a plain call.
+    unsafe { kill(child, SIGCONT) };
+    let mut calls = 0;
+    let end = loop {
+        let Some(st) = wait(child, 0) else { break -1 };
+        if st & 0x7f == 0 {
+            break (st >> 8) & 0xff;
+        }
+        // A system call's stop, an event stop: on. A signal's: delivered.
+        let sig = match stopsig(st) {
+            s if s == SIGTRAP | 0x80 => {
+                calls += 1;
+                0
+            }
+            SIGTRAP | SIGSTOP | -1 => 0,
+            s => s as u64,
+        };
+        ptrace(PTRACE_SYSCALL, child, 0, sig);
+    };
+    println!(
+        "stopped then seized: stopped {stopped}, seize {seized}, calls seen {}, exit {end}",
+        calls >= 2
+    );
 }

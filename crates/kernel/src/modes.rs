@@ -96,7 +96,7 @@ pub fn note_fsetid(has: bool) {
 
 #[allow(clippy::unnecessary_cast)] // the fields' widths differ by host
 fn identity(st: &libc::stat) -> (u64, u64) {
-    (st.st_dev as u64, st.st_ino as u64)
+    (crate::host::dev_of(st), st.st_ino as u64)
 }
 
 /// The file of host metadata `st` has the guest mode `perm`: watched if
@@ -210,7 +210,7 @@ const READ_KEPT: usize = 4096;
 
 #[allow(clippy::unnecessary_cast)] // the fields' widths differ by host
 fn key(st: &libc::stat) -> Key {
-    (st.st_dev as u64, st.st_ino as u64, st.st_ctime as i64, st.st_ctime_nsec as i64)
+    (crate::host::dev_of(st), st.st_ino as u64, st.st_ctime as i64, st.st_ctime_nsec as i64)
 }
 
 /// `field` of the reads of the file of metadata `st`, read with `read` if

@@ -171,9 +171,74 @@ fn sample_strays(cmd: &Command) {
     }
 }
 
+/// Below this share of the host's memory available (macOS's
+/// `kern.memorystatus_level`, in percent), no guest starts and a running
+/// one is ended: a Mac out of memory can panic (its compressor), taking
+/// the machine with it.
+const MEMORY_FLOOR: i64 = 20;
+
+/// Above this share of the host's memory wired (percent), likewise: wired
+/// memory is never compressed or paged out, and it grew so before each of
+/// the host panics fwe's data objects once caused.
+const WIRED_CEILING: i64 = 50;
+
+/// Why the host is too short of memory to run a guest, if it is.
+fn host_short_of_memory() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        let number = |name: &std::ffi::CStr| -> i64 {
+            let mut v = 0u64;
+            let mut len = std::mem::size_of::<u64>();
+            // SAFETY: a NUL-terminated name and an out-buffer of `len`
+            // bytes, which the call fills with as many as the value has.
+            let r = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    (&mut v as *mut u64).cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            assert_eq!(r, 0, "sysctl {name:?}");
+            // (Little-endian: a 4-byte value fills the low bytes.)
+            v as i64
+        };
+        let level = number(c"kern.memorystatus_level");
+        let total = number(c"hw.memsize");
+        // SAFETY: zeroed bytes are a valid `vm_statistics64`, which the
+        // call fills with `n` words at most.
+        let mut stats: libc::vm_statistics64 = unsafe { std::mem::zeroed() };
+        let mut n = libc::HOST_VM_INFO64_COUNT;
+        // SAFETY: as above, for this host.
+        let r = unsafe {
+            #[allow(deprecated)]
+            libc::host_statistics64(
+                libc::mach_host_self(),
+                libc::HOST_VM_INFO64,
+                (&mut stats as *mut libc::vm_statistics64).cast(),
+                &mut n,
+            )
+        };
+        assert_eq!(r, 0, "host_statistics64");
+        let wired = i64::from(stats.wire_count) * number(c"hw.pagesize");
+        let wired_share = wired * 100 / total;
+        if level < MEMORY_FLOOR || wired_share > WIRED_CEILING {
+            return Some(format!(
+                "the host is short of memory: {level}% available (floor {MEMORY_FLOOR}%), \
+                 {wired_share}% wired (ceiling {WIRED_CEILING}%)"
+            ));
+        }
+    }
+    None
+}
+
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
+    if let Some(why) = host_short_of_memory() {
+        panic!("{why}: not starting {cmd:?}");
+    }
     // Its own process group, so a timeout reaches the processes it starts.
     cmd.process_group(0);
     let feed = !input.is_empty();
@@ -204,12 +269,18 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
 
     let start = Instant::now();
     let mut timed_out = false;
+    let mut short = None;
+    let mut looked = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if start.elapsed() > limit {
-            timed_out = true;
+        if looked.elapsed() > Duration::from_millis(500) {
+            looked = Instant::now();
+            short = host_short_of_memory();
+        }
+        if start.elapsed() > limit || short.is_some() {
+            timed_out = short.is_none();
             // What is left of the guest's processes, and what each waits in.
             if let Ok(ps) = Command::new("ps")
                 .args(["-o", "pid,ppid,stat,wchan,command", "-g"])
@@ -248,6 +319,9 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
     };
     if timed_out {
         eprintln!("--- guest timed out after {limit:?} (killed)");
+    }
+    if let Some(why) = short {
+        panic!("{why}: the guest was ended");
     }
     // Readers finish once the pipes close: at the exit of the last process
     // holding them, which may have left the group. One still holding them
@@ -534,7 +608,7 @@ fn build_asm(name: &str, link_args: &[&str]) -> PathBuf {
 }
 
 /// A vendored real libc the dynamic C guests are built and run against.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Libc {
     /// musl: the dynamic linker is itself the shared libc, one self-contained
     /// file (`guests/musl`).
@@ -1773,6 +1847,46 @@ fn a_library_longer_than_a_branch_gets_its_stubs() {
     assert_eq!(run.status.code(), Some(0));
 }
 
+/// What `semopen` prints: a named semaphore made, made again (`EEXIST`),
+/// posted by a fork child, unlinked, then not found (`ENOENT`).
+const SEMOPEN: &str = "made; made again: errno 17; posts of a child taken, left 0; unlinked 0; \
+                       opened after: errno 2\n";
+
+/// Named POSIX semaphores, as Python's `multiprocessing` makes its locks,
+/// through each C library's `sem_open`: a file of `/dev/shm` made under a
+/// temporary name, mapped and linked to its name.
+#[test]
+fn named_semaphores_live_in_dev_shm() {
+    for libc in [Libc::Musl, Libc::Glibc] {
+        let prog = build_c_dynamic("semopen", libc, true);
+        let root = libc_rootfs(libc, "semopen");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), SEMOPEN, "{libc:?}: {err}");
+        assert_eq!(out.status.code(), Some(0), "{libc:?}: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// A process stopped while busy with state every process shares (the files
+/// of `/dev/shm`, its threads making and removing them) stops holding none
+/// of it, as Linux stops a task only on its way back to user mode: its
+/// parent uses `/dev/shm` while it is stopped.
+#[test]
+fn a_stopped_process_holds_no_shared_state() {
+    let prog = build_c_dynamic("stoplock", Libc::Musl, true);
+    let root = libc_rootfs(Libc::Musl, "stoplock");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog);
+    let out = run_bounded(cmd);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "ok\n", "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// Threads that first run the same pages of the shared libc at once, with
 /// the libc's preparation kept from the run before: each page's code is
 /// written as it first runs, and a thread that runs it meanwhile runs on.
@@ -1827,6 +1941,53 @@ fn getppid_follows_the_parents_end() {
         String::from_utf8_lossy(&out.stderr)
     );
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// A process that stops itself, continued by its parent the moment the
+/// parent sees it stopped, again and again while its other threads run:
+/// every stop and continue is reported, and each SIGCONT is taken once by
+/// its handler, as on Linux (macOS on its own can leave such a process
+/// suspended though shown as running).
+#[test]
+fn a_process_that_stops_itself_is_always_continued() {
+    for libc in [Libc::Musl, Libc::Glibc] {
+        let prog = build_c_dynamic("stopself", libc, true);
+        let root = libc_rootfs(libc, "stopself");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(stdout(&out), "ok\n", "{libc:?}: {err}");
+        assert_eq!(out.status.code(), Some(0), "{libc:?}: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+/// Job-control stops of a child with threads, as Linux makes them: every
+/// thread stands still, `/proc` shows `T`, each stop and continue is
+/// reported once to `wait` and told with `SIGCHLD` (none with
+/// `SA_NOCLDSTOP`), a storm of them is all reported, and `SIGKILL` ends a
+/// stopped child at once.
+#[test]
+fn a_stop_halts_every_thread_and_is_told_to_the_parent() {
+    for libc in [Libc::Musl, Libc::Glibc] {
+        let prog = build_c_dynamic("jobstop", libc, true);
+        let root = libc_rootfs(libc, "jobstop");
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&prog);
+        let out = run_bounded(cmd);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            stdout(&out),
+            "stop: reported 1, threads still 1, state T; continue: reported 1, threads on 1\n\
+             SIGCHLD: stopped 1 (status 19), continued 1 (status 18), from the child 1\n\
+             SIGTSTP: 1\nstorm: 300 of 300\nSA_NOCLDSTOP: reported 1, SIGCHLDs 0\n\
+             killed while stopped: 1\n",
+            "{libc:?}: {err}"
+        );
+        assert_eq!(out.status.code(), Some(0), "{libc:?}: {err}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
 }
 
 /// A thread made after another ended starts as a new one, whatever host
@@ -1889,6 +2050,15 @@ fn tracers_side_by_side_continue_only_their_own_tracees() {
     c_guest_prints("tracestorm", &[], "workers broken: 0, tracees not stopped or continued: 0\n");
 }
 
+/// Two processes of a user other than root make the same directory, file
+/// and FIFO at once (as PostgreSQL's parallel workers make their temporary
+/// directories): neither is refused in what the other made, which is never
+/// seen before its owner and mode are set, and no hidden name is listed.
+#[test]
+fn files_made_at_once_by_another_user_are_seen_whole() {
+    c_guest_prints("makerace", &[], "failed: 0, listed clean\n");
+}
+
 /// A process `/proc` shows sleeping in a semaphore wait is counted as
 /// waiting: fwe's own work on the way there is not shown as a sleep.
 #[test]
@@ -1910,6 +2080,15 @@ fn cgroups_made_and_removed_side_by_side() {
 fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
     c_guest_prints("blockedwake", &[], "taken by the other thread\n");
     c_guest_prints("blockedwake", &["sleeping"], "taken by the other thread\n");
+}
+
+/// `SIGURG` a process blocks and reads through a signalfd, sent by another
+/// process as the receiver starts each wait (PostgreSQL's latches), is read
+/// every time: never left blocked on the host by fwe's look for signals
+/// parked on a thread.
+#[test]
+fn a_signal_read_through_a_signalfd_always_arrives() {
+    c_guest_prints("urgwake", &[], "SIGURG: 20000 of 20000 answered\n");
 }
 
 /// A process keeps its pid in its pid namespace across an `execve` made
@@ -6006,6 +6185,8 @@ fn kernel_calls_move_data_and_keep_settings() {
 /// What the `mqueue` guest prints.
 const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-exec true\n\
     status: QSIZE:14         NOTIFY:0     SIGNO:0     NOTIFY_PID:0\n\
+    position: then 0, duplicate 0, rewound 0, read again true\n\
+    epoll: added 0, ready 1, events 0x5, data 7\n\
     listed: true, file the same: true\n\
     received: high/9 mid/5 low/1 low2/1\n\
     empty: true\n\
@@ -6013,7 +6194,8 @@ const MQUEUE: &str = "open: true, maxmsg 4, msgsize 32, mode 100640, close-on-ex
     real-time signal: registered 0, came true, mesgq true, from the sender true, value 0x7e47\n\
     thread: registered 0, came true, value 0x7ead\n\
     unlinked: name gone true, still sends 0, receives kept\n\
-    made again: true, empty true\n";
+    made again: true, empty true\n\
+    held by a child: still works true\n";
 
 const PIDFD: &str = "self: cloexec true, link anon_inode:[pidfd], fdinfo pid true\n\
     errors: -1 true, flags true, none true\n\
@@ -6267,7 +6449,8 @@ const DEBUGGER: &str = "exec: alternate true, entry then event then exit true\n\
     auxv: entry true\n\
     syscall info: size true, entry true, number 173, exit true\n\
     group stop: delivery true, event true, listen 0, stays true, continued true\n\
-    killed: true\n";
+    killed: true\n\
+    stopped then seized: stopped true, seize 0, calls seen true, exit 0\n";
 
 /// What debuggers ask of ptrace beyond its basics: a seized child runs
 /// on until interrupted, which stops it with an event stop; the system
@@ -6410,6 +6593,7 @@ fn proc_is_read_through_a_detached_mount() {
 
 /// What the `nsfd` guest prints.
 const NSFD: &str = "open: true, inode is the link's true, read refused true\n\
+    seek refused true, poll 1 revents 0x5, epoll refused true\n\
     nstype 0x4000000, parent of a UTS namespace refused true\n\
     setns: 0, own name true, back true\n\
     wrong type refused true\n\
@@ -6539,6 +6723,7 @@ const CALLS3: &str = "aio: setup 0, submitted 1 1, events 2, wrote 12 read 12, s
     msg_next_id: id true, then -1\n\
     process_vm: read 8 bytes 0x1234, wrote 8, child saw 0x99\n\
     landlock: abi 6, restricted true, inside read true, outside EACCES true\n\
+    landlock ruleset: named true, mode 0600 true, read refused true\n\
     low port: named true, reached true true, accepted true, bound again true\n";
 
 /// More calls: native AIO (a poll that waits, an eventfd signalled),
@@ -6663,6 +6848,22 @@ fn a_mapping_of_a_memfd_grows_and_remaps_from_its_file() {
     );
 }
 
+/// A memfd grown well past what it first held lies in several host
+/// objects (its extents, sized to it so that the host's memory compressor
+/// keeps a small index of each): read across their boundaries, mapped
+/// whole (one line in `/proc/self/maps`, as on Linux), written through the
+/// mapping, by a fork child too, mapped privately, grown into by `mremap`
+/// and remapped by `remap_file_pages`, every byte where the file has it.
+#[test]
+fn a_memfd_larger_than_its_first_extent_reads_maps_and_grows_as_one() {
+    assert_eq!(
+        memfd("extents"),
+        "read across: .xy.\nmapped: a xy z f\nlines in maps: 1\n\
+         written through the mapping: m\nfrom a child: k (status 0)\n\
+         privately: y P file f\ngrown: y ar\nremapped: 0 a\n"
+    );
+}
+
 /// A memfd opened again read-only through `/proc/self/fd`, as Chromium
 /// makes read-only shared memory, is read-only as Linux's new description
 /// is: `F_GETFL` says so; writes, writable shared mappings, resizing and
@@ -6685,6 +6886,44 @@ fn a_memfd_opened_again_read_only_is_read_only() {
             line("after an exec")
         )
     );
+}
+
+/// What the `memfd` guest's `locks` scenario prints.
+const MEMFD_LOCKS: &str = "\
+flock: 0
+another description: -1 EAGAIN
+a duplicate: 0
+unlocked: 0
+the child took it: true
+held by the shared description: -1 EAGAIN
+that description closed: 0
+unlock: 0
+record lock: 0
+  child sees: 0 type 1 start 0 len 10 parent's true
+  child in the way: -1 EAGAIN
+  child beside it: 0
+closing a duplicate let the child in: true
+the child's went as it ended: 0 type 2
+deadlock: -1 EDEADLK
+unlocked: 0
+the child took it: true
+ofd lock: 0
+another description: -1 EAGAIN
+a duplicate: 0
+the process's: -1 EAGAIN
+seen: 0 type 1 start 1 len 4 pid -1
+";
+
+/// A memfd's locks, kept by fwe's file store, hold between processes as
+/// Linux's: `flock` locks are an open file description's (shared by its
+/// duplicates and a fork child, gone with its last descriptor), a
+/// process's record locks conflict with others', show their holder, go
+/// when the process closes any descriptor of the file or ends, and a wait
+/// that would never end is refused; a description's record locks conflict
+/// with another description's and with the process's own.
+#[test]
+fn memfd_locks_hold_between_processes() {
+    assert_eq!(memfd("locks"), MEMFD_LOCKS);
 }
 
 /// What the `memfd` guest's `seals` scenario prints: a memfd named as
@@ -7398,6 +7637,18 @@ fn hv_runs_dynamic_non_pie_glibc_program() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// Named POSIX semaphores in the VM, as Debian's `python3`'s
+/// `multiprocessing` makes them ([`named_semaphores_live_in_dev_shm`]).
+#[test]
+fn hv_named_semaphores_live_in_dev_shm() {
+    let prog = build_c("semopen", Libc::Glibc, true, false);
+    let root = libc_rootfs(Libc::Glibc, "glibc-semopen-nopie");
+    let Some(out) = fwe_hv_in(&root, &prog, &[]) else { return };
+    assert_eq!(stdout(&out), SEMOPEN);
+    assert_eq!(out.status.code(), Some(0));
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// [`fwe_hv`] with a root filesystem.
 fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     let mut cmd = hv_command()?;
@@ -7772,6 +8023,21 @@ fn a_file_mapped_executable_past_its_code() {
     assert_eq!(out.status.code(), Some(0), "{err}");
 }
 
+/// What `maps view` prints: see [`a_private_mapping_of_a_memfd_follows_the_file`].
+const VIEW: &str = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
+                    writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
+
+/// A private mapping of a memfd follows the file in each page until that
+/// page is written (by the program, or by a system call for it), made
+/// writable later too.
+#[test]
+fn a_private_mapping_of_a_memfd_follows_the_file() {
+    let out = fwe(&rust_guest("maps"), &["view"]);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), VIEW, "{err}");
+    assert_eq!(out.status.code(), Some(0), "{err}");
+}
+
 /// MAP_FIXED over mapped memory replaces it, keeping the rest; a buffer
 /// across old and new is one buffer to the kernel; a widened page takes a
 /// write; a mapping over the program's own data (linked low, backed
@@ -7795,12 +8061,8 @@ fn hv_map_fixed_replaces_mapped_memory() {
     assert_eq!(out.status.code(), Some(0));
     // A private mapping of a memfd follows the file in each page until that
     // page is written (by the program, or by a system call for it).
-    let want = "view: follows the file B, its own write C, the file kept B, later file write unseen\n\
-                writable view: follows EF, written page G, its neighbour J, read into H, file I\n";
-    assert_eq!(stdout(&fwe(&rust_guest("maps"), &["view"])), want);
-
     let out = fwe_hv(&rust_low_guest("maps"), &["view"]).unwrap();
-    assert_eq!(stdout(&out), want);
+    assert_eq!(stdout(&out), VIEW);
     // Gigabytes reserved and mapped over take memory only where touched.
     let out = fwe_hv(&rust_low_guest("maps"), &["reserve"]).unwrap();
     assert_eq!(
@@ -8269,6 +8531,7 @@ fn landlock_follows_open_files_signals_mounts_and_datagrams() {
     assert_eq!(
         containers("landlock-gaps"),
         "restricted: ok\nftruncate: EACCES dup EACCES F_DUPFD EACCES\n\
+         ftruncate on a tmpfs: EACCES\n\
          a device's ioctl: EACCES, FIOCLEX ok\nmount: EPERM\n\
          ftruncate where it was passed: EACCES\nftruncate of its own: ok\n\
          kill(0): ok, kill(-1): ok, the one outside untouched\n\
@@ -8324,6 +8587,27 @@ fn socket_filters_read_packets_on_every_send() {
          sendto of x-sendto: 8\nsendto of k-sendto: 8\nwritev of x-writev: 8\n\
          writev of k-writev: 8\nsendmsg of x-sendmsg: 9\nsendmsg of k-sendmsg: 9\n\
          received: k-write k-sendto k-writev k-sendmsg\n"
+    );
+}
+
+/// An eBPF array map: a socket filter counts messages in it through the
+/// pointer its lookup returns; the map's descriptor, a duplicate of it and
+/// a fork child's all reach the same element, which the parent sees the
+/// child change. The map and the program are anonymous inodes.
+#[test]
+fn bpf_maps_are_shared_by_programs_duplicates_and_children() {
+    assert_eq!(
+        containers("bpf-map"),
+        "map: true anon_inode:bpf-map mode 600
+program: true anon_inode:bpf-prog
+\
+         attached: ok
+counted: ok 3
+through a duplicate: ok 3
+child sees 3
+\
+         after the child: ok 10
+"
     );
 }
 
@@ -8405,17 +8689,38 @@ fn extended_attributes() {
 /// upper layer an overlay is read-only, and an option fwe lacks is refused.
 #[test]
 fn overlay_mounts() {
-    assert_eq!(
-        containers("overlay"),
-        "mount: ok\na: lower1\nd: x y z\na written: lower1+ lower: lower1 upper: lower1+\n\
-         unlink: ok\ngone: ENOENT lower: g whiteout: true 0\nrename a lower dir: EXDEV\n\
-         rename a file: ok\nd: x2 y z lower: x y\nrmdir full: ENOTEMPTY\nrmdir: ok\n\
-         made again: ok holds: []\nopaque in upper: y\n\
-         opaque through the overlay: EOPNOTSUPP\nfchmod: ok\ne: 600 lower: 644 upper: 600\n\
-         f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\nroot: a d deep sub\n\
-         upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
-         metacopy: EINVAL\n"
-    );
+    // Of host directories, of a tmpfs's (fwe's store), and of each over the
+    // other: the same overlay.
+    for scenario in ["overlay", "overlay-tmpfs", "overlay-upper-tmpfs", "overlay-lower-tmpfs"] {
+        assert_eq!(
+            containers(scenario),
+            "mount: ok\na: lower1\nd: x y z\na written: lower1+ lower: lower1 upper: lower1+\n\
+             unlink: ok\ngone: ENOENT lower: g whiteout: true 0\nrename a lower dir: EXDEV\n\
+             rename a file: ok\nd: x2 y z lower: x y\nrmdir full: ENOTEMPTY\nrmdir: ok\n\
+             made again: ok holds: []\nopaque in upper: y\n\
+             opaque through the overlay: EOPNOTSUPP\nfchmod: ok\ne: 600 lower: 644 upper: 600\n\
+             f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\n\
+             bind over a whiteout: ok a socket: true\nroot: a d deep sub\n\
+             upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
+             metacopy: EINVAL\n",
+            "{scenario}"
+        );
+    }
+}
+
+/// inotify through an overlay, as LTP's inotify07 and inotify08 watch: a
+/// directory's watch hears a lower file in it changed (copied up to be),
+/// and a lower file's watch hears it written, of host layers and of a
+/// tmpfs's alike.
+#[test]
+fn overlay_files_are_watched_across_copy_up() {
+    for scenario in ["overlay-inotify", "overlay-inotify-tmpfs"] {
+        assert_eq!(
+            containers(scenario),
+            "mount: ok\nevents: dir 0x4 x, file 0x2 , h 0x4 , h 0x20 , h 0x8 , h 0x20 , h 0x8 \nlower: f upper: g\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// What container runtimes ask beyond the namespaces, as containerd's shim
@@ -8479,14 +8784,18 @@ fn container_descriptor_edges() {
 /// mount, and refuses an upper layer in a read-only mount.
 #[test]
 fn overlay_edge_cases() {
-    assert_eq!(
-        containers("overlay-edges"),
-        "mount: ok\nlayer's own: true not upper: true\nO_PATH|O_CREAT: ENOENT then: ENOENT\n\
-         moved dir: true\nrenamed over: ESTALE still reads: lower\n\
-         listing across copy-up: 8 entries, 8 distinct\nseek to 3: true\n\
-         exchange: ok h holds: []\nmknod 0:0: EPERM\nafter unmount: upper true lower false\n\
-         read-only upper: EROFS\n"
-    );
+    // Of host directories, and of a tmpfs's (fwe's store).
+    for scenario in ["overlay-edges", "overlay-edges-tmpfs"] {
+        assert_eq!(
+            containers(scenario),
+            "mount: ok\nlayer's own: true not upper: true\nO_PATH|O_CREAT: ENOENT then: ENOENT\n\
+             moved dir: true\nrenamed over: ESTALE still reads: lower\n\
+             listing across copy-up: 8 entries, 8 distinct\nseek to 3: true\n\
+             exchange: ok h holds: []\nmknod 0:0: EPERM\nafter unmount: upper true lower false\n\
+             read-only upper: EROFS\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// Root passes permission bits, also of modes that deny every access, which
@@ -8670,8 +8979,10 @@ fn namespaces_owners_unshare_and_cgroup_paths() {
 /// threads as well as forks, `pids.events` counting the refusals;
 /// `cgroup.threads` lists threads; a freeze holds the cgroups below and
 /// whoever joins or is forked into one; moves need write access to the
-/// common ancestor's `cgroup.procs` and stay in the cgroup namespace; and
-/// there is no cgroup v1 (`ENODEV`).
+/// common ancestor's `cgroup.procs` and stay in the cgroup namespace;
+/// a cgroup's directory takes no file and loses none but by the kernel,
+/// and is never renamed (`EACCES`, `EPERM`), an open to cut cuts nothing,
+/// and the mount is cgroup2's; and there is no cgroup v1 (`ENODEV`).
 #[test]
 fn cgroups_limits_freeze_and_delegation() {
     let out = run_c_guest("cgroups", &[], &[]);
@@ -8683,6 +8994,11 @@ fn cgroups_limits_freeze_and_delegation() {
          mkdir past descendants: 11\n\
          cgroup.type: domain\n\
          type threaded: -95, type junk: -22\n\
+         file made: 13\n\
+         file removed: 1\n\
+         cgroup renamed: 1\n\
+         cgroup.max.depth: 7\n\
+         filesystem: 63677270\n\
          cgroup.threads lists the threads: 2\n\
          thread past pids.max: 11\n\
          fork past pids.max: 11\n\
@@ -8725,6 +9041,7 @@ fn proc_files_programs_read() {
          environ has FWE_PROC=1: 1\n\
          limits: Limit                    | open files 1\n\
          statm words: 7\n\
+         open statm's link is its pid's: 1\n\
          io read_bytes: 1\n\
          comm write: 0\n\
          comm now: renamed\nname: renamed\n\
@@ -8840,13 +9157,27 @@ fn access_checks_the_guests_ids() {
 
 /// The no-dump flag is the guest's own: a file given another owner (which
 /// fwe keeps under a host flag of the same name) is not no-dump to
-/// `lsattr` or `statx`, `chattr -d` keeps its owner, and `chattr +d` shows.
+/// `lsattr` or `statx`, `chattr -d` keeps its owner, and `chattr +d` shows,
+/// on a tmpfs directory too.
 #[test]
 fn nodump_is_apart_from_kept_owners() {
     assert_eq!(
         fsrules("nodump"),
         "owned no-dump: (false, false)\nafter clearing: 1000:100\n\
-         set: (true, true) owner 1000:100\n"
+         set: (true, true) owner 1000:100\non a tmpfs: (true, true)\n"
+    );
+}
+
+/// A user outside a set-group-ID directory's group makes an `O_TMPFILE`
+/// file there asking for set-group-ID: the file takes the directory's
+/// group without the bit, is the user's, and links in through
+/// `/proc/self/fd`, on the host's files and on a tmpfs (LTP openat04).
+#[test]
+fn a_tmpfile_in_another_groups_set_group_id_directory_links_in() {
+    assert_eq!(
+        fsrules("tmpfile-sgid"),
+        "/tmp/sgid: made ok mode 755 65534:8, linked ok\n\
+         /dev/shm/sgid: made ok mode 755 65534:8, linked ok\n"
     );
 }
 
@@ -9234,6 +9565,108 @@ fn tmpfs_owner_and_inode_options_hold() {
         "mount: ok\nroot: 750 1000:100\nfile: ok dir: ok past the inodes: ENOSPC\n\
          statfs: files 3 free 0\nbad size: EINVAL bad uid: EINVAL\n"
     );
+}
+
+/// A tmpfs, a filesystem of fwe's store in memory, does by path what
+/// Linux's does: sockets bound and connected there, FIFOs, programs run
+/// from it (`ETXTBSY` while open to write), file handles, `/proc/self/fd`
+/// links of files renamed and removed, listings in the order names were
+/// made, and attribute calls by path.
+#[test]
+fn tmpfs_files_work_by_path() {
+    assert_eq!(
+        fsrules("store"),
+        "mount: ok\n\
+         socket: bind ok again EADDRINUSE connect ok peer /tmp/s/sock a socket true\n\
+         not a socket: ECONNREFUSED unlinked: ENOENT\n\
+         fifo: read hi the file's status true\n\
+         exec: exit 7, while open to write ETXTBSY\n\
+         handle: held, renamed held, removed ESTALE\n\
+         fd link: /tmp/s/a, /tmp/s/b, /tmp/s/b (deleted)\n\
+         listing: . .. z a m\n\
+         by path: ok ok ok ok; mode 640 size 10 atime 1000 mtime 2000 attribute v tmpfs true\n\
+         mount by descriptor: ok, another filesystem true\n\
+         cachestat: cached 3 dirty 3, of one page 1\n\
+         read at the end: 0 bytes, access time touched true\n\
+         rename to a 256-byte name: -1 errno 36\n\
+         times omitted: immutable (ok) 0, missing 0 (ok)\n"
+    );
+}
+
+/// A memfd a guest sends a process of the host's (as a program hands an X
+/// server the memory it draws in) reaches it as memory it maps: the data
+/// of the file, not fwe's stand-in for its descriptor.
+#[test]
+fn a_host_process_maps_a_memfd_it_is_sent() {
+    use std::io::Write;
+    use std::os::fd::AsRawFd;
+    let root = std::env::temp_dir().join(format!("fwe-hp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("tmp")).unwrap();
+    std::fs::copy(rust_guest("fsrules"), root.join("fsrules")).unwrap();
+    let listener = std::os::unix::net::UnixListener::bind(root.join("tmp/h.sock")).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let host = std::thread::spawn(move || -> Result<String, String> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        let (mut conn, _) = loop {
+            match listener.accept() {
+                Ok(c) => break c,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(20))
+                }
+                Err(e) => return Err(format!("no connection: {e}")),
+            }
+        };
+        conn.set_nonblocking(false).unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+        let mut byte = [0u8; 1];
+        let mut iov = libc::iovec { iov_base: byte.as_mut_ptr().cast(), iov_len: 1 };
+        let mut ctl = [0u8; 64];
+        // SAFETY: zeroed bytes are a valid `msghdr`, given valid buffers.
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = ctl.as_mut_ptr().cast();
+        msg.msg_controllen = ctl.len() as libc::socklen_t;
+        // SAFETY: a receive into the buffers above.
+        if unsafe { libc::recvmsg(conn.as_raw_fd(), &mut msg, 0) } != 1 {
+            return Err("no message".into());
+        }
+        // SAFETY: the control data the host wrote: its first message.
+        let fds: Vec<i32> = unsafe {
+            let c = libc::CMSG_FIRSTHDR(&msg);
+            if c.is_null() || (*c).cmsg_type != libc::SCM_RIGHTS {
+                return Err("no descriptor".into());
+            }
+            let n = ((*c).cmsg_len as usize - libc::CMSG_LEN(0) as usize) / 4;
+            let data = libc::CMSG_DATA(c).cast::<i32>();
+            (0..n).map(|i| data.add(i).read_unaligned()).collect()
+        };
+        let [fd] = fds[..] else { return Err(format!("{} descriptors", fds.len())) };
+        // SAFETY: a shared mapping of the descriptor received, read and
+        // unmapped here.
+        let text = unsafe {
+            let p =
+                libc::mmap(std::ptr::null_mut(), 4096, libc::PROT_READ, libc::MAP_SHARED, fd, 0);
+            if p == libc::MAP_FAILED {
+                return Err(format!("mmap: {}", std::io::Error::last_os_error()));
+            }
+            let b = std::slice::from_raw_parts(p.cast::<u8>(), 18).to_vec();
+            libc::munmap(p, 4096);
+            libc::close(fd);
+            b
+        };
+        conn.write_all(&text).unwrap();
+        Ok(String::from_utf8_lossy(&text).into_owned())
+    });
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("fsrules")).args(["host-peer", "/tmp/h.sock"]);
+    let out = run_bounded(cmd);
+    let host = host.join().unwrap();
+    let _ = std::fs::remove_dir_all(&root);
+    eprintln!("{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(host, Ok("drawn by the guest".to_string()));
+    assert_eq!(stdout(&out), "sent: ok\nthe host read: drawn by the guest\n");
 }
 
 /// `proc`'s `hidepid=invisible` hides another user's process from one who

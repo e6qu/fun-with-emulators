@@ -16,7 +16,7 @@ in [docs/architecture.md](docs/architecture.md#known-limitations).
 | M3 Containers | Done |
 | M4 Compatibility | Done |
 | M5 Release | Done but for the first release (the owner's) |
-| M6 Native speed and coverage | Under way: PR 1 done |
+| M6 Native speed and coverage | Under way: PRs 1 and 2 done |
 | M7 Graphical programs and sandboxes | Under way: PR 1 done |
 | M8 Virtual networking | After 1.0 |
 
@@ -46,7 +46,11 @@ What runs unmodified is in [README.md](README.md#status).
   their link kept relocations; code made at run time run by translation
   ([docs/jit.md](docs/jit.md)), its translations kept between runs; a JDK
   at work within budget; translated code within 1.3× of the same code
-  natively (PR 1).
+  natively (PR 1). Kernel state in memory every fwe process maps (the
+  process store, shared records, a file store for tmpfs, `/dev/shm`,
+  memfds and the cgroup tree) or in macOS's own objects, none of it on
+  disk; System V semaphores, messages and segments within 3× macOS
+  (PR 2).
 - **M7 PR 1 — A display:** X11 clients on an X server on the Mac
   (XQuartz, Xvfb), `MIT-SHM` where the server takes segments by
   descriptor; Weston and Xwayland in the guest; demo programs
@@ -80,37 +84,6 @@ Budgets, held in CI against native macOS on the same runner:
 | a C build (Lua), a Lua script, a Python script, xz | fwe's share of CPU samples 1.2× |
 | translated code (calls and returns, a switch, calls through a register, a loop) against the same code natively | 1.3× |
 | a function made at run time and run (no native counterpart) | 2 µs |
-
-#### PR 2 — Kernel state in memory, or in macOS, chosen explicitly
-
-fwe keeps some of Linux's kernel state in files under `$TMPDIR`: records
-(System V IPC, mount tables, namespaces, keys) as a lock file, a data
-file, a journal and a mapped generation word, and tables, counters and
-segments as mapped files. A record's change costs about eight file
-operations: a System V semaphore raised and lowered takes 84 µs under fwe
-against 0.8 µs natively.
-
-- [ ] **Two ways, both available:** each mechanism that holds state
-  either keeps it in fwe, in memory every fwe process maps (a store like
-  `procstore`'s: slots, locks naming their holder, waits, chained blocks),
-  or hands it to macOS as a host object (a `shm_open` object, a POSIX
-  semaphore, a host descriptor). Neither is on disk. Each mechanism names
-  which it uses, in its code and in
-  [docs/linux-on-macos.md](docs/linux-on-macos.md), decided by its
-  benchmarks.
-- [ ] **Moved:** records; the shared-futex, `ETXTBSY`, pipe-lock and
-  `EPOLLEXCLUSIVE` tables; eventfd and timerfd counters; System V
-  segments; BPF maps.
-- [ ] **memfd, `/dev/shm` and tmpfs** measured on both ways (a host file
-  against fwe's own file store in memory), and kept on the one that wins.
-- [ ] **Benchmarks:** micro: System V semaphore, message and segment
-  cycles, eventfd, a shared futex wake, each against native macOS where it
-  has one; macro: LTP's IPC tests' time, a fork-heavy build, PostgreSQL
-  or another System V user at work.
-
-**Done when:** nothing fwe keeps for the guest's kernel state is a file on
-disk; System V semaphores and messages hold 3× macOS and segments 1.5×;
-each mechanism's choice is documented with its numbers.
 
 #### PR 3 — Generated code run as it is, where it is sound
 

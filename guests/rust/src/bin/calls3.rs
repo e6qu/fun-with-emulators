@@ -31,6 +31,8 @@ const SYS_RT_SIGQUEUEINFO: i64 = 138;
 const SYS_EVENTFD2: i64 = 19;
 const SYS_PROCESS_VM_READV: i64 = 270;
 const SYS_PROCESS_VM_WRITEV: i64 = 271;
+/// `fstat` on arm64.
+const SYS_FSTAT: i64 = 80;
 const SYS_LANDLOCK_CREATE_RULESET: i64 = 444;
 const SYS_LANDLOCK_ADD_RULE: i64 = 445;
 const SYS_LANDLOCK_RESTRICT_SELF: i64 = 446;
@@ -363,6 +365,14 @@ fn main() {
             const READ_FILE: u64 = 1 << 2;
             let attr = [READ_FILE];
             let rs = syscall(SYS_LANDLOCK_CREATE_RULESET, attr.as_ptr(), 8i64, 0i64);
+            // Its descriptor: an anonymous inode's (mode 0600, no type),
+            // which reads refuse.
+            let link = std::fs::read_link(format!("/proc/self/fd/{rs}")).unwrap_or_default();
+            let named = link.as_os_str() == "anon_inode:[landlock-ruleset]";
+            let mut stat = [0u32; 32];
+            let statted = syscall(SYS_FSTAT, rs, stat.as_mut_ptr(), 0i64) == 0 && stat[4] == 0o600;
+            let mut byte = 0u8;
+            let refused = read(rs as i32, &mut byte, 1) == -1 && errno() == 22;
             let parent = open(c(&inside).as_ptr(), O_PATH);
             let rule: [u8; 12] = {
                 let mut r = [0u8; 12];
@@ -375,7 +385,14 @@ fn main() {
             let restricted = syscall(SYS_LANDLOCK_RESTRICT_SELF, rs, 0i64) == 0;
             let ok = open(c(&format!("{inside}/file")).as_ptr(), O_RDONLY) >= 0;
             let denied = open(c(&format!("{dir}/outside")).as_ptr(), O_RDONLY) < 0 && errno() == 13;
-            _exit(i32::from(restricted) | i32::from(ok) << 1 | i32::from(denied) << 2);
+            _exit(
+                i32::from(restricted)
+                    | i32::from(ok) << 1
+                    | i32::from(denied) << 2
+                    | i32::from(named) << 3
+                    | i32::from(statted) << 4
+                    | i32::from(refused) << 5,
+            );
         }
         let mut st = 0;
         waitpid(child, &mut st, 0);
@@ -385,6 +402,12 @@ fn main() {
             bits & 1 != 0,
             bits & 2 != 0,
             bits & 4 != 0
+        );
+        println!(
+            "landlock ruleset: named {}, mode 0600 {}, read refused {}",
+            bits & 8 != 0,
+            bits & 16 != 0,
+            bits & 32 != 0
         );
     }
     low_port();

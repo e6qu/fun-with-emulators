@@ -16,8 +16,10 @@
 //! writer sets. A writer takes the writers' mutex, sets the flag and waits
 //! for every counter given to a thread to drain; a reader that finds the flag set steps back
 //! and comes in holding the mutex, and a writer lets the readers waiting
-//! so come in first, so that readers are not kept out by a thread making
-//! one exclusive call after another. Shared sections are short (no call on this side
+//! so come in first, and the writers waiting for the mutex, so that no
+//! thread is kept out by others making one exclusive call after another
+//! (the host's mutex goes to whichever thread asks first, often the one
+//! that just let it go). Shared sections are short (no call on this side
 //! waits), so a writer spins. A host `fork` is made holding the lock for
 //! writing; the child clears the counters and the count of waiting
 //! readers, which may hold readers of other threads stepping back
@@ -51,6 +53,8 @@ pub struct Lock<T> {
     writing: AtomicBool,
     /// Readers that stepped back for a writer and wait to come in.
     waiting: AtomicUsize,
+    /// Writers waiting for the writers' mutex.
+    writers_waiting: AtomicUsize,
 }
 
 /// A backend's kernel, `None` until the program is loaded.
@@ -118,6 +122,7 @@ impl<T> Lock<T> {
             writers: Mutex::new(()),
             writing: AtomicBool::new(false),
             waiting: AtomicUsize::new(0),
+            writers_waiting: AtomicUsize::new(0),
         }
     }
 
@@ -128,15 +133,28 @@ impl<T> Lock<T> {
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
     pub fn lock(&self) -> Exclusive<'_, T> {
-        // Readers that wait come in first: a thread making one exclusive
-        // call after another would otherwise take the mutex back each time
-        // (the host's mutex gives it to whoever asks first).
+        // Readers and writers that wait come in first: a thread making one
+        // exclusive call after another would otherwise take the mutex back
+        // each time (the host's mutex gives it to whoever asks first), and
+        // keep another thread out of every call it makes.
         let mut turns = 0;
-        while self.waiting.load(Acquire) != 0 && turns < 10_000 {
+        while (self.waiting.load(Acquire) != 0 || self.writers_waiting.load(Acquire) != 0)
+            && turns < 10_000
+        {
             std::thread::yield_now();
             turns += 1;
         }
-        let writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+        // A writer counts as waiting only while another holds the mutex.
+        let writers = match self.writers.try_lock() {
+            Ok(w) => w,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.writers_waiting.fetch_add(1, SeqCst);
+                let w = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+                self.writers_waiting.fetch_sub(1, Release);
+                w
+            }
+        };
         self.writing.store(true, SeqCst);
         // Only the counters given out may count readers: a thread given one
         // after this look finds `writing` set, and steps back (the given
@@ -198,6 +216,7 @@ impl<T> Lock<T> {
             shard.0.store(0, SeqCst);
         }
         self.waiting.store(0, SeqCst);
+        self.writers_waiting.store(0, SeqCst);
     }
 }
 

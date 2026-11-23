@@ -82,9 +82,12 @@ pub fn init_main(pid: i32) {
         d.pending.store(std::ptr::null_mut(), Ordering::Release);
     }
     forget_wait_pipes();
+    crate::procstore::forked_child_holds();
     crate::pdeath::forked();
     crate::futex::forked_child();
     crate::sysvipc::forked_child();
+    crate::mqueue::forked_child();
+    crate::filestore::desc::forked_child();
     crate::textbusy::forked_child();
     crate::reclocks::forked_child();
     crate::tmpfile::forked_child();
@@ -371,6 +374,7 @@ fn wait_timer() -> i32 {
 /// which a child does not inherit, are dropped. Async-signal-safe.
 pub fn forked() {
     PROCESS.clear();
+    crate::signote::job_reset();
     crate::procstore::not_busy();
     with_own(Pending::clear);
     // The parent's other threads' sets are not the child's. Only entries
@@ -440,11 +444,9 @@ const TID_FIRST: i32 = 100_000;
 const TID_END: i32 = 4_194_304;
 
 /// A thread id outside a pid namespace of fwe's: the next of a counter
-/// every fwe process shares (a file beside the process records, taken in
-/// turn with `flock`), so no two live threads have the same one. They are
-/// taken [`TID_BLOCK`] at a time, the block marked this process's, and
-/// given out from the block (a slot of the robust lists' file is a thread's
-/// only once it is written after the process started).
+/// every fwe process shares (in the process store), so no two live threads
+/// have the same one. They are taken [`TID_BLOCK`] at a time, the block
+/// marked this process's, and given out from the block.
 fn shared_tid() -> i32 {
     let me = crate::host::pid();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
@@ -1514,6 +1516,11 @@ pub fn wake_others_if_asked(sig: libc::c_int) {
     if HOT.with(|h| h.wake_others.replace(false)) {
         wake_others(sig);
     }
+}
+
+/// Drop `sig` if it is pending for the process. Async-signal-safe.
+pub fn discard_process(sig: u64) {
+    let _ = PROCESS.take(sig);
 }
 
 /// Record `sig` as pending against the process; any thread that does not

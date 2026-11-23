@@ -5,7 +5,8 @@
 //! the namespace's own record, or for the initial namespace a named one):
 //! each object's key, owner, permissions and times, a semaphore set's
 //! values and undo adjustments, a queue's messages. A segment's memory is
-//! a file beside the record, which `shmat` maps shared. Every operation is
+//! a host shared memory object named for the segment ([`segment_name`]),
+//! which `shmat` maps shared. Every operation is
 //! one change of the record, under its lock, so a semaphore operation or a
 //! message is all or nothing across processes; an operation that must wait
 //! (a semaphore that would go below zero, a full or empty queue) waits for
@@ -136,6 +137,12 @@ pub struct Shm {
     /// to, against that user's `RLIMIT_MEMLOCK`, as Linux's
     /// `user_shm_lock` charges them.
     pub locked: Option<u32>,
+    /// Its memory's name ([`segment_name`]): this segment's alone, as an id
+    /// comes back once its sequence number wraps.
+    pub nonce: u64,
+    /// Whether its memory was made: when it was first attached, as Linux
+    /// gives a segment pages only when they are touched.
+    pub made: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -193,9 +200,8 @@ impl Obj {
 pub struct Ipc {
     /// By kind and id.
     pub objs: Tracked<(u8, i32), Obj>,
-    /// Each kind's slots' sequence numbers (an id is the slot and the
-    /// sequence, so one reused is a new id).
-    pub seqs: Tracked<(u8, i32), u16>,
+    /// Each kind's id allocation, as Linux's ([`Ids`]).
+    pub ids: [Ids; 3],
     /// The namespace's sysctls (`kernel.shmmax` and the like) set from
     /// their defaults, by name ([`crate::sysctl`]).
     pub sysctls: BTreeMap<String, String>,
@@ -213,17 +219,73 @@ pub struct Ipc {
     index: Lazy,
 }
 
+/// How a kind's ids are given, as Linux gives them (`ipc_idr_alloc`): a
+/// slot taken in turn below half as many again as are in use (at least
+/// 64), the first free one from the last taken on, and the kind's
+/// sequence number, which moves on each time the slots taken wrap back
+/// round. An id is the slot and the sequence number, so a slot taken
+/// again is another id.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Ids {
+    seq: u16,
+    /// The slot last taken (-1: none yet).
+    last: i32,
+    /// Where the next search for a free slot starts.
+    next: i32,
+}
+
+impl Default for Ids {
+    fn default() -> Self {
+        Ids { seq: 0, last: -1, next: 0 }
+    }
+}
+
+/// Linux's smallest round of slots (`ipc_min_cycle`, a radix tree's map).
+const MIN_CYCLE: i32 = 64;
+
+/// The sequence numbers an id holds: below `INT_MAX >> 15`.
+const SEQ_MAX: u16 = (i32::MAX / IPCMNI) as u16;
+
+/// A hash of an index's small integer keys: their bits mixed by a
+/// multiply (no keyed hash: a guest that picks colliding keys slows only
+/// its own namespace's lookups).
+#[derive(Default)]
+struct IntHash(u64);
+
+impl std::hash::Hasher for IntHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.write_u64(u64::from(b));
+        }
+    }
+    fn write_u8(&mut self, v: u8) {
+        self.write_u64(u64::from(v));
+    }
+    fn write_i32(&mut self, v: i32) {
+        self.write_u64(v as u32 as u64);
+    }
+    fn write_u64(&mut self, v: u64) {
+        let h = (self.0.rotate_left(5) ^ v).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        self.0 = h ^ (h >> 32);
+    }
+}
+
+type IntMap<K, V> = HashMap<K, V, std::hash::BuildHasherDefault<IntHash>>;
+
 /// The objects by key, the slots in use, and those that hold processes.
 #[derive(Clone, Debug, Default)]
 struct Index {
     /// (kind, key) to id, of objects with a key not marked for removal.
-    by_key: HashMap<(u8, i32), i32>,
+    by_key: IntMap<(u8, i32), i32>,
     /// (kind, id) to the key it is found by above.
-    key_of: HashMap<(u8, i32), i32>,
+    key_of: IntMap<(u8, i32), i32>,
     /// (kind, slot) to the id in it.
-    slots: HashMap<(u8, i32), i32>,
-    /// Each kind's count of slots in use, and the lowest that may be free.
-    used: [(usize, i32); 3],
+    slots: IntMap<(u8, i32), i32>,
+    /// Each kind's count of slots in use.
+    used: [usize; 3],
     /// Objects that name processes (attachments, waiters, undo
     /// adjustments) or are marked for removal: what [`Ipc::reap`] looks at.
     holders: BTreeSet<(u8, i32)>,
@@ -239,41 +301,57 @@ impl Clone for Lazy {
     }
 }
 
+/// Whether `o` names processes (attachments, waiters, undo adjustments)
+/// or is marked for removal: what [`Ipc::reap`] looks at.
+fn holds(o: &Obj) -> bool {
+    o.removed
+        || match &o.body {
+            Body::Shm(s) => !s.attached.is_empty(),
+            Body::Sem(s) => !s.waiting.is_empty() || !s.undo.is_empty(),
+            Body::Msg(_) => false,
+        }
+}
+
 impl Index {
     /// Object `(kind, id)` is now `o` (or gone).
     fn reindex(&mut self, kind: u8, id: i32, o: Option<&Obj>) {
+        let slot = (kind, id % IPCMNI);
+        // An object whose key, slot and holding are as indexed (its values
+        // changed): nothing to do.
+        if let Some(o) = o {
+            let key = (o.key != IPC_PRIVATE && !o.removed).then_some(o.key);
+            if self.slots.get(&slot) == Some(&id)
+                && self.key_of.get(&(kind, id)).copied() == key
+                && key.is_none_or(|k| self.by_key.get(&(kind, k)) == Some(&id))
+                && self.holders.contains(&(kind, id)) == holds(o)
+            {
+                return;
+            }
+        }
         if let Some(key) = self.key_of.remove(&(kind, id))
             && self.by_key.get(&(kind, key)) == Some(&id)
         {
             self.by_key.remove(&(kind, key));
         }
         self.holders.remove(&(kind, id));
-        let slot = (kind, id % IPCMNI);
         let used = &mut self.used[kind as usize % 3];
         match o {
             Some(o) => {
                 if self.slots.insert(slot, id).is_none() {
-                    used.0 += 1;
+                    *used += 1;
                 }
                 if o.key != IPC_PRIVATE && !o.removed {
                     self.by_key.insert((kind, o.key), id);
                     self.key_of.insert((kind, id), o.key);
                 }
-                let holds = o.removed
-                    || match &o.body {
-                        Body::Shm(s) => !s.attached.is_empty(),
-                        Body::Sem(s) => !s.waiting.is_empty() || !s.undo.is_empty(),
-                        Body::Msg(_) => false,
-                    };
-                if holds {
+                if holds(o) {
                     self.holders.insert((kind, id));
                 }
             }
             None => {
                 if self.slots.get(&slot) == Some(&id) {
                     self.slots.remove(&slot);
-                    used.0 -= 1;
-                    used.1 = used.1.min(slot.1);
+                    *used -= 1;
                 }
             }
         }
@@ -372,6 +450,8 @@ fn put_obj(e: &mut Enc, id: i32, o: &Obj) {
             e.u64(s.dtime as u64);
             e.bool(s.locked.is_some());
             e.u32(s.locked.unwrap_or(0));
+            e.u64(s.nonce);
+            e.bool(s.made);
             e.u64(s.attached.len() as u64);
             for &(p, n) in &s.attached {
                 put_proc(e, p);
@@ -426,9 +506,10 @@ fn get_obj(d: &mut Dec) -> (i32, Obj) {
                 (d.u64(), d.i32(), d.i32(), d.u64() as i64, d.u64() as i64);
             let locked = (d.bool(), d.u32());
             let locked = locked.0.then_some(locked.1);
+            let (nonce, made) = (d.u64(), d.bool());
             let n = d.count(16);
             let attached = (0..n).map(|_| (get_proc(d), d.u32())).collect();
-            Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked })
+            Body::Shm(Shm { size, cpid, lpid, atime, dtime, attached, locked, nonce, made })
         }
         1 => {
             let otime = d.u64() as i64;
@@ -478,6 +559,11 @@ impl Ipc {
             e.u64(bytes);
         }
         e.u64(self.mq_seq);
+        for ids in &self.ids {
+            e.u32(ids.seq.into());
+            e.i32(ids.last);
+            e.i32(ids.next);
+        }
     }
 
     fn get_rest(&mut self, d: &mut Dec) {
@@ -503,18 +589,15 @@ impl Ipc {
             self.mq_live.insert(dir, (uid, bytes));
         }
         self.mq_seq = d.u64();
+        for ids in &mut self.ids {
+            *ids = Ids { seq: d.u32() as u16, last: d.i32(), next: d.i32() };
+        }
     }
 }
 
 impl Data for Ipc {
     fn encode(&self, e: &mut Enc) {
         self.put_rest(e);
-        e.u64(self.seqs.len() as u64);
-        for (&(k, slot), &seq) in self.seqs.iter() {
-            e.u8(k);
-            e.i32(slot);
-            e.u32(seq as u32);
-        }
         e.u64(self.objs.len() as u64);
         for (&(_, id), o) in self.objs.iter() {
             put_obj(e, id, o);
@@ -524,11 +607,6 @@ impl Data for Ipc {
     fn decode(d: &mut Dec) -> Self {
         let mut ipc = Ipc::default();
         ipc.get_rest(d);
-        let n = d.count(9);
-        for _ in 0..n {
-            let (k, slot, seq) = (d.u8(), d.i32(), d.u32() as u16);
-            ipc.seqs.set((k, slot), Some(seq));
-        }
         let n = d.count(30);
         for _ in 0..n {
             let (id, obj) = get_obj(d);
@@ -537,49 +615,35 @@ impl Data for Ipc {
         ipc
     }
 
-    /// The objects and slots changed, each as it is now (or gone), with
-    /// the rest whole.
+    /// The objects changed, each as it is now (or gone), with the rest
+    /// whole.
     fn changes(&mut self, e: &mut Enc) -> bool {
         self.put_rest(e);
-        let seqs = self.seqs.take_changed();
-        e.u64(seqs.len() as u64);
-        for (k, slot) in seqs {
-            e.u8(k);
-            e.i32(slot);
-            match self.seqs.get(&(k, slot)) {
-                Some(&seq) => {
-                    e.bool(true);
-                    e.u32(seq as u32);
-                }
-                None => e.bool(false),
-            }
-        }
-        let objs = self.objs.take_changed();
-        e.u64(objs.len() as u64);
-        for (k, id) in objs {
-            e.u8(k);
-            match self.objs.get(&(k, id)) {
-                Some(o) => {
-                    e.bool(true);
-                    put_obj(e, id, o);
-                }
-                None => {
-                    e.bool(false);
-                    e.i32(id);
+        self.objs.take_changed(|keys, objs| {
+            e.u64(keys.len() as u64);
+            for &(k, id) in keys {
+                e.u8(k);
+                match objs.get(&(k, id)) {
+                    Some(o) => {
+                        e.bool(true);
+                        put_obj(e, id, o);
+                    }
+                    None => {
+                        e.bool(false);
+                        e.i32(id);
+                    }
                 }
             }
-        }
+        });
         true
+    }
+
+    fn forget_changes(&mut self) {
+        self.objs.forget_changed();
     }
 
     fn apply(&mut self, d: &mut Dec) {
         self.get_rest(d);
-        let n = d.count(6);
-        for _ in 0..n {
-            let (k, slot) = (d.u8(), d.i32());
-            let seq = d.bool().then(|| d.u32() as u16);
-            self.seqs.set((k, slot), seq);
-        }
         let n = d.count(6);
         for _ in 0..n {
             let k = d.u8();
@@ -599,15 +663,16 @@ impl Data for Ipc {
 #[derive(Debug)]
 pub struct Tracked<K, V> {
     map: BTreeMap<K, V>,
-    changed: BTreeSet<K>,
+    /// The keys changed.
+    changed: Keys<K>,
     /// The keys set since an index over the map last looked
-    /// ([`Tracked::take_unindexed`]).
-    unindexed: Mutex<BTreeSet<K>>,
+    /// ([`Tracked::each_unindexed`]), each perhaps more than once.
+    unindexed: Mutex<Keys<K>>,
 }
 
 impl<K, V> Default for Tracked<K, V> {
     fn default() -> Self {
-        Tracked { map: BTreeMap::new(), changed: BTreeSet::new(), unindexed: Mutex::default() }
+        Tracked { map: BTreeMap::new(), changed: Keys::default(), unindexed: Mutex::default() }
     }
 }
 
@@ -621,11 +686,48 @@ impl<K: Clone, V: Clone> Clone for Tracked<K, V> {
     }
 }
 
+/// Keys noted, each perhaps more than once: cut back to one of each once
+/// the list is twice as long as it was after its last cut, so a key noted
+/// costs a bounded share of a sort however many keys the map holds now (a
+/// map emptied after many changes keeps its many changed keys).
+#[derive(Clone, Debug)]
+struct Keys<K> {
+    list: Vec<K>,
+    /// The list's length after it was last cut back.
+    cut: usize,
+}
+
+impl<K> Default for Keys<K> {
+    fn default() -> Self {
+        Keys { list: Vec::new(), cut: 0 }
+    }
+}
+
+impl<K: Ord + Clone> Keys<K> {
+    fn note(&mut self, k: &K) {
+        self.list.push(k.clone());
+        if self.list.len() > 2 * self.cut + 16 {
+            self.once_each();
+        }
+    }
+    /// Each key once, in order.
+    fn once_each(&mut self) -> &[K] {
+        self.list.sort_unstable();
+        self.list.dedup();
+        self.cut = self.list.len();
+        &self.list
+    }
+    fn clear(&mut self) {
+        self.list.clear();
+        self.cut = 0;
+    }
+}
+
 impl<K: Ord + Clone, V> Tracked<K, V> {
     /// `k` changed: for the record's change, and for indexes.
     fn mark(&mut self, k: &K) {
-        self.changed.insert(k.clone());
-        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).insert(k.clone());
+        self.changed.note(k);
+        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).note(k);
     }
     pub fn get(&self, k: &K) -> Option<&V> {
         self.map.get(k)
@@ -676,27 +778,38 @@ impl<K: Ord + Clone, V> Tracked<K, V> {
         let unindexed = self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner());
         for (k, v) in self.map.iter_mut() {
             if f(k, v) {
-                self.changed.insert(k.clone());
-                unindexed.insert(k.clone());
+                self.changed.note(k);
+                unindexed.note(k);
             }
         }
     }
     /// Set `k` to `v` (or none) without counting it as changed: for data
     /// read, or changes applied.
     pub fn set(&mut self, k: K, v: Option<V>) {
-        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).insert(k.clone());
+        self.unindexed.get_mut().unwrap_or_else(|e| e.into_inner()).note(&k);
         match v {
             Some(v) => self.map.insert(k, v),
             None => self.map.remove(&k),
         };
     }
-    /// The keys changed since last asked.
-    pub fn take_changed(&mut self) -> Vec<K> {
-        std::mem::take(&mut self.changed).into_iter().collect()
+    /// The keys changed since last asked, once each, in order, with what
+    /// each holds now (none: removed), given to `f`; then forgotten.
+    pub fn take_changed(&mut self, f: impl FnOnce(&[K], &BTreeMap<K, V>)) {
+        f(self.changed.once_each(), &self.map);
+        self.changed.clear();
     }
-    /// The keys set since an index last asked.
-    fn take_unindexed(&self) -> BTreeSet<K> {
-        std::mem::take(&mut *self.unindexed.lock().unwrap_or_else(|e| e.into_inner()))
+    /// Forget the keys changed.
+    fn forget_changed(&mut self) {
+        self.changed.clear();
+    }
+    /// Each key set since an index last looked, with what it holds now,
+    /// given to `f`; then forgotten.
+    fn each_unindexed(&self, mut f: impl FnMut(&K, Option<&V>)) {
+        let mut keys = self.unindexed.lock().unwrap_or_else(|e| e.into_inner());
+        for k in keys.list.iter() {
+            f(k, self.map.get(k));
+        }
+        keys.clear();
     }
 }
 
@@ -773,15 +886,176 @@ pub fn current() -> Option<Arc<Record<Ipc>>> {
     CURRENT.lock().unwrap_or_else(|e| e.into_inner()).clone().or_else(initial)
 }
 
-/// The file of segment `id` in namespace record `r`.
-pub fn segment_path(r: &Record<Ipc>, id: i32) -> Vec<u8> {
-    [r.dir(), format!("/shm-{id}").as_bytes()].concat()
+/// The memory of the segment whose nonce is `nonce` ([`Shm::nonce`]): a
+/// POSIX shared memory object of the host's (memory, which any process,
+/// the host's X server among them, maps by its descriptor). (macOS's names
+/// are 31 bytes at most.)
+pub fn segment_name(nonce: u64) -> std::ffi::CString {
+    // `/fwe<euid>s<nonce in hex>`, written without the formatter (a
+    // segment's attachment and removal each name it).
+    let mut name = Vec::with_capacity(32);
+    name.extend_from_slice(b"/fwe");
+    let euid = crate::host::euid();
+    let mut digits = [0u8; 10];
+    let mut n = 0;
+    let mut v = euid;
+    loop {
+        digits[n] = b'0' + (v % 10) as u8;
+        n += 1;
+        v /= 10;
+        if v == 0 {
+            break;
+        }
+    }
+    name.extend(digits[..n].iter().rev());
+    name.push(b's');
+    let hex = 16 - (nonce.leading_zeros() as usize / 4).min(15);
+    for i in (0..hex).rev() {
+        name.push(b"0123456789abcdef"[(nonce >> (i * 4)) as usize & 15]);
+    }
+    std::ffi::CString::new(name).expect("a name without NUL")
 }
 
-fn remove_segment_file(r: &Record<Ipc>, id: i32) {
-    if let Ok(p) = std::ffi::CString::new(segment_path(r, id)) {
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        unsafe { libc::unlink(p.as_ptr()) };
+/// The device a segment's mappings are of (Linux's shared memory
+/// filesystem's, whose inode is the segment's id).
+pub const SEGMENT_DEV: u64 = crate::devnodes::makedev(0, 1);
+
+/// Segment `id` attached by process `p`, its memory made if it was not:
+/// a descriptor of the memory, for reading and writing unless
+/// `read_only`, and what [`detach_failed`] takes back if mapping it
+/// fails. One update of the namespace's record does it all, so a removal
+/// never comes between the memory's making and the attachment it is made
+/// for.
+pub fn attach(
+    r: &Record<Ipc>,
+    id: i32,
+    p: Proc,
+    read_only: bool,
+) -> Result<(std::os::fd::OwnedFd, Attached), i32> {
+    r.update_maybe(|t| {
+        let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) else {
+            return Err(errno::EIDRM);
+        };
+        let fd = if s.made {
+            open_segment(s.nonce, read_only)?
+        } else {
+            let fd = make_segment(s.nonce, s.size)?;
+            s.made = true;
+            fd
+        };
+        let before = Attached { atime: s.atime, lpid: s.lpid };
+        s.atime = crate::ipcops::now();
+        s.lpid = p.0;
+        attach_count(t, id, p, 1);
+        Ok(((fd, before), true))
+    })
+}
+
+/// A segment's times and last process before an attachment
+/// ([`attach`]).
+pub struct Attached {
+    atime: i64,
+    lpid: i32,
+}
+
+/// An attachment [`attach`] counted whose mapping failed: taken back, the
+/// segment's time and last process as they were.
+pub fn detach_failed(r: &Record<Ipc>, id: i32, p: Proc, before: Attached) {
+    let _ = r.update(|t| {
+        attach_count(t, id, p, -1);
+        if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {
+            s.atime = before.atime;
+            s.lpid = before.lpid;
+        }
+        Ok(())
+    });
+}
+
+/// A descriptor of segment `s`'s memory, for reading and writing unless
+/// `read_only`, made if it was not (`ENOENT`: it was removed). A segment is
+/// made under its namespace's lock ([`Record::update_maybe`]), so that two
+/// processes attaching it at once agree on one.
+pub fn segment_of(r: &Record<Ipc>, id: i32, read_only: bool) -> Result<std::os::fd::OwnedFd, i32> {
+    // (Read apart, the copy let go before the update below, which would
+    // otherwise find it shared and copy it whole.)
+    let made = match r.get().objs.get(&(Kind::Shm as u8, id)) {
+        Some(Obj { body: Body::Shm(s), .. }) => Some(s.made.then_some(s.nonce)),
+        _ => None,
+    };
+    let nonce = match made {
+        Some(Some(nonce)) => nonce,
+        Some(None) => {
+            return r.update_maybe(|t| match t.objs.get_mut(&(Kind::Shm as u8, id)) {
+                Some(Obj { body: Body::Shm(s), .. }) if s.made => {
+                    Ok((open_segment(s.nonce, read_only)?, false))
+                }
+                Some(Obj { body: Body::Shm(s), .. }) => {
+                    let fd = make_segment(s.nonce, s.size)?;
+                    s.made = true;
+                    Ok((fd, true))
+                }
+                _ => Err(errno::EIDRM),
+            });
+        }
+        None => return Err(errno::EIDRM),
+    };
+    open_segment(nonce, read_only).map_err(|e| if e == errno::ENOENT { errno::EIDRM } else { e })
+}
+
+/// Make the memory of a segment of `size` bytes (zeroes) named by `nonce`.
+fn make_segment(nonce: u64, size: u64) -> Result<std::os::fd::OwnedFd, i32> {
+    let name = segment_name(nonce);
+    // (No `O_CLOEXEC`, which macOS 26 refuses: the descriptor is closed once
+    // the segment is mapped.)
+    let flags = libc::O_RDWR | libc::O_CREAT | libc::O_EXCL;
+    // SAFETY: a NUL-terminated name.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0o600) };
+    if fd < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    // SAFETY: the descriptor just opened, owned from here on.
+    let fd = unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) };
+    // SAFETY: a plain host call on it.
+    if unsafe { libc::ftruncate(std::os::fd::AsRawFd::as_raw_fd(&fd), size as libc::off_t) } != 0 {
+        // SAFETY: the name made above.
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+        return Err(errno::ENOMEM);
+    }
+    Ok(fd)
+}
+
+/// A descriptor of the memory of the segment named by `nonce`, made
+/// already.
+fn open_segment(nonce: u64, read_only: bool) -> Result<std::os::fd::OwnedFd, i32> {
+    let name = segment_name(nonce);
+    let flags = if read_only { libc::O_RDONLY } else { libc::O_RDWR };
+    // SAFETY: a NUL-terminated name.
+    let fd = unsafe { libc::shm_open(name.as_ptr(), flags, 0) };
+    if fd < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
+    }
+    // SAFETY: the descriptor just opened, owned from here on.
+    Ok(unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) })
+}
+
+/// Segment `s` goes: its memory, if made, once nothing maps it.
+pub fn remove_segment(s: &Shm) {
+    if s.made {
+        let name = segment_name(s.nonce);
+        // SAFETY: a NUL-terminated name.
+        unsafe { libc::shm_unlink(name.as_ptr()) };
+    }
+}
+
+/// The namespace whose record is named `dir` goes
+/// ([`crate::shared::collect`]): its segments' memory with it.
+pub fn forget(dir: &[u8]) {
+    if let Ok(r) = Record::<Ipc>::join(dir, 0) {
+        for o in r.get().objs.values() {
+            if let Body::Shm(s) = &o.body {
+                remove_segment(s);
+            }
+        }
     }
 }
 
@@ -797,7 +1071,8 @@ impl Ipc {
         limit: usize,
     ) -> Result<i32, i32> {
         // An id asked for (`kernel.*_next_id`, used once): its slot, or
-        // the first free one past it, with its sequence number.
+        // the first free one past it, with its sequence number, the kind's
+        // own left as they were (as Linux leaves them).
         let next_name = match kind {
             Kind::Shm => "kernel/shm_next_id",
             Kind::Sem => "kernel/sem_next_id",
@@ -805,36 +1080,40 @@ impl Ipc {
         };
         let asked = self.sysctls.get(next_name).and_then(|v| v.trim().parse::<i32>().ok());
         let asked = asked.filter(|&v| v >= 0);
-        let slot = {
-            let mut idx = self.index();
-            let k = kind as u8;
-            if idx.used[k as usize % 3].0 >= limit {
+        let k = kind as u8;
+        // (The index and the ids are fields apart: the index is brought up
+        // to date through the objects' field, as `index` does.)
+        let ids = &mut self.ids[k as usize % 3];
+        let (slot, seq) = {
+            let mut idx = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
+            self.objs.each_unindexed(|&(kind, id), o| idx.reindex(kind, id, o));
+            let in_use = idx.used[k as usize % 3];
+            if in_use >= limit {
                 return Err(errno::ENOSPC);
             }
+            let free = |from: i32, to: i32| (from..to).find(|&s| !idx.slots.contains_key(&(k, s)));
             match asked {
-                Some(v) => (v % IPCMNI..IPCMNI)
-                    .find(|&s| !idx.slots.contains_key(&(k, s)))
-                    .ok_or(errno::ENOSPC)?,
+                Some(v) => (free(v % IPCMNI, IPCMNI).ok_or(errno::ENOSPC)?, (v / IPCMNI) as u16),
                 None => {
-                    let from = idx.used[k as usize % 3].1;
-                    let slot = (from..IPCMNI)
-                        .find(|&s| !idx.slots.contains_key(&(k, s)))
-                        .ok_or(errno::ENOSPC)?;
-                    // The slots below it are all in use.
-                    idx.used[k as usize % 3].1 = slot + 1;
-                    slot
+                    // `idr_alloc_cyclic`: the first free slot from the one
+                    // after the last taken, below the round's end, else
+                    // from the start.
+                    let end = (in_use * 3 / 2).max(MIN_CYCLE as usize).min(IPCMNI as usize) as i32;
+                    let from = ids.next.min(end);
+                    let slot = free(from, end).or_else(|| free(0, from)).ok_or(errno::ENOSPC)?;
+                    if slot <= ids.last {
+                        ids.seq = (ids.seq + 1) % SEQ_MAX;
+                    }
+                    ids.last = slot;
+                    ids.next = slot + 1;
+                    (slot, ids.seq)
                 }
             }
         };
-        let seq = match asked {
-            Some(v) => {
-                self.sysctls.remove(next_name);
-                (v / IPCMNI) as u16
-            }
-            None => self.seqs.get(&(kind as u8, slot)).copied().unwrap_or(0),
-        };
+        if asked.is_some() {
+            self.sysctls.remove(next_name);
+        }
         let id = seq as i32 * IPCMNI + slot;
-        self.seqs.insert((kind as u8, slot), seq.wrapping_add(1) % (i32::MAX / IPCMNI) as u16);
         self.objs.insert((kind as u8, id), Obj { key, perm, ctime: now(), removed: false, body });
         Ok(id)
     }
@@ -855,9 +1134,7 @@ impl Ipc {
     /// last looked.
     fn index(&self) -> std::sync::MutexGuard<'_, Index> {
         let mut idx = self.index.0.lock().unwrap_or_else(|e| e.into_inner());
-        for (kind, id) in self.objs.take_unindexed() {
-            idx.reindex(kind, id, self.objs.get(&(kind, id)));
-        }
+        self.objs.each_unindexed(|&(kind, id), o| idx.reindex(kind, id, o));
         idx
     }
 
@@ -888,7 +1165,7 @@ impl Ipc {
     }
 
     pub fn count(&self, kind: Kind) -> usize {
-        self.index().used[kind as usize % 3].0
+        self.index().used[kind as usize % 3]
     }
 
     /// Whether [`Ipc::reap`] has something to do.
@@ -899,7 +1176,7 @@ impl Ipc {
     /// What processes that have gone left: their attachments and undo
     /// adjustments (applied, as Linux applies them as a process ends), and
     /// a segment marked for removal whose last attachment that was.
-    pub fn reap(&mut self, r: &Record<Ipc>) -> bool {
+    pub fn reap(&mut self) -> bool {
         let mut changed = false;
         let mut gone_segments = Vec::new();
         // Only objects that name processes, or are marked for removal.
@@ -927,8 +1204,9 @@ impl Ipc {
             changed = true;
         }
         for id in gone_segments {
-            self.objs.remove(&(Kind::Shm as u8, id));
-            remove_segment_file(r, id);
+            if let Some(Obj { body: Body::Shm(s), .. }) = self.objs.remove(&(Kind::Shm as u8, id)) {
+                remove_segment(&s);
+            }
             changed = true;
         }
         changed
@@ -1159,7 +1437,7 @@ pub fn process_leaving(exec: bool) {
                 false
             });
         }
-        t.reap(&r);
+        t.reap();
         Ok(())
     });
 }
@@ -1238,6 +1516,45 @@ pub fn proc_listing(r: &Record<Ipc>, kind: Kind) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    /// A map emptied after many changes keeps its many changed keys, and
+    /// each change still costs a bounded share of a sort: the list is cut
+    /// back against its own length, not the map's count (a set of 32000
+    /// semaphore sets removed one by one sorted them all each time).
+    #[test]
+    fn changed_keys_are_cut_back_against_their_own_count() {
+        let mut t: Tracked<(u8, i32), ()> = Tracked::default();
+        const N: i32 = 20_000;
+        for id in 0..N {
+            t.set((0, id), Some(()));
+        }
+        let mut cuts = 0;
+        for id in 0..N {
+            let before = t.changed.cut;
+            t.get_mut(&(0, id));
+            t.set((0, id), None);
+            if t.changed.cut != before {
+                cuts += 1;
+            }
+        }
+        // Distinct keys double between cuts: about log2(N) of them.
+        assert!(cuts <= 20, "cut back {cuts} times");
+        let mut seen = 0;
+        t.take_changed(|keys, map| {
+            seen = keys.len();
+            assert!(map.is_empty());
+        });
+        assert_eq!(seen, N as usize);
+    }
+
+    #[test]
+    fn segment_names_are_the_euid_and_the_nonce_in_hex() {
+        let euid = crate::host::euid();
+        for nonce in [0u64, 1, 0xa, 0x1234_abcd, u64::MAX] {
+            let want = format!("/fwe{euid}s{nonce:x}");
+            assert_eq!(segment_name(nonce).to_bytes(), want.as_bytes());
+        }
+    }
+
     /// Changes reach another process's copy through the journal, and the
     /// data written whole when the journal outgrows it, in order.
     #[test]
@@ -1309,13 +1626,26 @@ mod tests {
         assert_eq!(s.undo, vec![((5, 6), vec![(1, -2)])]);
         let Body::Msg(m) = &back.objs[&(Kind::Msg as u8, msg)].body else { panic!() };
         assert_eq!(m.msgs, [(4, b"hi".to_vec())]);
-        // The next of a kind takes the next slot; a freed one is reused
-        // under a new sequence.
-        let shm2 = t.create(Kind::Shm, 9, perm, Body::Shm(Shm::default()), 10).unwrap();
+        assert_eq!(back.ids, t.ids);
+        // Slots are taken in turn, as Linux takes them: a freed one is not
+        // taken again until the round (64 slots, while few are in use)
+        // comes back to it, under the next sequence number.
+        let shm2 = t.create(Kind::Shm, 9, perm, Body::Shm(Shm::default()), 100).unwrap();
         assert_eq!(shm2, 1);
         t.objs.remove(&(Kind::Shm as u8, shm));
-        let shm3 = t.create(Kind::Shm, 10, perm, Body::Shm(Shm::default()), 10).unwrap();
-        assert_eq!(shm3, IPCMNI);
+        let shm3 = t.create(Kind::Shm, 10, perm, Body::Shm(Shm::default()), 100).unwrap();
+        assert_eq!(shm3, 2);
         assert_eq!(t.by_key(Kind::Shm, 10), Some(shm3));
+        // Each made and removed in turn, few in use: the round is 64.
+        for slot in 3..MIN_CYCLE {
+            let id = t.create(Kind::Shm, IPC_PRIVATE, perm, Body::Shm(Shm::default()), 100);
+            assert_eq!(id, Ok(slot));
+            t.objs.remove(&(Kind::Shm as u8, slot));
+        }
+        let again = t.create(Kind::Shm, IPC_PRIVATE, perm, Body::Shm(Shm::default()), 100);
+        assert_eq!(again, Ok(IPCMNI));
+        // Another kind's ids are its own.
+        let sem2 = t.create(Kind::Sem, IPC_PRIVATE, perm, Body::Sem(Sem::default()), 100);
+        assert_eq!(sem2, Ok(1));
     }
 }

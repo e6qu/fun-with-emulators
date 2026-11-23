@@ -128,6 +128,11 @@ int main(void) {
     target = pthread_self();
     unsigned long t;
     pthread_create(&t, 0, signaller, 0);
+    /* The signaller at work before the rounds, which can be over in a few
+     * milliseconds: its signals land all along them. */
+    while (!atomic_load(&signals))
+        ;
+    long landed = atomic_load(&signals);
     long (*caller)(long, long) = (long (*)(long, long))code;
     uint32_t *add = (uint32_t *)(code + (jc_callee - jc_begin)) + 1;
     long wrong = 0;
@@ -140,6 +145,6 @@ int main(void) {
     pthread_join(t, 0);
     printf("wrong calls: %ld of %d\n", wrong, ROUNDS * CALLS);
     printf("signals in the callee with another x30: %ld, signals %s\n", atomic_load(&wrong_x30),
-           atomic_load(&signals) ? "landed" : "none");
+           atomic_load(&signals) > landed ? "landed" : "none");
     return 0;
 }

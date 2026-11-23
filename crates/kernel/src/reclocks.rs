@@ -1,6 +1,7 @@
 //! Whether the process holds POSIX record locks (`F_SETLK`).
 //!
-//! Record locks are the host's, and macOS, as Linux, drops all of a
+//! Record locks are the host's (but those of fwe's own file store's files,
+//! which the store keeps: [`crate::filestore::locks`]), and macOS, as Linux, drops all of a
 //! process's locks on a file when the process closes any descriptor of
 //! it. Linux does so only for the guest's own closes; fwe must never close
 //! a descriptor of a guest's file it opened for its own ends. Most of fwe

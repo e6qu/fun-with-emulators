@@ -367,15 +367,10 @@ impl<P: Platform> Kernel<P> {
         let cgroup = match a.cgroup {
             None => None,
             Some(fd) => {
-                let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
-                match crate::cgroupfs::locate(&host) {
-                    Some((cg, None)) => {
-                        crate::cgroupfs::may_move(&crate::cgroupfs::current(), &cg)?;
-                        crate::cgroupfs::may_join(&cg)?;
-                        Some(cg)
-                    }
-                    _ => return Err(errno::EBADF),
-                }
+                let cg = crate::cgroupfs::of_fd(fd).map_err(|_| errno::EBADF)?;
+                crate::cgroupfs::may_move(&crate::cgroupfs::current(), &cg)?;
+                crate::cgroupfs::may_join(&cg)?;
+                Some(cg)
             }
         };
         // Within the cgroup's `pids.max`; frozen with it.
@@ -531,6 +526,10 @@ impl<P: Platform> Kernel<P> {
             fs.set_mount_ns(mnt);
             fs.ns = ns;
         }
+        if child > 0 {
+            crate::mqueue::forked(child);
+            crate::filestore::desc::forked(child);
+        }
         if child > 0 && t.child_writes.is_none() {
             // It starts in this process's cgroup, in its namespaces.
             crate::procreg::forked(
@@ -642,8 +641,9 @@ impl<P: Platform> Kernel<P> {
         crate::cgroupfs::forked();
         if t.frozen {
             // As a task forked into a frozen cgroup, it runs only once
-            // the cgroup thaws.
-            crate::host::kill_process(crate::host::pid(), libc::SIGSTOP);
+            // the cgroup thaws ([`crate::signal::continue_process`]).
+            crate::signal::stop_sent_now();
+            crate::host::stop_with(libc::SIGSTOP);
         }
         FILES_SHARED.store(t.files, std::sync::atomic::Ordering::SeqCst);
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);

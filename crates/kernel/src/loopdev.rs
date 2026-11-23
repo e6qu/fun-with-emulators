@@ -402,7 +402,7 @@ fn open_file(host: &[u8], dev: u64, ino: u64, write: bool) -> Result<OwnedFd, i3
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
     if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0
-        || (st.st_dev as u64, st.st_ino as u64) != (dev, ino)
+        || (crate::host::dev_of(&st), st.st_ino as u64) != (dev, ino)
     {
         return Err(errno::EIO);
     }
@@ -1048,7 +1048,7 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EBADF);
         }
         Ok(Attach {
-            backing: Backing::File { host, dev: hs.st_dev as u64, ino: hs.st_ino as u64 },
+            backing: Backing::File { host, dev: crate::host::dev_of(&hs), ino: hs.st_ino as u64 },
             path,
             st_dev: st.st_dev,
             st_ino: st.st_ino,

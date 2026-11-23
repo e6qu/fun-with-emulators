@@ -97,6 +97,15 @@ static void own(void) {
         words += *c == ' ' || *c == '\n';
     }
     printf("statm words: %d\n", words);
+    /* An open /proc file is named by its process's own directory. */
+    int f = open("/proc/self/statm", O_RDONLY);
+    char link[64], want[64];
+    snprintf(link, sizeof link, "/proc/self/fd/%d", f);
+    long l = readlink(link, buf, sizeof buf - 1);
+    buf[l < 0 ? 0 : l] = 0;
+    snprintf(want, sizeof want, "/proc/%d/statm", getpid());
+    printf("open statm's link is its pid's: %d\n", strcmp(buf, want) == 0);
+    close(f);
     slurp("/proc/self/io", buf, sizeof buf);
     printf("io read_bytes: %d\n", strstr(buf, "\nread_bytes: ") != 0);
     printf("comm write: %d\n", put("/proc/self/comm", "renamed"));

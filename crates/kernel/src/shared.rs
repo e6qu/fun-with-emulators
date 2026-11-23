@@ -1,21 +1,24 @@
-//! State that every fwe process sees: a record in fwe's private directory
-//! on the host, as a kernel keeps state every process sees in its own
-//! memory. Mount tables, namespaces and the cgroup tree are such records.
+//! State that every fwe process sees: a record in memory every fwe process
+//! maps ([`crate::procstore::named`]), as a kernel keeps state every
+//! process sees in its own memory. Mount tables, namespaces, System V IPC
+//! and the cgroup tree are such records.
 //!
-//! A record is a directory holding its data and a generation count each
-//! process maps, so a process rereads the data only when another has
-//! changed it. Each change, made under a lock, counts a generation. A type
-//! that keeps its changes ([`Data::changes`]) has each appended to a
-//! journal beside the data, which a process applies to its copy, until the
-//! journal outgrows the data and the data is written whole again; others
-//! are written whole each time. A record of thousands of objects (System V
-//! IPC's) so costs a change what the change holds, not what the record
-//! does.
+//! A record is named by a path in fwe's private directory on the host (its
+//! [`Record::dir`]), which is made only for host objects that belong with
+//! it ([`host_dir`]: an abstract socket's node, say); its data, its lock
+//! and the generation count each change counts are in the shared memory.
+//! Each process keeps a copy of the data, and reads it again only when
+//! another has changed it. A type that keeps its changes
+//! ([`Data::changes`]) has each appended to a journal beside the data,
+//! which a process applies to its copy, until the journal outgrows the
+//! data and the data is written whole again; others are written whole each
+//! time. A record of thousands of objects (System V IPC's) so costs a
+//! change what the change holds, not what the record does.
 
-use crate::host::{errno_to_linux, last_errno};
+use crate::host::errno_to_linux;
+use crate::procstore::named::{self, Slot};
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
-use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -34,6 +37,11 @@ pub trait Data: Clone + Default + Send + Sync + 'static {
     fn changes(&mut self, _e: &mut Enc) -> bool {
         false
     }
+    /// Forget the changes made since the data was read or last asked
+    /// (they are what it is, not changes of it).
+    fn forget_changes(&mut self) {
+        self.changes(&mut Enc::new());
+    }
     /// Apply changes [`Data::changes`] encoded (keeping none of them as
     /// changes of its own).
     fn apply(&mut self, _d: &mut Dec) {}
@@ -41,22 +49,7 @@ pub trait Data: Clone + Default + Send + Sync + 'static {
 
 /// The size a journal may reach before the data is written whole, when
 /// the data is smaller.
-const JOURNAL_MIN: u64 = 64 << 10;
-
-/// The bytes of the file at host path `p`.
-fn read_path(p: &[u8]) -> Result<Vec<u8>, i32> {
-    use std::os::unix::ffi::OsStrExt;
-    std::fs::read(std::ffi::OsStr::from_bytes(p))
-        .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
-}
-
-fn e() -> i32 {
-    errno_to_linux(last_errno())
-}
-
-fn c(p: &[u8]) -> Result<CString, i32> {
-    CString::new(p).map_err(|_| errno::EINVAL)
-}
+const JOURNAL_MIN: usize = 64 << 10;
 
 #[cfg(target_os = "macos")]
 const UL_COMPARE_AND_WAIT_SHARED: u32 = 3;
@@ -77,13 +70,13 @@ unsafe extern "C" {
     fn __ulock_wake(op: u32, addr: *mut libc::c_void, wake_value: u64) -> libc::c_int;
 }
 
-/// Sleep up to `slice` while the generation word reads `seen` (its low
-/// half, which every change changes), a shared host address wait any
-/// process's change ends ([`wake_all`]).
+/// Sleep up to `slice` while shared word `word` reads `seen` (its low half,
+/// which every change changes), a shared host address wait any process's
+/// change ends ([`wake_all`]).
 fn wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
     #[cfg(target_os = "macos")]
-    // SAFETY: the record's mapped generation word; the host sleeps while
-    // its low half still reads `seen`'s.
+    // SAFETY: a shared word of the store's; the host sleeps while its low
+    // half still reads `seen`'s.
     unsafe {
         __ulock_wait2(
             UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
@@ -100,7 +93,7 @@ fn wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
     }
 }
 
-/// Wake every process waiting for the record's generation to change.
+/// Wake every process waiting for the word to change.
 fn wake_all(word: &AtomicU64) {
     #[cfg(target_os = "macos")]
     // SAFETY: wakes waiters on the address; reads nothing.
@@ -136,7 +129,19 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 34;
+pub const FORMAT: u32 = 50;
+
+/// A number no other call of any process gives: for the names of host
+/// objects of fwe's (a System V segment's memory, an eventfd's counter).
+pub fn unique() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(0);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let pid = crate::host::pid() as u64;
+    hash(&[now.to_le_bytes(), pid.to_le_bytes(), n.to_le_bytes()].concat())
+}
 
 /// A name no other record has: the kind, this process and a count.
 fn fresh_name(kind: &str) -> String {
@@ -183,16 +188,55 @@ pub fn lock_exclusive(fd: i32) {
     crate::host::set_errno(saved);
 }
 
+/// The host directory of the record named `dir`, made if it is not there:
+/// for host objects that belong with the record (the nodes of a network
+/// namespace's abstract sockets, say), which go with it.
+pub fn host_dir(dir: &[u8]) -> Result<(), i32> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::DirBuilderExt;
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(std::ffi::OsStr::from_bytes(dir))
+        .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
+}
+
+/// The identity of the record named `dir`, if there is one.
+pub fn id_of(dir: &[u8]) -> Option<u64> {
+    named::find(dir).map(|s| s.id())
+}
+
+/// The note kept beside the record named `dir`'s data, if it has one.
+pub fn note(dir: &[u8]) -> Option<Vec<u8>> {
+    named::find(dir)?.note()
+}
+
+/// Keep `bytes` as the note beside the record named `dir`'s data.
+pub fn set_note(dir: &[u8], bytes: &[u8]) -> Result<(), i32> {
+    let slot = named::find(dir).ok_or(errno::ENOENT)?;
+    let held = slot.lock();
+    slot.set_note(&held, bytes);
+    Ok(())
+}
+
+/// A process's copy of a record's data: the generation it is at, and
+/// where in the journal (its epoch and offset) the changes after it begin.
+struct Copy<T> {
+    at: u64,
+    data: Arc<T>,
+    journal: Option<(u32, u32)>,
+}
+
 /// One record, as this process sees it.
 pub struct Record<T: Data> {
-    /// The record's directory.
+    /// The record's name.
     dir: Vec<u8>,
     /// Its identity (a namespace's number in `/proc/self/ns`).
     id: u64,
-    /// The shared generation count.
-    generation: &'static AtomicU64,
-    /// The data as last read, and the generation it was read at.
-    cache: Mutex<(u64, Arc<T>)>,
+    slot: Slot,
+    /// The data as last read (none while a change is being made, or before
+    /// it is first read).
+    cache: Mutex<Option<Copy<T>>>,
 }
 
 impl<T: Data> std::fmt::Debug for Record<T> {
@@ -203,15 +247,15 @@ impl<T: Data> std::fmt::Debug for Record<T> {
 
 impl<T: Data> Record<T> {
     /// The record called `name`, made with `initial` if it does not exist.
-    /// `id` is its identity, or 0 for one from its directory.
+    /// `id` is its identity, or 0 for the one it was given.
     pub fn named(name: &str, id: u64, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
         let mut dir = crate::fs::shm::user_dir()?;
         dir.extend_from_slice(format!("/v{FORMAT}-{name}").as_bytes());
         Record::open_or_make(dir, id, initial)
     }
 
-    /// The record at directory `dir`, inside another record's (whose life
-    /// it shares), made with `initial` if it does not exist.
+    /// The record named `dir`, inside another record's (whose life it
+    /// shares), made with `initial` if it does not exist.
     pub fn at(dir: Vec<u8>, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
         Record::open_or_make(dir, 0, initial)
     }
@@ -223,95 +267,49 @@ impl<T: Data> Record<T> {
         Record::named(&fresh_name(kind), 0, || data)
     }
 
-    /// The record whose directory is `dir` ([`Record::dir`]), which must
-    /// exist and hold data of this kind (one a parent process had). It is
-    /// never written here.
+    /// The record named `dir` ([`Record::dir`]), which must exist and hold
+    /// data of this kind (one a parent process had). It is never written
+    /// here.
     pub fn join(dir: &[u8], id: u64) -> Result<Record<T>, i32> {
-        let r = Record::open(dir.to_vec(), id, false)?;
-        let (whole, t) = r.read_file().map_err(|_| errno::ENOENT)?;
-        r.keep_current(whole, t);
+        let slot = named::find(dir).ok_or(errno::ENOENT)?;
+        if !slot.has_data() {
+            return Err(errno::ENOENT);
+        }
+        let r = Record::with(dir.to_vec(), id, slot);
+        let copy = r.read_current(None).map_err(|_| errno::ENOENT)?;
+        *r.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
         Ok(r)
     }
 
+    fn with(dir: Vec<u8>, id: u64, slot: Slot) -> Record<T> {
+        let id = if id != 0 { id } else { slot.id() };
+        Record { dir, id, slot, cache: Mutex::new(None) }
+    }
+
     fn open_or_make(dir: Vec<u8>, id: u64, initial: impl FnOnce() -> T) -> Result<Record<T>, i32> {
-        let r = Record::open(dir, id, true)?;
-        r.with_lock(|| {
-            match r.read_file() {
-                Ok((whole, t)) => r.keep_current(whole, t),
-                Err(_) => {
-                    let at = r.generation() + 1;
-                    let t = initial();
-                    r.write_file(at, &t)?;
-                    r.advance(at);
-                    r.keep_current(at, t);
-                }
+        let r = Record::with(dir.clone(), id, named::find_or_make(&dir));
+        r.with_lock(|held| {
+            if r.slot.has_data() {
+                let copy = r.read_current(None)?;
+                *r.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(copy);
+            } else {
+                let at = r.generation() + 1;
+                let mut t = initial();
+                // (What it holds now is not a change of it.)
+                t.forget_changes();
+                let mut enc = Enc::new();
+                t.encode(&mut enc);
+                let epoch = r.slot.write_whole(held, at, &enc.into_bytes());
+                r.slot.advance(held, at);
+                *r.cache.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(Copy { at, data: Arc::new(t), journal: Some((epoch, 0)) });
             }
             Ok(())
         })?;
         Ok(r)
     }
 
-    /// The data read whole, `t` at generation `whole`, brought up to date
-    /// from the journal and kept for [`Record::get`] if it is the data as
-    /// it is now: the first look reads nothing again.
-    fn keep_current(&self, whole: u64, t: T) {
-        let now = self.generation();
-        if let Ok((at, t)) = self.apply_after(whole, &t)
-            && at == now
-        {
-            *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = (at, Arc::new(t));
-        }
-    }
-
-    /// The record at `dir`, made if `make`, with its generation mapped.
-    fn open(dir: Vec<u8>, id: u64, make: bool) -> Result<Record<T>, i32> {
-        let d = c(&dir)?;
-        if make {
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            unsafe { libc::mkdir(d.as_ptr(), 0o700) };
-        }
-        let gen_path = c(&[&dir[..], b"/generation"].concat())?;
-        let create = if make { libc::O_CREAT } else { 0 };
-        // SAFETY: as above.
-        let fd = unsafe {
-            libc::open(gen_path.as_ptr(), libc::O_RDWR | create | libc::O_CLOEXEC, 0o600)
-        };
-        if fd < 0 {
-            return Err(e());
-        }
-        // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: plain host calls on the descriptor just opened.
-        let ok = unsafe { libc::ftruncate(fd, 8) == 0 && libc::fstat(fd, &mut st) == 0 };
-        if !ok {
-            let err = e();
-            // SAFETY: closing it again.
-            unsafe { libc::close(fd) };
-            return Err(err);
-        }
-        // SAFETY: a shared mapping of the 8-byte file, never unmapped: a
-        // process has only a few records, for as long as it lives.
-        let p = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                8,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            )
-        };
-        // SAFETY: the mapping holds its own reference to the file.
-        unsafe { libc::close(fd) };
-        if p == libc::MAP_FAILED {
-            return Err(e());
-        }
-        // SAFETY: the mapping is 8 bytes, page-aligned and lives forever.
-        let generation: &'static AtomicU64 = unsafe { &*(p as *const AtomicU64) };
-        let id = if id != 0 { id } else { 4026532000 + (st.st_ino as u64 & 0xffff_ffff) };
-        Ok(Record { dir, id, generation, cache: Mutex::new((u64::MAX, Arc::new(T::default()))) })
-    }
-
+    /// The record's name: a path in fwe's private directory ([`host_dir`]).
     pub fn dir(&self) -> &[u8] {
         &self.dir
     }
@@ -320,214 +318,151 @@ impl<T: Data> Record<T> {
         self.id
     }
 
-    fn data_path(&self) -> Vec<u8> {
-        [&self.dir[..], b"/data"].concat()
-    }
-
-    fn journal_path(&self) -> Vec<u8> {
-        [&self.dir[..], b"/journal"].concat()
-    }
-
-    /// The data as last written whole, and the generation it is at.
-    fn read_file(&self) -> Result<(u64, T), i32> {
-        let bytes = read_path(&self.data_path())?;
-        let mut d = Dec::new(&bytes);
-        let at = d.u64();
-        let t = T::decode(&mut d);
-        d.finish().map_err(|_| errno::EIO)?;
-        if !t.valid() {
-            return Err(errno::EIO);
-        }
-        Ok((at, t))
-    }
-
-    /// The generation the data written whole is at.
-    fn file_generation(&self) -> Result<u64, i32> {
-        use std::io::Read;
-        use std::os::unix::ffi::OsStrExt;
-        let mut f = std::fs::File::open(std::ffi::OsStr::from_bytes(&self.data_path()))
-            .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
-        let mut b = [0u8; 8];
-        f.read_exact(&mut b).map_err(|_| errno::EIO)?;
-        Ok(u64::from_le_bytes(b))
-    }
-
-    /// The journal's changes after generation `after`, one per generation
-    /// from `after + 1` on, each with its generation. A change written
+    /// The changes in `journal` (bytes from offset `start` of the journal)
+    /// after generation `after` and up to `upto`, in order, one for each
+    /// generation, and the offset past the last of them. A change written
     /// again for the same generation (its writer ended before the change
     /// counted) stands for the one before it.
-    fn journal_after(&self, after: u64) -> Vec<(u64, Vec<u8>)> {
-        let Ok(bytes) = read_path(&self.journal_path()) else { return Vec::new() };
-        let mut d = Dec::new(&bytes);
+    fn changes_in(journal: &[u8], start: u32, after: u64, upto: u64) -> (Vec<(u64, Vec<u8>)>, u32) {
+        let mut d = Dec::new(journal);
         let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+        let mut end = start;
         while !d.at_end() {
             let (at, body) = (d.u64(), d.bytes());
-            if !d.whole() {
-                // One being written as this read.
+            if !d.whole() || at > upto {
+                // (Changes past `upto` are read the next time.)
                 break;
             }
+            end = start + d.position() as u32;
             out.retain(|&(g, _)| g < at);
             if at > after {
                 out.push((at, body));
             }
         }
-        out
+        (out, end)
     }
 
-    /// The data at generation `seen` and the changes after it, applied:
-    /// the data and the generation it is now at (`Err` for changes
-    /// missing between).
-    fn apply_after(&self, seen: u64, base: &T) -> Result<(u64, T), i32> {
-        let changes = self.journal_after(seen);
-        let mut t = base.clone();
-        let mut at = seen;
-        for (g, body) in changes {
-            if g != at + 1 {
-                return Err(errno::EIO);
-            }
-            let mut d = Dec::new(&body);
-            t.apply(&mut d);
-            d.finish().map_err(|_| errno::EIO)?;
-            at = g;
-        }
-        Ok((at, t))
-    }
-
-    /// The data as it is now and the generation it is at: `cached` (at
-    /// generation `seen`) brought up to date from the journal when it
-    /// holds every change since, else read whole. What a change made
-    /// meanwhile tore is read again.
-    fn read_current(&self, seen: u64, cached: &Arc<T>) -> Result<(u64, Arc<T>), i32> {
-        // Files read: fwe's work, not a wait of the guest's.
-        let _busy = crate::procstore::Busy::new();
+    /// The data as it is now: `copy` (if any) brought up to date from the
+    /// journal when it holds every change since, else read whole. What a
+    /// change made meanwhile tore is read again.
+    fn read_current(&self, copy: Option<&Copy<T>>) -> Result<Copy<T>, i32> {
         let mut last = Err(errno::EIO);
         for _ in 0..100 {
-            let now = self.generation.load(Ordering::SeqCst);
-            let read = match self.file_generation() {
-                Ok(whole) if seen != u64::MAX && whole <= seen => self.apply_after(seen, cached),
-                Ok(_) => self.read_file().and_then(|(whole, t)| self.apply_after(whole, &t)),
-                Err(e) => Err(e),
+            let from = copy.and_then(|c| c.journal);
+            let Some(read) = self.slot.read(from) else {
+                std::thread::yield_now();
+                continue;
             };
-            match read {
-                Ok((at, t)) if at == now => return Ok((at, Arc::new(t))),
-                Ok((at, t)) => last = Ok((at, Arc::new(t))),
-                Err(e) => last = Err(e),
+            let (base_at, base) = match read.data {
+                Some((at, bytes)) => {
+                    let mut d = Dec::new(&bytes);
+                    let t = T::decode(&mut d);
+                    if d.finish().is_err() || !t.valid() {
+                        last = Err(errno::EIO);
+                        std::thread::yield_now();
+                        continue;
+                    }
+                    (at, Arc::new(t))
+                }
+                // (Read whole when there is no copy.)
+                None => match copy {
+                    Some(c) => (c.at, c.data.clone()),
+                    None => {
+                        std::thread::yield_now();
+                        continue;
+                    }
+                },
+            };
+            let (changes, end) =
+                Self::changes_in(&read.journal, read.start, base_at, read.generation);
+            let mut at = base_at;
+            let mut data = base;
+            if !changes.is_empty() {
+                let mut t = Arc::try_unwrap(data).unwrap_or_else(|a| (*a).clone());
+                let mut torn = false;
+                for (g, body) in changes {
+                    if g != at + 1 {
+                        torn = true;
+                        break;
+                    }
+                    let mut d = Dec::new(&body);
+                    t.apply(&mut d);
+                    if d.finish().is_err() {
+                        torn = true;
+                        break;
+                    }
+                    at = g;
+                }
+                if torn {
+                    last = Err(errno::EIO);
+                    std::thread::yield_now();
+                    continue;
+                }
+                data = Arc::new(t);
             }
+            if at == read.generation {
+                return Ok(Copy { at, data, journal: Some((read.epoch, end)) });
+            }
+            last = Err(errno::EIO);
             std::thread::yield_now();
         }
         last
     }
 
-    /// Under the lock: write `t` whole at generation `at`.
-    fn write_file(&self, at: u64, t: &T) -> Result<(), i32> {
-        use std::os::unix::ffi::OsStrExt;
-        let mut enc = Enc::new();
-        enc.u64(at);
-        t.encode(&mut enc);
-        let pid = crate::host::pid();
-        let tmp = [&self.data_path()[..], format!(".{pid}").as_bytes()].concat();
-        std::fs::write(std::ffi::OsStr::from_bytes(&tmp), enc.into_bytes())
-            .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))?;
-        let (from, to) = (c(&tmp)?, c(&self.data_path())?);
-        // SAFETY: NUL-terminated paths in the record's directory.
-        if unsafe { libc::rename(from.as_ptr(), to.as_ptr()) } != 0 {
-            return Err(e());
-        }
-        Ok(())
-    }
-
-    /// Under the lock: the change made at generation `at`, appended to
-    /// the journal in one write.
-    fn append_journal(&self, at: u64, body: Vec<u8>) -> Result<(), i32> {
-        use std::io::Write;
-        use std::os::unix::ffi::OsStrExt;
-        let mut enc = Enc::new();
-        enc.u64(at);
-        enc.bytes(&body);
-        std::fs::OpenOptions::new()
-            .append(true)
-            .create(true)
-            .open(std::ffi::OsStr::from_bytes(&self.journal_path()))
-            .and_then(|mut f| f.write_all(&enc.into_bytes()))
-            .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
-    }
-
-    /// Under the lock: the generation moves to `at`, for every process.
-    fn advance(&self, at: u64) {
-        self.generation.store(at, Ordering::SeqCst);
-        wake_all(self.generation);
-    }
-
     /// Under the lock: the data as it is now, the cached copy taken when
     /// it is current (no other process changed it since), else read.
-    fn take_locked(&self) -> Result<T, i32> {
-        let now = self.generation.load(Ordering::SeqCst);
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        let held = std::mem::replace(&mut *cache, (u64::MAX, Arc::new(T::default())));
-        if held.0 == now {
-            return Ok(Arc::try_unwrap(held.1).unwrap_or_else(|a| (*a).clone()));
-        }
-        let (_, t) = self.read_current(held.0, &held.1)?;
-        Ok(Arc::try_unwrap(t).unwrap_or_else(|a| (*a).clone()))
+    fn take_locked(&self) -> Result<(T, Option<(u32, u32)>), i32> {
+        let now = self.generation();
+        let held = self.cache.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let copy = match held {
+            Some(c) if c.at == now => c,
+            held => self.read_current(held.as_ref())?,
+        };
+        Ok((Arc::try_unwrap(copy.data).unwrap_or_else(|a| (*a).clone()), copy.journal))
     }
 
     /// Under the lock: `t` is the data now, for every process. A type
     /// that keeps its changes has them appended to the journal; the data
     /// is written whole once the journal outgrows it.
-    fn put_locked(&self, mut t: T) -> Result<(), i32> {
-        use std::os::unix::ffi::OsStrExt;
-        let at = self.generation.load(Ordering::SeqCst) + 1;
-        let mut changes = Enc::new();
-        let kept = t.changes(&mut changes);
-        let size =
-            |p: &[u8]| std::fs::metadata(std::ffi::OsStr::from_bytes(p)).map_or(0, |m| m.len());
-        let (whole, journal) = (size(&self.data_path()), size(&self.journal_path()));
-        let changes = changes.into_bytes();
-        if kept && whole > 0 && journal + changes.len() as u64 <= whole.max(JOURNAL_MIN) {
-            self.append_journal(at, changes)?;
+    fn put_locked(&self, held: &named::Held, mut t: T) {
+        let at = self.generation() + 1;
+        let mut entry = Enc::with_capacity(256);
+        entry.u64(at);
+        let kept = entry.section(|e| t.changes(e));
+        let entry = entry.into_bytes();
+        let (whole, journal) = self.slot.sizes();
+        let journal = if kept && whole > 0 && journal + entry.len() <= whole.max(JOURNAL_MIN) {
+            self.slot.append(held, &entry)
         } else {
-            self.write_file(at, &t)?;
-            if journal > 0 {
-                let _ = std::fs::write(std::ffi::OsStr::from_bytes(&self.journal_path()), b"");
-            }
-        }
-        self.advance(at);
-        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = (at, Arc::new(t));
-        Ok(())
+            let mut enc = Enc::new();
+            t.encode(&mut enc);
+            (self.slot.write_whole(held, at, &enc.into_bytes()), 0)
+        };
+        self.slot.advance(held, at);
+        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some(Copy { at, data: Arc::new(t), journal: Some(journal) });
     }
 
     /// Under the lock: `t`, which `f` left as it was, is the cached copy
     /// again.
-    fn restore_locked(&self, mut t: T) {
-        t.changes(&mut Enc::new());
+    fn restore_locked(&self, mut t: T, journal: Option<(u32, u32)>) {
+        t.forget_changes();
         *self.cache.lock().unwrap_or_else(|e| e.into_inner()) =
-            (self.generation.load(Ordering::SeqCst), Arc::new(t));
+            Some(Copy { at: self.generation(), data: Arc::new(t), journal });
     }
 
     /// Run `f` holding the record's lock.
-    fn with_lock<R>(&self, f: impl FnOnce() -> Result<R, i32>) -> Result<R, i32> {
-        // Files opened, locked, read and written: fwe's work, not a wait
-        // of the guest's.
+    fn with_lock<R>(&self, f: impl FnOnce(&named::Held) -> Result<R, i32>) -> Result<R, i32> {
+        // Waiting for another process's lock: fwe's work, not a wait of
+        // the guest's.
         let _busy = crate::procstore::Busy::new();
-        let lock = c(&[&self.dir[..], b"/lock"].concat())?;
-        // SAFETY: a NUL-terminated path in the record's directory.
-        let fd = unsafe {
-            libc::open(lock.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        if fd < 0 {
-            return Err(e());
-        }
-        lock_exclusive(fd);
-        let r = f();
-        // SAFETY: plain host call on the descriptor just opened; the lock
-        // goes with it.
-        unsafe { libc::close(fd) };
-        r
+        let held = self.slot.lock();
+        f(&held)
     }
 
     /// The record's generation: it changes with every change of its data.
     pub fn generation(&self) -> u64 {
-        self.generation.load(Ordering::SeqCst)
+        self.slot.generation()
     }
 
     /// Wait until the data changes from generation `seen`, `until` passes
@@ -547,28 +482,36 @@ impl<T: Data> Record<T> {
                 Some(d) => (d - now).min(crate::futex::SIGNAL_CHECK),
                 None => crate::futex::SIGNAL_CHECK,
             };
-            wait_word(self.generation, seen, slice);
+            self.slot.wait(seen, slice.as_nanos().max(1) as u64);
         }
     }
 
     /// The data as it is now.
     pub fn get(&self) -> Arc<T> {
-        let now = self.generation.load(Ordering::SeqCst);
+        let now = self.generation();
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.0 != now
-            && let Ok(fresh) = self.read_current(cache.0, &cache.1)
+        if let Some(c) = &*cache
+            && c.at == now
         {
-            *cache = fresh;
+            return c.data.clone();
         }
-        cache.1.clone()
+        match self.read_current(cache.as_ref()) {
+            Ok(fresh) => {
+                let data = fresh.data.clone();
+                *cache = Some(fresh);
+                data
+            }
+            // Torn by changes each time it was read: the copy as it was.
+            Err(_) => cache.as_ref().map_or_else(|| Arc::new(T::default()), |c| c.data.clone()),
+        }
     }
 
     /// Change the data with `f`, for every process.
     pub fn update<R>(&self, f: impl FnOnce(&mut T) -> Result<R, i32>) -> Result<R, i32> {
-        self.with_lock(|| {
-            let mut t = self.take_locked()?;
+        self.with_lock(|held| {
+            let (mut t, _) = self.take_locked()?;
             let r = f(&mut t)?;
-            self.put_locked(t)?;
+            self.put_locked(held, t);
             Ok(r)
         })
     }
@@ -580,13 +523,13 @@ impl<T: Data> Record<T> {
         &self,
         f: impl FnOnce(&mut T) -> Result<(R, bool), i32>,
     ) -> Result<R, i32> {
-        self.with_lock(|| {
-            let mut t = self.take_locked()?;
+        self.with_lock(|held| {
+            let (mut t, journal) = self.take_locked()?;
             let (r, changed) = f(&mut t)?;
             if changed {
-                self.put_locked(t)?;
+                self.put_locked(held, t);
             } else {
-                self.restore_locked(t);
+                self.restore_locked(t, journal);
             }
             Ok(r)
         })
@@ -761,6 +704,8 @@ fn collect_in(base: &[u8]) {
     }
     // What the live mount tables show.
     let mut shown: HashSet<Vec<u8>> = HashSet::new();
+    // The filesystems of fwe's store they show.
+    let mut stores: HashSet<u64> = HashSet::new();
     let kind_of = |d: &[u8]| -> Vec<u8> {
         let name = d.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
         let rest = name.strip_prefix(format!("v{FORMAT}-").as_bytes()).unwrap_or(&[]);
@@ -792,7 +737,14 @@ fn collect_in(base: &[u8]) {
                     // An overlay keeps the tmpfs its layers are in, even
                     // once that is unmounted.
                     crate::mounts::Source::Overlay(l) => {
-                        for p in l.paths().chain(l.work.as_deref()) {
+                        for place in l.places().chain(l.work.as_ref()) {
+                            let p = match place {
+                                crate::overlay::Place::Host(p) => p,
+                                crate::overlay::Place::Store { fs, .. } => {
+                                    stores.insert(*fs);
+                                    continue;
+                                }
+                            };
                             let Some(rest) = p.strip_prefix(&base[..]) else { continue };
                             let top = rest.split(|&b| b == b'/').find(|c| !c.is_empty());
                             if let Some(top) = top {
@@ -800,24 +752,44 @@ fn collect_in(base: &[u8]) {
                             }
                         }
                     }
+                    crate::mounts::Source::Store(id) => {
+                        stores.insert(*id);
+                    }
                     crate::mounts::Source::Synthetic => {}
                 }
             }
         }
     }
     live.extend(bound);
-    let Ok(entries) = std::fs::read_dir(os(&base)) else { return };
+    // Each record and each entry of the directory, by name: when it was
+    // made (or last changed, for a file), and whether it is a directory.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    let mut names: std::collections::BTreeMap<Vec<u8>, (u64, bool)> = Default::default();
+    for (path, made) in named::all() {
+        // (Records inside another's go with it.)
+        if let Some(name) = path.strip_prefix(&[&base[..], b"/"].concat()[..])
+            && !name.contains(&b'/')
+        {
+            names.insert(name.to_vec(), (made, false));
+        }
+    }
+    for e in std::fs::read_dir(os(&base)).into_iter().flatten().flatten() {
+        let changed = e
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(now, |d| d.as_secs());
+        let dir = e.file_type().is_ok_and(|t| t.is_dir());
+        let at = names.entry(e.file_name().as_bytes().to_vec()).or_insert((changed, dir));
+        *at = (at.0.max(changed), dir);
+    }
     let mine = format!("v{FORMAT}-");
-    for e in entries.flatten() {
-        let name = e.file_name().as_bytes().to_vec();
+    for (name, (made, dir)) in names {
         let path = [&base[..], b"/", &name].concat();
-        let young = || {
-            e.metadata()
-                .ok()
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.elapsed().ok())
-                .is_none_or(|age| age < YOUNG)
-        };
+        let young = now.saturating_sub(made) < YOUNG.as_secs();
         let gone = if let Some(rest) = name.strip_prefix(mine.as_bytes()) {
             let kind = rest.split(|&b| b == b'-').next().unwrap_or(&[]);
             match kind {
@@ -842,16 +814,21 @@ fn collect_in(base: &[u8]) {
                         kind != b"cgroup" || rest.starts_with(b"cgroup-")
                     }
                 }
+                // A filesystem of fwe's store no table shows and no live
+                // process holds a file of.
+                b"store" => {
+                    let id = rest.get(6..).and_then(|h| std::str::from_utf8(h).ok());
+                    match id.and_then(|h| u64::from_str_radix(h, 16).ok()) {
+                        Some(id) => !stores.contains(&id) && !crate::filestore::fs::in_use(id),
+                        None => true,
+                    }
+                }
                 _ => false,
             }
-        } else if let Some(dir) =
-            name.strip_prefix(b"tmpfs-").and_then(|n| n.strip_suffix(b".limit"))
-        {
-            // A tmpfs's size limit goes with it.
-            !shown.contains(&[&base[..], b"/tmpfs-", dir].concat())
         } else if name.starts_with(b"tmpfs-") || name.starts_with(b"shm-") {
-            // A tmpfs, or a rootfs's `/dev/shm`, that no table shows.
-            !shown.contains(&path)
+            // Another fwe build's directory of a tmpfs or of a `/dev/shm`
+            // (this one keeps them in its store) and their limits' files.
+            true
         } else if name.starts_with(b"ptrace-") {
             // ptrace's pages are the process store's.
             true
@@ -861,13 +838,39 @@ fn collect_in(base: &[u8]) {
                 && name[1..].iter().take_while(|b| b.is_ascii_digit()).count() > 0
                 && !name.starts_with(mine.as_bytes())
         };
-        if gone && !young() {
-            if e.file_type().is_ok_and(|t| t.is_dir()) {
-                let _ = std::fs::remove_dir_all(os(&path));
-            } else {
-                let _ = std::fs::remove_file(os(&path));
-            }
+        if gone && !young {
+            remove(&path, dir);
         }
+    }
+}
+
+/// Remove the record named `path`, the records inside it, and its host
+/// directory (`dir`) or file.
+pub fn remove(path: &[u8], dir: bool) {
+    use std::os::unix::ffi::OsStrExt;
+    let name = path.rsplit(|&b| b == b'/').next().unwrap_or(&[]);
+    if name.starts_with(format!("v{FORMAT}-ipc-").as_bytes()) {
+        crate::sysvipc::forget(path);
+    }
+    if let Some(id) = name
+        .strip_prefix(format!("v{FORMAT}-store-").as_bytes())
+        .and_then(|h| std::str::from_utf8(h).ok())
+        .and_then(|h| u64::from_str_radix(h, 16).ok())
+    {
+        crate::filestore::fs::remove(id);
+    }
+    let inside = [path, b"/"].concat();
+    for (name, _) in named::all() {
+        if name.starts_with(&inside) {
+            named::remove(&name);
+        }
+    }
+    named::remove(path);
+    let p = std::ffi::OsStr::from_bytes(path);
+    if dir {
+        let _ = std::fs::remove_dir_all(p);
+    } else {
+        let _ = std::fs::remove_file(p);
     }
 }
 

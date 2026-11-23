@@ -82,8 +82,9 @@ pub enum Mark {
     /// An `O_PATH` descriptor: it names a file, which is not open to
     /// read, write or act on ([`refuses_path`]).
     Path,
-    /// A POSIX message queue's descriptor ([`crate::mqueue`]).
-    Mq,
+    /// A POSIX message queue's descriptor, by its number
+    /// ([`crate::mqueue`]).
+    Mq(u32),
     /// A filesystem context of the new mount API (`fsopen`, `fspick`),
     /// by its number ([`crate::mountapi`]).
     FsContext(u32),
@@ -95,6 +96,8 @@ pub enum Mark {
     Ns(u32),
     /// An inotify instance, by its number ([`crate::inotify`]).
     Inotify(u32),
+    /// A Landlock ruleset, by its number ([`crate::landlock`]).
+    Landlock(u32),
     /// An `O_PATH | O_NOFOLLOW` descriptor of a link of fwe's `/proc` (a
     /// stand-in, its origin's path the link's), which names the link.
     ProcLink,
@@ -114,15 +117,9 @@ pub enum Mark {
     /// An ICMP datagram ("ping") socket whose host receives come with the
     /// IP header, which Linux's do not ([`crate::net`]).
     Ping,
-    /// A memfd opened again for reading only (through `/proc/self/fd`).
-    /// Linux makes a new open file description, read-only; the host can
-    /// reopen no file without a name, so this is the memfd's writable
-    /// description again, which fwe makes read-only as Linux's is
-    /// ([`read_only`], [`refuses_read_only`]): `F_GETFL` says so, and
-    /// writes, writable shared mappings, resizing and sealing through it
-    /// are refused. It shares the writable description's offset and status
-    /// flags.
-    ReadOnly,
+    /// A file of fwe's file store, by its description's number
+    /// ([`crate::filestore::desc`]).
+    Store(u32),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -215,11 +212,13 @@ fn insert(r: &mut BTreeMap<i32, Record>, fd: i32, rec: Record) {
     if rec.net.is_some() {
         NETS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
+    forget_identity(fd);
     count(Some(&rec), true);
     count(r.insert(fd, rec).as_ref(), false);
 }
 
 fn take(r: &mut BTreeMap<i32, Record>, fd: i32) {
+    forget_identity(fd);
     count(r.remove(&fd).as_ref(), false);
 }
 
@@ -235,8 +234,8 @@ pub fn tmpfs_mount(fd: i32, dev: u64, ino: u64) -> Option<u32> {
 }
 
 /// Whether `fd` is a file in a cgroup filesystem (which a write acts on,
-/// see [`crate::cgroupfs`]): its host path, if so.
-pub fn cgroup_file(fd: i32) -> Option<Vec<u8>> {
+/// see [`crate::cgroupfs`]): its cgroup and name, if so.
+pub fn cgroup_file(fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
     if CGROUP_FILES.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return None;
     }
@@ -244,18 +243,93 @@ pub fn cgroup_file(fd: i32) -> Option<Vec<u8>> {
     if o.fstype != FsType::Cgroup2 {
         return None;
     }
-    crate::fs::host_path_of(fd)
+    crate::cgroupfs::file_of(fd)
 }
 
 fn records() -> std::sync::MutexGuard<'static, BTreeMap<i32, Record>> {
     RECORDS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// The host identity (device, inode) of the file `fd` names. Within one
+/// system call ([`Call`]) a descriptor names the file it named when the
+/// call first asked, as Linux holds a call's files for its length: the
+/// host is asked once, and again only once fwe changes what it knows of
+/// `fd` ([`insert`], [`take`]).
 fn identity(fd: i32) -> Option<(u64, u64)> {
+    let (depth, seq) = CALL.get();
+    let slot = fd as usize % SEEN_SLOTS;
+    if depth > 0
+        && let (s, f, dev, ino) = SEEN.with(|m| m.get()[slot])
+        && (s, f) == (seq, fd)
+    {
+        return Some((dev, ino));
+    }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some((st.st_dev as u64, st.st_ino as u64))
+    if unsafe { libc::fstat(fd, &mut st) } != 0 {
+        return None;
+    }
+    let id = (crate::host::dev_of(&st), st.st_ino as u64);
+    if depth > 0 {
+        SEEN.with(|m| {
+            let mut all = m.get();
+            all[slot] = (seq, fd, id.0, id.1);
+            m.set(all);
+        });
+    }
+    Some(id)
+}
+
+/// The host identity of the file `fd` names now, asked of the host: what
+/// a record of it is made with (fwe may have put another file there in
+/// this call).
+fn identity_now(fd: i32) -> Option<(u64, u64)> {
+    forget_identity(fd);
+    identity(fd)
+}
+
+/// How many descriptors' identities one call keeps ([`identity`]).
+const SEEN_SLOTS: usize = 4;
+
+thread_local! {
+    /// This thread's system call: how deeply it is in one, and a number
+    /// that changes as each begins and ends.
+    static CALL: std::cell::Cell<(u32, u64)> = const { std::cell::Cell::new((0, 0)) };
+    /// Identities asked of the host in this thread's call: (call number,
+    /// descriptor, device, inode), by descriptor.
+    static SEEN: std::cell::Cell<[(u64, i32, u64, u64); SEEN_SLOTS]> =
+        const { std::cell::Cell::new([(0, -1, 0, 0); SEEN_SLOTS]) };
+}
+
+/// A system call of the guest's, for its length ([`identity`]).
+pub struct Call(());
+
+impl Call {
+    pub fn begin() -> Call {
+        let (depth, seq) = CALL.get();
+        CALL.set((depth + 1, seq + 1));
+        Call(())
+    }
+}
+
+impl Drop for Call {
+    fn drop(&mut self) {
+        let (depth, seq) = CALL.get();
+        CALL.set((depth - 1, seq + 1));
+    }
+}
+
+/// What this thread's call knows of `fd`'s identity is forgotten.
+fn forget_identity(fd: i32) {
+    let slot = fd as usize % SEEN_SLOTS;
+    SEEN.with(|m| {
+        let mut all = m.get();
+        if all[slot].1 == fd {
+            all[slot] = (0, -1, 0, 0);
+            m.set(all);
+        }
+    });
 }
 
 /// The record of `fd`, if fwe made one and `fd` still names that file.
@@ -274,7 +348,7 @@ pub fn opened(
     fstype: FsType,
     ovl: Option<std::sync::Arc<crate::overlay::Layers>>,
 ) {
-    let Some(id) = identity(fd) else { return };
+    let Some(id) = identity_now(fd) else { return };
     opened_as(fd, id, ns_path, mount, flags, fstype, ovl);
 }
 
@@ -419,63 +493,12 @@ pub fn refuses_path(nr: u64, a: &[u64; 6]) -> bool {
     }
 }
 
-/// Whether `fd` is a memfd opened again read-only ([`Mark::ReadOnly`]).
-pub fn read_only(fd: i32) -> bool {
-    any_marks() && marked(fd) == Some(Mark::ReadOnly)
-}
-
-/// The error system call `nr` (arguments `a`) fails with, as Linux fails
-/// it, where it would write, resize or map writable and shared a
-/// descriptor of [`Mark::ReadOnly`]: `EBADF` for writes and `fallocate`,
-/// `EINVAL` for `ftruncate`, `EACCES` for a mapping.
-pub fn refuses_read_only(nr: u64, a: &[u64; 6]) -> Option<i32> {
-    use fwe_abi::{errno, mman, nr as n};
-    if !any_marks() {
-        return None;
-    }
-    let ro = |fd: u64| read_only(fd as i32);
-    match nr {
-        n::WRITE | n::WRITEV | n::PWRITE64 | n::PWRITEV | n::PWRITEV2 | n::FALLOCATE => {
-            ro(a[0]).then_some(errno::EBADF)
-        }
-        n::FTRUNCATE => ro(a[0]).then_some(errno::EINVAL),
-        n::SENDFILE => ro(a[0]).then_some(errno::EBADF),
-        n::SPLICE | n::COPY_FILE_RANGE => ro(a[2]).then_some(errno::EBADF),
-        n::MMAP => (a[3] & mman::MAP_ANONYMOUS == 0
-            && a[3] & mman::MAP_TYPE != mman::MAP_PRIVATE
-            && a[2] & mman::PROT_WRITE != 0
-            && ro(a[4]))
-        .then_some(errno::EACCES),
-        _ => None,
-    }
-}
-
-/// What a descriptor of a mark that is fwe's alone takes to another
-/// process through `SCM_RIGHTS` ([`crate::scm`]): a read-only memfd's
-/// mark, which the receiver gives its descriptor ([`import`]).
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
-    read_only(fd).then(|| crate::scm::Export {
-        kind: crate::scm::kind::READ_ONLY,
-        state: Vec::new(),
-        companions: Vec::new(),
-        placeholder: false,
-    })
-}
-
-/// A descriptor received with the mark [`export`] sent: marked so here.
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn import(fd: i32) -> bool {
-    mark(fd, Mark::ReadOnly);
-    true
-}
-
 /// Record `fd` as a file opened in mount `mount` of a detached tree, with
 /// `flags` and `fstype` (a file reopened through the tree's descriptor, as
 /// `/proc/self/exe` of a program run through one): an ordinary open file
 /// there, not the tree's own descriptor.
 pub fn opened_in_tree(fd: i32, mount: u32, flags: u64, fstype: FsType) {
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some((dev, ino)) = identity_now(fd) else { return };
     let origin =
         Some(Origin { mount, flags, fstype, ns_path: Vec::new(), ovl: None, stand_in: None });
     insert(&mut records(), fd, Record { dev, ino, origin, mark: None, net: None });
@@ -495,7 +518,7 @@ pub fn rebase(moved: impl Fn(&[u8]) -> Vec<u8>) {
 
 /// Mark `fd` as standing in for another kind of file.
 pub fn mark(fd: i32, mark: Mark) {
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some((dev, ino)) = identity_now(fd) else { return };
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
     let (origin, net) = had.map_or((None, None), |rec| (rec.origin, rec.net));
@@ -512,7 +535,7 @@ pub fn pin_net(fd: i32, net: Option<std::sync::Arc<crate::shared::Record<crate::
     if net.is_none() && NETS.load(std::sync::atomic::Ordering::SeqCst) == 0 {
         return;
     }
-    let Some((dev, ino)) = identity(fd) else { return };
+    let Some((dev, ino)) = identity_now(fd) else { return };
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
     let (origin, mark) = had.map_or((None, None), |rec| (rec.origin, rec.mark));
@@ -535,7 +558,13 @@ pub fn origin(fd: i32) -> Option<Origin> {
 
 /// Whether `fd` is an `O_PATH` descriptor (a detached mount's is one).
 pub fn is_path(fd: i32) -> bool {
-    any_marks() && matches!(marked(fd), Some(Mark::Path | Mark::Detached(_) | Mark::ProcLink))
+    any_marks()
+        && match marked(fd) {
+            Some(Mark::Path | Mark::Detached(_) | Mark::ProcLink) => true,
+            // A file of fwe's store opened `O_PATH`.
+            Some(Mark::Store(_)) => crate::filestore::desc::is_path(fd),
+            _ => false,
+        }
 }
 
 /// The namespace path of the `/proc` link `fd` names, if it is an
@@ -576,14 +605,17 @@ pub fn closed(fd: i32) {
     take(&mut records(), fd);
     crate::overlay::closed(fd);
     crate::fdstate::closed(fd);
+    crate::procfile::closed(fd);
 }
 
 /// Whether a descriptor of this process other than `fd` is open on the
 /// file `fd` is (as a `dup` of it would be).
 pub fn shared_elsewhere(fd: i32) -> bool {
-    // An inet socket has no identity the host reports (every one is 0:0):
-    // a bound one's duplicates carry its mark.
-    if let Some(m @ Mark::NetBound { .. }) = marked(fd) {
+    // An inet socket has no identity the host reports (every one is 0:0),
+    // and a descriptor of fwe's store stands on the host's `/dev/null`, as
+    // all its others do: a bound socket's and a store descriptor's
+    // duplicates carry its mark.
+    if let Some(m @ (Mark::NetBound { .. } | Mark::Store(_))) = marked(fd) {
         let others: Vec<i32> = records()
             .iter()
             .filter(|(o, r)| **o != fd && r.mark == Some(m))
@@ -612,10 +644,27 @@ pub fn forget_closed() {
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
     crate::fdstate::duplicated(old, new);
+    crate::procfile::duplicated(old, new);
+    crate::synthdir::duplicated(old, new);
     let mut r = records();
-    match r.get(&old).cloned() {
-        Some(rec) => insert(&mut r, new, rec),
-        None => take(&mut r, new),
+    let mark = match r.get(&old).cloned() {
+        Some(rec) => {
+            let mark = rec.mark;
+            insert(&mut r, new, rec);
+            mark
+        }
+        None => {
+            take(&mut r, new);
+            None
+        }
+    };
+    drop(r);
+    // One more descriptor of a message queue or a file of fwe's store: its
+    // holders count it.
+    match mark {
+        Some(Mark::Mq(_)) => crate::mqueue::sync_holdings(&[]),
+        Some(Mark::Store(_)) => crate::filestore::desc::sync(&[]),
+        _ => {}
     }
 }
 
@@ -656,7 +705,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Loop(_)) => 9,
             Some(Mark::LoopControl) => 10,
             Some(Mark::Path) => 11,
-            Some(Mark::Mq) => 12,
+            Some(Mark::Mq(_)) => 12,
             Some(Mark::FsContext(_)) => 13,
             Some(Mark::Detached(_)) => 14,
             Some(Mark::Ns(_)) => 15,
@@ -670,7 +719,8 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Comm { .. }) => 23,
             Some(Mark::UtsName { .. }) => 24,
             Some(Mark::Ping) => 25,
-            Some(Mark::ReadOnly) => 26,
+            Some(Mark::Store(_)) => 26,
+            Some(Mark::Landlock(_)) => 27,
         });
         if let Some(Mark::Comm { tid }) = rec.mark {
             e.i32(tid);
@@ -686,8 +736,15 @@ pub fn save(e: &mut Enc) {
         if let Some(Mark::TimerSlack { host } | Mark::RemoteMem { id: host }) = rec.mark {
             e.i32(host);
         }
-        if let Some(Mark::FsContext(n) | Mark::Detached(n) | Mark::Ns(n) | Mark::Inotify(n)) =
-            rec.mark
+        if let Some(
+            Mark::FsContext(n)
+            | Mark::Detached(n)
+            | Mark::Ns(n)
+            | Mark::Inotify(n)
+            | Mark::Landlock(n)
+            | Mark::Store(n)
+            | Mark::Mq(n),
+        ) = rec.mark
         {
             e.u32(n);
         }
@@ -753,7 +810,7 @@ pub fn load(d: &mut Dec) {
             9 => Some(Mark::Loop(d.u32())),
             10 => Some(Mark::LoopControl),
             11 => Some(Mark::Path),
-            12 => Some(Mark::Mq),
+            12 => Some(Mark::Mq(d.u32())),
             13 => Some(Mark::FsContext(d.u32())),
             14 => Some(Mark::Detached(d.u32())),
             15 => Some(Mark::Ns(d.u32())),
@@ -767,7 +824,8 @@ pub fn load(d: &mut Dec) {
             23 => Some(Mark::Comm { tid: d.i32() }),
             24 => Some(Mark::UtsName { domain: d.bool() }),
             25 => Some(Mark::Ping),
-            26 => Some(Mark::ReadOnly),
+            26 => Some(Mark::Store(d.u32())),
+            27 => Some(Mark::Landlock(d.u32())),
             _ => None,
         };
         let net = crate::shared::load_opt(d).ok().flatten().map(Net);

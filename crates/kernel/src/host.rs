@@ -514,14 +514,114 @@ fn markable(fd: i32) -> bool {
     ok && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFCHR | libc::S_IFBLK)
 }
 
-/// `kill` of one host process `pid`: a pid that is not one (0, or
-/// negative, which the host takes for a group or every process) is refused
-/// (`ESRCH`), so a number from a guest or a record never signals more.
+/// A host `stat`'s device number as Linux's: macOS's `dev_t` is a signed
+/// 32-bit word, and a number of Linux's encoding with a minor of `0x80000`
+/// or more (a tmpfs's of fwe's store) has its top bit set, which widened
+/// as a signed number would be no device's.
+#[allow(clippy::unnecessary_cast)] // libc::stat field types differ by host
+pub fn dev_of(st: &libc::stat) -> u64 {
+    #[cfg(target_os = "macos")]
+    return st.st_dev as u32 as u64;
+    #[cfg(not(target_os = "macos"))]
+    return st.st_dev as u64;
+}
+
+/// `kill` of one host process `pid` for fwe's own ends (a pid it keeps:
+/// a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a
+/// message queue's notice, a wake): a pid that is not one (0, or negative,
+/// which the host takes for a group or every process) is refused
+/// (`ESRCH`), so a number from a guest or a record never signals more; a
+/// signal (not 0, which only asks whether the process is there) goes only
+/// to one of fwe's processes ([`is_fwe`]: its record's, of a process that
+/// started when this one did), as a pid kept from a process that ended may
+/// be the host's now. One refused is told on the standard error, with
+/// where it was sent from. A guest's own signal to a process it names
+/// goes by [`signal_named`].
+#[track_caller]
 pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     if pid <= 0 {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
+    // ([`kill`] looks for its wake signal itself.)
+    if sig != 0 && sig != WAKE_SIGNAL && !is_fwe(pid) {
+        refused_signal(pid, sig, std::panic::Location::caller());
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
     kill(pid, sig)
+}
+
+/// A guest's signal `sig` to host process `pid`, which it named (`kill`,
+/// `rt_sigqueueinfo`) and may signal: one of fwe's or one of the host's,
+/// as a Linux process signals any it may. A pid that is not one is
+/// refused (`ESRCH`), as by [`kill_process`].
+#[track_caller]
+pub fn signal_named(pid: libc::pid_t, sig: libc::c_int) -> i64 {
+    if pid <= 0 {
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
+    kill(pid, sig)
+}
+
+/// Tell that host signal `sig` to host process `pid`, not one of fwe's,
+/// sent from `from`, was refused ([`kill_process`]). Async-signal-safe.
+fn refused_signal(pid: libc::pid_t, sig: libc::c_int, from: &std::panic::Location<'_>) {
+    let line = signal_line(b"fwe: host signal ", pid, sig, from, b", not one of fwe's, refused");
+    // SAFETY: a valid buffer of the length given.
+    unsafe { libc::write(2, line.buf.as_ptr().cast(), line.len) };
+}
+
+/// "`what` `sig` to host process `pid``why` (sent from `from`)", a line.
+fn signal_line(
+    what: &[u8],
+    pid: libc::pid_t,
+    sig: libc::c_int,
+    from: &std::panic::Location<'_>,
+    why: &[u8],
+) -> Line {
+    let mut line = Line::new();
+    line.put(what);
+    line.num(sig as u64);
+    line.put(b" to host process ");
+    line.num(pid as u64);
+    line.put(why);
+    line.put(b" (sent from ");
+    line.put(from.file().as_bytes());
+    line.put(b":");
+    line.num(u64::from(from.line()));
+    line.put(b")\n");
+    line
+}
+
+/// A line put together without allocating (in a signal handler, say).
+struct Line {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl Line {
+    fn new() -> Line {
+        Line { buf: [0; 512], len: 0 }
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+    }
+
+    fn num(&mut self, mut v: u64) {
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.put(&digits[i..]);
+    }
 }
 
 /// Host process `pid`'s nice value as the host has it (0 for one that
@@ -603,11 +703,21 @@ pub fn host_mask_for(mask: u64) -> libc::sigset_t {
     host_sigset(mask & !(crate::signal::caught() | crate::signalfd::watched()))
 }
 
-/// Stop the process with host stop signal `sig` (`SIGTSTP`, `SIGTTIN`,
-/// `SIGTTOU`, `SIGSTOP`) until it is continued, so the parent's `waitpid`
-/// reports that signal, as on Linux: raised on this thread with its default
-/// action and unblocked for the moment, then put back.
+/// Stop the process on the host with host stop signal `sig` (`SIGTSTP`,
+/// `SIGTTIN`, `SIGTTOU`, `SIGSTOP`) until it is continued, so that its
+/// parent, a process that is not fwe's (a shell), sees it stop: raised on
+/// this thread with its default action and unblocked for the moment, then
+/// put back. Not if a `SIGCONT` came since the stop signal was sent
+/// ([`crate::signal::stop_stands`]). The host's `SIGCONT` that ends it is
+/// caught as it does ([`crate::signal::host_continued`]).
 pub fn stop_with(sig: libc::c_int) {
+    if crate::signal::stop_stands() {
+        raise_stop(sig);
+    }
+}
+
+/// [`stop_with`]'s stop.
+fn raise_stop(sig: libc::c_int) {
     // SAFETY: plain host calls on initialized values; the disposition and
     // the mask are restored as they were.
     unsafe {
@@ -704,6 +814,22 @@ pub fn signal_is_ignored(sig: u64) -> bool {
 
 /// Whether the host's `SIGCHLD` action has `SA_NOCLDSTOP` (the guest's
 /// does): no `SIGCHLD` for a child that stops or continues.
+/// This process's parent on the host. Async-signal-safe.
+pub fn parent_pid() -> i32 {
+    // SAFETY: plain host call.
+    unsafe { libc::getppid() }
+}
+
+/// Whether this process ignores `SIGCHLD` on the host (as the guest
+/// does). Async-signal-safe.
+pub fn sigchld_ignored() -> bool {
+    // SAFETY: zeroed bytes are a valid `sigaction`; the call only reads.
+    let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter; no new action.
+    unsafe { libc::sigaction(libc::SIGCHLD, std::ptr::null(), &mut old) };
+    old.sa_sigaction == libc::SIG_IGN
+}
+
 pub fn sigchld_nocldstop() -> bool {
     // SAFETY: zeroed bytes are a valid `sigaction`; the call only reads.
     let mut old: libc::sigaction = unsafe { std::mem::zeroed() };
@@ -879,14 +1005,18 @@ pub fn last_host_info(sig: libc::c_int) -> (i32, i32) {
 /// fault signal, which comes with the receiving thread's last fault in its
 /// siginfo instead (macOS fills a sent `SIGSEGV`, `SIGBUS`, `SIGILL` or
 /// `SIGFPE` so).
-pub fn sent_info(note: crate::signote::Note) -> crate::thread::SigInfo {
+pub fn sent_info(sig: u64, note: crate::signote::Note) -> crate::thread::SigInfo {
     let code = if note.code != 0 { note.code } else { signal::SI_USER };
+    // A child's stop or continue ([`crate::signal::take_notes`]): its
+    // status the value.
+    let child = sig == signal::SIGCHLD
+        && matches!(code, fwe_abi::wait::CLD_STOPPED | fwe_abi::wait::CLD_CONTINUED);
     crate::thread::SigInfo {
         code,
         pid: note.pid,
         uid: note.uid,
-        status: 0,
-        value: note.value,
+        status: if child { note.value as i32 } else { 0 },
+        value: if child { 0 } else { note.value },
         poll: None,
     }
 }
@@ -2037,6 +2167,21 @@ pub fn at_path<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A device number with its top bit set (a store tmpfs's `0:minor` of
+    /// `0x80000` or more) is read back as the number it was made from.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_device_number_with_its_top_bit_is_kept_whole() {
+        let dev = crate::devnodes::makedev(0, 0xf_9741);
+        assert!(dev & (1 << 31) != 0);
+        // SAFETY: an all-zero `stat` is a valid value.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        st.st_dev = dev as libc::dev_t;
+        assert_eq!(dev_of(&st), dev);
+        assert_eq!(crate::fsops::major(dev_of(&st)), 0);
+        assert_eq!(crate::fsops::minor(dev_of(&st)), 0xf_9741);
+    }
 
     /// The BSD's interface flags as Linux's: the loopback `lo` with its
     /// carrier up and no multicast; another interface's multicast moved.

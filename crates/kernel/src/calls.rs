@@ -196,7 +196,8 @@ impl<P: Platform> Kernel<P> {
         if !matches!(st.st_mode & S_IFMT, S_IFREG | S_IFBLK | S_IFDIR | S_IFLNK) {
             return err(errno::ESPIPE);
         }
-        if flags != 0 {
+        // A file of fwe's store is in memory: nothing to write back.
+        if flags != 0 && crate::filestore::desc::of(fd).is_none() {
             // SAFETY: plain host call on the guest's descriptor.
             unsafe { libc::fsync(fd) };
         }
@@ -542,8 +543,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `cachestat(fd, range, cstat, flags)`: how many of a file's pages in
-    /// `range` the host has in memory (`mincore` of a mapping of them);
-    /// none for any other kind of file.
+    /// `range` the host has in memory (`mincore` of a mapping of them), or
+    /// of a file of fwe's store hold memory; none for any other kind of
+    /// file.
     pub(crate) fn sys_cachestat(&mut self, fd: u64, range: u64, out: u64, flags: u64) -> i64 {
         let fd = fd as i32;
         if !crate::fdtable::guest_visible(fd)
@@ -558,6 +560,13 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let page = self.page_size;
+        // A file of fwe's store: its pages that hold memory, every one
+        // dirty, as a tmpfs file's are on Linux.
+        if let Some(n) = crate::filestore::io::cached_pages(fd, r[0], r[1], page) {
+            let n = guest!(n);
+            guest!(uaccess::write(out, [n, n, 0u64, 0, 0]));
+            return 0;
+        }
         // SAFETY: an all-zero `stat` is a valid out-parameter.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: as above.
@@ -711,10 +720,36 @@ impl<P: Platform> Kernel<P> {
                 crate::signote::note(host, libc::SIGKILL);
                 return crate::host::kill_process(host, libc::SIGKILL);
             }
+            // A SIGCONT for any of its threads continues the process.
+            if s == fwe_abi::signal::SIGCONT {
+                crate::signote::continuing(host, true);
+            }
             if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
                 return err(e);
             }
-            return crate::host::kill_process(host, crate::host::WAKE_SIGNAL);
+            return match crate::host::kill_process(host, crate::host::WAKE_SIGNAL) {
+                0 if s == fwe_abi::signal::SIGCONT => crate::signal::resume_process(host),
+                r => r,
+            };
+        }
+        // A stop or a continue of another of fwe's processes goes through
+        // its mailbox, as `kill`'s does: a stop it takes where it holds
+        // nothing shared, a continue that ends its stop
+        // ([`crate::signal::resume_process`]).
+        if crate::host::is_fwe(host)
+            && matches!(s, fwe_abi::signal::SIGSTOP | fwe_abi::signal::SIGCONT)
+        {
+            if s == fwe_abi::signal::SIGCONT {
+                crate::signote::continuing(host, true);
+            } else {
+                crate::reaper::stop_signal_sent(host);
+            }
+            let r = crate::signal::send_unhosted_from(host, s, code, value, (pid, uid));
+            return if r == 0 && s == fwe_abi::signal::SIGCONT {
+                crate::signal::resume_process(host)
+            } else {
+                r
+            };
         }
         // One the host lacks, or SIGTRAP (which the host would merge with
         // the target's next system-call trap): through the mailbox.
@@ -724,7 +759,7 @@ impl<P: Platform> Kernel<P> {
         };
         // A host signal names its sender's pid itself.
         crate::signote::note_with(host, h, code, value, uid);
-        let r = crate::host::kill_process(host, h);
+        let r = crate::host::signal_named(host, h);
         if r != 0 {
             crate::signote::unnote(host, h);
         }

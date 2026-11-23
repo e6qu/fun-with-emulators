@@ -115,6 +115,11 @@ like). The hypervisor backend's tests run on a software stand-in (`brew
 install unicorn`), never on a real VM unless asked to. Elsewhere only
 the unit tests run. [AGENTS.md](AGENTS.md) lists every check CI runs.
 
+The tests, LTP's runner and the benchmarks watch the host's memory: below
+20% of it available or above 50% of it wired, no guest starts and a run
+ends its processes and fails, saying what holds the memory
+(`tools/hostmem.py`), before a short Mac panics.
+
 LTP's system-call tests run under `fwe` against `tools/ltp/baseline.txt`;
 CI fails if a test in the baseline stops passing:
 

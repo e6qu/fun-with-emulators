@@ -98,6 +98,9 @@ pub fn show_file_caps(v: Vec<u8>) -> Result<Vec<u8>, i32> {
 
 /// Whether the file `t` names has file capabilities.
 pub fn has_file_caps(t: &Target) -> bool {
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.xattr(file.ino, CAPABILITY)).is_ok();
+    }
     let Ok(n) = host_name(CAPABILITY) else { return false };
     raw_get(t, &n, std::ptr::null_mut(), 0) >= 0
 }
@@ -236,11 +239,39 @@ impl Who {
 }
 
 /// What an attribute call acts on on the host: a file by path (never
-/// followed: the caller resolved what is to be), or an open descriptor.
+/// followed: the caller resolved what is to be), or an open descriptor (a
+/// file of fwe's store's is the store's: [`stored`]).
 pub enum Target<'a> {
     Path(&'a CStr),
     Fd(i32),
+    /// A file of fwe's store, found by its path (a tmpfs's).
+    Store(crate::filestore::desc::File),
 }
+
+/// The file of fwe's store `t` is a descriptor of, if it is one: its
+/// attributes are the store's.
+fn stored(t: &Target) -> Option<crate::filestore::desc::File> {
+    match t {
+        Target::Fd(fd) => crate::filestore::desc::of(*fd),
+        Target::Store(file) => Some(*file),
+        Target::Path(_) => None,
+    }
+}
+
+/// `f` on the store's filesystem of `file`, held.
+fn in_store<R>(
+    file: crate::filestore::desc::File,
+    f: impl FnOnce(&mut crate::filestore::tree::Tx) -> Result<R, i32>,
+) -> Result<R, i32> {
+    let fs = file.fs()?;
+    let mut t = fs.lock()?;
+    f(&mut t)
+}
+
+/// The Linux inode flags that leave a file's attributes unchangeable
+/// (`FS_IMMUTABLE_FL`, `FS_APPEND_FL`).
+#[cfg(target_os = "macos")]
+const FROZEN_FLAGS: u32 = 0x10 | 0x20;
 
 fn host_name(name: &[u8]) -> Result<CString, i32> {
     CString::new(name).map_err(|_| errno::EINVAL)
@@ -252,6 +283,9 @@ fn fail<T>() -> Result<T, i32> {
 
 /// The value of attribute `name` of `t`.
 pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.xattr(file.ino, name));
+    }
     let n = host_name(name)?;
     loop {
         let size = raw_get(t, &n, std::ptr::null_mut(), 0);
@@ -275,6 +309,9 @@ pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
 /// attributes Linux lets no one change (the host does).
 #[cfg(target_os = "macos")]
 fn frozen(t: &Target) -> bool {
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.stat(file.ino)).is_ok_and(|st| st.flags & FROZEN_FLAGS != 0);
+    }
     // SAFETY: an all-zero `stat` is a valid out-parameter.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid path or descriptor, and the out-parameter above.
@@ -282,6 +319,8 @@ fn frozen(t: &Target) -> bool {
         match t {
             Target::Path(p) => libc::lstat(p.as_ptr(), &mut st),
             Target::Fd(fd) => libc::fstat(*fd, &mut st),
+            // (Taken above.)
+            Target::Store(_) => -1,
         }
     };
     r == 0 && st.st_flags & (libc::UF_IMMUTABLE | libc::UF_APPEND) != 0
@@ -302,6 +341,18 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
     }
     if value.len() > SIZE_MAX {
         return Err(errno::E2BIG);
+    }
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| {
+            let had = s.xattr(file.ino, name).is_ok();
+            if flags & CREATE != 0 && had {
+                return Err(errno::EEXIST);
+            }
+            if flags & REPLACE != 0 && !had {
+                return Err(errno::ENODATA);
+            }
+            s.set_xattr(file.ino, name, Some(value))
+        });
     }
     let mut host_flags = 0;
     if flags & CREATE != 0 {
@@ -325,6 +376,8 @@ pub fn set(t: &Target, name: &[u8], value: &[u8], flags: u64) -> Result<(), i32>
             Target::Path(p) => libc::lsetxattr(p.as_ptr(), n.as_ptr(), v, len, host_flags),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::fsetxattr(*fd, n.as_ptr(), v, len, host_flags),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     };
     owned(t, raw)
@@ -345,6 +398,7 @@ fn owned(t: &Target, raw: impl Fn() -> i32) -> Result<(), i32> {
     let kept = match t {
         Target::Path(p) => crate::modes::own_path(p),
         Target::Fd(fd) => crate::modes::own_fd(*fd),
+        Target::Store(_) => Err(errno::EACCES),
     };
     if kept.is_err() {
         return e;
@@ -356,6 +410,9 @@ fn owned(t: &Target, raw: impl Fn() -> i32) -> Result<(), i32> {
 pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
     if frozen(t) {
         return Err(errno::EPERM);
+    }
+    if let Some(file) = stored(t) {
+        return in_store(file, |s| s.set_xattr(file.ino, name, None));
     }
     let n = host_name(name)?;
     // SAFETY: a valid name.
@@ -369,6 +426,8 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
             Target::Path(p) => libc::lremovexattr(p.as_ptr(), n.as_ptr()),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::fremovexattr(*fd, n.as_ptr()),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     };
     owned(t, raw)
@@ -377,7 +436,40 @@ pub fn remove(t: &Target, name: &[u8]) -> Result<(), i32> {
 /// The names of `t`'s attributes `who` sees, each NUL-terminated, as
 /// `listxattr` returns them.
 pub fn list(t: &Target, who: &Who) -> Result<Vec<u8>, i32> {
-    let all = loop {
+    let all = if let Some(file) = stored(t) {
+        // (Not fwe's own, which start with a NUL no guest's name has.)
+        in_store(file, |s| s.xattrs(file.ino))?
+            .into_iter()
+            .filter(|(n, _)| n.first() != Some(&0))
+            .flat_map(|(n, _)| n.into_iter().chain([0]))
+            .collect()
+    } else {
+        list_raw(t)?
+    };
+    let mut out = Vec::new();
+    for name in all.split(|&b| b == 0).filter(|n| !n.is_empty() && who.shows(n)) {
+        out.extend_from_slice(name);
+        out.push(0);
+    }
+    Ok(out)
+}
+
+/// The names of every attribute of `t`: on the host, fwe's and the
+/// host's own too; in the store, all but fwe's own.
+pub fn names(t: &Target) -> Result<Vec<Vec<u8>>, i32> {
+    if let Some(file) = stored(t) {
+        return Ok(in_store(file, |s| s.xattrs(file.ino))?
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.first() != Some(&0))
+            .collect());
+    }
+    Ok(list_raw(t)?.split(|&b| b == 0).filter(|n| !n.is_empty()).map(<[u8]>::to_vec).collect())
+}
+
+/// Every host attribute name of `t`, each NUL-terminated.
+fn list_raw(t: &Target) -> Result<Vec<u8>, i32> {
+    Ok(loop {
         let size = raw_list(t, std::ptr::null_mut(), 0);
         if size < 0 {
             return fail();
@@ -391,13 +483,7 @@ pub fn list(t: &Target, who: &Who) -> Result<Vec<u8>, i32> {
         if crate::host::last_errno() != libc::ERANGE {
             return fail();
         }
-    };
-    let mut out = Vec::new();
-    for name in all.split(|&b| b == 0).filter(|n| !n.is_empty() && who.shows(n)) {
-        out.extend_from_slice(name);
-        out.push(0);
-    }
-    Ok(out)
+    })
 }
 
 fn raw_get(t: &Target, n: &CStr, buf: *mut u8, len: usize) -> isize {
@@ -414,6 +500,8 @@ fn raw_get(t: &Target, n: &CStr, buf: *mut u8, len: usize) -> isize {
             Target::Path(p) => libc::lgetxattr(p.as_ptr(), n.as_ptr(), buf.cast(), len),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::fgetxattr(*fd, n.as_ptr(), buf.cast(), len),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     }
 }
@@ -461,6 +549,8 @@ fn raw_list(t: &Target, buf: *mut u8, len: usize) -> isize {
             Target::Path(p) => libc::llistxattr(p.as_ptr(), buf.cast(), len),
             #[cfg(not(target_os = "macos"))]
             Target::Fd(fd) => libc::flistxattr(*fd, buf.cast(), len),
+            // A file of fwe's store is the store's ([`stored`]).
+            Target::Store(_) => -1,
         }
     }
 }

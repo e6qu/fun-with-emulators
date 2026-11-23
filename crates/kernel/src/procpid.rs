@@ -82,6 +82,8 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         let start = b.pbi_start_tvsec * 1_000_000 + b.pbi_start_tvusec;
         let state = match b.pbi_status {
             4 => b'T', // SSTOP
+            // In a stop of fwe's.
+            2 | 3 if crate::signote::job_stop_of(pid).is_some() => b'T',
             5 => b'Z', // SZOMB
             // Not yet in the program: whatever waits the host shows it in
             // are its making's ([`crate::procstore::entered`]).
@@ -135,14 +137,24 @@ fn ticks_since_boot(started: f64) -> u64 {
 /// fwe's record of it; another's is the first the host lists, the one
 /// created first. One in fwe's own work, waiting for the host or not, is
 /// running ([`crate::procstore::Busy`]), as a Linux thread doing its
-/// kernel's work is.
+/// kernel's work is: the mark is read after the host's state, so a wait
+/// the host shows began after the mark was set, and is fwe's if the mark is
+/// still there.
 #[cfg(target_os = "macos")]
 fn threads_state(pid: i32) -> u8 {
-    /// `PROC_PIDLISTTHREADS`: the process's thread handles.
-    const PROC_PIDLISTTHREADS: i32 = 6;
-    if crate::procstore::busy(pid) {
+    let host = host_thread_state(pid);
+    if host != b'R' && crate::procstore::busy(pid) {
         return b'R';
     }
+    host
+}
+
+/// What the host shows of process `pid`'s main thread, as Linux's state
+/// letter ([`threads_state`]).
+#[cfg(target_os = "macos")]
+fn host_thread_state(pid: i32) -> u8 {
+    /// `PROC_PIDLISTTHREADS`: the process's thread handles.
+    const PROC_PIDLISTTHREADS: i32 = 6;
     if pid == crate::host::pid() {
         return match crate::thread::host_state(crate::thread::tgid()) {
             Some((_, _, true)) | None => b'R',
@@ -485,8 +497,6 @@ pub(crate) fn ns_link_of(kind: &[u8], dirs: &[Vec<u8>]) -> Vec<u8> {
 /// namespaces whose records are `dirs`: the identity the record has
 /// ([`crate::shared::Record`]), or `init`'s when it is in the initial one.
 fn ns_link(kind: &[u8], dirs: &[Vec<u8>], init: u64) -> Vec<u8> {
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::MetadataExt;
     let k: &[u8] = if kind == b"pid_for_children" { b"pid" } else { kind };
     let prefix = [format!("v{}-", crate::shared::FORMAT).as_bytes(), k, b"-"].concat();
     let init_mnt = [format!("v{}-mnt-init-", crate::shared::FORMAT).as_bytes()].concat();
@@ -498,9 +508,7 @@ fn ns_link(kind: &[u8], dirs: &[Vec<u8>], init: u64) -> Vec<u8> {
             if name.starts_with(&init_mnt) {
                 return Some(crate::mounts::store::INIT_ID);
             }
-            let generation = [&d[..], b"/generation"].concat();
-            let m = std::fs::metadata(std::ffi::OsStr::from_bytes(&generation)).ok()?;
-            Some(4026532000 + (m.ino() & 0xffff_ffff))
+            crate::shared::id_of(d)
         })
         .unwrap_or(init);
     [k, format!(":[{id}]").as_bytes()].concat()

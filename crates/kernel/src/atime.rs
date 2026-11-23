@@ -35,7 +35,10 @@ static NOATIME_ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBoo
 /// access time, as Linux's does.
 pub(crate) static NOATIME_FDS: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
-fn noatime_fd(fd: i32) -> bool {
+pub(crate) fn noatime_fd(fd: i32) -> bool {
+    if !NOATIME_ANY.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     NOATIME_FDS.lock().unwrap_or_else(|e| e.into_inner()).contains(&fd)
 }
 
@@ -70,6 +73,10 @@ pub fn before(n: u64, a: &[u64; 6]) -> Option<Before> {
     }
     let flags = if own { ms::NOATIME } else { crate::fdmarks::origin(fd)?.flags };
     if flags & (ms::NOATIME | ms::NODIRATIME | ms::STRICTATIME) == 0 {
+        return None;
+    }
+    // A file of fwe's store moves its own ([`crate::filestore`]).
+    if crate::filestore::desc::of(fd).is_some() {
         return None;
     }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.

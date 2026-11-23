@@ -42,7 +42,15 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import hostmem  # noqa: E402
+
+# LTP's IPC tests: System V's messages, semaphores and segments, and POSIX
+# message queues.
+IPC = re.compile(r"(msg|sem|shm|mq_)")
 
 # LTP's exit statuses (include/tst_res_flags.h), as bits.
 TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
@@ -180,19 +188,60 @@ def end_leftovers(fwe, root):
 def stacks(sid, work):
     """The stacks of the processes of session `sid`, as macOS's `sample`
     takes them: fwe's own frames, a few lines a thread."""
-    out = []
-    for pid in map(str, session(sid)[:8]):
-        path = os.path.join(work, f"sample-{pid}.txt")
-        subprocess.run(["sample", pid, "1", "-file", path], capture_output=True, timeout=60)
-        try:
-            with open(path) as f:
-                lines = [l.rstrip() for l in f if "fwe_" in l or "Thread_" in l or "libsystem_kernel" in l]
-            os.remove(path)
-        except OSError:
-            continue
-        out.append(f"--- stacks of {pid}:")
-        out.extend(l[:220] for l in lines[:60])
-    return "\n" + "\n".join(out) + "\n"
+    return "\n" + "".join(stacks_of(pid, work) for pid in session(sid)[:8])
+
+
+def stacks_of(pid, work):
+    """Process `pid`'s stacks ([`stacks`])."""
+    path = os.path.join(work, f"sample-{pid}.txt")
+    try:
+        subprocess.run(["sample", str(pid), "1", "-file", path], capture_output=True, timeout=60)
+        with open(path) as f:
+            lines = [l.rstrip() for l in f if "fwe_" in l or "Thread_" in l or "libsystem_kernel" in l]
+        os.remove(path)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "\n".join([f"--- stacks of {pid}:"] + [l[:220] for l in lines[:60]]) + "\n"
+
+
+# Whether a timeout has had every fwe process looked at ([`others`]).
+LOOKED = threading.Lock()
+LOOKED_DONE = []
+
+
+def seconds(etime):
+    """`ps`'s elapsed time ([[dd-]hh:]mm:ss) in seconds."""
+    days, _, rest = etime.rpartition("-")
+    total = 0
+    for part in rest.split(":"):
+        total = total * 60 + int(part)
+    return total + int(days or 0) * 86400
+
+
+def others(sid, work):
+    """Once a run, at its first timeout: every other fwe process on the
+    machine, its state and how long it has run (`T`: stopped), and the
+    stacks of those that may hold what the test waits for (a lock in
+    memory fwe's processes share names its holder, who may be any of
+    them): the stopped first, then the oldest."""
+    with LOOKED:
+        if LOOKED_DONE:
+            return ""
+        LOOKED_DONE.append(True)
+    ps = subprocess.run(["ps", "-axo", "pid=,stat=,etime=,comm="], capture_output=True, text=True)
+    mine = set(session(sid))
+    rows = []
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[3].endswith("/fwe") and int(parts[0]) not in mine:
+            rows.append(parts)
+    out = ["--- every other fwe process (pid, state, time):"]
+    out += [" ".join(r[:3]) for r in rows]
+    rows.sort(key=lambda r: ("T" not in r[1], -seconds(r[2])))
+    text = "\n".join(out) + "\n"
+    for r in rows[:12]:
+        text += stacks_of(int(r[0]), work)
+    return text
 
 
 # Tests run with fwe's notes kept ([`run_one`]): open12, whose O_NOATIME
@@ -281,6 +330,7 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             # Where each of its processes is stuck, for the record (a test
             # that hangs is a bug of fwe's to find).
             log.write(stacks(proc.pid, work).encode())
+            log.write(others(proc.pid, work).encode())
         # It, and whatever it left running in its session (in process
         # groups of its own, some of it).
         end_session(proc.pid)
@@ -296,7 +346,10 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     shutil.rmtree(tmp, ignore_errors=True)
     # (A timer test's every measurement, for `host_timers_late`.)
     keep = 400 if outcome == "timeout" or b"slept for too long" in out or b"--- fwe's notes" in out else 40
-    tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
+    lines = out.decode(errors="replace").splitlines()
+    # What failed, and on which file system, kept however long the output.
+    marks = [l for l in lines[:-keep] if re.search(r"T(FAIL|BROK|WARN)|=== Testing on", l)]
+    tail = "\n".join((marks + ["..."] if marks else []) + lines[-keep:])
     if outcome == "conf" and VIRT and SKIPS_ON_VM in out:
         outcome = "conf-vm"
     return name, outcome, time.monotonic() - start, tail
@@ -359,10 +412,84 @@ def host_timers_late(work, tail):
     return found
 
 
+# The tests running now, and the host's memory as they ran.
+RUNNING = set()
+RUNNING_LOCK = threading.Lock()
+MEMORY = []
+
+
+def memory_seen(log):
+    """What the memory guard does with each sample: kept, with the tests
+    running, and written to `log` if given."""
+    f = open(log, "w") if log else None
+
+    def seen(when, s):
+        with RUNNING_LOCK:
+            now = sorted(RUNNING)
+        MEMORY.append((s, now))
+        if f:
+            f.write(f"{when} {hostmem.describe(s)}: {' '.join(now)}\n")
+            f.flush()
+
+    return seen
+
+
+def memory_short(fwe, root):
+    """What the memory guard does when the host is short of memory: what
+    holds it is printed, every process of this fwe is ended and the run
+    fails, while the host can still say why."""
+
+    def short(why):
+        with RUNNING_LOCK:
+            now = sorted(RUNNING)
+        print(f"\n{why}; tests running: {' '.join(now)}", flush=True)
+        hostmem.report()
+        ps = subprocess.run(["ps", "-axo", "pid=,rss=,command="], capture_output=True,
+                            text=True).stdout.splitlines()
+        # What fwe's processes hold, by kind of region, for the largest few.
+        ours = sorted((l.split() for l in ps if fwe in l), key=lambda p: -int(p[1]))
+        for p in ours[:3]:
+            pid = int(p[0])
+            if pid > 0:
+                out = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True,
+                                     text=True).stdout
+                print(f"vmmap -summary {pid}:\n" + out[-6000:], flush=True)
+        ended = end_leftovers(fwe, root)
+        print(f"ended {ended} fwe processes; the run stops here", flush=True)
+        os._exit(3)
+
+    return short
+
+
+def memory_report():
+    """The samples with the least memory available, and each test's least."""
+    if not MEMORY:
+        return
+    print("\nleast memory available (the host's memory: tests running):")
+    for s, now in sorted(MEMORY, key=lambda m: m[0]["level"])[:12]:
+        print(f"    {hostmem.describe(s)}: {' '.join(now)}")
+    least = {}
+    for s, now in MEMORY:
+        for n in now:
+            least[n] = min(least.get(n, s["level"]), s["level"])
+    print("tests with the least memory available while they ran: " +
+          ", ".join(f"{n} {v}%" for n, v in sorted(least.items(), key=lambda x: x[1])[:25]))
+
+
 def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     """`run_one`, a failure of the runner itself (starting a test while
     another has the host short of processes, say) retried once, then
     reported as the outcome."""
+    with RUNNING_LOCK:
+        RUNNING.add(name)
+    try:
+        return run_guarded_inner(fwe, root, work, name, argv, hard_limit)
+    finally:
+        with RUNNING_LOCK:
+            RUNNING.discard(name)
+
+
+def run_guarded_inner(fwe, root, work, name, argv, hard_limit):
     for attempt in range(2):
         try:
             return run_one(fwe, root, work, name, argv, hard_limit)
@@ -379,11 +506,15 @@ def run_guarded(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
 # another's is in force; and those that measure time (how late a sleep or a
 # timeout ends, timer slack) or need the host's processors (fork14's 16384
 # forks of a process with as many mappings, quadratic on the host), which a
-# loaded machine makes miss.
+# loaded machine makes miss; and those that need many of the user's
+# processes at once (futex_cmp_requeue01's thousand waiters), of the
+# host's limit a user's processes share, which the tests beside them
+# would take.
 SERIAL = re.compile(
     r"^(fcntl30|fcntl35|fcntl37|splice06|vmsplice04|fork13"
     r"|fork14|prctl09|select02|poll02|pselect01|epoll_pwait03|epoll_wait02"
-    r"|clock_gettime04|clock_nanosleep02|nanosleep01|futex_wait05|pipe15)(_64)?$"
+    r"|clock_gettime04|clock_nanosleep02|nanosleep01|futex_wait05|pipe15"
+    r"|futex_cmp_requeue01)(_64)?$"
 )
 
 
@@ -400,6 +531,9 @@ def main():
     ap.add_argument("--update", action="store_true", help="rewrite the baseline from this run")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) // 2))
     ap.add_argument("--only", help="run only the tests whose name matches")
+    # One of n parts of the tests, by their names' order: for n machines.
+    ap.add_argument("--shard", help="k/n: run only the k-th of n parts of the tests")
+    ap.add_argument("--memory-log", help="the host's memory twice a second, to this file")
     ap.add_argument("--results", help="write every outcome to this file")
     ap.add_argument("--show", action="store_true", help="print the output of each test that does not pass")
     ap.add_argument("--hard-limit", type=int, default=HARD_LIMIT, help="seconds before a test is ended")
@@ -422,12 +556,16 @@ def main():
     tests = entries(os.path.join(root, "opt", "ltp"))
     if args.only:
         tests = [t for t in tests if re.search(args.only, t[0])]
+    if args.shard:
+        k, n = (int(x) for x in args.shard.split("/"))
+        tests = [t for i, t in enumerate(sorted(tests)) if i % n == k - 1]
     # The exceptions are not run (some wait out their whole timeout).
     excepted = set()
     if os.path.exists(args.exceptions):
         with open(args.exceptions) as f:
             excepted = {line.split()[0] for line in f if line.strip() and not line.startswith("#")}
     results = {n: "exception" for n, _ in tests if n in excepted}
+    took = {}
     with open(args.baseline) as f:
         passing = {line.strip() for line in f if line.strip() and not line.startswith("#")}
     if args.update:
@@ -451,6 +589,7 @@ def main():
             nonlocal done
             done += 1
             results[name] = outcome
+            took[name] = secs
             print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
             if args.show and outcome not in ("pass", "conf", "conf-vm", "script", "missing"):
                 print("    " + tail.replace("\n", "\n    "), flush=True)
@@ -464,6 +603,8 @@ def main():
         # (fork14's thousands of large address spaces torn down) would
         # disturb the timing of the next.
         serial.sort(key=lambda t: bool(SLOW.match(t[0])))
+        guard = hostmem.Guard(memory_short(fwe, root), memory_seen(args.memory_log))
+        guard.start()
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, limit(n)) for n, a in parallel]
             for fut in concurrent.futures.as_completed(futures):
@@ -473,6 +614,8 @@ def main():
             print(f"ended {left} processes tests left running")
         for n, a in serial:
             report(*run_guarded(fwe, root, work, n, a, limit(n)))
+        guard.stop()
+        memory_report()
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
@@ -490,6 +633,13 @@ def main():
     print("\noutcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     print(f"passed {passed} of {run} run ({100 * passed / max(run, 1):.1f}%), "
           f"{passed} of {applicable} applicable ({100 * passed / max(applicable, 1):.1f}%)")
+    # The IPC tests' time (System V's and POSIX message queues'), each
+    # test's own, summed: kernel state every process shares at work.
+    ipc = {n: t for n, t in took.items() if IPC.match(n) and results[n] == "pass"}
+    if ipc:
+        print(f"IPC tests: {len(ipc)} passed in {sum(ipc.values()):.1f} s, "
+              + ", ".join(f"{n} {t:.1f}" for n, t in sorted(ipc.items(), key=lambda x: -x[1])[:5])
+              + " the longest")
 
     if args.update:
         # (One that skipped on a virtual machine stays as it was.)

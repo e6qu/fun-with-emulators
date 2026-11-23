@@ -45,7 +45,7 @@ impl FileId {
         }
         #[allow(clippy::unnecessary_cast)] // field types differ by host
         Some(FileId([
-            st.st_dev as u64,
+            crate::host::dev_of(st),
             st.st_ino as u64,
             st.st_size as u64,
             st.st_mtime as u64,

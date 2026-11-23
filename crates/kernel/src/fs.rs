@@ -258,6 +258,10 @@ pub struct Resolved {
     pub mount_root: bool,
     /// Where it is in an overlay, when it is in one.
     pub ovl: Option<Ovl>,
+    /// The directory of fwe's file store holding the name (the directory
+    /// itself, for `.`), when it is in one (a tmpfs): `dir` is then an
+    /// empty directory nothing is found or made in.
+    pub store: Option<StoreDir>,
     /// What [`Resolved::prepare`] set up for a file being made in an
     /// overlay, which [`Resolved::finish`] puts in place.
     created: Option<overlay::Created>,
@@ -307,11 +311,49 @@ impl Resolved {
         if self.mount_flags & mounts::ms::RDONLY != 0 { Err(errno::EROFS) } else { Ok(()) }
     }
 
+    /// The target of the symbolic link the name is (`EINVAL` for another
+    /// file).
+    pub fn readlink(&self) -> Result<Vec<u8>, i32> {
+        if let Some(d) = &self.store {
+            let (ino, _) = d.find(&self.name)?;
+            return d.fs.lock()?.readlink(ino);
+        }
+        let name = self.name_c()?;
+        let mut target = vec![0u8; crate::uaccess::PATH_MAX];
+        // SAFETY: a NUL-terminated name in an open directory, and a buffer
+        // of its length.
+        let n = unsafe {
+            libc::readlinkat(
+                self.dir.as_raw_fd(),
+                name.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        if n < 0 {
+            return Err(e());
+        }
+        target.truncate(n as usize);
+        Ok(target)
+    }
+
+    /// The file of fwe's store the name is, if it is in the store
+    /// (`ENOENT` where there is none).
+    pub fn store_file(&self) -> Result<Option<crate::filestore::desc::File>, i32> {
+        let Some(d) = &self.store else { return Ok(None) };
+        let (ino, _) = d.find(&self.name)?;
+        Ok(Some(crate::filestore::desc::File { fs: d.fs.id, ino }))
+    }
+
     /// The host's `lstat` of the name: as the lookup saw it, or looked at
     /// now.
     pub(crate) fn lstat(&self) -> Option<libc::stat> {
         if let Some(seen) = self.seen {
             return seen.ok();
+        }
+        if let Some(d) = &self.store {
+            let (ino, _) = d.find(&self.name).ok()?;
+            return d.host_stat(ino).ok();
         }
         let name = self.name_c().ok()?;
         // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
@@ -332,16 +374,10 @@ impl Resolved {
     /// once it has.
     pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
         self.writable()?;
-        // A new name in a tmpfs of a number of inodes takes one of them
-        // (`ENOSPC`); one that is there already fails as it would anyway.
-        if matches!(how, Change::Create)
-            && self.ovl.is_none()
-            && crate::tmpfs::any_counted()
-            && self.lstat().is_none()
-        {
-            crate::tmpfs::take_inode(self.dir.as_raw_fd())?;
+        // fwe's store makes and changes its files itself.
+        if self.store.is_some() && self.ovl.is_none() {
+            return Ok(());
         }
-
         // What it sets up is looked at afresh.
         self.seen = None;
         let Some(o) = &self.ovl else { return Ok(()) };
@@ -351,12 +387,11 @@ impl Resolved {
             // Nothing there to change, or already in the upper layer.
             (overlay::Found::Missing, Change::Modify) => return Ok(()),
             (overlay::Found::Other { layer: 0, .. }, _) if upper => return Ok(()),
-            (overlay::Found::Dir(d), _) if upper && d.fds[0].is_some() => return Ok(()),
+            (overlay::Found::Dir(d), _) if upper && d.dirs[0].is_some() => return Ok(()),
             (overlay::Found::Missing, Change::Create) => {
                 let made = overlay::create(&o.layers, &o.parent, &self.name)?;
-                let (dir, name) = made.target();
-                self.dir = dup_cloexec(dir)?;
-                self.name = name.to_bytes().to_vec();
+                (self.dir, self.store) = stand_in(&made.dir)?;
+                self.name = made.target().to_vec();
                 self.created = Some(made);
                 return Ok(());
             }
@@ -364,22 +399,48 @@ impl Resolved {
             (_, Change::Create) | (_, Change::Remove) => return Ok(()),
             (_, Change::Modify) => overlay::copy_up(&o.layers, &o.path(&self.name))?,
         };
-        self.dir = dup_cloexec(dir.as_raw_fd())?;
+        (self.dir, self.store) = stand_in(&dir)?;
         Ok(())
+    }
+
+    /// The layers of the overlay it is in, if it is in one.
+    pub fn layers(&self) -> Option<Arc<Layers>> {
+        self.ovl.as_ref().map(|o| o.layers.clone())
+    }
+
+    /// After [`prepare`](Self::prepare) for a file to be made in an
+    /// overlay's upper layer of fwe's store, where a whiteout is at the
+    /// name: the attribute a directory made in its place takes (the
+    /// store's call replaces the whiteout, [`overlay::Created`]).
+    pub fn over_whiteout(&self) -> Option<&'static [u8]> {
+        self.created.as_ref().and_then(overlay::Created::over_whiteout)
     }
 
     /// Get ready for a `bind` to make a socket's node at what was
     /// resolved: in an overlay, the directory copied up, and a whiteout in
-    /// the way removed (the host makes the node where `bind` says, so it
-    /// cannot be made aside and moved over the whiteout). With `host_root`
-    /// (no root filesystem), the host's own directories are left to its
-    /// checks.
+    /// the way removed from a host layer (the host makes the node where
+    /// `bind` says, so it cannot be made aside and moved over the
+    /// whiteout; the store's `bind` replaces one itself,
+    /// [`Self::over_whiteout`]). With `host_root` (no root filesystem),
+    /// the host's own directories are left to its checks.
     pub fn prepare_bind(&mut self, host_root: bool) -> Result<(), i32> {
         // A name there already is an address in use, which Linux finds
         // first; then a read-only mount takes no new node (`EROFS`), and a
         // caller needs to write and search the directory (`EACCES`), as for
-        // any file it makes.
-        if self.lstat().is_none() {
+        // any file it makes: the directory the node goes in, an overlay's
+        // copied up.
+        let made = match &self.ovl {
+            Some(o) if !matches!(o.found, overlay::Found::Missing) => return Ok(()),
+            Some(o) => {
+                self.writable()?;
+                let made = overlay::create(&o.layers, &o.parent, &self.name)?;
+                (self.dir, self.store) = stand_in(&made.dir)?;
+                Some(made)
+            }
+            None if self.lstat().is_some() => return Ok(()),
+            None => None,
+        };
+        if self.store.is_none() {
             self.writable()?;
             let a = crate::creds::access();
             if let Some(st) = guest_stat(self.dir.as_raw_fd())
@@ -389,19 +450,18 @@ impl Resolved {
                 return Err(errno::EACCES);
             }
         }
-        let Some(o) = &self.ovl else { return Ok(()) };
-        if !matches!(o.found, overlay::Found::Missing) {
-            return Ok(());
-        }
-        self.writable()?;
-        let made = overlay::create(&o.layers, &o.parent, &self.name)?;
-        if let Some((_, _)) = &made.temp {
-            // SAFETY: a NUL-terminated name in a live directory.
-            if unsafe { libc::unlinkat(made.dir.as_raw_fd(), made.name.as_ptr(), 0) } != 0 {
-                return Err(e());
+        match made {
+            Some(made) if matches!(made.dir, overlay::LDir::Store(_)) => self.created = Some(made),
+            Some(made) if made.target() != made.name => {
+                // SAFETY: a NUL-terminated name in a live directory.
+                if unsafe { libc::unlinkat(self.dir.as_raw_fd(), cstr(&made.name)?.as_ptr(), 0) }
+                    != 0
+                {
+                    return Err(e());
+                }
             }
+            _ => {}
         }
-        self.dir = dup_cloexec(made.dir.as_raw_fd())?;
         Ok(())
     }
 
@@ -412,8 +472,8 @@ impl Resolved {
         match self.created.take() {
             Some(c) => {
                 let r = c.finish(made);
-                self.dir = dup_cloexec(c.dir.as_raw_fd())?;
-                self.name = c.name.to_bytes().to_vec();
+                (self.dir, self.store) = stand_in(&c.dir)?;
+                self.name = c.name.clone();
                 r
             }
             None => Ok(()),
@@ -430,9 +490,75 @@ impl Resolved {
             mount_root: false,
             mount_id: 0,
             ovl: None,
+            store: None,
             created: None,
             seen: None,
         }
+    }
+}
+
+/// A directory of fwe's file store ([`crate::filestore`]): a tmpfs's.
+#[derive(Clone)]
+pub struct StoreDir {
+    pub fs: Arc<crate::filestore::fs::Fs>,
+    pub ino: crate::filestore::tree::Ino,
+}
+
+impl StoreDir {
+    /// The directory at `path` (from the filesystem's root) of filesystem
+    /// `id`, its names taken as they are (no link followed).
+    pub fn at(id: u64, path: &[u8]) -> Result<StoreDir, i32> {
+        let fs = crate::filestore::fs::get(id, false)?;
+        let ino = {
+            let t = fs.lock()?;
+            let mut ino = t.root();
+            for comp in components(path) {
+                ino = t.lookup(ino, &comp)?;
+                if t.stat(ino)?.mode & crate::filestore::tree::S_IFMT
+                    != crate::filestore::tree::S_IFDIR
+                {
+                    return Err(errno::ENOTDIR);
+                }
+            }
+            ino
+        };
+        Ok(StoreDir { fs, ino })
+    }
+
+    /// The status of `ino` of its filesystem, as the host's `stat` lays it
+    /// out (the guest's owner and mode).
+    pub fn host_stat(&self, ino: crate::filestore::tree::Ino) -> Result<libc::stat, i32> {
+        self.host_stat_flags(ino).map(|(s, _)| s)
+    }
+
+    /// [`Self::host_stat`], with the inode's flags (`FS_*_FL`).
+    pub fn host_stat_flags(
+        &self,
+        ino: crate::filestore::tree::Ino,
+    ) -> Result<(libc::stat, u32), i32> {
+        let t = self.fs.lock()?;
+        let st = t.stat(ino)?;
+        Ok((crate::filestore::io::host_stat(t.dev(), &st), st.flags))
+    }
+
+    /// What `name` is in it: its inode and status (`.` and `..` too).
+    pub fn find(
+        &self,
+        name: &[u8],
+    ) -> Result<(crate::filestore::tree::Ino, crate::filestore::tree::Stat), i32> {
+        let t = self.fs.lock()?;
+        let ino = t.lookup(self.ino, name)?;
+        Ok((ino, t.stat(ino)?))
+    }
+}
+
+/// Where the resolver stands in directory `d` of an overlay's layer: a
+/// host directory's descriptor (a duplicate), or [`empty_dir`] with the
+/// store's directory.
+pub(crate) fn stand_in(d: &overlay::LDir) -> Result<(OwnedFd, Option<StoreDir>), i32> {
+    match d {
+        overlay::LDir::Host(fd) => Ok((dup_cloexec(fd.as_raw_fd())?, None)),
+        overlay::LDir::Store(s) => Ok((empty_dir()?, Some(s.clone()))),
     }
 }
 
@@ -519,8 +645,11 @@ impl Fs {
             Ok(ns) => Arc::new(ns),
             // The parent is in it, so it exists; failing that, the rootfs's.
             Err(_) => Arc::new(
-                Ns::initial(&root_host, shm::dir_path(&root_host).ok().as_deref())
-                    .expect("the initial mount namespace"),
+                Ns::initial(
+                    &root_host,
+                    Some(shm::store(&root_host).expect("the rootfs's /dev/shm")),
+                )
+                .expect("the initial mount namespace"),
             ),
         };
         Fs {
@@ -603,8 +732,11 @@ impl Fs {
         // SAFETY: `root` is a fresh owned directory descriptor.
         let root = unsafe { OwnedFd::from_raw_fd(root?) };
         let root_host = fd_path(root.as_raw_fd()).unwrap_or_else(|| b"/".to_vec());
-        let shm = shm::dir_path(&root_host).ok();
-        let mnt = Arc::new(Ns::initial(&root_host, shm.as_deref())?);
+        let shm = shm::store(&root_host).inspect_err(|&e| {
+            let name = fwe_abi::errno_name(e).unwrap_or("?");
+            eprintln!("fwe: the rootfs's /dev/shm cannot be had: {name} ({e})");
+        })?;
+        let mnt = Arc::new(Ns::initial(&root_host, Some(shm))?);
         Ok(Fs {
             root,
             cwd: b"/".to_vec(),
@@ -929,22 +1061,7 @@ impl Fs {
         let mut at = self.absolute(dirfd, path)?;
         for _ in 0..40 {
             let r = self.resolve(fcntl::AT_FDCWD as i32, &at, false).ok()?;
-            let name = std::ffi::CString::new(r.name.clone()).ok()?;
-            let mut target = vec![0u8; crate::uaccess::PATH_MAX];
-            // SAFETY: a NUL-terminated name in an open directory, and a
-            // buffer of its length; not a link, it fails (EINVAL).
-            let n = unsafe {
-                libc::readlinkat(
-                    r.dir.as_raw_fd(),
-                    name.as_ptr(),
-                    target.as_mut_ptr().cast(),
-                    target.len(),
-                )
-            };
-            if n <= 0 {
-                return None;
-            }
-            target.truncate(n as usize);
+            let target = r.readlink().ok().filter(|t| !t.is_empty())?;
             at = if target.starts_with(b"/") {
                 target
             } else {
@@ -1298,6 +1415,12 @@ impl Fs {
         if let Some(p) = crate::synthdir::path_of(fd) {
             return p;
         }
+        if let Some(p) = crate::procfile::path_of(fd) {
+            return p;
+        }
+        if crate::landlock::is_ruleset(fd) {
+            return b"anon_inode:[landlock-ruleset]".to_vec();
+        }
         if let Some(name) = crate::specialfd::anon_name(fd) {
             return format!("anon_inode:{name}").into_bytes();
         }
@@ -1313,6 +1436,11 @@ impl Fs {
         // A descriptor of a `/proc` link: the link's path.
         if let Some(link) = crate::fdmarks::proc_link(fd).and_then(|ns| self.from_ns(&ns)) {
             return link;
+        }
+        if let Some(file) = crate::filestore::desc::of(fd)
+            && let Some(t) = self.store_fd_target(fd, file)
+        {
+            return t;
         }
         if crate::inotify::instance_of(fd).is_some() {
             return b"anon_inode:inotify".to_vec();
@@ -1346,6 +1474,52 @@ impl Fs {
             // A kqueue (an epoll descriptor) has neither path nor type.
             None => b"anon_inode:[eventpoll]".to_vec(),
         }
+    }
+
+    /// [`Fs::fd_target`] of `fd`, a descriptor of `file` of fwe's store:
+    /// its path as Linux's `d_path` gives it, where it was opened while its
+    /// name is still there, where it is now if it moved (in the mount it
+    /// was opened through), and with ` (deleted)` once it has no name (an
+    /// `O_TMPFILE` never named, `#` and its inode in its directory).
+    fn store_fd_target(&self, fd: i32, file: crate::filestore::desc::File) -> Option<Vec<u8>> {
+        use crate::filestore::tree::{S_IFDIR, S_IFMT};
+        let origin = crate::fdmarks::origin(fd)?;
+        let opened = self.from_ns(&origin.ns_path)?;
+        let fs = file.fs().ok()?;
+        let (inner, deleted) = {
+            let t = fs.lock().ok()?;
+            let st = t.stat(file.ino).ok()?;
+            let place = crate::filestore::desc::place(fd);
+            match &place {
+                Some((d, name)) if t.lookup(*d, name).ok() == Some(file.ino) => {
+                    return Some(opened);
+                }
+                _ if st.nlink > 0 => (t.any_path(file.ino), false),
+                _ => match t.last_name(file.ino) {
+                    // Where its last name was.
+                    Some((d, name)) => (t.any_path(d).map(|p| mounts::join(&p, &name)), true),
+                    // An `O_TMPFILE` never named.
+                    None if place.is_none() && st.mode & S_IFMT != S_IFDIR => {
+                        let mut p = opened;
+                        p.extend_from_slice(format!("/#{} (deleted)", st.ino).as_bytes());
+                        return Some(p);
+                    }
+                    None => (None, true),
+                },
+            }
+        };
+        // In the mount it was opened through.
+        let table = self.mnt.table();
+        let now = inner.and_then(|inner| {
+            let m = table.get(origin.mount)?;
+            let rest = mounts::under(&inner, &m.root)?;
+            self.from_ns(&mounts::join(&m.point, rest))
+        });
+        let mut p = now.unwrap_or(opened);
+        if deleted {
+            p.extend_from_slice(b" (deleted)");
+        }
+        Some(p)
     }
 
     /// `/proc/<pid>/fd/<n>` of another process, host process `host`: a
@@ -1634,7 +1808,8 @@ impl Fs {
     /// Resolve `path` relative to `dirfd`. Every symlink is followed except,
     /// when `follow_final` is false, one that is the last component. The
     /// standard device nodes ([`DEVICES`]) resolve to the host's, and
-    /// `/dev/shm` to fwe's own directory for it ([`shm`]).
+    /// names in a filesystem of fwe's store (a tmpfs, `/dev/shm`: [`shm`])
+    /// to that store's directory ([`Resolved::store`]).
     pub fn resolve(&self, dirfd: i32, path: &[u8], follow_final: bool) -> Result<Resolved, i32> {
         // A trailing slash names a directory, as on Linux: a final link is
         // followed, and anything but a directory found is `ENOTDIR`.
@@ -1743,12 +1918,7 @@ impl Fs {
                 Entry::File(data) => Ok((data, None)),
                 Entry::Fd { fd, .. } => {
                     // Through the descriptor: only a regular file is run.
-                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                    // SAFETY: a valid out-parameter.
-                    if unsafe { libc::fstat(fd, &mut st) } != 0
-                        || st.st_mode & libc::S_IFMT != libc::S_IFREG
-                    {
+                    if !regular_fd(fd) {
                         return Err(errno::EACCES);
                     }
                     read_all(fd).map(|d| (d, crate::prepcache::FileId::of_fd(fd)))
@@ -1762,6 +1932,9 @@ impl Fs {
         // Nothing is run from a mount that runs nothing.
         if resolved.mount_flags & mounts::ms::NOEXEC != 0 {
             return Err(errno::EACCES);
+        }
+        if let Some(file) = resolved.store_file()? {
+            return crate::filestore::io::read_file(file, resolved.mount_flags).map(|d| (d, None));
         }
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
@@ -1796,12 +1969,7 @@ impl Fs {
                     Ok(data)
                 }
                 Entry::Fd { fd, .. } => {
-                    // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
-                    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                    // SAFETY: a valid out-parameter.
-                    if unsafe { libc::fstat(fd, &mut st) } != 0
-                        || st.st_mode & libc::S_IFMT != libc::S_IFREG
-                    {
+                    if !regular_fd(fd) {
                         return Err(errno::EACCES);
                     }
                     pread_head(fd, len)
@@ -1812,6 +1980,11 @@ impl Fs {
             };
         }
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
+        if let Some(file) = resolved.store_file()? {
+            let mut data = crate::filestore::io::read_file(file, resolved.mount_flags)?;
+            data.truncate(len);
+            return Ok(data);
+        }
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
         let fd = unsafe {
@@ -1829,6 +2002,11 @@ impl Fs {
     /// symbolic links, as `stat` gives them.
     pub fn file_id(&self, path: &[u8]) -> Option<(u64, u64)> {
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
+        if let Some(d) = &resolved.store {
+            let st = d.host_stat(d.find(&resolved.name).ok()?.0).ok()?;
+            #[allow(clippy::unnecessary_cast)] // the field types differ by host
+            return Some((crate::host::dev_of(&st), st.st_ino as u64));
+        }
         let name = resolved.name_c().ok()?;
         // SAFETY: zeroed bytes are a valid `stat`.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1836,7 +2014,7 @@ impl Fs {
         // out-parameter.
         let ok = unsafe { libc::fstatat(resolved.dir.as_raw_fd(), name.as_ptr(), &mut st, 0) } == 0;
         #[allow(clippy::unnecessary_cast)] // the field types differ by host
-        ok.then_some((st.st_dev as u64, st.st_ino as u64))
+        ok.then_some((crate::host::dev_of(&st), st.st_ino as u64))
     }
 
     /// Make this the view the socket calls resolve `AF_UNIX` paths in (see
@@ -1932,11 +2110,18 @@ impl Fs {
     pub fn chdir(&mut self, dirfd: i32, path: &[u8]) -> Result<(), i32> {
         let resolved = self.resolve(dirfd, path, true)?;
         // Confirm it is a directory we can enter.
-        let child = match &resolved.name[..] {
-            b"." => dup_cloexec(resolved.dir.as_raw_fd())?,
-            name => open_dir(resolved.dir.as_raw_fd(), &cstr(name)?)?,
-        };
-        drop(child);
+        if let Some(d) = &resolved.store {
+            let (_, st) = d.find(&resolved.name)?;
+            if st.mode & crate::filestore::tree::S_IFMT != crate::filestore::tree::S_IFDIR {
+                return Err(errno::ENOTDIR);
+            }
+        } else {
+            let child = match &resolved.name[..] {
+                b"." => dup_cloexec(resolved.dir.as_raw_fd())?,
+                name => open_dir(resolved.dir.as_raw_fd(), &cstr(name)?)?,
+            };
+            drop(child);
+        }
         let guest = resolved.ns_path.as_deref().and_then(|ns| self.from_ns(ns));
         self.cwd_mount = resolved.mount_id;
         self.cwd_outside = None;
@@ -1957,10 +2142,20 @@ impl Fs {
 
     /// Set the working directory to the host directory `fd` refers to.
     pub fn fchdir(&mut self, fd: i32) -> Result<(), i32> {
+        let table = self.mnt.table();
+        // A directory of fwe's store: where it is in the namespace.
+        if let Some(here) = store_here(&table, &self.proc_root, fd)? {
+            let (mount, ns) = here.at.ok_or(errno::EACCES)?;
+            let guest = self.from_ns(&ns).ok_or(errno::EACCES)?;
+            self.cwd = guest;
+            self.cwd_outside = None;
+            self.cwd_mount = mount;
+            self.republish();
+            return Ok(());
+        }
         let host = fd_path(fd).ok_or(errno::EBADF)?;
         // A directory opened through an overlay is that overlay's: its host
         // path is in one of the layers, which says nothing of where.
-        let table = self.mnt.table();
         let opened = overlay_here(&table, &self.proc_root, fd)
             .ok()
             .flatten()
@@ -2058,6 +2253,53 @@ fn overlay_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, 
     Here::overlay(&l, path, at).map(Some)
 }
 
+/// Where the walk starts from `fd`, a descriptor of a directory of fwe's
+/// store (`None` for another descriptor; `ENOTDIR` for another of the
+/// store's files): placed in the namespace where its filesystem is mounted
+/// and its path in it is now, preferring the mount it was opened through.
+fn store_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, i32> {
+    let Some(file) = crate::filestore::desc::of(fd) else { return Ok(None) };
+    let fs = file.fs()?;
+    let path = {
+        let t = fs.lock()?;
+        if t.stat(file.ino)?.mode & crate::filestore::tree::S_IFMT
+            != crate::filestore::tree::S_IFDIR
+        {
+            return Err(errno::ENOTDIR);
+        }
+        t.path(file.ino)
+    };
+    let place = |m: &Mount| {
+        if m.source != Source::Store(fs.id) {
+            return None;
+        }
+        let rest = mounts::under(path.as_deref()?, &m.root)?;
+        let ns = mounts::join(&m.point, rest);
+        (table.locate(&ns).0.id == m.id && mounts::under(&ns, root_ns).is_some())
+            .then_some((m.id, ns))
+    };
+    let origin = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
+    let at = table.get(origin).and_then(place).or_else(|| table.mounts.iter().find_map(place));
+    Here::of_store(StoreDir { fs, ino: file.ino }, at).map(Some)
+}
+
+/// Whether the link of status `link` in directory `d` of fwe's store may
+/// be followed by a caller of `fsuid` (`fs.protected_symlinks`): in a
+/// sticky directory others may write, only its owner's or the
+/// directory's owner's links (`EACCES`).
+pub(crate) fn may_follow_in_store(
+    d: &StoreDir,
+    link: &crate::filestore::tree::Stat,
+    fsuid: u32,
+) -> Result<(), i32> {
+    let dir = d.fs.lock()?.stat(d.ino)?;
+    let open = dir.mode & 0o1002 == 0o1002;
+    if !open || link.uid == fsuid || link.uid == dir.uid {
+        return Ok(());
+    }
+    Err(errno::EACCES)
+}
+
 /// Open the directory at `rest` (a path inside the mount, from its root)
 /// of the host-backed mount `m`; the rootfs through fwe's descriptor of
 /// it, one component at a time, never following a link.
@@ -2108,6 +2350,9 @@ struct Here {
     /// In an overlay mount: the directory in each of its layers (`dir` is
     /// the topmost of them).
     ovl: Option<OvlHere>,
+    /// In a filesystem of fwe's store: the directory (`dir` is an empty
+    /// directory of fwe's).
+    store: Option<StoreDir>,
 }
 
 impl Here {
@@ -2127,13 +2372,27 @@ impl Here {
         dir: overlay::Dir,
         at: Option<(u32, Vec<u8>)>,
     ) -> Result<Here, i32> {
-        let top = dup_cloexec(dir.top().1.as_raw_fd())?;
+        let (top, store) = stand_in(dir.top().1)?;
         Ok(Here {
             dir: top,
             at,
             phantom: false,
             ovl: Some(OvlHere { layers: layers.clone(), path, dir }),
+            store,
         })
+    }
+
+    /// Directory `d` of fwe's store.
+    fn of_store(d: StoreDir, at: Option<(u32, Vec<u8>)>) -> Result<Here, i32> {
+        Ok(Here { dir: empty_dir()?, at, phantom: false, ovl: None, store: Some(d) })
+    }
+
+    /// Its status, as the guest sees it.
+    fn stat(&self) -> Option<libc::stat> {
+        match &self.store {
+            Some(d) => d.host_stat(d.ino).ok(),
+            None => guest_stat(self.dir.as_raw_fd()),
+        }
     }
 }
 
@@ -2143,7 +2402,10 @@ fn open_here(v: &View, m: &Mount, rest: &[u8], ns: &[u8]) -> Result<Here, i32> {
     let at = Some((m.id, ns.to_vec()));
     match &m.source {
         Source::Overlay(l) => Here::overlay(l, m.fs_path(rest), at),
-        _ => Ok(Here { dir: open_in_mount(v, m, rest)?, at, phantom: false, ovl: None }),
+        Source::Store(id) => Here::of_store(StoreDir::at(*id, &m.fs_path(rest))?, at),
+        _ => {
+            Ok(Here { dir: open_in_mount(v, m, rest)?, at, phantom: false, ovl: None, store: None })
+        }
     }
 }
 
@@ -2155,16 +2417,20 @@ enum Step {
     Other,
     /// A directory of an overlay.
     OvlDir(overlay::Dir),
+    /// A directory of fwe's store.
+    StoreDir(crate::filestore::tree::Ino),
     Missing,
 }
 
 /// An empty directory nothing can be made in: what a name an overlay
 /// does not show is resolved in, so that it is found nowhere, and a call
-/// that would make it there without [`Resolved::prepare`] fails.
-fn empty_dir() -> Result<OwnedFd, i32> {
-    static PATH: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
-    let path = match PATH.get() {
-        Some(p) => p.clone(),
+/// that would make it there without [`Resolved::prepare`] fails; and what
+/// a name in fwe's store stands in (its own directory is the store's).
+/// Opened once, out of the guest's reach, and handed out as a duplicate.
+pub(crate) fn empty_dir() -> Result<OwnedFd, i32> {
+    static FD: std::sync::OnceLock<i32> = std::sync::OnceLock::new();
+    let fd = match FD.get() {
+        Some(&fd) => fd,
         None => {
             let p = mounts::join(&shm::user_dir()?, b"empty");
             let c = cstr(&p)?;
@@ -2173,10 +2439,12 @@ fn empty_dir() -> Result<OwnedFd, i32> {
                 libc::mkdir(c.as_ptr(), 0o500);
                 libc::chmod(c.as_ptr(), 0o500);
             }
-            PATH.get_or_init(|| p).clone()
+            let d = open_host_dir(&p)?;
+            let held = crate::fdtable::dup_reserved(d.as_raw_fd())?;
+            *FD.get_or_init(|| held)
         }
     };
-    open_host_dir(&path)
+    dup_cloexec(fd)
 }
 
 /// Whether host metadata `st` is of [`empty_dir`], which nothing may
@@ -2185,7 +2453,7 @@ fn empty_dir() -> Result<OwnedFd, i32> {
 pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
     static ID: std::sync::OnceLock<Option<(u64, u64)>> = std::sync::OnceLock::new();
     #[allow(clippy::unnecessary_cast)] // `st_dev` is narrower on macOS
-    let id = |s: &libc::stat| (s.st_dev as u64, s.st_ino as u64);
+    let id = |s: &libc::stat| (crate::host::dev_of(s), s.st_ino as u64);
     let empty = ID.get_or_init(|| {
         let d = empty_dir().ok()?;
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
@@ -2216,12 +2484,17 @@ pub(crate) fn may_follow(
         return Ok(());
     }
     let owner = crate::owners::of_at(dir, name, &st).0;
-    if owner == fsuid {
-        return Ok(());
-    }
     let Some(parent) = guest_stat(parent) else { return Ok(()) };
+    follows(owner, &parent, fsuid)
+}
+
+/// `protected_symlinks`' rule: a link owned by `owner` in a directory
+/// whose guest status is `parent` is followed by `fsuid` unless the
+/// directory is sticky and writable by others and neither the follower
+/// nor the directory's owner owns the link.
+fn follows(owner: u32, parent: &libc::stat, fsuid: u32) -> Result<(), i32> {
     let open = (libc::S_ISVTX | libc::S_IWOTH) as libc::mode_t;
-    if parent.st_mode & open != open || parent.st_uid == owner {
+    if owner == fsuid || parent.st_mode & open != open || parent.st_uid == owner {
         return Ok(());
     }
     Err(errno::EACCES)
@@ -2408,7 +2681,13 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     let (pm, prest) = table.locate(&parent);
                     if let Ok(found) = open_here(v, pm, &prest, &parent) {
                         let at = Some((m.id, ns.to_vec()));
-                        return Ok(Here { dir: found.dir, at, phantom: true, ovl: None });
+                        return Ok(Here {
+                            dir: found.dir,
+                            at,
+                            phantom: true,
+                            ovl: None,
+                            store: None,
+                        });
                     }
                     if parent == up {
                         return Err(errno::ENOENT);
@@ -2443,7 +2722,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     let mut here = match (path.first() == Some(&b'/'), dirfd as i64 == fcntl::AT_FDCWD) {
         (true, _) if let Some((dir, at, n)) = start => {
             pending.truncate(pending.len() - n);
-            Here { dir, at: Some(at), phantom: false, ovl: None }
+            Here { dir, at: Some(at), phantom: false, ovl: None, store: None }
         }
         (true, _) => enter(&root_ns)?,
         (false, true) => enter(&to_ns(v.proc_root, v.cwd))?,
@@ -2453,6 +2732,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             // overlay is the overlay's, wherever the mount has gone.
             match overlay_here(&table, &root_ns, dirfd)? {
                 Some(here) => here,
+                None if let Some(here) = store_here(&table, &root_ns, dirfd)? => here,
                 None => {
                     // A path relative to something that is not a directory
                     // names nothing (`ENOTDIR`).
@@ -2470,7 +2750,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         .filter(|ns| mounts::under(ns, &root_ns).is_some());
                     let dir = dup_cloexec(dirfd)?;
                     let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
-                    Here { dir, at, phantom: false, ovl: None }
+                    Here { dir, at, phantom: false, ovl: None, store: None }
                 }
             }
         }
@@ -2495,24 +2775,24 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             // Only the mounts below a missing directory are there.
             return Err(errno::ENOENT);
         }
-        let (dir, ovl) = match here.ovl {
-            None => (here.dir, None),
+        let (dir, store, ovl) = match here.ovl {
+            None => (here.dir, here.store, None),
             Some(o) if name == b"." => {
                 let found = overlay::Found::Dir(o.dir.clone());
-                (here.dir, Some(Ovl { layers: o.layers, parent: o.path, found }))
+                (here.dir, here.store, Some(Ovl { layers: o.layers, parent: o.path, found }))
             }
             Some(o) => {
-                let found = overlay::lookup(&o.layers, &o.dir, &cstr(&name)?)?;
-                let dir = match &found {
-                    overlay::Found::Missing => empty_dir()?,
+                let found = overlay::lookup(&o.layers, &o.dir, &name)?;
+                let (dir, store) = match &found {
+                    overlay::Found::Missing => (empty_dir()?, None),
                     overlay::Found::Other { layer, .. } => {
-                        dup_cloexec(o.dir.fds[*layer].as_ref().expect("its layer").as_raw_fd())?
+                        stand_in(o.dir.dirs[*layer].as_ref().expect("its layer"))?
                     }
                     overlay::Found::Dir(d) => {
-                        dup_cloexec(o.dir.fds[d.top().0].as_ref().expect("its layer").as_raw_fd())?
+                        stand_in(o.dir.dirs[d.top().0].as_ref().expect("its layer"))?
                     }
                 };
-                (dir, Some(Ovl { layers: o.layers, parent: o.path, found }))
+                (dir, store, Some(Ovl { layers: o.layers, parent: o.path, found }))
             }
         };
         Ok(Resolved {
@@ -2524,6 +2804,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             mount_id: mount.as_ref().map_or(0, |m| m.id),
             mount_root,
             ovl,
+            store,
             created: None,
             seen: None,
         })
@@ -2540,18 +2821,23 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
     let mut whole_runs = !check_search;
     let mut seen = None;
     while let Some(comp) = pending.pop() {
-        if whole_runs && let Some((dir, at, n)) = plain_run(&table, &here, &comp, &pending) {
+        if whole_runs
+            && here.store.is_none()
+            && let Some((dir, at, n)) = plain_run(&table, &here, &comp, &pending)
+        {
             pending.truncate(pending.len() + 1 - n);
             // `..` from here enters its parent by its path: no link led
             // here.
             ancestors.clear();
-            here = Here { dir, at: Some(at), phantom: false, ovl: None };
+            here = Here { dir, at: Some(at), phantom: false, ovl: None, store: None };
             continue;
         }
         whole_runs = false;
-        if check_search
+        // (A directory of fwe's store is the guest's own, its permissions
+        // checked always.)
+        if (check_search || here.store.is_some())
             && !here.phantom
-            && let Some(st) = guest_stat(here.dir.as_raw_fd())
+            && let Some(st) = here.stat()
             && st.st_mode & libc::S_IFMT == libc::S_IFDIR
             && !access.permits(&st, 1)
         {
@@ -2576,6 +2862,16 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         Some(a) => a,
                         None => enter(&parent)?,
                     };
+                }
+                None if let Some(d) = &here.store => {
+                    // A directory of fwe's store it cannot place: up in its
+                    // filesystem, no further than its root.
+                    if let Some(a) = ancestors.pop() {
+                        here = a;
+                    } else {
+                        let (up, _) = d.find(b"..")?;
+                        here = Here::of_store(StoreDir { fs: d.fs.clone(), ino: up }, None)?;
+                    }
                 }
                 None if here.ovl.is_some() => {
                     // An overlay directory fwe cannot place: up in the
@@ -2619,7 +2915,13 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         return Err(errno::ENOENT);
                     }
                     let dir = dup_cloexec(here.dir.as_raw_fd())?;
-                    let next = Here { dir, at: Some((m.id, child_ns)), phantom: true, ovl: None };
+                    let next = Here {
+                        dir,
+                        at: Some((m.id, child_ns)),
+                        phantom: true,
+                        ovl: None,
+                        store: None,
+                    };
                     ancestors.push(std::mem::replace(&mut here, next));
                     continue;
                 }
@@ -2634,6 +2936,32 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                             }
                             let (parent, name) = split_host(&m.root);
                             let parent = Here::overlay(l, parent, None)?;
+                            let mut r = done(parent, name, true)?;
+                            r.ns_path = Some(child_ns.clone());
+                            r.mount_flags = m.flags;
+                            r.fstype = m.fstype;
+                            r.mount_id = m.id;
+                            return Ok(r);
+                        }
+                        Err(e) => return Err(e),
+                    };
+                    if is_last {
+                        return done(next, b".".to_vec(), true);
+                    }
+                    ancestors.push(std::mem::replace(&mut here, next));
+                    continue;
+                }
+                if let Source::Store(id) = &m.source {
+                    let at = Some((m.id, child_ns.clone()));
+                    let next = match StoreDir::at(*id, &m.root) {
+                        Ok(d) => Here::of_store(d, at)?,
+                        Err(errno::ENOTDIR) => {
+                            // A file bind mount of a file of the store.
+                            if !is_last {
+                                return Err(errno::ENOTDIR);
+                            }
+                            let (parent, name) = split_host(&m.root);
+                            let parent = Here::of_store(StoreDir::at(*id, &parent)?, None)?;
                             let mut r = done(parent, name, true)?;
                             r.ns_path = Some(child_ns.clone());
                             r.mount_flags = m.flags;
@@ -2677,8 +3005,11 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                         return Err(errno::ENOTDIR);
                     }
                     let dir = parent;
-                    let mut r =
-                        done(Here { dir, at: None, phantom: false, ovl: None }, name, true)?;
+                    let mut r = done(
+                        Here { dir, at: None, phantom: false, ovl: None, store: None },
+                        name,
+                        true,
+                    )?;
                     r.ns_path = Some(child_ns.clone());
                     r.mount_flags = m.flags;
                     r.fstype = m.fstype;
@@ -2686,7 +3017,13 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     return Ok(r);
                 }
                 let dir = open_in_mount(v, &m, b"")?;
-                let next = Here { dir, at: Some((m.id, child_ns)), phantom: false, ovl: None };
+                let next = Here {
+                    dir,
+                    at: Some((m.id, child_ns)),
+                    phantom: false,
+                    ovl: None,
+                    store: None,
+                };
                 if is_last {
                     return done(next, b".".to_vec(), true);
                 }
@@ -2728,19 +3065,20 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             let next = match link {
                 Some(MagicLink::Fd(fd)) => match overlay_here(&table, &root_ns, fd)? {
                     Some(here) => here,
+                    None if let Some(here) = store_here(&table, &root_ns, fd)? => here,
                     None => {
                         let ns = fd_path(fd)
                             .and_then(|h| host_to_ns(&table, &h))
                             .filter(|ns| mounts::under(ns, &root_ns).is_some());
                         let at = ns.map(|ns| (table.locate(&ns).0.id, ns));
-                        Here { dir: dup_cloexec(fd)?, at, phantom: false, ovl: None }
+                        Here { dir: dup_cloexec(fd)?, at, phantom: false, ovl: None, store: None }
                     }
                 },
                 Some(MagicLink::Cwd) => enter(&to_ns(v.proc_root, v.cwd))?,
                 Some(MagicLink::Root) => enter(&root_ns)?,
                 None => {
                     let dir = dup_cloexec(here.dir.as_raw_fd())?;
-                    Here { dir, at: Some((id, child_ns)), phantom: true, ovl: None }
+                    Here { dir, at: Some((id, child_ns)), phantom: true, ovl: None, store: None }
                 }
             };
             if link.is_some() {
@@ -2752,25 +3090,60 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             }
             continue;
         }
+        // A name too long for the store's directories is refused by its
+        // lookup, before any check of what is done with it (as tmpfs's
+        // `simple_lookup`).
+        if here.store.is_some() && !here.phantom && comp.len() > crate::filestore::tree::NAME_MAX {
+            return Err(errno::ENAMETOOLONG);
+        }
         if is_last && !follow_final {
             return done(here, comp, false);
         }
         let comp_c = cstr(&comp)?;
         let step = if here.phantom {
             Step::Missing
+        } else if let Some(d) = here.store.as_ref().filter(|_| here.ovl.is_none()) {
+            match d.find(&comp) {
+                Ok((ino, st)) => match st.mode & crate::filestore::tree::S_IFMT {
+                    crate::filestore::tree::S_IFLNK => {
+                        if is_last && crate::sysctl::protected_links().0 {
+                            may_follow_in_store(d, &st, access.fsuid)?;
+                        }
+                        Step::Link(d.fs.lock()?.readlink(ino)?)
+                    }
+                    crate::filestore::tree::S_IFDIR if !is_last => Step::StoreDir(ino),
+                    _ => {
+                        seen = Some(Ok(d.host_stat(ino)?));
+                        Step::Other
+                    }
+                },
+                Err(errno::ENOENT) => {
+                    seen = Some(Err(libc::ENOENT));
+                    Step::Missing
+                }
+                Err(e) => return Err(e),
+            }
         } else if let Some(o) = &here.ovl {
-            match overlay::lookup(&o.layers, &o.dir, &comp_c)? {
+            match overlay::lookup(&o.layers, &o.dir, &comp)? {
                 overlay::Found::Missing => Step::Missing,
                 overlay::Found::Dir(d) => Step::OvlDir(d),
                 overlay::Found::Other { layer, link: true } => {
-                    let in_layer = o.dir.fds[layer].as_ref().expect("its layer");
+                    let in_layer = o.dir.dirs[layer].as_ref().expect("its layer");
                     // The link as its layer has it, in the directory as the
                     // topmost layer shows it.
                     if is_last && crate::sysctl::protected_links().0 {
-                        let top = here.dir.as_raw_fd();
-                        may_follow(in_layer.as_raw_fd(), &comp_c, top, access.fsuid)?;
+                        let owner = match in_layer {
+                            overlay::LDir::Host(fd) => {
+                                guest_stat_at(fd.as_raw_fd(), &comp_c).map(|st| st.st_uid)
+                            }
+                            overlay::LDir::Store(d) => d.find(&comp).ok().map(|f| f.1.uid),
+                        };
+                        let top = here.stat();
+                        if let (Some(owner), Some(top)) = (owner, top) {
+                            follows(owner, &top, access.fsuid)?;
+                        }
                     }
-                    Step::Link(readlink_at(in_layer.as_raw_fd(), &comp_c)?)
+                    Step::Link(in_layer.readlink(&comp)?)
                 }
                 overlay::Found::Other { .. } => Step::Other,
             }
@@ -2818,7 +3191,11 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 if symlinks > MAX_SYMLINKS {
                     return Err(errno::ELOOP);
                 }
-                if is_last && here.ovl.is_none() && crate::sysctl::protected_links().0 {
+                if is_last
+                    && here.ovl.is_none()
+                    && here.store.is_none()
+                    && crate::sysctl::protected_links().0
+                {
                     let d = here.dir.as_raw_fd();
                     may_follow(d, &comp_c, d, access.fsuid)?;
                 }
@@ -2849,10 +3226,18 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 r.seen = seen;
                 return Ok(r);
             }
+            // Not a directory, in fwe's store: nothing is below it.
+            Step::Other if here.store.is_some() => return Err(errno::ENOTDIR),
+            Step::StoreDir(ino) => {
+                let d = here.store.as_ref().expect("in fwe's store");
+                let at = here.at.as_ref().map(|(id, ns)| (*id, mounts::join(ns, &comp)));
+                let next = Here::of_store(StoreDir { fs: d.fs.clone(), ino }, at)?;
+                ancestors.push(std::mem::replace(&mut here, next));
+            }
             Step::Other => {
                 let child = open_dir(here.dir.as_raw_fd(), &comp_c)?;
                 let at = here.at.as_ref().map(|(id, ns)| (*id, mounts::join(ns, &comp)));
-                let next = Here { dir: child, at, phantom: false, ovl: None };
+                let next = Here { dir: child, at, phantom: false, ovl: None, store: None };
                 ancestors.push(std::mem::replace(&mut here, next));
             }
             Step::OvlDir(d) => {
@@ -2872,7 +3257,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                     // Missing, but a mount hangs below it.
                     let at = Some((here.at.as_ref().unwrap().0, p));
                     let dir = dup_cloexec(here.dir.as_raw_fd())?;
-                    let next = Here { dir, at, phantom: true, ovl: None };
+                    let next = Here { dir, at, phantom: true, ovl: None, store: None };
                     ancestors.push(std::mem::replace(&mut here, next));
                     continue;
                 }
@@ -2889,12 +3274,14 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
 }
 
 /// The host directories at the top of what mount `m` shows: its source's
-/// directory, or each of an overlay's layers'.
+/// directory, or each of an overlay's host layers'.
 fn mount_tops(m: &Mount) -> Vec<Vec<u8>> {
     match &m.source {
         Source::Host(_) => m.host_path(b"").into_iter().collect(),
-        Source::Overlay(l) => l.paths().map(|p| mounts::join(p, &m.root)).collect(),
-        Source::Synthetic | Source::Ns(_) => Vec::new(),
+        Source::Overlay(l) => {
+            l.places().filter_map(overlay::Place::host).map(|p| mounts::join(p, &m.root)).collect()
+        }
+        Source::Synthetic | Source::Ns(_) | Source::Store(_) => Vec::new(),
     }
 }
 
@@ -3074,7 +3461,21 @@ pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i
     let view = published();
     let Some(v) = view.as_ref() else { return Ok(path.to_vec()) };
     let mut r = resolve_in(&v.view(), fcntl::AT_FDCWD as i32, path, follow_final)?;
-    if !follow_final {
+    // A bind in an overlay: its directory copied up first, which may be
+    // in fwe's store.
+    if !follow_final && r.ovl.is_some() {
+        r.prepare_bind(v.root_host == b"/")?;
+    }
+    // In fwe's store: the socket's node in fwe's directory
+    // ([`crate::storenodes`]).
+    if let Some(d) = &r.store {
+        if follow_final {
+            return crate::storenodes::connect_to(d, &r.name);
+        }
+        r.writable()?;
+        return crate::storenodes::bind_at(d, &r.name, path, r.over_whiteout());
+    }
+    if !follow_final && r.ovl.is_none() {
         // A bind, which makes the socket's node there.
         r.prepare_bind(v.root_host == b"/")?;
     }
@@ -3138,8 +3539,14 @@ fn fifo_to_wait_for(r: &Resolved, flags: u64, host_root: bool) -> bool {
     if st.st_mode & libc::S_IFMT != libc::S_IFIFO {
         return false;
     }
-    let Ok(name) = r.name_c() else { return false };
-    let Some(guest) = guest_stat_at(r.dir.as_raw_fd(), &name) else { return false };
+    // A file of fwe's store keeps the guest's mode and owner.
+    let guest = if r.store.is_some() {
+        st
+    } else {
+        let Ok(name) = r.name_c() else { return false };
+        let Some(guest) = guest_stat_at(r.dir.as_raw_fd(), &name) else { return false };
+        guest
+    };
     let want = if flags & f::O_ACCMODE == f::O_WRONLY { 2 } else { 4 };
     // Without a root filesystem, the host's own (root's) are left to it.
     let host_own = host_root && guest.st_uid == 0 && guest.st_gid == 0;
@@ -3393,7 +3800,23 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         return Ok(());
     }
     let writes = flags & f::O_ACCMODE == f::O_WRONLY;
-    let Ok(name) = r.name_c() else { return Ok(()) };
+    // Where it is: a FIFO of fwe's store opens its node
+    // ([`crate::storenodes`]).
+    let (at, name) = match &r.store {
+        Some(d) => {
+            let Ok(file) = r.store_file() else { return Ok(()) };
+            let Some(Some(node)) = file
+                .map(|f| crate::storenodes::path(d.fs.id, f.ino).ok().and_then(|p| cstr(&p).ok()))
+            else {
+                return Ok(());
+            };
+            (libc::AT_FDCWD, node)
+        }
+        None => {
+            let Ok(name) = r.name_c() else { return Ok(()) };
+            (r.dir.as_raw_fd(), name)
+        }
+    };
     let access = if writes { libc::O_WRONLY } else { libc::O_RDONLY };
     let flags_host = libc::O_NOFOLLOW | libc::O_CLOEXEC;
     // A reader holds a non-blocking end too, opened first (a reader
@@ -3404,9 +3827,7 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         -1
     } else {
         // SAFETY: as above; does not wait.
-        unsafe {
-            libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | libc::O_NONBLOCK | flags_host)
-        }
+        unsafe { libc::openat(at, name.as_ptr(), access | libc::O_NONBLOCK | flags_host) }
     };
     // A writer already let through by the ends opened here, the one
     // opened to look and the one above, and gone again (it opened and
@@ -3427,7 +3848,7 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
         -1
     } else {
         // SAFETY: as above; waits for the other end.
-        unsafe { libc::openat(r.dir.as_raw_fd(), name.as_ptr(), access | flags_host) }
+        unsafe { libc::openat(at, name.as_ptr(), access | flags_host) }
     };
     let err = if already { errno::EINTR } else { e() };
     if early >= 0 {
@@ -3496,6 +3917,10 @@ pub(crate) fn take_fifo(flags: u64, st: &libc::stat) -> Option<i32> {
 /// The guest path of the host path an `AF_UNIX` socket is bound to, if it
 /// is in the published view.
 pub(crate) fn guest_of_host(host: &[u8]) -> Option<Vec<u8>> {
+    // A socket bound in fwe's store: the address it was bound by.
+    if let Some(guest) = crate::storenodes::guest_of(host) {
+        return Some(guest);
+    }
     let view = published();
     match view.as_ref() {
         Some(v) => from_ns(&v.proc_root, &host_to_ns(&v.ns.table(), host)?),
@@ -3649,9 +4074,18 @@ pub(crate) fn has_path(fd: i32, target: &[u8]) -> bool {
     target.starts_with(b"/") && crate::memfd::name(fd).is_none()
 }
 
+/// Whether `fd` is open on a regular file (as the guest sees it).
+fn regular_fd(fd: i32) -> bool {
+    crate::fsops::linux_fstat(fd)
+        .is_ok_and(|st| st.st_mode & fwe_abi::stat::S_IFMT == fwe_abi::stat::S_IFREG)
+}
+
 /// The first `len` bytes of the file open as `fd` (fewer at its end), read
 /// from its start without moving its offset.
 fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
+    if let Some(r) = crate::filestore::io::read_at(fd, 0, len as u64) {
+        return r;
+    }
     let mut out = vec![0u8; len];
     let mut at = 0;
     while at < len {
@@ -3705,6 +4139,9 @@ pub fn read_all_path(path: &[u8]) -> Result<Vec<u8>, i32> {
 /// program's bytes, grown as they were read, were copied at every
 /// doubling).
 fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
+    if let Some(r) = crate::filestore::io::read_at(fd, 0, u64::MAX) {
+        return r;
+    }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
@@ -3727,12 +4164,6 @@ fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
     }
 }
 
-/// `/dev/shm`: Linux mounts a tmpfs there that every process on the
-/// machine shares. fwe keeps one directory for it per rootfs (the host's
-/// `/` included), private to the user, shared by every fwe process that
-/// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
-/// user's temporary directory. Unlike a tmpfs it outlives the processes,
-/// until the host clears its temporary files.
 /// fwe's private directory on the host (`fwe-<uid>` in the user's
 /// temporary directory), which a process fwe starts in a way that leaves
 /// the host's answer for the temporary directory unreliable (a VM fork
@@ -3749,10 +4180,15 @@ pub fn adopt_host_dir(dir: Vec<u8>) {
     let _ = shm::USER_DIR.set(dir);
 }
 
+/// `/dev/shm`: Linux mounts a tmpfs there that every process on the
+/// machine shares. fwe keeps one filesystem of its store in memory for it
+/// per rootfs (the host's `/` included), private to the user, shared by
+/// every fwe process that runs on that root ([`shm::store`]). Unlike a
+/// tmpfs it outlives the processes, while its rootfs exists or a process
+/// holds a file of it ([`crate::shared::collect`]).
 pub(crate) mod shm {
-    use super::{OwnedFd, e, fd_path};
+    use super::e;
     use fwe_abi::errno;
-    use std::os::fd::{AsRawFd, FromRawFd};
 
     /// The user's own temporary directory on the host.
     fn user_temp() -> Vec<u8> {
@@ -3868,33 +4304,15 @@ pub(crate) mod shm {
     /// [`user_dir`], once known.
     pub(crate) static USER_DIR: std::sync::OnceLock<Vec<u8>> = std::sync::OnceLock::new();
 
-    /// The host path of the directory for the root at `root_host`, created
-    /// on first use: what the initial namespace mounts at `/dev/shm`.
-    pub(crate) fn dir_path(root_host: &[u8]) -> Result<Vec<u8>, i32> {
-        let mut base = user_dir()?;
-        // FNV-1a: stable across processes and fwe builds.
-        let hash = root_host
-            .iter()
-            .fold(0xcbf29ce484222325u64, |h, &b| (h ^ b as u64).wrapping_mul(0x100000001b3));
-        base.extend_from_slice(format!("/shm-{hash:016x}").as_bytes());
-        // Linux's `/dev/shm` is world-writable and sticky; this one is in a
-        // directory only the user can enter.
-        ensure_dir(&base, 0o1777, false)?;
-        // Its canonical path, as the host reports a descriptor's.
-        let p = c(&base)?;
-        // SAFETY: opening a directory by path; the result is checked.
-        let fd = unsafe {
-            libc::open(
-                p.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(e());
-        }
-        // SAFETY: `fd` is a fresh owned descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        Ok(fd_path(fd.as_raw_fd()).unwrap_or(base))
+    /// The filesystem of fwe's store for the root at `root_host`, made on
+    /// first use: what the initial namespace mounts at `/dev/shm`, every
+    /// fwe process on that root sharing it. World-writable and sticky, of
+    /// a tmpfs's default size, as Linux's.
+    pub(crate) fn store(root_host: &[u8]) -> Result<u64, i32> {
+        let id = crate::shared::hash(&[b"shm:", root_host].concat()) & !(0xff << 56) | 0x73 << 56;
+        let (size, inodes) = (crate::tmpfs::default_size(), crate::tmpfs::default_inodes());
+        crate::filestore::fs::make_as(id, 0o1777, 0, 0, size, inodes)?;
+        Ok(id)
     }
 }
 
@@ -4119,55 +4537,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `/dev/shm` is fwe's own directory for the root, whether or not the
-    /// rootfs has a `/dev`: reached directly, through a symlink and from
-    /// the working directory; its `..` is the root's `/dev`; files in it
-    /// report their guest paths.
+    /// `/dev/shm` is a filesystem of fwe's store, the root's own, whether
+    /// or not the rootfs has a `/dev`: reached directly, through a symlink
+    /// and from the working directory; its `..` is the root's `/dev`.
     #[test]
-    fn dev_shm_is_a_directory_of_its_own() {
+    fn dev_shm_is_a_filesystem_of_the_store() {
         let root = std::env::temp_dir().join(format!("fwe-fs-shm-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("tmp")).unwrap();
         std::os::unix::fs::symlink("/dev/shm/f", root.join("tmp/link")).unwrap();
         let mut fs = Fs::new(Some(root.to_str().unwrap().as_bytes())).unwrap();
-        let shm_dir = open_host_dir(&shm::dir_path(&fs.root_host).unwrap()).unwrap();
-        let is_shm = |fd: i32| same_file(fd, shm_dir.as_raw_fd());
+        let id = shm::store(&fs.root_host).unwrap();
         let at = fcntl::AT_FDCWD as i32;
         let top = fs.resolve(at, b"/dev/shm", true).unwrap();
         assert_eq!(top.name, b".");
-        assert!(is_shm(top.dir.as_raw_fd()));
+        let d = top.store.clone().expect("in the store");
+        assert_eq!(d.fs.id, id);
         assert!(!root.join("dev").exists());
-        // A file created there is found by each way in, and not in the rootfs.
-        let f = fs.resolve(at, b"/dev/shm/f", true).unwrap();
-        assert!(is_shm(f.dir.as_raw_fd()));
-        // SAFETY: creating a file in a live directory fd.
-        let fd = unsafe {
-            libc::openat(f.dir.as_raw_fd(), c"f".as_ptr(), libc::O_CREAT | libc::O_RDWR, 0o600)
+        // A file made there is found by each way in, and not in the rootfs.
+        let new = crate::filestore::tree::New {
+            mode: crate::filestore::tree::S_IFREG | 0o600,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
         };
-        assert!(fd >= 0);
-        // SAFETY: `fd` is a fresh descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        assert_eq!(fs.fd_target(fd.as_raw_fd()), b"/dev/shm/f");
-        for path in [&b"/tmp/link"[..], b"/dev/./shm/../shm/f", b"/../dev/shm/f"] {
+        let _ = d.fs.lock().unwrap().unlink(d.ino, b"f", false);
+        let f = d.fs.lock().unwrap().create(d.ino, b"f", &new).unwrap();
+        for path in [&b"/dev/shm/f"[..], b"/tmp/link", b"/dev/./shm/../shm/f", b"/../dev/shm/f"] {
             let r = fs.resolve(at, path, true).unwrap();
-            assert!(is_shm(r.dir.as_raw_fd()), "{}", String::from_utf8_lossy(path));
-            assert_eq!(r.name, b"f");
+            let s = r.store.as_ref().expect("in the store");
+            assert_eq!(
+                (s.ino, &r.name[..]),
+                (d.ino, &b"f"[..]),
+                "{}",
+                String::from_utf8_lossy(path)
+            );
+            assert_eq!(s.find(&r.name).unwrap().0, f);
         }
         fs.chdir(at, b"/dev/shm").unwrap();
-        assert!(is_shm(fs.resolve(at, b"f", true).unwrap().dir.as_raw_fd()));
-        // `..` from it, also relative to its descriptor, is the root's /dev,
-        // which holds nothing else while the rootfs has none.
-        assert_eq!(fs.resolve(top.dir.as_raw_fd(), b"../tmp", true).err(), Some(errno::ENOENT));
+        assert_eq!(fs.resolve(at, b"f", true).unwrap().store.unwrap().ino, d.ino);
+        // `..` from it is the root's /dev, which holds nothing else while
+        // the rootfs has none.
+        assert_eq!(fs.resolve(at, b"../tmp", true).err(), Some(errno::ENOENT));
         assert_eq!(fs.resolve(at, b"/dev/tmp", true).err(), Some(errno::ENOENT));
         std::fs::create_dir_all(root.join("dev/marker")).unwrap();
         let dev = open_dir(fs.root.as_raw_fd(), c"dev").unwrap();
-        for dir in [at, top.dir.as_raw_fd()] {
-            let up = fs.resolve(dir, b"../marker", true).unwrap();
-            assert!(same_file(up.dir.as_raw_fd(), dev.as_raw_fd()));
-        }
-        assert!(is_shm(fs.resolve(at, b"/dev/shm/f", true).unwrap().dir.as_raw_fd()));
-        // SAFETY: removing the file made above.
-        unsafe { libc::unlinkat(f.dir.as_raw_fd(), c"f".as_ptr(), 0) };
+        let up = fs.resolve(at, b"../marker", true).unwrap();
+        assert!(same_file(up.dir.as_raw_fd(), dev.as_raw_fd()));
+        d.fs.lock().unwrap().unlink(d.ino, b"f", false).unwrap();
         let _ = std::fs::remove_dir_all(&root);
     }
 

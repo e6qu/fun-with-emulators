@@ -2,13 +2,14 @@
 //! pid namespace appends a record of itself (`struct acct_v3`) to the
 //! accounting file as it ends.
 //!
-//! The file's host path is kept in a small file of fwe's, one per pid
-//! namespace (beside the process records in the initial one, in the
-//! namespace's record directory otherwise). An ending process's record
-//! goes to the nearest namespace, its own or one above it, with
-//! accounting on, as Linux's does: a failed `open` a namespace when none
-//! is. How many namespaces have it on is kept in the process store, so a
-//! process ends without looking for those files while none has.
+//! The file's host path is kept in a record of fwe's in memory
+//! ([`crate::shared::Record`]), one per pid namespace, named inside the
+//! namespace's record (beside the process records for the initial one),
+//! so it goes with the namespace. An ending process's record goes to the
+//! nearest namespace, its own or one above it, with accounting on, as
+//! Linux's does: a failed `open` a namespace when none is. How many
+//! namespaces have it on is kept in the process store, so a process ends
+//! without looking for those records while none has.
 
 use fwe_abi::errno;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,18 +26,35 @@ const ACCT_V3: u8 = 3;
 /// Linux's accounting clock (`AHZ`).
 const AHZ: u64 = 100;
 
-/// The file holding the accounting file's host path, for this process's
-/// pid namespace.
-fn setting() -> Option<std::ffi::CString> {
-    let dir = match crate::pidns::current().first() {
-        Some(ns) => ns.dir().to_vec(),
-        None => crate::procreg::records_dir()?,
-    };
-    setting_in(&dir)
+/// A pid namespace's accounting: the host path of its file, if it is on.
+#[derive(Clone, Debug, Default)]
+struct Setting {
+    file: Option<Vec<u8>>,
 }
 
-fn setting_in(dir: &[u8]) -> Option<std::ffi::CString> {
-    std::ffi::CString::new([dir, b"/acct"].concat()).ok()
+impl crate::shared::Data for Setting {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.bool(self.file.is_some());
+        e.bytes(self.file.as_deref().unwrap_or_default());
+    }
+    fn decode(d: &mut crate::snapshot::Dec) -> Self {
+        let on = d.bool();
+        let file = d.bytes();
+        Setting { file: on.then_some(file) }
+    }
+}
+
+/// The name of the setting of the pid namespace whose record is `dir`.
+fn setting_in(dir: &[u8]) -> Vec<u8> {
+    [dir, b"/acct"].concat()
+}
+
+/// This process's pid namespace's record name, or the initial one's.
+fn own_namespace() -> Option<Vec<u8>> {
+    match crate::pidns::current().first() {
+        Some(ns) => Some(ns.dir().to_vec()),
+        None => crate::procreg::records_dir(),
+    }
 }
 
 /// The accounting file a record of this process goes to: the nearest pid
@@ -46,9 +64,11 @@ fn target() -> Option<Vec<u8>> {
         crate::pidns::current().iter().map(|ns| ns.dir().to_vec()).collect();
     dirs.extend(crate::procreg::records_dir());
     dirs.iter().find_map(|d| {
-        let p = setting_in(d)?;
-        std::fs::read(<std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(p.as_bytes()))
-            .ok()
+        let name = setting_in(d);
+        // Only one made: a namespace whose accounting was never set has
+        // none.
+        crate::procstore::named::find(&name)?;
+        crate::shared::Record::<Setting>::at(name, Setting::default).ok()?.get().file.clone()
     })
 }
 
@@ -58,31 +78,30 @@ fn namespaces_on() -> &'static std::sync::atomic::AtomicU64 {
 
 /// Turn accounting on, to the file at host path `host`, or off (`None`).
 pub fn set(host: Option<&[u8]>) -> Result<(), i32> {
-    let path = setting().ok_or(errno::ENOMEM)?;
-    let p = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(path.as_bytes());
-    match host {
-        None => {
-            if std::fs::remove_file(p).is_ok() {
-                let on = namespaces_on();
-                let mut n = on.load(Ordering::SeqCst);
-                while n > 0 {
-                    match on.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
-                        Ok(_) => break,
-                        Err(now) => n = now,
-                    }
+    let dir = own_namespace().ok_or(errno::ENOMEM)?;
+    let r = crate::shared::Record::<Setting>::at(setting_in(&dir), Setting::default)?;
+    let (was, now) = r.update(|s| {
+        let was = s.file.is_some();
+        s.file = host.map(<[u8]>::to_vec);
+        Ok((was, s.file.is_some()))
+    })?;
+    let on = namespaces_on();
+    match (was, now) {
+        (false, true) => {
+            on.fetch_add(1, Ordering::SeqCst);
+        }
+        (true, false) => {
+            let mut n = on.load(Ordering::SeqCst);
+            while n > 0 {
+                match on.compare_exchange(n, n - 1, Ordering::SeqCst, Ordering::SeqCst) {
+                    Ok(_) => break,
+                    Err(now) => n = now,
                 }
             }
-            Ok(())
         }
-        Some(h) => {
-            if !std::fs::exists(p).unwrap_or(false) {
-                namespaces_on().fetch_add(1, Ordering::SeqCst);
-            }
-            let tmp = [path.as_bytes(), b".new"].concat();
-            let t = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&tmp);
-            std::fs::write(t, h).and_then(|()| std::fs::rename(t, p)).map_err(|_| errno::EIO)
-        }
+        _ => {}
     }
+    Ok(())
 }
 
 /// This process is a fork child.

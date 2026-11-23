@@ -270,6 +270,101 @@ fn dents(fd: i32, size: usize, max: usize) -> Vec<String> {
     out
 }
 
+/// An overlay: layers merged, changes copied up, removals covered by
+/// whiteouts, the lower layers untouched. Its lower layers are made in
+/// `lower`, its upper and work directories in `upper` (host directories,
+/// or a tmpfs's of fwe's store).
+unsafe fn overlay_scenario(lower: &str, upper: &str) {
+    // SAFETY: the calls take valid strings and buffers.
+    unsafe {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
+        for d in ["l1/d", "l1/sub", "l2/d", "l2/deep"] {
+            std::fs::create_dir_all(format!("{lower}/{d}")).unwrap();
+        }
+        for d in ["u", "w"] {
+            std::fs::create_dir_all(format!("{upper}/{d}")).unwrap();
+        }
+        for d in ["m", "ro"] {
+            std::fs::create_dir_all(format!("/tmp/{d}")).unwrap();
+        }
+        for (f, text) in [
+            ("l1/a", "lower1"),
+            ("l2/a", "lower2"),
+            ("l1/d/x", "x"),
+            ("l1/d/y", "y"),
+            ("l2/d/z", "z"),
+            ("l1/gone", "g"),
+            ("l1/sub/f", "f"),
+            ("l2/deep/e", "e"),
+        ] {
+            std::fs::write(format!("{lower}/{f}"), text).unwrap();
+        }
+        let opts = format!("lowerdir={lower}/l1:{lower}/l2,upperdir={upper}/u,workdir={upper}/w\0");
+        let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
+        println!("mount: {}", res(r as i64));
+        println!("a: {}", text("/tmp/m/a"));
+        println!("d: {}", names("/tmp/m/d"));
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new().append(true).open("/tmp/m/a").unwrap();
+        f.write_all(b"+").unwrap();
+        drop(f);
+        println!("a written: {} lower: {} upper: {}", text("/tmp/m/a"), text(&format!("{lower}/l1/a")), text(&format!("{upper}/u/a")));
+        println!("unlink: {}", io(std::fs::remove_file("/tmp/m/gone")));
+        let w = std::fs::symlink_metadata(format!("{upper}/u/gone")).unwrap();
+        println!(
+            "gone: {} lower: {} whiteout: {} {}",
+            io(std::fs::metadata("/tmp/m/gone")),
+            text(&format!("{lower}/l1/gone")),
+            w.file_type().is_char_device(),
+            w.rdev()
+        );
+        println!("rename a lower dir: {}", io(std::fs::rename("/tmp/m/d", "/tmp/m/e")));
+        println!("rename a file: {}", io(std::fs::rename("/tmp/m/d/x", "/tmp/m/d/x2")));
+        println!("d: {} lower: {}", names("/tmp/m/d"), names(&format!("{lower}/l1/d")));
+        println!("rmdir full: {}", name(if rmdir(c("/tmp/m/sub").as_ptr()) == 0 { 0 } else { errno() }));
+        std::fs::remove_file("/tmp/m/sub/f").unwrap();
+        println!("rmdir: {}", res(rmdir(c("/tmp/m/sub").as_ptr()) as i64));
+        println!("made again: {} holds: [{}]", io(std::fs::create_dir("/tmp/m/sub")), names("/tmp/m/sub"));
+        let mut buf = [0u8; 8];
+        let n = getxattr(c(&format!("{upper}/u/sub")).as_ptr(), c("trusted.overlay.opaque").as_ptr(), buf.as_mut_ptr(), 8);
+        println!("opaque in upper: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
+        let n = getxattr(c("/tmp/m/sub").as_ptr(), c("trusted.overlay.opaque").as_ptr(), buf.as_mut_ptr(), 8);
+        println!("opaque through the overlay: {}", res(n as i64));
+        // A file opened in a lower layer, then changed through it.
+        let fd = open(c("/tmp/m/deep/e").as_ptr(), O_RDONLY);
+        println!("fchmod: {}", res(fchmod(fd, 0o600) as i64));
+        close(fd);
+        let mode = |p: &str| std::fs::metadata(p).map(|m| format!("{:o}", m.permissions().mode() & 0o777)).unwrap_or_default();
+        println!("e: {} lower: {} upper: {}", mode("/tmp/m/deep/e"), mode(&format!("{lower}/l2/deep/e")), mode(&format!("{upper}/u/deep/e")));
+        let mut sf = [0u64; 15];
+        statfs(c("/tmp/m").as_ptr(), sf.as_mut_ptr());
+        println!("f_type: {:#x}", sf[0]);
+        let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+        println!("mountinfo: {}", info.lines().any(|l| l.contains(" /tmp/m ") && l.contains(" - overlay ")));
+        let fs = std::fs::read_to_string("/proc/filesystems").unwrap();
+        println!("filesystems: {}", fs.lines().any(|l| l == "nodev\toverlay"));
+        // A socket bound where a whiteout is takes its place.
+        let s = socket(1, 1, 0);
+        let (addr, len) = unix_addr("/tmp/m/gone");
+        let r = bind(s, &addr, len);
+        let socket_there = std::fs::symlink_metadata("/tmp/m/gone").is_ok_and(|m| m.file_type().is_socket());
+        println!("bind over a whiteout: {} a socket: {}", res(r as i64), socket_there);
+        close(s);
+        std::fs::remove_file("/tmp/m/gone").unwrap();
+        println!("root: {}", names("/tmp/m"));
+        println!("upper: {}", names(&format!("{upper}/u")));
+        println!("umount: {}", res(umount2(c("/tmp/m").as_ptr(), 0) as i64));
+        // Lower layers only: read-only.
+        let opts = format!("lowerdir={upper}/u:{lower}/l1\0");
+        let r = mount(c("overlay").as_ptr(), c("/tmp/ro").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
+        println!("read-only mount: {} a: {}", res(r as i64), text("/tmp/ro/a"));
+        println!("write: {}", io(std::fs::write("/tmp/ro/new", "x")));
+        let bad = b"lowerdir=/tmp/l1,metacopy=on\0";
+        let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, bad.as_ptr());
+        println!("metacopy: {}", res(r as i64));
+    }
+}
+
 fn main() {
     // SAFETY: the scenarios' calls take valid strings and buffers.
     unsafe {
@@ -528,12 +623,18 @@ fn main() {
                 const TRUNCATE: u64 = 1 << 14;
                 const IOCTL_DEV: u64 = 1 << 15;
                 std::fs::write("/tmp/t", "content").unwrap();
+                // A file of a tmpfs, fwe's store's.
+                std::fs::write("/dev/shm/t", "content").unwrap();
                 let mut sv = [0i32; 2];
                 socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
                 if fork() == 0 {
                     let handled = READ | WRITE | TRUNCATE | IOCTL_DEV;
-                    let r = restrict(handled, 0, &[("/tmp", READ | WRITE), ("/dev/null", READ | WRITE)]);
+                    let r = restrict(
+                        handled,
+                        0,
+                        &[("/tmp", READ | WRITE), ("/dev/shm", READ | WRITE), ("/dev/null", READ | WRITE)],
+                    );
                     println!("restricted: {}", res(r));
                     let fd = open(c("/tmp/t").as_ptr(), O_WRONLY);
                     let dup = syscall(23, fd);
@@ -544,6 +645,8 @@ fn main() {
                         res(syscall(46, dup, 0)),
                         res(syscall(46, dupfd as i64, 0))
                     );
+                    let shm = open(c("/dev/shm/t").as_ptr(), O_WRONLY);
+                    println!("ftruncate on a tmpfs: {}", res(syscall(46, shm, 0)));
                     // Passed to a process outside the domain.
                     let mut control = [0u8; 24];
                     control[..8].copy_from_slice(&20u64.to_ne_bytes());
@@ -881,6 +984,84 @@ fn main() {
                     got.push(String::from_utf8_lossy(&buf[..n as usize]).into_owned());
                 }
                 println!("received: {}", got.join(" "));
+            }
+            // An array map a socket filter counts messages in, through the
+            // pointer its lookup returns: read back through the map's
+            // descriptor, a duplicate of it and a fork child's, which the
+            // parent then sees change.
+            Some("bpf-map") => {
+                let ins = |code: u8, dst: u8, src: u8, off: i16, imm: i32| -> u64 {
+                    u64::from(code)
+                        | u64::from(dst | src << 4) << 8
+                        | u64::from(off as u16) << 16
+                        | u64::from(imm as u32) << 32
+                };
+                let bpf = |cmd: i64, attr: &[u8]| syscall(280, cmd, attr.as_ptr(), attr.len());
+                let mut attr = [0u8; 128];
+                for (i, v) in [2u32, 4, 8, 1].iter().enumerate() {
+                    attr[i * 4..i * 4 + 4].copy_from_slice(&v.to_ne_bytes());
+                }
+                let map = bpf(0, &attr) as i32;
+                let elem = |fd: i32, cmd: i64, value: &mut u64| {
+                    let key = 0u32;
+                    let mut a = [0u8; 128];
+                    a[0..4].copy_from_slice(&fd.to_ne_bytes());
+                    a[8..16].copy_from_slice(&(&key as *const u32 as u64).to_ne_bytes());
+                    a[16..24].copy_from_slice(&(value as *mut u64 as u64).to_ne_bytes());
+                    res(bpf(cmd, &a))
+                };
+                let link = std::fs::read_link(format!("/proc/self/fd/{map}")).unwrap();
+                let file = std::mem::ManuallyDrop::new(unsafe {
+                    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(map)
+                });
+                let mode = std::os::unix::fs::PermissionsExt::mode(&file.metadata().unwrap().permissions());
+                println!("map: {} {} mode {mode:o}", map >= 0, link.display());
+                let insns = [
+                    ins(0x18, 1, 1, 0, map), // r1 = map
+                    ins(0, 0, 0, 0, 0),
+                    ins(0xb7, 2, 0, 0, 0),   // r2 = 0
+                    ins(0x63, 10, 2, -4, 0), // *(u32 *)(fp - 4) = r2
+                    ins(0xbf, 2, 10, 0, 0),  // r2 = fp
+                    ins(0x07, 2, 0, 0, -4),  // r2 -= 4
+                    ins(0x85, 0, 0, 0, 1),   // r0 = lookup(r1, r2)
+                    ins(0x15, 0, 0, 3, 0),   // if r0 == 0 goto out
+                    ins(0x79, 1, 0, 0, 0),   // r1 = *(u64 *)r0
+                    ins(0x07, 1, 0, 0, 1),   // r1 += 1
+                    ins(0x7b, 0, 1, 0, 0),   // *(u64 *)r0 = r1
+                    ins(0xb7, 0, 0, 0, 0xffff), // out: keep it all
+                    ins(0x95, 0, 0, 0, 0),
+                ];
+                let lic = c("GPL");
+                let mut attr = [0u8; 128];
+                attr[0..4].copy_from_slice(&1u32.to_ne_bytes()); // SOCKET_FILTER
+                attr[4..8].copy_from_slice(&(insns.len() as u32).to_ne_bytes());
+                attr[8..16].copy_from_slice(&(insns.as_ptr() as u64).to_ne_bytes());
+                attr[16..24].copy_from_slice(&(lic.as_ptr() as u64).to_ne_bytes());
+                let prog = bpf(5, &attr) as i32;
+                let link = std::fs::read_link(format!("/proc/self/fd/{prog}")).unwrap();
+                println!("program: {} {}", prog >= 0, link.display());
+                let mut sv = [0i32; 2];
+                socketpair(AF_UNIX, 2, 0, sv.as_mut_ptr());
+                println!("attached: {}", res(syscall(208, sv[1], 1, 50, &prog as *const i32, 4)));
+                for _ in 0..3 {
+                    write(sv[0], b"m".as_ptr(), 1);
+                }
+                let mut v = 0u64;
+                println!("counted: {} {v}", elem(map, 1, &mut v));
+                let dup = syscall(23, map) as i32;
+                let mut v = 0u64;
+                println!("through a duplicate: {} {v}", elem(dup, 1, &mut v));
+                if fork() == 0 {
+                    let mut v = 0u64;
+                    elem(map, 1, &mut v);
+                    println!("child sees {v}");
+                    let mut ten = 10u64;
+                    elem(map, 2, &mut ten);
+                    _exit(0);
+                }
+                waitpid(-1, std::ptr::null_mut(), 0);
+                let mut v = 0u64;
+                println!("after the child: {} {v}", elem(map, 1, &mut v));
             }
             // A program only the VM runs, on a host without one: the exec
 
@@ -1249,80 +1430,88 @@ fn main() {
                     println!("through it: {n} {text:?}");
                 }
             }
-            // An overlay: layers merged, changes copied up, removals
-            // covered by whiteouts, the lower layers untouched.
-            Some("overlay") => {
-                use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
-                for d in ["l1/d", "l1/sub", "l2/d", "l2/deep", "u", "w", "m", "ro"] {
+            // inotify through an overlay, as LTP's inotify07 and inotify08
+            // watch: a directory's watch hears a change of a lower file in
+            // it, and a lower file's watch a write to it, each copying the
+            // file up; with `-tmpfs`, every layer in a tmpfs.
+            Some(s @ ("overlay-inotify" | "overlay-inotify-tmpfs")) => {
+                if s == "overlay-inotify-tmpfs" {
+                    let r = mount(c("tmpfs").as_ptr(), c("/tmp").as_ptr(), c("tmpfs").as_ptr(), 0, std::ptr::null());
+                    assert_eq!(r, 0, "tmpfs");
+                }
+                for d in ["l/d", "u", "w", "m"] {
                     std::fs::create_dir_all(format!("/tmp/{d}")).unwrap();
                 }
-                for (f, text) in [
-                    ("l1/a", "lower1"),
-                    ("l2/a", "lower2"),
-                    ("l1/d/x", "x"),
-                    ("l1/d/y", "y"),
-                    ("l2/d/z", "z"),
-                    ("l1/gone", "g"),
-                    ("l1/sub/f", "f"),
-                    ("l2/deep/e", "e"),
-                ] {
-                    std::fs::write(format!("/tmp/{f}"), text).unwrap();
-                }
-                let opts = b"lowerdir=/tmp/l1:/tmp/l2,upperdir=/tmp/u,workdir=/tmp/w\0";
+                std::fs::write("/tmp/l/d/x", "x").unwrap();
+                std::fs::write("/tmp/l/f", "f").unwrap();
+                std::fs::write("/tmp/l/h", "").unwrap();
+                let opts = b"lowerdir=/tmp/l,upperdir=/tmp/u,workdir=/tmp/w\0";
                 let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
                 println!("mount: {}", res(r as i64));
-                println!("a: {}", text("/tmp/m/a"));
-                println!("d: {}", names("/tmp/m/d"));
-                use std::io::Write;
-                let mut f = std::fs::OpenOptions::new().append(true).open("/tmp/m/a").unwrap();
-                f.write_all(b"+").unwrap();
-                drop(f);
-                println!("a written: {} lower: {} upper: {}", text("/tmp/m/a"), text("/tmp/l1/a"), text("/tmp/u/a"));
-                println!("unlink: {}", io(std::fs::remove_file("/tmp/m/gone")));
-                let w = std::fs::symlink_metadata("/tmp/u/gone").unwrap();
-                println!(
-                    "gone: {} lower: {} whiteout: {} {}",
-                    io(std::fs::metadata("/tmp/m/gone")),
-                    text("/tmp/l1/gone"),
-                    w.file_type().is_char_device(),
-                    w.rdev()
-                );
-                println!("rename a lower dir: {}", io(std::fs::rename("/tmp/m/d", "/tmp/m/e")));
-                println!("rename a file: {}", io(std::fs::rename("/tmp/m/d/x", "/tmp/m/d/x2")));
-                println!("d: {} lower: {}", names("/tmp/m/d"), names("/tmp/l1/d"));
-                println!("rmdir full: {}", name(if rmdir(c("/tmp/m/sub").as_ptr()) == 0 { 0 } else { errno() }));
-                std::fs::remove_file("/tmp/m/sub/f").unwrap();
-                println!("rmdir: {}", res(rmdir(c("/tmp/m/sub").as_ptr()) as i64));
-                println!("made again: {} holds: [{}]", io(std::fs::create_dir("/tmp/m/sub")), names("/tmp/m/sub"));
-                let mut buf = [0u8; 8];
-                let n = getxattr(c("/tmp/u/sub").as_ptr(), c("trusted.overlay.opaque").as_ptr(), buf.as_mut_ptr(), 8);
-                println!("opaque in upper: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]));
-                let n = getxattr(c("/tmp/m/sub").as_ptr(), c("trusted.overlay.opaque").as_ptr(), buf.as_mut_ptr(), 8);
-                println!("opaque through the overlay: {}", res(n as i64));
-                // A file opened in a lower layer, then changed through it.
-                let fd = open(c("/tmp/m/deep/e").as_ptr(), O_RDONLY);
-                println!("fchmod: {}", res(fchmod(fd, 0o600) as i64));
+                const IN_MODIFY: u32 = 0x2;
+                const IN_ATTRIB: u32 = 0x4;
+                let ino = syscall(26, 0o4000i64) as i32;
+                let wd_dir = syscall(27, ino as i64, c("/tmp/m/d").as_ptr(), (IN_ATTRIB | IN_MODIFY) as i64);
+                let wd_file = syscall(27, ino as i64, c("/tmp/m/f").as_ptr(), (IN_ATTRIB | IN_MODIFY) as i64);
+                // As LTP's inotify08: a lower file watched for its
+                // attributes, opens and closes, copied up by a chmod, then
+                // written whole.
+                const IN_CLOSE_WRITE: u32 = 0x8;
+                const IN_OPEN: u32 = 0x20;
+                let wd_h = syscall(27, ino as i64, c("/tmp/m/h").as_ptr(), (IN_ATTRIB | IN_OPEN | IN_CLOSE_WRITE) as i64);
+                chmod(c("/tmp/m/d/x").as_ptr(), 0o600);
+                let fd = open(c("/tmp/m/f").as_ptr(), 1);
+                write(fd, b"g".as_ptr(), 1);
                 close(fd);
-                let mode = |p: &str| std::fs::metadata(p).map(|m| format!("{:o}", m.permissions().mode() & 0o777)).unwrap_or_default();
-                println!("e: {} lower: {} upper: {}", mode("/tmp/m/deep/e"), mode("/tmp/l2/deep/e"), mode("/tmp/u/deep/e"));
-                let mut sf = [0u64; 15];
-                statfs(c("/tmp/m").as_ptr(), sf.as_mut_ptr());
-                println!("f_type: {:#x}", sf[0]);
-                let info = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
-                println!("mountinfo: {}", info.lines().any(|l| l.contains(" /tmp/m ") && l.contains(" - overlay ")));
-                let fs = std::fs::read_to_string("/proc/filesystems").unwrap();
-                println!("filesystems: {}", fs.lines().any(|l| l == "nodev\toverlay"));
-                println!("root: {}", names("/tmp/m"));
-                println!("upper: {}", names("/tmp/u"));
-                println!("umount: {}", res(umount2(c("/tmp/m").as_ptr(), 0) as i64));
-                // Lower layers only: read-only.
-                let opts = b"lowerdir=/tmp/u:/tmp/l1\0";
-                let r = mount(c("overlay").as_ptr(), c("/tmp/ro").as_ptr(), c("overlay").as_ptr(), 0, opts.as_ptr());
-                println!("read-only mount: {} a: {}", res(r as i64), text("/tmp/ro/a"));
-                println!("write: {}", io(std::fs::write("/tmp/ro/new", "x")));
-                let bad = b"lowerdir=/tmp/l1,metacopy=on\0";
-                let r = mount(c("overlay").as_ptr(), c("/tmp/m").as_ptr(), c("overlay").as_ptr(), 0, bad.as_ptr());
-                println!("metacopy: {}", res(r as i64));
+                chmod(c("/tmp/m/h").as_ptr(), 0o600);
+                chmod(c("/tmp/m/h").as_ptr(), 0o644);
+                std::fs::write("/tmp/m/h", "1").unwrap();
+                // Closed while a duplicate is open: no event until the last.
+                let fd = open(c("/tmp/m/h").as_ptr(), 1);
+                let again = syscall(23, fd as i64) as i32;
+                close(fd);
+                close(again);
+                let mut buf = [0u8; 4096];
+                let n = read(ino, buf.as_mut_ptr(), buf.len());
+                let mut events = Vec::new();
+                let mut at = 0;
+                while at + 16 <= n.max(0) as usize {
+                    let wd = i32::from_ne_bytes(buf[at..at + 4].try_into().unwrap());
+                    let mask = u32::from_ne_bytes(buf[at + 4..at + 8].try_into().unwrap());
+                    let len = u32::from_ne_bytes(buf[at + 12..at + 16].try_into().unwrap()) as usize;
+                    let name = std::ffi::CStr::from_bytes_until_nul(&buf[at + 16..at + 16 + len])
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let who = if wd as i64 == wd_dir {
+                        "dir"
+                    } else if wd as i64 == wd_file {
+                        "file"
+                    } else if wd as i64 == wd_h {
+                        "h"
+                    } else {
+                        "?"
+                    };
+                    events.push(format!("{who} {mask:#x} {name}"));
+                    at += 16 + len;
+                }
+                println!("events: {}", events.join(", "));
+                println!("lower: {} upper: {}", text("/tmp/l/f"), text("/tmp/u/f"));
+            }
+            // An overlay of host directories, of a tmpfs's (fwe's store),
+            // and of each over the other.
+            Some(s @ ("overlay" | "overlay-tmpfs" | "overlay-upper-tmpfs" | "overlay-lower-tmpfs")) => {
+                std::fs::create_dir_all("/tmp/t").unwrap();
+                if s != "overlay" {
+                    let r = mount(c("tmpfs").as_ptr(), c("/tmp/t").as_ptr(), c("tmpfs").as_ptr(), 0, std::ptr::null());
+                    assert_eq!(r, 0, "tmpfs");
+                }
+                let (lower, upper) = match s {
+                    "overlay" => ("/tmp", "/tmp"),
+                    "overlay-tmpfs" => ("/tmp/t", "/tmp/t"),
+                    "overlay-upper-tmpfs" => ("/tmp", "/tmp/t"),
+                    _ => ("/tmp/t", "/tmp"),
+                };
+                overlay_scenario(lower, upper);
             }
             // Processes sharing a SOCK_SEQPACKET socket take whole
             // messages, however they come in; and a child forked while a
@@ -1397,8 +1586,13 @@ fn main() {
             // What an overlay must not do: write a layer through a layer's
             // own directory, a descriptor that outlived its mount, or a
             // name it does not show; lose track of a moved directory or a
-            // listing's place; show what a whiteout hid.
-            Some("overlay-edges") => {
+            // listing's place; show what a whiteout hid. With `-tmpfs`, every
+            // layer in a tmpfs (fwe's store).
+            Some(s @ ("overlay-edges" | "overlay-edges-tmpfs")) => {
+                if s == "overlay-edges-tmpfs" {
+                    let r = mount(c("tmpfs").as_ptr(), c("/tmp").as_ptr(), c("tmpfs").as_ptr(), 0, std::ptr::null());
+                    assert_eq!(r, 0, "tmpfs");
+                }
                 for d in ["l1/d", "l1/e", "l1/lst", "l1/h", "u", "w", "m", "ro/up", "ro/work", "rm"] {
                     std::fs::create_dir_all(format!("/tmp/{d}")).unwrap();
                 }

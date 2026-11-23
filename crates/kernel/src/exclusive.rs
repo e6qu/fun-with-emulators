@@ -2,16 +2,16 @@
 //! sets wait on with it wakes one of them, as Linux's does, where every
 //! host kqueue watching the pipe fires.
 //!
-//! A page every fwe process maps (in fwe's private directory) holds a slot
-//! per pipe some set watches exclusively, by the pipe's host identity:
-//! how many writes it has had, and how many of them a waiter took. A write
-//! counts one more ([`wrote`]); a set whose wait such a write ended takes
-//! one ([`take`]), and one that finds none left was not the one woken: it
-//! waits again ([`wait_for_write`]). A set that finds the pipe ready when
-//! it asks, without waiting, takes every write there is ([`take_all`]):
-//! the readiness was there before it, for whoever asks. An edge-triggered
-//! set sees a counted pipe readable anew when it was written to, not when
-//! it holds more ([`crate::epoll`]).
+//! A table in memory every fwe process maps ([`crate::procstore::area`])
+//! holds a slot per pipe some set watches exclusively, by the pipe's host
+//! identity: how many writes it has had, and how many of them a waiter
+//! took. A write counts one more ([`wrote`]); a set whose wait such a
+//! write ended takes one ([`take`]), and one that finds none left was not
+//! the one woken: it waits again ([`wait_for_write`]). A set that finds the
+//! pipe ready when it asks, without waiting, takes every write there is
+//! ([`take_all`]): the readiness was there before it, for whoever asks. An
+//! edge-triggered set sees a counted pipe readable anew when it was
+//! written to, not when it holds more ([`crate::epoll`]).
 //!
 //! Only writes the guest makes with `write` and `writev` are counted.
 
@@ -22,6 +22,9 @@ const SLOTS: usize = 127;
 /// A slot: the pipe's identity (its two ends' host handles), writes,
 /// writes taken.
 const SLOT_WORDS: usize = 4;
+/// The table's size: a count of slots in use, then the slots
+/// ([`crate::procstore::Area::Exclusive`]).
+pub(crate) const BYTES: usize = (1 + SLOTS * SLOT_WORDS) * 8;
 
 /// The page: a count of slots in use, then the slots.
 struct Table {
@@ -30,7 +33,7 @@ struct Table {
 
 static TABLE: std::sync::OnceLock<Option<Table>> = std::sync::OnceLock::new();
 
-/// The shared page, mapped on first use.
+/// The shared table, in memory every fwe process maps.
 fn table() -> Option<&'static Table> {
     // On Linux, epoll is the host's, which does this itself.
     if cfg!(target_os = "linux") {
@@ -38,43 +41,7 @@ fn table() -> Option<&'static Table> {
     }
     TABLE
         .get_or_init(|| {
-            let mut path = crate::fs::shm::user_dir().ok()?;
-            path.extend_from_slice(b"/epoll-exclusive");
-            let c = std::ffi::CString::new(path).ok()?;
-            let len = (1 + SLOTS * SLOT_WORDS) * 8;
-            // SAFETY: a NUL-terminated path in fwe's private directory.
-            let fd = unsafe {
-                libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-            };
-            if fd < 0 {
-                return None;
-            }
-            // SAFETY: plain host calls on the descriptor just opened. A
-            // file shorter than the page is grown with zeros; one of that
-            // size already is left as it is.
-            let map = unsafe {
-                let mut st: libc::stat = std::mem::zeroed();
-                if libc::fstat(fd, &mut st) == 0 && (st.st_size as usize) < len {
-                    libc::ftruncate(fd, len as libc::off_t);
-                }
-                let m = libc::mmap(
-                    std::ptr::null_mut(),
-                    len,
-                    libc::PROT_READ | libc::PROT_WRITE,
-                    libc::MAP_SHARED,
-                    fd,
-                    0,
-                );
-                libc::close(fd);
-                m
-            };
-            if map == libc::MAP_FAILED {
-                return None;
-            }
-            // SAFETY: the mapping is `len` bytes, page-aligned, shared and
-            // never unmapped; every access is atomic.
-            let words = unsafe { std::slice::from_raw_parts(map as *const AtomicU64, len / 8) };
-            Some(Table { words })
+            Some(Table { words: crate::procstore::area(crate::procstore::Area::Exclusive) })
         })
         .as_ref()
 }
@@ -100,7 +67,7 @@ impl Table {
         }
         // A new slot, made under a lock so that two makers of the same
         // pipe's agree.
-        let _lock = Lock::take()?;
+        let _lock = crate::procstore::lock_area(crate::procstore::Area::Exclusive);
         let used = (self.in_use().load(Ordering::Acquire) as usize).min(SLOTS);
         if let Some(s) = (0..used)
             .map(|i| self.slot(i))
@@ -136,34 +103,6 @@ impl Table {
 /// Which slot this process takes next when every one holds writes no
 /// one took.
 static NEXT_TAKEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-/// The lock that makes slots.
-struct Lock(i32);
-
-impl Lock {
-    fn take() -> Option<Lock> {
-        let mut path = crate::fs::shm::user_dir().ok()?;
-        path.extend_from_slice(b"/epoll-exclusive.lock");
-        let c = std::ffi::CString::new(path).ok()?;
-        // SAFETY: a NUL-terminated path; the lock goes with the descriptor.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: plain host call on the descriptor just opened.
-        crate::shared::lock_exclusive(fd);
-        Some(Lock(fd))
-    }
-}
-
-impl Drop for Lock {
-    fn drop(&mut self) {
-        // SAFETY: the descriptor `take` opened; closing it drops the lock.
-        unsafe { libc::close(self.0) };
-    }
-}
 
 /// The identity of the pipe open as `fd`, if it is one: the same for both
 /// of its ends (the host gives each end an inode of its own).

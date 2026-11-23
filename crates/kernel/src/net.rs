@@ -76,8 +76,8 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     }
     if raw[0] == 0 {
         // Abstract namespace: no macOS equivalent. Map the name to a stable
-        // file under a per-host temp directory so peers rendezvous, the
-        // name kept beside it (`<file>.name`) to be reported back.
+        // socket node under a per-host temp directory so peers rendezvous,
+        // the name kept in memory ([`AbstractNames`]) to be reported back.
         let dir = abstract_dir();
         // Private to fwe's user, whatever the host's umask (fwe sets it to
         // 0, the guest's being its own to apply).
@@ -85,12 +85,18 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
             use std::os::unix::fs::DirBuilderExt;
             let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
         }
-        let p = abstract_file(&raw[1..]);
-        let name = p.with_extension("name");
-        if !name.exists() {
-            let _ = std::fs::write(&name, &raw[1..]);
+        let name = &raw[1..];
+        let key = abstract_key(name);
+        if let Some(r) = abstract_names()
+            && !r.get().names.get(&key).is_some_and(|(n, _)| n == name)
+        {
+            let _ = r.update(|t| {
+                let owner = t.names.get(&key).map_or(0, |e| e.1);
+                t.names.insert(key, (name.to_vec(), owner));
+                Ok(())
+            });
         }
-        return Ok(p.into_os_string().into_vec());
+        return Ok(abstract_file(name).into_os_string().into_vec());
     }
     // Pathed: trim at the first NUL, then resolve as a file's path is, in
     // the guest's filesystem.
@@ -121,6 +127,13 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
         return Ok(());
     }
     let access = crate::creds::access();
+    // A socket's file in fwe's store: its own owner and mode.
+    if let Some(st) = node_path(hb, a).and_then(|p| crate::storenodes::stat_of(&p)) {
+        if access.dac_override && !access.scoped {
+            return Ok(());
+        }
+        return if access.permits(&st, 2) { Ok(()) } else { Err(errno::EACCES) };
+    }
     // `CAP_DAC_OVERRIDE` passes every node, but in a user namespace of
     // fwe's only a node mapped there ([`crate::creds::Access::permits`]).
     if access.dac_override && !access.scoped {
@@ -151,19 +164,85 @@ fn may_write_socket(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Result<(), i32> {
     if access.permits(&st, 2) { Ok(()) } else { Err(errno::EACCES) }
 }
 
-/// The file abstract name `name` (without its leading NUL) stands as.
-fn abstract_file(name: &[u8]) -> std::path::PathBuf {
+/// The host path of the node Unix host address `hb` names (`a`'s): its
+/// path, or its name in `a`'s directory.
+fn node_path(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Option<Vec<u8>> {
+    let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
+    let name = &hb[2..end];
+    match &a.dir {
+        Some(d) => {
+            use std::os::fd::AsRawFd;
+            Some(crate::mounts::join(&crate::fs::fd_path(d.as_raw_fd())?, name))
+        }
+        None => Some(name.to_vec()),
+    }
+}
+
+/// Abstract name `name`'s (without its leading NUL) key: its hash, which
+/// names its socket node.
+fn abstract_key(name: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut h);
-    abstract_dir().join(format!("{:016x}", h.finish()))
+    h.finish()
+}
+
+/// The socket node abstract name `name` (without its leading NUL) stands
+/// as.
+fn abstract_file(name: &[u8]) -> std::path::PathBuf {
+    abstract_dir().join(format!("{:016x}", abstract_key(name)))
+}
+
+/// The abstract names of a network namespace that were bound: each one's
+/// key ([`abstract_key`]), the name, and the host process that last bound
+/// it (0: none yet). In memory every fwe process maps, as a kernel keeps
+/// them; the host has only each one's socket node.
+#[derive(Clone, Debug, Default)]
+struct AbstractNames {
+    names: std::collections::BTreeMap<u64, (Vec<u8>, i32)>,
+}
+
+impl crate::shared::Data for AbstractNames {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.u64(self.names.len() as u64);
+        for (key, (name, owner)) in &self.names {
+            e.u64(*key);
+            e.bytes(name);
+            e.i32(*owner);
+        }
+    }
+    fn decode(d: &mut crate::snapshot::Dec) -> Self {
+        let n = d.count(8 + 8 + 4);
+        let names = (0..n)
+            .map(|_| {
+                let key = d.u64();
+                let name = d.bytes();
+                (key, (name, d.i32()))
+            })
+            .collect();
+        AbstractNames { names }
+    }
+}
+
+/// This process's network namespace's abstract names (the initial one's
+/// outside one).
+fn abstract_names() -> Option<crate::shared::Record<AbstractNames>> {
+    match crate::netns::current() {
+        Some(net) => crate::shared::Record::at(
+            [net.dir(), b"/abstract-names"].concat(),
+            AbstractNames::default,
+        )
+        .ok(),
+        None => crate::shared::Record::named("abstract-names", 0, AbstractNames::default).ok(),
+    }
 }
 
 /// The host process that bound abstract name `name`, if one did (for a
 /// Landlock domain that scopes abstract sockets).
 pub fn abstract_owner(name: &[u8]) -> Option<i32> {
-    let b = std::fs::read(abstract_file(name).with_extension("owner")).ok()?;
-    Some(i32::from_ne_bytes(b.get(..4)?.try_into().ok()?))
+    let r = abstract_names()?;
+    let owner = r.get().names.get(&abstract_key(name)).map(|e| e.1)?;
+    (owner != 0).then_some(owner)
 }
 
 /// Where abstract names' files are: each network namespace has its own.
@@ -178,14 +257,16 @@ fn abstract_dir() -> std::path::PathBuf {
 }
 
 /// The abstract name (without its leading NUL) host path `host` stands
-/// for, if it is one's file.
+/// for, if it is one's socket node.
 fn abstract_name(host: &[u8]) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(host));
     if path.parent()? != abstract_dir() {
         return None;
     }
-    std::fs::read(path.with_extension("name")).ok()
+    let key = u64::from_str_radix(path.file_name()?.to_str()?, 16).ok()?;
+    let r = abstract_names()?;
+    r.get().names.get(&key).map(|e| e.0.clone())
 }
 
 /// Reverse [`root_unix_path`] for addresses handed back to the guest: an
@@ -1025,10 +1106,18 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, true, &a.guest);
     }
-    // Who bound an abstract name, beside its file.
-    if r == 0 && src[..2] == 1u16.to_ne_bytes() && src.get(2) == Some(&0) {
+    // Who bound an abstract name.
+    if r == 0
+        && src[..2] == 1u16.to_ne_bytes()
+        && src.get(2) == Some(&0)
+        && let Some(names) = abstract_names()
+    {
         let me = crate::host::pid();
-        let _ = std::fs::write(abstract_file(&src[3..]).with_extension("owner"), me.to_ne_bytes());
+        let name = &src[3..];
+        let _ = names.update(|t| {
+            t.names.insert(abstract_key(name), (name.to_vec(), me));
+            Ok(())
+        });
     }
     if r == 0
         && let Some(plan) = plan
@@ -1039,7 +1128,17 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     if r == 0 && kept_value(fd as i32, SO_PASSCRED) != 0 {
         passcred_bound(fd as i32, true);
     }
-    if r == 0 && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
+    // A socket's file in fwe's store takes the socket's mode, or goes
+    // with a bind that failed.
+    let stored = (family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0)
+        .then(|| node_path(&hb, &a))
+        .flatten()
+        .filter(|p| crate::storenodes::file_of(p).is_some());
+    if let Some(p) = &stored {
+        let mode = socket_inode(fd as i32).map_or(0o777, |s| s.perm) & !umask;
+        crate::storenodes::bound(p, (r == 0).then_some(mode));
+    }
+    if r == 0 && stored.is_none() && family(&hb) == libc::AF_UNIX && a.len > 2 && hb[2] != 0 {
         // The node takes the socket's mode (its `fchmod`, or every bit),
         // less the umask, as on Linux.
         let mode = socket_inode(fd as i32).map_or(0o777, |s| s.perm) & !umask;
@@ -3189,7 +3288,8 @@ fn send_control(
     to: Option<&[u8]>,
 ) -> Result<Option<crate::scm::Prepared>, i32> {
     if len == 0 {
-        return creds_for(fd, to).map_or(Ok(None), |c| crate::scm::prepare(&[], Some(c)).map(Some));
+        return creds_for(fd, to)
+            .map_or(Ok(None), |c| crate::scm::prepare(&[], Some(c), false).map(Some));
     }
     let ctl = uaccess::read_bytes(control, (len as usize).min(64 * 1024))?;
     if !is_unix(fd) {
@@ -3203,7 +3303,15 @@ fn send_control(
     if out.fds.is_empty() && creds.is_none() {
         return Ok(None);
     }
-    crate::scm::prepare(&out.fds, creds).map(Some)
+    crate::scm::prepare(&out.fds, creds, host_peer(fd)).map(Some)
+}
+
+/// Whether the peer of connected Unix socket `fd` is a process of the
+/// host's, not fwe's (an X server, say): it reads no bundle
+/// ([`crate::scm::prepare`]).
+#[cfg(not(target_os = "linux"))]
+fn host_peer(fd: i32) -> bool {
+    host_peercred(fd).is_ok_and(|(pid, _, _)| pid > 0 && crate::procreg::read(pid).is_none())
 }
 
 #[cfg(test)]

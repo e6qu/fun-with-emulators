@@ -1,7 +1,9 @@
 //! POSIX message queues: messages taken by priority, the status line a
 //! queue's descriptor reads as (and its file in the mqueue filesystem,
 //! which lists it), a queue that outlives its name while it is
-//! open, and notifications another process's message sets off (a signal,
+//! open (or a fork child holds it), its descriptor's position shared by
+//! a duplicate and `epoll` finding it ready, and notifications another
+//! process's message sets off (a signal,
 //! standard or real-time, carrying the registered value and the sender, and a notification thread
 //! the C library runs). It prints what it observed.
 //!
@@ -64,6 +66,14 @@ unsafe extern "C" {
     fn mq_getattr(q: i32, attr: *mut MqAttr) -> i32;
     fn mq_notify(q: i32, ev: *const SigEvent) -> i32;
     fn read(fd: i32, buf: *mut u8, len: usize) -> isize;
+    fn write(fd: i32, buf: *const u8, len: usize) -> isize;
+    fn dup(fd: i32) -> i32;
+    fn close(fd: i32) -> i32;
+    fn lseek(fd: i32, off: i64, whence: i32) -> i64;
+    fn pipe(fds: *mut i32) -> i32;
+    fn epoll_create1(flags: i32) -> i32;
+    fn epoll_ctl(ep: i32, op: i32, fd: i32, ev: *mut u64) -> i32;
+    fn epoll_wait(ep: i32, evs: *mut u64, n: i32, timeout: i32) -> i32;
     fn fcntl(fd: i32, cmd: i32, ...) -> i32;
     fn pread(fd: i32, buf: *mut u8, len: usize, off: i64) -> isize;
     fn getpid() -> i32;
@@ -157,6 +167,22 @@ fn main() {
         let mut buf = [0u8; 64];
         let n = read(q, buf.as_mut_ptr(), buf.len());
         println!("status: {}", String::from_utf8_lossy(&buf[..n.max(0) as usize]).trim_end());
+        // Its position moved, for a duplicate too; rewound, it reads again.
+        let after = read(q, buf.as_mut_ptr(), buf.len());
+        let d = dup(q);
+        let dup_reads = read(d, buf.as_mut_ptr(), buf.len());
+        let rewound = lseek(d, 0, 0);
+        let whole = read(q, buf.as_mut_ptr(), buf.len());
+        close(d);
+        println!("position: then {after}, duplicate {dup_reads}, rewound {rewound}, read again {}", whole == n);
+        // Always ready to `epoll` (`EPOLLIN | EPOLLOUT`).
+        let ep = epoll_create1(0);
+        let mut ev = [5u64, 7];
+        let added = epoll_ctl(ep, 1, q, ev.as_mut_ptr());
+        let mut out = [0u64; 8];
+        let ready = epoll_wait(ep, out.as_mut_ptr(), 4, 0);
+        println!("epoll: added {added}, ready {ready}, events {:#x}, data {}", out[0] & 0xffff_ffff, out[1]);
+        close(ep);
         // The mqueue filesystem lists the queue, its file read as the same.
         let file = format!("/dev/mqueue/fwe-mq-{}", getpid());
         let listed = std::fs::read_dir("/dev/mqueue")
@@ -253,5 +279,26 @@ fn main() {
         println!("made again: {}, empty {}", again >= 0, got.curmsgs == 0);
         mq_close(again);
         mq_unlink(name.as_ptr());
+
+        // Unlinked and closed here, a queue lives while a child holds it.
+        let held = CString::new(format!("/fwe-mq-held-{}", getpid())).unwrap();
+        let small = MqAttr { maxmsg: 4, msgsize: 32, ..MqAttr::default() };
+        let h = mq_open(held.as_ptr(), O_RDWR | O_CREAT | O_EXCL, 0o600, &small);
+        mq_unlink(held.as_ptr());
+        let mut p = [0i32; 2];
+        pipe(p.as_mut_ptr());
+        let child = fork();
+        if child == 0 {
+            let mut b = 0u8;
+            read(p[0], &mut b, 1);
+            let sent = mq_send(h, b"held".as_ptr(), 4, 0);
+            let n = mq_receive(h, buf.as_mut_ptr(), buf.len(), std::ptr::null_mut());
+            _exit(if sent == 0 && n == 4 { 0 } else { 1 });
+        }
+        mq_close(h);
+        write(p[1], b"x".as_ptr(), 1);
+        let mut st = 0;
+        waitpid(child, &mut st, 0);
+        println!("held by a child: still works {}", st == 0);
     }
 }

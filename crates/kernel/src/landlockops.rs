@@ -32,18 +32,13 @@ fn remove_right(mode: u32) -> u64 {
     }
 }
 
-/// The host mode of what is at host path `path` (following a final link
-/// if `follow`), if anything is.
-fn host_mode(path: &[u8], follow: bool) -> Option<u32> {
-    let c = std::ffi::CString::new(path).ok()?;
-    // SAFETY: an all-zero `stat` is a valid out-parameter; a NUL-terminated
-    // path.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: as above.
-    let r = unsafe {
-        if follow { libc::stat(c.as_ptr(), &mut st) } else { libc::lstat(c.as_ptr(), &mut st) }
-    };
-    (r == 0).then_some(st.st_mode as u32)
+/// What a path names, as a domain's rules see it: the identities above
+/// the directory it is in and above it ([`ll::Ids`]), and its mode, if
+/// anything is there.
+struct Target {
+    dir: ll::Ids,
+    obj: ll::Ids,
+    mode: Option<u32>,
 }
 
 /// A guest `sockaddr`'s family and its port (an inet one) or path bytes
@@ -148,14 +143,74 @@ pub fn sendable_messages(vec: u64, vlen: u64) -> Option<u64> {
 }
 
 impl<P: Platform> Kernel<P> {
-    /// The host paths of what `path` from `dirfd` names and of the
-    /// directory it is in.
-    fn ll_target(&self, dirfd: u64, path: u64, follow: bool) -> Option<(Vec<u8>, Vec<u8>)> {
-        let p = uaccess::read_cstr(path, uaccess::PATH_MAX).ok()?;
-        let r = self.fs_opt()?.resolve(dirfd as i32, &p, follow).ok()?;
-        let dir = crate::fs::host_path_of(r.dir.as_raw_fd())?;
-        let obj = if r.name == b"." { dir.clone() } else { [&dir[..], b"/", &r.name[..]].concat() };
-        Some((dir, obj))
+    /// What `path` from `dirfd` names ([`Target`]): none for a path that
+    /// does not resolve, which the call itself refuses as it fails to.
+    fn ll_target(&self, dirfd: u64, path: u64, follow: bool) -> Result<Option<Target>, i32> {
+        let Ok(p) = uaccess::read_cstr(path, uaccess::PATH_MAX) else { return Ok(None) };
+        let Some(fs) = self.fs_opt() else { return Ok(None) };
+        let Ok(r) = fs.resolve(dirfd as i32, &p, follow) else { return Ok(None) };
+        self.ll_resolved(&r, 0).map(Some)
+    }
+
+    /// [`Target`] of what `r` resolved to; `depth` mounts crossed on the
+    /// way up so far. What resolved but cannot be placed is refused: a
+    /// domain's checks are never skipped.
+    fn ll_resolved(&self, r: &crate::fs::Resolved, depth: u32) -> Result<Target, i32> {
+        let mode = r.lstat().map(|st| st.st_mode as u32);
+        let Some(d) = &r.store else {
+            let dir = crate::fs::host_path_of(r.dir.as_raw_fd()).ok_or(errno::EACCES)?;
+            let obj =
+                if r.name == b"." { dir.clone() } else { [&dir[..], b"/", &r.name[..]].concat() };
+            return Ok(Target { dir: ll::ancestry(&dir), obj: ll::ancestry(&obj), mode });
+        };
+        // In fwe's store: up its directories to the mount's root, then on
+        // from the directory the mount is on, as Linux's walk goes past a
+        // mount point it hides.
+        let dev = crate::host::dev_of(&d.host_stat(d.ino)?);
+        let table = self.fs().mounts();
+        let m = table.get(r.mount_id).ok_or(errno::EACCES)?;
+        let top = crate::fs::StoreDir::at(d.fs.id, &m.root)?.ino;
+        let mut dir = Vec::new();
+        let mut at = d.ino;
+        {
+            let t = d.fs.lock()?;
+            loop {
+                dir.push((dev, at));
+                if at == top {
+                    break;
+                }
+                let up = t.lookup(at, b"..")?;
+                if up == at {
+                    break;
+                }
+                at = up;
+            }
+        }
+        if m.point != b"/" && depth < 40 {
+            // On from the mount point's nearest ancestor there is: the
+            // objects a rule can be on (fwe mounts `/dev/shm` in a root
+            // with no `/dev`). One outside the process's root is beyond
+            // its view, as the walk ends there.
+            let mut above = crate::fs::normalize(&m.point, b"..");
+            while let Some(path) = self.fs().from_ns(&above) {
+                match self.fs().resolve(fcntl::AT_FDCWD as i32, &path, true) {
+                    Ok(r) => {
+                        dir.extend(self.ll_resolved(&r, depth + 1)?.obj);
+                        break;
+                    }
+                    Err(errno::ENOENT) if above != b"/" => {
+                        above = crate::fs::normalize(&above, b"..");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        // (Nothing there: the directory's, as a host path's ancestry has.)
+        let obj = match d.find(&r.name) {
+            Ok((ino, _)) if ino != d.ino => [&[(dev, ino)][..], &dir].concat(),
+            _ => dir.clone(),
+        };
+        Ok(Target { dir, obj, mode })
     }
 
     /// The checks of call `n` with `a`: what a descriptor it opens is
@@ -170,12 +225,14 @@ impl<P: Platform> Kernel<P> {
                     return Ok(none);
                 }
                 let follow = flags & fcntl::O_NOFOLLOW == 0;
-                let Some((dir, obj)) = self.ll_target(a[0], a[1], follow) else { return Ok(none) };
+                let Some(Target { dir, obj, mode }) = self.ll_target(a[0], a[1], follow)? else {
+                    return Ok(none);
+                };
                 let acc = flags & fcntl::O_ACCMODE;
                 let (read, write) = (acc != fcntl::O_WRONLY, acc != fcntl::O_RDONLY);
-                match host_mode(&obj, follow) {
+                match mode {
                     Some(m) if m & libc::S_IFMT as u32 == libc::S_IFDIR as u32 => {
-                        ll::check_path(&obj, if read { ll::READ_DIR } else { 0 }, true)?;
+                        ll::check(&obj, if read { ll::READ_DIR } else { 0 }, true)?;
                         Ok(none)
                     }
                     Some(_) => {
@@ -189,11 +246,11 @@ impl<P: Platform> Kernel<P> {
                         if write && flags & fcntl::O_TRUNC != 0 {
                             need |= ll::TRUNCATE;
                         }
-                        ll::check_path(&obj, need, true)?;
+                        ll::check(&obj, need, true)?;
                         Ok(ll::withheld(&obj, write))
                     }
                     None if flags & fcntl::O_CREAT != 0 => {
-                        ll::check_path(&dir, ll::MAKE_REG, false)?;
+                        ll::check(&dir, ll::MAKE_REG, false)?;
                         Ok(ll::withheld(&dir, write))
                     }
                     None => Ok(none),
@@ -205,55 +262,55 @@ impl<P: Platform> Kernel<P> {
                     nr::MKNODAT => (a[0], a[1], make_right(a[2] as u32)),
                     _ => (a[1], a[2], ll::MAKE_SYM),
                 };
-                if let Some((dir, _)) = self.ll_target(dirfd, path, false) {
-                    ll::check_path(&dir, right, false)?;
+                if let Some(t) = self.ll_target(dirfd, path, false)? {
+                    ll::check(&t.dir, right, false)?;
                 }
                 Ok(none)
             }
             nr::UNLINKAT => {
                 const AT_REMOVEDIR: u64 = 0x200;
-                if let Some((dir, _)) = self.ll_target(a[0], a[1], false) {
+                if let Some(t) = self.ll_target(a[0], a[1], false)? {
                     let right =
                         if a[2] & AT_REMOVEDIR != 0 { ll::REMOVE_DIR } else { ll::REMOVE_FILE };
-                    ll::check_path(&dir, right, false)?;
+                    ll::check(&t.dir, right, false)?;
                 }
                 Ok(none)
             }
             nr::LINKAT => {
                 let follow = a[4] & fcntl::AT_SYMLINK_FOLLOW != 0;
-                let (Some((from_dir, from)), Some((to_dir, _))) =
-                    (self.ll_target(a[0], a[1], follow), self.ll_target(a[2], a[3], false))
+                let (Some(from), Some(to)) =
+                    (self.ll_target(a[0], a[1], follow)?, self.ll_target(a[2], a[3], false)?)
                 else {
                     return Ok(none);
                 };
-                ll::check_refer(&from_dir, &to_dir)?;
-                let kind = host_mode(&from, follow).unwrap_or(libc::S_IFREG as u32);
-                ll::check_path(&to_dir, make_right(kind), false)?;
+                ll::check_refer(&from.dir, &to.dir)?;
+                let kind = from.mode.unwrap_or(libc::S_IFREG as u32);
+                ll::check(&to.dir, make_right(kind), false)?;
                 Ok(none)
             }
             nr::RENAMEAT | nr::RENAMEAT2 => {
                 const RENAME_EXCHANGE: u64 = 2;
                 let exchange = n == nr::RENAMEAT2 && a[4] & RENAME_EXCHANGE != 0;
-                let (Some((from_dir, from)), Some((to_dir, to))) =
-                    (self.ll_target(a[0], a[1], false), self.ll_target(a[2], a[3], false))
+                let (Some(from), Some(to)) =
+                    (self.ll_target(a[0], a[1], false)?, self.ll_target(a[2], a[3], false)?)
                 else {
                     return Ok(none);
                 };
-                ll::check_refer(&from_dir, &to_dir)?;
-                let kind = host_mode(&from, false).unwrap_or(libc::S_IFREG as u32);
-                ll::check_path(&from_dir, remove_right(kind), false)?;
-                ll::check_path(&to_dir, make_right(kind), false)?;
-                if let Some(over) = host_mode(&to, false) {
-                    ll::check_path(&to_dir, remove_right(over), false)?;
+                ll::check_refer(&from.dir, &to.dir)?;
+                let kind = from.mode.unwrap_or(libc::S_IFREG as u32);
+                ll::check(&from.dir, remove_right(kind), false)?;
+                ll::check(&to.dir, make_right(kind), false)?;
+                if let Some(over) = to.mode {
+                    ll::check(&to.dir, remove_right(over), false)?;
                     if exchange {
-                        ll::check_path(&from_dir, make_right(over), false)?;
+                        ll::check(&from.dir, make_right(over), false)?;
                     }
                 }
                 Ok(none)
             }
             nr::TRUNCATE => {
-                if let Some((_, obj)) = self.ll_target(fcntl::AT_FDCWD as u64, a[0], true) {
-                    ll::check_path(&obj, ll::TRUNCATE, true)?;
+                if let Some(t) = self.ll_target(fcntl::AT_FDCWD as u64, a[0], true)? {
+                    ll::check(&t.obj, ll::TRUNCATE, true)?;
                 }
                 Ok(none)
             }
@@ -264,12 +321,12 @@ impl<P: Platform> Kernel<P> {
                         AF_UNIX if rest.first().is_some_and(|&c| c != 0) => {
                             let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
                             let path = &rest[..end];
-                            let p = self.fs_opt().and_then(|fs| {
-                                let r = fs.resolve(fcntl::AT_FDCWD as i32, path, false).ok()?;
-                                crate::fs::host_path_of(r.dir.as_raw_fd())
+                            let r = self.fs_opt().and_then(|fs| {
+                                fs.resolve(fcntl::AT_FDCWD as i32, path, false).ok()
                             });
-                            if let Some(dir) = p {
-                                ll::check_path(&dir, ll::MAKE_SOCK, false)?;
+                            if let Some(r) = r {
+                                let t = self.ll_resolved(&r, 0)?;
+                                ll::check(&t.dir, ll::MAKE_SOCK, false)?;
                             }
                         }
                         _ => {}
@@ -315,7 +372,6 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn landlock_exec(&self, path: &[u8]) -> Result<(), i32> {
         let Some(fs) = self.fs_opt() else { return Ok(()) };
         let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true) else { return Ok(()) };
-        let Some(dir) = crate::fs::host_path_of(r.dir.as_raw_fd()) else { return Ok(()) };
-        ll::check_path(&[&dir[..], b"/", &r.name[..]].concat(), ll::EXECUTE, true)
+        ll::check(&self.ll_resolved(&r, 0)?.obj, ll::EXECUTE, true)
     }
 }

@@ -57,6 +57,9 @@ import tempfile
 import threading
 import time
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import hostmem  # noqa: E402
+
 ROUNDS = 9
 # The micro-benchmarks', each a fraction of a second: more rounds, so a
 # runner's passing load spoils none of the best of them.
@@ -156,6 +159,45 @@ MICRO = [
     # request waited for, and a window's frame drawn through shared memory.
     ("X request round trip", ["x11", "rtt", "20000"], "us"),
     ("X frame through shared memory", ["x11", "shm", "300"], "us"),
+    # System V IPC, which programs that share memory between processes use
+    # (databases, X's MIT-SHM): a semaphore raised and lowered, a message
+    # sent and received, a segment's life (made, attached, written,
+    # detached, removed).
+    ("System V semaphore up+down", ["ipc", "sem", "10000"], "ns"),
+    ("System V message send+receive", ["ipc", "msg", "10000"], "ns"),
+    ("System V segment made and removed", ["ipc", "shm", "1000"], "ns"),
+    # A small file's life on the disk (fwe's /tmp is the host's): made,
+    # 4 KiB written and read back, closed and removed; and a file used as
+    # shared memory there (made, sized to 64 KiB, mapped, written,
+    # removed), as a program that keeps its shared memory in a file does.
+    ("file's life in /tmp", ["mem", "life", "/tmp", "2000"], "us"),
+    ("shared memory file's life in /tmp", ["mem", "segment", "/tmp", "2000"], "us"),
+]
+
+# Micro-benchmarks of what macOS has no counterpart of: under fwe and on
+# Linux only.
+MICRO_LINUX = [
+    ("eventfd write+read", ["ipc", "eventfd", "200000"], "ns"),
+    # A wake of a futex in memory processes share, no one waiting.
+    ("shared futex wake", ["ipc", "futex", "200000"], "ns"),
+    # A synthetic file (/proc/self/stat) opened, read whole and closed.
+    ("/proc file open+read+close", ["file", "proc", "20000"], "ns"),
+    # Files in memory (fwe's store; Linux's tmpfs), beside the same on the
+    # disk above: a small file's life in /dev/shm, a POSIX shared memory
+    # object's (made, sized to 64 KiB, mapped, written, removed: as
+    # `shm_open` makes one there), and a memfd's (made, 4 KiB written and
+    # read back, closed).
+    ("file's life in /dev/shm", ["mem", "life", "/dev/shm", "3000"], "us"),
+    ("shared memory object's life in /dev/shm", ["mem", "segment", "/dev/shm", "3000"], "us"),
+    ("memfd's life", ["mem", "memfd", "-", "3000"], "us"),
+]
+
+# What only macOS is measured at: the host's own cost of what fwe does for
+# a Linux call, beside the row of that call.
+MICRO_NATIVE = [
+    # A segment of its own (a POSIX shared memory object made, mapped and
+    # removed): what each System V segment costs the host under fwe.
+    ("POSIX shared memory object made and removed", ["ipc", "pshm", "3000"], "ns"),
 ]
 
 
@@ -194,6 +236,16 @@ BUDGETS = {
     # A graphical program's calls to its X server, as a system call is.
     "X request round trip (us)": 1.5,
     "X frame through shared memory (us)": 1.5,
+    # Kernel state every process shares, kept in memory as a kernel keeps
+    # it (ROADMAP.md M6 PR 2).
+    "System V semaphore up+down (ns)": 3.0,
+    "System V message send+receive (ns)": 3.0,
+    # Each segment is a host shared memory object of its own (one MIT-SHM
+    # shares without a copy, freed when removed): the host's own cycle of
+    # one ("POSIX shared memory object made and removed", natively) is
+    # 1.2-1.5x macOS's System V segment, and fwe's four calls' work comes
+    # on top of it (docs/linux-on-macos.md).
+    "System V segment made and removed (ns)": 3.0,
 }
 
 # The most fwe's figure may be, in the row's own unit: making a
@@ -241,6 +293,7 @@ BREW = {
     "jdk": "opt/openjdk@25/bin",
     "node": "opt/node@24/bin/node",
     "luajit": "opt/luajit/bin/luajit",
+    "postgres": "opt/postgresql@18/bin",
 }
 
 
@@ -249,7 +302,8 @@ def backends(cmd, fresh=()):
     """Which of fwe's backends ran the programs of `cmd` (fwe, or `env -i`
     and fwe), by the `backend:` marks of `FWE_TIMING` (every program a run
     starts, in every process): "native", "VM", or both with how many of
-    each. `fresh` is emptied first."""
+    each. `fresh` is emptied first. A run that does not end is reported as
+    any other ([`run_limited`])."""
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
@@ -257,7 +311,7 @@ def backends(cmd, fresh=()):
         cmd, env = cmd[:2] + ["FWE_TIMING=1"] + cmd[2:], None
     else:
         env = dict(os.environ, FWE_TIMING="1")
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace")
+    r = run_limited(cmd, f"{os.path.basename(cmd[0])} backends", env)
     n = collections.Counter(re.findall(r"timing: backend: (native|vm) ", r.stderr))
     if not n:
         return "unknown"
@@ -378,7 +432,7 @@ def startup_ms(cmd, n=30):
 def micro(prefix, bench):
     """The micro-benchmarks, with `prefix` (fwe and its options, or none)."""
     r = {"startup (ms)": startup_ms(prefix + [bench, "exit"])}
-    for name, args, unit in MICRO:
+    for name, args, unit in MICRO + MICRO_LINUX:
         r[f"{name} ({unit})"] = best(lambda: run_bench(prefix, bench, args))
     # fork + exec of the benchmark itself (under fwe without a root, the
     # guest sees host paths).
@@ -410,6 +464,17 @@ def micro_pair(fwe, guest, native):
     ours, theirs = {}, {}
     for name, f in runs:
         ours[name], theirs[name] = pair(name, lambda: f(fwe, guest), lambda: f([], native))
+    # What macOS has no counterpart of, under fwe alone.
+    for name, args, unit in MICRO_LINUX:
+        took = [run_bench(fwe, guest, args) for _ in range(MICRO_ROUNDS)]
+        print(f"{name} ({unit}): rounds under fwe " + ", ".join(f"{t:.4g}" for t in took),
+              file=sys.stderr)
+        ours[f"{name} ({unit})"] = min(took)
+    for name, args, unit in MICRO_NATIVE:
+        took = [run_bench([], native, args) for _ in range(MICRO_ROUNDS)]
+        print(f"{name} ({unit}): rounds natively " + ", ".join(f"{t:.4g}" for t in took),
+              file=sys.stderr)
+        theirs[f"{name} ({unit})"] = min(took)
     return ours, theirs
 
 
@@ -482,7 +547,8 @@ def linux(a):
             # The workloads, with the Lua just built and Alpine's programs.
             shutil.copytree(WORKLOADS, os.path.join(src, "wl"))
             subprocess.run(
-                ["docker", "exec", name, "apk", "add", "-q", "sqlite", "git", "xz", "python3"],
+                ["docker", "exec", name, "apk", "add", "-q", "sqlite", "git", "xz", "python3",
+                 "postgresql18", "postgresql18-client"],
                 check=True,
             )
 
@@ -512,6 +578,9 @@ def linux(a):
                 ("SQLite (s)", "sqlite3 /tmp/w/db '.read /src/wl/bench.sql'"),
                 ("git (s)", "sh /src/wl/git.sh /src/src /usr/bin/git"),
                 ("xz (s)", "sh /src/wl/xz.sh /src/src /usr/bin/xz"),
+                # As PostgreSQL's own user: it refuses to run as root.
+                ("PostgreSQL (s)", "chown postgres /tmp/w && su -s /bin/sh -c "
+                 "'cd /tmp/w && sh /src/wl/postgres.sh /usr/libexec/postgresql18' postgres"),
             ):
                 r[row] = best(lambda cmd=cmd: timed(cmd), 3)
         finally:
@@ -520,6 +589,16 @@ def linux(a):
 
 
 def macos(a):
+    # The host's memory watched throughout (tools/hostmem.py): short of it,
+    # the run says what holds it, ends fwe's processes and fails.
+    def short(why):
+        print(f"\n{why}", flush=True)
+        hostmem.report()
+        ended = hostmem.end_processes("^" + re.escape(a.fwe) + " ")
+        print(f"ended {ended} fwe processes; the run stops here", flush=True)
+        os._exit(3)
+
+    hostmem.Guard(short).start()
     x_server(a.xvfb)
     fwe = [a.fwe]
     # Where a start's time goes (FWE_TIMING), for the log.
@@ -552,6 +631,14 @@ def macos(a):
         execname=os.path.basename(a.native)[:16])
     pcs("fork+exit+wait (micro) natively", [a.native, "fork", "2000"],
         execname=os.path.basename(a.native)[:16])
+    # And a System V segment's cycle: the host's calls under fwe, and
+    # natively for macOS's own segment and for a shared memory object.
+    seg = ["ipc", "shm", "20000"]
+    pcs("System V segment made and removed (micro)", fwe + [a.bench] + seg)
+    pcs("System V segment made and removed (micro) natively", [a.native] + seg,
+        execname=os.path.basename(a.native)[:16])
+    pcs("POSIX shared memory object made and removed (micro) natively",
+        [a.native, "ipc", "pshm", "20000"], execname=os.path.basename(a.native)[:16])
     results = {"fwe": ours, "macOS": theirs}
     # The benchmark program alone, and forking and running itself.
     ran = backends(fwe + [a.bench, "forkexec", "2", a.bench])
@@ -720,6 +807,7 @@ def build(a, fwe, results):
         share=True,
     )
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
+    postgres(a, fwe, guest_env, results)
     results["fwe"][GEARS] = gears_fwe(a, fwe, guest_env)
     jdk(a, fwe, guest_env, results)
     host_costs()
@@ -806,14 +894,17 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
 LIMIT = 300
 
 
-def run_limited(cmd, name):
-    """`cmd` run as `subprocess.run` with its output captured as text, for
-    at most LIMIT seconds. Past them, each of its processes is sampled
+def run_limited(cmd, name, env=None):
+    """`cmd` run as `subprocess.run` with its output captured as text (in
+    environment `env`, or this one's), for at most LIMIT seconds. Past
+    them, each of its processes is sampled
     (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
-    on top of its threads' stacks printed), the process group it was started
-    in is stopped, and the benchmarks fail."""
+    on top of its threads' stacks printed), they are ended, and the
+    benchmarks fail. Its processes are its descendants and, for a run under
+    fwe, every process of fwe's on its root: a daemon a guest started (a
+    database's server) has left the session and its parent."""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         errors="replace", start_new_session=True)
+                         errors="replace", start_new_session=True, env=env)
     try:
         out, err = p.communicate(timeout=LIMIT)
     except subprocess.TimeoutExpired:
@@ -824,6 +915,12 @@ def run_limited(cmd, name):
             pids.append(pid)
             kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
             todo += [int(k) for k in kids.stdout.split()]
+        if "--root" in cmd:
+            root = cmd[cmd.index("--root") + 1]
+            ours = subprocess.run(["pgrep", "-f", "--", f"--root {root} "], capture_output=True,
+                                  text=True)
+            pids += [int(k) for k in ours.stdout.split() if int(k) not in pids]
+        pids = [pid for pid in pids if pid > 0 and pid != os.getpid()]
         for pid in pids:
             path = os.path.abspath(f"bench-{slug}-hung-{pid}.sample")
             subprocess.run(["sample", str(pid), "3", "-file", path], capture_output=True)
@@ -836,6 +933,11 @@ def run_limited(cmd, name):
             print(f"{name}: process {pid} after {LIMIT} s, on top of its stacks:\n"
                   + "\n".join(top), file=sys.stderr)
         os.killpg(p.pid, signal.SIGKILL)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
         out, err = p.communicate()
         sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
                  f"{err[-3000:]}")
@@ -1873,6 +1975,33 @@ def jdk(a, fwe, guest_env, results):
     shutil.rmtree(native, ignore_errors=True)
 
 
+def postgres(a, fwe, guest_env, results):
+    """PostgreSQL at work, a System V user (`workloads/postgres.sh`: its
+    segment, its shared memory and semaphores, a process for each client):
+    under fwe in its Alpine root, natively with Homebrew's build of the
+    same release."""
+    root = alpine_root("postgres", a.cache)
+    shutil.copy(os.path.join(WORKLOADS, "postgres.sh"), os.path.join(root, "tmp"))
+    # PostgreSQL runs as no root: its user, as the package's install script
+    # (not run when the root is unpacked) makes it, and the workload run as
+    # it, as on Linux.
+    for name, entry in (("passwd", "postgres:x:70:70:PostgreSQL user:/var/lib/postgresql:/bin/sh"),
+                        ("group", "postgres:x:70:")):
+        path = os.path.join(root, "etc", name)
+        if not any(l.startswith("postgres:") for l in open(path)):
+            with open(path, "a") as f:
+                f.write(entry + "\n")
+    native = tempfile.mkdtemp()
+    ours_w, theirs_w = os.path.join(root, "tmp", "w"), os.path.join(native, "w")
+    ours = guest_env + fwe + ["--root", root, os.path.join(root, "bin/sh"), "-c",
+                              "chown postgres /tmp/w && su -s /bin/sh -c "
+                              "'cd /tmp/w && sh /tmp/postgres.sh /usr/libexec/postgresql18' postgres"]
+    bin_dir = os.path.join(a.brew, BREW["postgres"])
+    theirs = ["/bin/sh", "-c", f"cd {theirs_w} && sh {WORKLOADS}/postgres.sh {bin_dir}"]
+    workload(results, "PostgreSQL (s)", ours, theirs, (ours_w, theirs_w), len(guest_env) + 1)
+    shutil.rmtree(native, ignore_errors=True)
+
+
 def workloads(a, fwe, guest_env, lua_src, results):
     """The workloads of Python, SQLite, git and xz: under fwe in their
     Alpine root, natively with Homebrew's builds of them. git and xz work on
@@ -1999,7 +2128,9 @@ def workloads(a, fwe, guest_env, lua_src, results):
 def render(results):
     cols = [c for c in ("fwe", FWE_VM, "macOS", "Linux", VM) if c in results]
     against = [c for c in ("macOS", VM) if c in results]
+    # (And what only macOS is measured at, MICRO_NATIVE.)
     rows = list(results["fwe"].keys())
+    rows += [r for r in results.get("macOS", {}) if r not in results["fwe"]]
     shares = results.get(SHARE, {})
     ran = results.get(BACKEND, {})
     lines = [
@@ -2009,7 +2140,8 @@ def render(results):
     ]
     for row in rows:
         vals = [results[c].get(row) for c in cols]
-        ratios = [f"{results['fwe'][row] / results[c][row]:.1f}x" if results[c].get(row) else ""
+        ratios = [f"{results['fwe'][row] / results[c][row]:.1f}x"
+                  if results[c].get(row) and row in results["fwe"] else ""
                   for c in against]
         cells = ["" if v is None else f"{v:.1f}" if v >= 10 else f"{v:.2f}" for v in vals]
         share = f"{shares[row]:.2f}x" if row in shares else ""

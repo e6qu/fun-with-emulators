@@ -24,11 +24,14 @@ fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
 /// `flock(fd, op)`. Waiting for the lock blocks, so the backends run it
 /// without the kernel lock ([`crate::blocking_syscall`]).
 pub(crate) fn flock(fd: u64, op: u64) -> i64 {
-    // A message queue's descriptor holds the host lock that keeps the
-    // queue alive ([`crate::mqueue`]): the guest's lock is not taken there.
-    if crate::fdmarks::any_marks()
-        && crate::fdmarks::marked(fd as i32) == Some(crate::fdmarks::Mark::Mq)
-    {
+    // A file of fwe's store: its locks are the store's.
+    if let Some(r) = crate::filestore::locks::flock(fd as i32, op) {
+        return r;
+    }
+    // A message queue's descriptor stands on `/dev/null`
+    // ([`crate::mqueue`]), which the host locks not: the guest's lock is
+    // not taken there.
+    if crate::mqueue::is_queue(fd as i32) {
         return match host::flock_op_to_host(op) {
             Some(_) => 0,
             None => err(errno::EINVAL),
@@ -49,6 +52,9 @@ pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
     let lock: fwe_abi::Flock = guest!(uaccess::read(arg));
     if matches!(cmd, fcntl::F_OFD_SETLK | fcntl::F_OFD_SETLKW) && lock.l_pid != 0 {
         return err(errno::EINVAL);
+    }
+    if let Some(r) = crate::filestore::locks::set(fd, cmd, &lock) {
+        return r;
     }
     let lock = match host::flock_to_host(&lock) {
         Ok(l) => l,
@@ -293,6 +299,7 @@ impl<P: Platform> Kernel<P> {
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
     fn dispatch_counted(&mut self, n: u64, a: [u64; 6]) -> i64 {
+        let _call = crate::fdmarks::Call::begin();
         // Limits another process set for this one take effect now.
         if crate::procreg::take_limits_left() {
             self.take_pending_limits();
@@ -405,8 +412,14 @@ impl<P: Platform> Kernel<P> {
                 crate::dnotify::closed(fd);
                 crate::loopdev::closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
+                let stored = crate::filestore::desc::closing(fd);
                 crate::fdmarks::closed(fd);
                 if let Some(after) = queue {
+                    // SAFETY: plain host call.
+                    let r = ret(unsafe { libc::close(fd) });
+                    after();
+                    r
+                } else if let Some(after) = stored {
                     // SAFETY: plain host call.
                     let r = ret(unsafe { libc::close(fd) });
                     after();
@@ -444,7 +457,7 @@ impl<P: Platform> Kernel<P> {
             // SAFETY: the host validates the epoll_event pointer.
             nr::EPOLL_CTL => unsafe { crate::epoll::ctl(a[0], a[1], a[2], a[3]) },
             nr::MEMFD_CREATE => match uaccess::read_cstr(a[0], fwe_abi::memfd::NAME_MAX) {
-                Ok(name) => crate::memfd::create(&name, a[1]),
+                Ok(name) => crate::memfd::create(&name, a[1], &self.creds),
                 Err(errno::ENAMETOOLONG) => err(errno::EINVAL),
                 Err(e) => err(e),
             },
@@ -607,6 +620,8 @@ impl<P: Platform> Kernel<P> {
                 unsafe { libc::sync() };
                 0
             }
+            // A file of fwe's store is in memory: nothing to write back.
+            nr::FSYNC | nr::FDATASYNC if crate::filestore::desc::of(a[0] as i32).is_some() => 0,
             nr::FSYNC | nr::FDATASYNC => match crate::loopdev::fsync(a[0] as i32) {
                 Some(r) => r,
                 None => {
@@ -1037,7 +1052,11 @@ impl<P: Platform> Kernel<P> {
     fn shared_call(&self, n: u64, a: [u64; 6]) -> i64 {
         match n {
             nr::LSEEK => {
-                if let Some(r) = crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32) {
+                if let Some(r) = crate::procfile::lseek(a[0] as i32, a[2]) {
+                    r
+                } else if let Some(r) =
+                    crate::synthdir::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
                     r
                 } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
@@ -1045,7 +1064,13 @@ impl<P: Platform> Kernel<P> {
                 } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
                     && is_dir_fd(a[0] as i32)
                 {
+                    // An overlay's directory (of fwe's store's in its top
+                    // layer, too): by its merged listing.
                     crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                } else if let Some(r) =
+                    crate::filestore::io::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
+                {
+                    r
                 } else if let Some(r) =
                     crate::fsops::dir_lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
@@ -1400,16 +1425,6 @@ impl<P: Platform> Kernel<P> {
                         // An `O_PATH` descriptor's flags: that, and the
                         // large-file flag every arm64 open has.
                         (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
-                    } else if crate::fdmarks::read_only(fd) {
-                        let r = (r & !libc::O_ACCMODE) | libc::O_RDONLY;
-                        host::status_flags_to_linux(r) as i64
-                    } else if r & libc::O_ACCMODE == libc::O_RDONLY
-                        && crate::memfd::write_refused(fd)
-                    {
-                        // Read-only on the host since it was sealed (see
-                        // `memfd`), but open for writing as far as Linux goes.
-                        let r = (r & !libc::O_ACCMODE) | libc::O_RDWR;
-                        host::status_flags_to_linux(r) as i64
                     } else {
                         host::status_flags_to_linux(r) as i64
                     }
@@ -1429,6 +1444,15 @@ impl<P: Platform> Kernel<P> {
                     let asked: fwe_abi::Flock = guest!(uaccess::read(arg));
                     if cmd == fcntl::F_OFD_GETLK && asked.l_pid != 0 {
                         return err(errno::EINVAL);
+                    }
+                    if let Some(r) = crate::filestore::locks::get(fd, cmd, &asked) {
+                        return match r {
+                            Ok(answer) => {
+                                guest!(uaccess::write(arg, answer));
+                                0
+                            }
+                            Err(e) => err(e),
+                        };
                     }
                     let mut lock = match host::flock_to_host(&asked) {
                         Ok(l) => l,
@@ -1580,7 +1604,7 @@ impl<P: Platform> Kernel<P> {
         if unsafe { libc::fstat(fd, &mut host) } != 0 {
             return last_error();
         }
-        match crate::leases::set(fd, host.st_dev as u64, host.st_ino, kind) {
+        match crate::leases::set(fd, crate::host::dev_of(&host), host.st_ino, kind) {
             Ok(()) => 0,
             Err(e) => err(e),
         }
@@ -1596,7 +1620,7 @@ impl<P: Platform> Kernel<P> {
         if unsafe { libc::fstat(fd, &mut st) } < 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
             return err(errno::EBADF);
         }
-        let id = (st.st_dev as u64, st.st_ino);
+        let id = (crate::host::dev_of(&st), st.st_ino);
         if cmd == fcntl::F_GETPIPE_SZ {
             return crate::fdstate::pipe_size(id) as i64;
         }
@@ -1624,6 +1648,9 @@ impl<P: Platform> Kernel<P> {
             return err(e);
         }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = crate::filestore::io::ioctl(fd, req, arg, &self.creds) {
             return r;
         }
         if let Some(r) = self.ns_ioctl(fd, req, arg) {
@@ -2849,6 +2876,27 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             .iter()
             .map(|p| p.events & libc::POLLOUT != 0 && crate::specialfd::eventfd_writable(p.fd))
             .collect();
+        // A synthetic file or directory, or an object of fwe's own, whose
+        // host descriptor (`/dev/null`, a pipe's read end) says nothing of
+        // it: ready to read and write, as Linux reports a file with no wait
+        // of its own, and not asked the host.
+        let synthetic: Vec<bool> = set
+            .iter()
+            .map(|p| {
+                crate::procfile::is(p.fd)
+                    || crate::synthdir::is_synth(p.fd)
+                    || crate::anonfd::is(p.fd)
+                    || crate::mqueue::is_queue(p.fd)
+            })
+            .collect();
+        for (p, &s) in ask.iter_mut().zip(&synthetic) {
+            if s {
+                p.fd = -1;
+            }
+        }
+        let always = libc::POLLIN | libc::POLLOUT | libc::POLLRDNORM | libc::POLLWRNORM;
+        let ready_now =
+            set.iter().zip(&synthetic).any(|(p, &s)| s && p.events & (always | libc::POLLPRI) != 0);
         for p in &mut ask {
             if p.events & libc::POLLOUT != 0 && crate::fdstate::pipe_full(p.fd) {
                 p.events &= !libc::POLLOUT;
@@ -2863,7 +2911,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         }
         let left =
             deadline.map_or(-1, |d| d.saturating_duration_since(Instant::now()).as_nanos() as i64);
-        let wait = if writable.contains(&true) {
+        let wait = if writable.contains(&true) || ready_now {
             0
         } else if full && !(0..1_000_000).contains(&left) {
             1_000_000
@@ -2871,8 +2919,9 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             left
         };
         crate::thread::wait_ready_ns(&mut ask, wait)?;
-        for ((p, a), &w) in set.iter_mut().zip(&ask).zip(&writable) {
-            p.revents = a.revents | if w { libc::POLLOUT } else { 0 };
+        for (((p, a), &w), &s) in set.iter_mut().zip(&ask).zip(&writable).zip(&synthetic) {
+            p.revents =
+                if s { p.events & always } else { a.revents | if w { libc::POLLOUT } else { 0 } };
             linux_revents(p);
             if crate::mountwatch::changed(p.fd) == Some(true) {
                 p.revents |= libc::POLLERR | (p.events & libc::POLLPRI);
@@ -3077,12 +3126,14 @@ impl<P: Platform> Kernel<P> {
         };
         let resolved;
         let cname;
+        let stored;
         // A change of the file: not through a read-only mount (`EROFS`), an
         // overlay's lower file copied up first.
         let file = if name.is_empty() && at & fcntl::AT_EMPTY_PATH != 0 {
             if set && let Err(e) = self.fd_change(dfd) {
                 return err(e);
             }
+            stored = crate::filestore::desc::of(dfd);
             FlagFile::Fd(dfd)
         } else {
             let follow = at & fcntl::AT_SYMLINK_NOFOLLOW == 0;
@@ -3095,6 +3146,10 @@ impl<P: Platform> Kernel<P> {
                 }
                 Err(e) => return err(e),
             };
+            stored = match resolved.store_file() {
+                Ok(f) => f,
+                Err(e) => return err(e),
+            };
             cname = match resolved.name_c() {
                 Ok(c) => c,
                 Err(e) => return err(e),
@@ -3102,6 +3157,22 @@ impl<P: Platform> Kernel<P> {
             FlagFile::At(std::os::fd::AsRawFd::as_raw_fd(&resolved.dir), &cname)
         };
         let r = (|| {
+            // A file of fwe's store keeps its own flags.
+            if let Some(f) = stored {
+                if let Some((x, extra)) = wanted {
+                    if extra {
+                        return Err(errno::EOPNOTSUPP);
+                    }
+                    let creds = &self.creds;
+                    return crate::filestore::io::set_flags_of(f, xflags_to_flags(x), creds)
+                        .map(|()| 0);
+                }
+                let x = flags_to_xflags(crate::filestore::io::flags_of(f)?);
+                let mut out = vec![0u8; size as usize];
+                out[..8].copy_from_slice(&x.to_ne_bytes());
+                uaccess::write_from(attr, &out)?;
+                return Ok(0);
+            }
             if let Some((x, extra)) = wanted {
                 return self.set_flags_of(file, xflags_to_flags(x), extra).map(|()| 0);
             }
@@ -4143,6 +4214,9 @@ fn uid_in(arg: u64, gid: bool) -> Result<u32, i32> {
 
 /// Whether `fd` is open on a directory.
 fn is_dir_fd(fd: i32) -> bool {
+    if let Some(st) = crate::filestore::io::stat(fd) {
+        return st.is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.
@@ -4906,7 +4980,8 @@ mod tests {
     /// fwe's internal wake signal, whose host default action ends a
     /// process, never reaches a process that is not fwe's (one this test
     /// started), whatever asks: a signal the host lacks, a descriptor
-    /// (`pidfd_getfd`), its memory (`process_vm_readv`).
+    /// (`pidfd_getfd`), its memory (`process_vm_readv`); nor does any
+    /// signal fwe sends for its own ends to a pid it keeps.
     #[cfg(target_os = "macos")]
     #[test]
     fn internal_signals_never_reach_other_processes() {
@@ -4917,6 +4992,10 @@ mod tests {
         assert!(!host::is_fwe(pid));
         assert_eq!(host::kill_process(pid, host::WAKE_SIGNAL), err(errno::ESRCH));
         assert_eq!(host::kill(-pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        for sig in [libc::SIGTERM, libc::SIGKILL, libc::SIGSTOP, libc::SIGCONT, libc::SIGCHLD] {
+            assert_eq!(host::kill_process(pid, sig), err(errno::ESRCH), "signal {sig}");
+        }
+        assert_eq!(host::kill_process(pid, 0), 0, "it is there");
         // A real-time signal, which only fwe's mailbox carries.
         assert_eq!(k.syscall(nr::KILL, [pid as u64, 40, 0, 0, 0, 0]), err(errno::EINVAL));
         let fd = k.syscall(nr::PIDFD_OPEN, [pid as u64, 0, 0, 0, 0, 0]);

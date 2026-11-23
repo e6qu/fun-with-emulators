@@ -1,15 +1,16 @@
 //! `process_vm_readv` and `process_vm_writev`: another process's memory,
 //! read or written without stopping it.
 //!
-//! Its memory is its own, so the caller writes the request (and, to
-//! write, the data) to a file of fwe's and asks the process through its
-//! signal mailbox ([`crate::signote::request_mem`]); the process carries
-//! it out in its wake handler, with the host's copies of its own task,
-//! which report an address with nothing behind it rather than fault, and
-//! wakes the caller on a reply socket. A tracee of the caller's stopped
-//! in a ptrace stop serves only its tracer's requests: its memory goes
-//! through its ptrace mailbox ([`crate::ptrace::tracee_memory`]). The
-//! caller's own memory is copied directly.
+//! Its memory is its own, so the caller writes the request (and, to write,
+//! the data) to a host shared memory object both map (memory, not a file)
+//! and asks the process through its signal mailbox
+//! ([`crate::signote::request_mem`]); the process carries it out in its
+//! wake handler, with the host's copies of its own task, which report an
+//! address with nothing behind it rather than fault, and wakes the caller
+//! on a reply socket. A tracee of the caller's stopped in a ptrace stop
+//! serves only its tracer's requests: its memory goes through its ptrace
+//! mailbox ([`crate::ptrace::tracee_memory`]). The caller's own memory is
+//! copied directly.
 
 use crate::{Kernel, Platform, uaccess};
 use fwe_abi::{err, errno};
@@ -178,10 +179,9 @@ pub fn remote(host: i32, addr: u64, data: &mut [u8], write: bool) -> Result<usiz
 #[cfg(target_os = "macos")]
 fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -> Result<i64, i32> {
     use crate::signote::{MEM_HEADER, MEM_RETRY};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let reply = crate::signote::fd_reply_socket().ok_or(errno::EMFILE)?;
-    let me = crate::host::pid();
-    let path = crate::signote::mem_request_path(me, reply.token).ok_or(errno::ENOMEM)?;
-    let p = <std::ffi::OsStr as std::os::unix::ffi::OsStrExt>::from_bytes(&path);
+    let name = crate::signote::mem_name(crate::host::pid(), reply.token);
     // The ranges, cut to the data that moves.
     let mut left = data.len() as u64;
     let mut cut = Vec::new();
@@ -193,59 +193,104 @@ fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -
         cut.push((base, n));
         left -= n;
     }
-    let mut file = Vec::with_capacity(MEM_HEADER + cut.len() * 16);
-    file.extend_from_slice(&u32::from(write).to_ne_bytes());
-    file.extend_from_slice(&(cut.len() as u32).to_ne_bytes());
-    file.extend_from_slice(&0i64.to_ne_bytes());
-    for (base, len) in &cut {
-        file.extend_from_slice(&base.to_ne_bytes());
-        file.extend_from_slice(&len.to_ne_bytes());
+    let data_at = MEM_HEADER + cut.len() * 16;
+    let size = data_at + data.len();
+    // The request, in a host shared memory object the process maps
+    // (memory, not a file).
+    // SAFETY: a NUL-terminated name; plain host calls.
+    let fd = unsafe {
+        libc::shm_open(
+            name.as_ptr().cast(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL,
+            0o600 as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
     }
-    let data_at = file.len();
-    if write {
-        file.extend_from_slice(data);
-    } else {
-        file.resize(data_at + data.len(), 0);
-    }
+    // Out of the guest's descriptors (closed if there is no room).
+    let fd = match crate::fdtable::reserve(fd) {
+        Ok(fd) => fd,
+        Err(e) => {
+            // SAFETY: a NUL-terminated name.
+            unsafe { libc::shm_unlink(name.as_ptr().cast()) };
+            return Err(e);
+        }
+    };
+    // SAFETY: a descriptor just made, owned here.
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let result = (|| {
-        for _ in 0..1000 {
-            std::fs::write(p, &file).map_err(|_| errno::EIO)?;
-            crate::signote::request_mem(host, reply.token)?;
-            if crate::host::kill_process(host, crate::host::WAKE_SIGNAL) != 0 {
-                return Err(errno::ESRCH);
+        // SAFETY: plain host calls on the object just made.
+        let map = unsafe {
+            if libc::ftruncate(fd.as_raw_fd(), size as libc::off_t) != 0 {
+                return Err(errno::ENOMEM);
             }
-            // Its answer, while it lives.
-            loop {
-                let mut fds = [libc::pollfd { fd: reply.sock, events: libc::POLLIN, revents: 0 }];
-                // SAFETY: one valid pollfd.
-                if unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) } > 0 {
-                    break;
-                }
-                if !crate::host::process_exists(host) {
+            libc::mmap(
+                std::ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                fd.as_raw_fd(),
+                0,
+            )
+        };
+        if map == libc::MAP_FAILED {
+            return Err(errno::ENOMEM);
+        }
+        // SAFETY: the mapping just made, `size` bytes, unmapped below.
+        let m = unsafe { std::slice::from_raw_parts_mut(map.cast::<u8>(), size) };
+        m[..4].copy_from_slice(&u32::from(write).to_ne_bytes());
+        m[4..8].copy_from_slice(&(cut.len() as u32).to_ne_bytes());
+        for (i, (base, len)) in cut.iter().enumerate() {
+            let at = MEM_HEADER + i * 16;
+            m[at..at + 8].copy_from_slice(&base.to_ne_bytes());
+            m[at + 8..at + 16].copy_from_slice(&len.to_ne_bytes());
+        }
+        if write {
+            m[data_at..].copy_from_slice(data);
+        }
+        let r = (|| {
+            for _ in 0..1000 {
+                m[8..16].copy_from_slice(&0i64.to_ne_bytes());
+                crate::signote::request_mem(host, reply.token)?;
+                if crate::host::kill_process(host, crate::host::WAKE_SIGNAL) != 0 {
                     return Err(errno::ESRCH);
                 }
-                if crate::thread::deliverable() != 0 {
-                    return Err(errno::EINTR);
+                // Its answer, while it lives.
+                loop {
+                    let mut fds =
+                        [libc::pollfd { fd: reply.sock, events: libc::POLLIN, revents: 0 }];
+                    // SAFETY: one valid pollfd.
+                    if unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) } > 0 {
+                        break;
+                    }
+                    if !crate::host::process_exists(host) {
+                        return Err(errno::ESRCH);
+                    }
+                    if crate::thread::deliverable() != 0 {
+                        return Err(errno::EINTR);
+                    }
                 }
+                crate::signote::receive_fd(reply.sock);
+                let r = i64::from_ne_bytes(m[8..16].try_into().unwrap());
+                if r == MEM_RETRY {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    continue;
+                }
+                if r > 0 && !write {
+                    let n = (r as usize).min(data.len());
+                    data[..n].copy_from_slice(&m[data_at..data_at + n]);
+                }
+                return Ok(r);
             }
-            crate::signote::receive_fd(reply.sock);
-            let back = std::fs::read(p).map_err(|_| errno::EIO)?;
-            let r = back
-                .get(8..16)
-                .map_or(-i64::from(errno::EFAULT), |b| i64::from_ne_bytes(b.try_into().unwrap()));
-            if r == MEM_RETRY {
-                std::thread::sleep(std::time::Duration::from_millis(1));
-                continue;
-            }
-            if r > 0 && !write {
-                let n = (r as usize).min(data.len());
-                data[..n].copy_from_slice(&back[data_at..data_at + n]);
-            }
-            return Ok(r);
-        }
-        Err(errno::EAGAIN)
+            Err(errno::EAGAIN)
+        })();
+        // SAFETY: the mapping made above, no longer used.
+        unsafe { libc::munmap(map, size) };
+        r
     })();
-    let _ = std::fs::remove_file(p);
+    // SAFETY: a NUL-terminated name.
+    unsafe { libc::shm_unlink(name.as_ptr().cast()) };
     result
 }
 

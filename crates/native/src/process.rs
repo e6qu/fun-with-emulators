@@ -549,6 +549,17 @@ fn linux_wstatus(pid: i32, status: libc::c_int) -> i32 {
     }
 }
 
+/// Which children a `wait4` of host pid argument `pid` waits for.
+fn select_of(pid: i32) -> reaper::Select {
+    match pid {
+        -1 => reaper::Select::Any,
+        // SAFETY: plain host call.
+        0 => reaper::Select::Pgid(unsafe { libc::getpgrp() }),
+        p if p > 0 => reaper::Select::Pid(p),
+        p => reaper::Select::Pgid(-p),
+    }
+}
+
 /// `wait4(pid, wstatus, options, rusage)`: reap a child. Blocks, so it runs
 /// without the kernel lock.
 pub fn do_wait4(regs: &Regs) -> i64 {
@@ -600,7 +611,14 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         return wait4_tracer(pid, host_options, wstatus, rusage);
     }
     start_watcher_if_wanted();
-    if !reaper::active() {
+    let want = Want {
+        exited: true,
+        stopped: options & fwe_abi::wait::WUNTRACED != 0,
+        continued: options & fwe_abi::wait::WCONTINUED != 0,
+    };
+    // Ends alone are the host's to report; stops and continues of fwe's,
+    // and an adopted child's anything, are looked for too.
+    if !reaper::active() && !want.stopped && !want.continued {
         let r = wait4_host(pid, host_options, wstatus, rusage);
         // A child that began to be traced while this waited, and stopped.
         if r == err(errno::EINTR) && fwe_kernel::ptrace::tracing() {
@@ -608,19 +626,8 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         }
         return r;
     }
-    // A reaper: its own children, and those it adopted.
-    let sel = match pid {
-        -1 => reaper::Select::Any,
-        // SAFETY: plain host call.
-        0 => reaper::Select::Pgid(unsafe { libc::getpgrp() }),
-        p if p > 0 => reaper::Select::Pid(p),
-        p => reaper::Select::Pgid(-p),
-    };
-    let want = Want {
-        exited: true,
-        stopped: options & fwe_abi::wait::WUNTRACED != 0,
-        continued: options & fwe_abi::wait::WCONTINUED != 0,
-    };
+    // Its own children, and those it adopted.
+    let sel = select_of(pid);
     reaper_wait(
         sel,
         host_options & libc::WNOHANG != 0,
@@ -649,11 +656,12 @@ struct Want {
     continued: bool,
 }
 
-/// A reaper's `wait` for the children `sel` picks: `own` checks its own
-/// children (without blocking; `ECHILD` when it has none), then `adopted`
-/// reports one it adopted that ended, stopped or continued, as `want`
-/// says (taken, unless `peek`); until one is found, or there are none, or
-/// a signal arrives (`EINTR`), unless `nohang`.
+/// A `wait` for the children `sel` picks: `own` checks its own children
+/// as the host reports them (without blocking; `ECHILD` when it has none),
+/// then `adopted` reports one it adopted that ended, stopped or continued,
+/// or an own child's stop or continue of fwe's, as `want` says (taken,
+/// unless `peek`); until one is found, or there are none, or a signal
+/// arrives (`EINTR`), unless `nohang`.
 fn reaper_wait(
     sel: reaper::Select,
     nohang: bool,
@@ -676,6 +684,11 @@ fn reaper_wait(
             let live = reaper::has_live_adopted(sel);
             if want.exited
                 && let Some(e) = reaper::take_adopted(sel, peek)
+            {
+                return Some(adopted(&e));
+            }
+            if (want.stopped || want.continued)
+                && let Some(e) = reaper::take_own_change(sel, peek, want.stopped, want.continued)
             {
                 return Some(adopted(&e));
             }
@@ -743,6 +756,20 @@ fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
             // A thread is named by its tid, a process as the guest knows it.
             return if thread { p as i64 } else { fwe_kernel::pidns::guest_ret(p as i64) };
         }
+        // An own child's stop or continue of fwe's (one it does not trace).
+        let (stopped, continued) =
+            (host_options & libc::WUNTRACED != 0, host_options & libc::WCONTINUED != 0);
+        if (stopped || continued)
+            && let Some(e) = reaper::take_own_change(select_of(pid), false, stopped, continued)
+        {
+            if wstatus != 0 && fwe_kernel::uaccess::write(wstatus, e.status).is_err() {
+                return err(errno::EFAULT);
+            }
+            if rusage != 0 && fwe_kernel::uaccess::write(rusage, [0u64; 18]).is_err() {
+                return err(errno::EFAULT);
+            }
+            return i64::from(reaper::guest_pid(&e));
+        }
         let r = wait4_host(pid, host_options | libc::WNOHANG, wstatus, rusage);
         // A traced process that is not a child is no host child to wait for.
         let traced_other =
@@ -790,6 +817,31 @@ fn waitid_tracer(
                     if thread { p } else { fwe_kernel::pidns::guest_ret(i64::from(p)) as i32 };
                 words[5] = fwe_kernel::procreg::ids(p)[0] as i32;
                 words[6] = (status >> 8) & 0xffff;
+                if fwe_kernel::uaccess::write(infop, words).is_err() {
+                    return err(errno::EFAULT);
+                }
+            }
+            return 0;
+        }
+        // An own child's stop or continue of fwe's (one it does not trace).
+        let (stopped, continued) =
+            (options & fwe_abi::wait::WSTOPPED != 0, options & fwe_abi::wait::WCONTINUED != 0);
+        let sel = match idtype {
+            libc::P_PID => reaper::Select::Pid(id as i32),
+            libc::P_PGID => reaper::Select::Pgid(id as i32),
+            _ => reaper::Select::Any,
+        };
+        if (stopped || continued)
+            && let Some(e) = reaper::take_own_change(sel, peek, stopped, continued)
+        {
+            if infop != 0 {
+                let (code, status) = reaper::child_code(e.status);
+                let mut words = [0i32; 32];
+                words[0] = fwe_abi::signal::SIGCHLD as i32;
+                words[2] = code;
+                words[4] = reaper::guest_pid(&e);
+                words[5] = fwe_kernel::procreg::ids(e.pid)[0] as i32;
+                words[6] = status;
                 if fwe_kernel::uaccess::write(infop, words).is_err() {
                     return err(errno::EFAULT);
                 }
@@ -936,7 +988,8 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         return if r < 0 { r } else { zero_rusage() };
     }
     start_watcher_if_wanted();
-    if !reaper::active() {
+    // Ends alone are the host's to report (see `do_wait4`).
+    if !reaper::active() && options & (w::WSTOPPED | w::WCONTINUED) == 0 {
         let r = waitid_host(idtype, id, host_options, infop, options);
         if nonblock && r == 0 {
             return err(errno::EAGAIN);

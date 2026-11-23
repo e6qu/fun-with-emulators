@@ -4,8 +4,8 @@
 //! `/dev/shm`) and be woken from there: process-shared locks, conditions
 //! and semaphores, and test harnesses that count whom they woke.
 //!
-//! Every fwe process maps one table ([`table`]), a file in fwe's private
-//! directory. A waiter takes a slot in it, writes its futex's key there
+//! Every fwe process maps one table ([`table`]), in memory they all map
+//! ([`crate::procstore::area`]). A waiter takes a slot in it, writes its futex's key there
 //! (what memory the word is in, as [`crate::mm::region::sharing`] tells
 //! it: the memory object and offset for shared memory, as Linux keys the
 //! page; the process and address for private memory), and sleeps on the
@@ -87,6 +87,9 @@ fn in_use(t: &[Slot]) -> &[Slot] {
 /// at once, across every fwe process of the user, is beyond any program
 /// fwe runs).
 const SLOTS: usize = 16384;
+/// The table's size: the header (in a slot's room), then the slots
+/// ([`crate::procstore::Area::Futexes`]).
+pub(crate) const BYTES: usize = (SLOTS + 1) * size_of::<Slot>();
 
 fn st(state: u32) -> u32 {
     state & 0xff
@@ -117,30 +120,7 @@ fn header() -> Option<&'static Header> {
 }
 
 fn map_table() -> Option<usize> {
-    let mut path = crate::fs::shm::user_dir().ok()?;
-    path.extend_from_slice(format!("/v{}-futexes", crate::shared::FORMAT).as_bytes());
-    let path = std::ffi::CString::new(path).ok()?;
-    let size = (SLOTS + 1) * size_of::<Slot>();
-    // SAFETY: plain host calls; the file is fwe's own, and the mapping is
-    // kept for the process's life.
-    unsafe {
-        let fd = libc::open(path.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600);
-        if fd < 0 {
-            return None;
-        }
-        // Zeroes (every slot free) the first time; the same size after.
-        let grown = libc::ftruncate(fd, size as libc::off_t) == 0;
-        let p = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
-        libc::close(fd);
-        (grown && p != libc::MAP_FAILED).then_some(p as usize)
-    }
+    Some(crate::procstore::area(crate::procstore::Area::Futexes).as_ptr() as usize)
 }
 
 /// Where guest address `uaddr` is in the host's address space (a backend
@@ -357,6 +337,16 @@ pub fn leave(i: usize) -> bool {
 /// Wake up to `count` waiters of the futex at guest `uaddr` waiting for
 /// any of `bits`, oldest first: the number woken.
 pub fn wake(uaddr: u64, count: u32, bits: u32) -> i64 {
+    // No slot waiting: nothing to wake, and no key to work out (two looks
+    // at the host's regions). A waiter takes its slot before it looks at
+    // the word again, so one that comes after this look sees the word the
+    // waker changed.
+    if let Some(t) = table()
+        && !in_use(t).iter().any(|s| st(s.state.load(SeqCst)) == WAITING)
+        && !crate::futex::any_private_waiting()
+    {
+        return 0;
+    }
     let (Some(t), Some(key)) = (table(), key_of(host_of(uaddr))) else {
         return crate::futex::wake_private_bits(uaddr, count, bits);
     };

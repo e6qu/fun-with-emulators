@@ -27,6 +27,7 @@
 //! and takes notes whatever its thread was doing.
 
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{self, SeqCst};
 
 /// The directory of the process records, made once as the process starts
@@ -264,6 +265,118 @@ pub fn queue_thread_from(
     put_from(target, tid, sig, code, value, (pid as u32, uid))
 }
 
+/// The mailbox's count of the `SIGCONT`s sent to its process
+/// ([`continuing`]), after the queue: also the word a process in a stop of
+/// fwe's sleeps on ([`park_word`]).
+const CONTINUED_AT: usize = QUEUE_AT + QUEUE_LEN * ENTRY;
+/// The process's job-control stop, as its parent's `wait` sees it: the
+/// number of its stops so far times 256, plus the signal of the one it is
+/// in (none while it runs) ([`job_stopped`], [`job_continued`]).
+const STOP_AT: usize = CONTINUED_AT + 1;
+/// The latest of those stops a `wait` reported.
+const STOP_SEEN_AT: usize = CONTINUED_AT + 2;
+/// How many times it came back from a stop; and the latest of those a
+/// `wait` reported.
+const CONT_AT: usize = CONTINUED_AT + 3;
+const CONT_SEEN_AT: usize = CONTINUED_AT + 4;
+const _: () = assert!(CONT_SEEN_AT < crate::procstore::MAILBOX_WORDS - 1);
+
+/// How many times host process `pid` has been continued ([`continuing`]): 0
+/// while it has no mailbox. Async-signal-safe once the store is mapped.
+pub fn continued(pid: i32) -> u64 {
+    crate::procstore::mailbox(pid, false)
+        .and_then(|mb| mb.get(CONTINUED_AT))
+        .map_or(0, |w| w.load(SeqCst))
+}
+
+/// Host process `pid` is sent `SIGCONT`: a stop signal sent to it before,
+/// still queued or pending, is not taken, as Linux discards a pending stop
+/// signal as `SIGCONT` is sent (`prepare_signal`), and a stop of fwe's it
+/// is in ends ([`park_word`]). Made a mailbox if `make` (a sender's), else
+/// async-signal-safe (the process's own handler, with nothing queued for
+/// it without one).
+pub fn continuing(pid: i32, make: bool) {
+    if let Some(w) = crate::procstore::mailbox(pid, make).and_then(|mb| mb.get(CONTINUED_AT)) {
+        w.fetch_add(1, SeqCst);
+        crate::shared::wake_word(w);
+    }
+}
+
+/// The word this process sleeps on in a stop of fwe's, which every
+/// continue changes and wakes ([`continuing`]); its mailbox made if it has
+/// none.
+pub fn park_word() -> &'static AtomicU64 {
+    let mb = crate::procstore::mailbox(crate::host::pid_now(), true);
+    mb.and_then(|mb| mb.get(CONTINUED_AT)).expect("a mailbox has its words")
+}
+
+/// This process is new (a fork child, or a program fwe starts, not one an
+/// `execve` ran): what an earlier process of its number left of its stops
+/// in a mailbox it may share is not its. Async-signal-safe.
+pub fn job_reset() {
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    for i in [STOP_AT, STOP_SEEN_AT, CONT_AT, CONT_SEEN_AT] {
+        if let Some(w) = mb.get(i) {
+            w.store(0, SeqCst);
+        }
+    }
+}
+
+/// This process enters a job-control stop of fwe's, of signal `sig`.
+pub fn job_stopped(sig: u64) {
+    if let Some(w) =
+        crate::procstore::mailbox(crate::host::pid_now(), true).and_then(|mb| mb.get(STOP_AT))
+    {
+        let seq = w.load(SeqCst) >> 8;
+        w.store((seq + 1) << 8 | (sig & 0xff), SeqCst);
+    }
+}
+
+/// This process comes back from its job-control stop.
+pub fn job_continued() {
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    if let (Some(stop), Some(cont)) = (mb.get(STOP_AT), mb.get(CONT_AT)) {
+        stop.fetch_and(!0xff, SeqCst);
+        cont.fetch_add(1, SeqCst);
+    }
+}
+
+/// The signal of the job-control stop of fwe's host process `pid` is in,
+/// if any. Async-signal-safe.
+pub fn job_stop_of(pid: i32) -> Option<u64> {
+    let w = crate::procstore::mailbox(pid, false)?.get(STOP_AT)?.load(SeqCst);
+    (w & 0xff != 0).then_some(w & 0xff)
+}
+
+/// What a `wait` of host process `pid`'s parent reports of its
+/// job-control stops: the stop it is in, if `stopped` and none reported it
+/// yet, as `(CLD_STOPPED, signal)`; else, if `continued`, its coming back
+/// from one since none reported, as `(CLD_CONTINUED, SIGCONT)`. Taken
+/// (reported once), unless `peek`.
+pub fn take_job_change(pid: i32, stopped: bool, continued: bool, peek: bool) -> Option<(i32, i32)> {
+    let mb = crate::procstore::mailbox(pid, false)?;
+    let (stop, stop_seen) = (mb.get(STOP_AT)?, mb.get(STOP_SEEN_AT)?);
+    let (cont, cont_seen) = (mb.get(CONT_AT)?, mb.get(CONT_SEEN_AT)?);
+    // Claimed by one `wait` alone, however many look at once.
+    let claim = |word: &AtomicU64, from: u64, to: u64| {
+        peek || word.compare_exchange(from, to, SeqCst, SeqCst).is_ok()
+    };
+    let now = stop.load(SeqCst);
+    if stopped && now & 0xff != 0 {
+        let seen = stop_seen.load(SeqCst);
+        if now >> 8 > seen && claim(stop_seen, seen, now >> 8) {
+            return Some((fwe_abi::wait::CLD_STOPPED, (now & 0xff) as i32));
+        }
+    }
+    if continued && now & 0xff == 0 {
+        let (n, seen) = (cont.load(SeqCst), cont_seen.load(SeqCst));
+        if n > seen && claim(cont_seen, seen, n) {
+            return Some((fwe_abi::wait::CLD_CONTINUED, fwe_abi::signal::SIGCONT as i32));
+        }
+    }
+    None
+}
+
 /// What a queue entry holds in place of a signal for a request of a
 /// descriptor ([`request_fd`]): above every signal number.
 const FD_REQUEST: u64 = 0x1_0000;
@@ -299,30 +412,37 @@ pub fn limits_set(target: i32) -> Result<(), i32> {
     put(target, 0, LIMITS_NOTE, 0, 0)
 }
 
-/// Ask process `target` to copy between its memory and the request file
+/// Ask process `target` to copy between its memory and the request object
 /// of reply socket `token` ([`answer_mem`]).
 pub fn request_mem(target: i32, token: u64) -> Result<(), i32> {
     put(target, 0, MEM_REQUEST, 0, token)
 }
 
-/// A memory request's file: its reply socket's path with `m` after it.
-fn mem_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH + 1]) -> Option<usize> {
-    let mut sock = [0u8; SUN_PATH];
-    let len = reply_path(pid, token, &mut sock)?;
-    buf[..len].copy_from_slice(&sock[..len]);
-    buf[len] = b'm';
-    buf[len + 1] = 0;
-    Some(len + 1)
+/// The length of a memory request object's name, its NUL included.
+pub const MEM_NAME: usize = 21;
+
+/// The name of process `pid`'s memory request `token`: a host shared
+/// memory object (memory, not a file), named `/fwe` and a hash of the
+/// user, the process and the token, within the host's 31 bytes;
+/// NUL-terminated. Async-signal-safe.
+pub fn mem_name(pid: i32, token: u64) -> [u8; MEM_NAME] {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut key = [0u8; 4 + 4 + 8 + 3];
+    key[..3].copy_from_slice(b"mem");
+    key[3..7].copy_from_slice(&uid.to_ne_bytes());
+    key[7..11].copy_from_slice(&pid.to_ne_bytes());
+    key[11..19].copy_from_slice(&token.to_ne_bytes());
+    let h = crate::shared::hash(&key);
+    let mut name = [0u8; MEM_NAME];
+    name[..4].copy_from_slice(b"/fwe");
+    for i in 0..16 {
+        name[4 + i] = b"0123456789abcdef"[(h >> (60 - 4 * i) & 0xf) as usize];
+    }
+    name
 }
 
-/// The path of process `pid`'s memory request `token`.
-pub fn mem_request_path(pid: i32, token: u64) -> Option<Vec<u8>> {
-    let mut buf = [0u8; SUN_PATH + 1];
-    let len = mem_path(pid, token, &mut buf)?;
-    Some(buf[..len].to_vec())
-}
-
-/// A memory request's file: a header (the operation, 0 to read this
+/// A memory request's object: a header (the operation, 0 to read this
 /// process's memory and 1 to write it; the count of ranges; the result,
 /// written by the answer), the ranges (address and length), then the
 /// data. The answer's result is the bytes copied, `-EFAULT` if none could
@@ -344,84 +464,91 @@ unsafe extern "C" {
 /// task, which report an address with nothing behind it rather than fault,
 /// and tell the caller on its reply socket. Async-signal-safe.
 fn answer_mem(caller: i32, token: u64) {
-    let mut path = [0u8; SUN_PATH + 1];
-    let Some(_) = mem_path(caller, token, &mut path) else { return };
+    let name = mem_name(caller, token);
     let saved = crate::host::last_errno();
-    // SAFETY: a NUL-terminated path; buffers on the stack of their stated
-    // lengths; the host copies check the addresses they are given.
+    // SAFETY: a NUL-terminated name; the object mapped whole for the
+    // duration, every access within its size; the host copies check the
+    // addresses they are given.
     unsafe {
-        let fd = libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC);
+        let fd = libc::shm_open(name.as_ptr().cast(), libc::O_RDWR, 0 as libc::c_uint);
         if fd >= 0 {
-            let mut h = [0u8; MEM_HEADER];
-            let ok = libc::pread(fd, h.as_mut_ptr().cast(), MEM_HEADER, 0) == MEM_HEADER as isize;
-            let write = u32::from_ne_bytes(h[..4].try_into().unwrap()) == 1;
-            let count = u32::from_ne_bytes(h[4..8].try_into().unwrap()) as usize;
-            let data_at = MEM_HEADER + count * 16;
-            let mut done: i64 = 0;
-            let mut failed = !ok;
-            'ranges: for i in 0..count.min(1024) {
-                if failed {
-                    break;
-                }
-                let mut r = [0u8; 16];
-                if libc::pread(fd, r.as_mut_ptr().cast(), 16, (MEM_HEADER + i * 16) as libc::off_t)
-                    != 16
-                {
-                    failed = true;
-                    break;
-                }
-                let base = u64::from_ne_bytes(r[..8].try_into().unwrap());
-                let len = u64::from_ne_bytes(r[8..].try_into().unwrap());
-                let mut off = 0u64;
-                while off < len {
-                    let Some((host, room)) = crate::uaccess::try_run(base + off) else {
-                        done = MEM_RETRY;
-                        break 'ranges;
-                    };
-                    let n = (len - off).min(room).min(4096);
-                    let mut buf = [0u8; 4096];
-                    let at = (data_at as u64 + done as u64) as libc::off_t;
-                    #[cfg(target_os = "macos")]
-                    let copied = if write {
-                        libc::pread(fd, buf.as_mut_ptr().cast(), n as usize, at) == n as isize
-                            && mach_vm_write(mach_task_self_, host, buf.as_ptr() as usize, n as u32)
-                                == 0
-                    } else {
-                        let mut out = 0u64;
-                        mach_vm_read_overwrite(
-                            mach_task_self_,
-                            host,
-                            n,
-                            buf.as_mut_ptr() as u64,
-                            &mut out,
-                        ) == 0
-                            && out == n
-                            && libc::pwrite(fd, buf.as_ptr().cast(), n as usize, at) == n as isize
-                    };
-                    #[cfg(not(target_os = "macos"))]
-                    let copied = {
-                        let _ = (host, at, write, &mut buf);
-                        false
-                    };
-                    if !copied {
-                        failed = true;
-                        break 'ranges;
-                    }
-                    done += n as i64;
-                    off += n;
-                }
-            }
-            let result = if done == MEM_RETRY || done > 0 || !failed {
-                done
+            let mut st: libc::stat = std::mem::zeroed();
+            let size = if libc::fstat(fd, &mut st) == 0 { st.st_size as usize } else { 0 };
+            let map = if size >= MEM_HEADER {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
             } else {
-                -i64::from(fwe_abi::errno::EFAULT)
+                libc::MAP_FAILED
             };
-            libc::pwrite(fd, result.to_ne_bytes().as_ptr().cast(), 8, 8);
             libc::close(fd);
+            if map != libc::MAP_FAILED {
+                let m = std::slice::from_raw_parts_mut(map.cast::<u8>(), size);
+                let word =
+                    |m: &[u8], at: usize| u64::from_ne_bytes(m[at..at + 8].try_into().unwrap());
+                let write = u32::from_ne_bytes(m[..4].try_into().unwrap()) == 1;
+                let count = u32::from_ne_bytes(m[4..8].try_into().unwrap()) as usize;
+                let data_at = MEM_HEADER + count.min(1024) * 16;
+                let mut done: i64 = 0;
+                let mut failed = data_at > size;
+                'ranges: for i in 0..count.min(1024) {
+                    if failed {
+                        break;
+                    }
+                    let base = word(m, MEM_HEADER + i * 16);
+                    let len = word(m, MEM_HEADER + i * 16 + 8);
+                    let mut off = 0u64;
+                    while off < len {
+                        let Some((host, room)) = crate::uaccess::try_run(base + off) else {
+                            done = MEM_RETRY;
+                            break 'ranges;
+                        };
+                        let n = (len - off).min(room).min(4096);
+                        let at = data_at + done as usize;
+                        if at + n as usize > size {
+                            failed = true;
+                            break 'ranges;
+                        }
+                        let buf = m[at..].as_mut_ptr();
+                        #[cfg(target_os = "macos")]
+                        let copied = if write {
+                            mach_vm_write(mach_task_self_, host, buf as usize, n as u32) == 0
+                        } else {
+                            let mut out = 0u64;
+                            mach_vm_read_overwrite(mach_task_self_, host, n, buf as u64, &mut out)
+                                == 0
+                                && out == n
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let copied = {
+                            let _ = (host, write, buf);
+                            false
+                        };
+                        if !copied {
+                            failed = true;
+                            break 'ranges;
+                        }
+                        done += n as i64;
+                        off += n;
+                    }
+                }
+                let result = if done == MEM_RETRY || done > 0 || !failed {
+                    done
+                } else {
+                    -i64::from(fwe_abi::errno::EFAULT)
+                };
+                m[8..16].copy_from_slice(&result.to_ne_bytes());
+                libc::munmap(map, size);
+            }
         }
     }
     crate::host::set_errno(saved);
-    // The answer itself is in the file: the caller is only woken.
+    // The answer itself is in the object: the caller is only woken.
     answer_fd(caller, -1, token);
 }
 
@@ -441,12 +568,20 @@ fn put_from(
 ) -> Result<(), i32> {
     let mb = crate::procstore::mailbox(target, true).ok_or(fwe_abi::errno::ESRCH)?;
     let q = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY).ok_or(fwe_abi::errno::ESRCH)?;
+    // A stop signal is dated by the target's continuations in place of a
+    // value (it carries none): one sent before the next is not taken.
+    let stop = crate::signal::discarded_by_continue(sig, code);
+    let value = if stop { mb.get(CONTINUED_AT).map_or(0, |w| w.load(SeqCst)) } else { value };
     let sig_of = |e: &[crate::procstore::Word]| e[0].load(SeqCst) & 0xffff_ffff;
     // A standard signal already queued for the process is not queued
-    // again, as Linux keeps one.
+    // again, as Linux keeps one (a stop signal that is to be taken).
     if sig < fwe_abi::signal::SIGRTMIN
         && tid == 0
-        && q.chunks(ENTRY).any(|e| sig_of(e) == sig && (e[2].load(SeqCst) >> 32) as i32 == 0)
+        && q.chunks(ENTRY).any(|e| {
+            sig_of(e) == sig
+                && (e[2].load(SeqCst) >> 32) as i32 == 0
+                && (!stop || e[3].load(SeqCst) >= value)
+        })
     {
         return Ok(());
     }
@@ -527,6 +662,25 @@ pub fn drain(mut post: impl FnMut(u64, Note)) {
             answer_mem(pid, value);
         } else if sig == FD_REQUEST {
             answer_fd(pid, code_tid as u32 as i32, value);
+        } else if crate::signal::discarded_by_continue(sig, code_tid as u32 as i32)
+            && value < continued(crate::host::pid_now())
+        {
+            // A stop signal sent before the process was last continued:
+            // gone, as on Linux.
+        } else if crate::signal::discarded_by_continue(sig, code_tid as u32 as i32) {
+            // Pending as of its sending ([`put_from`]); the value only
+            // dated it, a stop signal carries none.
+            crate::signal::stop_sent_at(value);
+            post(
+                sig,
+                Note {
+                    pid,
+                    uid: (ids >> 32) as u32,
+                    code: code_tid as u32 as i32,
+                    value: 0,
+                    tid: (code_tid >> 32) as i32,
+                },
+            );
         } else {
             post(
                 sig,

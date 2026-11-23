@@ -353,7 +353,7 @@ jobs:
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
       # The native side's programs: the clang release Alpine's root has, and
       # the workloads' programs (tools/bench/run.py, BREW), and an X server.
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit xorg-server
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server
       - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --linux linux.json --out macos.json
       - if: always()
         uses: actions/upload-artifact@v4
@@ -383,9 +383,16 @@ jobs:
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
   # baseline must still pass, and the pass rate is reported.
   ltp:
-    name: LTP system calls (macos-26)
+    name: LTP system calls (macos-26, part ${{ matrix.shard }} of 8)
     runs-on: macos-26
     timeout-minutes: 60
+    # In parts, each on a runner of its own, the host's memory watched
+    # (tools/hostmem.py): a part that stops names its tests and what held
+    # the memory.
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
@@ -421,12 +428,15 @@ jobs:
         run: |
           # Four at once: most of a test's time is spent waiting.
           python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
-            --jobs 4 --results ltp-results.txt --show
+            --jobs 4 --results ltp-results.txt --show --shard ${{ matrix.shard }}/8 \
+            --memory-log ltp-memory.log
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ltp-results
-          path: ltp-results.txt
+          name: ltp-results-${{ matrix.shard }}
+          path: |
+            ltp-results.txt
+            ltp-memory.log
           if-no-files-found: ignore
 
   # The hypervisor backend, for real. GitHub's hosted macOS runners are VMs

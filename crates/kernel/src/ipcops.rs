@@ -70,7 +70,7 @@ impl<P: Platform> Kernel<P> {
         let perm = self.new_perm(flags);
         let creds = self.creds.clone();
         let made = r.update_maybe(|t| {
-            let reaped = t.reap(&r);
+            let reaped = t.reap();
             if key != ipc::IPC_PRIVATE
                 && let Some(id) = t.by_key(kind, key)
             {
@@ -92,21 +92,6 @@ impl<P: Platform> Kernel<P> {
             Ok(((id, true), true))
         });
         match made {
-            Ok((id, true)) if kind == Kind::Shm => {
-                // The segment's memory: a file of its size beside the record.
-                let size = match r.get().objs.get(&(Kind::Shm as u8, id)).map(|o| o.body.clone()) {
-                    Some(Body::Shm(s)) => s.size,
-                    _ => 0,
-                };
-                if let Err(e) = make_segment(&r, id, size) {
-                    let _ = r.update(|t| {
-                        t.objs.remove(&(Kind::Shm as u8, id));
-                        Ok(())
-                    });
-                    return err(e);
-                }
-                id as i64
-            }
             Ok((id, _)) => id as i64,
             Err(e) => err(e),
         }
@@ -143,7 +128,8 @@ impl<P: Platform> Kernel<P> {
                 if flags & ipc::SHM_HUGETLB != 0 {
                     huge_segment(flags, &creds)?;
                 }
-                Ok(Body::Shm(ipc::Shm { size, cpid: me, ..ipc::Shm::default() }))
+                let nonce = crate::shared::unique();
+                Ok(Body::Shm(ipc::Shm { size, cpid: me, nonce, ..ipc::Shm::default() }))
             },
         )
     }
@@ -245,56 +231,33 @@ impl<P: Platform> Kernel<P> {
         } else if flags & ipc::SHM_REMAP != 0 {
             return err(errno::EINVAL);
         }
-        let Ok(path) = std::ffi::CString::new(ipc::segment_path(&r, id)) else {
-            return err(errno::EINVAL);
-        };
-        let access = if flags & ipc::SHM_RDONLY != 0 { libc::O_RDONLY } else { libc::O_RDWR };
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe { libc::open(path.as_ptr(), access | libc::O_CLOEXEC) };
-        if fd < 0 {
-            // Removed meanwhile.
-            return err(errno::EIDRM);
-        }
-        let fd = match crate::fdtable::reserve(fd) {
-            Ok(fd) => fd,
+        let read_only = flags & ipc::SHM_RDONLY != 0;
+        let me = ipc::me();
+        let (memory, before) = match ipc::attach(&r, id, me, read_only) {
+            Ok(m) => m,
             Err(e) => return err(e),
         };
-        let mapped = self.sys_mmap(at, size, prot, map, fd as u64, 0);
-        // SAFETY: fwe's own descriptor; the mapping holds the file.
-        unsafe { libc::close(fd) };
-        if mapped < 0 {
-            return mapped;
-        }
         // Listed as Linux lists a segment: a deleted file of the shared
         // memory filesystem's, named by its key, whose inode is its id.
-        crate::maps::record().rename(
-            mapped as u64,
-            size,
-            crate::maps::Object {
-                name: crate::maps::Name::Path(
-                    format!("/SYSV{key:08x} (deleted)").into_bytes().into(),
-                ),
-                dev: crate::devnodes::makedev(0, 1),
-                ino: id as u64,
-                offset: 0,
-                held: None,
-            },
-        );
-        crate::maps::publish();
-        let me = ipc::me();
+        let object = crate::maps::Object {
+            name: crate::maps::Name::Path(format!("/SYSV{key:08x} (deleted)").into_bytes().into()),
+            dev: ipc::SEGMENT_DEV,
+            ino: id as u64,
+            offset: 0,
+            held: None,
+        };
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&memory);
+        let mapped = self.map_shared_memory(at, size, prot, map, read_only, fd, object);
+        drop(memory);
+        if mapped < 0 {
+            ipc::detach_failed(&r, id, me, before);
+            return mapped;
+        }
         ipc::note_attached(mapped as u64, id, size);
         // A locked segment's pages are kept in memory.
         if locked {
             crate::mm::wire_segment(id, true);
         }
-        let _ = r.update(|t| {
-            ipc::attach_count(t, id, me, 1);
-            if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {
-                s.atime = now();
-                s.lpid = me.0;
-            }
-            Ok(())
-        });
         mapped
     }
 
@@ -318,7 +281,7 @@ impl<P: Platform> Kernel<P> {
                 s.dtime = now();
                 s.lpid = me.0;
             }
-            t.reap(&r);
+            t.reap();
             Ok(())
         });
         0
@@ -400,9 +363,10 @@ impl<P: Platform> Kernel<P> {
                             o.ctime = now();
                         }
                         _ => {
-                            t.objs.remove(&(kind as u8, id));
-                            if kind == Kind::Shm {
-                                remove_segment(&r, id);
+                            if let Some(Obj { body: Body::Shm(s), .. }) =
+                                t.objs.remove(&(kind as u8, id))
+                            {
+                                ipc::remove_segment(&s);
                             }
                         }
                     }
@@ -716,7 +680,7 @@ fn ipc_wait<T>(
             }
         }
         match r.update_maybe(|t| {
-            let reaped = t.reap(r);
+            let reaped = t.reap();
             let (out, changed) = step(t, waited)?;
             Ok((out, changed || reaped))
         }) {
@@ -1006,7 +970,7 @@ pub fn blocking(ctx: Result<IpcContext, i32>, nr: u64, a: [u64; 6]) -> i64 {
     }
 }
 
-fn now() -> i64 {
+pub(crate) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64)
@@ -1086,33 +1050,6 @@ fn shm_lock(
         s.locked = Some(user);
     }
     Ok(())
-}
-
-/// The file of a new segment `id` of `size` bytes (zeroes).
-fn make_segment(r: &Record<Ipc>, id: i32, size: u64) -> Result<(), i32> {
-    let path = std::ffi::CString::new(ipc::segment_path(r, id)).map_err(|_| errno::EINVAL)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory; the
-    // descriptor is closed again.
-    unsafe {
-        let fd = libc::open(
-            path.as_ptr(),
-            libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC,
-            0o600,
-        );
-        if fd < 0 {
-            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-        }
-        let ok = libc::ftruncate(fd, size as libc::off_t) == 0;
-        libc::close(fd);
-        if ok { Ok(()) } else { Err(errno::ENOMEM) }
-    }
-}
-
-fn remove_segment(r: &Record<Ipc>, id: i32) {
-    if let Ok(p) = std::ffi::CString::new(ipc::segment_path(r, id)) {
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        unsafe { libc::unlink(p.as_ptr()) };
-    }
 }
 
 #[cfg(test)]

@@ -223,7 +223,8 @@ with `fwe hv stand-in: VIOLATION:` on which the tests fail:
 - a vector entry that is not `hvc #2`;
 - a change to the stage 2 the VM ran with (anything but shared segments);
 - host memory behind stage 2 replaced while mapped, checked now and then;
-- anonymous host memory behind stage 2 shared with another process;
+- private memory behind stage 2 (any outside the segments' window of
+  guest-physical space) that is anonymous and shared with another process;
 - through a watcher process started with the VM, a process that ends or
   execs with its VM alive.
 

@@ -140,21 +140,20 @@ fn of_kind(dir: &[u8], name: &str) -> bool {
     base.starts_with(prefix.as_bytes()) && !base[prefix.len()..].starts_with(b"init-")
 }
 
-/// Record that the namespace whose record is at `dir` belongs to the user
-/// namespace `user` (`None`: the initial one), in a file beside its data:
-/// what `NS_GET_USERNS` gives and the namespace limits count it against.
+/// Record that the namespace whose record is `dir` belongs to the user
+/// namespace `user` (`None`: the initial one), in the note beside its
+/// data ([`crate::shared::set_note`]): what `NS_GET_USERNS` gives and the
+/// namespace limits count it against.
 pub fn set_owner(dir: &[u8], user: Option<&Record<crate::userns::UserNs>>) {
-    use std::os::unix::ffi::OsStrExt;
     let text =
         user.map_or_else(Vec::new, |u| [u.dir(), format!("\n{}", u.id()).as_bytes()].concat());
-    let _ = std::fs::write(std::ffi::OsStr::from_bytes(&[dir, b"/owner"].concat()), text);
+    let _ = crate::shared::set_note(dir, &text);
 }
 
-/// The user namespace that owns the namespace whose record is at `dir`:
-/// its record's directory and identity (`None`: the initial one).
+/// The user namespace that owns the namespace whose record is `dir`: its
+/// record's name and identity (`None`: the initial one).
 pub fn owner_of(dir: &[u8]) -> Option<(Vec<u8>, u64)> {
-    use std::os::unix::ffi::OsStrExt;
-    let text = std::fs::read(std::ffi::OsStr::from_bytes(&[dir, b"/owner"].concat())).ok()?;
+    let text = crate::shared::note(dir)?;
     let nl = text.iter().rposition(|&b| b == b'\n')?;
     let id = std::str::from_utf8(&text[nl + 1..]).ok()?.parse().ok()?;
     Some((text[..nl].to_vec(), id))

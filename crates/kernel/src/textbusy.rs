@@ -28,6 +28,8 @@ const HEAD: usize = 8;
 const RUNS_AT: usize = HEAD;
 const WRITES_AT: usize = RUNS_AT + RUN_SLOTS * SLOT;
 const WORDS: usize = WRITES_AT + WRITE_SLOTS * SLOT;
+/// The table's size ([`crate::procstore::Area::TextBusy`]).
+pub(crate) const BYTES: usize = WORDS * 8;
 
 static TABLE: std::sync::OnceLock<Option<&'static [AtomicU64]>> = std::sync::OnceLock::new();
 
@@ -36,45 +38,9 @@ static MY_SLOT: AtomicUsize = AtomicUsize::new(0);
 static MY_DEV: AtomicU64 = AtomicU64::new(0);
 static MY_INO: AtomicU64 = AtomicU64::new(0);
 
-/// The shared table, mapped on first use.
+/// The shared table, in memory every fwe process maps.
 fn table() -> Option<&'static [AtomicU64]> {
-    *TABLE.get_or_init(|| {
-        let mut path = crate::fs::shm::user_dir().ok()?;
-        path.extend_from_slice(b"/text-busy");
-        let c = std::ffi::CString::new(path).ok()?;
-        let len = WORDS * 8;
-        // SAFETY: a NUL-terminated path in fwe's private directory.
-        let fd = unsafe {
-            libc::open(c.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_CLOEXEC, 0o600)
-        };
-        if fd < 0 {
-            return None;
-        }
-        // SAFETY: plain host calls on the descriptor just opened; a file
-        // shorter than the table is grown with zeros.
-        let map = unsafe {
-            let mut st: libc::stat = std::mem::zeroed();
-            if libc::fstat(fd, &mut st) == 0 && (st.st_size as usize) < len {
-                libc::ftruncate(fd, len as libc::off_t);
-            }
-            let m = libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd,
-                0,
-            );
-            libc::close(fd);
-            m
-        };
-        if map == libc::MAP_FAILED {
-            return None;
-        }
-        // SAFETY: the mapping is `len` bytes, page-aligned, shared and never
-        // unmapped; every access is atomic.
-        Some(unsafe { std::slice::from_raw_parts(map as *const AtomicU64, WORDS) })
-    })
+    *TABLE.get_or_init(|| Some(crate::procstore::area(crate::procstore::Area::TextBusy)))
 }
 
 fn me() -> u64 {

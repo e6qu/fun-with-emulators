@@ -11,38 +11,12 @@
 use crate::mounts::{FsType, Source, ms};
 use crate::{Kernel, Platform, guest, uaccess};
 use fwe_abi::{err, errno};
-use std::os::fd::AsRawFd;
-use std::os::unix::ffi::OsStrExt;
 
 /// `umount2` flags.
 const MNT_FORCE: u64 = 1;
 const MNT_DETACH: u64 = 2;
 const MNT_EXPIRE: u64 = 4;
 const UMOUNT_NOFOLLOW: u64 = 8;
-
-/// A new directory of fwe's to back a tmpfs: in its private directory, so
-/// only the user reaches it from the host.
-fn tmpfs_dir(mode: u32) -> Result<Vec<u8>, i32> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mut dir = crate::fs::shm::user_dir()?;
-    let pid = crate::host::pid();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_nanos());
-    dir.extend_from_slice(
-        format!("/tmpfs-{pid}-{now}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes(),
-    );
-    let c = std::ffi::CString::new(dir.clone()).map_err(|_| errno::EINVAL)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    if unsafe { libc::mkdir(c.as_ptr(), 0o700) } != 0 {
-        return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-    }
-    // The mode asked for, whatever the umask.
-    // SAFETY: as above.
-    unsafe { libc::chmod(c.as_ptr(), mode as libc::mode_t) };
-    Ok(dir)
-}
 
 /// The access-time flag a new mount (or a remount) with `flags` gets if
 /// it names none: `relatime`, Linux's default.
@@ -156,6 +130,9 @@ impl<P: Platform> Kernel<P> {
                     if crate::synthdir::path_of(fd).is_some() {
                         return Ok((ns, true));
                     }
+                    if let Some(st) = crate::filestore::io::stat(fd) {
+                        return Ok((ns, st?.st_mode & libc::S_IFMT == libc::S_IFDIR));
+                    }
                     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
                     let mut st: libc::stat = unsafe { std::mem::zeroed() };
                     // SAFETY: a valid out-parameter.
@@ -173,22 +150,8 @@ impl<P: Platform> Kernel<P> {
             };
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
-        let name = r.name_c()?;
         // It must exist.
-        // SAFETY: zeroed bytes are a valid `stat`; `fstatat` fills it.
-        let mut st: libc::stat = unsafe { std::mem::zeroed() };
-        // SAFETY: a live directory descriptor and NUL-terminated name.
-        if unsafe {
-            libc::fstatat(
-                std::os::fd::AsRawFd::as_raw_fd(&r.dir),
-                name.as_ptr(),
-                &mut st,
-                libc::AT_SYMLINK_NOFOLLOW,
-            )
-        } != 0
-        {
-            return Err(crate::host::errno_to_linux(crate::host::last_errno()));
-        }
+        let st = r.lstat().ok_or(errno::ENOENT)?;
         let ns = r.ns_path.ok_or(errno::EINVAL)?;
         Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
     }
@@ -208,30 +171,23 @@ impl<P: Platform> Kernel<P> {
                 // Options as [`Self::fs_data`] keeps them: ids the initial
                 // namespace's.
                 let o = crate::tmpfs::parse(data)?;
-                let dir = tmpfs_dir(o.mode.unwrap_or(0o1777))?;
-                // Its root is its mounter's, or the owner asked for.
-                let owner = (o.uid.unwrap_or(self.creds.fsuid), o.gid.unwrap_or(self.creds.fsgid));
-                let kept = std::fs::File::open(std::ffi::OsStr::from_bytes(&dir))
-                    .map_err(|e| crate::host::errno_to_linux(e.raw_os_error().unwrap_or(0)))
-                    .and_then(|f| crate::owners::keep_fd(f.as_raw_fd(), owner));
-                if let Err(e) = kept {
-                    let _ = std::fs::remove_dir(std::ffi::OsStr::from_bytes(&dir));
-                    return Err(e);
-                }
-                // The limits asked for are kept beside it ([`crate::tmpfs`]).
-                if let Some(limit) = o.size {
-                    crate::tmpfs::mounted(&dir, limit);
-                }
-                if let Some(n) = o.inodes {
-                    crate::tmpfs::mounted_inodes(&dir, n);
-                }
-                Source::Host(dir)
+                // A filesystem of fwe's store, in memory: its root is its
+                // mounter's, or the owner asked for, and it holds what its
+                // size and inodes allow.
+                let id = crate::filestore::fs::make(
+                    o.mode.unwrap_or(0o1777),
+                    o.uid.unwrap_or(self.creds.fsuid),
+                    o.gid.unwrap_or(self.creds.fsgid),
+                    o.size.unwrap_or_else(crate::tmpfs::default_size),
+                    o.inodes.unwrap_or_else(crate::tmpfs::default_inodes),
+                )?;
+                Source::Store(id)
             }
             FsType::Cgroup2 => {
                 // The hierarchy from the cgroup namespace's root.
-                let dir = crate::cgroupfs::tree_dir()?;
+                let id = crate::cgroupfs::tree()?.id;
                 root = self.fs().ns.cgroup.as_ref().map_or(b"/".to_vec(), |c| c.get().root.clone());
-                Source::Host(dir)
+                Source::Store(id)
             }
             FsType::Overlay => {
                 let layers = self.overlay_layers(data)?;
@@ -256,16 +212,12 @@ impl<P: Platform> Kernel<P> {
         Some(crate::mounts::join(&dir, &r.name))
     }
 
-    /// The host directory of the guest directory `path`, which must be in
-    /// a mount of host directories (`EINVAL` for one in an overlay or in
-    /// a filesystem of fwe's).
-    fn host_dir(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
-        self.host_dir_rw(path, false)
-    }
-
-    /// [`host_dir`](Self::host_dir) of a directory to be written to:
-    /// `EROFS` in a read-only mount.
-    fn host_dir_rw(&self, path: &[u8], write: bool) -> Result<Vec<u8>, i32> {
+    /// Where the guest directory `path`, an overlay's layer, is: a host
+    /// directory of a mount of host directories, or a directory of a
+    /// filesystem of fwe's store (`EINVAL` for one in an overlay or in a
+    /// filesystem fwe makes up); `EROFS` for one to be written to (`write`)
+    /// in a read-only mount.
+    fn layer_place(&self, path: &[u8], write: bool) -> Result<crate::overlay::Place, i32> {
         let (ns, is_dir) = self.mount_path(path, true)?;
         if !is_dir {
             return Err(errno::ENOTDIR);
@@ -275,16 +227,20 @@ impl<P: Platform> Kernel<P> {
         if write && m.read_only() {
             return Err(errno::EROFS);
         }
-        m.host_path(&rest).ok_or(errno::EINVAL)
+        if let crate::mounts::Source::Store(id) = m.source {
+            return Ok(crate::overlay::Place::Store { fs: id, path: m.fs_path(&rest) });
+        }
+        m.host_path(&rest).map(crate::overlay::Place::Host).ok_or(errno::EINVAL)
     }
 
     /// The layers an overlay's mount options (`data`) name, checked as
     /// Linux checks them, with the work directory made ready.
     fn overlay_layers(&self, data: &[u8]) -> Result<crate::overlay::Layers, i32> {
         let o = crate::overlay::parse(data)?;
-        let lowers = o.lowers.iter().map(|p| self.host_dir(p)).collect::<Result<Vec<_>, _>>()?;
-        let upper = o.upper.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
-        let work = o.work.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
+        let lowers =
+            o.lowers.iter().map(|p| self.layer_place(p, false)).collect::<Result<Vec<_>, _>>()?;
+        let upper = o.upper.as_deref().map(|p| self.layer_place(p, true)).transpose()?;
+        let work = o.work.as_deref().map(|p| self.layer_place(p, true)).transpose()?;
         if let (Some(u), Some(w)) = (&upper, &work) {
             // Separate directories of one filesystem.
             let dev = |p: &[u8]| -> Result<u64, i32> {
@@ -295,12 +251,9 @@ impl<P: Platform> Kernel<P> {
                 if unsafe { libc::stat(c.as_ptr(), &mut st) } != 0 {
                     return Err(crate::host::errno_to_linux(crate::host::last_errno()));
                 }
-                Ok(st.st_dev as u64)
+                Ok(crate::host::dev_of(&st))
             };
-            if dev(u)? != dev(w)?
-                || crate::mounts::under(u, w).is_some()
-                || crate::mounts::under(w, u).is_some()
-            {
+            if !u.same_fs(w, dev)? || u.nested(w) {
                 return Err(errno::EINVAL);
             }
             crate::overlay::prepare_work(w)?;
@@ -366,16 +319,11 @@ impl<P: Platform> Kernel<P> {
             if flags & ms::BIND == 0
                 && let Ok(o) = crate::tmpfs::parse(&data)
                 && let (m, _) = ns.table().locate(&point)
-                && m.fstype == FsType::Tmpfs
-                && m.root == b"/"
-                && let Some(dir) = m.host_path(b"")
+                && let Source::Store(id) = m.source
+                && let Err(e) = crate::filestore::fs::get(id, false)
+                    .and_then(|f| f.lock()?.limit(o.size, o.inodes))
             {
-                if let Some(limit) = o.size {
-                    crate::tmpfs::mounted(&dir, limit);
-                }
-                if let Some(n) = o.inodes {
-                    crate::tmpfs::mounted_inodes(&dir, n);
-                }
+                return err(e);
             }
             ns.update(|t| t.remount(&point, flags, opts))
         } else if flags & ms::BIND != 0
@@ -581,8 +529,10 @@ impl<P: Platform> Kernel<P> {
         let roots_of = |m: &crate::mounts::Mount| -> Vec<Vec<u8>> {
             let roots: Vec<Vec<u8>> = match &m.source {
                 Source::Host(_) => m.host_path(b"").into_iter().collect(),
-                Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
-                Source::Synthetic | Source::Ns(_) => Vec::new(),
+                Source::Overlay(l) => {
+                    l.places().filter_map(crate::overlay::Place::host).map(<[u8]>::to_vec).collect()
+                }
+                Source::Synthetic | Source::Ns(_) | Source::Store(_) => Vec::new(),
             };
             roots.iter().map(|r| canonical(r)).collect()
         };

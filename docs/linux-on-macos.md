@@ -908,7 +908,7 @@ the host reports differently.
 | `preadv`, `pwritev`, `preadv2`, `pwritev2` | Offset -1 uses the file position; `RWF_NOWAIT` polls first (not for a regular file), `RWF_DSYNC`/`RWF_SYNC` sync after, `RWF_APPEND` sets `O_APPEND` for the call; other flags `EOPNOTSUPP`. | `preadv`, `pwritev`, `readv`, `writev`, `poll`, `fsync` |
 | `lseek` | Swaps `SEEK_DATA` and `SEEK_HOLE` (3 and 4, reversed on the host); fwe's directories, loop devices and overlay directories are seeked by fwe. | `lseek` |
 | `newfstatat`, `fstat`, `statx` | Translated to the arm64 layout, with the mode and owner fwe keeps, Linux device numbers, a symlink's mode 0777. `statx` adds the immutable, append-only, no-dump and mount-root attributes, the mount id and the host's birth time (`STATX_BTIME`). | `fstatat`, `fstat` |
-| `getdents64` | Entries built from the host's; an overlay directory merges its layers; `O_TMPFILE` names and fwe's cgroup files hidden; fwe's directories listed from memory; an entry's `d_off` is its position in the listing (APFS gives none), which `lseek` returns to by listing again, as `telldir` and `seekdir` need. | `__getdirentries64` |
+| `getdents64` | Entries built from the host's; an overlay directory merges its layers; `O_TMPFILE` names hidden; fwe's directories listed from memory; an entry's `d_off` is its position in the listing (APFS gives none), which `lseek` returns to by listing again, as `telldir` and `seekdir` need. | `__getdirentries64` |
 | `faccessat`, `faccessat2` | fwe's permission check, as `open`'s, against the guest owner and mode, on the file and each directory searched: the real user and group (with the capabilities Linux gives a real root) by default, the effective ones with `AT_EACCESS`; `CAP_DAC_OVERRIDE` passes all but a file of no execute bit; `W_OK` on a read-only mount is `EROFS` for all but a device, FIFO or socket. | `fstatat`, `fstat` |
 | `readlinkat` | `/proc` links answered by fwe; an `O_PATH` stand-in reads the link it names. | `readlinkat`, `readlink` |
 | `mkdirat`, `mknodat` | Umask applied by fwe; a directory takes the permission and sticky bits of its mode, set-group-ID only from a set-group-ID parent; a mode denying its owner and the maker's ownership kept in attributes. `mknodat` makes a file, FIFO, socket node or one of fwe's device nodes ([Devices](#devices)); a device takes `CAP_MKNOD` but for a whiteout (0:0), as on Linux. | `mkdirat`, `openat(O_CREAT\|O_EXCL)`, `mkfifoat` |
@@ -932,7 +932,7 @@ the host reports differently.
 | `setxattr`, `getxattr`, `listxattr`, `removexattr`, their `l` and `f` forms, and their `at` forms (`setxattrat` and the rest, with `struct xattr_args`) | Linux's namespaces and rules ([Files and descriptors](#files-and-descriptors)); fwe's `/proc` files have none. | the host's attribute calls on the file's host path or descriptor |
 | `file_getattr`, `file_setattr` | The inode flags (immutable, append-only, no-dump, no-access-time) as `fa_xflags`, Linux's checks of the size and flags, in Linux's order (owner, `CAP_LINUX_IMMUTABLE`, then what the filesystem keeps); a change `EROFS` through a read-only mount, an overlay file copied up first; what only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set. | `fstatat`, `lchflags` by path (`fstat`, `fchflags` for a descriptor) |
 | `name_to_handle_at`, `open_by_handle_at` | A handle is the host file system id and inode; opening needs `CAP_DAC_READ_SEARCH`, then opens as `openat` (permissions, read-only mounts, `O_PATH`) at the path the caller sees the file at in `mount_fd`'s mount, under its root; a file it cannot see so is `ESTALE`. | `fstatfs`, `fsgetpath`, then as `openat` |
-| `memfd_create` | See [Shared memory and memfd](#shared-memory-and-memfd). | `open(O_CREAT\|O_EXCL)`, `unlink` |
+| `memfd_create` | See [Shared memory and memfd](#shared-memory-and-memfd). | none; `shm_open`, `shm_unlink` for its data at its first write |
 | `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. A run starts in the directory fwe was started in (under `--root`, its path in the root, or `/` where it lies outside). Search permission checked. | `openat` (to check), `fcntl(F_GETPATH)` |
 | `umask` | Kept and applied by fwe; fwe's host umask is 0. | none |
 
@@ -986,14 +986,14 @@ checked by fwe.
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind (keeping the source's per-mount flags, read-only too, and leaving unbindable submounts behind), move, remount and propagation changes. Other types `ENODEV`. A tmpfs's and a `proc`'s options are checked as Linux checks them (`EINVAL`), a user or group id kept as the initial namespace's. | none; a tmpfs gets a new directory (`mkdir`) in fwe's private directory |
+| `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind (keeping the source's per-mount flags, read-only too, and leaving unbindable submounts behind), move, remount and propagation changes. Other types `ENODEV`. A tmpfs's and a `proc`'s options are checked as Linux checks them (`EINVAL`), a user or group id kept as the initial namespace's. | none; a tmpfs is a new filesystem of fwe's store, in memory ([Kernel-wide state](#kernel-wide-state)) |
 | `umount2` | `MNT_DETACH`, `MNT_FORCE`, `MNT_EXPIRE`, `UMOUNT_NOFOLLOW`; a mount in use is `EBUSY` unless detached (`MNT_FORCE` does not pass it, as on Linux's own file systems). | none |
 | `pivot_root`, `chroot` | The root becomes a path in the namespace's view; the working directory follows `pivot_root` as Linux's. | none |
 | `fsopen`, `fspick`, `fsconfig`, `fsmount` | A filesystem context is the process's, kept against an anonymous file's descriptor; `FSCONFIG_CMD_CREATE` makes the filesystem as `mount` does; reading the descriptor gives its messages. | an anonymous file |
 | `open_tree`, `move_mount` | A detached tree (`fsmount`, `OPEN_TREE_CLONE`) is kept against an `O_PATH` descriptor of its root; `move_mount` attaches or moves, `MOVE_MOUNT_BENEATH` included. | none |
 | `mount_setattr` | Sets and clears `ro`, `nosuid`, `nodev`, `noexec`, the access-time modes and `nosymfollow`, and propagation, on a mount or tree (`AT_RECURSIVE`); `MOUNT_ATTR_IDMAP` is `EINVAL`. | none |
 | `statmount`, `listmount` | From the table, by unique mount id; a mount out of the caller's reach is `EPERM` without `CAP_SYS_ADMIN`. | none |
-| `statfs`, `fstatfs` | Sizes and counts the host's; the type is the mount's (ext4 for the rootfs and its binds) with its flags; a sized tmpfs reports its size, and one of a number of inodes those and how many are free; a pipe, socket or anonymous descriptor reports Linux's pipefs, sockfs or anon-inode magic. | `fstatfs` |
+| `statfs`, `fstatfs` | Sizes and counts the host's; the type is the mount's (ext4 for the rootfs and its binds) with its flags; a tmpfs reports its size and inodes (by default half the memory, and an inode for every two of its pages) and how many are free, and the cgroup hierarchy cgroup2's type; a pipe, socket or anonymous descriptor reports Linux's pipefs, sockfs or anon-inode magic. | `fstatfs` |
 
 **`mount`**: a bind of a directory or file in the guest's tree is a new
 table entry showing it; a bind of a standard device node fwe serves from
@@ -1028,7 +1028,7 @@ and the per-call differences are in [Address-space layout](#address-space-layout
 | `madvise` | Advice and each mapping checked as Linux checks them; `MADV_DONTNEED` zero-fills private anonymous memory; `MADV_DONTFORK`, guard pages, `MADV_REMOVE` and `MADV_DONTNEED_LOCKED` as [The mmap family](#the-mmap-family) lists; `MADV_HWPOISON`/`SOFT_OFFLINE` need `CAP_SYS_ADMIN`. | native: `mmap` (fresh pages), `madvise`, `mprotect`; VM: slab edit |
 | `msync` | Flags and alignment checked; each mapping in the range synced, a hole `ENOMEM` after the rest; `MS_INVALIDATE` of locked memory `EBUSY`. | `msync` (VM: of shared segments) |
 | `mincore` | One byte per guest page, from the host's residency. | `mincore` |
-| `process_vm_readv`, `process_vm_writev` | Permission as for ptrace; the caller's own memory copied directly; another fwe process's copied by that process in its wake handler, from a request file of fwe's, with the host's copies of its own task (an address with nothing behind it is an error, not a fault); a fault partway returns the bytes copied | `mach_vm_read_overwrite`, `mach_vm_write` (in the target), `pread`/`pwrite` |
+| `process_vm_readv`, `process_vm_writev` | Permission as for ptrace; the caller's own memory copied directly; another fwe process's copied by that process in its wake handler, through a request in a shared memory object both map, with the host's copies of its own task (an address with nothing behind it is an error, not a fault); a fault partway returns the bytes copied | `shm_open`, `mmap`; `mach_vm_read_overwrite`, `mach_vm_write` (in the target) |
 | `pkey_alloc`, `pkey_free`, `pkey_mprotect` | As on a CPU without protection keys (arm64's need `FEAT_S1POE`): none to allocate (`ENOSPC`), none to free; `pkey_mprotect` with key -1 is `mprotect`. | `mprotect` |
 | `mlock`, `mlock2`, `munlock`, `mlockall`, `munlockall` | Range and `RLIMIT_MEMLOCK` checked (for `MAP_LOCKED` and `MCL_FUTURE` mappings too), pages read in and wired on the host (not with `MLOCK_ONFAULT`, which the host cannot do), marked locked; the host's wiring is as far as it lets a user process, the guest's result Linux's. | `mlock`, `munlock` |
 | `mseal` | The mappings marked sealed in fwe's record; later changes to them fail with `EPERM`. | none |
@@ -1308,13 +1308,13 @@ sees the message:
 
 | Passed descriptor | What the receiver gets |
 |---|---|
-| eventfd | the same counter (its file is mapped) and readiness pipe, shared with the sender |
+| eventfd | the same counter (its shared memory mapped) and readiness pipe, shared with the sender |
 | timerfd | a kqueue of its own (the host passes none) armed on the sender's schedule; expiries are counted apart |
 | signalfd | a signalfd of its own with the same mask, reading the receiver's signals, as Linux's does |
 | netlink socket | the same socket, answered through the same host end, for the namespace it was made in |
 | process descriptor | a kqueue of its own watching the same process (a `PIDFD_THREAD` one of another process's thread watches that process) |
-| `SOCK_SEQPACKET` socket, memfd | itself: its buffer size or extended attributes say what it is |
-| memfd opened again read-only | itself, marked read-only again |
+| `SOCK_SEQPACKET` socket | itself: its buffer size says what it is |
+| a file of fwe's store (a memfd, a tmpfs or `/dev/shm` file) | the same open file description of the same file, its offset and flags shared; a process of the host's (an X server) is handed the shared memory object of the file's data instead, which it maps, writable only if the description may write: the file's first extent, which holds all of a file sized before it held data; one grown past it is refused (`EOPNOTSUPP`) |
 
 The sender holds the bundle's end until the receiver has emptied it: the
 host collects descriptors in flight that no process holds, and a
@@ -1331,8 +1331,8 @@ object behind it.
 **`socket(AF_UNIX, SOCK_SEQPACKET)`**: macOS has none. fwe makes a stream
 socket and frames each message with a 4-byte length; a send writes a whole
 frame or nothing, a receive takes one frame, cut to the buffer with
-`MSG_TRUNC`. Between processes sharing the socket, a byte-range lock on a
-file of fwe's keeps frames whole (`crates/kernel/src/seqpacket.rs`).
+`MSG_TRUNC`. Between processes sharing the socket, a lock in the memory
+every fwe process maps keeps frames whole (`crates/kernel/src/seqpacket.rs`).
 
 **`socket(AF_NETLINK)`**: the guest's descriptor is one end of a host
 datagram pair, so `recv`, `poll` and `epoll` are the host's; a request
@@ -1399,7 +1399,7 @@ namespace's records last until the host reboots
 
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
-| `shmget`, `shmat`, `shmdt`, `shmctl` | a segment's state in the namespace's record, its memory a file beside it; `shmat` maps the file shared, listed in `/proc/<pid>/maps` as `/SYSV<key> (deleted)`; `SHM_LOCK` charges the segment to the locker's `RLIMIT_MEMLOCK` and wires each attachment; `SHM_HUGETLB` finds no huge pages (`ENOMEM`; `SHM_NORESERVE` gets ordinary pages) | `open`, `ftruncate`, `mmap`, `unlink` |
+| `shmget`, `shmat`, `shmdt`, `shmctl` | a segment's state in the namespace's record, its memory a host shared memory object named for it, made at its first attachment; `shmat` maps the object shared, listed in `/proc/<pid>/maps` as `/SYSV<key> (deleted)`; `SHM_LOCK` charges the segment to the locker's `RLIMIT_MEMLOCK` and wires each attachment; `SHM_HUGETLB` finds no huge pages (`ENOMEM`; `SHM_NORESERVE` gets ordinary pages) | `shm_open`, `ftruncate`, `mmap`, `shm_unlink` |
 | `semget`, `semctl`, `semop`, `semtimedop` | values and `SEM_UNDO` adjustments in the record; a `semop` applies all its operations or none; waits run without the kernel lock | `flock`, `__ulock_wait2`, `__ulock_wake` |
 | `msgget`, `msgctl`, `msgsnd`, `msgrcv` | messages in the record; waits as for semaphores | as above |
 | `kernel.msg_next_id`, `sem_next_id`, `shm_next_id` | the id the next object of the kind gets in the IPC namespace, used once | none |
@@ -1722,7 +1722,7 @@ them out on the slab and the guest's page tables:
 | Call | Linux | fwe, native | fwe, VM |
 |---|---|---|---|
 | `mmap` anonymous / private file | kernel VMA | host `mmap` at the guest's address or where macOS places it; offset a multiple of 16 KiB; a private mapping of a file with no name (a memfd, an unlinked file: memory shared through it) is a shared host mapping kept unwritable, each page made a copy of itself when first written (by the guest, by fwe for it, or by a `read` into it), so a page not yet written shows what others write to the file (the host's private mapping is a copy from the start) | slab range; a private file mapping is a copy of the file's data when mapped, but one of a file with no name is a segment of the file kept unwritable in stage 1, each 4 KiB page made a copy in the slab when first written |
-| `MAP_SHARED` | shared pages | host `MAP_SHARED`; an executable shared file mapping is made private, since its code is rewritten, but one of a file open for writing (a memfd a JIT maps twice) stays shared and runs by translation | a *segment*: a host shared mapping outside the slab (anonymous shared memory is an unlinked file), mapped into the VM once |
+| `MAP_SHARED` | shared pages | host `MAP_SHARED`; an executable shared file mapping is made private, since its code is rewritten, but one of a file open for writing (a memfd a JIT maps twice) stays shared and runs by translation | a *segment*: a host shared mapping outside the slab (anonymous shared memory is a host shared memory object with no name), mapped into the VM once |
 | `MAP_FIXED`, `MAP_FIXED_NOREPLACE` | replace / refuse to replace | host `MAP_FIXED`; `NOREPLACE` checks where macOS put it (`EEXIST`) | page-table edit; slab memory at its own address is reused, zeroed |
 | `munmap` | | host `munmap` | pages removed from stage 1, TLBs flushed; the slab range zeroed before reuse |
 | `mprotect` | | host `mprotect`; memory made executable runs by translation, never executable on the host ([Write+exec memory](#writeexec-memory)) | stage-1 permission edit |
@@ -1758,8 +1758,8 @@ without `MAP_JIT`, whose memory is switched per thread
 
 | Linux | macOS | fwe |
 |---|---|---|
-| `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file in fwe's private directory, unlinked at once; name and seals in extended attributes, so every holder sees them; `F_SEAL_WRITE` clones the file and swaps this process's descriptors for read-only ones of the clone; opened again read-only through `/proc/self/fd`, the same host description marked read-only (`F_GETFL` says so; writes, writable shared mappings, resizing and seals refused), the mark following it through `fork`, `execve` and `SCM_RIGHTS`; a mapping of it (or of any file with no name) holds a descriptor of the file, through which `mremap` grows it and `remap_file_pages` remaps it |
-| `/dev/shm` tmpfs (`shm_open`, `sem_open`) | no tmpfs at `/dev/shm` | a directory per rootfs in the user's temporary directory, shared by every fwe process on that root, a mount point to the resolver |
+| `memfd_create`: an anonymous file with a name and seals | no memfd, no seals | a file with no name in a filesystem of fwe's store ([Kernel-wide state](#kernel-wide-state)), its name and seals the file's own, so every holder sees them; its data in host shared memory objects, its extents (the first sized to the file when it first holds data, each further one as long as all before it), which every holder maps, a mapping across them a host mapping of each at the file's offsets; `F_SEAL_WRITE` refused (`EBUSY`) while this process maps it shared and writable, and then refusing writes, resizing and writable shared mappings; opened again read-only through `/proc/self/fd`, a new read-only description of the same file; a mapping of it holds the file, through which `mremap` grows it and `remap_file_pages` remaps it |
+| `/dev/shm` (`shm_open`, `sem_open`) and every tmpfs | no tmpfs; `shm_open` objects with no path | a filesystem of fwe's store each, in memory: `/dev/shm` one per rootfs, which every fwe process on that root shares; a tmpfs one per mount, holding what its size and inodes allow (`ENOSPC`); names, directories, links, owners, modes, times, attributes, flags and locks in the store, a regular file's data in a shared memory object, a FIFO's or socket's channel a host node in fwe's private directory |
 | System V shared memory | own `shmget` | see [Other IPC calls](#other-ipc-calls) |
 
 ### Processes
@@ -2019,12 +2019,15 @@ recorded by fwe and the target woken with the wake signal:
 | `kill(pid, sig)` to another process, a signal the host has | pid mapped out of the pid namespace; permission checked as on Linux; a sender note left in the target's mailbox if it is an fwe process (`crates/kernel/src/signote.rs`) | `kill(<host pid>, <host signal>)` |
 | `kill`/`rt_sigqueueinfo` with `SIGTRAP` to another fwe process | queued in its mailbox, as a signal the host lacks is: the host would merge a host `SIGTRAP` with the target's next system-call trap (fwe's `brk`, a `SIGTRAP` too), and it would be lost | `SIGEMT` to wake the target |
 | `kill` with `SIGKILL` | the same | an fwe target is sent `SIGINFO` (the kill relay), so a VM process can tear its VM down first; any other process the real `SIGKILL` |
+| `kill`/`tgkill` with `SIGSTOP` to an fwe process, this one too | queued in its mailbox (this one's pending set), dated by how many times it was continued; the process stops itself when it takes it, at the end of a call or in its handler, once none of its threads holds a lock of the memory fwe's processes share, and a thread that holds none takes none until it is continued: as Linux stops a task only on its way back to user mode. The host's `SIGSTOP` would stop it wherever it was, a lock every other process needs held | `SIGEMT` to wake the target; the target stops in fwe: its other threads wait for its kernel lock, it sleeps on its count of continues, and its parent learns of it with `SIGCHLD` through its mailbox, which its `wait` looks at. One whose parent is a living process that is not fwe's (a shell) raises `SIGSTOP` on itself, for that parent to see |
+| `kill` with `SIGCONT` to an fwe process | its count of continuations moved on first: a stop signal sent to it before is not taken, queued or pending, as Linux discards one as `SIGCONT` is sent; a stop signal sent drops a pending `SIGCONT`. The guest's `SIGCONT` goes through its mailbox, and the count ends a stop of fwe's; a process stopped on the host (whose parent is not fwe's) is sent the host's too, once, which its handler does not take for the guest's | the mailbox; `kill(<host pid>, SIGCONT)` for a stop on the host |
 | `kill` of itself with a fault signal (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | recorded directly, since macOS's `siginfo` cannot tell a sent one from a fault | none |
 | `kill`/`tgkill`/`rt_sigqueueinfo` with a real-time signal (or `SIGSTKFLT`, `SIGPWR`) | recorded directly within the process; to another fwe process queued in its mailbox with the sender, code and value; to a process that is not fwe's `EINVAL` | `SIGEMT` to wake the target |
 | `tgkill(tgid, tid, sig)`, a signal the guest catches or a fault signal | posted to that thread directly, which a relayed host signal could not target | `SIGEMT` to wake it |
 | `tgkill`/`tkill` of a thread of another process | queued in its process's mailbox with the tid, and posted to that thread | `SIGEMT` to wake the process |
 | `tgkill` of a signal the host acts on | — | `pthread_kill(<host thread>, <host signal>)` |
 | `kill(-1, sig)` | only the caller's pid namespace or its run of fwe, never other host processes | `kill` of each |
+| fwe's own signals to a process it keeps the pid of (a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a message queue's notice) | sent only to one of fwe's processes, one that started when the record says: a pid kept from a process that ended may be the host's now; a refusal is told on the standard error | `kill` of a process of fwe's only |
 | `kill(0, sig)`, `kill(-pgid, sig)` | the group's members listed from the host; each the caller may signal is sent the signal as one process would be (this one last), the others passed over; 0 if any took it, `EPERM` if the caller may signal none, as Linux's `kill_pgrp` | `proc_listpids(PROC_PGRP_ONLY)`, then `kill` of each |
 
 - **Permission** follows Linux: `CAP_KILL`, or the caller's real or
@@ -2109,7 +2112,7 @@ pipe, or both, so the guest can mix them in one `epoll`:
 | Linux | macOS | fwe |
 |---|---|---|
 | `epoll` | `kqueue` | the epoll descriptor is a kqueue; `EPOLLIN`/`EPOLLOUT` become `EVFILT_READ`/`EVFILT_WRITE`, `EPOLLET` → `EV_CLEAR` (a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen), `EPOLLONESHOT` → `EV_ONESHOT`, `EPOLLPRI` on a TCP socket → `EVFILT_EXCEPT` with `NOTE_OOB` (its urgent data), `EPOLLEXCLUSIVE` → a count of a pipe's writes every fwe process shares, of which each woken set must take one to report it (a socket's readiness, a shared listening socket's included, wakes every set, as the host gives no count of what one took), data in `udata`; `epoll_event` is 16 bytes on arm64; returned events under [Network events](#network-events) |
-| `eventfd` | none | a pipe plus a 64-bit counter in a file of fwe's every holder maps, so a fork child or a process it is passed to shares it; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness; a blocking write past the counter's maximum waits for a read (looked for each millisecond) or a signal |
+| `eventfd` | none | a pipe plus a 64-bit counter in shared memory every holder maps, so a fork child or a process it is passed to shares it; the pipe holds one byte exactly while the counter is non-zero, so `kqueue` sees readiness; a blocking write past the counter's maximum waits for a read (looked for each millisecond) or a signal |
 | `timerfd` | none | a kqueue with one one-shot `EVFILT_TIMER` for the next expiry, in nanoseconds and on time (`NOTE_CRITICAL`); the schedule is fwe's |
 | `signalfd` | none | a readiness pipe per signalfd, holding a byte while the process's queue of `signalfd_siginfo` has a signal it watches; a pending signal the thread blocks and a signalfd watches moves onto that queue, a standard one once, and the first read of a signalfd watching it takes it |
 | inotify | `kqueue` vnode events (no names), FSEvents (paths, after the fact); neither reports open, read or close | fwe raises the events itself from every fwe process's file calls; an instance is a host datagram socket bound in fwe's private directory, so reading and `epoll` are the host's |
@@ -2135,7 +2138,7 @@ names macOS does not support:
 | `sockaddr` starts with a 2-byte family | a length byte, then a family byte | header rewritten in place |
 | `MSG_NOSIGNAL` | `SO_NOSIGPIPE` | every socket gets `SO_NOSIGPIPE`; fwe raises `SIGPIPE` itself for a write or send without `MSG_NOSIGNAL` |
 | `AF_UNIX` paths | 104-byte limit | resolved in the guest's root; a long one bound, connected or sent to from its directory with `pthread_fchdir_np`; connecting or sending needs write permission on the node, as fwe keeps its mode |
-| abstract `AF_UNIX` names | none | files in a per-host temporary directory, or in an fwe network namespace's own directory, each with its name beside it; a name whose socket is gone is free to bind again |
+| abstract `AF_UNIX` names | none | socket nodes in a per-host temporary directory, or in an fwe network namespace's own directory, named by a hash of the name; the names and who bound each in a record in memory every fwe process maps, one per network namespace; a name whose socket is gone is free to bind again |
 | socket option numbers and layouts at `SOL_SOCKET`, `IPPROTO_IP`, `IPPROTO_IPV6`, `IPPROTO_TCP` and `IPPROTO_ICMPV6` | numbered apart (`IP_TOS` 1 and 3, `TCP_KEEPIDLE` 4 and `TCP_KEEPALIVE` 0x10, `ICMP6_FILTER` 1 and 18); `group_req` packed to 4 bytes; `ip_mreq_source` ordered apart; multicast TTL and loop a byte; an `icmp6_filter` bit blocks a type on Linux and passes it on macOS | each translated (`crates/kernel/src/sockopt.rs`); one the host lacks is `ENOPROTOOPT`, but `SO_NO_CHECK`, `SO_PRIORITY`, `SO_PASSCRED` (acted on, see [Sockets](#sockets)), `IP_RECVERR`, `IPV6_RECVERR` and `SOL_RAW`'s `ICMP_FILTER` are kept and read back, and `SO_DOMAIN`/`SO_PROTOCOL` answered by fwe (the protocol from the host's `proc_pidfdinfo`, so a ping or raw socket's is its own); any other level is `ENOPROTOOPT`, so no Linux option reaches the host as another |
 | `SOL_UDP` options | none (macOS's one, `UDP_NOCKSUM`, has `UDP_CORK`'s number) | fwe's: `UDP_CORK` holds sends back until cleared, then sends them as one datagram; `UDP_SEGMENT` cuts a send into datagrams of its size (64 at most, `EINVAL` past them); `UDP_GRO` joins nothing, as Linux need not; `UDP_NO_CHECK6_TX`/`RX` leave checksums to the host; `UDP_ENCAP` (IPsec) and the rest `ENOPROTOOPT` |
 | `SO_SNDBUF`/`SO_RCVBUF` doubled, capped by `wmem_max`/`rmem_max`; the `FORCE` forms with `CAP_NET_ADMIN` | the size as given | Linux's arithmetic, the host's buffer given the result |
@@ -2166,17 +2169,53 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 
 ### Kernel-wide state
 
-What Linux keeps in one kernel for every process (mount tables,
-namespaces, the cgroup tree, loop devices, IPC objects, keys, inotify
-watches, shared futexes) lives in fwe's private directory on the host
-(`crates/kernel/src/shared.rs`): a directory per record, its data changed
-under a lock, and a mapped generation count so a process rereads only
-after another changed it.
+What Linux keeps in one kernel for every process lives, under fwe, in
+memory every fwe process of the user maps (host shared memory objects),
+never in files on the disk: a file's pages are written back to the disk,
+and a file's making, opening and removal cost the host tens of
+microseconds each, where memory is read and written at memory's speed.
+What macOS has itself (a pipe, a socket, a wait on shared memory) is
+macOS's.
 
-The private directory is in the user's temporary directory. A record's
-name carries a format number, so another fwe build never reads it, and a
-record no live process holds is collected, as are the files a gone
-process left ([architecture.md](architecture.md)).
+| State | Where it is | Code |
+|---|---|---|
+| process records, thread ids, signal mailboxes, mapping lists, how processes ended, ptrace pages, shared futex waiters, pipe-write and `ETXTBSY` locks | the process store: one shared memory object; an entry is read with no lock (again if a change came between) and written under a lock naming its holder's pid, taken over from one that died holding it | `procstore.rs` |
+| mount tables, namespaces, System V IPC, POSIX message queues, keys, loop devices, inotify watches, abstract socket names and their binders | shared records: named slots of the process store, each a lock, a generation count and the data, with a journal of changes, so a change costs what it holds and a process reads again only after another changed it | `shared.rs` |
+| a System V segment's memory, an eventfd's counter, an eBPF map or program, the VM's anonymous shared memory, a `process_vm_readv` or `process_vm_writev` request | a shared memory object each: a segment's and a request's named for it, the others with no name, held by their descriptors and mappings | `sysvipc.rs`, `specialfd.rs`, `memobj.rs`, `procvm.rs` |
+| tmpfs, `/dev/shm`, memfds, the cgroup tree | fwe's file store: a filesystem's names, inodes, attributes and locks in a shared memory arena of its own, a regular file's data in shared memory objects sized to it (its extents: macOS's compressor indexes an object's pages by its size, in wired memory); pages a cut or a punched hole frees are zeroed and left for macOS to take back first when it runs short (`MADV_ZERO`, `MADV_FREE_REUSABLE`: macOS takes no page of a shared object back for good), where Linux frees them | `filestore/` |
+| a shared futex's wait | macOS's wait on the shared address, which keys on the memory as Linux's does | `futex.rs` |
+| the channel of a FIFO or socket in a tmpfs, a socket bound to an abstract name, the sockets a descriptor is sent between processes on, an inotify instance's socket | macOS's pipes and Unix sockets, their nodes in fwe's private directory (`fwe-<uid>` in the user's temporary directory) | `storenodes.rs`, `signote.rs`, `inotify.rs` |
+
+The name of each record and object carries a format number, so another
+fwe build never reads it, and what no live process holds is collected
+([architecture.md](architecture.md)).
+
+What it costs (micro benchmarks of `tools/bench/run.py`, on CI's macOS 26
+and Linux arm64 runners; the System V calls' budget is 3x macOS's):
+
+| Benchmark | fwe | macOS | Linux |
+|---|---|---|---|
+| System V semaphore up+down | 1048 ns | 610 ns | 593 ns |
+| System V message send+receive | 864 ns | 1301 ns | 785 ns |
+| System V segment made, attached, written, detached, removed | 8.87 µs | 3.14 µs (a shared memory object made, mapped and removed: what fwe's segment costs the host) | 9.36 µs |
+| eventfd write+read | 954 ns | none | 504 ns |
+| shared futex wake, no one waiting | 89 ns | none | 287 ns |
+| a small file's life in `/dev/shm` (made, 4 KiB written and read back, closed, removed) | 57.8 µs | none | 6.54 µs |
+| the same file's life in `/tmp`, on the disk | 165 µs | 127 µs | 13.0 µs |
+| a memfd's life (made, 4 KiB written and read back, closed) | 29.7 µs | none | 4.31 µs |
+| a shared memory object's life in `/dev/shm` (made, sized to 64 KiB, mapped, written, removed) | 66.1 µs | none | 11.1 µs |
+
+A file in fwe's store costs a third of the same file on the disk under
+fwe, and under half of macOS's own disk file: memfds, `/dev/shm` and every
+tmpfs are the store's.
+
+Programs at work, on the same runners:
+
+| Workload | fwe | macOS | Linux |
+|---|---|---|---|
+| LTP's IPC tests (System V and POSIX message queues), the 47 that pass | 37.0 s, 20.1 s of it `semop05`'s own sleep | none | — |
+| Lua built from clean with `make -j4` (a fork-heavy build) | 1.89 s | 1.80 s | 2.12 s |
+| PostgreSQL 18 (`tools/bench/workloads/postgres.sh`): `initdb`, a server, `pgbench` of 4 clients × 250 transactions, a `count(*)` its parallel workers scan (System V and POSIX shared memory, semaphores, signals) | 2.76 s | 1.66 s | 1.34 s |
 
 ### Namespaces
 
@@ -2211,22 +2250,25 @@ exactly as a native one; its host process is what their records name.
 
 macOS has no cgroups and no unprivileged way to hold a process to a
 memory or CPU budget. fwe keeps one cgroup v2 tree for all the user's fwe
-processes, as a machine has one: its cgroups are directories in fwe's
-private directory, their interface files files there, which a `cgroup2`
-mount shows; a process's cgroup is in its process record, and a `fork`
+processes, as a machine has one: a filesystem of fwe's store, in memory
+([Kernel-wide state](#kernel-wide-state)), its cgroups directories and
+their interface files files, which a `cgroup2` mount shows (a cgroup's
+directory takes no other file and loses none, and is not renamed, as
+kernfs's: `EACCES`, `EPERM`; an open to cut one of its files cuts
+nothing); a process's cgroup is in its process record, and a `fork`
 child starts in its parent's (`crates/kernel/src/cgroupfs.rs`). A member
 is a host process, native or running the VM alike.
 
 | File | What fwe does | On the host |
 |---|---|---|
-| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree, a write to `cgroup.subtree_control` naming a controller Linux lacks `EINVAL` (one the cgroup may not use `ENOENT`) before anything changes; a new cgroup's files are its creator's, a controller's whoever enables it; lists read as they are when opened (`cgroup.threads` lists every thread); making, removing and moving into a cgroup one at a time across processes, as under Linux's `cgroup_mutex` | the directories, a lock file beside them, the process records |
+| `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.events`, `cgroup.stat`, `cgroup.max.depth`, `cgroup.max.descendants` | Linux's rules: no controllers for children of a cgroup with processes, `EBUSY` removing one in use, `EAGAIN` for a cgroup past a depth or descendant limit up the tree, a write to `cgroup.subtree_control` naming a controller Linux lacks `EINVAL` (one the cgroup may not use `ENOENT`) before anything changes; a new cgroup's files are its creator's, a controller's whoever enables it; lists read as they are when opened (`cgroup.threads` lists every thread); making, removing and moving into a cgroup one at a time across processes, as under Linux's `cgroup_mutex` | none: the store and a lock in the process store, the process records |
 | moving a process (`cgroup.procs`, `CLONE_INTO_CGROUP`) | Linux's delegation: write access to `cgroup.procs` of the cgroup the source and destination are both in (`EACCES`), both inside the writer's cgroup namespace (`ENOENT`; the hierarchy is mounted `nsdelegate`) | none |
 | `cgroup.type`, `cgroup.threads` | only domain cgroups: `threaded` is `EOPNOTSUPP`, and a thread moves only to the cgroup it is in | none |
 | `pids.current`, `memory.current`, `cpu.stat` | the members' threads, resident memory, and user and system time, summed | each member's task information (`proc_pidinfo`) |
 | `pids.max` | `max` or a whole number up to Linux's 4194304, with no suffix (`EINVAL`); enforced on `fork` and on a new thread natively, not on a VM thread (`EAGAIN` past it, counting threads, up the tree), each refusal counted in `pids.events`; a thread looks at the limits only after a process moved or a limit changed (a shared generation) | none |
-| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too; a frozen member is a stopped process, so a `SIGCONT` thaws it and its parent sees the stop | `SIGSTOP`, `SIGCONT` to each (a VM's vCPUs stop with their process) |
+| `cgroup.freeze` | stops and continues the members of the cgroup and every cgroup below it; a cgroup is frozen while one above it is (`cgroup.events`), and a process that joins one, or is forked into one, is stopped too; a frozen member is a stopped process, so a `SIGCONT` thaws it and its parent sees the stop | fwe's `SIGSTOP` to each, which it takes where it holds nothing other processes wait for, and its continue (a VM's vCPU threads wait with the process's other threads) |
 | `cgroup.kill` | kills the members | `SIGKILL`, relayed so a process running the VM takes it down first |
-| device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`) | none |
+| device programs (`BPF_PROG_TYPE_CGROUP_DEVICE`) | decide every device open and `mknod` of members, on fwe's eBPF interpreter (`bpf.rs`); kept with the cgroup's directory, where no listing shows them | none |
 | `memory.max`, `memory.high`, `memory.low`, `memory.min`, `memory.swap.max`, `cpu.max`, `cpu.weight`, `io.max`, `cpuset.*` | kept and read back (a memory limit in whole pages, as Linux keeps it), not enforced | none: macOS has no such limit for a process |
 
 ### Mounts
@@ -2237,15 +2279,18 @@ fwe's mounts exist only in its tables (`crates/kernel/src/mounts.rs`,
 `mountops.rs`, `mountapi.rs`, `overlay.rs`), which its path resolver
 follows:
 
-- a mount shows a host directory (rootfs, bind source, a tmpfs's backing
-  directory), an overlay of several, or one of fwe's filesystems (`proc`,
-  `sysfs`, `cgroup2`, `devpts`, `mqueue`);
+- a mount shows a host directory (rootfs, bind source), an overlay of
+  several, a filesystem of fwe's store in memory (a tmpfs, `/dev/shm`,
+  `cgroup2`), or one of fwe's own (`proc`, `sysfs`, `devpts`, `mqueue`);
 - propagation as Linux's: peer groups, slaves, across namespaces;
 - `nosuid`, `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time
   flags are enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
 - an overlay is resolved as Linux's `overlay`: upper then lower layers,
-  whiteouts (0:0 device nodes) and opaque directories, copy-up as an APFS
-  clone, each change built in the work directory and renamed into place;
+  each a host directory or a tmpfs's of fwe's store, whiteouts (0:0
+  device nodes) and opaque directories, copy-up as an APFS clone between
+  host layers and as a copy otherwise, each change built in the work
+  directory and renamed into place, a file made where a whiteout is
+  taking its place at once;
   a directory opened in a bind mount of one stays in that mount, with what
   is mounted below it;
 - a namespace's file (`/proc/<pid>/ns/<kind>`, a thread's under
@@ -2266,6 +2311,7 @@ guest's identity virtual:
 | real/effective/saved/fs uids and gids, groups | the host process's, changeable only by root | virtual (`crates/kernel/src/creds.rs`), default root (0), Linux's `set*id` rules |
 | capability sets and securebits | none | the five sets and securebits (`caps.rs`), changed by `capset`, `prctl`, `setuid`, `execve` as on Linux; every capability but `CAP_SYS_TIME` at the start; held in the process's user namespace and checked against the namespace that owns the object, as below |
 | `chown` | changes the owner | kept in an attribute (`org.fwe.owner`, `crates/kernel/src/owners.rs`) under Linux's rules and shown by `stat`; a Unix socket node's, which macOS gives no attribute, in a file of fwe's named by the node's identity; the host file stays fwe's user's |
+| a file made by a user other than root (`open` with `O_CREAT`, `mkdir`, `mknod`, `symlink`) | made with the host user's owner, given another after | made under a hidden name, given its owner and mode, then renamed onto its name only if none is there (`renameatx_np`, `RENAME_EXCL`): it is never seen as root's before its owner is set |
 | permission bits for a caller that is not root | the host's, for the host user | fwe's check by the guest's owner, mode and file-system ids, and each directory's search bit along a path (in a root filesystem) |
 | file capabilities, set-ID programs | set-ID bits, honoured only for root's files | `execve` acts on a program's `security.capability` attribute and its set-ID bits (the owner and group fwe keeps) with Linux's rules: the new ids and capability sets, the ambient set cleared, nothing gained on a `nosuid` mount, and under `no_new_privs` or while traced by a tracer without `CAP_SYS_PTRACE` over the caller no capability beyond the caller's permitted ones and the set-ID ids only for a caller with `CAP_SETUID` not under `no_new_privs`; the attribute is checked as it is written (revisions 2 and 3), kept for the root of the writer's user namespace, and removed by `chown`, a write or a truncation, as Linux removes it |
 
@@ -2368,8 +2414,8 @@ socket programs use (`crates/kernel/src/bpf.rs`, `bpfmap.rs`,
   process sends to the socket by any call, reading the data with
   `bpf_skb_load_bytes`.
 - **Maps**: array and hash maps, with the lookup, update and delete
-  helpers. A loaded program or map is an unlinked file of fwe's that its
-  descriptor is open on, so every process holding a descriptor, a fork
+  helpers. A loaded program or map is a host shared memory object that
+  its descriptor is open on, so every process holding a descriptor, a fork
   child too, shares it.
 - A program of any other type Linux has loads (libraries probe for
   support by loading one) but is never attached nor run (`EINVAL` to
@@ -2505,7 +2551,8 @@ where fwe falls short of Linux in detail is in
 | Signal permission | **enforced** | `CAP_KILL` in the target's user namespace or Linux's uid match, `SIGCONT` within the session, each member of a group; `kill(-1)` reaches the caller's pid namespace, or the processes of its run of fwe, never other host processes |
 | Signals the host lacks (`SIGSTKFLT`, `SIGPWR`, 32–64) | **emulated** | fwe's pending sets, another fwe process's mailbox; to a process fwe did not start `EINVAL` ([Sending a signal](#sending-a-signal)) |
 | siginfo sender | **emulated** | the sender's pid and guest uid in the receiver's namespaces |
-| `SIGKILL`, `SIGSTOP` | **host** | `SIGKILL` to an fwe process relayed so a VM goes down first |
+| `SIGKILL` | **host** | to an fwe process relayed so a VM goes down first |
+| `SIGSTOP` | **emulated** | to an fwe process fwe's own, which it takes where it holds nothing other processes wait for, then stops with the host's ([Sending a signal](#sending-a-signal)); from outside fwe the host's |
 | `RLIMIT_CPU` | **enforced** | `SIGXCPU` at the soft limit (the host's), `SIGKILL` at the hard limit (fwe's) |
 | `RLIMIT_FSIZE` | **host** | `SIGXFSZ`, `EFBIG`; never above the host's hard limit |
 | `RLIMIT_DATA` | **host** | set on the fwe process; the guest's `brk` is not held to it |
@@ -2581,7 +2628,7 @@ where fwe falls short of Linux in detail is in
 | Unix socket nodes | **enforced** | connecting or sending needs write permission (`EACCES`) |
 | `O_TMPFILE` | **emulated** | a hidden name, counted as no link, gone with its last descriptor |
 | Case sensitivity | **host** | the volume's: APFS by default folds case ([known limitations](architecture.md#known-limitations)) |
-| tmpfs | **emulated** | a host directory; `size=` and `nr_inodes=` enforced (`ENOSPC`), `mode=`, `uid=`, `gid=` give the root (its maker's by default) ([Mounts](#mounts)) |
+| tmpfs | **emulated** | a filesystem of fwe's store, in memory; `size=` and `nr_inodes=` enforced (`ENOSPC`; a file's names past its first count as inodes, as Linux's), half the memory and an inode for every two of its pages by default; `mode=`, `uid=`, `gid=` give the root (its maker's by default) ([Mounts](#mounts)) |
 | proc, sysfs, cgroup2, devpts, mqueue | **emulated** | fwe's; `proc`'s `hidepid=` (with `gid=`) and `subset=pid` **enforced** (`ENOENT`, `EPERM`) |
 | overlay, bind, move | **emulated** | Linux's layering and copy-up; binds keep their flags |
 | cgroup v1, ext4, btrfs, XFS, FUSE, NFS and other types | **refused** | `ENODEV`, as without them |
@@ -2620,7 +2667,7 @@ where fwe falls short of Linux in detail is in
 | Linux AIO (`io_setup` and the rest) | **emulated** | requests carried out as submitted; `fs.aio-max-nr` enforced ([Waiting and event calls](#waiting-and-event-calls)); POSIX AIO is the C library's, on threads |
 | Unix stream and datagram sockets | **host** | Linux's buffer sizes ([Socket calls](#socket-calls)) |
 | Unix `SOCK_SEQPACKET` | **emulated** | a framed host stream |
-| Unix abstract names | **emulated** | files per network namespace |
+| Unix abstract names | **emulated** | socket nodes per network namespace, the names in memory |
 | Unix autobind | **emulated** | an abstract name of five hexadecimal digits, as Linux gives it: on `bind` with the family alone, and for a socket passing credentials (`SO_PASSCRED`) on `connect` or a datagram send unbound |
 | Unix `SOCK_RAW` | **emulated** | a datagram socket, as Linux makes it |
 | `SCM_RIGHTS` | **emulated** | up to 253 descriptors; fwe's own kinds travel with their state |
@@ -2668,7 +2715,7 @@ where fwe falls short of Linux in detail is in
 | `mkdir`, `rmdir`, `cgroup.procs`, `cgroup.subtree_control`, `cgroup.controllers`, `cgroup.max.*` | **enforced** | Linux's delegation and no-internal-process rules; a new cgroup's files are its creator's, a controller's files whoever enabled it; an unknown controller `EINVAL` |
 | `cgroup.type`, `cgroup.threads` | **refused** | `threaded` `EOPNOTSUPP`; a thread moves only where it is |
 | `cgroup.events`, `cgroup.stat` | **emulated** | |
-| `cgroup.freeze`, `cgroup.kill` | **emulated** | host `SIGSTOP`, `SIGCONT`, `SIGKILL` to the members |
+| `cgroup.freeze`, `cgroup.kill` | **emulated** | fwe's `SIGSTOP` and continue ([Sending a signal](#sending-a-signal)), `SIGKILL` to the members |
 | `pids.max` | **enforced** | at `fork` and a native thread's creation, up the tree (`EAGAIN`), not for a VM thread; `max` or a whole number up to 4194304 (`EINVAL` otherwise, a suffix too) |
 | `pids.current`, `memory.current`, `cpu.stat` | **host** | the members' threads, resident memory and times |
 | `memory.max`, `high`, `low`, `min`, `swap.max`, `oom.group`, `cpu.max`, `cpu.weight`, `cpuset.*`, `io.*`, `hugetlb.*`, `rdma.*`, `misc.*` | **kept** | macOS bounds no process's memory or CPU; a memory limit is parsed as Linux parses it (suffixes `K` to `E`) and kept in whole pages; `memory.stat`, `memory.events`, `io.stat` read zeros |
@@ -2767,9 +2814,9 @@ the host takes as Linux would (`Kernel::sync_host_signal`):
 | read by a `signalfd` or `rt_sigtimedwait` | caught by fwe, whatever the disposition, while it is read | to queue it there |
 | default, and the default ends or stops the process (`SIGINT`, `SIGTERM`, `SIGHUP`, `SIGTSTP`, `SIGTTIN`, …) | caught by fwe, which carries the default out | so a thread whose guest mask blocks it keeps it pending, the parent sees Linux's status, and a VM process tears its VM down first |
 | default, and the default ignores (`SIGCHLD`, `SIGURG`, `SIGWINCH`) | caught by fwe, which drops it unless the guest blocks it | macOS discards such a signal even while it is blocked; Linux keeps a blocked one pending |
-| default `SIGCONT` | host default | the host does the same |
+| `SIGCONT`, whatever its disposition | caught by fwe | one from a process that is not fwe's (a shell's `fg`, a host `kill -CONT`) is the guest's `SIGCONT`, and ends a stop of fwe's; fwe's processes send the guest's as fwe's ([Sending a signal](#sending-a-signal)), and the host's only to end a stop on the host, which it does caught or not |
 | ignored | host `SIG_IGN` | the host does the same, and keeps it ignored across `execve` |
-| `SIGKILL`, `SIGSTOP` | the host's | they cannot be caught |
+| `SIGKILL`, `SIGSTOP` | the host's | they cannot be caught; fwe's processes send `SIGSTOP` to each other as fwe's ([Sending a signal](#sending-a-signal)) |
 | fault signals (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`, `SIGTRAP`) | fwe's fault handlers, always | see [Faults in guest code](#faults-in-guest-code) |
 
 A guest thread runs under a host mask holding only the guest-blocked
@@ -2981,8 +3028,8 @@ sequenceDiagram
 |---|---|---|
 | Ctrl-C (`VINTR`, with `ISIG`): `SIGINT` to the foreground group | relayed (sequence above) | `SIGINT` |
 | Ctrl-\\ (`VQUIT`): `SIGQUIT` | relayed; a default ends the process with the host `SIGQUIT` | `SIGQUIT`; a core file, as Linux writes one, if `RLIMIT_CORE` allows |
-| Ctrl-Z (`VSUSP`): `SIGTSTP` (18) | relayed as 20; a default stop is fwe's: it stops itself with the host `SIGTSTP` | `SIGTSTP`; the shell sees the job stopped by `SIGTSTP` |
-| `fg`/`bg`: `SIGCONT` (19) | the host continues the process; a guest handler is entered | `SIGCONT` (18) |
+| Ctrl-Z (`VSUSP`): `SIGTSTP` (18) | relayed as 20; a default stop is fwe's: the shell's child stops itself with the host `SIGTSTP`, its children of fwe's stop in fwe | `SIGTSTP`; the shell sees the job stopped by `SIGTSTP` |
+| `fg`/`bg`: `SIGCONT` (19) | caught: the host continues the shell's child, and every process of the job takes the guest's `SIGCONT`, which ends a stop of fwe's, a guest handler entered | `SIGCONT` (18) |
 | Ctrl-T (`VSTATUS`, macOS only): `SIGINFO` to the foreground group | no note came with it, so it is no kill relay: dropped; once the guest sets its `termios`, which has no such key, Ctrl-T and Ctrl-Y (`VDSUSP`) are disabled (`_POSIX_VDISABLE`) | nothing; with the keys disabled, the character as input |
 | Ctrl-D, Ctrl-S/Ctrl-Q, erase, kill, `VLNEXT` and the rest of canonical editing | done by the host's line discipline as the guest's `termios` sets it | the edited line; `read` returns 0 at end of file |
 | a background job reads (or, with `TOSTOP`, writes) the terminal: `SIGTTIN`/`SIGTTOU` | relayed; a default stop is fwe's, as for `SIGTSTP` | the job stops |
@@ -3047,6 +3094,7 @@ sequenceDiagram
 | a child continued | — | `0xffff` |
 | a guest child ended by a Linux-only signal | it exited with 128 + the signal, leaving its Linux status in its record's entry | killed by that signal |
 | `SIGCHLD` `siginfo`: `CLD_KILLED`/`CLD_DUMPED`/`CLD_STOPPED` | `si_status` mapped to Linux's signal | Linux's signal number |
+| `SIGCHLD` `siginfo`: `CLD_STOPPED`/`CLD_CONTINUED` of a stop of fwe's | the child's note in the parent's mailbox, with the signal | Linux's `siginfo` |
 | `SIGCHLD` `siginfo`: `CLD_CONTINUED` | `si_status` is what stopped it on macOS; set to what continued it | `SIGCONT`, as Linux reports |
 | `rusage` from `wait4` | `ru_maxrss` from bytes to KiB | Linux's `rusage` |
 | `waitid` | the host gives no `rusage` | zero-filled `rusage` |
@@ -3094,7 +3142,7 @@ what they mean to fwe:
 | `kill -9` of a VM process | none: it ends with its VM alive, which can bring the machine down ([hypervisor.md](hypervisor.md#never-end-a-vm-process-abnormally)) | — |
 | `kill -INFO <pid>` | no note came with it, so it is no kill relay: dropped | nothing |
 | `kill -EMT <pid>` | the wake signal: only interrupts | nothing |
-| `kill -STOP`, `kill -CONT` | the host's own | the process stops and continues; a parent's `wait` with `WUNTRACED` sees the stop by `SIGSTOP` (19) |
+| `kill -STOP`, `kill -CONT` | `SIGSTOP` the host's own, which stops the process on the host; `SIGCONT` caught, the guest's, ending a stop of the host's or of fwe's | the process stops and continues; a parent's `wait` with `WUNTRACED` sees the stop by `SIGSTOP` (19) |
 | `kill -SEGV <pid>` (a fault signal) from a process fwe does not run | macOS gives it the thread's last fault, and no note says it was sent | taken as a fault ([limitations](architecture.md#known-limitations)) |
 
 ### Files changing on the host

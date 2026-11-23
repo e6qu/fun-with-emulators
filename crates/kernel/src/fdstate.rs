@@ -247,7 +247,7 @@ fn capped(fd: i32) -> Option<(PipeId, u64, u64)> {
     if unsafe { libc::fstat(fd, &mut st) } != 0 || st.st_mode & libc::S_IFMT != libc::S_IFIFO {
         return None;
     }
-    let id = (st.st_dev as u64, st.st_ino);
+    let id = (crate::host::dev_of(&st), st.st_ino);
     let size = pipe_size(id);
     (size < default_pipe_size()).then(|| (pipe_key(id), size, st.st_size.max(0) as u64))
 }

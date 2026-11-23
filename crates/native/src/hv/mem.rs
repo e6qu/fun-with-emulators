@@ -740,8 +740,10 @@ impl Mem {
             return err(errno::ENOMEM);
         }
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC | mman::PROT_BTI);
-        // A shared mapping of a file opened read-only stays read-only.
+        // A shared mapping of a file opened read-only stays read-only (a
+        // private view's pages become copies as they are written).
         let read_only = |p: &Piece<Area>| match p.value.back {
+            _ if is_view(&p.value) => false,
             Back::Segment { id, .. } => self.segments.get(&id).is_some_and(|s| !s.writable),
             Back::Slab { .. } => false,
         };
@@ -967,9 +969,24 @@ pub fn view_fault(va: u64) -> bool {
     ok && m.own_view_pages(page, page + PAGE).is_ok()
 }
 
+/// Whether host descriptor `fd` is a host shared memory object's.
+fn is_object(fd: i32) -> bool {
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let ok = unsafe { libc::fstat(fd, &mut st) == 0 };
+    ok && fwe_kernel::memobj::may_be(&st)
+}
+
 /// Copy `len` bytes of `source`'s file into slab memory at `host` (short
 /// of the file's end, the rest stays zero).
 fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
+    // A host shared memory object (a file of fwe's store's data), which the
+    // host reads only through a mapping.
+    if is_object(s.file.as_raw_fd()) {
+        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        return fwe_kernel::mm::copy_object(s.file.as_raw_fd(), s.offset, host, len, rw);
+    }
     let mut done = 0u64;
     while done < len {
         // SAFETY: slab memory backing the mapping; the file is the guest's.
@@ -996,9 +1013,23 @@ fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
 }
 
 /// `file` opened again for reading and writing, if the user may (by its
-/// path, checked to be the same file); `ENOMEM` when fwe has no descriptor
-/// left to keep it in.
+/// path, checked to be the same file; a file of fwe's store's data, by
+/// its object's name); `ENOMEM` when fwe has no descriptor left to keep
+/// it in.
 fn reopen_writable(file: &OwnedFd) -> Result<Option<OwnedFd>, i32> {
+    if is_object(file.as_raw_fd()) {
+        let Some((fwe_kernel::filestore::data::KIND, id, _)) =
+            fwe_kernel::memobj::identify(file.as_raw_fd())
+        else {
+            return Ok(None);
+        };
+        let Ok(fd) = fwe_kernel::filestore::data::open_object(id) else { return Ok(None) };
+        let fd = fwe_kernel::fdtable::reserve(std::os::fd::IntoRawFd::into_raw_fd(fd))
+            .map_err(|_| errno::ENOMEM)?;
+        // SAFETY: a descriptor just made, owned here, out of the guest's
+        // range.
+        return Ok(Some(unsafe { OwnedFd::from_raw_fd(fd) }));
+    }
     let mut path = [0u8; libc::PATH_MAX as usize];
     // SAFETY: F_GETPATH fills `path` (PATH_MAX bytes) with a C string.
     if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } != 0 {
@@ -1023,25 +1054,10 @@ fn reopen_writable(file: &OwnedFd) -> Result<Option<OwnedFd>, i32> {
     Ok(same.then_some(fd))
 }
 
-/// An unlinked file of `len` bytes to back anonymous shared memory, so a
-/// fork child can map the same pages.
+/// A host shared memory object of `len` bytes with no name to back
+/// anonymous shared memory, so a fork child can map the same pages.
 fn anonymous_file(len: u64) -> Result<OwnedFd, i32> {
-    let mut path = *b"/tmp/fwe-shared-XXXXXX\0";
-    // SAFETY: a NUL-terminated template; the file is unlinked at once.
-    let fd = unsafe { libc::mkstemp(path.as_mut_ptr().cast()) };
-    if fd < 0 {
-        return Err(last_errno());
-    }
-    // SAFETY: the template now names the file just made.
-    unsafe { libc::unlink(path.as_ptr().cast()) };
-    let fd = fwe_kernel::fdtable::reserve(fd).map_err(|_| errno::ENOMEM)?;
-    // SAFETY: a descriptor just made, owned here.
-    let owned = unsafe { OwnedFd::from_raw_fd(fd) };
-    // SAFETY: sizing the file just made.
-    if unsafe { libc::ftruncate(owned.as_raw_fd(), len as i64) } != 0 {
-        return Err(last_errno());
-    }
-    Ok(owned)
+    fwe_kernel::memobj::nameless(len)
 }
 
 /// The host's last error as a Linux errno.

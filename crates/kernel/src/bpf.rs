@@ -400,12 +400,10 @@ fn mem(
             if rel < 0 || rel as u64 + size as u64 > u64::from(map.value_size) {
                 return None;
             }
+            let got = map.read(file + rel as u64, size).ok()?;
             let mut b = [0u8; 8];
-            // SAFETY: a valid buffer of `size` bytes (at most 8).
-            let n = unsafe {
-                libc::pread(map.fd, b.as_mut_ptr().cast(), size, (file + rel as u64) as libc::off_t)
-            };
-            return (n == size as isize).then(|| u64::from_le_bytes(b));
+            b[..size].copy_from_slice(&got);
+            return Some(u64::from_le_bytes(b));
         }
         Val::Scalar(_) | Val::Map(_) => return None,
     };
@@ -492,11 +490,9 @@ fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32, src_is_x: bool) -> Opti
     Some(Val::Scalar(fit(v)))
 }
 
-/// Write `bytes` to map `m`'s file at `at`.
+/// Write `bytes` to map `m`'s elements at `at`.
 fn map_write(m: &crate::bpfmap::Map, at: u64, bytes: &[u8]) -> Option<()> {
-    // SAFETY: a valid buffer of its length.
-    let n = unsafe { libc::pwrite(m.fd, bytes.as_ptr().cast(), bytes.len(), at as libc::off_t) };
-    (n == bytes.len() as isize).then_some(())
+    m.write(at, bytes).ok()
 }
 
 /// `len` bytes of the stack at pointer `p`.
@@ -562,94 +558,46 @@ fn helper(
 
 // --- the bpf system call -------------------------------------------------------
 
-/// The extended attribute that makes a file one of fwe's loaded programs,
-/// holding the program's identity.
-#[cfg(target_os = "macos")]
-const PROG_ATTR: &std::ffi::CStr = c"org.fwe.bpf.prog";
-
-#[cfg(target_os = "macos")]
-fn last() -> i32 {
-    crate::host::errno_to_linux(crate::host::last_errno())
-}
+/// A loaded program's object ([`crate::memobj`]): its type and length,
+/// then its instructions from [`PROG_CODE`].
+const PROG_CODE: usize = 16;
 
 /// A descriptor for loaded program `bytes` of type `ty` with identity
-/// `id`: an unlinked file of fwe's holding its instructions, its identity
-/// and type in an attribute.
+/// `id`: an object of fwe's in host shared memory holding them.
 #[cfg(target_os = "macos")]
 fn prog_fd(bytes: &[u8], id: u32, ty: u32) -> Result<i32, i32> {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static N: AtomicU64 = AtomicU64::new(0);
-    let mut path = crate::fs::shm::user_dir()?;
-    let pid = crate::host::pid();
-    path.extend_from_slice(format!("/bpf-{pid}-{}", N.fetch_add(1, Ordering::Relaxed)).as_bytes());
-    let p = std::ffi::CString::new(path).map_err(|_| errno::EINVAL)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    let fd = unsafe {
-        libc::open(p.as_ptr(), libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC, 0o600)
-    };
-    if fd < 0 {
-        return Err(last());
-    }
-    // SAFETY: as above; fwe's own file.
-    unsafe { libc::unlink(p.as_ptr()) };
-    let mut idb = [0u8; 8];
-    idb[..4].copy_from_slice(&id.to_le_bytes());
-    idb[4..].copy_from_slice(&ty.to_le_bytes());
-    // SAFETY: valid buffers for the calls.
-    let ok = unsafe {
-        libc::write(fd, bytes.as_ptr().cast(), bytes.len()) == bytes.len() as isize
-            && libc::fsetxattr(fd, PROG_ATTR.as_ptr(), idb.as_ptr().cast(), 8, 0, 0) == 0
-    };
-    if !ok {
-        let e = last();
-        // SAFETY: closing the descriptor just made.
-        unsafe { libc::close(fd) };
-        return Err(e);
-    }
+    let (fd, mem) =
+        crate::memobj::make(crate::memobj::PROG, u64::from(id), PROG_CODE + bytes.len())?;
+    let mut head = [0u8; PROG_CODE];
+    head[..4].copy_from_slice(&ty.to_le_bytes());
+    head[4..8].copy_from_slice(&(bytes.len() as u32).to_le_bytes());
+    mem.write(0, &head).ok_or(errno::EFAULT)?;
+    mem.write(PROG_CODE, bytes).ok_or(errno::EFAULT)?;
     Ok(fd)
 }
 
-/// The identity and instructions of the program `fd` is a descriptor of.
-#[cfg(target_os = "macos")]
-pub fn prog_of(fd: i32) -> Option<(u32, Vec<u8>)> {
-    let (id, _) = prog_id_type(fd)?;
-    let mut bytes = Vec::new();
-    let mut chunk = [0u8; 4096];
-    loop {
-        // SAFETY: a valid buffer.
-        let n =
-            unsafe { libc::pread(fd, chunk.as_mut_ptr().cast(), chunk.len(), bytes.len() as i64) };
-        if n <= 0 {
-            break;
-        }
-        bytes.extend_from_slice(&chunk[..n as usize]);
+/// The identity, type and instructions of the program `fd` is a
+/// descriptor of.
+fn prog_parts(fd: i32) -> Option<(u32, u32, Vec<u8>)> {
+    let (kind, id, size) = crate::memobj::identify(fd)?;
+    if kind != crate::memobj::PROG {
+        return None;
     }
-    Some((id, bytes))
+    let mem = crate::memobj::Mapping::of(fd, size).ok()?;
+    let head = mem.read(0, PROG_CODE)?;
+    let w = |i: usize| u32::from_le_bytes(head[i..i + 4].try_into().unwrap());
+    let bytes = mem.read(PROG_CODE, w(4) as usize)?;
+    Some((id as u32, w(0), bytes))
+}
+
+/// The identity and instructions of the program `fd` is a descriptor of.
+pub fn prog_of(fd: i32) -> Option<(u32, Vec<u8>)> {
+    prog_parts(fd).map(|(id, _, bytes)| (id, bytes))
 }
 
 /// The identity and program type of the program `fd` is a descriptor of.
-#[cfg(target_os = "macos")]
 fn prog_id_type(fd: i32) -> Option<(u32, u32)> {
-    let mut idb = [0u8; 8];
-    // SAFETY: a valid buffer of its length.
-    let n = unsafe { libc::fgetxattr(fd, PROG_ATTR.as_ptr(), idb.as_mut_ptr().cast(), 8, 0, 0) };
-    let w = |i: usize| u32::from_le_bytes(idb[i..i + 4].try_into().unwrap());
-    match n {
-        8 => Some((w(0), w(4))),
-        // Written by an fwe that kept device programs only.
-        4 => Some((w(0), BPF_PROG_TYPE_CGROUP_DEVICE)),
-        _ => None,
-    }
-}
-
-#[cfg(not(target_os = "macos"))]
-fn prog_id_type(_fd: i32) -> Option<(u32, u32)> {
-    None
-}
-
-#[cfg(not(target_os = "macos"))]
-pub fn prog_of(_fd: i32) -> Option<(u32, Vec<u8>)> {
-    None
+    prog_parts(fd).map(|(id, ty, _)| (id, ty))
 }
 
 /// A new program identity.
@@ -674,11 +622,11 @@ pub fn fresh_map_id() -> u32 {
     return 1;
 }
 
-/// The maps of each loaded socket filter, by the program file's host
-/// identity: the instruction that loads each, and the map (through a
-/// descriptor of fwe's, so the program keeps it).
+/// The maps of each loaded socket filter, by the program's identity: the
+/// instruction that loads each, and the map (mapped, so the program keeps
+/// it).
 type FilterMaps = Vec<(usize, crate::bpfmap::Map)>;
-pub(crate) static PROG_MAPS: std::sync::Mutex<Vec<((u64, u64), FilterMaps)>> =
+pub(crate) static PROG_MAPS: std::sync::Mutex<Vec<(u32, FilterMaps)>> =
     std::sync::Mutex::new(Vec::new());
 
 /// The maps program `bytes` loads by descriptor, as fwe keeps them.
@@ -690,9 +638,7 @@ fn resolve_maps(bytes: &[u8]) -> Result<FilterMaps, i32> {
         let ins = insns[i];
         if ins.code == LD_IMM64 {
             if ins.src == PSEUDO_MAP_FD {
-                let m = crate::bpfmap::of(ins.imm).ok_or(errno::EBADF)?;
-                let fd = crate::fdtable::dup_reserved(m.fd)?;
-                out.push((i, crate::bpfmap::Map { fd, ..m }));
+                out.push((i, crate::bpfmap::of(ins.imm).ok_or(errno::EBADF)?));
             }
             i += 2;
         } else {
@@ -719,12 +665,11 @@ pub fn attach_socket(fd: i32, prog: Option<i32>) -> Result<(), i32> {
         f.retain(|e| e.0 != so);
         return if f.len() < before { Ok(()) } else { Err(errno::ENOENT) };
     };
-    let (_, ty, bytes) = prog_info(prog).ok_or(errno::EBADF)?;
+    let (id, ty, bytes) = prog_info(prog).ok_or(errno::EBADF)?;
     if ty != BPF_PROG_TYPE_SOCKET_FILTER {
         return Err(errno::EINVAL);
     }
     let program = load_filter(&bytes)?;
-    let id = crate::fsops::host_identity(prog).ok_or(errno::EBADF)?;
     let maps = PROG_MAPS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -763,13 +708,9 @@ pub fn filter_send(fd: i32, data: &[u8]) -> Option<u64> {
     Some(keep.min(len))
 }
 
-/// The cgroup directory `fd` is open on, on the host.
+/// The cgroup whose directory `fd` is open on.
 fn cgroup_dir(fd: i32) -> Result<Vec<u8>, i32> {
-    let host = crate::fs::host_path_of(fd).ok_or(errno::EBADF)?;
-    match crate::cgroupfs::locate(&host) {
-        Some((_, None)) => Ok(host),
-        _ => Err(errno::EINVAL),
-    }
+    crate::cgroupfs::of_fd(fd)
 }
 
 fn word(a: &[u8], at: usize) -> u32 {
@@ -871,14 +812,15 @@ pub fn sys_bpf(cmd: u64, attr: u64, size: u64) -> i64 {
                 _ => Vec::new(),
             };
             #[cfg(target_os = "macos")]
-            return prog_fd(&bytes, fresh_id(), ty).map(|fd| {
-                if !maps.is_empty()
-                    && let Some(id) = crate::fsops::host_identity(fd)
-                {
-                    PROG_MAPS.lock().unwrap_or_else(|e| e.into_inner()).push((id, maps));
-                }
-                fd as i64
-            });
+            return {
+                let id = fresh_id();
+                prog_fd(&bytes, id, ty).map(|fd| {
+                    if !maps.is_empty() {
+                        PROG_MAPS.lock().unwrap_or_else(|e| e.into_inner()).push((id, maps));
+                    }
+                    fd as i64
+                })
+            };
             #[cfg(not(target_os = "macos"))]
             return {
                 let _ = maps;
@@ -1048,19 +990,19 @@ mod tests {
     }
 
     /// A map of `entries` values of 8 bytes, keyed by 4 (an array) or 8
-    /// (a hash table), in a file of the test's own.
+    /// (a hash table), in memory of the test's own.
     fn test_map(ty: u32, entries: u32) -> crate::bpfmap::Map {
-        let path = std::env::temp_dir().join(format!(
-            "fwe-bpfmap-{}-{ty}-{:?}",
-            std::process::id(),
-            std::thread::current().id()
-        ));
-        let f = std::fs::File::create_new(&path).unwrap();
-        let _ = std::fs::remove_file(&path);
         let key_size = if ty == 2 { 4 } else { 8 };
-        f.set_len(u64::from(entries) * (if ty == 2 { 8 } else { 1 + 8 + 8 })).unwrap();
-        let fd = std::os::fd::IntoRawFd::into_raw_fd(f);
-        crate::bpfmap::Map { fd, ty, key_size, value_size: 8, max_entries: entries, id: 1 }
+        let slot = if ty == 2 { 8 } else { 1 + 8 + 8 };
+        let mem = crate::memobj::Mapping::anonymous(64 + entries as usize * slot);
+        crate::bpfmap::Map {
+            mem: std::sync::Arc::new(mem),
+            ty,
+            key_size,
+            value_size: 8,
+            max_entries: entries,
+            id: 1,
+        }
     }
 
     #[test]
@@ -1086,7 +1028,7 @@ mod tests {
     #[test]
     fn a_filter_writes_through_a_map_value() {
         let m = test_map(2, 1);
-        let mut ld = ins(0x18, 1, PSEUDO_MAP_FD, 0, m.fd).to_vec();
+        let mut ld = ins(0x18, 1, PSEUDO_MAP_FD, 0, 3).to_vec();
         ld.extend_from_slice(&ins(0, 0, 0, 0, 0));
         let prog = [
             ld,
@@ -1103,7 +1045,7 @@ mod tests {
         .concat();
         assert_eq!(load(&prog), Err(errno::EINVAL));
         let p = load_filter(&prog).unwrap();
-        assert_eq!(exec(&p, &[0u8; 192], &[(0, m)], &[]), Some(0));
+        assert_eq!(exec(&p, &[0u8; 192], &[(0, m.clone())], &[]), Some(0));
         assert_eq!(m.lookup(&0u32.to_le_bytes()), Ok(1u64.to_le_bytes().to_vec()));
     }
 

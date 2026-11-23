@@ -209,11 +209,16 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
     }
     let set = host::host_sigset(parked);
     REROUTING.set(true);
-    // SAFETY: `set` is an initialized signal set; the pending signals are
-    // delivered to this thread between the two calls.
+    // The mask as it was is put back, not the signals blocked: a caught
+    // signal the host showed pending may be one this thread never blocked
+    // (it landed during the look, and is delivered as the look returns),
+    // which blocked now would wait unseen on the host.
+    let mut was = host::empty_sigset();
+    // SAFETY: initialized signal sets; the pending signals are delivered to
+    // this thread between the two calls.
     unsafe {
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut was);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &was, std::ptr::null_mut());
     }
     REROUTING.set(false);
     thread::wake_others(host::WAKE_SIGNAL);
@@ -423,7 +428,6 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
     let plain = fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls()
         && !matches!(nr, EXIT | EXECVE | EXECVEAT | WAIT4 | WAITID | PIDFD_GETFD | RT_SIGTIMEDWAIT)
-        && !fwe_kernel::ipcops::waits(nr)
         && (!matches!(nr, CLONE | CLONE3) || thread_clone);
     // A thread that is not the last ends here, as the trap would end it,
     // with every host signal blocked first: one for the process is then
@@ -464,6 +468,13 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
             Ok(a) => crate::threads::do_clone(regs, a),
             Err(e) => fwe_abi::err(e),
         };
+        KERNEL.finish(regs, nr, &args, r);
+    } else if fwe_kernel::ipcops::waits(nr) {
+        // A semaphore or message queue wait: what it needs of the kernel is
+        // taken under the lock, and it waits without it (a guest signal
+        // ends the wait as it looks between slices).
+        let ctx = kernel().as_ref().unwrap().ipc_context();
+        let r = fwe_kernel::ipcops::blocking(ctx, nr, args);
         KERNEL.finish(regs, nr, &args, r);
     // SAFETY: guest pointers in `args` reference guest memory.
     } else if let Some(r) = unsafe { fwe_kernel::blocking_syscall(nr, args) } {
@@ -973,17 +984,19 @@ fn take_async(
     let record = || {
         if sig == host::WAKE_SIGNAL {
             // Signals the host lacks, queued by another process.
-            fwe_kernel::signote::drain(|lsig, note| {
-                // One for a thread of this process goes to it, if it is there.
-                if note.tid != 0 {
-                    thread::post_directed(note.tid, lsig, host::sent_info(note));
-                } else {
-                    thread::post_landed(lsig, host::sent_info(note));
-                }
-            });
+            fwe_kernel::signal::take_notes();
         } else {
             let info = sent();
             let lsig = host::signal_to_linux(sig);
+            // A stop signal from the host (its terminal's), or one fwe sends
+            // as the host's, is pending as of now.
+            if fwe_kernel::signal::stops(lsig) {
+                fwe_kernel::signal::stop_sent_now();
+            }
+            // The host's SIGCONT is the guest's only from outside fwe.
+            if lsig == fwe_abi::signal::SIGCONT && !fwe_kernel::signal::host_continued(info.pid) {
+                return;
+            }
             if in_fork_child() {
                 // Kept until the child forgets its parent's signals.
                 keep_early(lsig, info);
@@ -1435,7 +1448,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // signal for the guest, whatever this thread was running. (A genuine
     // fault that coincides with a note faults again, without one.)
     if let Some(note) = fwe_kernel::signote::take(sig) {
-        take_async(sig, || host::sent_info(note), ctx, guest_interrupted(ctx));
+        let lsig = host::signal_to_linux(sig);
+        take_async(sig, || host::sent_info(lsig, note), ctx, guest_interrupted(ctx));
         return;
     }
     // A fault signal whose syndrome is no abort of the instruction it
