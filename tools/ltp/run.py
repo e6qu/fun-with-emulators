@@ -430,12 +430,19 @@ def host_memory():
             mb(pages.get("Pages occupied by compressor", 0)), float(used.group(1)) if used else 0.0)
 
 
-def watch_memory(log, stop):
-    """Every two seconds, the host's memory and the tests running, kept and
-    written to `log` as they are taken (flushed: a runner that dies keeps
-    what was written)."""
+# Below this much of the host's memory available (%), the run stops: a
+# macOS host out of memory panics (its compressor), and a runner that dies
+# keeps no log.
+MEMORY_FLOOR = 30
+
+
+def watch_memory(log, stop, fwe, root):
+    """Twice a second, the host's memory and the tests running, kept and
+    written to `log` as they are taken. Below [`MEMORY_FLOOR`], what holds
+    the memory is printed, every process of this fwe is ended and the run
+    fails, while the host can still say why."""
     with open(log, "w") as f:
-        while not stop.wait(2):
+        while not stop.wait(0.5):
             level, free, compressed, swap = host_memory()
             with RUNNING_LOCK:
                 now = sorted(RUNNING)
@@ -443,6 +450,35 @@ def watch_memory(log, stop):
             f.write(f"{time.strftime('%H:%M:%S')} available {level}%, free {free} MB, compressed "
                     f"{compressed} MB, swap {swap:.0f} MB: {' '.join(now)}\n")
             f.flush()
+            if 0 < level < MEMORY_FLOOR:
+                memory_exhausted(level, free, compressed, swap, now, fwe, root)
+
+
+def memory_exhausted(level, free, compressed, swap, now, fwe, root):
+    """The host short of memory: what holds it, then every process of this
+    fwe ended and the run failed."""
+    print(f"\nthe host is short of memory: available {level}%, free {free} MB, compressed "
+          f"{compressed} MB, swap {swap:.0f} MB; tests running: {' '.join(now)}", flush=True)
+    ps = subprocess.run(["ps", "-axo", "pid=,ppid=,rss=,vsz=,command="], capture_output=True,
+                        text=True).stdout.splitlines()
+    biggest = sorted(ps, key=lambda l: -int(l.split()[2]) if len(l.split()) > 2 else 0)[:30]
+    print("processes holding the most memory (pid, parent, resident KB, virtual KB, command):")
+    for line in biggest:
+        print("    " + line[:300])
+    print(subprocess.run(["vm_stat"], capture_output=True, text=True).stdout, flush=True)
+    # What fwe's processes hold, by kind of region (shared memory of fwe's
+    # stores among it), for the largest few.
+    ours = [l.split() for l in ps if fwe in l]
+    ours.sort(key=lambda p: -int(p[2]))
+    for p in ours[:3]:
+        pid = int(p[0])
+        if pid > 0:
+            out = subprocess.run(["vmmap", "-summary", str(pid)], capture_output=True,
+                                 text=True).stdout
+            print(f"vmmap -summary {pid}:\n" + out[-6000:], flush=True)
+    ended = end_leftovers(fwe, root)
+    print(f"ended {ended} fwe processes; the run stops here", flush=True)
+    os._exit(3)
 
 
 def memory_report():
@@ -585,7 +621,7 @@ def main():
         serial.sort(key=lambda t: bool(SLOW.match(t[0])))
         stop_watch = threading.Event()
         if args.memory_log:
-            threading.Thread(target=watch_memory, args=(args.memory_log, stop_watch),
+            threading.Thread(target=watch_memory, args=(args.memory_log, stop_watch, fwe, root),
                              daemon=True).start()
         with concurrent.futures.ThreadPoolExecutor(args.jobs) as pool:
             futures = [pool.submit(run_guarded, fwe, root, work, n, a, limit(n)) for n, a in parallel]
