@@ -323,30 +323,37 @@ pub fn limits_set(target: i32) -> Result<(), i32> {
     put(target, 0, LIMITS_NOTE, 0, 0)
 }
 
-/// Ask process `target` to copy between its memory and the request file
+/// Ask process `target` to copy between its memory and the request object
 /// of reply socket `token` ([`answer_mem`]).
 pub fn request_mem(target: i32, token: u64) -> Result<(), i32> {
     put(target, 0, MEM_REQUEST, 0, token)
 }
 
-/// A memory request's file: its reply socket's path with `m` after it.
-fn mem_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH + 1]) -> Option<usize> {
-    let mut sock = [0u8; SUN_PATH];
-    let len = reply_path(pid, token, &mut sock)?;
-    buf[..len].copy_from_slice(&sock[..len]);
-    buf[len] = b'm';
-    buf[len + 1] = 0;
-    Some(len + 1)
+/// The length of a memory request object's name, its NUL included.
+pub const MEM_NAME: usize = 21;
+
+/// The name of process `pid`'s memory request `token`: a host shared
+/// memory object (memory, not a file), named `/fwe` and a hash of the
+/// user, the process and the token, within the host's 31 bytes;
+/// NUL-terminated. Async-signal-safe.
+pub fn mem_name(pid: i32, token: u64) -> [u8; MEM_NAME] {
+    // SAFETY: getuid cannot fail.
+    let uid = unsafe { libc::getuid() };
+    let mut key = [0u8; 4 + 4 + 8 + 3];
+    key[..3].copy_from_slice(b"mem");
+    key[3..7].copy_from_slice(&uid.to_ne_bytes());
+    key[7..11].copy_from_slice(&pid.to_ne_bytes());
+    key[11..19].copy_from_slice(&token.to_ne_bytes());
+    let h = crate::shared::hash(&key);
+    let mut name = [0u8; MEM_NAME];
+    name[..4].copy_from_slice(b"/fwe");
+    for i in 0..16 {
+        name[4 + i] = b"0123456789abcdef"[(h >> (60 - 4 * i) & 0xf) as usize];
+    }
+    name
 }
 
-/// The path of process `pid`'s memory request `token`.
-pub fn mem_request_path(pid: i32, token: u64) -> Option<Vec<u8>> {
-    let mut buf = [0u8; SUN_PATH + 1];
-    let len = mem_path(pid, token, &mut buf)?;
-    Some(buf[..len].to_vec())
-}
-
-/// A memory request's file: a header (the operation, 0 to read this
+/// A memory request's object: a header (the operation, 0 to read this
 /// process's memory and 1 to write it; the count of ranges; the result,
 /// written by the answer), the ranges (address and length), then the
 /// data. The answer's result is the bytes copied, `-EFAULT` if none could
@@ -368,84 +375,91 @@ unsafe extern "C" {
 /// task, which report an address with nothing behind it rather than fault,
 /// and tell the caller on its reply socket. Async-signal-safe.
 fn answer_mem(caller: i32, token: u64) {
-    let mut path = [0u8; SUN_PATH + 1];
-    let Some(_) = mem_path(caller, token, &mut path) else { return };
+    let name = mem_name(caller, token);
     let saved = crate::host::last_errno();
-    // SAFETY: a NUL-terminated path; buffers on the stack of their stated
-    // lengths; the host copies check the addresses they are given.
+    // SAFETY: a NUL-terminated name; the object mapped whole for the
+    // duration, every access within its size; the host copies check the
+    // addresses they are given.
     unsafe {
-        let fd = libc::open(path.as_ptr().cast(), libc::O_RDWR | libc::O_CLOEXEC);
+        let fd = libc::shm_open(name.as_ptr().cast(), libc::O_RDWR, 0 as libc::c_uint);
         if fd >= 0 {
-            let mut h = [0u8; MEM_HEADER];
-            let ok = libc::pread(fd, h.as_mut_ptr().cast(), MEM_HEADER, 0) == MEM_HEADER as isize;
-            let write = u32::from_ne_bytes(h[..4].try_into().unwrap()) == 1;
-            let count = u32::from_ne_bytes(h[4..8].try_into().unwrap()) as usize;
-            let data_at = MEM_HEADER + count * 16;
-            let mut done: i64 = 0;
-            let mut failed = !ok;
-            'ranges: for i in 0..count.min(1024) {
-                if failed {
-                    break;
-                }
-                let mut r = [0u8; 16];
-                if libc::pread(fd, r.as_mut_ptr().cast(), 16, (MEM_HEADER + i * 16) as libc::off_t)
-                    != 16
-                {
-                    failed = true;
-                    break;
-                }
-                let base = u64::from_ne_bytes(r[..8].try_into().unwrap());
-                let len = u64::from_ne_bytes(r[8..].try_into().unwrap());
-                let mut off = 0u64;
-                while off < len {
-                    let Some((host, room)) = crate::uaccess::try_run(base + off) else {
-                        done = MEM_RETRY;
-                        break 'ranges;
-                    };
-                    let n = (len - off).min(room).min(4096);
-                    let mut buf = [0u8; 4096];
-                    let at = (data_at as u64 + done as u64) as libc::off_t;
-                    #[cfg(target_os = "macos")]
-                    let copied = if write {
-                        libc::pread(fd, buf.as_mut_ptr().cast(), n as usize, at) == n as isize
-                            && mach_vm_write(mach_task_self_, host, buf.as_ptr() as usize, n as u32)
-                                == 0
-                    } else {
-                        let mut out = 0u64;
-                        mach_vm_read_overwrite(
-                            mach_task_self_,
-                            host,
-                            n,
-                            buf.as_mut_ptr() as u64,
-                            &mut out,
-                        ) == 0
-                            && out == n
-                            && libc::pwrite(fd, buf.as_ptr().cast(), n as usize, at) == n as isize
-                    };
-                    #[cfg(not(target_os = "macos"))]
-                    let copied = {
-                        let _ = (host, at, write, &mut buf);
-                        false
-                    };
-                    if !copied {
-                        failed = true;
-                        break 'ranges;
-                    }
-                    done += n as i64;
-                    off += n;
-                }
-            }
-            let result = if done == MEM_RETRY || done > 0 || !failed {
-                done
+            let mut st: libc::stat = std::mem::zeroed();
+            let size = if libc::fstat(fd, &mut st) == 0 { st.st_size as usize } else { 0 };
+            let map = if size >= MEM_HEADER {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_SHARED,
+                    fd,
+                    0,
+                )
             } else {
-                -i64::from(fwe_abi::errno::EFAULT)
+                libc::MAP_FAILED
             };
-            libc::pwrite(fd, result.to_ne_bytes().as_ptr().cast(), 8, 8);
             libc::close(fd);
+            if map != libc::MAP_FAILED {
+                let m = std::slice::from_raw_parts_mut(map.cast::<u8>(), size);
+                let word =
+                    |m: &[u8], at: usize| u64::from_ne_bytes(m[at..at + 8].try_into().unwrap());
+                let write = u32::from_ne_bytes(m[..4].try_into().unwrap()) == 1;
+                let count = u32::from_ne_bytes(m[4..8].try_into().unwrap()) as usize;
+                let data_at = MEM_HEADER + count.min(1024) * 16;
+                let mut done: i64 = 0;
+                let mut failed = data_at > size;
+                'ranges: for i in 0..count.min(1024) {
+                    if failed {
+                        break;
+                    }
+                    let base = word(m, MEM_HEADER + i * 16);
+                    let len = word(m, MEM_HEADER + i * 16 + 8);
+                    let mut off = 0u64;
+                    while off < len {
+                        let Some((host, room)) = crate::uaccess::try_run(base + off) else {
+                            done = MEM_RETRY;
+                            break 'ranges;
+                        };
+                        let n = (len - off).min(room).min(4096);
+                        let at = data_at + done as usize;
+                        if at + n as usize > size {
+                            failed = true;
+                            break 'ranges;
+                        }
+                        let buf = m[at..].as_mut_ptr();
+                        #[cfg(target_os = "macos")]
+                        let copied = if write {
+                            mach_vm_write(mach_task_self_, host, buf as usize, n as u32) == 0
+                        } else {
+                            let mut out = 0u64;
+                            mach_vm_read_overwrite(mach_task_self_, host, n, buf as u64, &mut out)
+                                == 0
+                                && out == n
+                        };
+                        #[cfg(not(target_os = "macos"))]
+                        let copied = {
+                            let _ = (host, write, buf);
+                            false
+                        };
+                        if !copied {
+                            failed = true;
+                            break 'ranges;
+                        }
+                        done += n as i64;
+                        off += n;
+                    }
+                }
+                let result = if done == MEM_RETRY || done > 0 || !failed {
+                    done
+                } else {
+                    -i64::from(fwe_abi::errno::EFAULT)
+                };
+                m[8..16].copy_from_slice(&result.to_ne_bytes());
+                libc::munmap(map, size);
+            }
         }
     }
     crate::host::set_errno(saved);
-    // The answer itself is in the file: the caller is only woken.
+    // The answer itself is in the object: the caller is only woken.
     answer_fd(caller, -1, token);
 }
 

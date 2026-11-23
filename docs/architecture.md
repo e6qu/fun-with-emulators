@@ -1524,8 +1524,9 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   the namespaces with accounting on; while there are none, an ending
   process looks for no file.
 - `process_vm_readv`/`process_vm_writev` (`crates/kernel/src/procvm.rs`):
-  the caller writes the ranges (and data to write) to a request file and
-  asks the other process through its mailbox; its wake handler copies with
+  the caller writes the ranges (and data to write) to a request, a host
+  shared memory object both map, and asks the other process through its
+  mailbox; its wake handler copies with
   `mach_vm_read_overwrite` and `mach_vm_write` on its own task (which fail
   for an address with nothing behind it) and wakes the caller on a reply
   socket. In the VM it translates guest addresses without waiting on the

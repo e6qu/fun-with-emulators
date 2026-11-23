@@ -76,8 +76,8 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     }
     if raw[0] == 0 {
         // Abstract namespace: no macOS equivalent. Map the name to a stable
-        // file under a per-host temp directory so peers rendezvous, the
-        // name kept beside it (`<file>.name`) to be reported back.
+        // socket node under a per-host temp directory so peers rendezvous,
+        // the name kept in memory ([`AbstractNames`]) to be reported back.
         let dir = abstract_dir();
         // Private to fwe's user, whatever the host's umask (fwe sets it to
         // 0, the guest's being its own to apply).
@@ -85,12 +85,18 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
             use std::os::unix::fs::DirBuilderExt;
             let _ = std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&dir);
         }
-        let p = abstract_file(&raw[1..]);
-        let name = p.with_extension("name");
-        if !name.exists() {
-            let _ = std::fs::write(&name, &raw[1..]);
+        let name = &raw[1..];
+        let key = abstract_key(name);
+        if let Some(r) = abstract_names()
+            && !r.get().names.get(&key).is_some_and(|(n, _)| n == name)
+        {
+            let _ = r.update(|t| {
+                let owner = t.names.get(&key).map_or(0, |e| e.1);
+                t.names.insert(key, (name.to_vec(), owner));
+                Ok(())
+            });
         }
-        return Ok(p.into_os_string().into_vec());
+        return Ok(abstract_file(name).into_os_string().into_vec());
     }
     // Pathed: trim at the first NUL, then resolve as a file's path is, in
     // the guest's filesystem.
@@ -172,19 +178,71 @@ fn node_path(hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> Option<Vec<u8>> {
     }
 }
 
-/// The file abstract name `name` (without its leading NUL) stands as.
-fn abstract_file(name: &[u8]) -> std::path::PathBuf {
+/// Abstract name `name`'s (without its leading NUL) key: its hash, which
+/// names its socket node.
+fn abstract_key(name: &[u8]) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     name.hash(&mut h);
-    abstract_dir().join(format!("{:016x}", h.finish()))
+    h.finish()
+}
+
+/// The socket node abstract name `name` (without its leading NUL) stands
+/// as.
+fn abstract_file(name: &[u8]) -> std::path::PathBuf {
+    abstract_dir().join(format!("{:016x}", abstract_key(name)))
+}
+
+/// The abstract names of a network namespace that were bound: each one's
+/// key ([`abstract_key`]), the name, and the host process that last bound
+/// it (0: none yet). In memory every fwe process maps, as a kernel keeps
+/// them; the host has only each one's socket node.
+#[derive(Clone, Debug, Default)]
+struct AbstractNames {
+    names: std::collections::BTreeMap<u64, (Vec<u8>, i32)>,
+}
+
+impl crate::shared::Data for AbstractNames {
+    fn encode(&self, e: &mut crate::snapshot::Enc) {
+        e.u64(self.names.len() as u64);
+        for (key, (name, owner)) in &self.names {
+            e.u64(*key);
+            e.bytes(name);
+            e.i32(*owner);
+        }
+    }
+    fn decode(d: &mut crate::snapshot::Dec) -> Self {
+        let n = d.count(8 + 8 + 4);
+        let names = (0..n)
+            .map(|_| {
+                let key = d.u64();
+                let name = d.bytes();
+                (key, (name, d.i32()))
+            })
+            .collect();
+        AbstractNames { names }
+    }
+}
+
+/// This process's network namespace's abstract names (the initial one's
+/// outside one).
+fn abstract_names() -> Option<crate::shared::Record<AbstractNames>> {
+    match crate::netns::current() {
+        Some(net) => crate::shared::Record::at(
+            [net.dir(), b"/abstract-names"].concat(),
+            AbstractNames::default,
+        )
+        .ok(),
+        None => crate::shared::Record::named("abstract-names", 0, AbstractNames::default).ok(),
+    }
 }
 
 /// The host process that bound abstract name `name`, if one did (for a
 /// Landlock domain that scopes abstract sockets).
 pub fn abstract_owner(name: &[u8]) -> Option<i32> {
-    let b = std::fs::read(abstract_file(name).with_extension("owner")).ok()?;
-    Some(i32::from_ne_bytes(b.get(..4)?.try_into().ok()?))
+    let r = abstract_names()?;
+    let owner = r.get().names.get(&abstract_key(name)).map(|e| e.1)?;
+    (owner != 0).then_some(owner)
 }
 
 /// Where abstract names' files are: each network namespace has its own.
@@ -199,14 +257,16 @@ fn abstract_dir() -> std::path::PathBuf {
 }
 
 /// The abstract name (without its leading NUL) host path `host` stands
-/// for, if it is one's file.
+/// for, if it is one's socket node.
 fn abstract_name(host: &[u8]) -> Option<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::path::Path::new(std::ffi::OsStr::from_bytes(host));
     if path.parent()? != abstract_dir() {
         return None;
     }
-    std::fs::read(path.with_extension("name")).ok()
+    let key = u64::from_str_radix(path.file_name()?.to_str()?, 16).ok()?;
+    let r = abstract_names()?;
+    r.get().names.get(&key).map(|e| e.0.clone())
 }
 
 /// Reverse [`root_unix_path`] for addresses handed back to the guest: an
@@ -1046,10 +1106,18 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
     if r == 0 && a.dir.is_some() {
         remember_name(fd as i32, true, &a.guest);
     }
-    // Who bound an abstract name, beside its file.
-    if r == 0 && src[..2] == 1u16.to_ne_bytes() && src.get(2) == Some(&0) {
+    // Who bound an abstract name.
+    if r == 0
+        && src[..2] == 1u16.to_ne_bytes()
+        && src.get(2) == Some(&0)
+        && let Some(names) = abstract_names()
+    {
         let me = crate::host::pid();
-        let _ = std::fs::write(abstract_file(&src[3..]).with_extension("owner"), me.to_ne_bytes());
+        let name = &src[3..];
+        let _ = names.update(|t| {
+            t.names.insert(abstract_key(name), (name.to_vec(), me));
+            Ok(())
+        });
     }
     if r == 0
         && let Some(plan) = plan
