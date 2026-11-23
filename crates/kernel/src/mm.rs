@@ -1507,7 +1507,9 @@ impl<P: Platform> Kernel<P> {
                 _ => Ok(None),
             }
         };
+        // Memory of no file has nothing to hold or record by piece.
         let held: Vec<Option<crate::maps::HeldFile>> = match &source {
+            _ if st.is_none() => Vec::new(),
             Some(Ok(pieces)) => {
                 let mut held = Vec::with_capacity(pieces.len());
                 for p in pieces {
@@ -1530,7 +1532,8 @@ impl<P: Platform> Kernel<P> {
             Some(Err(e)) => err(*e),
             None => self.mmap_call(addr, len, prot, flags, fd, offset, false),
         };
-        let pieces = match source {
+        let pieces: Vec<(u64, u64)> = match source {
+            _ if st.is_none() => Vec::new(),
             Some(Ok(pieces)) => pieces.into_iter().map(|p| (p.from, p.len)).collect(),
             _ => vec![(offset, self.page_up(len))],
         };

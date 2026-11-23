@@ -144,9 +144,17 @@ impl<T> Lock<T> {
             std::thread::yield_now();
             turns += 1;
         }
-        self.writers_waiting.fetch_add(1, SeqCst);
-        let writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
-        self.writers_waiting.fetch_sub(1, Release);
+        // A writer counts as waiting only while another holds the mutex.
+        let writers = match self.writers.try_lock() {
+            Ok(w) => w,
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => {
+                self.writers_waiting.fetch_add(1, SeqCst);
+                let w = self.writers.lock().unwrap_or_else(|e| e.into_inner());
+                self.writers_waiting.fetch_sub(1, Release);
+                w
+            }
+        };
         self.writing.store(true, SeqCst);
         // Only the counters given out may count readers: a thread given one
         // after this look finds `writing` set, and steps back (the given
