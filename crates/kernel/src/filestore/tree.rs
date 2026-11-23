@@ -501,11 +501,16 @@ impl Tx<'_> {
         }
     }
 
-    /// Index the entry at entries index `n` (from 0) under `name`.
+    /// Index the entry at entries index `n` (from 0) under `name`. The
+    /// index's used slots are its live entries' and those removed ones
+    /// left (`GONE`), together never more than the entries made since it
+    /// was last made (`n`, the removed ones still in the entries counted):
+    /// kept at most half full by that count, a lookup always ends at an
+    /// empty slot.
     fn index_entry(&mut self, d: u64, name: &[u8], n: u64) -> Result<(), i32> {
-        let (mut cap, live) = (self.m.u64_at(d + D_INDEX_CAP), self.m.u64_at(d + D_LIVE));
-        if (live + 1) * 2 > cap {
-            self.reindex(d, ((live + 1) * 4).next_power_of_two().max(16))?;
+        let mut cap = self.m.u64_at(d + D_INDEX_CAP);
+        if (n + 1) * 2 > cap {
+            self.reindex(d, ((n + 1) * 4).next_power_of_two().max(16))?;
             cap = self.m.u64_at(d + D_INDEX_CAP);
         }
         let index = self.m.u64_at(d + D_INDEX);
@@ -568,10 +573,16 @@ impl Tx<'_> {
         self.set_u32_raw(e + E_LEN, name.len() as u32);
         self.set_u32_raw(e + E_KIND, kind);
         self.m.set_u64(e + E_INO, ino);
+        // Indexed before it counts: an index made again for it is made of
+        // the entries before it, so it is indexed once.
+        if let Err(err) = self.index_entry(d, name, len) {
+            self.m.set_u64(e + E_INO, 0);
+            self.m.free(nm, name.len());
+            return Err(err);
+        }
         // Written whole before it counts.
         self.m.set_u64(d + D_NEXT, pos + 1);
         self.m.set_u64(d + D_LEN, len + 1);
-        self.index_entry(d, name, len)?;
         self.m.set_u64(d + D_LIVE, self.m.u64_at(d + D_LIVE) + 1);
         Ok(())
     }
@@ -1697,6 +1708,32 @@ mod tests {
         assert_eq!(t.stat(d).unwrap().nlink, 2);
         t.unlink(root, b"d", true).unwrap();
         assert_eq!(t.stat(root).unwrap().nlink, 3);
+        drop(t);
+        Arena::remove(id);
+    }
+
+    /// Names made and removed one after another, from a directory's first
+    /// entry on, a few live at a time, as `/dev/shm`'s temporary files are
+    /// (`sem_open`'s): each is found while it is there and missing before
+    /// and after, however many were removed before it, of names of the
+    /// same length.
+    #[test]
+    fn a_missing_name_is_found_missing_after_many_removals() {
+        let (id, a) = fresh();
+        let mut t = lock(&a, root_dir).unwrap();
+        let root = t.root();
+        for n in 0..1000 {
+            if n == 500 {
+                t.create(root, b"kept", &file(0o600)).unwrap();
+            }
+            let name = format!("tmp.{n:04}");
+            assert_eq!(t.lookup(root, name.as_bytes()), Err(errno::ENOENT), "{name}");
+            let ino = t.create(root, name.as_bytes(), &file(0o600)).unwrap();
+            assert_eq!(t.lookup(root, name.as_bytes()), Ok(ino), "{name}");
+            t.unlink(root, name.as_bytes(), false).unwrap();
+        }
+        assert_eq!(t.lookup(root, b"missing"), Err(errno::ENOENT));
+        assert!(t.lookup(root, b"kept").is_ok());
         drop(t);
         Arena::remove(id);
     }

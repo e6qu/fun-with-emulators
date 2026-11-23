@@ -4091,12 +4091,6 @@ fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
     }
 }
 
-/// `/dev/shm`: Linux mounts a tmpfs there that every process on the
-/// machine shares. fwe keeps one directory for it per rootfs (the host's
-/// `/` included), private to the user, shared by every fwe process that
-/// runs on that root: `fwe-<uid>/shm-<hash of the root's host path>` in the
-/// user's temporary directory. Unlike a tmpfs it outlives the processes,
-/// until the host clears its temporary files.
 /// fwe's private directory on the host (`fwe-<uid>` in the user's
 /// temporary directory), which a process fwe starts in a way that leaves
 /// the host's answer for the temporary directory unreliable (a VM fork
@@ -4113,6 +4107,12 @@ pub fn adopt_host_dir(dir: Vec<u8>) {
     let _ = shm::USER_DIR.set(dir);
 }
 
+/// `/dev/shm`: Linux mounts a tmpfs there that every process on the
+/// machine shares. fwe keeps one filesystem of its store in memory for it
+/// per rootfs (the host's `/` included), private to the user, shared by
+/// every fwe process that runs on that root ([`shm::store`]). Unlike a
+/// tmpfs it outlives the processes, while its rootfs exists or a process
+/// holds a file of it ([`crate::shared::collect`]).
 pub(crate) mod shm {
     use super::e;
     use fwe_abi::errno;
