@@ -705,7 +705,10 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   latest `SIGCONT` is not taken. The stop is fwe's (`signal::job_stop`):
   the stopping thread wakes the others, which then wait for the kernel
   lock it keeps (a thread in the program's code takes its wake under that
-  lock, one in a host call ends the call to), notes the stop in its
+  lock, one in a host call ends the call to; the lock counts the guest's
+  threads waiting for it, `klock::guests_waiting`). Once the last of them
+  waits there, as Linux's group stop is complete once its last thread
+  stops, it notes the stop in its
   mailbox (its signal, and a count of stops and of continues, which a
   `wait` takes each once), tells its parent with `SIGCHLD` through the
   parent's mailbox, and sleeps on its count of `SIGCONT`s, which every
@@ -1163,7 +1166,9 @@ contents come from is in
   system call, `D` while the host brings in a page for it, and `R` while
   it does fwe's own work, waiting for one of fwe's locks or the host's
   reading and writing of fwe's records (a mark in the process store,
-  `procstore::Busy`), as a Linux task doing its kernel's work is not
+  `procstore::Busy`, which also counts the times it was set: read before
+  and after the host's state, it tells a wait of fwe's that ended between
+  the two), as a Linux task doing its kernel's work is not
   asleep, or before it has gone into the program (a fork's child whose
   making waits; `procstore::entered` marks it as it goes in).
 - `cpuinfo` is Linux's arm64 format: BogoMIPS from the host's timer, the
@@ -1216,7 +1221,9 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
 - **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
   fwe process maps counts, for each pipe a set watches exclusively, its
   writes and the writes a waiter took. A set a write woke reports it only
-  if it takes one; the others wait for the next write. An edge-triggered
+  if it takes one; the others try again at each write counted from then
+  on (the writer counts its write once the host's call returns, after the
+  host woke every set). An edge-triggered
   set sees such a pipe readable anew when written to.
 - **Fork:** of the epoll and timerfd kqueues a fork child rebuilds (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events)), a timer
