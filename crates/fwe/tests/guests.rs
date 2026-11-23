@@ -2082,6 +2082,14 @@ fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
     c_guest_prints("blockedwake", &["sleeping"], "taken by the other thread\n");
 }
 
+/// A pipe several processes' epoll sets watch with `EPOLLEXCLUSIVE` wakes
+/// exactly one of them for each byte written, as LTP's `epoll_wait16`
+/// checks.
+#[test]
+fn an_exclusive_epoll_wake_reaches_one_waiter() {
+    c_guest_prints("epollx", &[], "each write woke one waiter: yes\n");
+}
+
 /// `SIGURG` a process blocks and reads through a signalfd, sent by another
 /// process as the receiver starts each wait (PostgreSQL's latches), is read
 /// every time: never left blocked on the host by fwe's look for signals

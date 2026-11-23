@@ -766,56 +766,59 @@ fn wait_exclusive(ep: i32, events: u64, max: usize, ns: i64, exclusive: &[i32]) 
             left.as_nanos().min(i64::MAX as u128) as i64
         })
     };
+    let mut ready = match kevent_wait(ep, max, left()) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    // Woken by a write to a pipe watched exclusively: only if this set
+    // takes it. A hang-up or error is everyone's.
+    let mut lost: Ready = Vec::new();
+    ready.retain(|&(fd, bits, data)| {
+        let only_input = bits & (EPOLLHUP | EPOLLERR) == 0 && bits & EPOLLIN != 0;
+        if only_input && exclusive.contains(&fd) && !crate::exclusive::take(fd) {
+            lost.push((fd, bits, data));
+            return false;
+        }
+        true
+    });
+    if lost.is_empty() || !ready.is_empty() {
+        return write_events(events, &ready);
+    }
+    // Another set took the write, or it is not counted yet: the host
+    // wakes every set as the write is made, and the writer counts it
+    // once its call returns. The host's edge is spent, so this set
+    // tries again for each write counted from here on, in slices, for
+    // a signal. The count is read before each try: one counted
+    // between the try and the wait ends the wait at once.
     loop {
-        let mut ready = match kevent_wait(ep, max, left()) {
+        let seen: Vec<u64> =
+            lost.iter().map(|&(fd, ..)| crate::exclusive::writes(fd).unwrap_or(0)).collect();
+        let taken: Ready =
+            lost.iter().copied().filter(|&(fd, ..)| crate::exclusive::take(fd)).collect();
+        if !taken.is_empty() {
+            return write_events(events, &taken);
+        }
+        let ns = left();
+        if ns == 0 {
+            return write_events(events, &[]);
+        }
+        if crate::thread::deliverable() != 0 {
+            return fwe_abi::err(fwe_abi::errno::EINTR);
+        }
+        let slice = std::time::Duration::from_millis(10);
+        let slice =
+            if ns > 0 { slice.min(std::time::Duration::from_nanos(ns as u64)) } else { slice };
+        crate::exclusive::wait_for_write(lost[0].0, seen[0], slice);
+        // Meanwhile, what else of the set is ready.
+        let others: Ready = match kevent_wait(ep, max, 0) {
             Ok(r) => r,
             Err(e) => return e,
-        };
-        // Woken by a write to a pipe watched exclusively: only if this set
-        // takes it. A hang-up or error is everyone's.
-        let mut lost = None;
-        ready.retain(|&(fd, bits, _)| {
-            let only_input = bits & (EPOLLHUP | EPOLLERR) == 0 && bits & EPOLLIN != 0;
-            if only_input && exclusive.contains(&fd) && !crate::exclusive::take(fd) {
-                lost = Some(fd);
-                return false;
-            }
-            true
-        });
-        let Some(fd) = lost.filter(|_| ready.is_empty()) else {
-            return write_events(events, &ready);
-        };
-        // Another set took it. The pipe may stay ready (by level) until it
-        // is read: wait for the next write, in slices, for a signal.
-        let seen = crate::exclusive::writes(fd).unwrap_or(0);
-        loop {
-            let ns = left();
-            if ns == 0 {
-                return write_events(events, &[]);
-            }
-            if crate::thread::deliverable() != 0 {
-                return fwe_abi::err(fwe_abi::errno::EINTR);
-            }
-            let slice = std::time::Duration::from_millis(10);
-            let slice =
-                if ns > 0 { slice.min(std::time::Duration::from_nanos(ns as u64)) } else { slice };
-            crate::exclusive::wait_for_write(fd, seen, slice);
-            if crate::exclusive::writes(fd) != Some(seen) {
-                break;
-            }
-            // Meanwhile, what else of the set is ready.
-            let others: Ready = match kevent_wait(ep, max, 0) {
-                Ok(r) => r,
-                Err(e) => return e,
-            }
-            .into_iter()
-            .filter(|&(fd, bits, _)| {
-                !(exclusive.contains(&fd) && bits & (EPOLLHUP | EPOLLERR) == 0)
-            })
-            .collect();
-            if !others.is_empty() {
-                return write_events(events, &others);
-            }
+        }
+        .into_iter()
+        .filter(|&(fd, bits, _)| !(exclusive.contains(&fd) && bits & (EPOLLHUP | EPOLLERR) == 0))
+        .collect();
+        if !others.is_empty() {
+            return write_events(events, &others);
         }
     }
 }
