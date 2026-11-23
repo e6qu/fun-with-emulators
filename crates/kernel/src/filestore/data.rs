@@ -273,43 +273,31 @@ pub fn zero(id: u64, start: u64, end: u64) -> Result<(), i32> {
 }
 
 /// The whole pages at `at`, `len` bytes of a shared mapping, read as
-/// zeroes. On Linux their memory goes back to the host. On macOS each
-/// page that ever held anything (in memory, compressed or paged out, as
-/// `mincore` tells) is written with zeroes in place, and one that never
-/// did is left alone, holding no memory still; what a page held stays the
-/// object's until it goes. (macOS's calls that would take a shared
-/// object's pages back, `MADV_ZERO` then `MADV_FREE_REUSABLE`, are not
-/// made: their use was followed by a panic of the host's memory
-/// compressor.)
+/// zeroes, their memory the host's again. On Linux they go
+/// (`MADV_REMOVE`). On macOS, which takes no page of a shared object back
+/// for good, they are zeroed (`MADV_ZERO`, which writes no page that held
+/// nothing and pages none back in) and left for the host to take first
+/// when it runs short (`MADV_FREE_REUSABLE`, as macOS's `malloc` leaves
+/// freed memory): a page written again after is dirty, and kept.
 ///
 /// # Safety
 /// Pages of a shared mapping no one else uses as memory of their own.
 pub(super) unsafe fn give_back(at: *mut libc::c_void, len: usize) {
     #[cfg(target_os = "macos")]
     {
-        // A few thousand pages' states at a time; what says a page is of
-        // anonymous memory alone says nothing of what it holds.
-        const CHUNK: usize = 4096 * PAGE as usize;
-        const MINCORE_ANONYMOUS: libc::c_char = 0x80u8 as libc::c_char;
-        let mut states = vec![0 as libc::c_char; CHUNK / PAGE as usize];
-        let mut done = 0;
-        while done < len {
-            let n = (len - done).min(CHUNK);
-            let base = at as usize + done;
-            // SAFETY: inside the caller's mapping; one byte a page.
-            let known =
-                unsafe { libc::mincore(base as *mut libc::c_void, n, states.as_mut_ptr()) } == 0;
-            for (i, &state) in states[..n.div_ceil(PAGE as usize)].iter().enumerate() {
-                if known && state & !MINCORE_ANONYMOUS == 0 {
-                    continue;
-                }
-                let page = base + i * PAGE as usize;
-                let size = (PAGE as usize).min(base + n - page);
-                // SAFETY: a page of the caller's mapping, guaranteed unused.
-                unsafe { std::ptr::write_bytes(page as *mut u8, 0, size) };
-            }
-            done += n;
-        }
+        /// `<sys/mman.h>`'s, which the libc crate does not have.
+        const MADV_ZERO: libc::c_int = 11;
+        // SAFETY: whole pages of the caller's mapping, which no one uses.
+        let zeroed = unsafe { libc::madvise(at, len, MADV_ZERO) };
+        assert_eq!(zeroed, 0, "MADV_ZERO of fwe's own pages: {}", std::io::Error::last_os_error());
+        // SAFETY: as above.
+        let reusable = unsafe { libc::madvise(at, len, libc::MADV_FREE_REUSABLE) };
+        assert_eq!(
+            reusable,
+            0,
+            "MADV_FREE_REUSABLE of fwe's own pages: {}",
+            std::io::Error::last_os_error()
+        );
     }
     // SAFETY: guaranteed by the caller.
     #[cfg(not(target_os = "macos"))]
@@ -361,24 +349,47 @@ mod tests {
         assert_eq!(open(id, true).err(), Some(fwe_abi::errno::ENOENT));
     }
 
-    /// Zeroed whole pages read as zeroes; those that never held anything
-    /// are not brought into memory by it.
+    /// Zeroed whole pages read as zeroes, through another mapping too, and
+    /// no longer count against the process's memory; written again, they
+    /// keep what is written.
     #[test]
-    fn zeroing_touches_only_pages_that_held_data() {
+    fn zeroed_pages_read_as_zeroes_and_go_back() {
+        // `task_vm_info`'s `phys_footprint`: its 19th 64-bit word
+        // (`<mach/task_info.h>`, flavor `TASK_VM_INFO`).
+        let footprint = || {
+            const TASK_VM_INFO: libc::task_flavor_t = 22;
+            let mut info = [0u64; 64];
+            let mut n = (std::mem::size_of_val(&info) / 4) as libc::mach_msg_type_number_t;
+            // SAFETY: a valid out-buffer of `n` 32-bit words, for this task.
+            let r = unsafe {
+                #[allow(deprecated)]
+                libc::task_info(
+                    libc::mach_task_self(),
+                    TASK_VM_INFO,
+                    info.as_mut_ptr().cast(),
+                    &mut n,
+                )
+            };
+            assert_eq!(r, 0);
+            info[18]
+        };
         let id = make().unwrap();
-        write(id, PAGE + 1, &[9u8; 100]).unwrap();
-        zero(id, 0, 64 * PAGE).unwrap();
-        let mut b = [1u8; 100];
-        read(id, PAGE + 1, &mut b).unwrap();
-        assert_eq!(b, [0u8; 100]);
-        let v = view(id, 64 * PAGE).unwrap();
-        let mut states = [0 as libc::c_char; 64];
-        let len = 64 * PAGE as usize;
-        // SAFETY: inside the view; one byte a page.
-        let r = unsafe { libc::mincore(v.base as *mut libc::c_void, len, states.as_mut_ptr()) };
-        assert_eq!(r, 0);
-        let held = states.iter().filter(|&&s| s as u8 & !0x80 != 0).count();
-        assert_eq!(held, 1, "{states:?}");
+        // Held open: its pages are this process's while its view is mapped.
+        keep(id);
+        let len = 64 * PAGE;
+        write(id, 0, &vec![9u8; len as usize]).unwrap();
+        let before = footprint();
+        zero(id, 0, len).unwrap();
+        let after = footprint();
+        assert!(before - after >= len / 2, "{before} -> {after}");
+        let mut b = vec![1u8; len as usize];
+        read(id, 0, &mut b).unwrap();
+        assert!(b.iter().all(|&x| x == 0));
+        write(id, PAGE, b"kept").unwrap();
+        let mut k = [0u8; 4];
+        read(id, PAGE, &mut k).unwrap();
+        assert_eq!(&k, b"kept");
+        let_go(id);
         remove(id);
     }
 }
