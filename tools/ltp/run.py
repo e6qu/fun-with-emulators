@@ -42,6 +42,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 # LTP's exit statuses (include/tst_res_flags.h), as bits.
@@ -180,19 +181,60 @@ def end_leftovers(fwe, root):
 def stacks(sid, work):
     """The stacks of the processes of session `sid`, as macOS's `sample`
     takes them: fwe's own frames, a few lines a thread."""
-    out = []
-    for pid in map(str, session(sid)[:8]):
-        path = os.path.join(work, f"sample-{pid}.txt")
-        subprocess.run(["sample", pid, "1", "-file", path], capture_output=True, timeout=60)
-        try:
-            with open(path) as f:
-                lines = [l.rstrip() for l in f if "fwe_" in l or "Thread_" in l or "libsystem_kernel" in l]
-            os.remove(path)
-        except OSError:
-            continue
-        out.append(f"--- stacks of {pid}:")
-        out.extend(l[:220] for l in lines[:60])
-    return "\n" + "\n".join(out) + "\n"
+    return "\n" + "".join(stacks_of(pid, work) for pid in session(sid)[:8])
+
+
+def stacks_of(pid, work):
+    """Process `pid`'s stacks ([`stacks`])."""
+    path = os.path.join(work, f"sample-{pid}.txt")
+    try:
+        subprocess.run(["sample", str(pid), "1", "-file", path], capture_output=True, timeout=60)
+        with open(path) as f:
+            lines = [l.rstrip() for l in f if "fwe_" in l or "Thread_" in l or "libsystem_kernel" in l]
+        os.remove(path)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return "\n".join([f"--- stacks of {pid}:"] + [l[:220] for l in lines[:60]]) + "\n"
+
+
+# Whether a timeout has had every fwe process looked at ([`others`]).
+LOOKED = threading.Lock()
+LOOKED_DONE = []
+
+
+def seconds(etime):
+    """`ps`'s elapsed time ([[dd-]hh:]mm:ss) in seconds."""
+    days, _, rest = etime.rpartition("-")
+    total = 0
+    for part in rest.split(":"):
+        total = total * 60 + int(part)
+    return total + int(days or 0) * 86400
+
+
+def others(sid, work):
+    """Once a run, at its first timeout: every other fwe process on the
+    machine, its state and how long it has run (`T`: stopped), and the
+    stacks of those that may hold what the test waits for (a lock in
+    memory fwe's processes share names its holder, who may be any of
+    them): the stopped first, then the oldest."""
+    with LOOKED:
+        if LOOKED_DONE:
+            return ""
+        LOOKED_DONE.append(True)
+    ps = subprocess.run(["ps", "-axo", "pid=,stat=,etime=,comm="], capture_output=True, text=True)
+    mine = set(session(sid))
+    rows = []
+    for line in ps.stdout.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) == 4 and parts[3].endswith("/fwe") and int(parts[0]) not in mine:
+            rows.append(parts)
+    out = ["--- every other fwe process (pid, state, time):"]
+    out += [" ".join(r[:3]) for r in rows]
+    rows.sort(key=lambda r: ("T" not in r[1], -seconds(r[2])))
+    text = "\n".join(out) + "\n"
+    for r in rows[:12]:
+        text += stacks_of(int(r[0]), work)
+    return text
 
 
 # Tests run with fwe's notes kept ([`run_one`]): open12, whose O_NOATIME
@@ -281,6 +323,7 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
             # Where each of its processes is stuck, for the record (a test
             # that hangs is a bug of fwe's to find).
             log.write(stacks(proc.pid, work).encode())
+            log.write(others(proc.pid, work).encode())
         # It, and whatever it left running in its session (in process
         # groups of its own, some of it).
         end_session(proc.pid)
