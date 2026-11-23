@@ -299,7 +299,8 @@ def backends(cmd, fresh=()):
     """Which of fwe's backends ran the programs of `cmd` (fwe, or `env -i`
     and fwe), by the `backend:` marks of `FWE_TIMING` (every program a run
     starts, in every process): "native", "VM", or both with how many of
-    each. `fresh` is emptied first."""
+    each. `fresh` is emptied first. A run that does not end is reported as
+    any other ([`run_limited`])."""
     for d in fresh:
         shutil.rmtree(d, ignore_errors=True)
         os.makedirs(d)
@@ -307,7 +308,7 @@ def backends(cmd, fresh=()):
         cmd, env = cmd[:2] + ["FWE_TIMING=1"] + cmd[2:], None
     else:
         env = dict(os.environ, FWE_TIMING="1")
-    r = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace")
+    r = run_limited(cmd, f"{os.path.basename(cmd[0])} backends", env)
     n = collections.Counter(re.findall(r"timing: backend: (native|vm) ", r.stderr))
     if not n:
         return "unknown"
@@ -880,14 +881,15 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
 LIMIT = 300
 
 
-def run_limited(cmd, name):
-    """`cmd` run as `subprocess.run` with its output captured as text, for
-    at most LIMIT seconds. Past them, each of its processes is sampled
+def run_limited(cmd, name, env=None):
+    """`cmd` run as `subprocess.run` with its output captured as text (in
+    environment `env`, or this one's), for at most LIMIT seconds. Past
+    them, each of its processes is sampled
     (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
     on top of its threads' stacks printed), the process group it was started
     in is stopped, and the benchmarks fail."""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-                         errors="replace", start_new_session=True)
+                         errors="replace", start_new_session=True, env=env)
     try:
         out, err = p.communicate(timeout=LIMIT)
     except subprocess.TimeoutExpired:
