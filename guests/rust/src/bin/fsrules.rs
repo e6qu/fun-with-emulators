@@ -1823,6 +1823,20 @@ fn store_scenario() {
     // SAFETY: NUL-terminated paths.
     let (r, e) = unsafe { (rename(c("/tmp/s/at-end").as_ptr(), c(&long).as_ptr()), errno()) };
     println!("rename to a 256-byte name: {r} errno {e}");
+    // Both times omitted: nothing done, on an immutable file and on a
+    // path that names nothing alike.
+    const FS_IMMUTABLE_FL: u32 = 0x10;
+    let omit = [0i64, (1 << 30) - 2, 0, (1 << 30) - 2];
+    let set = try_set_flags("/tmp/s/cached", FS_IMMUTABLE_FL);
+    // SAFETY: NUL-terminated paths; the times array.
+    let (immutable, missing) = unsafe {
+        (
+            utimensat(AT_FDCWD, c("/tmp/s/cached").as_ptr(), &omit, 0),
+            utimensat(AT_FDCWD, c("/tmp/s/none/x").as_ptr(), &omit, 0),
+        )
+    };
+    let unset = try_set_flags("/tmp/s/cached", 0);
+    println!("times omitted: immutable ({set}) {immutable}, missing {missing} ({unset})");
 }
 
 /// The names in directory `p`.

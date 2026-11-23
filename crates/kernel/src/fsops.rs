@@ -3129,6 +3129,11 @@ impl<P: Platform> Kernel<P> {
             None
         } else {
             let t: [fwe_abi::Timespec; 2] = guest!(uaccess::read(times));
+            // Both left as they are: nothing to do, and the path is not
+            // looked at, as Linux returns before it.
+            if t.iter().all(|t| t.tv_nsec == fwe_abi::UTIME_OMIT) {
+                return 0;
+            }
             Some(t.map(|t| libc::timespec {
                 tv_sec: t.tv_sec as libc::time_t,
                 tv_nsec: match t.tv_nsec {
@@ -3145,15 +3150,11 @@ impl<P: Platform> Kernel<P> {
         let kinds = host_times.map(|t| t.map(|x| x.tv_nsec));
         let explicit =
             kinds.is_some_and(|k| k.iter().any(|&n| n != libc::UTIME_NOW && n != libc::UTIME_OMIT));
-        let all_omitted = kinds.is_some_and(|k| k.iter().all(|&n| n == libc::UTIME_OMIT));
         // Both set to now (what an append-only file takes).
         let touch = kinds.is_none_or(|k| k.iter().all(|&n| n == libc::UTIME_NOW));
         let may = |st: &libc::stat| -> Result<(), i32> {
             let c = &self.creds;
-            if all_omitted
-                || c.fsuid == st.st_uid
-                || c.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid)
-            {
+            if c.fsuid == st.st_uid || c.has_over(crate::caps::CAP_FOWNER, st.st_uid, st.st_gid) {
                 Ok(())
             } else if explicit {
                 Err(errno::EPERM)
