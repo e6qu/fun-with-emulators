@@ -2195,19 +2195,27 @@ and Linux arm64 runners; the System V calls' budget is 3x macOS's):
 
 | Benchmark | fwe | macOS | Linux |
 |---|---|---|---|
-| System V semaphore up+down | 916 ns | 616 ns | 594 ns |
-| System V message send+receive | 910 ns | 1319 ns | 783 ns |
-| System V segment made, attached, written, detached, removed | 11.4 µs | 4.3 µs (a shared memory object made, mapped and removed: what fwe's segment costs the host) | 9.0 µs |
-| eventfd write+read | 986 ns | none | 504 ns |
-| shared futex wake, no one waiting | 90 ns | none | 287 ns |
-| a small file's life in `/dev/shm` (made, 4 KiB written and read back, closed, removed) | 58.6 µs | none | 6.45 µs |
-| the same file's life in `/tmp`, on the disk | 358 µs | 277 µs | 12.8 µs |
-| a memfd's life (made, 4 KiB written and read back, closed) | 31.2 µs | none | 4.27 µs |
-| a shared memory object's life in `/dev/shm` (made, sized to 64 KiB, mapped, written, removed) | 66.3 µs | none | 10.5 µs |
+| System V semaphore up+down | 1048 ns | 610 ns | 593 ns |
+| System V message send+receive | 864 ns | 1301 ns | 785 ns |
+| System V segment made, attached, written, detached, removed | 8.87 µs | 3.14 µs (a shared memory object made, mapped and removed: what fwe's segment costs the host) | 9.36 µs |
+| eventfd write+read | 954 ns | none | 504 ns |
+| shared futex wake, no one waiting | 89 ns | none | 287 ns |
+| a small file's life in `/dev/shm` (made, 4 KiB written and read back, closed, removed) | 57.8 µs | none | 6.54 µs |
+| the same file's life in `/tmp`, on the disk | 165 µs | 127 µs | 13.0 µs |
+| a memfd's life (made, 4 KiB written and read back, closed) | 29.7 µs | none | 4.31 µs |
+| a shared memory object's life in `/dev/shm` (made, sized to 64 KiB, mapped, written, removed) | 66.1 µs | none | 11.1 µs |
 
-A file in fwe's store costs a sixth of the same file on the disk under
-fwe, and a fifth of macOS's own disk file: memfds, `/dev/shm` and every
+A file in fwe's store costs a third of the same file on the disk under
+fwe, and under half of macOS's own disk file: memfds, `/dev/shm` and every
 tmpfs are the store's.
+
+Programs at work, on the same runners:
+
+| Workload | fwe | macOS | Linux |
+|---|---|---|---|
+| LTP's IPC tests (System V and POSIX message queues), the 47 that pass | 37.0 s, 20.1 s of it `semop05`'s own sleep | none | — |
+| Lua built from clean with `make -j4` (a fork-heavy build) | 1.89 s | 1.80 s | 2.12 s |
+| PostgreSQL 18 (`tools/bench/workloads/postgres.sh`): `initdb`, a server, `pgbench` of 4 clients × 250 transactions, a `count(*)` its parallel workers scan (System V and POSIX shared memory, semaphores, signals) | 2.76 s | 1.66 s | 1.34 s |
 
 ### Namespaces
 
