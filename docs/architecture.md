@@ -705,10 +705,7 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   latest `SIGCONT` is not taken. The stop is fwe's (`signal::job_stop`):
   the stopping thread wakes the others, which then wait for the kernel
   lock it keeps (a thread in the program's code takes its wake under that
-  lock, one in a host call ends the call to; the lock counts the guest's
-  threads waiting for it, `klock::guests_waiting`). Once the last of them
-  waits there, as Linux's group stop is complete once its last thread
-  stops, it notes the stop in its
+  lock, one in a host call ends the call to), notes the stop in its
   mailbox (its signal, and a count of stops and of continues, which a
   `wait` takes each once), tells its parent with `SIGCHLD` through the
   parent's mailbox, and sleeps on its count of `SIGCONT`s, which every
