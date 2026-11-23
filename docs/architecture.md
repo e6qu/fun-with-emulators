@@ -909,7 +909,8 @@ keeping fwe's own descriptors apart and Linux's limits exact:
 
 - `stat`/`statx` are translated to the arm64 Linux layout; `statx` reports
   the immutable, append-only and no-dump attributes from the host's file
-  flags, and the birth time APFS keeps. A tmpfs file is on the device
+  flags, and the birth time APFS keeps. A file of fwe's store (a tmpfs's,
+  `/dev/shm`'s, a memfd) is on its filesystem's own device, which
   `/proc/<pid>/mountinfo` gives its mount, in page-sized blocks; any other
   mount of host files has there the host device its files report.
   `getdents64` is built from `getdirentries`, re-reading from the directory
@@ -975,17 +976,33 @@ keeping fwe's own descriptors apart and Linux's limits exact:
   (any write call, a truncation, a copy or splice into it, a shared
   writable mapping) once this process opened it to write, by its host
   identity as a set-ID file is watched (`modes::CAPS_FILES`).
-- **memfd** (`crates/kernel/src/memfd.rs`): `/proc/self/fd` names it
-  `/memfd:<name> (deleted)`; `F_SEAL_SHRINK`/`GROW` are checked by
-  `ftruncate` and `fallocate`, `F_SEAL_EXEC` by `fchmod`; after
-  `F_SEAL_WRITE` the host refuses writes and writable shared mappings,
-  reported as `EPERM`. Opened again read-only through `/proc/self/fd`, it
-  is the same host description with a mark (`fdmarks::Mark::ReadOnly`)
-  that makes it read-only as Linux's new description is, and travels with
-  it through `fork`, `execve` and `SCM_RIGHTS`. A mapping of a file with no
-  name holds a descriptor of it (`maps::HeldFile`), so `mremap` and
-  `remap_file_pages` map more of it as Linux's mapping, which holds its
-  file, does.
+- **fwe's file store** (`crates/kernel/src/filestore/`, `storeops.rs`,
+  `storenodes.rs`): the files of every tmpfs, of `/dev/shm`, of memfds and
+  of the cgroup tree. A filesystem's names, inodes, owners, modes, times,
+  attributes, flags, seals, holders and locks are in a shared memory arena
+  of its own (`arena.rs`, `tree.rs`), changed under its lock; a regular
+  file's data is a host shared memory object (`data.rs`), made at the
+  first write, sparse up to 16 TiB, mapped by each process that reads or
+  writes it, its pages counted against the filesystem's size as they are
+  first written. A guest's descriptor of a store file stands on
+  `/dev/null`, which keeps the description's offset and status flags; the
+  store keeps which process holds which file through which description
+  (`desc.rs`), so a file with no names goes once its last holder lets go,
+  a fork child holding what its parent held. The path calls in a store
+  directory run Linux's checks in Linux's order (`storeops.rs`); a FIFO or
+  socket made in one has a host node in fwe's private directory behind
+  it. A store file passed by `SCM_RIGHTS` to another fwe process is the
+  same description; to a process of the host's (an X server), the data's
+  object.
+- **memfd** (`crates/kernel/src/memfd.rs`): a file with no name in the
+  store's filesystem of memfds; `/proc/self/fd` names it
+  `/memfd:<name> (deleted)`; `F_SEAL_SHRINK`/`GROW` are checked by every
+  write, `ftruncate` and `fallocate`, `F_SEAL_EXEC` by `fchmod`, and
+  `F_SEAL_WRITE` refuses writes, cutting and writable shared mappings.
+  Opened again read-only through `/proc/self/fd`, it is a new read-only
+  description of the same file. A mapping of a file with no name holds a
+  descriptor of it (`maps::HeldFile`), so `mremap` and `remap_file_pages`
+  map more of it as Linux's mapping, which holds its file, does.
 - **Programs run from a descriptor** (`execveat(fd, "", AT_EMPTY_PATH)`,
   `/dev/fd/N`, a `/proc/self/fd` path, as crun runs its sealed copy) are
   read through it; fwe keeps a descriptor of the program, which
@@ -1141,7 +1158,8 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   namespace record's generation, checked in slices).
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
-  An eventfd's counter is a file of fwe's, mapped, with a lock word, so a
+  An eventfd's counter is a host shared memory object with no name,
+  mapped, with a lock word, so a
   fork child and its parent, or a process it is passed to, share one
   counter, as on Linux. The counter counts its writes too: an
   edge-triggered set sees the eventfd readable anew on each, as Linux
@@ -1257,7 +1275,7 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   `EAGAIN`. Buffers hold two of the largest messages, and that odd size
   marks the socket, so one received with `SCM_RIGHTS` is recognised. A
   message is sent or taken under the socket's lock for that direction (a
-  mutex within a process, a byte-range lock on a file of fwe's between
+  mutex within a process, a lock in the process store between
   processes).
 - Control messages (`crates/kernel/src/scm.rs`): a descriptor fwe stands
   in for travels with a bundle, a host datagram socket sent last that
@@ -1379,14 +1397,17 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   `userxattr`). The overlay's own attributes are hidden; `metacopy=on`,
   `redirect_dir=on` and `index=on` are refused.
 - **tmpfs limits and owner** (`crates/kernel/src/tmpfs.rs`): a tmpfs mount
-  is a directory of fwe's, its `size=` and `nr_inodes=` kept in files beside
-  it. Its use is what its files take on the host, and its inodes its root
-  and each name in it, recounted once a count is a quarter second old; a
-  write past the size (any of the write calls, or `copy_file_range`,
-  `sendfile` or `splice` into a file) writes what fits or fails with
-  `ENOSPC`, `fallocate` fits whole or fails, a name made past the inodes
-  fails with `ENOSPC`, and `statfs` reports both and what is left; a remount
-  with `size=` or `nr_inodes=` sets a new one. Its root is its maker's, or
+  is a new filesystem of fwe's store, of `size=` and `nr_inodes=` (half
+  the memory and an inode for every two of its pages by default, as
+  Linux's). Its use is the pages its files' data holds and its inodes,
+  each file's names past its first counting as one more (Linux's
+  `shmem_link`), counted as they change under the filesystem's lock; a
+  write past the size (any of the write calls, a write through a shared
+  mapping, or `copy_file_range`, `sendfile` or `splice` into a file)
+  writes what fits or fails with `ENOSPC` (`SIGBUS` for a mapping),
+  `fallocate` fits whole or fails, a name made past the inodes fails with
+  `ENOSPC`, and `statfs` reports both and what is left; a remount with
+  `size=` or `nr_inodes=` sets a new one. Its root is its maker's, or
   `uid=` and `gid=`'s, with `mode=`'s mode.
 - **`proc` options** (`crates/kernel/src/procfs.rs`): `hidepid=` hides
   another process's `/proc/<pid>` from a reader that may not trace it and
@@ -1395,9 +1416,13 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   at each open, `stat` and listing; `subset=pid` shows only the
   processes' directories and `self` and `thread-self`.
 
-- **cgroups** (`crates/kernel/src/cgroupfs.rs`, `bpf.rs`): device programs
-  are kept in the cgroup's directory, so they outlive the runtime that
-  attached them. The eBPF interpreter checks each access against the
+- **cgroups** (`crates/kernel/src/cgroupfs.rs`, `bpf.rs`): the tree is a
+  filesystem of fwe's store that lasts as long as the user's fwe does; a
+  file that reports what is so now (`cgroup.procs`, `cgroup.events`,
+  `pids.current`...) is made anew as it is opened where what it says
+  changed, so a reader's descriptor keeps what it was shown. Device
+  programs are attributes of the cgroup's directory no listing shows, so
+  they outlive the runtime that attached them. The eBPF interpreter checks each access against the
   context and stack and stops a program that runs too long. A program of
   a type fwe does not run (anything but device programs and socket
   filters) does not load (`EINVAL`, as a kernel without the type answers
@@ -1479,7 +1504,7 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   nothing to restart (`EINTR`); `process_mrelease` answers for a process on
   its way out, whose memory the host frees itself.
 - `acct` (`crates/kernel/src/acct.rs`): the accounting file's host path is
-  kept in a file of fwe's for the pid namespace, and each ending process
+  kept in a record of fwe's in memory for the pid namespace, and each ending process
   appends its `struct acct_v3` to the nearest namespace's with accounting
   on, its own or one above: times, memory and faults from its usage,
   `AFORK` for a fork child that ran no program. The process store counts
@@ -1704,13 +1729,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - `fallocate` reserves space past the end (mode 0, `FALLOC_FL_KEEP_SIZE`)
   and punches holes, but does not fill a hole inside a sparse file; other
   modes are `EOPNOTSUPP`.
-- `/dev/shm` outlives its processes until the host clears its temporary
-  files.
-- memfd: `F_SEAL_GROW` does not stop a `writev` or `pwritev` past the end
-  (`write` and `pwrite64` are checked); `F_SEAL_WRITE` does not reach
-  another process's descriptors and changes the inode number; a memfd
-  reopened through `/proc/self/fd` shares the original's offset and status
-  flags.
+- `/dev/shm`'s files go once no fwe process on its root is left (fwe
+  collects what no live process holds), where Linux keeps them until the
+  machine stops.
+- `F_SEAL_WRITE` is refused (`EBUSY`) for a writable shared mapping of
+  this process only: another process's goes unseen.
+- A file of fwe's store holds memory in 16 KiB pages: what a truncation or
+  punched hole frees stays the data object's (zeroed) until the file goes,
+  though the filesystem counts it free.
 - `tee` needs a write end of its input pipe (`EINVAL` otherwise); without
   one, `splice` from a pipe to a file or waiting socket that a signal or
   error cuts short loses what it took and did not write.
@@ -1730,12 +1756,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   directory).
 
 **Mounts**
-- A tmpfs's files are host files: its size counts their host blocks, and
-  its inodes their names, up to a quarter second late, so writes or new
-  names from several processes at once can pass them, and so can writes
-  through a shared mapping, which fwe does not see; an unlinked file still
-  open holds no inode. A remount may limit a tmpfs that had no limit, or
-  to less than it uses.
+- A remount may limit a tmpfs that had no limit, or to less than it
+  uses.
 - `proc`'s `hidepid=noaccess` lets another's `/proc/<pid>` directory
   itself be opened, not only `stat`ed; what is in it is refused.
 - A new file does not inherit its directory's no-dump and no-access-time
