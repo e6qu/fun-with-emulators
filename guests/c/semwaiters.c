@@ -2,7 +2,9 @@
  * counted by GETNCNT or GETZCNT, as semctl01 expects: fwe's own work on
  * the way to the wait (its records' files, a page brought in) is not
  * shown as a sleep. Eight workers at once, each with sets of its own,
- * load the host as a test run does.
+ * load the host as a test run does. A waiter shown sleeping but not
+ * counted is told: the count then, 20 ms later, and its state then; a
+ * worker's failing call, with its errno.
  *
  * Built freestanding and linked against the target libc's shared library
  * (no system headers), as the other dynamic guests. */
@@ -24,8 +26,11 @@ int pipe(int fds[2]);
 ssize_t write(int fd, const void *buf, size_t n);
 int snprintf(char *s, size_t n, const char *format, ...);
 int printf(const char *format, ...);
+int dprintf(int fd, const char *format, ...);
+int usleep(unsigned usec);
 char *strrchr(const char *s, int c);
 int sched_yield(void);
+int *__errno_location(void);
 
 #define IPC_PRIVATE 0
 #define IPC_CREAT 01000
@@ -65,16 +70,20 @@ static int worker(void) {
     int wrong = 0;
     for (int r = 0; r < ROUNDS; r++) {
         int id = semget(IPC_PRIVATE, 1, IPC_CREAT | 0600);
-        if (id < 0)
+        if (id < 0) {
+            dprintf(1, "round %d: semget errno %d\n", r, *__errno_location());
             return -1;
+        }
         int zero = r & 1;
         if (zero)
             semctl(id, 0, SETVAL, 1);
         int pids[WAITERS];
         for (int i = 0; i < WAITERS; i++) {
             int pid = fork();
-            if (pid < 0)
+            if (pid < 0) {
+                dprintf(1, "round %d: fork errno %d\n", r, *__errno_location());
                 return -1;
+            }
             if (pid == 0) {
                 struct sembuf s = {0, zero ? 0 : -1, 0};
                 semop(id, &s, 1);
@@ -83,8 +92,14 @@ static int worker(void) {
             pids[i] = pid;
             while (state(pid) != 'S')
                 sched_yield();
-            if (semctl(id, 0, zero ? GETZCNT : GETNCNT) != i + 1)
+            int counted = semctl(id, 0, zero ? GETZCNT : GETNCNT);
+            if (counted != i + 1) {
                 wrong++;
+                usleep(20000);
+                int later = semctl(id, 0, zero ? GETZCNT : GETNCNT);
+                dprintf(1, "round %d, waiter %d (pid %d): counted %d, 20 ms later %d, state %c\n",
+                        r, i + 1, pid, counted, later, state(pid));
+            }
         }
         for (int i = 0; i < WAITERS; i++) {
             kill(pids[i], SIGKILL);
