@@ -623,12 +623,18 @@ fn main() {
                 const TRUNCATE: u64 = 1 << 14;
                 const IOCTL_DEV: u64 = 1 << 15;
                 std::fs::write("/tmp/t", "content").unwrap();
+                // A file of a tmpfs, fwe's store's.
+                std::fs::write("/dev/shm/t", "content").unwrap();
                 let mut sv = [0i32; 2];
                 socketpair(AF_UNIX, SOCK_STREAM, 0, sv.as_mut_ptr());
                 std::io::Write::flush(&mut std::io::stdout()).unwrap();
                 if fork() == 0 {
                     let handled = READ | WRITE | TRUNCATE | IOCTL_DEV;
-                    let r = restrict(handled, 0, &[("/tmp", READ | WRITE), ("/dev/null", READ | WRITE)]);
+                    let r = restrict(
+                        handled,
+                        0,
+                        &[("/tmp", READ | WRITE), ("/dev/shm", READ | WRITE), ("/dev/null", READ | WRITE)],
+                    );
                     println!("restricted: {}", res(r));
                     let fd = open(c("/tmp/t").as_ptr(), O_WRONLY);
                     let dup = syscall(23, fd);
@@ -639,6 +645,8 @@ fn main() {
                         res(syscall(46, dup, 0)),
                         res(syscall(46, dupfd as i64, 0))
                     );
+                    let shm = open(c("/dev/shm/t").as_ptr(), O_WRONLY);
+                    println!("ftruncate on a tmpfs: {}", res(syscall(46, shm, 0)));
                     // Passed to a process outside the domain.
                     let mut control = [0u8; 24];
                     control[..8].copy_from_slice(&20u64.to_ne_bytes());

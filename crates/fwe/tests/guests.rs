@@ -8522,6 +8522,7 @@ fn landlock_follows_open_files_signals_mounts_and_datagrams() {
     assert_eq!(
         containers("landlock-gaps"),
         "restricted: ok\nftruncate: EACCES dup EACCES F_DUPFD EACCES\n\
+         ftruncate on a tmpfs: EACCES\n\
          a device's ioctl: EACCES, FIOCLEX ok\nmount: EPERM\n\
          ftruncate where it was passed: EACCES\nftruncate of its own: ok\n\
          kill(0): ok, kill(-1): ok, the one outside untouched\n\

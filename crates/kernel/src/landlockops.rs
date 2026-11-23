@@ -143,40 +143,43 @@ pub fn sendable_messages(vec: u64, vlen: u64) -> Option<u64> {
 }
 
 impl<P: Platform> Kernel<P> {
-    /// What `path` from `dirfd` names ([`Target`]).
-    fn ll_target(&self, dirfd: u64, path: u64, follow: bool) -> Option<Target> {
-        let p = uaccess::read_cstr(path, uaccess::PATH_MAX).ok()?;
-        let r = self.fs_opt()?.resolve(dirfd as i32, &p, follow).ok()?;
-        self.ll_resolved(&r, 0)
+    /// What `path` from `dirfd` names ([`Target`]): none for a path that
+    /// does not resolve, which the call itself refuses as it fails to.
+    fn ll_target(&self, dirfd: u64, path: u64, follow: bool) -> Result<Option<Target>, i32> {
+        let Ok(p) = uaccess::read_cstr(path, uaccess::PATH_MAX) else { return Ok(None) };
+        let Some(fs) = self.fs_opt() else { return Ok(None) };
+        let Ok(r) = fs.resolve(dirfd as i32, &p, follow) else { return Ok(None) };
+        self.ll_resolved(&r, 0).map(Some)
     }
 
     /// [`Target`] of what `r` resolved to; `depth` mounts crossed on the
-    /// way up so far.
-    fn ll_resolved(&self, r: &crate::fs::Resolved, depth: u32) -> Option<Target> {
+    /// way up so far. What resolved but cannot be placed is refused: a
+    /// domain's checks are never skipped.
+    fn ll_resolved(&self, r: &crate::fs::Resolved, depth: u32) -> Result<Target, i32> {
         let mode = r.lstat().map(|st| st.st_mode as u32);
         let Some(d) = &r.store else {
-            let dir = crate::fs::host_path_of(r.dir.as_raw_fd())?;
+            let dir = crate::fs::host_path_of(r.dir.as_raw_fd()).ok_or(errno::EACCES)?;
             let obj =
                 if r.name == b"." { dir.clone() } else { [&dir[..], b"/", &r.name[..]].concat() };
-            return Some(Target { dir: ll::ancestry(&dir), obj: ll::ancestry(&obj), mode });
+            return Ok(Target { dir: ll::ancestry(&dir), obj: ll::ancestry(&obj), mode });
         };
         // In fwe's store: up its directories to the mount's root, then on
         // from the directory the mount is on, as Linux's walk goes past a
         // mount point it hides.
-        let dev = d.host_stat(d.ino).ok()?.st_dev as u64;
+        let dev = d.host_stat(d.ino)?.st_dev as u64;
         let table = self.fs().mounts();
-        let m = table.get(r.mount_id)?;
-        let top = crate::fs::StoreDir::at(d.fs.id, &m.root).ok()?.ino;
+        let m = table.get(r.mount_id).ok_or(errno::EACCES)?;
+        let top = crate::fs::StoreDir::at(d.fs.id, &m.root)?.ino;
         let mut dir = Vec::new();
         let mut at = d.ino;
         {
-            let t = d.fs.lock().ok()?;
+            let t = d.fs.lock()?;
             loop {
                 dir.push((dev, at));
                 if at == top {
                     break;
                 }
-                let up = t.lookup(at, b"..").ok()?;
+                let up = t.lookup(at, b"..")?;
                 if up == at {
                     break;
                 }
@@ -184,17 +187,30 @@ impl<P: Platform> Kernel<P> {
             }
         }
         if m.point != b"/" && depth < 40 {
-            let above = crate::fs::normalize(&m.point, b"..");
-            let path = self.fs().from_ns(&above)?;
-            let r = self.fs().resolve(fcntl::AT_FDCWD as i32, &path, true).ok()?;
-            dir.extend(self.ll_resolved(&r, depth + 1)?.obj);
+            // On from the mount point's nearest ancestor there is: the
+            // objects a rule can be on (fwe mounts `/dev/shm` in a root
+            // with no `/dev`). One outside the process's root is beyond
+            // its view, as the walk ends there.
+            let mut above = crate::fs::normalize(&m.point, b"..");
+            while let Some(path) = self.fs().from_ns(&above) {
+                match self.fs().resolve(fcntl::AT_FDCWD as i32, &path, true) {
+                    Ok(r) => {
+                        dir.extend(self.ll_resolved(&r, depth + 1)?.obj);
+                        break;
+                    }
+                    Err(errno::ENOENT) if above != b"/" => {
+                        above = crate::fs::normalize(&above, b"..");
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
         }
         // (Nothing there: the directory's, as a host path's ancestry has.)
         let obj = match d.find(&r.name) {
             Ok((ino, _)) if ino != d.ino => [&[(dev, ino)][..], &dir].concat(),
             _ => dir.clone(),
         };
-        Some(Target { dir, obj, mode })
+        Ok(Target { dir, obj, mode })
     }
 
     /// The checks of call `n` with `a`: what a descriptor it opens is
@@ -209,7 +225,7 @@ impl<P: Platform> Kernel<P> {
                     return Ok(none);
                 }
                 let follow = flags & fcntl::O_NOFOLLOW == 0;
-                let Some(Target { dir, obj, mode }) = self.ll_target(a[0], a[1], follow) else {
+                let Some(Target { dir, obj, mode }) = self.ll_target(a[0], a[1], follow)? else {
                     return Ok(none);
                 };
                 let acc = flags & fcntl::O_ACCMODE;
@@ -246,14 +262,14 @@ impl<P: Platform> Kernel<P> {
                     nr::MKNODAT => (a[0], a[1], make_right(a[2] as u32)),
                     _ => (a[1], a[2], ll::MAKE_SYM),
                 };
-                if let Some(t) = self.ll_target(dirfd, path, false) {
+                if let Some(t) = self.ll_target(dirfd, path, false)? {
                     ll::check(&t.dir, right, false)?;
                 }
                 Ok(none)
             }
             nr::UNLINKAT => {
                 const AT_REMOVEDIR: u64 = 0x200;
-                if let Some(t) = self.ll_target(a[0], a[1], false) {
+                if let Some(t) = self.ll_target(a[0], a[1], false)? {
                     let right =
                         if a[2] & AT_REMOVEDIR != 0 { ll::REMOVE_DIR } else { ll::REMOVE_FILE };
                     ll::check(&t.dir, right, false)?;
@@ -263,7 +279,7 @@ impl<P: Platform> Kernel<P> {
             nr::LINKAT => {
                 let follow = a[4] & fcntl::AT_SYMLINK_FOLLOW != 0;
                 let (Some(from), Some(to)) =
-                    (self.ll_target(a[0], a[1], follow), self.ll_target(a[2], a[3], false))
+                    (self.ll_target(a[0], a[1], follow)?, self.ll_target(a[2], a[3], false)?)
                 else {
                     return Ok(none);
                 };
@@ -276,7 +292,7 @@ impl<P: Platform> Kernel<P> {
                 const RENAME_EXCHANGE: u64 = 2;
                 let exchange = n == nr::RENAMEAT2 && a[4] & RENAME_EXCHANGE != 0;
                 let (Some(from), Some(to)) =
-                    (self.ll_target(a[0], a[1], false), self.ll_target(a[2], a[3], false))
+                    (self.ll_target(a[0], a[1], false)?, self.ll_target(a[2], a[3], false)?)
                 else {
                     return Ok(none);
                 };
@@ -293,7 +309,7 @@ impl<P: Platform> Kernel<P> {
                 Ok(none)
             }
             nr::TRUNCATE => {
-                if let Some(t) = self.ll_target(fcntl::AT_FDCWD as u64, a[0], true) {
+                if let Some(t) = self.ll_target(fcntl::AT_FDCWD as u64, a[0], true)? {
                     ll::check(&t.obj, ll::TRUNCATE, true)?;
                 }
                 Ok(none)
@@ -305,11 +321,11 @@ impl<P: Platform> Kernel<P> {
                         AF_UNIX if rest.first().is_some_and(|&c| c != 0) => {
                             let end = rest.iter().position(|&c| c == 0).unwrap_or(rest.len());
                             let path = &rest[..end];
-                            let t = self.fs_opt().and_then(|fs| {
-                                let r = fs.resolve(fcntl::AT_FDCWD as i32, path, false).ok()?;
-                                self.ll_resolved(&r, 0)
+                            let r = self.fs_opt().and_then(|fs| {
+                                fs.resolve(fcntl::AT_FDCWD as i32, path, false).ok()
                             });
-                            if let Some(t) = t {
+                            if let Some(r) = r {
+                                let t = self.ll_resolved(&r, 0)?;
                                 ll::check(&t.dir, ll::MAKE_SOCK, false)?;
                             }
                         }
@@ -356,7 +372,6 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn landlock_exec(&self, path: &[u8]) -> Result<(), i32> {
         let Some(fs) = self.fs_opt() else { return Ok(()) };
         let Ok(r) = fs.resolve(fcntl::AT_FDCWD as i32, path, true) else { return Ok(()) };
-        let Some(t) = self.ll_resolved(&r, 0) else { return Ok(()) };
-        ll::check(&t.obj, ll::EXECUTE, true)
+        ll::check(&self.ll_resolved(&r, 0)?.obj, ll::EXECUTE, true)
     }
 }

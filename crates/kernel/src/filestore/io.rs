@@ -355,12 +355,16 @@ pub fn ftruncate(fd: i32, len: i64) -> Option<i64> {
             return Err(errno::EINVAL);
         }
         let file = desc::of(fd).ok_or(errno::EBADF)?;
+        // Opened in a Landlock domain that let it not truncate the file,
+        // whoever holds it now: told after the file's own refusals, as
+        // Linux asks the security module last.
+        let landlock = crate::landlock::may_ftruncate(fd);
         // A cgroup's interface file keeps what it holds: Linux's kernfs
         // takes a new size and changes nothing.
         if file.fs == crate::cgroupfs::tree_id() {
-            return Ok(());
+            return landlock;
         }
-        truncate_file(file, len as u64)
+        truncate_checked(file, len as u64, landlock)
     })();
     Some(r.map_or_else(err, |()| 0))
 }
@@ -368,12 +372,20 @@ pub fn ftruncate(fd: i32, len: i64) -> Option<i64> {
 /// Cut or grow regular file `file` to `len` bytes, as its seals and flags
 /// allow (`EPERM`).
 pub fn truncate_file(file: File, len: u64) -> Result<(), i32> {
+    truncate_checked(file, len, Ok(()))
+}
+
+/// [`truncate_file`], refused with `security`'s error (a Landlock
+/// domain's) after the file's append-only and immutable flags and before
+/// its seals, in Linux's order.
+fn truncate_checked(file: File, len: u64, security: Result<(), i32>) -> Result<(), i32> {
     in_file(file, |file, t| {
         let st = t.stat(file.ino)?;
         if st.mode & tree::S_IFMT != tree::S_IFREG {
             return Err(errno::EINVAL);
         }
         unchangeable(t, file.ino, false)?;
+        security?;
         let seals = t.seals(file.ino)?;
         if (len < st.size && seals & fcntl::F_SEAL_SHRINK != 0)
             || (len > st.size && seals & fcntl::F_SEAL_GROW != 0)

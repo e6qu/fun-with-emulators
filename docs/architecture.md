@@ -1507,7 +1507,10 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   a layer, which `fork` and `execve` carry. While a domain is in force
   each call it restricts is checked first: a file access is granted by a
   rule on the file or a directory above it, matched by host identity up
-  the file's host path (`EACCES`); a move between directories needs
+  the file's host path, or for a file of fwe's store by its store
+  identity up to its mount and on from the mount point's nearest
+  ancestor there is (`EACCES`, as for what resolves but cannot be
+  placed); a move between directories needs
   `REFER` in both (`EXDEV`); truncation of a regular file and `ioctl` on
   a device (but for the requests Linux leaves to any holder) are decided
   at open, and a refusal is marked on the open file description
