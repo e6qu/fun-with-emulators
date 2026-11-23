@@ -899,8 +899,10 @@ def run_limited(cmd, name, env=None):
     environment `env`, or this one's), for at most LIMIT seconds. Past
     them, each of its processes is sampled
     (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
-    on top of its threads' stacks printed), the process group it was started
-    in is stopped, and the benchmarks fail."""
+    on top of its threads' stacks printed), they are ended, and the
+    benchmarks fail. Its processes are its descendants and, for a run under
+    fwe, every process of fwe's on its root: a daemon a guest started (a
+    database's server) has left the session and its parent."""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
                          errors="replace", start_new_session=True, env=env)
     try:
@@ -913,6 +915,12 @@ def run_limited(cmd, name, env=None):
             pids.append(pid)
             kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
             todo += [int(k) for k in kids.stdout.split()]
+        if "--root" in cmd:
+            root = cmd[cmd.index("--root") + 1]
+            ours = subprocess.run(["pgrep", "-f", "--", f"--root {root} "], capture_output=True,
+                                  text=True)
+            pids += [int(k) for k in ours.stdout.split() if int(k) not in pids]
+        pids = [pid for pid in pids if pid > 0 and pid != os.getpid()]
         for pid in pids:
             path = os.path.abspath(f"bench-{slug}-hung-{pid}.sample")
             subprocess.run(["sample", str(pid), "3", "-file", path], capture_output=True)
@@ -925,6 +933,11 @@ def run_limited(cmd, name, env=None):
             print(f"{name}: process {pid} after {LIMIT} s, on top of its stacks:\n"
                   + "\n".join(top), file=sys.stderr)
         os.killpg(p.pid, signal.SIGKILL)
+        for pid in pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
         out, err = p.communicate()
         sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
                  f"{err[-3000:]}")
