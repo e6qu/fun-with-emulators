@@ -138,8 +138,13 @@ int main(void) {
     char state = state_of(child);
     kill(child, SIGCONT);
     int continued = waitpid(child, &status, WCONTINUED) == child && status == 0xffff;
-    usleep(50000);
-    int again = count[0] != before[0] && count[1] != before[1] && count[2] != before[2];
+    /* Every thread runs again: soon, on a host as busy as it may be (a
+     * thread kept stopped never does). */
+    int again = 0;
+    for (int i = 0; i < 5000 && !again; i++) {
+        usleep(1000);
+        again = count[0] != before[0] && count[1] != before[1] && count[2] != before[2];
+    }
     printf("stop: reported %d, threads still %d, state %c; continue: reported %d, threads on %d\n",
            reported, still, state, continued, again);
     printf("SIGCHLD: stopped %d (status %d), continued %d (status %d), from the child %d\n", stops,
