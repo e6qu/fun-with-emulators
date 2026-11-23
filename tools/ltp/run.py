@@ -346,7 +346,10 @@ def run_one(fwe, root, work, name, argv, hard_limit=HARD_LIMIT):
     shutil.rmtree(tmp, ignore_errors=True)
     # (A timer test's every measurement, for `host_timers_late`.)
     keep = 400 if outcome == "timeout" or b"slept for too long" in out or b"--- fwe's notes" in out else 40
-    tail = "\n".join(out.decode(errors="replace").splitlines()[-keep:])
+    lines = out.decode(errors="replace").splitlines()
+    # What failed, and on which file system, kept however long the output.
+    marks = [l for l in lines[:-keep] if re.search(r"T(FAIL|BROK|WARN)|=== Testing on", l)]
+    tail = "\n".join((marks + ["..."] if marks else []) + lines[-keep:])
     if outcome == "conf" and VIRT and SKIPS_ON_VM in out:
         outcome = "conf-vm"
     return name, outcome, time.monotonic() - start, tail
