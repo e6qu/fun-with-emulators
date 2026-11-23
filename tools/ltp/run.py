@@ -45,6 +45,10 @@ import tempfile
 import threading
 import time
 
+# LTP's IPC tests: System V's messages, semaphores and segments, and POSIX
+# message queues.
+IPC = re.compile(r"(msg|sem|shm|mq_)")
+
 # LTP's exit statuses (include/tst_res_flags.h), as bits.
 TFAIL, TBROK, TWARN, TCONF = 1, 2, 4, 32
 # Tests that take tens of seconds or more, however well fwe does: started
@@ -471,6 +475,7 @@ def main():
         with open(args.exceptions) as f:
             excepted = {line.split()[0] for line in f if line.strip() and not line.startswith("#")}
     results = {n: "exception" for n, _ in tests if n in excepted}
+    took = {}
     with open(args.baseline) as f:
         passing = {line.strip() for line in f if line.strip() and not line.startswith("#")}
     if args.update:
@@ -494,6 +499,7 @@ def main():
             nonlocal done
             done += 1
             results[name] = outcome
+            took[name] = secs
             print(f"[{done}/{len(tests)}] {name}: {outcome} ({secs:.1f}s)", flush=True)
             if args.show and outcome not in ("pass", "conf", "conf-vm", "script", "missing"):
                 print("    " + tail.replace("\n", "\n    "), flush=True)
@@ -533,6 +539,13 @@ def main():
     print("\noutcomes: " + ", ".join(f"{k} {v}" for k, v in sorted(counts.items())))
     print(f"passed {passed} of {run} run ({100 * passed / max(run, 1):.1f}%), "
           f"{passed} of {applicable} applicable ({100 * passed / max(applicable, 1):.1f}%)")
+    # The IPC tests' time (System V's and POSIX message queues'), each
+    # test's own, summed: kernel state every process shares at work.
+    ipc = {n: t for n, t in took.items() if IPC.match(n) and results[n] == "pass"}
+    if ipc:
+        print(f"IPC tests: {len(ipc)} passed in {sum(ipc.values()):.1f} s, "
+              + ", ".join(f"{n} {t:.1f}" for n, t in sorted(ipc.items(), key=lambda x: -x[1])[:5])
+              + " the longest")
 
     if args.update:
         # (One that skipped on a virtual machine stays as it was.)
