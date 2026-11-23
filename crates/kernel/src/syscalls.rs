@@ -4975,7 +4975,8 @@ mod tests {
     /// fwe's internal wake signal, whose host default action ends a
     /// process, never reaches a process that is not fwe's (one this test
     /// started), whatever asks: a signal the host lacks, a descriptor
-    /// (`pidfd_getfd`), its memory (`process_vm_readv`).
+    /// (`pidfd_getfd`), its memory (`process_vm_readv`); nor does any
+    /// signal fwe sends for its own ends to a pid it keeps.
     #[cfg(target_os = "macos")]
     #[test]
     fn internal_signals_never_reach_other_processes() {
@@ -4986,6 +4987,10 @@ mod tests {
         assert!(!host::is_fwe(pid));
         assert_eq!(host::kill_process(pid, host::WAKE_SIGNAL), err(errno::ESRCH));
         assert_eq!(host::kill(-pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        for sig in [libc::SIGTERM, libc::SIGKILL, libc::SIGSTOP, libc::SIGCONT, libc::SIGCHLD] {
+            assert_eq!(host::kill_process(pid, sig), err(errno::ESRCH), "signal {sig}");
+        }
+        assert_eq!(host::kill_process(pid, 0), 0, "it is there");
         // A real-time signal, which only fwe's mailbox carries.
         assert_eq!(k.syscall(nr::KILL, [pid as u64, 40, 0, 0, 0, 0]), err(errno::EINVAL));
         let fd = k.syscall(nr::PIDFD_OPEN, [pid as u64, 0, 0, 0, 0, 0]);

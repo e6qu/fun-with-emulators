@@ -759,7 +759,7 @@ impl<P: Platform> Kernel<P> {
         };
         // A host signal names its sender's pid itself.
         crate::signote::note_with(host, h, code, value, uid);
-        let r = crate::host::kill_process(host, h);
+        let r = crate::host::signal_named(host, h);
         if r != 0 {
             crate::signote::unnote(host, h);
         }

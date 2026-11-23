@@ -1138,7 +1138,7 @@ impl<P: Platform> Kernel<P> {
             ) {
                 crate::reaper::stop_signal_sent(target);
             }
-            let r = host::kill_process(target, h);
+            let r = host::signal_named(target, h);
             if r != 0 && noted {
                 crate::signote::unnote(target, h);
             }

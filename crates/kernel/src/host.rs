@@ -514,14 +514,141 @@ fn markable(fd: i32) -> bool {
     ok && matches!(st.st_mode & libc::S_IFMT, libc::S_IFREG | libc::S_IFCHR | libc::S_IFBLK)
 }
 
-/// `kill` of one host process `pid`: a pid that is not one (0, or
-/// negative, which the host takes for a group or every process) is refused
-/// (`ESRCH`), so a number from a guest or a record never signals more.
+/// `kill` of one host process `pid` for fwe's own ends (a pid it keeps:
+/// a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a
+/// message queue's notice, a wake): a pid that is not one (0, or negative,
+/// which the host takes for a group or every process) is refused
+/// (`ESRCH`), so a number from a guest or a record never signals more; a
+/// signal (not 0, which only asks whether the process is there) goes only
+/// to one of fwe's processes ([`is_fwe`]: its record's, of a process that
+/// started when this one did), as a pid kept from a process that ended may
+/// be the host's now. One refused is told on the standard error, with
+/// where it was sent from. A guest's own signal to a process it names
+/// goes by [`signal_named`].
+#[track_caller]
 pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
     if pid <= 0 {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
+    // ([`kill`] looks for its wake signal itself.)
+    if sig != 0 && sig != WAKE_SIGNAL && !is_fwe(pid) {
+        refused_signal(pid, sig, std::panic::Location::caller());
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
     kill(pid, sig)
+}
+
+/// A guest's signal `sig` to host process `pid`, which it named (`kill`,
+/// `rt_sigqueueinfo`) and may signal: one of fwe's or one of the host's,
+/// as a Linux process signals any it may. A pid that is not one is
+/// refused (`ESRCH`), as by [`kill_process`].
+#[track_caller]
+pub fn signal_named(pid: libc::pid_t, sig: libc::c_int) -> i64 {
+    if pid <= 0 {
+        return fwe_abi::err(fwe_abi::errno::ESRCH);
+    }
+    // PROBE: a guest's signal to a process not fwe's, kept (not refused).
+    #[cfg(target_os = "macos")]
+    if sig != 0 && !is_fwe(pid) {
+        probe_log(pid, sig, std::panic::Location::caller(), b"fwe: a guest's host signal ");
+    }
+    kill(pid, sig)
+}
+
+/// Tell that host signal `sig` to host process `pid`, not one of fwe's,
+/// sent from `from`, was refused ([`kill_process`]). Async-signal-safe.
+fn refused_signal(pid: libc::pid_t, sig: libc::c_int, from: &std::panic::Location<'_>) {
+    let line = signal_line(b"fwe: host signal ", pid, sig, from, b", not one of fwe's, refused");
+    // SAFETY: a valid buffer of the length given.
+    unsafe { libc::write(2, line.buf.as_ptr().cast(), line.len) };
+    #[cfg(target_os = "macos")]
+    probe_log(pid, sig, from, b"fwe: host signal ");
+}
+
+/// "`what` `sig` to host process `pid``why` (sent from `from`)", a line.
+fn signal_line(
+    what: &[u8],
+    pid: libc::pid_t,
+    sig: libc::c_int,
+    from: &std::panic::Location<'_>,
+    why: &[u8],
+) -> Line {
+    let mut line = Line::new();
+    line.put(what);
+    line.num(sig as u64);
+    line.put(b" to host process ");
+    line.num(pid as u64);
+    line.put(why);
+    line.put(b" (sent from ");
+    line.put(from.file().as_bytes());
+    line.put(b":");
+    line.num(u64::from(from.line()));
+    line.put(b")\n");
+    line
+}
+
+/// PROBE: a signal to a host process not fwe's, with the process's
+/// program, appended to the file `FWE_REFUSED_LOG` names, if it is set.
+/// Async-signal-safe.
+#[cfg(target_os = "macos")]
+fn probe_log(pid: libc::pid_t, sig: libc::c_int, from: &std::panic::Location<'_>, what: &[u8]) {
+    // SAFETY: a NUL-terminated name; the environment is not changed while
+    // fwe runs.
+    let path = unsafe { libc::getenv(c"FWE_REFUSED_LOG".as_ptr()) };
+    if path.is_null() {
+        return;
+    }
+    let line = signal_line(what, pid, sig, from, b"");
+    let mut exe = [0u8; 1024];
+    // SAFETY: a valid out-buffer of its length.
+    let n = unsafe { libc::proc_pidpath(pid, exe.as_mut_ptr().cast(), exe.len() as u32) };
+    // SAFETY: a NUL-terminated path; plain host calls on valid buffers.
+    unsafe {
+        let fd = libc::open(
+            path,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND | libc::O_CLOEXEC,
+            0o644 as libc::c_uint,
+        );
+        if fd >= 0 {
+            libc::write(fd, line.buf.as_ptr().cast(), line.len - 1);
+            libc::write(fd, b" exe ".as_ptr().cast(), 5);
+            libc::write(fd, exe.as_ptr().cast(), n.max(0) as usize);
+            libc::write(fd, b"\n".as_ptr().cast(), 1);
+            libc::close(fd);
+        }
+    }
+}
+
+/// A line put together without allocating (in a signal handler, say).
+struct Line {
+    buf: [u8; 512],
+    len: usize,
+}
+
+impl Line {
+    fn new() -> Line {
+        Line { buf: [0; 512], len: 0 }
+    }
+
+    fn put(&mut self, bytes: &[u8]) {
+        let n = bytes.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&bytes[..n]);
+        self.len += n;
+    }
+
+    fn num(&mut self, mut v: u64) {
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.put(&digits[i..]);
+    }
 }
 
 /// Host process `pid`'s nice value as the host has it (0 for one that
