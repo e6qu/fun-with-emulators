@@ -397,7 +397,7 @@ fn identity(st: &libc::stat) -> (u64, u64, bool, u64) {
 /// The device an overlay's files are on to their watches: its own, so a
 /// watch through the overlay is not of a layer's file seen another way.
 fn overlay_dev(l: &crate::overlay::Layers) -> u64 {
-    (1 << 63) | (crate::shared::hash(l.paths().next().unwrap_or_default()) >> 1)
+    (1 << 63) | (crate::shared::hash(&l.key()) >> 1)
 }
 
 /// What a file of an overlay is to its watches: the lower file it was
@@ -411,6 +411,28 @@ fn overlay_ident(fd: i32, dev: u64) -> Option<(u64, u64)> {
         (unsafe { libc::fstat(fd, &mut st) } == 0).then(|| identity(&st).1)
     })?;
     Some((dev, ino))
+}
+
+/// What file `file` of fwe's store, in an overlay's layer, is to its
+/// watches: as [`overlay_ident`] tells a host file.
+fn store_overlay_ident(file: crate::filestore::desc::File, dev: u64) -> (u64, u64) {
+    (dev, crate::overlay::origin_in_store(file).map_or(file.ino, |(_, i)| i))
+}
+
+/// `s`, a file of directory `d` of fwe's store, as seen through overlay
+/// `l`.
+fn store_through_overlay(
+    mut s: Subject,
+    d: &crate::fs::StoreDir,
+    l: &crate::overlay::Layers,
+) -> Subject {
+    use crate::filestore::desc::File;
+    let dev = overlay_dev(l);
+    (s.dev, s.ino) = store_overlay_ident(File { fs: d.fs.id, ino: s.ino }, dev);
+    if s.parent.is_some() {
+        s.parent = Some(store_overlay_ident(File { fs: d.fs.id, ino: d.ino }, dev));
+    }
+    s
 }
 
 /// `s`, `name` in host directory `dir`, as seen through overlay `l`.
@@ -492,7 +514,11 @@ pub fn store_subject(d: &crate::fs::StoreDir, name: &[u8]) -> Option<Subject> {
 /// The subject what `r` resolved is (as an overlay shows it, in one).
 fn resolved_subject(r: &crate::fs::Resolved) -> Option<Subject> {
     if let Some(d) = &r.store {
-        return store_subject(d, &r.name);
+        let s = store_subject(d, &r.name)?;
+        return Some(match &r.ovl {
+            Some(o) => store_through_overlay(s, d, &o.layers),
+            None => s,
+        });
     }
     let dir = std::os::fd::AsRawFd::as_raw_fd(&r.dir);
     let s = subject_at(dir, &r.name)?;
@@ -512,14 +538,25 @@ pub fn subject_of_fd(fd: i32) -> Option<Subject> {
         let st = t.stat(file.ino).ok()?;
         let dev = t.dev();
         let place = crate::filestore::desc::place(fd);
-        return Some(Subject {
+        let mut s = Subject {
             dev,
             ino: file.ino,
             dir: st.mode & crate::filestore::tree::S_IFMT == crate::filestore::tree::S_IFDIR,
             nlink: st.nlink as u64,
             parent: place.as_ref().map(|p| (dev, p.0)),
-            name: place.map(|p| p.1).unwrap_or_default(),
-        });
+            name: place.as_ref().map(|p| p.1.clone()).unwrap_or_default(),
+        };
+        drop(t);
+        // Opened through an overlay: as the overlay shows it.
+        if let Some(l) = fdmarks::origin(fd).and_then(|o| o.ovl) {
+            use crate::filestore::desc::File;
+            let dev = overlay_dev(&l);
+            (s.dev, s.ino) = store_overlay_ident(file, dev);
+            if let Some(p) = &place {
+                s.parent = Some(store_overlay_ident(File { fs: file.fs, ino: p.0 }, dev));
+            }
+        }
+        return Some(s);
     }
     let mut s = host_subject_of_fd(fd)?;
     if let Some(l) = fdmarks::origin(fd).and_then(|o| o.ovl) {

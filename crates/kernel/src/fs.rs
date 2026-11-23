@@ -375,7 +375,7 @@ impl Resolved {
     pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
         self.writable()?;
         // fwe's store makes and changes its files itself.
-        if self.store.is_some() {
+        if self.store.is_some() && self.ovl.is_none() {
             return Ok(());
         }
         // What it sets up is looked at afresh.
@@ -387,12 +387,11 @@ impl Resolved {
             // Nothing there to change, or already in the upper layer.
             (overlay::Found::Missing, Change::Modify) => return Ok(()),
             (overlay::Found::Other { layer: 0, .. }, _) if upper => return Ok(()),
-            (overlay::Found::Dir(d), _) if upper && d.fds[0].is_some() => return Ok(()),
+            (overlay::Found::Dir(d), _) if upper && d.dirs[0].is_some() => return Ok(()),
             (overlay::Found::Missing, Change::Create) => {
                 let made = overlay::create(&o.layers, &o.parent, &self.name)?;
-                let (dir, name) = made.target();
-                self.dir = dup_cloexec(dir)?;
-                self.name = name.to_bytes().to_vec();
+                (self.dir, self.store) = stand_in(&made.dir)?;
+                self.name = made.target().to_vec();
                 self.created = Some(made);
                 return Ok(());
             }
@@ -400,22 +399,48 @@ impl Resolved {
             (_, Change::Create) | (_, Change::Remove) => return Ok(()),
             (_, Change::Modify) => overlay::copy_up(&o.layers, &o.path(&self.name))?,
         };
-        self.dir = dup_cloexec(dir.as_raw_fd())?;
+        (self.dir, self.store) = stand_in(&dir)?;
         Ok(())
+    }
+
+    /// The layers of the overlay it is in, if it is in one.
+    pub fn layers(&self) -> Option<Arc<Layers>> {
+        self.ovl.as_ref().map(|o| o.layers.clone())
+    }
+
+    /// After [`prepare`](Self::prepare) for a file to be made in an
+    /// overlay's upper layer of fwe's store, where a whiteout is at the
+    /// name: the attribute a directory made in its place takes (the
+    /// store's call replaces the whiteout, [`overlay::Created`]).
+    pub fn over_whiteout(&self) -> Option<&'static [u8]> {
+        self.created.as_ref().and_then(overlay::Created::over_whiteout)
     }
 
     /// Get ready for a `bind` to make a socket's node at what was
     /// resolved: in an overlay, the directory copied up, and a whiteout in
-    /// the way removed (the host makes the node where `bind` says, so it
-    /// cannot be made aside and moved over the whiteout). With `host_root`
-    /// (no root filesystem), the host's own directories are left to its
-    /// checks.
+    /// the way removed from a host layer (the host makes the node where
+    /// `bind` says, so it cannot be made aside and moved over the
+    /// whiteout; the store's `bind` replaces one itself,
+    /// [`Self::over_whiteout`]). With `host_root` (no root filesystem),
+    /// the host's own directories are left to its checks.
     pub fn prepare_bind(&mut self, host_root: bool) -> Result<(), i32> {
         // A name there already is an address in use, which Linux finds
         // first; then a read-only mount takes no new node (`EROFS`), and a
         // caller needs to write and search the directory (`EACCES`), as for
-        // any file it makes.
-        if self.lstat().is_none() {
+        // any file it makes: the directory the node goes in, an overlay's
+        // copied up.
+        let made = match &self.ovl {
+            Some(o) if !matches!(o.found, overlay::Found::Missing) => return Ok(()),
+            Some(o) => {
+                self.writable()?;
+                let made = overlay::create(&o.layers, &o.parent, &self.name)?;
+                (self.dir, self.store) = stand_in(&made.dir)?;
+                Some(made)
+            }
+            None if self.lstat().is_some() => return Ok(()),
+            None => None,
+        };
+        if self.store.is_none() {
             self.writable()?;
             let a = crate::creds::access();
             if let Some(st) = guest_stat(self.dir.as_raw_fd())
@@ -425,19 +450,18 @@ impl Resolved {
                 return Err(errno::EACCES);
             }
         }
-        let Some(o) = &self.ovl else { return Ok(()) };
-        if !matches!(o.found, overlay::Found::Missing) {
-            return Ok(());
-        }
-        self.writable()?;
-        let made = overlay::create(&o.layers, &o.parent, &self.name)?;
-        if let Some((_, _)) = &made.temp {
-            // SAFETY: a NUL-terminated name in a live directory.
-            if unsafe { libc::unlinkat(made.dir.as_raw_fd(), made.name.as_ptr(), 0) } != 0 {
-                return Err(e());
+        match made {
+            Some(made) if matches!(made.dir, overlay::LDir::Store(_)) => self.created = Some(made),
+            Some(made) if made.target() != made.name => {
+                // SAFETY: a NUL-terminated name in a live directory.
+                if unsafe { libc::unlinkat(self.dir.as_raw_fd(), cstr(&made.name)?.as_ptr(), 0) }
+                    != 0
+                {
+                    return Err(e());
+                }
             }
+            _ => {}
         }
-        self.dir = dup_cloexec(made.dir.as_raw_fd())?;
         Ok(())
     }
 
@@ -448,8 +472,8 @@ impl Resolved {
         match self.created.take() {
             Some(c) => {
                 let r = c.finish(made);
-                self.dir = dup_cloexec(c.dir.as_raw_fd())?;
-                self.name = c.name.to_bytes().to_vec();
+                (self.dir, self.store) = stand_in(&c.dir)?;
+                self.name = c.name.clone();
                 r
             }
             None => Ok(()),
@@ -517,6 +541,16 @@ impl StoreDir {
         let t = self.fs.lock()?;
         let ino = t.lookup(self.ino, name)?;
         Ok((ino, t.stat(ino)?))
+    }
+}
+
+/// Where the resolver stands in directory `d` of an overlay's layer: a
+/// host directory's descriptor (a duplicate), or [`empty_dir`] with the
+/// store's directory.
+pub(crate) fn stand_in(d: &overlay::LDir) -> Result<(OwnedFd, Option<StoreDir>), i32> {
+    match d {
+        overlay::LDir::Host(fd) => Ok((dup_cloexec(fd.as_raw_fd())?, None)),
+        overlay::LDir::Store(s) => Ok((empty_dir()?, Some(s.clone()))),
     }
 }
 
@@ -2330,13 +2364,13 @@ impl Here {
         dir: overlay::Dir,
         at: Option<(u32, Vec<u8>)>,
     ) -> Result<Here, i32> {
-        let top = dup_cloexec(dir.top().1.as_raw_fd())?;
+        let (top, store) = stand_in(dir.top().1)?;
         Ok(Here {
             dir: top,
             at,
             phantom: false,
             ovl: Some(OvlHere { layers: layers.clone(), path, dir }),
-            store: None,
+            store,
         })
     }
 
@@ -2442,12 +2476,17 @@ pub(crate) fn may_follow(
         return Ok(());
     }
     let owner = crate::owners::of_at(dir, name, &st).0;
-    if owner == fsuid {
-        return Ok(());
-    }
     let Some(parent) = guest_stat(parent) else { return Ok(()) };
+    follows(owner, &parent, fsuid)
+}
+
+/// `protected_symlinks`' rule: a link owned by `owner` in a directory
+/// whose guest status is `parent` is followed by `fsuid` unless the
+/// directory is sticky and writable by others and neither the follower
+/// nor the directory's owner owns the link.
+fn follows(owner: u32, parent: &libc::stat, fsuid: u32) -> Result<(), i32> {
     let open = (libc::S_ISVTX | libc::S_IWOTH) as libc::mode_t;
-    if parent.st_mode & open != open || parent.st_uid == owner {
+    if owner == fsuid || parent.st_mode & open != open || parent.st_uid == owner {
         return Ok(());
     }
     Err(errno::EACCES)
@@ -2728,25 +2767,24 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
             // Only the mounts below a missing directory are there.
             return Err(errno::ENOENT);
         }
-        let store = here.store;
-        let (dir, ovl) = match here.ovl {
-            None => (here.dir, None),
+        let (dir, store, ovl) = match here.ovl {
+            None => (here.dir, here.store, None),
             Some(o) if name == b"." => {
                 let found = overlay::Found::Dir(o.dir.clone());
-                (here.dir, Some(Ovl { layers: o.layers, parent: o.path, found }))
+                (here.dir, here.store, Some(Ovl { layers: o.layers, parent: o.path, found }))
             }
             Some(o) => {
-                let found = overlay::lookup(&o.layers, &o.dir, &cstr(&name)?)?;
-                let dir = match &found {
-                    overlay::Found::Missing => empty_dir()?,
+                let found = overlay::lookup(&o.layers, &o.dir, &name)?;
+                let (dir, store) = match &found {
+                    overlay::Found::Missing => (empty_dir()?, None),
                     overlay::Found::Other { layer, .. } => {
-                        dup_cloexec(o.dir.fds[*layer].as_ref().expect("its layer").as_raw_fd())?
+                        stand_in(o.dir.dirs[*layer].as_ref().expect("its layer"))?
                     }
                     overlay::Found::Dir(d) => {
-                        dup_cloexec(o.dir.fds[d.top().0].as_ref().expect("its layer").as_raw_fd())?
+                        stand_in(o.dir.dirs[d.top().0].as_ref().expect("its layer"))?
                     }
                 };
-                (dir, Some(Ovl { layers: o.layers, parent: o.path, found }))
+                (dir, store, Some(Ovl { layers: o.layers, parent: o.path, found }))
             }
         };
         Ok(Resolved {
@@ -3056,7 +3094,7 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         let comp_c = cstr(&comp)?;
         let step = if here.phantom {
             Step::Missing
-        } else if let Some(d) = &here.store {
+        } else if let Some(d) = here.store.as_ref().filter(|_| here.ovl.is_none()) {
             match d.find(&comp) {
                 Ok((ino, st)) => match st.mode & crate::filestore::tree::S_IFMT {
                     crate::filestore::tree::S_IFLNK => {
@@ -3078,18 +3116,26 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
                 Err(e) => return Err(e),
             }
         } else if let Some(o) = &here.ovl {
-            match overlay::lookup(&o.layers, &o.dir, &comp_c)? {
+            match overlay::lookup(&o.layers, &o.dir, &comp)? {
                 overlay::Found::Missing => Step::Missing,
                 overlay::Found::Dir(d) => Step::OvlDir(d),
                 overlay::Found::Other { layer, link: true } => {
-                    let in_layer = o.dir.fds[layer].as_ref().expect("its layer");
+                    let in_layer = o.dir.dirs[layer].as_ref().expect("its layer");
                     // The link as its layer has it, in the directory as the
                     // topmost layer shows it.
                     if is_last && crate::sysctl::protected_links().0 {
-                        let top = here.dir.as_raw_fd();
-                        may_follow(in_layer.as_raw_fd(), &comp_c, top, access.fsuid)?;
+                        let owner = match in_layer {
+                            overlay::LDir::Host(fd) => {
+                                guest_stat_at(fd.as_raw_fd(), &comp_c).map(|st| st.st_uid)
+                            }
+                            overlay::LDir::Store(d) => d.find(&comp).ok().map(|f| f.1.uid),
+                        };
+                        let top = here.stat();
+                        if let (Some(owner), Some(top)) = (owner, top) {
+                            follows(owner, &top, access.fsuid)?;
+                        }
                     }
-                    Step::Link(readlink_at(in_layer.as_raw_fd(), &comp_c)?)
+                    Step::Link(in_layer.readlink(&comp)?)
                 }
                 overlay::Found::Other { .. } => Step::Other,
             }
@@ -3220,11 +3266,13 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
 }
 
 /// The host directories at the top of what mount `m` shows: its source's
-/// directory, or each of an overlay's layers'.
+/// directory, or each of an overlay's host layers'.
 fn mount_tops(m: &Mount) -> Vec<Vec<u8>> {
     match &m.source {
         Source::Host(_) => m.host_path(b"").into_iter().collect(),
-        Source::Overlay(l) => l.paths().map(|p| mounts::join(p, &m.root)).collect(),
+        Source::Overlay(l) => {
+            l.places().filter_map(overlay::Place::host).map(|p| mounts::join(p, &m.root)).collect()
+        }
         Source::Synthetic | Source::Ns(_) | Source::Store(_) => Vec::new(),
     }
 }
@@ -3405,6 +3453,11 @@ pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i
     let view = published();
     let Some(v) = view.as_ref() else { return Ok(path.to_vec()) };
     let mut r = resolve_in(&v.view(), fcntl::AT_FDCWD as i32, path, follow_final)?;
+    // A bind in an overlay: its directory copied up first, which may be
+    // in fwe's store.
+    if !follow_final && r.ovl.is_some() {
+        r.prepare_bind(v.root_host == b"/")?;
+    }
     // In fwe's store: the socket's node in fwe's directory
     // ([`crate::storenodes`]).
     if let Some(d) = &r.store {
@@ -3412,9 +3465,9 @@ pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i
             return crate::storenodes::connect_to(d, &r.name);
         }
         r.writable()?;
-        return crate::storenodes::bind_at(d, &r.name, path);
+        return crate::storenodes::bind_at(d, &r.name, path, r.over_whiteout());
     }
-    if !follow_final {
+    if !follow_final && r.ovl.is_none() {
         // A bind, which makes the socket's node there.
         r.prepare_bind(v.root_host == b"/")?;
     }

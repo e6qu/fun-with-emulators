@@ -212,16 +212,12 @@ impl<P: Platform> Kernel<P> {
         Some(crate::mounts::join(&dir, &r.name))
     }
 
-    /// The host directory of the guest directory `path`, which must be in
-    /// a mount of host directories (`EINVAL` for one in an overlay or in
-    /// a filesystem of fwe's).
-    fn host_dir(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
-        self.host_dir_rw(path, false)
-    }
-
-    /// [`host_dir`](Self::host_dir) of a directory to be written to:
-    /// `EROFS` in a read-only mount.
-    fn host_dir_rw(&self, path: &[u8], write: bool) -> Result<Vec<u8>, i32> {
+    /// Where the guest directory `path`, an overlay's layer, is: a host
+    /// directory of a mount of host directories, or a directory of a
+    /// filesystem of fwe's store (`EINVAL` for one in an overlay or in a
+    /// filesystem fwe makes up); `EROFS` for one to be written to (`write`)
+    /// in a read-only mount.
+    fn layer_place(&self, path: &[u8], write: bool) -> Result<crate::overlay::Place, i32> {
         let (ns, is_dir) = self.mount_path(path, true)?;
         if !is_dir {
             return Err(errno::ENOTDIR);
@@ -231,16 +227,20 @@ impl<P: Platform> Kernel<P> {
         if write && m.read_only() {
             return Err(errno::EROFS);
         }
-        m.host_path(&rest).ok_or(errno::EINVAL)
+        if let crate::mounts::Source::Store(id) = m.source {
+            return Ok(crate::overlay::Place::Store { fs: id, path: m.fs_path(&rest) });
+        }
+        m.host_path(&rest).map(crate::overlay::Place::Host).ok_or(errno::EINVAL)
     }
 
     /// The layers an overlay's mount options (`data`) name, checked as
     /// Linux checks them, with the work directory made ready.
     fn overlay_layers(&self, data: &[u8]) -> Result<crate::overlay::Layers, i32> {
         let o = crate::overlay::parse(data)?;
-        let lowers = o.lowers.iter().map(|p| self.host_dir(p)).collect::<Result<Vec<_>, _>>()?;
-        let upper = o.upper.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
-        let work = o.work.as_deref().map(|p| self.host_dir_rw(p, true)).transpose()?;
+        let lowers =
+            o.lowers.iter().map(|p| self.layer_place(p, false)).collect::<Result<Vec<_>, _>>()?;
+        let upper = o.upper.as_deref().map(|p| self.layer_place(p, true)).transpose()?;
+        let work = o.work.as_deref().map(|p| self.layer_place(p, true)).transpose()?;
         if let (Some(u), Some(w)) = (&upper, &work) {
             // Separate directories of one filesystem.
             let dev = |p: &[u8]| -> Result<u64, i32> {
@@ -253,10 +253,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 Ok(st.st_dev as u64)
             };
-            if dev(u)? != dev(w)?
-                || crate::mounts::under(u, w).is_some()
-                || crate::mounts::under(w, u).is_some()
-            {
+            if !u.same_fs(w, dev)? || u.nested(w) {
                 return Err(errno::EINVAL);
             }
             crate::overlay::prepare_work(w)?;
@@ -532,7 +529,9 @@ impl<P: Platform> Kernel<P> {
         let roots_of = |m: &crate::mounts::Mount| -> Vec<Vec<u8>> {
             let roots: Vec<Vec<u8>> = match &m.source {
                 Source::Host(_) => m.host_path(b"").into_iter().collect(),
-                Source::Overlay(l) => l.paths().map(<[u8]>::to_vec).collect(),
+                Source::Overlay(l) => {
+                    l.places().filter_map(crate::overlay::Place::host).map(<[u8]>::to_vec).collect()
+                }
                 Source::Synthetic | Source::Ns(_) | Source::Store(_) => Vec::new(),
             };
             roots.iter().map(|r| canonical(r)).collect()

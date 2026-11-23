@@ -284,7 +284,16 @@ impl Mount {
         }
         let dir = match &self.source {
             Source::Host(_) => self.host_path(b""),
-            Source::Overlay(l) => l.paths().next().map(<[u8]>::to_vec),
+            Source::Overlay(l) => match l.places().next() {
+                // The device of its topmost layer's filesystem of fwe's
+                // store.
+                Some(crate::overlay::Place::Store { fs, .. }) => {
+                    let dev =
+                        crate::filestore::fs::get(*fs, false).and_then(|f| Ok(f.lock()?.dev()));
+                    return dev.map_or(own, |d| (crate::fsops::major(d), crate::fsops::minor(d)));
+                }
+                p => p.and_then(crate::overlay::Place::host).map(<[u8]>::to_vec),
+            },
             _ => None,
         };
         let st = dir.and_then(|p| std::ffi::CString::new(p).ok()).and_then(|c| {

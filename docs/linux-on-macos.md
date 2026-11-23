@@ -2278,8 +2278,11 @@ follows:
 - `nosuid`, `nodev`, `noexec`, `nosymfollow`, `ro` and the access-time
   flags are enforced by fwe; busy mounts refuse `umount` (`EBUSY`);
 - an overlay is resolved as Linux's `overlay`: upper then lower layers,
-  whiteouts (0:0 device nodes) and opaque directories, copy-up as an APFS
-  clone, each change built in the work directory and renamed into place;
+  each a host directory or a tmpfs's of fwe's store, whiteouts (0:0
+  device nodes) and opaque directories, copy-up as an APFS clone between
+  host layers and as a copy otherwise, each change built in the work
+  directory and renamed into place, a file made where a whiteout is
+  taking its place at once;
   a directory opened in a bind mount of one stays in that mount, with what
   is mounted below it;
 - a namespace's file (`/proc/<pid>/ns/<kind>`, a thread's under

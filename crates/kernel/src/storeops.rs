@@ -19,6 +19,41 @@ const FS_APPEND_FL: u32 = 0x20;
 /// (`F_SEAL_SEAL`), as Linux's tmpfs makes its files.
 const TMPFS_SEALS: u32 = fcntl::F_SEAL_SEAL;
 
+/// Make `name` in directory `dir` with `make`, in place of the whiteout an
+/// overlay's upper layer has there when `over` is the attribute a
+/// directory made in its place takes ([`Resolved::over_whiteout`]): the
+/// whiteout goes and the file comes in one change of the filesystem, as
+/// Linux's overlay replaces a whiteout; one that is no longer a whiteout
+/// is in the way (`EEXIST`).
+pub(crate) fn make_over(
+    t: &mut tree::Tx,
+    dir: Ino,
+    name: &[u8],
+    over: Option<&[u8]>,
+    make: impl FnOnce(&mut tree::Tx) -> Result<Ino, i32>,
+) -> Result<Ino, i32> {
+    let Some(attr) = over else { return make(t) };
+    let st = t.stat(t.lookup(dir, name)?)?;
+    if st.mode & S_IFMT != tree::S_IFCHR || st.rdev != 0 {
+        return Err(errno::EEXIST);
+    }
+    t.unlink(dir, name, false)?;
+    let whiteout =
+        New { mode: tree::S_IFCHR | (st.mode & 0o7777), uid: st.uid, gid: st.gid, rdev: 0 };
+    let ino = match make(t) {
+        Ok(ino) => ino,
+        Err(e) => {
+            // Put back as it was.
+            t.create(dir, name, &whiteout)?;
+            return Err(e);
+        }
+    };
+    if t.stat(ino)?.mode & S_IFMT == S_IFDIR {
+        t.set_xattr(ino, attr, Some(b"y"))?;
+    }
+    Ok(ino)
+}
+
 /// Whether directory `d` is a cgroup's ([`crate::cgroupfs`]): its names
 /// are the kernel's to make, but for the cgroups `mkdir` makes.
 fn in_cgroups(d: &StoreDir) -> bool {
@@ -79,7 +114,7 @@ impl<P: Platform> Kernel<P> {
     /// Whether the caller may make or remove a name in directory `dir` of
     /// fwe's store: the mount is writable (`EROFS`), the directory is there
     /// still (`ENOENT`) and the caller may write and search it (`EACCES`).
-    fn store_may_change(&self, r: &Resolved, d: &StoreDir) -> Result<Stat, i32> {
+    pub(crate) fn store_may_change(&self, r: &Resolved, d: &StoreDir) -> Result<Stat, i32> {
         r.writable()?;
         let st = d.fs.lock()?.stat(d.ino)?;
         if st.nlink == 0 {
@@ -123,7 +158,7 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         if let Some(ns) = &r.ns_path {
-            crate::fdmarks::opened(fd, ns.clone(), r.mount_id, r.mount_flags, r.fstype, None);
+            crate::fdmarks::opened(fd, ns.clone(), r.mount_id, r.mount_flags, r.fstype, r.layers());
         }
         if let Some(d) = &r.store
             && r.name != b"."
@@ -152,6 +187,8 @@ impl<P: Platform> Kernel<P> {
             crate::cgroupfs::refresh(&cg, &r.name);
         }
         let found = match d.find(&r.name) {
+            // The whiteout an overlay's file is made in place of.
+            Ok(_) if r.over_whiteout().is_some() => None,
             Ok(f) => Some(f),
             Err(errno::ENOENT) => None,
             Err(e) => return err(e),
@@ -337,7 +374,7 @@ impl<P: Platform> Kernel<P> {
             _ => return err(errno::ENXIO),
         };
         if let Some(ns) = &r.ns_path {
-            crate::fdmarks::opened(fd, ns.clone(), r.mount_id, r.mount_flags, r.fstype, None);
+            crate::fdmarks::opened(fd, ns.clone(), r.mount_id, r.mount_flags, r.fstype, r.layers());
         }
         crate::fdstate::update(fd, |s| s.created = false);
         fd as i64
@@ -371,7 +408,10 @@ impl<P: Platform> Kernel<P> {
         let perm = self.fs().apply_umask(asked);
         let (uid, gid, perm) = self.store_owner(&dir, perm, asked, false);
         let made = d.fs.lock().and_then(|mut t| {
-            let ino = t.create(d.ino, &r.name, &New { mode: S_IFREG | perm, uid, gid, rdev: 0 })?;
+            let new = New { mode: S_IFREG | perm, uid, gid, rdev: 0 };
+            let ino = make_over(&mut t, d.ino, &r.name, r.over_whiteout(), |t| {
+                t.create(d.ino, &r.name, &new)
+            })?;
             t.set_seals(ino, TMPFS_SEALS)?;
             Ok(ino)
         });
@@ -440,7 +480,7 @@ impl<P: Platform> Kernel<P> {
             }
         };
         if let Some(ns) = &r.ns_path {
-            crate::fdmarks::opened(fd, ns.clone(), r.mount_id, r.mount_flags, r.fstype, None);
+            crate::fdmarks::opened(fd, ns.clone(), r.mount_id, r.mount_flags, r.fstype, r.layers());
         }
         crate::fdstate::update(fd, |s| s.created = true);
         fd as i64
@@ -448,7 +488,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `mkdirat` of what was resolved in directory `d` of fwe's store.
     pub(crate) fn store_mkdir(&self, r: &Resolved, d: &StoreDir, mode: u32) -> i64 {
-        if d.find(&r.name).is_ok() {
+        if r.over_whiteout().is_none() && d.find(&r.name).is_ok() {
             return err(errno::EEXIST);
         }
         let dir = match self.store_may_change(r, d) {
@@ -478,7 +518,8 @@ impl<P: Platform> Kernel<P> {
         let perm = self.fs().apply_umask(mode & 0o7777) & 0o1777;
         let (uid, gid, perm) = self.store_owner(&dir, perm, mode, true);
         let made = d.fs.lock().and_then(|mut t| {
-            t.create(d.ino, &r.name, &New { mode: S_IFDIR | perm, uid, gid, rdev: 0 })
+            let new = New { mode: S_IFDIR | perm, uid, gid, rdev: 0 };
+            make_over(&mut t, d.ino, &r.name, r.over_whiteout(), |t| t.create(d.ino, &r.name, &new))
         });
         if let Err(e) = made {
             return err(e);
@@ -503,7 +544,7 @@ impl<P: Platform> Kernel<P> {
         perm: u32,
         rdev: u64,
     ) -> i64 {
-        if d.find(&r.name).is_ok() {
+        if r.over_whiteout().is_none() && d.find(&r.name).is_ok() {
             return err(errno::EEXIST);
         }
         let dir = match self.store_may_change(r, d) {
@@ -520,9 +561,10 @@ impl<P: Platform> Kernel<P> {
                 major: crate::devnodes::major(rdev),
                 minor: crate::devnodes::minor(rdev),
             };
-            // A whiteout (a 0:0 character device) needs no `CAP_MKNOD`.
+            // A whiteout (a 0:0 character device) needs no `CAP_MKNOD`, and
+            // in an overlay is the overlay's own, as on Linux.
             let whiteout = kind == tree::S_IFCHR && node.major == 0 && node.minor == 0;
-            if !whiteout && !self.creds.has(crate::caps::CAP_MKNOD) {
+            if !whiteout && !self.creds.has(crate::caps::CAP_MKNOD) || whiteout && r.ovl.is_some() {
                 return err(errno::EPERM);
             }
             if let Err(e) = crate::cgroupfs::check_device(
@@ -538,7 +580,10 @@ impl<P: Platform> Kernel<P> {
         let (uid, gid, applied) = self.store_owner(&dir, applied, perm, false);
         let rdev = if matches!(kind, tree::S_IFCHR | tree::S_IFBLK) { rdev } else { 0 };
         let made = d.fs.lock().and_then(|mut t| {
-            let ino = t.create(d.ino, &r.name, &New { mode: kind | applied, uid, gid, rdev })?;
+            let new = New { mode: kind | applied, uid, gid, rdev };
+            let ino = make_over(&mut t, d.ino, &r.name, r.over_whiteout(), |t| {
+                t.create(d.ino, &r.name, &new)
+            })?;
             if kind == S_IFREG {
                 t.set_seals(ino, TMPFS_SEALS)?;
             }
@@ -563,7 +608,7 @@ impl<P: Platform> Kernel<P> {
     /// `symlinkat` of `target` at what was resolved in directory `d` of
     /// fwe's store.
     pub(crate) fn store_symlink(&self, r: &Resolved, d: &StoreDir, target: &[u8]) -> i64 {
-        if d.find(&r.name).is_ok() {
+        if r.over_whiteout().is_none() && d.find(&r.name).is_ok() {
             return err(errno::EEXIST);
         }
         if let Err(e) = self.store_may_change(r, d) {
@@ -579,7 +624,12 @@ impl<P: Platform> Kernel<P> {
                 _ => self.creds.fsgid,
             }
         });
-        match d.fs.lock().and_then(|mut t| t.symlink(d.ino, &r.name, target, uid, gid)) {
+        let made = d.fs.lock().and_then(|mut t| {
+            make_over(&mut t, d.ino, &r.name, r.over_whiteout(), |t| {
+                t.symlink(d.ino, &r.name, target, uid, gid)
+            })
+        });
+        match made {
             Ok(_) => 0,
             Err(e) => err(e),
         }
@@ -657,7 +707,7 @@ impl<P: Platform> Kernel<P> {
         if nd.fs.id != fs {
             return err(errno::EXDEV);
         }
-        if nd.find(&new.name).is_ok() {
+        if new.over_whiteout().is_none() && nd.find(&new.name).is_ok() {
             return err(errno::EEXIST);
         }
         if let Err(e) = self.store_may_change(new, nd) {
@@ -701,7 +751,9 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         let linked = nd.fs.lock().and_then(|mut t| {
-            t.link(ino, nd.ino, &new.name)?;
+            make_over(&mut t, nd.ino, &new.name, new.over_whiteout(), |t| {
+                t.link(ino, nd.ino, &new.name).map(|()| ino)
+            })?;
             // Named, it is no longer one to name again from its descriptor.
             t.set_linkable(ino, false)
         });

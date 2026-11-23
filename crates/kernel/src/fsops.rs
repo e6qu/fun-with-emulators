@@ -1007,8 +1007,9 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        // A file of fwe's store (a tmpfs's).
-        if let Some(d) = resolved.store.clone() {
+        // A file of fwe's store (a tmpfs's); in an overlay, once it is
+        // ready to be changed (below).
+        if let Some(d) = resolved.store.clone().filter(|_| resolved.ovl.is_none()) {
             let slash = path.last() == Some(&b'/');
             return self.store_open(&resolved, &d, flags, mode, slash);
         }
@@ -1049,6 +1050,16 @@ impl<P: Platform> Kernel<P> {
             {
                 return err(e);
             }
+        }
+        // An overlay's file in a layer of fwe's store (copied up, or its
+        // directory, to be changed).
+        if let Some(d) = resolved.store.clone() {
+            let slash = path.last() == Some(&b'/');
+            let r = self.store_open(&resolved, &d, flags, mode, slash);
+            return match resolved.finish(r >= 0) {
+                Err(e) if r < 0 => err(e),
+                _ => r,
+            };
         }
         let name = match resolved.name_c() {
             Ok(n) => n,
@@ -1524,6 +1535,7 @@ impl<P: Platform> Kernel<P> {
                 Ok((ino, _)) => store_statfs(
                     crate::filestore::desc::File { fs: d.fs.id, ino },
                     r.mount_flags,
+                    r.fstype,
                     buf,
                 ),
                 Err(e) => err(e),
@@ -1541,8 +1553,10 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_fstatfs(&mut self, fd: u64, buf: u64) -> i64 {
         let fd = fd as i32;
         if let Some(file) = crate::filestore::desc::of(fd) {
-            let flags = crate::fdmarks::origin(fd).map_or(0, |o| o.flags);
-            return store_statfs(file, flags, buf);
+            let o = crate::fdmarks::origin(fd);
+            let flags = o.as_ref().map_or(0, |o| o.flags);
+            let fstype = o.map_or(crate::mounts::FsType::Tmpfs, |o| o.fstype);
+            return store_statfs(file, flags, fstype, buf);
         }
         // A pipe's or socket's filesystem is the kernel's own (pipefs,
         // sockfs), which the host does not report.
@@ -2203,7 +2217,7 @@ impl<P: Platform> Kernel<P> {
             Err(e) => return err(e),
         };
         // In fwe's store (a tmpfs).
-        if let Some(d) = r.store.clone() {
+        if let Some(d) = r.store.clone().filter(|_| r.ovl.is_none()) {
             return self.store_mkdir(&r, &d, mode as u32);
         }
         if let Err(e) = r.writable() {
@@ -2214,6 +2228,14 @@ impl<P: Platform> Kernel<P> {
         }
         if let Err(e) = r.prepare(Change::Create) {
             return err(e);
+        }
+        // An overlay's directory in a layer of fwe's store.
+        if let Some(d) = r.store.clone() {
+            let made = self.store_mkdir(&r, &d, mode as u32);
+            return match r.finish(made == 0) {
+                Err(e) if made == 0 => err(e),
+                _ => made,
+            };
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         // The permission and sticky bits, as Linux's `mkdir` takes: a
@@ -2385,10 +2407,6 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = removed_dir_only(&r, crate::fs::trailing_slash(&path)) {
             return err(e);
         }
-        // In fwe's store (a tmpfs).
-        if let Some(d) = r.store.clone() {
-            return self.store_unlink(&r, &d, flags & fcntl::AT_REMOVEDIR != 0);
-        }
         if let Some(o) = &r.ovl {
             if let Err(e) = self.may_remove_in_overlay(o, &r.name) {
                 return err(e);
@@ -2400,12 +2418,16 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => return err(e),
             };
             let rmdir = flags & fcntl::AT_REMOVEDIR != 0;
-            return self.change_in(up.as_raw_fd(), || {
+            return self.change_in_layer(&r, &up, || {
                 match crate::overlay::remove(&o.layers, &o.parent, &r.name, rmdir) {
                     Ok(()) => 0,
                     Err(e) => err(e),
                 }
             });
+        }
+        // In fwe's store (a tmpfs).
+        if let Some(d) = r.store.clone() {
+            return self.store_unlink(&r, &d, flags & fcntl::AT_REMOVEDIR != 0);
         }
         let Ok(name) = r.name_c() else { return err(errno::EINVAL) };
         let dir = r.dir;
@@ -2523,7 +2545,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EXDEV);
         }
         // In fwe's store (a tmpfs): both, or not one filesystem.
-        if old.store.is_some() || new.store.is_some() {
+        if (old.store.is_some() || new.store.is_some()) && old.ovl.is_none() && new.ovl.is_none() {
             let (Some(od), Some(nd)) = (&old.store, &new.store) else { return err(errno::EXDEV) };
             let ino = match od.find(&old.name) {
                 Ok((ino, _)) => ino,
@@ -2533,6 +2555,10 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EEXIST);
             }
             return self.store_link(od.fs.id, ino, &new, nd, false);
+        }
+        if old.ovl.is_some() != new.ovl.is_some() {
+            // One in an overlay, the other not: not one filesystem.
+            return err(errno::EXDEV);
         }
         if crate::sysctl::protected_links().1
             && let Err(e) = self.may_hardlink(&old)
@@ -2548,6 +2574,17 @@ impl<P: Platform> Kernel<P> {
         }
         if let Err(e) = new.prepare(Change::Create) {
             return err(e);
+        }
+        // An overlay's upper layer in fwe's store.
+        if let (Some(od), Some(nd)) = (old.store.clone(), new.store.clone()) {
+            let made = match od.find(&old.name) {
+                Ok((ino, _)) => self.store_link(od.fs.id, ino, &new, &nd, false),
+                Err(e) => err(e),
+            };
+            return match new.finish(made == 0) {
+                Err(e) if made == 0 => err(e),
+                _ => made,
+            };
         }
         let (Ok(on), Ok(nn)) = (old.name_c(), new.name_c()) else { return err(errno::EINVAL) };
         let (o, n) = (old.dir.as_raw_fd(), new.dir.as_raw_fd());
@@ -2658,11 +2695,6 @@ impl<P: Platform> Kernel<P> {
             // place): not one filesystem.
             return err(errno::EXDEV);
         }
-        // In fwe's store (a tmpfs): both, or not one filesystem.
-        if old.store.is_some() || new.store.is_some() {
-            let (Some(od), Some(nd)) = (&old.store, &new.store) else { return err(errno::EXDEV) };
-            return self.store_rename(&old, od, &new, nd, flags);
-        }
         if let (Some(a), Some(b)) = (&old.ovl, &new.ovl) {
             if flags & RENAME_WHITEOUT != 0 {
                 return err(errno::EINVAL);
@@ -2678,8 +2710,8 @@ impl<P: Platform> Kernel<P> {
                 (Ok(x), Ok(y)) => (x, y),
                 (Err(e), _) | (_, Err(e)) => return err(e),
             };
-            return self.change_in(ua.as_raw_fd(), || {
-                self.change_in(ub.as_raw_fd(), || {
+            return self.change_in_layer(&old, &ua, || {
+                self.change_in_layer(&new, &ub, || {
                     let from = (&a.parent[..], &old.name[..]);
                     let to = (&b.parent[..], &new.name[..]);
                     match crate::overlay::rename(&a.layers, from, to, how) {
@@ -2688,6 +2720,11 @@ impl<P: Platform> Kernel<P> {
                     }
                 })
             });
+        }
+        // In fwe's store (a tmpfs): both, or not one filesystem.
+        if old.store.is_some() || new.store.is_some() {
+            let (Some(od), Some(nd)) = (&old.store, &new.store) else { return err(errno::EXDEV) };
+            return self.store_rename(&old, od, &new, nd, flags);
         }
         let (Ok(on), Ok(nn)) = (old.name_c(), new.name_c()) else { return err(errno::EINVAL) };
         let (o, n) = (old.dir.as_raw_fd(), new.dir.as_raw_fd());
@@ -2895,10 +2932,18 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = crate::leases::break_for(dev, st.st_ino, true, false) {
             return err(e);
         }
+        // An overlay's file copied up first, to the layer it is cut in.
+        let mut r = r;
+        if let Err(e) = r.prepare(crate::fs::Change::Modify) {
+            return err(e);
+        }
         // In fwe's store (a tmpfs).
         if let Some(d) = &r.store {
-            #[allow(clippy::unnecessary_cast)] // `ino_t` differs by host
-            let file = crate::filestore::desc::File { fs: d.fs.id, ino: st.st_ino as u64 };
+            let ino = match d.find(&r.name) {
+                Ok((ino, _)) => ino,
+                Err(e) => return err(e),
+            };
+            let file = crate::filestore::desc::File { fs: d.fs.id, ino };
             let r = crate::filestore::io::truncate_file(file, len).map_or_else(err, |()| 0);
             // A set-ID file cut by a caller without `CAP_FSETID` loses its
             // bits, as one written does.
@@ -2909,10 +2954,6 @@ impl<P: Platform> Kernel<P> {
                 let _ = crate::filestore::io::chmod_file(file, kept);
             }
             return r;
-        }
-        let mut r = r;
-        if let Err(e) = r.prepare(crate::fs::Change::Modify) {
-            return err(e);
         }
         let Ok(name) = r.name_c() else { return err(errno::ENOENT) };
         let dir = r.dir.as_raw_fd();
@@ -3086,6 +3127,18 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: the guest passed a buffer of `count` bytes.
         if let Some(r) = unsafe { crate::synthdir::getdents64(fd as i32, buf, count) } {
             return r;
+        }
+        // An overlay's directory whose top layer is one of fwe's store's:
+        // its layers' entries merged (below, for a host one).
+        if crate::filestore::desc::of(fd as i32).is_some()
+            && let Some(l) = crate::fdmarks::origin(fd as i32).and_then(|o| o.ovl)
+            && crate::filestore::io::stat(fd as i32)
+                .is_some_and(|st| st.is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR))
+        {
+            return crate::overlay::getdents64(fd as i32, buf, count, || {
+                let path = crate::overlay::path_of(&l, fd as i32).ok_or(errno::ENOENT)?;
+                crate::overlay::list(&crate::overlay::open(&l, &path)?)
+            });
         }
         if let Some(r) = crate::filestore::io::getdents64(fd as i32, buf, count) {
             return r;
@@ -4071,16 +4124,16 @@ impl<P: Platform> Kernel<P> {
     fn may_remove_in_overlay(&self, o: &crate::fs::Ovl, name: &[u8]) -> Result<(), i32> {
         use crate::overlay::Found;
         let Ok(d) = crate::overlay::open(&o.layers, &o.parent) else { return Ok(()) };
-        let Ok(dir) = stat_fd(d.top().1.as_raw_fd()) else { return Ok(()) };
+        let Ok(dir) = d.top().1.guest_stat(b".") else { return Ok(()) };
         if dir.st_mode & 0o1000 == 0 {
             return Ok(());
         }
         let file = match &o.found {
-            Found::Other { layer, .. } => match (&d.fds[*layer], CString::new(name)) {
-                (Some(l), Ok(n)) => stat_at(l.as_raw_fd(), &n),
-                _ => return Ok(()),
+            Found::Other { layer, .. } => match &d.dirs[*layer] {
+                Some(l) => l.guest_stat(name),
+                None => return Ok(()),
             },
-            Found::Dir(child) => stat_fd(child.top().1.as_raw_fd()),
+            Found::Dir(child) => child.top().1.guest_stat(b"."),
             Found::Missing => return Ok(()),
         };
         match file {
@@ -4095,6 +4148,19 @@ impl<P: Platform> Kernel<P> {
     /// that does is not refused by the host's: refused with `EACCES`, the
     /// directory's mode is kept apart and `op` tried again
     /// ([`crate::modes`]).
+    /// [`Self::change_in`] the overlay layer's directory `d` (of what `r`
+    /// resolved): a host directory, or one of fwe's store, which the caller
+    /// must be able to write and search.
+    fn change_in_layer(&self, r: &Resolved, d: &crate::overlay::LDir, op: impl Fn() -> i64) -> i64 {
+        match d {
+            crate::overlay::LDir::Host(fd) => self.change_in(fd.as_raw_fd(), op),
+            crate::overlay::LDir::Store(sd) => match self.store_may_change(r, sd) {
+                Ok(_) => op(),
+                Err(e) => err(e),
+            },
+        }
+    }
+
     fn change_in(&self, dir: i32, op: impl Fn() -> i64) -> i64 {
         let st = match stat_fd(dir) {
             Ok(st) => st,
@@ -4167,15 +4233,25 @@ impl<P: Platform> Kernel<P> {
         // A file of fwe's store (an `O_TMPFILE` of a tmpfs, say): named
         // there, in its own filesystem.
         if let Some(file) = crate::filestore::desc::of(fd) {
-            let new = match self.fs().resolve(newdirfd as i32, newpath, false) {
+            let mut new = match self.fs().resolve(newdirfd as i32, newpath, false) {
                 Ok(r) => r,
                 Err(e) => return err(e),
             };
-            let Some(nd) = new.store.clone() else { return err(errno::EXDEV) };
             if new.mount_root {
                 return err(errno::EEXIST);
             }
-            return self.store_link(file.fs, file.ino, &new, &nd, true);
+            // In an overlay whose upper layer is the file's filesystem.
+            if new.ovl.is_some()
+                && let Err(e) = new.prepare(Change::Create)
+            {
+                return err(e);
+            }
+            let Some(nd) = new.store.clone() else { return err(errno::EXDEV) };
+            let made = self.store_link(file.fs, file.ino, &new, &nd, true);
+            return match new.finish(made == 0) {
+                Err(e) if made == 0 => err(e),
+                _ => made,
+            };
         }
         let Some(host) = crate::fs::host_path_of(fd) else { return err(errno::ENOENT) };
         let Ok(src) = CString::new(host) else { return err(errno::EINVAL) };
@@ -4222,18 +4298,31 @@ impl<P: Platform> Kernel<P> {
             return Err(errno::EROFS);
         }
         let Some(layers) = o.ovl.clone() else { return Ok(()) };
-        if let Some(host) = o.stand_in {
-            // An O_PATH stand-in names its file by path: copied up by it,
-            // the stand-in names the copy.
-            let upper = layers.upper.as_deref().ok_or(errno::EROFS)?;
-            if crate::mounts::under(&host, upper).is_some() {
+        if let Some(host) = o.stand_in.clone() {
+            // An O_PATH stand-in names its host file by path: copied up by
+            // it, the stand-in names the copy.
+            if let Some(crate::overlay::Place::Host(upper)) = &layers.upper
+                && crate::mounts::under(&host, upper).is_some()
+            {
                 return Ok(());
             }
             let path = crate::overlay::path_of(&layers, fd).ok_or(errno::ESTALE)?;
             let up = crate::overlay::copy_up(&layers, &path)?;
             let name = path.rsplit(|&b| b == b'/').next().unwrap_or_default();
-            if let Some(dir) = crate::fs::host_path_of(up.as_raw_fd()) {
-                crate::fdmarks::set_stand_in(fd, crate::mounts::join(&dir, name));
+            match &up {
+                crate::overlay::LDir::Host(d) => {
+                    if let Some(dir) = crate::fs::host_path_of(d.as_raw_fd()) {
+                        crate::fdmarks::set_stand_in(fd, crate::mounts::join(&dir, name));
+                    }
+                }
+                // Copied up into fwe's store: the descriptor is one of the
+                // store's now, as it would be opened there.
+                crate::overlay::LDir::Store(sd) => {
+                    let (ino, _) = sd.find(name)?;
+                    let file = crate::filestore::desc::File { fs: sd.fs.id, ino };
+                    let flags = fcntl::O_PATH | fcntl::O_NOFOLLOW;
+                    self.store_onto(fd, file, flags, &o)?;
+                }
             }
             return Ok(());
         }
@@ -4242,12 +4331,36 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: plain host calls on an open descriptor.
         let (status, fd_flags) =
             unsafe { (libc::fcntl(fd, libc::F_GETFL), libc::fcntl(fd, libc::F_GETFD)) };
-        let keep = libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK;
         let dir = stat_fd(fd).is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+        let up = match up {
+            crate::overlay::LDir::Host(d) => d,
+            crate::overlay::LDir::Store(sd) => {
+                // The same access and status flags, as Linux's.
+                let mut flags = (status & libc::O_ACCMODE) as u64;
+                if status & libc::O_APPEND != 0 {
+                    flags |= fcntl::O_APPEND;
+                }
+                if status & libc::O_NONBLOCK != 0 {
+                    flags |= fcntl::O_NONBLOCK;
+                }
+                if fd_flags & libc::FD_CLOEXEC != 0 {
+                    flags |= fcntl::O_CLOEXEC;
+                }
+                let (ino, _) = sd.find(&name)?;
+                let file = crate::filestore::desc::File { fs: sd.fs.id, ino };
+                self.store_onto(fd, file, flags, &o)?;
+                if dir {
+                    crate::overlay::moved(fd);
+                }
+                return Ok(());
+            }
+        };
+        let keep = libc::O_ACCMODE | libc::O_APPEND | libc::O_NONBLOCK;
         let open_flags = status & keep
             | libc::O_NOFOLLOW
             | libc::O_CLOEXEC
             | if dir { libc::O_DIRECTORY } else { 0 };
+        let Ok(name) = CString::new(name) else { return Err(errno::EINVAL) };
         // SAFETY: a NUL-terminated name in a live directory.
         let copy = unsafe { libc::openat(up.as_raw_fd(), name.as_ptr(), open_flags) };
         if copy < 0 {
@@ -4271,6 +4384,42 @@ impl<P: Platform> Kernel<P> {
         if dir {
             crate::overlay::moved(fd);
         }
+        Ok(())
+    }
+
+    /// Put a new description of `file` of fwe's store, open with Linux's
+    /// `flags`, at descriptor `fd` in place of what it was (an overlay's
+    /// lower file, now copied up: `o` is where `fd` was opened), its offset
+    /// kept.
+    fn store_onto(
+        &self,
+        fd: i32,
+        file: crate::filestore::desc::File,
+        flags: u64,
+        o: &crate::fdmarks::Origin,
+    ) -> Result<(), i32> {
+        use crate::filestore::desc;
+        let copy = desc::open(file, flags, desc::new_id(flags))?;
+        // SAFETY: plain host calls on the two open descriptors; `copy`
+        // replaces `fd`, then goes.
+        let r = unsafe {
+            let offset = libc::lseek(fd, 0, libc::SEEK_CUR);
+            if offset > 0 {
+                libc::lseek(copy, offset, libc::SEEK_SET);
+            }
+            libc::dup2(copy, fd)
+        };
+        if r >= 0 {
+            crate::fdmarks::duplicated(copy, fd);
+        }
+        crate::fdmarks::closed(copy);
+        // SAFETY: the descriptor opened above.
+        unsafe { libc::close(copy) };
+        desc::sync(&[]);
+        if r < 0 {
+            return Err(host::errno_to_linux(host::last_errno()));
+        }
+        crate::fdmarks::opened(fd, o.ns_path.clone(), o.mount, o.flags, o.fstype, o.ovl.clone());
         Ok(())
     }
 
@@ -4664,10 +4813,21 @@ fn statfs_flags(flags: u64) -> i64 {
 
 /// `statfs` of the filesystem of fwe's store `file` is in, through a mount
 /// with `flags`, into guest `buf`.
-fn store_statfs(file: crate::filestore::desc::File, flags: u64, buf: u64) -> i64 {
+/// `statfs` of `file` of fwe's store, through a mount with `flags` of a
+/// filesystem of type `fstype`: the store's, or an overlay's whose layer
+/// holds it (the type the overlay's).
+fn store_statfs(
+    file: crate::filestore::desc::File,
+    flags: u64,
+    fstype: crate::mounts::FsType,
+    buf: u64,
+) -> i64 {
     match crate::filestore::io::statfs_file(file) {
         Ok(mut out) => {
             out.f_flags = statfs_flags(flags);
+            if fstype == crate::mounts::FsType::Overlay {
+                out.f_type = crate::overlay::MAGIC;
+            }
             guest!(uaccess::write(buf, out));
             0
         }

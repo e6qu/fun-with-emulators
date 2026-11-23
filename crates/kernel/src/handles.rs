@@ -351,7 +351,8 @@ impl<P: Platform> Kernel<P> {
         let dirs: Vec<Vec<u8>> = match &m.source {
             crate::mounts::Source::Host(_) => vec![m.host_path(b"")?],
             crate::mounts::Source::Overlay(layers) => {
-                layers.paths().map(|p| crate::mounts::join(p, &m.root)).collect()
+                let host = layers.places().filter_map(crate::overlay::Place::host);
+                host.map(|p| crate::mounts::join(p, &m.root)).collect()
             }
             _ => return None,
         };

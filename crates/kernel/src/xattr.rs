@@ -454,6 +454,19 @@ pub fn list(t: &Target, who: &Who) -> Result<Vec<u8>, i32> {
     Ok(out)
 }
 
+/// The names of every attribute of `t`: on the host, fwe's and the
+/// host's own too; in the store, all but fwe's own.
+pub fn names(t: &Target) -> Result<Vec<Vec<u8>>, i32> {
+    if let Some(file) = stored(t) {
+        return Ok(in_store(file, |s| s.xattrs(file.ino))?
+            .into_iter()
+            .map(|(n, _)| n)
+            .filter(|n| n.first() != Some(&0))
+            .collect());
+    }
+    Ok(list_raw(t)?.split(|&b| b == 0).filter(|n| !n.is_empty()).map(<[u8]>::to_vec).collect())
+}
+
 /// Every host attribute name of `t`, each NUL-terminated.
 fn list_raw(t: &Target) -> Result<Vec<u8>, i32> {
     Ok(loop {

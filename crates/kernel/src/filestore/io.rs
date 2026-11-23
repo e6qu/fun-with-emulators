@@ -824,6 +824,39 @@ fn set_flags(
     t.set_flags(ino, f)
 }
 
+/// Up to `len` bytes at `off` of `file`, read by fwe for itself (an
+/// overlay's copy-up): its access time left as it is.
+pub fn read_for_fwe(file: File, off: u64, len: u64) -> Result<Vec<u8>, i32> {
+    in_file(file, |file, t| {
+        let (object, n) = t.readable(file.ino, off, len)?;
+        let mut out = vec![0u8; n as usize];
+        if n > 0 {
+            data::read(object, off, &mut out)?;
+        }
+        Ok(out)
+    })
+}
+
+/// Write `bytes` at `off` of `file` for fwe itself (an overlay's copy-up),
+/// all of them (`ENOSPC` when the filesystem is full).
+pub fn write_for_fwe(file: File, off: u64, bytes: &[u8]) -> Result<(), i32> {
+    in_file(file, |file, t| {
+        let mut done = 0u64;
+        while done < bytes.len() as u64 {
+            let rest = bytes.len() as u64 - done;
+            let Writable { object, off: at, fits } =
+                t.writable(file.ino, off + done, rest, false)?;
+            if fits == 0 {
+                return Err(errno::ENOSPC);
+            }
+            data::write(object, at, &bytes[done as usize..(done + fits) as usize])?;
+            done += fits;
+            t.wrote(file.ino, at + fits)?;
+        }
+        Ok(())
+    })
+}
+
 /// Up to `len` bytes at `off` of the file `fd` is a descriptor of, if it
 /// is one of the store's (its position as it was): what fwe reads of it
 /// for itself (a program to run).

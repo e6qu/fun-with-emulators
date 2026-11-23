@@ -737,7 +737,14 @@ fn collect_in(base: &[u8]) {
                     // An overlay keeps the tmpfs its layers are in, even
                     // once that is unmounted.
                     crate::mounts::Source::Overlay(l) => {
-                        for p in l.paths().chain(l.work.as_deref()) {
+                        for place in l.places().chain(l.work.as_ref()) {
+                            let p = match place {
+                                crate::overlay::Place::Host(p) => p,
+                                crate::overlay::Place::Store { fs, .. } => {
+                                    stores.insert(*fs);
+                                    continue;
+                                }
+                            };
                             let Some(rest) = p.strip_prefix(&base[..]) else { continue };
                             let top = rest.split(|&b| b == b'/').find(|c| !c.is_empty());
                             if let Some(top) = top {

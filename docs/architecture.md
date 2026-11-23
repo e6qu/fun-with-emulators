@@ -1815,7 +1815,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - A mount is not busy for a process fwe did not start, for another
   process's working directory, or for a file another process opened at a
   host path two mounts share (a bind, a lower layer two overlays have).
-- Overlays: layers must be host directories (not in another overlay); a
+- Overlays: a layer is a host directory or a tmpfs's (fwe's store), not
+  a directory of another overlay; a
   directory a lower layer has cannot be renamed (`EXDEV`, as with
   `redirect_dir=off`); a rename leaving a whiteout, and a `bind` over one,
   are two host steps another process can see between; a lower file that

@@ -159,9 +159,7 @@ fn set_cloexec(fd: i32, cloexec: bool) {
 fn tree_fd(root: &Mount) -> Result<i32, i32> {
     let host = match &root.source {
         Source::Host(_) => root.host_path(b""),
-        Source::Overlay(l) => {
-            l.upper.clone().or_else(|| l.lowers.first().cloned()).map(|d| join(&d, &root.root))
-        }
+        Source::Overlay(l) => l.places().next().and_then(|p| p.host()).map(|d| join(d, &root.root)),
         Source::Synthetic | Source::Ns(_) | Source::Store(_) => None,
     };
     let Some(path) = host else {

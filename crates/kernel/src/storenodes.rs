@@ -92,10 +92,15 @@ pub fn file_of(host: &[u8]) -> Option<File> {
 /// file made there, owned by the caller, and the host path of its node to
 /// bind. A name there is an address in use (`EADDRINUSE`); the caller
 /// needs to write and search the directory (`EACCES`).
-pub fn bind_at(d: &StoreDir, name: &[u8], guest: &[u8]) -> Result<Vec<u8>, i32> {
+pub fn bind_at(
+    d: &StoreDir,
+    name: &[u8],
+    guest: &[u8],
+    over: Option<&'static [u8]>,
+) -> Result<Vec<u8>, i32> {
     let a = crate::creds::access();
     let mut t = d.fs.lock()?;
-    if t.lookup(d.ino, name).is_ok() {
+    if over.is_none() && t.lookup(d.ino, name).is_ok() {
         return Err(errno::EADDRINUSE);
     }
     let dir = crate::filestore::io::host_stat(t.dev(), &t.stat(d.ino)?);
@@ -105,7 +110,9 @@ pub fn bind_at(d: &StoreDir, name: &[u8], guest: &[u8]) -> Result<Vec<u8>, i32> 
     // A set-group-ID directory's group, as for any file made there.
     #[allow(clippy::unnecessary_cast)] // `mode_t` differs by host
     let gid = if dir.st_mode as u32 & 0o2000 != 0 { dir.st_gid } else { a.fsgid };
-    let ino = t.create(d.ino, name, &tree::New { mode: S_IFSOCK, uid: a.fsuid, gid, rdev: 0 })?;
+    let new = tree::New { mode: S_IFSOCK, uid: a.fsuid, gid, rdev: 0 };
+    let ino =
+        crate::storeops::make_over(&mut t, d.ino, name, over, |t| t.create(d.ino, name, &new))?;
     t.set_xattr(ino, BOUND, Some(guest))?;
     let host = path(d.fs.id, ino)?;
     let c = CString::new(host.clone()).map_err(|_| errno::EINVAL)?;

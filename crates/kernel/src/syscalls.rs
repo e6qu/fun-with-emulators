@@ -1061,14 +1061,16 @@ impl<P: Platform> Kernel<P> {
                 } else if let Some(r) = crate::loopdev::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
                     r
+                } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
+                    && is_dir_fd(a[0] as i32)
+                {
+                    // An overlay's directory (of fwe's store's in its top
+                    // layer, too): by its merged listing.
+                    crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 } else if let Some(r) =
                     crate::filestore::io::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
                     r
-                } else if crate::fdmarks::origin(a[0] as i32).is_some_and(|o| o.ovl.is_some())
-                    && is_dir_fd(a[0] as i32)
-                {
-                    crate::overlay::lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 } else if let Some(r) =
                     crate::fsops::dir_lseek(a[0] as i32, a[1] as i64, a[2] as i32)
                 {
@@ -4212,6 +4214,9 @@ fn uid_in(arg: u64, gid: bool) -> Result<u32, i32> {
 
 /// Whether `fd` is open on a directory.
 fn is_dir_fd(fd: i32) -> bool {
+    if let Some(st) = crate::filestore::io::stat(fd) {
+        return st.is_ok_and(|st| st.st_mode & libc::S_IFMT == libc::S_IFDIR);
+    }
     // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
     // SAFETY: a valid out-parameter.

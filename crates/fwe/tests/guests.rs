@@ -8562,17 +8562,38 @@ fn extended_attributes() {
 /// upper layer an overlay is read-only, and an option fwe lacks is refused.
 #[test]
 fn overlay_mounts() {
-    assert_eq!(
-        containers("overlay"),
-        "mount: ok\na: lower1\nd: x y z\na written: lower1+ lower: lower1 upper: lower1+\n\
-         unlink: ok\ngone: ENOENT lower: g whiteout: true 0\nrename a lower dir: EXDEV\n\
-         rename a file: ok\nd: x2 y z lower: x y\nrmdir full: ENOTEMPTY\nrmdir: ok\n\
-         made again: ok holds: []\nopaque in upper: y\n\
-         opaque through the overlay: EOPNOTSUPP\nfchmod: ok\ne: 600 lower: 644 upper: 600\n\
-         f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\nroot: a d deep sub\n\
-         upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
-         metacopy: EINVAL\n"
-    );
+    // Of host directories, of a tmpfs's (fwe's store), and of each over the
+    // other: the same overlay.
+    for scenario in ["overlay", "overlay-tmpfs", "overlay-upper-tmpfs", "overlay-lower-tmpfs"] {
+        assert_eq!(
+            containers(scenario),
+            "mount: ok\na: lower1\nd: x y z\na written: lower1+ lower: lower1 upper: lower1+\n\
+             unlink: ok\ngone: ENOENT lower: g whiteout: true 0\nrename a lower dir: EXDEV\n\
+             rename a file: ok\nd: x2 y z lower: x y\nrmdir full: ENOTEMPTY\nrmdir: ok\n\
+             made again: ok holds: []\nopaque in upper: y\n\
+             opaque through the overlay: EOPNOTSUPP\nfchmod: ok\ne: 600 lower: 644 upper: 600\n\
+             f_type: 0x794c7630\nmountinfo: true\nfilesystems: true\n\
+             bind over a whiteout: ok a socket: true\nroot: a d deep sub\n\
+             upper: a d deep gone sub\numount: ok\nread-only mount: ok a: lower1+\nwrite: EROFS\n\
+             metacopy: EINVAL\n",
+            "{scenario}"
+        );
+    }
+}
+
+/// inotify through an overlay, as LTP's inotify07 and inotify08 watch: a
+/// directory's watch hears a lower file in it changed (copied up to be),
+/// and a lower file's watch hears it written, of host layers and of a
+/// tmpfs's alike.
+#[test]
+fn overlay_files_are_watched_across_copy_up() {
+    for scenario in ["overlay-inotify", "overlay-inotify-tmpfs"] {
+        assert_eq!(
+            containers(scenario),
+            "mount: ok\nevents: dir 0x4 x, file 0x2 \nlower: f upper: g\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// What container runtimes ask beyond the namespaces, as containerd's shim
@@ -8636,14 +8657,18 @@ fn container_descriptor_edges() {
 /// mount, and refuses an upper layer in a read-only mount.
 #[test]
 fn overlay_edge_cases() {
-    assert_eq!(
-        containers("overlay-edges"),
-        "mount: ok\nlayer's own: true not upper: true\nO_PATH|O_CREAT: ENOENT then: ENOENT\n\
-         moved dir: true\nrenamed over: ESTALE still reads: lower\n\
-         listing across copy-up: 8 entries, 8 distinct\nseek to 3: true\n\
-         exchange: ok h holds: []\nmknod 0:0: EPERM\nafter unmount: upper true lower false\n\
-         read-only upper: EROFS\n"
-    );
+    // Of host directories, and of a tmpfs's (fwe's store).
+    for scenario in ["overlay-edges", "overlay-edges-tmpfs"] {
+        assert_eq!(
+            containers(scenario),
+            "mount: ok\nlayer's own: true not upper: true\nO_PATH|O_CREAT: ENOENT then: ENOENT\n\
+             moved dir: true\nrenamed over: ESTALE still reads: lower\n\
+             listing across copy-up: 8 entries, 8 distinct\nseek to 3: true\n\
+             exchange: ok h holds: []\nmknod 0:0: EPERM\nafter unmount: upper true lower false\n\
+             read-only upper: EROFS\n",
+            "{scenario}"
+        );
+    }
 }
 
 /// Root passes permission bits, also of modes that deny every access, which
