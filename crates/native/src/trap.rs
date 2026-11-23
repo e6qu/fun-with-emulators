@@ -209,11 +209,16 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
     }
     let set = host::host_sigset(parked);
     REROUTING.set(true);
-    // SAFETY: `set` is an initialized signal set; the pending signals are
-    // delivered to this thread between the two calls.
+    // The mask as it was is put back, not the signals blocked: a caught
+    // signal the host showed pending may be one this thread never blocked
+    // (it landed during the look, and is delivered as the look returns),
+    // which blocked now would wait unseen on the host.
+    let mut was = host::empty_sigset();
+    // SAFETY: initialized signal sets; the pending signals are delivered to
+    // this thread between the two calls.
     unsafe {
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, std::ptr::null_mut());
+        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut was);
+        libc::pthread_sigmask(libc::SIG_SETMASK, &was, std::ptr::null_mut());
     }
     REROUTING.set(false);
     thread::wake_others(host::WAKE_SIGNAL);

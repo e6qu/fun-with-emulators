@@ -2082,6 +2082,15 @@ fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
     c_guest_prints("blockedwake", &["sleeping"], "taken by the other thread\n");
 }
 
+/// `SIGURG` a process blocks and reads through a signalfd, sent by another
+/// process as the receiver starts each wait (PostgreSQL's latches), is read
+/// every time: never left blocked on the host by fwe's look for signals
+/// parked on a thread.
+#[test]
+fn a_signal_read_through_a_signalfd_always_arrives() {
+    c_guest_prints("urgwake", &[], "SIGURG: 20000 of 20000 answered\n");
+}
+
 /// A process keeps its pid in its pid namespace across an `execve` made
 /// while other threads run, which runs a fresh fwe from the exec state.
 #[test]
