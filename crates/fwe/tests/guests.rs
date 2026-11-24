@@ -10172,11 +10172,19 @@ impl Xvfb {
                 return w;
             }
             assert!(!gui.ended(), "no window {search:?}: {}", gui.report());
-            assert!(
-                began.elapsed() < Duration::from_secs(secs),
-                "no window {search:?} after {secs} s: {}",
-                gui.report()
-            );
+            if began.elapsed() >= Duration::from_secs(secs) {
+                // Those of the name not shown, or too small to count.
+                let mut all = vec!["search"];
+                all.extend(search);
+                let unseen: Vec<Window> = stdout(&self.xdotool(&all))
+                    .lines()
+                    .map(|id| self.geometry(id.trim()))
+                    .collect();
+                panic!(
+                    "no window {search:?} after {secs} s (unshown or empty: {unseen:?}): {}",
+                    gui.report()
+                );
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
     }
@@ -10457,7 +10465,7 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     // Venus says what its swapchain does, and any call that fails.
     let mut env = VENUS.to_vec();
     env.push(("VN_DEBUG", "init,wsi,result"));
-    let mut gui = Gui::start(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &env);
+    let mut gui = Gui::start_traced(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &env, true);
     let w = x.window(&mut gui, &["--name", "Vkcube X11"], 120);
     std::thread::sleep(Duration::from_secs(2));
     let first = x.shot(&w, "vkcube-first");
@@ -10469,9 +10477,9 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
 /// Vulkan, on the Venus driver, in an X server with GLX (Alpine's Xvfb,
 /// run by fwe), which names the renderer; its gears drawn and turning.
-/// Xvfb has no DRI3, so Mesa takes the path of its software renderers
-/// (`LIBGL_ALWAYS_SOFTWARE`), where `GALLIUM_DRIVER` chooses Zink, which
-/// shows its frames through Vulkan's swapchain.
+/// Xvfb has no DRI3, which GLX asks of Zink unless told it may present
+/// another way (`LIBGL_KOPPER_DRI2`): Zink then shows its frames through
+/// Vulkan's swapchain, as vkcube does.
 #[test]
 fn alpine_display_glxgears_draws_on_the_gpu() {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
@@ -10481,8 +10489,8 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
     let x = Xvfb::in_root(&root);
     let mut env = VENUS.to_vec();
     env.extend([
-        ("LIBGL_ALWAYS_SOFTWARE", "1"),
-        ("GALLIUM_DRIVER", "zink"),
+        ("MESA_LOADER_DRIVER_OVERRIDE", "zink"),
+        ("LIBGL_KOPPER_DRI2", "1"),
         ("LIBGL_DEBUG", "verbose"),
     ]);
     let local = |program: &str| format!("DISPLAY=:{} exec {program}", x.number);

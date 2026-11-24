@@ -198,8 +198,8 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" MESA_VK_WSI_DEBUG=sw \
 ```
 
 (`MESA_VK_WSI_DEBUG=sw` sends the frames to the X server as images, as
-it takes them; `LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=zink` puts
-OpenGL on the GPU on a server without DRI3, as Xvfb is.)
+it takes them; `MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the
+GPU, with `LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.)
 
 CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
 `xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
