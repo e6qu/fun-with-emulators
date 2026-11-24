@@ -2165,7 +2165,7 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 | MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
 | `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
 | Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
-| GPU rendering: `/dev/dri/renderD128`, a render node of the virtio-gpu driver a VM's GPU has, or of the GPU's own driver | Metal; Vulkan through MoltenVK; virglrenderer's Venus, which runs a virtio-gpu guest's Vulkan commands on the host's Vulkan (krunkit's GPU) | fwe's render node, speaking virtio-gpu to Mesa's Venus driver, its commands run by virglrenderer's Venus on MoltenVK in a helper process of fwe's (see [Devices](#devices)); OpenGL through Mesa's Zink on it; frames reach the X server as copies |
+| GPU rendering: a Vulkan driver the loader finds by its manifest in `/usr/share/vulkan/icd.d` or `/etc/vulkan/icd.d`, which talks to the GPU's kernel driver through `/dev/dri` | Metal; Vulkan through MoltenVK or KosmicKrisp, in the process | fwe's Linux Vulkan driver in `/etc/vulkan/icd.d`, whose every command reaches the Mac's Vulkan driver in fwe's process through one ioctl on `/dev/fwe-gpu` (see [Devices](#devices)); OpenGL through Mesa's Zink on it; frames reach the X server as copies |
 
 ### Kernel-wide state
 
@@ -2461,18 +2461,18 @@ numbers mean nothing there. fwe keeps its own:
 - Loop devices are fwe's own block devices 7:N with `/dev/loop-control`
   (10:237), in a shared record (`loopdev.rs`); fwe carries out their
   reads, writes and requests on the attached file.
-- The GPU is fwe's character device 226:128, `/dev/dri/renderD128`, a
-  virtio-gpu render node (`drm.rs`), there when virglrenderer is
-  installed:
+- The GPU is fwe's character device 10:241, `/dev/fwe-gpu`, which fwe's
+  Linux Vulkan driver (`/etc/vulkan/icd.d/libvulkan_fwe.so`) opens, there
+  where a Mac Vulkan driver is installed:
 
-  | Linux (virtio-gpu) | fwe |
+  | Linux (a Vulkan driver) | fwe |
   |---|---|
-  | the device found by libdrm: `/sys/dev/char/226:128` and a PCI device 1af4:1050 | the same `/sys` entries |
-  | `CONTEXT_INIT` with Venus's capability set | a context of virglrenderer's Venus, in the process's GPU helper (a process of fwe's, started at the first open, ended with the process) |
-  | `RESOURCE_CREATE_BLOB` (host memory), `MAP`, `mmap` | a resource of the renderer's; its memory a shared memory object the helper passes back, mapped at the guest's address, the same pages |
-  | `EXECBUFFER` and its fence (a sync file) | the commands submitted to the renderer; the fence a pipe, readable once the renderer signals it |
-  | the device after `fork` | the parent's opens are the parent's: the child's calls on them `ENODEV`; its own opens start a helper of its own |
-  | `wait` and `SIGCHLD` | the guest's children only: the helper's launcher, fwe's child for a moment, is neither waited for nor signalled |
+  | the loader finds the driver by its manifest | fwe's manifest and library in `/etc/vulkan/icd.d`, a directory fwe answers itself; the root's own drivers stay where they are |
+  | a command, run by the driver in the process | its arguments packed into words and passed with one ioctl; fwe calls the Mac driver's function for it with them, in the same process, the guest's pointers the driver's to read and write |
+  | the driver's descriptors and threads, in the process | the Mac driver's descriptors kept out of the guest's descriptor range; its threads take no signal of the guest's |
+  | a swapchain of an X window (xcb, Xlib) | the Mac driver's swapchain of no window; each frame copied to the window with `xcb_put_image` |
+  | robustness2's null descriptors | the Mac driver's, or stand-ins of fwe's where it has none (MoltenVK) |
+  | the device after `fork` | unusable in the child (macOS's libraries do not work there): its calls `ENODEV` until it calls `execve` |
 
 ### Time, scheduling and limits
 

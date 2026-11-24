@@ -57,12 +57,12 @@ What runs unmodified is in [README.md](README.md#status).
   (`xterm`, `xeyes`, `xclock`, GTK 3 and 4, Qt, Tk, `glxgears` by
   Mesa's software renderer, Wine's Notepad in the VM) driven and checked
   by screenshot; an X frame and request round trip benchmarked.
-- **M7 PR 2 — The GPU:** a Linux GPU device (`/dev/dri/renderD128`)
-  speaking virtio-gpu to Mesa's Venus Vulkan driver, its commands run on
-  the Mac's GPU by virglrenderer and MoltenVK in a helper process of
-  fwe's; OpenGL
-  through Zink; `vkcube` and `glxgears` drawn on it in CI; a Vulkan
-  submission and `vkcube`'s frames within 1.5× of MoltenVK natively.
+- **M7 PR 2 — The GPU:** fwe's own Linux Vulkan driver, each command
+  passed to the Mac's Vulkan driver (MoltenVK, or KosmicKrisp) in fwe's
+  process through one device ioctl; X11 swapchains on the driver's own;
+  null descriptors where the Mac's driver lacks them; OpenGL through
+  Zink; `vkcube` and `glxgears` drawn on it in CI; a Vulkan submission
+  and `vkcube`'s frames within 1.5× of the same driver natively.
 
 What each Linux mechanism becomes under fwe is in
 [docs/linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces).

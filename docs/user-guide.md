@@ -181,24 +181,24 @@ has: start it, and give its programs `DISPLAY=:N` inside, as `sh -c
 'DISPLAY=:1 exec glxgears'`). Windows programs draw through Wine's X11
 driver, in the VM, with `DISPLAY` set the same way.
 
-Vulkan programs draw on the Mac's GPU, through a Linux GPU device fwe
-provides (`/dev/dri/renderD128`) and Mesa's driver for it (Venus), once
-the renderer behind the device, virglrenderer, is installed; OpenGL
-programs use the GPU through Mesa's Zink. Windows need Mesa 26.3 or
-later in the userland (Alpine 3.25's: an earlier Venus has no swapchain
-on a Mac):
+Vulkan programs draw on the Mac's GPU through fwe's own Linux Vulkan
+driver, which fwe puts where a Linux Vulkan loader looks
+(`/etc/vulkan/icd.d`) once the Mac has a Vulkan driver: MoltenVK
+(`brew install molten-vk`), or KosmicKrisp (Homebrew's `mesa`, macOS 26
+and an Apple GPU), which fwe takes first. OpenGL programs use the GPU
+through Mesa's Zink. `VK_DRIVER_FILES` makes fwe's driver the only one a
+program sees (a userland's Mesa drivers draw on the CPU):
 
 ```sh
-brew install e6qu/fwe/fwe-virglrenderer
-linux ~/alpine /bin/sh -c 'apk add -q -X https://dl-cdn.alpinelinux.org/alpine/v3.25/main \
-  mesa-vulkan-virtio vulkan-tools'
-env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" MESA_VK_WSI_DEBUG=sw \
+brew install molten-vk
+linux ~/alpine /bin/sh -c 'apk add -q vulkan-tools'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
+  VK_DRIVER_FILES=/etc/vulkan/icd.d/fwe_icd.aarch64.json \
   "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/vkcube --wsi xcb
 ```
 
-(`MESA_VK_WSI_DEBUG=sw` sends the frames to the X server as images, as
-it takes them; `MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the
-GPU, with `LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.)
+(`MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the GPU, with
+`LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.)
 
 CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
 `xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
@@ -261,7 +261,8 @@ that lacks it, and `--strace` names it.
 - **io_uring** and **fanotify**: refused, and programs fall back to
   ordinary calls and inotify.
 - **Linux's devices and drivers**: no `/dev/kvm`, FUSE or kernel
-  modules, and of GPUs only fwe's (Vulkan through Venus); files live on the Mac's filesystem, so disk filesystems
+  modules, and of GPUs only fwe's (Vulkan through fwe's driver, its
+  windows X11's); files live on the Mac's filesystem, so disk filesystems
   (ext4, btrfs) and block devices are not there.
 - **Resource limits of cgroups** but the process count: accepted, not
   enforced.
@@ -270,8 +271,8 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **The GPU after `fork`**: a forked child's copy of its parent's open of
-  `/dev/dri/renderD128` fails (`ENODEV`); an open of its own works.
+- **The GPU after `fork`**: a forked child has no GPU (its Vulkan calls
+  fail) until it runs a program with `execve`.
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are
