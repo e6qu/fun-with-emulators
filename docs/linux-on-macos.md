@@ -2165,7 +2165,7 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 | MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
 | `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
 | Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
-| GPU rendering (`/dev/dri`) | Metal | none: Mesa's software renderer |
+| GPU rendering: `/dev/dri/renderD128`, a render node of the virtio-gpu driver a VM's GPU has, or of the GPU's own driver | Metal; Vulkan through MoltenVK; virglrenderer's Venus, which runs a virtio-gpu guest's Vulkan commands on the host's Vulkan (krunkit's GPU) | fwe's render node, speaking virtio-gpu to Mesa's Venus driver, its commands run by virglrenderer's Venus on MoltenVK in fwe's process (see [Devices](#devices)); OpenGL through Mesa's Zink on it; frames reach the X server as copies |
 
 ### Kernel-wide state
 
@@ -2461,6 +2461,17 @@ numbers mean nothing there. fwe keeps its own:
 - Loop devices are fwe's own block devices 7:N with `/dev/loop-control`
   (10:237), in a shared record (`loopdev.rs`); fwe carries out their
   reads, writes and requests on the attached file.
+- The GPU is fwe's character device 226:128, `/dev/dri/renderD128`, a
+  virtio-gpu render node (`drm.rs`), there when virglrenderer is
+  installed:
+
+  | Linux (virtio-gpu) | fwe |
+  |---|---|
+  | the device found by libdrm: `/sys/dev/char/226:128` and a PCI device 1af4:1050 | the same `/sys` entries |
+  | `CONTEXT_INIT` with Venus's capability set | a context of virglrenderer's Venus, in fwe's process |
+  | `RESOURCE_CREATE_BLOB` (host memory), `MAP`, `mmap` | a resource of the renderer's; its memory (MoltenVK's) mapped at the guest's address, the same pages |
+  | `EXECBUFFER` and its fence (a sync file) | the commands submitted to the renderer; the fence a pipe, readable once the renderer signals it |
+  | the device after `fork` | the parent's only: a child's calls `ENODEV` until it runs a program |
 
 ### Time, scheduling and limits
 

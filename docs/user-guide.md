@@ -178,13 +178,30 @@ clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way, and OpenGL
 through Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`) on a server
 with GLX (Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
 has: start it, and give its programs `DISPLAY=:N` inside, as `sh -c
-'DISPLAY=:1 exec glxgears'`); there is no GPU yet. Windows programs draw
-through Wine's X11 driver, in the VM, with `DISPLAY` set the same way.
+'DISPLAY=:1 exec glxgears'`). Windows programs draw through Wine's X11
+driver, in the VM, with `DISPLAY` set the same way.
+
+Vulkan programs draw on the Mac's GPU, through a Linux GPU device fwe
+provides (`/dev/dri/renderD128`) and Mesa's driver for it (Venus), once
+the renderer behind the device, virglrenderer, is installed; OpenGL
+programs use the GPU through Mesa's Zink:
+
+```sh
+brew tap slp/krunkit
+HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
+linux ~/alpine /bin/sh -c 'apk add -q mesa-vulkan-virtio vulkan-tools'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" MESA_VK_WSI_DEBUG=sw \
+  "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/vkcube --wsi xcb
+```
+
+(`MESA_VK_WSI_DEBUG=sw` sends the frames to the X server as images, as
+it takes them; `MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the
+GPU.)
 
 CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
 `xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
-against Alpine's, driving each with keys and the pointer and checking
-what it draws.
+against Alpine's, and `vkcube` and glxgears on the runner's GPU, driving
+each with keys and the pointer and checking what it draws.
 
 ## Containers
 
@@ -241,8 +258,8 @@ that lacks it, and `--strace` names it.
   start (`--network=none` or the host's network does).
 - **io_uring** and **fanotify**: refused, and programs fall back to
   ordinary calls and inotify.
-- **Linux's devices and drivers**: no `/dev/kvm`, GPU, FUSE or kernel
-  modules; files live on the Mac's filesystem, so disk filesystems
+- **Linux's devices and drivers**: no `/dev/kvm`, FUSE or kernel
+  modules, and of GPUs only fwe's (Vulkan through Venus); files live on the Mac's filesystem, so disk filesystems
   (ext4, btrfs) and block devices are not there.
 - **Resource limits of cgroups** but the process count: accepted, not
   enforced.
@@ -251,8 +268,8 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **The GPU**: programs with windows draw by software
-  ([roadmap](../ROADMAP.md#m7--graphical-programs-and-sandboxes)).
+- **The GPU after `fork`**: a forked child has no GPU until it starts a
+  program (`execve`).
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are

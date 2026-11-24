@@ -17,7 +17,7 @@ in [docs/architecture.md](docs/architecture.md#known-limitations).
 | M4 Compatibility | Done |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way: PRs 1 and 2 done |
-| M7 Graphical programs and sandboxes | Under way: PR 1 done |
+| M7 Graphical programs and sandboxes | Under way: PRs 1 and 2 done |
 | M8 Virtual networking | After 1.0 |
 
 What runs unmodified is in [README.md](README.md#status).
@@ -57,6 +57,11 @@ What runs unmodified is in [README.md](README.md#status).
   (`xterm`, `xeyes`, `xclock`, GTK 3 and 4, Qt, Tk, `glxgears` by
   Mesa's software renderer, Wine's Notepad in the VM) driven and checked
   by screenshot; an X frame and request round trip benchmarked.
+- **M7 PR 2 — The GPU:** a Linux GPU device (`/dev/dri/renderD128`)
+  speaking virtio-gpu to Mesa's Venus Vulkan driver, its commands run on
+  the Mac's GPU by virglrenderer and MoltenVK in fwe's process; OpenGL
+  through Zink; `vkcube` and `glxgears` drawn on it in CI; a Vulkan
+  submission and `vkcube`'s frames within 1.5× of MoltenVK natively.
 
 What each Linux mechanism becomes under fwe is in
 [docs/linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces).
@@ -148,18 +153,6 @@ hold 1.5×.
 CI starts an X server and drives each program with synthetic input,
 checking what it draws by screenshot.
 
-#### PR 2 — The GPU
-
-- [ ] **A Linux GPU device** (`/dev/dri/renderD128`) speaking virtio-gpu
-  to Mesa's Venus Vulkan driver, its commands run on the Mac's GPU through
-  virglrenderer and MoltenVK in-process, as libkrun does; OpenGL through
-  Zink, Direct3D under Wine through DXVK and VKD3D-Proton.
-- [ ] **Benchmarks:** a Vulkan submission and a frame presented;
-  `vkcube`'s frame rate against MoltenVK natively.
-
-**Done when:** `glxgears` and `vkcube` draw on the GPU and `vkcube` holds
-1.5× of MoltenVK natively.
-
 #### PR 3 — Browsers and application frameworks
 
 - [ ] **Browsers:** Chrome or Chromium, and Firefox, sandboxes on,
@@ -175,7 +168,8 @@ they draw.
 #### PR 4 — Graphical Wine
 
 - [ ] Wine's Notepad, Minesweeper and `regedit`, and a Direct3D demo,
-  natively through Wine's X11 driver.
+  natively through Wine's X11 driver, Direct3D on the GPU through DXVK
+  and VKD3D-Proton.
 
 **Done when:** they draw in CI, the demo on the GPU.
 

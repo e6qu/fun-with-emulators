@@ -1404,6 +1404,28 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   (MIT-SHM 1.2) fwe asks it once, on a connection of its own with the
   client's authorization; a server that does not gets the `ShmAttach` as
   it was.
+- The GPU (`crates/kernel/src/drm.rs`, `virgl.rs`): `/dev/dri/renderD128`
+  is a node of fwe's (char 226:128, in a `dri` directory of its device
+  nodes), there only where virglrenderer loads and starts: it is opened
+  with `dlopen` (`FWE_VIRGLRENDERER`, else Homebrew's place for krunkit's
+  build, which has Venus in-process on MoltenVK) the first time the node
+  is looked up, and every call into it is made one at a time with every
+  host signal blocked, so its threads never take the guest's. `/sys`
+  shows a virtio-gpu PCI device (1af4:1050) behind it, as libdrm reads it.
+  An open of the node is a descriptor marked `Mark::Drm`, with a context
+  of Venus's capability set (`DRM_IOCTL_VIRTGPU_CONTEXT_INIT`) and the
+  resources it made, let go with its last descriptor. Its ioctls are the
+  virtio-gpu driver's: a blob (`RESOURCE_CREATE_BLOB`, host memory only)
+  is a resource of the renderer's, its GEM handle the resource's id; an
+  `mmap` of the offset `MAP` gave puts the renderer's pages of it at the
+  guest's address (`mach_vm_remap`, the same pages, not a copy);
+  `EXECBUFFER` submits the context's commands and, asked for a fence,
+  gives a pipe's read end, which the renderer's fence callback makes
+  readable as a sync file polls (no syncobjs: Venus keeps its own on
+  them). A fork child's calls on it fail with `ENODEV` (the renderer and
+  the host's GPU objects are the parent's), and its `execve` starts a
+  fresh fwe, whose program has a GPU of its own; in the VM backend there
+  is no device.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
   rootfs (`fwe --pull` writes the host's name servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
@@ -1995,8 +2017,16 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   display number a guest names is looked for in its root. A server
   without MIT-SHM 1.2 sees a guest's `ShmAttach` name a segment it cannot
   find, and the client draws without shared memory if it can.
-- No GPU: OpenGL is Mesa's software renderer, and Wayland programs need a
-  compositor run in the guest (Weston, drawing on the X display).
+- The GPU is Vulkan through Mesa's Venus driver only (OpenGL through
+  Zink on it; virgl's OpenGL resources and transfers are `ENOSYS`), on
+  one render node, with virglrenderer installed (krunkit's build). Its
+  buffers are not shared as descriptors (PRIME is `EOPNOTSUPP`), so an X
+  server takes a program's frames as copies (`MESA_VK_WSI_DEBUG=sw`),
+  and a submission waits on no fence of another's (`FENCE_FD_IN` is
+  `EINVAL`). A fork child has no GPU (`ENODEV`) until it runs a program,
+  nor has the VM backend.
+- Wayland programs need a compositor run in the guest (Weston, drawing on
+  the X display).
 
 **IPC and keys**
 - System V: `SHM_INFO` reports no resident pages; a segment stays
