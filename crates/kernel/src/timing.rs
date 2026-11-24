@@ -183,7 +183,11 @@ pub fn calls_and_signals() -> String {
         .map(|(name, n)| format!("{name} {n}"))
         .collect();
     let (woken, retried) = ipc_wakes();
-    let gpu = crate::vulkan::device::counts().map(|c| format!("; {c}")).unwrap_or_default();
+    let gpu: String = [crate::vulkan::device::counts(), crate::fdtable::plugs()]
+        .into_iter()
+        .flatten()
+        .map(|c| format!("; {c}"))
+        .collect();
     format!(
         "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}; \
          IPC waiters woken {woken}, of them tried again under the lock {retried}{gpu}",

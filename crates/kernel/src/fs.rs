@@ -3806,6 +3806,8 @@ pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<()
                     return Ok(());
                 }
             } else {
+                // Where a plug put it, in the guest's range once it is gone.
+                let fd = crate::fdtable::into_range(fd);
                 // SAFETY: a descriptor just opened, ours alone.
                 let fd = unsafe { OwnedFd::from_raw_fd(fd) };
                 // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.

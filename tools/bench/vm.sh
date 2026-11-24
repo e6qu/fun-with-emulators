@@ -4,12 +4,10 @@
 # framework), then under fwe and natively (`macos`), in one table with
 # fwe's ratio to each and fwe's share of the programs that compute.
 #
-# Needs Lima, Homebrew's builds the native side runs, the GPU's renderer
-# and a password for sudo (DTrace, for fwe's share):
+# Needs Lima, Homebrew's builds the native side runs, the Mac's Vulkan
+# driver and a password for sudo (DTrace, for fwe's share):
 #     brew install lima llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 \
 #         luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
-#     brew tap slp/krunkit
-#     HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
 # Run from the repository: sh tools/bench/vm.sh. The VM (fwe-bench) is
 # kept, stopped, for the next run; `limactl delete fwe-bench` removes it.
 # A Linux VM is a hypervisor client: not while fwe's VM tests run.

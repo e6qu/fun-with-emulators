@@ -11,8 +11,8 @@
  *
  * The microseconds each took, as the last word printed.
  *
- * The same source is built for Linux (run under fwe, on Mesa's Venus
- * driver on fwe's GPU device) and for macOS (run natively on MoltenVK),
+ * The same source is built for Linux (run under fwe, on fwe's Vulkan
+ * driver, MoltenVK in fwe's process) and for macOS (run natively on MoltenVK),
  * the loader opened by name (LIBVULKAN; Linux's soname by default), so
  * neither build links it. */
 #include <dlfcn.h>

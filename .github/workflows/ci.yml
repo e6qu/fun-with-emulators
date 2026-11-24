@@ -46,8 +46,9 @@ jobs:
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: sw_vers && uname -m && clang --version
       # The VM backend's tests run on the software stand-in for
-      # Hypervisor.framework here, which needs Unicorn.
-      - run: brew install unicorn
+      # Hypervisor.framework here, which needs Unicorn; the GPU device's on
+      # Vulkan's mock driver (vulkan-tools), which does no GPU work.
+      - run: brew install unicorn vulkan-tools
       - run: cargo build
       - name: Report hypervisor availability (informational)
         run: |
@@ -231,8 +232,9 @@ jobs:
   # fetched roots' programs (FWE_DISPLAY_TESTS, not on a development
   # machine), Wine's in the VM, driven with xdotool and checked by what
   # they draw (libX11, `LIBX11`, takes the screenshots). Vulkan's and
-  # OpenGL's on the runner's GPU (Metal) through fwe's GPU device, whose
-  # renderer is virglrenderer's Venus on MoltenVK (Formula/fwe-virglrenderer.rb).
+  # OpenGL's on the runner's GPU (Metal), through fwe's Vulkan driver on
+  # MoltenVK: the runner's KosmicKrisp (Homebrew's Mesa, which xorg-server
+  # brings) finds no device on its paravirtual GPU, so MoltenVK is named.
   display:
     name: Display (macos-26)
     runs-on: macos-26
@@ -245,17 +247,10 @@ jobs:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
-      - run: brew install xorg-server xdotool unicorn vulkan-tools
-      # The GPU's renderer: this commit's formula (Formula/), built and
-      # tested.
-      - run: |
-          brew tap-new --no-git local/fwe
-          cp Formula/fwe-virglrenderer.rb "$(brew --repository local/fwe)/Formula/"
-          brew install --build-from-source local/fwe/fwe-virglrenderer
-          brew test local/fwe/fwe-virglrenderer
-      # The Mac's Vulkan drivers the GPU helper's loader finds, each one's
-      # devices, and whether each has what Zink needs (robustness2's
-      # nullDescriptor): a record of the runner, which fails nothing.
+      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools
+      # The Mac's Vulkan drivers, each one's devices, and whether each has
+      # what Zink needs (robustness2's nullDescriptor): a record of the
+      # runner, which fails nothing.
       - name: The runner's Vulkan drivers
         run: |
           for icd in "$(brew --prefix)"/etc/vulkan/icd.d/*.json "$(brew --prefix)"/share/vulkan/icd.d/*.json; do
@@ -267,6 +262,7 @@ jobs:
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
           export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
+          export FWE_VULKAN_DRIVER="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
           cargo test -p fwe --test guests -- display_ --nocapture
         env:
           FWE_DISPLAY_TESTS: "1"
@@ -376,11 +372,6 @@ jobs:
       # The native side's programs: the clang release Alpine's root has, and
       # the workloads' programs (tools/bench/run.py, BREW), and an X server.
       - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
-      # The GPU's renderer under fwe: this commit's formula (Formula/).
-      - run: |
-          brew tap-new --no-git local/fwe
-          cp Formula/fwe-virglrenderer.rb "$(brew --repository local/fwe)/Formula/"
-          brew install --build-from-source local/fwe/fwe-virglrenderer
       # The Vulkan benchmark for macOS, with Homebrew's headers.
       - run: clang -O2 -I"$(brew --prefix)/include" -o vkbench-mac tools/bench/vkbench.c
       - run: chmod +x bench vkbench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json

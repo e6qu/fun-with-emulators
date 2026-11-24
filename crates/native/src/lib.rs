@@ -637,6 +637,8 @@ pub(crate) fn reexec(
     let mut penv: Vec<*const libc::c_char> = cenv.iter().map(|c| c.as_ptr()).collect();
     penv.push(std::ptr::null());
     before_exec();
+    // The Mac's Vulkan driver's descriptors, which it does not close on exec.
+    fwe_kernel::vulkan::device::before_exec(held);
     fwe_kernel::host::hand_over_for_exec();
     // SAFETY: NUL-terminated argument and environment arrays of C strings
     // that live across the call.

@@ -10169,6 +10169,17 @@ impl Xvfb {
     /// The visible window `search` finds (xdotool's search arguments), once
     /// `gui` has made it, within `secs`: the largest, where there are more.
     fn window(&self, gui: &mut Gui, search: &[&str], secs: u64) -> Window {
+        self.window_sized(gui, search, None, secs)
+    }
+
+    /// [`Xvfb::window`], of size `size` (width, height) if given.
+    fn window_sized(
+        &self,
+        gui: &mut Gui,
+        search: &[&str],
+        size: Option<(i32, i32)>,
+        secs: u64,
+    ) -> Window {
         let began = Instant::now();
         loop {
             let mut args = vec!["search", "--onlyvisible"];
@@ -10178,6 +10189,7 @@ impl Xvfb {
                 .lines()
                 .map(|id| self.geometry(id.trim()))
                 .filter(|w| w.w > 1 && w.h > 1)
+                .filter(|w| size.is_none_or(|(sw, sh)| w.w == sw && w.h == sh))
                 .max_by_key(|w| w.w * w.h);
             if let Some(w) = best {
                 return w;
@@ -10419,10 +10431,8 @@ fn alpine_display_glxgears_turns_by_software() {
 }
 
 /// What a program of a display root says, run to its end (within
-/// `secs`): its standard output. Its calls are traced, and Mesa's Vulkan
-/// driver and loader say what they find (`VN_DEBUG`, `VK_LOADER_DEBUG`),
-/// and so does the GPU helper's loader, on the host
-/// (`FWE_GPU_VK_LOADER_DEBUG`), for a failure's report.
+/// `secs`): its standard output. Its calls are traced, and the Vulkan
+/// loader says what it finds (`VK_LOADER_DEBUG`), for a failure's report.
 fn display_output(
     x: &Xvfb,
     name: &str,
@@ -10432,11 +10442,7 @@ fn display_output(
     secs: u64,
 ) -> String {
     let mut env = env.to_vec();
-    env.extend([
-        ("VN_DEBUG", "init"),
-        ("VK_LOADER_DEBUG", "error,warn,driver"),
-        ("FWE_GPU_VK_LOADER_DEBUG", "error,warn,driver"),
-    ]);
+    env.push(("VK_LOADER_DEBUG", "error,warn,driver"));
     let mut gui = Gui::start_traced(x, name, root, args[0], &args[1..], &env, true);
     let began = Instant::now();
     let status = loop {
@@ -10454,47 +10460,39 @@ fn display_output(
     std::fs::read_to_string(display_dir().join(format!("{name}.out"))).unwrap()
 }
 
-/// What a program needs to draw with Vulkan on fwe's GPU: Mesa's Venus
-/// driver its only one, and its X11 frames copied to the server (Xvfb has
-/// no DRI3 to share them).
-const VENUS: [(&str, &str); 2] = [
-    ("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/virtio_icd.aarch64.json"),
-    ("MESA_VK_WSI_DEBUG", "sw"),
-];
+/// What a program needs to draw with Vulkan on the Mac's GPU: fwe's driver
+/// its only one (the root has Mesa's too, which draw on the CPU).
+const FWE_VULKAN: [(&str, &str); 1] =
+    [("VK_DRIVER_FILES", "/etc/vulkan/icd.d/fwe_icd.aarch64.json")];
 
 /// The Vulkan device a program finds is the Mac's GPU, through fwe's
-/// virtio-gpu device and Mesa's Venus driver: `vulkaninfo` names it.
-fn assert_venus_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
+/// driver: `vulkaninfo` names it.
+fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
     let name = format!("{test}-vulkaninfo");
-    let info = display_output(x, &name, root, &["/usr/bin/vulkaninfo", "--summary"], &VENUS, 120);
+    let info =
+        display_output(x, &name, root, &["/usr/bin/vulkaninfo", "--summary"], &FWE_VULKAN, 120);
     let device =
         info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
-    assert!(
-        device.contains("Venus") && device.contains("Apple"),
-        "the device is not the GPU:\n{info}"
-    );
+    assert!(device.contains("Apple"), "the device is not the GPU:\n{info}");
     // All it finds (the X surface's capabilities among it), for a failure
     // after: in the test's output directory.
-    display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &VENUS, 120);
+    display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &FWE_VULKAN, 120);
 }
 
-/// vkcube draws its cube with Vulkan on the Mac's GPU (Mesa's Venus driver
-/// on fwe's virtio-gpu device, its commands run by virglrenderer on
-/// MoltenVK), and it turns.
+/// vkcube draws its cube with Vulkan on the Mac's GPU (fwe's driver, its
+/// commands run by the Mac's), and it turns.
 #[test]
 fn alpine_display_vkcube_draws_on_the_gpu() {
     let Some(x) = display_tests() else { return };
     let root = x11_root("vkcube");
-    assert_venus_on_the_gpu(&x, &root, "vkcube");
+    assert_vulkan_on_the_gpu(&x, &root, "vkcube");
     let args = ["--wsi", "xcb", "--width", "300", "--height", "300"];
-    // Venus says what its swapchain does, and any call that fails.
-    let mut env = VENUS.to_vec();
-    env.push(("VN_DEBUG", "init,wsi,result"));
-    let mut gui = Gui::start_traced(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &env, true);
+    let mut gui =
+        Gui::start_traced(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &FWE_VULKAN, true);
     // Its window's name is `_NET_WM_NAME` only, which xdotool does not
-    // read (`WM_NAME`, XGetWMName): it is the one window here with no
-    // name xdotool sees.
-    let w = x.window(&mut gui, &["--name", "^$"], 120);
+    // read (`WM_NAME`, XGetWMName): the one window of its size here with
+    // no name xdotool sees.
+    let w = x.window_sized(&mut gui, &["--name", "^$"], Some((300, 300)), 120);
     std::thread::sleep(Duration::from_secs(2));
     let first = x.shot(&w, "vkcube-first");
     assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
@@ -10517,7 +10515,7 @@ fn mock_vulkan_driver() -> Option<String> {
 /// drivers (`/etc/vulkan/icd.d`), and through it the Mac's: here Vulkan's
 /// mock driver, whose device `vulkaninfo` lists.
 #[test]
-fn alpine_vulkaninfo_finds_the_macs_driver_through_fwes() {
+fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
         return;
     }
@@ -10571,8 +10569,8 @@ fn gpu_device_across_fork_and_exec() {
 }
 
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
-/// Vulkan, on the Venus driver, in an X server with GLX (Alpine's Xvfb,
-/// run by fwe), which names the renderer; its gears drawn and turning.
+/// Vulkan, on fwe's driver, in an X server with GLX (Alpine's Xvfb, run by
+/// fwe), which names the renderer; its gears drawn and turning.
 /// Xvfb has no DRI3, which GLX asks of Zink unless told it may present
 /// another way (`LIBGL_KOPPER_DRI2`): Zink then shows its frames through
 /// Vulkan's swapchain, as vkcube does.
@@ -10583,7 +10581,7 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
     }
     let root = x11_root("glxgears-gpu");
     let x = Xvfb::in_root(&root);
-    let mut env = VENUS.to_vec();
+    let mut env = FWE_VULKAN.to_vec();
     env.extend([
         ("MESA_LOADER_DRIVER_OVERRIDE", "zink"),
         ("LIBGL_KOPPER_DRI2", "1"),
@@ -10593,7 +10591,7 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
     let glxinfo = local("/usr/bin/glxinfo -B");
     let info = display_output(&x, "glxinfo-gpu", &root, &["/bin/sh", "-c", &glxinfo], &env, 120);
     let renderer = info.lines().find(|l| l.contains("OpenGL renderer string")).unwrap_or_default();
-    assert!(renderer.contains("zink") && renderer.contains("Venus"), "not on the GPU:\n{info}");
+    assert!(renderer.contains("zink") && renderer.contains("Apple"), "not on the GPU:\n{info}");
     let command = local("/usr/bin/glxgears -geometry 300x300+0+0");
     let mut gui = Gui::start(&x, "glxgears-gpu", &root, "/bin/sh", &["-c", &command], &env);
     let w = x.window(&mut gui, &["--name", "glxgears"], 120);

@@ -235,8 +235,8 @@ BUDGETS = {
     "JIT code: a loop (ns)": 1.3,
     # A graphical program's calls to its X server, as a system call is.
     "X request round trip (us)": 1.5,
-    # Vulkan on the GPU: Mesa's Venus driver on fwe's device, its commands
-    # run by virglrenderer on MoltenVK, against MoltenVK's own program
+    # Vulkan on the GPU: fwe's Vulkan driver, its commands run by MoltenVK
+    # in fwe's process, against the same program on MoltenVK natively
     # (ROADMAP.md M7 PR 2).
     "vkcube frame (ms)": 1.5,
     "Vulkan submission round trip (us)": 1.5,
@@ -426,10 +426,11 @@ VKCUBE = "vkcube frame (ms)"
 VKCUBE_ARGS = ["--present_mode", "0", "--width", "300", "--height", "300"]
 # Two runs' frames: their times' difference is the frames' alone.
 VKCUBE_FRAMES = (200, 1200)
-# Mesa's Venus driver, the root's only one, its frames copied to the X
-# server (Xvfb has no DRI3 to share them).
-VENUS_ENV = ["VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json",
-             "MESA_VK_WSI_DEBUG=sw"]
+# fwe's Vulkan driver, the guest's only one, on MoltenVK (the native side's
+# driver): fwe's environment and the guest's alike.
+def gpu_env(brew):
+    return ["VK_DRIVER_FILES=/etc/vulkan/icd.d/fwe_icd.aarch64.json",
+            "FWE_VULKAN_DRIVER=" + os.path.join(brew, "etc/vulkan/icd.d/MoltenVK_icd.json")]
 
 
 def vkcube_ms(cmd, env=None):
@@ -454,17 +455,17 @@ VKBENCH = {VK_SUBMIT: ("submit", "3000"), VK_FRAME: ("frame", "1000")}
 
 def vulkan(a, fwe, guest_env, results):
     """Vulkan on the GPU: a submission's round trip and a frame's work
-    (tools/bench/vkbench.c), and vkcube's frames. Under fwe, Alpine's programs on fwe's GPU device
-    (Mesa's Venus, virglrenderer on MoltenVK), vkcube at the X server here;
-    natively, the same on MoltenVK (Homebrew's vkcube in a window of
-    macOS's)."""
+    (tools/bench/vkbench.c), and vkcube's frames. Under fwe, Alpine's
+    programs on fwe's Vulkan driver (MoltenVK in fwe's process), vkcube at
+    the X server here; natively, the same on MoltenVK (Homebrew's vkcube in
+    a window of macOS's)."""
     root = alpine_root("display", a.cache)
     icd = dict(os.environ, VK_ICD_FILENAMES=os.path.join(a.brew, "etc/vulkan/icd.d/MoltenVK_icd.json"))
     shutil.copy(a.vkbench, os.path.join(root, "tmp/vkbench"))
-    guest = guest_env + VENUS_ENV + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
+    guest = guest_env + gpu_env(a.brew) + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
     for row, args in VKBENCH.items():
         results["fwe"][row] = best(lambda: run_bench(guest[:-1], guest[-1], list(args)))
-        # Where its time goes: the device's calls and their stages.
+        # Where its time goes: the Vulkan commands and their time.
         r = subprocess.run(guest[:2] + ["FWE_TIMING=1"] + guest[2:] + list(args),
                            capture_output=True, text=True, errors="replace", timeout=600)
         for line in r.stderr.splitlines():
@@ -473,15 +474,15 @@ def vulkan(a, fwe, guest_env, results):
         results["macOS"][row] = best(lambda: float(subprocess.run(
             [a.vkbench_native, *args, os.path.join(a.brew, "lib/libvulkan.1.dylib")],
             env=icd, check=True, capture_output=True, text=True).stdout.split()[-1]))
-    ours = (guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + VENUS_ENV + fwe
+    ours = (guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + gpu_env(a.brew) + fwe
             + ["--root", root, os.path.join(root, "usr/bin/vkcube"), "--wsi", "xcb"] + VKCUBE_ARGS)
     results["fwe"][VKCUBE] = vkcube_ms(ours)
     # The program itself: Homebrew's `vkcube` command opens its app with
     # `open`, which takes no arguments for it.
     theirs = [os.path.join(a.brew, "opt/vulkan-tools/cube/vkcube.app/Contents/MacOS/vkcube")] + VKCUBE_ARGS
     results["macOS"][VKCUBE] = vkcube_ms(theirs, icd)
-    # Where its time goes: the device's calls by kind and the memory it
-    # mapped, and fwe's other calls (FWE_TIMING's last mark).
+    # Where its time goes: the Vulkan commands, and fwe's other calls
+    # (FWE_TIMING's last mark).
     timed = ours[:2] + ["FWE_TIMING=1"] + ours[2:] + ["--c", "300"]
     r = subprocess.run(timed, capture_output=True, text=True, errors="replace", timeout=600)
     for line in r.stderr.splitlines():

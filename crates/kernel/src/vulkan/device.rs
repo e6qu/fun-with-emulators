@@ -7,8 +7,13 @@
 //! - **A descriptor** of it is marked as an open of the device
 //!   ([`Mark::Gpu`]); its one ioctl ([`super::generated::IOCTL_CALL`]) runs a
 //!   command. Most run without the kernel lock ([`io`]), so a program's
-//!   threads call the driver at once; the few that make the driver open
-//!   descriptors of its own hold it ([`ioctl`], [`LOCKED`]).
+//!   threads call the driver at once.
+//! - **The driver's own descriptors** (Metal's caches, which it opens as a
+//!   device is made and as pipelines are compiled, read-write and not
+//!   close-on-exec) are kept out of the guest's range: those commands
+//!   ([`LOCKED`]) run under the kernel lock with the guest's range plugged
+//!   ([`crate::fdtable::plugged`]), and an `execve` closes them
+//!   ([`before_exec`]).
 //! - **A fork child** never calls the driver: the driver's threads, and
 //!   the dispatch queues and Metal objects it holds, are its parent's
 //!   (macOS's own libraries do not work in a fork child). Its copies of its
@@ -131,25 +136,75 @@ fn key_of(fd: i32) -> Option<u32> {
     }
 }
 
-/// Commands that run holding the kernel lock: those after which the driver
-/// may hold descriptors of its own (the Metal caches it opens as a device
-/// is made and pipelines are compiled).
-pub const LOCKED: [usize; 5] = [
-    cmd::vkCreateInstance,
-    cmd::vkCreateDevice,
-    cmd::vkCreateComputePipelines,
-    cmd::vkCreateGraphicsPipelines,
-    cmd::vkCreateShaderModule,
-];
+/// Commands that run holding the kernel lock, the guest's descriptor range
+/// plugged: those the driver opens descriptors of its own in (Metal's
+/// library cache as a device is made, its function cache as a pipeline is
+/// compiled).
+pub const LOCKED: [usize; 3] =
+    [cmd::vkCreateDevice, cmd::vkCreateComputePipelines, cmd::vkCreateGraphicsPipelines];
 
 /// The device's ioctl on `fd` with record `arg`, if `fd` is the device:
-/// Linux's answer. Under the kernel lock.
+/// Linux's answer. Under the kernel lock: a command of [`LOCKED`] runs with
+/// the guest's range plugged.
 pub fn ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
     if req != generated::IOCTL_CALL {
         return None;
     }
     let key = key_of(fd)?;
-    Some(run(key, arg))
+    let command = crate::uaccess::read::<u32>(arg).ok()? as usize;
+    if !LOCKED.contains(&command) {
+        return Some(run(key, arg));
+    }
+    Some(crate::fdtable::plugged(|| run(key, arg)).unwrap_or_else(|e| -(e as i64)))
+}
+
+/// Before an `execve` that starts a fresh fwe, from a process with the
+/// driver in its memory: the descriptors out of the guest's range but
+/// `keep` (the driver's, which it did not make close-on-exec) are closed
+/// by it.
+pub fn before_exec(keep: Option<i32>) {
+    if !driver_in_memory() {
+        return;
+    }
+    for fd in all_fds() {
+        if !crate::fdtable::guest_visible(fd) && Some(fd) != keep {
+            // SAFETY: a plain host call; the descriptor is not used again.
+            unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+        }
+    }
+}
+
+/// Every descriptor of the process.
+fn all_fds() -> Vec<i32> {
+    #[cfg(target_os = "macos")]
+    {
+        let size = std::mem::size_of::<libc::proc_fdinfo>();
+        let mut n = 256usize;
+        loop {
+            // SAFETY: zeroed bytes are valid `proc_fdinfo`s.
+            let mut buf: Vec<libc::proc_fdinfo> = vec![unsafe { std::mem::zeroed() }; n];
+            // SAFETY: a valid out-buffer of `n` entries.
+            let got = unsafe {
+                libc::proc_pidinfo(
+                    libc::getpid(),
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    buf.as_mut_ptr().cast(),
+                    (n * size) as i32,
+                )
+            };
+            if got <= 0 {
+                return Vec::new();
+            }
+            let count = got as usize / size;
+            if count < n {
+                return buf[..count].iter().map(|f| f.proc_fd).collect();
+            }
+            n *= 2;
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    Vec::new()
 }
 
 /// The device's ioctl without the kernel lock ([`crate::blocking_syscall`]):
