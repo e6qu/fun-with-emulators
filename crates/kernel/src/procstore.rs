@@ -1028,6 +1028,7 @@ thread_local! {
 /// Linux stops a task only on its way back to user mode, never with a
 /// kernel lock held, which would leave every other process that needs it
 /// waiting until the stopped one is continued.
+#[must_use = "dropped at once, it lets go at once"]
 pub(crate) struct Holding(());
 
 impl Holding {
@@ -1112,6 +1113,7 @@ pub(crate) fn forked_child_holds() {
 }
 
 /// A held record lock ([`lock`]), let go when dropped.
+#[must_use = "dropped at once, it lets go at once"]
 pub struct Held {
     word: &'static AtomicU32,
     _holding: Holding,

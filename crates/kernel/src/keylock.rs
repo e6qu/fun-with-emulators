@@ -28,6 +28,7 @@ const NAP_NS: i64 = 200_000;
 
 /// A key's lock, held until dropped; counted for this process's stops
 /// ([`crate::procstore::Holding`]).
+#[must_use = "dropped at once, it lets go at once"]
 pub struct Held {
     holder: &'static AtomicU64,
     _holding: crate::procstore::Holding,

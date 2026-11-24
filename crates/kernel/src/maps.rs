@@ -642,6 +642,7 @@ static ANY_SEALED: AtomicBool = AtomicBool::new(false);
 
 /// The record, locked; its count, whether it locks future mappings and
 /// whether any memory was sealed are published as the lock is let go.
+#[must_use = "dropped at once, it lets go at once"]
 pub struct Held(MutexGuard<'static, Record>);
 
 impl std::ops::Deref for Held {

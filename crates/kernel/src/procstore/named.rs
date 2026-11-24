@@ -267,6 +267,7 @@ pub struct Read {
 }
 
 /// The record's lock, held ([`Slot::lock`]), let go when dropped.
+#[must_use = "dropped at once, it lets go at once"]
 pub struct Held {
     n: &'static Named,
     _holding: super::Holding,
