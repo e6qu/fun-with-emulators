@@ -33,6 +33,20 @@ pub fn to_file(path: &[u8]) -> Result<(), String> {
 /// Note `message` in the trace file, when the run traces to one: what fwe's
 /// own threads (the reaper's watcher) see and do, which no system call
 /// shows. Nothing without a trace file.
+/// Every call is traced (not only the failures): what calls fwe makes
+/// without the kernel, which holds the tracer, look at ([`calls_traced`]).
+static ALL_CALLS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The run traces every call, as `tracer` says.
+pub fn traces(tracer: Tracer) {
+    ALL_CALLS.store(tracer.enabled && !tracer.failures_only, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether every call is traced, to a file.
+pub fn calls_traced() -> bool {
+    ALL_CALLS.load(std::sync::atomic::Ordering::Relaxed) && FILE.get().is_some()
+}
+
 pub fn note_to_file(message: &str) {
     if FILE.get().is_some() {
         Tracer { enabled: true, failures_only: false }.write_line(message);

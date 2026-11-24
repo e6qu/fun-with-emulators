@@ -46,11 +46,7 @@ fn main() {
         Some(lld) => Command::new(lld),
         None => {
             let lld = rust_lld();
-            assert!(
-                lld.exists(),
-                "{} is not there: name an ld.lld with FWE_LLD",
-                lld.display()
-            );
+            assert!(lld.exists(), "{} is not there: name an ld.lld with FWE_LLD", lld.display());
             let mut c = Command::new(lld);
             c.args(["-flavor", "gnu"]);
             c
