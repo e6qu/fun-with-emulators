@@ -158,7 +158,8 @@ pub fn exec_needs_new_image() -> bool {
     false
 }
 
-/// In a fork child: the renderer's state is the parent's. (Its fences'
+/// In a fork child (only: not at a process's start, as
+/// [`crate::thread::init_main`] is): the renderer's state is the parent's. (Its fences'
 /// table is left alone: the renderer's thread, which the child does not
 /// have, may have held its lock.)
 pub fn forked_child() {

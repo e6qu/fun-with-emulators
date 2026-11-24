@@ -10028,8 +10028,8 @@ impl Gui {
         Gui::start_traced(x, name, root, program, args, env, false)
     }
 
-    /// As [`Gui::start`], every system call traced too if `calls` (fwe's
-    /// notes alone otherwise).
+    /// As [`Gui::start`], every system call traced if `calls`, else those
+    /// that fail (with fwe's notes, for a failure's report).
     fn start_traced(
         x: &Xvfb,
         name: &str,
@@ -10041,9 +10041,7 @@ impl Gui {
     ) -> Gui {
         let dir = display_dir();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-        if calls {
-            cmd.arg("--strace");
-        }
+        cmd.arg(if calls { "--strace" } else { "--strace=failures" });
         cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
             .arg("--root")
             .arg(&root.0)

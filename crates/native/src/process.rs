@@ -390,6 +390,9 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         thread::init_main(shown);
         LIVE_THREADS.store(1, Ordering::SeqCst);
+        // The GPU's renderer is the parent's (its threads, the host's GPU
+        // objects): not this child's to use.
+        fwe_kernel::drm::forked_child();
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
             // Best effort, as for Linux's own write of the word.
             let _ = fwe_kernel::uaccess::write(child_tid, thread::tid());
