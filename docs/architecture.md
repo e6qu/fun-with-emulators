@@ -1437,7 +1437,7 @@ Sockets and terminals are the host's; fwe translates their interfaces:
     guest's create infos whose chains keep only the structures fwe lays
     out, with no layers, the window systems' extensions replaced by the
     driver's they are built on, and a portability driver's enumeration
-    and subset added. No host code calls guest code: allocators reach the
+    (where the driver lists it: it is the loader's) and subset added. No host code calls guest code: allocators reach the
     driver as NULL, and the extensions whose structures hold callbacks
     are not offered.
   - Most commands run without the kernel lock (`vulkan::device::io`),

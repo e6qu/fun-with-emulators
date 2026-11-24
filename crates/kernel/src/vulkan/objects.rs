@@ -249,6 +249,25 @@ fn field<T: Copy>(info: *mut u8, offset: usize) -> *mut T {
 /// extensions the driver's (a portability driver's enumeration added), no
 /// layers.
 pub fn create_instance(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32> {
+    // A portability driver's enumeration is the loader's extension, which
+    // a driver called with no loader between may lack: enabled where the
+    // driver lists it.
+    let enumeration = c"VK_KHR_portability_enumeration";
+    let portability = driver.portability
+        && global(driver, cmd::vkEnumerateInstanceExtensionProperties).is_some_and(|f| {
+            super::host_extensions(|count, props| {
+                // SAFETY: the driver's function, with valid out-parameters.
+                unsafe {
+                    generated::call(
+                        cmd::vkEnumerateInstanceExtensionProperties,
+                        f,
+                        &words(&[0, count, props]),
+                    ) as i32
+                }
+            })
+            .iter()
+            .any(|(n, _)| n.as_slice() == enumeration.to_bytes())
+        });
     let mut copies = Copies::default();
     let info = copies.structure(w[0], INSTANCE_INFO)?;
     // SAFETY: `info` is a copy of the guest's `VkInstanceCreateInfo`.
@@ -258,8 +277,8 @@ pub fn create_instance(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32
         let names = chain::read_names(*field::<u64>(info, 56), *field::<u32>(info, 48))?;
         let names = super::host_names(names);
         let mut extra = Vec::new();
-        if driver.portability {
-            extra.push(c"VK_KHR_portability_enumeration");
+        if portability && !names.iter().any(|n| n.as_slice() == enumeration.to_bytes()) {
+            extra.push(enumeration);
             *field::<u32>(info, 16) |= ENUMERATE_PORTABILITY;
         }
         let (list, len) = copies.names(&names, &extra);
