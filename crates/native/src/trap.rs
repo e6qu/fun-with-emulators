@@ -213,13 +213,8 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
     // signal the host showed pending may be one this thread never blocked
     // (it landed during the look, and is delivered as the look returns),
     // which blocked now would wait unseen on the host.
-    let mut was = host::empty_sigset();
-    // SAFETY: initialized signal sets; the pending signals are delivered to
-    // this thread between the two calls.
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut was);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &was, std::ptr::null_mut());
-    }
+    // The pending signals are delivered to this thread as they unblock.
+    drop(host::MaskGuard::unblock(&set));
     REROUTING.set(false);
     thread::wake_others(host::WAKE_SIGNAL);
 }
@@ -228,10 +223,8 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
 fn block_async_signals() {
     let mut all = host::host_sigset(u64::MAX);
     // SAFETY: `all` is an initialized signal set.
-    unsafe {
-        libc::sigaddset(&mut all, host::WAKE_SIGNAL);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-    }
+    unsafe { libc::sigaddset(&mut all, host::WAKE_SIGNAL) };
+    host::block_signals(&all);
     UNBLOCKED.with(|u| u.set(false));
 }
 
@@ -245,9 +238,7 @@ fn reblock() {
 
 /// Run under the host mask this thread's guest mask calls for.
 fn apply_guest_mask() {
-    let mask = host::host_mask_for(thread::mask());
-    // SAFETY: `mask` is an initialized signal set.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) };
+    host::set_signal_mask(&host::host_mask_for(thread::mask()));
     UNBLOCKED.with(|u| u.set(true));
 }
 
@@ -437,12 +428,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         && !fwe_kernel::ptrace::stops_at_syscalls()
         && !fwe_kernel::ptrace::traced()
     {
-        // SAFETY: a full set, and blocking it on this thread only.
-        unsafe {
-            let mut all: libc::sigset_t = std::mem::zeroed();
-            libc::sigfillset(&mut all);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-        }
+        host::block_signals(&host::full_sigset());
         fwe_kernel::thread_exit_cleanup();
         crate::exit_current_thread(b.regs.x[0] as i32, true);
     }

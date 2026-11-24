@@ -1,3 +1,5 @@
 disallowed-methods = [
   { path = "libc::kill", reason = "signal a process through host::kill_process, host::signal_named or host::kill_self; ask whether it is there with host::probe" },
+  { path = "libc::pthread_sigmask", reason = "change the host mask for a scope with host::MaskGuard (put back on every path out), for good with host::set_signal_mask, block_signals or unblock_signals; read it with host::signal_mask" },
+  { path = "libc::sigprocmask", reason = "the host mask is a thread's: see libc::pthread_sigmask's reason" },
 ]

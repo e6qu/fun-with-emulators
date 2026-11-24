@@ -648,6 +648,124 @@ pub fn is_fwe(pid: HostPid) -> bool {
     crate::procreg::read(pid).is_some()
 }
 
+/// A change of the calling thread's host signal mask, undone as it is
+/// dropped: the mask goes back to what it was on every path out of the
+/// scope that holds it. A mask is its thread's, so this stays on the thread
+/// that made it (neither `Send` nor `Sync`). Async-signal-safe.
+#[must_use = "dropped at once, it puts the mask back at once"]
+pub struct MaskGuard {
+    old: libc::sigset_t,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl MaskGuard {
+    /// Block `set` too.
+    #[inline(always)]
+    pub fn block(set: &libc::sigset_t) -> MaskGuard {
+        MaskGuard::change(libc::SIG_BLOCK, set)
+    }
+
+    /// Unblock `set`.
+    #[inline(always)]
+    pub fn unblock(set: &libc::sigset_t) -> MaskGuard {
+        MaskGuard::change(libc::SIG_UNBLOCK, set)
+    }
+
+    /// Make `set` the mask.
+    #[inline(always)]
+    pub fn set(set: &libc::sigset_t) -> MaskGuard {
+        MaskGuard::change(libc::SIG_SETMASK, set)
+    }
+
+    #[inline(always)]
+    fn change(how: libc::c_int, set: &libc::sigset_t) -> MaskGuard {
+        let mut old = empty_sigset();
+        // SAFETY: initialized signal sets; only this thread's mask changes.
+        unsafe { mask_call(how, set, &mut old) };
+        MaskGuard { old, _thread: std::marker::PhantomData }
+    }
+
+    /// The mask as it was.
+    pub fn old(&self) -> &libc::sigset_t {
+        &self.old
+    }
+
+    /// Keep the change: the mask is not put back (a fork child that goes on
+    /// with it, and sets its own later).
+    #[inline(always)]
+    pub fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for MaskGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: the mask this thread had, as the change read it.
+        unsafe { mask_call(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    }
+}
+
+/// The host's `pthread_sigmask`, which only this module calls: a change
+/// that lasts past its scope goes through [`set_signal_mask`],
+/// [`block_signals`] or [`unblock_signals`], one undone as it ends through
+/// a [`MaskGuard`].
+///
+/// # Safety
+/// `set` null or an initialized set, `old` null or writable.
+#[inline(always)]
+#[allow(clippy::disallowed_methods)] // the one call of it
+unsafe fn mask_call(how: libc::c_int, set: *const libc::sigset_t, old: *mut libc::sigset_t) {
+    // SAFETY: as the caller promises; only this thread's mask changes.
+    unsafe { libc::pthread_sigmask(how, set, old) };
+}
+
+/// Make `set` the calling thread's host mask from now on (a thread taking
+/// on its guest mask). Async-signal-safe.
+#[inline(always)]
+pub fn set_signal_mask(set: &libc::sigset_t) {
+    // SAFETY: an initialized set.
+    unsafe { mask_call(libc::SIG_SETMASK, set, std::ptr::null_mut()) };
+}
+
+/// Block `set` on the calling thread from now on. Async-signal-safe.
+#[inline(always)]
+pub fn block_signals(set: &libc::sigset_t) {
+    // SAFETY: an initialized set.
+    unsafe { mask_call(libc::SIG_BLOCK, set, std::ptr::null_mut()) };
+}
+
+/// Unblock `set` on the calling thread from now on (one the process dies
+/// of). Async-signal-safe.
+#[inline(always)]
+pub fn unblock_signals(set: &libc::sigset_t) {
+    // SAFETY: an initialized set.
+    unsafe { mask_call(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
+}
+
+/// The calling thread's host mask. Async-signal-safe.
+#[inline(always)]
+pub fn signal_mask() -> libc::sigset_t {
+    let mut set = empty_sigset();
+    // SAFETY: no change; `set` is written.
+    unsafe { mask_call(libc::SIG_BLOCK, std::ptr::null(), &mut set) };
+    set
+}
+
+/// A host signal set of every signal.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn full_sigset() -> libc::sigset_t {
+    // SAFETY: an all-zero sigset_t is valid storage; sigfillset fills it.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut set);
+        set
+    }
+}
+
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -715,11 +833,10 @@ fn raise_stop(sig: libc::c_int) {
         libc::sigaction(sig, &dfl, &mut old);
         let mut set = empty_sigset();
         libc::sigaddset(&mut set, sig);
-        let mut mask = empty_sigset();
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut mask);
+        let unblocked = MaskGuard::unblock(&set);
         // Delivered before raise returns: the process stops here.
         libc::raise(sig);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        drop(unblocked);
         libc::sigaction(sig, &old, std::ptr::null_mut());
     }
 }
@@ -734,9 +851,7 @@ fn raise_stop(sig: libc::c_int) {
 /// next system call, and they are taken again as they arrive.
 pub fn hand_over_for_exec() {
     let mask = crate::thread::mask();
-    let set = host_sigset(mask);
-    // SAFETY: an initialized signal set; changing this thread's mask.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) };
+    set_signal_mask(&host_sigset(mask));
     let pending = crate::thread::pending() & mask;
     for sig in 1..=signal::NSIG {
         if pending & (1 << (sig - 1)) == 0 || !crate::signal::relayed(sig) {
@@ -753,9 +868,7 @@ pub fn hand_over_for_exec() {
 /// The relayed signals the calling thread blocks on the host, as a Linux
 /// set.
 pub fn blocked_signals() -> u64 {
-    let mut set = empty_sigset();
-    // SAFETY: `set` is a valid out-parameter; no change is made.
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set) };
+    let set = signal_mask();
     let mut out = 0;
     for sig in 1..=signal::NSIG {
         if let Some(h) = signal_to_host(sig).filter(|_| crate::signal::relayed(sig)) {
@@ -2161,6 +2274,46 @@ pub fn at_path<T>(
 mod tests {
     use super::*;
 
+    /// A guard puts the mask back as it goes, nested ones in turn; one
+    /// kept leaves its change.
+    #[test]
+    fn mask_guards_put_the_mask_back() {
+        // A signal nothing else here blocks or sends.
+        let member = |sig| {
+            let set = signal_mask();
+            // SAFETY: an initialized set.
+            unsafe { libc::sigismember(&set, sig) == 1 }
+        };
+        let one = |sig| {
+            let mut set = empty_sigset();
+            // SAFETY: an initialized set.
+            unsafe { libc::sigaddset(&mut set, sig) };
+            set
+        };
+        // Run on a thread of its own: the mask is the thread's.
+        std::thread::spawn(move || {
+            assert!(!member(libc::SIGXCPU) && !member(libc::SIGXFSZ));
+            {
+                let _outer = MaskGuard::block(&one(libc::SIGXCPU));
+                assert!(member(libc::SIGXCPU));
+                {
+                    let inner = MaskGuard::block(&one(libc::SIGXFSZ));
+                    // SAFETY: an initialized set.
+                    assert_eq!(unsafe { libc::sigismember(inner.old(), libc::SIGXCPU) }, 1);
+                    assert!(member(libc::SIGXFSZ));
+                }
+                assert!(member(libc::SIGXCPU) && !member(libc::SIGXFSZ));
+            }
+            assert!(!member(libc::SIGXCPU));
+            MaskGuard::block(&one(libc::SIGXFSZ)).keep();
+            assert!(member(libc::SIGXFSZ));
+            unblock_signals(&one(libc::SIGXFSZ));
+            assert!(!member(libc::SIGXFSZ));
+        })
+        .join()
+        .unwrap();
+    }
+
     /// A device number with its top bit set (a store tmpfs's `0:minor` of
     /// `0x80000` or more) is read back as the number it was made from.
     #[cfg(target_os = "macos")]
@@ -2447,19 +2600,8 @@ pub fn clone_name_at(
 /// storage in the handler, in `malloc`, which the thread may be in
 /// already, making it for the thread's own first access.
 pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
-    // SAFETY: zeroed sets, filled or written by the calls; this thread's
-    // mask only, restored below.
-    let old = unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut old);
-        old
-    };
-    let r = f();
-    // SAFETY: the mask saved above.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
-    r
+    let _blocked = MaskGuard::set(&full_sigset());
+    f()
 }
 
 /// This process's host pid as the kernel has it now, asked each time: in

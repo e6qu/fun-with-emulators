@@ -178,21 +178,13 @@ pub fn map_rules() -> Result<String, String> {
     ];
     // The signals that end a process wait until the VM is gone: it must
     // never end with one alive (a CI job's cancel sends SIGTERM).
-    // SAFETY: changing this thread's mask; restored below.
-    let old = unsafe {
-        let mut set: libc::sigset_t = std::mem::zeroed();
-        libc::sigemptyset(&mut set);
-        for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
-            libc::sigaddset(&mut set, sig);
-        }
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::pthread_sigmask(libc::SIG_BLOCK, &set, &mut old);
-        old
-    };
-    let out = with_vm(&cases);
-    // SAFETY: restoring the mask saved above.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
-    out
+    let mut set = fwe_kernel::host::empty_sigset();
+    for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
+        // SAFETY: an initialized signal set.
+        unsafe { libc::sigaddset(&mut set, sig) };
+    }
+    let _held = fwe_kernel::host::MaskGuard::block(&set);
+    with_vm(&cases)
 }
 
 type Make = Box<dyn Fn() -> Result<Host, String>>;

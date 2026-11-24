@@ -250,10 +250,9 @@ impl Platform for NativePlatform {
         // terminates the process with that signal.
         unsafe {
             libc::signal(sig, libc::SIG_DFL);
-            let mut set: libc::sigset_t = std::mem::zeroed();
-            libc::sigemptyset(&mut set);
+            let mut set = fwe_kernel::host::empty_sigset();
             libc::sigaddset(&mut set, sig);
-            libc::sigprocmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            fwe_kernel::host::unblock_signals(&set);
             libc::raise(sig);
             libc::_exit(128 + sig)
         }

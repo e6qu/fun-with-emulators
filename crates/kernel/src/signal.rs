@@ -1448,13 +1448,9 @@ pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64
     let new: u64 = guest!(uaccess::read(set));
     thread::save_mask(thread::mask());
     thread::set_mask(new);
-    let mut old = host::empty_sigset();
-    let during = host::host_mask_for(new);
-    // SAFETY: plain host calls on valid signal sets.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &during, &mut old) };
+    let during = host::MaskGuard::set(&host::host_mask_for(new));
     let r = if thread::deliverable() != 0 { err(errno::EINTR) } else { call() };
-    // SAFETY: restoring the mask saved above.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+    drop(during);
     if r != err(errno::EINTR)
         && let Some(mask) = thread::take_saved_mask()
     {
@@ -1482,21 +1478,13 @@ pub(crate) unsafe fn sigsuspend(set: u64, size: u64) -> i64 {
         // Block every relayed signal while checking, so one that arrives
         // between the check and the wait is not lost: sigsuspend unblocks
         // atomically.
-        let all = host::host_sigset(u64::MAX);
-        let mut old = host::empty_sigset();
-        // SAFETY: plain host calls on valid signal sets.
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old) };
+        let _checking = host::MaskGuard::block(&host::host_sigset(u64::MAX));
         if thread::deliverable() != 0 {
-            // SAFETY: restoring the mask saved above.
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
             return err(errno::EINTR);
         }
         let wait = host::host_mask_for(thread::mask());
-        // SAFETY: as above; returns after a host handler ran.
-        unsafe {
-            libc::sigsuspend(&wait);
-            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
-        }
+        // SAFETY: a valid signal set; returns after a host handler ran.
+        unsafe { libc::sigsuspend(&wait) };
     }
 }
 
@@ -1531,14 +1519,10 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
         drain_to_signalfd();
         // Block everything while checking, so a signal arriving between the
         // check and the wait is not lost: pselect unblocks atomically.
-        let all = host::host_sigset(u64::MAX);
-        let mut old = host::empty_sigset();
-        // SAFETY: plain host calls on valid signal sets.
-        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old) };
+        let checking = host::MaskGuard::block(&host::host_sigset(u64::MAX));
         let ready = thread::pending() & want;
         if ready != 0 {
-            // SAFETY: restoring the mask saved above.
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
+            drop(checking);
             let sig = ready.trailing_zeros() as u64 + 1;
             let Some(i) = thread::take_pending(sig) else { continue };
             if info != 0 {
@@ -1552,8 +1536,6 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
             Some(d) => {
                 let now = Instant::now();
                 if now >= d {
-                    // SAFETY: restoring the mask saved above.
-                    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
                     return err(errno::EAGAIN);
                 }
                 Some(d - now)
@@ -1575,8 +1557,8 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
                 ts.as_ref().map_or(std::ptr::null(), |t| t as *const _),
                 &wait,
             );
-            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
         }
+        drop(checking);
         if thread::deliverable() & !want != 0 {
             // A signal the guest handles arrived instead.
             return err(errno::EINTR);

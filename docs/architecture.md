@@ -696,6 +696,12 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   is there), so no number fwe holds reaches a process group or every
   process on the host. A guest's group or `kill(-1)` is sent to each
   member. `clippy.toml` refuses `libc::kill` anywhere else.
+- **Host masks put back by scope:** a change of a thread's host mask
+  for a scope is a `host::MaskGuard`, which puts the mask back as it is
+  dropped, on every path out (`sigsuspend`'s and `sigtimedwait`'s checks,
+  a call's temporary mask, a fork, a stop); a change for good is one of
+  `host.rs`'s named calls. `clippy.toml` refuses `libc::pthread_sigmask`
+  and `libc::sigprocmask` anywhere else.
 - **Wake pipes:** every host signal a thread takes writes a byte to that
   thread's pipe (`thread::poke_wait`), and the sleeps, `poll`, `select`
   and the `epoll` waits watch it beside the guest's descriptors

@@ -726,7 +726,8 @@ pub fn start_if_reaper() {
 /// blocked while it checks for a child to report, so none is missed
 /// before [`Waiter::sleep`].
 pub struct Waiter {
-    old: libc::sigset_t,
+    /// Its signals blocked between its looks, until it is dropped.
+    blocked: Option<crate::host::MaskGuard>,
     slot: usize,
 }
 
@@ -744,13 +745,9 @@ impl Waiter {
             std::process::exit(1)
         };
         let mut all = crate::host::host_sigset(u64::MAX);
-        let mut old = crate::host::empty_sigset();
-        // SAFETY: plain host calls on valid signal sets.
-        unsafe {
-            libc::sigaddset(&mut all, crate::host::WAKE_SIGNAL);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
-        }
-        Waiter { old, slot }
+        // SAFETY: an initialized signal set.
+        unsafe { libc::sigaddset(&mut all, crate::host::WAKE_SIGNAL) };
+        Waiter { blocked: Some(crate::host::MaskGuard::block(&all)), slot }
     }
 
     /// Wait until a signal arrives: a wake ([`wake_waiters`]), a child's
@@ -770,8 +767,8 @@ impl Default for Waiter {
 
 impl Drop for Waiter {
     fn drop(&mut self) {
-        // SAFETY: restoring the mask saved in `new`.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+        // The mask back first, then the slot given up.
+        drop(self.blocked.take());
         WAITERS[self.slot].store(0, SeqCst);
         while WAKING.load(SeqCst) != 0 {
             std::hint::spin_loop();

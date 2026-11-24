@@ -815,31 +815,6 @@ pub struct Pending {
     info: [SigSlot; signal::NSIG as usize],
 }
 
-/// Every host signal blocked on the calling thread for the life of the
-/// value, its mask put back as it goes. Async-signal-safe.
-struct AllBlocked(libc::sigset_t);
-
-impl AllBlocked {
-    fn new() -> AllBlocked {
-        // SAFETY: zeroed bytes are a valid `sigset_t`, filled and passed as
-        // the host asks; only this thread's mask changes.
-        unsafe {
-            let mut all: libc::sigset_t = std::mem::zeroed();
-            libc::sigfillset(&mut all);
-            let mut old: libc::sigset_t = std::mem::zeroed();
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
-            AllBlocked(old)
-        }
-    }
-}
-
-impl Drop for AllBlocked {
-    fn drop(&mut self) {
-        // SAFETY: the mask this thread had, as `new` read it.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.0, std::ptr::null_mut()) };
-    }
-}
-
 impl Pending {
     pub const fn new() -> Pending {
         Pending {
@@ -1055,7 +1030,7 @@ impl Pending {
         }
         // No handler of this thread runs while the slot is claimed: a post
         // to it would wait for this take.
-        let _blocked = AllBlocked::new();
+        let _blocked = crate::host::MaskGuard::block(&crate::host::full_sigset());
         // Not pending, or being written, or taken by another thread.
         if state.compare_exchange(FULL, TAKING, Ordering::SeqCst, Ordering::SeqCst).is_err() {
             return None;

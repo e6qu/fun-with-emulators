@@ -452,9 +452,7 @@ fn fork_with_signals_held(
     // SAFETY: plain host calls on initialized signal sets and the pipe
     // opened above, each end closed once in each process.
     unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
+        let mut all = host::full_sigset();
         // Memory faults stay deliverable: the child's checked copies of
         // guest memory recover from them, and a blocked one would end it.
         // The other fault signals fwe raises nowhere before the child
@@ -466,7 +464,7 @@ fn fork_with_signals_held(
             libc::sigdelset(&mut all, sig);
         }
         libc::sigdelset(&mut all, libc::SIGSYS);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+        let held = host::MaskGuard::block(&all);
         let pid = fork();
         fwe_kernel::timing::mark("fork: host fork returned");
         // What a failed fork left, kept for the caller across the calls below.
@@ -476,18 +474,22 @@ fn fork_with_signals_held(
             b = in_parent(pid);
         }
         if pid != 0 {
-            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            drop(held);
             if go[1] >= 0 {
                 libc::write(go[1], (&b as *const u8).cast(), 1);
             }
-        } else if go[0] >= 0 {
-            libc::close(go[1]);
-            // Until the parent's byte, or its end (should it be gone: then
-            // [`GO`], nothing written for it).
-            while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
-                && host::last_errno() == libc::EINTR
-            {}
-            fwe_kernel::timing::mark("fork: child let go");
+        } else {
+            // The child goes on with them held, until it takes its own mask.
+            held.keep();
+            if go[0] >= 0 {
+                libc::close(go[1]);
+                // Until the parent's byte, or its end (should it be gone:
+                // then [`GO`], nothing written for it).
+                while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
+                    && host::last_errno() == libc::EINTR
+                {}
+                fwe_kernel::timing::mark("fork: child let go");
+            }
         }
         for fd in go.into_iter().filter(|&fd| fd >= 0) {
             if pid == 0 && fd == go[1] {
