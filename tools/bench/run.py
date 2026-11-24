@@ -417,7 +417,10 @@ def gears_fwe(a, fwe, guest_env):
 
 VKCUBE = "vkcube frame (ms)"
 # Frames as fast as they are made, not at a display's refresh, of the same
-# size on both sides.
+# size on both sides. (A runner's display paces MoltenVK's frames all the
+# same: natively a frame there is its refresh, 16.7 ms; under fwe the
+# frames are copied to Xvfb, which paces nothing. The submission's round
+# trip, VK_SUBMIT, is what compares the GPU's work.)
 VKCUBE_ARGS = ["--present_mode", "0", "--width", "300", "--height", "300"]
 # Two runs' frames: their times' difference is the frames' alone.
 VKCUBE_FRAMES = (200, 1200)
