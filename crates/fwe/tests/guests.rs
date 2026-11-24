@@ -10025,8 +10025,25 @@ impl Gui {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Gui {
+        Gui::start_traced(x, name, root, program, args, env, false)
+    }
+
+    /// As [`Gui::start`], every system call traced too if `calls` (fwe's
+    /// notes alone otherwise).
+    fn start_traced(
+        x: &Xvfb,
+        name: &str,
+        root: &ScratchRoot,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        calls: bool,
+    ) -> Gui {
         let dir = display_dir();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        if calls {
+            cmd.arg("--strace");
+        }
         cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
             .arg("--root")
             .arg(&root.0)
@@ -10376,7 +10393,9 @@ fn alpine_display_glxgears_turns_by_software() {
 }
 
 /// What a program of a display root says, run to its end (within
-/// `secs`): its standard output.
+/// `secs`): its standard output. Its calls are traced, and Mesa's Vulkan
+/// driver and loader say what they find (`VN_DEBUG`, `VK_LOADER_DEBUG`),
+/// for a failure's report.
 fn display_output(
     x: &Xvfb,
     name: &str,
@@ -10385,7 +10404,9 @@ fn display_output(
     env: &[(&str, &str)],
     secs: u64,
 ) -> String {
-    let mut gui = Gui::start(x, name, root, args[0], &args[1..], env);
+    let mut env = env.to_vec();
+    env.extend([("VN_DEBUG", "init"), ("VK_LOADER_DEBUG", "error,warn,driver")]);
+    let mut gui = Gui::start_traced(x, name, root, args[0], &args[1..], &env, true);
     let began = Instant::now();
     let status = loop {
         if let Some(s) = gui.child.try_wait().unwrap() {

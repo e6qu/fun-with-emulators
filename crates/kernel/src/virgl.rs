@@ -103,7 +103,13 @@ static RENDERER: OnceLock<Result<Api, String>> = OnceLock::new();
 /// The renderer, loaded and started: why not, if it is not.
 fn renderer() -> Result<&'static Api, &'static str> {
     RENDERER
-        .get_or_init(|| crate::host::with_signals_blocked(start))
+        .get_or_init(|| {
+            let r = crate::host::with_signals_blocked(start);
+            if let Err(e) = &r {
+                crate::trace::note_to_file(&format!("no GPU: {e}"));
+            }
+            r
+        })
         .as_ref()
         .map_err(|e| e.as_str())
 }
