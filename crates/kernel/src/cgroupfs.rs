@@ -481,7 +481,8 @@ pub fn refresh(cg: &[u8], name: &[u8]) {
                 let tids = if p == crate::host::pid() {
                     crate::thread::tids()
                 } else {
-                    crate::thread::published_tids(p)
+                    let published = crate::thread::published_tids(p);
+                    published.into_iter().map(crate::pidns::thread_number).collect()
                 };
                 v.extend(tids.into_iter().filter(|&t| t != pid && t > 0));
             }
@@ -1020,8 +1021,8 @@ fn thread_process(tid: i32) -> Result<crate::ids::HostPid, i32> {
     if tid == 0 || crate::thread::tids().contains(&tid) {
         return Ok(crate::host::pid());
     }
-    match crate::thread::owner_of_tid(tid) {
-        Some(p) => Ok(p),
+    match crate::thread::named(tid) {
+        Some((_, p)) => Ok(p),
         None => process(tid),
     }
 }

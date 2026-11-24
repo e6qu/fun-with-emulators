@@ -1,8 +1,9 @@
 //! Numbers of different kinds kept apart by their types: a host process's
-//! pid is a [`HostPid`], which no guest-visible number, thread id or
-//! process group converts to without saying so. Each is the bare number in
-//! memory (`#[repr(transparent)]`), so a call that takes one costs what it
-//! did with the number.
+//! pid is a [`HostPid`], and a thread as every process can name it is a
+//! [`Tid`]; neither converts from a guest-visible number (one a pid
+//! namespace numbers), or to the other, without saying so. Each is the
+//! bare number in memory (`#[repr(transparent)]`), so a call that takes one
+//! costs what it did with the number.
 
 use std::num::NonZeroI32;
 
@@ -51,6 +52,40 @@ impl std::fmt::Display for HostPid {
     }
 }
 
+/// A thread as fwe names it to every process, as Linux's initial pid
+/// namespace numbers it: a process's main thread by its host pid, any
+/// other by a number of fwe's shared counter (above every host pid), which
+/// a thread in a pid namespace of fwe's takes too, beside its numbers
+/// there. No two live threads of fwe's processes have the same one, so it
+/// names a thread to another process (its tracer, a signal's sender, a
+/// reader of its state) whatever namespaces either is in.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct Tid(NonZeroI32);
+
+impl Tid {
+    /// The thread `id` names, if it can name one (above 0).
+    #[inline]
+    pub const fn new(id: i32) -> Option<Tid> {
+        match HostPid::new(id) {
+            Some(p) => Some(Tid(p.0)),
+            None => None,
+        }
+    }
+
+    /// Process `pid`'s main thread.
+    #[inline]
+    pub const fn main_of(pid: HostPid) -> Tid {
+        Tid(pid.0)
+    }
+
+    /// The id, for a record shared with other processes.
+    #[inline]
+    pub const fn get(self) -> i32 {
+        self.0.get()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -67,5 +102,14 @@ mod tests {
     #[test]
     fn a_host_pid_or_none_is_the_size_of_a_pid() {
         assert_eq!(size_of::<Option<HostPid>>(), size_of::<libc::pid_t>());
+        assert_eq!(size_of::<Option<Tid>>(), size_of::<i32>());
+    }
+
+    #[test]
+    fn a_main_thread_is_named_by_its_process() {
+        let p = HostPid::new(4321).unwrap();
+        assert_eq!(Tid::main_of(p).get(), 4321);
+        assert_eq!(Tid::new(0), None);
+        assert_eq!(Tid::new(-7), None);
     }
 }

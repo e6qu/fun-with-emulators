@@ -803,19 +803,18 @@ impl<P: Platform> Kernel<P> {
                 } else {
                     // Another process's thread: its host process and, for
                     // one not its main thread, its number.
-                    let target = match thread::owner_of_tid(pid) {
-                        Some(owner) => Some((owner, Some(pid))),
-                        None => crate::pidns::to_host(pid)
+                    let target = thread::named(pid).or_else(|| {
+                        crate::pidns::to_host(pid)
                             .filter(|&h| host::probe(h).exists())
-                            .map(|h| (h, None)),
-                    };
-                    let Some((owner, tid)) = target else {
+                            .map(|h| (crate::ids::Tid::main_of(h), h))
+                    });
+                    let Some((tid, owner)) = target else {
                         return err(errno::ESRCH);
                     };
                     if !self.may_access(owner, false, false) {
                         return err(errno::EPERM);
                     }
-                    thread::published_robust(owner, tid).unwrap_or(0)
+                    thread::published_robust(tid, owner).unwrap_or(0)
                 };
                 guest!(uaccess::write(a[1], head));
                 guest!(uaccess::write(a[2], 24u64));
@@ -2444,7 +2443,7 @@ impl<P: Platform> Kernel<P> {
         if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
             return Ok(host::pid());
         }
-        if let Some(owner) = thread::owner_of_tid(id).filter(|&o| host::is_fwe(o)) {
+        if let Some((_, owner)) = thread::named(id).filter(|&(_, o)| host::is_fwe(o)) {
             return Ok(owner);
         }
         crate::pidns::host_arg(id)
@@ -4693,7 +4692,8 @@ mod tests {
     #[test]
     fn affinity_of_a_thread_of_the_process() {
         const TID: i32 = 900_001; // high enough that no test uses it
-        let pending = crate::thread::register(TID);
+        let id = crate::ids::Tid::new(TID).unwrap();
+        let pending = crate::thread::register(crate::thread::NewThread { tid: TID, id });
         let mut mask = [0u64; 16];
         let p = mask.as_mut_ptr() as u64;
         let mut k = kernel();

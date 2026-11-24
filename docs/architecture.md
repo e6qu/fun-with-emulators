@@ -611,10 +611,14 @@ host; fwe adds Linux's thread identity and futexes:
   `CLONE_CHILD_CLEARTID` act as on Linux. A new thread starts with its
   creator's thread pointer (without `CLONE_SETTLS`), name, signal mask
   and floating-point control and status registers.
-- Thread ids: the main thread's is the pid; another's comes from its pid
-  namespace or, outside one, from a counter all fwe processes share,
-  numbered from 100000 (past every macOS pid, so a thread number never
-  names another process) and wrapping below 4194304.
+- Thread ids: the main thread's is the pid. Every other thread takes a
+  number from a counter all fwe processes share, numbered from 100000
+  (past every macOS pid, so a thread number never names another process)
+  and wrapping below 4194304: its `Tid`, as Linux's initial pid namespace
+  numbers it, which names it to every other process. Outside a pid
+  namespace of fwe's it is also its thread id; in one, its thread id is a
+  number of the namespace, whose record keeps the `Tid` beside it, so a
+  caller's number for a thread is translated to the `Tid` and back.
 - Futexes (`crates/kernel/src/futex.rs`) wait outside the kernel lock. A
   wake takes waiters oldest first and marks each woken, so it reports
   exactly how many it woke. `FUTEX_WAIT_BITSET`/`WAKE_BITSET` match by
@@ -734,12 +738,13 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets. One
   for a thread of another process (`tgkill`, ptrace's attach) is queued
-  with the tid and posted to that thread through a table of the threads'
-  pending sets the handler reads without a lock.
-- **Threads of another process:** thread numbers are taken in blocks of
-  64, each block's process recorded in the process store; a process that
-  has had more than its main thread publishes its tids in an entry of its
-  own there, which `/proc/<pid>/task` lists.
+  with the thread's `Tid` and posted to that thread through a table of the
+  threads' pending sets, by `Tid`, the handler reads without a lock.
+- **Threads of another process:** `Tid`s are taken in blocks of 64, each
+  block's process recorded in the process store; a process that has had
+  more than its main thread publishes its threads' `Tid`s and robust-list
+  heads in entries of its own there, which `/proc/<pid>/task`,
+  `cgroup.threads` and `get_robust_list` read in the reader's numbers.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` replaces its former
   parent's while that is pending, and absorbs one after it, as Linux
   sends them.
@@ -769,7 +774,9 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 memory or threads, so a tracee does its tracer's work itself:
 
 - **Mailbox:** a page per traced thread in the process store (named by the
-  pid for a main thread, the tid for another), kept while its tracer lives:
+  host pid for a main thread, the `Tid` for another, so tracers in pid
+  namespaces whose threads have the same numbers never share one), kept
+  while its tracer lives:
   a tracee detached or ended marks it so, and its tracer frees it as it next
   looks, so no tracer's request lands in a page made again for another
   tracee. It names the thread's process and holds the stop's wait status,
@@ -792,7 +799,9 @@ memory or threads, so a tracee does its tracer's work itself:
   fetched afresh, in the VM as well). Its `wait4` and `waitid` report a
   tracee's stop from the mailbox before the host's children, looking again
   as tracees stop, and the end of a tracee that is not its child, which
-  the tracee leaves in its mailbox.
+  the tracee leaves in its mailbox. A wait for a process group matches a
+  traced thread by its process's group; a wait for a thread looks only at
+  its mailbox (it is no host child).
 - **Events:** a fork, vfork or clone a tracer follows
   (`PTRACE_O_TRACEFORK` and the like) stops the parent with the event and
   starts the child traced, stopped by `SIGSTOP`, with its parent's options

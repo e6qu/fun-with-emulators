@@ -637,10 +637,12 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
                 }
                 // Its threads, as it published them (the main thread always).
                 let listed = t == pid.to_string().as_bytes()
-                    || std::str::from_utf8(t)
-                        .ok()
-                        .and_then(|t| t.parse::<i32>().ok())
-                        .is_some_and(|t| crate::thread::published_tids(host).contains(&t));
+                    || std::str::from_utf8(t).ok().and_then(|t| t.parse::<i32>().ok()).is_some_and(
+                        |t| {
+                            let tids = crate::thread::published_tids(host);
+                            tids.into_iter().any(|id| crate::pidns::thread_number(id) == t)
+                        },
+                    );
                 return if listed { Entry::Dir } else { Entry::Missing };
             }
             Entry::Missing
@@ -663,7 +665,10 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
             out.push((pid.to_string().into_bytes(), DT_DIR));
             let me = pid.to_string().into_bytes();
             let tids = crate::pidns::to_host(pid).map(crate::thread::published_tids);
-            for t in tids.unwrap_or_default() {
+            for t in tids.unwrap_or_default().into_iter().map(crate::pidns::thread_number) {
+                if t == 0 {
+                    continue;
+                }
                 let name = t.to_string().into_bytes();
                 if name != me {
                     out.push((name, DT_DIR));
@@ -679,9 +684,13 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
 pub fn listed() -> Vec<i32> {
     let chain = crate::pidns::current();
     let mut pids: Vec<i32> = match chain.first() {
-        Some(r) => {
-            r.get().pids.iter().filter(|(_, e)| !e.thread && e.host != 0).map(|(n, _)| *n).collect()
-        }
+        Some(r) => r
+            .get()
+            .pids
+            .iter()
+            .filter(|(_, e)| e.thread.is_none() && e.host != 0)
+            .map(|(n, _)| *n)
+            .collect(),
         None => crate::procreg::all().into_iter().map(|(p, _)| p.get()).collect(),
     };
     pids.push(crate::thread::tgid());

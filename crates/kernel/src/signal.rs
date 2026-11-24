@@ -430,10 +430,11 @@ pub fn take_notes() {
                 return;
             }
         }
-        if note.tid != 0 {
-            thread::post_directed(note.tid, lsig, info);
-        } else {
-            thread::post_landed(lsig, info);
+        match crate::ids::Tid::new(note.tid) {
+            Some(t) => {
+                thread::post_directed(t, lsig, info);
+            }
+            None => thread::post_landed(lsig, info),
         }
     });
 }
@@ -1080,8 +1081,7 @@ impl<P: Platform> Kernel<P> {
         // finds the task and signals its thread group): this one's, or
         // another process's.
         let pid = if pid > 0 && thread::host_thread(pid).is_some() { me } else { pid as i64 };
-        let thread_owner =
-            || if crate::pidns::nested() { None } else { thread::owner_of_tid(pid as i32) };
+        let thread_owner = || thread::named(pid as i32).map(|(_, p)| p);
         // The host process (or group) `pid` names in the guest's pid
         // namespace (a thread's number in one of fwe's names its process).
         let target = match pid {
@@ -1239,7 +1239,7 @@ impl<P: Platform> Kernel<P> {
                 .get()
                 .pids
                 .iter()
-                .filter(|(n, e)| !e.thread && **n != 1 && e.host != 0)
+                .filter(|(n, e)| e.thread.is_none() && **n != 1 && e.host != 0)
                 .map(|(_, e)| e.host)
                 .collect(),
             None => crate::procreg::run().into_iter().map(HostPid::get).collect(),
@@ -1293,7 +1293,7 @@ impl<P: Platform> Kernel<P> {
     /// `sig` for thread `tid` of host process `owner` (not this one): in the
     /// process's queue, the process woken to give it to the thread
     /// ([`crate::signote::queue_thread`]); SIGKILL ends the process.
-    fn signal_other_thread(&mut self, owner: HostPid, tid: i32, sig: u64) -> i64 {
+    fn signal_other_thread(&mut self, owner: HostPid, tid: crate::ids::Tid, sig: u64) -> i64 {
         // The table of threads may name a process that has gone, its pid
         // since taken by one that is not fwe's.
         if !host::is_fwe(owner) {
@@ -1337,9 +1337,9 @@ impl<P: Platform> Kernel<P> {
             if tid == tgid {
                 return self.sys_kill(tid, sig);
             }
-            return match thread::owner_of_tid(tid as i32) {
-                Some(owner) if crate::pidns::to_host(tgid as i32) == Some(owner) => {
-                    self.signal_other_thread(owner, tid as i32, sig)
+            return match thread::named(tid as i32) {
+                Some((t, owner)) if crate::pidns::to_host(tgid as i32) == Some(owner) => {
+                    self.signal_other_thread(owner, t, sig)
                 }
                 _ => err(errno::ESRCH),
             };
@@ -1348,8 +1348,8 @@ impl<P: Platform> Kernel<P> {
         // exited one's number may already be another process's pid); with
         // no process named (`tkill`), it may be another's.
         let Some(host_thread) = thread::host_thread(tid as i32) else {
-            return match thread::owner_of_tid(tid as i32) {
-                Some(owner) if tgid == -1 => self.signal_other_thread(owner, tid as i32, sig),
+            return match thread::named(tid as i32) {
+                Some((t, owner)) if tgid == -1 => self.signal_other_thread(owner, t, sig),
                 _ => err(errno::ESRCH),
             };
         };

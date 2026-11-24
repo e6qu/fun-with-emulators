@@ -222,7 +222,7 @@ impl<P: Platform> Kernel<P> {
             if p == thread::tgid() || thread::tids().contains(&p) {
                 return Ok(crate::host::pid());
             }
-            if let Some(owner) = thread::owner_of_tid(p) {
+            if let Some((_, owner)) = thread::named(p) {
                 return Ok(owner);
             }
             let h = crate::ids::HostPid::new(crate::pidns::host_arg(p)?).ok_or(errno::ESRCH)?;
@@ -675,9 +675,8 @@ impl<P: Platform> Kernel<P> {
         // Another thread's id names its process, as on Linux.
         let tgid = if tid.is_none() && thread::host_thread(tgid).is_some() { me } else { tgid };
         // Another process's thread, named alone, names its process too.
-        let owner = (tid.is_none() && tgid != me && !crate::pidns::nested())
-            .then(|| thread::owner_of_tid(tgid))
-            .flatten();
+        let owner =
+            (tid.is_none() && tgid != me).then(|| thread::named(tgid).map(|(_, p)| p)).flatten();
         let Some(host) = owner.or_else(|| crate::pidns::to_host(tgid)) else {
             return err(errno::ESRCH);
         };
@@ -713,7 +712,10 @@ impl<P: Platform> Kernel<P> {
             // Another process's other thread: queued for it in the
             // process's mailbox, the process woken to give it to the
             // thread (SIGKILL ends the process).
-            if thread::owner_of_tid(t) != Some(host) || !crate::host::is_fwe(host) {
+            let Some((t, _)) = thread::named(t).filter(|&(_, o)| o == host) else {
+                return err(errno::ESRCH);
+            };
+            if !crate::host::is_fwe(host) {
                 return err(errno::ESRCH);
             }
             if s == fwe_abi::signal::SIGKILL {

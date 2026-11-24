@@ -322,7 +322,7 @@ pub fn stops_at_syscalls() -> bool {
 /// thread, its tid for another.
 fn self_id() -> i32 {
     let tid = crate::thread::tid();
-    if tid == 0 || tid == crate::thread::tgid() { me() } else { tid }
+    if tid == 0 || tid == crate::thread::tgid() { me() } else { crate::thread::id().get() }
 }
 
 /// The words a new tracing starts with at 0.
@@ -1127,10 +1127,15 @@ fn tracee(pid: i32) -> Result<Page, i32> {
     Ok(mb)
 }
 
-/// The tracee a tracer names by `pid` (a traced thread's tid, or a process's
-/// pid as the guest names it), as its mailbox is named.
+/// The tracee a tracer names by `pid` (a thread's or a process's id as
+/// its pid namespace numbers it), as its mailbox is named: a thread's
+/// [`crate::ids::Tid`], a process's host pid.
 pub fn target_of(pid: i32) -> Option<i32> {
-    if pid > 0 && open(mailbox_tag(pid), None).is_some() {
+    if let Some(t) = crate::pidns::thread_of(pid) {
+        return Some(t.get());
+    }
+    // Outside a namespace of fwe's a thread's id is its `Tid`.
+    if !crate::pidns::nested() && pid > 0 && open(mailbox_tag(pid), None).is_some() {
         return Some(pid);
     }
     crate::pidns::to_host(pid).map(HostPid::get)
@@ -1315,7 +1320,31 @@ pub fn wait_for_stop(seen: u64, slice: Duration) {
 /// A stop of a tracee `wanted` accepts (by host pid, or a thread's tid)
 /// not yet reported: its id, wait status and whether it is a thread,
 /// reported now unless `peek`.
-pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, bool)> {
+/// A tracee as a tracer's `wait` finds it: its mailbox's id (a thread's
+/// [`crate::ids::Tid`], a process's host pid) and the host process it is
+/// in.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Tracee {
+    pub id: i32,
+    pub process: HostPid,
+}
+
+impl Tracee {
+    /// Whether it is a thread other than its process's main one.
+    pub fn thread(self) -> bool {
+        self.id != self.process.get()
+    }
+
+    /// It as the caller's pid namespace numbers it (0: outside it).
+    pub fn number(self) -> i32 {
+        match crate::ids::Tid::new(self.id).filter(|_| self.thread()) {
+            Some(t) => crate::pidns::thread_number(t),
+            None => crate::pidns::guest_ret(i64::from(self.id)) as i32,
+        }
+    }
+}
+
+pub fn take_stop(wanted: impl Fn(Tracee) -> bool, peek: bool) -> Option<(Tracee, i32)> {
     let inbox = open(inbox_tag(me()), None)?;
     for slot in &inbox.0[1..] {
         let pid = slot.load(Ordering::Acquire) as i32;
@@ -1327,11 +1356,13 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, 
             let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
             continue;
         };
-        if mb.word(W_TRACER).load(Ordering::Acquire) != me() as u64 || !wanted(pid) {
+        let tracee = HostPid::new(proc_of(&mb)).map(|process| Tracee { id: pid, process });
+        let Some(tracee) = tracee
+            .filter(|&t| mb.word(W_TRACER).load(Ordering::Acquire) == me() as u64 && wanted(t))
+        else {
             continue;
-        }
+        };
         let state = mb.word(W_STATE).load(Ordering::Acquire);
-        let thread = proc_of(&mb) != pid;
         if state == GONE {
             if !peek {
                 crate::procstore::free_page(mailbox_tag(pid));
@@ -1345,13 +1376,13 @@ pub fn take_stop(wanted: impl Fn(i32) -> bool, peek: bool) -> Option<(i32, i32, 
                 crate::procstore::free_page(mailbox_tag(pid));
                 let _ = slot.compare_exchange(pid as u64, 0, Ordering::AcqRel, Ordering::Acquire);
             }
-            return Some((pid, status, thread));
+            return Some((tracee, status));
         }
         if state == STOPPED {
             if !peek {
                 mb.word(W_STATE).store(REPORTED, Ordering::Release);
             }
-            return Some((pid, mb.word(W_STATUS).load(Ordering::Acquire) as i32, thread));
+            return Some((tracee, mb.word(W_STATUS).load(Ordering::Acquire) as i32));
         }
     }
     None
@@ -1863,21 +1894,21 @@ impl<P: crate::Platform> crate::Kernel<P> {
         // A thread of another process, attached to on its own: fwe's
         // SIGSTOP for it, through its process's queue (seized: the nudge).
         if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE)
-            && let Some(owner) = crate::thread::owner_of_tid(pid as i32)
+            && let Some((t, owner)) = crate::thread::named(pid as i32)
         {
             if owner.get() == me() || !self.may_trace(owner) {
                 return err(errno::EPERM);
             }
             let (r, code) = if request == PTRACE_SEIZE {
-                (seize(pid as i32, owner.get(), data), POKE_CODE)
+                (seize(t.get(), owner.get(), data), POKE_CODE)
             } else {
-                (attach_id(pid as i32, owner.get()), 0)
+                (attach_id(t.get(), owner.get()), 0)
             };
             if let Err(e) = r {
                 return err(e);
             }
             let stop = fwe_abi::signal::SIGSTOP;
-            return match crate::signote::queue_thread(owner, pid as i32, stop, code, 0) {
+            return match crate::signote::queue_thread(owner, t, stop, code, 0) {
                 Ok(()) => crate::host::kill_process(owner, crate::host::WAKE_SIGNAL),
                 Err(e) => err(e),
             };
@@ -2003,8 +2034,8 @@ impl<P: crate::Platform> crate::Kernel<P> {
     fn nudge(&self, id: i32) -> i64 {
         let Some(proc) = process_of(id) else { return fwe_abi::err(errno::ESRCH) };
         let stop = fwe_abi::signal::SIGSTOP;
-        if proc.get() != id {
-            return match crate::signote::queue_thread(proc, id, stop, POKE_CODE, 0) {
+        if let Some(t) = crate::ids::Tid::new(id).filter(|_| proc.get() != id) {
+            return match crate::signote::queue_thread(proc, t, stop, POKE_CODE, 0) {
                 Ok(()) => crate::host::kill_process(proc, crate::host::WAKE_SIGNAL),
                 Err(e) => fwe_abi::err(e),
             };

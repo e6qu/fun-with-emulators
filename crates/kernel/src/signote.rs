@@ -26,7 +26,7 @@
 //! sender, or a mark while a sender fills it: no lock, so a handler reads
 //! and takes notes whatever its thread was doing.
 
-use crate::ids::HostPid;
+use crate::ids::{HostPid, Tid};
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering::{self, SeqCst};
@@ -250,20 +250,20 @@ pub fn queue_from(
 }
 
 /// [`queue`] for thread `tid` of host process `target`.
-pub fn queue_thread(target: HostPid, tid: i32, sig: u64, code: i32, value: u64) -> Result<(), i32> {
-    put(target, tid, sig, code, value)
+pub fn queue_thread(target: HostPid, tid: Tid, sig: u64, code: i32, value: u64) -> Result<(), i32> {
+    put(target, tid.get(), sig, code, value)
 }
 
 /// [`queue_thread`] with the sender the signal names, as [`queue_from`].
 pub fn queue_thread_from(
     target: HostPid,
-    tid: i32,
+    tid: Tid,
     sig: u64,
     code: i32,
     value: u64,
     (pid, uid): (i32, u32),
 ) -> Result<(), i32> {
-    put_from(target, tid, sig, code, value, (pid as u32, uid))
+    put_from(target, tid.get(), sig, code, value, (pid as u32, uid))
 }
 
 /// The mailbox's count of the `SIGCONT`s sent to its process

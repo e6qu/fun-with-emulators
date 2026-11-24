@@ -1350,7 +1350,7 @@ struct Spawn {
     /// The creating thread's pointer-authentication keys, which a new
     /// thread starts with as on Linux.
     keys: [u64; 10],
-    tid: i32,
+    tid: thread::NewThread,
     tpidr: u64,
     clear_child_tid: u64,
     sigmask: u64,
@@ -1400,7 +1400,8 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     if let Err(e) = a.thread_check() {
         return err(e);
     }
-    let tid = thread::alloc_tid();
+    let new = thread::alloc_tid();
+    let tid = new.tid;
     // Traced from its start if the tracer follows new threads.
     fwe_kernel::ptrace::new_thread(tid);
     if flags & cl::CLONE_PARENT_SETTID != 0 && ptid != 0 {
@@ -1413,11 +1414,11 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     regs.x[0] = 0;
     regs.sp = stack;
     regs.pc = parent.pc + 4;
-    let pending = thread::register(tid);
+    let pending = thread::register(new);
     let spawn = Box::new(Spawn {
         keys: thread_keys(),
         regs,
-        tid,
+        tid: new,
         tpidr,
         clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
         sigmask: thread::mask(),

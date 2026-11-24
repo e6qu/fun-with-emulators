@@ -346,7 +346,7 @@ impl<P: Platform> Kernel<P> {
             nr::TKILL => {
                 let tid = a[0] as i32;
                 if let Some(owner) =
-                    crate::thread::owner_of_tid(tid).or_else(|| crate::pidns::to_host(tid))
+                    crate::thread::named(tid).map(|(_, p)| p).or_else(|| crate::pidns::to_host(tid))
                 {
                     ll::may_signal(owner)?;
                 }

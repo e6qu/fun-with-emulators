@@ -2044,6 +2044,19 @@ fn a_connect_is_made_once_however_signals_land() {
     );
 }
 
+/// A tracer of another process's thread finds its stops as Linux
+/// reports them: by its process group (with the thread's user as the
+/// sender), by its thread id in a pid namespace, and in two namespaces at
+/// once, whose threads have the same numbers, each its own.
+#[test]
+fn traced_threads_are_found_by_group_and_in_namespaces() {
+    c_guest_prints(
+        "tracethreads",
+        &[],
+        "by id: 0\nby group: 0\nin a namespace: 0\nside by side: 0 0, same thread numbers: 1\n",
+    );
+}
+
 /// Tracers side by side: each continues its own tracee, stopped; none's
 /// requests reach another's, as their mailboxes' pages are freed and made
 /// again.

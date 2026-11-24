@@ -11,6 +11,7 @@
 //! Each thread's pending set is also registered by tid so another thread can
 //! direct a signal at it.
 
+use crate::ids::{HostPid, Tid};
 use fwe_abi::{Stack, signal};
 use std::cell::Cell;
 use std::sync::atomic::{
@@ -23,6 +24,9 @@ static TGID: AtomicI32 = AtomicI32::new(0);
 
 thread_local! {
     static TID: Cell<i32> = const { Cell::new(0) };
+    /// This thread's [`Tid`] when it is not its process's main thread (0
+    /// for the main one, whose is its process's host pid).
+    static ID: Cell<i32> = const { Cell::new(0) };
     /// `set_tid_address`: futex word cleared and woken when the thread exits.
     static CLEAR_CHILD_TID: Cell<u64> = const { Cell::new(0) };
     static ROBUST_LIST: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
@@ -56,6 +60,7 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
 pub fn init_main(pid: i32) {
     TGID.store(pid, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
+    ID.with(|t| t.set(0));
     // An end status and a thread list left by an earlier process of this
     // number.
     crate::procreg::forget_end(crate::host::pid());
@@ -470,23 +475,31 @@ const TID_BLOCK: i32 = 64;
 /// the end.
 pub(crate) static TID_BLOCK_LEFT: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0));
 
-/// The host process thread `tid` (one of another process's) is in, if a
+/// The host process thread `t` (other than a main thread) is in, if a
 /// live one.
-pub fn owner_of_tid(tid: i32) -> Option<crate::ids::HostPid> {
-    if !(TID_FIRST..TID_END).contains(&tid) {
+fn owner_of(t: Tid) -> Option<HostPid> {
+    let id = t.get();
+    if !(TID_FIRST..TID_END).contains(&id) {
         return None;
     }
-    let pid = crate::ids::HostPid::new(crate::procstore::tid_block_owner(
-        ((tid - TID_FIRST) / TID_BLOCK) as usize,
-    ))?;
-    (crate::host::probe(pid).exists() && published_tids(pid).contains(&tid)).then_some(pid)
+    let block = ((id - TID_FIRST) / TID_BLOCK) as usize;
+    let pid = HostPid::new(crate::procstore::tid_block_owner(block))?;
+    (crate::host::probe(pid).exists() && published_tids(pid).contains(&t)).then_some(pid)
 }
 
-/// The threads (tids, the main thread's the process's pid) another
-/// process published ([`publish_tids`]).
-pub fn published_tids(pid: crate::ids::HostPid) -> Vec<i32> {
+/// The thread the caller names `n` (a thread id as its pid namespace
+/// numbers it), other than a process's main thread: its [`Tid`] and the
+/// host process it is in, if a live one.
+pub fn named(n: i32) -> Option<(Tid, HostPid)> {
+    let t = if crate::pidns::nested() { crate::pidns::thread_of(n)? } else { Tid::new(n)? };
+    owner_of(t).map(|p| (t, p))
+}
+
+/// The threads another process published ([`publish_tids`]), its main
+/// thread's first.
+pub fn published_tids(pid: HostPid) -> Vec<Tid> {
     let b = crate::procstore::get_of(crate::procstore::Kind::Threads, pid).unwrap_or_default();
-    b.as_chunks::<4>().0.iter().map(|c| i32::from_ne_bytes(*c)).collect()
+    b.as_chunks::<4>().0.iter().filter_map(|c| Tid::new(i32::from_ne_bytes(*c))).collect()
 }
 
 /// Whether this process published its threads ([`publish_tids`]), and
@@ -504,7 +517,7 @@ static TIDS_ENDED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-fn publish_tids(tids: &[i32]) {
+fn publish_tids(tids: &[Tid]) {
     if TIDS_ENDED.load(Ordering::SeqCst) {
         return;
     }
@@ -519,7 +532,7 @@ fn publish_tids(tids: &[i32]) {
         return;
     }
     *published = me;
-    let b: Vec<u8> = tids.iter().flat_map(|t| t.to_ne_bytes()).collect();
+    let b: Vec<u8> = tids.iter().flat_map(|t| t.get().to_ne_bytes()).collect();
     crate::procstore::put_own(crate::procstore::Kind::Threads, Some(&b));
 }
 
@@ -532,23 +545,37 @@ pub(crate) fn forget_published() {
     ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
-/// Allocate a fresh thread id for a new thread: in a pid namespace of
-/// fwe's, a number from it (threads and processes share the numbers);
-/// outside one, a number no host process has ([`shared_tid`]).
-pub fn alloc_tid() -> i32 {
-    if crate::pidns::nested() {
-        let host = crate::host::pid().get();
-        if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
-            crate::pidns::remember_thread(nums[0], nums.clone());
-            return nums[0];
-        }
-    }
-    shared_tid()
+/// A new thread's numbers ([`alloc_tid`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NewThread {
+    /// Its thread id as its process's pid namespace numbers it (`gettid`).
+    pub tid: i32,
+    /// It to every process.
+    pub id: Tid,
 }
 
-/// Record this host thread's guest thread id (called when a thread starts).
-pub fn set_tid(tid: i32) {
+/// Allocate a new thread's numbers: its [`Tid`], a number no host process
+/// has ([`shared_tid`]), which is also its thread id outside a pid
+/// namespace of fwe's; in one, its thread id is a number from it (threads
+/// and processes share the numbers).
+pub fn alloc_tid() -> NewThread {
+    let n = shared_tid();
+    let id = Tid::new(n).expect("the shared counter's numbers are above 0");
+    if crate::pidns::nested() {
+        let host = crate::host::pid().get();
+        if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, Some(id)) {
+            crate::pidns::remember_thread(nums[0], nums.clone());
+            return NewThread { tid: nums[0], id };
+        }
+    }
+    NewThread { tid: n, id }
+}
+
+/// Record this host thread's numbers (called when a thread starts).
+pub fn set_tid(new: NewThread) {
+    let tid = new.tid;
     TID.with(|t| t.set(tid));
+    ID.with(|t| t.set(new.id.get()));
     // A thread a tracer follows begins traced.
     crate::ptrace::thread_started(tid);
     // A new thread: its creator's timer slack, as its own and its default.
@@ -562,6 +589,14 @@ pub fn set_tid(tid: i32) {
 /// This thread's guest thread id (`gettid`).
 pub fn tid() -> i32 {
     TID.with(Cell::get)
+}
+
+/// This thread to every process: its [`Tid`].
+pub fn id() -> Tid {
+    match Tid::new(ID.with(Cell::get)) {
+        Some(t) => t,
+        None => Tid::main_of(crate::host::pid()),
+    }
 }
 
 pub fn set_clear_child_tid(addr: u64) {
@@ -583,11 +618,7 @@ pub fn set_robust_list(head: u64, len: u64) {
         r.robust = head;
     }
     drop(threads);
-    if me == tgid() {
-        publish_robust(crate::host::pid().get(), head);
-    } else if !crate::pidns::nested() {
-        publish_robust(me, head);
-    }
+    publish_robust(id(), head);
 }
 
 pub fn robust_list() -> (u64, u64) {
@@ -620,15 +651,14 @@ pub fn robust_list_of(tid: i32) -> Option<u64> {
 
 // Robust-list heads for other processes to read (`get_robust_list`): the
 // process's entry of them in the process store ([`crate::procstore`]),
-// which only it writes, as (id, head) pairs: the main thread's id its host
-// pid, another's its thread number of fwe's ([`shared_tid`]).
+// which only it writes, as ([`Tid`], head) pairs.
 
 /// The heads this process published, by id.
 pub(crate) static ROBUST: Mutex<Vec<(i32, u64)>> = Mutex::new(Vec::new());
 
-/// Record thread `id`'s (a host pid or a thread number) robust-list head
-/// (0: none).
-fn publish_robust(id: i32, head: u64) {
+/// Record thread `t`'s robust-list head (0: none).
+fn publish_robust(t: Tid, head: u64) {
+    let id = t.get();
     let mut heads = ROBUST.lock().unwrap_or_else(|e| e.into_inner());
     let had = heads.iter().position(|&(i, _)| i == id);
     match (had, head) {
@@ -646,11 +676,10 @@ fn publish_robust(id: i32, head: u64) {
     crate::procstore::put_own(crate::procstore::Kind::Robust, Some(&b));
 }
 
-/// Another process's thread's robust-list head: `host` the main thread of
-/// that host process, or `tid` one of its other threads (a number of
-/// fwe's, of process `host`). `None` if it published none.
-pub fn published_robust(host: crate::ids::HostPid, tid: Option<i32>) -> Option<u64> {
-    let id = tid.unwrap_or(host.get());
+/// Thread `t`'s robust-list head, as its process `host` published it.
+/// `None` if it published none.
+pub fn published_robust(t: Tid, host: HostPid) -> Option<u64> {
+    let id = t.get();
     let b = crate::procstore::get_of(crate::procstore::Kind::Robust, host)?;
     b.as_chunks::<16>().0.iter().find_map(|c| {
         let i = u64::from_ne_bytes(c[..8].try_into().unwrap()) as i32;
@@ -1140,6 +1169,8 @@ static PROCESS: Pending = Pending::new();
 
 struct Registered {
     tid: i32,
+    /// It to every process.
+    id: Tid,
     pending: Arc<Pending>,
     /// The host thread, or 0 while it is being created.
     host: libc::pthread_t,
@@ -1163,6 +1194,19 @@ pub fn tids() -> Vec<i32> {
     let mut out = vec![me];
     let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     out.extend(threads.iter().map(|r| r.tid).filter(|&t| t != me));
+    out
+}
+
+/// The guest's threads, by [`Tid`], the main thread's first.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn ids() -> Vec<Tid> {
+    let main = Tid::main_of(crate::host::pid());
+    let mut out = vec![main];
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    out.extend(threads.iter().map(|r| r.id).filter(|&t| t != main));
     out
 }
 
@@ -1205,6 +1249,7 @@ thread_local! {
 /// its state is a new thread's.
 pub(crate) fn thread_reused() {
     TID.with(|t| t.set(0));
+    ID.with(|t| t.set(0));
     CLEAR_CHILD_TID.with(|c| c.set(0));
     ROBUST_LIST.with(|r| r.set((0, 0)));
     NAME.with(|n| n.set(None));
@@ -1259,7 +1304,7 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 /// Register the calling host thread as guest thread [`tid`], so signals can
 /// be directed at it. Called when a guest thread starts.
 pub fn register_current() {
-    let pending = register(tid());
+    let pending = register(NewThread { tid: tid(), id: id() });
     adopt(&pending);
     // SAFETY: plain host call.
     set_host_thread(&pending, unsafe { libc::pthread_self() });
@@ -1273,7 +1318,8 @@ pub fn register_current() {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-pub fn register(tid: i32) -> Arc<Pending> {
+pub fn register(new: NewThread) -> Arc<Pending> {
+    let tid = new.tid;
     if tid != tgid() {
         let s = slack();
         SLACK_HANDOFF.lock().unwrap_or_else(|e| e.into_inner()).push((tid, s));
@@ -1285,10 +1331,10 @@ pub fn register(tid: i32) -> Arc<Pending> {
     // Its creator's nice value, as Linux's thread inherits it.
     let nice = if tid != tgid() { nice_of(self::tid()) } else { 0 };
     let pending = Arc::new(Pending::new());
-    let entry = Registered { tid, pending: pending.clone(), host: 0, robust: 0, nice };
+    let entry = Registered { tid, id: new.id, pending: pending.clone(), host: 0, robust: 0, nice };
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
-    directed_add(tid, Arc::as_ptr(&pending));
-    publish_tids(&tids());
+    directed_add(new.id, Arc::as_ptr(&pending));
+    publish_tids(&ids());
     pending
 }
 
@@ -1325,23 +1371,24 @@ pub fn set_host_thread(pending: &Arc<Pending>, host: libc::pthread_t) {
     let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(r) = threads.iter_mut().find(|r| Arc::ptr_eq(&r.pending, pending)) {
         r.host = host;
-        directed_host(r.tid, host);
+        directed_host(r.id, host);
     }
 }
 
 /// Drop the registration owning `pending` (a thread that never started).
 pub fn unregister(pending: &Arc<Pending>) {
-    let gone: Vec<i32> = {
+    let gone: Vec<(i32, Tid)> = {
         let mut t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
-        let gone = t.iter().filter(|r| Arc::ptr_eq(&r.pending, pending)).map(|r| r.tid).collect();
+        let gone =
+            t.iter().filter(|r| Arc::ptr_eq(&r.pending, pending)).map(|r| (r.tid, r.id)).collect();
         t.retain(|r| !Arc::ptr_eq(&r.pending, pending));
         gone
     };
-    for tid in gone {
-        directed_remove(tid);
+    for (tid, id) in gone {
+        directed_remove(id);
         crate::threadfs::forget(tid);
     }
-    publish_tids(&tids());
+    publish_tids(&ids());
 }
 
 /// Forget the calling thread's registration as it exits.
@@ -1350,11 +1397,11 @@ pub fn unregister_current() {
     crate::pidfd::thread_gone(tid());
     drop_wait_pipe();
     let own = HOT.with(|h| h.own.replace(std::ptr::null()));
-    directed_remove(tid());
+    directed_remove(id());
     THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
-    publish_tids(&tids());
+    publish_tids(&ids());
     if tid() != tgid() {
-        publish_robust(tid(), 0);
+        publish_robust(id(), 0);
     }
 }
 
@@ -1379,6 +1426,7 @@ pub fn process_ending() {
 const DIRECTED_SLOTS: usize = 512;
 
 struct Directed {
+    /// The thread's [`Tid`] (0: a free slot).
     tid: AtomicI32,
     readers: AtomicU32,
     pending: std::sync::atomic::AtomicPtr<Pending>,
@@ -1394,7 +1442,8 @@ static DIRECTED: [Directed; DIRECTED_SLOTS] = [const {
     }
 }; DIRECTED_SLOTS];
 
-fn directed_add(tid: i32, pending: *const Pending) {
+fn directed_add(t: Tid, pending: *const Pending) {
+    let tid = t.get();
     for d in &DIRECTED {
         if d.tid.load(Ordering::Acquire) == 0 && d.readers.load(Ordering::Acquire) == 0 {
             d.pending.store(pending as *mut Pending, Ordering::Release);
@@ -1407,13 +1456,15 @@ fn directed_add(tid: i32, pending: *const Pending) {
 }
 
 #[allow(clippy::unnecessary_cast)] // `pthread_t` is a pointer on macOS
-fn directed_host(tid: i32, host: libc::pthread_t) {
+fn directed_host(t: Tid, host: libc::pthread_t) {
+    let tid = t.get();
     if let Some(d) = DIRECTED.iter().find(|d| d.tid.load(Ordering::Acquire) == tid) {
         d.host.store(host as usize, Ordering::Release);
     }
 }
 
-fn directed_remove(tid: i32) {
+fn directed_remove(t: Tid) {
+    let tid = t.get();
     if let Some(d) = DIRECTED.iter().find(|d| d.tid.load(Ordering::Acquire) == tid) {
         d.tid.store(0, Ordering::Release);
         // Until no handler reads it.
@@ -1424,10 +1475,11 @@ fn directed_remove(tid: i32) {
     }
 }
 
-/// Post `sig` for thread `tid` of this process and wake it: whether it was
+/// Post `sig` for thread `t` of this process and wake it: whether it was
 /// there. Async-signal-safe.
 #[allow(clippy::unnecessary_cast)] // `pthread_t` is a pointer on macOS
-pub fn post_directed(tid: i32, sig: u64, info: SigInfo) -> bool {
+pub fn post_directed(t: Tid, sig: u64, info: SigInfo) -> bool {
+    let tid = t.get();
     for d in &DIRECTED {
         if d.tid.load(Ordering::Acquire) != tid {
             continue;
@@ -1691,9 +1743,12 @@ mod tests {
     #[test]
     fn thread_ids_never_name_a_host_process() {
         let (a, b) = (alloc_tid(), alloc_tid());
-        assert!((TID_FIRST..TID_END).contains(&a), "{a}");
-        assert!((TID_FIRST..TID_END).contains(&b), "{b}");
-        assert_ne!(a, b);
+        for t in [a, b] {
+            assert!((TID_FIRST..TID_END).contains(&t.id.get()), "{t:?}");
+            // Outside a pid namespace, its id is its thread id.
+            assert_eq!(t.tid, t.id.get());
+        }
+        assert_ne!(a.id, b.id);
     }
 
     #[test]

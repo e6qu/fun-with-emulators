@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 /// What a freshly spawned host thread needs to become a guest thread.
 struct Spawn {
     regs: Regs,
-    tid: i32,
+    tid: thread::NewThread,
     /// Guest thread pointer: `CLONE_SETTLS`'s, else the creator's.
     tls: u64,
     /// `set_tid_address` word (`CLONE_CHILD_CLEARTID`), or 0.
@@ -50,7 +50,8 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         return err(e);
     }
 
-    let tid = thread::alloc_tid();
+    let new = thread::alloc_tid();
+    let tid = new.tid;
     // Traced from its start if the tracer follows new threads.
     fwe_kernel::ptrace::new_thread(tid);
     if flags & cl::CLONE_PARENT_SETTID != 0 && parent_tid != 0 {
@@ -68,13 +69,13 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
 
     let spawn = Box::new(Spawn {
         regs,
-        tid,
+        tid: new,
         tls: if flags & cl::CLONE_SETTLS != 0 { tls } else { thread_pointer() },
         clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
         sigmask: thread::mask(),
         name: thread::name(),
         fp: fp_controls(),
-        pending: thread::register(tid),
+        pending: thread::register(new),
     });
     let pending = spawn.pending.clone();
 

@@ -7,6 +7,7 @@
 //! another is in that one's record too, as on Linux a process has a pid in
 //! every namespace above its own.
 
+use crate::ids::Tid;
 use crate::shared::Data;
 use crate::snapshot::{Dec, Enc};
 use std::collections::BTreeMap;
@@ -25,7 +26,7 @@ pub struct PidNs {
     /// The next number to try.
     pub next: i32,
     /// Each number in use, and the host pid (of the process, or the
-    /// thread's process) it stands for; a thread's has its tid.
+    /// thread's process) it stands for; a thread's has its [`Tid`].
     pub pids: BTreeMap<i32, Entry>,
 }
 
@@ -34,9 +35,9 @@ pub struct PidNs {
 pub struct Entry {
     /// The host process.
     pub host: i32,
-    /// The thread's number when this is a thread of that process (the
-    /// process's own number is its main thread's).
-    pub thread: bool,
+    /// The thread, when this is a number of one of that process's threads
+    /// other than its main one (whose number is the process's).
+    pub thread: Option<Tid>,
 }
 
 impl Data for PidNs {
@@ -54,15 +55,16 @@ impl Data for PidNs {
         for (n, entry) in &self.pids {
             e.i32(*n);
             e.i32(entry.host);
-            e.bool(entry.thread);
+            e.i32(entry.thread.map_or(0, Tid::get));
         }
     }
 
     fn decode(d: &mut Dec) -> Self {
         let parent = if d.bool() { Some((d.bytes(), d.u64())) } else { None };
         let next = d.i32();
-        let n = d.count(9);
-        let pids = (0..n).map(|_| (d.i32(), Entry { host: d.i32(), thread: d.bool() })).collect();
+        let n = d.count(12);
+        let pids =
+            (0..n).map(|_| (d.i32(), Entry { host: d.i32(), thread: Tid::new(d.i32()) })).collect();
         PidNs { parent, next, pids }
     }
 }
@@ -93,7 +95,7 @@ impl PidNs {
 
     /// The number the process with host pid `host` has here.
     pub fn number_of(&self, host: i32) -> Option<i32> {
-        self.pids.iter().find(|(_, e)| e.host == host && !e.thread).map(|(n, _)| *n)
+        self.pids.iter().find(|(_, e)| e.host == host && e.thread.is_none()).map(|(n, _)| *n)
     }
 
     /// The host pid number `n` stands for.
@@ -165,7 +167,7 @@ pub fn chain_from(ns: Option<std::sync::Arc<crate::shared::Record<PidNs>>>) -> C
 /// Number a new process or thread in every namespace of `chain`, for the
 /// host pid `host` (0 until known, see [`set_host`]). Returns the numbers,
 /// the chain's first namespace's first.
-pub fn alloc(chain: &Chain, host: i32, thread: bool) -> Result<Vec<i32>, i32> {
+pub fn alloc(chain: &Chain, host: i32, thread: Option<Tid>) -> Result<Vec<i32>, i32> {
     alloc_chosen(chain, host, thread, &[])
 }
 
@@ -175,7 +177,7 @@ pub fn alloc(chain: &Chain, host: i32, thread: bool) -> Result<Vec<i32>, i32> {
 pub fn alloc_chosen(
     chain: &Chain,
     host: i32,
-    thread: bool,
+    thread: Option<Tid>,
     chosen: &[i32],
 ) -> Result<Vec<i32>, i32> {
     use fwe_abi::errno;
@@ -265,7 +267,7 @@ pub fn released(numbers: &[(Vec<u8>, i32)], host: i32) {
         let Some(&(_, n)) = numbers.iter().find(|(d, _)| d == r.dir()) else { continue };
         remember_released(host, r.dir(), n);
         let _ = r.update(|ns| {
-            if ns.pids.get(&n).is_some_and(|e| e.host == host && !e.thread) {
+            if ns.pids.get(&n).is_some_and(|e| e.host == host && e.thread.is_none()) {
                 ns.pids.remove(&n);
             }
             Ok(())
@@ -281,6 +283,25 @@ pub fn to_host(pid: i32) -> Option<crate::ids::HostPid> {
     }
 }
 
+/// The thread number `n` of the current namespace names (one of a
+/// process's threads other than its main one).
+pub fn thread_of(n: i32) -> Option<Tid> {
+    current().first()?.get().pids.get(&n)?.thread
+}
+
+/// Thread `t`'s number in the current namespace (a main thread's is its
+/// process's), or 0 when it is outside it.
+pub fn thread_number(t: Tid) -> i32 {
+    match current().first() {
+        None => t.get(),
+        Some(r) => {
+            let ns = r.get();
+            let n = ns.pids.iter().find(|(_, e)| e.thread == Some(t)).map(|(n, _)| *n);
+            n.or_else(|| ns.number_of(t.get())).unwrap_or(0)
+        }
+    }
+}
+
 /// Whether the process is in a pid namespace of fwe's.
 pub fn nested() -> bool {
     NESTED.load(std::sync::atomic::Ordering::Acquire)
@@ -290,8 +311,13 @@ pub fn nested() -> bool {
 /// other process in it (those of namespaces inside it too, which are
 /// numbered here), as Linux does.
 pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
-    let hosts: std::collections::BTreeSet<i32> =
-        ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
+    let hosts: std::collections::BTreeSet<i32> = ns
+        .get()
+        .pids
+        .values()
+        .filter(|e| e.thread.is_none() && e.host > 0)
+        .map(|e| e.host)
+        .collect();
     // Only processes that are still members: a number left behind can name
     // a host pid that has since been given to another process.
     let members = hosts.into_iter().filter(|&h| h != init).filter_map(crate::ids::HostPid::new);
@@ -304,8 +330,13 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
 /// Whether a process of the namespace whose record is `ns`, other than
 /// its init `init`, still runs (a zombie has ended).
 pub fn members_alive(ns: &crate::shared::Record<PidNs>, init: i32) -> bool {
-    let hosts: std::collections::BTreeSet<i32> =
-        ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
+    let hosts: std::collections::BTreeSet<i32> = ns
+        .get()
+        .pids
+        .values()
+        .filter(|e| e.thread.is_none() && e.host > 0)
+        .map(|e| e.host)
+        .collect();
     hosts.into_iter().filter(|&h| h != init).filter_map(crate::ids::HostPid::new).any(|h| {
         crate::procreg::host_info(h).is_some_and(|(_, _, zombie)| !zombie) && member(h, ns.dir())
     })
@@ -439,7 +470,7 @@ pub fn release_thread(tid: i32) {
         .unwrap_or_else(|| vec![tid]);
     for (r, n) in current().iter().zip(nums) {
         let _ = r.update(|ns| {
-            if ns.pids.get(&n).is_some_and(|e| e.thread) {
+            if ns.pids.get(&n).is_some_and(|e| e.thread.is_some()) {
                 ns.pids.remove(&n);
             }
             Ok(())
@@ -454,15 +485,15 @@ mod tests {
     #[test]
     fn numbers_from_one_and_maps_both_ways() {
         let mut ns = PidNs::new(None);
-        assert_eq!(ns.alloc(Entry { host: 500, thread: false }), Some(1));
-        assert_eq!(ns.alloc(Entry { host: 500, thread: true }), Some(2));
-        assert_eq!(ns.alloc(Entry { host: 600, thread: false }), Some(3));
+        assert_eq!(ns.alloc(Entry { host: 500, thread: None }), Some(1));
+        assert_eq!(ns.alloc(Entry { host: 500, thread: Tid::new(100_064) }), Some(2));
+        assert_eq!(ns.alloc(Entry { host: 600, thread: None }), Some(3));
         assert_eq!(ns.number_of(600), Some(3));
         assert_eq!(ns.number_of(500), Some(1));
         assert_eq!(ns.host_of(2), Some(500));
         ns.release(500);
         assert_eq!(ns.host_of(1), None);
-        assert_eq!(ns.alloc(Entry { host: 700, thread: false }), Some(4));
+        assert_eq!(ns.alloc(Entry { host: 700, thread: None }), Some(4));
         let mut e = Enc::new();
         ns.encode(&mut e);
         let b = e.into_bytes();

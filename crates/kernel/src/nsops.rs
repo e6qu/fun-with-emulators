@@ -430,7 +430,7 @@ impl<P: Platform> Kernel<P> {
         let nums = if chain.is_empty() {
             Vec::new()
         } else {
-            pidns::alloc_chosen(&chain, 0, false, chosen)?
+            pidns::alloc_chosen(&chain, 0, None, chosen)?
         };
         let saved = if new != 0 || !nums.is_empty() {
             let old = (fs.mount_ns().clone(), std::mem::replace(&mut fs.ns, ns));
