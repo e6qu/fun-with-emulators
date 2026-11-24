@@ -245,7 +245,7 @@ jobs:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
-      - run: brew install xorg-server xdotool unicorn
+      - run: brew install xorg-server xdotool unicorn vulkan-tools
       # The GPU's renderer: this commit's formula (Formula/), built and
       # tested.
       - run: |
@@ -253,6 +253,16 @@ jobs:
           cp Formula/fwe-virglrenderer.rb "$(brew --repository local/fwe)/Formula/"
           brew install --build-from-source local/fwe/fwe-virglrenderer
           brew test local/fwe/fwe-virglrenderer
+      # The Mac's Vulkan drivers the GPU helper's loader finds, each one's
+      # devices, and whether each has what Zink needs (robustness2's
+      # nullDescriptor): a record of the runner, which fails nothing.
+      - name: The runner's Vulkan drivers
+        run: |
+          for icd in "$(brew --prefix)"/etc/vulkan/icd.d/*.json "$(brew --prefix)"/share/vulkan/icd.d/*.json; do
+            echo "== $icd"
+            VK_DRIVER_FILES="$icd" vulkaninfo 2>&1 \
+              | grep -E "deviceName|driverName|apiVersion|nullDescriptor|ERROR|Cannot" | sort -u || true
+          done
       - name: The display tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"

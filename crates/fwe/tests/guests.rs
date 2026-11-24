@@ -10173,10 +10173,11 @@ impl Xvfb {
             }
             assert!(!gui.ended(), "no window {search:?}: {}", gui.report());
             if began.elapsed() >= Duration::from_secs(secs) {
-                // Every window the server has, named or not (`--name ''`
-                // matches all), with its name and size, and what the
-                // search said.
-                let every = self.xdotool(&["search", "--name", ""]);
+                // Every window the server has, named or not (`.*` matches
+                // a window with no name too: xdotool matches it as ""; an
+                // empty pattern macOS's regcomp refuses), with its name
+                // and size, and what the search said.
+                let every = self.xdotool(&["search", "--name", ".*"]);
                 let windows: Vec<String> = stdout(&every)
                     .lines()
                     .map(|id| {
@@ -10186,9 +10187,10 @@ impl Xvfb {
                     .collect();
                 panic!(
                     "no window {search:?} on {} after {secs} s; the search said {:?}; \
-                     its windows: {windows:#?}: {}",
+                     its windows: {windows:#?} ({:?}): {}",
                     self.display(),
                     String::from_utf8_lossy(&found.stderr),
+                    String::from_utf8_lossy(&every.stderr),
                     gui.report()
                 );
             }
@@ -10478,7 +10480,10 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     let mut env = VENUS.to_vec();
     env.push(("VN_DEBUG", "init,wsi,result"));
     let mut gui = Gui::start_traced(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &env, true);
-    let w = x.window(&mut gui, &["--name", "Vkcube X11"], 120);
+    // Its window's name is `_NET_WM_NAME` only, which xdotool does not
+    // read (`WM_NAME`, XGetWMName): it is the one window here with no
+    // name xdotool sees.
+    let w = x.window(&mut gui, &["--name", "^$"], 120);
     std::thread::sleep(Duration::from_secs(2));
     let first = x.shot(&w, "vkcube-first");
     assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
