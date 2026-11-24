@@ -145,6 +145,12 @@ pub fn parent(handle: u64) -> u64 {
     objects().get(&handle).map_or(0, |e| e.parent)
 }
 
+/// The object `handle`'s parent is of: a queue's physical device, a command
+/// buffer's device (0 if none, or unknown).
+pub fn grandparent(handle: u64) -> u64 {
+    objects().get(&handle).map_or(0, |e| e.grandparent)
+}
+
 /// The family of queue `handle` (0 if it is not a queue known).
 pub fn queue_family(handle: u64) -> u32 {
     objects().get(&handle).map_or(0, |e| e.family)
@@ -308,10 +314,12 @@ pub fn create_device(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32> 
     };
     let mut copies = Copies::default();
     let info = copies.structure(w[1], DEVICE_INFO)?;
+    let null_descriptors;
     // SAFETY: `info` is a copy of the guest's `VkDeviceCreateInfo`.
     unsafe {
         let next = *field::<u64>(info, 8);
         *field::<u64>(info, 8) = copies.chain(next, |_| true)?;
+        null_descriptors = super::null::device_wants(driver, w[0], *field::<u64>(info, 8));
         let names = chain::read_names(*field::<u64>(info, 56), *field::<u32>(info, 48))?;
         let names = super::host_names(names);
         let mut extra = Vec::new();
@@ -340,6 +348,17 @@ pub fn create_device(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32> 
     if r as u32 as i32 == result::SUCCESS {
         let table = device_table(driver, instance, device, &of_instance);
         add(device, Arc::new(table), w[0], instance);
+        // Null descriptors the driver lacks: stand-ins of fwe's, or no
+        // device.
+        if null_descriptors && super::null::start(driver, device, w[0]).is_err() {
+            if let Some(f) = function(driver, cmd::vkDestroyDevice, device) {
+                // SAFETY: the driver's vkDestroyDevice for the device just
+                // made, which nothing else has.
+                unsafe { generated::call(cmd::vkDestroyDevice, f, &words(&[device, 0])) };
+            }
+            remove(device);
+            return Ok(result::ERROR_INITIALIZATION_FAILED as u32 as u64);
+        }
         uaccess::write(w[3], device).map_err(|_| errno::EFAULT)?;
     }
     Ok(r)

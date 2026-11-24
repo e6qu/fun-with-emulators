@@ -31,6 +31,8 @@
 //!   (`VK_EXT_headless_surface`), whose frames the library shows in the
 //!   program's X window. fwe answers its queries of an object's parent and
 //!   a queue's family ([`generated::PARENT`], [`generated::QUEUE_FAMILY`]).
+//! - **Null descriptors** where the driver has none are stand-ins of fwe's
+//!   ([`null`]).
 //! - **Waits** with a timeout end at the deadline the stub computed, and
 //!   are made in slices of [`SLICE_NS`]: a signal for the waiting thread
 //!   ends the call with `EINTR`, and the stub makes it again.
@@ -41,6 +43,7 @@ pub mod driver;
 pub mod files;
 #[rustfmt::skip]
 pub mod generated;
+pub mod null;
 pub mod objects;
 
 use fwe_abi::errno;
@@ -217,7 +220,26 @@ fn special(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Resul
         }
         cmd::vkCreateInstance => objects::create_instance(driver, w),
         cmd::vkCreateDevice => objects::create_device(driver, w),
-        cmd::vkDestroyInstance | cmd::vkDestroyDevice => plain(driver, index, w),
+        cmd::vkDestroyInstance => plain(driver, index, w),
+        cmd::vkDestroyDevice => {
+            null::stop(driver, w[0]);
+            plain(driver, index, w)
+        }
+        cmd::vkGetPhysicalDeviceFeatures2 => {
+            let r = plain(driver, index, w)?;
+            null::features(driver, w[0], w[1]);
+            Ok(r)
+        }
+        cmd::vkUpdateDescriptorSets
+        | cmd::vkUpdateDescriptorSetWithTemplate
+        | cmd::vkCmdPushDescriptorSet
+        | cmd::vkCmdPushDescriptorSetWithTemplate
+        | cmd::vkCmdPushDescriptorSet2
+        | cmd::vkCmdPushDescriptorSetWithTemplate2
+        | cmd::vkCmdBindVertexBuffers
+        | cmd::vkCmdBindVertexBuffers2
+        | cmd::vkCreateDescriptorUpdateTemplate
+        | cmd::vkDestroyDescriptorUpdateTemplate => null::call(driver, index, w),
         cmd::vkWaitForFences
         | cmd::vkWaitSemaphores
         | cmd::vkWaitSemaphoresKHR

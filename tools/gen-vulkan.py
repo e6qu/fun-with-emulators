@@ -173,6 +173,17 @@ HOST_SPECIAL = {
     "vkWaitSemaphores",
     "vkWaitSemaphoresKHR",
     "vkAcquireNextImageKHR",
+    # Null descriptors where the driver has none (null.rs).
+    "vkUpdateDescriptorSets",
+    "vkUpdateDescriptorSetWithTemplate",
+    "vkCmdPushDescriptorSet",
+    "vkCmdPushDescriptorSetWithTemplate",
+    "vkCmdPushDescriptorSet2",
+    "vkCmdPushDescriptorSetWithTemplate2",
+    "vkCmdBindVertexBuffers",
+    "vkCmdBindVertexBuffers2",
+    "vkCreateDescriptorUpdateTemplate",
+    "vkDestroyDescriptorUpdateTemplate",
 }
 
 # The device's interface, between the guest library and fwe (both written

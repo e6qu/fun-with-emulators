@@ -297,3 +297,83 @@ fn fake_driver() -> &'static super::driver::Driver {
 }
 
 const _: () = assert!(MOST_ARGS >= 11 && MOST_ARGS <= 16);
+
+#[test]
+fn null_descriptors_structures_are_vulkans() {
+    for (stype, size) in super::null::LAYOUTS {
+        assert_eq!(generated::struct_size(stype), Some(size as u64), "structure type {stype}");
+    }
+}
+
+fn dummies() -> super::null::Dummies {
+    super::null::Dummies {
+        buffer: 0xb0,
+        uniform_texel: 0xc0,
+        storage_texel: 0xc1,
+        view: 0xd0,
+        ..Default::default()
+    }
+}
+
+/// A `VkWriteDescriptorSet` of `n` descriptors of type `kind` with its
+/// elements at `array`.
+fn write(kind: u32, n: u32, array: u64) -> [u8; 64] {
+    let mut w = [0u8; 64];
+    w[32..36].copy_from_slice(&n.to_ne_bytes());
+    w[36..40].copy_from_slice(&kind.to_ne_bytes());
+    let field = match kind {
+        1 | 2 | 3 | 10 => 40,
+        4 | 5 => 56,
+        _ => 48,
+    };
+    w[field..field + 8].copy_from_slice(&array.to_ne_bytes());
+    w
+}
+
+fn word(b: &[u8], at: usize) -> u64 {
+    u64::from_ne_bytes(b[at..at + 8].try_into().unwrap())
+}
+
+#[test]
+fn null_handles_in_descriptor_writes_are_stand_ins() {
+    let d = dummies();
+    // Two sampled images (one null), a null storage texel buffer, a null
+    // uniform buffer, and one with no null handle.
+    let images: [[u64; 3]; 2] = [[0x5a, 0x77, 5], [0x5a, 0, 5]];
+    let texel: [u64; 1] = [0];
+    let buffers: [[u64; 3]; 1] = [[0, 16, 64]];
+    let whole: [[u64; 3]; 1] = [[0x99, 0, 64]];
+    let writes = [
+        write(1, 2, images.as_ptr() as u64),
+        write(5, 1, texel.as_ptr() as u64),
+        write(6, 1, buffers.as_ptr() as u64),
+        write(7, 1, whole.as_ptr() as u64),
+    ];
+    let fixed = super::null::fix_writes_for_test(&d, 4, writes.as_ptr() as u64).unwrap();
+    let images = crate::uaccess::read_bytes(word(&fixed, 40), 48).unwrap();
+    assert_eq!((word(&images, 8), word(&images, 32)), (0x77, 0xd0), "the null view only");
+    assert_eq!(word(&images, 24), 0x5a, "its sampler kept");
+    assert_eq!(crate::uaccess::read::<u64>(word(&fixed, 64 + 56)).unwrap(), 0xc1);
+    let buffer = crate::uaccess::read_bytes(word(&fixed, 128 + 48), 24).unwrap();
+    assert_eq!((word(&buffer, 0), word(&buffer, 8), word(&buffer, 16)), (0xb0, 0, !0));
+    assert_eq!(word(&fixed, 192 + 48), whole.as_ptr() as u64, "no null: the guest's own");
+    // Writes with no null handle pass as they are.
+    let plain = [write(7, 1, whole.as_ptr() as u64)];
+    assert!(super::null::fix_writes_for_test(&d, 1, plain.as_ptr() as u64).is_none());
+}
+
+#[test]
+fn null_handles_in_template_data_are_stand_ins() {
+    let d = dummies();
+    // A uniform texel buffer view at 0, then two image infos at 16 with a
+    // stride of 32.
+    let mut data = [0u64; 12];
+    data[2 + 1] = 0x77;
+    data[2 + 4] = 0x5a;
+    let entries = [(4, 1, 0, 8), (2, 2, 16, 32)];
+    let fixed = super::null::fix_template_for_test(&d, &entries, data.as_ptr() as u64).unwrap();
+    assert_eq!(word(&fixed, 0), 0xc0);
+    assert_eq!(word(&fixed, 16 + 8), 0x77);
+    assert_eq!(word(&fixed, 48 + 8), 0xd0);
+    assert_eq!(word(&fixed, 48), 0x5a);
+}
