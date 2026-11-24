@@ -29,19 +29,66 @@ OUT_C = os.path.join(ROOT, "driver", "vulkan", "generated.c")
 OUT_H = os.path.join(ROOT, "driver", "vulkan", "generated.h")
 OUT_RS = os.path.join(ROOT, "crates", "kernel", "src", "vulkan", "generated.rs")
 
-# Commands the guest library answers itself: finding functions, and the
-# window systems (surfaces are the loader's; swapchains are the library's,
-# made of the Mac driver's images).
+# Commands the guest library answers itself: finding functions. (The
+# window systems' commands are its own too, by name: driver/vulkan/wsi.c.)
 GUEST_SIDE = {
     "vkGetInstanceProcAddr",
     "vkGetDeviceProcAddr",
 }
-GUEST_EXTENSIONS = {
-    "VK_KHR_surface",
-    "VK_KHR_swapchain",
-    "VK_KHR_xcb_surface",
-    "VK_KHR_xlib_surface",
-}
+
+# The window systems' extensions the guest library builds its own on: a
+# swapchain of the driver's, on a surface of no window (headless), whose
+# images the library shows in the X window. Their commands are the host's
+# (the library calls them), but the extensions are offered as the library's
+# (crates/kernel/src/vulkan, GUEST_EXTENSIONS), not as the driver's.
+HOST_WSI = {"VK_KHR_surface", "VK_KHR_swapchain", "VK_EXT_headless_surface"}
+
+# Commands of the window systems the guest library answers itself
+# (driver/vulkan/wsi.c, `fwe_wsi_<name>`): those that take a surface (the
+# loader's, of an X window), directly or in a structure, and present and a
+# swapchain's end. Every other command of a swapchain's the driver answers:
+# a guest's swapchain is the driver's.
+WSI_ALSO = {"vkQueuePresentKHR", "vkDestroySwapchainKHR"}
+# Extensions whose commands only the library calls: a surface of no window.
+INTERNAL = {"VK_EXT_headless_surface"}
+
+
+def holds_surface(reg, t, seen=()):
+    """Whether type `t` is a surface or a structure that holds one."""
+    t = reg.resolve(t)
+    if t == "VkSurfaceKHR":
+        return True
+    ty = reg.types.get(t)
+    if ty is None or ty.get("category") not in ("struct", "union") or t in seen:
+        return False
+    for m in ty.findall("member"):
+        mt = m.find("type")
+        if mt is not None and holds_surface(reg, mt.text, seen + (t,)):
+            return True
+    return False
+
+
+def use_of(reg, name, exts):
+    """Who answers command `name` for a program: the driver (its stub), the
+    window systems of the library, or no one (the library's own)."""
+    if any(name in exts[e]["commands"] for e in INTERNAL if e in exts):
+        return "INTERNAL"
+    if name in WSI_ALSO or any(holds_surface(reg, p["type"]) for p in reg.command(name)["params"]):
+        return "WSI"
+    return "STUB"
+
+
+# Window systems' extensions: a block of another extension's that needs one
+# brings commands and structures of window systems the library does not
+# have (a device group's present modes, say): left out.
+WSI_DEPENDS = ("VK_KHR_surface", "VK_KHR_swapchain", "VK_KHR_display")
+
+
+def wsi_block(ext, req):
+    """Whether block `req` of extension `ext` needs a window system's
+    extension other than `ext`'s own kind."""
+    return ext not in HOST_WSI and any(w in (req.get("depends") or "") for w in WSI_DEPENDS)
+
 
 # Extensions never offered: their commands or structures hand the driver a
 # function of the guest's to call (host code never calls guest code), or
@@ -61,7 +108,6 @@ EXCLUDED_EXTENSIONS = {
     "VK_EXT_display_surface_counter",
     "VK_EXT_display_control",
     "VK_EXT_acquire_drm_display",
-    "VK_EXT_headless_surface",
     "VK_KHR_surface_protected_capabilities",
     "VK_EXT_surface_maintenance1",
     "VK_KHR_surface_maintenance1",
@@ -126,20 +172,25 @@ HOST_SPECIAL = {
     "vkWaitForFences",
     "vkWaitSemaphores",
     "vkWaitSemaphoresKHR",
+    "vkAcquireNextImageKHR",
 }
 
 # The device's interface, between the guest library and fwe (both written
 # from here): one ioctl, `_IOWR('F', 1, struct fwe_vk_call)`, whose record
 # is the command's index, its word count, the address of its words and the
-# result fwe writes back. Index `COMMANDS` asks whether the object in word
-# 0 has command word 1 (for `vkGet*ProcAddr`).
+# result fwe writes back. Past the commands, fwe's own queries: whether the
+# object in word 0 has command word 1 (for `vkGet*ProcAddr`); the object an
+# object is of (a physical device's instance, a device's physical device,
+# a queue's device); and the family of a queue.
+QUERIES = ["HAS", "PARENT", "QUEUE_FAMILY"]
 CALL_RECORD = 24
 IOCTL_CALL = (3 << 30) | (CALL_RECORD << 16) | (ord("F") << 8) | 1
 
 # Commands that wait with a timeout, and which argument it is: the stub
 # turns it into an absolute CLOCK_MONOTONIC deadline (UINT64_MAX stays
 # forever), so a wait restarted after a signal ends when it would have.
-DEADLINES = {"vkWaitForFences": 4, "vkWaitSemaphores": 2, "vkWaitSemaphoresKHR": 2}
+DEADLINES = {"vkWaitForFences": 4, "vkWaitSemaphores": 2, "vkWaitSemaphoresKHR": 2,
+             "vkAcquireNextImageKHR": 2}
 
 C_SCALARS = {
     "void": "void",
@@ -314,6 +365,8 @@ class Registry:
                 api = req.get("api")
                 if api and "vulkan" not in api.split(","):
                     continue
+                if wsi_block(e.get("name"), req):
+                    continue
                 for c in req.findall("command"):
                     cmds.append(c.get("name"))
             exts[e.get("name")] = {
@@ -431,7 +484,7 @@ def covered(reg):
     offered, and why any command was left out."""
     exts = {}
     for name, e in reg.extensions.items():
-        if name in EXCLUDED_EXTENSIONS or name in GUEST_EXTENSIONS:
+        if name in EXCLUDED_EXTENSIONS:
             continue
         if name in PROVISIONAL:
             pass
@@ -621,6 +674,8 @@ def required_types(reg, exts, features=True):
             api = req.get("api")
             if api and "vulkan" not in api.split(","):
                 continue
+            if b.tag == "extension" and wsi_block(b.get("name"), req):
+                continue
             for t in req.findall("type"):
                 names.add(reg.resolve(t.get("name")))
     return names
@@ -657,20 +712,33 @@ def emit(reg, commands, exts, refused):
         "/* The one ioctl: _IOWR('F', 1, struct fwe_vk_call). */",
         f"#define FWE_VK_IOCTL_CALL 0x{IOCTL_CALL:x}u",
         f"#define FWE_VK_CALL_RECORD {CALL_RECORD}",
-        "/* The index asking whether an object has a command. */",
-        f"#define FWE_VK_HAS {len(commands)}u",
+        "/* fwe's queries, past the commands: whether an object has a command,",
+        " * the object it is of, a queue's family. */",
+    ] + [f"#define FWE_VK_{q} {len(commands) + i}u" for i, q in enumerate(QUERIES)] + [
         f"#define FWE_VK_COMMANDS {len(commands)}u",
         f'#define FWE_VK_REGISTRY "{reg.version}"',
         "",
         "/* Each command's index. */",
     ] + [f"#define FWE_VK_CMD_{n} {i}u" for i, n in enumerate(commands)]
+    h.append("")
+    h.append("/* Each command as the driver has it (its stub), and the window systems'")
+    h.append(" * commands the library answers itself (wsi.c): the library's. */")
+    h.append("#ifdef FWE_VK_LIBRARY")
+    for n in commands:
+        cmd = reg.command(n)
+        rk = "void" if cmd["ret"] == "void" else reg.kind(cmd["ret"])
+        params = ", ".join(C_TYPES[abi(reg, p)] for p in cmd["params"]) or "void"
+        h.append(f"{C_TYPES[rk]} fwe_host_{n}({params});")
+        if use_of(reg, n, exts) == "WSI":
+            h.append(f"{C_TYPES[rk]} fwe_wsi_{n}({params});")
+    h.append("#endif")
     c.append("")
     for i, n in enumerate(commands):
         cmd = reg.command(n)
         rk = "void" if cmd["ret"] == "void" else reg.kind(cmd["ret"])
         ks = [abi(reg, p) for p in cmd["params"]]
         params = ", ".join(f"{C_TYPES[k]} a{j}" for j, k in enumerate(ks)) or "void"
-        c.append(f"static {C_TYPES[rk]} {n}_(%s) {{" % params)
+        c.append(f"{C_TYPES[rk]} fwe_host_{n}(%s) {{" % params)
         words = ", ".join(c_word(k, f"a{j}") for j, k in enumerate(ks))
         c.append(f"    uint64_t w[{max(len(ks), 1)}] = {{{words or '0'}}};")
         if n in DEADLINES:
@@ -694,7 +762,9 @@ def emit(reg, commands, exts, refused):
         if "alias" in target and target["alias"] in index_of and alias not in index_of:
             names.append((alias, target["alias"]))
     for name, target in sorted(names):
-        c.append(f'    {{"{name}", (fwe_vk_fn){target}_, FWE_VK_{level(reg, target).upper()}, {index_of[target]}}},')
+        use = use_of(reg, target, exts)
+        fn = f"fwe_wsi_{target}" if use == "WSI" else f"fwe_host_{target}"
+        c.append(f'    {{"{name}", (fwe_vk_fn){fn}, FWE_VK_{level(reg, target).upper()}, FWE_VK_USE_{use}, {index_of[target]}}},')
     c.append("};")
     c.append(f"const unsigned fwe_vk_entry_count = {len(names)};")
     c.append("")
@@ -711,7 +781,10 @@ def emit(reg, commands, exts, refused):
     rs.append(f"/// How many commands there are.\npub const COMMANDS: usize = {len(commands)};")
     rs.append(f"/// The device's one ioctl: `_IOWR('F', 1, struct fwe_vk_call)`.\npub const IOCTL_CALL: u64 = {IOCTL_CALL:#x};")
     rs.append(f"/// The size of its record: command, word count, words' address, result.\npub const CALL_RECORD: usize = {CALL_RECORD};")
-    rs.append("/// The index that asks whether an object has a command.\npub const HAS: u32 = COMMANDS as u32;")
+    rs.append("/// fwe's queries, past the commands: whether an object has a command,")
+    rs.append("/// the object it is of, a queue's family.")
+    for i, q in enumerate(QUERIES):
+        rs.append(f"pub const {q}: u32 = COMMANDS as u32 + {i};")
     rs.append("")
     rs.append("/// The argument of command `index` that its stub made an absolute")
     rs.append("/// `CLOCK_MONOTONIC` deadline, if it waits with a timeout.")
@@ -830,9 +903,10 @@ def emit(reg, commands, exts, refused):
     rs.append("    })")
     rs.append("}")
     rs.append("")
-    rs.append("/// The extensions whose commands are all covered, and their kind.")
+    rs.append("/// The driver's extensions whose commands are all covered, and their")
+    rs.append("/// kind (the window systems' are the guest library's).")
     rs.append("pub static EXTENSIONS: &[(&str, Level)] = &[")
-    for n in sorted(exts):
+    for n in sorted(set(exts) - HOST_WSI):
         lv = "Instance" if exts[n]["type"] == "instance" else "Device"
         rs.append(f'    ("{n}", Level::{lv}),')
     rs.append("];")

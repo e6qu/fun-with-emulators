@@ -9,6 +9,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define FWE_VK_LIBRARY
 #include "generated.h"
 
 #define FWE_EXPORT __attribute__((visibility("default")))
@@ -21,6 +22,11 @@
 
 /* What a command's first argument is (crates/kernel/src/vulkan, Level). */
 enum fwe_vk_level { FWE_VK_GLOBAL, FWE_VK_INSTANCE, FWE_VK_DEVICE };
+
+/* Who answers a command for a program: the driver, through its stub; the
+ * library's window systems (wsi.c); or no one (the library alone calls it,
+ * through its stub). */
+enum fwe_vk_use { FWE_VK_USE_STUB, FWE_VK_USE_WSI, FWE_VK_USE_INTERNAL };
 
 /* The device's ioctl's record. */
 struct fwe_vk_call {
@@ -38,6 +44,7 @@ struct fwe_vk_entry {
     const char *name;
     fwe_vk_fn stub;
     enum fwe_vk_level level;
+    enum fwe_vk_use use;
     uint32_t index; /* fwe's number for it */
 };
 extern const struct fwe_vk_entry fwe_vk_entries[];
@@ -49,6 +56,24 @@ uint64_t fwe_vk_call(uint32_t command, const uint64_t *w, uint32_t count, uint64
 
 /* Whether object `handle` (NULL for none) has command `command`. */
 int fwe_vk_has(const void *handle, uint32_t command);
+
+/* The object `handle` is of (a physical device's instance, a device's
+ * physical device), or NULL. */
+void *fwe_vk_parent(const void *handle);
+
+/* The family of queue `queue`. */
+uint32_t fwe_vk_queue_family(const void *queue);
+
+/* The window systems' functions the library answers by a name of no
+ * command of the driver's (wsi.c). */
+fwe_vk_fn fwe_wsi_proc(const char *name);
+
+/* The library's own memory: `size` bytes, zeroed, or NULL. */
+void *fwe_alloc(size_t size);
+void fwe_free(void *p, size_t size);
+
+void *memcpy(void *dst, const void *src, size_t n);
+void *memset(void *dst, int c, size_t n);
 
 /* A timeout in nanoseconds from now as an absolute CLOCK_MONOTONIC deadline
  * (UINT64_MAX stays forever). */

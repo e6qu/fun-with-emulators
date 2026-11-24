@@ -2,7 +2,7 @@
  * stubs' calls.
  *
  * A Linux Vulkan loader loads this library from fwe's manifest in
- * /usr/share/vulkan/icd.d and finds its functions through
+ * /etc/vulkan/icd.d and finds its functions through
  * vk_icdGetInstanceProcAddr. Each Vulkan command is a stub (generated.c)
  * that hands its arguments to fwe with one ioctl on fwe's GPU device,
  * /dev/fwe-gpu; fwe calls the Mac's Vulkan driver with them. */
@@ -93,6 +93,32 @@ int fwe_vk_has(const void *handle, uint32_t command) {
     return fwe_vk_call(FWE_VK_HAS, w, 2, 0) != 0;
 }
 
+void *fwe_vk_parent(const void *handle) {
+    uint64_t w[1] = {(uint64_t)(uintptr_t)handle};
+    return (void *)(uintptr_t)fwe_vk_call(FWE_VK_PARENT, w, 1, 0);
+}
+
+uint32_t fwe_vk_queue_family(const void *queue) {
+    uint64_t w[1] = {(uint64_t)(uintptr_t)queue};
+    return (uint32_t)fwe_vk_call(FWE_VK_QUEUE_FAMILY, w, 1, 0);
+}
+
+#define SYS_munmap 215
+#define SYS_mmap 222
+#define PROT_READ 1
+#define PROT_WRITE 2
+#define MAP_PRIVATE 2
+#define MAP_ANONYMOUS 0x20
+
+void *fwe_alloc(size_t size) {
+    long p = fwe_syscall(SYS_mmap, 0, (long)size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    return p < 0 && p > -4096 ? 0 : (void *)p;
+}
+
+void fwe_free(void *p, size_t size) {
+    if (p) fwe_syscall(SYS_munmap, (long)p, (long)size, 0, 0, 0, 0);
+}
+
 uint64_t fwe_vk_deadline(uint64_t timeout) {
     if (timeout == UINT64_MAX) return timeout;
     struct {
@@ -123,9 +149,6 @@ static const struct fwe_vk_entry *find(const char *name) {
     return 0;
 }
 
-/* The window systems' functions, the library's own (wsi.c). */
-fwe_vk_fn fwe_wsi_proc(const char *name, enum fwe_vk_level level);
-
 FWE_EXPORT fwe_vk_fn vk_icdGetInstanceProcAddr(void *instance, const char *name);
 FWE_EXPORT fwe_vk_fn vkGetDeviceProcAddr(void *device, const char *name);
 
@@ -138,10 +161,19 @@ FWE_EXPORT int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
     return FWE_VK_SUCCESS;
 }
 
+/* Command `e`'s function for object `handle`, if a program may have it:
+ * the driver's command (its stub) or the library's window systems' (wsi.c),
+ * where the driver has the command for the object. */
+static fwe_vk_fn given(const struct fwe_vk_entry *e, const void *handle) {
+    if (e->use == FWE_VK_USE_INTERNAL) return 0;
+    if (handle && !fwe_vk_has(handle, e->index)) return 0;
+    return e->stub;
+}
+
 FWE_EXPORT fwe_vk_fn vk_icdGetPhysicalDeviceProcAddr(void *instance, const char *name) {
     const struct fwe_vk_entry *e = find(name);
-    if (!e || e->level != FWE_VK_INSTANCE) return fwe_wsi_proc(name, FWE_VK_INSTANCE);
-    return fwe_vk_has(instance, e->index) ? e->stub : 0;
+    if (!e) return fwe_wsi_proc(name);
+    return e->level == FWE_VK_INSTANCE ? given(e, instance) : 0;
 }
 
 FWE_EXPORT fwe_vk_fn vk_icdGetInstanceProcAddr(void *instance, const char *name) {
@@ -152,20 +184,15 @@ FWE_EXPORT fwe_vk_fn vk_icdGetInstanceProcAddr(void *instance, const char *name)
     if (!compare(name, "vk_icdGetPhysicalDeviceProcAddr"))
         return (fwe_vk_fn)vk_icdGetPhysicalDeviceProcAddr;
     if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)vkGetDeviceProcAddr;
-    fwe_vk_fn wsi = fwe_wsi_proc(name, instance ? FWE_VK_DEVICE : FWE_VK_GLOBAL);
-    if (wsi) return wsi;
     const struct fwe_vk_entry *e = find(name);
-    if (!e) return 0;
-    if (!instance) return e->level == FWE_VK_GLOBAL ? e->stub : 0;
-    if (e->level == FWE_VK_GLOBAL) return e->stub;
-    return fwe_vk_has(instance, e->index) ? e->stub : 0;
+    if (!e) return instance ? fwe_wsi_proc(name) : 0;
+    if (!instance || e->level == FWE_VK_GLOBAL) return e->level == FWE_VK_GLOBAL ? given(e, 0) : 0;
+    return given(e, instance);
 }
 
 FWE_EXPORT fwe_vk_fn vkGetDeviceProcAddr(void *device, const char *name) {
     if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)vkGetDeviceProcAddr;
-    fwe_vk_fn wsi = fwe_wsi_proc(name, FWE_VK_DEVICE);
-    if (wsi) return wsi;
     const struct fwe_vk_entry *e = find(name);
     if (!e || e->level != FWE_VK_DEVICE) return 0;
-    return fwe_vk_has(device, e->index) ? e->stub : 0;
+    return given(e, device);
 }

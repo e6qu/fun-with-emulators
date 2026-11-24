@@ -2,7 +2,7 @@
 //! each command's type.
 
 use super::generated::{self, MOST_ARGS, cmd};
-use super::{Function, Level, offered, words};
+use super::{Function, Level, host_names, offered, words};
 use std::ffi::c_void;
 use std::sync::Mutex;
 
@@ -198,6 +198,7 @@ fn the_guest_is_offered_what_fwe_covers_and_the_window_systems() {
         ("VK_EXT_debug_utils", 2),             // calls back: not offered
         ("VK_KHR_portability_enumeration", 1), // fwe's to use
         ("VK_KHR_surface", 25),                // the guest library's
+        ("VK_EXT_headless_surface", 1),        // what it is built on
         ("VK_EXT_metal_surface", 1),           // the Mac's window system
     ]
     .iter()
@@ -216,14 +217,55 @@ fn the_guest_is_offered_what_fwe_covers_and_the_window_systems() {
             "VK_KHR_xlib_surface"
         ]
     );
+    // Without a surface of no window, no window systems.
+    let bare = &host[..4];
+    let names: Vec<Vec<u8>> = offered(bare, Level::Instance).into_iter().map(|(n, _)| n).collect();
+    assert_eq!(names, [b"VK_KHR_get_physical_device_properties2".to_vec()]);
     let device: Vec<String> = offered(
-        &[(b"VK_KHR_portability_subset".to_vec(), 1), (b"VK_KHR_external_memory_fd".to_vec(), 1)],
+        &[
+            (b"VK_KHR_portability_subset".to_vec(), 1),
+            (b"VK_KHR_external_memory_fd".to_vec(), 1),
+            (b"VK_KHR_swapchain".to_vec(), 70),
+        ],
         Level::Device,
     )
     .into_iter()
     .map(|(n, _)| String::from_utf8(n).unwrap())
     .collect();
     assert_eq!(device, ["VK_KHR_portability_subset", "VK_KHR_swapchain"]);
+    let none = offered(&[(b"VK_KHR_portability_subset".to_vec(), 1)], Level::Device);
+    assert_eq!(none.len(), 1, "no swapchains where the driver has none");
+}
+
+#[test]
+fn the_window_systems_extensions_are_the_drivers_its_built_on() {
+    let names = |l: &[&str]| l.iter().map(|n| n.as_bytes().to_vec()).collect::<Vec<_>>();
+    assert_eq!(
+        host_names(names(&[
+            "VK_KHR_surface",
+            "VK_KHR_xcb_surface",
+            "VK_KHR_get_physical_device_properties2",
+            "VK_KHR_xlib_surface"
+        ])),
+        names(&[
+            "VK_KHR_surface",
+            "VK_EXT_headless_surface",
+            "VK_KHR_get_physical_device_properties2"
+        ])
+    );
+    assert_eq!(host_names(names(&["VK_KHR_swapchain"])), names(&["VK_KHR_swapchain"]));
+}
+
+#[test]
+fn a_queue_knows_its_family_and_an_object_its_parent() {
+    let (device, queue) = (0x7000_0000_5000u64, 0x7000_0000_6000u64);
+    super::objects::add_for_test(device, &[]);
+    let mut out = queue;
+    let w = words(&[device, 3, 0, &mut out as *mut u64 as u64]);
+    super::objects::after(fake_driver(), cmd::vkGetDeviceQueue, &w, 0);
+    assert_eq!(super::objects::queue_family(queue), 3);
+    assert_eq!(super::objects::parent(queue), device);
+    assert_eq!(super::objects::parent(0x7000_0000_7000), 0);
 }
 
 #[test]

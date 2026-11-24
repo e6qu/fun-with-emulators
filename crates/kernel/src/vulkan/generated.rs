@@ -9,18 +9,22 @@ pub const REGISTRY: &str = "1.4.363";
 /// The most arguments a command has.
 pub const MOST_ARGS: usize = 15;
 /// How many commands there are.
-pub const COMMANDS: usize = 691;
+pub const COMMANDS: usize = 702;
 /// The device's one ioctl: `_IOWR('F', 1, struct fwe_vk_call)`.
 pub const IOCTL_CALL: u64 = 0xc0184601;
 /// The size of its record: command, word count, words' address, result.
 pub const CALL_RECORD: usize = 24;
-/// The index that asks whether an object has a command.
-pub const HAS: u32 = COMMANDS as u32;
+/// fwe's queries, past the commands: whether an object has a command,
+/// the object it is of, a queue's family.
+pub const HAS: u32 = COMMANDS as u32 + 0;
+pub const PARENT: u32 = COMMANDS as u32 + 1;
+pub const QUEUE_FAMILY: u32 = COMMANDS as u32 + 2;
 
 /// The argument of command `index` that its stub made an absolute
 /// `CLOCK_MONOTONIC` deadline, if it waits with a timeout.
 pub fn deadline_arg(index: usize) -> Option<usize> {
     match NAMES[index] {
+        "vkAcquireNextImageKHR" => Some(2),
         "vkWaitForFences" => Some(4),
         "vkWaitSemaphores" => Some(2),
         "vkWaitSemaphoresKHR" => Some(2),
@@ -262,6 +266,20 @@ pub static NAMES: [&str; COMMANDS] = [
     "vkGetRenderingAreaGranularity",
     "vkCmdSetRenderingAttachmentLocations",
     "vkCmdSetRenderingInputAttachmentIndices",
+    "vkDestroySurfaceKHR",
+    "vkGetPhysicalDeviceSurfaceSupportKHR",
+    "vkGetPhysicalDeviceSurfaceCapabilitiesKHR",
+    "vkGetPhysicalDeviceSurfaceFormatsKHR",
+    "vkGetPhysicalDeviceSurfacePresentModesKHR",
+    "vkCreateSwapchainKHR",
+    "vkDestroySwapchainKHR",
+    "vkGetSwapchainImagesKHR",
+    "vkAcquireNextImageKHR",
+    "vkQueuePresentKHR",
+    "vkGetDeviceGroupPresentCapabilitiesKHR",
+    "vkGetDeviceGroupSurfacePresentModesKHR",
+    "vkGetPhysicalDevicePresentRectanglesKHR",
+    "vkAcquireNextImage2KHR",
     "vkGetPhysicalDeviceVideoCapabilitiesKHR",
     "vkGetPhysicalDeviceVideoFormatPropertiesKHR",
     "vkCreateVideoSessionKHR",
@@ -306,10 +324,6 @@ pub static NAMES: [&str; COMMANDS] = [
     "vkGetDeviceGroupPeerMemoryFeaturesKHR",
     "vkCmdSetDeviceMaskKHR",
     "vkCmdDispatchBaseKHR",
-    "vkGetDeviceGroupPresentCapabilitiesKHR",
-    "vkGetDeviceGroupSurfacePresentModesKHR",
-    "vkGetPhysicalDevicePresentRectanglesKHR",
-    "vkAcquireNextImage2KHR",
     "vkTrimCommandPoolKHR",
     "vkEnumeratePhysicalDeviceGroupsKHR",
     "vkGetPhysicalDeviceExternalBufferPropertiesKHR",
@@ -443,6 +457,7 @@ pub static NAMES: [&str; COMMANDS] = [
     "vkGetBufferDeviceAddressEXT",
     "vkGetPhysicalDeviceCooperativeMatrixPropertiesNV",
     "vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV",
+    "vkCreateHeadlessSurfaceEXT",
     "vkGetBufferDeviceAddressKHR",
     "vkGetBufferOpaqueCaptureAddressKHR",
     "vkGetDeviceMemoryOpaqueCaptureAddressKHR",
@@ -959,6 +974,20 @@ pub static LEVELS: [Level; COMMANDS] = [
     Level::Device,
     Level::Instance,
     Level::Instance,
+    Level::Instance,
+    Level::Instance,
+    Level::Instance,
+    Level::Device,
+    Level::Device,
+    Level::Device,
+    Level::Device,
+    Level::Device,
+    Level::Device,
+    Level::Device,
+    Level::Instance,
+    Level::Device,
+    Level::Instance,
+    Level::Instance,
     Level::Device,
     Level::Device,
     Level::Device,
@@ -1002,10 +1031,6 @@ pub static LEVELS: [Level; COMMANDS] = [
     Level::Device,
     Level::Device,
     Level::Device,
-    Level::Device,
-    Level::Instance,
-    Level::Device,
-    Level::Device,
     Level::Instance,
     Level::Instance,
     Level::Instance,
@@ -1136,6 +1161,7 @@ pub static LEVELS: [Level; COMMANDS] = [
     Level::Device,
     Level::Device,
     Level::Device,
+    Level::Instance,
     Level::Instance,
     Level::Instance,
     Level::Device,
@@ -1660,6 +1686,20 @@ pub static SPECIAL: [bool; COMMANDS] = [
     false,
     false,
     false,
+    true,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
+    false,
     false,
     false,
     false,
@@ -1811,11 +1851,8 @@ pub static SPECIAL: [bool; COMMANDS] = [
     false,
     false,
     false,
-    false,
-    false,
-    false,
-    false,
     true,
+    false,
     false,
     false,
     false,
@@ -2348,465 +2385,476 @@ pub mod cmd {
     pub const vkGetRenderingAreaGranularity: usize = 229;
     pub const vkCmdSetRenderingAttachmentLocations: usize = 230;
     pub const vkCmdSetRenderingInputAttachmentIndices: usize = 231;
-    pub const vkGetPhysicalDeviceVideoCapabilitiesKHR: usize = 232;
-    pub const vkGetPhysicalDeviceVideoFormatPropertiesKHR: usize = 233;
-    pub const vkCreateVideoSessionKHR: usize = 234;
-    pub const vkDestroyVideoSessionKHR: usize = 235;
-    pub const vkGetVideoSessionMemoryRequirementsKHR: usize = 236;
-    pub const vkBindVideoSessionMemoryKHR: usize = 237;
-    pub const vkCreateVideoSessionParametersKHR: usize = 238;
-    pub const vkUpdateVideoSessionParametersKHR: usize = 239;
-    pub const vkDestroyVideoSessionParametersKHR: usize = 240;
-    pub const vkCmdBeginVideoCodingKHR: usize = 241;
-    pub const vkCmdEndVideoCodingKHR: usize = 242;
-    pub const vkCmdControlVideoCodingKHR: usize = 243;
-    pub const vkCmdDecodeVideoKHR: usize = 244;
-    pub const vkCmdBindTransformFeedbackBuffersEXT: usize = 245;
-    pub const vkCmdBeginTransformFeedbackEXT: usize = 246;
-    pub const vkCmdEndTransformFeedbackEXT: usize = 247;
-    pub const vkCmdBeginQueryIndexedEXT: usize = 248;
-    pub const vkCmdEndQueryIndexedEXT: usize = 249;
-    pub const vkCmdDrawIndirectByteCountEXT: usize = 250;
-    pub const vkCreateCuModuleNVX: usize = 251;
-    pub const vkCreateCuFunctionNVX: usize = 252;
-    pub const vkDestroyCuModuleNVX: usize = 253;
-    pub const vkDestroyCuFunctionNVX: usize = 254;
-    pub const vkCmdCuLaunchKernelNVX: usize = 255;
-    pub const vkGetImageViewHandleNVX: usize = 256;
-    pub const vkGetImageViewHandle64NVX: usize = 257;
-    pub const vkGetImageViewAddressNVX: usize = 258;
-    pub const vkGetDeviceCombinedImageSamplerIndexNVX: usize = 259;
-    pub const vkCmdDrawIndirectCountAMD: usize = 260;
-    pub const vkCmdDrawIndexedIndirectCountAMD: usize = 261;
-    pub const vkGetShaderInfoAMD: usize = 262;
-    pub const vkCmdBeginRenderingKHR: usize = 263;
-    pub const vkCmdEndRenderingKHR: usize = 264;
-    pub const vkGetPhysicalDeviceExternalImageFormatPropertiesNV: usize = 265;
-    pub const vkGetPhysicalDeviceFeatures2KHR: usize = 266;
-    pub const vkGetPhysicalDeviceProperties2KHR: usize = 267;
-    pub const vkGetPhysicalDeviceFormatProperties2KHR: usize = 268;
-    pub const vkGetPhysicalDeviceImageFormatProperties2KHR: usize = 269;
-    pub const vkGetPhysicalDeviceQueueFamilyProperties2KHR: usize = 270;
-    pub const vkGetPhysicalDeviceMemoryProperties2KHR: usize = 271;
-    pub const vkGetPhysicalDeviceSparseImageFormatProperties2KHR: usize = 272;
-    pub const vkGetDeviceGroupPeerMemoryFeaturesKHR: usize = 273;
-    pub const vkCmdSetDeviceMaskKHR: usize = 274;
-    pub const vkCmdDispatchBaseKHR: usize = 275;
-    pub const vkGetDeviceGroupPresentCapabilitiesKHR: usize = 276;
-    pub const vkGetDeviceGroupSurfacePresentModesKHR: usize = 277;
-    pub const vkGetPhysicalDevicePresentRectanglesKHR: usize = 278;
-    pub const vkAcquireNextImage2KHR: usize = 279;
-    pub const vkTrimCommandPoolKHR: usize = 280;
-    pub const vkEnumeratePhysicalDeviceGroupsKHR: usize = 281;
-    pub const vkGetPhysicalDeviceExternalBufferPropertiesKHR: usize = 282;
-    pub const vkGetPhysicalDeviceExternalSemaphorePropertiesKHR: usize = 283;
-    pub const vkCmdPushDescriptorSetKHR: usize = 284;
-    pub const vkCmdPushDescriptorSetWithTemplateKHR: usize = 285;
-    pub const vkCmdBeginConditionalRenderingEXT: usize = 286;
-    pub const vkCmdEndConditionalRenderingEXT: usize = 287;
-    pub const vkCreateDescriptorUpdateTemplateKHR: usize = 288;
-    pub const vkDestroyDescriptorUpdateTemplateKHR: usize = 289;
-    pub const vkUpdateDescriptorSetWithTemplateKHR: usize = 290;
-    pub const vkCmdSetViewportWScalingNV: usize = 291;
-    pub const vkCmdSetDiscardRectangleEXT: usize = 292;
-    pub const vkCmdSetDiscardRectangleEnableEXT: usize = 293;
-    pub const vkCmdSetDiscardRectangleModeEXT: usize = 294;
-    pub const vkCreateRenderPass2KHR: usize = 295;
-    pub const vkCmdBeginRenderPass2KHR: usize = 296;
-    pub const vkCmdNextSubpass2KHR: usize = 297;
-    pub const vkCmdEndRenderPass2KHR: usize = 298;
-    pub const vkGetPhysicalDeviceExternalFencePropertiesKHR: usize = 299;
-    pub const vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR: usize = 300;
-    pub const vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR: usize = 301;
-    pub const vkAcquireProfilingLockKHR: usize = 302;
-    pub const vkReleaseProfilingLockKHR: usize = 303;
-    pub const vkGetPhysicalDeviceSurfaceCapabilities2KHR: usize = 304;
-    pub const vkGetPhysicalDeviceSurfaceFormats2KHR: usize = 305;
-    pub const vkCreateGpaSessionAMD: usize = 306;
-    pub const vkDestroyGpaSessionAMD: usize = 307;
-    pub const vkSetGpaDeviceClockModeAMD: usize = 308;
-    pub const vkGetGpaDeviceClockInfoAMD: usize = 309;
-    pub const vkCmdBeginGpaSessionAMD: usize = 310;
-    pub const vkCmdEndGpaSessionAMD: usize = 311;
-    pub const vkCmdBeginGpaSampleAMD: usize = 312;
-    pub const vkCmdEndGpaSampleAMD: usize = 313;
-    pub const vkGetGpaSessionStatusAMD: usize = 314;
-    pub const vkGetGpaSessionResultsAMD: usize = 315;
-    pub const vkResetGpaSessionAMD: usize = 316;
-    pub const vkCmdCopyGpaSessionResultsAMD: usize = 317;
-    pub const vkWriteSamplerDescriptorsEXT: usize = 318;
-    pub const vkWriteResourceDescriptorsEXT: usize = 319;
-    pub const vkCmdBindSamplerHeapEXT: usize = 320;
-    pub const vkCmdBindResourceHeapEXT: usize = 321;
-    pub const vkCmdPushDataEXT: usize = 322;
-    pub const vkGetImageOpaqueCaptureDataEXT: usize = 323;
-    pub const vkGetPhysicalDeviceDescriptorSizeEXT: usize = 324;
-    pub const vkRegisterCustomBorderColorEXT: usize = 325;
-    pub const vkUnregisterCustomBorderColorEXT: usize = 326;
-    pub const vkGetTensorOpaqueCaptureDataARM: usize = 327;
-    pub const vkCmdSetSampleLocationsEXT: usize = 328;
-    pub const vkGetPhysicalDeviceMultisamplePropertiesEXT: usize = 329;
-    pub const vkGetImageMemoryRequirements2KHR: usize = 330;
-    pub const vkGetBufferMemoryRequirements2KHR: usize = 331;
-    pub const vkGetImageSparseMemoryRequirements2KHR: usize = 332;
-    pub const vkCreateAccelerationStructureKHR: usize = 333;
-    pub const vkDestroyAccelerationStructureKHR: usize = 334;
-    pub const vkCmdBuildAccelerationStructuresKHR: usize = 335;
-    pub const vkCmdBuildAccelerationStructuresIndirectKHR: usize = 336;
-    pub const vkBuildAccelerationStructuresKHR: usize = 337;
-    pub const vkCopyAccelerationStructureKHR: usize = 338;
-    pub const vkCopyAccelerationStructureToMemoryKHR: usize = 339;
-    pub const vkCopyMemoryToAccelerationStructureKHR: usize = 340;
-    pub const vkWriteAccelerationStructuresPropertiesKHR: usize = 341;
-    pub const vkCmdCopyAccelerationStructureKHR: usize = 342;
-    pub const vkCmdCopyAccelerationStructureToMemoryKHR: usize = 343;
-    pub const vkCmdCopyMemoryToAccelerationStructureKHR: usize = 344;
-    pub const vkGetAccelerationStructureDeviceAddressKHR: usize = 345;
-    pub const vkCmdWriteAccelerationStructuresPropertiesKHR: usize = 346;
-    pub const vkGetDeviceAccelerationStructureCompatibilityKHR: usize = 347;
-    pub const vkGetAccelerationStructureBuildSizesKHR: usize = 348;
-    pub const vkCmdTraceRaysKHR: usize = 349;
-    pub const vkCreateRayTracingPipelinesKHR: usize = 350;
-    pub const vkGetRayTracingShaderGroupHandlesKHR: usize = 351;
-    pub const vkGetRayTracingCaptureReplayShaderGroupHandlesKHR: usize = 352;
-    pub const vkCmdTraceRaysIndirectKHR: usize = 353;
-    pub const vkGetRayTracingShaderGroupStackSizeKHR: usize = 354;
-    pub const vkCmdSetRayTracingPipelineStackSizeKHR: usize = 355;
-    pub const vkCreateSamplerYcbcrConversionKHR: usize = 356;
-    pub const vkDestroySamplerYcbcrConversionKHR: usize = 357;
-    pub const vkBindBufferMemory2KHR: usize = 358;
-    pub const vkBindImageMemory2KHR: usize = 359;
-    pub const vkCreateValidationCacheEXT: usize = 360;
-    pub const vkDestroyValidationCacheEXT: usize = 361;
-    pub const vkMergeValidationCachesEXT: usize = 362;
-    pub const vkGetValidationCacheDataEXT: usize = 363;
-    pub const vkCmdBindShadingRateImageNV: usize = 364;
-    pub const vkCmdSetViewportShadingRatePaletteNV: usize = 365;
-    pub const vkCmdSetCoarseSampleOrderNV: usize = 366;
-    pub const vkCreateAccelerationStructureNV: usize = 367;
-    pub const vkDestroyAccelerationStructureNV: usize = 368;
-    pub const vkGetAccelerationStructureMemoryRequirementsNV: usize = 369;
-    pub const vkBindAccelerationStructureMemoryNV: usize = 370;
-    pub const vkCmdBuildAccelerationStructureNV: usize = 371;
-    pub const vkCmdCopyAccelerationStructureNV: usize = 372;
-    pub const vkCmdTraceRaysNV: usize = 373;
-    pub const vkCreateRayTracingPipelinesNV: usize = 374;
-    pub const vkGetRayTracingShaderGroupHandlesNV: usize = 375;
-    pub const vkGetAccelerationStructureHandleNV: usize = 376;
-    pub const vkCmdWriteAccelerationStructuresPropertiesNV: usize = 377;
-    pub const vkCompileDeferredNV: usize = 378;
-    pub const vkGetDescriptorSetLayoutSupportKHR: usize = 379;
-    pub const vkCmdDrawIndirectCountKHR: usize = 380;
-    pub const vkCmdDrawIndexedIndirectCountKHR: usize = 381;
-    pub const vkCmdWriteBufferMarkerAMD: usize = 382;
-    pub const vkCmdWriteBufferMarker2AMD: usize = 383;
-    pub const vkGetPhysicalDeviceCalibrateableTimeDomainsEXT: usize = 384;
-    pub const vkGetCalibratedTimestampsEXT: usize = 385;
-    pub const vkCmdDrawMeshTasksNV: usize = 386;
-    pub const vkCmdDrawMeshTasksIndirectNV: usize = 387;
-    pub const vkCmdDrawMeshTasksIndirectCountNV: usize = 388;
-    pub const vkCmdSetExclusiveScissorEnableNV: usize = 389;
-    pub const vkCmdSetExclusiveScissorNV: usize = 390;
-    pub const vkCmdSetCheckpointNV: usize = 391;
-    pub const vkGetQueueCheckpointDataNV: usize = 392;
-    pub const vkGetQueueCheckpointData2NV: usize = 393;
-    pub const vkGetSemaphoreCounterValueKHR: usize = 394;
-    pub const vkWaitSemaphoresKHR: usize = 395;
-    pub const vkSignalSemaphoreKHR: usize = 396;
-    pub const vkInitializePerformanceApiINTEL: usize = 397;
-    pub const vkUninitializePerformanceApiINTEL: usize = 398;
-    pub const vkCmdSetPerformanceMarkerINTEL: usize = 399;
-    pub const vkCmdSetPerformanceStreamMarkerINTEL: usize = 400;
-    pub const vkCmdSetPerformanceOverrideINTEL: usize = 401;
-    pub const vkAcquirePerformanceConfigurationINTEL: usize = 402;
-    pub const vkReleasePerformanceConfigurationINTEL: usize = 403;
-    pub const vkQueueSetPerformanceConfigurationINTEL: usize = 404;
-    pub const vkGetPerformanceParameterINTEL: usize = 405;
-    pub const vkGetPhysicalDeviceFragmentShadingRatesKHR: usize = 406;
-    pub const vkCmdSetFragmentShadingRateKHR: usize = 407;
-    pub const vkCmdSetRenderingAttachmentLocationsKHR: usize = 408;
-    pub const vkCmdSetRenderingInputAttachmentIndicesKHR: usize = 409;
-    pub const vkGetBufferDeviceAddressEXT: usize = 410;
-    pub const vkGetPhysicalDeviceCooperativeMatrixPropertiesNV: usize = 411;
-    pub const vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV: usize = 412;
-    pub const vkGetBufferDeviceAddressKHR: usize = 413;
-    pub const vkGetBufferOpaqueCaptureAddressKHR: usize = 414;
-    pub const vkGetDeviceMemoryOpaqueCaptureAddressKHR: usize = 415;
-    pub const vkCmdSetLineStippleEXT: usize = 416;
-    pub const vkResetQueryPoolEXT: usize = 417;
-    pub const vkCmdSetCullModeEXT: usize = 418;
-    pub const vkCmdSetFrontFaceEXT: usize = 419;
-    pub const vkCmdSetPrimitiveTopologyEXT: usize = 420;
-    pub const vkCmdSetViewportWithCountEXT: usize = 421;
-    pub const vkCmdSetScissorWithCountEXT: usize = 422;
-    pub const vkCmdBindVertexBuffers2EXT: usize = 423;
-    pub const vkCmdSetDepthTestEnableEXT: usize = 424;
-    pub const vkCmdSetDepthWriteEnableEXT: usize = 425;
-    pub const vkCmdSetDepthCompareOpEXT: usize = 426;
-    pub const vkCmdSetDepthBoundsTestEnableEXT: usize = 427;
-    pub const vkCmdSetStencilTestEnableEXT: usize = 428;
-    pub const vkCmdSetStencilOpEXT: usize = 429;
-    pub const vkCreateDeferredOperationKHR: usize = 430;
-    pub const vkDestroyDeferredOperationKHR: usize = 431;
-    pub const vkGetDeferredOperationMaxConcurrencyKHR: usize = 432;
-    pub const vkGetDeferredOperationResultKHR: usize = 433;
-    pub const vkDeferredOperationJoinKHR: usize = 434;
-    pub const vkGetPipelineExecutablePropertiesKHR: usize = 435;
-    pub const vkGetPipelineExecutableStatisticsKHR: usize = 436;
-    pub const vkGetPipelineExecutableInternalRepresentationsKHR: usize = 437;
-    pub const vkCopyMemoryToImageEXT: usize = 438;
-    pub const vkCopyImageToMemoryEXT: usize = 439;
-    pub const vkCopyImageToImageEXT: usize = 440;
-    pub const vkTransitionImageLayoutEXT: usize = 441;
-    pub const vkGetImageSubresourceLayout2EXT: usize = 442;
-    pub const vkMapMemory2KHR: usize = 443;
-    pub const vkUnmapMemory2KHR: usize = 444;
-    pub const vkGetGeneratedCommandsMemoryRequirementsNV: usize = 445;
-    pub const vkCmdPreprocessGeneratedCommandsNV: usize = 446;
-    pub const vkCmdExecuteGeneratedCommandsNV: usize = 447;
-    pub const vkCmdBindPipelineShaderGroupNV: usize = 448;
-    pub const vkCreateIndirectCommandsLayoutNV: usize = 449;
-    pub const vkDestroyIndirectCommandsLayoutNV: usize = 450;
-    pub const vkCmdSetDepthBias2EXT: usize = 451;
-    pub const vkCreatePrivateDataSlotEXT: usize = 452;
-    pub const vkDestroyPrivateDataSlotEXT: usize = 453;
-    pub const vkSetPrivateDataEXT: usize = 454;
-    pub const vkGetPrivateDataEXT: usize = 455;
-    pub const vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR: usize = 456;
-    pub const vkGetEncodedVideoSessionParametersKHR: usize = 457;
-    pub const vkCmdEncodeVideoKHR: usize = 458;
-    pub const vkQueueSetPerfHintQCOM: usize = 459;
-    pub const vkCmdDispatchTileQCOM: usize = 460;
-    pub const vkCmdBeginPerTileExecutionQCOM: usize = 461;
-    pub const vkCmdEndPerTileExecutionQCOM: usize = 462;
-    pub const vkSetLatencySleepModeLegacyNV: usize = 463;
-    pub const vkLatencySleepLegacyNV: usize = 464;
-    pub const vkSetLatencyMarkerLegacyNV: usize = 465;
-    pub const vkGetLatencyTimingsLegacyNV: usize = 466;
-    pub const vkQueueNotifyOutOfBandLegacyNV: usize = 467;
-    pub const vkGetSleepStatusLegacyNV: usize = 468;
-    pub const vkShutdownLatencyDeviceLegacyNV: usize = 469;
-    pub const vkCmdSetEvent2KHR: usize = 470;
-    pub const vkCmdResetEvent2KHR: usize = 471;
-    pub const vkCmdWaitEvents2KHR: usize = 472;
-    pub const vkCmdPipelineBarrier2KHR: usize = 473;
-    pub const vkCmdWriteTimestamp2KHR: usize = 474;
-    pub const vkQueueSubmit2KHR: usize = 475;
-    pub const vkGetDescriptorSetLayoutSizeEXT: usize = 476;
-    pub const vkGetDescriptorSetLayoutBindingOffsetEXT: usize = 477;
-    pub const vkGetDescriptorEXT: usize = 478;
-    pub const vkCmdBindDescriptorBuffersEXT: usize = 479;
-    pub const vkCmdSetDescriptorBufferOffsetsEXT: usize = 480;
-    pub const vkCmdBindDescriptorBufferEmbeddedSamplersEXT: usize = 481;
-    pub const vkGetBufferOpaqueCaptureDescriptorDataEXT: usize = 482;
-    pub const vkGetImageOpaqueCaptureDescriptorDataEXT: usize = 483;
-    pub const vkGetImageViewOpaqueCaptureDescriptorDataEXT: usize = 484;
-    pub const vkGetSamplerOpaqueCaptureDescriptorDataEXT: usize = 485;
-    pub const vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT: usize = 486;
-    pub const vkCmdBindIndexBuffer3KHR: usize = 487;
-    pub const vkCmdBindVertexBuffers3KHR: usize = 488;
-    pub const vkCmdDrawIndirect2KHR: usize = 489;
-    pub const vkCmdDrawIndexedIndirect2KHR: usize = 490;
-    pub const vkCmdDispatchIndirect2KHR: usize = 491;
-    pub const vkCmdCopyMemoryKHR: usize = 492;
-    pub const vkCmdCopyMemoryToImageKHR: usize = 493;
-    pub const vkCmdCopyImageToMemoryKHR: usize = 494;
-    pub const vkCmdUpdateMemoryKHR: usize = 495;
-    pub const vkCmdFillMemoryKHR: usize = 496;
-    pub const vkCmdCopyQueryPoolResultsToMemoryKHR: usize = 497;
-    pub const vkCmdDrawIndirectCount2KHR: usize = 498;
-    pub const vkCmdDrawIndexedIndirectCount2KHR: usize = 499;
-    pub const vkCmdBeginConditionalRendering2EXT: usize = 500;
-    pub const vkCmdBindTransformFeedbackBuffers2EXT: usize = 501;
-    pub const vkCmdBeginTransformFeedback2EXT: usize = 502;
-    pub const vkCmdEndTransformFeedback2EXT: usize = 503;
-    pub const vkCmdDrawIndirectByteCount2EXT: usize = 504;
-    pub const vkCmdDrawMeshTasksIndirect2EXT: usize = 505;
-    pub const vkCmdDrawMeshTasksIndirectCount2EXT: usize = 506;
-    pub const vkCmdWriteMarkerToMemoryAMD: usize = 507;
-    pub const vkCreateAccelerationStructure2KHR: usize = 508;
-    pub const vkCmdSetFragmentShadingRateEnumNV: usize = 509;
-    pub const vkCmdDrawMeshTasksEXT: usize = 510;
-    pub const vkCmdDrawMeshTasksIndirectEXT: usize = 511;
-    pub const vkCmdDrawMeshTasksIndirectCountEXT: usize = 512;
-    pub const vkCmdCopyBuffer2KHR: usize = 513;
-    pub const vkCmdCopyImage2KHR: usize = 514;
-    pub const vkCmdCopyBufferToImage2KHR: usize = 515;
-    pub const vkCmdCopyImageToBuffer2KHR: usize = 516;
-    pub const vkCmdBlitImage2KHR: usize = 517;
-    pub const vkCmdResolveImage2KHR: usize = 518;
-    pub const vkGetDeviceFaultInfoEXT: usize = 519;
-    pub const vkCmdSetVertexInputEXT: usize = 520;
-    pub const vkGetDeviceSubpassShadingMaxWorkgroupSizeHUAWEI: usize = 521;
-    pub const vkCmdSubpassShadingHUAWEI: usize = 522;
-    pub const vkCmdBindInvocationMaskHUAWEI: usize = 523;
-    pub const vkGetMemoryRemoteAddressNV: usize = 524;
-    pub const vkGetPipelinePropertiesEXT: usize = 525;
-    pub const vkCmdSetPatchControlPointsEXT: usize = 526;
-    pub const vkCmdSetRasterizerDiscardEnableEXT: usize = 527;
-    pub const vkCmdSetDepthBiasEnableEXT: usize = 528;
-    pub const vkCmdSetLogicOpEXT: usize = 529;
-    pub const vkCmdSetPrimitiveRestartEnableEXT: usize = 530;
-    pub const vkCmdSetColorWriteEnableEXT: usize = 531;
-    pub const vkCmdTraceRaysIndirect2KHR: usize = 532;
-    pub const vkCmdDrawMultiEXT: usize = 533;
-    pub const vkCmdDrawMultiIndexedEXT: usize = 534;
-    pub const vkCreateMicromapEXT: usize = 535;
-    pub const vkDestroyMicromapEXT: usize = 536;
-    pub const vkCmdBuildMicromapsEXT: usize = 537;
-    pub const vkBuildMicromapsEXT: usize = 538;
-    pub const vkCopyMicromapEXT: usize = 539;
-    pub const vkCopyMicromapToMemoryEXT: usize = 540;
-    pub const vkCopyMemoryToMicromapEXT: usize = 541;
-    pub const vkWriteMicromapsPropertiesEXT: usize = 542;
-    pub const vkCmdCopyMicromapEXT: usize = 543;
-    pub const vkCmdCopyMicromapToMemoryEXT: usize = 544;
-    pub const vkCmdCopyMemoryToMicromapEXT: usize = 545;
-    pub const vkCmdWriteMicromapsPropertiesEXT: usize = 546;
-    pub const vkGetDeviceMicromapCompatibilityEXT: usize = 547;
-    pub const vkGetMicromapBuildSizesEXT: usize = 548;
-    pub const vkCmdDrawClusterHUAWEI: usize = 549;
-    pub const vkCmdDrawClusterIndirectHUAWEI: usize = 550;
-    pub const vkSetDeviceMemoryPriorityEXT: usize = 551;
-    pub const vkGetDeviceBufferMemoryRequirementsKHR: usize = 552;
-    pub const vkGetDeviceImageMemoryRequirementsKHR: usize = 553;
-    pub const vkGetDeviceImageSparseMemoryRequirementsKHR: usize = 554;
-    pub const vkCmdSetDispatchParametersARM: usize = 555;
-    pub const vkGetDescriptorSetLayoutHostMappingInfoVALVE: usize = 556;
-    pub const vkGetDescriptorSetHostMappingVALVE: usize = 557;
-    pub const vkCmdCopyMemoryIndirectNV: usize = 558;
-    pub const vkCmdCopyMemoryToImageIndirectNV: usize = 559;
-    pub const vkCmdDecompressMemoryNV: usize = 560;
-    pub const vkCmdDecompressMemoryIndirectCountNV: usize = 561;
-    pub const vkGetPipelineIndirectMemoryRequirementsNV: usize = 562;
-    pub const vkCmdUpdatePipelineIndirectBufferNV: usize = 563;
-    pub const vkGetPipelineIndirectDeviceAddressNV: usize = 564;
-    pub const vkCmdSetDepthClampEnableEXT: usize = 565;
-    pub const vkCmdSetPolygonModeEXT: usize = 566;
-    pub const vkCmdSetRasterizationSamplesEXT: usize = 567;
-    pub const vkCmdSetSampleMaskEXT: usize = 568;
-    pub const vkCmdSetAlphaToCoverageEnableEXT: usize = 569;
-    pub const vkCmdSetAlphaToOneEnableEXT: usize = 570;
-    pub const vkCmdSetLogicOpEnableEXT: usize = 571;
-    pub const vkCmdSetColorBlendEnableEXT: usize = 572;
-    pub const vkCmdSetColorBlendEquationEXT: usize = 573;
-    pub const vkCmdSetColorWriteMaskEXT: usize = 574;
-    pub const vkCmdSetTessellationDomainOriginEXT: usize = 575;
-    pub const vkCmdSetRasterizationStreamEXT: usize = 576;
-    pub const vkCmdSetConservativeRasterizationModeEXT: usize = 577;
-    pub const vkCmdSetExtraPrimitiveOverestimationSizeEXT: usize = 578;
-    pub const vkCmdSetDepthClipEnableEXT: usize = 579;
-    pub const vkCmdSetSampleLocationsEnableEXT: usize = 580;
-    pub const vkCmdSetColorBlendAdvancedEXT: usize = 581;
-    pub const vkCmdSetProvokingVertexModeEXT: usize = 582;
-    pub const vkCmdSetLineRasterizationModeEXT: usize = 583;
-    pub const vkCmdSetLineStippleEnableEXT: usize = 584;
-    pub const vkCmdSetDepthClipNegativeOneToOneEXT: usize = 585;
-    pub const vkCmdSetViewportWScalingEnableNV: usize = 586;
-    pub const vkCmdSetViewportSwizzleNV: usize = 587;
-    pub const vkCmdSetCoverageToColorEnableNV: usize = 588;
-    pub const vkCmdSetCoverageToColorLocationNV: usize = 589;
-    pub const vkCmdSetCoverageModulationModeNV: usize = 590;
-    pub const vkCmdSetCoverageModulationTableEnableNV: usize = 591;
-    pub const vkCmdSetCoverageModulationTableNV: usize = 592;
-    pub const vkCmdSetShadingRateImageEnableNV: usize = 593;
-    pub const vkCmdSetRepresentativeFragmentTestEnableNV: usize = 594;
-    pub const vkCmdSetCoverageReductionModeNV: usize = 595;
-    pub const vkCreateTensorARM: usize = 596;
-    pub const vkDestroyTensorARM: usize = 597;
-    pub const vkCreateTensorViewARM: usize = 598;
-    pub const vkDestroyTensorViewARM: usize = 599;
-    pub const vkGetTensorMemoryRequirementsARM: usize = 600;
-    pub const vkBindTensorMemoryARM: usize = 601;
-    pub const vkGetDeviceTensorMemoryRequirementsARM: usize = 602;
-    pub const vkCmdCopyTensorARM: usize = 603;
-    pub const vkGetPhysicalDeviceExternalTensorPropertiesARM: usize = 604;
-    pub const vkGetTensorOpaqueCaptureDescriptorDataARM: usize = 605;
-    pub const vkGetTensorViewOpaqueCaptureDescriptorDataARM: usize = 606;
-    pub const vkGetShaderModuleIdentifierEXT: usize = 607;
-    pub const vkGetShaderModuleCreateInfoIdentifierEXT: usize = 608;
-    pub const vkGetPhysicalDeviceOpticalFlowImageFormatsNV: usize = 609;
-    pub const vkCreateOpticalFlowSessionNV: usize = 610;
-    pub const vkDestroyOpticalFlowSessionNV: usize = 611;
-    pub const vkBindOpticalFlowSessionImageNV: usize = 612;
-    pub const vkCmdOpticalFlowExecuteNV: usize = 613;
-    pub const vkCmdBindIndexBuffer2KHR: usize = 614;
-    pub const vkGetRenderingAreaGranularityKHR: usize = 615;
-    pub const vkGetDeviceImageSubresourceLayoutKHR: usize = 616;
-    pub const vkGetImageSubresourceLayout2KHR: usize = 617;
-    pub const vkAntiLagUpdateAMD: usize = 618;
-    pub const vkCreateShadersEXT: usize = 619;
-    pub const vkDestroyShaderEXT: usize = 620;
-    pub const vkGetShaderBinaryDataEXT: usize = 621;
-    pub const vkCmdBindShadersEXT: usize = 622;
-    pub const vkCmdSetDepthClampRangeEXT: usize = 623;
-    pub const vkGetFramebufferTilePropertiesQCOM: usize = 624;
-    pub const vkGetDynamicRenderingTilePropertiesQCOM: usize = 625;
-    pub const vkGetPhysicalDeviceCooperativeVectorPropertiesNV: usize = 626;
-    pub const vkConvertCooperativeVectorMatrixNV: usize = 627;
-    pub const vkCmdConvertCooperativeVectorMatrixNV: usize = 628;
-    pub const vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR: usize = 629;
-    pub const vkCreateDataGraphPipelinesARM: usize = 630;
-    pub const vkCreateDataGraphPipelineSessionARM: usize = 631;
-    pub const vkGetDataGraphPipelineSessionBindPointRequirementsARM: usize = 632;
-    pub const vkGetDataGraphPipelineSessionMemoryRequirementsARM: usize = 633;
-    pub const vkBindDataGraphPipelineSessionMemoryARM: usize = 634;
-    pub const vkDestroyDataGraphPipelineSessionARM: usize = 635;
-    pub const vkCmdDispatchDataGraphARM: usize = 636;
-    pub const vkGetDataGraphPipelineAvailablePropertiesARM: usize = 637;
-    pub const vkGetDataGraphPipelinePropertiesARM: usize = 638;
-    pub const vkGetPhysicalDeviceQueueFamilyDataGraphPropertiesARM: usize = 639;
-    pub const vkGetPhysicalDeviceQueueFamilyDataGraphProcessingEnginePropertiesARM: usize = 640;
-    pub const vkGetPhysicalDeviceQueueFamilyDataGraphEngineOperationPropertiesARM: usize = 641;
-    pub const vkCmdSetAttachmentFeedbackLoopEnableEXT: usize = 642;
-    pub const vkCmdSetLineStippleKHR: usize = 643;
-    pub const vkGetPhysicalDeviceCalibrateableTimeDomainsKHR: usize = 644;
-    pub const vkGetCalibratedTimestampsKHR: usize = 645;
-    pub const vkCmdBindDescriptorSets2KHR: usize = 646;
-    pub const vkCmdPushConstants2KHR: usize = 647;
-    pub const vkCmdPushDescriptorSet2KHR: usize = 648;
-    pub const vkCmdPushDescriptorSetWithTemplate2KHR: usize = 649;
-    pub const vkCmdSetDescriptorBufferOffsets2EXT: usize = 650;
-    pub const vkCmdBindDescriptorBufferEmbeddedSamplers2EXT: usize = 651;
-    pub const vkCmdBindTileMemoryQCOM: usize = 652;
-    pub const vkCmdCopyMemoryIndirectKHR: usize = 653;
-    pub const vkCmdCopyMemoryToImageIndirectKHR: usize = 654;
-    pub const vkCmdDecompressMemoryEXT: usize = 655;
-    pub const vkCmdDecompressMemoryIndirectCountEXT: usize = 656;
-    pub const vkCreateExternalComputeQueueNV: usize = 657;
-    pub const vkDestroyExternalComputeQueueNV: usize = 658;
-    pub const vkGetExternalComputeQueueDataNV: usize = 659;
-    pub const vkGetClusterAccelerationStructureBuildSizesNV: usize = 660;
-    pub const vkCmdBuildClusterAccelerationStructureIndirectNV: usize = 661;
-    pub const vkGetPartitionedAccelerationStructuresBuildSizesNV: usize = 662;
-    pub const vkCmdBuildPartitionedAccelerationStructuresNV: usize = 663;
-    pub const vkGetGeneratedCommandsMemoryRequirementsEXT: usize = 664;
-    pub const vkCmdPreprocessGeneratedCommandsEXT: usize = 665;
-    pub const vkCmdExecuteGeneratedCommandsEXT: usize = 666;
-    pub const vkCreateIndirectCommandsLayoutEXT: usize = 667;
-    pub const vkDestroyIndirectCommandsLayoutEXT: usize = 668;
-    pub const vkCreateIndirectExecutionSetEXT: usize = 669;
-    pub const vkDestroyIndirectExecutionSetEXT: usize = 670;
-    pub const vkUpdateIndirectExecutionSetPipelineEXT: usize = 671;
-    pub const vkUpdateIndirectExecutionSetShaderEXT: usize = 672;
-    pub const vkGetDeviceFaultReportsKHR: usize = 673;
-    pub const vkGetDeviceFaultDebugInfoKHR: usize = 674;
-    pub const vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV: usize = 675;
-    pub const vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM: usize = 676;
-    pub const vkEnumeratePhysicalDeviceShaderInstrumentationMetricsARM: usize = 677;
-    pub const vkCreateShaderInstrumentationARM: usize = 678;
-    pub const vkDestroyShaderInstrumentationARM: usize = 679;
-    pub const vkCmdBeginShaderInstrumentationARM: usize = 680;
-    pub const vkCmdEndShaderInstrumentationARM: usize = 681;
-    pub const vkGetShaderInstrumentationValuesARM: usize = 682;
-    pub const vkClearShaderInstrumentationMetricsARM: usize = 683;
-    pub const vkCmdEndRendering2EXT: usize = 684;
-    pub const vkCmdBeginCustomResolveEXT: usize = 685;
-    pub const vkCmdEndRendering2KHR: usize = 686;
-    pub const vkGetPhysicalDeviceQueueFamilyDataGraphOpticalFlowImageFormatsARM: usize = 687;
-    pub const vkCmdSetComputeOccupancyPriorityNV: usize = 688;
-    pub const vkGetPhysicalDeviceCooperativeMatrixProperties2EXT: usize = 689;
-    pub const vkCmdSetPrimitiveRestartIndexEXT: usize = 690;
+    pub const vkDestroySurfaceKHR: usize = 232;
+    pub const vkGetPhysicalDeviceSurfaceSupportKHR: usize = 233;
+    pub const vkGetPhysicalDeviceSurfaceCapabilitiesKHR: usize = 234;
+    pub const vkGetPhysicalDeviceSurfaceFormatsKHR: usize = 235;
+    pub const vkGetPhysicalDeviceSurfacePresentModesKHR: usize = 236;
+    pub const vkCreateSwapchainKHR: usize = 237;
+    pub const vkDestroySwapchainKHR: usize = 238;
+    pub const vkGetSwapchainImagesKHR: usize = 239;
+    pub const vkAcquireNextImageKHR: usize = 240;
+    pub const vkQueuePresentKHR: usize = 241;
+    pub const vkGetDeviceGroupPresentCapabilitiesKHR: usize = 242;
+    pub const vkGetDeviceGroupSurfacePresentModesKHR: usize = 243;
+    pub const vkGetPhysicalDevicePresentRectanglesKHR: usize = 244;
+    pub const vkAcquireNextImage2KHR: usize = 245;
+    pub const vkGetPhysicalDeviceVideoCapabilitiesKHR: usize = 246;
+    pub const vkGetPhysicalDeviceVideoFormatPropertiesKHR: usize = 247;
+    pub const vkCreateVideoSessionKHR: usize = 248;
+    pub const vkDestroyVideoSessionKHR: usize = 249;
+    pub const vkGetVideoSessionMemoryRequirementsKHR: usize = 250;
+    pub const vkBindVideoSessionMemoryKHR: usize = 251;
+    pub const vkCreateVideoSessionParametersKHR: usize = 252;
+    pub const vkUpdateVideoSessionParametersKHR: usize = 253;
+    pub const vkDestroyVideoSessionParametersKHR: usize = 254;
+    pub const vkCmdBeginVideoCodingKHR: usize = 255;
+    pub const vkCmdEndVideoCodingKHR: usize = 256;
+    pub const vkCmdControlVideoCodingKHR: usize = 257;
+    pub const vkCmdDecodeVideoKHR: usize = 258;
+    pub const vkCmdBindTransformFeedbackBuffersEXT: usize = 259;
+    pub const vkCmdBeginTransformFeedbackEXT: usize = 260;
+    pub const vkCmdEndTransformFeedbackEXT: usize = 261;
+    pub const vkCmdBeginQueryIndexedEXT: usize = 262;
+    pub const vkCmdEndQueryIndexedEXT: usize = 263;
+    pub const vkCmdDrawIndirectByteCountEXT: usize = 264;
+    pub const vkCreateCuModuleNVX: usize = 265;
+    pub const vkCreateCuFunctionNVX: usize = 266;
+    pub const vkDestroyCuModuleNVX: usize = 267;
+    pub const vkDestroyCuFunctionNVX: usize = 268;
+    pub const vkCmdCuLaunchKernelNVX: usize = 269;
+    pub const vkGetImageViewHandleNVX: usize = 270;
+    pub const vkGetImageViewHandle64NVX: usize = 271;
+    pub const vkGetImageViewAddressNVX: usize = 272;
+    pub const vkGetDeviceCombinedImageSamplerIndexNVX: usize = 273;
+    pub const vkCmdDrawIndirectCountAMD: usize = 274;
+    pub const vkCmdDrawIndexedIndirectCountAMD: usize = 275;
+    pub const vkGetShaderInfoAMD: usize = 276;
+    pub const vkCmdBeginRenderingKHR: usize = 277;
+    pub const vkCmdEndRenderingKHR: usize = 278;
+    pub const vkGetPhysicalDeviceExternalImageFormatPropertiesNV: usize = 279;
+    pub const vkGetPhysicalDeviceFeatures2KHR: usize = 280;
+    pub const vkGetPhysicalDeviceProperties2KHR: usize = 281;
+    pub const vkGetPhysicalDeviceFormatProperties2KHR: usize = 282;
+    pub const vkGetPhysicalDeviceImageFormatProperties2KHR: usize = 283;
+    pub const vkGetPhysicalDeviceQueueFamilyProperties2KHR: usize = 284;
+    pub const vkGetPhysicalDeviceMemoryProperties2KHR: usize = 285;
+    pub const vkGetPhysicalDeviceSparseImageFormatProperties2KHR: usize = 286;
+    pub const vkGetDeviceGroupPeerMemoryFeaturesKHR: usize = 287;
+    pub const vkCmdSetDeviceMaskKHR: usize = 288;
+    pub const vkCmdDispatchBaseKHR: usize = 289;
+    pub const vkTrimCommandPoolKHR: usize = 290;
+    pub const vkEnumeratePhysicalDeviceGroupsKHR: usize = 291;
+    pub const vkGetPhysicalDeviceExternalBufferPropertiesKHR: usize = 292;
+    pub const vkGetPhysicalDeviceExternalSemaphorePropertiesKHR: usize = 293;
+    pub const vkCmdPushDescriptorSetKHR: usize = 294;
+    pub const vkCmdPushDescriptorSetWithTemplateKHR: usize = 295;
+    pub const vkCmdBeginConditionalRenderingEXT: usize = 296;
+    pub const vkCmdEndConditionalRenderingEXT: usize = 297;
+    pub const vkCreateDescriptorUpdateTemplateKHR: usize = 298;
+    pub const vkDestroyDescriptorUpdateTemplateKHR: usize = 299;
+    pub const vkUpdateDescriptorSetWithTemplateKHR: usize = 300;
+    pub const vkCmdSetViewportWScalingNV: usize = 301;
+    pub const vkCmdSetDiscardRectangleEXT: usize = 302;
+    pub const vkCmdSetDiscardRectangleEnableEXT: usize = 303;
+    pub const vkCmdSetDiscardRectangleModeEXT: usize = 304;
+    pub const vkCreateRenderPass2KHR: usize = 305;
+    pub const vkCmdBeginRenderPass2KHR: usize = 306;
+    pub const vkCmdNextSubpass2KHR: usize = 307;
+    pub const vkCmdEndRenderPass2KHR: usize = 308;
+    pub const vkGetPhysicalDeviceExternalFencePropertiesKHR: usize = 309;
+    pub const vkEnumeratePhysicalDeviceQueueFamilyPerformanceQueryCountersKHR: usize = 310;
+    pub const vkGetPhysicalDeviceQueueFamilyPerformanceQueryPassesKHR: usize = 311;
+    pub const vkAcquireProfilingLockKHR: usize = 312;
+    pub const vkReleaseProfilingLockKHR: usize = 313;
+    pub const vkGetPhysicalDeviceSurfaceCapabilities2KHR: usize = 314;
+    pub const vkGetPhysicalDeviceSurfaceFormats2KHR: usize = 315;
+    pub const vkCreateGpaSessionAMD: usize = 316;
+    pub const vkDestroyGpaSessionAMD: usize = 317;
+    pub const vkSetGpaDeviceClockModeAMD: usize = 318;
+    pub const vkGetGpaDeviceClockInfoAMD: usize = 319;
+    pub const vkCmdBeginGpaSessionAMD: usize = 320;
+    pub const vkCmdEndGpaSessionAMD: usize = 321;
+    pub const vkCmdBeginGpaSampleAMD: usize = 322;
+    pub const vkCmdEndGpaSampleAMD: usize = 323;
+    pub const vkGetGpaSessionStatusAMD: usize = 324;
+    pub const vkGetGpaSessionResultsAMD: usize = 325;
+    pub const vkResetGpaSessionAMD: usize = 326;
+    pub const vkCmdCopyGpaSessionResultsAMD: usize = 327;
+    pub const vkWriteSamplerDescriptorsEXT: usize = 328;
+    pub const vkWriteResourceDescriptorsEXT: usize = 329;
+    pub const vkCmdBindSamplerHeapEXT: usize = 330;
+    pub const vkCmdBindResourceHeapEXT: usize = 331;
+    pub const vkCmdPushDataEXT: usize = 332;
+    pub const vkGetImageOpaqueCaptureDataEXT: usize = 333;
+    pub const vkGetPhysicalDeviceDescriptorSizeEXT: usize = 334;
+    pub const vkRegisterCustomBorderColorEXT: usize = 335;
+    pub const vkUnregisterCustomBorderColorEXT: usize = 336;
+    pub const vkGetTensorOpaqueCaptureDataARM: usize = 337;
+    pub const vkCmdSetSampleLocationsEXT: usize = 338;
+    pub const vkGetPhysicalDeviceMultisamplePropertiesEXT: usize = 339;
+    pub const vkGetImageMemoryRequirements2KHR: usize = 340;
+    pub const vkGetBufferMemoryRequirements2KHR: usize = 341;
+    pub const vkGetImageSparseMemoryRequirements2KHR: usize = 342;
+    pub const vkCreateAccelerationStructureKHR: usize = 343;
+    pub const vkDestroyAccelerationStructureKHR: usize = 344;
+    pub const vkCmdBuildAccelerationStructuresKHR: usize = 345;
+    pub const vkCmdBuildAccelerationStructuresIndirectKHR: usize = 346;
+    pub const vkBuildAccelerationStructuresKHR: usize = 347;
+    pub const vkCopyAccelerationStructureKHR: usize = 348;
+    pub const vkCopyAccelerationStructureToMemoryKHR: usize = 349;
+    pub const vkCopyMemoryToAccelerationStructureKHR: usize = 350;
+    pub const vkWriteAccelerationStructuresPropertiesKHR: usize = 351;
+    pub const vkCmdCopyAccelerationStructureKHR: usize = 352;
+    pub const vkCmdCopyAccelerationStructureToMemoryKHR: usize = 353;
+    pub const vkCmdCopyMemoryToAccelerationStructureKHR: usize = 354;
+    pub const vkGetAccelerationStructureDeviceAddressKHR: usize = 355;
+    pub const vkCmdWriteAccelerationStructuresPropertiesKHR: usize = 356;
+    pub const vkGetDeviceAccelerationStructureCompatibilityKHR: usize = 357;
+    pub const vkGetAccelerationStructureBuildSizesKHR: usize = 358;
+    pub const vkCmdTraceRaysKHR: usize = 359;
+    pub const vkCreateRayTracingPipelinesKHR: usize = 360;
+    pub const vkGetRayTracingShaderGroupHandlesKHR: usize = 361;
+    pub const vkGetRayTracingCaptureReplayShaderGroupHandlesKHR: usize = 362;
+    pub const vkCmdTraceRaysIndirectKHR: usize = 363;
+    pub const vkGetRayTracingShaderGroupStackSizeKHR: usize = 364;
+    pub const vkCmdSetRayTracingPipelineStackSizeKHR: usize = 365;
+    pub const vkCreateSamplerYcbcrConversionKHR: usize = 366;
+    pub const vkDestroySamplerYcbcrConversionKHR: usize = 367;
+    pub const vkBindBufferMemory2KHR: usize = 368;
+    pub const vkBindImageMemory2KHR: usize = 369;
+    pub const vkCreateValidationCacheEXT: usize = 370;
+    pub const vkDestroyValidationCacheEXT: usize = 371;
+    pub const vkMergeValidationCachesEXT: usize = 372;
+    pub const vkGetValidationCacheDataEXT: usize = 373;
+    pub const vkCmdBindShadingRateImageNV: usize = 374;
+    pub const vkCmdSetViewportShadingRatePaletteNV: usize = 375;
+    pub const vkCmdSetCoarseSampleOrderNV: usize = 376;
+    pub const vkCreateAccelerationStructureNV: usize = 377;
+    pub const vkDestroyAccelerationStructureNV: usize = 378;
+    pub const vkGetAccelerationStructureMemoryRequirementsNV: usize = 379;
+    pub const vkBindAccelerationStructureMemoryNV: usize = 380;
+    pub const vkCmdBuildAccelerationStructureNV: usize = 381;
+    pub const vkCmdCopyAccelerationStructureNV: usize = 382;
+    pub const vkCmdTraceRaysNV: usize = 383;
+    pub const vkCreateRayTracingPipelinesNV: usize = 384;
+    pub const vkGetRayTracingShaderGroupHandlesNV: usize = 385;
+    pub const vkGetAccelerationStructureHandleNV: usize = 386;
+    pub const vkCmdWriteAccelerationStructuresPropertiesNV: usize = 387;
+    pub const vkCompileDeferredNV: usize = 388;
+    pub const vkGetDescriptorSetLayoutSupportKHR: usize = 389;
+    pub const vkCmdDrawIndirectCountKHR: usize = 390;
+    pub const vkCmdDrawIndexedIndirectCountKHR: usize = 391;
+    pub const vkCmdWriteBufferMarkerAMD: usize = 392;
+    pub const vkCmdWriteBufferMarker2AMD: usize = 393;
+    pub const vkGetPhysicalDeviceCalibrateableTimeDomainsEXT: usize = 394;
+    pub const vkGetCalibratedTimestampsEXT: usize = 395;
+    pub const vkCmdDrawMeshTasksNV: usize = 396;
+    pub const vkCmdDrawMeshTasksIndirectNV: usize = 397;
+    pub const vkCmdDrawMeshTasksIndirectCountNV: usize = 398;
+    pub const vkCmdSetExclusiveScissorEnableNV: usize = 399;
+    pub const vkCmdSetExclusiveScissorNV: usize = 400;
+    pub const vkCmdSetCheckpointNV: usize = 401;
+    pub const vkGetQueueCheckpointDataNV: usize = 402;
+    pub const vkGetQueueCheckpointData2NV: usize = 403;
+    pub const vkGetSemaphoreCounterValueKHR: usize = 404;
+    pub const vkWaitSemaphoresKHR: usize = 405;
+    pub const vkSignalSemaphoreKHR: usize = 406;
+    pub const vkInitializePerformanceApiINTEL: usize = 407;
+    pub const vkUninitializePerformanceApiINTEL: usize = 408;
+    pub const vkCmdSetPerformanceMarkerINTEL: usize = 409;
+    pub const vkCmdSetPerformanceStreamMarkerINTEL: usize = 410;
+    pub const vkCmdSetPerformanceOverrideINTEL: usize = 411;
+    pub const vkAcquirePerformanceConfigurationINTEL: usize = 412;
+    pub const vkReleasePerformanceConfigurationINTEL: usize = 413;
+    pub const vkQueueSetPerformanceConfigurationINTEL: usize = 414;
+    pub const vkGetPerformanceParameterINTEL: usize = 415;
+    pub const vkGetPhysicalDeviceFragmentShadingRatesKHR: usize = 416;
+    pub const vkCmdSetFragmentShadingRateKHR: usize = 417;
+    pub const vkCmdSetRenderingAttachmentLocationsKHR: usize = 418;
+    pub const vkCmdSetRenderingInputAttachmentIndicesKHR: usize = 419;
+    pub const vkGetBufferDeviceAddressEXT: usize = 420;
+    pub const vkGetPhysicalDeviceCooperativeMatrixPropertiesNV: usize = 421;
+    pub const vkGetPhysicalDeviceSupportedFramebufferMixedSamplesCombinationsNV: usize = 422;
+    pub const vkCreateHeadlessSurfaceEXT: usize = 423;
+    pub const vkGetBufferDeviceAddressKHR: usize = 424;
+    pub const vkGetBufferOpaqueCaptureAddressKHR: usize = 425;
+    pub const vkGetDeviceMemoryOpaqueCaptureAddressKHR: usize = 426;
+    pub const vkCmdSetLineStippleEXT: usize = 427;
+    pub const vkResetQueryPoolEXT: usize = 428;
+    pub const vkCmdSetCullModeEXT: usize = 429;
+    pub const vkCmdSetFrontFaceEXT: usize = 430;
+    pub const vkCmdSetPrimitiveTopologyEXT: usize = 431;
+    pub const vkCmdSetViewportWithCountEXT: usize = 432;
+    pub const vkCmdSetScissorWithCountEXT: usize = 433;
+    pub const vkCmdBindVertexBuffers2EXT: usize = 434;
+    pub const vkCmdSetDepthTestEnableEXT: usize = 435;
+    pub const vkCmdSetDepthWriteEnableEXT: usize = 436;
+    pub const vkCmdSetDepthCompareOpEXT: usize = 437;
+    pub const vkCmdSetDepthBoundsTestEnableEXT: usize = 438;
+    pub const vkCmdSetStencilTestEnableEXT: usize = 439;
+    pub const vkCmdSetStencilOpEXT: usize = 440;
+    pub const vkCreateDeferredOperationKHR: usize = 441;
+    pub const vkDestroyDeferredOperationKHR: usize = 442;
+    pub const vkGetDeferredOperationMaxConcurrencyKHR: usize = 443;
+    pub const vkGetDeferredOperationResultKHR: usize = 444;
+    pub const vkDeferredOperationJoinKHR: usize = 445;
+    pub const vkGetPipelineExecutablePropertiesKHR: usize = 446;
+    pub const vkGetPipelineExecutableStatisticsKHR: usize = 447;
+    pub const vkGetPipelineExecutableInternalRepresentationsKHR: usize = 448;
+    pub const vkCopyMemoryToImageEXT: usize = 449;
+    pub const vkCopyImageToMemoryEXT: usize = 450;
+    pub const vkCopyImageToImageEXT: usize = 451;
+    pub const vkTransitionImageLayoutEXT: usize = 452;
+    pub const vkGetImageSubresourceLayout2EXT: usize = 453;
+    pub const vkMapMemory2KHR: usize = 454;
+    pub const vkUnmapMemory2KHR: usize = 455;
+    pub const vkGetGeneratedCommandsMemoryRequirementsNV: usize = 456;
+    pub const vkCmdPreprocessGeneratedCommandsNV: usize = 457;
+    pub const vkCmdExecuteGeneratedCommandsNV: usize = 458;
+    pub const vkCmdBindPipelineShaderGroupNV: usize = 459;
+    pub const vkCreateIndirectCommandsLayoutNV: usize = 460;
+    pub const vkDestroyIndirectCommandsLayoutNV: usize = 461;
+    pub const vkCmdSetDepthBias2EXT: usize = 462;
+    pub const vkCreatePrivateDataSlotEXT: usize = 463;
+    pub const vkDestroyPrivateDataSlotEXT: usize = 464;
+    pub const vkSetPrivateDataEXT: usize = 465;
+    pub const vkGetPrivateDataEXT: usize = 466;
+    pub const vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR: usize = 467;
+    pub const vkGetEncodedVideoSessionParametersKHR: usize = 468;
+    pub const vkCmdEncodeVideoKHR: usize = 469;
+    pub const vkQueueSetPerfHintQCOM: usize = 470;
+    pub const vkCmdDispatchTileQCOM: usize = 471;
+    pub const vkCmdBeginPerTileExecutionQCOM: usize = 472;
+    pub const vkCmdEndPerTileExecutionQCOM: usize = 473;
+    pub const vkSetLatencySleepModeLegacyNV: usize = 474;
+    pub const vkLatencySleepLegacyNV: usize = 475;
+    pub const vkSetLatencyMarkerLegacyNV: usize = 476;
+    pub const vkGetLatencyTimingsLegacyNV: usize = 477;
+    pub const vkQueueNotifyOutOfBandLegacyNV: usize = 478;
+    pub const vkGetSleepStatusLegacyNV: usize = 479;
+    pub const vkShutdownLatencyDeviceLegacyNV: usize = 480;
+    pub const vkCmdSetEvent2KHR: usize = 481;
+    pub const vkCmdResetEvent2KHR: usize = 482;
+    pub const vkCmdWaitEvents2KHR: usize = 483;
+    pub const vkCmdPipelineBarrier2KHR: usize = 484;
+    pub const vkCmdWriteTimestamp2KHR: usize = 485;
+    pub const vkQueueSubmit2KHR: usize = 486;
+    pub const vkGetDescriptorSetLayoutSizeEXT: usize = 487;
+    pub const vkGetDescriptorSetLayoutBindingOffsetEXT: usize = 488;
+    pub const vkGetDescriptorEXT: usize = 489;
+    pub const vkCmdBindDescriptorBuffersEXT: usize = 490;
+    pub const vkCmdSetDescriptorBufferOffsetsEXT: usize = 491;
+    pub const vkCmdBindDescriptorBufferEmbeddedSamplersEXT: usize = 492;
+    pub const vkGetBufferOpaqueCaptureDescriptorDataEXT: usize = 493;
+    pub const vkGetImageOpaqueCaptureDescriptorDataEXT: usize = 494;
+    pub const vkGetImageViewOpaqueCaptureDescriptorDataEXT: usize = 495;
+    pub const vkGetSamplerOpaqueCaptureDescriptorDataEXT: usize = 496;
+    pub const vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT: usize = 497;
+    pub const vkCmdBindIndexBuffer3KHR: usize = 498;
+    pub const vkCmdBindVertexBuffers3KHR: usize = 499;
+    pub const vkCmdDrawIndirect2KHR: usize = 500;
+    pub const vkCmdDrawIndexedIndirect2KHR: usize = 501;
+    pub const vkCmdDispatchIndirect2KHR: usize = 502;
+    pub const vkCmdCopyMemoryKHR: usize = 503;
+    pub const vkCmdCopyMemoryToImageKHR: usize = 504;
+    pub const vkCmdCopyImageToMemoryKHR: usize = 505;
+    pub const vkCmdUpdateMemoryKHR: usize = 506;
+    pub const vkCmdFillMemoryKHR: usize = 507;
+    pub const vkCmdCopyQueryPoolResultsToMemoryKHR: usize = 508;
+    pub const vkCmdDrawIndirectCount2KHR: usize = 509;
+    pub const vkCmdDrawIndexedIndirectCount2KHR: usize = 510;
+    pub const vkCmdBeginConditionalRendering2EXT: usize = 511;
+    pub const vkCmdBindTransformFeedbackBuffers2EXT: usize = 512;
+    pub const vkCmdBeginTransformFeedback2EXT: usize = 513;
+    pub const vkCmdEndTransformFeedback2EXT: usize = 514;
+    pub const vkCmdDrawIndirectByteCount2EXT: usize = 515;
+    pub const vkCmdDrawMeshTasksIndirect2EXT: usize = 516;
+    pub const vkCmdDrawMeshTasksIndirectCount2EXT: usize = 517;
+    pub const vkCmdWriteMarkerToMemoryAMD: usize = 518;
+    pub const vkCreateAccelerationStructure2KHR: usize = 519;
+    pub const vkCmdSetFragmentShadingRateEnumNV: usize = 520;
+    pub const vkCmdDrawMeshTasksEXT: usize = 521;
+    pub const vkCmdDrawMeshTasksIndirectEXT: usize = 522;
+    pub const vkCmdDrawMeshTasksIndirectCountEXT: usize = 523;
+    pub const vkCmdCopyBuffer2KHR: usize = 524;
+    pub const vkCmdCopyImage2KHR: usize = 525;
+    pub const vkCmdCopyBufferToImage2KHR: usize = 526;
+    pub const vkCmdCopyImageToBuffer2KHR: usize = 527;
+    pub const vkCmdBlitImage2KHR: usize = 528;
+    pub const vkCmdResolveImage2KHR: usize = 529;
+    pub const vkGetDeviceFaultInfoEXT: usize = 530;
+    pub const vkCmdSetVertexInputEXT: usize = 531;
+    pub const vkGetDeviceSubpassShadingMaxWorkgroupSizeHUAWEI: usize = 532;
+    pub const vkCmdSubpassShadingHUAWEI: usize = 533;
+    pub const vkCmdBindInvocationMaskHUAWEI: usize = 534;
+    pub const vkGetMemoryRemoteAddressNV: usize = 535;
+    pub const vkGetPipelinePropertiesEXT: usize = 536;
+    pub const vkCmdSetPatchControlPointsEXT: usize = 537;
+    pub const vkCmdSetRasterizerDiscardEnableEXT: usize = 538;
+    pub const vkCmdSetDepthBiasEnableEXT: usize = 539;
+    pub const vkCmdSetLogicOpEXT: usize = 540;
+    pub const vkCmdSetPrimitiveRestartEnableEXT: usize = 541;
+    pub const vkCmdSetColorWriteEnableEXT: usize = 542;
+    pub const vkCmdTraceRaysIndirect2KHR: usize = 543;
+    pub const vkCmdDrawMultiEXT: usize = 544;
+    pub const vkCmdDrawMultiIndexedEXT: usize = 545;
+    pub const vkCreateMicromapEXT: usize = 546;
+    pub const vkDestroyMicromapEXT: usize = 547;
+    pub const vkCmdBuildMicromapsEXT: usize = 548;
+    pub const vkBuildMicromapsEXT: usize = 549;
+    pub const vkCopyMicromapEXT: usize = 550;
+    pub const vkCopyMicromapToMemoryEXT: usize = 551;
+    pub const vkCopyMemoryToMicromapEXT: usize = 552;
+    pub const vkWriteMicromapsPropertiesEXT: usize = 553;
+    pub const vkCmdCopyMicromapEXT: usize = 554;
+    pub const vkCmdCopyMicromapToMemoryEXT: usize = 555;
+    pub const vkCmdCopyMemoryToMicromapEXT: usize = 556;
+    pub const vkCmdWriteMicromapsPropertiesEXT: usize = 557;
+    pub const vkGetDeviceMicromapCompatibilityEXT: usize = 558;
+    pub const vkGetMicromapBuildSizesEXT: usize = 559;
+    pub const vkCmdDrawClusterHUAWEI: usize = 560;
+    pub const vkCmdDrawClusterIndirectHUAWEI: usize = 561;
+    pub const vkSetDeviceMemoryPriorityEXT: usize = 562;
+    pub const vkGetDeviceBufferMemoryRequirementsKHR: usize = 563;
+    pub const vkGetDeviceImageMemoryRequirementsKHR: usize = 564;
+    pub const vkGetDeviceImageSparseMemoryRequirementsKHR: usize = 565;
+    pub const vkCmdSetDispatchParametersARM: usize = 566;
+    pub const vkGetDescriptorSetLayoutHostMappingInfoVALVE: usize = 567;
+    pub const vkGetDescriptorSetHostMappingVALVE: usize = 568;
+    pub const vkCmdCopyMemoryIndirectNV: usize = 569;
+    pub const vkCmdCopyMemoryToImageIndirectNV: usize = 570;
+    pub const vkCmdDecompressMemoryNV: usize = 571;
+    pub const vkCmdDecompressMemoryIndirectCountNV: usize = 572;
+    pub const vkGetPipelineIndirectMemoryRequirementsNV: usize = 573;
+    pub const vkCmdUpdatePipelineIndirectBufferNV: usize = 574;
+    pub const vkGetPipelineIndirectDeviceAddressNV: usize = 575;
+    pub const vkCmdSetDepthClampEnableEXT: usize = 576;
+    pub const vkCmdSetPolygonModeEXT: usize = 577;
+    pub const vkCmdSetRasterizationSamplesEXT: usize = 578;
+    pub const vkCmdSetSampleMaskEXT: usize = 579;
+    pub const vkCmdSetAlphaToCoverageEnableEXT: usize = 580;
+    pub const vkCmdSetAlphaToOneEnableEXT: usize = 581;
+    pub const vkCmdSetLogicOpEnableEXT: usize = 582;
+    pub const vkCmdSetColorBlendEnableEXT: usize = 583;
+    pub const vkCmdSetColorBlendEquationEXT: usize = 584;
+    pub const vkCmdSetColorWriteMaskEXT: usize = 585;
+    pub const vkCmdSetTessellationDomainOriginEXT: usize = 586;
+    pub const vkCmdSetRasterizationStreamEXT: usize = 587;
+    pub const vkCmdSetConservativeRasterizationModeEXT: usize = 588;
+    pub const vkCmdSetExtraPrimitiveOverestimationSizeEXT: usize = 589;
+    pub const vkCmdSetDepthClipEnableEXT: usize = 590;
+    pub const vkCmdSetSampleLocationsEnableEXT: usize = 591;
+    pub const vkCmdSetColorBlendAdvancedEXT: usize = 592;
+    pub const vkCmdSetProvokingVertexModeEXT: usize = 593;
+    pub const vkCmdSetLineRasterizationModeEXT: usize = 594;
+    pub const vkCmdSetLineStippleEnableEXT: usize = 595;
+    pub const vkCmdSetDepthClipNegativeOneToOneEXT: usize = 596;
+    pub const vkCmdSetViewportWScalingEnableNV: usize = 597;
+    pub const vkCmdSetViewportSwizzleNV: usize = 598;
+    pub const vkCmdSetCoverageToColorEnableNV: usize = 599;
+    pub const vkCmdSetCoverageToColorLocationNV: usize = 600;
+    pub const vkCmdSetCoverageModulationModeNV: usize = 601;
+    pub const vkCmdSetCoverageModulationTableEnableNV: usize = 602;
+    pub const vkCmdSetCoverageModulationTableNV: usize = 603;
+    pub const vkCmdSetShadingRateImageEnableNV: usize = 604;
+    pub const vkCmdSetRepresentativeFragmentTestEnableNV: usize = 605;
+    pub const vkCmdSetCoverageReductionModeNV: usize = 606;
+    pub const vkCreateTensorARM: usize = 607;
+    pub const vkDestroyTensorARM: usize = 608;
+    pub const vkCreateTensorViewARM: usize = 609;
+    pub const vkDestroyTensorViewARM: usize = 610;
+    pub const vkGetTensorMemoryRequirementsARM: usize = 611;
+    pub const vkBindTensorMemoryARM: usize = 612;
+    pub const vkGetDeviceTensorMemoryRequirementsARM: usize = 613;
+    pub const vkCmdCopyTensorARM: usize = 614;
+    pub const vkGetPhysicalDeviceExternalTensorPropertiesARM: usize = 615;
+    pub const vkGetTensorOpaqueCaptureDescriptorDataARM: usize = 616;
+    pub const vkGetTensorViewOpaqueCaptureDescriptorDataARM: usize = 617;
+    pub const vkGetShaderModuleIdentifierEXT: usize = 618;
+    pub const vkGetShaderModuleCreateInfoIdentifierEXT: usize = 619;
+    pub const vkGetPhysicalDeviceOpticalFlowImageFormatsNV: usize = 620;
+    pub const vkCreateOpticalFlowSessionNV: usize = 621;
+    pub const vkDestroyOpticalFlowSessionNV: usize = 622;
+    pub const vkBindOpticalFlowSessionImageNV: usize = 623;
+    pub const vkCmdOpticalFlowExecuteNV: usize = 624;
+    pub const vkCmdBindIndexBuffer2KHR: usize = 625;
+    pub const vkGetRenderingAreaGranularityKHR: usize = 626;
+    pub const vkGetDeviceImageSubresourceLayoutKHR: usize = 627;
+    pub const vkGetImageSubresourceLayout2KHR: usize = 628;
+    pub const vkAntiLagUpdateAMD: usize = 629;
+    pub const vkCreateShadersEXT: usize = 630;
+    pub const vkDestroyShaderEXT: usize = 631;
+    pub const vkGetShaderBinaryDataEXT: usize = 632;
+    pub const vkCmdBindShadersEXT: usize = 633;
+    pub const vkCmdSetDepthClampRangeEXT: usize = 634;
+    pub const vkGetFramebufferTilePropertiesQCOM: usize = 635;
+    pub const vkGetDynamicRenderingTilePropertiesQCOM: usize = 636;
+    pub const vkGetPhysicalDeviceCooperativeVectorPropertiesNV: usize = 637;
+    pub const vkConvertCooperativeVectorMatrixNV: usize = 638;
+    pub const vkCmdConvertCooperativeVectorMatrixNV: usize = 639;
+    pub const vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR: usize = 640;
+    pub const vkCreateDataGraphPipelinesARM: usize = 641;
+    pub const vkCreateDataGraphPipelineSessionARM: usize = 642;
+    pub const vkGetDataGraphPipelineSessionBindPointRequirementsARM: usize = 643;
+    pub const vkGetDataGraphPipelineSessionMemoryRequirementsARM: usize = 644;
+    pub const vkBindDataGraphPipelineSessionMemoryARM: usize = 645;
+    pub const vkDestroyDataGraphPipelineSessionARM: usize = 646;
+    pub const vkCmdDispatchDataGraphARM: usize = 647;
+    pub const vkGetDataGraphPipelineAvailablePropertiesARM: usize = 648;
+    pub const vkGetDataGraphPipelinePropertiesARM: usize = 649;
+    pub const vkGetPhysicalDeviceQueueFamilyDataGraphPropertiesARM: usize = 650;
+    pub const vkGetPhysicalDeviceQueueFamilyDataGraphProcessingEnginePropertiesARM: usize = 651;
+    pub const vkGetPhysicalDeviceQueueFamilyDataGraphEngineOperationPropertiesARM: usize = 652;
+    pub const vkCmdSetAttachmentFeedbackLoopEnableEXT: usize = 653;
+    pub const vkCmdSetLineStippleKHR: usize = 654;
+    pub const vkGetPhysicalDeviceCalibrateableTimeDomainsKHR: usize = 655;
+    pub const vkGetCalibratedTimestampsKHR: usize = 656;
+    pub const vkCmdBindDescriptorSets2KHR: usize = 657;
+    pub const vkCmdPushConstants2KHR: usize = 658;
+    pub const vkCmdPushDescriptorSet2KHR: usize = 659;
+    pub const vkCmdPushDescriptorSetWithTemplate2KHR: usize = 660;
+    pub const vkCmdSetDescriptorBufferOffsets2EXT: usize = 661;
+    pub const vkCmdBindDescriptorBufferEmbeddedSamplers2EXT: usize = 662;
+    pub const vkCmdBindTileMemoryQCOM: usize = 663;
+    pub const vkCmdCopyMemoryIndirectKHR: usize = 664;
+    pub const vkCmdCopyMemoryToImageIndirectKHR: usize = 665;
+    pub const vkCmdDecompressMemoryEXT: usize = 666;
+    pub const vkCmdDecompressMemoryIndirectCountEXT: usize = 667;
+    pub const vkCreateExternalComputeQueueNV: usize = 668;
+    pub const vkDestroyExternalComputeQueueNV: usize = 669;
+    pub const vkGetExternalComputeQueueDataNV: usize = 670;
+    pub const vkGetClusterAccelerationStructureBuildSizesNV: usize = 671;
+    pub const vkCmdBuildClusterAccelerationStructureIndirectNV: usize = 672;
+    pub const vkGetPartitionedAccelerationStructuresBuildSizesNV: usize = 673;
+    pub const vkCmdBuildPartitionedAccelerationStructuresNV: usize = 674;
+    pub const vkGetGeneratedCommandsMemoryRequirementsEXT: usize = 675;
+    pub const vkCmdPreprocessGeneratedCommandsEXT: usize = 676;
+    pub const vkCmdExecuteGeneratedCommandsEXT: usize = 677;
+    pub const vkCreateIndirectCommandsLayoutEXT: usize = 678;
+    pub const vkDestroyIndirectCommandsLayoutEXT: usize = 679;
+    pub const vkCreateIndirectExecutionSetEXT: usize = 680;
+    pub const vkDestroyIndirectExecutionSetEXT: usize = 681;
+    pub const vkUpdateIndirectExecutionSetPipelineEXT: usize = 682;
+    pub const vkUpdateIndirectExecutionSetShaderEXT: usize = 683;
+    pub const vkGetDeviceFaultReportsKHR: usize = 684;
+    pub const vkGetDeviceFaultDebugInfoKHR: usize = 685;
+    pub const vkGetPhysicalDeviceCooperativeMatrixFlexibleDimensionsPropertiesNV: usize = 686;
+    pub const vkEnumeratePhysicalDeviceQueueFamilyPerformanceCountersByRegionARM: usize = 687;
+    pub const vkEnumeratePhysicalDeviceShaderInstrumentationMetricsARM: usize = 688;
+    pub const vkCreateShaderInstrumentationARM: usize = 689;
+    pub const vkDestroyShaderInstrumentationARM: usize = 690;
+    pub const vkCmdBeginShaderInstrumentationARM: usize = 691;
+    pub const vkCmdEndShaderInstrumentationARM: usize = 692;
+    pub const vkGetShaderInstrumentationValuesARM: usize = 693;
+    pub const vkClearShaderInstrumentationMetricsARM: usize = 694;
+    pub const vkCmdEndRendering2EXT: usize = 695;
+    pub const vkCmdBeginCustomResolveEXT: usize = 696;
+    pub const vkCmdEndRendering2KHR: usize = 697;
+    pub const vkGetPhysicalDeviceQueueFamilyDataGraphOpticalFlowImageFormatsARM: usize = 698;
+    pub const vkCmdSetComputeOccupancyPriorityNV: usize = 699;
+    pub const vkGetPhysicalDeviceCooperativeMatrixProperties2EXT: usize = 700;
+    pub const vkCmdSetPrimitiveRestartIndexEXT: usize = 701;
 }
 
 /// Each command's index by name.
@@ -3986,24 +4034,24 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             232 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            233 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            234 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            235 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
+            }
+            233 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2], a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            234 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            235 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
             }
             236 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
@@ -4011,78 +4059,78 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 r as u32 as u64
             }
             237 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            238 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            239 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            240 => {
+            238 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
+            239 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            240 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as usize as *mut c_void);
+                r as u32 as u64
+            }
             241 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
             }
             242 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
             }
             243 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             244 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
             }
             245 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             246 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             247 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
             }
             248 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
             }
             249 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
             250 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, u64, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32, a[6] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
             }
             251 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
             252 => {
@@ -4091,9 +4139,9 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 r as u32 as u64
             }
             253 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             254 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
@@ -4106,619 +4154,619 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             256 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            257 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            258 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            259 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void);
+                0
+            }
+            260 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
+                0
+            }
+            261 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
+                0
+            }
+            262 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as u32);
+                0
+            }
+            263 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32);
+                0
+            }
+            264 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, u64, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3], a[4], a[5] as u32, a[6] as u32);
+                0
+            }
+            265 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            266 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            267 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            268 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            269 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            270 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 u64::from(r)
             }
-            257 => {
+            271 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r
             }
-            258 => {
+            272 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            259 => {
+            273 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64) -> u64 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2]);
                 r
             }
-            260 => {
+            274 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
                 0
             }
-            261 => {
+            275 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
                 0
             }
-            262 => {
+            276 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, i32, i32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32 as i32, a[3] as u32 as i32, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void);
                 r as u32 as u64
             }
-            263 => {
+            277 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            264 => {
+            278 => {
                 let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void);
                 0
             }
-            265 => {
+            279 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, i32, i32, u32, u32, u32, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as u32 as i32, a[3] as u32 as i32, a[4] as u32, a[5] as u32, a[6] as u32, a[7] as usize as *mut c_void);
                 r as u32 as u64
             }
-            266 => {
+            280 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            267 => {
+            281 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            268 => {
+            282 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
                 0
             }
-            269 => {
+            283 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            270 => {
+            284 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            271 => {
+            285 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            272 => {
+            286 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 0
             }
-            273 => {
+            287 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as usize as *mut c_void);
                 0
             }
-            274 => {
+            288 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
-            275 => {
+            289 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32, u32, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32, a[4] as u32, a[5] as u32, a[6] as u32);
                 0
             }
-            276 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            277 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            278 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            279 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            280 => {
+            290 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as u32);
                 0
             }
-            281 => {
+            291 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            282 => {
+            292 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            283 => {
+            293 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            284 => {
+            294 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, u64, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3] as u32, a[4] as u32, a[5] as usize as *mut c_void);
                 0
             }
-            285 => {
+            295 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as usize as *mut c_void);
                 0
             }
-            286 => {
+            296 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            287 => {
+            297 => {
                 let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void);
                 0
             }
-            288 => {
+            298 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            289 => {
+            299 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
-            290 => {
+            300 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as usize as *mut c_void);
                 0
             }
-            291 => {
+            301 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            292 => {
+            302 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            293 => {
+            303 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
-            294 => {
+            304 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
                 0
             }
-            295 => {
+            305 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            296 => {
+            306 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            297 => {
+            307 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            298 => {
+            308 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            299 => {
+            309 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            300 => {
+            310 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
                 r as u32 as u64
             }
-            301 => {
+            311 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            302 => {
+            312 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
-            303 => {
+            313 => {
                 let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void);
                 0
             }
-            304 => {
+            314 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            305 => {
+            315 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            306 => {
+            316 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            307 => {
+            317 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
-            308 => {
+            318 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
-            309 => {
+            319 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
-            310 => {
+            320 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1]);
                 r as u32 as u64
             }
-            311 => {
+            321 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1]);
                 r as u32 as u64
             }
-            312 => {
+            322 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            313 => {
+            323 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as u32);
                 0
             }
-            314 => {
+            324 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1]);
                 r as u32 as u64
             }
-            315 => {
+            325 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
                 r as u32 as u64
             }
-            316 => {
+            326 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1]);
                 r as u32 as u64
             }
-            317 => {
+            327 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1]);
                 0
             }
-            318 => {
+            328 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            319 => {
+            329 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            320 => {
+            330 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            321 => {
+            331 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            322 => {
+            332 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            323 => {
+            333 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            324 => {
+            334 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32) -> u64 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
                 r
             }
-            325 => {
+            335 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            326 => {
+            336 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
-            327 => {
+            337 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            328 => {
+            338 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            329 => {
+            339 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
                 0
             }
-            330 => {
+            340 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            331 => {
+            341 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            332 => {
+            342 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 0
             }
-            333 => {
+            343 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            334 => {
+            344 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
-            335 => {
+            345 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 0
             }
-            336 => {
+            346 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void);
                 0
             }
-            337 => {
+            347 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
                 r as u32 as u64
             }
-            338 => {
+            348 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            339 => {
+            349 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            340 => {
+            350 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            341 => {
+            351 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, usize, *mut c_void, usize) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4] as usize, a[5] as usize as *mut c_void, a[6] as usize);
                 r as u32 as u64
             }
-            342 => {
+            352 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            343 => {
+            353 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            344 => {
+            354 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            345 => {
+            355 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r
             }
-            346 => {
+            356 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4], a[5] as u32);
                 0
             }
-            347 => {
+            357 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            348 => {
+            358 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
                 0
             }
-            349 => {
+            359 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void, u32, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as u32, a[6] as u32, a[7] as u32);
                 0
             }
-            350 => {
+            360 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as usize as *mut c_void, std::ptr::null_mut(), a[6] as usize as *mut c_void);
                 r as u32 as u64
             }
-            351 => {
+            361 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, usize, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as usize, a[5] as usize as *mut c_void);
                 r as u32 as u64
             }
-            352 => {
+            362 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, usize, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as usize, a[5] as usize as *mut c_void);
                 r as u32 as u64
             }
-            353 => {
+            363 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void, u64) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5]);
                 0
             }
-            354 => {
+            364 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, i32) -> u64 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32 as i32);
                 r
             }
-            355 => {
+            365 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
-            356 => {
+            366 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            357 => {
+            367 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
-            358 => {
+            368 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            359 => {
+            369 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            360 => {
+            370 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            361 => {
+            371 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
-            362 => {
+            372 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            363 => {
+            373 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            364 => {
+            374 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, i32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as u32 as i32);
                 0
             }
-            365 => {
+            375 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            366 => {
+            376 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            367 => {
+            377 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            368 => {
+            378 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
-            }
-            369 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            370 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            371 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u32, u64, u64, u64, u64) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2], a[3], a[4] as u32, a[5], a[6], a[7], a[8]);
-                0
-            }
-            372 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32 as i32);
-                0
-            }
-            373 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u32, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12] as u32, a[13] as u32, a[14] as u32);
-                0
-            }
-            374 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void, std::ptr::null_mut(), a[5] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            375 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, usize, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as usize, a[5] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            376 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            377 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, u64, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4], a[5] as u32);
-                0
-            }
-            378 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32);
-                r as u32 as u64
             }
             379 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
@@ -4726,163 +4774,163 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             380 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             381 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u64, u64, u32, u64, u64, u64, u64) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2], a[3], a[4] as u32, a[5], a[6], a[7], a[8]);
                 0
             }
             382 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32 as i32);
+                0
+            }
+            383 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u32, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5], a[6], a[7], a[8], a[9], a[10], a[11], a[12] as u32, a[13] as u32, a[14] as u32);
+                0
+            }
+            384 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void, std::ptr::null_mut(), a[5] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            385 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, usize, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as usize, a[5] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            386 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, usize, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            387 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, u64, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4], a[5] as u32);
+                0
+            }
+            388 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32);
+                r as u32 as u64
+            }
+            389 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            390 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
+                0
+            }
+            391 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
+                0
+            }
+            392 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, u64, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3], a[4] as u32);
                 0
             }
-            383 => {
+            393 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4] as u32);
                 0
             }
-            384 => {
+            394 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            385 => {
+            395 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
                 r as u32 as u64
             }
-            386 => {
+            396 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32);
                 0
             }
-            387 => {
+            397 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as u32);
                 0
             }
-            388 => {
+            398 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
                 0
             }
-            389 => {
+            399 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            390 => {
+            400 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            391 => {
+            401 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            392 => {
+            402 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            393 => {
+            403 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            394 => {
+            404 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            395 => {
+            405 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u64) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2]);
                 r as u32 as u64
             }
-            396 => {
+            406 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
-            397 => {
+            407 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
-            398 => {
+            408 => {
                 let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void);
                 0
             }
-            399 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            400 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            401 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            402 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            403 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1]);
-                r as u32 as u64
-            }
-            404 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1]);
-                r as u32 as u64
-            }
-            405 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            406 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            407 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            408 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
             409 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
             }
             410 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r
+                r as u32 as u64
             }
             411 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
             412 => {
@@ -4891,248 +4939,248 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 r as u32 as u64
             }
             413 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r
+                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1]);
+                r as u32 as u64
             }
             414 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r
+                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1]);
+                r as u32 as u64
             }
             415 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r
+                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             416 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u16) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u16);
-                0
-            }
-            417 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32);
-                0
-            }
-            418 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            419 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            420 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            421 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            422 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            423 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void, a[6] as usize as *mut c_void);
-                0
-            }
-            424 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            425 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            426 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            427 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            428 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            429 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32 as i32, a[3] as u32 as i32, a[4] as u32 as i32, a[5] as u32 as i32);
-                0
-            }
-            430 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, std::ptr::null_mut(), a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            431 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            432 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64) -> u32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1]);
-                u64::from(r)
-            }
-            433 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1]);
-                r as u32 as u64
-            }
-            434 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1]);
-                r as u32 as u64
-            }
-            435 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            436 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            437 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            438 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            439 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            440 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            441 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            442 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                0
-            }
-            443 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            444 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            445 => {
+            417 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            446 => {
+            418 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            447 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            448 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, u64, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3] as u32);
-                0
-            }
-            449 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            450 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            451 => {
+            419 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            452 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
+            420 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r
             }
-            453 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            454 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, u64, u64, u64) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3], a[4]);
-                r as u32 as u64
-            }
-            455 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, u64, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3], a[4] as usize as *mut c_void);
-                0
-            }
-            456 => {
+            421 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            457 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
+            422 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
-            458 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+            423 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            424 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r
+            }
+            425 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r
+            }
+            426 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r
+            }
+            427 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u16) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u16);
                 0
             }
-            459 => {
+            428 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32);
+                0
+            }
+            429 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            430 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            431 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            432 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            433 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            434 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void, a[6] as usize as *mut c_void);
+                0
+            }
+            435 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            436 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            437 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            438 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            439 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            440 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, i32, i32, i32, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32 as i32, a[3] as u32 as i32, a[4] as u32 as i32, a[5] as u32 as i32);
+                0
+            }
+            441 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, std::ptr::null_mut(), a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            442 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            443 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64) -> u32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1]);
+                u64::from(r)
+            }
+            444 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1]);
+                r as u32 as u64
+            }
+            445 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1]);
+                r as u32 as u64
+            }
+            446 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            447 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            448 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            449 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r as u32 as u64
             }
-            460 => {
+            450 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            451 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            452 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            453 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                0
+            }
+            454 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            455 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            456 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            457 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
+            458 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            459 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32, u64, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3] as u32);
+                0
+            }
+            460 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
             461 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
             462 => {
@@ -5141,53 +5189,53 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             463 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
             }
             464 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2]);
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
             465 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, i32, u64, u64, u64) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3], a[4]);
+                r as u32 as u64
             }
             466 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, i32, u64, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3], a[4] as usize as *mut c_void);
                 0
             }
             467 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             468 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            469 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            469 => {
-                let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void);
-                0
-            }
             470 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
             }
             471 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2]);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             472 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             473 => {
@@ -5196,124 +5244,124 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             474 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32);
                 0
             }
             475 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u64) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3]);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2]);
+                0
             }
             476 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32);
+                0
+            }
+            477 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            478 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            479 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            480 => {
+                let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void);
+                0
+            }
+            481 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 0
             }
-            477 => {
+            482 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2]);
+                0
+            }
+            483 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                0
+            }
+            484 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            485 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32);
+                0
+            }
+            486 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u64) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3]);
+                r as u32 as u64
+            }
+            487 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                0
+            }
+            488 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            478 => {
+            489 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, usize, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize, a[3] as usize as *mut c_void);
                 0
             }
-            479 => {
+            490 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
                 0
             }
-            480 => {
+            491 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, u64, u32, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3] as u32, a[4] as u32, a[5] as usize as *mut c_void, a[6] as usize as *mut c_void);
                 0
             }
-            481 => {
+            492 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2], a[3] as u32);
                 0
             }
-            482 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            483 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            484 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            485 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            486 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            487 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            488 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
-                0
-            }
-            489 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            490 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            491 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            492 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
             493 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             494 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             495 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3], a[4] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             496 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             497 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, *mut c_void, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as usize as *mut c_void, a[5] as u32, a[6] as u32);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             498 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
@@ -5321,8 +5369,8 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             499 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
             500 => {
@@ -5331,23 +5379,23 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             501 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             502 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             503 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             504 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as u32, a[5] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             505 => {
@@ -5356,53 +5404,53 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             506 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3], a[4] as usize as *mut c_void);
                 0
             }
             507 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3] as u32);
                 0
             }
             508 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, *mut c_void, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4] as usize as *mut c_void, a[5] as u32, a[6] as u32);
+                0
             }
             509 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             510 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             511 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             512 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
             513 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
             514 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
             515 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void, a[4] as u32, a[5] as u32);
                 0
             }
             516 => {
@@ -5421,183 +5469,183 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             519 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            520 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32, a[4] as usize as *mut c_void);
-                0
-            }
-            521 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            522 => {
-                let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void);
-                0
-            }
-            523 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32 as i32);
-                0
-            }
-            524 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            525 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            526 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            527 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            528 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            529 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            530 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            531 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            532 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1]);
-                0
-            }
-            533 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32, a[4] as u32, a[5] as u32);
-                0
-            }
-            534 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32, a[4] as u32, a[5] as u32, a[6] as usize as *mut c_void);
-                0
-            }
-            535 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            536 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+            520 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
                 0
             }
-            537 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            538 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            539 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            540 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            541 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            542 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, usize, *mut c_void, usize) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4] as usize, a[5] as usize as *mut c_void, a[6] as usize);
-                r as u32 as u64
-            }
-            543 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            544 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            545 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            546 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, u64, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4], a[5] as u32);
-                0
-            }
-            547 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            548 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                0
-            }
-            549 => {
+            521 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32);
                 0
             }
-            550 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2]);
+            522 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as u32);
                 0
+            }
+            523 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4], a[5] as u32, a[6] as u32);
+                0
+            }
+            524 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            525 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            526 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            527 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            528 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            529 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            530 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            531 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32, a[4] as usize as *mut c_void);
+                0
+            }
+            532 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            533 => {
+                let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void);
+                0
+            }
+            534 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32 as i32);
+                0
+            }
+            535 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            536 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            537 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            538 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            539 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            540 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            541 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            542 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            543 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1]);
+                0
+            }
+            544 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32, a[4] as u32, a[5] as u32);
+                0
+            }
+            545 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, u32, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32, a[4] as u32, a[5] as u32, a[6] as usize as *mut c_void);
+                0
+            }
+            546 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            547 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            548 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            549 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            550 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             551 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, f32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], f32::from_bits(a[2] as u32));
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             552 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             553 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, usize, *mut c_void, usize) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4] as usize, a[5] as usize as *mut c_void, a[6] as usize);
+                r as u32 as u64
             }
             554 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             555 => {
@@ -5606,104 +5654,104 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             556 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            557 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, i32, u64, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as u32 as i32, a[4], a[5] as u32);
+                0
+            }
+            558 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            557 => {
+            559 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                0
+            }
+            560 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as u32);
+                0
+            }
+            561 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2]);
+                0
+            }
+            562 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, f32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], f32::from_bits(a[2] as u32));
+                0
+            }
+            563 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            564 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            565 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                0
+            }
+            566 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            567 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            568 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 0
             }
-            558 => {
+            569 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32);
                 0
             }
-            559 => {
+            570 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u32, u32, u64, i32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as u32, a[4], a[5] as u32 as i32, a[6] as usize as *mut c_void);
                 0
             }
-            560 => {
+            571 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
                 0
             }
-            561 => {
+            572 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32);
                 0
             }
-            562 => {
+            573 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            563 => {
+            574 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32, u64) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2]);
                 0
             }
-            564 => {
+            575 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> u64 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 r
-            }
-            565 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            566 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            567 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            568 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
-                0
-            }
-            569 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            570 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            571 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            572 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
-                0
-            }
-            573 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
-                0
-            }
-            574 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
-                0
-            }
-            575 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
             }
             576 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
@@ -5716,13 +5764,13 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             578 => {
-                let f: unsafe extern "C" fn(*mut c_void, f32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, f32::from_bits(a[1] as u32));
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
                 0
             }
             579 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
                 0
             }
             580 => {
@@ -5731,53 +5779,53 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             581 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
             582 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
             583 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
-                0
-            }
-            584 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            585 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            586 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            587 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
-            588 => {
+            584 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                0
+            }
+            585 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                0
+            }
+            586 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            587 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            588 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
                 0
             }
             589 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
+                let f: unsafe extern "C" fn(*mut c_void, f32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, f32::from_bits(a[1] as u32));
                 0
             }
             590 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
             591 => {
@@ -5786,118 +5834,118 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             592 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
                 0
             }
             593 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            594 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            595 => {
                 let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
                 0
             }
+            594 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            595 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
             596 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
             }
             597 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
             }
             598 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u32, a[3] as usize as *mut c_void);
+                0
+            }
+            599 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            600 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            601 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            602 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            603 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            604 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            605 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            606 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32);
+                0
+            }
+            607 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            599 => {
+            608 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            600 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            601 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            602 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            603 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            604 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            605 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            606 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            607 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
-                0
-            }
-            608 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
             609 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            610 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            611 => {
+            610 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
                 0
             }
+            611 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
             612 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, i32, u64, i32) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32 as i32, a[3], a[4] as u32 as i32);
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
                 r as u32 as u64
             }
             613 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
             614 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, i32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4] as u32 as i32);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             615 => {
@@ -5906,228 +5954,228 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             616 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             617 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                0
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
             }
             618 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            619 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, std::ptr::null_mut(), a[4] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            620 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            621 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            622 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                0
-            }
-            623 => {
-                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
-                0
-            }
-            624 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            625 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            626 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            627 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            628 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            629 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            630 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as usize as *mut c_void, std::ptr::null_mut(), a[6] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            631 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            632 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            633 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            634 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            635 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            636 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
                 0
             }
-            637 => {
+            619 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            620 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            638 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            639 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            640 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                0
-            }
-            641 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            642 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32);
-                0
-            }
-            643 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, u16) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u16);
-                0
-            }
-            644 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            645 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            646 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            647 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            648 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            649 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            650 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            651 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            652 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            653 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            654 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            655 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                0
-            }
-            656 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u32, u32) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4] as u32, a[5] as u32);
-                0
-            }
-            657 => {
+            621 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            658 => {
+            622 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            623 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, i32, u64, i32) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as u32 as i32, a[3], a[4] as u32 as i32);
+                r as u32 as u64
+            }
+            624 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                0
+            }
+            625 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, i32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4] as u32 as i32);
+                0
+            }
+            626 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut());
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            627 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            628 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                0
+            }
+            629 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            630 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, std::ptr::null_mut(), a[4] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            631 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            632 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            633 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                0
+            }
+            634 => {
+                let f: unsafe extern "C" fn(*mut c_void, i32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32 as i32, a[2] as usize as *mut c_void);
+                0
+            }
+            635 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            636 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            637 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            638 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            639 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
+            }
+            640 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            641 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2], a[3] as u32, a[4] as usize as *mut c_void, std::ptr::null_mut(), a[6] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            642 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            643 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            644 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            645 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            646 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            647 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void);
+                0
+            }
+            648 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            649 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, u32, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as u32, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            650 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            651 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
+            }
+            652 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            653 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32);
+                0
+            }
+            654 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, u16) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as u16);
+                0
+            }
+            655 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            656 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            657 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            658 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             659 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             660 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             661 => {
@@ -6136,8 +6184,8 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             662 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             663 => {
@@ -6146,74 +6194,74 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             664 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             665 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            666 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
+            }
+            667 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u64, u64, u32, u32) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2], a[3], a[4] as u32, a[5] as u32);
+                0
+            }
+            668 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            669 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut());
+                0
+            }
+            670 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
-            666 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
-                0
-            }
-            667 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            668 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
-            669 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
-                r as u32 as u64
-            }
-            670 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
-                0
-            }
             671 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
                 0
             }
             672 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) = std::mem::transmute(f);
-                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
             673 => {
-                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
             }
             674 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                0
             }
             675 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
             }
             676 => {
-                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                0
             }
             677 => {
-                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
-                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
-                r as u32 as u64
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void);
+                0
             }
             678 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
@@ -6226,56 +6274,111 @@ pub unsafe fn call(index: usize, f: *const c_void, a: &[u64; MOST_ARGS]) -> u64 
                 0
             }
             680 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            681 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            682 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
+                0
+            }
+            683 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, u32, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], a[2] as u32, a[3] as usize as *mut c_void);
+                0
+            }
+            684 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            685 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            686 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            687 => {
+                let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            688 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            689 => {
+                let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
+                let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, std::ptr::null_mut(), a[3] as usize as *mut c_void);
+                r as u32 as u64
+            }
+            690 => {
+                let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void) = std::mem::transmute(f);
+                f(a[0] as usize as *mut c_void, a[1], std::ptr::null_mut());
+                0
+            }
+            691 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1]);
                 0
             }
-            681 => {
+            692 => {
                 let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void);
                 0
             }
-            682 => {
+            693 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64, *mut c_void, *mut c_void, u32) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1], a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as u32);
                 r as u32 as u64
             }
-            683 => {
+            694 => {
                 let f: unsafe extern "C" fn(*mut c_void, u64) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1]);
                 0
             }
-            684 => {
+            695 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            685 => {
+            696 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            686 => {
+            697 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            687 => {
+            698 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32, *mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as u32, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void, a[4] as usize as *mut c_void, a[5] as usize as *mut c_void);
                 r as u32 as u64
             }
-            688 => {
+            699 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void);
                 0
             }
-            689 => {
+            700 => {
                 let f: unsafe extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void) -> i32 = std::mem::transmute(f);
                 let r = f(a[0] as usize as *mut c_void, a[1] as usize as *mut c_void, a[2] as usize as *mut c_void, a[3] as usize as *mut c_void);
                 r as u32 as u64
             }
-            690 => {
+            701 => {
                 let f: unsafe extern "C" fn(*mut c_void, u32) = std::mem::transmute(f);
                 f(a[0] as usize as *mut c_void, a[1] as u32);
                 0
@@ -6545,482 +6648,509 @@ pub fn outputs(
         229 => {
             out(a[2], 1, 8, false);
         }
-        232 => {
-            out(a[2], 1, 336, true);
-        }
         233 => {
-            out(a[2], 1, 4, false);
-            out(a[3], read_count(a[2], 4), 56, true);
+            out(a[3], 1, 4, false);
         }
         234 => {
-            out(a[3], 1, 8, false);
+            out(a[2], 1, 52, false);
+        }
+        235 => {
+            out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 8, false);
         }
         236 => {
             out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 4, false);
+        }
+        237 => {
+            out(a[3], 1, 8, false);
+        }
+        239 => {
+            out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 8, false);
+        }
+        240 => {
+            out(a[5], 1, 4, false);
+        }
+        242 => {
+            out(a[1], 1, 152, true);
+        }
+        243 => {
+            out(a[2], 1, 4, false);
+        }
+        244 => {
+            out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 16, false);
+        }
+        245 => {
+            out(a[2], 1, 4, false);
+        }
+        246 => {
+            out(a[2], 1, 336, true);
+        }
+        247 => {
+            out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 56, true);
+        }
+        248 => {
+            out(a[3], 1, 8, false);
+        }
+        250 => {
+            out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 48, true);
-        }
-        238 => {
-            out(a[3], 1, 8, false);
-        }
-        251 => {
-            out(a[3], 1, 8, false);
         }
         252 => {
             out(a[3], 1, 8, false);
         }
-        258 => {
+        265 => {
+            out(a[3], 1, 8, false);
+        }
+        266 => {
+            out(a[3], 1, 8, false);
+        }
+        272 => {
             out(a[2], 1, 32, true);
         }
-        262 => {
+        276 => {
             out(a[4], 1, 8, false);
             out(a[5], read_count(a[4], 8), 1, false);
         }
-        265 => {
+        279 => {
             out(a[7], 1, 48, false);
         }
-        266 => {
+        280 => {
             out(a[1], 1, 240, true);
         }
-        267 => {
-            out(a[1], 1, 840, true);
-        }
-        268 => {
-            out(a[2], 1, 32, true);
-        }
-        269 => {
-            out(a[2], 1, 48, true);
-        }
-        270 => {
-            out(a[1], 1, 4, false);
-            out(a[2], read_count(a[1], 4), 40, true);
-        }
-        271 => {
-            out(a[1], 1, 536, true);
-        }
-        272 => {
-            out(a[2], 1, 4, false);
-            out(a[3], read_count(a[2], 4), 40, true);
-        }
-        273 => {
-            out(a[4], 1, 4, false);
-        }
-        276 => {
-            out(a[1], 1, 152, true);
-        }
-        277 => {
-            out(a[2], 1, 4, false);
-        }
-        278 => {
-            out(a[2], 1, 4, false);
-            out(a[3], read_count(a[2], 4), 16, false);
-        }
-        279 => {
-            out(a[2], 1, 4, false);
-        }
         281 => {
-            out(a[1], 1, 4, false);
-            out(a[2], read_count(a[1], 4), 288, true);
+            out(a[1], 1, 840, true);
         }
         282 => {
             out(a[2], 1, 32, true);
         }
         283 => {
+            out(a[2], 1, 48, true);
+        }
+        284 => {
+            out(a[1], 1, 4, false);
+            out(a[2], read_count(a[1], 4), 40, true);
+        }
+        285 => {
+            out(a[1], 1, 536, true);
+        }
+        286 => {
+            out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 40, true);
+        }
+        287 => {
+            out(a[4], 1, 4, false);
+        }
+        291 => {
+            out(a[1], 1, 4, false);
+            out(a[2], read_count(a[1], 4), 288, true);
+        }
+        292 => {
             out(a[2], 1, 32, true);
         }
-        288 => {
-            out(a[3], 1, 8, false);
-        }
-        295 => {
-            out(a[3], 1, 8, false);
-        }
-        299 => {
+        293 => {
             out(a[2], 1, 32, true);
         }
-        300 => {
+        298 => {
+            out(a[3], 1, 8, false);
+        }
+        305 => {
+            out(a[3], 1, 8, false);
+        }
+        309 => {
+            out(a[2], 1, 32, true);
+        }
+        310 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 48, true);
             out(a[4], read_count(a[2], 4), 792, true);
         }
-        301 => {
+        311 => {
             out(a[2], 1, 4, false);
         }
-        304 => {
+        314 => {
             out(a[2], 1, 72, true);
         }
-        305 => {
+        315 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 24, true);
         }
-        306 => {
+        316 => {
             out(a[3], 1, 8, false);
         }
-        308 => {
+        318 => {
             out(a[1], 1, 32, true);
         }
-        309 => {
+        319 => {
             out(a[1], 1, 32, true);
         }
-        312 => {
+        322 => {
             out(a[3], 1, 4, false);
         }
-        315 => {
+        325 => {
             out(a[3], 1, 8, false);
             out(a[4], read_count(a[3], 8), 1, false);
         }
-        323 => {
+        333 => {
             out(a[3], a[1], 16, false);
         }
-        325 => {
+        335 => {
             out(a[3], 1, 4, false);
         }
-        327 => {
+        337 => {
             out(a[3], a[1], 16, false);
         }
-        329 => {
+        339 => {
             out(a[2], 1, 24, true);
         }
-        330 => {
+        340 => {
             out(a[2], 1, 40, true);
         }
-        331 => {
+        341 => {
             out(a[2], 1, 40, true);
         }
-        332 => {
+        342 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 64, true);
         }
-        333 => {
+        343 => {
             out(a[3], 1, 8, false);
-        }
-        341 => {
-            out(a[5], a[4], 1, false);
-        }
-        347 => {
-            out(a[2], 1, 4, false);
-        }
-        348 => {
-            out(a[4], 1, 40, true);
-        }
-        350 => {
-            out(a[6], a[3], 8, false);
         }
         351 => {
             out(a[5], a[4], 1, false);
         }
-        352 => {
-            out(a[5], a[4], 1, false);
+        357 => {
+            out(a[2], 1, 4, false);
         }
-        356 => {
-            out(a[3], 1, 8, false);
+        358 => {
+            out(a[4], 1, 40, true);
         }
         360 => {
+            out(a[6], a[3], 8, false);
+        }
+        361 => {
+            out(a[5], a[4], 1, false);
+        }
+        362 => {
+            out(a[5], a[4], 1, false);
+        }
+        366 => {
             out(a[3], 1, 8, false);
         }
-        363 => {
+        370 => {
+            out(a[3], 1, 8, false);
+        }
+        373 => {
             out(a[2], 1, 8, false);
             out(a[3], read_count(a[2], 8), 1, false);
         }
-        367 => {
+        377 => {
             out(a[3], 1, 8, false);
         }
-        369 => {
+        379 => {
             out(a[2], 1, 40, true);
         }
-        374 => {
+        384 => {
             out(a[5], a[2], 8, false);
         }
-        375 => {
+        385 => {
             out(a[5], a[4], 1, false);
         }
-        376 => {
+        386 => {
             out(a[3], a[2], 1, false);
         }
-        379 => {
+        389 => {
             out(a[2], 1, 24, true);
         }
-        384 => {
+        394 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 4, false);
         }
-        385 => {
+        395 => {
             out(a[3], a[1], 8, false);
             out(a[4], 1, 8, false);
         }
-        392 => {
-            out(a[1], 1, 4, false);
-            out(a[2], read_count(a[1], 4), 32, true);
-        }
-        393 => {
-            out(a[1], 1, 4, false);
-            out(a[2], read_count(a[1], 4), 32, true);
-        }
-        394 => {
-            out(a[2], 1, 8, false);
-        }
         402 => {
+            out(a[1], 1, 4, false);
+            out(a[2], read_count(a[1], 4), 32, true);
+        }
+        403 => {
+            out(a[1], 1, 4, false);
+            out(a[2], read_count(a[1], 4), 32, true);
+        }
+        404 => {
             out(a[2], 1, 8, false);
         }
-        405 => {
+        412 => {
+            out(a[2], 1, 8, false);
+        }
+        415 => {
             out(a[2], 1, 16, false);
         }
-        406 => {
+        416 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 32, true);
         }
-        411 => {
+        421 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 48, true);
         }
-        412 => {
+        422 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 32, true);
         }
-        430 => {
+        423 => {
+            out(a[3], 1, 8, false);
+        }
+        441 => {
             out(a[2], 1, 8, false);
         }
-        435 => {
+        446 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 536, true);
         }
-        436 => {
+        447 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 544, true);
         }
-        437 => {
+        448 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 552, true);
         }
-        442 => {
+        453 => {
             out(a[3], 1, 56, true);
         }
-        443 => {
+        454 => {
             out(a[2], 1, 8, false);
         }
-        445 => {
+        456 => {
             out(a[2], 1, 40, true);
         }
-        449 => {
+        460 => {
             out(a[3], 1, 8, false);
         }
-        452 => {
+        463 => {
             out(a[3], 1, 8, false);
         }
-        455 => {
+        466 => {
             out(a[4], 1, 8, false);
         }
-        456 => {
+        467 => {
             out(a[2], 1, 24, true);
         }
-        457 => {
+        468 => {
             out(a[2], 1, 24, true);
             out(a[3], 1, 8, false);
             out(a[4], read_count(a[3], 8), 1, false);
         }
-        468 => {
+        479 => {
             out(a[1], 1, 4, false);
         }
-        476 => {
+        487 => {
             out(a[2], 1, 8, false);
         }
-        477 => {
+        488 => {
             out(a[3], 1, 8, false);
         }
-        478 => {
+        489 => {
             out(a[3], a[2], 1, false);
         }
-        508 => {
+        519 => {
             out(a[3], 1, 8, false);
         }
-        519 => {
+        530 => {
             out(a[1], 1, 32, true);
             out(a[2], 1, 296, true);
         }
-        521 => {
+        532 => {
             out(a[2], 1, 8, false);
         }
-        525 => {
+        536 => {
             out(a[2], 1, 16, false);
         }
-        535 => {
+        546 => {
             out(a[3], 1, 8, false);
         }
-        542 => {
+        553 => {
             out(a[5], a[4], 1, false);
         }
-        547 => {
+        558 => {
             out(a[2], 1, 4, false);
         }
-        548 => {
+        559 => {
             out(a[3], 1, 40, true);
         }
-        552 => {
+        563 => {
             out(a[2], 1, 40, true);
         }
-        553 => {
+        564 => {
             out(a[2], 1, 40, true);
         }
-        554 => {
+        565 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 64, true);
         }
-        556 => {
+        567 => {
             out(a[2], 1, 32, true);
         }
-        557 => {
+        568 => {
             out(a[2], 1, 8, false);
         }
-        562 => {
+        573 => {
             out(a[2], 1, 40, true);
-        }
-        596 => {
-            out(a[3], 1, 8, false);
-        }
-        598 => {
-            out(a[3], 1, 8, false);
-        }
-        600 => {
-            out(a[2], 1, 40, true);
-        }
-        602 => {
-            out(a[2], 1, 40, true);
-        }
-        604 => {
-            out(a[2], 1, 32, true);
         }
         607 => {
-            out(a[2], 1, 56, true);
-        }
-        608 => {
-            out(a[2], 1, 56, true);
+            out(a[3], 1, 8, false);
         }
         609 => {
+            out(a[3], 1, 8, false);
+        }
+        611 => {
+            out(a[2], 1, 40, true);
+        }
+        613 => {
+            out(a[2], 1, 40, true);
+        }
+        615 => {
+            out(a[2], 1, 32, true);
+        }
+        618 => {
+            out(a[2], 1, 56, true);
+        }
+        619 => {
+            out(a[2], 1, 56, true);
+        }
+        620 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 24, true);
         }
-        610 => {
+        621 => {
             out(a[3], 1, 8, false);
         }
-        615 => {
+        626 => {
             out(a[2], 1, 8, false);
         }
-        616 => {
+        627 => {
             out(a[2], 1, 56, true);
         }
-        617 => {
+        628 => {
             out(a[3], 1, 56, true);
         }
-        619 => {
+        630 => {
             out(a[4], a[1], 8, false);
         }
-        621 => {
+        632 => {
             out(a[2], 1, 8, false);
             out(a[3], read_count(a[2], 8), 1, false);
         }
-        624 => {
+        635 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 48, true);
         }
-        625 => {
+        636 => {
             out(a[2], 1, 48, true);
         }
-        626 => {
+        637 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 40, true);
         }
-        629 => {
+        640 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 56, true);
         }
-        630 => {
+        641 => {
             out(a[6], a[3], 8, false);
         }
-        631 => {
+        642 => {
             out(a[3], 1, 8, false);
         }
-        632 => {
+        643 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 32, true);
         }
-        633 => {
+        644 => {
             out(a[2], 1, 40, true);
         }
-        637 => {
+        648 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 4, false);
         }
-        638 => {
+        649 => {
             out(a[3], a[2], 40, true);
         }
-        639 => {
+        650 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 160, true);
         }
-        640 => {
+        651 => {
             out(a[2], 1, 24, true);
         }
-        641 => {
+        652 => {
             out(a[3], 1, 16, false);
         }
-        644 => {
+        655 => {
             out(a[1], 1, 4, false);
             out(a[2], read_count(a[1], 4), 4, false);
         }
-        645 => {
+        656 => {
             out(a[3], a[1], 8, false);
             out(a[4], 1, 8, false);
         }
-        657 => {
+        668 => {
             out(a[3], 1, 8, false);
         }
-        659 => {
+        670 => {
             out(a[1], 1, 24, true);
         }
-        660 => {
+        671 => {
             out(a[2], 1, 40, true);
-        }
-        662 => {
-            out(a[2], 1, 40, true);
-        }
-        664 => {
-            out(a[2], 1, 40, true);
-        }
-        667 => {
-            out(a[3], 1, 8, false);
-        }
-        669 => {
-            out(a[3], 1, 8, false);
         }
         673 => {
-            out(a[2], 1, 4, false);
-            out(a[3], read_count(a[2], 4), 608, true);
-        }
-        674 => {
-            out(a[1], 1, 32, true);
+            out(a[2], 1, 40, true);
         }
         675 => {
-            out(a[1], 1, 4, false);
-            out(a[2], read_count(a[1], 4), 56, true);
-        }
-        676 => {
-            out(a[2], 1, 4, false);
-            out(a[3], read_count(a[2], 4), 24, true);
-            out(a[4], read_count(a[2], 4), 280, true);
-        }
-        677 => {
-            out(a[1], 1, 4, false);
-            out(a[2], read_count(a[1], 4), 528, true);
+            out(a[2], 1, 40, true);
         }
         678 => {
             out(a[3], 1, 8, false);
         }
-        682 => {
+        680 => {
+            out(a[3], 1, 8, false);
+        }
+        684 => {
             out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 608, true);
+        }
+        685 => {
+            out(a[1], 1, 32, true);
+        }
+        686 => {
+            out(a[1], 1, 4, false);
+            out(a[2], read_count(a[1], 4), 56, true);
         }
         687 => {
+            out(a[2], 1, 4, false);
+            out(a[3], read_count(a[2], 4), 24, true);
+            out(a[4], read_count(a[2], 4), 280, true);
+        }
+        688 => {
+            out(a[1], 1, 4, false);
+            out(a[2], read_count(a[1], 4), 528, true);
+        }
+        689 => {
+            out(a[3], 1, 8, false);
+        }
+        693 => {
+            out(a[2], 1, 4, false);
+        }
+        698 => {
             out(a[4], 1, 4, false);
             out(a[5], read_count(a[4], 4), 24, true);
         }
-        689 => {
+        700 => {
             out(a[2], 1, 4, false);
             out(a[3], read_count(a[2], 4), 48, true);
         }
@@ -7086,6 +7216,8 @@ pub fn struct_size(stype: u32) -> Option<u64> {
         54 => 216, // VkPhysicalDeviceVulkan13Properties
         55 => 104, // VkPhysicalDeviceVulkan14Features
         56 => 144, // VkPhysicalDeviceVulkan14Properties
+        1000001000 => 104, // VkSwapchainCreateInfoKHR
+        1000001001 => 64, // VkPresentInfoKHR
         1000018000 => 24, // VkPipelineRasterizationStateRasterizationOrderAMD
         1000023000 => 32, // VkVideoProfileInfoKHR
         1000023001 => 336, // VkVideoCapabilitiesKHR
@@ -7426,6 +7558,7 @@ pub fn struct_size(stype: u32) -> Option<u64> {
         1000254000 => 24, // VkPhysicalDeviceProvokingVertexFeaturesEXT
         1000254001 => 24, // VkPipelineRasterizationProvokingVertexStateCreateInfoEXT
         1000254002 => 24, // VkPhysicalDeviceProvokingVertexPropertiesEXT
+        1000256000 => 24, // VkHeadlessSurfaceCreateInfoEXT
         1000257000 => 32, // VkPhysicalDeviceBufferDeviceAddressFeatures
         1000257002 => 24, // VkBufferOpaqueCaptureAddressCreateInfo
         1000257003 => 24, // VkMemoryOpaqueCaptureAddressAllocateInfo
@@ -8027,7 +8160,8 @@ pub fn struct_size(stype: u32) -> Option<u64> {
     })
 }
 
-/// The extensions whose commands are all covered, and their kind.
+/// The driver's extensions whose commands are all covered, and their
+/// kind (the window systems' are the guest library's).
 pub static EXTENSIONS: &[(&str, Level)] = &[
     ("VK_AMD_anti_lag", Level::Device),
     ("VK_AMD_buffer_marker", Level::Device),

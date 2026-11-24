@@ -24,7 +24,13 @@
 //!   copies ([`chain`]).
 //! - **Instances and devices** are made from copies of the guest's create
 //!   infos, with the window systems' extensions (the guest library's own)
-//!   taken out, and a portability driver's extensions put in.
+//!   replaced by the driver's it builds them on, and a portability
+//!   driver's extensions put in.
+//! - **Window systems** are the guest library's (`driver/vulkan/wsi.c`):
+//!   a program's swapchain is the driver's, on a surface of no window
+//!   (`VK_EXT_headless_surface`), whose frames the library shows in the
+//!   program's X window. fwe answers its queries of an object's parent and
+//!   a queue's family ([`generated::PARENT`], [`generated::QUEUE_FAMILY`]).
 //! - **Waits** with a timeout end at the deadline the stub computed, and
 //!   are made in slices of [`SLICE_NS`]: a signal for the waiting thread
 //!   ends the call with `EINTR`, and the stub makes it again.
@@ -65,14 +71,18 @@ pub mod result {
     pub const ERROR_UNKNOWN: i32 = -13;
 }
 
+/// The driver's extensions a surface of the guest library's is built on: a
+/// surface of no window.
+const SURFACE: &[&CStr] = &[c"VK_KHR_surface", c"VK_EXT_headless_surface"];
+
 /// The extensions the guest library implements itself (the window
-/// systems), with their versions: offered with the driver's, and never
-/// passed to it.
-pub const GUEST_EXTENSIONS: [(&CStr, u32, Level); 4] = [
-    (c"VK_KHR_surface", 25, Level::Instance),
-    (c"VK_KHR_xcb_surface", 6, Level::Instance),
-    (c"VK_KHR_xlib_surface", 6, Level::Instance),
-    (c"VK_KHR_swapchain", 70, Level::Device),
+/// systems), with their versions, and the driver's it builds each on:
+/// offered where the driver has those, which are enabled in its place.
+pub const GUEST_EXTENSIONS: [(&CStr, u32, Level, &[&CStr]); 4] = [
+    (c"VK_KHR_surface", 25, Level::Instance, SURFACE),
+    (c"VK_KHR_xcb_surface", 6, Level::Instance, SURFACE),
+    (c"VK_KHR_xlib_surface", 6, Level::Instance, SURFACE),
+    (c"VK_KHR_swapchain", 70, Level::Device, &[c"VK_KHR_swapchain"]),
 ];
 
 /// The size of a `VkExtensionProperties`: a 256-byte name and a version.
@@ -83,8 +93,11 @@ const EXTENSION_PROPERTIES: usize = 260;
 /// ioctl itself.
 pub fn call(index: u32, w: &[u64; MOST_ARGS]) -> Result<u64, i32> {
     let driver = driver::get().map_err(|_| errno::ENODEV)?;
-    if index == generated::HAS {
-        return Ok(u64::from(objects::has(driver, w[0], w[1])));
+    match index {
+        generated::HAS => return Ok(u64::from(objects::has(driver, w[0], w[1]))),
+        generated::PARENT => return Ok(objects::parent(w[0])),
+        generated::QUEUE_FAMILY => return Ok(u64::from(objects::queue_family(w[0]))),
+        _ => {}
     }
     let index = index as usize;
     if index >= COMMANDS {
@@ -205,9 +218,10 @@ fn special(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Resul
         cmd::vkCreateInstance => objects::create_instance(driver, w),
         cmd::vkCreateDevice => objects::create_device(driver, w),
         cmd::vkDestroyInstance | cmd::vkDestroyDevice => plain(driver, index, w),
-        cmd::vkWaitForFences | cmd::vkWaitSemaphores | cmd::vkWaitSemaphoresKHR => {
-            wait(driver, index, w)
-        }
+        cmd::vkWaitForFences
+        | cmd::vkWaitSemaphores
+        | cmd::vkWaitSemaphoresKHR
+        | cmd::vkAcquireNextImageKHR => wait(driver, index, w),
         _ => plain(driver, index, w),
     }
 }
@@ -227,7 +241,8 @@ fn registry_version() -> u32 {
     (major << 22) | (minor << 12) | 0xfff
 }
 
-/// A wait with a timeout (`vkWaitForFences`, `vkWaitSemaphores`), whose
+/// A wait with a timeout (`vkWaitForFences`, `vkWaitSemaphores`,
+/// `vkAcquireNextImageKHR`), whose
 /// stub made the timeout argument an absolute `CLOCK_MONOTONIC` deadline:
 /// waited for in slices of [`SLICE_NS`] until the GPU is done, the
 /// deadline passes, or a signal for the thread comes (`EINTR`: the stub
@@ -240,6 +255,8 @@ fn wait(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Result<u
         let left = deadline.saturating_sub(monotonic_ns());
         slice[at] = left.min(SLICE_NS);
         let r = plain(driver, index, &slice)?;
+        // A slice that ended with time left: `VK_TIMEOUT` (an acquire's
+        // `VK_NOT_READY` is for a timeout of 0, which a slice never is).
         if r as u32 as i32 != result::TIMEOUT || left <= SLICE_NS {
             return Ok(r);
         }
@@ -276,8 +293,10 @@ fn host_extensions(enumerate: impl Fn(u64, u64) -> i32) -> Vec<(Vec<u8>, u32)> {
 }
 
 /// The extensions of `level` offered to the guest: the driver's that fwe
-/// covers ([`generated::EXTENSIONS`]), and the guest library's own.
+/// covers ([`generated::EXTENSIONS`]), and the guest library's own where
+/// the driver has those they are built on.
 pub fn offered(host: &[(Vec<u8>, u32)], level: Level) -> Vec<(Vec<u8>, u32)> {
+    let has = |name: &[u8]| host.iter().any(|(n, _)| n.as_slice() == name);
     let mut list: Vec<(Vec<u8>, u32)> = host
         .iter()
         .filter(|(name, _)| {
@@ -291,15 +310,29 @@ pub fn offered(host: &[(Vec<u8>, u32)], level: Level) -> Vec<(Vec<u8>, u32)> {
     list.extend(
         GUEST_EXTENSIONS
             .iter()
-            .filter(|(.., l)| *l == level)
-            .map(|(n, v, _)| (n.to_bytes().to_vec(), *v)),
+            .filter(|(_, _, l, on)| *l == level && on.iter().all(|e| has(e.to_bytes())))
+            .map(|(n, v, ..)| (n.to_bytes().to_vec(), *v)),
     );
     list
 }
 
-/// Whether `name` is an extension the guest library implements itself.
-pub fn guest_extension(name: &[u8]) -> bool {
-    GUEST_EXTENSIONS.iter().any(|(n, ..)| n.to_bytes() == name)
+/// The driver's extensions to enable for the guest's `names`: each of the
+/// guest library's replaced by those it is built on, once each.
+pub fn host_names(names: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::new();
+    for name in names {
+        let replaced = GUEST_EXTENSIONS.iter().find(|(n, ..)| n.to_bytes() == name.as_slice());
+        let these = match replaced {
+            Some((.., on)) => on.iter().map(|e| e.to_bytes().to_vec()).collect(),
+            None => vec![name],
+        };
+        for n in these {
+            if !out.contains(&n) {
+                out.push(n);
+            }
+        }
+    }
+    out
 }
 
 /// Write extension list `list` to the guest as Vulkan's enumerations do: the

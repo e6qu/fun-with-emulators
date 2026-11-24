@@ -32,6 +32,8 @@ pub(crate) struct Entry {
     table: Arc<Table>,
     parent: u64,
     grandparent: u64,
+    /// A queue's family.
+    family: u32,
 }
 
 /// Every object, by handle. Held across a host fork ([`crate::forklock`]).
@@ -127,9 +129,25 @@ fn device_table(driver: &Driver, instance: u64, device: u64, of_instance: &Table
 }
 
 fn add(handle: u64, table: Arc<Table>, parent: u64, grandparent: u64) {
+    add_with_family(handle, table, parent, grandparent, 0);
+}
+
+fn add_with_family(handle: u64, table: Arc<Table>, parent: u64, grandparent: u64, family: u32) {
     if handle != 0 {
-        objects_mut().insert(handle, Entry { table, parent, grandparent });
+        objects_mut().insert(handle, Entry { table, parent, grandparent, family });
     }
+}
+
+/// The object `handle` is of: a physical device's instance, a device's
+/// physical device, a queue's device, a command buffer's pool (0 if none,
+/// or unknown).
+pub fn parent(handle: u64) -> u64 {
+    objects().get(&handle).map_or(0, |e| e.parent)
+}
+
+/// The family of queue `handle` (0 if it is not a queue known).
+pub fn queue_family(handle: u64) -> u32 {
+    objects().get(&handle).map_or(0, |e| e.family)
 }
 
 /// `handle` is gone, and the objects of it.
@@ -169,9 +187,15 @@ pub fn after(_driver: &Driver, index: usize, w: &[u64; MOST_ARGS], r: u64) {
             }
         }
         cmd::vkGetDeviceQueue | cmd::vkGetDeviceQueue2 => {
-            let out = if index == cmd::vkGetDeviceQueue { w[3] } else { w[2] };
+            // vkGetDeviceQueue's family is its second argument;
+            // VkDeviceQueueInfo2's at 20.
+            let (out, family) = if index == cmd::vkGetDeviceQueue {
+                (w[3], w[1] as u32)
+            } else {
+                (w[2], uaccess::read::<u32>(w[1] + 20).unwrap_or(0))
+            };
             let Some((table, pd)) = table_of(w[0]) else { return };
-            add(uaccess::read::<u64>(out).unwrap_or(0), table, w[0], pd);
+            add_with_family(uaccess::read::<u64>(out).unwrap_or(0), table, w[0], pd, family);
         }
         cmd::vkAllocateCommandBuffers if ok == 0 => {
             // VkCommandBufferAllocateInfo: the pool at 16, the count at 28.
@@ -226,8 +250,7 @@ pub fn create_instance(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32
         let next = *field::<u64>(info, 8);
         *field::<u64>(info, 8) = copies.chain(next, |_| true)?;
         let names = chain::read_names(*field::<u64>(info, 56), *field::<u32>(info, 48))?;
-        let names: Vec<Vec<u8>> =
-            names.into_iter().filter(|n| !super::guest_extension(n)).collect();
+        let names = super::host_names(names);
         let mut extra = Vec::new();
         if driver.portability {
             extra.push(c"VK_KHR_portability_enumeration");
@@ -290,8 +313,7 @@ pub fn create_device(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32> 
         let next = *field::<u64>(info, 8);
         *field::<u64>(info, 8) = copies.chain(next, |_| true)?;
         let names = chain::read_names(*field::<u64>(info, 56), *field::<u32>(info, 48))?;
-        let names: Vec<Vec<u8>> =
-            names.into_iter().filter(|n| !super::guest_extension(n)).collect();
+        let names = super::host_names(names);
         let mut extra = Vec::new();
         if has_subset && !names.iter().any(|n| n.as_slice() == subset.to_bytes()) {
             extra.push(subset);
