@@ -456,8 +456,14 @@ def vulkan(a, fwe, guest_env, results):
     root = alpine_root("display", a.cache)
     icd = dict(os.environ, VK_ICD_FILENAMES=os.path.join(a.brew, "etc/vulkan/icd.d/MoltenVK_icd.json"))
     shutil.copy(a.vkbench, os.path.join(root, "tmp/vkbench"))
-    results["fwe"][VK_SUBMIT] = best(lambda: run_bench(
-        guest_env + VENUS_ENV + fwe + ["--root", root], os.path.join(root, "tmp/vkbench"), ["3000"]))
+    submit = guest_env + VENUS_ENV + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
+    results["fwe"][VK_SUBMIT] = best(lambda: run_bench(submit[:-1], submit[-1], ["3000"]))
+    # Where a submission's time goes: the device's calls and their stages.
+    r = subprocess.run(submit[:2] + ["FWE_TIMING=1"] + submit[2:] + ["3000"],
+                       capture_output=True, text=True, errors="replace", timeout=600)
+    for line in r.stderr.splitlines():
+        if "timing: exit:" in line:
+            print(f"{VK_SUBMIT}: {line}", flush=True)
     results["macOS"][VK_SUBMIT] = best(lambda: float(subprocess.run(
         [a.vkbench_native, "3000", os.path.join(a.brew, "lib/libvulkan.1.dylib")],
         env=icd, check=True, capture_output=True, text=True).stdout.split()[-1]))

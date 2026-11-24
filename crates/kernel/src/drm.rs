@@ -217,6 +217,31 @@ static CALL_NS: [AtomicU64; KINDS.len()] = [const { AtomicU64::new(0) }; KINDS.l
 static MAPPED: AtomicU64 = AtomicU64::new(0);
 static MAPPINGS: AtomicU64 = AtomicU64::new(0);
 
+/// Where a submission's time goes (counted with `FWE_TIMING`): the
+/// renderer running its commands, a fence made, and a fence's wait from
+/// made to signalled (the renderer's queue and the GPU).
+#[derive(Clone, Copy)]
+enum Stage {
+    Submit,
+    FenceMade,
+    FenceSignalled,
+}
+const STAGES: [&str; 3] = ["renderer's submit", "fence made", "fence made to signalled"];
+static STAGE_COUNT: [AtomicU64; STAGES.len()] = [const { AtomicU64::new(0) }; STAGES.len()];
+static STAGE_NS: [AtomicU64; STAGES.len()] = [const { AtomicU64::new(0) }; STAGES.len()];
+
+/// A stage done, begun at `began` (none: not counting).
+fn staged(stage: Stage, began: Option<std::time::Instant>) {
+    let Some(b) = began else { return };
+    STAGE_COUNT[stage as usize].fetch_add(1, Relaxed);
+    STAGE_NS[stage as usize].fetch_add(b.elapsed().as_nanos() as u64, Relaxed);
+}
+
+/// Now, if counting.
+fn clock() -> Option<std::time::Instant> {
+    crate::timing::on().then(std::time::Instant::now)
+}
+
 /// A call of number `nr` done, begun at `began` (counted with `FWE_TIMING`).
 fn counted(nr: u64, began: Option<std::time::Instant>) {
     let Some(b) = began else { return };
@@ -243,10 +268,18 @@ pub fn counts() -> Option<String> {
         .filter(|c| c.1 > 0)
         .map(|(k, n, ns)| format!("{k} {n} ({} us)", ns / 1000))
         .collect();
+    let stages: Vec<String> = STAGES
+        .iter()
+        .enumerate()
+        .map(|(i, k)| (k, STAGE_COUNT[i].load(Relaxed), STAGE_NS[i].load(Relaxed)))
+        .filter(|c| c.1 > 0)
+        .map(|(k, n, ns)| format!("{k} {n}x {} ns", ns / n))
+        .collect();
     (!calls.is_empty()).then(|| {
         format!(
-            "GPU calls: {}; GPU memory mapped: {} bytes in {} mappings",
+            "GPU calls: {}; submissions' stages (mean): {}; GPU memory mapped: {} bytes in {} mappings",
             calls.join(", "),
+            stages.join(", "),
             MAPPED.load(Relaxed),
             MAPPINGS.load(Relaxed)
         )
@@ -571,9 +604,13 @@ fn execbuffer(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
         crate::virgl::attach(ctx, h)?;
     }
     let mut commands = uaccess::read_bytes(command, size as usize)?;
+    let began = clock();
     crate::virgl::submit(ctx, &mut commands)?;
+    staged(Stage::Submit, began);
     if flags & EXECBUF_FENCE_FD_OUT != 0 {
-        let fd = fence(ctx, ring)?;
+        let began = clock();
+        let fd = fence(ctx, ring, began)?;
+        staged(Stage::FenceMade, began);
         put_u32(&mut c, EXECBUFFER_FENCE_FD, fd as u32);
         if let Err(e) = arg_out(req, arg, &c) {
             // SAFETY: the descriptor just made, never given out.
@@ -590,6 +627,8 @@ struct Pending {
     id: u64,
     /// The write end of its pipe (fwe's).
     write: i32,
+    /// When it was asked for, if counting.
+    made: Option<std::time::Instant>,
 }
 
 /// A context's ring: (context, ring).
@@ -604,8 +643,8 @@ fn fences() -> std::sync::MutexGuard<'static, BTreeMap<Ring, (u64, Vec<Pending>)
 
 /// A fence on context `ctx`'s ring `ring`, after the commands submitted:
 /// the read end of a pipe (close-on-exec, as Linux's sync files are),
-/// readable once it signals.
-fn fence(ctx: u32, ring: u32) -> Result<i32, i32> {
+/// readable once it signals. `made`: when it was asked for, if counting.
+fn fence(ctx: u32, ring: u32, made: Option<std::time::Instant>) -> Result<i32, i32> {
     let mut ends = [0i32; 2];
     crate::fsops::make_pipe(&mut ends, fwe_abi::fcntl::O_CLOEXEC)?;
     let [read, write] = ends;
@@ -622,7 +661,7 @@ fn fence(ctx: u32, ring: u32) -> Result<i32, i32> {
         let mut f = fences();
         let (last, list) = f.entry((ctx, ring)).or_default();
         *last += 1;
-        list.push(Pending { id: *last, write });
+        list.push(Pending { id: *last, write, made });
         *last
     };
     // The lock let go first: the renderer may signal on this thread.
@@ -661,6 +700,7 @@ fn context_gone(ctx: u32) {
 /// `fences`' pipes made readable, and fwe's ends of them closed.
 fn signal(fences: Vec<Pending>) {
     for p in fences {
+        staged(Stage::FenceSignalled, p.made);
         // SAFETY: a pipe's write end of fwe's, closed once written.
         unsafe {
             libc::write(p.write, [0u8].as_ptr().cast(), 1);
