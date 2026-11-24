@@ -3,7 +3,7 @@
 # with what it needs. Each line is a path under that URL and the file's
 # SHA-256.
 v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
-v3.24/main/aarch64/python3-3.14.10-r1.apk 980b5108e756f1aae298c041ef6bb229b655b7a5393b8c001f6bac8a03825429
+v3.24/main/aarch64/python3-3.14.10-r2.apk 5b3b31cb75a51d0b4956d128f3d737be654740590c0262c4fbd6aae2dfb2afb4
 v3.24/main/aarch64/sqlite-libs-3.53.4-r0.apk b39d8d73c1208838a436f2d481ba605b52a095f8d6ff781556eafc81cd1a13e9
 v3.24/main/aarch64/readline-8.3.3-r1.apk 9f0ae0923c02b0d6aba62e9173542b65396ba3f0efefcbf087ea32f1120e7b34
 v3.24/main/aarch64/libncursesw-6.6_p20260516-r0.apk 51a7aa4b3ec40b144d0801c0544e0a9f62e2a41d04b6067bb5e95786040741c6
@@ -13,7 +13,6 @@ v3.24/main/aarch64/mpdecimal-4.0.1-r0.apk 358959600f99f58deee30ca9089c7f6f0f1bd7
 v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
 v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
 v3.24/main/aarch64/xz-libs-5.8.4-r0.apk 9be375832e747afe14f98e400e8b55d8f6fde25e41663090c81600628daab093
-v3.24/main/aarch64/gdbm-1.26-r0.apk bad50eb26533e2f58e014fbcd3c1744f2fdb79954af6e3c188ccd059251c7790
-v3.24/main/aarch64/libffi-3.5.2-r1.apk 9a67280b0c7c62db658c2d4d32ed1199903bef859c32dd4245e1a7e35c89ab4b
+v3.24/main/aarch64/libffi-3.8.1-r0.apk f6f6de8c25f181e3c96ee9d1120880565d970a8bf5dd06acbcfb9f2df8159963
 v3.24/main/aarch64/libexpat-2.10.0-r0.apk 99144fe0b1bb9316a3bc30c38707996767806661f4a0456fcf4565ac92e79b0f
 v3.24/main/aarch64/libbz2-1.0.8-r6.apk 28cb76bb6d11d2a55c3061b5fcb2ab84996412a248b2c9fe52bb710d0a2a84e7
