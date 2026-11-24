@@ -240,6 +240,7 @@ BUDGETS = {
     # (ROADMAP.md M7 PR 2).
     "vkcube frame (ms)": 1.5,
     "Vulkan submission round trip (us)": 1.5,
+    "Vulkan frame made and read (us)": 1.5,
     "X frame through shared memory (us)": 1.5,
     # Kernel state every process shares, kept in memory as a kernel keeps
     # it (ROADMAP.md M6 PR 2).
@@ -419,8 +420,9 @@ VKCUBE = "vkcube frame (ms)"
 # Frames as fast as they are made, not at a display's refresh, of the same
 # size on both sides. (A runner's display paces MoltenVK's frames all the
 # same: natively a frame there is its refresh, 16.7 ms; under fwe the
-# frames are copied to Xvfb, which paces nothing. The submission's round
-# trip, VK_SUBMIT, is what compares the GPU's work.)
+# frames are copied to Xvfb, which paces nothing. The same frame's work
+# unpaced on both sides, VK_FRAME, and a submission's round trip,
+# VK_SUBMIT, are what compare the GPU's work.)
 VKCUBE_ARGS = ["--present_mode", "0", "--width", "300", "--height", "300"]
 # Two runs' frames: their times' difference is the frames' alone.
 VKCUBE_FRAMES = (200, 1200)
@@ -445,28 +447,32 @@ def vkcube_ms(cmd, env=None):
 
 
 VK_SUBMIT = "Vulkan submission round trip (us)"
+VK_FRAME = "Vulkan frame made and read (us)"
+# Each row's mode of tools/bench/vkbench.c, and its count.
+VKBENCH = {VK_SUBMIT: ("submit", "3000"), VK_FRAME: ("frame", "1000")}
 
 
 def vulkan(a, fwe, guest_env, results):
-    """Vulkan on the GPU: a submission's round trip (tools/bench/vkbench.c)
-    and vkcube's frames. Under fwe, Alpine's programs on fwe's GPU device
+    """Vulkan on the GPU: a submission's round trip and a frame's work
+    (tools/bench/vkbench.c), and vkcube's frames. Under fwe, Alpine's programs on fwe's GPU device
     (Mesa's Venus, virglrenderer on MoltenVK), vkcube at the X server here;
     natively, the same on MoltenVK (Homebrew's vkcube in a window of
     macOS's)."""
     root = alpine_root("display", a.cache)
     icd = dict(os.environ, VK_ICD_FILENAMES=os.path.join(a.brew, "etc/vulkan/icd.d/MoltenVK_icd.json"))
     shutil.copy(a.vkbench, os.path.join(root, "tmp/vkbench"))
-    submit = guest_env + VENUS_ENV + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
-    results["fwe"][VK_SUBMIT] = best(lambda: run_bench(submit[:-1], submit[-1], ["3000"]))
-    # Where a submission's time goes: the device's calls and their stages.
-    r = subprocess.run(submit[:2] + ["FWE_TIMING=1"] + submit[2:] + ["3000"],
-                       capture_output=True, text=True, errors="replace", timeout=600)
-    for line in r.stderr.splitlines():
-        if "timing: exit:" in line:
-            print(f"{VK_SUBMIT}: {line}", flush=True)
-    results["macOS"][VK_SUBMIT] = best(lambda: float(subprocess.run(
-        [a.vkbench_native, "3000", os.path.join(a.brew, "lib/libvulkan.1.dylib")],
-        env=icd, check=True, capture_output=True, text=True).stdout.split()[-1]))
+    guest = guest_env + VENUS_ENV + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
+    for row, args in VKBENCH.items():
+        results["fwe"][row] = best(lambda: run_bench(guest[:-1], guest[-1], list(args)))
+        # Where its time goes: the device's calls and their stages.
+        r = subprocess.run(guest[:2] + ["FWE_TIMING=1"] + guest[2:] + list(args),
+                           capture_output=True, text=True, errors="replace", timeout=600)
+        for line in r.stderr.splitlines():
+            if "timing: exit:" in line:
+                print(f"{row}: {line}", flush=True)
+        results["macOS"][row] = best(lambda: float(subprocess.run(
+            [a.vkbench_native, *args, os.path.join(a.brew, "lib/libvulkan.1.dylib")],
+            env=icd, check=True, capture_output=True, text=True).stdout.split()[-1]))
     ours = (guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + VENUS_ENV + fwe
             + ["--root", root, os.path.join(root, "usr/bin/vkcube"), "--wsi", "xcb"] + VKCUBE_ARGS)
     results["fwe"][VKCUBE] = vkcube_ms(ours)
