@@ -1285,12 +1285,15 @@ mod tests {
         for name in ["cgroup.procs", "cgroup.controllers", "cgroup.stat"] {
             assert_eq!(owner(&cg, name.as_bytes()), (1000, 1001), "{name}");
         }
-        attach(&cg, 0xfeed_0001, b"prog").unwrap();
-        assert_eq!(attached(&cg), vec![0xfeed_0001]);
-        assert_eq!(find(0xfeed_0001).as_deref(), Some(&b"prog"[..]));
+        // A program id of this process's: the tree outlives it, and a run
+        // ended before its test did leaves its own.
+        let id = 0xfe00_0000 | std::process::id();
+        attach(&cg, id, b"prog").unwrap();
+        assert_eq!(attached(&cg), vec![id]);
+        assert_eq!(find(id).as_deref(), Some(&b"prog"[..]));
         let procs = in_tree(|t| t.lookup(dir_in(t, &cg)?, b"cgroup.procs")).unwrap();
         unmake(&cg);
-        assert_eq!(find(0xfeed_0001), None);
+        assert_eq!(find(id), None);
         assert_eq!(in_tree(|t| t.stat(procs).map(|_| ())), Err(errno::ENOENT));
         assert_eq!(in_tree(|t| dir_in(t, &cg)), Err(errno::ENOENT));
     }

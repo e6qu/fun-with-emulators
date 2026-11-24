@@ -326,7 +326,7 @@ pub(crate) fn stop_process(target: HostPid, sig: u64) -> i64 {
 /// frozen cgroup's thaw): the stop signals sent to it before are not
 /// taken, and it comes back from its stop ([`resume_process`]).
 pub(crate) fn continue_process(target: HostPid) -> i64 {
-    crate::signote::continuing(target, true);
+    crate::signote::continuing(target);
     resume_process(target)
 }
 
@@ -354,7 +354,7 @@ pub fn host_continued(sender: i32) -> bool {
     if HostPid::new(sender).is_some_and(crate::procstore::recorded) {
         return false;
     }
-    crate::signote::continuing(host::pid_now(), false);
+    crate::signote::continuing_own();
     true
 }
 
@@ -1169,7 +1169,7 @@ impl<P: Platform> Kernel<P> {
             return stop_process(target, sig);
         }
         if sig == signal::SIGCONT && (to_self || host::is_fwe(target)) {
-            crate::signote::continuing(target, true);
+            crate::signote::continuing(target);
             if to_self {
                 return post_own(sig);
             }
@@ -1315,7 +1315,7 @@ impl<P: Platform> Kernel<P> {
             }
             // A SIGCONT for any of its threads continues the process.
             signal::SIGCONT => {
-                crate::signote::continuing(owner, true);
+                crate::signote::continuing(owner);
                 match crate::signote::queue_thread(owner, tid, sig, signal::SI_TKILL, 0) {
                     Ok(()) => match host::kill_process(owner, host::WAKE_SIGNAL) {
                         0 => resume_process(owner),
@@ -1372,7 +1372,7 @@ impl<P: Platform> Kernel<P> {
         // SIGCONT for any thread continues the process: a stop signal sent
         // before is not taken.
         if sig == signal::SIGCONT {
-            crate::signote::continuing(host::pid(), true);
+            crate::signote::continuing(host::pid());
         }
         // A signal the backend's handler catches is posted to the thread
         // directly, with the wake signal to interrupt it: sent as a host

@@ -215,7 +215,7 @@ pub fn find_or_make(name: &[u8]) -> Slot {
         n.state.store(LIVE, SeqCst);
         return Slot { n };
     }
-    super::fatal(&format!("the shared records are full ({SLOTS} are kept)"))
+    super::fatal(format_args!("the shared records are full ({SLOTS} are kept)"))
 }
 
 /// Every record: its name, and when it was made (seconds since 1970).

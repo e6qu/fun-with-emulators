@@ -106,7 +106,7 @@ fn claim(w: &crate::procstore::Word, seen: u64) -> Option<u64> {
 /// The signal [`note`] was for could not be sent: take the note back, if
 /// it is still this process's.
 pub fn unnote(target: HostPid, sig: libc::c_int) {
-    let Some(mb) = crate::procstore::mailbox(target, false) else { return };
+    let Some(mb) = crate::procstore::mailbox(target) else { return };
     let Some(slots) = slots(mb, sig) else { return };
     let me = crate::host::pid().get() as u64;
     // This process's latest note there.
@@ -124,7 +124,7 @@ pub fn unnote(target: HostPid, sig: libc::c_int) {
 /// of one is there, recent (it is never taken: the signal ends the
 /// process before a handler could).
 pub fn kill_noted(target: HostPid) -> bool {
-    let Some(mb) = crate::procstore::mailbox(target, false) else { return false };
+    let Some(mb) = crate::procstore::mailbox(target) else { return false };
     let Some(slots) = slots(mb, libc::SIGKILL) else { return false };
     let now = now_ns();
     slots.chunks(SLOT).any(|s| {
@@ -143,7 +143,7 @@ pub fn note(target: HostPid, sig: libc::c_int) {
 /// `code` and value `value` (a message queue's notification), from user
 /// `uid` (an initial-namespace id).
 pub fn note_with(target: HostPid, sig: libc::c_int, code: i32, value: u64, uid: u32) {
-    let Some(mb) = crate::procstore::mailbox(target, true) else { return };
+    let Some(mb) = crate::procstore::mailbox_or_make(target) else { return };
     let Some(slots) = slots(mb, sig) else { return };
     let me = crate::host::pid().get() as u64;
     // A free slot of the signal's, or the oldest note's.
@@ -174,7 +174,7 @@ pub fn note_with(target: HostPid, sig: libc::c_int, code: i32, value: u64, uid: 
 /// Async-signal-safe.
 fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
     // (A fork child's handler may run before it knows its own pid.)
-    let mb = crate::procstore::mailbox(crate::host::pid_now(), false)?;
+    let mb = crate::procstore::mailbox(crate::host::pid_now())?;
     let slots = slots(mb, sig)?;
     let now = now_ns();
     for _ in 0..64 {
@@ -285,19 +285,27 @@ const _: () = assert!(CONT_SEEN_AT < crate::procstore::MAILBOX_WORDS - 1);
 /// How many times host process `pid` has been continued ([`continuing`]): 0
 /// while it has no mailbox. Async-signal-safe once the store is mapped.
 pub fn continued(pid: HostPid) -> u64 {
-    crate::procstore::mailbox(pid, false)
-        .and_then(|mb| mb.get(CONTINUED_AT))
-        .map_or(0, |w| w.load(SeqCst))
+    crate::procstore::mailbox(pid).and_then(|mb| mb.get(CONTINUED_AT)).map_or(0, |w| w.load(SeqCst))
 }
 
 /// Host process `pid` is sent `SIGCONT`: a stop signal sent to it before,
 /// still queued or pending, is not taken, as Linux discards a pending stop
 /// signal as `SIGCONT` is sent (`prepare_signal`), and a stop of fwe's it
-/// is in ends ([`park_word`]). Made a mailbox if `make` (a sender's), else
-/// async-signal-safe (the process's own handler, with nothing queued for
-/// it without one).
-pub fn continuing(pid: HostPid, make: bool) {
-    if let Some(w) = crate::procstore::mailbox(pid, make).and_then(|mb| mb.get(CONTINUED_AT)) {
+/// is in ends ([`park_word`]). Its mailbox is made if it has none (the
+/// sender's).
+pub fn continuing(pid: HostPid) {
+    count_continue(crate::procstore::mailbox_or_make(pid));
+}
+
+/// [`continuing`] of this process, from its own handler of the host's
+/// `SIGCONT`: async-signal-safe (with no mailbox, nothing was queued for
+/// it, and nothing is counted).
+pub fn continuing_own() {
+    count_continue(crate::procstore::mailbox(crate::host::pid_now()));
+}
+
+fn count_continue(mb: Option<&'static [AtomicU64]>) {
+    if let Some(w) = mb.and_then(|mb| mb.get(CONTINUED_AT)) {
         w.fetch_add(1, SeqCst);
         crate::shared::wake_word(w);
     }
@@ -307,7 +315,7 @@ pub fn continuing(pid: HostPid, make: bool) {
 /// continue changes and wakes ([`continuing`]); its mailbox made if it has
 /// none.
 pub fn park_word() -> &'static AtomicU64 {
-    let mb = crate::procstore::mailbox(crate::host::pid_now(), true);
+    let mb = crate::procstore::mailbox_or_make(crate::host::pid_now());
     mb.and_then(|mb| mb.get(CONTINUED_AT)).expect("a mailbox has its words")
 }
 
@@ -315,7 +323,7 @@ pub fn park_word() -> &'static AtomicU64 {
 /// `execve` ran): what an earlier process of its number left of its stops
 /// in a mailbox it may share is not its. Async-signal-safe.
 pub fn job_reset() {
-    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now()) else { return };
     for i in [STOP_AT, STOP_SEEN_AT, CONT_AT, CONT_SEEN_AT] {
         if let Some(w) = mb.get(i) {
             w.store(0, SeqCst);
@@ -326,7 +334,7 @@ pub fn job_reset() {
 /// This process enters a job-control stop of fwe's, of signal `sig`.
 pub fn job_stopped(sig: u64) {
     if let Some(w) =
-        crate::procstore::mailbox(crate::host::pid_now(), true).and_then(|mb| mb.get(STOP_AT))
+        crate::procstore::mailbox_or_make(crate::host::pid_now()).and_then(|mb| mb.get(STOP_AT))
     {
         let seq = w.load(SeqCst) >> 8;
         w.store((seq + 1) << 8 | (sig & 0xff), SeqCst);
@@ -335,7 +343,7 @@ pub fn job_stopped(sig: u64) {
 
 /// This process comes back from its job-control stop.
 pub fn job_continued() {
-    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now()) else { return };
     if let (Some(stop), Some(cont)) = (mb.get(STOP_AT), mb.get(CONT_AT)) {
         stop.fetch_and(!0xff, SeqCst);
         cont.fetch_add(1, SeqCst);
@@ -345,7 +353,7 @@ pub fn job_continued() {
 /// The signal of the job-control stop of fwe's host process `pid` is in,
 /// if any. Async-signal-safe.
 pub fn job_stop_of(pid: HostPid) -> Option<u64> {
-    let w = crate::procstore::mailbox(pid, false)?.get(STOP_AT)?.load(SeqCst);
+    let w = crate::procstore::mailbox(pid)?.get(STOP_AT)?.load(SeqCst);
     (w & 0xff != 0).then_some(w & 0xff)
 }
 
@@ -360,7 +368,7 @@ pub fn take_job_change(
     continued: bool,
     peek: bool,
 ) -> Option<(i32, i32)> {
-    let mb = crate::procstore::mailbox(pid, false)?;
+    let mb = crate::procstore::mailbox(pid)?;
     let (stop, stop_seen) = (mb.get(STOP_AT)?, mb.get(STOP_SEEN_AT)?);
     let (cont, cont_seen) = (mb.get(CONT_AT)?, mb.get(CONT_SEEN_AT)?);
     // Claimed by one `wait` alone, however many look at once.
@@ -572,7 +580,7 @@ fn put_from(
     value: u64,
     (me, uid): (u32, u32),
 ) -> Result<(), i32> {
-    let mb = crate::procstore::mailbox(target, true).ok_or(fwe_abi::errno::ESRCH)?;
+    let mb = crate::procstore::mailbox_or_make(target).ok_or(fwe_abi::errno::ESRCH)?;
     let q = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY).ok_or(fwe_abi::errno::ESRCH)?;
     // A stop signal is dated by the target's continuations in place of a
     // value (it carries none): one sent before the next is not taken.
@@ -617,7 +625,7 @@ fn put_from(
 /// ([`crate::thread::admits`]) stays queued, with those of its number
 /// after it, until it has. Async-signal-safe (it allocates nothing).
 pub fn drain(mut post: impl FnMut(u64, Note)) {
-    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now(), false) else { return };
+    let Some(mb) = crate::procstore::mailbox(crate::host::pid_now()) else { return };
     let Some(q) = mb.get(QUEUE_AT..QUEUE_AT + QUEUE_LEN * ENTRY) else { return };
     // In ticket order.
     let mut queued = [(0u64, 0usize); QUEUE_LEN];

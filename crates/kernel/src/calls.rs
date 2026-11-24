@@ -724,7 +724,7 @@ impl<P: Platform> Kernel<P> {
             }
             // A SIGCONT for any of its threads continues the process.
             if s == fwe_abi::signal::SIGCONT {
-                crate::signote::continuing(host, true);
+                crate::signote::continuing(host);
             }
             if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
                 return err(e);
@@ -742,7 +742,7 @@ impl<P: Platform> Kernel<P> {
             && matches!(s, fwe_abi::signal::SIGSTOP | fwe_abi::signal::SIGCONT)
         {
             if s == fwe_abi::signal::SIGCONT {
-                crate::signote::continuing(host, true);
+                crate::signote::continuing(host);
             } else {
                 crate::reaper::stop_signal_sent(host);
             }

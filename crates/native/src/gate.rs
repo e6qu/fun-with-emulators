@@ -42,7 +42,8 @@ pub const EXIT_GATE_TRAP: u32 = 0xd420_0000 | (EXIT_GATE_IMM << 5);
 /// Size of each thread's gate stack.
 const STACK_SIZE: usize = 1 << 20;
 
-/// One thread's gate state, at the start of its gate mapping.
+/// One thread's gate state, in the last page of its gate mapping, whose
+/// stack is below it.
 #[repr(C)]
 pub struct Block {
     /// The guest's registers at the call (`pc` set by the Rust half), and
@@ -75,6 +76,8 @@ const _: () = assert!(std::mem::offset_of!(Block, active) == 808);
 const _: () = assert!(std::mem::offset_of!(Block, signals) == 816);
 const _: () = assert!(std::mem::offset_of!(Block, seen) == 824);
 const _: () = assert!(std::mem::offset_of!(Block, stack) == 832);
+// The block is the last page of its mapping, above the stack.
+const _: () = assert!(std::mem::size_of::<Block>() <= 4096);
 
 /// Byte offset of the block's pointer in the host TSD, for the gate.
 #[unsafe(no_mangle)]
@@ -132,35 +135,32 @@ pub fn ensure_block() {
         return;
     }
     let page = crate::page_size() as usize;
-    let size = page + STACK_SIZE;
-    // SAFETY: a fresh mapping for the block (first page) and the stack
-    // above it, for the life of the thread, as its signal stack is.
+    // The stack, then the block (its last page) above it: the stack
+    // starts below the block and grows away from it, to a guard
+    // ([`fwe_kernel::host::GUARD`]) at its foot, where an overflow faults
+    // and the process ends instead of writing over the mapping below.
+    let low =
+        fwe_kernel::host::map_stack(STACK_SIZE + page).expect("allocating the gate stack failed");
+    let p = (low + STACK_SIZE) as u64;
+    BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+    // SAFETY: the block, at the start of its page of the new mapping, for
+    // the life of the thread, as its signal stack is.
     unsafe {
-        let p = libc::mmap(
-            std::ptr::null_mut(),
-            size,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        assert_ne!(p, libc::MAP_FAILED, "allocating the gate stack failed");
-        BLOCKS.lock().unwrap_or_else(|e| e.into_inner()).push(p as u64);
         let b = p as *mut Block;
-        (*b).stack = p as u64 + size as u64;
-        libc::pthread_setspecific(key(), p);
+        (*b).stack = p;
+        libc::pthread_setspecific(key(), p as *const libc::c_void);
     }
 }
 
 /// Give this thread the block and gate stack at `p` (a mapping an ended
 /// thread gave back, [`crate::stacks`]), fresh.
 pub fn adopt_block(p: u64) {
-    let size = crate::page_size() as usize + STACK_SIZE;
-    // SAFETY: the mapping is this thread's alone now; the block starts it.
+    // SAFETY: the mapping is this thread's alone now; the block is its
+    // last page, the stack below it.
     unsafe {
         std::ptr::write_bytes(p as *mut Block, 0, 1);
         let b = p as *mut Block;
-        (*b).stack = p + size as u64;
+        (*b).stack = p;
         libc::pthread_setspecific(key(), p as *const libc::c_void);
     }
 }

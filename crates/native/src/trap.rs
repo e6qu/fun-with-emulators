@@ -1000,7 +1000,8 @@ fn take_async(
         // signal. Entering `HostCode` would apply the guest's mask and let
         // signals nest in this handler without bound, each frame further
         // down the thread's signal stack until the host cannot deliver one
-        // and ends the process.
+        // and ends the process. That code may be in the host allocator.
+        let _no_allocation = host::NoAllocation::enter();
         record();
         // A system call made through the gate delivers it as it ends; one
         // on its way out starts that again, to look for it.
@@ -1717,21 +1718,7 @@ extern "C" fn on_probe_signal(
 
 /// Report synchronous signals during host probes instead of dying silently.
 pub fn install_probe_reporter() {
-    // SAFETY: a fresh mapping for the signal stack, leaked for the life of
-    // the process.
-    unsafe {
-        let stack = libc::mmap(
-            std::ptr::null_mut(),
-            SIGNAL_STACK_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        assert_ne!(stack, libc::MAP_FAILED, "allocating the signal stack failed");
-        let ss = libc::stack_t { ss_sp: stack, ss_size: SIGNAL_STACK_SIZE, ss_flags: 0 };
-        assert_eq!(libc::sigaltstack(&ss, std::ptr::null_mut()), 0, "sigaltstack failed");
-    }
+    install_thread_altstack();
     for sig in [libc::SIGTRAP, libc::SIGILL, libc::SIGSEGV, libc::SIGBUS, libc::SIGSYS] {
         install(sig, on_probe_signal);
     }
@@ -1802,22 +1789,13 @@ pub fn altstack_mapping() -> Option<u64> {
     }
 }
 
+/// Give the calling thread a fresh signal stack, with a guard below it
+/// ([`host::GUARD`]): a handler nested past its room faults there, and the
+/// process ends, instead of writing over the mapping below. Kept for the
+/// life of the thread, then given to a later one ([`crate::stacks`]).
 pub fn install_thread_altstack() {
-    // SAFETY: a fresh mapping for the signal stack, leaked for the life of
-    // the thread (which runs until the process or the thread exits).
-    unsafe {
-        let stack = libc::mmap(
-            std::ptr::null_mut(),
-            SIGNAL_STACK_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        assert_ne!(stack, libc::MAP_FAILED, "allocating the signal stack failed");
-        let ss = libc::stack_t { ss_sp: stack, ss_size: SIGNAL_STACK_SIZE, ss_flags: 0 };
-        assert_eq!(libc::sigaltstack(&ss, std::ptr::null_mut()), 0, "sigaltstack failed");
-    }
+    let stack = host::map_stack(SIGNAL_STACK_SIZE).expect("allocating the signal stack failed");
+    use_altstack(stack as u64);
 }
 
 /// Install the per-thread signal stack and the process-wide handlers for

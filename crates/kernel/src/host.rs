@@ -648,6 +648,39 @@ pub fn is_fwe(pid: HostPid) -> bool {
     crate::procreg::read(pid).is_some()
 }
 
+thread_local! {
+    /// How many [`NoAllocation`] marks the thread is under.
+    static NO_ALLOCATION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While one lives, the calling thread is in a host signal handler that
+/// interrupted fwe's own code, which may be inside the host allocator:
+/// nothing may allocate or free. A debug build's allocator ends the
+/// process if something does ([`allocation_forbidden`]), so the tests find
+/// it. Neither `Send` nor `Sync`: the mark is its thread's.
+pub struct NoAllocation(std::marker::PhantomData<*const ()>);
+
+impl NoAllocation {
+    #[inline]
+    pub fn enter() -> NoAllocation {
+        NO_ALLOCATION.with(|n| n.set(n.get() + 1));
+        NoAllocation(std::marker::PhantomData)
+    }
+}
+
+impl Drop for NoAllocation {
+    #[inline]
+    fn drop(&mut self) {
+        NO_ALLOCATION.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// Whether the calling thread is under a [`NoAllocation`] mark.
+#[inline]
+pub fn allocation_forbidden() -> bool {
+    NO_ALLOCATION.try_with(std::cell::Cell::get).is_ok_and(|n| n != 0)
+}
+
 /// A change of the calling thread's host signal mask, undone as it is
 /// dropped: the mask goes back to what it was on every path out of the
 /// scope that holds it. A mask is its thread's, so this stays on the thread
@@ -2274,6 +2307,52 @@ pub fn at_path<T>(
 mod tests {
     use super::*;
 
+    /// How a forked child that writes a byte at `addr` ends: `None` if it
+    /// exits, else the signal that ends it.
+    fn write_in_child(addr: usize) -> Option<i32> {
+        // SAFETY: the child only writes and exits; the parent waits for it.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                std::ptr::write_volatile(addr as *mut u8, 1);
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status))
+        }
+    }
+
+    /// Below a stack is its guard, which a write past its foot faults in;
+    /// a shared object has one on each side.
+    #[test]
+    fn stacks_and_shared_memory_are_guarded() {
+        let size = 1 << 20;
+        let low = map_stack(size).unwrap();
+        assert_eq!(write_in_child(low), None);
+        assert_eq!(write_in_child(low + size - 1), None);
+        assert!(write_in_child(low - 1).is_some(), "a write below the stack");
+        assert!(write_in_child(low - GUARD).is_some(), "a write at the guard's foot");
+
+        let name = std::ffi::CString::new(format!("/fwe-g{}", std::process::id())).unwrap();
+        // SAFETY: plain host calls on an object of the test's own.
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+        assert!(fd >= 0);
+        // SAFETY: as above.
+        unsafe {
+            libc::shm_unlink(name.as_ptr());
+            assert_eq!(libc::ftruncate(fd, size as libc::off_t), 0);
+        }
+        let base = map_shared_guarded(fd, size).unwrap();
+        // SAFETY: the descriptor is no longer needed.
+        unsafe { libc::close(fd) };
+        assert_eq!(write_in_child(base), None);
+        assert_eq!(write_in_child(base + size - 1), None);
+        assert!(write_in_child(base - 1).is_some(), "a write below the object");
+        assert!(write_in_child(base + size).is_some(), "a write above the object");
+    }
+
     /// A guard puts the mask back as it goes, nested ones in turn; one
     /// kept leaves its change.
     #[test]
@@ -2589,6 +2668,75 @@ pub fn clone_name_at(
     {
         let _ = (src_dir, src, dst_dir, dst);
         Err(le::EOPNOTSUPP)
+    }
+}
+
+/// The inaccessible room kept beside fwe's own stacks and shared memory
+/// ([`map_stack`], [`map_shared_guarded`]): a stack that overflows (a
+/// handler nested without bound, a guest thread's stack made with no guard
+/// of its own) faults in it, and its process ends, instead of writing over
+/// the next mapping, which may be memory every fwe process shares.
+pub const GUARD: usize = 64 << 10;
+
+/// A new stack of `size` bytes (a multiple of the host page) with
+/// [`GUARD`] inaccessible bytes below it, kept for the process's life: its
+/// lowest usable address, or `None` if the host has no room.
+pub fn map_stack(size: usize) -> Option<usize> {
+    // SAFETY: a fresh anonymous mapping, then its lowest part made
+    // inaccessible; nothing else refers to either yet.
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            GUARD + size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        if libc::mprotect(p, GUARD, libc::PROT_NONE) != 0 {
+            libc::munmap(p, GUARD + size);
+            return None;
+        }
+        Some(p as usize + GUARD)
+    }
+}
+
+/// `size` bytes of shared memory object `fd`, read and written, mapped
+/// between two [`GUARD`]s of inaccessible room: its address, or the host's
+/// error.
+pub fn map_shared_guarded(fd: i32, size: usize) -> Result<usize, i32> {
+    // SAFETY: room reserved inaccessible, then the object mapped over its
+    // middle, which nothing else uses: the guards stay around it.
+    unsafe {
+        let room = libc::mmap(
+            std::ptr::null_mut(),
+            size + 2 * GUARD,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if room == libc::MAP_FAILED {
+            return Err(last_errno());
+        }
+        let at = room as usize + GUARD;
+        let p = libc::mmap(
+            at as *mut libc::c_void,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            let e = last_errno();
+            libc::munmap(room, size + 2 * GUARD);
+            return Err(e);
+        }
+        Ok(at)
     }
 }
 

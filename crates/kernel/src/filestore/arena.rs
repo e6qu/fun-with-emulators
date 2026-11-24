@@ -106,23 +106,12 @@ impl Arena {
             eprintln!("fwe: a store's arena {name:?} is {} bytes, not {SIZE}", st.st_size);
             return Err(fwe_abi::errno::EIO);
         }
-        // SAFETY: a new shared mapping of the object, where the host
-        // places it.
-        let mapped = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                raw,
-                0,
-            )
-        };
-        if mapped == libc::MAP_FAILED {
-            return Err(last());
-        }
+        // Between guards: files every fwe process shares, which a stack
+        // overflowing beside them must not reach.
+        let base =
+            crate::host::map_shared_guarded(raw, SIZE).map_err(crate::host::errno_to_linux)?;
         drop(fd);
-        let a = Arena { base: mapped as usize };
+        let a = Arena { base };
         let h = a.header();
         // The first to get here sets it up; another waits under the lock.
         {

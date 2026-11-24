@@ -679,6 +679,22 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   backend always knows whether it interrupted guest code or its own. Each
   thread otherwise runs under a host mask that blocks only the
   guest-blocked signals the host acts on itself.
+- **A handler that interrupted fwe** only records the signal: that code
+  may be in the host allocator, so nothing there allocates or frees
+  (`host::NoAllocation` marks it; a debug build's allocator ends the
+  process if something does, so the tests find it), and calls that might
+  are split from those that cannot (`procstore::mailbox` finds a mailbox,
+  `mailbox_or_make` may make one; `signote::continuing_own` beside
+  `continuing`).
+- **Guards:** fwe's own stacks (each thread's signal stack, and its
+  gate's stack below the gate's block) have an inaccessible
+  `host::GUARD` below them, and the shared memory of every fwe process
+  (the process store, the file store's arenas) one on each side
+  (`host::map_stack`, `host::map_shared_guarded`): a stack that
+  overflows (a handler nested without bound, a guest thread's stack made
+  with no guard of its own) faults there and its process ends, instead of
+  writing over the mapping beside it, which may be memory every fwe
+  process shares.
 - **Parked signals:** a process-wide signal the host holds can sit on a
   thread running fwe's handlers. A native thread entering a system call
   with such a signal parked on it, one the guest catches, takes it off the

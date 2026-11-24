@@ -305,19 +305,14 @@ fn map() -> Result<Store, String> {
             libc::close(fd);
             return Err(format!("{name} is {} bytes, not {SIZE}", st.st_size));
         }
-        let p = libc::mmap(
-            std::ptr::null_mut(),
-            SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_SHARED,
-            fd,
-            0,
-        );
+        // Between guards: every fwe process's records, which a stack
+        // overflowing beside them must not reach.
+        let mapped = crate::host::map_shared_guarded(fd, SIZE);
         libc::close(fd);
-        if p == libc::MAP_FAILED {
-            return Err(err("mapping"));
+        match mapped {
+            Ok(base) => Ok(Store { base }),
+            Err(e) => Err(format!("mapping {name}: {}", std::io::Error::from_raw_os_error(e))),
         }
-        Ok(Store { base: p as usize })
     }
 }
 
@@ -347,7 +342,7 @@ pub(crate) fn sized(fd: i32) -> Option<libc::stat> {
 /// The store, mapped on first use. fwe cannot run without it (no process
 /// would know another): a failure to map it ends the process, saying why.
 fn store() -> &'static Store {
-    STORE.get_or_init(|| map().unwrap_or_else(|e| fatal(&format!("the process records: {e}"))))
+    STORE.get_or_init(|| map().unwrap_or_else(|e| fatal(format_args!("the process records: {e}"))))
 }
 
 /// The store from a signal handler, which cannot map it: mapped by then
@@ -363,7 +358,7 @@ pub fn is_mapped() -> bool {
 }
 
 /// End the process: the store cannot do what it must.
-fn fatal(why: &str) -> ! {
+fn fatal(why: std::fmt::Arguments) -> ! {
     eprintln!("fwe: {why}");
     std::process::exit(1)
 }
@@ -716,7 +711,7 @@ impl Store {
         for _ in &chunks {
             match self.take_block() {
                 Some(b) => blocks.push(b),
-                None => fatal("the process records' memory is full"),
+                None => fatal(format_args!("the process records' memory is full")),
             }
         }
         for (i, chunk) in chunks.iter().enumerate() {
@@ -791,11 +786,20 @@ pub fn tid_block_owner(block: usize) -> i32 {
 /// A word of shared memory.
 pub type Word = AtomicU64;
 
-/// Host pid `pid`'s signal mailbox (its words after its owner's), given
-/// one now if it has none and `make`. Without `make`, async-signal-safe
-/// once the store is mapped ([`init`]).
-pub fn mailbox(pid: HostPid, make: bool) -> Option<&'static [AtomicU64]> {
-    let s = if make { store() } else { mapped()? };
+/// Host pid `pid`'s signal mailbox (its words after its owner's), if it
+/// has one. Async-signal-safe once the store is mapped ([`init`]).
+pub fn mailbox(pid: HostPid) -> Option<&'static [AtomicU64]> {
+    mailbox_in(mapped()?, pid, false)
+}
+
+/// [`mailbox`], given one now if it has none (a sender's). Not in a
+/// signal handler: it may map the store, and ends the process if every
+/// mailbox is taken.
+pub fn mailbox_or_make(pid: HostPid) -> Option<&'static [AtomicU64]> {
+    mailbox_in(store(), pid, true)
+}
+
+fn mailbox_in(s: &'static Store, pid: HostPid, make: bool) -> Option<&'static [AtomicU64]> {
     let e = s.entry(pid)?;
     let words = |i: u32| -> &'static [AtomicU64] {
         let at = MAILBOXES_AT + (i as usize - 1) * MAILBOX_WORDS * 8;
@@ -832,7 +836,7 @@ pub fn mailbox(pid: HostPid, make: bool) -> Option<&'static [AtomicU64]> {
             }
         }
     }
-    fatal(&format!("the signal mailboxes are full ({MAILBOXES} processes have one)"))
+    fatal(format_args!("the signal mailboxes are full ({MAILBOXES} processes have one)"))
 }
 
 /// The three shared words of the cell tagged `tag` (not 0): the one
@@ -909,7 +913,7 @@ pub fn page(tag: u64, make: Option<i32>) -> Option<&'static [Word; PAGE_WORDS]> 
             return Some(words(i));
         }
     }
-    fatal(&format!("the shared pages are full ({PAGES} are kept)"))
+    fatal(format_args!("the shared pages are full ({PAGES} are kept)"))
 }
 
 /// The page tagged `tag` is free again.
@@ -1343,7 +1347,7 @@ pub fn put_ended(pid: HostPid, start: u64, bytes: &[u8]) {
         slot.state.store(next(cur, FULL), SeqCst);
         return;
     }
-    fatal(&format!("the table of ended processes is full ({ENDED} not reaped)"));
+    fatal(format_args!("the table of ended processes is full ({ENDED} not reaped)"));
 }
 
 /// The ended accounts kept of processes whose host pid `wanted` picks.
