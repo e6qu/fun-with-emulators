@@ -461,7 +461,9 @@ def vulkan(a, fwe, guest_env, results):
     ours = (guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + VENUS_ENV + fwe
             + ["--root", root, os.path.join(root, "usr/bin/vkcube"), "--wsi", "xcb"] + VKCUBE_ARGS)
     results["fwe"][VKCUBE] = vkcube_ms(ours)
-    theirs = [os.path.join(a.brew, "bin/vkcube")] + VKCUBE_ARGS
+    # The program itself: Homebrew's `vkcube` command opens its app with
+    # `open`, which takes no arguments for it.
+    theirs = [os.path.join(a.brew, "opt/vulkan-tools/cube/vkcube.app/Contents/MacOS/vkcube")] + VKCUBE_ARGS
     results["macOS"][VKCUBE] = vkcube_ms(theirs, icd)
     # Where its time goes: the device's calls by kind and the memory it
     # mapped, and fwe's other calls (FWE_TIMING's last mark).
