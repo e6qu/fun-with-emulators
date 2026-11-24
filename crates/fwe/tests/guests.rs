@@ -10440,6 +10440,9 @@ fn assert_venus_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
         device.contains("Venus") && device.contains("Apple"),
         "the device is not the GPU:\n{info}"
     );
+    // All it finds (the X surface's capabilities among it), for a failure
+    // after: in the test's output directory.
+    display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &VENUS, 120);
 }
 
 /// vkcube draws its cube with Vulkan on the Mac's GPU (Mesa's Venus driver
@@ -10451,8 +10454,11 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     let root = x11_root("vkcube");
     assert_venus_on_the_gpu(&x, &root, "vkcube");
     let args = ["--wsi", "xcb", "--width", "300", "--height", "300"];
-    let mut gui = Gui::start(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &VENUS);
-    let w = x.window(&mut gui, &["--name", "vkcube"], 120);
+    // Venus says what its swapchain does, and any call that fails.
+    let mut env = VENUS.to_vec();
+    env.push(("VN_DEBUG", "init,wsi,result"));
+    let mut gui = Gui::start(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &env);
+    let w = x.window(&mut gui, &["--name", "Vkcube X11"], 120);
     std::thread::sleep(Duration::from_secs(2));
     let first = x.shot(&w, "vkcube-first");
     assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
@@ -10463,6 +10469,9 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
 /// Vulkan, on the Venus driver, in an X server with GLX (Alpine's Xvfb,
 /// run by fwe), which names the renderer; its gears drawn and turning.
+/// Xvfb has no DRI3, so Mesa takes the path of its software renderers
+/// (`LIBGL_ALWAYS_SOFTWARE`), where `GALLIUM_DRIVER` chooses Zink, which
+/// shows its frames through Vulkan's swapchain.
 #[test]
 fn alpine_display_glxgears_draws_on_the_gpu() {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
@@ -10471,7 +10480,11 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
     let root = x11_root("glxgears-gpu");
     let x = Xvfb::in_root(&root);
     let mut env = VENUS.to_vec();
-    env.push(("MESA_LOADER_DRIVER_OVERRIDE", "zink"));
+    env.extend([
+        ("LIBGL_ALWAYS_SOFTWARE", "1"),
+        ("GALLIUM_DRIVER", "zink"),
+        ("LIBGL_DEBUG", "verbose"),
+    ]);
     let local = |program: &str| format!("DISPLAY=:{} exec {program}", x.number);
     let glxinfo = local("/usr/bin/glxinfo -B");
     let info = display_output(&x, "glxinfo-gpu", &root, &["/bin/sh", "-c", &glxinfo], &env, 120);
