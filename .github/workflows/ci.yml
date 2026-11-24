@@ -232,7 +232,7 @@ jobs:
   # machine), Wine's in the VM, driven with xdotool and checked by what
   # they draw (libX11, `LIBX11`, takes the screenshots). Vulkan's and
   # OpenGL's on the runner's GPU (Metal) through fwe's GPU device, whose
-  # renderer is virglrenderer's Venus on MoltenVK (krunkit's build).
+  # renderer is virglrenderer's Venus on MoltenVK (Formula/fwe-virglrenderer.rb).
   display:
     name: Display (macos-26)
     runs-on: macos-26
@@ -246,11 +246,13 @@ jobs:
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
       - run: brew install xorg-server xdotool unicorn
-      # The GPU's renderer (its tap's formulas are built from source, not
-      # Homebrew's API).
+      # The GPU's renderer: this commit's formula (Formula/), built and
+      # tested.
       - run: |
-          brew tap slp/krunkit
-          HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
+          brew tap-new --no-git local/fwe
+          cp Formula/fwe-virglrenderer.rb "$(brew --repository local/fwe)/Formula/"
+          brew install --build-from-source local/fwe/fwe-virglrenderer
+          brew test local/fwe/fwe-virglrenderer
       - name: The display tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
@@ -364,11 +366,11 @@ jobs:
       # The native side's programs: the clang release Alpine's root has, and
       # the workloads' programs (tools/bench/run.py, BREW), and an X server.
       - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
-      # The GPU's renderer under fwe (its tap's formulas are built from
-      # source, not Homebrew's API).
+      # The GPU's renderer under fwe: this commit's formula (Formula/).
       - run: |
-          brew tap slp/krunkit
-          HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
+          brew tap-new --no-git local/fwe
+          cp Formula/fwe-virglrenderer.rb "$(brew --repository local/fwe)/Formula/"
+          brew install --build-from-source local/fwe/fwe-virglrenderer
       # The Vulkan benchmark for macOS, with Homebrew's headers.
       - run: clang -O2 -I"$(brew --prefix)/include" -o vkbench-mac tools/bench/vkbench.c
       - run: chmod +x bench vkbench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json

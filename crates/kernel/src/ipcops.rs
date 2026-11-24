@@ -247,7 +247,7 @@ impl<P: Platform> Kernel<P> {
             held: None,
         };
         let fd = std::os::fd::AsRawFd::as_raw_fd(&memory);
-        let mapped = self.map_shared_memory(at, size, prot, map, read_only, fd, object);
+        let mapped = self.map_shared_memory(at, size, prot, map, read_only, fd, 0, object);
         drop(memory);
         if mapped < 0 {
             ipc::detach_failed(&r, id, me, before);

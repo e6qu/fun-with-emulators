@@ -1407,28 +1407,42 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   (MIT-SHM 1.2) fwe asks it once, on a connection of its own with the
   client's authorization; a server that does not gets the `ShmAttach` as
   it was.
-- The GPU (`crates/kernel/src/drm.rs`, `virgl.rs`): `/dev/dri/renderD128`
-  is a node of fwe's (char 226:128, in a `dri` directory of its device
-  nodes), there only where virglrenderer loads and starts: it is opened
-  with `dlopen` (`FWE_VIRGLRENDERER`, else Homebrew's place for krunkit's
-  build, which has Venus in-process on MoltenVK) the first time the node
-  is looked up, and every call into it is made one at a time with every
-  host signal blocked, so its threads never take the guest's. `/sys`
-  shows a virtio-gpu PCI device (1af4:1050) behind it, as libdrm reads it.
+- The GPU (`crates/kernel/src/drm.rs`, `virgl.rs`, `virglhelper.rs`):
+  `/dev/dri/renderD128` is a node of fwe's (char 226:128, in a `dri`
+  directory of its device nodes), there only where virglrenderer is
+  installed (`FWE_VIRGLRENDERER`, else the `fwe-virglrenderer` formula's
+  prefix) and its helper starts. The renderer runs in a process of fwe's,
+  the GPU helper (`fwe --gpu-helper`), not the guest's: virglrenderer and
+  Metal open descriptors and start threads of their own, which in the
+  guest's process would sit among the guest's descriptors and take its
+  signals. A process's first open of the node starts it through a
+  launcher (`fwe --gpu-launch`), which starts the helper in a process
+  group of its own and ends, so the helper is no child of the guest's.
+  The launcher is fwe's own child while it lives (`ownchild.rs`): a
+  guest's `wait` that reaps or sees it goes on as if it had not, and the
+  `SIGCHLD` of its end is not the guest's. Requests go to the helper one
+  at a time over a socket (`hostproc.rs` passes a blob's memory back as a
+  descriptor, `SCM_RIGHTS`), fences come back over another, which a
+  thread of fwe's reads; both are fwe's own descriptors, and the helper
+  ends when they close. `/sys` shows a virtio-gpu PCI device (1af4:1050)
+  behind the node, as libdrm reads it.
   An open of the node is a descriptor marked `Mark::Drm`, with a context
   of Venus's capability set (`DRM_IOCTL_VIRTGPU_CONTEXT_INIT`) and the
   resources it made, let go with its last descriptor. Its ioctls are the
   virtio-gpu driver's: a blob (`RESOURCE_CREATE_BLOB`, host memory only)
-  is a resource of the renderer's, its GEM handle the resource's id; an
-  `mmap` of the offset `MAP` gave puts the renderer's pages of it at the
-  guest's address (`mach_vm_remap`, the same pages, not a copy);
+  is a resource of the renderer's, its GEM handle the resource's id, and
+  a mappable one's memory a shared memory object the helper passes back;
+  an `mmap` of the offset `MAP` gave maps that object at the guest's
+  address, as a System V segment is (the same pages, not a copy), listed
+  in `/proc/self/maps` as the node;
   `EXECBUFFER` submits the context's commands and, asked for a fence,
   gives a pipe's read end, which the renderer's fence callback makes
   readable as a sync file polls (no syncobjs: Venus keeps its own on
-  them). A fork child's calls on it fail with `ENODEV` (the renderer and
-  the host's GPU objects are the parent's), and its `execve` starts a
-  fresh fwe, whose program has a GPU of its own; in the VM backend there
-  is no device.
+  them); if the helper ends, every fence signals. A fork child's calls on
+  its parent's opens fail with `ENODEV` (their contexts are the parent's
+  helper's), and the child's own opens start a helper of its own; a
+  process keeps its helper across `execve`. In the VM backend there is no
+  device.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
   rootfs (`fwe --pull` writes the host's name servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
@@ -2022,12 +2036,13 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   find, and the client draws without shared memory if it can.
 - The GPU is Vulkan through Mesa's Venus driver only (OpenGL through
   Zink on it; virgl's OpenGL resources and transfers are `ENOSYS`), on
-  one render node, with virglrenderer installed (krunkit's build). Its
+  one render node, with virglrenderer installed (`fwe-virglrenderer`). Its
   buffers are not shared as descriptors (PRIME is `EOPNOTSUPP`), so an X
   server takes a program's frames as copies (`MESA_VK_WSI_DEBUG=sw`),
   and a submission waits on no fence of another's (`FENCE_FD_IN` is
-  `EINVAL`). A fork child has no GPU (`ENODEV`) until it runs a program,
-  nor has the VM backend. Windows need the guest's Mesa to be 26.3 or
+  `EINVAL`). A fork child's copy of its parent's open of the device fails
+  its calls (`ENODEV`; one the child opens works), and the VM backend has
+  no device. Windows need the guest's Mesa to be 26.3 or
   later: an earlier Venus offers a swapchain only where the host's Vulkan
   imports semaphores from sync files, which MoltenVK does not.
 - Wayland programs need a compositor run in the guest (Weston, drawing on

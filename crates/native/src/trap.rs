@@ -947,6 +947,11 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
 /// interrupted by it.
 extern "C" fn on_async(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     fwe_kernel::timing::signal(sig);
+    // The end of a child of fwe's own is not the guest's.
+    // SAFETY: `info` is valid for SA_SIGINFO handlers.
+    if sig == libc::SIGCHLD && !unsafe { host::sigchld_for_guest(info) } {
+        return;
+    }
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let sent = || unsafe { host::signal_info(sig, info) };
     take_async(sig, sent, ctx, guest_interrupted(ctx));

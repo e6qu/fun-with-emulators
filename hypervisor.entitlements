@@ -6,7 +6,8 @@
     <key>com.apple.security.hypervisor</key>
     <true/>
     <!-- Under the hardened runtime (a notarized release): guest code is
-         mapped executable, and the software stand-in loads Unicorn. -->
+         mapped executable, the software stand-in loads Unicorn, and the
+         GPU helper virglrenderer. -->
     <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
     <true/>
     <key>com.apple.security.cs.disable-library-validation</key>

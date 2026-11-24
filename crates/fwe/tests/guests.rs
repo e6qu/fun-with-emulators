@@ -10173,15 +10173,22 @@ impl Xvfb {
             }
             assert!(!gui.ended(), "no window {search:?}: {}", gui.report());
             if began.elapsed() >= Duration::from_secs(secs) {
-                // Those of the name not shown, or too small to count.
-                let mut all = vec!["search"];
-                all.extend(search);
-                let unseen: Vec<Window> = stdout(&self.xdotool(&all))
+                // Every window the server has, named or not (`--name ''`
+                // matches all), with its name and size, and what the
+                // search said.
+                let every = self.xdotool(&["search", "--name", ""]);
+                let windows: Vec<String> = stdout(&every)
                     .lines()
-                    .map(|id| self.geometry(id.trim()))
+                    .map(|id| {
+                        let name = self.xdotool(&["getwindowname", id.trim()]);
+                        format!("{:?} {:?}", self.geometry(id.trim()), stdout(&name).trim())
+                    })
                     .collect();
                 panic!(
-                    "no window {search:?} after {secs} s (unshown or empty: {unseen:?}): {}",
+                    "no window {search:?} on {} after {secs} s; the search said {:?}; \
+                     its windows: {windows:#?}: {}",
+                    self.display(),
+                    String::from_utf8_lossy(&found.stderr),
                     gui.report()
                 );
             }
@@ -10472,6 +10479,23 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "vkcube-next", 10);
     assert_ne!(next.digest, first.digest, "the cube did not turn: {}", gui.report());
+}
+
+/// A fork child of a process using the GPU: its copy of the parent's open
+/// fails, an open of its own has a renderer of its own, and the parent's
+/// open goes on working; the parent's wait sees its child only (not the
+/// processes fwe starts for the renderer).
+#[test]
+fn display_a_fork_child_opens_a_gpu_of_its_own() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    c_guest_prints(
+        "gpufork",
+        &[],
+        "child: inherited open ENODEV, own open has a context\n\
+         parent: waited for the child, then no child; its open works\n",
+    );
 }
 
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on

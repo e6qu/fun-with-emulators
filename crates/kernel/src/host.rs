@@ -1047,6 +1047,47 @@ pub fn si_code_to_linux(code: i32) -> i32 {
     code
 }
 
+/// A child of the guest's whose state changed and that no wait has taken,
+/// as `waitid` sees it without reaping it; fwe's own children seen on the
+/// way are reaped ([`crate::ownchild`]). Async-signal-safe.
+fn guest_child_changed() -> Option<libc::siginfo_t> {
+    loop {
+        // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
+        // only inspects children.
+        let child = unsafe {
+            let mut si: libc::siginfo_t = std::mem::zeroed();
+            let how = libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED;
+            (libc::waitid(libc::P_ALL, 0, &mut si, how | libc::WNOHANG | libc::WNOWAIT) == 0
+                && si.si_pid() != 0)
+                .then_some(si)
+        };
+        // SAFETY: filled in by the host.
+        match child.map(|si| unsafe { si.si_pid() }) {
+            Some(p) if crate::ownchild::reap_seen(p) => continue,
+            _ => return child,
+        }
+    }
+}
+
+/// Whether host `SIGCHLD`, delivered with `info`, is the guest's: not if it
+/// is about a child of fwe's own ([`crate::ownchild`]) and no child of the
+/// guest's has changed state with it (the host may merge a pending
+/// `SIGCHLD` with another). Async-signal-safe.
+///
+/// # Safety
+/// `info` is the `siginfo_t` the host passed a `SA_SIGINFO` handler.
+pub unsafe fn sigchld_for_guest(info: *const libc::siginfo_t) -> bool {
+    // SAFETY: guaranteed by the caller.
+    let pid = unsafe { (*info).si_pid() };
+    if !crate::ownchild::is_own(pid) {
+        return true;
+    }
+    let saved = last_errno();
+    let guest = guest_child_changed().is_some();
+    set_errno(saved);
+    guest
+}
+
 /// The Linux `siginfo` of host signal `sig` delivered with `info`.
 ///
 /// macOS empties the `siginfo` of a signal left pending while blocked. For
@@ -1069,17 +1110,14 @@ pub unsafe fn signal_info(
             std::sync::atomic::Ordering::SeqCst,
         );
     }
+    // About a child of fwe's own ([`sigchld_for_guest`] let it through for
+    // a change of the guest's it hid): the guest's is looked for.
+    if sig == libc::SIGCHLD && crate::ownchild::is_own(pid) {
+        pid = 0;
+    }
     if sig == libc::SIGCHLD && pid == 0 {
         let saved = last_errno();
-        // SAFETY: an all-zero siginfo_t is a valid out-parameter; the call
-        // only inspects children.
-        let child = unsafe {
-            let mut si: libc::siginfo_t = std::mem::zeroed();
-            let how = libc::WEXITED | libc::WSTOPPED | libc::WCONTINUED;
-            (libc::waitid(libc::P_ALL, 0, &mut si, how | libc::WNOHANG | libc::WNOWAIT) == 0
-                && si.si_pid() != 0)
-                .then_some(si)
-        };
+        let child = guest_child_changed();
         if let Some(si) = child {
             // SAFETY: filled in by the host.
             (code, pid, uid, status) =

@@ -1489,7 +1489,9 @@ impl<P: Platform> Kernel<P> {
             && let Some(source) = crate::drm::map_source(fd as i32, offset, self.page_up(len))
         {
             return match source {
-                Ok(host) => self.map_gpu_memory(addr, len, prot, flags, host),
+                Ok(memory) => {
+                    self.map_gpu_memory(addr, len, prot, flags, fd as i32, offset, memory)
+                }
                 Err(e) => err(e),
             };
         }
@@ -1709,42 +1711,37 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Map `len` bytes of the GPU's memory at host address `host` (a
-    /// resource's, [`crate::drm::map_source`]) at `addr`, as `mmap` asked:
-    /// a place made as for shared memory of no file, then the resource's
-    /// pages put there, the same pages (not a copy). Shared only, and not
-    /// to run.
-    fn map_gpu_memory(&mut self, addr: u64, len: u64, prot: u64, flags: u64, host: u64) -> i64 {
+    /// Map `len` bytes of the GPU's memory (a blob's part, [`crate::drm::map_source`])
+    /// at `addr`, as `mmap` of device descriptor `fd` asked: the blob's
+    /// shared memory object mapped there, the same pages the renderer
+    /// uses. Shared only, and not to run; listed as Linux lists it, the
+    /// device's node at the offset the guest gave.
+    #[allow(clippy::too_many_arguments)]
+    fn map_gpu_memory(
+        &mut self,
+        addr: u64,
+        len: u64,
+        prot: u64,
+        flags: u64,
+        fd: i32,
+        offset: u64,
+        memory: crate::drm::GpuMemory,
+    ) -> i64 {
+        use std::os::fd::AsRawFd;
         let shared = matches!(flags & mman::MAP_TYPE, mman::MAP_SHARED | mman::MAP_SHARED_VALIDATE);
         if !shared || prot & mman::PROT_EXEC != 0 {
             return err(errno::EINVAL);
         }
-        let place = (flags & !mman::MAP_TYPE) | mman::MAP_SHARED | mman::MAP_ANONYMOUS;
-        let r = self.sys_mmap(addr, len, prot, place, u64::MAX, 0);
-        if r < 0 {
-            return r;
+        let Ok(st) = crate::fsops::linux_fstat(fd) else { return err(errno::EBADF) };
+        let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd));
+        let object = crate::maps::Object::file(path, &st, offset);
+        let place = flags & (mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE | mman::MAP_LOCKED);
+        let host = memory.object.as_raw_fd();
+        let r = self.map_shared_memory(addr, len, prot, place, false, host, memory.offset, object);
+        if r >= 0 {
+            crate::drm::mapped(self.page_up(len));
         }
-        #[cfg(target_os = "macos")]
-        {
-            let at = crate::uaccess::g2h(r as u64);
-            let len = self.page_up(len);
-            if !region::move_pages(host, at, len) {
-                self.sys_munmap(r as u64, len);
-                return err(errno::ENOMEM);
-            }
-            // The protections asked for (the pages came with the
-            // renderer's).
-            // SAFETY: the guest's mapping just made.
-            unsafe { libc::mprotect(at as *mut libc::c_void, len as usize, host_prot(prot)) };
-            crate::drm::mapped(len);
-            r
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = host;
-            self.sys_munmap(r as u64, len);
-            err(errno::ENODEV)
-        }
+        r
     }
 
     /// Map `len` bytes of a file from `offset` at `addr` (as `mmap` would,
@@ -1784,11 +1781,11 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Map `len` bytes of host shared memory `fd`, `object`, shared, at
-    /// `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
-    /// with `prot`, `nowrite` if it may not be made writable: a System V
-    /// segment's attachment, which needs none of what a guest's mapping of
-    /// a file of its own looks at.
+    /// Map `len` bytes of host shared memory `fd` from `at`, `object`,
+    /// shared, at `addr` (with `flags` Linux's `MAP_FIXED`, or none for
+    /// anywhere), with `prot`, `nowrite` if it may not be made writable: a
+    /// System V segment's attachment, or the GPU's memory, which need none
+    /// of what a guest's mapping of a file of its own looks at.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_shared_memory(
         &mut self,
@@ -1798,6 +1795,7 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         nowrite: bool,
         fd: i32,
+        at: u64,
         object: crate::maps::Object,
     ) -> i64 {
         if too_many_maps(0) {
@@ -1812,7 +1810,7 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EAGAIN);
             }
         }
-        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0, false);
+        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, at, false);
         if r < 0 {
             return r;
         }

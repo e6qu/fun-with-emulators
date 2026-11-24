@@ -93,11 +93,9 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if vm && !crate::hv::usable() {
         return Err(err(fwe_abi::errno::ENOEXEC));
     }
-    // A program only the VM can run, an exec from a process with other
-    // threads (which must end), or from a fork child holding its parent's
-    // copy of the GPU's renderer (the new program's GPU is its own):
-    // replace this process with a fresh fwe.
-    if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 || fwe_kernel::drm::exec_needs_new_image() {
+    // A program only the VM can run, or an exec from a process with other
+    // threads (which must end): replace this process with a fresh fwe.
+    if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
         fwe_kernel::release_robust_lists();
         let state = k.exec_state();
         crate::jitcount::write_seen();
@@ -390,8 +388,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         thread::init_main(shown);
         LIVE_THREADS.store(1, Ordering::SeqCst);
-        // The GPU's renderer is the parent's (its threads, the host's GPU
-        // objects): not this child's to use.
+        // The GPU's helper and the contexts in it are the parent's: the
+        // child lets go of its copies of their sockets and fences.
         fwe_kernel::drm::forked_child();
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
             // Best effort, as for Linux's own write of the word.
@@ -955,6 +953,10 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
             host::set_errno(host::HostErrno::new(libc::EINTR));
         }
     }
+    // A child of fwe's own, not the guest's: the wait goes on.
+    if r > 0 && fwe_kernel::ownchild::taken(r) {
+        return wait4_host(pid, host_options, wstatus, rusage);
+    }
     if r < 0 {
         return fwe_kernel::host::last_error();
     }
@@ -1149,6 +1151,18 @@ fn waitid_host(
     }
     if r != 0 {
         return fwe_kernel::host::last_error();
+    }
+    // A child of fwe's own, not the guest's (reaped now if the wait only
+    // looked): the wait goes on.
+    // SAFETY: `si` was filled by the host.
+    let seen = unsafe { si.si_pid() };
+    let own = if host_options & libc::WNOWAIT != 0 {
+        fwe_kernel::ownchild::reap_seen(seen)
+    } else {
+        fwe_kernel::ownchild::taken(seen)
+    };
+    if own {
+        return waitid_host(idtype, id, host_options, infop, options);
     }
     let mut words = [0i32; 32]; // a 128-byte siginfo_t
     // SAFETY: `si` was filled by the host.

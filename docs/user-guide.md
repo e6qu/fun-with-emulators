@@ -189,8 +189,7 @@ later in the userland (Alpine 3.25's: an earlier Venus has no swapchain
 on a Mac):
 
 ```sh
-brew tap slp/krunkit
-HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
+brew install e6qu/fwe/fwe-virglrenderer
 linux ~/alpine /bin/sh -c 'apk add -q -X https://dl-cdn.alpinelinux.org/alpine/v3.25/main \
   mesa-vulkan-virtio vulkan-tools'
 env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" MESA_VK_WSI_DEBUG=sw \

@@ -1,11 +1,12 @@
 //! The GPU: a Linux render node, `/dev/dri/renderD128`, that speaks the
 //! virtio-gpu driver's device interface (the one a Linux VM's GPU has), so
-//! that Mesa's Venus Vulkan driver uses it, its commands run in this
-//! process by virglrenderer's Venus on the host's Vulkan ([`crate::virgl`]).
+//! that Mesa's Venus Vulkan driver uses it, its commands run by
+//! virglrenderer's Venus on the host's Vulkan in the process's GPU helper
+//! ([`crate::virgl`]).
 //!
 //! - **The node** is one of fwe's (a node file in its own directory of
 //!   them, [`crate::fs`]), `/dev/dri` in the rootfs's `/dev`, present only
-//!   where the renderer loads ([`present`]), as Linux has no render node
+//!   where the renderer's helper starts ([`present`]), as Linux has no render node
 //!   without a GPU. libdrm finds it as Linux shows a virtio-gpu PCI device:
 //!   `/sys/dev/char/226:128` and the device's directories ([`sys_lookup`]).
 //! - **A descriptor** of it has a context (`DRM_IOCTL_VIRTGPU_CONTEXT_INIT`)
@@ -13,16 +14,18 @@
 //!   unique in the process), kept by the descriptor's mark
 //!   ([`Mark::Drm`]) and let go with its last descriptor.
 //! - **Resources** are the renderer's blobs (host memory Vulkan uses, a
-//!   Venus ring among them); `mmap` of the offset `DRM_IOCTL_VIRTGPU_MAP`
-//!   gives maps the same pages in guest memory ([`map_source`]).
+//!   Venus ring among them); a mappable one's memory is a shared memory
+//!   object the helper passes back, which `mmap` of the offset
+//!   `DRM_IOCTL_VIRTGPU_MAP` gives maps in guest memory ([`map_source`]).
 //! - **Fences** a submission asks for (`VIRTGPU_EXECBUF_FENCE_FD_OUT`) are
 //!   pipes: the guest holds the read end, which becomes readable as the
 //!   renderer signals the fence ([`fence_signalled`]), as a sync file
 //!   polls. Venus needs no other synchronization from the kernel: with no
 //!   timeline syncobjs it keeps its own.
-//! - **A fork child** has none of it: the renderer's state (its threads, the
-//!   host's GPU objects) is the parent's, so a child's calls on the device
-//!   fail with `ENODEV`.
+//! - **A fork child**'s copies of its parent's opens are the parent's (their
+//!   contexts are the parent's helper's), so its calls on them fail with
+//!   `ENODEV`; an open of its own starts a helper of its own
+//!   ([`forked_child`]).
 
 use crate::fdmarks::{self, Mark};
 use crate::uaccess;
@@ -42,23 +45,20 @@ pub fn is_node(n: crate::devnodes::Node) -> bool {
     n == node()
 }
 
-/// A fork child, whose renderer is its parent's.
-static FORKED: AtomicBool = AtomicBool::new(false);
 /// The backend has no place for the GPU's memory (the VM's).
 static ABSENT: AtomicBool = AtomicBool::new(false);
 
-/// Whether the device is there: the backend can map its memory, the
-/// renderer loads and starts, and this process is not a fork child of one
-/// that started it.
+/// Whether the device is there: the backend can map its memory, and the
+/// renderer's helper starts (or runs).
 pub fn present() -> bool {
-    !FORKED.load(Relaxed) && !ABSENT.load(Relaxed) && crate::virgl::available().is_ok()
+    !ABSENT.load(Relaxed) && crate::virgl::available()
 }
 
 /// Whether the device is to be shown in `/sys`: as [`present`], but by the
 /// renderer being installed, not started (a program reading `/sys` need
 /// not start the GPU's renderer; one opening `/dev/dri` does).
 fn listed() -> bool {
-    !FORKED.load(Relaxed) && !ABSENT.load(Relaxed) && crate::virgl::installed()
+    !ABSENT.load(Relaxed) && crate::virgl::installed()
 }
 
 /// The backend cannot map the GPU's memory into the guest's (the VM's
@@ -69,24 +69,29 @@ pub fn absent() {
 
 /// An open of the device ([`Mark::Drm`]).
 #[derive(Default)]
-struct File {
+pub(crate) struct File {
     /// Its context, once made: its id and its number of rings.
     ctx: Option<(u32, u32)>,
     /// Its resources, by GEM handle (the resource's id).
     handles: BTreeMap<u32, Resource>,
+    /// A fork child's copy of its parent's open, whose context is the
+    /// parent's helper's: its calls fail (`ENODEV`).
+    parents: bool,
 }
 
 /// A resource a descriptor made.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Resource {
     size: u64,
     blob_mem: u32,
-    /// Its memory in this process, once mapped.
-    host: Option<u64>,
+    /// Its memory: a shared memory object's descriptor, fwe's own (a
+    /// mappable blob's).
+    memory: Option<std::sync::Arc<std::os::fd::OwnedFd>>,
 }
 
-/// Every open of the device, by its mark's key.
-static FILES: Mutex<BTreeMap<u32, File>> = Mutex::new(BTreeMap::new());
+/// Every open of the device, by its mark's key. Held across a host fork
+/// ([`crate::forklock`]).
+pub(crate) static FILES: Mutex<BTreeMap<u32, File>> = Mutex::new(BTreeMap::new());
 static NEXT_KEY: AtomicU32 = AtomicU32::new(1);
 /// Contexts' and resources' ids: unique in the process, as the renderer
 /// keeps them for every context alike.
@@ -131,7 +136,7 @@ pub fn check_open() -> Result<(), i32> {
 /// Open `key` of the device is gone: its context and resources with it.
 fn release(key: u32) {
     let Some(f) = files().remove(&key) else { return };
-    if FORKED.load(Relaxed) {
+    if f.parents {
         return;
     }
     if let Some((ctx, _)) = f.ctx {
@@ -143,27 +148,22 @@ fn release(key: u32) {
     }
 }
 
-/// A new program is about to replace this one in this process image:
-/// whether it needs a fresh image instead, to have the GPU (a fork child
-/// of a process that started the renderer, whose copy of it is the
-/// parent's). If not, the new program has the device as any other.
-pub fn exec_needs_new_image() -> bool {
-    if !FORKED.load(Relaxed) {
-        return false;
-    }
-    if crate::virgl::started() {
-        return true;
-    }
-    FORKED.store(false, Relaxed);
-    false
-}
-
 /// In a fork child (only: not at a process's start, as
-/// [`crate::thread::init_main`] is): the renderer's state is the parent's. (Its fences'
-/// table is left alone: the renderer's thread, which the child does not
-/// have, may have held its lock.)
+/// [`crate::thread::init_main`] is; its locks free, [`crate::forklock`]):
+/// the opens it has are its parent's, whose contexts are the parent's
+/// helper's, and so are the fences waited for; the child lets go of its
+/// copies of their pipes' ends, and of the helper ([`crate::virgl`]). A
+/// new open of the device is the child's own.
 pub fn forked_child() {
-    FORKED.store(true, Relaxed);
+    for f in files().values_mut() {
+        f.parents = true;
+    }
+    let pending = std::mem::take(&mut *fences());
+    for p in pending.into_values().flat_map(|(_, list)| list) {
+        // SAFETY: this process's copy of a fence pipe's end of fwe's.
+        unsafe { libc::close(p.write) };
+    }
+    crate::virgl::forked_child();
 }
 
 /// The open of the device `fd` is, if it is one.
@@ -217,16 +217,17 @@ static CALL_NS: [AtomicU64; KINDS.len()] = [const { AtomicU64::new(0) }; KINDS.l
 static MAPPED: AtomicU64 = AtomicU64::new(0);
 static MAPPINGS: AtomicU64 = AtomicU64::new(0);
 
-/// Where a submission's time goes (counted with `FWE_TIMING`): the
-/// renderer running its commands, a fence made, and a fence's wait from
-/// made to signalled (the renderer's queue and the GPU).
+/// Where a submission's time goes (counted with `FWE_TIMING`): its
+/// commands sent to the renderer's helper, a fence made, and a fence's
+/// wait from made to signalled (the helper, the renderer's queue and the
+/// GPU).
 #[derive(Clone, Copy)]
 enum Stage {
     Submit,
     FenceMade,
     FenceSignalled,
 }
-const STAGES: [&str; 3] = ["renderer's submit", "fence made", "fence made to signalled"];
+const STAGES: [&str; 3] = ["commands sent", "fence made", "fence made to signalled"];
 static STAGE_COUNT: [AtomicU64; STAGES.len()] = [const { AtomicU64::new(0) }; STAGES.len()];
 static STAGE_NS: [AtomicU64; STAGES.len()] = [const { AtomicU64::new(0) }; STAGES.len()];
 
@@ -318,7 +319,7 @@ fn put_u64(b: &mut [u8], at: usize, v: u64) {
 }
 
 fn call(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
-    if FORKED.load(Relaxed) {
+    if files().get(&key).is_some_and(|f| f.parents) {
         return Err(errno::ENODEV);
     }
     match ioc_nr(req) {
@@ -482,7 +483,7 @@ fn context(key: u32) -> Result<(u32, u32), i32> {
 
 /// Resource `handle` of the descriptor.
 fn resource(key: u32, handle: u32) -> Result<Resource, i32> {
-    files().get(&key).ok_or(errno::EBADF)?.handles.get(&handle).copied().ok_or(errno::ENOENT)
+    files().get(&key).ok_or(errno::EBADF)?.handles.get(&handle).cloned().ok_or(errno::ENOENT)
 }
 
 /// `DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB`: a blob of the renderer's,
@@ -504,17 +505,20 @@ fn create_blob(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
     }
     let (ctx, _) = context(key)?;
     if cmd_size > 0 {
-        let mut commands = uaccess::read_bytes(cmd, cmd_size as usize)?;
-        crate::virgl::submit(ctx, &mut commands)?;
+        let commands = uaccess::read_bytes(cmd, cmd_size as usize)?;
+        crate::virgl::submit(ctx, &commands)?;
     }
     let res = NEXT_RES.fetch_add(1, Relaxed);
-    crate::virgl::create_blob(ctx, res, mem, flags, id, size)?;
+    // A mappable blob's memory comes with it, to map where the guest does.
+    let mappable = flags & BLOB_FLAG_USE_MAPPABLE != 0;
+    let memory = crate::virgl::create_blob(ctx, res, mem, flags, id, size, mappable)?;
     crate::virgl::attach(ctx, res)?;
+    let memory = memory.map(std::sync::Arc::new);
     files()
         .get_mut(&key)
         .ok_or(errno::EBADF)?
         .handles
-        .insert(res, Resource { size, blob_mem: mem, host: None });
+        .insert(res, Resource { size, blob_mem: mem, memory });
     put_u32(&mut c, BLOB_BO_HANDLE, res);
     put_u32(&mut c, BLOB_RES_HANDLE, res);
     arg_out(req, arg, &c)?;
@@ -539,35 +543,33 @@ fn map_offset(handle: u32) -> u64 {
     (handle as u64) << 32
 }
 
-/// Mapping `len` bytes at `offset` of device descriptor `fd`: the host
-/// memory of the resource the offset names ([`map_offset`]), mapped once
-/// in this process (the renderer keeps it), and that memory's start for
-/// the part asked for.
-pub fn map_source(fd: i32, offset: u64, len: u64) -> Option<Result<u64, i32>> {
+/// A part of a blob's memory to map: its shared memory object, and where
+/// in it the part starts.
+pub struct GpuMemory {
+    pub object: std::sync::Arc<std::os::fd::OwnedFd>,
+    pub offset: u64,
+}
+
+/// Mapping `len` bytes at `offset` of device descriptor `fd`: the memory
+/// of the resource the offset names ([`map_offset`]), and where in it the
+/// part asked for starts (on a host page).
+pub fn map_source(fd: i32, offset: u64, len: u64) -> Option<Result<GpuMemory, i32>> {
     let key = key_of(fd)?;
     Some((|| {
-        if FORKED.load(Relaxed) {
+        if files().get(&key).is_some_and(|f| f.parents) {
             return Err(errno::ENODEV);
         }
         let (handle, within) = ((offset >> 32) as u32, offset & 0xffff_ffff);
         let r = resource(key, handle)?;
-        if within
-            .checked_add(len)
-            .is_none_or(|end| end > r.size.next_multiple_of(crate::mm::host_page_size()))
+        let page = crate::mm::host_page_size();
+        if !within.is_multiple_of(page)
+            || within.checked_add(len).is_none_or(|end| end > r.size.next_multiple_of(page))
         {
             return Err(errno::EINVAL);
         }
-        let host = match r.host {
-            Some(h) => h,
-            None => {
-                let h = crate::virgl::map(handle)?;
-                if let Some(res) = files().get_mut(&key).and_then(|f| f.handles.get_mut(&handle)) {
-                    res.host = Some(h);
-                }
-                h
-            }
-        };
-        Ok(host + within)
+        // Only a mappable blob has memory to map.
+        let object = r.memory.ok_or(errno::EINVAL)?;
+        Ok(GpuMemory { object, offset: within })
     })())
 }
 
@@ -603,9 +605,9 @@ fn execbuffer(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
         resource(key, h)?;
         crate::virgl::attach(ctx, h)?;
     }
-    let mut commands = uaccess::read_bytes(command, size as usize)?;
+    let commands = uaccess::read_bytes(command, size as usize)?;
     let began = clock();
-    crate::virgl::submit(ctx, &mut commands)?;
+    crate::virgl::submit(ctx, &commands)?;
     staged(Stage::Submit, began);
     if flags & EXECBUF_FENCE_FD_OUT != 0 {
         let began = clock();
@@ -622,7 +624,7 @@ fn execbuffer(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
 }
 
 /// A fence asked for and not yet signalled.
-struct Pending {
+pub(crate) struct Pending {
     /// Its id on its context's ring, in the order given.
     id: u64,
     /// The write end of its pipe (fwe's).
@@ -635,7 +637,7 @@ struct Pending {
 type Ring = (u32, u32);
 
 /// Each ring's fences not yet signalled, in order, and the last id given.
-static FENCES: Mutex<BTreeMap<Ring, (u64, Vec<Pending>)>> = Mutex::new(BTreeMap::new());
+pub(crate) static FENCES: Mutex<BTreeMap<Ring, (u64, Vec<Pending>)>> = Mutex::new(BTreeMap::new());
 
 fn fences() -> std::sync::MutexGuard<'static, BTreeMap<Ring, (u64, Vec<Pending>)>> {
     FENCES.lock().unwrap_or_else(|e| e.into_inner())
@@ -664,7 +666,6 @@ fn fence(ctx: u32, ring: u32, made: Option<std::time::Instant>) -> Result<i32, i
         list.push(Pending { id: *last, write, made });
         *last
     };
-    // The lock let go first: the renderer may signal on this thread.
     if let Err(e) = crate::virgl::create_fence(ctx, ring, id) {
         fence_signalled(ctx, ring, id);
         // SAFETY: the read end just made, never given out.
@@ -694,6 +695,13 @@ fn context_gone(ctx: u32) {
         let rings: Vec<Ring> = f.range((ctx, 0)..=(ctx, u32::MAX)).map(|(&r, _)| r).collect();
         rings.into_iter().filter_map(|r| f.remove(&r)).flat_map(|(_, list)| list).collect()
     };
+    signal(done);
+}
+
+/// The renderer's helper is gone, and its work: every fence signals.
+pub fn renderer_gone() {
+    let done: Vec<Pending> =
+        std::mem::take(&mut *fences()).into_values().flat_map(|(_, list)| list).collect();
     signal(done);
 }
 
