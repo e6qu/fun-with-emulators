@@ -390,7 +390,7 @@ fn job_stop(platform: &mut impl crate::Platform, sig: u64) {
             if seen != at || thread::pending() & bit(signal::SIGKILL) != 0 {
                 break;
             }
-            crate::shared::wait_word_for(word, seen, std::time::Duration::from_secs(60));
+            crate::shared::guest_wait_word(word, seen, std::time::Duration::from_secs(60));
         }
         crate::signote::job_continued();
         // Killed: no continue to tell of.

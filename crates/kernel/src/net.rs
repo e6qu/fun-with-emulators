@@ -3317,6 +3317,7 @@ fn host_peer(fd: i32) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
 
@@ -3731,6 +3732,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 pub(crate) mod scm_tests {
     use super::*;
 
@@ -3966,6 +3968,7 @@ pub(crate) mod scm_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod udp_option_tests {
     use super::*;
 

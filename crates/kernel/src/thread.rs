@@ -314,7 +314,7 @@ pub fn poke_fd() -> i32 {
 pub fn nap_ns(ns: i64) {
     let after = std::time::Duration::from_nanos(ns.max(0) as u64);
     let Some((wake, timer)) = wait_pipe() else {
-        std::thread::sleep(after);
+        crate::procstore::guest_sleep(after);
         return;
     };
     let mut all = [

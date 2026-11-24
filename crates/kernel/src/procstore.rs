@@ -325,6 +325,9 @@ fn map() -> Result<Store, String> {
 /// size: another process making it at once sizes it, and its size is 0
 /// until that process's `ftruncate` is done (this one's is refused
 /// meanwhile). `None` if it cannot be looked at.
+// Its sleep is unmarked: the store it is sized for may be this process's,
+// which a busy mark is kept in.
+#[allow(clippy::disallowed_methods)]
 pub(crate) fn sized(fd: i32) -> Option<libc::stat> {
     // SAFETY: zeroed bytes are a valid `stat`.
     let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -379,7 +382,12 @@ pub fn init() {
 /// `/proc` shows it running ([`busy`]), where a program waiting for it
 /// to sleep (in a semaphore wait it is on its way to, say) would take a
 /// host wait of fwe's for that.
-pub struct Busy(bool);
+///
+/// fwe's own sleeps and waits take one ([`Busy::sleep`],
+/// [`crate::shared::busy_wait_word`]); the guest's own are
+/// [`guest_sleep`] and [`crate::shared::guest_wait_word`]. The mark is
+/// its thread's, so a `Busy` stays on it (neither `Send` nor `Sync`).
+pub struct Busy(bool, std::marker::PhantomData<*const ()>);
 
 /// A busy mark's depth (the [`Busy`] alive) is its low half; its high half
 /// counts each one made, so a look that reads the mark before and after
@@ -393,8 +401,21 @@ impl Busy {
         if main && let Some(w) = busy_word(crate::host::pid()) {
             busy_enter(w);
         }
-        Busy(main)
+        Busy(main, std::marker::PhantomData)
     }
+
+    /// Sleep for `d` in fwe's own work.
+    #[allow(clippy::disallowed_methods)] // the sleep marked busy
+    pub fn sleep(&self, d: std::time::Duration) {
+        std::thread::sleep(d);
+    }
+}
+
+/// Sleep for `d` in a wait of the guest's own (a blocking call's), which
+/// `/proc` shows asleep, as Linux does.
+#[allow(clippy::disallowed_methods)] // the guest's sleep
+pub fn guest_sleep(d: std::time::Duration) {
+    std::thread::sleep(d);
 }
 
 impl Default for Busy {
@@ -1143,6 +1164,7 @@ pub(crate) fn hold_word(word: &'static AtomicU32) -> (Held, bool) {
                 // not wait for another's lock). Woken as it is let go; a
                 // while at most, to look at the holder again.
                 drop(holding);
+                let _busy = Busy::new();
                 wait(word, holder, 10_000_000);
             }
         }
@@ -1450,6 +1472,7 @@ fn wake(word: &AtomicU32) {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
 

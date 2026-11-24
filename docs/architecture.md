@@ -1191,7 +1191,11 @@ contents come from is in
   and after the host's state, it tells a wait of fwe's that ended between
   the two), as a Linux task doing its kernel's work is not
   asleep, or before it has gone into the program (a fork's child whose
-  making waits; `procstore::entered` marks it as it goes in).
+  making waits; `procstore::entered` marks it as it goes in). A sleep or
+  shared-word wait of fwe's takes a `Busy` (`Busy::sleep`,
+  `shared::busy_wait_word`); one of the guest's is named so
+  (`procstore::guest_sleep`, `shared::guest_wait_word`), and
+  `clippy.toml` refuses `std::thread::sleep` elsewhere.
 - `cpuinfo` is Linux's arm64 format: BogoMIPS from the host's timer, the
   features of the hwcaps the program was given, the implementer and, for
   a chip Linux knows, the part from `hw.cpufamily`. `/proc/net` is

@@ -682,7 +682,7 @@ pub fn reaped_child(child: i32) {
     // is not waited for long.
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while busy(|| crate::pidns::members_alive(&r, child)) && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        crate::procstore::Busy::new().sleep(std::time::Duration::from_millis(1));
     }
 }
 

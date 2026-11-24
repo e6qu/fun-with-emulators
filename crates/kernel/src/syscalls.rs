@@ -4253,6 +4253,7 @@ fn changes_mappings(n: u64) -> bool {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
     use crate::{Brk, Tracer};

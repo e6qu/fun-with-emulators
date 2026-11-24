@@ -383,6 +383,7 @@ pub fn read(pid: HostPid) -> Option<ProcRecord> {
         // A process just forked writes its own record as it starts
         // ([`own_whole`]): wait for it, as it is there on Linux.
         let live = || host_info(pid).is_some_and(|(_, _, zombie)| !zombie);
+        let busy = crate::procstore::Busy::new();
         for _ in 0..2000 {
             if let Some(r) = read_any(pid).filter(|r| start_time(pid) == Some(r.start)) {
                 return with_held(pid, Some(r));
@@ -390,7 +391,7 @@ pub fn read(pid: HostPid) -> Option<ProcRecord> {
             if !live() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_micros(50));
+            busy.sleep(std::time::Duration::from_micros(50));
         }
         // Gone before it wrote one.
         if !live() {

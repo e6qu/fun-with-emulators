@@ -72,7 +72,9 @@ unsafe extern "C" {
 
 /// Sleep up to `slice` while shared word `word` reads `seen` (its low half,
 /// which every change changes), a shared host address wait any process's
-/// change ends ([`wake_all`]).
+/// change ends ([`wake_all`]). Whose wait it is, its callers say
+/// ([`guest_wait_word`], [`busy_wait_word`]).
+#[cfg_attr(not(target_os = "macos"), allow(clippy::disallowed_methods))]
 fn wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
     #[cfg(target_os = "macos")]
     // SAFETY: a shared word of the store's; the host sleeps while its low
@@ -108,8 +110,21 @@ fn wake_all(word: &AtomicU64) {
     let _ = word;
 }
 
-/// Sleep up to `slice` while shared word `word` reads `seen`.
-pub(crate) fn wait_word_for(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
+/// Sleep up to `slice` while shared word `word` reads `seen`, in a wait of
+/// the guest's own (a blocking call's, a stop), which `/proc` shows.
+pub(crate) fn guest_wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
+    if word.load(Ordering::Acquire) == seen {
+        wait_word(word, seen, slice);
+    }
+}
+
+/// [`guest_wait_word`] in fwe's own work (`/proc` shows it running).
+pub(crate) fn busy_wait_word(
+    _: &crate::procstore::Busy,
+    word: &AtomicU64,
+    seen: u64,
+    slice: std::time::Duration,
+) {
     if word.load(Ordering::Acquire) == seen {
         wait_word(word, seen, slice);
     }

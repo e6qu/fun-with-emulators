@@ -21,7 +21,7 @@
 //! A tracee whose tracer has ended goes on as if detached.
 
 use crate::ids::HostPid;
-use crate::shared::{wait_word_for, wake_word};
+use crate::shared::{busy_wait_word, guest_wait_word, wake_word};
 use fwe_abi::errno;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::time::Duration;
@@ -818,7 +818,7 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
             if waited && mb.word(W_STATE).load(Ordering::Acquire) == STOPPED {
                 signal_tracer(tracer, crate::host::WAKE_SIGNAL);
             }
-            wait_word_for(mb.word(W_REQ), req, Duration::from_millis(100));
+            guest_wait_word(mb.word(W_REQ), req, Duration::from_millis(100));
             waited = true;
             continue;
         }
@@ -930,7 +930,7 @@ fn listen(mb: &Page, tracer: i32) -> bool {
         if !alive(tracer) {
             return false;
         }
-        wait_word_for(mb.word(W_INTERRUPT), 0, Duration::from_millis(20));
+        guest_wait_word(mb.word(W_INTERRUPT), 0, Duration::from_millis(20));
     }
 }
 
@@ -1291,7 +1291,10 @@ fn ask(mb: &Page, pid: i32, op: u64, addr: u64, data: u64) -> Result<i64, i32> {
             return Err(errno::ESRCH);
         }
         let _ = pid;
-        wait_word_for(mb.word(W_DONE), done, Duration::from_millis(100));
+        // The tracer's request is fwe's work, as Linux does it in the
+        // tracer's call.
+        let busy = crate::procstore::Busy::new();
+        busy_wait_word(&busy, mb.word(W_DONE), done, Duration::from_millis(100));
     }
     let r = mb.word(W_RESULT).load(Ordering::Acquire) as i64;
     if r < 0 { Err(-r as i32) } else { Ok(r) }
@@ -1311,9 +1314,9 @@ pub fn inbox_generation() -> u64 {
 /// or `slice` passes.
 pub fn wait_for_stop(seen: u64, slice: Duration) {
     if let Some(inbox) = open(inbox_tag(me()), None) {
-        wait_word_for(inbox.word(0), seen, slice);
+        guest_wait_word(inbox.word(0), seen, slice);
     } else {
-        std::thread::sleep(slice);
+        crate::procstore::guest_sleep(slice);
     }
 }
 

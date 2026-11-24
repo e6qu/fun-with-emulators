@@ -1675,7 +1675,7 @@ pub mod store {
                     }
                     Err(_) => {
                         tries += 1;
-                        std::thread::sleep(std::time::Duration::from_millis(1));
+                        crate::procstore::Busy::new().sleep(std::time::Duration::from_millis(1));
                     }
                 }
             };

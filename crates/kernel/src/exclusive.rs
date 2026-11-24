@@ -189,8 +189,8 @@ pub fn writes(fd: i32) -> Option<u64> {
 /// Wait up to `slice` for a write to `fd` after the `seen`th.
 pub fn wait_for_write(fd: i32, seen: u64, slice: std::time::Duration) {
     match slot_of(fd) {
-        Some(s) => crate::shared::wait_word_for(&s[2], seen, slice),
-        None => std::thread::sleep(slice),
+        Some(s) => crate::shared::guest_wait_word(&s[2], seen, slice),
+        None => crate::procstore::guest_sleep(slice),
     }
 }
 

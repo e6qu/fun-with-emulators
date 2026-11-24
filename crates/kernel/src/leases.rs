@@ -251,7 +251,8 @@ pub fn break_for(dev: u64, ino: u64, write: bool, nonblock: bool) -> Result<(), 
         if nonblock {
             return Err(errno::EWOULDBLOCK);
         }
-        std::thread::sleep(std::time::Duration::from_millis(10));
+        // An open waits for the lease's break, as Linux's sleeps.
+        crate::procstore::guest_sleep(std::time::Duration::from_millis(10));
     }
 }
 

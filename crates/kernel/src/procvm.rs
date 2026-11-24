@@ -289,7 +289,7 @@ fn remote_copy(
                 crate::signote::receive_fd(reply.sock);
                 let r = i64::from_ne_bytes(m[8..16].try_into().unwrap());
                 if r == MEM_RETRY {
-                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    crate::procstore::Busy::new().sleep(std::time::Duration::from_millis(1));
                     continue;
                 }
                 if r > 0 && !write {
