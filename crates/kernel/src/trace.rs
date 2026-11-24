@@ -95,6 +95,7 @@ impl Tracer {
         } else {
             let _ = write!(line, "{result:#x}");
         }
+        returned(&mut line, nr, args, result);
         self.write_line(&line);
     }
 
@@ -122,6 +123,39 @@ impl Tracer {
         // tracer do not interleave mid-line.
         // SAFETY: `out` is a valid buffer of `out.len()` bytes.
         unsafe { libc::write(fd, out.as_ptr().cast(), out.len()) };
+    }
+}
+
+/// What a call gave back or was given in memory that says what happened:
+/// a `ppoll`'s returned events (each descriptor's, up to 16), and a Unix
+/// socket's address in `connect` and `bind` (`@` for an abstract name).
+fn returned(line: &mut String, nr: u64, args: &[u64; 6], result: i64) {
+    use fwe_abi::nr as n;
+    match nr {
+        n::PPOLL if result > 0 => {
+            let count = args[1].min(16) as usize;
+            let Ok(fds) = crate::uaccess::read_bytes(args[0], count * 8) else { return };
+            line.push_str(" [");
+            for (i, p) in fds.as_chunks::<8>().0.iter().enumerate() {
+                let fd = i32::from_ne_bytes([p[0], p[1], p[2], p[3]]);
+                let revents = u16::from_ne_bytes([p[6], p[7]]);
+                let _ = write!(line, "{}{fd}:{revents:#x}", if i > 0 { " " } else { "" });
+            }
+            line.push(']');
+        }
+        n::CONNECT | n::BIND => {
+            let len = args[2].min(110) as usize;
+            let Ok(addr) = crate::uaccess::read_bytes(args[1], len) else { return };
+            if len > 2 && u16::from_ne_bytes([addr[0], addr[1]]) == 1 {
+                let path = &addr[2..];
+                let (at, name) = match path.split_first() {
+                    Some((0, rest)) => ("@", rest),
+                    _ => ("", &path[..path.iter().position(|&b| b == 0).unwrap_or(path.len())]),
+                };
+                let _ = write!(line, " [{at}{}]", String::from_utf8_lossy(name));
+            }
+        }
+        _ => {}
     }
 }
 

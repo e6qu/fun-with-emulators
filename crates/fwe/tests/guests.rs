@@ -9791,7 +9791,18 @@ impl Xvfb {
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
         let err = display_dir().join(format!("xvfb-{number}.err"));
         let child = Command::new(xvfb)
-            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-nolisten", "tcp"])
+            // `-audit 4`: each client the server takes or refuses, and why,
+            // in its log.
+            .args([
+                &format!(":{number}"),
+                "-screen",
+                "0",
+                "1024x768x24",
+                "-nolisten",
+                "tcp",
+                "-audit",
+                "4",
+            ])
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&err).unwrap())
             .spawn()
