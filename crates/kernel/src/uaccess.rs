@@ -52,7 +52,8 @@ fn table_mut() -> TableMut {
 }
 
 /// How many translated ranges there are: none, mostly (the native backend
-/// translates nothing), and a copy then takes no lock.
+/// translates nothing), and a translation ([`run`]) or a copy then takes
+/// no lock.
 static TRANSLATED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 /// The table, writable; its count kept as it is let go.
@@ -204,9 +205,6 @@ pub fn try_run(addr: u64) -> Option<(u64, u64)> {
 /// The host address of guest address `addr` (itself, outside every
 /// translated range).
 pub fn g2h(addr: u64) -> u64 {
-    if table().is_empty() {
-        return addr;
-    }
     run(addr).0
 }
 
@@ -228,9 +226,6 @@ pub(crate) fn thread_reused() {
 /// thread is starting ([`g2h`]), remembered so the kernel's own copies
 /// through it are taken as copies of `addr` ([`guest_of`]).
 pub fn host_arg(addr: u64) -> u64 {
-    if table().is_empty() {
-        return addr;
-    }
     let (host, room) = run(addr);
     if host != addr {
         HOST_ARGS.with(|h| h.borrow_mut().push((host, host.saturating_add(room), addr)));

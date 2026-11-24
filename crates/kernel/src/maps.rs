@@ -176,11 +176,6 @@ pub struct Record {
     exe_id: (u64, u64),
     /// Some memory was sealed: until then no call looks for a seal.
     any_sealed: bool,
-    /// The latest plain mapping (anonymous, unlocked: start, length,
-    /// protection, shared), not yet among the areas: one unmapped whole
-    /// before anything looks is never put there ([`mapped_plain`],
-    /// [`unmapped`]). [`record`] puts it there first.
-    pending: Option<(u64, u64, u64, bool)>,
 }
 
 impl Default for Record {
@@ -198,14 +193,6 @@ impl Record {
             exe: Vec::new(),
             exe_id: (0, 0),
             any_sealed: false,
-            pending: None,
-        }
-    }
-
-    /// Put the pending mapping among the areas.
-    fn settle(&mut self) {
-        if let Some((start, len, prot, shared)) = self.pending.take() {
-            self.mapped(start, len, prot, shared, None);
         }
     }
 
@@ -564,7 +551,7 @@ impl Record {
 
     /// How many mappings there are (what `vm.max_map_count` limits).
     pub fn count(&self) -> usize {
-        self.areas.len() + usize::from(self.pending.is_some())
+        self.areas.len()
     }
 
     pub fn areas_in(&self, start: u64, end: u64) -> Vec<Piece<Area>> {
@@ -627,6 +614,29 @@ pub fn page_size() -> u64 {
 /// This process's record.
 static RECORD: Mutex<Record> = Mutex::new(Record::new());
 
+/// The latest plain mapping (anonymous, unlocked), not yet in [`RECORD`]:
+/// one unmapped whole before anything looks is never put there
+/// ([`mapped_plain`], [`unmapped`]); [`record`] puts it there first.
+static PENDING: crate::deferred::Deferred<Plain> = crate::deferred::Deferred::new(Plain {
+    start: 0,
+    len: 0,
+    prot: 0,
+    shared: false,
+    fresh: false,
+});
+
+/// A plain mapping kept apart ([`PENDING`]).
+#[derive(Clone, Copy)]
+struct Plain {
+    start: u64,
+    len: u64,
+    prot: u64,
+    shared: bool,
+    /// Placed where nothing was (not `MAP_FIXED`): it replaced nothing,
+    /// so unmapped whole it leaves the record as it was.
+    fresh: bool,
+}
+
 /// How many mappings the record holds, as its lock was last let go: read
 /// without the lock by every `mmap` ([`count`]).
 static COUNT: AtomicUsize = AtomicUsize::new(0);
@@ -667,45 +677,52 @@ impl Drop for Held {
     }
 }
 
-/// This process's record, to read or change.
+/// This process's record, to read or change, the pending mapping in it.
 pub fn record() -> Held {
     let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
-    h.0.settle();
+    if let Some(p) = PENDING.take() {
+        h.mapped(p.start, p.len, p.prot, p.shared, None);
+    }
     h
 }
 
 /// The guest mapped `[start, start + len)` with `prot` (`shared` or
-/// private), nothing named: as [`Record::mapped`], but kept apart until
-/// something looks, so that one unmapped at once ([`unmapped`]) costs the
-/// areas nothing. Returns whether it is locked (`mlockall(MCL_FUTURE)`).
-pub fn mapped_plain(start: u64, len: u64, prot: u64, shared: bool) -> bool {
+/// private), nothing named, `fresh` where nothing was (not `MAP_FIXED`):
+/// as [`Record::mapped`], but kept apart until something looks, without
+/// the record's lock, so that one unmapped at once ([`unmapped`]) costs
+/// the record nothing. Returns whether it is locked (`mlockall(MCL_FUTURE)`).
+pub fn mapped_plain(start: u64, len: u64, prot: u64, shared: bool, fresh: bool) -> bool {
+    let plain = Plain { start, len, prot, shared, fresh };
+    // (`mlockall` and every mapping call hold the kernel lock for writing:
+    // the flag is as the last of them left it.)
+    if !locks_future() && PENDING.put(plain) {
+        return false;
+    }
     let mut h = record();
     if h.lock_future {
         return h.mapped(start, len, prot, shared, None);
     }
-    h.0.pending = Some((start, len, prot, shared));
-    false
+    if PENDING.put(plain) {
+        return false;
+    }
+    h.mapped(start, len, prot, shared, None)
 }
 
-/// The guest unmapped `[start, start + len)`: the pending mapping if it is
-/// that one, else as [`Record::unmapped`].
+/// The guest unmapped `[start, start + len)`: the pending mapping, if it is
+/// that one and replaced nothing, taken back without the record's lock;
+/// else as [`Record::unmapped`], the pending mapping put in first.
 pub fn unmapped(start: u64, len: u64) {
-    let mut h = Held(RECORD.lock().unwrap_or_else(|e| e.into_inner()));
-    if h.0.pending.is_some_and(|(s, l, _, _)| (s, l) == (start, len)) {
-        // What it replaced goes too (one look where nothing was).
-        h.0.pending = None;
-        h.unmapped(start, len);
+    if PENDING.take_back(|p| (p.start, p.len) == (start, len) && p.fresh) {
         return;
     }
-    h.0.settle();
-    h.unmapped(start, len);
+    record().unmapped(start, len);
 }
 
 /// How many mappings the record holds, without its lock: as of the last
-/// change, which a call racing with another thread's map may miss as it
-/// would with the lock.
+/// change, the pending one with them, which a call racing with another
+/// thread's map may miss as it would with the lock.
 pub fn count() -> usize {
-    COUNT.load(Relaxed)
+    COUNT.load(Relaxed) + usize::from(PENDING.is_kept())
 }
 
 /// Whether mappings made from now on are locked, without the record's
@@ -1079,19 +1096,27 @@ mod tests {
     fn a_pending_mapping_is_seen_by_readers_and_dropped_by_its_unmap() {
         let (a, b, len) = (0x7a00_0000_0000u64, 0x7b00_0000_0000u64, 0x4000u64);
         let before = record().count();
-        mapped_plain(a, len, 3, false);
+        mapped_plain(a, len, 3, false, true);
         assert_eq!(count(), before + 1);
         unmapped(a, len);
         assert_eq!(record().span_at(a), None);
         assert_eq!(record().count(), before);
-        mapped_plain(b, len, 3, false);
+        mapped_plain(b, len, 3, false, true);
         assert_eq!(record().span_at(b), Some((b, b + len)));
         unmapped(b, len);
         assert_eq!(record().span_at(b), None);
+        // Two in turn: the first is put in for the second to be kept.
+        mapped_plain(a, len, 3, false, true);
+        mapped_plain(b, len, 1, false, true);
+        assert_eq!(count(), before + 2);
+        unmapped(b, len);
+        assert_eq!(record().span_at(a), Some((a, a + len)));
+        unmapped(a, len);
+        assert_eq!(record().count(), before);
         // One made over another (`MAP_FIXED`) and unmapped at once takes
         // the one it replaced with it.
         record().mapped(a, 4 * len, 1, false, None);
-        mapped_plain(a + len, len, 3, false);
+        mapped_plain(a + len, len, 3, false, false);
         unmapped(a + len, len);
         assert_eq!(record().span_at(a + len), None);
         assert_eq!(record().span_at(a), Some((a, a + len)));
