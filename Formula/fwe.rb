@@ -14,11 +14,15 @@ class Fwe < Formula
   license "MIT"
   head "https://github.com/e6qu/fun-with-emulators.git", branch: "main"
 
+  depends_on "lld" => :build
   depends_on "rust" => :build
   depends_on arch: :arm64
   depends_on :macos
 
   def install
+    # The Linux Vulkan driver fwe serves is linked by lld (Homebrew's Rust
+    # has no rust-lld).
+    ENV["FWE_LLD"] = Formula["lld"].opt_bin/"ld.lld"
     system "cargo", "install", *std_cargo_args(path: "crates/fwe")
     system "codesign", "--sign", "-", "--force", "--options", "runtime",
            "--entitlements", "hypervisor.entitlements", bin/"fwe"

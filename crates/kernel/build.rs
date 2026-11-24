@@ -2,7 +2,8 @@
 //! for a macOS build of fwe, which serves it to Linux programs
 //! ([`crate::vulkan`]). It is an aarch64 Linux shared library, freestanding:
 //! compiled by clang and linked by the Rust toolchain's `rust-lld`, as the
-//! tests' guests are. Other builds need neither.
+//! tests' guests are, or by the `ld.lld` that `FWE_LLD` names (a toolchain
+//! with no `rust-lld`, as Homebrew's Rust). Other builds need neither.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -12,6 +13,7 @@ const SOURCES: [&str; 3] = ["icd.c", "generated.c", "wsi.c"];
 fn main() {
     let dir = Path::new(env("CARGO_MANIFEST_DIR").as_str()).join("../../driver/vulkan");
     println!("cargo:rerun-if-changed={}", dir.display());
+    println!("cargo:rerun-if-env-changed=FWE_LLD");
     if env("CARGO_CFG_TARGET_OS") != "macos" {
         return;
     }
@@ -40,10 +42,22 @@ fn main() {
             .arg(&object));
         objects.push(object);
     }
-    run(Command::new(rust_lld())
+    let mut link = match std::env::var_os("FWE_LLD") {
+        Some(lld) => Command::new(lld),
+        None => {
+            let lld = rust_lld();
+            assert!(
+                lld.exists(),
+                "{} is not there: name an ld.lld with FWE_LLD",
+                lld.display()
+            );
+            let mut c = Command::new(lld);
+            c.args(["-flavor", "gnu"]);
+            c
+        }
+    };
+    run(link
         .args([
-            "-flavor",
-            "gnu",
             "-shared",
             "-soname",
             "libvulkan_fwe.so",

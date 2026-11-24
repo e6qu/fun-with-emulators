@@ -32,7 +32,9 @@ notarized, and macOS refuses to run it until its quarantine mark is gone:
 xattr -d com.apple.quarantine fwe
 ```
 
-From source, with Rust installed:
+From source, with Rust (rustup's, whose toolchain has `rust-lld`; with
+another, `FWE_LLD` names an `ld.lld`, as Homebrew's `lld` has) and the
+Xcode command line tools' `clang`, which build fwe's Linux Vulkan driver:
 
 ```sh
 cargo build --release -p fwe
