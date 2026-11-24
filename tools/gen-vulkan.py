@@ -45,7 +45,7 @@ HOST_WSI = {"VK_KHR_surface", "VK_KHR_swapchain", "VK_EXT_headless_surface"}
 
 # Commands of the window systems the guest library answers itself
 # (driver/vulkan/wsi.c, `fwe_wsi_<name>`): those that take a surface (the
-# loader's, of an X window), directly or in a structure, and present and a
+# library's, of an X window), directly or in a structure, and present and a
 # swapchain's end. Every other command of a swapchain's the driver answers:
 # a guest's swapchain is the driver's.
 WSI_ALSO = {"vkQueuePresentKHR", "vkDestroySwapchainKHR"}

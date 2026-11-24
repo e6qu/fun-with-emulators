@@ -10518,7 +10518,8 @@ fn mock_vulkan_driver() -> Option<String> {
 
 /// A Linux program's Vulkan loader finds fwe's driver where it looks for
 /// drivers (`/etc/vulkan/icd.d`), and through it the Mac's: here Vulkan's
-/// mock driver, whose device `vulkaninfo` lists.
+/// mock driver, whose device `vulkaninfo` lists, and on an X display, its
+/// surfaces of X windows.
 #[test]
 fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
@@ -10540,6 +10541,29 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
     assert!(
         text.contains("Vulkan Mock Device"),
         "{text}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // On an X display: the loader asks fwe's driver for a surface of its
+    // own of an X window, which the device presents to.
+    let x = Xvfb::start().expect("XVFB: the display tests need Xvfb");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/vulkaninfo"))
+        .env("FWE_VULKAN_DRIVER", &driver)
+        .env("VK_LOADER_DEBUG", "error,warn")
+        .env("DISPLAY", x.display())
+        .env_remove("WAYLAND_DISPLAY");
+    let out = run_bounded(cmd);
+    let text = stdout(&out);
+    let presentable = text.split_once("Presentable Surfaces:").map(|(_, rest)| rest);
+    assert!(
+        presentable
+            .is_some_and(|p| p.contains("VK_KHR_xcb_surface") && p.contains("VK_KHR_xlib_surface")),
+        "no presentable X surfaces:\n{}\n{}",
+        text.lines().take(40).collect::<Vec<_>>().join("\n"),
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));

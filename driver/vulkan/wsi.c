@@ -1,7 +1,8 @@
 /* fwe's Linux Vulkan driver: the window systems (X11, through xcb or Xlib).
  *
- * A program's surface is the loader's, of an X window (VkIcdSurfaceXcb or
- * VkIcdSurfaceXlib). Its swapchain is the Mac driver's, made on a surface
+ * A program's surface is the library's, of an X window, laid out as the
+ * loader's VkIcdSurfaceXcb or VkIcdSurfaceXlib: the loader asks the driver
+ * for a surface of its own and hands the driver that. Its swapchain is the Mac driver's, made on a surface
  * of no window (VK_EXT_headless_surface), so acquiring an image, and the
  * fences and semaphores of it, are the driver's own; the swapchain's handle
  * is the driver's, and every command of it but present and its end is the
@@ -264,7 +265,9 @@ struct rect2d {
     struct extent extent;
 };
 
-/* The loader's surfaces of X windows (vk_icd.h). */
+/* Surfaces of X windows, the library's, laid out as the loader's
+ * (vk_icd.h): the loader asks the driver for a surface of its own of each
+ * it makes, and hands the driver that. */
 struct icd_surface_xcb {
     uint32_t platform;
     void *connection;
@@ -276,6 +279,42 @@ struct icd_surface_xlib {
     void *display;
     unsigned long window;
 };
+
+union icd_surface {
+    uint32_t platform;
+    struct icd_surface_xcb xcb;
+    struct icd_surface_xlib xlib;
+};
+
+/* VkXcbSurfaceCreateInfoKHR, VkXlibSurfaceCreateInfoKHR. */
+struct xcb_surface_info {
+    uint32_t type;
+    const void *next;
+    uint32_t flags;
+    void *connection;
+    uint32_t window;
+};
+_Static_assert(sizeof(struct xcb_surface_info) == 40, "VkXcbSurfaceCreateInfoKHR");
+
+struct xlib_surface_info {
+    uint32_t type;
+    const void *next;
+    uint32_t flags;
+    void *display;
+    unsigned long window;
+};
+_Static_assert(sizeof(struct xlib_surface_info) == 40, "VkXlibSurfaceCreateInfoKHR");
+
+/* VkAllocationCallbacks: the program's, called in its own process. */
+struct allocation_callbacks {
+    void *user;
+    void *(*allocate)(void *user, size_t size, size_t alignment, int scope);
+    void *(*reallocate)(void *user, void *p, size_t size, size_t alignment, int scope);
+    void (*free)(void *user, void *p);
+    void (*internal_allocate)(void *user, size_t size, int type, int scope);
+    void (*internal_free)(void *user, size_t size, int type, int scope);
+};
+#define VK_SYSTEM_ALLOCATION_SCOPE_OBJECT 1
 
 /* xcb's and Xlib's functions, the program's own. */
 typedef struct {
@@ -415,9 +454,43 @@ static int32_t enumerate(uint32_t *count, void *out, const void *items, uint32_t
     return given < n ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+/* A surface of the library's, from `allocator` where the program gives one. */
+static union icd_surface *new_surface(const struct allocation_callbacks *allocator) {
+    if (allocator)
+        return allocator->allocate(allocator->user, sizeof(union icd_surface), _Alignof(union icd_surface),
+                                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
+    return fwe_alloc(sizeof(union icd_surface));
+}
+
+static int32_t create_xcb_surface(void *instance, const void *info, const void *allocator, uint64_t *surface) {
+    (void)instance;
+    const struct xcb_surface_info *i = info;
+    union icd_surface *s = new_surface(allocator);
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->xcb = (struct icd_surface_xcb){VK_ICD_WSI_PLATFORM_XCB, i->connection, i->window};
+    *surface = (uint64_t)(uintptr_t)s;
+    return VK_SUCCESS;
+}
+
+static int32_t create_xlib_surface(void *instance, const void *info, const void *allocator, uint64_t *surface) {
+    (void)instance;
+    const struct xlib_surface_info *i = info;
+    union icd_surface *s = new_surface(allocator);
+    if (!s) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    s->xlib = (struct icd_surface_xlib){VK_ICD_WSI_PLATFORM_XLIB, i->display, i->window};
+    *surface = (uint64_t)(uintptr_t)s;
+    return VK_SUCCESS;
+}
+
 void fwe_wsi_vkDestroySurfaceKHR(void *instance, uint64_t surface, void *allocator) {
-    /* The loader's own, which it frees. */
-    (void)instance, (void)surface, (void)allocator;
+    (void)instance;
+    void *s = (void *)(uintptr_t)surface;
+    const struct allocation_callbacks *a = allocator;
+    if (!s) return;
+    if (a)
+        a->free(a->user, s);
+    else
+        fwe_free(s, sizeof(union icd_surface));
 }
 
 int32_t fwe_wsi_vkGetPhysicalDeviceSurfaceSupportKHR(void *pd, uint32_t family, uint64_t surface, void *supported) {
@@ -816,8 +889,14 @@ static int same(const char *a, const char *b) {
     return *a == *b;
 }
 
-fwe_vk_fn fwe_wsi_proc(const char *name) {
+fwe_vk_fn fwe_wsi_physical_device_proc(const char *name) {
     if (same(name, "vkGetPhysicalDeviceXcbPresentationSupportKHR")) return (fwe_vk_fn)xcb_presentation_support;
     if (same(name, "vkGetPhysicalDeviceXlibPresentationSupportKHR")) return (fwe_vk_fn)xlib_presentation_support;
     return 0;
+}
+
+fwe_vk_fn fwe_wsi_instance_proc(const char *name) {
+    if (same(name, "vkCreateXcbSurfaceKHR")) return (fwe_vk_fn)create_xcb_surface;
+    if (same(name, "vkCreateXlibSurfaceKHR")) return (fwe_vk_fn)create_xlib_surface;
+    return fwe_wsi_physical_device_proc(name);
 }

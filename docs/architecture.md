@@ -1461,7 +1461,8 @@ Sockets and terminals are the host's; fwe translates their interfaces:
     bad guest pointer ends the process with `SIGSEGV`, as a fault in a
     Linux driver's code in the process does.
   - Window systems are the guest library's (`driver/vulkan/wsi.c`): a
-    program's surface is the loader's, of an X window (xcb or Xlib); its
+    program's surface is the library's, of an X window (xcb or Xlib), made
+    when the loader asks the driver for one of its own; its
     swapchain is the driver's, on a surface of no window
     (`VK_EXT_headless_surface`), so acquiring images and their fences and
     semaphores are the driver's own. Present copies the image to memory

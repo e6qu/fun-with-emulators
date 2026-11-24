@@ -65,8 +65,10 @@ void *fwe_vk_parent(const void *handle);
 uint32_t fwe_vk_queue_family(const void *queue);
 
 /* The window systems' functions the library answers by a name of no
- * command of the driver's (wsi.c). */
-fwe_vk_fn fwe_wsi_proc(const char *name);
+ * command of the driver's (wsi.c): a physical device's (presentation
+ * support), and an instance's (those and making surfaces of X windows). */
+fwe_vk_fn fwe_wsi_physical_device_proc(const char *name);
+fwe_vk_fn fwe_wsi_instance_proc(const char *name);
 
 /* The library's own memory: `size` bytes, zeroed, or NULL. */
 void *fwe_alloc(size_t size);

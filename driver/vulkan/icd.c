@@ -172,7 +172,7 @@ static fwe_vk_fn given(const struct fwe_vk_entry *e, const void *handle) {
 
 FWE_EXPORT fwe_vk_fn vk_icdGetPhysicalDeviceProcAddr(void *instance, const char *name) {
     const struct fwe_vk_entry *e = find(name);
-    if (!e) return fwe_wsi_proc(name);
+    if (!e) return fwe_wsi_physical_device_proc(name);
     return e->level == FWE_VK_INSTANCE ? given(e, instance) : 0;
 }
 
@@ -185,7 +185,7 @@ FWE_EXPORT fwe_vk_fn vk_icdGetInstanceProcAddr(void *instance, const char *name)
         return (fwe_vk_fn)vk_icdGetPhysicalDeviceProcAddr;
     if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)vkGetDeviceProcAddr;
     const struct fwe_vk_entry *e = find(name);
-    if (!e) return instance ? fwe_wsi_proc(name) : 0;
+    if (!e) return instance ? fwe_wsi_instance_proc(name) : 0;
     if (!instance || e->level == FWE_VK_GLOBAL) return e->level == FWE_VK_GLOBAL ? given(e, 0) : 0;
     return given(e, instance);
 }
