@@ -427,8 +427,10 @@ records Linux would:
   mappings) is recorded (`fwe_kernel::mm::track`) and removed when
   unmapped; fwe's own memory never is, so `execve` discards exactly the
   old program. As in Linux's view below, the latest mapping waits beside
-  the set until anything else changes or reads it, so one unmapped at
-  once costs the set a single look.
+  the set, outside its lock (`fwe_kernel::deferred`), until anything else
+  changes or reads it: one placed by the host (not `MAP_FIXED`) and
+  unmapped at once, with no range marked by `madvise`, `MAP_GROWSDOWN` or
+  a file view, takes neither the lock nor a look.
 - **Linux's view** (`crates/kernel/src/maps.rs`): each successful memory
   call, with the guest's protections and sharing and the file and offset
   mapped; the loaders add the program, its dynamic linker (file-backed as
@@ -436,8 +438,9 @@ records Linux would:
   break is the heap. Memory fwe maps that the guest did not ask for (code
   stubs, a guard page) is listed as anonymous with the host's protections,
   so a program looking for free space does not pick it. The latest plain
-  anonymous mapping waits beside the list until anything reads it, so a
-  buffer mapped and unmapped at once never changes the list.
+  anonymous mapping waits beside the list, outside its lock, until
+  anything reads it, so a buffer the host placed, mapped and unmapped at
+  once, never takes the lock or changes the list.
 - **Other processes:** each process publishes its record, with its start
   time, in an entry of its own in the process store before its next
   system call that is not a memory call, and before a `fork`, so a run of
