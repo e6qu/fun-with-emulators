@@ -472,13 +472,14 @@ pub(crate) static TID_BLOCK_LEFT: Mutex<(i32, i32, i32)> = Mutex::new((0, 0, 0))
 
 /// The host process thread `tid` (one of another process's) is in, if a
 /// live one.
-pub fn owner_of_tid(tid: i32) -> Option<i32> {
+pub fn owner_of_tid(tid: i32) -> Option<crate::ids::HostPid> {
     if !(TID_FIRST..TID_END).contains(&tid) {
         return None;
     }
-    let pid = crate::procstore::tid_block_owner(((tid - TID_FIRST) / TID_BLOCK) as usize);
-    (pid > 0 && crate::host::process_exists(pid) && published_tids(pid).contains(&tid))
-        .then_some(pid)
+    let pid = crate::ids::HostPid::new(crate::procstore::tid_block_owner(
+        ((tid - TID_FIRST) / TID_BLOCK) as usize,
+    ))?;
+    (crate::host::probe(pid).exists() && published_tids(pid.get()).contains(&tid)).then_some(pid)
 }
 
 /// The threads (tids, the main thread's the process's pid) another

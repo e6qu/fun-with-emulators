@@ -77,14 +77,9 @@ pub fn collect() {
     }
 }
 
-/// Whether host process `pid` exists (none at or below 0 is asked about).
+/// Whether host process `pid` exists (none at or below 0 is one).
 fn alive(pid: i32) -> bool {
-    if pid <= 0 {
-        return false;
-    }
-    // SAFETY: a signal 0 sends nothing; it asks whether `pid` exists.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
+    crate::ids::HostPid::new(pid).is_some_and(|p| crate::host::probe(p).exists())
 }
 
 fn ino_dec(hex: &str) -> u64 {

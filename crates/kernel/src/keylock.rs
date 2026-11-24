@@ -41,10 +41,10 @@ impl Drop for Held {
 
 /// Whether host process `pid`, a lock's holder, has ended.
 fn ended(pid: u64) -> bool {
-    // SAFETY: signal 0 only asks whether the process exists.
-    pid != 0
-        && unsafe { libc::kill(pid as i32, 0) } != 0
-        && crate::host::last_errno() == libc::ESRCH
+    i32::try_from(pid)
+        .ok()
+        .and_then(crate::ids::HostPid::new)
+        .is_some_and(|p| crate::host::probe(p) == crate::host::Probe::Gone)
 }
 
 /// Take the lock of `key` in `area`'s table, waiting for it if `wait`:

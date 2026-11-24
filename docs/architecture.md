@@ -685,6 +685,13 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   thread, with `SIGEMT`. Another process is sent it only if it is a live
   fwe process, one with a record (`host::kill` checks every send): the
   host's default action for `SIGEMT` would end any other.
+- **One process per host signal:** a host process is a `HostPid`
+  (`crates/kernel/src/ids.rs`), a pid above 0, and the host's `kill` is
+  reached only through `host.rs` with one (`kill_process` for fwe's own
+  ends, `signal_named` for the guest's, `probe` to ask whether a process
+  is there), so no number fwe holds reaches a process group or every
+  process on the host. A guest's group or `kill(-1)` is sent to each
+  member. `clippy.toml` refuses `libc::kill` anywhere else.
 - **Wake pipes:** every host signal a thread takes writes a byte to that
   thread's pipe (`thread::poke_wait`), and the sleeps, `poll`, `select`
   and the `epoll` waits watch it beside the guest's descriptors

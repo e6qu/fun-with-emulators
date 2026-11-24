@@ -531,27 +531,32 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
             if n.owner == ipc::me() {
                 crate::thread::post_process(sig, info);
                 crate::thread::wake_others(crate::host::WAKE_SIGNAL);
-            } else if let Some(h) = crate::host::signal_to_host(sig) {
-                // Another process: a host signal, with a note of what it
-                // carries.
-                crate::signote::note_with(n.owner.0, h, info.code, info.value, by.uid);
-                if crate::host::kill_process(n.owner.0, h) != 0 {
-                    crate::signote::unnote(n.owner.0, h);
-                }
-            } else {
-                // One the host lacks (a real-time signal): queued in the
-                // owner's mailbox. A notification that cannot be delivered
-                // is lost, as Linux's is when its receiver has gone.
-                crate::signal::send_unhosted_from(
-                    n.owner.0,
-                    sig,
-                    info.code,
-                    info.value,
-                    (by.pid, by.uid),
-                );
+            } else if let Some(owner) = crate::ids::HostPid::new(n.owner.0) {
+                signal_other(owner, sig, info, (by.pid, by.uid));
             }
         }
         _ => {}
+    }
+}
+
+/// A notification's signal `sig` with `info`, sent by `by` (host pid,
+/// user), to another process `owner`: a host signal with a note of what
+/// it carries, or one the host lacks (a real-time signal) queued in the
+/// owner's mailbox. One that cannot be delivered is lost, as Linux's is
+/// when its receiver has gone.
+fn signal_other(
+    owner: crate::ids::HostPid,
+    sig: u64,
+    info: crate::thread::SigInfo,
+    by: (i32, u32),
+) {
+    if let Some(h) = crate::host::signal_to_host(sig) {
+        crate::signote::note_with(owner.get(), h, info.code, info.value, by.1);
+        if crate::host::kill_process(owner, h) != 0 {
+            crate::signote::unnote(owner.get(), h);
+        }
+    } else {
+        crate::signal::send_unhosted_from(owner, sig, info.code, info.value, by);
     }
 }
 

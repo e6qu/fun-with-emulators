@@ -153,7 +153,9 @@ pub fn watcher_wanted() -> bool {
 /// `lineage`), tells its parent, whose watcher is to follow it.
 pub fn foster_started(lineage: &[Proc]) {
     let Some(&(parent, _)) = lineage.first() else { return };
-    if crate::signote::foster(parent).is_ok() {
+    if crate::signote::foster(parent).is_ok()
+        && let Some(parent) = crate::ids::HostPid::new(parent)
+    {
         let _ = crate::host::kill_process(parent, crate::host::WAKE_SIGNAL);
     }
 }

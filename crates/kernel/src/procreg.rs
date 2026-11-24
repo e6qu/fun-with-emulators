@@ -1127,8 +1127,10 @@ pub fn change_sched(
         }
         Err(e) => out = Err(e),
     })?;
-    if let Some(n) = nice {
-        crate::host::set_nice(pid, n);
+    if let Some(n) = nice
+        && let Some(p) = crate::ids::HostPid::new(pid)
+    {
+        crate::host::set_nice(p, n);
     }
     out
 }
@@ -1138,7 +1140,9 @@ pub fn change_sched(
 /// ([`crate::host::set_nice`]).
 pub fn set_nice(pid: i32, nice: i32) -> Result<(), i32> {
     change(pid, |r| r.nice = nice)?;
-    crate::host::set_nice(pid, nice);
+    if let Some(p) = crate::ids::HostPid::new(pid) {
+        crate::host::set_nice(p, nice);
+    }
     Ok(())
 }
 
@@ -1510,8 +1514,7 @@ pub fn host_stopped(pid: i32) -> bool {
 /// `launchd`'s, which a reaper of fwe's may have adopted). Not where a
 /// living process that is not fwe's (a shell) must see it stop.
 pub fn stops_in_fwe() -> bool {
-    let parent = crate::host::parent_pid();
-    parent == 1 || crate::host::is_fwe(parent)
+    crate::host::parent_pid().is_some_and(|p| p.get() == 1 || crate::host::is_fwe(p))
 }
 
 /// Whether this process is a foster child ([`ProcRecord::foster`]).
@@ -1668,8 +1671,8 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
         // A process that is not there at all (one just reaped, say) is
         // told apart in one cheap call (`ESRCH`; a zombie is still there),
         // where the `sysctl` below costs tens of microseconds.
-        // SAFETY: signal 0 sends nothing; it only looks the process up.
-        if pid > 0 && unsafe { libc::kill(pid, 0) } != 0 && crate::host::last_errno() == libc::ESRCH
+        if crate::ids::HostPid::new(pid)
+            .is_some_and(|p| crate::host::probe(p) == crate::host::Probe::Gone)
         {
             return None;
         }

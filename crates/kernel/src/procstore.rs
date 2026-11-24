@@ -798,7 +798,8 @@ pub fn mailbox(pid: i32, make: bool) -> Option<&'static [AtomicU64]> {
             // None free: those of processes gone are taken back.
             for i in 1..=MAILBOXES as u32 {
                 let owner = words(i)[0].load(SeqCst) as i32;
-                if owner > 0 && !crate::host::process_exists(owner) {
+                if crate::ids::HostPid::new(owner).is_some_and(|o| !crate::host::probe(o).exists())
+                {
                     forget_mailbox(owner);
                 }
             }
@@ -867,7 +868,10 @@ pub fn page(tag: u64, make: Option<i32>) -> Option<&'static [Word; PAGE_WORDS]> 
     for gone in [false, true] {
         let free = (0..PAGES).find(|&i| {
             let [t, o] = tags(i);
-            t.load(SeqCst) == 0 || gone && !crate::host::process_exists(o.load(SeqCst) as i32)
+            t.load(SeqCst) == 0
+                || gone
+                    && !crate::ids::HostPid::new(o.load(SeqCst) as i32)
+                        .is_some_and(|o| crate::host::probe(o).exists())
         });
         if let Some(i) = free {
             for w in words(i) {

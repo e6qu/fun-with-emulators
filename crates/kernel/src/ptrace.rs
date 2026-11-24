@@ -20,6 +20,7 @@
 //!
 //! A tracee whose tracer has ended goes on as if detached.
 
+use crate::ids::HostPid;
 use crate::shared::{wait_word_for, wake_word};
 use fwe_abi::errno;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
@@ -224,8 +225,16 @@ fn me() -> i32 {
     crate::host::pid()
 }
 
+/// Whether host process `pid` (a pid a mailbox keeps) is there.
 fn alive(pid: i32) -> bool {
-    crate::host::process_exists(pid)
+    HostPid::new(pid).is_some_and(|p| crate::host::probe(p).exists())
+}
+
+/// Host signal `sig` to tracer `tracer` (a pid its tracee keeps).
+fn signal_tracer(tracer: i32, sig: libc::c_int) {
+    if let Some(t) = HostPid::new(tracer) {
+        crate::host::kill_process(t, sig);
+    }
 }
 
 // --- the tracee ----------------------------------------------------------------
@@ -542,8 +551,8 @@ fn report_end(id: i32, tracer: i32, status: i32) {
         inbox.word(0).fetch_add(1, Ordering::AcqRel);
         wake_word(inbox.word(0));
     }
-    crate::host::kill_process(tracer, libc::SIGCHLD);
-    crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+    signal_tracer(tracer, libc::SIGCHLD);
+    signal_tracer(tracer, crate::host::WAKE_SIGNAL);
 }
 
 /// Into a fork snapshot (the VM backend's child, a fresh process): the
@@ -622,6 +631,7 @@ pub fn exiting(status: i32) {
             if let Some(mb) = open(mailbox_tag(pid), None)
                 && mb.word(W_TRACER).load(Ordering::Acquire) == me() as u64
                 && mb.word(W_OPTIONS).load(Ordering::Acquire) & PTRACE_O_EXITKILL != 0
+                && let Some(pid) = HostPid::new(pid)
             {
                 crate::host::kill_process(pid, libc::SIGKILL);
             }
@@ -754,9 +764,9 @@ fn report(
         inbox.word(0).fetch_add(1, Ordering::AcqRel);
         wake_word(inbox.word(0));
     }
-    crate::host::kill_process(tracer, libc::SIGCHLD);
+    signal_tracer(tracer, libc::SIGCHLD);
     // fwe's wake signal too, which ends a host wait the tracer is in.
-    crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+    signal_tracer(tracer, crate::host::WAKE_SIGNAL);
 }
 
 /// How serving a stop ended.
@@ -807,7 +817,7 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
             // this process (whose `PTRACE_TRACEME` it had not seen): that
             // wait slept on, the signal spent.
             if waited && mb.word(W_STATE).load(Ordering::Acquire) == STOPPED {
-                crate::host::kill_process(tracer, crate::host::WAKE_SIGNAL);
+                signal_tracer(tracer, crate::host::WAKE_SIGNAL);
             }
             wait_word_for(mb.word(W_REQ), req, Duration::from_millis(100));
             waited = true;
@@ -1124,12 +1134,12 @@ pub fn target_of(pid: i32) -> Option<i32> {
     if pid > 0 && open(mailbox_tag(pid), None).is_some() {
         return Some(pid);
     }
-    crate::pidns::to_host(pid)
+    crate::pidns::to_host(pid).map(HostPid::get)
 }
 
 /// The host process tracee `id` is in.
-pub fn process_of(id: i32) -> i32 {
-    open(mailbox_tag(id), None).map_or(id, |mb| proc_of(&mb))
+pub fn process_of(id: i32) -> Option<HostPid> {
+    HostPid::new(open(mailbox_tag(id), None).map_or(id, |mb| proc_of(&mb)))
 }
 
 /// The tracee host process `pid`'s mailbox, if this process traces it and
@@ -1850,24 +1860,26 @@ impl<P: crate::Platform> crate::Kernel<P> {
         if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE)
             && let Some(owner) = crate::thread::owner_of_tid(pid as i32)
         {
-            if owner == me() || !self.may_trace(owner) {
+            if owner.get() == me() || !self.may_trace(owner.get()) {
                 return err(errno::EPERM);
             }
             let (r, code) = if request == PTRACE_SEIZE {
-                (seize(pid as i32, owner, data), POKE_CODE)
+                (seize(pid as i32, owner.get(), data), POKE_CODE)
             } else {
-                (attach_id(pid as i32, owner), 0)
+                (attach_id(pid as i32, owner.get()), 0)
             };
             if let Err(e) = r {
                 return err(e);
             }
             let stop = fwe_abi::signal::SIGSTOP;
-            return match crate::signote::queue_thread(owner, pid as i32, stop, code, 0) {
+            return match crate::signote::queue_thread(owner.get(), pid as i32, stop, code, 0) {
                 Ok(()) => crate::host::kill_process(owner, crate::host::WAKE_SIGNAL),
                 Err(e) => err(e),
             };
         }
-        let Some(target) = target_of(pid as i32).filter(|&t| alive(process_of(t))) else {
+        let Some(target) = target_of(pid as i32)
+            .filter(|&t| process_of(t).is_some_and(|p| crate::host::probe(p).exists()))
+        else {
             return err(errno::ESRCH);
         };
         if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE) {
@@ -1885,6 +1897,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
             if let Err(e) = r {
                 return err(e);
             }
+            let Some(target) = HostPid::new(target) else { return err(errno::ESRCH) };
             return crate::signal::send_unhosted(target, fwe_abi::signal::SIGSTOP, code, 0);
         }
         if request == PTRACE_INTERRUPT {
@@ -1898,7 +1911,9 @@ impl<P: crate::Platform> crate::Kernel<P> {
             if !traces(target) {
                 return err(errno::ESRCH);
             }
-            crate::host::kill_process(process_of(target), libc::SIGKILL);
+            if let Some(p) = process_of(target) {
+                crate::host::kill_process(p, libc::SIGKILL);
+            }
             return 0;
         }
         let r: Result<i64, i32> = (|| match request {
@@ -1979,15 +1994,15 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// fwe's nudge ([`POKE_CODE`]) to tracee `id`: a thread through its
     /// process's queue, a process through its own.
     fn nudge(&self, id: i32) -> i64 {
-        let proc = process_of(id);
+        let Some(proc) = process_of(id) else { return fwe_abi::err(errno::ESRCH) };
         let stop = fwe_abi::signal::SIGSTOP;
-        if proc != id {
-            return match crate::signote::queue_thread(proc, id, stop, POKE_CODE, 0) {
+        if proc.get() != id {
+            return match crate::signote::queue_thread(proc.get(), id, stop, POKE_CODE, 0) {
                 Ok(()) => crate::host::kill_process(proc, crate::host::WAKE_SIGNAL),
                 Err(e) => fwe_abi::err(e),
             };
         }
-        crate::signal::send_unhosted(id, stop, POKE_CODE, 0)
+        crate::signal::send_unhosted(proc, stop, POKE_CODE, 0)
     }
 }
 

@@ -609,11 +609,12 @@ fn spawn_child(fds: &[(i32, bool)], state: &[u8]) -> Result<i32, String> {
     match r {
         Ok(()) => Ok(pid),
         Err(e) => {
-            // SAFETY: ending and reaping the child that could not be set up.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            // Ended and reaped: the child that could not be set up.
+            if let Some(child) = fwe_kernel::ids::HostPid::new(pid) {
+                fwe_kernel::host::kill_child(child);
             }
+            // SAFETY: reaping the child spawned above.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
             Err(e)
         }
     }

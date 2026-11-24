@@ -100,7 +100,12 @@ fn remote_mem(id: i32, addr: u64, buf: u64, len: u64, write: bool) -> Result<u64
     let n = if crate::ptrace::traces_stopped(id) {
         crate::ptrace::tracee_memory(id, addr, &mut data, write)?
     } else {
-        crate::procvm::remote(crate::ptrace::process_of(id), addr, &mut data, write)?
+        crate::procvm::remote(
+            crate::ptrace::process_of(id).ok_or(errno::ESRCH)?,
+            addr,
+            &mut data,
+            write,
+        )?
     };
     if n == 0 {
         return Err(errno::EIO);

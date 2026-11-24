@@ -8,6 +8,8 @@
 //! built for `aarch64-unknown-linux-musl`.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// The tests signal the fwe processes they start, and their groups.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};

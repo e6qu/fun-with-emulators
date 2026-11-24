@@ -339,16 +339,16 @@ impl<P: Platform> Kernel<P> {
                 if pid > 0
                     && let Some(host) = crate::pidns::to_host(pid)
                 {
-                    ll::may_signal(host)?;
+                    ll::may_signal(host.get())?;
                 }
                 Ok(none)
             }
             nr::TKILL => {
                 let tid = a[0] as i32;
-                if let Some(owner) = crate::thread::owner_of_tid(tid) {
-                    ll::may_signal(owner)?;
-                } else if let Some(host) = crate::pidns::to_host(tid) {
-                    ll::may_signal(host)?;
+                if let Some(owner) =
+                    crate::thread::owner_of_tid(tid).or_else(|| crate::pidns::to_host(tid))
+                {
+                    ll::may_signal(owner.get())?;
                 }
                 Ok(none)
             }
@@ -360,7 +360,7 @@ impl<P: Platform> Kernel<P> {
             }
             nr::PIDFD_SEND_SIGNAL => {
                 if let Some(t) = crate::pidfd::of(a[0] as i32) {
-                    ll::may_signal(t.host)?;
+                    ll::may_signal(t.host.get())?;
                 }
                 Ok(none)
             }

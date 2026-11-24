@@ -4044,7 +4044,7 @@ fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)>
     if pid == crate::thread::tgid() {
         return Ok([&b"/proc/self"[..], sub].concat());
     }
-    Err((crate::pidns::to_host(pid), pid, sub.to_vec()))
+    Err((crate::pidns::to_host(pid).map(crate::ids::HostPid::get), pid, sub.to_vec()))
 }
 
 /// [`Fs::proc_target`] of `p`, a path in fwe's `/proc` (`/proc/42/maps`).

@@ -49,11 +49,10 @@ fn me() -> u64 {
 
 /// Whether host process `pid` is there.
 fn alive(pid: u64) -> bool {
-    if pid == 0 || pid > i32::MAX as u64 {
-        return false;
-    }
-    // SAFETY: signal 0 only asks whether the process exists.
-    unsafe { libc::kill(pid as i32, 0) == 0 || crate::host::last_errno() == libc::EPERM }
+    i32::try_from(pid)
+        .ok()
+        .and_then(crate::ids::HostPid::new)
+        .is_some_and(|p| crate::host::probe(p).exists())
 }
 
 /// This process runs the program whose file is host `dev`, `ino`.

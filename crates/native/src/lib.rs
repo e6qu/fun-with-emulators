@@ -659,16 +659,9 @@ pub fn install_kill_relay() {
                 // The host's own SIGINFO (Ctrl-T): nothing on Linux.
                 return;
             }
-            // The pid from the system call itself, not libc's copy, which a
-            // fork child has the parent's of until `fork` returns in it.
-            // SAFETY: async-signal-safe calls ending the process.
-            unsafe {
-                // <sys/syscall.h>: SYS_getpid.
-                const SYS_GETPID: libc::c_int = 20;
-                #[allow(deprecated)]
-                let me = libc::syscall(SYS_GETPID) as libc::pid_t;
-                libc::kill(me, libc::SIGKILL)
-            };
+            // To the pid from the system call itself, not libc's copy, which
+            // a fork child has the parent's of until `fork` returns in it.
+            fwe_kernel::host::kill_self(libc::SIGKILL);
         }
         // SAFETY: installing a handler that only ends the process.
         unsafe { libc::signal(fwe_kernel::host::KILL_RELAY, die as *const () as usize) };

@@ -1794,7 +1794,7 @@ impl<P: Platform> Kernel<P> {
             return 0;
         }
         if let Some(t) = crate::pidfd::of(fd as i32) {
-            guest!(uaccess::write(buf, pidfd_stat(t.host)));
+            guest!(uaccess::write(buf, pidfd_stat(t.host.get())));
             return 0;
         }
         // A synthetic file: what its path is.
@@ -1874,7 +1874,7 @@ impl<P: Platform> Kernel<P> {
             return 0;
         }
         if empty && let Some(t) = crate::pidfd::of(dirfd as i32) {
-            guest!(uaccess::write(buf, with_mount(statx_of(&pidfd_stat(t.host)))));
+            guest!(uaccess::write(buf, with_mount(statx_of(&pidfd_stat(t.host.get())))));
             return 0;
         }
         let (host, node) = if empty {
@@ -3406,7 +3406,7 @@ impl<P: Platform> Kernel<P> {
         if h.gid.is_some_and(|g| c.fsgid == g || c.groups().contains(&g)) {
             return true;
         }
-        crate::pidns::to_host(pid).is_some_and(|host| self.may_access(host, false, true))
+        crate::pidns::to_host(pid).is_some_and(|host| self.may_access(host.get(), false, true))
     }
 
     /// Whether the caller is refused another process's `/proc/<pid>` file
@@ -3455,7 +3455,7 @@ impl<P: Platform> Kernel<P> {
                 let host = if who == b"self" {
                     crate::host::pid()
                 } else {
-                    crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
+                    crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?.get()
                 };
                 // Another process's takes CAP_SYS_NICE, as on Linux.
                 let own = host == crate::host::pid();
@@ -3471,7 +3471,7 @@ impl<P: Platform> Kernel<P> {
         let host = if who == b"self" {
             crate::host::pid()
         } else {
-            crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
+            crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?.get()
         };
         let own = host == crate::host::pid();
         // The file is its process's effective user's and group's, mode
@@ -3504,19 +3504,19 @@ impl<P: Platform> Kernel<P> {
             Some(i) => (num(&rest[..i])?, Some(num(rest[i..].strip_prefix(b"/task/")?)?)),
         };
         let host = crate::pidns::to_host(pid)?;
-        if host == crate::host::pid() {
+        if host == crate::host::me() {
             return None;
         }
         let id = match tid {
             Some(t) if t != pid => crate::ptrace::target_of(t)?,
-            _ => host,
+            _ => host.get(),
         };
         // Only an fwe process's memory can be reached (through its mailbox):
         // any other is one the caller may not attach to.
         if !crate::host::is_fwe(host) {
             return Some(Err(errno::EACCES));
         }
-        Some(if crate::ptrace::traces(id) || self.may_access(host, true, true) {
+        Some(if crate::ptrace::traces(id) || self.may_access(host.get(), true, true) {
             Ok(id)
         } else {
             Err(errno::EACCES)
@@ -3545,7 +3545,7 @@ impl<P: Platform> Kernel<P> {
         let host = if who == b"self" {
             me
         } else {
-            crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?
+            crate::pidns::to_host(std::str::from_utf8(who).ok()?.parse().ok()?)?.get()
         };
         let target = crate::procreg::read(host).and_then(|r| crate::procpid::user_record(&r.ns));
         let (privileged, own) = match &target {
@@ -5694,11 +5694,9 @@ mod tests {
                 fd < 0
             })
             .count();
-        // SAFETY: ending and reaping the child forked above.
-        unsafe {
-            libc::kill(child, libc::SIGKILL);
-            libc::waitpid(child, std::ptr::null_mut(), 0);
-        }
+        crate::host::kill_child(crate::ids::HostPid::new(child).unwrap());
+        // SAFETY: reaping the child forked above.
+        unsafe { libc::waitpid(child, std::ptr::null_mut(), 0) };
         assert_eq!(failures, 0);
     }
 

@@ -87,14 +87,14 @@ impl<P: Platform> Kernel<P> {
             Ok(v) => v,
             Err(e) => return err(e),
         };
-        let Some(host) = crate::pidns::to_host(pid).filter(|&h| crate::host::process_exists(h))
+        let Some(host) = crate::pidns::to_host(pid).filter(|&h| crate::host::probe(h).exists())
         else {
             return err(errno::ESRCH);
         };
-        let me = crate::host::pid();
+        let me = crate::host::me();
         // Only an fwe process can copy its own memory for the caller; any
         // other is one the caller may not attach to, as `ptrace` has it.
-        if host != me && (!crate::host::is_fwe(host) || !self.may_trace(host)) {
+        if host != me && (!crate::host::is_fwe(host) || !self.may_trace(host.get())) {
             return err(errno::EPERM);
         }
         let total = local.iter().map(|r| r.1).sum::<u64>().min(remote.iter().map(|r| r.1).sum());
@@ -125,7 +125,7 @@ impl<P: Platform> Kernel<P> {
                 }
             }
             if done == 0 { -i64::from(errno::EFAULT) } else { done as i64 }
-        } else if crate::ptrace::traces_stopped(host) {
+        } else if crate::ptrace::traces_stopped(host.get()) {
             // A tracee of this process, stopped: its memory through its
             // mailbox, as its stop serves no other request.
             let mut done = 0usize;
@@ -134,7 +134,12 @@ impl<P: Platform> Kernel<P> {
                 if n == 0 {
                     continue;
                 }
-                match crate::ptrace::tracee_memory(host, base, &mut data[done..done + n], write) {
+                match crate::ptrace::tracee_memory(
+                    host.get(),
+                    base,
+                    &mut data[done..done + n],
+                    write,
+                ) {
                     Ok(k) if k == n => done += k,
                     Ok(k) => {
                         done += k;
@@ -169,7 +174,12 @@ impl<P: Platform> Kernel<P> {
 
 /// Copy between process `host`'s memory at `addr` and `data` (into it if
 /// `write`): the bytes moved.
-pub fn remote(host: i32, addr: u64, data: &mut [u8], write: bool) -> Result<usize, i32> {
+pub fn remote(
+    host: crate::ids::HostPid,
+    addr: u64,
+    data: &mut [u8],
+    write: bool,
+) -> Result<usize, i32> {
     let n = remote_copy(host, write, &[(addr, data.len() as u64)], data)?;
     Ok(n.max(0) as usize)
 }
@@ -177,7 +187,12 @@ pub fn remote(host: i32, addr: u64, data: &mut [u8], write: bool) -> Result<usiz
 /// Have process `host` copy between its `remote` ranges and `data`: the
 /// bytes moved (or `-EFAULT`).
 #[cfg(target_os = "macos")]
-fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -> Result<i64, i32> {
+fn remote_copy(
+    host: crate::ids::HostPid,
+    write: bool,
+    remote: &[(u64, u64)],
+    data: &mut [u8],
+) -> Result<i64, i32> {
     use crate::signote::{MEM_HEADER, MEM_RETRY};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let reply = crate::signote::fd_reply_socket().ok_or(errno::EMFILE)?;
@@ -252,7 +267,7 @@ fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -
         let r = (|| {
             for _ in 0..1000 {
                 m[8..16].copy_from_slice(&0i64.to_ne_bytes());
-                crate::signote::request_mem(host, reply.token)?;
+                crate::signote::request_mem(host.get(), reply.token)?;
                 if crate::host::kill_process(host, crate::host::WAKE_SIGNAL) != 0 {
                     return Err(errno::ESRCH);
                 }
@@ -264,7 +279,7 @@ fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -
                     if unsafe { libc::poll(fds.as_mut_ptr(), 1, 100) } > 0 {
                         break;
                     }
-                    if !crate::host::process_exists(host) {
+                    if !crate::host::probe(host).exists() {
                         return Err(errno::ESRCH);
                     }
                     if crate::thread::deliverable() != 0 {
@@ -295,6 +310,11 @@ fn remote_copy(host: i32, write: bool, remote: &[(u64, u64)], data: &mut [u8]) -
 }
 
 #[cfg(not(target_os = "macos"))]
-fn remote_copy(_: i32, _: bool, _: &[(u64, u64)], _: &mut [u8]) -> Result<i64, i32> {
+fn remote_copy(
+    _: crate::ids::HostPid,
+    _: bool,
+    _: &[(u64, u64)],
+    _: &mut [u8],
+) -> Result<i64, i32> {
     Err(errno::ENOSYS)
 }

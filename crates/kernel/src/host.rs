@@ -3,6 +3,7 @@
 //! Host values come from the `libc` crate, so this module compiles on any
 //! Unix host; on Linux hosts most translations are the identity.
 
+use crate::ids::HostPid;
 use fwe_abi::{clock, errno as le, fcntl, resource, signal, wait};
 
 /// The calling thread's host `errno`.
@@ -355,14 +356,11 @@ pub fn last_pid() -> i32 {
         .unwrap_or(0)
 }
 
-/// The pids of process group `pgid` (none for a number that is not one).
+/// The processes of host process group `pgid`, fwe's and others.
 #[cfg(target_os = "macos")]
-fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    if pgid <= 0 {
-        return Vec::new();
-    }
+pub fn group_members(pgid: HostPid) -> Vec<HostPid> {
     // <sys/proc_info.h>: PROC_PGRP_ONLY.
-    let (kind, arg): (u32, u32) = (2, pgid as u32);
+    let (kind, arg): (u32, u32) = (2, pgid.get() as u32);
     // SAFETY: sizing, then filling, a buffer of pids.
     unsafe {
         let n = libc::proc_listpids(kind, arg, std::ptr::null_mut(), 0);
@@ -377,34 +375,25 @@ fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
             (pids.len() * size_of::<libc::pid_t>()) as i32,
         );
         pids.truncate(n.max(0) as usize / size_of::<libc::pid_t>());
-        pids.retain(|&p| p > 0);
-        pids
+        pids.into_iter().filter_map(HostPid::new).collect()
     }
 }
 
-/// The pids of process group `pgid`, read from `/proc`.
+/// The processes of host process group `pgid`, fwe's and others, read
+/// from `/proc`.
 #[cfg(not(target_os = "macos"))]
-fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
+pub fn group_members(pgid: HostPid) -> Vec<HostPid> {
     let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
-    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+    dir.filter_map(|e| HostPid::new(e.ok()?.file_name().to_str()?.parse().ok()?))
         .filter(|&p| {
             // The group is the fifth field, after the name in parentheses.
-            std::fs::read_to_string(format!("/proc/{p}/stat")).ok().is_some_and(|st| {
+            std::fs::read_to_string(format!("/proc/{}/stat", p.get())).ok().is_some_and(|st| {
                 st.rsplit_once(')')
                     .and_then(|(_, rest)| rest.split_whitespace().nth(2)?.parse().ok())
-                    == Some(pgid)
+                    == Some(pgid.get())
             })
         })
         .collect()
-}
-
-/// The processes of host process group `pgid` (none for a number that is
-/// not one), fwe's and others.
-pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    if pgid <= 0 {
-        return Vec::new();
-    }
-    pids_of(pgid)
 }
 
 /// Whether host descriptor `fd` is of a file with no name left (a memfd's,
@@ -416,59 +405,79 @@ pub fn unlinked(fd: i32) -> bool {
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_nlink == 0 }
 }
 
-/// `kill(pid, sig)` for a host signal and a `kill`-style `pid` (a process,
-/// 0 for the caller's group, or `-pgid`). A `SIGKILL` reaches fwe processes
-/// as [`KILL_RELAY`], with a note of its sender ([`kill_relayed`]). Returns
-/// 0 or a negated Linux errno.
+/// `kill` of host process `pid` with host signal `sig`, for
+/// [`kill_process`] and [`signal_named`]: one process, never a group or
+/// every process (no [`HostPid`] names one). A `SIGKILL` reaches an fwe
+/// process as [`KILL_RELAY`], with a note of its sender
+/// ([`kill_relayed`]). Returns 0 or a negated Linux errno.
 ///
-/// -1 is refused (`ESRCH`): on the host it is every process of the user, so
-/// a guest's -1 is resolved to fwe's own processes before it gets here
-/// ([`kill_process`] sends to each).
-///
-/// [`WAKE_SIGNAL`] goes only to one live fwe process (`ESRCH` otherwise):
+/// [`WAKE_SIGNAL`] goes only to a live fwe process (`ESRCH` otherwise):
 /// any other process takes the host's default action for it, which ends
 /// it.
-pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
-    if pid == -1 {
-        return fwe_abi::err(fwe_abi::errno::ESRCH);
-    }
-    if sig == WAKE_SIGNAL && (pid <= 0 || !is_fwe(pid)) {
+fn kill(pid: HostPid, sig: libc::c_int) -> i64 {
+    if sig == WAKE_SIGNAL && !is_fwe(pid) {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     #[cfg(target_os = "macos")]
     if sig == libc::SIGKILL {
-        // SAFETY: plain host calls.
-        let (me, group) = unsafe { (libc::getpid(), libc::getpgrp()) };
-        let mut targets = match pid {
-            p if p > 0 => vec![p],
-            0 => pids_of(group),
-            p => pids_of(-p),
-        };
-        if targets.is_empty() {
-            return fwe_abi::err(fwe_abi::errno::ESRCH);
+        let fwe = exe_of(pid_now());
+        if fwe.is_some() && exe_of(pid.get()) == fwe {
+            // The relay is taken only with a note of its sender: the
+            // host's own SIGINFO (macOS's Ctrl-T) is no kill.
+            crate::signote::note(pid.get(), KILL_RELAY);
+            return ret(raw_kill(pid.get(), KILL_RELAY));
         }
-        // This process last: it may be among them.
-        targets.sort_by_key(|&p| p == me);
-        let fwe = exe_of(me);
-        let mut result = fwe_abi::err(fwe_abi::errno::ESRCH);
-        for t in targets {
-            let s = if fwe.is_some() && exe_of(t) == fwe { KILL_RELAY } else { libc::SIGKILL };
-            if s == KILL_RELAY {
-                // The relay is taken only with a note of its sender: the
-                // host's own SIGINFO (macOS's Ctrl-T) is no kill.
-                crate::signote::note(t, KILL_RELAY);
-            }
-            // SAFETY: plain host call.
-            if unsafe { libc::kill(t, s) } == 0 {
-                result = 0;
-            } else if result != 0 {
-                result = last_error();
-            }
-        }
-        return result;
     }
-    // SAFETY: plain host call.
-    ret(unsafe { libc::kill(pid, sig) })
+    ret(raw_kill(pid.get(), sig))
+}
+
+/// The host's `kill(pid, sig)` itself, for this module's typed callers and
+/// a process's signal to itself ([`kill_self`]). Async-signal-safe.
+#[allow(clippy::disallowed_methods)] // the one call of the host's `kill`
+fn raw_kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
+    // SAFETY: plain host call; every caller names its target by type.
+    unsafe { libc::kill(pid, sig) }
+}
+
+/// Host signal `sig` to this process itself. Async-signal-safe.
+pub fn kill_self(sig: libc::c_int) {
+    raw_kill(pid_now(), sig);
+}
+
+/// The host's `SIGKILL` to `child`, a child of this process it reaps next
+/// (one it could not finish setting up): the host's own, never relayed, as
+/// the child may not yet take fwe's relay.
+pub fn kill_child(child: HostPid) {
+    raw_kill(child.get(), libc::SIGKILL);
+}
+
+/// What the host says of a process asked whether it is there (its `kill`
+/// with signal 0).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// There, and this user may signal it.
+    Live,
+    /// There (a zombie is), but not this user's to signal.
+    NoPermission,
+    Gone,
+}
+
+impl Probe {
+    /// Whether the process is there, whoever's it is.
+    pub fn exists(self) -> bool {
+        self != Probe::Gone
+    }
+}
+
+/// Whether host process `pid` is there. Async-signal-safe.
+pub fn probe(pid: HostPid) -> Probe {
+    if raw_kill(pid.get(), 0) == 0 {
+        return Probe::Live;
+    }
+    match last_errno() {
+        libc::EPERM => Probe::NoPermission,
+        _ => Probe::Gone,
+    }
 }
 
 /// Mark the open file description of `fd` as opened without a right a
@@ -528,23 +537,17 @@ pub fn dev_of(st: &libc::stat) -> u64 {
 
 /// `kill` of one host process `pid` for fwe's own ends (a pid it keeps:
 /// a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a
-/// message queue's notice, a wake): a pid that is not one (0, or negative,
-/// which the host takes for a group or every process) is refused
-/// (`ESRCH`), so a number from a guest or a record never signals more; a
-/// signal (not 0, which only asks whether the process is there) goes only
-/// to one of fwe's processes ([`is_fwe`]: its record's, of a process that
-/// started when this one did), as a pid kept from a process that ended may
-/// be the host's now. One refused is told on the standard error, with
-/// where it was sent from. A guest's own signal to a process it names
-/// goes by [`signal_named`].
+/// message queue's notice, a wake): only to one of fwe's processes
+/// ([`is_fwe`]: its record's, of a process that started when this one
+/// did), as a pid kept from a process that ended may be the host's now
+/// (`ESRCH`). One refused is told on the standard error, with where it
+/// was sent from. A guest's own signal to a process it names goes by
+/// [`signal_named`]; whether a process is there, by [`probe`].
 #[track_caller]
-pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
-    if pid <= 0 {
-        return fwe_abi::err(fwe_abi::errno::ESRCH);
-    }
+pub fn kill_process(pid: HostPid, sig: libc::c_int) -> i64 {
     // ([`kill`] looks for its wake signal itself.)
-    if sig != 0 && sig != WAKE_SIGNAL && !is_fwe(pid) {
-        refused_signal(pid, sig, std::panic::Location::caller());
+    if sig != WAKE_SIGNAL && !is_fwe(pid) {
+        refused_signal(pid.get(), sig, std::panic::Location::caller());
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     kill(pid, sig)
@@ -552,13 +555,8 @@ pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
 
 /// A guest's signal `sig` to host process `pid`, which it named (`kill`,
 /// `rt_sigqueueinfo`) and may signal: one of fwe's or one of the host's,
-/// as a Linux process signals any it may. A pid that is not one is
-/// refused (`ESRCH`), as by [`kill_process`].
-#[track_caller]
-pub fn signal_named(pid: libc::pid_t, sig: libc::c_int) -> i64 {
-    if pid <= 0 {
-        return fwe_abi::err(fwe_abi::errno::ESRCH);
-    }
+/// as a Linux process signals any it may.
+pub fn signal_named(pid: HostPid, sig: libc::c_int) -> i64 {
     kill(pid, sig)
 }
 
@@ -638,26 +636,16 @@ pub fn nice_of(pid: libc::pid_t) -> i32 {
 /// nice value but not lower it (only its root may), so a guest's lowering
 /// stands in fwe's record while the host process keeps the value it had:
 /// Linux's result is the guest's, the host's limit is the host's.
-pub fn set_nice(pid: libc::pid_t, nice: i32) {
-    if pid <= 0 {
-        return;
-    }
+pub fn set_nice(pid: HostPid, nice: i32) {
     // SAFETY: plain host call on one process of this user's.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid.get() as libc::id_t, nice) };
 }
 
 /// Whether host process `pid` is a live fwe process (one with a record):
 /// the only kind that takes fwe's internal signals ([`WAKE_SIGNAL`]) and
 /// serves requests left in its mailbox.
-pub fn is_fwe(pid: libc::pid_t) -> bool {
-    pid > 0 && crate::procreg::read(pid).is_some()
-}
-
-/// Whether host process `pid` exists (a zombie does), whether or not this
-/// user may signal it.
-pub fn process_exists(pid: libc::pid_t) -> bool {
-    let r = kill_process(pid, 0);
-    r == 0 || r == fwe_abi::err(fwe_abi::errno::EPERM)
+pub fn is_fwe(pid: HostPid) -> bool {
+    crate::procreg::read(pid.get()).is_some()
 }
 
 #[cfg_attr(
@@ -814,10 +802,11 @@ pub fn signal_is_ignored(sig: u64) -> bool {
 
 /// Whether the host's `SIGCHLD` action has `SA_NOCLDSTOP` (the guest's
 /// does): no `SIGCHLD` for a child that stops or continues.
-/// This process's parent on the host. Async-signal-safe.
-pub fn parent_pid() -> i32 {
+/// This process's parent on the host (none once it is reparented to no
+/// process, which the host never does: launchd's is 1). Async-signal-safe.
+pub fn parent_pid() -> Option<HostPid> {
     // SAFETY: plain host call.
-    unsafe { libc::getppid() }
+    HostPid::new(unsafe { libc::getppid() })
 }
 
 /// Whether this process ignores `SIGCHLD` on the host (as the guest
@@ -2514,6 +2503,20 @@ pub fn only_thread() -> bool {
 #[cfg(not(target_os = "macos"))]
 pub fn only_thread() -> bool {
     false
+}
+
+/// This process ([`pid`]) as a [`HostPid`].
+#[inline]
+pub fn me() -> HostPid {
+    // SAFETY: the host's `getpid`, which is above 0.
+    unsafe { HostPid::new_unchecked(pid()) }
+}
+
+/// This process ([`pid_now`]) as a [`HostPid`]. Async-signal-safe.
+#[inline]
+pub fn me_now() -> HostPid {
+    // SAFETY: the host's `getpid`, which is above 0.
+    unsafe { HostPid::new_unchecked(pid_now()) }
 }
 
 /// This process's host pid, kept: asked of the host once, and again in a

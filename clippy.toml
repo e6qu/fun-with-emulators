@@ -1,0 +1,3 @@
+disallowed-methods = [
+  { path = "libc::kill", reason = "signal a process through host::kill_process, host::signal_named or host::kill_self; ask whether it is there with host::probe" },
+]

@@ -659,8 +659,9 @@ pub fn check_creds([pid, uid, gid]: [u32; 3]) -> Result<Creds, i32> {
         crate::host::pid()
     } else {
         crate::pidns::to_host(pid as i32)
-            .filter(|&h| crate::host::process_exists(h))
+            .filter(|&h| crate::host::probe(h).exists())
             .ok_or(errno::ESRCH)?
+            .get()
     };
     Ok(Creds { host_pid, uid, gid })
 }

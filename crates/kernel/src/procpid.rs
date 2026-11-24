@@ -534,7 +534,11 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         // the host's process 1, too): that it exists, and what the host
         // tells of it.
         return match sub {
-            b"" if crate::host::process_exists(host) => Entry::Dir,
+            b"" if crate::ids::HostPid::new(host)
+                .is_some_and(|h| crate::host::probe(h).exists()) =>
+            {
+                Entry::Dir
+            }
             b"/stat" => match host_info(host) {
                 Some(h) => {
                     let comm = crate::procreg::kinfo(host).map(|k| k.comm).unwrap_or_default();
@@ -581,7 +585,9 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         },
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
         b"/environ" => Entry::File(environ(&rec.auxv, &rec.cmdline, |addr, buf| {
-            crate::procvm::remote(host, addr, buf, false).is_ok_and(|n| n == buf.len())
+            crate::ids::HostPid::new(host).is_some_and(|h| {
+                crate::procvm::remote(h, addr, buf, false).is_ok_and(|n| n == buf.len())
+            })
         })),
         b"/limits" => match crate::fs::OtherView::of(host) {
             Some(v) => Entry::File(limits(&v.limits)),
@@ -661,7 +667,9 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
         b"/task" => {
             out.push((pid.to_string().into_bytes(), DT_DIR));
             let me = pid.to_string().into_bytes();
-            for t in crate::thread::published_tids(crate::pidns::to_host(pid).unwrap_or(pid)) {
+            for t in
+                crate::thread::published_tids(crate::pidns::to_host(pid).map_or(pid, |h| h.get()))
+            {
                 let name = t.to_string().into_bytes();
                 if name != me {
                     out.push((name, DT_DIR));

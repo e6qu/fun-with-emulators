@@ -1,6 +1,7 @@
 //! System call dispatch and the non-memory system calls.
 
 use crate::host::{self, last_error, ret};
+use crate::ids::HostPid;
 use crate::{Kernel, Platform, guest, thread, uaccess};
 use fwe_abi::{
     Pollfd, Rlimit, Sigaction, Stack, Timespec, UTSNAME_LEN, Utsname, Winsize, clock, err, errno,
@@ -133,7 +134,7 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
         return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(who).ok()?.parse().ok()?;
-    crate::pidns::to_host(pid)
+    crate::pidns::to_host(pid).map(HostPid::get)
 }
 
 /// Whether call `n` with `a` runs on the kernel lock's shared side
@@ -806,16 +807,16 @@ impl<P: Platform> Kernel<P> {
                     let target = match thread::owner_of_tid(pid) {
                         Some(owner) => Some((owner, Some(pid))),
                         None => crate::pidns::to_host(pid)
-                            .filter(|&h| host::process_exists(h))
+                            .filter(|&h| host::probe(h).exists())
                             .map(|h| (h, None)),
                     };
                     let Some((owner, tid)) = target else {
                         return err(errno::ESRCH);
                     };
-                    if !self.may_access(owner, false, false) {
+                    if !self.may_access(owner.get(), false, false) {
                         return err(errno::EPERM);
                     }
-                    thread::published_robust(owner, tid).unwrap_or(0)
+                    thread::published_robust(owner.get(), tid).unwrap_or(0)
                 };
                 guest!(uaccess::write(a[1], head));
                 guest!(uaccess::write(a[2], 24u64));
@@ -1546,11 +1547,11 @@ impl<P: Platform> Kernel<P> {
         let host = match who {
             0 => 0,
             p if p > 0 => match crate::pidns::to_host(p) {
-                Some(h) => h,
+                Some(h) => h.get(),
                 None => return err(errno::ESRCH),
             },
             p => match crate::pidns::to_host(p.wrapping_neg()) {
-                Some(h) => -h,
+                Some(g) => -g.get(),
                 None => return err(errno::ESRCH),
             },
         };
@@ -1944,8 +1945,8 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 pid => match crate::pidns::to_host(pid as i32) {
-                    Some(h) if pid <= i32::MAX as u64 && host::process_exists(h) => {
-                        crate::ptrace::set_ptracer(h);
+                    Some(h) if pid <= i32::MAX as u64 && host::probe(h).exists() => {
+                        crate::ptrace::set_ptracer(h.get());
                         0
                     }
                     _ => err(errno::EINVAL),
@@ -2002,10 +2003,10 @@ impl<P: Platform> Kernel<P> {
             let c = &self.creds.caps;
             [c.effective, c.permitted, c.inheritable]
         } else {
-            let Some(host) = crate::pidns::to_host(pid).filter(|&h| host::process_exists(h)) else {
+            let Some(host) = crate::pidns::to_host(pid).filter(|&h| host::probe(h).exists()) else {
                 return err(errno::ESRCH);
             };
-            let s = crate::procreg::security(host).unwrap_or_default();
+            let s = crate::procreg::security(host.get()).unwrap_or_default();
             [s.caps[0], s.caps[1], s.caps[2]]
         };
         if data == 0 {
@@ -2417,7 +2418,7 @@ impl<P: Platform> Kernel<P> {
         let procs: u64 = crate::procpid::listed()
             .into_iter()
             .filter_map(crate::pidns::to_host)
-            .map(|h| crate::procpid::host_info(h).map_or(1, |i| i.threads.max(1)))
+            .map(|h| crate::procpid::host_info(h.get()).map_or(1, |i| i.threads.max(1)))
             .sum();
         let info = fwe_abi::Sysinfo {
             uptime: host::uptime() as i64,
@@ -2445,10 +2446,10 @@ impl<P: Platform> Kernel<P> {
             return Ok(host::pid());
         }
         if let Some(owner) = thread::owner_of_tid(id).filter(|&o| host::is_fwe(o)) {
-            return Ok(owner);
+            return Ok(owner.get());
         }
         match crate::pidns::host_arg(id) {
-            Ok(h) if host::process_exists(h) => Ok(h),
+            Ok(h) if HostPid::new(h).is_some_and(|h| host::probe(h).exists()) => Ok(h),
             _ => Err(errno::ESRCH),
         }
     }
@@ -2512,7 +2513,7 @@ impl<P: Platform> Kernel<P> {
             {
                 return err(errno::EPERM);
             }
-            if !host::is_fwe(target) {
+            if !HostPid::new(target).is_some_and(host::is_fwe) {
                 return 0;
             }
         }
@@ -2654,7 +2655,9 @@ impl<P: Platform> Kernel<P> {
                 return err(e);
             }
             // Woken to take it up now (it has a mailbox, being fwe's).
-            if crate::signote::limits_set(target).is_ok() {
+            if crate::signote::limits_set(target).is_ok()
+                && let Some(target) = HostPid::new(target)
+            {
                 host::kill_process(target, host::WAKE_SIGNAL);
             }
         }
@@ -3720,6 +3723,7 @@ impl<P: Platform> Kernel<P> {
             crate::procpid::listed()
                 .into_iter()
                 .filter_map(crate::pidns::to_host)
+                .map(HostPid::get)
                 .collect::<Vec<_>>()
         };
         // The main thread names the process; another of this process's
@@ -3732,7 +3736,8 @@ impl<P: Platform> Kernel<P> {
             prio::PROCESS if thread::host_thread(who).is_some() => vec![own_thread(who)],
             prio::PROCESS => processes(
                 crate::pidns::to_host(who)
-                    .filter(|&h| h > 0 && (h == me || crate::host::process_exists(h)))
+                    .filter(|&h| h.get() == me || crate::host::probe(h).exists())
+                    .map(HostPid::get)
                     .into_iter()
                     .collect(),
             ),
@@ -3740,8 +3745,8 @@ impl<P: Platform> Kernel<P> {
                 let group = if who == 0 {
                     my_group
                 } else {
-                    match crate::pidns::to_host(who).filter(|&g| g > 0) {
-                        Some(g) => g,
+                    match crate::pidns::to_host(who) {
+                        Some(g) => g.get(),
                         None => return Ok(Vec::new()),
                     }
                 };
@@ -3886,7 +3891,7 @@ pub(crate) fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
     } else if who == 0 || who == me {
         crate::procpid::cpu_ns(crate::host::pid())
     } else {
-        crate::pidns::to_host(who).and_then(crate::procpid::cpu_ns)
+        crate::pidns::to_host(who).and_then(|h| crate::procpid::cpu_ns(h.get()))
     };
     Some(match sample {
         Some((user, _)) if which == 1 => Ok(user),
@@ -4969,9 +4974,9 @@ mod tests {
         let r = k
             .syscall(nr::RT_SIGQUEUEINFO, [-1i64 as u64, 10, kernel_code.as_ptr() as u64, 0, 0, 0]);
         assert_eq!(r, err(errno::EPERM));
-        assert_eq!(host::kill(-1, libc::SIGUSR1), err(errno::ESRCH));
+        // The host's every process, or a group, is no process to fwe.
         for pid in [-1, 0, -5] {
-            assert_eq!(host::kill_process(pid, libc::SIGUSR1), err(errno::ESRCH));
+            assert_eq!(HostPid::new(pid), None);
         }
         // tgkill's thread group must be a process.
         assert_eq!(k.syscall(nr::TGKILL, [-1i64 as u64, 1, 0, 0, 0, 0]), err(errno::EINVAL));
@@ -4988,14 +4993,14 @@ mod tests {
         let _held = crate::thread::signals_held();
         let mut k = kernel();
         let mut child = std::process::Command::new("/bin/sleep").arg("30").spawn().unwrap();
-        let pid = child.id() as i32;
-        assert!(!host::is_fwe(pid));
-        assert_eq!(host::kill_process(pid, host::WAKE_SIGNAL), err(errno::ESRCH));
-        assert_eq!(host::kill(-pid, host::WAKE_SIGNAL), err(errno::ESRCH));
+        let host_pid = HostPid::new(child.id() as i32).unwrap();
+        let pid = host_pid.get();
+        assert!(!host::is_fwe(host_pid));
+        assert_eq!(host::kill_process(host_pid, host::WAKE_SIGNAL), err(errno::ESRCH));
         for sig in [libc::SIGTERM, libc::SIGKILL, libc::SIGSTOP, libc::SIGCONT, libc::SIGCHLD] {
-            assert_eq!(host::kill_process(pid, sig), err(errno::ESRCH), "signal {sig}");
+            assert_eq!(host::kill_process(host_pid, sig), err(errno::ESRCH), "signal {sig}");
         }
-        assert_eq!(host::kill_process(pid, 0), 0, "it is there");
+        assert_eq!(host::probe(host_pid), host::Probe::Live, "it is there");
         // A real-time signal, which only fwe's mailbox carries.
         assert_eq!(k.syscall(nr::KILL, [pid as u64, 40, 0, 0, 0, 0]), err(errno::EINVAL));
         let fd = k.syscall(nr::PIDFD_OPEN, [pid as u64, 0, 0, 0, 0, 0]);

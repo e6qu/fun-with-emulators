@@ -141,7 +141,8 @@ pub fn deliver(inst: &[u8], mask: u32) -> bool {
     if crate::signote::queue(pid, fwe_abi::signal::SIGIO, POLL_MSG, value).is_err() {
         return false;
     }
-    crate::host::kill_process(pid, crate::host::WAKE_SIGNAL) == 0
+    crate::ids::HostPid::new(pid)
+        .is_some_and(|p| crate::host::kill_process(p, crate::host::WAKE_SIGNAL) == 0)
 }
 
 /// Post the signal for an event on this process's watch of `fd`.

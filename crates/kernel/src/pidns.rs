@@ -106,12 +106,12 @@ impl PidNs {
         self.pids.retain(|_, e| e.host != host);
     }
 
-    /// Forget the numbers of host processes that no longer exist.
+    /// Forget the numbers of host processes that no longer exist. A
+    /// number held for a child that has not yet taken it up (host 0,
+    /// [`adopt`]) stays.
     pub fn sweep(&mut self) {
         self.pids.retain(|_, e| {
-            // SAFETY: a signal 0 only checks that the process exists.
-            let alive = unsafe { libc::kill(e.host, 0) } == 0;
-            alive || crate::host::last_errno() == libc::EPERM
+            crate::ids::HostPid::new(e.host).is_none_or(|h| crate::host::probe(h).exists())
         });
     }
 }
@@ -273,11 +273,11 @@ pub fn released(numbers: &[(Vec<u8>, i32)], host: i32) {
     }
 }
 
-/// The host pid behind `pid` in the current namespace.
-pub fn to_host(pid: i32) -> Option<i32> {
+/// The host process behind `pid` in the current namespace.
+pub fn to_host(pid: i32) -> Option<crate::ids::HostPid> {
     match current().first() {
-        None => Some(pid),
-        Some(r) => r.get().host_of(pid).filter(|&h| h != 0),
+        None => crate::ids::HostPid::new(pid),
+        Some(r) => r.get().host_of(pid).and_then(crate::ids::HostPid::new),
     }
 }
 
@@ -295,6 +295,7 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
     // Only processes that are still members: a number left behind can name
     // a host pid that has since been given to another process.
     for h in hosts.into_iter().filter(|&h| h != init && member(h, ns.dir())) {
+        let Some(h) = crate::ids::HostPid::new(h) else { continue };
         // Relayed, so a VM process takes its VM down first.
         crate::host::kill_process(h, libc::SIGKILL);
     }
@@ -385,7 +386,7 @@ pub fn host_arg(pid: i32) -> Result<i32, i32> {
     if pid <= 0 || !nested() {
         return Ok(pid);
     }
-    to_host(pid).ok_or(fwe_abi::errno::ESRCH)
+    to_host(pid).map(crate::ids::HostPid::get).ok_or(fwe_abi::errno::ESRCH)
 }
 
 /// A host pid a call returns (an error passes through) as the guest's.

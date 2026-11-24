@@ -672,7 +672,7 @@ pub fn write(cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
             if text.trim() != "1" {
                 return Err(errno::EINVAL);
             }
-            for pid in members(cg, true).into_iter().filter(|&p| p > 0) {
+            for pid in members(cg, true).into_iter().filter_map(crate::ids::HostPid::new) {
                 // Relayed, so a VM process takes its VM down first.
                 crate::host::kill_process(pid, libc::SIGKILL);
             }
@@ -853,6 +853,7 @@ fn below_root(cg: &[u8]) -> impl Iterator<Item = Vec<u8>> {
 /// member is a stopped process, which stops where it holds nothing shared
 /// ([`crate::signal::stop_process`]).
 fn freeze(pid: i32, frozen: bool) {
+    let Some(pid) = crate::ids::HostPid::new(pid) else { return };
     if frozen {
         crate::signal::stop_process(pid, fwe_abi::signal::SIGSTOP);
     } else {
@@ -1018,7 +1019,7 @@ fn thread_process(tid: i32) -> Result<i32, i32> {
         return Ok(crate::host::pid());
     }
     match crate::thread::owner_of_tid(tid) {
-        Some(p) => Ok(p),
+        Some(p) => Ok(p.get()),
         None => process(tid),
     }
 }

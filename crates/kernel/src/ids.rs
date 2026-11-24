@@ -1,0 +1,71 @@
+//! Numbers of different kinds kept apart by their types: a host process's
+//! pid is a [`HostPid`], which no guest-visible number, thread id or
+//! process group converts to without saying so. Each is the bare number in
+//! memory (`#[repr(transparent)]`), so a call that takes one costs what it
+//! did with the number.
+
+use std::num::NonZeroI32;
+
+/// A host process: a pid above 0. A number that is not one (0 and the
+/// negative numbers name process groups, or every process, to the host's
+/// `kill`) has no `HostPid`, so nothing typed so can signal more than one
+/// process.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct HostPid(NonZeroI32);
+
+impl HostPid {
+    /// The host process `pid`, if `pid` is one (above 0).
+    #[inline]
+    pub const fn new(pid: libc::pid_t) -> Option<HostPid> {
+        if pid <= 0 {
+            return None;
+        }
+        match NonZeroI32::new(pid) {
+            Some(p) => Some(HostPid(p)),
+            None => None,
+        }
+    }
+
+    /// `pid`, which the host gave as a process's (its `getpid`, a child's
+    /// `fork`).
+    ///
+    /// # Safety
+    /// `pid` must be above 0.
+    #[inline]
+    pub const unsafe fn new_unchecked(pid: libc::pid_t) -> HostPid {
+        // SAFETY: above 0, so not 0, as the caller promises.
+        HostPid(unsafe { NonZeroI32::new_unchecked(pid) })
+    }
+
+    /// The pid, for the host's calls.
+    #[inline]
+    pub const fn get(self) -> libc::pid_t {
+        self.0.get()
+    }
+}
+
+impl std::fmt::Display for HostPid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.get().fmt(f)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_number_above_0_is_a_host_process() {
+        assert_eq!(HostPid::new(0), None);
+        assert_eq!(HostPid::new(-1), None);
+        assert_eq!(HostPid::new(i32::MIN), None);
+        assert_eq!(HostPid::new(1).map(HostPid::get), Some(1));
+        assert_eq!(HostPid::new(i32::MAX).map(HostPid::get), Some(i32::MAX));
+    }
+
+    #[test]
+    fn a_host_pid_or_none_is_the_size_of_a_pid() {
+        assert_eq!(size_of::<Option<HostPid>>(), size_of::<libc::pid_t>());
+    }
+}

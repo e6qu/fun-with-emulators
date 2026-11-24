@@ -274,8 +274,7 @@ fn host_pid() -> i32 {
 }
 
 fn alive(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks the process exists.
-    unsafe { libc::kill(pid, 0) == 0 || crate::host::last_errno() == libc::EPERM }
+    crate::ids::HostPid::new(pid).is_some_and(|p| crate::host::probe(p).exists())
 }
 
 /// Descriptor `fd` is being closed: a device this process ran down

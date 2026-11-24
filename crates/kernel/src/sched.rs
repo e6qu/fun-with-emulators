@@ -80,13 +80,10 @@ impl<P: Platform> Kernel<P> {
             return Ok(me);
         }
         let host = crate::pidns::to_host(pid).ok_or(errno::ESRCH)?;
-        // SAFETY: signal 0 only checks the process exists.
-        let exists =
-            unsafe { libc::kill(host, 0) } == 0 || crate::host::last_errno() == libc::EPERM;
-        if crate::procreg::read(host).is_none() && !exists {
+        if crate::procreg::read(host.get()).is_none() && !crate::host::probe(host).exists() {
             return Err(errno::ESRCH);
         }
-        Ok(host)
+        Ok(host.get())
     }
 
     /// Process `host`'s attributes (an ordinary process's for one without
