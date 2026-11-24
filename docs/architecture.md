@@ -2027,7 +2027,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   server takes a program's frames as copies (`MESA_VK_WSI_DEBUG=sw`),
   and a submission waits on no fence of another's (`FENCE_FD_IN` is
   `EINVAL`). A fork child has no GPU (`ENODEV`) until it runs a program,
-  nor has the VM backend.
+  nor has the VM backend. Windows need the guest's Mesa to be 26.3 or
+  later: an earlier Venus offers a swapchain only where the host's Vulkan
+  imports semaphores from sync files, which MoltenVK does not.
 - Wayland programs need a compositor run in the guest (Weston, drawing on
   the X display).
 

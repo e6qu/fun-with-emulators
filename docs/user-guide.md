@@ -184,12 +184,15 @@ driver, in the VM, with `DISPLAY` set the same way.
 Vulkan programs draw on the Mac's GPU, through a Linux GPU device fwe
 provides (`/dev/dri/renderD128`) and Mesa's driver for it (Venus), once
 the renderer behind the device, virglrenderer, is installed; OpenGL
-programs use the GPU through Mesa's Zink:
+programs use the GPU through Mesa's Zink. Windows need Mesa 26.3 or
+later in the userland (Alpine 3.25's: an earlier Venus has no swapchain
+on a Mac):
 
 ```sh
 brew tap slp/krunkit
 HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
-linux ~/alpine /bin/sh -c 'apk add -q mesa-vulkan-virtio vulkan-tools'
+linux ~/alpine /bin/sh -c 'apk add -q -X https://dl-cdn.alpinelinux.org/alpine/v3.25/main \
+  mesa-vulkan-virtio vulkan-tools'
 env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" MESA_VK_WSI_DEBUG=sw \
   "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/vkcube --wsi xcb
 ```

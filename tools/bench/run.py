@@ -632,7 +632,9 @@ def linux(a):
             try:
                 r[GEARS] = gears_ms(
                     ["docker", "run", "--rm", "--name", "fwe-gears"] + env + [image, "sh", "-c",
-                     "apk add -q xvfb font-misc-misc mesa-utils mesa-dri-gallium"
+                     # Mesa as the root fwe runs it in has it: 3.25's.
+                     "apk add -q -X https://dl-cdn.alpinelinux.org/alpine/v3.25/main"
+                     " xvfb font-misc-misc mesa-utils mesa-dri-gallium"
                      f" && (Xvfb :{GEARS_DISPLAY} -screen 0 1024x768x24 -nolisten tcp"
                      " >/dev/null 2>&1 &)"
                      f" && while [ ! -e {sock} ]; do sleep 0.1; done && {GEARS_CMD}"]
