@@ -10064,6 +10064,11 @@ impl Gui {
             .env("XDG_RUNTIME_DIR", "/tmp/xdg")
             .env("LANG", "C.UTF-8")
             .env("DISPLAY", x.display());
+        // fwe's own choice of the Mac's Vulkan driver (CI's names MoltenVK:
+        // KosmicKrisp, which fwe takes first, has no device on a runner).
+        if let Some(driver) = std::env::var_os("FWE_VULKAN_DRIVER") {
+            cmd.env("FWE_VULKAN_DRIVER", driver);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }

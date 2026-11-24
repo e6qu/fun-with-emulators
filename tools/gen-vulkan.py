@@ -819,6 +819,12 @@ def emit(reg, commands, exts, refused):
         rs.append(f"    Level::{level(reg, n)},")
     rs.append("];")
     rs.append("")
+    rs.append("/// Whether each command returns a `VkResult`, by index.")
+    rs.append("pub static RESULTS: [bool; COMMANDS] = [")
+    for n in commands:
+        rs.append(f"    {'true' if reg.command(n)['ret'] == 'VkResult' else 'false'},")
+    rs.append("];")
+    rs.append("")
     rs.append("/// The commands fwe answers with code of its own, by index.")
     rs.append("pub static SPECIAL: [bool; COMMANDS] = [")
     for n in commands:
