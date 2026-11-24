@@ -12,6 +12,9 @@
 //! installs it (`fwe-virglrenderer`); fwe runs where it is not installed
 //! (the device is then absent, as on a Linux machine with no GPU), and a
 //! process that never opens the device never starts the helper.
+//! The helper is a macOS program, so its environment is not fwe's (the
+//! guest's) but the variables of fwe's named for it, `FWE_GPU_<NAME>`
+//! given it as `<NAME>`.
 //!
 //! Requests go one at a time over one socket ([`crate::virglhelper::Op`]);
 //! the fences the renderer signals come back over another, which a thread
@@ -133,6 +136,28 @@ fn socket_pair() -> Result<(OwnedFd, OwnedFd), String> {
     Ok((ours, theirs))
 }
 
+/// What a name in fwe's environment starts with to be in the helper's.
+const HELPER_PREFIX: &str = "FWE_GPU_";
+
+/// The helper's environment, a macOS program's: not fwe's, which is the
+/// guest's (a guest's `VK_DRIVER_FILES` names its own Vulkan driver, which
+/// the host's Vulkan loader would look for), but each `FWE_GPU_<NAME>` of
+/// fwe's as `<NAME>` (`FWE_GPU_VK_LOADER_DEBUG`, `FWE_GPU_MVK_CONFIG_...`).
+fn helper_environment() -> crate::hostproc::Env {
+    crate::hostproc::Env::new(helper_vars(std::env::vars_os()))
+}
+
+/// The helper's variables of those of fwe's environment, `vars`.
+fn helper_vars(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)> {
+    use std::os::unix::ffi::OsStrExt;
+    vars.filter_map(|(k, v)| {
+        let name = k.as_bytes().strip_prefix(HELPER_PREFIX.as_bytes())?;
+        (!name.is_empty()).then(|| (std::ffi::OsStr::from_bytes(name).to_owned(), v))
+    })
+}
+
 /// Start the helper (through its launcher) and wait for it to say whether
 /// the renderer started; then start the thread that takes its events.
 fn connect() -> Result<(), String> {
@@ -163,7 +188,7 @@ fn connect() -> Result<(), String> {
         (events_theirs.as_raw_fd(), crate::virglhelper::EVENTS_FD),
         (hold_read.as_raw_fd(), 0),
     ];
-    let launcher = crate::hostproc::spawn(&path, &argv, &moved, &[2])
+    let launcher = crate::hostproc::spawn(&path, &argv, &helper_environment(), &moved, &[2])
         .map_err(|e| format!("the GPU helper's launcher did not start (errno {e})"))?;
     // Recorded as fwe's own before it may end (it ends when `hold_write`
     // closes); dropped, it is reaped.
@@ -334,4 +359,23 @@ pub fn create_fence(ctx: u32, ring: u32, id: u64) -> Result<(), i32> {
     let mut p = payload(&[ctx, ring], &[]);
     p.extend_from_slice(&id.to_le_bytes());
     call(Op::CreateFence, &p).map(|_| ())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_helper_has_only_the_variables_named_for_it() {
+        let os = |k: &str, v: &str| (k.into(), v.into());
+        let fwe = [
+            os("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/virtio_icd.aarch64.json"),
+            os("HOME", "/root"),
+            os("FWE_GPU_VK_LOADER_DEBUG", "error"),
+            os("FWE_GPU_", "nameless"),
+            os("FWE_VIRGLRENDERER", "/x.dylib"),
+        ];
+        let got: Vec<_> = helper_vars(fwe.into_iter()).collect();
+        assert_eq!(got, [os("VK_LOADER_DEBUG", "error")]);
+    }
 }

@@ -1418,6 +1418,10 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   signals. A process's first open of the node starts it through a
   launcher (`fwe --gpu-launch`), which starts the helper in a process
   group of its own and ends, so the helper is no child of the guest's.
+  The helper is a macOS program, so its environment is not fwe's, which
+  is the guest's (whose `VK_DRIVER_FILES`, say, names a Linux driver), but
+  fwe's `FWE_GPU_<NAME>` variables as `<NAME>` (`FWE_GPU_VK_LOADER_DEBUG`
+  sets the host Vulkan loader's `VK_LOADER_DEBUG`).
   The launcher is fwe's own child while it lives (`ownchild.rs`): a
   guest's `wait` that reaps or sees it goes on as if it had not, and the
   `SIGCHLD` of its end is not the guest's. Requests go to the helper one

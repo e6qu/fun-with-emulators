@@ -6,8 +6,45 @@
 use crate::ids::HostPid;
 use std::os::fd::{FromRawFd, OwnedFd};
 
+/// A spawned process's environment: its `NAME=value` strings, and the
+/// null-terminated array of pointers to them a spawn takes.
+pub struct Env {
+    _strings: Vec<std::ffi::CString>,
+    pointers: Vec<*const libc::c_char>,
+}
+
+impl Env {
+    /// The environment of `vars` (a name or value holding a NUL is left
+    /// out: no environment string can hold one).
+    pub fn new<I, K, V>(vars: I) -> Env
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let strings: Vec<std::ffi::CString> = vars
+            .into_iter()
+            .filter_map(|(k, v)| {
+                let mut kv = k.as_ref().as_bytes().to_vec();
+                kv.push(b'=');
+                kv.extend_from_slice(v.as_ref().as_bytes());
+                std::ffi::CString::new(kv).ok()
+            })
+            .collect();
+        let pointers = strings.iter().map(|s| s.as_ptr()).chain([std::ptr::null()]).collect();
+        Env { _strings: strings, pointers }
+    }
+
+    /// The array a spawn takes (the strings move with `self`, not their
+    /// bytes: the pointers stay good while `self` lives).
+    pub fn as_ptr(&self) -> *const *mut libc::c_char {
+        self.pointers.as_ptr() as *const *mut libc::c_char
+    }
+}
+
 /// Start program `path` with `argv` (NUL-terminated pointers, ending in
-/// null) and this process's environment, as a process of fwe's own: in a
+/// null) and environment `env`, as a process of fwe's own: in a
 /// process group of its own, every signal unblocked and at its default,
 /// holding only the descriptors `moved` puts in place (each `(from, to)`)
 /// and those `kept` names (the rest close as it starts). Its pid, or the
@@ -16,6 +53,7 @@ use std::os::fd::{FromRawFd, OwnedFd};
 pub fn spawn(
     _path: &std::ffi::CStr,
     _argv: &[*const libc::c_char],
+    _env: &Env,
     _moved: &[(i32, i32)],
     _kept: &[i32],
 ) -> Result<HostPid, i32> {
@@ -27,6 +65,7 @@ pub fn spawn(
 pub fn spawn(
     path: &std::ffi::CStr,
     argv: &[*const libc::c_char],
+    env: &Env,
     moved: &[(i32, i32)],
     kept: &[i32],
 ) -> Result<HostPid, i32> {
@@ -40,7 +79,6 @@ pub fn spawn(
             fa: *mut libc::posix_spawn_file_actions_t,
             fd: libc::c_int,
         ) -> libc::c_int;
-        static environ: *const *const libc::c_char;
     }
     // The actions run in order in the new process, so a source that is
     // another's target would be overwritten before it is read: each source
@@ -92,7 +130,7 @@ pub fn spawn(
             &fa,
             &attr,
             argv.as_ptr() as *const *mut libc::c_char,
-            environ as *const *mut libc::c_char,
+            env.as_ptr(),
         );
         libc::posix_spawn_file_actions_destroy(&mut fa);
         libc::posix_spawnattr_destroy(&mut attr);
@@ -231,7 +269,7 @@ mod tests {
         let script = c"echo three >&3; echo four >&4; echo zero >&0";
         let argv = [c"/bin/sh".as_ptr(), c"-c".as_ptr(), script.as_ptr(), std::ptr::null()];
         let moved = [(pw.as_raw_fd(), 3), (qw.as_raw_fd(), 4), (rw.as_raw_fd(), 0)];
-        let pid = spawn(c"/bin/sh", &argv, &moved, &[2]).unwrap();
+        let pid = spawn(c"/bin/sh", &argv, &Env::new(std::env::vars_os()), &moved, &[2]).unwrap();
         let mut status = 0;
         // SAFETY: plain host call on the child just started.
         assert_eq!(unsafe { libc::waitpid(pid.get(), &mut status, 0) }, pid.get());
@@ -245,6 +283,23 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn a_spawned_process_has_the_environment_given_and_no_other() {
+        use std::io::Read;
+        let (mut out, out_w) = pipe_above(300);
+        let argv = [c"/usr/bin/env".as_ptr(), std::ptr::null()];
+        let env = Env::new([("ONE", "1"), ("TWO", "two words")]);
+        let pid = spawn(c"/usr/bin/env", &argv, &env, &[(out_w.as_raw_fd(), 1)], &[]).unwrap();
+        let mut status = 0;
+        // SAFETY: plain host call on the child just started.
+        assert_eq!(unsafe { libc::waitpid(pid.get(), &mut status, 0) }, pid.get());
+        drop(out_w);
+        let mut got = String::new();
+        out.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "ONE=1\nTWO=two words\n");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn descriptors_swapped_in_a_spawn_each_land_where_named() {
         use std::io::Read;
         let (mut p, pw) = pipe_above(300);
@@ -254,7 +309,8 @@ mod tests {
         // source is the other's target.
         let script = std::ffi::CString::new(format!("echo p >&{b}; echo q >&{a}")).unwrap();
         let argv = [c"/bin/sh".as_ptr(), c"-c".as_ptr(), script.as_ptr(), std::ptr::null()];
-        let pid = spawn(c"/bin/sh", &argv, &[(a, b), (b, a)], &[]).unwrap();
+        let pid = spawn(c"/bin/sh", &argv, &Env::new(std::env::vars_os()), &[(a, b), (b, a)], &[])
+            .unwrap();
         let mut status = 0;
         // SAFETY: plain host call on the child just started.
         assert_eq!(unsafe { libc::waitpid(pid.get(), &mut status, 0) }, pid.get());

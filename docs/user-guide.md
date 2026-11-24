@@ -270,8 +270,8 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **The GPU after `fork`**: a forked child has no GPU until it starts a
-  program (`execve`).
+- **The GPU after `fork`**: a forked child's copy of its parent's open of
+  `/dev/dri/renderD128` fails (`ENODEV`); an open of its own works.
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are

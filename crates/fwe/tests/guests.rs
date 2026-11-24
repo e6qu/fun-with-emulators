@@ -10408,7 +10408,8 @@ fn alpine_display_glxgears_turns_by_software() {
 /// What a program of a display root says, run to its end (within
 /// `secs`): its standard output. Its calls are traced, and Mesa's Vulkan
 /// driver and loader say what they find (`VN_DEBUG`, `VK_LOADER_DEBUG`),
-/// for a failure's report.
+/// and so does the GPU helper's loader, on the host
+/// (`FWE_GPU_VK_LOADER_DEBUG`), for a failure's report.
 fn display_output(
     x: &Xvfb,
     name: &str,
@@ -10418,7 +10419,11 @@ fn display_output(
     secs: u64,
 ) -> String {
     let mut env = env.to_vec();
-    env.extend([("VN_DEBUG", "init"), ("VK_LOADER_DEBUG", "error,warn,driver")]);
+    env.extend([
+        ("VN_DEBUG", "init"),
+        ("VK_LOADER_DEBUG", "error,warn,driver"),
+        ("FWE_GPU_VK_LOADER_DEBUG", "error,warn,driver"),
+    ]);
     let mut gui = Gui::start_traced(x, name, root, args[0], &args[1..], &env, true);
     let began = Instant::now();
     let status = loop {

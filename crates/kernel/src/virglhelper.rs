@@ -166,7 +166,9 @@ pub fn launch(fwe: &std::path::Path, library: &std::ffi::OsStr) -> ! {
     let lib = std::ffi::CString::new(library.as_bytes()).expect("no NUL in a path");
     let flag = c"--gpu-helper";
     let argv = [path.as_ptr(), flag.as_ptr(), lib.as_ptr(), std::ptr::null()];
-    let started = crate::hostproc::spawn(&path, &argv, &[], &[2, REQUESTS_FD, EVENTS_FD])
+    // The launcher's environment is the helper's, as its client made it.
+    let env = crate::hostproc::Env::new(std::env::vars_os());
+    let started = crate::hostproc::spawn(&path, &argv, &env, &[], &[2, REQUESTS_FD, EVENTS_FD])
         .inspect_err(|e| eprintln!("fwe: the GPU helper did not start (errno {e})"))
         .is_ok();
     // SAFETY: closing this process's copies, which only the helper needs.
