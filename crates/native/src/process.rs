@@ -93,9 +93,11 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if vm && !crate::hv::usable() {
         return Err(err(fwe_abi::errno::ENOEXEC));
     }
-    // A program only the VM can run, or an exec from a process with other
-    // threads (which must end): replace this process with a fresh fwe.
-    if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
+    // A program only the VM can run, an exec from a process with other
+    // threads (which must end), or from a fork child holding its parent's
+    // copy of the GPU's renderer (the new program's GPU is its own):
+    // replace this process with a fresh fwe.
+    if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 || fwe_kernel::drm::exec_needs_new_image() {
         fwe_kernel::release_robust_lists();
         let state = k.exec_state();
         crate::jitcount::write_seen();

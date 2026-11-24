@@ -98,6 +98,9 @@ pub enum Mark {
     Inotify(u32),
     /// A Landlock ruleset, by its number ([`crate::landlock`]).
     Landlock(u32),
+    /// The GPU's render node, open as the device, by its number
+    /// ([`crate::drm`]).
+    Drm(u32),
     /// An `O_PATH | O_NOFOLLOW` descriptor of a link of fwe's `/proc` (a
     /// stand-in, its origin's path the link's), which names the link.
     ProcLink,
@@ -721,6 +724,7 @@ pub fn save(e: &mut Enc) {
             Some(Mark::Ping) => 25,
             Some(Mark::Store(_)) => 26,
             Some(Mark::Landlock(_)) => 27,
+            Some(Mark::Drm(_)) => 28,
         });
         if let Some(Mark::Comm { tid }) = rec.mark {
             e.i32(tid);
@@ -745,6 +749,7 @@ pub fn save(e: &mut Enc) {
             | Mark::Ns(n)
             | Mark::Inotify(n)
             | Mark::Landlock(n)
+            | Mark::Drm(n)
             | Mark::Store(n)
             | Mark::Mq(n),
         ) = rec.mark
@@ -831,6 +836,7 @@ pub fn load(d: &mut Dec) {
             25 => Some(Mark::Ping),
             26 => Some(Mark::Store(d.u32())),
             27 => Some(Mark::Landlock(d.u32())),
+            28 => Some(Mark::Drm(crate::drm::restored(d.u32()))),
             _ => None,
         };
         let net = crate::shared::load_opt(d).ok().flatten().map(Net);

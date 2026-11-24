@@ -97,6 +97,7 @@ pub fn init_main(pid: i32) {
     crate::reclocks::forked_child();
     crate::tmpfile::forked_child();
     crate::posixtimer::forked_child();
+    crate::drm::forked_child();
     crate::ptrace::forked_child();
     register_current();
 }

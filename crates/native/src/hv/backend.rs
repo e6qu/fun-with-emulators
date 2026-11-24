@@ -600,6 +600,8 @@ pub(super) fn become_vm_process() -> Result<(), String> {
     vm::create()?;
     VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     fwe_kernel::forbid_fork();
+    // The guest's memory is the VM's, where the GPU's is not mapped.
+    fwe_kernel::drm::absent();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);

@@ -979,6 +979,170 @@ pub mod loopdev {
     pub const CONFIG_INFO: usize = 8;
 }
 
+/// The DRM device interface (`include/uapi/drm/drm.h`) and virtio-gpu's
+/// driver calls on it (`include/uapi/drm/virtgpu_drm.h`), as Mesa's Venus
+/// Vulkan driver uses them. An ioctl number holds its argument's size: the
+/// DRM core copies what the caller passed and zero-fills the rest of the
+/// structure it knows, so callers built against an older (shorter) or newer
+/// structure work alike.
+pub mod drm {
+    /// The character devices' major number.
+    pub const MAJOR: u32 = 226;
+    /// The first render node's minor (`/dev/dri/renderD128`).
+    pub const RENDER_MINOR: u32 = 128;
+
+    /// The ioctl type byte (`DRM_IOCTL_BASE`).
+    pub const TYPE: u64 = b'd' as u64;
+    /// Driver calls are numbered from here (`DRM_COMMAND_BASE`).
+    pub const COMMAND_BASE: u64 = 0x40;
+
+    /// The type of ioctl `req`.
+    pub const fn ioc_type(req: u64) -> u64 {
+        (req >> 8) & 0xff
+    }
+    /// The number of ioctl `req` within its type.
+    pub const fn ioc_nr(req: u64) -> u64 {
+        req & 0xff
+    }
+    /// The size of ioctl `req`'s argument.
+    pub const fn ioc_size(req: u64) -> usize {
+        ((req >> 16) & 0x3fff) as usize
+    }
+
+    pub const NR_VERSION: u64 = 0x00;
+    pub const NR_GEM_CLOSE: u64 = 0x09;
+    pub const NR_GET_CAP: u64 = 0x0c;
+    pub const NR_SET_CLIENT_CAP: u64 = 0x0d;
+    pub const NR_PRIME_HANDLE_TO_FD: u64 = 0x2d;
+    pub const NR_PRIME_FD_TO_HANDLE: u64 = 0x2e;
+
+    pub const NR_VIRTGPU_MAP: u64 = COMMAND_BASE + 0x01;
+    pub const NR_VIRTGPU_EXECBUFFER: u64 = COMMAND_BASE + 0x02;
+    pub const NR_VIRTGPU_GETPARAM: u64 = COMMAND_BASE + 0x03;
+    pub const NR_VIRTGPU_RESOURCE_CREATE: u64 = COMMAND_BASE + 0x04;
+    pub const NR_VIRTGPU_RESOURCE_INFO: u64 = COMMAND_BASE + 0x05;
+    pub const NR_VIRTGPU_TRANSFER_FROM_HOST: u64 = COMMAND_BASE + 0x06;
+    pub const NR_VIRTGPU_TRANSFER_TO_HOST: u64 = COMMAND_BASE + 0x07;
+    pub const NR_VIRTGPU_WAIT: u64 = COMMAND_BASE + 0x08;
+    pub const NR_VIRTGPU_GET_CAPS: u64 = COMMAND_BASE + 0x09;
+    pub const NR_VIRTGPU_RESOURCE_CREATE_BLOB: u64 = COMMAND_BASE + 0x0a;
+    pub const NR_VIRTGPU_CONTEXT_INIT: u64 = COMMAND_BASE + 0x0b;
+
+    /// `struct drm_version`: `int version_major, version_minor,
+    /// version_patchlevel`, then three `size_t` length and `char *` buffer
+    /// pairs: name, date, description.
+    pub const VERSION_SIZE: usize = 64;
+    pub const VERSION_MAJOR: usize = 0;
+    pub const VERSION_MINOR: usize = 4;
+    pub const VERSION_PATCHLEVEL: usize = 8;
+    pub const VERSION_NAME_LEN: usize = 16;
+    pub const VERSION_NAME: usize = 24;
+    pub const VERSION_DATE_LEN: usize = 32;
+    pub const VERSION_DATE: usize = 40;
+    pub const VERSION_DESC_LEN: usize = 48;
+    pub const VERSION_DESC: usize = 56;
+
+    /// `struct drm_get_cap` and `struct drm_set_client_cap`: `__u64
+    /// capability, value`.
+    pub const CAP_SIZE: usize = 16;
+    pub const CAP_PRIME: u64 = 0x5;
+    pub const CAP_TIMESTAMP_MONOTONIC: u64 = 0x6;
+    pub const CAP_SYNCOBJ: u64 = 0x13;
+    pub const CAP_SYNCOBJ_TIMELINE: u64 = 0x14;
+    /// `DRM_CAP_PRIME`'s bits: buffers imported and exported as fds.
+    pub const PRIME_CAP_IMPORT: u64 = 0x1;
+    pub const PRIME_CAP_EXPORT: u64 = 0x2;
+
+    /// `struct drm_gem_close`: `__u32 handle, pad`.
+    pub const GEM_CLOSE_SIZE: usize = 8;
+    /// `struct drm_prime_handle`: `__u32 handle, flags`, `__s32 fd`.
+    pub const PRIME_SIZE: usize = 12;
+    pub const PRIME_HANDLE: usize = 0;
+    pub const PRIME_FLAGS: usize = 4;
+    pub const PRIME_FD: usize = 8;
+
+    /// `struct drm_virtgpu_map`: `__u64 offset` (for `mmap`), `__u32
+    /// handle, pad`.
+    pub const MAP_SIZE: usize = 16;
+    pub const MAP_OFFSET: usize = 0;
+    pub const MAP_HANDLE: usize = 8;
+
+    /// `struct drm_virtgpu_execbuffer`.
+    pub const EXECBUFFER_SIZE: usize = 64;
+    pub const EXECBUFFER_FLAGS: usize = 0;
+    pub const EXECBUFFER_SIZE_FIELD: usize = 4;
+    pub const EXECBUFFER_COMMAND: usize = 8;
+    pub const EXECBUFFER_BO_HANDLES: usize = 16;
+    pub const EXECBUFFER_NUM_BO_HANDLES: usize = 24;
+    pub const EXECBUFFER_FENCE_FD: usize = 28;
+    pub const EXECBUFFER_RING_IDX: usize = 32;
+    pub const EXECBUFFER_SYNCOBJ_STRIDE: usize = 36;
+    pub const EXECBUFFER_NUM_IN_SYNCOBJS: usize = 40;
+    pub const EXECBUFFER_NUM_OUT_SYNCOBJS: usize = 44;
+    pub const EXECBUF_FENCE_FD_IN: u32 = 0x01;
+    pub const EXECBUF_FENCE_FD_OUT: u32 = 0x02;
+    pub const EXECBUF_RING_IDX: u32 = 0x04;
+    pub const EXECBUF_FLAGS: u32 = EXECBUF_FENCE_FD_IN | EXECBUF_FENCE_FD_OUT | EXECBUF_RING_IDX;
+
+    /// `struct drm_virtgpu_getparam`: `__u64 param, value` (`value` the
+    /// address of a `u64` the answer goes to).
+    pub const GETPARAM_SIZE: usize = 16;
+    pub const PARAM_3D_FEATURES: u64 = 1;
+    pub const PARAM_CAPSET_QUERY_FIX: u64 = 2;
+    pub const PARAM_RESOURCE_BLOB: u64 = 3;
+    pub const PARAM_HOST_VISIBLE: u64 = 4;
+    pub const PARAM_CROSS_DEVICE: u64 = 5;
+    pub const PARAM_CONTEXT_INIT: u64 = 6;
+    pub const PARAM_SUPPORTED_CAPSET_IDS: u64 = 7;
+    pub const PARAM_EXPLICIT_DEBUG_NAME: u64 = 8;
+
+    /// `struct drm_virtgpu_resource_info`: `__u32 bo_handle, res_handle,
+    /// size, blob_mem`.
+    pub const RESOURCE_INFO_SIZE: usize = 16;
+
+    /// `struct drm_virtgpu_get_caps`: `__u32 cap_set_id, cap_set_ver`,
+    /// `__u64 addr`, `__u32 size, pad`.
+    pub const GET_CAPS_SIZE: usize = 24;
+    pub const CAPSET_VENUS: u32 = 4;
+
+    /// `struct drm_virtgpu_resource_create_blob`: `__u32 blob_mem,
+    /// blob_flags, bo_handle, res_handle`, `__u64 size`, `__u32 pad,
+    /// cmd_size`, `__u64 cmd, blob_id`, `__u32 blob_hints, pad2` (the last
+    /// two not in older headers).
+    pub const CREATE_BLOB_SIZE: usize = 56;
+    pub const BLOB_MEM: usize = 0;
+    pub const BLOB_FLAGS: usize = 4;
+    pub const BLOB_BO_HANDLE: usize = 8;
+    pub const BLOB_RES_HANDLE: usize = 12;
+    pub const BLOB_SIZE: usize = 16;
+    pub const BLOB_CMD_SIZE: usize = 28;
+    pub const BLOB_CMD: usize = 32;
+    pub const BLOB_ID: usize = 40;
+    pub const BLOB_MEM_GUEST: u32 = 0x1;
+    pub const BLOB_MEM_HOST3D: u32 = 0x2;
+    pub const BLOB_MEM_HOST3D_GUEST: u32 = 0x3;
+    pub const BLOB_FLAG_USE_MAPPABLE: u32 = 0x1;
+    pub const BLOB_FLAG_USE_SHAREABLE: u32 = 0x2;
+    pub const BLOB_FLAG_USE_CROSS_DEVICE: u32 = 0x4;
+
+    /// `struct drm_virtgpu_context_init`: `__u32 num_params, pad`, `__u64
+    /// ctx_set_params` (an array of `struct drm_virtgpu_context_set_param`:
+    /// `__u64 param, value`).
+    pub const CONTEXT_INIT_SIZE: usize = 16;
+    pub const SET_PARAM_SIZE: usize = 16;
+    pub const CONTEXT_PARAM_CAPSET_ID: u64 = 1;
+    pub const CONTEXT_PARAM_NUM_RINGS: u64 = 2;
+    pub const CONTEXT_PARAM_POLL_RINGS_MASK: u64 = 3;
+    pub const CONTEXT_PARAM_DEBUG_NAME: u64 = 4;
+    /// The most rings a context may have (`VIRTGPU_MAX_RINGS`... the
+    /// kernel's limit).
+    pub const MAX_RINGS: u64 = 64;
+
+    /// virtio-gpu's PCI identity, as Mesa's Venus looks for it.
+    pub const PCI_VENDOR: u16 = 0x1af4;
+    pub const PCI_DEVICE: u16 = 0x1050;
+}
+
 /// `struct termios` fields (Linux asm-generic, arm64). The guest layout is
 /// `c_iflag, c_oflag, c_cflag, c_lflag` (4 × u32), `c_line` (u8), then
 /// `c_cc[NCCS]`; baud is encoded in `c_cflag`. `crates/kernel/src/term.rs`

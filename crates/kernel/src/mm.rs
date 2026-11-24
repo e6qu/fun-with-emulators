@@ -1383,6 +1383,15 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EOPNOTSUPP);
             }
         }
+        // The GPU's memory: a resource's pages, which the renderer keeps.
+        if flags & mman::MAP_ANONYMOUS == 0
+            && let Some(source) = crate::drm::map_source(fd as i32, offset, self.page_up(len))
+        {
+            return match source {
+                Ok(host) => self.map_gpu_memory(addr, len, prot, flags, host),
+                Err(e) => err(e),
+            };
+        }
         // Anonymous huge pages: of a size the hardware has (`EINVAL`), and
         // reserved from the pool, which is empty (`vm.nr_hugepages` is 0:
         // fwe has no huge pages to give), so `ENOMEM` unless the mapping
@@ -1595,6 +1604,44 @@ impl<P: Platform> Kernel<P> {
             crate::maps::publish();
         }
         r
+    }
+
+    /// Map `len` bytes of the GPU's memory at host address `host` (a
+    /// resource's, [`crate::drm::map_source`]) at `addr`, as `mmap` asked:
+    /// a place made as for shared memory of no file, then the resource's
+    /// pages put there, the same pages (not a copy). Shared only, and not
+    /// to run.
+    fn map_gpu_memory(&mut self, addr: u64, len: u64, prot: u64, flags: u64, host: u64) -> i64 {
+        let shared = matches!(flags & mman::MAP_TYPE, mman::MAP_SHARED | mman::MAP_SHARED_VALIDATE);
+        if !shared || prot & mman::PROT_EXEC != 0 {
+            return err(errno::EINVAL);
+        }
+        let place = (flags & !mman::MAP_TYPE) | mman::MAP_SHARED | mman::MAP_ANONYMOUS;
+        let r = self.sys_mmap(addr, len, prot, place, u64::MAX, 0);
+        if r < 0 {
+            return r;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let at = crate::uaccess::g2h(r as u64);
+            let len = self.page_up(len);
+            if !region::move_pages(host, at, len) {
+                self.sys_munmap(r as u64, len);
+                return err(errno::ENOMEM);
+            }
+            // The protections asked for (the pages came with the
+            // renderer's).
+            // SAFETY: the guest's mapping just made.
+            unsafe { libc::mprotect(at as *mut libc::c_void, len as usize, host_prot(prot)) };
+            crate::drm::mapped(len);
+            r
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            let _ = host;
+            self.sys_munmap(r as u64, len);
+            err(errno::ENODEV)
+        }
     }
 
     /// Map `len` bytes of a file from `offset` at `addr` (as `mmap` would,
