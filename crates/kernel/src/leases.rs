@@ -103,13 +103,13 @@ fn now() -> u64 {
 /// This process: host pid and start time.
 fn me() -> (i32, u64) {
     let pid = crate::host::pid();
-    (pid, crate::procreg::host_info(pid).map_or(0, |i| i.0))
+    (pid.get(), crate::procreg::host_info(pid).map_or(0, |i| i.0))
 }
 
 /// Drop leases of ended processes and those whose break ran out.
 fn tidy(l: &mut Leases, now: u64) {
     l.0.retain(|e| {
-        crate::procreg::alive((e.pid, e.start)) && e.breaking.is_none_or(|(_, by)| by > now)
+        crate::procreg::alive_kept((e.pid, e.start)) && e.breaking.is_none_or(|(_, by)| by > now)
     });
 }
 
@@ -264,9 +264,9 @@ fn tell(pid: i32, sig: u32, fd: i32) {
     let (sig, code) =
         if sig == 0 { (signal::SIGIO, signal::SI_KERNEL) } else { (u64::from(sig), POLL_MSG) };
     let Some(h) = crate::host::signal_to_host(sig) else { return };
-    crate::signote::note_with(pid, h, code, fd as u64, crate::creds::real_uid());
+    crate::signote::note_with(holder, h, code, fd as u64, crate::creds::real_uid());
     if crate::host::kill_process(holder, h) != 0 {
-        crate::signote::unnote(pid, h);
+        crate::signote::unnote(holder, h);
     }
 }
 

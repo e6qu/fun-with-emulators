@@ -186,7 +186,8 @@ fn waits_for(waiters: &[[(i32, u64); 2]], from: (i32, u64), to: (i32, u64)) -> b
         if at == to {
             return true;
         }
-        let Some(w) = waiters.iter().find(|w| w[0] == at && crate::procreg::alive(w[0])) else {
+        let Some(w) = waiters.iter().find(|w| w[0] == at && crate::procreg::alive_kept(w[0]))
+        else {
             return false;
         };
         at = w[1];

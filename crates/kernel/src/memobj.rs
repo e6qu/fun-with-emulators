@@ -175,7 +175,7 @@ pub fn identify(fd: i32) -> Option<(u8, u64, usize)> {
     // SAFETY: a buffer of the size the call is given.
     let n = unsafe {
         libc::proc_pidfdinfo(
-            crate::host::pid(),
+            crate::host::pid().get(),
             fd,
             PROC_PIDFDPSHMINFO,
             info.as_mut_ptr().cast(),

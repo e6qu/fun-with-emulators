@@ -44,7 +44,7 @@ fn table() -> Option<&'static [AtomicU64]> {
 }
 
 fn me() -> u64 {
-    crate::host::pid() as u64
+    crate::host::pid().get() as u64
 }
 
 /// Whether host process `pid` is there.

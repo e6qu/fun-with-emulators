@@ -58,14 +58,14 @@ pub enum Mark {
     /// of host process `host`, opened for writing by a process that was
     /// `privileged` there, and whose own id in the map's parent namespace
     /// is `own` (Linux checks the opener's credentials).
-    ProcMap { host: i32, which: u8, privileged: bool, own: u32 },
+    ProcMap { host: crate::ids::HostPid, which: u8, privileged: bool, own: u32 },
     /// `/proc/<pid>/oom_score_adj` (or the older `oom_adj`, `legacy`) of
     /// host process `host`, opened for writing by a process that may lower
     /// it (`privileged`: `CAP_SYS_RESOURCE`).
-    OomScore { host: i32, legacy: bool, privileged: bool },
+    OomScore { host: crate::ids::HostPid, legacy: bool, privileged: bool },
     /// `/proc/<pid>/timerslack_ns` of host process `host`, opened for
     /// writing.
-    TimerSlack { host: i32 },
+    TimerSlack { host: crate::ids::HostPid },
     /// `/proc/<pid>/comm` (or a thread's), opened for writing: of thread
     /// `tid` of this process (0: its main thread), or of another process
     /// (-1), whose name a write may not change.
@@ -733,8 +733,11 @@ pub fn save(e: &mut Enc) {
             e.i32(tid);
             e.bool(nonblock);
         }
-        if let Some(Mark::TimerSlack { host } | Mark::RemoteMem { id: host }) = rec.mark {
-            e.i32(host);
+        if let Some(Mark::TimerSlack { host }) = rec.mark {
+            e.i32(host.get());
+        }
+        if let Some(Mark::RemoteMem { id }) = rec.mark {
+            e.i32(id);
         }
         if let Some(
             Mark::FsContext(n)
@@ -755,12 +758,12 @@ pub fn save(e: &mut Enc) {
             e.u8(i);
         }
         if let Some(Mark::OomScore { host, legacy, privileged }) = rec.mark {
-            e.i32(host);
+            e.i32(host.get());
             e.bool(legacy);
             e.bool(privileged);
         }
         if let Some(Mark::ProcMap { host, which, privileged, own }) = rec.mark {
-            e.i32(host);
+            e.i32(host.get());
             e.u8(which);
             e.bool(privileged);
             e.u32(own);
@@ -798,14 +801,16 @@ pub fn load(d: &mut Dec) {
             1 => Some(Mark::SeqPacket),
             2 => Some(Mark::DevFull),
             3 => Some(Mark::NetBound { port: d.u32() as u16, any: d.bool(), key: d.u8() }),
-            4 => Some(Mark::ProcMap {
-                host: d.i32(),
-                which: d.u8(),
-                privileged: d.bool(),
-                own: d.u32(),
-            }),
+            4 => {
+                let (host, which, privileged, own) = (d.host_pid(), d.u8(), d.bool(), d.u32());
+                host.map(|host| Mark::ProcMap { host, which, privileged, own })
+            }
             6 => Some(Mark::Sysctl(d.u8())),
-            7 => Some(Mark::OomScore { host: d.i32(), legacy: d.bool(), privileged: d.bool() }),
+            7 => {
+                // (A pid that is not one marks the state bad.)
+                let (host, legacy, privileged) = (d.host_pid(), d.bool(), d.bool());
+                host.map(|host| Mark::OomScore { host, legacy, privileged })
+            }
             8 => Some(Mark::Netlink),
             9 => Some(Mark::Loop(d.u32())),
             10 => Some(Mark::LoopControl),
@@ -816,7 +821,7 @@ pub fn load(d: &mut Dec) {
             15 => Some(Mark::Ns(d.u32())),
             16 => Some(Mark::Inotify(d.u32())),
             17 => Some(Mark::ProcLink),
-            18 => Some(Mark::TimerSlack { host: d.i32() }),
+            18 => d.host_pid().map(|host| Mark::TimerSlack { host }),
             19 => Some(Mark::Pid { host: d.i32(), tid: d.i32(), nonblock: d.bool() }),
             20 => Some(Mark::Mem),
             21 => Some(Mark::Pagemap),

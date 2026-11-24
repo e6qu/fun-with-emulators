@@ -294,8 +294,8 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
         ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
     // Only processes that are still members: a number left behind can name
     // a host pid that has since been given to another process.
-    for h in hosts.into_iter().filter(|&h| h != init && member(h, ns.dir())) {
-        let Some(h) = crate::ids::HostPid::new(h) else { continue };
+    let members = hosts.into_iter().filter(|&h| h != init).filter_map(crate::ids::HostPid::new);
+    for h in members.filter(|&h| member(h, ns.dir())) {
         // Relayed, so a VM process takes its VM down first.
         crate::host::kill_process(h, libc::SIGKILL);
     }
@@ -306,14 +306,14 @@ pub fn zap(ns: &crate::shared::Record<PidNs>, init: i32) {
 pub fn members_alive(ns: &crate::shared::Record<PidNs>, init: i32) -> bool {
     let hosts: std::collections::BTreeSet<i32> =
         ns.get().pids.values().filter(|e| !e.thread && e.host > 0).map(|e| e.host).collect();
-    hosts.into_iter().filter(|&h| h != init).any(|h| {
+    hosts.into_iter().filter(|&h| h != init).filter_map(crate::ids::HostPid::new).any(|h| {
         crate::procreg::host_info(h).is_some_and(|(_, _, zombie)| !zombie) && member(h, ns.dir())
     })
 }
 
 /// Whether live host process `host` is in the pid namespace whose record
 /// is `dir` (or one inside it), by fwe's record of it.
-fn member(host: i32, dir: &[u8]) -> bool {
+fn member(host: crate::ids::HostPid, dir: &[u8]) -> bool {
     let Some(r) = crate::procreg::read(host) else { return false };
     pid_dirs(&r.ns).into_iter().any(|d| {
         crate::shared::Record::<PidNs>::join(&d, 0).ok().is_some_and(|ns| {
@@ -348,7 +348,7 @@ pub fn init_gone(dirs: &[Vec<u8>], host: i32) {
 /// This process is ending: if it is its pid namespace's init, the
 /// namespace ends with it.
 pub fn exiting() {
-    let me = crate::host::pid();
+    let me = crate::host::pid().get();
     if let Some(ns) = current().first()
         && ns.get().number_of(me) == Some(1)
     {
@@ -359,12 +359,12 @@ pub fn exiting() {
 /// The pid namespace of fwe's whose init is host process `host`, if any:
 /// the one to end with it when it is sent `SIGKILL`, which it cannot see
 /// coming ([`zap`]).
-pub fn led_by(host: i32) -> Option<crate::shared::Record<PidNs>> {
+pub fn led_by(host: crate::ids::HostPid) -> Option<crate::shared::Record<PidNs>> {
     let r = crate::procreg::read(host)?;
     pid_dirs(&r.ns)
         .iter()
         .filter_map(|d| crate::shared::Record::<PidNs>::join(d, 0).ok())
-        .find(|ns| ns.get().host_of(1) == Some(host))
+        .find(|ns| ns.get().host_of(1) == Some(host.get()))
 }
 
 /// Forget a reaped child's numbers, in every namespace of the chain.
@@ -400,7 +400,7 @@ pub fn guest_ret(r: i64) -> i64 {
 /// what the namespace's record holds for this host process.
 pub fn adopt(ns: &crate::ns::Namespaces, known: i32) -> i32 {
     set_current(chain_from(ns.pid.clone()));
-    let host = crate::host::pid();
+    let host = crate::host::pid().get();
     if known > 0 {
         // Its number stands for it from now on, not only once the parent
         // gets to it.

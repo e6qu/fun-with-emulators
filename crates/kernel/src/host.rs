@@ -420,11 +420,11 @@ fn kill(pid: HostPid, sig: libc::c_int) -> i64 {
     }
     #[cfg(target_os = "macos")]
     if sig == libc::SIGKILL {
-        let fwe = exe_of(pid_now());
+        let fwe = exe_of(pid_now().get());
         if fwe.is_some() && exe_of(pid.get()) == fwe {
             // The relay is taken only with a note of its sender: the
             // host's own SIGINFO (macOS's Ctrl-T) is no kill.
-            crate::signote::note(pid.get(), KILL_RELAY);
+            crate::signote::note(pid, KILL_RELAY);
             return ret(raw_kill(pid.get(), KILL_RELAY));
         }
     }
@@ -441,7 +441,7 @@ fn raw_kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
 
 /// Host signal `sig` to this process itself. Async-signal-safe.
 pub fn kill_self(sig: libc::c_int) {
-    raw_kill(pid_now(), sig);
+    raw_kill(pid_now().get(), sig);
 }
 
 /// The host's `SIGKILL` to `child`, a child of this process it reaps next
@@ -624,10 +624,10 @@ impl Line {
 
 /// Host process `pid`'s nice value as the host has it (0 for one that
 /// is not there).
-pub fn nice_of(pid: libc::pid_t) -> i32 {
+pub fn nice_of(pid: HostPid) -> i32 {
     // SAFETY: plain host call; -1 is a valid value, so errno is not
     // consulted (an absent process reads as 0).
-    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid.get() as libc::id_t) };
     v.clamp(-20, 19)
 }
 
@@ -645,7 +645,7 @@ pub fn set_nice(pid: HostPid, nice: i32) {
 /// the only kind that takes fwe's internal signals ([`WAKE_SIGNAL`]) and
 /// serves requests left in its mailbox.
 pub fn is_fwe(pid: HostPid) -> bool {
-    crate::procreg::read(pid.get()).is_some()
+    crate::procreg::read(pid).is_some()
 }
 
 #[cfg_attr(
@@ -954,7 +954,7 @@ pub unsafe fn signal_info(
     // ([`crate::procreg::ending`]).
     let ended = (sig == libc::SIGCHLD
         && matches!(code, wait::CLD_EXITED | wait::CLD_KILLED | wait::CLD_DUMPED))
-    .then(|| crate::procreg::end_status(pid))
+    .then(|| HostPid::new(pid).and_then(crate::procreg::end_status))
     .flatten();
     if let Some(s) = ended {
         code = if s & 0x80 != 0 { wait::CLD_DUMPED } else { wait::CLD_KILLED };
@@ -972,7 +972,11 @@ pub unsafe fn signal_info(
     // One this process sent itself carries its own guest user; one from a
     // process that is not fwe's, the host user's.
     let uid = guest_uid.unwrap_or_else(|| {
-        if pid != 0 && pid == pid_now() { crate::creds::real_uid() } else { uid_to_initial(uid) }
+        if pid != 0 && pid == pid_now().get() {
+            crate::creds::real_uid()
+        } else {
+            uid_to_initial(uid)
+        }
     });
     crate::thread::SigInfo { code, pid, uid, status, value, poll: None }
 }
@@ -2462,20 +2466,16 @@ pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
 /// a signal handler, which may run in a fork child before its
 /// `pthread_atfork` handlers have forgotten the parent's [`pid`] (or
 /// libc its own copy). Async-signal-safe.
-pub fn pid_now() -> i32 {
+pub fn pid_now() -> HostPid {
     #[cfg(target_os = "macos")]
-    {
-        // SAFETY: the `getpid` system call (20), which cannot fail.
-        #[allow(deprecated)]
-        unsafe {
-            libc::syscall(20)
-        }
-    }
+    // SAFETY: the `getpid` system call (20), which cannot fail.
+    #[allow(deprecated)]
+    let p = unsafe { libc::syscall(20) } as libc::pid_t;
     #[cfg(not(target_os = "macos"))]
-    {
-        // SAFETY: plain host call.
-        unsafe { libc::getpid() }
-    }
+    // SAFETY: plain host call.
+    let p = unsafe { libc::getpid() };
+    // SAFETY: a process's own pid is above 0.
+    unsafe { HostPid::new_unchecked(p) }
 }
 
 /// Whether the calling thread is its process's only host thread, as the
@@ -2488,7 +2488,7 @@ pub fn only_thread() -> bool {
     // SAFETY: a buffer of the size given.
     let n = unsafe {
         libc::proc_pidinfo(
-            pid(),
+            pid().get(),
             libc::PROC_PIDTASKINFO,
             0,
             (&mut info as *mut libc::proc_taskinfo).cast(),
@@ -2505,31 +2505,18 @@ pub fn only_thread() -> bool {
     false
 }
 
-/// This process ([`pid`]) as a [`HostPid`].
-#[inline]
-pub fn me() -> HostPid {
-    // SAFETY: the host's `getpid`, which is above 0.
-    unsafe { HostPid::new_unchecked(pid()) }
-}
-
-/// This process ([`pid_now`]) as a [`HostPid`]. Async-signal-safe.
-#[inline]
-pub fn me_now() -> HostPid {
-    // SAFETY: the host's `getpid`, which is above 0.
-    unsafe { HostPid::new_unchecked(pid_now()) }
-}
-
 /// This process's host pid, kept: asked of the host once, and again in a
 /// fork child (a `pthread_atfork` handler forgets it).
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-pub fn pid() -> i32 {
+pub fn pid() -> HostPid {
     use std::sync::atomic::Ordering::Relaxed;
     let p = PID.load(Relaxed);
     if p != 0 {
-        return p;
+        // SAFETY: only a pid from `getpid` (above 0) is stored.
+        return unsafe { HostPid::new_unchecked(p) };
     }
     static FORGET: std::sync::Once = std::sync::Once::new();
     FORGET.call_once(|| {
@@ -2542,7 +2529,8 @@ pub fn pid() -> i32 {
     // SAFETY: getpid cannot fail.
     let p = unsafe { libc::getpid() };
     PID.store(p, Relaxed);
-    p
+    // SAFETY: a process's own pid is above 0.
+    unsafe { HostPid::new_unchecked(p) }
 }
 
 static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);

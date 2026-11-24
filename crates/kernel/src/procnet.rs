@@ -403,7 +403,7 @@ fn sockets(net: Option<&Record<Net>>, guest: GuestPath) -> Vec<Sock> {
 
 /// What the host reports of socket `fd` of host process `pid`.
 #[cfg(target_os = "macos")]
-fn host_socket(pid: i32, fd: i32) -> Option<Sock> {
+fn host_socket(pid: crate::ids::HostPid, fd: i32) -> Option<Sock> {
     /// Offsets in `struct socket_fdinfo` (`sys/proc_info.h`), measured
     /// against the SDK's headers (checked by a test).
     const TYPE: usize = 176;
@@ -485,7 +485,7 @@ fn host_socket(pid: i32, fd: i32) -> Option<Sock> {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn host_socket(_: i32, _: i32) -> Option<Sock> {
+fn host_socket(_: crate::ids::HostPid, _: i32) -> Option<Sock> {
     None
 }
 

@@ -365,7 +365,7 @@ pub fn made(cg: &[u8]) -> Result<(), i32> {
 
 /// The processes in cgroup `cg` (host pids), or in it and every cgroup
 /// below it with `subtree`.
-pub fn members(cg: &[u8], subtree: bool) -> Vec<i32> {
+pub fn members(cg: &[u8], subtree: bool) -> Vec<crate::ids::HostPid> {
     procreg::all()
         .into_iter()
         .filter(|(_, r)| {
@@ -412,7 +412,7 @@ pub fn remove(cg: &[u8]) -> Result<(), i32> {
 
 /// The task count, resident memory and CPU time (in microseconds) of host
 /// process `pid`.
-fn usage(pid: i32) -> (u64, u64, u64, u64) {
+fn usage(pid: crate::ids::HostPid) -> (u64, u64, u64, u64) {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: zeroed bytes are a valid `proc_taskinfo`, which the call fills.
@@ -421,7 +421,7 @@ fn usage(pid: i32) -> (u64, u64, u64, u64) {
         // SAFETY: a valid out-buffer of `size` bytes.
         let n = unsafe {
             libc::proc_pidinfo(
-                pid,
+                pid.get(),
                 libc::PROC_PIDTASKINFO,
                 0,
                 (&mut t as *mut libc::proc_taskinfo).cast(),
@@ -461,9 +461,9 @@ pub fn refresh(cg: &[u8], name: &[u8]) {
             put(t, dir, name, now.as_bytes(), st.mode & 0o7777, (st.uid, st.gid))
         });
     };
-    let lines = |pids: Vec<i32>| {
+    let lines = |pids: Vec<crate::ids::HostPid>| {
         let mut v: Vec<i32> =
-            pids.into_iter().map(crate::pidns::to_guest).filter(|&p| p != 0).collect();
+            pids.into_iter().map(|p| crate::pidns::to_guest(p.get())).filter(|&p| p != 0).collect();
         v.sort_unstable();
         v.iter().map(|p| format!("{p}\n")).collect::<String>()
     };
@@ -473,7 +473,7 @@ pub fn refresh(cg: &[u8], name: &[u8]) {
         b"cgroup.threads" => {
             let mut v: Vec<i32> = Vec::new();
             for p in members(cg, false) {
-                let pid = crate::pidns::to_guest(p);
+                let pid = crate::pidns::to_guest(p.get());
                 if pid == 0 {
                     continue;
                 }
@@ -672,7 +672,7 @@ pub fn write(cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
             if text.trim() != "1" {
                 return Err(errno::EINVAL);
             }
-            for pid in members(cg, true).into_iter().filter_map(crate::ids::HostPid::new) {
+            for pid in members(cg, true) {
                 // Relayed, so a VM process takes its VM down first.
                 crate::host::kill_process(pid, libc::SIGKILL);
             }
@@ -852,8 +852,7 @@ fn below_root(cg: &[u8]) -> impl Iterator<Item = Vec<u8>> {
 /// Freeze (`SIGSTOP`) or thaw (`SIGCONT`) host process `pid`: a frozen
 /// member is a stopped process, which stops where it holds nothing shared
 /// ([`crate::signal::stop_process`]).
-fn freeze(pid: i32, frozen: bool) {
-    let Some(pid) = crate::ids::HostPid::new(pid) else { return };
+fn freeze(pid: crate::ids::HostPid, frozen: bool) {
     if frozen {
         crate::signal::stop_process(pid, fwe_abi::signal::SIGSTOP);
     } else {
@@ -1006,20 +1005,23 @@ pub fn user_tasks(uid: u32) -> u64 {
 
 /// The host process of pid `pid` (0: this one) of the caller's pid
 /// namespace.
-fn process(pid: i32) -> Result<i32, i32> {
+fn process(pid: i32) -> Result<crate::ids::HostPid, i32> {
     if pid < 0 {
         return Err(errno::EINVAL);
     }
-    if pid == 0 { Ok(crate::host::pid()) } else { crate::pidns::host_arg(pid) }
+    if pid == 0 {
+        return Ok(crate::host::pid());
+    }
+    crate::ids::HostPid::new(crate::pidns::host_arg(pid)?).ok_or(errno::ESRCH)
 }
 
 /// The host process thread `tid` (0: the caller) is in.
-fn thread_process(tid: i32) -> Result<i32, i32> {
+fn thread_process(tid: i32) -> Result<crate::ids::HostPid, i32> {
     if tid == 0 || crate::thread::tids().contains(&tid) {
         return Ok(crate::host::pid());
     }
     match crate::thread::owner_of_tid(tid) {
-        Some(p) => Ok(p.get()),
+        Some(p) => Ok(p),
         None => process(tid),
     }
 }

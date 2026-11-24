@@ -525,11 +525,11 @@ pub(crate) struct MapsView {
     pub areas: Vec<crate::vmas::Piece<crate::maps::Area>>,
     pub record: crate::maps::Record,
     pub page: u64,
-    other: Option<(i32, crate::maps::Published)>,
+    other: Option<(crate::ids::HostPid, crate::maps::Published)>,
 }
 
 impl MapsView {
-    pub(crate) fn of(pid: i32) -> Option<MapsView> {
+    pub(crate) fn of(pid: crate::ids::HostPid) -> Option<MapsView> {
         if pid == crate::host::pid() {
             // The host's view first: its lock comes before the record's.
             let extra = host_guest_memory();
@@ -541,7 +541,7 @@ impl MapsView {
         let extra: Vec<(u64, u64, u64)> = p
             .tracked
             .iter()
-            .flat_map(|&(s, l)| regions_of(pid, s, s + l))
+            .flat_map(|&(s, l)| regions_of(pid.get(), s, s + l))
             .map(|(lo, hi, prot, _)| (lo, hi, prot))
             .collect();
         let areas = p.record.with_extra(&extra);
@@ -554,7 +554,7 @@ impl MapsView {
             None => resident(start, end),
             Some((pid, p)) => {
                 let host = p.host_of(start);
-                regions_of(*pid, host, host + (end - start)).iter().map(|r| r.3).sum()
+                regions_of(pid.get(), host, host + (end - start)).iter().map(|r| r.3).sum()
             }
         }
     }
@@ -1987,7 +1987,7 @@ impl<P: Platform> Kernel<P> {
     /// `ioctl(fd, PROCMAP_QUERY, arg)` on a descriptor of host process
     /// `pid`'s `/proc/<pid>/maps`: the mapping `arg` asks about, described
     /// in it.
-    pub(crate) fn procmap_query(&mut self, pid: i32, arg: u64) -> i64 {
+    pub(crate) fn procmap_query(&mut self, pid: crate::ids::HostPid, arg: u64) -> i64 {
         use fwe_abi::procmap::*;
         let size_of = std::mem::size_of::<Query>() as u64;
         let usize = match crate::uaccess::read::<u64>(arg) {

@@ -304,7 +304,7 @@ pub fn bind_for_notify(fd: i32, path: &[u8]) -> Result<Vec<u8>, i32> {
         if let Some(mut s) = m.remove(&ino) {
             close(s.peer);
             s.peer = peer;
-            s.bound = Some((path.to_vec(), crate::host::pid()));
+            s.bound = Some((path.to_vec(), crate::host::pid().get()));
             m.insert(new_ino, s);
         }
     });
@@ -677,7 +677,7 @@ pub fn closed(fd: i32) {
         unsafe { libc::close(s.peer) };
         // Its address (one no other socket is given) goes with it, in the
         // process that bound it.
-        let me = crate::host::pid();
+        let me = crate::host::pid().get();
         let path = s.bound.filter(|&(_, by)| by == me).map(|(p, _)| p);
         if let Some(c) = path.and_then(|p| std::ffi::CString::new(p).ok()) {
             // SAFETY: a NUL-terminated path in fwe's private directory.

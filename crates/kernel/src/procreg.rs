@@ -11,6 +11,7 @@
 //! record of how it ended, which its parent's `wait` removes, or else the
 //! reaper that adopts it once its parent is gone.
 
+use crate::ids::HostPid;
 use crate::snapshot::{Dec, Enc};
 use std::ffi::OsStr;
 use std::os::unix::ffi::OsStrExt;
@@ -173,12 +174,12 @@ pub fn publish_security(s: Security) {
 }
 
 /// Host process `pid`'s security state, if fwe has its record.
-pub fn security(pid: i32) -> Option<Security> {
+pub fn security(pid: HostPid) -> Option<Security> {
     read(pid).map(|r| r.sec)
 }
 
 /// A host process, as its pid and its start time.
-pub type Proc = (i32, u64);
+pub type Proc = (HostPid, u64);
 
 /// A process's scheduling policy and attributes, as `sched_setattr` sets
 /// them (the nice value is the record's own).
@@ -231,7 +232,7 @@ impl Sched {
 fn put_procs(e: &mut Enc, ps: &[Proc]) {
     e.u64(ps.len() as u64);
     for (p, s) in ps {
-        e.i32(*p);
+        e.i32(p.get());
         e.u64(*s);
     }
 }
@@ -242,7 +243,8 @@ fn put_procs(e: &mut Enc, ps: &[Proc]) {
 )]
 fn get_procs(d: &mut Dec) -> Vec<Proc> {
     let n = d.count(12);
-    (0..n).map(|_| (d.i32(), d.u64())).collect()
+    // (A pid that is not one marks the record bad, and it is not taken.)
+    (0..n).filter_map(|_| Some((d.host_pid()?, d.u64()))).collect()
 }
 
 fn put_opt(e: &mut Enc, p: Option<Proc>) {
@@ -275,7 +277,7 @@ pub fn records_dir() -> Option<Vec<u8>> {
 }
 
 /// Host process `pid`'s parent as the host has it, if it exists.
-pub fn host_parent(pid: i32) -> Option<i32> {
+pub fn host_parent(pid: HostPid) -> Option<i32> {
     host_info(pid).map(|(_, ppid, _)| ppid)
 }
 
@@ -284,7 +286,7 @@ pub fn host_parent(pid: i32) -> Option<i32> {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-pub fn start_time(pid: i32) -> Option<u64> {
+pub fn start_time(pid: HostPid) -> Option<u64> {
     if pid == crate::host::pid() {
         return own_start();
     }
@@ -302,13 +304,13 @@ pub fn own_start() -> Option<u64> {
     static OF: AtomicI32 = AtomicI32::new(0);
     static START: AtomicU64 = AtomicU64::new(0);
     let pid = crate::host::pid();
-    if OF.load(SeqCst) == pid {
+    if OF.load(SeqCst) == pid.get() {
         return Some(START.load(SeqCst));
     }
     let (start, _, _) = host_info(pid)?;
     // (Two threads asking at once store the same.)
     START.store(start, SeqCst);
-    OF.store(pid, SeqCst);
+    OF.store(pid.get(), SeqCst);
     Some(start)
 }
 
@@ -372,7 +374,7 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-pub fn read(pid: i32) -> Option<ProcRecord> {
+pub fn read(pid: HostPid) -> Option<ProcRecord> {
     if pid == crate::host::pid() {
         return with_held(pid, read_own(pid));
     }
@@ -401,25 +403,25 @@ pub fn read(pid: i32) -> Option<ProcRecord> {
 /// This process forked `child`, which writes its own record as it starts:
 /// every process waits for it to, as on Linux the child is there once the
 /// fork returns ([`crate::procstore::mark_unwritten`]).
-pub fn child_writes_own(child: i32) {
+pub fn child_writes_own(child: HostPid) {
     crate::procstore::mark_unwritten(child);
 }
 
 /// This process's record as last read, by its version then
 /// ([`crate::procstore::version`]).
 #[allow(clippy::type_complexity)]
-static OWN: std::sync::Mutex<Option<(i32, u32, std::sync::Arc<ProcRecord>)>> =
+static OWN: std::sync::Mutex<Option<(HostPid, u32, std::sync::Arc<ProcRecord>)>> =
     std::sync::Mutex::new(None);
 
 /// [`read`] of this process's own record (host pid `me`).
-fn read_own(me: i32) -> Option<ProcRecord> {
+fn read_own(me: HostPid) -> Option<ProcRecord> {
     own_record(me).map(|r| (*r).clone())
 }
 
 /// This process's own record (host pid `me`), shared: read again only
 /// once it changed, which its version tells (a thread started reads it,
 /// for its creator's timer slack; a fork, for what its child inherits).
-fn own_record(me: i32) -> Option<std::sync::Arc<ProcRecord>> {
+fn own_record(me: HostPid) -> Option<std::sync::Arc<ProcRecord>> {
     let version = crate::procstore::version(me)?;
     {
         let own = OWN.lock().unwrap_or_else(|e| e.into_inner());
@@ -453,13 +455,13 @@ fn with_own<R>(f: impl FnOnce(&ProcRecord) -> R) -> Option<R> {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-fn read_any(pid: i32) -> Option<ProcRecord> {
+fn read_any(pid: HostPid) -> Option<ProcRecord> {
     decode(&crate::procstore::get(pid)?)
 }
 
 /// The head of a record [`encode`] wrote: when its process started, its
 /// namespaces and its parent (the first of its line).
-fn decode_head(bytes: &[u8]) -> Option<(u64, Vec<Vec<u8>>, Option<i32>)> {
+fn decode_head(bytes: &[u8]) -> Option<(u64, Vec<Vec<u8>>, Option<HostPid>)> {
     let mut d = Dec::new(bytes);
     let start = d.u64();
     d.bytes();
@@ -544,13 +546,13 @@ pub fn ending(status: i32) {
 
 /// The Linux wait status host process `pid` left as it ended of a signal.
 /// Async-signal-safe (a `SIGCHLD` handler asks): it allocates nothing.
-pub fn end_status(pid: i32) -> Option<i32> {
+pub fn end_status(pid: HostPid) -> Option<i32> {
     crate::procstore::end_status(pid)
 }
 
 /// Host process `pid` was reaped, or this one starts with that number:
 /// its end status goes.
-pub fn forget_end(pid: i32) {
+pub fn forget_end(pid: HostPid) {
     crate::procstore::forget_end(pid);
 }
 
@@ -558,7 +560,7 @@ pub fn forget_end(pid: i32) {
 /// Where a new process has the pid already, only the old one's record
 /// goes: the files beside it (its mailbox and mappings) are the new one's
 /// now, which may have opened them before it wrote its own record.
-pub fn remove(held: &crate::procstore::Held, pid: i32) {
+pub fn remove(held: &crate::procstore::Held, pid: HostPid) {
     crate::procstore::remove(held, pid);
     if start_time(pid).is_some() {
         return;
@@ -584,8 +586,8 @@ pub fn collect_leftovers(young: std::time::Duration) {
             }
             _ => continue,
         };
-        let Ok(pid) = pid.parse::<i32>() else { continue };
-        if pid <= 0 || start_time(pid).is_some() || read(pid).is_some() {
+        let Some(pid) = pid.parse::<i32>().ok().and_then(HostPid::new) else { continue };
+        if start_time(pid).is_some() || read(pid).is_some() {
             continue;
         }
         let old = e
@@ -602,18 +604,18 @@ pub fn collect_leftovers(young: std::time::Duration) {
 
 /// Every live process fwe has a record of, forgetting those that ended
 /// (zombies too).
-pub fn all() -> Vec<(i32, ProcRecord)> {
+pub fn all() -> Vec<(HostPid, ProcRecord)> {
     listed(true).0
 }
 
 /// [`all`], without waiting for the processes just forked that are still
 /// to write their records ([`crate::procstore::mark_unwritten`]): whether
 /// there are live ones, beside.
-pub fn all_written() -> (Vec<(i32, ProcRecord)>, bool) {
+pub fn all_written() -> (Vec<(HostPid, ProcRecord)>, bool) {
     listed(false)
 }
 
-fn listed(wait: bool) -> (Vec<(i32, ProcRecord)>, bool) {
+fn listed(wait: bool) -> (Vec<(HostPid, ProcRecord)>, bool) {
     let mut out = Vec::new();
     let mut unwritten = false;
     for pid in crate::procstore::pids() {
@@ -645,14 +647,14 @@ fn listed(wait: bool) -> (Vec<(i32, ProcRecord)>, bool) {
 /// The first fwe process of the run that host process `pid` (with record
 /// `r`) belongs to: the last of its line of ancestors, or itself if it has
 /// none.
-fn run_root(pid: i32, r: &ProcRecord) -> Proc {
+fn run_root(pid: HostPid, r: &ProcRecord) -> Proc {
     r.lineage.last().copied().unwrap_or((pid, r.start))
 }
 
 /// The live processes of this process's run of fwe: those started, one
 /// from another, from the same first fwe process (which a program run
 /// under fwe sees as its whole system, where `kill(-1)` reaches).
-pub fn run() -> Vec<i32> {
+pub fn run() -> Vec<HostPid> {
     let me = me();
     let Some(mine) = read(me) else { return vec![me] };
     let root = run_root(me, &mine);
@@ -664,13 +666,13 @@ pub fn run() -> Vec<i32> {
 /// which it cannot see coming), so leave that for it if a reaper might
 /// take it. A zombie has ended too, but its record stays until it is
 /// reaped: `/proc/<pid>` shows it, as Linux shows a zombie.
-pub fn gone(pid: i32) {
+pub fn gone(pid: HostPid) {
     let Some(held) = crate::procstore::lock(pid) else { return };
     if let Some(r) = read_any(pid)
         && !alive((pid, r.start))
     {
         // A namespace's init takes its namespace with it.
-        crate::pidns::init_gone(&r.ns, pid);
+        crate::pidns::init_gone(&r.ns, pid.get());
         // An account the process left itself stands.
         let told = crate::procstore::has_ended(pid, r.start);
         if !told
@@ -702,9 +704,9 @@ fn parent_autoreaps(lineage: &[Proc]) -> bool {
 }
 
 /// Host process `pid` (this one or a child) has changed process group.
-pub fn record_pgid(pid: i32) {
+pub fn record_pgid(pid: HostPid) {
     // SAFETY: plain host call.
-    let pgid = unsafe { libc::getpgid(pid) };
+    let pgid = unsafe { libc::getpgid(pid.get()) };
     if read(pid).is_some_and(|r| r.pgid != pgid) {
         let _ = change(pid, |r| r.pgid = pgid);
     }
@@ -720,7 +722,7 @@ pub fn own_autoreap(on: bool) {
 
 /// Host process `host`'s numbers in the pid namespaces that `dirs` (a
 /// process's namespaces' records) name, and those above them.
-pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
+pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: HostPid) -> Vec<(Vec<u8>, i32)> {
     let prefix = format!("v{}-pid-", crate::shared::FORMAT);
     let mut out: Vec<(Vec<u8>, i32)> = Vec::new();
     for d in dirs {
@@ -729,7 +731,7 @@ pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
         }
         let Ok(r) = crate::shared::Record::<crate::pidns::PidNs>::join(d, 0) else { continue };
         for ns in crate::pidns::chain_from(Some(std::sync::Arc::new(r))) {
-            if let Some(n) = ns.get().number_of(host)
+            if let Some(n) = ns.get().number_of(host.get())
                 && !out.iter().any(|(d, _)| d == ns.dir())
             {
                 out.push((ns.dir().to_vec(), n));
@@ -740,7 +742,7 @@ pub(crate) fn numbers_in(dirs: &[Vec<u8>], host: i32) -> Vec<(Vec<u8>, i32)> {
 }
 
 /// The host pid of this process.
-fn me() -> i32 {
+fn me() -> HostPid {
     crate::host::pid()
 }
 
@@ -750,7 +752,7 @@ pub fn own_cgroup() -> Vec<u8> {
 }
 
 /// Host process `pid`'s cgroup (the root's for one fwe has no record of).
-pub fn cgroup_of(pid: i32) -> Vec<u8> {
+pub fn cgroup_of(pid: HostPid) -> Vec<u8> {
     read(pid).map_or_else(|| b"/".to_vec(), |r| r.cgroup().to_vec())
 }
 
@@ -762,7 +764,7 @@ impl ProcRecord {
     }
 }
 
-fn fresh(pid: i32, start: u64) -> ProcRecord {
+fn fresh(pid: HostPid, start: u64) -> ProcRecord {
     ProcRecord {
         start,
         cgroup: Vec::new(),
@@ -776,7 +778,7 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
         declined: Vec::new(),
         kept: Vec::new(),
         // SAFETY: plain host call.
-        pgid: unsafe { libc::getpgid(pid) },
+        pgid: unsafe { libc::getpgid(pid.get()) },
         autoreap: false,
         oom_score_adj: 0,
         oom_score_adj_min: 0,
@@ -799,7 +801,7 @@ fn fresh(pid: i32, start: u64) -> ProcRecord {
 
 /// Change the record of host process `pid` with `f` (making one if it has
 /// none).
-fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
+fn change(pid: HostPid, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
     // Under the record's lock: a parent and its child may change one.
     let held = crate::procstore::lock(pid).ok_or(fwe_abi::errno::ESRCH)?;
@@ -812,13 +814,13 @@ fn change(pid: i32, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
 }
 
 /// Put host process `pid` in `cgroup`.
-pub fn set_cgroup(pid: i32, cgroup: &[u8]) -> Result<(), i32> {
+pub fn set_cgroup(pid: HostPid, cgroup: &[u8]) -> Result<(), i32> {
     change(pid, |r| r.cgroup = cgroup.to_vec())
 }
 
 /// Record that host process `pid` is in the namespaces whose shared
 /// records are `ns`.
-pub fn set_namespaces(pid: i32, ns: Vec<Vec<u8>>) {
+pub fn set_namespaces(pid: HostPid, ns: Vec<Vec<u8>>) {
     let _ = change(pid, |r| r.ns = ns);
 }
 
@@ -826,7 +828,7 @@ pub fn set_namespaces(pid: i32, ns: Vec<Vec<u8>>) {
 type Pending = Box<dyn Fn(&mut ProcRecord) + Send>;
 
 /// The changes [`batch`] holds back, with the process they are for.
-static BATCH: std::sync::Mutex<Option<(i32, Vec<Pending>)>> = std::sync::Mutex::new(None);
+static BATCH: std::sync::Mutex<Option<(HostPid, Vec<Pending>)>> = std::sync::Mutex::new(None);
 
 /// Whether a [`batch`] runs: only then is [`BATCH`] looked at, so a
 /// process forked while another thread reads a record never inherits it
@@ -871,7 +873,7 @@ fn change_own(f: impl Fn(&mut ProcRecord) + Send + 'static) {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-fn with_held(pid: i32, r: Option<ProcRecord>) -> Option<ProcRecord> {
+fn with_held(pid: HostPid, r: Option<ProcRecord>) -> Option<ProcRecord> {
     if !BATCHING.load(std::sync::atomic::Ordering::SeqCst) {
         return r;
     }
@@ -1061,7 +1063,7 @@ fn apply(r: &mut ProcRecord, i: &Inherit) {
 /// written it already, see [`own_line`]) and this process's mappings `maps`
 /// (see [`crate::maps::forked`]).
 pub fn forked(
-    child: i32,
+    child: HostPid,
     ns: Vec<Vec<u8>>,
     line: &(Vec<Proc>, Option<Proc>),
     inherit: &Inherit,
@@ -1102,12 +1104,12 @@ pub fn forked(
 
 /// Host process `pid`'s nice value: as `setpriority` set it, or for a
 /// process fwe has no record of, the host's.
-pub fn nice(pid: i32) -> i32 {
+pub fn nice(pid: HostPid) -> i32 {
     read(pid).map_or_else(|| crate::host::nice_of(pid), |r| r.nice)
 }
 
 /// Host process `pid`'s scheduling attributes, if fwe has its record.
-pub fn sched(pid: i32) -> Option<Sched> {
+pub fn sched(pid: HostPid) -> Option<Sched> {
     read(pid).map(|r| r.sched)
 }
 
@@ -1115,7 +1117,7 @@ pub fn sched(pid: i32) -> Option<Sched> {
 /// `f`, under its record's lock (`f`'s error is the result, the record
 /// unchanged).
 pub fn change_sched(
-    pid: i32,
+    pid: HostPid,
     f: impl FnOnce(&Sched, i32) -> Result<(Sched, i32), i32>,
 ) -> Result<(), i32> {
     let mut out = Ok(());
@@ -1127,10 +1129,8 @@ pub fn change_sched(
         }
         Err(e) => out = Err(e),
     })?;
-    if let Some(n) = nice
-        && let Some(p) = crate::ids::HostPid::new(pid)
-    {
-        crate::host::set_nice(p, n);
+    if let Some(n) = nice {
+        crate::host::set_nice(pid, n);
     }
     out
 }
@@ -1138,28 +1138,26 @@ pub fn change_sched(
 /// Host process `pid`'s nice value is now `nice`: kept in its record,
 /// and the host process given it as far as the host lets
 /// ([`crate::host::set_nice`]).
-pub fn set_nice(pid: i32, nice: i32) -> Result<(), i32> {
+pub fn set_nice(pid: HostPid, nice: i32) -> Result<(), i32> {
     change(pid, |r| r.nice = nice)?;
-    if let Some(p) = crate::ids::HostPid::new(pid) {
-        crate::host::set_nice(p, nice);
-    }
+    crate::host::set_nice(pid, nice);
     Ok(())
 }
 
 /// Host process `pid`'s CPU affinity, `None` for a process fwe has no
 /// record of (empty: every CPU).
-pub fn affinity(pid: i32) -> Option<Vec<u64>> {
+pub fn affinity(pid: HostPid) -> Option<Vec<u64>> {
     read(pid).map(|r| r.affinity)
 }
 
 /// Host process `pid`'s CPU affinity is now `mask`.
-pub fn set_affinity(pid: i32, mask: Vec<u64>) -> Result<(), i32> {
+pub fn set_affinity(pid: HostPid, mask: Vec<u64>) -> Result<(), i32> {
     change(pid, |r| r.affinity = mask)
 }
 
 /// This process's CPU affinity as last read, with its pid and record's
 /// version then.
-pub(crate) static OWN_AFFINITY: std::sync::Mutex<Option<(i32, u32, Vec<u64>)>> =
+pub(crate) static OWN_AFFINITY: std::sync::Mutex<Option<(HostPid, u32, Vec<u64>)>> =
     std::sync::Mutex::new(None);
 
 /// This process's CPU affinity, read again only once its record changed
@@ -1183,13 +1181,13 @@ pub fn own_affinity() -> Vec<u64> {
 }
 
 /// Host process `pid`'s `oom_score_adj` (0 for one fwe has no record of).
-pub fn oom_score_adj(pid: i32) -> i32 {
+pub fn oom_score_adj(pid: HostPid) -> i32 {
     read(pid).map_or(0, |r| r.oom_score_adj)
 }
 
 /// Leave resource limit `res` (soft, hard) for host process `pid` to take
 /// up ([`take_limits`]).
-pub fn push_limit(pid: i32, res: u32, soft: u64, hard: u64) -> Result<(), i32> {
+pub fn push_limit(pid: HostPid, res: u32, soft: u64, hard: u64) -> Result<(), i32> {
     change(pid, |r| {
         r.limits.retain(|l| l.0 != res);
         r.limits.push((res, soft, hard));
@@ -1221,7 +1219,7 @@ pub fn set_own_rlimits(limits: Vec<(u32, u64, u64)>) {
 
 /// Host process `pid`'s limit `res` (soft, hard): one left for it to take
 /// up, else what it published. `None` for a process fwe has no record of.
-pub fn limit_of(pid: i32, res: u32) -> Option<Option<(u64, u64)>> {
+pub fn limit_of(pid: HostPid, res: u32) -> Option<Option<(u64, u64)>> {
     let r = read(pid)?;
     let left = r.limits.iter().find(|l| l.0 == res);
     Some(left.or_else(|| r.rlimits.iter().find(|l| l.0 == res)).map(|l| (l.1, l.2)))
@@ -1241,13 +1239,13 @@ pub fn take_limits() -> Vec<(u32, u64, u64)> {
 /// The user namespace host process `pid` is in, as its record's directory
 /// (empty: the initial one, which is also that of a process fwe has no
 /// record of): what a capability over the process is asked in.
-pub fn user_ns(pid: i32) -> Vec<u8> {
+pub fn user_ns(pid: HostPid) -> Vec<u8> {
     read(pid).and_then(|r| crate::nsfd::dir_among(b"user", &r.ns)).unwrap_or_default()
 }
 
 /// Host process `pid`'s ids ([`ProcRecord::ids`]; root's for one fwe has
 /// no record of).
-pub fn ids(pid: i32) -> [u32; 8] {
+pub fn ids(pid: HostPid) -> [u32; 8] {
     read(pid).map_or([0; 8], |r| r.ids)
 }
 
@@ -1255,7 +1253,7 @@ pub fn ids(pid: i32) -> [u32; 8] {
 /// does while the process lives, while it is a zombie and until whoever
 /// reaps it is done: what its `SIGCHLD` names as its sender's (`si_uid`).
 /// `None` for a process fwe has no record of.
-pub fn kept_uid(pid: i32) -> Option<u32> {
+pub fn kept_uid(pid: HostPid) -> Option<u32> {
     read_any(pid).map(|r| r.ids[0])
 }
 
@@ -1265,25 +1263,25 @@ pub fn set_own_ids(ids: [u32; 8]) {
 }
 
 /// Host process `pid`'s main thread's timer slack and its default.
-pub fn slack(pid: i32) -> (u64, u64) {
+pub fn slack(pid: HostPid) -> (u64, u64) {
     read(pid).map_or((crate::thread::DEFAULT_SLACK, crate::thread::DEFAULT_SLACK), |r| r.slack)
 }
 
 /// Set host process `pid`'s main thread's timer slack to `value` (0: its
 /// default).
-pub fn set_slack(pid: i32, value: u64) -> Result<(), i32> {
+pub fn set_slack(pid: HostPid, value: u64) -> Result<(), i32> {
     change(pid, |r| r.slack.0 = if value == 0 { r.slack.1 } else { value })
 }
 
 /// Host process `pid`'s `oom_score_adj` and the least it may set without
 /// `CAP_SYS_RESOURCE`.
-pub fn oom_score_adj_range(pid: i32) -> (i32, i32) {
+pub fn oom_score_adj_range(pid: HostPid) -> (i32, i32) {
     read(pid).map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min))
 }
 
 /// Set host process `pid`'s `oom_score_adj`, and, set by a privileged
 /// process (`floor`), the least it may set without privilege.
-pub fn set_oom_score_adj(pid: i32, value: i32, floor: bool) -> Result<(), i32> {
+pub fn set_oom_score_adj(pid: HostPid, value: i32, floor: bool) -> Result<(), i32> {
     change(pid, |r| {
         r.oom_score_adj = value;
         if floor {
@@ -1304,7 +1302,7 @@ pub fn child_line() -> (Vec<Proc>, Option<Proc>) {
     with_own(|r| line.extend_from_slice(&r.lineage));
     let bound = crate::pidns::current()
         .first()
-        .and_then(|r| r.get().host_of(1))
+        .and_then(|r| HostPid::new(r.get().host_of(1)?))
         .and_then(|h| Some((h, start_time(h)?)));
     (line, bound)
 }
@@ -1466,7 +1464,7 @@ pub fn own_prepared(prepared: &Prepared) -> bool {
 /// record made for it ([`Prepared`]) written as the child's, with its start
 /// time. False, writing nothing, when the child is not there to tell its
 /// start time, or a record of it is there already.
-pub fn prepared_for(child: i32, prepared: &Prepared) -> bool {
+pub fn prepared_for(child: HostPid, prepared: &Prepared) -> bool {
     let Some(start) = start_time(child) else { return false };
     let Some(held) = crate::procstore::lock(child) else { return false };
     let start = start.to_le_bytes();
@@ -1495,7 +1493,7 @@ pub fn own_subreaper() -> bool {
 /// Whether host process `pid` is stopped, and by which signal (the
 /// host's): in a stop of fwe's ([`crate::signote::job_stop_of`]) or the
 /// host's. `None` if it runs or is gone.
-pub fn stopped_by(pid: i32) -> Option<i32> {
+pub fn stopped_by(pid: HostPid) -> Option<i32> {
     if let Some(sig) = crate::signote::job_stop_of(pid) {
         return crate::host::signal_to_host(sig).or(Some(libc::SIGSTOP));
     }
@@ -1504,7 +1502,7 @@ pub fn stopped_by(pid: i32) -> Option<i32> {
 
 /// Whether host process `pid` is stopped on the host (a stop only the
 /// host's `SIGCONT` ends).
-pub fn host_stopped(pid: i32) -> bool {
+pub fn host_stopped(pid: HostPid) -> bool {
     host_stopped_by(pid).is_some()
 }
 
@@ -1523,7 +1521,7 @@ pub fn own_foster() -> bool {
 }
 
 /// [`stopped_by`] of the host's stop alone.
-fn host_stopped_by(pid: i32) -> Option<i32> {
+fn host_stopped_by(pid: HostPid) -> Option<i32> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: zeroed bytes are a valid `proc_bsdinfo`, which the call fills.
@@ -1532,7 +1530,7 @@ fn host_stopped_by(pid: i32) -> Option<i32> {
         // SAFETY: a valid out-buffer of `size` bytes.
         let n = unsafe {
             libc::proc_pidinfo(
-                pid,
+                pid.get(),
                 libc::PROC_PIDTBSDINFO,
                 0,
                 (&mut info as *mut libc::proc_bsdinfo).cast(),
@@ -1548,7 +1546,7 @@ fn host_stopped_by(pid: i32) -> Option<i32> {
         const XSTAT: usize = 280;
         let mut buf = [0u8; SIZE];
         let mut len = SIZE;
-        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid.get()];
         // SAFETY: a valid name and out-buffer of `len` bytes.
         let r = unsafe {
             libc::sysctl(
@@ -1593,11 +1591,11 @@ pub struct Kinfo {
 /// 36, the command name at 243, the parent and process group at 560 and
 /// 564).
 #[cfg(target_os = "macos")]
-pub fn kinfo(pid: i32) -> Option<Kinfo> {
+pub fn kinfo(pid: HostPid) -> Option<Kinfo> {
     const SIZE: usize = 648;
     let mut buf = [0u8; SIZE];
     let mut len = SIZE;
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid];
+    let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_PID, pid.get()];
     // SAFETY: a valid name and out-buffer of `len` bytes.
     let r = unsafe {
         libc::sysctl(
@@ -1628,12 +1626,12 @@ pub fn kinfo(pid: i32) -> Option<Kinfo> {
 }
 
 #[cfg(not(target_os = "macos"))]
-pub fn kinfo(_: i32) -> Option<Kinfo> {
+pub fn kinfo(_: HostPid) -> Option<Kinfo> {
     None
 }
 
 /// Host process `pid`'s `kinfo_proc`, if it is a zombie.
-pub fn zombie_info(pid: i32) -> Option<Kinfo> {
+pub fn zombie_info(pid: HostPid) -> Option<Kinfo> {
     kinfo(pid).filter(|k| k.state == 5)
 }
 
@@ -1643,8 +1641,14 @@ pub fn alive(p: Proc) -> bool {
     host_info(p.0).is_some_and(|(start, _, zombie)| start == p.1 && !zombie)
 }
 
+/// [`alive`] of a process kept as bare numbers (a pid and a start time)
+/// where processes share state: none whose pid is not one is.
+pub fn alive_kept((pid, start): (i32, u64)) -> bool {
+    HostPid::new(pid).is_some_and(|p| alive((p, start)))
+}
+
 /// Host process `pid`'s start time, parent and whether it is a zombie.
-pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
+pub fn host_info(pid: HostPid) -> Option<(u64, i32, bool)> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: zeroed bytes are a valid `proc_bsdinfo`, which the call fills.
@@ -1653,7 +1657,7 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
         // SAFETY: a valid out-buffer of `size` bytes.
         let n = unsafe {
             libc::proc_pidinfo(
-                pid,
+                pid.get(),
                 libc::PROC_PIDTBSDINFO,
                 0,
                 (&mut info as *mut libc::proc_bsdinfo).cast(),
@@ -1671,9 +1675,7 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
         // A process that is not there at all (one just reaped, say) is
         // told apart in one cheap call (`ESRCH`; a zombie is still there),
         // where the `sysctl` below costs tens of microseconds.
-        if crate::ids::HostPid::new(pid)
-            .is_some_and(|p| crate::host::probe(p) == crate::host::Probe::Gone)
-        {
+        if crate::host::probe(pid) == crate::host::Probe::Gone {
             return None;
         }
         // The host tells nothing that way of a zombie, nor of a process
@@ -1694,7 +1696,7 @@ pub fn host_info(pid: i32) -> Option<(u64, i32, bool)> {
 /// or, once that has gone too, the reaper that adopts it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Ended {
-    pub pid: i32,
+    pub pid: HostPid,
     pub start: u64,
     /// Its wait status, in Linux's layout.
     pub status: i32,
@@ -1711,7 +1713,7 @@ pub struct Ended {
 impl Ended {
     fn encode(&self) -> Vec<u8> {
         let mut e = Enc::new();
-        e.i32(self.pid);
+        e.i32(self.pid.get());
         e.u64(self.start);
         e.i32(self.status);
         e.i32(self.pgid);
@@ -1728,12 +1730,13 @@ impl Ended {
 
     fn decode(bytes: &[u8]) -> Option<Ended> {
         let mut d = Dec::new(bytes);
-        let (pid, start, status, pgid) = (d.i32(), d.u64(), d.i32(), d.i32());
+        let (pid, start, status, pgid) = (d.host_pid(), d.u64(), d.i32(), d.i32());
         let (lineage, bound) = (get_procs(&mut d), get_opt(&mut d));
         let n = d.count(12);
         let numbers = (0..n).map(|_| (d.bytes(), d.i32())).collect();
         let foster = d.bool();
         d.finish().ok()?;
+        let pid = pid?;
         Some(Ended { pid, start, status, pgid, lineage, bound, numbers, foster })
     }
 
@@ -1755,12 +1758,12 @@ pub fn all_ended() -> Vec<Ended> {
 
 /// The records of processes with host pid `pid` that ended and are not yet
 /// reaped (an older one may have had its number).
-fn ended_of(pid: i32) -> Vec<Ended> {
+fn ended_of(pid: HostPid) -> Vec<Ended> {
     ended_where(|p| p == pid)
 }
 
 /// The ended records of the host pids `wanted` picks.
-fn ended_where(wanted: impl Fn(i32) -> bool) -> Vec<Ended> {
+fn ended_where(wanted: impl Fn(HostPid) -> bool) -> Vec<Ended> {
     crate::procstore::ended(wanted).iter().filter_map(|b| Ended::decode(b)).collect()
 }
 
@@ -1788,9 +1791,9 @@ pub fn take_adopted_end(e: &Ended) -> bool {
 }
 
 /// Child `pid` was reaped by its parent: forget it, and how it ended.
-pub fn reaped(pid: i32) {
+pub fn reaped(pid: HostPid) {
     forget_end(pid);
-    crate::reaper::forget_exit_signal(pid);
+    crate::reaper::forget_exit_signal(pid.get());
     // The record goes, unless a process that has the pid since wrote it:
     // one look at its head, under its lock.
     if let Some(held) = crate::procstore::lock(pid) {
@@ -1799,7 +1802,7 @@ pub fn reaped(pid: i32) {
                 let now = start_time(pid);
                 if now != Some(start) {
                     // An init killed outright: its namespace goes with it.
-                    crate::pidns::init_gone(&ns, pid);
+                    crate::pidns::init_gone(&ns, pid.get());
                     crate::procstore::remove(&held, pid);
                     // Its mailbox, unless a process has the pid now.
                     if now.is_none() {
@@ -1874,7 +1877,7 @@ pub fn exiting(status: i32) {
             pgid: unsafe { libc::getpgrp() },
             numbers: crate::pidns::current()
                 .iter()
-                .filter_map(|ns| Some((ns.dir().to_vec(), ns.get().number_of(me)?)))
+                .filter_map(|ns| Some((ns.dir().to_vec(), ns.get().number_of(me.get())?)))
                 .collect(),
             lineage,
             bound,
@@ -1898,7 +1901,7 @@ pub fn exiting(status: i32) {
 /// The host reaped the children of `parent` as they ended (it ignores
 /// `SIGCHLD`, or set `SA_NOCLDWAIT`): forget those that ended, which no
 /// reaper is to take.
-fn forget_children(parent: i32) {
+fn forget_children(parent: HostPid) {
     for e in all_ended().into_iter().filter(|e| e.lineage.first().is_some_and(|p| p.0 == parent)) {
         take_ended(&e);
     }
@@ -1920,7 +1923,7 @@ mod tests {
     /// A record carries what others check of the process's security.
     #[test]
     fn records_carry_the_security_state() {
-        let mut r = fresh(1, 2);
+        let mut r = fresh(HostPid::new(1).unwrap(), 2);
         assert_eq!(r.sec.dumpable, crate::coredump::SUID_DUMP_USER);
         r.sec = Security {
             caps: [1, 2, 3, 4, 5],

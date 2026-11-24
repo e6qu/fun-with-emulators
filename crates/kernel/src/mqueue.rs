@@ -126,7 +126,7 @@ impl Queue {
 }
 
 fn alive(p: Proc) -> bool {
-    p == ipc::me() || crate::procreg::alive(p)
+    p == ipc::me() || crate::procreg::alive_kept(p)
 }
 
 impl Data for Queue {
@@ -307,9 +307,9 @@ fn set_holder(q: &mut Queue, p: Proc, n: u32, own: bool) -> bool {
 /// process holds are held by the child as many times (unless it counted
 /// itself already), so that this process closing its own or ending frees
 /// none the child has.
-pub fn forked(child: i32) {
+pub fn forked(child: crate::ids::HostPid) {
     if let Some(start) = crate::procreg::start_time(child) {
-        hand_on((child, start));
+        hand_on((child.get(), start));
     }
 }
 
@@ -551,9 +551,9 @@ fn signal_other(
     by: (i32, u32),
 ) {
     if let Some(h) = crate::host::signal_to_host(sig) {
-        crate::signote::note_with(owner.get(), h, info.code, info.value, by.1);
+        crate::signote::note_with(owner, h, info.code, info.value, by.1);
         if crate::host::kill_process(owner, h) != 0 {
-            crate::signote::unnote(owner.get(), h);
+            crate::signote::unnote(owner, h);
         }
     } else {
         crate::signal::send_unhosted_from(owner, sig, info.code, info.value, by);
@@ -563,7 +563,7 @@ fn signal_other(
 /// What a send or receive needs of the caller, taken under the kernel
 /// lock: who it is.
 fn sender(creds: &Creds) -> Sender {
-    let pid = crate::host::pid();
+    let pid = crate::host::pid().get();
     Sender { pid, uid: creds.uid }
 }
 
@@ -1133,7 +1133,10 @@ fn sweep_addresses(ns_dir: &[u8]) {
         let pid = std::str::from_utf8(rest.split(|&b| b == b'-').next().unwrap_or_default())
             .ok()
             .and_then(|p| p.parse::<i32>().ok());
-        if pid.is_some_and(|p| crate::procreg::start_time(p).is_none()) {
+        if pid
+            .and_then(crate::ids::HostPid::new)
+            .is_some_and(|p| crate::procreg::start_time(p).is_none())
+        {
             let _ = std::fs::remove_file(e.path());
         }
     }

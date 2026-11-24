@@ -270,7 +270,7 @@ fn now_secs() -> u64 {
 }
 
 fn host_pid() -> i32 {
-    crate::host::pid()
+    crate::host::pid().get()
 }
 
 fn alive(pid: i32) -> bool {

@@ -124,6 +124,17 @@ impl<'a> Dec<'a> {
     pub fn i64(&mut self) -> i64 {
         self.u64() as i64
     }
+    /// A host process's pid: none, and the snapshot bad, for a number that
+    /// is not one.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    pub fn host_pid(&mut self) -> Option<crate::ids::HostPid> {
+        let p = crate::ids::HostPid::new(self.i32());
+        self.bad |= p.is_none();
+        p
+    }
     /// A count of items, each at least `min` bytes long: bounded by what is
     /// left, so a corrupt count cannot ask for a huge allocation.
     #[cfg_attr(

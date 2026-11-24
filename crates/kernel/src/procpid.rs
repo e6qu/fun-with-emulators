@@ -2,6 +2,7 @@
 //! namespace, from fwe's record of each ([`crate::procreg`]) and what the
 //! host reports of its process (state, parent, times, memory).
 
+use crate::ids::HostPid;
 use crate::procfs::{DT_DIR, DT_LNK, DT_REG, Entry};
 
 /// What the host reports of a process.
@@ -25,7 +26,7 @@ pub struct HostInfo {
 const HZ: u64 = 100;
 
 /// What the host reports of host process `pid`.
-pub fn host_info(pid: i32) -> Option<HostInfo> {
+pub fn host_info(pid: HostPid) -> Option<HostInfo> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: zeroed bytes are valid for both structures, which the
@@ -35,7 +36,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         // SAFETY: a valid out-buffer of `bsize` bytes.
         if unsafe {
             libc::proc_pidinfo(
-                pid,
+                pid.get(),
                 libc::PROC_PIDTBSDINFO,
                 0,
                 (&mut b as *mut libc::proc_bsdinfo).cast(),
@@ -56,7 +57,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
                 ppid: crate::reaper::parent_of(pid, z.ppid),
                 pgid: z.pgid,
                 // SAFETY: plain host call.
-                sid: unsafe { libc::getsid(pid) },
+                sid: unsafe { libc::getsid(pid.get()) },
                 nice: 0,
                 threads: 1,
                 rss_bytes: 0,
@@ -72,7 +73,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         // SAFETY: a valid out-buffer of `tsize` bytes.
         let have_task = unsafe {
             libc::proc_pidinfo(
-                pid,
+                pid.get(),
                 libc::PROC_PIDTASKINFO,
                 0,
                 (&mut t as *mut libc::proc_taskinfo).cast(),
@@ -96,7 +97,7 @@ pub fn host_info(pid: i32) -> Option<HostInfo> {
         let ns_to_ticks = |ns: u64| ns * HZ / 1_000_000_000;
         let started = b.pbi_start_tvsec as f64 + b.pbi_start_tvusec as f64 / 1e6;
         // SAFETY: plain host call.
-        let sid = unsafe { libc::getsid(pid) };
+        let sid = unsafe { libc::getsid(pid.get()) };
         Some(HostInfo {
             state,
             // The guest's parent: an orphan's is the reaper that adopted it.
@@ -142,7 +143,7 @@ fn ticks_since_boot(started: f64) -> u64 {
 /// went on at either look nor began or ended between them (a wait for
 /// fwe's lock, over just before the second look, is fwe's).
 #[cfg(target_os = "macos")]
-fn threads_state(pid: i32) -> u8 {
+fn threads_state(pid: HostPid) -> u8 {
     let before = crate::procstore::busy_mark(pid);
     let host = host_thread_state(pid);
     if host != b'R' && crate::procstore::busy_between(before, crate::procstore::busy_mark(pid)) {
@@ -154,7 +155,7 @@ fn threads_state(pid: i32) -> u8 {
 /// What the host shows of process `pid`'s main thread, as Linux's state
 /// letter ([`threads_state`]).
 #[cfg(target_os = "macos")]
-fn host_thread_state(pid: i32) -> u8 {
+fn host_thread_state(pid: HostPid) -> u8 {
     /// `PROC_PIDLISTTHREADS`: the process's thread handles.
     const PROC_PIDLISTTHREADS: i32 = 6;
     if pid == crate::host::pid() {
@@ -167,7 +168,7 @@ fn host_thread_state(pid: i32) -> u8 {
     let size = std::mem::size_of_val(&handles) as i32;
     // SAFETY: a valid out-buffer of `size` bytes.
     let got = unsafe {
-        libc::proc_pidinfo(pid, PROC_PIDLISTTHREADS, 0, handles.as_mut_ptr().cast(), size)
+        libc::proc_pidinfo(pid.get(), PROC_PIDLISTTHREADS, 0, handles.as_mut_ptr().cast(), size)
     };
     if got < 8 {
         return b'R';
@@ -179,7 +180,7 @@ fn host_thread_state(pid: i32) -> u8 {
     // SAFETY: a valid out-buffer of `tsize` bytes.
     let n = unsafe {
         libc::proc_pidinfo(
-            pid,
+            pid.get(),
             libc::PROC_PIDTHREADINFO,
             handles[0],
             (&mut t as *mut libc::proc_threadinfo).cast(),
@@ -200,7 +201,7 @@ fn host_thread_state(pid: i32) -> u8 {
 
 /// The CPU time host process `pid` has used, user and system, in
 /// nanoseconds.
-pub fn cpu_ns(pid: i32) -> Option<(u64, u64)> {
+pub fn cpu_ns(pid: HostPid) -> Option<(u64, u64)> {
     #[cfg(target_os = "macos")]
     {
         // SAFETY: zeroed bytes are a valid `proc_taskinfo`, which the call
@@ -210,7 +211,7 @@ pub fn cpu_ns(pid: i32) -> Option<(u64, u64)> {
         // SAFETY: a valid out-buffer of `size` bytes.
         let got = unsafe {
             libc::proc_pidinfo(
-                pid,
+                pid.get(),
                 libc::PROC_PIDTASKINFO,
                 0,
                 (&mut t as *mut libc::proc_taskinfo).cast(),
@@ -366,7 +367,7 @@ pub fn limits(limits: &[(u64, u64)]) -> Vec<u8> {
 /// `/proc/<pid>/statm` of host process `host`, in pages: its size and
 /// resident set as the host has them (`/proc/<pid>/status` reports the
 /// same); the shared, text and data counts are not kept (0).
-pub fn statm(host: i32) -> Vec<u8> {
+pub fn statm(host: HostPid) -> Vec<u8> {
     let h = host_info(host).unwrap_or_default();
     let page = crate::maps::page_size().max(1);
     format!("{} {} 0 0 0 0 0\n", h.vsize / page, h.rss_bytes / page).into_bytes()
@@ -375,8 +376,8 @@ pub fn statm(host: i32) -> Vec<u8> {
 /// `/proc/<pid>/io` of host process `host`: the bytes it had the host read
 /// from and write to storage; the counts of `read` and `write` calls and
 /// the bytes they moved are not kept (0).
-pub fn io(host: i32) -> Vec<u8> {
-    let (read, written) = crate::host::disk_io(host);
+pub fn io(host: HostPid) -> Vec<u8> {
+    let (read, written) = crate::host::disk_io(host.get());
     format!(
         "rchar: 0\nwchar: 0\nsyscr: 0\nsyscw: 0\nread_bytes: {read}\nwrite_bytes: {written}\n\
          cancelled_write_bytes: 0\n"
@@ -528,17 +529,13 @@ pub fn user_record(dirs: &[Vec<u8>]) -> Option<crate::shared::Record<crate::user
 
 /// The entry `sub` (empty for the directory itself) of `/proc/<pid>`, for
 /// process `pid` of the reader's pid namespace behind host pid `host`.
-pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
+pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
     let Some(rec) = crate::procreg::read(host) else {
         // A process fwe has no record of (one of another user's, such as
         // the host's process 1, too): that it exists, and what the host
         // tells of it.
         return match sub {
-            b"" if crate::ids::HostPid::new(host)
-                .is_some_and(|h| crate::host::probe(h).exists()) =>
-            {
-                Entry::Dir
-            }
+            b"" if crate::host::probe(host).exists() => Entry::Dir,
             b"/stat" => match host_info(host) {
                 Some(h) => {
                     let comm = crate::procreg::kinfo(host).map(|k| k.comm).unwrap_or_default();
@@ -559,7 +556,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
             let i = rec.ids;
             let s = rec.sec;
             let [effective, permitted, inheritable, bounding, ambient] = s.caps;
-            let tracer = crate::ptrace::tracer_of(host);
+            let tracer = crate::ptrace::tracer_of(host.get());
             Creds {
                 uids: [u(i[0]), u(i[1]), u(i[2]), u(i[3])],
                 gids: [g(i[4]), g(i[5]), g(i[6]), g(i[7])],
@@ -585,9 +582,7 @@ pub fn entry(host: i32, pid: i32, sub: &[u8]) -> Entry {
         },
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
         b"/environ" => Entry::File(environ(&rec.auxv, &rec.cmdline, |addr, buf| {
-            crate::ids::HostPid::new(host).is_some_and(|h| {
-                crate::procvm::remote(h, addr, buf, false).is_ok_and(|n| n == buf.len())
-            })
+            crate::procvm::remote(host, addr, buf, false).is_ok_and(|n| n == buf.len())
         })),
         b"/limits" => match crate::fs::OtherView::of(host) {
             Some(v) => Entry::File(limits(&v.limits)),
@@ -667,9 +662,8 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
         b"/task" => {
             out.push((pid.to_string().into_bytes(), DT_DIR));
             let me = pid.to_string().into_bytes();
-            for t in
-                crate::thread::published_tids(crate::pidns::to_host(pid).map_or(pid, |h| h.get()))
-            {
+            let tids = crate::pidns::to_host(pid).map(crate::thread::published_tids);
+            for t in tids.unwrap_or_default() {
                 let name = t.to_string().into_bytes();
                 if name != me {
                     out.push((name, DT_DIR));
@@ -688,7 +682,7 @@ pub fn listed() -> Vec<i32> {
         Some(r) => {
             r.get().pids.iter().filter(|(_, e)| !e.thread && e.host != 0).map(|(n, _)| *n).collect()
         }
-        None => crate::procreg::all().into_iter().map(|(p, _)| p).collect(),
+        None => crate::procreg::all().into_iter().map(|(p, _)| p.get()).collect(),
     };
     pids.push(crate::thread::tgid());
     pids.sort_unstable();
@@ -826,7 +820,7 @@ pub enum FdTarget {
 /// The guest's descriptors of host process `host`, with what each is open
 /// on (fwe's own, in the reserved range, left out: every fwe process
 /// reserves the same range).
-pub fn fds(host: i32) -> Vec<(i32, FdTarget)> {
+pub fn fds(host: HostPid) -> Vec<(i32, FdTarget)> {
     #[cfg(target_os = "macos")]
     {
         let size = std::mem::size_of::<libc::proc_fdinfo>();
@@ -838,7 +832,7 @@ pub fn fds(host: i32) -> Vec<(i32, FdTarget)> {
             // SAFETY: a valid out-buffer of `n` entries.
             let got = unsafe {
                 libc::proc_pidinfo(
-                    host,
+                    host.get(),
                     libc::PROC_PIDLISTFDS,
                     0,
                     buf.as_mut_ptr().cast(),
@@ -870,7 +864,7 @@ pub fn fds(host: i32) -> Vec<(i32, FdTarget)> {
 /// What descriptor `fd` of host process `host`, of host kind `kind`, is
 /// open on.
 #[cfg(target_os = "macos")]
-fn target_of(host: i32, fd: i32, kind: i32) -> Option<FdTarget> {
+fn target_of(host: HostPid, fd: i32, kind: i32) -> Option<FdTarget> {
     /// The `proc_pidfdinfo` flavours, and where in their results the path
     /// and the pipe's identity are (measured against the SDK's headers).
     const VNODE_PATH: i32 = 2;
@@ -882,8 +876,9 @@ fn target_of(host: i32, fd: i32, kind: i32) -> Option<FdTarget> {
     let info = |flavor: i32, size: usize| -> Option<Vec<u8>> {
         let mut b = vec![0u8; size];
         // SAFETY: a valid out-buffer of `size` bytes.
-        let n =
-            unsafe { libc::proc_pidfdinfo(host, fd, flavor, b.as_mut_ptr().cast(), size as i32) };
+        let n = unsafe {
+            libc::proc_pidfdinfo(host.get(), fd, flavor, b.as_mut_ptr().cast(), size as i32)
+        };
         (n as usize == size).then_some(b)
     };
     Some(match kind {
@@ -907,7 +902,7 @@ fn target_of(host: i32, fd: i32, kind: i32) -> Option<FdTarget> {
 /// The handle of the socket a connected Unix socket, descriptor `fd` of
 /// host process `host`, is connected to: what [`socket_id`] gives for
 /// the other end.
-pub fn socket_peer(host: i32, fd: i32) -> Option<u64> {
+pub fn socket_peer(host: HostPid, fd: i32) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         let at = peer_offset()?;
@@ -924,18 +919,18 @@ pub fn socket_peer(host: i32, fd: i32) -> Option<u64> {
 
 /// `PROC_PIDFDSOCKETINFO` of descriptor `fd` of host process `host`.
 #[cfg(target_os = "macos")]
-pub(crate) fn socket_info_of(host: i32, fd: i32) -> Option<Vec<u8>> {
+pub(crate) fn socket_info_of(host: HostPid, fd: i32) -> Option<Vec<u8>> {
     socket_info(host, fd)
 }
 
 #[cfg(target_os = "macos")]
-fn socket_info(host: i32, fd: i32) -> Option<Vec<u8>> {
+fn socket_info(host: HostPid, fd: i32) -> Option<Vec<u8>> {
     const SOCKET: i32 = 3;
     const SOCKET_SIZE: usize = 792;
     let mut b = vec![0u8; SOCKET_SIZE];
     // SAFETY: a valid out-buffer of its size.
     let n = unsafe {
-        libc::proc_pidfdinfo(host, fd, SOCKET, b.as_mut_ptr().cast(), SOCKET_SIZE as i32)
+        libc::proc_pidfdinfo(host.get(), fd, SOCKET, b.as_mut_ptr().cast(), SOCKET_SIZE as i32)
     };
     (n as usize == SOCKET_SIZE).then_some(b)
 }
@@ -973,7 +968,7 @@ fn peer_offset() -> Option<usize> {
 /// A socket's identity as every process names it: the host's kernel handle
 /// of descriptor `fd` of host process `host` (its `fstat` inode is a
 /// number only that process can read).
-pub fn socket_id(host: i32, fd: i32) -> Option<u64> {
+pub fn socket_id(host: HostPid, fd: i32) -> Option<u64> {
     #[cfg(target_os = "macos")]
     {
         const SOCKET: i32 = 3;
@@ -983,7 +978,7 @@ pub fn socket_id(host: i32, fd: i32) -> Option<u64> {
         let mut b = vec![0u8; SOCKET_SIZE];
         // SAFETY: a valid out-buffer of its size.
         let n = unsafe {
-            libc::proc_pidfdinfo(host, fd, SOCKET, b.as_mut_ptr().cast(), SOCKET_SIZE as i32)
+            libc::proc_pidfdinfo(host.get(), fd, SOCKET, b.as_mut_ptr().cast(), SOCKET_SIZE as i32)
         };
         if n as usize != SOCKET_SIZE {
             return None;

@@ -70,7 +70,7 @@ impl<P: Platform> Kernel<P> {
     /// half not the guest's): `EINVAL` for a negative one, `ESRCH` for one
     /// that is not there. A host process fwe did not start counts, as an
     /// ordinary one that fwe cannot change.
-    fn sched_target(&self, pid: u64) -> Result<i32, i32> {
+    fn sched_target(&self, pid: u64) -> Result<crate::ids::HostPid, i32> {
         let pid = pid as i32;
         if pid < 0 {
             return Err(errno::EINVAL);
@@ -80,15 +80,15 @@ impl<P: Platform> Kernel<P> {
             return Ok(me);
         }
         let host = crate::pidns::to_host(pid).ok_or(errno::ESRCH)?;
-        if crate::procreg::read(host.get()).is_none() && !crate::host::probe(host).exists() {
+        if crate::procreg::read(host).is_none() && !crate::host::probe(host).exists() {
             return Err(errno::ESRCH);
         }
-        Ok(host.get())
+        Ok(host)
     }
 
     /// Process `host`'s attributes (an ordinary process's for one without
     /// a record).
-    fn sched_of(&self, host: i32) -> Sched {
+    fn sched_of(&self, host: crate::ids::HostPid) -> Sched {
         crate::procreg::sched(host).unwrap_or_default()
     }
 
@@ -97,7 +97,7 @@ impl<P: Platform> Kernel<P> {
     /// without `CAP_SYS_NICE`.
     fn sched_allowed(
         &self,
-        host: i32,
+        host: crate::ids::HostPid,
         cur: &Sched,
         nice_now: i32,
         policy: u32,
@@ -146,7 +146,7 @@ impl<P: Platform> Kernel<P> {
     /// utilisation clamps (`EINVAL`).
     fn sched_apply(
         &self,
-        host: i32,
+        host: crate::ids::HostPid,
         cur: &Sched,
         nice: i32,
         req: &Request,
@@ -195,7 +195,7 @@ impl<P: Platform> Kernel<P> {
     /// Set process `host`'s scheduling as `req` asks, under its record's
     /// lock. A host process fwe did not start is the host's to schedule:
     /// checked, then `EPERM`.
-    fn sched_set(&mut self, host: i32, req: Request) -> Result<(), i32> {
+    fn sched_set(&mut self, host: crate::ids::HostPid, req: Request) -> Result<(), i32> {
         if crate::procreg::read(host).is_none() {
             let nice = crate::procreg::nice(host);
             self.sched_apply(host, &Sched::default(), nice, &req)?;

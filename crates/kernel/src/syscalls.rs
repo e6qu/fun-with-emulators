@@ -124,7 +124,7 @@ pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) ->
 
 /// The host process whose `/proc/<pid>/maps` descriptor `fd` is open on,
 /// if it is one.
-fn maps_of_fd(fd: i32) -> Option<i32> {
+fn maps_of_fd(fd: i32) -> Option<HostPid> {
     let o = crate::fdmarks::origin(fd)?;
     if o.fstype != crate::mounts::FsType::Proc {
         return None;
@@ -134,7 +134,7 @@ fn maps_of_fd(fd: i32) -> Option<i32> {
         return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(who).ok()?.parse().ok()?;
-    crate::pidns::to_host(pid).map(HostPid::get)
+    crate::pidns::to_host(pid)
 }
 
 /// Whether call `n` with `a` runs on the kernel lock's shared side
@@ -692,8 +692,8 @@ impl<P: Platform> Kernel<P> {
                     && pid != me
                     // SAFETY: as above.
                     && unsafe { libc::getsid(pid) } == sid
-                    && crate::procreg::read(pid).is_some_and(|r| {
-                        r.execed && r.lineage.first().is_some_and(|&(p, _)| p == me)
+                    && HostPid::new(pid).and_then(crate::procreg::read).is_some_and(|r| {
+                        r.execed && r.lineage.first().is_some_and(|&(p, _)| p.get() == me)
                     })
                 {
                     return err(errno::EACCES);
@@ -701,8 +701,7 @@ impl<P: Platform> Kernel<P> {
                 // SAFETY: plain host call.
                 let r = ret(unsafe { libc::setpgid(pid, pgid) });
                 if r == 0 {
-                    let me = crate::host::pid();
-                    crate::procreg::record_pgid(if pid == 0 { me } else { pid });
+                    crate::procreg::record_pgid(HostPid::new(pid).unwrap_or_else(crate::host::pid));
                 }
                 r
             }
@@ -813,10 +812,10 @@ impl<P: Platform> Kernel<P> {
                     let Some((owner, tid)) = target else {
                         return err(errno::ESRCH);
                     };
-                    if !self.may_access(owner.get(), false, false) {
+                    if !self.may_access(owner, false, false) {
                         return err(errno::EPERM);
                     }
-                    thread::published_robust(owner.get(), tid).unwrap_or(0)
+                    thread::published_robust(owner, tid).unwrap_or(0)
                 };
                 guest!(uaccess::write(a[1], head));
                 guest!(uaccess::write(a[2], 24u64));
@@ -2006,7 +2005,7 @@ impl<P: Platform> Kernel<P> {
             let Some(host) = crate::pidns::to_host(pid).filter(|&h| host::probe(h).exists()) else {
                 return err(errno::ESRCH);
             };
-            let s = crate::procreg::security(host.get()).unwrap_or_default();
+            let s = crate::procreg::security(host).unwrap_or_default();
             [s.caps[0], s.caps[1], s.caps[2]]
         };
         if data == 0 {
@@ -2401,7 +2400,7 @@ impl<P: Platform> Kernel<P> {
             filters: crate::seccomp::filter_count(),
             umask: self.fs().umask(),
             locked: crate::maps::record().locked_bytes(),
-            tracer: match crate::ptrace::tracer_of(host) {
+            tracer: match crate::ptrace::tracer_of(host.get()) {
                 0 => 0,
                 t => crate::pidns::to_guest(t),
             },
@@ -2418,7 +2417,7 @@ impl<P: Platform> Kernel<P> {
         let procs: u64 = crate::procpid::listed()
             .into_iter()
             .filter_map(crate::pidns::to_host)
-            .map(|h| crate::procpid::host_info(h.get()).map_or(1, |i| i.threads.max(1)))
+            .map(|h| crate::procpid::host_info(h).map_or(1, |i| i.threads.max(1)))
             .sum();
         let info = fwe_abi::Sysinfo {
             uptime: host::uptime() as i64,
@@ -2440,18 +2439,19 @@ impl<P: Platform> Kernel<P> {
     /// caller's for 0 or one of its threads (glibc's `pthread_getattr_np`
     /// asks with the thread's own id), the process of another's thread,
     /// or a process (`ESRCH` for none).
-    fn affinity_target(&self, pid: u64) -> Result<i32, i32> {
+    fn affinity_target(&self, pid: u64) -> Result<HostPid, i32> {
         let id = pid as i32;
         if id == 0 || id == thread::tgid() || thread::host_thread(id).is_some() {
             return Ok(host::pid());
         }
         if let Some(owner) = thread::owner_of_tid(id).filter(|&o| host::is_fwe(o)) {
-            return Ok(owner.get());
+            return Ok(owner);
         }
-        match crate::pidns::host_arg(id) {
-            Ok(h) if HostPid::new(h).is_some_and(|h| host::probe(h).exists()) => Ok(h),
-            _ => Err(errno::ESRCH),
-        }
+        crate::pidns::host_arg(id)
+            .ok()
+            .and_then(HostPid::new)
+            .filter(|&h| host::probe(h).exists())
+            .ok_or(errno::ESRCH)
     }
 
     /// `sched_getaffinity(pid, len, mask)`: the affinity of the process
@@ -2513,7 +2513,7 @@ impl<P: Platform> Kernel<P> {
             {
                 return err(errno::EPERM);
             }
-            if !HostPid::new(target).is_some_and(host::is_fwe) {
+            if !host::is_fwe(target) {
                 return 0;
             }
         }
@@ -2529,11 +2529,14 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let target = match crate::pidns::host_arg(pid as i32) {
-            Ok(0) => host::getpid() as i32,
-            Ok(h) => h,
+            Ok(0) => host::pid(),
+            Ok(h) => match HostPid::new(h) {
+                Some(h) => h,
+                None => return err(errno::ESRCH),
+            },
             Err(e) => return err(e),
         };
-        if target != host::getpid() as i32 {
+        if target != host::pid() {
             return self.prlimit_other(target, res, new, old);
         }
         if old != 0 {
@@ -2595,7 +2598,7 @@ impl<P: Platform> Kernel<P> {
     /// (one left for it, else the one it published), and a new one left
     /// there ([`crate::procreg::push_limit`]), the target woken to take it
     /// up at once ([`crate::signote::limits_set`]).
-    fn prlimit_other(&mut self, target: i32, res: u64, new: u64, old: u64) -> i64 {
+    fn prlimit_other(&mut self, target: HostPid, res: u64, new: u64, old: u64) -> i64 {
         if crate::procreg::read(target).is_none() {
             return err(errno::ESRCH);
         }
@@ -2655,9 +2658,7 @@ impl<P: Platform> Kernel<P> {
                 return err(e);
             }
             // Woken to take it up now (it has a mailbox, being fwe's).
-            if crate::signote::limits_set(target).is_ok()
-                && let Some(target) = HostPid::new(target)
-            {
+            if crate::signote::limits_set(target).is_ok() {
                 host::kill_process(target, host::WAKE_SIGNAL);
             }
         }
@@ -3716,14 +3717,14 @@ impl<P: Platform> Kernel<P> {
     /// user namespace numbers it).
     fn prio_targets(&self, which: u64, who: i32) -> Result<Vec<PrioTarget>, i32> {
         use fwe_abi::prio;
-        // SAFETY: plain host calls.
-        let (me, my_group) = unsafe { (libc::getpid(), libc::getpgrp()) };
-        let processes = |v: Vec<i32>| v.into_iter().map(PrioTarget::Process).collect();
+        let me = crate::host::pid();
+        // SAFETY: plain host call.
+        let my_group = unsafe { libc::getpgrp() };
+        let processes = |v: Vec<HostPid>| v.into_iter().map(PrioTarget::Process).collect();
         let seen = || {
             crate::procpid::listed()
                 .into_iter()
                 .filter_map(crate::pidns::to_host)
-                .map(HostPid::get)
                 .collect::<Vec<_>>()
         };
         // The main thread names the process; another of this process's
@@ -3736,8 +3737,7 @@ impl<P: Platform> Kernel<P> {
             prio::PROCESS if thread::host_thread(who).is_some() => vec![own_thread(who)],
             prio::PROCESS => processes(
                 crate::pidns::to_host(who)
-                    .filter(|&h| h.get() == me || crate::host::probe(h).exists())
-                    .map(HostPid::get)
+                    .filter(|&h| h == me || crate::host::probe(h).exists())
                     .into_iter()
                     .collect(),
             ),
@@ -3753,7 +3753,10 @@ impl<P: Platform> Kernel<P> {
                 // (A process gone meanwhile has no group: -1, never one's.)
                 // SAFETY: plain host call.
                 processes(
-                    seen().into_iter().filter(|&h| unsafe { libc::getpgid(h) } == group).collect(),
+                    seen()
+                        .into_iter()
+                        .filter(|&h| unsafe { libc::getpgid(h.get()) } == group)
+                        .collect(),
                 )
             }
             prio::USER => {
@@ -3767,7 +3770,8 @@ impl<P: Platform> Kernel<P> {
                         None => return Ok(Vec::new()),
                     }
                 };
-                let own = |h: i32| if h == me { self.creds.uid } else { crate::procreg::ids(h)[0] };
+                let own =
+                    |h: HostPid| if h == me { self.creds.uid } else { crate::procreg::ids(h)[0] };
                 processes(seen().into_iter().filter(|&h| own(h) == uid).collect())
             }
             _ => return Err(errno::EINVAL),
@@ -3806,7 +3810,7 @@ impl<P: Platform> Kernel<P> {
         // initial user namespace; another user's process, in its own.
         let privileged = self.creds.has(crate::caps::CAP_SYS_NICE);
         let over =
-            |h: i32| self.creds.has_in(&crate::procreg::user_ns(h), crate::caps::CAP_SYS_NICE);
+            |h: HostPid| self.creds.has_in(&crate::procreg::user_ns(h), crate::caps::CAP_SYS_NICE);
         // `RLIMIT_NICE` bounds the least nice value as 20 less it.
         let floor =
             20 - own_limit(resource::RLIMIT_NICE).map_or(0, |(soft, _)| soft.min(40) as i32);
@@ -3844,7 +3848,7 @@ impl<P: Platform> Kernel<P> {
             } else if h != me && crate::procreg::read(h).is_none() {
                 // A process fwe did not start: as far as the host lets.
                 // SAFETY: plain host call.
-                ret(unsafe { libc::setpriority(libc::PRIO_PROCESS, h as libc::id_t, nice) })
+                ret(unsafe { libc::setpriority(libc::PRIO_PROCESS, h.get() as libc::id_t, nice) })
             } else if crate::procreg::set_nice(h, nice).is_err() {
                 err(errno::ESRCH)
             } else {
@@ -3861,7 +3865,7 @@ impl<P: Platform> Kernel<P> {
 /// What a `getpriority`/`setpriority` call acts on.
 enum PrioTarget {
     /// A host process (for this one, its main thread).
-    Process(i32),
+    Process(HostPid),
     /// Another thread of this process, by tid.
     Thread(i32),
 }
@@ -3891,7 +3895,7 @@ pub(crate) fn cpu_clock_ns(id: u64) -> Option<Result<u64, i32>> {
     } else if who == 0 || who == me {
         crate::procpid::cpu_ns(crate::host::pid())
     } else {
-        crate::pidns::to_host(who).and_then(|h| crate::procpid::cpu_ns(h.get()))
+        crate::pidns::to_host(who).and_then(crate::procpid::cpu_ns)
     };
     Some(match sample {
         Some((user, _)) if which == 1 => Ok(user),

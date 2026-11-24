@@ -142,7 +142,7 @@ fn key_of(host: u64) -> Option<[u64; 2]> {
 }
 
 fn me() -> u32 {
-    crate::host::pid() as u32
+    crate::host::pid().get() as u32
 }
 
 /// This process, as slots name their owner: (pid, start time).
@@ -151,7 +151,7 @@ fn me_proc() -> (u32, u64) {
     let pid = me();
     let mut m = ME.lock().unwrap_or_else(|e| e.into_inner());
     if m.0 != pid {
-        *m = (pid, crate::procreg::start_time(pid as i32).unwrap_or(0));
+        *m = (pid, crate::procreg::own_start().unwrap_or(0));
     }
     *m
 }
@@ -159,7 +159,7 @@ fn me_proc() -> (u32, u64) {
 /// Whether slot `s`'s owner still runs.
 fn owner_alive(s: &Slot) -> bool {
     let (pid, start) = (s.owner.load(SeqCst), s.owner_start.load(SeqCst));
-    (pid, start) == me_proc() || crate::procreg::alive((pid as i32, start))
+    (pid, start) == me_proc() || crate::procreg::alive_kept((pid as i32, start))
 }
 
 /// Free slot `s`, seen in state `seen`, if it is still so.

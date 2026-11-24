@@ -351,7 +351,7 @@ impl<P: Platform> Kernel<P> {
         if flags & fwe_abi::clone::CLONE_PARENT != 0
             && crate::pidns::current()
                 .first()
-                .is_some_and(|ns| ns.get().number_of(crate::host::pid()) == Some(1))
+                .is_some_and(|ns| ns.get().number_of(crate::host::pid().get()) == Some(1))
         {
             // A pid namespace's init has no parent in its namespace to give.
             return Err(errno::EINVAL);
@@ -502,6 +502,7 @@ impl<P: Platform> Kernel<P> {
     /// it with its start time, so the child, whose every page touched is a
     /// fault, writes neither. Whether they were (the child is told).
     pub fn fork_write_child(&self, t: &ForkNs, child: i32) -> bool {
+        let Some(child) = crate::ids::HostPid::new(child) else { return false };
         let Some((record, view)) = t.prepared.as_ref() else { return false };
         if !crate::procreg::prepared_for(child, record) {
             return false;
@@ -526,14 +527,15 @@ impl<P: Platform> Kernel<P> {
             fs.set_mount_ns(mnt);
             fs.ns = ns;
         }
-        if child > 0 {
-            crate::mqueue::forked(child);
-            crate::filestore::desc::forked(child);
+        let forked = crate::ids::HostPid::new(child);
+        if let Some(c) = forked {
+            crate::mqueue::forked(c);
+            crate::filestore::desc::forked(c);
         }
-        if child > 0 && t.child_writes.is_none() {
+        if let Some(c) = forked.filter(|_| t.child_writes.is_none()) {
             // It starts in this process's cgroup, in its namespaces.
             crate::procreg::forked(
-                child,
+                c,
                 t.dirs.clone(),
                 &t.line,
                 &t.inherit,
@@ -542,8 +544,8 @@ impl<P: Platform> Kernel<P> {
             );
             // It holds this process's session keyring.
         }
-        if child > 0 && t.child_writes.is_some() && !t.written.get() {
-            crate::procreg::child_writes_own(child);
+        if let Some(c) = forked.filter(|_| t.child_writes.is_some() && !t.written.get()) {
+            crate::procreg::child_writes_own(c);
         }
         if child > 0 {
             crate::keys::forked(child);
@@ -594,7 +596,7 @@ impl<P: Platform> Kernel<P> {
         }
         // Its numbers stand for it from now on, not only once the parent
         // gets to it: whether it is an init, for one, depends on it.
-        pidns::set_host(&t.chain, &t.nums, crate::host::pid());
+        pidns::set_host(&t.chain, &t.nums, crate::host::pid().get());
         pidns::set_current(t.chain);
         if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
@@ -654,7 +656,7 @@ impl<P: Platform> Kernel<P> {
         if !prepared || t.nums.first() == Some(&1) {
             crate::reaper::start_if_reaper();
         }
-        t.nums.first().copied().unwrap_or_else(crate::host::pid)
+        t.nums.first().copied().unwrap_or_else(|| crate::host::pid().get())
     }
 
     /// `CLONE_CLEAR_SIGHAND`: every handler back to the default action (an

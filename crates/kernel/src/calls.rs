@@ -37,7 +37,7 @@ fn order<T: Ord>(x: &T, y: &T) -> i64 {
 
 /// The identity of descriptor `fd` of host process `host` ([`FileKey`]),
 /// if it has that descriptor.
-fn file_key(host: i32, fd: i32) -> Option<FileKey> {
+fn file_key(host: crate::ids::HostPid, fd: i32) -> Option<FileKey> {
     use crate::procpid::FdTarget;
     let (_, t) = crate::procpid::fds(host).into_iter().find(|(f, _)| *f == fd)?;
     Some(match t {
@@ -214,7 +214,7 @@ impl<P: Platform> Kernel<P> {
     /// pipe, or the same file and, in the caller, share their status flags
     /// (one is a copy of the other).
     pub(crate) fn sys_kcmp(&mut self, pid1: u64, pid2: u64, ty: u64, i1: u64, i2: u64) -> i64 {
-        let host = |p: u64| -> Result<i32, i32> {
+        let host = |p: u64| -> Result<crate::ids::HostPid, i32> {
             let p = p as i32;
             if p <= 0 {
                 return Err(errno::ESRCH);
@@ -223,9 +223,9 @@ impl<P: Platform> Kernel<P> {
                 return Ok(crate::host::pid());
             }
             if let Some(owner) = thread::owner_of_tid(p) {
-                return Ok(owner.get());
+                return Ok(owner);
             }
-            let h = crate::pidns::host_arg(p)?;
+            let h = crate::ids::HostPid::new(crate::pidns::host_arg(p)?).ok_or(errno::ESRCH)?;
             if crate::procreg::read(h).is_none() {
                 return Err(errno::ESRCH);
             }
@@ -313,7 +313,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let mut done = 0u64;
-        if t.host == crate::host::me() {
+        if t.host == crate::host::pid() {
             for (addr, len) in ranges {
                 let r = self.sys_madvise(addr, len, advice);
                 if r < 0 {
@@ -324,11 +324,10 @@ impl<P: Platform> Kernel<P> {
             return done as i64;
         }
         // Linux's `PTRACE_MODE_READ_FSCREDS`, and `CAP_SYS_NICE`.
-        if !self.may_access(t.host.get(), false, true) || !self.creds.has(crate::caps::CAP_SYS_NICE)
-        {
+        if !self.may_access(t.host, false, true) || !self.creds.has(crate::caps::CAP_SYS_NICE) {
             return err(errno::EPERM);
         }
-        let Some(view) = crate::mm::MapsView::of(t.host.get()) else { return err(errno::ESRCH) };
+        let Some(view) = crate::mm::MapsView::of(t.host) else { return err(errno::ESRCH) };
         let page = view.page.max(1);
         for (addr, len) in ranges {
             let end = addr.checked_add(len.div_ceil(page) * page);
@@ -718,16 +717,14 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::ESRCH);
             }
             if s == fwe_abi::signal::SIGKILL {
-                crate::signote::note(host.get(), libc::SIGKILL);
+                crate::signote::note(host, libc::SIGKILL);
                 return crate::host::kill_process(host, libc::SIGKILL);
             }
             // A SIGCONT for any of its threads continues the process.
             if s == fwe_abi::signal::SIGCONT {
-                crate::signote::continuing(host.get(), true);
+                crate::signote::continuing(host, true);
             }
-            if let Err(e) =
-                crate::signote::queue_thread_from(host.get(), t, s, code, value, (pid, uid))
-            {
+            if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
                 return err(e);
             }
             return match crate::host::kill_process(host, crate::host::WAKE_SIGNAL) {
@@ -743,9 +740,9 @@ impl<P: Platform> Kernel<P> {
             && matches!(s, fwe_abi::signal::SIGSTOP | fwe_abi::signal::SIGCONT)
         {
             if s == fwe_abi::signal::SIGCONT {
-                crate::signote::continuing(host.get(), true);
+                crate::signote::continuing(host, true);
             } else {
-                crate::reaper::stop_signal_sent(host.get());
+                crate::reaper::stop_signal_sent(host);
             }
             let r = crate::signal::send_unhosted_from(host, s, code, value, (pid, uid));
             return if r == 0 && s == fwe_abi::signal::SIGCONT {
@@ -761,10 +758,10 @@ impl<P: Platform> Kernel<P> {
             return crate::signal::send_unhosted_from(host, s, code, value, (pid, uid));
         };
         // A host signal names its sender's pid itself.
-        crate::signote::note_with(host.get(), h, code, value, uid);
+        crate::signote::note_with(host, h, code, value, uid);
         let r = crate::host::signal_named(host, h);
         if r != 0 {
-            crate::signote::unnote(host.get(), h);
+            crate::signote::unnote(host, h);
         }
         r
     }

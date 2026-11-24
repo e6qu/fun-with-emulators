@@ -91,10 +91,10 @@ impl<P: Platform> Kernel<P> {
         else {
             return err(errno::ESRCH);
         };
-        let me = crate::host::me();
+        let me = crate::host::pid();
         // Only an fwe process can copy its own memory for the caller; any
         // other is one the caller may not attach to, as `ptrace` has it.
-        if host != me && (!crate::host::is_fwe(host) || !self.may_trace(host.get())) {
+        if host != me && (!crate::host::is_fwe(host) || !self.may_trace(host)) {
             return err(errno::EPERM);
         }
         let total = local.iter().map(|r| r.1).sum::<u64>().min(remote.iter().map(|r| r.1).sum());
@@ -196,7 +196,7 @@ fn remote_copy(
     use crate::signote::{MEM_HEADER, MEM_RETRY};
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
     let reply = crate::signote::fd_reply_socket().ok_or(errno::EMFILE)?;
-    let name = crate::signote::mem_name(crate::host::pid(), reply.token);
+    let name = crate::signote::mem_name(crate::host::pid().get(), reply.token);
     // The ranges, cut to the data that moves.
     let mut left = data.len() as u64;
     let mut cut = Vec::new();
@@ -267,7 +267,7 @@ fn remote_copy(
         let r = (|| {
             for _ in 0..1000 {
                 m[8..16].copy_from_slice(&0i64.to_ne_bytes());
-                crate::signote::request_mem(host.get(), reply.token)?;
+                crate::signote::request_mem(host, reply.token)?;
                 if crate::host::kill_process(host, crate::host::WAKE_SIGNAL) != 0 {
                     return Err(errno::ESRCH);
                 }

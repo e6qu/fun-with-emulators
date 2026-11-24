@@ -661,8 +661,8 @@ pub fn check_creds([pid, uid, gid]: [u32; 3]) -> Result<Creds, i32> {
         crate::pidns::to_host(pid as i32)
             .filter(|&h| crate::host::probe(h).exists())
             .ok_or(errno::ESRCH)?
-            .get()
-    };
+    }
+    .get();
     Ok(Creds { host_pid, uid, gid })
 }
 
@@ -670,7 +670,7 @@ pub fn check_creds([pid, uid, gid]: [u32; 3]) -> Result<Creds, i32> {
 /// when asked: its pid, real user and group ids.
 pub fn own_creds() -> Creds {
     let id = crate::creds::identity();
-    Creds { host_pid: crate::host::pid(), uid: id.uids[0], gid: id.gids[0] }
+    Creds { host_pid: crate::host::pid().get(), uid: id.uids[0], gid: id.gids[0] }
 }
 
 /// The host addresses (socket paths) of datagram sockets that asked for

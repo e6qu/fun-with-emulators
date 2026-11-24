@@ -907,7 +907,7 @@ fn decode_published(body: &[u8]) -> Option<Published> {
 
 /// The mappings host process `pid` published, if it is a process of
 /// fwe's that has.
-pub fn of_process(pid: i32) -> Option<Published> {
+pub fn of_process(pid: crate::ids::HostPid) -> Option<Published> {
     let published = crate::procstore::get_of(crate::procstore::Kind::Maps, pid).filter(|b| {
         b.get(..8).map(|s| u64::from_le_bytes(s.try_into().unwrap()))
             == crate::procreg::start_time(pid)

@@ -53,7 +53,7 @@ fn ended(pid: u64) -> bool {
 /// is waited on as a held lock is.
 pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
     let t = crate::procstore::area(area);
-    let me = crate::host::pid() as u64;
+    let me = crate::host::pid().get() as u64;
     let slots = t.len() / SLOT_WORDS;
     let slot = |i: usize| &t[i * SLOT_WORDS..(i + 1) * SLOT_WORDS];
     let take = |h: u64, holder: &AtomicU64| {

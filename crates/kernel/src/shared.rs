@@ -139,7 +139,7 @@ pub fn unique() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let pid = crate::host::pid() as u64;
+    let pid = crate::host::pid().get() as u64;
     hash(&[now.to_le_bytes(), pid.to_le_bytes(), n.to_le_bytes()].concat())
 }
 

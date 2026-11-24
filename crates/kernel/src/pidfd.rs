@@ -145,7 +145,7 @@ pub fn thread_gone(tid: i32) {
     if THREAD_FDS.load(Ordering::Relaxed) == 0 {
         return;
     }
-    let me = crate::host::me();
+    let me = crate::host::pid();
     for (fd, m) in fdmarks::marks() {
         if m == (Mark::Pid { host: me.get(), tid, nonblock: false })
             || m == (Mark::Pid { host: me.get(), tid, nonblock: true })
@@ -161,7 +161,7 @@ pub fn thread_gone(tid: i32) {
 /// `NSpid`.
 pub fn fdinfo(fd: i32) -> Option<String> {
     let t = of(fd)?;
-    let me = crate::host::me();
+    let me = crate::host::pid();
     let pid = if t.host == me {
         thread::tgid()
     } else if ended(fd) && !crate::host::probe(t.host).exists() {
@@ -260,7 +260,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
     let exits: HashMap<i32, i32> = (0..n).map(|_| (d.i32(), d.i32())).collect();
     *EXITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(exits);
     let n = d.count(14);
-    let me = crate::host::me();
+    let me = crate::host::pid();
     for _ in 0..n {
         let (fd, host, tid, nonblock, cloexec) = (d.i32(), d.i32(), d.i32(), d.bool(), d.bool());
         let Some(host) = HostPid::new(host) else { continue };
@@ -324,8 +324,8 @@ pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
         let reaped = exit_status(t.host.get()).is_some() || !crate::host::probe(t.host).exists();
         return if reaped { err(errno::ESRCH) } else { 0 };
     }
-    let exiting = crate::procreg::kinfo(t.host.get()).is_some_and(|k| k.exiting || k.state == 5);
-    if exiting || crate::signote::kill_noted(t.host.get()) { 0 } else { err(errno::EINVAL) }
+    let exiting = crate::procreg::kinfo(t.host).is_some_and(|k| k.exiting || k.state == 5);
+    if exiting || crate::signote::kill_noted(t.host) { 0 } else { err(errno::EINVAL) }
 }
 
 /// The host process a `/proc/<pid>` directory descriptor names (which
@@ -334,11 +334,11 @@ fn proc_dir_target(fd: i32) -> Option<HostPid> {
     let path = crate::synthdir::path_of(fd)?;
     let rest = path.strip_prefix(b"/proc/")?;
     if rest == b"self" || rest == b"thread-self" {
-        return Some(crate::host::me());
+        return Some(crate::host::pid());
     }
     let pid: i32 = std::str::from_utf8(rest).ok()?.parse().ok()?;
     if pid == thread::tgid() {
-        return Some(crate::host::me());
+        return Some(crate::host::pid());
     }
     crate::pidns::to_host(pid)
 }
@@ -351,7 +351,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         let nonblock = flags & PIDFD_NONBLOCK != 0;
-        let me = crate::host::me();
+        let me = crate::host::pid();
         let t = if thread::host_thread(pid).is_some() || pid == thread::tid() {
             // One of this process's threads: the main one names the
             // process; another only as a thread.
@@ -415,7 +415,7 @@ impl<P: Platform> Kernel<P> {
         if gone {
             return err(errno::ESRCH);
         }
-        let me = crate::host::me();
+        let me = crate::host::pid();
         let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host.get()) };
         if pid == 0 {
             // Not in the caller's pid namespace or one below it.
@@ -458,7 +458,7 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return Err(err(errno::ESRCH));
         }
-        let me = crate::host::me();
+        let me = crate::host::pid();
         if t.host == me {
             if !crate::fdtable::guest_visible(target_fd) {
                 return Err(err(errno::EBADF));
@@ -473,7 +473,7 @@ impl<P: Platform> Kernel<P> {
         }
         // Only an fwe process can be asked for its descriptors; any other is
         // one the caller may not attach to, as `ptrace` has it.
-        if !crate::host::is_fwe(t.host) || !self.may_trace(t.host.get()) {
+        if !crate::host::is_fwe(t.host) || !self.may_trace(t.host) {
             return Err(err(errno::EPERM));
         }
         Ok(GetFd { host: t.host, fd: target_fd, pidfd: fd })
@@ -508,7 +508,7 @@ impl<P: Platform> Kernel<P> {
     fn pidfd_info(&self, fd: i32, t: Target, arg: u64, size: u64) -> i64 {
         let asked: u64 = guest!(uaccess::read(arg));
         // As the caller's pid namespace numbers it: none outside it.
-        let me = crate::host::me();
+        let me = crate::host::pid();
         let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host.get()) };
         if pid == 0 {
             return err(errno::ESRCH);
@@ -524,9 +524,9 @@ impl<P: Platform> Kernel<P> {
             mask |= PIDFD_INFO_EXIT;
             put(&mut info, 60, status as u32);
         } else {
-            let ids = crate::procreg::ids(t.host.get());
-            let host_ppid = crate::procreg::host_parent(t.host.get()).unwrap_or(0);
-            let ppid = crate::reaper::parent_of(t.host.get(), host_ppid);
+            let ids = crate::procreg::ids(t.host);
+            let host_ppid = crate::procreg::host_parent(t.host).unwrap_or(0);
+            let ppid = crate::reaper::parent_of(t.host, host_ppid);
             put(&mut info, 16, pid as u32);
             put(&mut info, 20, pid as u32);
             put(&mut info, 24, crate::pidns::to_guest(ppid) as u32);
@@ -566,14 +566,14 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return err(errno::ESRCH);
         }
-        let me = crate::host::me();
-        if t.host != me && !self.may_access(t.host.get(), false, true) {
+        let me = crate::host::pid();
+        if t.host != me && !self.may_access(t.host, false, true) {
             return err(errno::EPERM);
         }
         let dirs = if t.host == me {
             self.fs().ns_dirs()
         } else {
-            match crate::procreg::read(t.host.get()) {
+            match crate::procreg::read(t.host) {
                 Some(r) => r.ns,
                 None => return err(errno::ESRCH),
             }
@@ -602,11 +602,11 @@ impl<P: Platform> Kernel<P> {
         if ended(fd) {
             return err(errno::ESRCH);
         }
-        let me = crate::host::me();
+        let me = crate::host::pid();
         let dirs = if t.host == me {
             self.fs().ns_dirs()
         } else {
-            match crate::procreg::read(t.host.get()) {
+            match crate::procreg::read(t.host) {
                 Some(r) => r.ns,
                 None => return err(errno::ESRCH),
             }
@@ -761,7 +761,7 @@ mod imp {
         let Some(reply) = crate::signote::fd_reply_socket() else {
             return err(errno::EMFILE);
         };
-        if let Err(e) = crate::signote::request_fd(g.host.get(), g.fd, reply.token) {
+        if let Err(e) = crate::signote::request_fd(g.host, g.fd, reply.token) {
             return err(e);
         }
         if crate::host::kill_process(g.host, crate::host::WAKE_SIGNAL) != 0 {

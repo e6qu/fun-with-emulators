@@ -1238,7 +1238,7 @@ static EARLY_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// still to be forgotten as its parent's. Async-signal-safe.
 fn in_fork_child() -> bool {
     let forking = FORKING.load(std::sync::atomic::Ordering::SeqCst);
-    forking != 0 && forking != host::pid_now()
+    forking != 0 && forking != host::pid_now().get()
 }
 
 /// Keep Linux signal `sig`, carrying `info`, for [`post_early`].

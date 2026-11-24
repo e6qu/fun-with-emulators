@@ -608,7 +608,7 @@ fn fresh_id() -> u32 {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.subsec_nanos());
-    let pid = crate::host::pid() as u32;
+    let pid = crate::host::pid().get() as u32;
     ((now ^ pid.rotate_left(16) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_mul(2654435761))
         & 0x7fff_ffff)
         .max(1)

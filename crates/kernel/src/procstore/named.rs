@@ -81,7 +81,9 @@ const WAITING: u64 = 1;
 
 /// Whether host process `pid` lives (a zombie died holding what it held).
 fn holder_live(pid: u32) -> bool {
-    crate::procreg::host_info(pid as i32).is_some_and(|(_, _, zombie)| !zombie)
+    crate::ids::HostPid::new(pid as i32)
+        .and_then(crate::procreg::host_info)
+        .is_some_and(|(_, _, zombie)| !zombie)
 }
 
 /// The base of the identities records are given: past those of Linux's
@@ -331,7 +333,7 @@ impl Slot {
     /// sequence number goes: the bytes it had not yet put in place are
     /// lost with it).
     pub fn lock(&self) -> Held {
-        let me = crate::host::pid() as u32;
+        let me = crate::host::pid().get() as u32;
         let word = &self.n.lock;
         let mut spins = 0;
         loop {

@@ -93,11 +93,11 @@ pub type Proc = (i32, u64);
 
 /// This process.
 pub fn me() -> Proc {
-    (crate::host::pid(), crate::procreg::own_start().unwrap_or(0))
+    (crate::host::pid().get(), crate::procreg::own_start().unwrap_or(0))
 }
 
 fn alive(p: Proc) -> bool {
-    p == me() || crate::procreg::alive(p)
+    p == me() || crate::procreg::alive_kept(p)
 }
 
 fn now() -> i64 {

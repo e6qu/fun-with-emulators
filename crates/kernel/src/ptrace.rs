@@ -222,7 +222,7 @@ fn open(tag: u64, make: Option<i32>) -> Option<Page> {
 }
 
 fn me() -> i32 {
-    crate::host::pid()
+    crate::host::pid().get()
 }
 
 /// Whether host process `pid` (a pid a mailbox keeps) is there.
@@ -274,10 +274,9 @@ fn tracer() -> i32 {
 /// then grant what the program grants. The tracer's capabilities are the
 /// ones its process record holds now.
 pub fn tracer_capable() -> bool {
-    let t = tracer();
-    if !traced() || t <= 0 {
+    let Some(t) = HostPid::new(tracer()).filter(|_| traced()) else {
         return true;
-    }
+    };
     let sec = crate::procreg::security(t).unwrap_or_default();
     let euid = crate::procreg::ids(t)[1];
     let effective = sec.caps[0] & 1 << crate::caps::CAP_SYS_PTRACE != 0;
@@ -1739,7 +1738,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// Whether the caller may attach to host process `target` as a tracer
     /// (`PTRACE_MODE_ATTACH_REALCREDS`: `ptrace`, `process_vm_readv`,
     /// `pidfd_getfd`).
-    pub(crate) fn may_trace(&self, target: i32) -> bool {
+    pub(crate) fn may_trace(&self, target: crate::ids::HostPid) -> bool {
         self.may_access(target, true, false)
     }
 
@@ -1757,7 +1756,12 @@ impl<P: crate::Platform> crate::Kernel<P> {
     ///   descendant, or one the target named with `PR_SET_PTRACER`; 2,
     ///   only with `CAP_SYS_PTRACE` there; 3, none;
     /// - Landlock: the target in the caller's domain or one nested in it.
-    pub(crate) fn may_access(&self, target: i32, attach: bool, fscreds: bool) -> bool {
+    pub(crate) fn may_access(
+        &self,
+        target: crate::ids::HostPid,
+        attach: bool,
+        fscreds: bool,
+    ) -> bool {
         let ns = crate::procreg::user_ns(target);
         let cap = || self.creds.has_in(&ns, crate::caps::CAP_SYS_PTRACE);
         let c = &self.creds;
@@ -1787,7 +1791,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// `CAP_SYS_PTRACE` in its user namespace.
     fn yama_allows(
         &self,
-        target: i32,
+        target: HostPid,
         sec: &crate::procreg::Security,
         cap: impl Fn() -> bool,
     ) -> bool {
@@ -1795,14 +1799,16 @@ impl<P: crate::Platform> crate::Kernel<P> {
             0 => true,
             1 => {
                 let line =
-                    |pid: i32| crate::procreg::read(pid).map(|r| r.lineage).unwrap_or_default();
+                    |pid: HostPid| crate::procreg::read(pid).map(|r| r.lineage).unwrap_or_default();
                 // A descendant; or the target named the caller, or a
                 // process the caller descends from, or any.
-                line(target).iter().any(|&(p, _)| p == me())
+                line(target).iter().any(|&(p, _)| p.get() == me())
                     || sec.ptracer == -1
                     || (sec.ptracer > 0
                         && (sec.ptracer == me()
-                            || line(me()).iter().any(|&(p, _)| p == sec.ptracer)))
+                            || line(crate::host::pid())
+                                .iter()
+                                .any(|&(p, _)| p.get() == sec.ptracer)))
                     || cap()
             }
             2 => cap(),
@@ -1814,7 +1820,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     /// `parent` (`PTRACE_TRACEME`): Yama refuses it at scope 3, and at
     /// scope 2 unless the parent has `CAP_SYS_PTRACE` over the caller;
     /// Landlock unless the parent's domain holds the caller's.
-    fn may_be_traced_by(&self, parent: i32) -> bool {
+    fn may_be_traced_by(&self, parent: HostPid) -> bool {
         let allowed = match crate::sysctl::number(b"kernel/yama/ptrace_scope").unwrap_or(1) {
             0 | 1 => true,
             2 => {
@@ -1838,12 +1844,11 @@ impl<P: crate::Platform> crate::Kernel<P> {
         use crate::uaccess;
         use fwe_abi::err;
         if request == PTRACE_TRACEME {
-            // SAFETY: getppid cannot fail.
-            let parent = unsafe { libc::getppid() };
+            let Some(parent) = crate::host::parent_pid() else { return err(errno::EPERM) };
             if !traced() && !self.may_be_traced_by(parent) {
                 return err(errno::EPERM);
             }
-            return match traceme(parent) {
+            return match traceme(parent.get()) {
                 Ok(()) => {
                     self.resync_for_tracing();
                     0
@@ -1860,7 +1865,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         if matches!(request, PTRACE_ATTACH | PTRACE_SEIZE)
             && let Some(owner) = crate::thread::owner_of_tid(pid as i32)
         {
-            if owner.get() == me() || !self.may_trace(owner.get()) {
+            if owner.get() == me() || !self.may_trace(owner) {
                 return err(errno::EPERM);
             }
             let (r, code) = if request == PTRACE_SEIZE {
@@ -1872,7 +1877,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
                 return err(e);
             }
             let stop = fwe_abi::signal::SIGSTOP;
-            return match crate::signote::queue_thread(owner.get(), pid as i32, stop, code, 0) {
+            return match crate::signote::queue_thread(owner, pid as i32, stop, code, 0) {
                 Ok(()) => crate::host::kill_process(owner, crate::host::WAKE_SIGNAL),
                 Err(e) => err(e),
             };
@@ -1886,7 +1891,9 @@ impl<P: crate::Platform> crate::Kernel<P> {
             if target == me() || crate::thread::host_thread(pid as i32).is_some() {
                 return err(errno::EPERM);
             }
-            if !self.may_trace(target) || crate::procreg::read(target).is_none() {
+            if !HostPid::new(target)
+                .is_some_and(|t| self.may_trace(t) && crate::procreg::read(t).is_some())
+            {
                 return err(errno::EPERM);
             }
             let (r, code) = if request == PTRACE_SEIZE {
@@ -1997,7 +2004,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         let Some(proc) = process_of(id) else { return fwe_abi::err(errno::ESRCH) };
         let stop = fwe_abi::signal::SIGSTOP;
         if proc.get() != id {
-            return match crate::signote::queue_thread(proc.get(), id, stop, POKE_CODE, 0) {
+            return match crate::signote::queue_thread(proc, id, stop, POKE_CODE, 0) {
                 Ok(()) => crate::host::kill_process(proc, crate::host::WAKE_SIGNAL),
                 Err(e) => fwe_abi::err(e),
             };

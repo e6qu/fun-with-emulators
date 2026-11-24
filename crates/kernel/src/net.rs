@@ -1112,7 +1112,7 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
         && src.get(2) == Some(&0)
         && let Some(names) = abstract_names()
     {
-        let me = crate::host::pid();
+        let me = crate::host::pid().get();
         let name = &src[3..];
         let _ = names.update(|t| {
             t.names.insert(abstract_key(name), (name.to_vec(), me));
@@ -2694,7 +2694,7 @@ fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
 /// The `ucred` of fwe's process `pid` (a host pid) as the caller sees it:
 /// its effective ids, if fwe has a record of it.
 fn ucred_of(pid: i32) -> Option<[u32; 3]> {
-    let ids = crate::procreg::read(pid)?.ids;
+    let ids = crate::procreg::read(crate::ids::HostPid::new(pid)?)?.ids;
     Some(guest_ucred(pid, ids[1], ids[5]))
 }
 
@@ -3311,7 +3311,9 @@ fn send_control(
 /// ([`crate::scm::prepare`]).
 #[cfg(not(target_os = "linux"))]
 fn host_peer(fd: i32) -> bool {
-    host_peercred(fd).is_ok_and(|(pid, _, _)| pid > 0 && crate::procreg::read(pid).is_none())
+    host_peercred(fd).is_ok_and(|(pid, _, _)| {
+        crate::ids::HostPid::new(pid).is_some_and(|p| crate::procreg::read(p).is_none())
+    })
 }
 
 #[cfg(test)]
@@ -4331,7 +4333,7 @@ mod creds_tests {
     fn credentials_come_when_asked() {
         let _g = super::scm_tests::serial();
         let sv = pair(SOCK_STREAM);
-        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        let me = crate::pidns::to_guest(crate::host::pid().get()) as u32;
         assert_eq!(send_control(sv[0], &[]), 1);
         let (_, c, _) = recv_control(sv[1], 64, 0);
         assert_eq!(creds_in(&c), None);
@@ -4377,7 +4379,7 @@ mod creds_tests {
         let r = unsafe { sendto(tx as u64, byte.as_ptr() as u64, 1, 0, a.as_ptr() as u64, alen) };
         assert_eq!(r, 1);
         let (_, c, _) = recv_control(rx, 64, 0);
-        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        let me = crate::pidns::to_guest(crate::host::pid().get()) as u32;
         assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
         closed(rx);
         close_all(&[rx, tx]);

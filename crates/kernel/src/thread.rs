@@ -448,7 +448,7 @@ const TID_END: i32 = 4_194_304;
 /// have the same one. They are taken [`TID_BLOCK`] at a time, the block
 /// marked this process's, and given out from the block.
 fn shared_tid() -> i32 {
-    let me = crate::host::pid();
+    let me = crate::host::pid().get();
     let mut block = TID_BLOCK_LEFT.lock().unwrap_or_else(|e| e.into_inner());
     // A fork child's block is its parent's.
     if block.0 == me && block.1 < block.2 {
@@ -479,12 +479,12 @@ pub fn owner_of_tid(tid: i32) -> Option<crate::ids::HostPid> {
     let pid = crate::ids::HostPid::new(crate::procstore::tid_block_owner(
         ((tid - TID_FIRST) / TID_BLOCK) as usize,
     ))?;
-    (crate::host::probe(pid).exists() && published_tids(pid.get()).contains(&tid)).then_some(pid)
+    (crate::host::probe(pid).exists() && published_tids(pid).contains(&tid)).then_some(pid)
 }
 
 /// The threads (tids, the main thread's the process's pid) another
 /// process published ([`publish_tids`]).
-pub fn published_tids(pid: i32) -> Vec<i32> {
+pub fn published_tids(pid: crate::ids::HostPid) -> Vec<i32> {
     let b = crate::procstore::get_of(crate::procstore::Kind::Threads, pid).unwrap_or_default();
     b.as_chunks::<4>().0.iter().map(|c| i32::from_ne_bytes(*c)).collect()
 }
@@ -510,7 +510,7 @@ fn publish_tids(tids: &[i32]) {
     }
     // How many, for `RLIMIT_NPROC`.
     crate::procstore::set_own_threads(tids.len() as u32);
-    let me = crate::host::pid();
+    let me = crate::host::pid().get();
     // Its threads take turns.
     let mut published = PUBLISHED.lock().unwrap_or_else(|e| e.into_inner());
     // A process that never had another thread has no list; one that had
@@ -537,7 +537,7 @@ pub(crate) fn forget_published() {
 /// outside one, a number no host process has ([`shared_tid`]).
 pub fn alloc_tid() -> i32 {
     if crate::pidns::nested() {
-        let host = crate::host::pid();
+        let host = crate::host::pid().get();
         if let Ok(nums) = crate::pidns::alloc(&crate::pidns::current(), host, true) {
             crate::pidns::remember_thread(nums[0], nums.clone());
             return nums[0];
@@ -583,9 +583,8 @@ pub fn set_robust_list(head: u64, len: u64) {
         r.robust = head;
     }
     drop(threads);
-    let host = crate::host::pid();
     if me == tgid() {
-        publish_robust(host, head);
+        publish_robust(crate::host::pid().get(), head);
     } else if !crate::pidns::nested() {
         publish_robust(me, head);
     }
@@ -650,8 +649,8 @@ fn publish_robust(id: i32, head: u64) {
 /// Another process's thread's robust-list head: `host` the main thread of
 /// that host process, or `tid` one of its other threads (a number of
 /// fwe's, of process `host`). `None` if it published none.
-pub fn published_robust(host: i32, tid: Option<i32>) -> Option<u64> {
-    let id = tid.unwrap_or(host);
+pub fn published_robust(host: crate::ids::HostPid, tid: Option<i32>) -> Option<u64> {
+    let id = tid.unwrap_or(host.get());
     let b = crate::procstore::get_of(crate::procstore::Kind::Robust, host)?;
     b.as_chunks::<16>().0.iter().find_map(|c| {
         let i = u64::from_ne_bytes(c[..8].try_into().unwrap()) as i32;

@@ -271,7 +271,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         fwe_kernel::timing::mark("fork: prepared");
         // A fault signal sent to the child before it is set up is kept
         // for it (`trap::post_early`).
-        trap::FORKING.store(host::pid(), Ordering::SeqCst);
+        trap::FORKING.store(host::pid().get(), Ordering::SeqCst);
         // The translations whole in the child.
         let mut jit = crate::jit::hold();
         let pid = fwe_kernel::fork_locked(|| {
@@ -521,7 +521,9 @@ fn reaped_signal(pid: i32, wstatus: i32) {
     // done; a child fwe did not start is the host user's.
     // SAFETY: getuid cannot fail.
     let host_user = host::uid_to_initial(unsafe { libc::getuid() });
-    let uid = fwe_kernel::procreg::kept_uid(pid).unwrap_or(host_user);
+    let uid = fwe_kernel::ids::HostPid::new(pid)
+        .and_then(fwe_kernel::procreg::kept_uid)
+        .unwrap_or(host_user);
     let info = thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
     reaper::reaped_child_signal(pid, info);
 }
@@ -530,7 +532,8 @@ fn reaped_signal(pid: i32, wstatus: i32) {
 /// Host process `pid` ended so.
 fn linux_wstatus(pid: i32, status: libc::c_int) -> i32 {
     if (libc::WIFEXITED(status) || libc::WIFSIGNALED(status))
-        && let Some(s) = fwe_kernel::procreg::end_status(pid)
+        && let Some(s) =
+            fwe_kernel::ids::HostPid::new(pid).and_then(fwe_kernel::procreg::end_status)
     {
         // It ended of a Linux signal, as it recorded: one the host lacks,
         // ignores by default, or with the core fwe dumped.
@@ -815,7 +818,9 @@ fn waitid_tracer(
                 words[2] = CLD_TRAPPED;
                 words[4] =
                     if thread { p } else { fwe_kernel::pidns::guest_ret(i64::from(p)) as i32 };
-                words[5] = fwe_kernel::procreg::ids(p)[0] as i32;
+                words[5] = fwe_kernel::ids::HostPid::new(p)
+                    .map_or(0, |p| fwe_kernel::procreg::ids(p)[0])
+                    as i32;
                 words[6] = (status >> 8) & 0xffff;
                 if fwe_kernel::uaccess::write(infop, words).is_err() {
                     return err(errno::EFAULT);
@@ -907,7 +912,9 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         // Reaped: its numbers are free again, and its records go.
         reaper::busy(|| {
             fwe_kernel::pidns::reaped(r);
-            fwe_kernel::procreg::reaped(r);
+            if let Some(p) = fwe_kernel::ids::HostPid::new(r) {
+                fwe_kernel::procreg::reaped(p);
+            }
             reaper::reaped_own_child(r);
         });
         reaper::reaped_child(r);
@@ -1080,12 +1087,13 @@ fn waitid_host(
     let (pid, host_uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
     // The child's real user, as its record keeps it (the host names the
     // host user).
-    let uid = fwe_kernel::procreg::kept_uid(pid)
+    let uid = fwe_kernel::ids::HostPid::new(pid)
+        .and_then(fwe_kernel::procreg::kept_uid)
         .map_or_else(|| host::uid_to_linux(host_uid), |u| fwe_kernel::userns::to_ns(u, false));
     if pid != 0 {
         // It ended of a Linux signal, as it recorded (see `linux_wstatus`).
         let ended = matches!(si.si_code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
-            .then(|| fwe_kernel::procreg::end_status(pid))
+            .then(|| fwe_kernel::ids::HostPid::new(pid).and_then(fwe_kernel::procreg::end_status))
             .flatten();
         let code = match ended {
             Some(s) if s & 0x80 != 0 => w::CLD_DUMPED,
@@ -1117,7 +1125,9 @@ fn waitid_host(
             // Reaped: its numbers are free again, and its records go.
             reaper::busy(|| {
                 fwe_kernel::pidns::reaped(pid);
-                fwe_kernel::procreg::reaped(pid);
+                if let Some(p) = fwe_kernel::ids::HostPid::new(pid) {
+                    fwe_kernel::procreg::reaped(p);
+                }
                 reaper::reaped_own_child(pid);
             });
             reaper::reaped_child(pid);
