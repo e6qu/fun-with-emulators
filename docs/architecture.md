@@ -1434,8 +1434,11 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   of Venus's capability set (`DRM_IOCTL_VIRTGPU_CONTEXT_INIT`) and the
   resources it made, let go with its last descriptor. Its ioctls are the
   virtio-gpu driver's: a blob (`RESOURCE_CREATE_BLOB`, host memory only)
-  is a resource of the renderer's, its GEM handle the resource's id, and
-  a mappable one's memory a shared memory object the helper passes back;
+  is a resource of the renderer's, its GEM handle the resource's id, no
+  larger than the host's memory (`ENOMEM`: its memory is a host shared
+  memory object of its size, as fwe's file store's extents are kept to
+  theirs), and a mappable one's memory a shared memory object the helper
+  passes back;
   an `mmap` of the offset `MAP` gave maps that object at the guest's
   address, as a System V segment is (the same pages, not a copy), listed
   in `/proc/self/maps` as the node;

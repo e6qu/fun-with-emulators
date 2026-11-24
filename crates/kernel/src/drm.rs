@@ -486,6 +486,21 @@ fn resource(key: u32, handle: u32) -> Result<Resource, i32> {
     files().get(&key).ok_or(errno::EBADF)?.handles.get(&handle).cloned().ok_or(errno::ENOENT)
 }
 
+/// Whether a blob of `size` bytes may be made on a host of `memory` bytes:
+/// none larger than the host's memory. Its memory is a host shared memory
+/// object of that size, and macOS keeps a wired index for each such object
+/// sized to the object (a guest's absurd size would cost the host its
+/// wired memory: docs/architecture.md, "fwe's file store").
+fn blob_fits(size: u64, memory: u64) -> bool {
+    size <= memory
+}
+
+/// The host's memory, as [`blob_fits`] bounds a blob by.
+fn host_memory() -> u64 {
+    static MEMORY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MEMORY.get_or_init(|| crate::host::memory().total)
+}
+
 /// `DRM_IOCTL_VIRTGPU_RESOURCE_CREATE_BLOB`: a blob of the renderer's,
 /// made by the context's commands given with it (or its shared memory,
 /// blob 0), under a new handle.
@@ -502,6 +517,9 @@ fn create_blob(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
         || cmd_size % 4 != 0
     {
         return Err(errno::EINVAL);
+    }
+    if !blob_fits(size, host_memory()) {
+        return Err(errno::ENOMEM);
     }
     let (ctx, _) = context(key)?;
     if cmd_size > 0 {
@@ -894,6 +912,15 @@ fn listing(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_blob_is_larger_than_the_hosts_memory() {
+        let gib = 1u64 << 30;
+        assert!(blob_fits(4096, 24 * gib));
+        assert!(blob_fits(24 * gib, 24 * gib));
+        assert!(!blob_fits(24 * gib + 1, 24 * gib));
+        assert!(!blob_fits(1 << 44, 24 * gib));
+    }
     use crate::procfs::Entry;
 
     /// `path` with its links followed, as `realpath` does: a component at a
