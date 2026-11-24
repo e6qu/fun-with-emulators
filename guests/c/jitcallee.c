@@ -139,7 +139,13 @@ int main(void) {
     for (long k = 1; k <= ROUNDS; k++) {
         *add = 0x91000205 | (uint32_t)k << 10; /* add x5, x16, #k */
         flush(add, 4);
+        long before = atomic_load(&signals);
         wrong += caller(CALLS, k);
+        /* A round can be over before the signaller's next signal (its
+         * thread not run meanwhile, on a busy machine): its calls are made
+         * again, each checked as the first, until one lands among them. */
+        for (int again = 0; atomic_load(&signals) == before && again < 20000; again++)
+            wrong += caller(CALLS, k);
     }
     atomic_store(&stop, 1);
     pthread_join(t, 0);

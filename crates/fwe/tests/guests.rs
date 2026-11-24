@@ -10568,6 +10568,74 @@ fn gpu_device_across_fork_and_exec() {
     assert_eq!(out.status.code(), Some(0));
 }
 
+/// The tests' Mac Vulkan driver (`tests/fake_vulkan_driver.c`), which does
+/// as Metal does under MoltenVK: built for test `test`, with its manifest;
+/// the manifest's path.
+fn fake_vulkan_driver(test: &str) -> PathBuf {
+    let dir = out_dir().join(format!("fake-vulkan-{test}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("libfake_vulkan.dylib");
+    let source = repo().join("crates/fwe/tests/fake_vulkan_driver.c");
+    let status = Command::new("clang")
+        .args(["-dynamiclib", "-O1", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&lib)
+        .arg(&source)
+        .status()
+        .expect("clang runs");
+    assert!(status.success(), "the fake Vulkan driver did not build");
+    let manifest = dir.join("fake_icd.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{{\"file_format_version\": \"1.0.1\", \"ICD\": {{\"library_path\": \"{}\", \
+             \"api_version\": \"1.3.0\"}}}}\n",
+            lib.display()
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+/// What the Mac's Vulkan driver does in fwe's process stays out of the
+/// program's way: the descriptors it opens are not the program's, a signal
+/// the host gives one of its threads reaches the program's waiting thread,
+/// and a wait on a fence that never signals ends at its timeout.
+#[test]
+fn gpu_driver_descriptors_and_threads_are_not_the_programs() {
+    let prog = build_c_dynamic("gpuhygiene", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "gpuhygiene");
+    let manifest = fake_vulkan_driver("hygiene");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_VULKAN_DRIVER", &manifest);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "descriptors: the program's own\n\
+         signal: taken while waiting\n\
+         fence: timed out\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A bad pointer the driver writes through ends the process with SIGSEGV,
+/// as a fault in a Linux driver's code in the process does.
+#[test]
+fn gpu_driver_fault_on_a_bad_pointer_is_sigsegv() {
+    use std::os::unix::process::ExitStatusExt;
+    let prog = build_c_dynamic("gpuhygiene", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "gpuhygiene-fault");
+    let manifest = fake_vulkan_driver("fault");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).arg("fault").env("FWE_VULKAN_DRIVER", &manifest);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), "", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{:?}", out.status);
+}
+
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
 /// Vulkan, on fwe's driver, in an X server with GLX (Alpine's Xvfb, run by
 /// fwe), which names the renderer; its gears drawn and turning.

@@ -1003,6 +1003,18 @@ fn take_async(
         // and ends the process. That code may be in the host allocator.
         let _no_allocation = host::NoAllocation::enter();
         record();
+        if thread::foreign() {
+            // A thread a host library made (the Mac's Vulkan driver's,
+            // started in a guest's call, its mask the guest's): the signal
+            // is the process's (posted above), for the guest's threads to
+            // take, woken; and this thread takes no more, the host's own
+            // mask on it, which the handler's return sets, blocking all.
+            thread::wake_others(host::WAKE_SIGNAL);
+            // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO
+            // handlers.
+            unsafe { (*(ctx as *mut Ucontext)).uc_sigmask = !0 };
+            return;
+        }
         // A system call made through the gate delivers it as it ends; one
         // on its way out starts that again, to look for it.
         crate::gate::note_signal();

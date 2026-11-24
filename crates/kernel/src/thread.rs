@@ -586,6 +586,21 @@ pub fn set_tid(new: NewThread) {
     }
 }
 
+/// Whether the calling thread is one a host library made: no guest
+/// thread's (none registered on it), and not the process's first. fwe's
+/// own threads, and a guest thread until it is registered, block every
+/// signal, so a signal handled on a thread that is not a guest's is on
+/// one of these. Async-signal-safe.
+pub fn foreign() -> bool {
+    #[cfg(target_os = "macos")]
+    // SAFETY: reads the calling thread's own state.
+    let first = unsafe { libc::pthread_main_np() } != 0;
+    // The native backend, whose handlers ask, is macOS's.
+    #[cfg(not(target_os = "macos"))]
+    let first = true;
+    HOT.with(|h| h.own.get().is_null()) && tid() == 0 && !first
+}
+
 /// This thread's guest thread id (`gettid`).
 pub fn tid() -> i32 {
     TID.with(Cell::get)
