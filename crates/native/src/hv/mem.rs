@@ -557,7 +557,7 @@ impl Mem {
             )
         };
         if host == libc::MAP_FAILED {
-            return Err(last_errno());
+            return Err(last_linux_errno());
         }
         let host = host as u64;
         let ipa = match vm::map_segment(host, hlen, writable) {
@@ -1002,7 +1002,7 @@ fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
             if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(last_errno());
+            return Err(last_linux_errno());
         }
         if n == 0 {
             break;
@@ -1061,7 +1061,7 @@ fn anonymous_file(len: u64) -> Result<OwnedFd, i32> {
 }
 
 /// The host's last error as a Linux errno.
-fn last_errno() -> i32 {
+fn last_linux_errno() -> i32 {
     fwe_kernel::host::errno_to_linux(fwe_kernel::host::last_errno())
 }
 

@@ -325,7 +325,7 @@ fn datagram(inst: &[u8], ev: &[u8]) -> Sent {
     });
     match r {
         Ok(n) if n == ev.len() as i32 => Sent::Yes,
-        _ => match crate::host::last_errno() {
+        _ => match crate::host::last_errno().raw() {
             libc::ENOENT | libc::ECONNREFUSED => Sent::Gone,
             _ => Sent::No,
         },

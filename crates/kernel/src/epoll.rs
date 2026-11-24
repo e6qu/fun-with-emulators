@@ -560,7 +560,7 @@ unsafe fn ctl_kqueue(epfd: u64, op: u64, fd: u64, (events, data): (u32, u64)) ->
             let e = r.data as i32;
             let is_delete = r.flags & libc::EV_DELETE != 0;
             if e != 0 && !(is_delete && e == libc::ENOENT) {
-                return -(crate::host::errno_to_linux(e) as i64);
+                return -(crate::host::HostErrno::new(e).linux() as i64);
             }
         }
     }
@@ -605,7 +605,7 @@ unsafe fn ctl_always(epfd: i32, fd: i32, on: bool, extra: u16, data: u64) -> i64
     if n == 1 && out.flags & libc::EV_ERROR != 0 {
         let e = out.data as i32;
         if e != 0 && !(!on && e == libc::ENOENT) {
-            return -(crate::host::errno_to_linux(e) as i64);
+            return -(crate::host::HostErrno::new(e).linux() as i64);
         }
     }
     let mut a = ALWAYS.lock();

@@ -328,7 +328,7 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
                 let mut pfd = libc::pollfd { fd: rfd, events: libc::POLLIN, revents: 0 };
                 // SAFETY: a valid single-element pollfd; wait indefinitely.
                 if unsafe { libc::poll(&mut pfd, 1, -1) } < 0
-                    && crate::host::last_errno() == libc::EINTR
+                    && crate::host::last_errno().is(libc::EINTR)
                     && crate::thread::deliverable() != 0
                 {
                     // A signal the guest handles: let it run.

@@ -64,7 +64,7 @@ mod imp {
     use crate::creds::Creds;
     use fwe_abi::{err, errno};
 
-    fn last_errno() -> i32 {
+    fn last_linux_errno() -> i32 {
         crate::host::errno_to_linux(crate::host::last_errno())
     }
 
@@ -83,7 +83,7 @@ mod imp {
         // SAFETY: a NUL-terminated name.
         let fd = unsafe { libc::memfd_create(name.as_ptr(), flags) };
         if fd < 0 {
-            return Err(last_errno());
+            return Err(last_linux_errno());
         }
         if seals != 0 {
             // SAFETY: plain host call on the fresh descriptor.
@@ -102,13 +102,13 @@ mod imp {
     pub fn get_seals(fd: i32) -> i64 {
         // SAFETY: plain host call.
         let r = unsafe { libc::fcntl(fd, libc::F_GET_SEALS) };
-        if r < 0 { err(last_errno()) } else { r as i64 }
+        if r < 0 { err(last_linux_errno()) } else { r as i64 }
     }
 
     pub fn add_seals(fd: i32, add: u64) -> i64 {
         // SAFETY: plain host call.
         if unsafe { libc::fcntl(fd, libc::F_ADD_SEALS, add as libc::c_int) } < 0 {
-            return err(last_errno());
+            return err(last_linux_errno());
         }
         0
     }

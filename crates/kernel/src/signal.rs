@@ -1398,7 +1398,7 @@ impl<P: Platform> Kernel<P> {
                 }
             }
         };
-        if r == 0 { 0 } else { err(host::errno_to_linux(r)) }
+        if r == 0 { 0 } else { err(host::HostErrno::new(r).linux()) }
     }
 
     /// Have the host catch the relayed signals in `want` for the duration of

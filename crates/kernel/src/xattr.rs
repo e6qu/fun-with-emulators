@@ -299,7 +299,7 @@ pub fn get(t: &Target, name: &[u8]) -> Result<Vec<u8>, i32> {
             return Ok(buf);
         }
         // Grown since it was measured: measure again.
-        if crate::host::last_errno() != libc::ERANGE {
+        if !crate::host::last_errno().is(libc::ERANGE) {
             return fail();
         }
     }
@@ -480,7 +480,7 @@ fn list_raw(t: &Target) -> Result<Vec<u8>, i32> {
             buf.truncate(got as usize);
             break buf;
         }
-        if crate::host::last_errno() != libc::ERANGE {
+        if !crate::host::last_errno().is(libc::ERANGE) {
             return fail();
         }
     })
@@ -531,7 +531,7 @@ pub fn list_host(fd: i32) -> Result<Vec<u8>, i32> {
             buf.truncate(got as usize);
             return Ok(buf);
         }
-        if crate::host::last_errno() != libc::ERANGE {
+        if !crate::host::last_errno().is(libc::ERANGE) {
             return fail();
         }
     }

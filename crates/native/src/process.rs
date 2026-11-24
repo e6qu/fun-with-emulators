@@ -417,7 +417,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         unsafe {
             let mut b = 0u8;
             while libc::read(done[0], (&mut b as *mut u8).cast(), 1) < 0
-                && host::last_errno() == libc::EINTR
+                && host::last_errno().is(libc::EINTR)
             {}
             libc::close(done[0]);
         }
@@ -486,7 +486,7 @@ fn fork_with_signals_held(
                 // Until the parent's byte, or its end (should it be gone:
                 // then [`GO`], nothing written for it).
                 while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
-                    && host::last_errno() == libc::EINTR
+                    && host::last_errno().is(libc::EINTR)
                 {}
                 fwe_kernel::timing::mark("fork: child let go");
             }
@@ -937,7 +937,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     // SAFETY: `status` and `usage` are valid out-parameters.
     let mut r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
     fwe_kernel::timing::mark("wait: host wait returned");
-    if r < 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
+    if r < 0 && host::last_errno().is(libc::EINTR) && host_options & libc::WNOHANG == 0 {
         // The child's own SIGCHLD may interrupt the wait before the host
         // reports the child: Linux reports a child that is ready over the
         // signal, so it is looked for once more.
@@ -947,7 +947,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         if again > 0 {
             r = again;
         } else {
-            host::set_errno(libc::EINTR);
+            host::set_errno(host::HostErrno::new(libc::EINTR));
         }
     }
     if r < 0 {
@@ -1132,13 +1132,13 @@ fn waitid_host(
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `si` is a valid out-parameter.
     let mut r = unsafe { libc::waitid(idtype, id, &mut si, host_options) };
-    if r != 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
+    if r != 0 && host::last_errno().is(libc::EINTR) && host_options & libc::WNOHANG == 0 {
         // As for `wait4`: a child ready is reported over its own signal.
         // SAFETY: as above.
         r = unsafe { libc::waitid(idtype, id, &mut si, host_options | libc::WNOHANG) };
         // SAFETY: `si` was filled by the host.
         if r != 0 || unsafe { si.si_pid() } == 0 {
-            host::set_errno(libc::EINTR);
+            host::set_errno(host::HostErrno::new(libc::EINTR));
             r = -1;
         }
     }

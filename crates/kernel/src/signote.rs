@@ -884,7 +884,7 @@ fn answer_fd(caller: i32, fd: i32, token: u64) {
             }
             if libc::sendmsg(s, &m, 0) < 0 && valid {
                 // One the host passes on no socket (a kqueue): its error.
-                let mut refused = crate::host::last_errno();
+                let mut refused = crate::host::last_errno().raw();
                 let mut again =
                     libc::iovec { iov_base: (&mut refused as *mut i32).cast(), iov_len: 4 };
                 m.msg_iov = &mut again;
@@ -900,9 +900,9 @@ fn answer_fd(caller: i32, fd: i32, token: u64) {
     crate::host::set_errno(saved);
 }
 
-/// What arrived on reply socket `sock`: the host errno of the answer (0
-/// for none) and the descriptor sent (-1 for none).
-pub fn receive_fd(sock: i32) -> (i32, i32) {
+/// What arrived on reply socket `sock`: the host errno of the answer (none
+/// if it is 0) and the descriptor sent (-1 for none).
+pub fn receive_fd(sock: i32) -> (Option<crate::host::HostErrno>, i32) {
     let mut answer: i32 = 0;
     let mut ctl = [0u64; 4];
     // SAFETY: zeroed bytes are a valid `msghdr`; buffers of their stated
@@ -915,7 +915,7 @@ pub fn receive_fd(sock: i32) -> (i32, i32) {
         m.msg_control = ctl.as_mut_ptr().cast();
         m.msg_controllen = std::mem::size_of_val(&ctl) as _;
         if libc::recvmsg(sock, &mut m, libc::MSG_DONTWAIT) < 4 {
-            return (libc::EAGAIN, -1);
+            return (Some(crate::host::HostErrno::new(libc::EAGAIN)), -1);
         }
         let c = libc::CMSG_FIRSTHDR(&m);
         let fd = if !c.is_null()
@@ -926,7 +926,7 @@ pub fn receive_fd(sock: i32) -> (i32, i32) {
         } else {
             -1
         };
-        (answer, fd)
+        ((answer != 0).then_some(crate::host::HostErrno::new(answer)), fd)
     }
 }
 

@@ -785,8 +785,8 @@ mod imp {
             }
         }
         let (r, fd) = crate::signote::receive_fd(reply.sock);
-        if r != 0 {
-            return err(crate::host::errno_to_linux(r));
+        if let Some(e) = r {
+            return err(e.linux());
         }
         if fd < 0 {
             return err(errno::EBADF);

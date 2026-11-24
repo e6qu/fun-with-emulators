@@ -15,7 +15,6 @@
 //! time. A record of thousands of objects (System V IPC's) so costs a
 //! change what the change holds, not what the record does.
 
-use crate::host::errno_to_linux;
 use crate::procstore::named::{self, Slot};
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
@@ -187,13 +186,13 @@ pub fn lock_exclusive(fd: i32) {
     // SAFETY: plain host calls on the caller's descriptor.
     unsafe {
         while libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            match crate::host::last_errno() {
+            match crate::host::last_errno().raw() {
                 libc::EWOULDBLOCK if now() - start <= 1_000_000_000 => libc::sched_yield(),
                 // A signal came: the lock is still to take.
                 libc::EINTR => 0,
                 _ => {
                     while libc::flock(fd, libc::LOCK_EX) != 0
-                        && crate::host::last_errno() == libc::EINTR
+                        && crate::host::last_errno().is(libc::EINTR)
                     {}
                     break;
                 }
@@ -213,7 +212,9 @@ pub fn host_dir(dir: &[u8]) -> Result<(), i32> {
         .recursive(true)
         .mode(0o700)
         .create(std::ffi::OsStr::from_bytes(dir))
-        .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
+        .map_err(|e| {
+            e.raw_os_error().map_or(errno::EIO, |e| crate::host::HostErrno::new(e).linux())
+        })
 }
 
 /// The identity of the record named `dir`, if there is one.
@@ -638,7 +639,7 @@ pub fn collect() {
             child => {
                 let mut status = 0;
                 while libc::waitpid(child, &mut status, 0) < 0
-                    && crate::host::last_errno() == libc::EINTR
+                    && crate::host::last_errno().is(libc::EINTR)
                 {}
             }
         }

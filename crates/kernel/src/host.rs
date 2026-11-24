@@ -6,9 +6,51 @@
 use crate::ids::HostPid;
 use fwe_abi::{clock, errno as le, fcntl, resource, signal, wait};
 
+/// A host `errno`: the host's numbering, which is not Linux's (`EAGAIN`
+/// is 35 on macOS, 11 on Linux). It is never handed to the guest as it is:
+/// [`HostErrno::linux`] is the Linux errno of the same meaning, and it
+/// compares only with a host constant ([`HostErrno::is`]). The bare number
+/// in memory (`#[repr(transparent)]`).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HostErrno(i32);
+
+impl HostErrno {
+    /// Host errno `e` (a `libc` constant, or a number the host gave).
+    #[inline]
+    pub const fn new(e: i32) -> HostErrno {
+        HostErrno(e)
+    }
+
+    /// Whether it is host errno `e` (a `libc` constant).
+    #[inline]
+    pub const fn is(self, e: i32) -> bool {
+        self.0 == e
+    }
+
+    /// The Linux errno of the same meaning.
+    #[inline]
+    pub fn linux(self) -> i32 {
+        errno_to_linux(self)
+    }
+
+    /// The host's number, for the host's own interfaces
+    /// (`std::io::Error::from_raw_os_error`, a host call's result).
+    #[inline]
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for HostErrno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::io::Error::from_raw_os_error(self.0).fmt(f)
+    }
+}
+
 /// The calling thread's host `errno`.
-pub fn last_errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+pub fn last_errno() -> HostErrno {
+    HostErrno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
 }
 
 /// (host errno, Linux errno). Searched in order, first match wins.
@@ -106,8 +148,8 @@ const ERRNO_TABLE: &[(i32, i32)] = &[
 ];
 
 /// Translate a host errno into the Linux errno with the same meaning.
-pub fn errno_to_linux(host: i32) -> i32 {
-    ERRNO_TABLE.iter().find(|(h, _)| *h == host).map(|(_, l)| *l).unwrap_or(le::EIO)
+pub fn errno_to_linux(host: HostErrno) -> i32 {
+    ERRNO_TABLE.iter().find(|(h, _)| *h == host.0).map(|(_, l)| *l).unwrap_or(le::EIO)
 }
 
 /// The raw Linux return value for the current host `errno`.
@@ -474,7 +516,7 @@ pub fn probe(pid: HostPid) -> Probe {
     if raw_kill(pid.get(), 0) == 0 {
         return Probe::Live;
     }
-    match last_errno() {
+    match last_errno().raw() {
         libc::EPERM => Probe::NoPermission,
         _ => Probe::Gone,
     }
@@ -1161,7 +1203,8 @@ pub fn sent_info(sig: u64, note: crate::signote::Note) -> crate::thread::SigInfo
 }
 
 /// Set the calling thread's host `errno`.
-pub fn set_errno(value: i32) {
+pub fn set_errno(value: HostErrno) {
+    let value = value.raw();
     // SAFETY: writing this thread's errno.
     #[cfg(target_os = "macos")]
     unsafe {
@@ -1326,14 +1369,14 @@ pub unsafe fn openat(
     loop {
         // SAFETY: `name` is NUL-terminated; the caller vouches for `dir`.
         let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, mode) };
-        if fd >= 0 || flags & libc::O_CREAT == 0 || last_errno() != libc::ENOENT || tries == 100 {
+        if fd >= 0 || flags & libc::O_CREAT == 0 || !last_errno().is(libc::ENOENT) || tries == 100 {
             return fd;
         }
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: a valid descriptor and out parameter.
         if unsafe { libc::fstat(dir, &mut st) } != 0 || st.st_nlink == 0 {
-            set_errno(libc::ENOENT);
+            set_errno(HostErrno::new(libc::ENOENT));
             return -1;
         }
         tries += 1;
@@ -1345,7 +1388,7 @@ pub unsafe fn openat(
 /// answers `ENOTTY` for anything that is not a terminal, where macOS gives
 /// `ENODEV` for some devices (`/dev/null`) and `EOPNOTSUPP` for others.
 pub fn tty_error() -> i64 {
-    match last_errno() {
+    match last_errno().raw() {
         libc::ENODEV | libc::EOPNOTSUPP => -(le::ENOTTY as i64),
         _ => last_error(),
     }
@@ -1836,7 +1879,7 @@ pub fn reserve_fixed(addr: u64, len: u64) -> Result<(), ReserveError> {
         )
     };
     if p == libc::MAP_FAILED {
-        return Err(match last_errno() {
+        return Err(match last_errno().raw() {
             libc::EEXIST => ReserveError::Occupied,
             libc::ENOMEM | libc::EINVAL => ReserveError::OutOfRange,
             e => ReserveError::Other(e),
@@ -2291,7 +2334,7 @@ pub fn at_path<T>(
         // SAFETY: back to the process's working directory.
         unsafe { pthread_fchdir_np(-1) };
         // SAFETY: the call's errno, kept for its caller to read.
-        unsafe { *libc::__error() = e };
+        unsafe { *libc::__error() = e.raw() };
         Ok(r)
     }
     #[cfg(not(target_os = "macos"))]
@@ -2484,11 +2527,11 @@ mod tests {
 
     #[test]
     fn errno_translation() {
-        assert_eq!(errno_to_linux(libc::EAGAIN), le::EAGAIN);
-        assert_eq!(errno_to_linux(libc::ENOSYS), le::ENOSYS);
-        assert_eq!(errno_to_linux(libc::ECONNREFUSED), le::ECONNREFUSED);
-        assert_eq!(errno_to_linux(libc::ENOTSUP), le::EOPNOTSUPP);
-        assert_eq!(errno_to_linux(100_000), le::EIO);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::EAGAIN)), le::EAGAIN);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::ENOSYS)), le::ENOSYS);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::ECONNREFUSED)), le::ECONNREFUSED);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::ENOTSUP)), le::EOPNOTSUPP);
+        assert_eq!(errno_to_linux(HostErrno::new(100_000)), le::EIO);
     }
 
     #[test]
@@ -2610,10 +2653,10 @@ pub fn rename_at(
     if r == 0 {
         return Ok(());
     }
-    match last_errno() {
+    match last_errno().raw() {
         #[cfg(target_os = "macos")]
         libc::ENOTSUP if how != Rename::Replace => Err(le::EINVAL),
-        e => Err(errno_to_linux(e)),
+        e => Err(errno_to_linux(HostErrno::new(e))),
     }
 }
 
@@ -2628,9 +2671,9 @@ pub fn clone_at(src: i32, dst_dir: i32, dst: &std::ffi::CStr) -> Result<(), i32>
         if unsafe { libc::fclonefileat(src, dst_dir, dst.as_ptr(), 0) } == 0 {
             return Ok(());
         }
-        match last_errno() {
+        match last_errno().raw() {
             libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
-            e => Err(errno_to_linux(e)),
+            e => Err(errno_to_linux(HostErrno::new(e))),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -2659,9 +2702,9 @@ pub fn clone_name_at(
         if r == 0 {
             return Ok(());
         }
-        match last_errno() {
+        match last_errno().raw() {
             libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
-            e => Err(errno_to_linux(e)),
+            e => Err(errno_to_linux(HostErrno::new(e))),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -2707,7 +2750,7 @@ pub fn map_stack(size: usize) -> Option<usize> {
 /// `size` bytes of shared memory object `fd`, read and written, mapped
 /// between two [`GUARD`]s of inaccessible room: its address, or the host's
 /// error.
-pub fn map_shared_guarded(fd: i32, size: usize) -> Result<usize, i32> {
+pub fn map_shared_guarded(fd: i32, size: usize) -> Result<usize, HostErrno> {
     // SAFETY: room reserved inaccessible, then the object mapped over its
     // middle, which nothing else uses: the guards stay around it.
     unsafe {

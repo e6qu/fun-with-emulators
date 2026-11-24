@@ -1037,7 +1037,7 @@ mod watch {
                 )
             };
             if n < 0 {
-                if crate::host::last_errno() == libc::EINTR {
+                if crate::host::last_errno().is(libc::EINTR) {
                     continue;
                 }
                 return;
@@ -1119,7 +1119,7 @@ mod watch {
                 libc::kevent(kq, std::ptr::null(), 0, evs.as_mut_ptr(), evs.len() as i32, timeout)
             };
             if n < 0 {
-                if crate::host::last_errno() == libc::EINTR {
+                if crate::host::last_errno().is(libc::EINTR) {
                     continue;
                 }
                 RUNNING.store(false, SeqCst);

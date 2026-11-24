@@ -204,7 +204,7 @@ fn read_path(path: &CStr) -> Option<(u32, u32)> {
     };
     // A socket node takes no attribute (it has none): its owner is kept
     // apart.
-    if n < 0 && crate::host::last_errno() == libc::ENOATTR {
+    if n < 0 && crate::host::last_errno().is(libc::ENOATTR) {
         return socket_node(path).and_then(|st| crate::socketowners::read(&st));
     }
     decode(&buf, n)

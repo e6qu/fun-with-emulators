@@ -48,7 +48,9 @@ pub fn write(st: &libc::stat, owner: Option<(u32, u32)>) -> Result<(), i32> {
         .open(&tmp)
         .and_then(|mut f| std::io::Write::write_all(&mut f, &v))
         .and_then(|()| std::fs::rename(&tmp, &path))
-        .map_err(|e| e.raw_os_error().map_or(fwe_abi::errno::EIO, crate::host::errno_to_linux))
+        .map_err(|e| {
+            e.raw_os_error().map_or(fwe_abi::errno::EIO, |e| crate::host::HostErrno::new(e).linux())
+        })
 }
 
 /// Remove the owners of socket nodes that are gone, and what a writer

@@ -279,7 +279,7 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         }
         // SAFETY: a valid array of `all.len()` entries.
         let n = unsafe { libc::poll(all.as_mut_ptr(), all.len() as libc::nfds_t, poll_ms) };
-        if n < 0 && crate::host::last_errno() != libc::EINTR {
+        if n < 0 && !crate::host::last_errno().is(libc::EINTR) {
             return Err(crate::host::errno_to_linux(crate::host::last_errno()));
         }
         let ready = all[..fds.len()].iter().filter(|p| p.revents != 0).count() as i32;

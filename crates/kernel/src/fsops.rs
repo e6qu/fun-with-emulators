@@ -917,7 +917,7 @@ impl<P: Platform> Kernel<P> {
                     // finds; a link, or a refusal root may pass, takes the
                     // whole way.
                     let e = host::last_errno();
-                    return matches!(e, libc::ENOENT | libc::ENOTDIR).then(last_error);
+                    return matches!(e.raw(), libc::ENOENT | libc::ENOTDIR).then(last_error);
                 }
                 // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
                 let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -1205,7 +1205,7 @@ impl<P: Platform> Kernel<P> {
             Some(st) => {
                 let fd = open();
                 if fd < 0
-                    && host::last_errno() == libc::EACCES
+                    && host::last_errno().is(libc::EACCES)
                     && self.passes_dac(st, open_wants(flags))
                     && crate::modes::keep_at(dirfd, &name, crate::modes::perm_of(st)).is_ok()
                 {
@@ -1221,7 +1221,7 @@ impl<P: Platform> Kernel<P> {
         if fd < 0
             && flags & fcntl::O_PATH != 0
             && matches!(
-                host::last_errno(),
+                host::last_errno().raw(),
                 libc::ENXIO | libc::ENODEV | libc::EBUSY | libc::EOPNOTSUPP
             )
         {
@@ -3291,7 +3291,7 @@ impl<P: Platform> Kernel<P> {
         // SAFETY: `name` NUL-terminated; `dir` live; times valid or null.
         let r = unsafe { libc::utimensat(dir.as_raw_fd(), name.as_ptr(), times_ptr, host_flags) };
         #[cfg(target_os = "macos")]
-        if r != 0 && host::last_errno() == libc::EPERM && touch {
+        if r != 0 && host::last_errno().is(libc::EPERM) && touch {
             // An append-only file's times set to now (see `set_times_fd`), by
             // its path ([`crate::reclocks`]).
             return host::at_path(dir.as_raw_fd(), &name, |p| touch_append_only(p, times_ptr))
@@ -5317,7 +5317,7 @@ fn set_times_fd(fd: i32, times: *const libc::timespec, touch: bool) -> i64 {
     // SAFETY: valid timespec array pointer or null.
     let r = unsafe { libc::futimens(fd, times) };
     #[cfg(target_os = "macos")]
-    if r != 0 && host::last_errno() == libc::EPERM && touch {
+    if r != 0 && host::last_errno().is(libc::EPERM) && touch {
         let Ok(st) = stat_fd(fd) else { return err(errno::EPERM) };
         let fixed = libc::UF_IMMUTABLE | libc::SF_IMMUTABLE | libc::SF_APPEND;
         if st.st_flags & libc::UF_APPEND == 0 || st.st_flags & fixed != 0 {

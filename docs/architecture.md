@@ -78,7 +78,10 @@ flowchart TD
 - **Translation:** Linux values (errno, flags, clock ids, signals,
   rlimits, ioctls) map to host values in `crates/kernel/src/host.rs`.
   `crates/abi` holds the Linux side; `tools/gen-abi.py` generates system
-  call numbers and errno values from the UAPI headers.
+  call numbers and errno values from the UAPI headers. A host errno is a
+  `host::HostErrno`, which reaches the guest only through `.linux()` (its
+  Linux errno) and compares only with a host constant (`.is(libc::E…)`),
+  so a host number is never returned as Linux's.
 
 ## System calls
 

@@ -154,7 +154,7 @@ fn wait(kq: i32) {
         let mut out: libc::kevent = std::mem::zeroed();
         let n = loop {
             let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null());
-            if n >= 0 || crate::host::last_errno() != libc::EINTR {
+            if n >= 0 || !crate::host::last_errno().is(libc::EINTR) {
                 break n;
             }
         };

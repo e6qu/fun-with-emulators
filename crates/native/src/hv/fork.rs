@@ -231,7 +231,7 @@ fn write_all(fd: i32, mut buf: &[u8]) -> bool {
     while !buf.is_empty() {
         // SAFETY: writing our buffer to our socket.
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-        if n < 0 && host::last_errno() == libc::EINTR {
+        if n < 0 && host::last_errno().is(libc::EINTR) {
             continue;
         }
         if n <= 0 {
@@ -516,7 +516,7 @@ fn read_byte(fd: i32) -> bool {
     loop {
         // SAFETY: reading one byte into a local.
         let n = unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) };
-        if n < 0 && host::last_errno() == libc::EINTR {
+        if n < 0 && host::last_errno().is(libc::EINTR) {
             continue;
         }
         return n == 1;

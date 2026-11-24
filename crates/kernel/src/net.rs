@@ -291,7 +291,7 @@ fn abstract_stale(hb: &[u8; SOCKADDR_MAX], len: libc::socklen_t, ty: i32) -> boo
             return false;
         }
         let r = libc::connect(probe, hb.as_ptr().cast(), len);
-        let refused = r < 0 && crate::host::last_errno() == libc::ECONNREFUSED;
+        let refused = r < 0 && crate::host::last_errno().is(libc::ECONNREFUSED);
         libc::close(probe);
         refused
     }
@@ -417,7 +417,7 @@ fn in_dir(dir: Option<&std::os::fd::OwnedFd>, call: impl FnOnce() -> i32) -> i32
             let r = call();
             let e = crate::host::last_errno();
             pthread_fchdir_np(-1);
-            *libc::__error() = e;
+            *libc::__error() = e.raw();
             r
         }
     }
@@ -767,7 +767,7 @@ fn buffer_size(fd: i32, optname: u64, optval: u64, optlen: u64, admin: bool) -> 
             return 0;
         }
         // Past what the host takes: the most it does.
-        if crate::host::last_errno() != libc::ENOBUFS || size <= least {
+        if !crate::host::last_errno().is(libc::ENOBUFS) || size <= least {
             return last_error();
         }
         size /= 2;
@@ -1349,7 +1349,7 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
         return 0;
     }
     let e = crate::host::last_errno();
-    match e {
+    match e.raw() {
         libc::EINTR | libc::EINPROGRESS => {
             connecting(fd, true);
             return err(crate::host::errno_to_linux(e));
@@ -1361,7 +1361,7 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
             return err(crate::host::errno_to_linux(e));
         }
     }
-    if e == libc::EALREADY {
+    if e.is(libc::EALREADY) {
         // SAFETY: plain host call on the guest's socket.
         if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
             connecting(fd, true);
@@ -1384,7 +1384,7 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
     if r != 0 {
         return crate::host::last_error();
     }
-    if so_error != 0 { err(crate::host::errno_to_linux(so_error)) } else { 0 }
+    if so_error != 0 { err(crate::host::HostErrno::new(so_error).linux()) } else { 0 }
 }
 
 /// Unix sockets bound (`local`) or connected to a path the host knows only

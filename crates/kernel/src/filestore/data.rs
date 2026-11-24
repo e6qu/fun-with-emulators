@@ -103,15 +103,15 @@ pub fn make(hint: u64) -> Result<u64, i32> {
         }
         match create(object_id(id, 0), f) {
             Ok(_) => return Ok(id),
-            Err(libc::EEXIST) => continue,
-            Err(e) => return Err(crate::host::errno_to_linux(e)),
+            Err(e) if e.is(libc::EEXIST) => continue,
+            Err(e) => return Err(e.linux()),
         }
     }
 }
 
 /// Make the object whose identity is `object`, `len` bytes long: its
 /// descriptor, or the host's errno (`EEXIST` if it is there).
-fn create(object: u64, len: u64) -> Result<OwnedFd, i32> {
+fn create(object: u64, len: u64) -> Result<OwnedFd, crate::host::HostErrno> {
     let n = name(object);
     // SAFETY: a NUL-terminated name. (No `O_CLOEXEC`: macOS 26 refuses
     // it; the descriptor is moved into fwe's range or closed by its owner.)
@@ -155,8 +155,8 @@ fn object(id: u64, k: u32, read_only: bool, make: bool) -> Result<Option<OwnedFd
             return Ok(Some(fd));
         }
         let e = crate::host::last_errno();
-        if e != libc::ENOENT {
-            return Err(crate::host::errno_to_linux(e));
+        if !e.is(libc::ENOENT) {
+            return Err(e.linux());
         }
         if !make {
             return Ok(None);
@@ -167,8 +167,9 @@ fn object(id: u64, k: u32, read_only: bool, make: bool) -> Result<Option<OwnedFd
         match create(object_id(id, k), extent(id, k).1) {
             Ok(fd) if !read_only => return Ok(Some(fd)),
             // Opened again as asked.
-            Ok(_) | Err(libc::EEXIST) => continue,
-            Err(e) => return Err(crate::host::errno_to_linux(e)),
+            Ok(_) => continue,
+            Err(e) if e.is(libc::EEXIST) => continue,
+            Err(e) => return Err(e.linux()),
         }
     }
 }

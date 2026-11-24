@@ -311,7 +311,7 @@ fn map() -> Result<Store, String> {
         libc::close(fd);
         match mapped {
             Ok(base) => Ok(Store { base }),
-            Err(e) => Err(format!("mapping {name}: {}", std::io::Error::from_raw_os_error(e))),
+            Err(e) => Err(format!("mapping {name}: {e}")),
         }
     }
 }
