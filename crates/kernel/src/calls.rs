@@ -37,7 +37,7 @@ fn order<T: Ord>(x: &T, y: &T) -> i64 {
 
 /// The identity of descriptor `fd` of host process `host` ([`FileKey`]),
 /// if it has that descriptor.
-fn file_key(host: i32, fd: i32) -> Option<FileKey> {
+fn file_key(host: crate::ids::HostPid, fd: i32) -> Option<FileKey> {
     use crate::procpid::FdTarget;
     let (_, t) = crate::procpid::fds(host).into_iter().find(|(f, _)| *f == fd)?;
     Some(match t {
@@ -214,7 +214,7 @@ impl<P: Platform> Kernel<P> {
     /// pipe, or the same file and, in the caller, share their status flags
     /// (one is a copy of the other).
     pub(crate) fn sys_kcmp(&mut self, pid1: u64, pid2: u64, ty: u64, i1: u64, i2: u64) -> i64 {
-        let host = |p: u64| -> Result<i32, i32> {
+        let host = |p: u64| -> Result<crate::ids::HostPid, i32> {
             let p = p as i32;
             if p <= 0 {
                 return Err(errno::ESRCH);
@@ -222,10 +222,10 @@ impl<P: Platform> Kernel<P> {
             if p == thread::tgid() || thread::tids().contains(&p) {
                 return Ok(crate::host::pid());
             }
-            if let Some(owner) = thread::owner_of_tid(p) {
+            if let Some((_, owner)) = thread::named(p) {
                 return Ok(owner);
             }
-            let h = crate::pidns::host_arg(p)?;
+            let h = crate::ids::HostPid::new(crate::pidns::host_arg(p)?).ok_or(errno::ESRCH)?;
             if crate::procreg::read(h).is_none() {
                 return Err(errno::ESRCH);
             }
@@ -490,7 +490,7 @@ impl<P: Platform> Kernel<P> {
                     return Ok(true);
                 }
                 match crate::pidns::to_host(who) {
-                    Some(h) if crate::host::process_exists(h) => Ok(false),
+                    Some(h) if crate::host::probe(h).exists() => Ok(false),
                     _ => Err(errno::ESRCH),
                 }
             }
@@ -675,9 +675,8 @@ impl<P: Platform> Kernel<P> {
         // Another thread's id names its process, as on Linux.
         let tgid = if tid.is_none() && thread::host_thread(tgid).is_some() { me } else { tgid };
         // Another process's thread, named alone, names its process too.
-        let owner = (tid.is_none() && tgid != me && !crate::pidns::nested())
-            .then(|| thread::owner_of_tid(tgid))
-            .flatten();
+        let owner =
+            (tid.is_none() && tgid != me).then(|| thread::named(tgid).map(|(_, p)| p)).flatten();
         let Some(host) = owner.or_else(|| crate::pidns::to_host(tgid)) else {
             return err(errno::ESRCH);
         };
@@ -691,7 +690,7 @@ impl<P: Platform> Kernel<P> {
         // The caller's own `si_pid` and `si_uid`, as Linux delivers them:
         // the pid as the process it names in the caller's namespace (0 for
         // none), the user as the caller's user namespace has it.
-        let pid = crate::pidns::to_host(word(16)).unwrap_or(0);
+        let pid = crate::pidns::to_host(word(16)).map_or(0, crate::ids::HostPid::get);
         let uid = crate::userns::from_ns(word(20) as u32, false).unwrap_or(crate::userns::OVERFLOW);
         let info = thread::SigInfo { code, pid, uid, value, ..Default::default() };
         if tgid == me {
@@ -713,7 +712,10 @@ impl<P: Platform> Kernel<P> {
             // Another process's other thread: queued for it in the
             // process's mailbox, the process woken to give it to the
             // thread (SIGKILL ends the process).
-            if thread::owner_of_tid(t) != Some(host) || !crate::host::is_fwe(host) {
+            let Some((t, _)) = thread::named(t).filter(|&(_, o)| o == host) else {
+                return err(errno::ESRCH);
+            };
+            if !crate::host::is_fwe(host) {
                 return err(errno::ESRCH);
             }
             if s == fwe_abi::signal::SIGKILL {
@@ -722,7 +724,7 @@ impl<P: Platform> Kernel<P> {
             }
             // A SIGCONT for any of its threads continues the process.
             if s == fwe_abi::signal::SIGCONT {
-                crate::signote::continuing(host, true);
+                crate::signote::continuing(host);
             }
             if let Err(e) = crate::signote::queue_thread_from(host, t, s, code, value, (pid, uid)) {
                 return err(e);
@@ -740,7 +742,7 @@ impl<P: Platform> Kernel<P> {
             && matches!(s, fwe_abi::signal::SIGSTOP | fwe_abi::signal::SIGCONT)
         {
             if s == fwe_abi::signal::SIGCONT {
-                crate::signote::continuing(host, true);
+                crate::signote::continuing(host);
             } else {
                 crate::reaper::stop_signal_sent(host);
             }

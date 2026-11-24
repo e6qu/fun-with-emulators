@@ -9,6 +9,10 @@
 //! fwe's own large blocks (a program's bytes, a cache entry read whole)
 //! are kept out of those regions; there are few of them, so a mapping each
 //! costs little.
+//!
+//! A debug build ends the process if a host signal handler that interrupted
+//! fwe's own code allocates or frees ([`fwe_kernel::host::NoAllocation`]):
+//! that code may have been inside the host allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 
@@ -21,6 +25,27 @@ const PAGE: usize = 16 << 10;
 
 pub struct Allocator;
 
+/// In a debug build: end the process, saying why, if the calling thread
+/// is in a signal handler that may not allocate.
+#[inline(always)]
+fn not_in_a_handler() {
+    #[cfg(debug_assertions)]
+    if fwe_kernel::host::allocation_forbidden() {
+        const WHY: &[u8] = b"fwe: an allocation in a signal handler that interrupted fwe\n";
+        // SAFETY: a write of a static message, then the end of the process
+        // by `SIGABRT` at its default action (fwe's handler for it is
+        // where the allocation may be).
+        unsafe {
+            libc::write(2, WHY.as_ptr().cast(), WHY.len());
+            libc::signal(libc::SIGABRT, libc::SIG_DFL);
+            let mut abrt = fwe_kernel::host::empty_sigset();
+            libc::sigaddset(&mut abrt, libc::SIGABRT);
+            fwe_kernel::host::unblock_signals(&abrt);
+            libc::abort();
+        }
+    }
+}
+
 fn mapped(l: Layout) -> bool {
     l.size() >= MAPPED_FROM && l.align() <= PAGE
 }
@@ -30,6 +55,7 @@ fn mapped(l: Layout) -> bool {
 // zero-filled, as `alloc_zeroed` needs.
 unsafe impl GlobalAlloc for Allocator {
     unsafe fn alloc(&self, l: Layout) -> *mut u8 {
+        not_in_a_handler();
         if !mapped(l) {
             // SAFETY: the caller's layout, as `GlobalAlloc` asks.
             return unsafe { System.alloc(l) };
@@ -49,6 +75,7 @@ unsafe impl GlobalAlloc for Allocator {
     }
 
     unsafe fn alloc_zeroed(&self, l: Layout) -> *mut u8 {
+        not_in_a_handler();
         if !mapped(l) {
             // SAFETY: the caller's layout.
             return unsafe { System.alloc_zeroed(l) };
@@ -58,6 +85,7 @@ unsafe impl GlobalAlloc for Allocator {
     }
 
     unsafe fn dealloc(&self, p: *mut u8, l: Layout) {
+        not_in_a_handler();
         if !mapped(l) {
             // SAFETY: a block `System` made for this layout.
             return unsafe { System.dealloc(p, l) };
@@ -67,6 +95,7 @@ unsafe impl GlobalAlloc for Allocator {
     }
 
     unsafe fn realloc(&self, p: *mut u8, l: Layout, size: usize) -> *mut u8 {
+        not_in_a_handler();
         // SAFETY: the caller's layout and size, as `GlobalAlloc` asks.
         let new = unsafe { Layout::from_size_align_unchecked(size, l.align()) };
         if !mapped(l) && !mapped(new) {

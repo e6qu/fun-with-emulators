@@ -845,7 +845,7 @@ mod tests {
     fn the_initial_namespaces_last_pid_is_the_hosts() {
         let text = read(b"/proc/sys/kernel/ns_last_pid").unwrap();
         let last: i32 = String::from_utf8(text).unwrap().trim().parse().unwrap();
-        assert!(last >= crate::host::pid());
+        assert!(last >= crate::host::pid().get());
         assert_eq!(set_last_pid(100), Err(errno::EPERM));
         assert!(children(b"/proc/sys/kernel").iter().any(|(n, _)| n == b"ns_last_pid"));
     }

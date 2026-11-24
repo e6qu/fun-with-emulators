@@ -27,6 +27,7 @@
 //! bound ([`crate::signote::fd_reply_socket`]), as `SCM_RIGHTS`.
 
 use crate::fdmarks::{self, Mark};
+use crate::ids::HostPid;
 use crate::{Kernel, Platform, guest, thread, uaccess};
 
 use fwe_abi::pidfd::*;
@@ -38,8 +39,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 /// What a process descriptor names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
-    /// The process's host pid.
-    pub host: i32,
+    /// The process.
+    pub host: HostPid,
     /// For a `PIDFD_THREAD` descriptor of one of this process's other
     /// threads: its tid (0 for a process).
     pub tid: i32,
@@ -60,7 +61,9 @@ pub fn of(fd: i32) -> Option<Target> {
         return None;
     }
     match fdmarks::marked(fd)? {
-        Mark::Pid { host, tid, nonblock } => Some(Target { host, tid, nonblock }),
+        Mark::Pid { host, tid, nonblock } => {
+            Some(Target { host: HostPid::new(host)?, tid, nonblock })
+        }
         _ => None,
     }
 }
@@ -110,7 +113,7 @@ pub fn open(t: Target, cloexec: bool) -> Result<i32, i32> {
     if t.tid != 0 {
         THREAD_FDS.fetch_add(1, Ordering::Relaxed);
     }
-    fdmarks::mark(fd, Mark::Pid { host: t.host, tid: t.tid, nonblock: t.nonblock });
+    fdmarks::mark(fd, Mark::Pid { host: t.host.get(), tid: t.tid, nonblock: t.nonblock });
     Ok(fd)
 }
 
@@ -144,8 +147,8 @@ pub fn thread_gone(tid: i32) {
     }
     let me = crate::host::pid();
     for (fd, m) in fdmarks::marks() {
-        if m == (Mark::Pid { host: me, tid, nonblock: false })
-            || m == (Mark::Pid { host: me, tid, nonblock: true })
+        if m == (Mark::Pid { host: me.get(), tid, nonblock: false })
+            || m == (Mark::Pid { host: me.get(), tid, nonblock: true })
         {
             imp::trigger(fd);
         }
@@ -161,10 +164,10 @@ pub fn fdinfo(fd: i32) -> Option<String> {
     let me = crate::host::pid();
     let pid = if t.host == me {
         thread::tgid()
-    } else if ended(fd) && !crate::host::process_exists(t.host) {
+    } else if ended(fd) && !crate::host::probe(t.host).exists() {
         -1
     } else {
-        crate::pidns::to_guest(t.host)
+        crate::pidns::to_guest(t.host.get())
     };
     Some(format!("Pid:\t{pid}\nNSpid:\t{pid}\n"))
 }
@@ -176,7 +179,7 @@ pub fn fdinfo(fd: i32) -> Option<String> {
 pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
     let t = of(fd)?;
     let mut e = crate::snapshot::Enc::new();
-    e.i32(t.host);
+    e.i32(t.host.get());
     e.bool(t.nonblock);
     Some(crate::scm::Export {
         kind: crate::scm::kind::PIDFD,
@@ -191,19 +194,21 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
 /// whether it was.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
-    let t = Target { host: d.i32(), tid: 0, nonblock: d.bool() };
+    let (host, nonblock) = (d.i32(), d.bool());
+    let Some(host) = HostPid::new(host) else { return false };
+    let t = Target { host, tid: 0, nonblock };
     let Ok(kq) = watch(t) else { return false };
     if !crate::scm::replace(fd, kq) {
         return false;
     }
-    fdmarks::mark(fd, Mark::Pid { host: t.host, tid: 0, nonblock: t.nonblock });
+    fdmarks::mark(fd, Mark::Pid { host: t.host.get(), tid: 0, nonblock: t.nonblock });
     true
 }
 
 /// `PIDFD_NONBLOCK` set or cleared on `fd` (`F_SETFL`).
 pub fn set_nonblock(fd: i32, on: bool) {
     if let Some(t) = of(fd) {
-        fdmarks::mark(fd, Mark::Pid { host: t.host, tid: t.tid, nonblock: on });
+        fdmarks::mark(fd, Mark::Pid { host: t.host.get(), tid: t.tid, nonblock: on });
     }
 }
 
@@ -220,6 +225,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
         .into_iter()
         .filter_map(|(fd, m)| match m {
             Mark::Pid { host, tid, nonblock } => {
+                let host = HostPid::new(host)?;
                 // SAFETY: F_GETFD only queries the descriptor.
                 let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
                 (flags >= 0).then_some((
@@ -234,7 +240,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     e.u64(fds.len() as u64);
     for (fd, t, cloexec) in fds {
         e.i32(fd);
-        e.i32(t.host);
+        e.i32(t.host.get());
         e.i32(t.tid);
         e.bool(t.nonblock);
         e.bool(cloexec);
@@ -257,6 +263,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
     let me = crate::host::pid();
     for _ in 0..n {
         let (fd, host, tid, nonblock, cloexec) = (d.i32(), d.i32(), d.i32(), d.bool(), d.bool());
+        let Some(host) = HostPid::new(host) else { continue };
         if exec && cloexec {
             // Closed by the exec: its record goes, so that no later kqueue
             // at its number (which the host gives no identity either) is
@@ -279,7 +286,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
         if tid != 0 {
             THREAD_FDS.fetch_add(1, Ordering::Relaxed);
         }
-        fdmarks::mark(fd, Mark::Pid { host, tid, nonblock });
+        fdmarks::mark(fd, Mark::Pid { host: host.get(), tid, nonblock });
     }
 }
 
@@ -291,7 +298,7 @@ pub fn wait_target(fd: i32) -> Result<(i32, bool), i32> {
         return Err(errno::EBADF);
     }
     let t = of(fd).ok_or(errno::EBADF)?;
-    Ok((t.host, t.nonblock))
+    Ok((t.host.get(), t.nonblock))
 }
 
 /// `process_mrelease(pidfd, flags)`: release the memory of a process being
@@ -314,7 +321,7 @@ pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
         return err(errno::ESRCH);
     }
     if ended(fd) {
-        let reaped = exit_status(t.host).is_some() || !crate::host::process_exists(t.host);
+        let reaped = exit_status(t.host.get()).is_some() || !crate::host::probe(t.host).exists();
         return if reaped { err(errno::ESRCH) } else { 0 };
     }
     let exiting = crate::procreg::kinfo(t.host).is_some_and(|k| k.exiting || k.state == 5);
@@ -323,7 +330,7 @@ pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
 
 /// The host process a `/proc/<pid>` directory descriptor names (which
 /// `pidfd_send_signal` takes as Linux does), if `fd` is one.
-fn proc_dir_target(fd: i32) -> Option<i32> {
+fn proc_dir_target(fd: i32) -> Option<HostPid> {
     let path = crate::synthdir::path_of(fd)?;
     let rest = path.strip_prefix(b"/proc/")?;
     if rest == b"self" || rest == b"thread-self" {
@@ -357,7 +364,7 @@ impl<P: Platform> Kernel<P> {
             }
         } else {
             let Some(host) = crate::pidns::to_host(pid) else { return err(errno::ESRCH) };
-            if !crate::host::process_exists(host) {
+            if !crate::host::probe(host).exists() {
                 return err(errno::ESRCH);
             }
             Target { host, tid: 0, nonblock }
@@ -409,7 +416,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::ESRCH);
         }
         let me = crate::host::pid();
-        let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host) };
+        let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host.get()) };
         if pid == 0 {
             // Not in the caller's pid namespace or one below it.
             return err(errno::EINVAL);
@@ -421,7 +428,7 @@ impl<P: Platform> Kernel<P> {
         }
         if flags & PIDFD_SIGNAL_PROCESS_GROUP != 0 {
             // SAFETY: plain host call.
-            let pgid = unsafe { libc::getpgid(t.host) };
+            let pgid = unsafe { libc::getpgid(t.host.get()) };
             if pgid < 0 {
                 return err(errno::ESRCH);
             }
@@ -502,7 +509,7 @@ impl<P: Platform> Kernel<P> {
         let asked: u64 = guest!(uaccess::read(arg));
         // As the caller's pid namespace numbers it: none outside it.
         let me = crate::host::pid();
-        let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host) };
+        let pid = if t.host == me { thread::tgid() } else { crate::pidns::to_guest(t.host.get()) };
         if pid == 0 {
             return err(errno::ESRCH);
         }
@@ -510,9 +517,9 @@ impl<P: Platform> Kernel<P> {
         let put =
             |info: &mut [u8], at: usize, v: u32| info[at..at + 4].copy_from_slice(&v.to_ne_bytes());
         let mut mask = 0u64;
-        let gone = ended(fd) && !crate::host::process_exists(t.host);
+        let gone = ended(fd) && !crate::host::probe(t.host).exists();
         if gone {
-            let status = exit_status(t.host).filter(|_| asked & PIDFD_INFO_EXIT != 0);
+            let status = exit_status(t.host.get()).filter(|_| asked & PIDFD_INFO_EXIT != 0);
             let Some(status) = status else { return err(errno::ESRCH) };
             mask |= PIDFD_INFO_EXIT;
             put(&mut info, 60, status as u32);
@@ -659,7 +666,7 @@ impl<P: Platform> Kernel<P> {
 #[derive(Clone, Copy, Debug)]
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct GetFd {
-    host: i32,
+    host: HostPid,
     fd: i32,
     pidfd: i32,
 }
@@ -741,7 +748,7 @@ mod imp {
                 trigger(kq);
             }
         } else {
-            attach(kq, t.host);
+            attach(kq, t.host.get());
         }
         Ok(kq)
     }
@@ -778,8 +785,8 @@ mod imp {
             }
         }
         let (r, fd) = crate::signote::receive_fd(reply.sock);
-        if r != 0 {
-            return err(crate::host::errno_to_linux(r));
+        if let Some(e) = r {
+            return err(e.linux());
         }
         if fd < 0 {
             return err(errno::EBADF);

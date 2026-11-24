@@ -1357,7 +1357,7 @@ impl Fs {
     /// namespace: its working directory and root, as the reader names
     /// them (a namespace path where the reader is in another mount
     /// namespace), its mounts, and its network files.
-    fn other_view(&self, host: i32, sub: &[u8]) -> Option<crate::procfs::Entry> {
+    fn other_view(&self, host: crate::ids::HostPid, sub: &[u8]) -> Option<crate::procfs::Entry> {
         use crate::procfs::Entry;
         if sub == b"/net" {
             return Some(Entry::Dir);
@@ -1525,7 +1525,7 @@ impl Fs {
     /// `/proc/<pid>/fd/<n>` of another process, host process `host`: a
     /// link to what its descriptor `n` is open on, a path as this process
     /// sees it.
-    fn other_fd(&self, host: i32, n: &[u8]) -> crate::procfs::Entry {
+    fn other_fd(&self, host: crate::ids::HostPid, n: &[u8]) -> crate::procfs::Entry {
         use crate::procpid::FdTarget;
         let Some(fd) = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok()) else {
             return crate::procfs::Entry::Missing;
@@ -1621,7 +1621,11 @@ impl Fs {
     /// The process a `/proc/<pid>/...` path (from `dirfd`) is about and the
     /// rest of the path: `None` for the caller (`self` or its own pid),
     /// else its host pid (`None` inside when it has none), with the rest.
-    pub fn proc_target(&self, dirfd: i32, path: &[u8]) -> Option<(Option<Option<i32>>, Vec<u8>)> {
+    pub fn proc_target(
+        &self,
+        dirfd: i32,
+        path: &[u8],
+    ) -> Option<(Option<Option<crate::ids::HostPid>>, Vec<u8>)> {
         proc_target_of(&self.synthetic_path(dirfd, path)?)
     }
 
@@ -3303,7 +3307,7 @@ fn proc_magic_link(rel: &[u8]) -> Option<MagicLink> {
         p == b"self"
             || p == b"thread-self"
             || std::str::from_utf8(p).ok().and_then(|n| n.parse::<i32>().ok())
-                == Some(crate::pidns::to_guest(crate::host::pid()))
+                == Some(crate::pidns::to_guest(crate::host::pid().get()))
     };
     match parts[..] {
         [who, b"fd", n] if own(who) => {
@@ -3971,7 +3975,7 @@ pub struct OtherView {
 
 impl OtherView {
     /// What host process `host` shares, if it does.
-    pub fn of(host: i32) -> Option<OtherView> {
+    pub fn of(host: crate::ids::HostPid) -> Option<OtherView> {
         let b = crate::procstore::get_of(crate::procstore::Kind::View, host)?;
         let mut d = crate::snapshot::Dec::new(&b);
         let (mnt, root, cwd) = (d.bytes(), d.bytes(), d.bytes());
@@ -4029,7 +4033,7 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
 /// host pid (if it is in the reader's pid namespace), pid and the rest of
 /// the path.
 #[allow(clippy::type_complexity)]
-fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)> {
+fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<crate::ids::HostPid>, i32, Vec<u8>)> {
     let Some(rest) = absolute.strip_prefix(b"/proc/") else { return Ok(absolute.to_vec()) };
     let (num, sub) = match rest.iter().position(|&b| b == b'/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -4048,7 +4052,7 @@ fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<i32>, i32, Vec<u8>)>
 }
 
 /// [`Fs::proc_target`] of `p`, a path in fwe's `/proc` (`/proc/42/maps`).
-pub(crate) fn proc_target_of(p: &[u8]) -> Option<(Option<Option<i32>>, Vec<u8>)> {
+pub(crate) fn proc_target_of(p: &[u8]) -> Option<(Option<Option<crate::ids::HostPid>>, Vec<u8>)> {
     match own_or_other(p) {
         Ok(own) => Some((None, own.strip_prefix(b"/proc/self")?.to_vec())),
         Err((host, _, sub)) => Some((Some(host), sub)),

@@ -213,13 +213,8 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
     // signal the host showed pending may be one this thread never blocked
     // (it landed during the look, and is delivered as the look returns),
     // which blocked now would wait unseen on the host.
-    let mut was = host::empty_sigset();
-    // SAFETY: initialized signal sets; the pending signals are delivered to
-    // this thread between the two calls.
-    unsafe {
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut was);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &was, std::ptr::null_mut());
-    }
+    // The pending signals are delivered to this thread as they unblock.
+    drop(host::MaskGuard::unblock(&set));
     REROUTING.set(false);
     thread::wake_others(host::WAKE_SIGNAL);
 }
@@ -228,10 +223,8 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
 fn block_async_signals() {
     let mut all = host::host_sigset(u64::MAX);
     // SAFETY: `all` is an initialized signal set.
-    unsafe {
-        libc::sigaddset(&mut all, host::WAKE_SIGNAL);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-    }
+    unsafe { libc::sigaddset(&mut all, host::WAKE_SIGNAL) };
+    host::block_signals(&all);
     UNBLOCKED.with(|u| u.set(false));
 }
 
@@ -245,9 +238,7 @@ fn reblock() {
 
 /// Run under the host mask this thread's guest mask calls for.
 fn apply_guest_mask() {
-    let mask = host::host_mask_for(thread::mask());
-    // SAFETY: `mask` is an initialized signal set.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) };
+    host::set_signal_mask(&host::host_mask_for(thread::mask()));
     UNBLOCKED.with(|u| u.set(true));
 }
 
@@ -437,12 +428,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
         && !fwe_kernel::ptrace::stops_at_syscalls()
         && !fwe_kernel::ptrace::traced()
     {
-        // SAFETY: a full set, and blocking it on this thread only.
-        unsafe {
-            let mut all: libc::sigset_t = std::mem::zeroed();
-            libc::sigfillset(&mut all);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
-        }
+        host::block_signals(&host::full_sigset());
         fwe_kernel::thread_exit_cleanup();
         crate::exit_current_thread(b.regs.x[0] as i32, true);
     }
@@ -1014,7 +1000,8 @@ fn take_async(
         // signal. Entering `HostCode` would apply the guest's mask and let
         // signals nest in this handler without bound, each frame further
         // down the thread's signal stack until the host cannot deliver one
-        // and ends the process.
+        // and ends the process. That code may be in the host allocator.
+        let _no_allocation = host::NoAllocation::enter();
         record();
         // A system call made through the gate delivers it as it ends; one
         // on its way out starts that again, to look for it.
@@ -1238,7 +1225,7 @@ static EARLY_VALUE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64:
 /// still to be forgotten as its parent's. Async-signal-safe.
 fn in_fork_child() -> bool {
     let forking = FORKING.load(std::sync::atomic::Ordering::SeqCst);
-    forking != 0 && forking != host::pid_now()
+    forking != 0 && forking != host::pid_now().get()
 }
 
 /// Keep Linux signal `sig`, carrying `info`, for [`post_early`].
@@ -1731,21 +1718,7 @@ extern "C" fn on_probe_signal(
 
 /// Report synchronous signals during host probes instead of dying silently.
 pub fn install_probe_reporter() {
-    // SAFETY: a fresh mapping for the signal stack, leaked for the life of
-    // the process.
-    unsafe {
-        let stack = libc::mmap(
-            std::ptr::null_mut(),
-            SIGNAL_STACK_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        assert_ne!(stack, libc::MAP_FAILED, "allocating the signal stack failed");
-        let ss = libc::stack_t { ss_sp: stack, ss_size: SIGNAL_STACK_SIZE, ss_flags: 0 };
-        assert_eq!(libc::sigaltstack(&ss, std::ptr::null_mut()), 0, "sigaltstack failed");
-    }
+    install_thread_altstack();
     for sig in [libc::SIGTRAP, libc::SIGILL, libc::SIGSEGV, libc::SIGBUS, libc::SIGSYS] {
         install(sig, on_probe_signal);
     }
@@ -1816,22 +1789,13 @@ pub fn altstack_mapping() -> Option<u64> {
     }
 }
 
+/// Give the calling thread a fresh signal stack, with a guard below it
+/// ([`host::GUARD`]): a handler nested past its room faults there, and the
+/// process ends, instead of writing over the mapping below. Kept for the
+/// life of the thread, then given to a later one ([`crate::stacks`]).
 pub fn install_thread_altstack() {
-    // SAFETY: a fresh mapping for the signal stack, leaked for the life of
-    // the thread (which runs until the process or the thread exits).
-    unsafe {
-        let stack = libc::mmap(
-            std::ptr::null_mut(),
-            SIGNAL_STACK_SIZE,
-            libc::PROT_READ | libc::PROT_WRITE,
-            libc::MAP_PRIVATE | libc::MAP_ANON,
-            -1,
-            0,
-        );
-        assert_ne!(stack, libc::MAP_FAILED, "allocating the signal stack failed");
-        let ss = libc::stack_t { ss_sp: stack, ss_size: SIGNAL_STACK_SIZE, ss_flags: 0 };
-        assert_eq!(libc::sigaltstack(&ss, std::ptr::null_mut()), 0, "sigaltstack failed");
-    }
+    let stack = host::map_stack(SIGNAL_STACK_SIZE).expect("allocating the signal stack failed");
+    use_altstack(stack as u64);
 }
 
 /// Install the per-thread signal stack and the process-wide handlers for

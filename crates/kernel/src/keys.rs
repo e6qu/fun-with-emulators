@@ -329,7 +329,7 @@ pub struct Caller {
 
 /// This process's identity: host pid and start time.
 fn me() -> (i32, u64) {
-    let pid = crate::host::pid();
+    let pid = crate::host::pid().get();
     (pid, crate::procreg::own_start().unwrap_or(0))
 }
 
@@ -358,7 +358,7 @@ impl Store {
         if let Some(h) = self.holders.iter().find(|h| h.pid == c.pid && h.start == c.start) {
             return Some(std::borrow::Cow::Borrowed(h));
         }
-        if c.pid != crate::host::pid() {
+        if c.pid != crate::host::pid().get() {
             return None;
         }
         match *INHERIT.lock().unwrap_or_else(|e| e.into_inner()) {
@@ -919,7 +919,7 @@ impl Store {
     /// Collect what is gone: holders of ended processes, invalidated keys,
     /// keys revoked or expired a `gc_delay` ago, and keys nothing reaches.
     fn collect(&mut self) {
-        let alive = |h: &Holder| crate::procreg::alive((h.pid, h.start));
+        let alive = |h: &Holder| crate::procreg::alive_kept((h.pid, h.start));
         self.holders.retain(alive);
         let now = now();
         let delay = sysctl("gc_delay");
@@ -1013,7 +1013,11 @@ pub fn forked(child: i32) {
     if !st.get().holders.iter().any(|h| h.pid == pid && h.start == start) {
         return;
     }
-    let Some(cstart) = crate::procreg::host_info(child).map(|i| i.0) else { return };
+    let Some(cstart) =
+        crate::ids::HostPid::new(child).and_then(crate::procreg::host_info).map(|i| i.0)
+    else {
+        return;
+    };
     let _ = with(|s| {
         let Some(h) = s.holders.iter().find(|h| h.pid == pid && h.start == start).cloned() else {
             return ((), false);
@@ -1774,7 +1778,9 @@ impl<P: Platform> Kernel<P> {
     /// effective ones, and both session keyrings that user's.
     fn session_to_parent(&self, c: &Caller) -> i64 {
         // SAFETY: getppid cannot fail.
-        let ppid = unsafe { libc::getppid() };
+        let Some(ppid) = crate::ids::HostPid::new(unsafe { libc::getppid() }) else {
+            return err(errno::EPERM);
+        };
         let Some(pstart) = crate::procreg::host_info(ppid).map(|i| i.0) else {
             return err(errno::EPERM);
         };
@@ -1789,7 +1795,7 @@ impl<P: Platform> Kernel<P> {
         result(with(|s| {
             let r = (|| {
                 let (ses, _) = s.lookup(c, KEY_SPEC_SESSION_KEYRING, Look::PLAIN, KEY_LINK)?;
-                let parent = Caller { pid: ppid, start: pstart, ..c.clone() };
+                let parent = Caller { pid: ppid.get(), start: pstart, ..c.clone() };
                 let theirs = s.holder(&parent).map_or(0, |h| h.session);
                 let owner = |k: i32| s.keys.get(&k).map(|k| k.uid);
                 if owner(ses) != Some(euid)
@@ -1964,6 +1970,20 @@ impl<P: Platform> Kernel<P> {
             Ok(k) => k,
             Err(e) => return err(e),
         };
+        // The lengths are the key's to bound, checked before anything is
+        // read, as Linux checks them (`keyctl_pkey_params_get_2`).
+        let q = match kc::pkey_query(&key, &info) {
+            Ok(q) => q,
+            Err(e) => return err(e),
+        };
+        let (most_in, most_out) = match op {
+            KEYCTL_PKEY_ENCRYPT => (q.max_dec_size, q.max_enc_size),
+            KEYCTL_PKEY_DECRYPT => (q.max_enc_size, q.max_dec_size),
+            _ => (q.max_data_size, q.max_sig_size),
+        };
+        if in_len > usize::from(most_in) || out_len > usize::from(most_out) {
+            return err(errno::EINVAL);
+        }
         let input = guest!(uaccess::read_bytes(a[2], in_len));
         if op == KEYCTL_PKEY_VERIFY {
             let sig = guest!(uaccess::read_bytes(a[3], out_len));

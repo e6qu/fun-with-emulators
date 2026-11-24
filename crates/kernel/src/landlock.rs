@@ -293,7 +293,7 @@ pub fn publish() {
 
 /// Host process `pid`'s chain (none if it is not restricted, or the one
 /// kept is a former process's).
-fn chain_of(pid: i32) -> Vec<u64> {
+fn chain_of(pid: crate::ids::HostPid) -> Vec<u64> {
     let Some(b) = crate::procstore::get_of(crate::procstore::Kind::Landlock, pid) else {
         return Vec::new();
     };
@@ -306,7 +306,7 @@ fn chain_of(pid: i32) -> Vec<u64> {
 
 /// Whether host process `target` is inside every layer of this process's
 /// domain that scopes `scope` (it is the same domain or one nested in it).
-fn within(target: i32, scope: u64) -> bool {
+fn within(target: crate::ids::HostPid, scope: u64) -> bool {
     let d = DOMAIN.lock().unwrap_or_else(|e| e.into_inner());
     if !d.iter().any(|l| l.1.scoped & scope != 0) {
         return true;
@@ -323,19 +323,18 @@ fn within(target: i32, scope: u64) -> bool {
 }
 
 /// A signal to host process `target`: `EPERM` outside a scoping layer.
-pub fn may_signal(target: i32) -> Result<(), i32> {
+pub fn may_signal(target: crate::ids::HostPid) -> Result<(), i32> {
     if !active() || within(target, SCOPE_SIGNAL) { Ok(()) } else { Err(errno::EPERM) }
 }
 
 /// Tracing (or reading as a tracer does) host process `target`: only one
 /// in this process's domain or one nested in it (`EPERM` for a process
 /// less restricted, as Linux's Landlock has it for every layer).
-pub fn may_trace(target: i32) -> Result<(), i32> {
+pub fn may_trace(target: crate::ids::HostPid) -> Result<(), i32> {
     if !active() {
         return Ok(());
     }
-    // SAFETY: getpid cannot fail.
-    if target == unsafe { libc::getpid() } {
+    if target == crate::host::pid() {
         return Ok(());
     }
     let theirs = chain_of(target);
@@ -348,7 +347,7 @@ pub fn may_trace(target: i32) -> Result<(), i32> {
 
 /// `PTRACE_TRACEME` with host process `parent` as tracer: the parent's
 /// domain must be this process's or one this one's is nested in.
-pub fn may_be_traced_by(parent: i32) -> Result<(), i32> {
+pub fn may_be_traced_by(parent: crate::ids::HostPid) -> Result<(), i32> {
     let theirs = chain_of(parent);
     if theirs.is_empty() {
         return Ok(());
@@ -363,7 +362,13 @@ pub fn may_be_traced_by(parent: i32) -> Result<(), i32> {
 
 /// A connection to an abstract socket bound by host process `owner`.
 pub fn may_connect_abstract(owner: i32) -> Result<(), i32> {
-    if !active() || within(owner, SCOPE_ABSTRACT_UNIX_SOCKET) { Ok(()) } else { Err(errno::EPERM) }
+    if !active()
+        || crate::ids::HostPid::new(owner).is_some_and(|o| within(o, SCOPE_ABSTRACT_UNIX_SOCKET))
+    {
+        Ok(())
+    } else {
+        Err(errno::EPERM)
+    }
 }
 
 /// The identities (device, inode) of a file and of every directory above

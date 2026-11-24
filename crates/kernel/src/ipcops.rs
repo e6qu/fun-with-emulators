@@ -98,7 +98,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_shmget(&mut self, key: u64, size: u64, flags: u64) -> i64 {
-        let me = crate::host::pid();
+        let me = crate::host::pid().get();
         let creds = self.creds.clone();
         self.ipc_get(
             Kind::Shm,
@@ -1053,6 +1053,7 @@ fn shm_lock(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
     use crate::creds::Creds;

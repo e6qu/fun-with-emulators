@@ -48,7 +48,7 @@ fn start() {
         return;
     }
     let Some((kq, parent)) = watch_parent() else { return };
-    let me = crate::host::pid();
+    let me = crate::host::pid().get();
     KNOWN.store((me as u64) << 32 | parent as u32 as u64, SeqCst);
     let started = crate::host::with_signals_blocked(|| {
         std::thread::Builder::new().name("fwe-pdeath".into()).spawn(move || wait(kq))
@@ -64,13 +64,13 @@ fn start() {
 /// This process's host parent, while the watch knows it lives.
 pub fn parent() -> Option<i32> {
     let v = KNOWN.load(SeqCst);
-    ((v >> 32) as i32 == crate::host::pid() && v != 0).then_some(v as u32 as i32)
+    ((v >> 32) as i32 == crate::host::pid().get() && v != 0).then_some(v as u32 as i32)
 }
 
 /// This process asked the host for its parent: from the 32nd time, the
 /// parent is watched and the answer kept ([`parent`]).
 pub fn asked() {
-    let me = crate::host::pid() as u64;
+    let me = crate::host::pid().get() as u64;
     let v = ASKS.load(SeqCst);
     let n = if v >> 32 == me { (v & 0xffff_ffff) + 1 } else { 1 };
     ASKS.store(me << 32 | n.min(1 << 20), SeqCst);
@@ -154,7 +154,7 @@ fn wait(kq: i32) {
         let mut out: libc::kevent = std::mem::zeroed();
         let n = loop {
             let n = libc::kevent(kq, std::ptr::null(), 0, &mut out, 1, std::ptr::null());
-            if n >= 0 || crate::host::last_errno() != libc::EINTR {
+            if n >= 0 || !crate::host::last_errno().is(libc::EINTR) {
                 break n;
             }
         };
@@ -178,10 +178,9 @@ fn deliver(sig: u64) {
     if sig == 0 {
         return;
     }
-    let me = crate::host::pid();
     match crate::host::signal_to_host(sig) {
         Some(h) => {
-            crate::host::kill_process(me, h);
+            crate::host::kill_process(crate::host::pid(), h);
         }
         None => {
             // SAFETY: getuid cannot fail.

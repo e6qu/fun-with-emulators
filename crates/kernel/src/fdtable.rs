@@ -225,7 +225,7 @@ pub fn dup_reserved(fd: i32) -> Result<i32, i32> {
     let high = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, guest_max()) };
     if high >= 0 {
         Ok(high)
-    } else if crate::host::last_errno() == libc::EBADF {
+    } else if crate::host::last_errno().is(libc::EBADF) {
         Err(fwe_abi::errno::EBADF)
     } else {
         Err(fwe_abi::errno::EMFILE)

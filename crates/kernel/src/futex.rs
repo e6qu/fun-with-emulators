@@ -924,6 +924,7 @@ pub(crate) fn requeue_private(
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
     use fwe_abi::futex::{FUTEX_WAIT, FUTEX_WAKE};

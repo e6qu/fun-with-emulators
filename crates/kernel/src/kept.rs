@@ -41,6 +41,7 @@ pub(crate) struct Kept<T> {
 }
 
 /// A [`Kept`] table, locked.
+#[must_use = "dropped at once, it lets go at once"]
 pub(crate) struct Held<'a, T: Table> {
     used: &'a AtomicBool,
     guard: MutexGuard<'a, T>,

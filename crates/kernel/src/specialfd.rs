@@ -1151,7 +1151,8 @@ mod imp {
             if unsafe { libc::fcntl(rfd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
                 return Some(r);
             }
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            // The write waits for room, as Linux's sleeps.
+            crate::procstore::guest_sleep(std::time::Duration::from_millis(1));
             if crate::thread::deliverable() != 0 {
                 return Some(err(errno::EINTR));
             }
@@ -1229,6 +1230,7 @@ mod imp {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
     use fwe_abi::eventfd::*;

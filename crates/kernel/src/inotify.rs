@@ -140,7 +140,7 @@ impl Registry {
 }
 
 fn alive(p: Proc) -> bool {
-    p == crate::sysvipc::me() || crate::procreg::alive(p)
+    p == crate::sysvipc::me() || crate::procreg::alive_kept(p)
 }
 
 static REGISTRY: OnceLock<Record<Registry>> = OnceLock::new();
@@ -325,7 +325,7 @@ fn datagram(inst: &[u8], ev: &[u8]) -> Sent {
     });
     match r {
         Ok(n) if n == ev.len() as i32 => Sent::Yes,
-        _ => match crate::host::last_errno() {
+        _ => match crate::host::last_errno().raw() {
             libc::ENOENT | libc::ECONNREFUSED => Sent::Gone,
             _ => Sent::No,
         },
@@ -349,7 +349,7 @@ fn forget(inst: &[u8]) {
 fn sender(f: impl FnOnce(i32) -> Result<i32, i32>) -> Result<i32, i32> {
     static S: Mutex<(i32, i32)> = Mutex::new((-1, 0));
     let mut g = S.lock().unwrap_or_else(|e| e.into_inner());
-    let me = crate::host::pid();
+    let me = crate::host::pid().get();
     if g.0 < 0 || g.1 != me {
         // SAFETY: plain host call; the socket is fwe's own.
         let s = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
@@ -719,7 +719,7 @@ pub fn unmounted(mnt: &[u8], point: &[u8]) {
 /// A cookie tying a move's two events together.
 pub fn cookie() -> u32 {
     static N: AtomicU32 = AtomicU32::new(0);
-    let pid = crate::host::pid() as u32;
+    let pid = crate::host::pid().get() as u32;
     (pid << 12) ^ N.fetch_add(1, Ordering::Relaxed).wrapping_add(1)
 }
 

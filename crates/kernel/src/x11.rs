@@ -464,7 +464,7 @@ fn send_with_fd(fd: i32, data: &[u8], pass: i32) -> bool {
             continue;
         }
         let e = crate::host::last_errno();
-        if r < 0 && (e == libc::EAGAIN || e == libc::EINTR) {
+        if r < 0 && (e.is(libc::EAGAIN) || e.is(libc::EINTR)) {
             let mut p = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
             // SAFETY: one valid pollfd.
             unsafe { libc::poll(&mut p, 1, -1) };

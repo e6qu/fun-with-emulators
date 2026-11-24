@@ -126,7 +126,7 @@ impl Queue {
 }
 
 fn alive(p: Proc) -> bool {
-    p == ipc::me() || crate::procreg::alive(p)
+    p == ipc::me() || crate::procreg::alive_kept(p)
 }
 
 impl Data for Queue {
@@ -307,9 +307,9 @@ fn set_holder(q: &mut Queue, p: Proc, n: u32, own: bool) -> bool {
 /// process holds are held by the child as many times (unless it counted
 /// itself already), so that this process closing its own or ending frees
 /// none the child has.
-pub fn forked(child: i32) {
+pub fn forked(child: crate::ids::HostPid) {
     if let Some(start) = crate::procreg::start_time(child) {
-        hand_on((child, start));
+        hand_on((child.get(), start));
     }
 }
 
@@ -531,34 +531,39 @@ fn send_notification(n: &Notify, why: u8, by: Sender) {
             if n.owner == ipc::me() {
                 crate::thread::post_process(sig, info);
                 crate::thread::wake_others(crate::host::WAKE_SIGNAL);
-            } else if let Some(h) = crate::host::signal_to_host(sig) {
-                // Another process: a host signal, with a note of what it
-                // carries.
-                crate::signote::note_with(n.owner.0, h, info.code, info.value, by.uid);
-                if crate::host::kill_process(n.owner.0, h) != 0 {
-                    crate::signote::unnote(n.owner.0, h);
-                }
-            } else {
-                // One the host lacks (a real-time signal): queued in the
-                // owner's mailbox. A notification that cannot be delivered
-                // is lost, as Linux's is when its receiver has gone.
-                crate::signal::send_unhosted_from(
-                    n.owner.0,
-                    sig,
-                    info.code,
-                    info.value,
-                    (by.pid, by.uid),
-                );
+            } else if let Some(owner) = crate::ids::HostPid::new(n.owner.0) {
+                signal_other(owner, sig, info, (by.pid, by.uid));
             }
         }
         _ => {}
     }
 }
 
+/// A notification's signal `sig` with `info`, sent by `by` (host pid,
+/// user), to another process `owner`: a host signal with a note of what
+/// it carries, or one the host lacks (a real-time signal) queued in the
+/// owner's mailbox. One that cannot be delivered is lost, as Linux's is
+/// when its receiver has gone.
+fn signal_other(
+    owner: crate::ids::HostPid,
+    sig: u64,
+    info: crate::thread::SigInfo,
+    by: (i32, u32),
+) {
+    if let Some(h) = crate::host::signal_to_host(sig) {
+        crate::signote::note_with(owner, h, info.code, info.value, by.1);
+        if crate::host::kill_process(owner, h) != 0 {
+            crate::signote::unnote(owner, h);
+        }
+    } else {
+        crate::signal::send_unhosted_from(owner, sig, info.code, info.value, by);
+    }
+}
+
 /// What a send or receive needs of the caller, taken under the kernel
 /// lock: who it is.
 fn sender(creds: &Creds) -> Sender {
-    let pid = crate::host::pid();
+    let pid = crate::host::pid().get();
     Sender { pid, uid: creds.uid }
 }
 
@@ -1128,7 +1133,10 @@ fn sweep_addresses(ns_dir: &[u8]) {
         let pid = std::str::from_utf8(rest.split(|&b| b == b'-').next().unwrap_or_default())
             .ok()
             .and_then(|p| p.parse::<i32>().ok());
-        if pid.is_some_and(|p| crate::procreg::start_time(p).is_none()) {
+        if pid
+            .and_then(crate::ids::HostPid::new)
+            .is_some_and(|p| crate::procreg::start_time(p).is_none())
+        {
             let _ = std::fs::remove_file(e.path());
         }
     }

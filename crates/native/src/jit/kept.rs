@@ -290,7 +290,7 @@ pub(super) fn program_is(id: Option<(u64, u64)>) {
 pub(super) fn forked() {
     if let Some(k) = kept().as_mut() {
         k.new.clear();
-        k.owner = fwe_kernel::host::pid();
+        k.owner = fwe_kernel::host::pid().get();
     }
 }
 
@@ -304,7 +304,7 @@ fn begun(k: &mut Option<Kept>) -> &mut Kept {
         parts: HashMap::default(),
         last: None,
         new: HashMap::default(),
-        owner: fwe_kernel::host::pid(),
+        owner: fwe_kernel::host::pid().get(),
     })
 }
 
@@ -788,7 +788,7 @@ pub(super) fn write() {
     let mut k = kept();
     let Some(k) = k.as_mut() else { return };
     let new = std::mem::take(&mut k.new);
-    if new.is_empty() || k.owner != fwe_kernel::host::pid() {
+    if new.is_empty() || k.owner != fwe_kernel::host::pid().get() {
         return;
     }
     let Some(build) = build_dir() else { return };

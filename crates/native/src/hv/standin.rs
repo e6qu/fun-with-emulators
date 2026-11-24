@@ -564,16 +564,17 @@ pub fn vm_destroy() -> hv_return_t {
     if !VM_LIVE.load(SeqCst) {
         return HV_BAD_ARGUMENT;
     }
-    let live = VCPUS.iter().filter(|p| !p.load(SeqCst).is_null()).count();
-    if live > 0 {
-        violation(&format!("hv_vm_destroy with {live} vCPU(s) still alive"));
+    if VCPUS.iter().any(|p| !p.load(SeqCst).is_null()) {
+        violation("hv_vm_destroy with vCPUs still alive");
         return HV_BUSY;
     }
     VM_LIVE.store(false, SeqCst);
     tell_watcher(b'D');
-    // Not a lock a handler may wait on: drop the records only if free.
+    // Not a lock a handler may wait on: the records are taken out only if
+    // it is free, and not freed (a handler may not free; a VM is destroyed
+    // once, and its records go with the process).
     if let Ok(mut g) = VM.try_lock() {
-        *g = None;
+        std::mem::forget(g.take());
     }
     HV_SUCCESS
 }

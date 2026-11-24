@@ -271,7 +271,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         fwe_kernel::timing::mark("fork: prepared");
         // A fault signal sent to the child before it is set up is kept
         // for it (`trap::post_early`).
-        trap::FORKING.store(host::pid(), Ordering::SeqCst);
+        trap::FORKING.store(host::pid().get(), Ordering::SeqCst);
         // The translations whole in the child.
         let mut jit = crate::jit::hold();
         let pid = fwe_kernel::fork_locked(|| {
@@ -417,7 +417,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         unsafe {
             let mut b = 0u8;
             while libc::read(done[0], (&mut b as *mut u8).cast(), 1) < 0
-                && host::last_errno() == libc::EINTR
+                && host::last_errno().is(libc::EINTR)
             {}
             libc::close(done[0]);
         }
@@ -452,9 +452,7 @@ fn fork_with_signals_held(
     // SAFETY: plain host calls on initialized signal sets and the pipe
     // opened above, each end closed once in each process.
     unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
+        let mut all = host::full_sigset();
         // Memory faults stay deliverable: the child's checked copies of
         // guest memory recover from them, and a blocked one would end it.
         // The other fault signals fwe raises nowhere before the child
@@ -466,7 +464,7 @@ fn fork_with_signals_held(
             libc::sigdelset(&mut all, sig);
         }
         libc::sigdelset(&mut all, libc::SIGSYS);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
+        let held = host::MaskGuard::block(&all);
         let pid = fork();
         fwe_kernel::timing::mark("fork: host fork returned");
         // What a failed fork left, kept for the caller across the calls below.
@@ -476,18 +474,22 @@ fn fork_with_signals_held(
             b = in_parent(pid);
         }
         if pid != 0 {
-            libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut());
+            drop(held);
             if go[1] >= 0 {
                 libc::write(go[1], (&b as *const u8).cast(), 1);
             }
-        } else if go[0] >= 0 {
-            libc::close(go[1]);
-            // Until the parent's byte, or its end (should it be gone: then
-            // [`GO`], nothing written for it).
-            while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
-                && host::last_errno() == libc::EINTR
-            {}
-            fwe_kernel::timing::mark("fork: child let go");
+        } else {
+            // The child goes on with them held, until it takes its own mask.
+            held.keep();
+            if go[0] >= 0 {
+                libc::close(go[1]);
+                // Until the parent's byte, or its end (should it be gone:
+                // then [`GO`], nothing written for it).
+                while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
+                    && host::last_errno().is(libc::EINTR)
+                {}
+                fwe_kernel::timing::mark("fork: child let go");
+            }
         }
         for fd in go.into_iter().filter(|&fd| fd >= 0) {
             if pid == 0 && fd == go[1] {
@@ -521,7 +523,9 @@ fn reaped_signal(pid: i32, wstatus: i32) {
     // done; a child fwe did not start is the host user's.
     // SAFETY: getuid cannot fail.
     let host_user = host::uid_to_initial(unsafe { libc::getuid() });
-    let uid = fwe_kernel::procreg::kept_uid(pid).unwrap_or(host_user);
+    let uid = fwe_kernel::ids::HostPid::new(pid)
+        .and_then(fwe_kernel::procreg::kept_uid)
+        .unwrap_or(host_user);
     let info = thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
     reaper::reaped_child_signal(pid, info);
 }
@@ -530,7 +534,8 @@ fn reaped_signal(pid: i32, wstatus: i32) {
 /// Host process `pid` ended so.
 fn linux_wstatus(pid: i32, status: libc::c_int) -> i32 {
     if (libc::WIFEXITED(status) || libc::WIFSIGNALED(status))
-        && let Some(s) = fwe_kernel::procreg::end_status(pid)
+        && let Some(s) =
+            fwe_kernel::ids::HostPid::new(pid).and_then(fwe_kernel::procreg::end_status)
     {
         // It ended of a Linux signal, as it recorded: one the host lacks,
         // ignores by default, or with the core fwe dumped.
@@ -608,7 +613,11 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         }
     }
     if fwe_kernel::ptrace::tracing() {
-        return wait4_tracer(pid, host_options, wstatus, rusage);
+        // A tracee named alone, as its mailbox is named (a thread's number
+        // is its process's to the host).
+        let guest = regs.x[0] as i32;
+        let tracee = if guest > 0 { fwe_kernel::ptrace::target_of(guest) } else { None };
+        return wait4_tracer(pid, tracee, host_options, wstatus, rusage);
     }
     start_watcher_if_wanted();
     let want = Want {
@@ -622,7 +631,9 @@ pub fn do_wait4(regs: &Regs) -> i64 {
         let r = wait4_host(pid, host_options, wstatus, rusage);
         // A child that began to be traced while this waited, and stopped.
         if r == err(errno::EINTR) && fwe_kernel::ptrace::tracing() {
-            return wait4_tracer(pid, host_options, wstatus, rusage);
+            let guest = regs.x[0] as i32;
+            let tracee = if guest > 0 { fwe_kernel::ptrace::target_of(guest) } else { None };
+            return wait4_tracer(pid, tracee, host_options, wstatus, rusage);
         }
         return r;
     }
@@ -733,28 +744,52 @@ fn start_watcher_if_wanted() {
 }
 
 /// children as the host reports them, looking again as tracees stop.
-fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
+/// `wait4` of a tracer: `pid` as the host names the child or group, and
+/// `tracee` the one it names alone, as its mailbox is named.
+fn wait4_tracer(
+    pid: i32,
+    tracee: Option<i32>,
+    host_options: i32,
+    wstatus: u64,
+    rusage: u64,
+) -> i64 {
+    use fwe_kernel::ptrace::Tracee;
     // SAFETY: plain host calls.
-    let pgid_of = |p: i32| unsafe { libc::getpgid(p) };
+    let pgid_of = |t: Tracee| unsafe { libc::getpgid(t.process.get()) };
     // SAFETY: as above.
     let my_pgid = unsafe { libc::getpgrp() };
-    let wanted = |p: i32| match pid {
+    let wanted = |t: Tracee| match pid {
         -1 => true,
-        0 => pgid_of(p) == my_pgid,
-        p if p > 0 => p == pid,
-        p => pgid_of(p) == -p,
+        0 => pgid_of(t) == my_pgid,
+        p if p > 0 => Some(t.id) == tracee,
+        p => pgid_of(t) == -p,
     };
+    // A thread is no host child: only its stops are looked for.
+    let thread =
+        tracee.filter(|&i| fwe_kernel::ptrace::process_of(i).is_some_and(|p| p.get() != i));
     loop {
         let seen = fwe_kernel::ptrace::inbox_generation();
-        if let Some((p, status, thread)) = fwe_kernel::ptrace::take_stop(wanted, false) {
+        if let Some((t, status)) = fwe_kernel::ptrace::take_stop(wanted, false) {
             if wstatus != 0 && fwe_kernel::uaccess::write(wstatus, status).is_err() {
                 return err(errno::EFAULT);
             }
             if rusage != 0 && fwe_kernel::uaccess::write(rusage, [0u64; 18]).is_err() {
                 return err(errno::EFAULT);
             }
-            // A thread is named by its tid, a process as the guest knows it.
-            return if thread { p as i64 } else { fwe_kernel::pidns::guest_ret(p as i64) };
+            return i64::from(t.number());
+        }
+        if let Some(i) = thread {
+            if !fwe_kernel::ptrace::traces(i) {
+                return err(errno::ECHILD);
+            }
+            if host_options & libc::WNOHANG != 0 {
+                return 0;
+            }
+            if fwe_kernel::thread::deliverable() != 0 {
+                return err(errno::EINTR);
+            }
+            fwe_kernel::ptrace::wait_for_stop(seen, std::time::Duration::from_millis(20));
+            continue;
         }
         // An own child's stop or continue of fwe's (one it does not trace).
         let (stopped, continued) =
@@ -772,8 +807,8 @@ fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         }
         let r = wait4_host(pid, host_options | libc::WNOHANG, wstatus, rusage);
         // A traced process that is not a child is no host child to wait for.
-        let traced_other =
-            r == err(errno::ECHILD) && (pid > 0 && fwe_kernel::ptrace::traces(pid) || pid == -1);
+        let traced_other = r == err(errno::ECHILD)
+            && (pid > 0 && tracee.is_some_and(fwe_kernel::ptrace::traces) || pid == -1);
         if r != 0 && !(traced_other && pid > 0) {
             return r;
         }
@@ -790,38 +825,64 @@ fn wait4_tracer(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
 /// `waitid` of a tracer: a stop of one of its tracees first, reported as
 /// `CLD_TRAPPED` with the stop's signal (and event) as its status, then its
 /// children as the host reports them, looking again as tracees stop.
+///
+/// `idtype` and `id` as the host names the child or group, and `tracee`
+/// the one `P_PID` names, as its mailbox is named.
 fn waitid_tracer(
     idtype: libc::idtype_t,
     id: libc::id_t,
+    tracee: Option<i32>,
     host_options: i32,
     infop: u64,
     options: u64,
 ) -> i64 {
+    use fwe_kernel::ptrace::Tracee;
     const CLD_TRAPPED: i32 = 4;
     // SAFETY: plain host call.
-    let pgid_of = |p: i32| unsafe { libc::getpgid(p) };
-    let wanted = |p: i32| match idtype {
-        libc::P_PID => p == id as i32,
-        libc::P_PGID => pgid_of(p) == id as i32,
+    let pgid_of = |t: Tracee| unsafe { libc::getpgid(t.process.get()) };
+    let wanted = |t: Tracee| match idtype {
+        libc::P_PID => Some(t.id) == tracee,
+        libc::P_PGID => pgid_of(t) == id as i32,
         _ => true,
     };
+    // A thread is no host child: only its stops are looked for.
+    let thread = tracee.filter(|&i| {
+        idtype == libc::P_PID && fwe_kernel::ptrace::process_of(i).is_some_and(|p| p.get() != i)
+    });
     let peek = options & fwe_abi::wait::WNOWAIT != 0;
     loop {
         let seen = fwe_kernel::ptrace::inbox_generation();
-        if let Some((p, status, thread)) = fwe_kernel::ptrace::take_stop(wanted, peek) {
+        if let Some((t, status)) = fwe_kernel::ptrace::take_stop(wanted, peek) {
             if infop != 0 {
                 let mut words = [0i32; 32];
                 words[0] = fwe_abi::signal::SIGCHLD as i32;
                 words[2] = CLD_TRAPPED;
-                words[4] =
-                    if thread { p } else { fwe_kernel::pidns::guest_ret(i64::from(p)) as i32 };
-                words[5] = fwe_kernel::procreg::ids(p)[0] as i32;
+                words[4] = t.number();
+                // Its process's real user, as the sender.
+                words[5] = fwe_kernel::procreg::ids(t.process)[0] as i32;
                 words[6] = (status >> 8) & 0xffff;
                 if fwe_kernel::uaccess::write(infop, words).is_err() {
                     return err(errno::EFAULT);
                 }
             }
             return 0;
+        }
+        if let Some(i) = thread {
+            if !fwe_kernel::ptrace::traces(i) {
+                return err(errno::ECHILD);
+            }
+            if host_options & libc::WNOHANG != 0 {
+                // None to report: `si_pid` 0, as Linux leaves it.
+                if infop != 0 && fwe_kernel::uaccess::write(infop, [0i32; 32]).is_err() {
+                    return err(errno::EFAULT);
+                }
+                return 0;
+            }
+            if fwe_kernel::thread::deliverable() != 0 {
+                return err(errno::EINTR);
+            }
+            fwe_kernel::ptrace::wait_for_stop(seen, std::time::Duration::from_millis(20));
+            continue;
         }
         // An own child's stop or continue of fwe's (one it does not trace).
         let (stopped, continued) =
@@ -854,7 +915,7 @@ fn waitid_tracer(
             && fwe_kernel::uaccess::read::<i32>(infop + 16).is_ok_and(|pid| pid != 0);
         let traced_other = r == err(errno::ECHILD)
             && idtype == libc::P_PID
-            && fwe_kernel::ptrace::traces(id as i32);
+            && tracee.is_some_and(fwe_kernel::ptrace::traces);
         if (r < 0 && !traced_other) || reported || host_options & libc::WNOHANG != 0 {
             return r.min(0);
         }
@@ -876,7 +937,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     // SAFETY: `status` and `usage` are valid out-parameters.
     let mut r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
     fwe_kernel::timing::mark("wait: host wait returned");
-    if r < 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
+    if r < 0 && host::last_errno().is(libc::EINTR) && host_options & libc::WNOHANG == 0 {
         // The child's own SIGCHLD may interrupt the wait before the host
         // reports the child: Linux reports a child that is ready over the
         // signal, so it is looked for once more.
@@ -886,7 +947,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         if again > 0 {
             r = again;
         } else {
-            host::set_errno(libc::EINTR);
+            host::set_errno(host::HostErrno::new(libc::EINTR));
         }
     }
     if r < 0 {
@@ -907,7 +968,9 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
         // Reaped: its numbers are free again, and its records go.
         reaper::busy(|| {
             fwe_kernel::pidns::reaped(r);
-            fwe_kernel::procreg::reaped(r);
+            if let Some(p) = fwe_kernel::ids::HostPid::new(r) {
+                fwe_kernel::procreg::reaped(p);
+            }
             reaper::reaped_own_child(r);
         });
         reaper::reaped_child(r);
@@ -939,10 +1002,17 @@ pub fn do_waitid(regs: &Regs) -> i64 {
     // A process descriptor names its process; one made non-blocking waits
     // as `WNOHANG` does, failing with `EAGAIN` when nothing has changed.
     let mut nonblock = false;
+    // A tracee named alone, as its mailbox is named (a thread's number is
+    // its process's to the host).
+    let mut tracee = match idtype {
+        w::P_PID if id as i32 > 0 => fwe_kernel::ptrace::target_of(id as i32),
+        _ => None,
+    };
     let (idtype, id) = match idtype {
         w::P_PIDFD => match fwe_kernel::pidfd::wait_target(id as i32) {
             Ok((host, nb)) => {
                 nonblock = nb;
+                tracee = Some(host);
                 (libc::P_PID, host as libc::id_t)
             }
             Err(e) => return err(e),
@@ -984,7 +1054,7 @@ pub fn do_waitid(regs: &Regs) -> i64 {
         0
     };
     if fwe_kernel::ptrace::tracing() {
-        let r = waitid_tracer(idtype, id, host_options, infop, options);
+        let r = waitid_tracer(idtype, id, tracee, host_options, infop, options);
         return if r < 0 { r } else { zero_rusage() };
     }
     start_watcher_if_wanted();
@@ -1062,13 +1132,13 @@ fn waitid_host(
     let mut si: libc::siginfo_t = unsafe { std::mem::zeroed() };
     // SAFETY: `si` is a valid out-parameter.
     let mut r = unsafe { libc::waitid(idtype, id, &mut si, host_options) };
-    if r != 0 && host::last_errno() == libc::EINTR && host_options & libc::WNOHANG == 0 {
+    if r != 0 && host::last_errno().is(libc::EINTR) && host_options & libc::WNOHANG == 0 {
         // As for `wait4`: a child ready is reported over its own signal.
         // SAFETY: as above.
         r = unsafe { libc::waitid(idtype, id, &mut si, host_options | libc::WNOHANG) };
         // SAFETY: `si` was filled by the host.
         if r != 0 || unsafe { si.si_pid() } == 0 {
-            host::set_errno(libc::EINTR);
+            host::set_errno(host::HostErrno::new(libc::EINTR));
             r = -1;
         }
     }
@@ -1080,12 +1150,13 @@ fn waitid_host(
     let (pid, host_uid, status) = unsafe { (si.si_pid(), si.si_uid(), si.si_status()) };
     // The child's real user, as its record keeps it (the host names the
     // host user).
-    let uid = fwe_kernel::procreg::kept_uid(pid)
+    let uid = fwe_kernel::ids::HostPid::new(pid)
+        .and_then(fwe_kernel::procreg::kept_uid)
         .map_or_else(|| host::uid_to_linux(host_uid), |u| fwe_kernel::userns::to_ns(u, false));
     if pid != 0 {
         // It ended of a Linux signal, as it recorded (see `linux_wstatus`).
         let ended = matches!(si.si_code, w::CLD_EXITED | w::CLD_KILLED | w::CLD_DUMPED)
-            .then(|| fwe_kernel::procreg::end_status(pid))
+            .then(|| fwe_kernel::ids::HostPid::new(pid).and_then(fwe_kernel::procreg::end_status))
             .flatten();
         let code = match ended {
             Some(s) if s & 0x80 != 0 => w::CLD_DUMPED,
@@ -1117,7 +1188,9 @@ fn waitid_host(
             // Reaped: its numbers are free again, and its records go.
             reaper::busy(|| {
                 fwe_kernel::pidns::reaped(pid);
-                fwe_kernel::procreg::reaped(pid);
+                if let Some(p) = fwe_kernel::ids::HostPid::new(pid) {
+                    fwe_kernel::procreg::reaped(p);
+                }
                 reaper::reaped_own_child(pid);
             });
             reaper::reaped_child(pid);

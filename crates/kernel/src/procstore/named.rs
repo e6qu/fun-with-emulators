@@ -81,7 +81,9 @@ const WAITING: u64 = 1;
 
 /// Whether host process `pid` lives (a zombie died holding what it held).
 fn holder_live(pid: u32) -> bool {
-    crate::procreg::host_info(pid as i32).is_some_and(|(_, _, zombie)| !zombie)
+    crate::ids::HostPid::new(pid as i32)
+        .and_then(crate::procreg::host_info)
+        .is_some_and(|(_, _, zombie)| !zombie)
 }
 
 /// The base of the identities records are given: past those of Linux's
@@ -213,7 +215,7 @@ pub fn find_or_make(name: &[u8]) -> Slot {
         n.state.store(LIVE, SeqCst);
         return Slot { n };
     }
-    super::fatal(&format!("the shared records are full ({SLOTS} are kept)"))
+    super::fatal(format_args!("the shared records are full ({SLOTS} are kept)"))
 }
 
 /// Every record: its name, and when it was made (seconds since 1970).
@@ -265,6 +267,7 @@ pub struct Read {
 }
 
 /// The record's lock, held ([`Slot::lock`]), let go when dropped.
+#[must_use = "dropped at once, it lets go at once"]
 pub struct Held {
     n: &'static Named,
     _holding: super::Holding,
@@ -331,7 +334,7 @@ impl Slot {
     /// sequence number goes: the bytes it had not yet put in place are
     /// lost with it).
     pub fn lock(&self) -> Held {
-        let me = crate::host::pid() as u32;
+        let me = crate::host::pid().get() as u32;
         let word = &self.n.lock;
         let mut spins = 0;
         loop {

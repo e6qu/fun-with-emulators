@@ -104,7 +104,7 @@ pub fn start(spec: &str) -> Result<(), String> {
     fwe_kernel::host::with_signals_blocked(|| {
         std::thread::Builder::new().name("fwe-hv-record".into()).spawn(|| {
             loop {
-                std::thread::sleep(std::time::Duration::from_millis(500));
+                fwe_kernel::procstore::Busy::new().sleep(std::time::Duration::from_millis(500));
                 let mut l = Line::new();
                 l.s("heartbeat runs ").dec(RUNS.load(SeqCst));
                 l.emit();

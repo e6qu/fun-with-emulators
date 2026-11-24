@@ -160,7 +160,8 @@ pub fn process_ending(status: i32) {
 /// This process's `struct acct_v3`.
 fn record(status: i32) -> [u8; 64] {
     // SAFETY: getpid and getppid cannot fail.
-    let (me, parent) = unsafe { (libc::getpid(), libc::getppid()) };
+    let parent = unsafe { libc::getppid() };
+    let me = crate::host::pid();
     let rec = crate::procreg::read(me);
     let ids = crate::procreg::ids(me);
     let start = rec.as_ref().map_or(0, |r| r.start);
@@ -189,7 +190,7 @@ fn record(status: i32) -> [u8; 64] {
     b[8..12].copy_from_slice(&ids[0].to_le_bytes());
     b[12..16].copy_from_slice(&ids[4].to_le_bytes());
     let g = crate::pidns::to_guest;
-    b[16..20].copy_from_slice(&(g(me) as u32).to_le_bytes());
+    b[16..20].copy_from_slice(&(g(me.get()) as u32).to_le_bytes());
     b[20..24].copy_from_slice(&(g(parent) as u32).to_le_bytes());
     b[24..28].copy_from_slice(&((start / 1_000_000) as u32).to_le_bytes());
     let elapsed = now.saturating_sub(start) / (1_000_000 / AHZ);

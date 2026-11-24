@@ -3,11 +3,54 @@
 //! Host values come from the `libc` crate, so this module compiles on any
 //! Unix host; on Linux hosts most translations are the identity.
 
+use crate::ids::HostPid;
 use fwe_abi::{clock, errno as le, fcntl, resource, signal, wait};
 
+/// A host `errno`: the host's numbering, which is not Linux's (`EAGAIN`
+/// is 35 on macOS, 11 on Linux). It is never handed to the guest as it is:
+/// [`HostErrno::linux`] is the Linux errno of the same meaning, and it
+/// compares only with a host constant ([`HostErrno::is`]). The bare number
+/// in memory (`#[repr(transparent)]`).
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct HostErrno(i32);
+
+impl HostErrno {
+    /// Host errno `e` (a `libc` constant, or a number the host gave).
+    #[inline]
+    pub const fn new(e: i32) -> HostErrno {
+        HostErrno(e)
+    }
+
+    /// Whether it is host errno `e` (a `libc` constant).
+    #[inline]
+    pub const fn is(self, e: i32) -> bool {
+        self.0 == e
+    }
+
+    /// The Linux errno of the same meaning.
+    #[inline]
+    pub fn linux(self) -> i32 {
+        errno_to_linux(self)
+    }
+
+    /// The host's number, for the host's own interfaces
+    /// (`std::io::Error::from_raw_os_error`, a host call's result).
+    #[inline]
+    pub const fn raw(self) -> i32 {
+        self.0
+    }
+}
+
+impl std::fmt::Display for HostErrno {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::io::Error::from_raw_os_error(self.0).fmt(f)
+    }
+}
+
 /// The calling thread's host `errno`.
-pub fn last_errno() -> i32 {
-    std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO)
+pub fn last_errno() -> HostErrno {
+    HostErrno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
 }
 
 /// (host errno, Linux errno). Searched in order, first match wins.
@@ -105,8 +148,8 @@ const ERRNO_TABLE: &[(i32, i32)] = &[
 ];
 
 /// Translate a host errno into the Linux errno with the same meaning.
-pub fn errno_to_linux(host: i32) -> i32 {
-    ERRNO_TABLE.iter().find(|(h, _)| *h == host).map(|(_, l)| *l).unwrap_or(le::EIO)
+pub fn errno_to_linux(host: HostErrno) -> i32 {
+    ERRNO_TABLE.iter().find(|(h, _)| *h == host.0).map(|(_, l)| *l).unwrap_or(le::EIO)
 }
 
 /// The raw Linux return value for the current host `errno`.
@@ -355,14 +398,11 @@ pub fn last_pid() -> i32 {
         .unwrap_or(0)
 }
 
-/// The pids of process group `pgid` (none for a number that is not one).
+/// The processes of host process group `pgid`, fwe's and others.
 #[cfg(target_os = "macos")]
-fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    if pgid <= 0 {
-        return Vec::new();
-    }
+pub fn group_members(pgid: HostPid) -> Vec<HostPid> {
     // <sys/proc_info.h>: PROC_PGRP_ONLY.
-    let (kind, arg): (u32, u32) = (2, pgid as u32);
+    let (kind, arg): (u32, u32) = (2, pgid.get() as u32);
     // SAFETY: sizing, then filling, a buffer of pids.
     unsafe {
         let n = libc::proc_listpids(kind, arg, std::ptr::null_mut(), 0);
@@ -377,34 +417,25 @@ fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
             (pids.len() * size_of::<libc::pid_t>()) as i32,
         );
         pids.truncate(n.max(0) as usize / size_of::<libc::pid_t>());
-        pids.retain(|&p| p > 0);
-        pids
+        pids.into_iter().filter_map(HostPid::new).collect()
     }
 }
 
-/// The pids of process group `pgid`, read from `/proc`.
+/// The processes of host process group `pgid`, fwe's and others, read
+/// from `/proc`.
 #[cfg(not(target_os = "macos"))]
-fn pids_of(pgid: libc::pid_t) -> Vec<libc::pid_t> {
+pub fn group_members(pgid: HostPid) -> Vec<HostPid> {
     let Ok(dir) = std::fs::read_dir("/proc") else { return Vec::new() };
-    dir.filter_map(|e| e.ok()?.file_name().to_str()?.parse::<libc::pid_t>().ok())
+    dir.filter_map(|e| HostPid::new(e.ok()?.file_name().to_str()?.parse().ok()?))
         .filter(|&p| {
             // The group is the fifth field, after the name in parentheses.
-            std::fs::read_to_string(format!("/proc/{p}/stat")).ok().is_some_and(|st| {
+            std::fs::read_to_string(format!("/proc/{}/stat", p.get())).ok().is_some_and(|st| {
                 st.rsplit_once(')')
                     .and_then(|(_, rest)| rest.split_whitespace().nth(2)?.parse().ok())
-                    == Some(pgid)
+                    == Some(pgid.get())
             })
         })
         .collect()
-}
-
-/// The processes of host process group `pgid` (none for a number that is
-/// not one), fwe's and others.
-pub fn group_members(pgid: libc::pid_t) -> Vec<libc::pid_t> {
-    if pgid <= 0 {
-        return Vec::new();
-    }
-    pids_of(pgid)
 }
 
 /// Whether host descriptor `fd` is of a file with no name left (a memfd's,
@@ -416,59 +447,79 @@ pub fn unlinked(fd: i32) -> bool {
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_nlink == 0 }
 }
 
-/// `kill(pid, sig)` for a host signal and a `kill`-style `pid` (a process,
-/// 0 for the caller's group, or `-pgid`). A `SIGKILL` reaches fwe processes
-/// as [`KILL_RELAY`], with a note of its sender ([`kill_relayed`]). Returns
-/// 0 or a negated Linux errno.
+/// `kill` of host process `pid` with host signal `sig`, for
+/// [`kill_process`] and [`signal_named`]: one process, never a group or
+/// every process (no [`HostPid`] names one). A `SIGKILL` reaches an fwe
+/// process as [`KILL_RELAY`], with a note of its sender
+/// ([`kill_relayed`]). Returns 0 or a negated Linux errno.
 ///
-/// -1 is refused (`ESRCH`): on the host it is every process of the user, so
-/// a guest's -1 is resolved to fwe's own processes before it gets here
-/// ([`kill_process`] sends to each).
-///
-/// [`WAKE_SIGNAL`] goes only to one live fwe process (`ESRCH` otherwise):
+/// [`WAKE_SIGNAL`] goes only to a live fwe process (`ESRCH` otherwise):
 /// any other process takes the host's default action for it, which ends
 /// it.
-pub fn kill(pid: libc::pid_t, sig: libc::c_int) -> i64 {
-    if pid == -1 {
-        return fwe_abi::err(fwe_abi::errno::ESRCH);
-    }
-    if sig == WAKE_SIGNAL && (pid <= 0 || !is_fwe(pid)) {
+fn kill(pid: HostPid, sig: libc::c_int) -> i64 {
+    if sig == WAKE_SIGNAL && !is_fwe(pid) {
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     #[cfg(target_os = "macos")]
     if sig == libc::SIGKILL {
-        // SAFETY: plain host calls.
-        let (me, group) = unsafe { (libc::getpid(), libc::getpgrp()) };
-        let mut targets = match pid {
-            p if p > 0 => vec![p],
-            0 => pids_of(group),
-            p => pids_of(-p),
-        };
-        if targets.is_empty() {
-            return fwe_abi::err(fwe_abi::errno::ESRCH);
+        let fwe = exe_of(pid_now().get());
+        if fwe.is_some() && exe_of(pid.get()) == fwe {
+            // The relay is taken only with a note of its sender: the
+            // host's own SIGINFO (macOS's Ctrl-T) is no kill.
+            crate::signote::note(pid, KILL_RELAY);
+            return ret(raw_kill(pid.get(), KILL_RELAY));
         }
-        // This process last: it may be among them.
-        targets.sort_by_key(|&p| p == me);
-        let fwe = exe_of(me);
-        let mut result = fwe_abi::err(fwe_abi::errno::ESRCH);
-        for t in targets {
-            let s = if fwe.is_some() && exe_of(t) == fwe { KILL_RELAY } else { libc::SIGKILL };
-            if s == KILL_RELAY {
-                // The relay is taken only with a note of its sender: the
-                // host's own SIGINFO (macOS's Ctrl-T) is no kill.
-                crate::signote::note(t, KILL_RELAY);
-            }
-            // SAFETY: plain host call.
-            if unsafe { libc::kill(t, s) } == 0 {
-                result = 0;
-            } else if result != 0 {
-                result = last_error();
-            }
-        }
-        return result;
     }
-    // SAFETY: plain host call.
-    ret(unsafe { libc::kill(pid, sig) })
+    ret(raw_kill(pid.get(), sig))
+}
+
+/// The host's `kill(pid, sig)` itself, for this module's typed callers and
+/// a process's signal to itself ([`kill_self`]). Async-signal-safe.
+#[allow(clippy::disallowed_methods)] // the one call of the host's `kill`
+fn raw_kill(pid: libc::pid_t, sig: libc::c_int) -> libc::c_int {
+    // SAFETY: plain host call; every caller names its target by type.
+    unsafe { libc::kill(pid, sig) }
+}
+
+/// Host signal `sig` to this process itself. Async-signal-safe.
+pub fn kill_self(sig: libc::c_int) {
+    raw_kill(pid_now().get(), sig);
+}
+
+/// The host's `SIGKILL` to `child`, a child of this process it reaps next
+/// (one it could not finish setting up): the host's own, never relayed, as
+/// the child may not yet take fwe's relay.
+pub fn kill_child(child: HostPid) {
+    raw_kill(child.get(), libc::SIGKILL);
+}
+
+/// What the host says of a process asked whether it is there (its `kill`
+/// with signal 0).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Probe {
+    /// There, and this user may signal it.
+    Live,
+    /// There (a zombie is), but not this user's to signal.
+    NoPermission,
+    Gone,
+}
+
+impl Probe {
+    /// Whether the process is there, whoever's it is.
+    pub fn exists(self) -> bool {
+        self != Probe::Gone
+    }
+}
+
+/// Whether host process `pid` is there. Async-signal-safe.
+pub fn probe(pid: HostPid) -> Probe {
+    if raw_kill(pid.get(), 0) == 0 {
+        return Probe::Live;
+    }
+    match last_errno().raw() {
+        libc::EPERM => Probe::NoPermission,
+        _ => Probe::Gone,
+    }
 }
 
 /// Mark the open file description of `fd` as opened without a right a
@@ -528,23 +579,17 @@ pub fn dev_of(st: &libc::stat) -> u64 {
 
 /// `kill` of one host process `pid` for fwe's own ends (a pid it keeps:
 /// a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a
-/// message queue's notice, a wake): a pid that is not one (0, or negative,
-/// which the host takes for a group or every process) is refused
-/// (`ESRCH`), so a number from a guest or a record never signals more; a
-/// signal (not 0, which only asks whether the process is there) goes only
-/// to one of fwe's processes ([`is_fwe`]: its record's, of a process that
-/// started when this one did), as a pid kept from a process that ended may
-/// be the host's now. One refused is told on the standard error, with
-/// where it was sent from. A guest's own signal to a process it names
-/// goes by [`signal_named`].
+/// message queue's notice, a wake): only to one of fwe's processes
+/// ([`is_fwe`]: its record's, of a process that started when this one
+/// did), as a pid kept from a process that ended may be the host's now
+/// (`ESRCH`). One refused is told on the standard error, with where it
+/// was sent from. A guest's own signal to a process it names goes by
+/// [`signal_named`]; whether a process is there, by [`probe`].
 #[track_caller]
-pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
-    if pid <= 0 {
-        return fwe_abi::err(fwe_abi::errno::ESRCH);
-    }
+pub fn kill_process(pid: HostPid, sig: libc::c_int) -> i64 {
     // ([`kill`] looks for its wake signal itself.)
-    if sig != 0 && sig != WAKE_SIGNAL && !is_fwe(pid) {
-        refused_signal(pid, sig, std::panic::Location::caller());
+    if sig != WAKE_SIGNAL && !is_fwe(pid) {
+        refused_signal(pid.get(), sig, std::panic::Location::caller());
         return fwe_abi::err(fwe_abi::errno::ESRCH);
     }
     kill(pid, sig)
@@ -552,13 +597,8 @@ pub fn kill_process(pid: libc::pid_t, sig: libc::c_int) -> i64 {
 
 /// A guest's signal `sig` to host process `pid`, which it named (`kill`,
 /// `rt_sigqueueinfo`) and may signal: one of fwe's or one of the host's,
-/// as a Linux process signals any it may. A pid that is not one is
-/// refused (`ESRCH`), as by [`kill_process`].
-#[track_caller]
-pub fn signal_named(pid: libc::pid_t, sig: libc::c_int) -> i64 {
-    if pid <= 0 {
-        return fwe_abi::err(fwe_abi::errno::ESRCH);
-    }
+/// as a Linux process signals any it may.
+pub fn signal_named(pid: HostPid, sig: libc::c_int) -> i64 {
     kill(pid, sig)
 }
 
@@ -626,10 +666,10 @@ impl Line {
 
 /// Host process `pid`'s nice value as the host has it (0 for one that
 /// is not there).
-pub fn nice_of(pid: libc::pid_t) -> i32 {
+pub fn nice_of(pid: HostPid) -> i32 {
     // SAFETY: plain host call; -1 is a valid value, so errno is not
     // consulted (an absent process reads as 0).
-    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid as libc::id_t) };
+    let v = unsafe { libc::getpriority(libc::PRIO_PROCESS, pid.get() as libc::id_t) };
     v.clamp(-20, 19)
 }
 
@@ -638,26 +678,167 @@ pub fn nice_of(pid: libc::pid_t) -> i32 {
 /// nice value but not lower it (only its root may), so a guest's lowering
 /// stands in fwe's record while the host process keeps the value it had:
 /// Linux's result is the guest's, the host's limit is the host's.
-pub fn set_nice(pid: libc::pid_t, nice: i32) {
-    if pid <= 0 {
-        return;
-    }
+pub fn set_nice(pid: HostPid, nice: i32) {
     // SAFETY: plain host call on one process of this user's.
-    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid as libc::id_t, nice) };
+    unsafe { libc::setpriority(libc::PRIO_PROCESS, pid.get() as libc::id_t, nice) };
 }
 
 /// Whether host process `pid` is a live fwe process (one with a record):
 /// the only kind that takes fwe's internal signals ([`WAKE_SIGNAL`]) and
 /// serves requests left in its mailbox.
-pub fn is_fwe(pid: libc::pid_t) -> bool {
-    pid > 0 && crate::procreg::read(pid).is_some()
+pub fn is_fwe(pid: HostPid) -> bool {
+    crate::procreg::read(pid).is_some()
 }
 
-/// Whether host process `pid` exists (a zombie does), whether or not this
-/// user may signal it.
-pub fn process_exists(pid: libc::pid_t) -> bool {
-    let r = kill_process(pid, 0);
-    r == 0 || r == fwe_abi::err(fwe_abi::errno::EPERM)
+thread_local! {
+    /// How many [`NoAllocation`] marks the thread is under.
+    static NO_ALLOCATION: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// While one lives, the calling thread is in a host signal handler that
+/// interrupted fwe's own code, which may be inside the host allocator:
+/// nothing may allocate or free. A debug build's allocator ends the
+/// process if something does ([`allocation_forbidden`]), so the tests find
+/// it. Neither `Send` nor `Sync`: the mark is its thread's.
+pub struct NoAllocation(std::marker::PhantomData<*const ()>);
+
+impl NoAllocation {
+    #[inline]
+    pub fn enter() -> NoAllocation {
+        NO_ALLOCATION.with(|n| n.set(n.get() + 1));
+        NoAllocation(std::marker::PhantomData)
+    }
+}
+
+impl Drop for NoAllocation {
+    #[inline]
+    fn drop(&mut self) {
+        NO_ALLOCATION.with(|n| n.set(n.get() - 1));
+    }
+}
+
+/// Whether the calling thread is under a [`NoAllocation`] mark.
+#[inline]
+pub fn allocation_forbidden() -> bool {
+    NO_ALLOCATION.try_with(std::cell::Cell::get).is_ok_and(|n| n != 0)
+}
+
+/// A change of the calling thread's host signal mask, undone as it is
+/// dropped: the mask goes back to what it was on every path out of the
+/// scope that holds it. A mask is its thread's, so this stays on the thread
+/// that made it (neither `Send` nor `Sync`). Async-signal-safe.
+#[must_use = "dropped at once, it puts the mask back at once"]
+pub struct MaskGuard {
+    old: libc::sigset_t,
+    _thread: std::marker::PhantomData<*const ()>,
+}
+
+impl MaskGuard {
+    /// Block `set` too.
+    #[inline(always)]
+    pub fn block(set: &libc::sigset_t) -> MaskGuard {
+        MaskGuard::change(libc::SIG_BLOCK, set)
+    }
+
+    /// Unblock `set`.
+    #[inline(always)]
+    pub fn unblock(set: &libc::sigset_t) -> MaskGuard {
+        MaskGuard::change(libc::SIG_UNBLOCK, set)
+    }
+
+    /// Make `set` the mask.
+    #[inline(always)]
+    pub fn set(set: &libc::sigset_t) -> MaskGuard {
+        MaskGuard::change(libc::SIG_SETMASK, set)
+    }
+
+    #[inline(always)]
+    fn change(how: libc::c_int, set: &libc::sigset_t) -> MaskGuard {
+        let mut old = empty_sigset();
+        // SAFETY: initialized signal sets; only this thread's mask changes.
+        unsafe { mask_call(how, set, &mut old) };
+        MaskGuard { old, _thread: std::marker::PhantomData }
+    }
+
+    /// The mask as it was.
+    pub fn old(&self) -> &libc::sigset_t {
+        &self.old
+    }
+
+    /// Keep the change: the mask is not put back (a fork child that goes on
+    /// with it, and sets its own later).
+    #[inline(always)]
+    pub fn keep(self) {
+        std::mem::forget(self);
+    }
+}
+
+impl Drop for MaskGuard {
+    #[inline(always)]
+    fn drop(&mut self) {
+        // SAFETY: the mask this thread had, as the change read it.
+        unsafe { mask_call(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+    }
+}
+
+/// The host's `pthread_sigmask`, which only this module calls: a change
+/// that lasts past its scope goes through [`set_signal_mask`],
+/// [`block_signals`] or [`unblock_signals`], one undone as it ends through
+/// a [`MaskGuard`].
+///
+/// # Safety
+/// `set` null or an initialized set, `old` null or writable.
+#[inline(always)]
+#[allow(clippy::disallowed_methods)] // the one call of it
+unsafe fn mask_call(how: libc::c_int, set: *const libc::sigset_t, old: *mut libc::sigset_t) {
+    // SAFETY: as the caller promises; only this thread's mask changes.
+    unsafe { libc::pthread_sigmask(how, set, old) };
+}
+
+/// Make `set` the calling thread's host mask from now on (a thread taking
+/// on its guest mask). Async-signal-safe.
+#[inline(always)]
+pub fn set_signal_mask(set: &libc::sigset_t) {
+    // SAFETY: an initialized set.
+    unsafe { mask_call(libc::SIG_SETMASK, set, std::ptr::null_mut()) };
+}
+
+/// Block `set` on the calling thread from now on. Async-signal-safe.
+#[inline(always)]
+pub fn block_signals(set: &libc::sigset_t) {
+    // SAFETY: an initialized set.
+    unsafe { mask_call(libc::SIG_BLOCK, set, std::ptr::null_mut()) };
+}
+
+/// Unblock `set` on the calling thread from now on (one the process dies
+/// of). Async-signal-safe.
+#[inline(always)]
+pub fn unblock_signals(set: &libc::sigset_t) {
+    // SAFETY: an initialized set.
+    unsafe { mask_call(libc::SIG_UNBLOCK, set, std::ptr::null_mut()) };
+}
+
+/// The calling thread's host mask. Async-signal-safe.
+#[inline(always)]
+pub fn signal_mask() -> libc::sigset_t {
+    let mut set = empty_sigset();
+    // SAFETY: no change; `set` is written.
+    unsafe { mask_call(libc::SIG_BLOCK, std::ptr::null(), &mut set) };
+    set
+}
+
+/// A host signal set of every signal.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn full_sigset() -> libc::sigset_t {
+    // SAFETY: an all-zero sigset_t is valid storage; sigfillset fills it.
+    unsafe {
+        let mut set: libc::sigset_t = std::mem::zeroed();
+        libc::sigfillset(&mut set);
+        set
+    }
 }
 
 #[cfg_attr(
@@ -727,11 +908,10 @@ fn raise_stop(sig: libc::c_int) {
         libc::sigaction(sig, &dfl, &mut old);
         let mut set = empty_sigset();
         libc::sigaddset(&mut set, sig);
-        let mut mask = empty_sigset();
-        libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, &mut mask);
+        let unblocked = MaskGuard::unblock(&set);
         // Delivered before raise returns: the process stops here.
         libc::raise(sig);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
+        drop(unblocked);
         libc::sigaction(sig, &old, std::ptr::null_mut());
     }
 }
@@ -746,9 +926,7 @@ fn raise_stop(sig: libc::c_int) {
 /// next system call, and they are taken again as they arrive.
 pub fn hand_over_for_exec() {
     let mask = crate::thread::mask();
-    let set = host_sigset(mask);
-    // SAFETY: an initialized signal set; changing this thread's mask.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &set, std::ptr::null_mut()) };
+    set_signal_mask(&host_sigset(mask));
     let pending = crate::thread::pending() & mask;
     for sig in 1..=signal::NSIG {
         if pending & (1 << (sig - 1)) == 0 || !crate::signal::relayed(sig) {
@@ -765,9 +943,7 @@ pub fn hand_over_for_exec() {
 /// The relayed signals the calling thread blocks on the host, as a Linux
 /// set.
 pub fn blocked_signals() -> u64 {
-    let mut set = empty_sigset();
-    // SAFETY: `set` is a valid out-parameter; no change is made.
-    unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, std::ptr::null(), &mut set) };
+    let set = signal_mask();
     let mut out = 0;
     for sig in 1..=signal::NSIG {
         if let Some(h) = signal_to_host(sig).filter(|_| crate::signal::relayed(sig)) {
@@ -814,10 +990,11 @@ pub fn signal_is_ignored(sig: u64) -> bool {
 
 /// Whether the host's `SIGCHLD` action has `SA_NOCLDSTOP` (the guest's
 /// does): no `SIGCHLD` for a child that stops or continues.
-/// This process's parent on the host. Async-signal-safe.
-pub fn parent_pid() -> i32 {
+/// This process's parent on the host (none once it is reparented to no
+/// process, which the host never does: launchd's is 1). Async-signal-safe.
+pub fn parent_pid() -> Option<HostPid> {
     // SAFETY: plain host call.
-    unsafe { libc::getppid() }
+    HostPid::new(unsafe { libc::getppid() })
 }
 
 /// Whether this process ignores `SIGCHLD` on the host (as the guest
@@ -965,7 +1142,7 @@ pub unsafe fn signal_info(
     // ([`crate::procreg::ending`]).
     let ended = (sig == libc::SIGCHLD
         && matches!(code, wait::CLD_EXITED | wait::CLD_KILLED | wait::CLD_DUMPED))
-    .then(|| crate::procreg::end_status(pid))
+    .then(|| HostPid::new(pid).and_then(crate::procreg::end_status))
     .flatten();
     if let Some(s) = ended {
         code = if s & 0x80 != 0 { wait::CLD_DUMPED } else { wait::CLD_KILLED };
@@ -983,7 +1160,11 @@ pub unsafe fn signal_info(
     // One this process sent itself carries its own guest user; one from a
     // process that is not fwe's, the host user's.
     let uid = guest_uid.unwrap_or_else(|| {
-        if pid != 0 && pid == pid_now() { crate::creds::real_uid() } else { uid_to_initial(uid) }
+        if pid != 0 && pid == pid_now().get() {
+            crate::creds::real_uid()
+        } else {
+            uid_to_initial(uid)
+        }
     });
     crate::thread::SigInfo { code, pid, uid, status, value, poll: None }
 }
@@ -1022,7 +1203,8 @@ pub fn sent_info(sig: u64, note: crate::signote::Note) -> crate::thread::SigInfo
 }
 
 /// Set the calling thread's host `errno`.
-pub fn set_errno(value: i32) {
+pub fn set_errno(value: HostErrno) {
+    let value = value.raw();
     // SAFETY: writing this thread's errno.
     #[cfg(target_os = "macos")]
     unsafe {
@@ -1187,14 +1369,14 @@ pub unsafe fn openat(
     loop {
         // SAFETY: `name` is NUL-terminated; the caller vouches for `dir`.
         let fd = unsafe { libc::openat(dir, name.as_ptr(), flags, mode) };
-        if fd >= 0 || flags & libc::O_CREAT == 0 || last_errno() != libc::ENOENT || tries == 100 {
+        if fd >= 0 || flags & libc::O_CREAT == 0 || !last_errno().is(libc::ENOENT) || tries == 100 {
             return fd;
         }
         // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
         // SAFETY: a valid descriptor and out parameter.
         if unsafe { libc::fstat(dir, &mut st) } != 0 || st.st_nlink == 0 {
-            set_errno(libc::ENOENT);
+            set_errno(HostErrno::new(libc::ENOENT));
             return -1;
         }
         tries += 1;
@@ -1206,7 +1388,7 @@ pub unsafe fn openat(
 /// answers `ENOTTY` for anything that is not a terminal, where macOS gives
 /// `ENODEV` for some devices (`/dev/null`) and `EOPNOTSUPP` for others.
 pub fn tty_error() -> i64 {
-    match last_errno() {
+    match last_errno().raw() {
         libc::ENODEV | libc::EOPNOTSUPP => -(le::ENOTTY as i64),
         _ => last_error(),
     }
@@ -1697,7 +1879,7 @@ pub fn reserve_fixed(addr: u64, len: u64) -> Result<(), ReserveError> {
         )
     };
     if p == libc::MAP_FAILED {
-        return Err(match last_errno() {
+        return Err(match last_errno().raw() {
             libc::EEXIST => ReserveError::Occupied,
             libc::ENOMEM | libc::EINVAL => ReserveError::OutOfRange,
             e => ReserveError::Other(e),
@@ -2152,7 +2334,7 @@ pub fn at_path<T>(
         // SAFETY: back to the process's working directory.
         unsafe { pthread_fchdir_np(-1) };
         // SAFETY: the call's errno, kept for its caller to read.
-        unsafe { *libc::__error() = e };
+        unsafe { *libc::__error() = e.raw() };
         Ok(r)
     }
     #[cfg(not(target_os = "macos"))]
@@ -2167,6 +2349,92 @@ pub fn at_path<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// How a forked child that writes a byte at `addr` ends: `None` if it
+    /// exits, else the signal that ends it.
+    fn write_in_child(addr: usize) -> Option<i32> {
+        // SAFETY: the child only writes and exits; the parent waits for it.
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0);
+            if pid == 0 {
+                std::ptr::write_volatile(addr as *mut u8, 1);
+                libc::_exit(0);
+            }
+            let mut status = 0;
+            assert_eq!(libc::waitpid(pid, &mut status, 0), pid);
+            libc::WIFSIGNALED(status).then(|| libc::WTERMSIG(status))
+        }
+    }
+
+    /// Below a stack is its guard, which a write past its foot faults in;
+    /// a shared object has one on each side.
+    #[test]
+    fn stacks_and_shared_memory_are_guarded() {
+        let size = 1 << 20;
+        let low = map_stack(size).unwrap();
+        assert_eq!(write_in_child(low), None);
+        assert_eq!(write_in_child(low + size - 1), None);
+        assert!(write_in_child(low - 1).is_some(), "a write below the stack");
+        assert!(write_in_child(low - GUARD).is_some(), "a write at the guard's foot");
+
+        let name = std::ffi::CString::new(format!("/fwe-g{}", std::process::id())).unwrap();
+        // SAFETY: plain host calls on an object of the test's own.
+        let fd = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR | libc::O_CREAT, 0o600) };
+        assert!(fd >= 0);
+        // SAFETY: as above.
+        unsafe {
+            libc::shm_unlink(name.as_ptr());
+            assert_eq!(libc::ftruncate(fd, size as libc::off_t), 0);
+        }
+        let base = map_shared_guarded(fd, size).unwrap();
+        // SAFETY: the descriptor is no longer needed.
+        unsafe { libc::close(fd) };
+        assert_eq!(write_in_child(base), None);
+        assert_eq!(write_in_child(base + size - 1), None);
+        assert!(write_in_child(base - 1).is_some(), "a write below the object");
+        assert!(write_in_child(base + size).is_some(), "a write above the object");
+    }
+
+    /// A guard puts the mask back as it goes, nested ones in turn; one
+    /// kept leaves its change.
+    #[test]
+    fn mask_guards_put_the_mask_back() {
+        // A signal nothing else here blocks or sends.
+        let member = |sig| {
+            let set = signal_mask();
+            // SAFETY: an initialized set.
+            unsafe { libc::sigismember(&set, sig) == 1 }
+        };
+        let one = |sig| {
+            let mut set = empty_sigset();
+            // SAFETY: an initialized set.
+            unsafe { libc::sigaddset(&mut set, sig) };
+            set
+        };
+        // Run on a thread of its own: the mask is the thread's.
+        std::thread::spawn(move || {
+            assert!(!member(libc::SIGXCPU) && !member(libc::SIGXFSZ));
+            {
+                let _outer = MaskGuard::block(&one(libc::SIGXCPU));
+                assert!(member(libc::SIGXCPU));
+                {
+                    let inner = MaskGuard::block(&one(libc::SIGXFSZ));
+                    // SAFETY: an initialized set.
+                    assert_eq!(unsafe { libc::sigismember(inner.old(), libc::SIGXCPU) }, 1);
+                    assert!(member(libc::SIGXFSZ));
+                }
+                assert!(member(libc::SIGXCPU) && !member(libc::SIGXFSZ));
+            }
+            assert!(!member(libc::SIGXCPU));
+            MaskGuard::block(&one(libc::SIGXFSZ)).keep();
+            assert!(member(libc::SIGXFSZ));
+            unblock_signals(&one(libc::SIGXFSZ));
+            assert!(!member(libc::SIGXFSZ));
+        })
+        .join()
+        .unwrap();
+    }
 
     /// A device number with its top bit set (a store tmpfs's `0:minor` of
     /// `0x80000` or more) is read back as the number it was made from.
@@ -2259,11 +2527,11 @@ mod tests {
 
     #[test]
     fn errno_translation() {
-        assert_eq!(errno_to_linux(libc::EAGAIN), le::EAGAIN);
-        assert_eq!(errno_to_linux(libc::ENOSYS), le::ENOSYS);
-        assert_eq!(errno_to_linux(libc::ECONNREFUSED), le::ECONNREFUSED);
-        assert_eq!(errno_to_linux(libc::ENOTSUP), le::EOPNOTSUPP);
-        assert_eq!(errno_to_linux(100_000), le::EIO);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::EAGAIN)), le::EAGAIN);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::ENOSYS)), le::ENOSYS);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::ECONNREFUSED)), le::ECONNREFUSED);
+        assert_eq!(errno_to_linux(HostErrno::new(libc::ENOTSUP)), le::EOPNOTSUPP);
+        assert_eq!(errno_to_linux(HostErrno::new(100_000)), le::EIO);
     }
 
     #[test]
@@ -2385,10 +2653,10 @@ pub fn rename_at(
     if r == 0 {
         return Ok(());
     }
-    match last_errno() {
+    match last_errno().raw() {
         #[cfg(target_os = "macos")]
         libc::ENOTSUP if how != Rename::Replace => Err(le::EINVAL),
-        e => Err(errno_to_linux(e)),
+        e => Err(errno_to_linux(HostErrno::new(e))),
     }
 }
 
@@ -2403,9 +2671,9 @@ pub fn clone_at(src: i32, dst_dir: i32, dst: &std::ffi::CStr) -> Result<(), i32>
         if unsafe { libc::fclonefileat(src, dst_dir, dst.as_ptr(), 0) } == 0 {
             return Ok(());
         }
-        match last_errno() {
+        match last_errno().raw() {
             libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
-            e => Err(errno_to_linux(e)),
+            e => Err(errno_to_linux(HostErrno::new(e))),
         }
     }
     #[cfg(not(target_os = "macos"))]
@@ -2434,15 +2702,84 @@ pub fn clone_name_at(
         if r == 0 {
             return Ok(());
         }
-        match last_errno() {
+        match last_errno().raw() {
             libc::ENOTSUP | libc::EXDEV => Err(le::EOPNOTSUPP),
-            e => Err(errno_to_linux(e)),
+            e => Err(errno_to_linux(HostErrno::new(e))),
         }
     }
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (src_dir, src, dst_dir, dst);
         Err(le::EOPNOTSUPP)
+    }
+}
+
+/// The inaccessible room kept beside fwe's own stacks and shared memory
+/// ([`map_stack`], [`map_shared_guarded`]): a stack that overflows (a
+/// handler nested without bound, a guest thread's stack made with no guard
+/// of its own) faults in it, and its process ends, instead of writing over
+/// the next mapping, which may be memory every fwe process shares.
+pub const GUARD: usize = 64 << 10;
+
+/// A new stack of `size` bytes (a multiple of the host page) with
+/// [`GUARD`] inaccessible bytes below it, kept for the process's life: its
+/// lowest usable address, or `None` if the host has no room.
+pub fn map_stack(size: usize) -> Option<usize> {
+    // SAFETY: a fresh anonymous mapping, then its lowest part made
+    // inaccessible; nothing else refers to either yet.
+    unsafe {
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            GUARD + size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            return None;
+        }
+        if libc::mprotect(p, GUARD, libc::PROT_NONE) != 0 {
+            libc::munmap(p, GUARD + size);
+            return None;
+        }
+        Some(p as usize + GUARD)
+    }
+}
+
+/// `size` bytes of shared memory object `fd`, read and written, mapped
+/// between two [`GUARD`]s of inaccessible room: its address, or the host's
+/// error.
+pub fn map_shared_guarded(fd: i32, size: usize) -> Result<usize, HostErrno> {
+    // SAFETY: room reserved inaccessible, then the object mapped over its
+    // middle, which nothing else uses: the guards stay around it.
+    unsafe {
+        let room = libc::mmap(
+            std::ptr::null_mut(),
+            size + 2 * GUARD,
+            libc::PROT_NONE,
+            libc::MAP_PRIVATE | libc::MAP_ANON,
+            -1,
+            0,
+        );
+        if room == libc::MAP_FAILED {
+            return Err(last_errno());
+        }
+        let at = room as usize + GUARD;
+        let p = libc::mmap(
+            at as *mut libc::c_void,
+            size,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED | libc::MAP_FIXED,
+            fd,
+            0,
+        );
+        if p == libc::MAP_FAILED {
+            let e = last_errno();
+            libc::munmap(room, size + 2 * GUARD);
+            return Err(e);
+        }
+        Ok(at)
     }
 }
 
@@ -2454,39 +2791,24 @@ pub fn clone_name_at(
 /// storage in the handler, in `malloc`, which the thread may be in
 /// already, making it for the thread's own first access.
 pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
-    // SAFETY: zeroed sets, filled or written by the calls; this thread's
-    // mask only, restored below.
-    let old = unsafe {
-        let mut all: libc::sigset_t = std::mem::zeroed();
-        let mut old: libc::sigset_t = std::mem::zeroed();
-        libc::sigfillset(&mut all);
-        libc::pthread_sigmask(libc::SIG_SETMASK, &all, &mut old);
-        old
-    };
-    let r = f();
-    // SAFETY: the mask saved above.
-    unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &old, std::ptr::null_mut()) };
-    r
+    let _blocked = MaskGuard::set(&full_sigset());
+    f()
 }
 
 /// This process's host pid as the kernel has it now, asked each time: in
 /// a signal handler, which may run in a fork child before its
 /// `pthread_atfork` handlers have forgotten the parent's [`pid`] (or
 /// libc its own copy). Async-signal-safe.
-pub fn pid_now() -> i32 {
+pub fn pid_now() -> HostPid {
     #[cfg(target_os = "macos")]
-    {
-        // SAFETY: the `getpid` system call (20), which cannot fail.
-        #[allow(deprecated)]
-        unsafe {
-            libc::syscall(20)
-        }
-    }
+    // SAFETY: the `getpid` system call (20), which cannot fail.
+    #[allow(deprecated)]
+    let p = unsafe { libc::syscall(20) } as libc::pid_t;
     #[cfg(not(target_os = "macos"))]
-    {
-        // SAFETY: plain host call.
-        unsafe { libc::getpid() }
-    }
+    // SAFETY: plain host call.
+    let p = unsafe { libc::getpid() };
+    // SAFETY: a process's own pid is above 0.
+    unsafe { HostPid::new_unchecked(p) }
 }
 
 /// Whether the calling thread is its process's only host thread, as the
@@ -2499,7 +2821,7 @@ pub fn only_thread() -> bool {
     // SAFETY: a buffer of the size given.
     let n = unsafe {
         libc::proc_pidinfo(
-            pid(),
+            pid().get(),
             libc::PROC_PIDTASKINFO,
             0,
             (&mut info as *mut libc::proc_taskinfo).cast(),
@@ -2522,11 +2844,12 @@ pub fn only_thread() -> bool {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-pub fn pid() -> i32 {
+pub fn pid() -> HostPid {
     use std::sync::atomic::Ordering::Relaxed;
     let p = PID.load(Relaxed);
     if p != 0 {
-        return p;
+        // SAFETY: only a pid from `getpid` (above 0) is stored.
+        return unsafe { HostPid::new_unchecked(p) };
     }
     static FORGET: std::sync::Once = std::sync::Once::new();
     FORGET.call_once(|| {
@@ -2539,7 +2862,8 @@ pub fn pid() -> i32 {
     // SAFETY: getpid cannot fail.
     let p = unsafe { libc::getpid() };
     PID.store(p, Relaxed);
-    p
+    // SAFETY: a process's own pid is above 0.
+    unsafe { HostPid::new_unchecked(p) }
 }
 
 static PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);

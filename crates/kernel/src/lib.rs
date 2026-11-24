@@ -39,6 +39,7 @@ mod fsops;
 pub mod futex;
 mod handles;
 pub mod host;
+pub mod ids;
 pub mod inotify;
 pub mod ipcops;
 mod kept;

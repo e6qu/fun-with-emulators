@@ -279,7 +279,7 @@ const IN_FLIGHT: i32 = 0;
 /// Whether holder `p` (a process, or a message: [`IN_FLIGHT`]) is still
 /// there.
 pub(super) fn alive(p: (i32, u64)) -> bool {
-    p.0 == IN_FLIGHT || crate::procreg::alive(p)
+    p.0 == IN_FLIGHT || crate::procreg::alive_kept(p)
 }
 
 /// This process is ending: it holds none of its files any more, nor their
@@ -329,9 +329,9 @@ pub fn closing(fd: i32) -> Option<impl FnOnce()> {
 /// process holds are held by the child as many times (unless it counted
 /// itself already), so that this process closing its own or ending frees
 /// none the child has.
-pub fn forked(child: i32) {
+pub fn forked(child: crate::ids::HostPid) {
     if let Some(start) = crate::procreg::start_time(child) {
-        hand_on((child, start));
+        hand_on((child.get(), start));
     }
 }
 

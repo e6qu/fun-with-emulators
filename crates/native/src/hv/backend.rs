@@ -82,7 +82,7 @@ impl Platform for HvPlatform {
             libc::signal(sig, libc::SIG_DFL);
             let mut set = host::empty_sigset();
             libc::sigaddset(&mut set, sig);
-            libc::pthread_sigmask(libc::SIG_UNBLOCK, &set, std::ptr::null_mut());
+            host::unblock_signals(&set);
             libc::raise(sig);
             libc::_exit(128 + sig)
         }
@@ -486,12 +486,12 @@ extern "C" fn on_fault(sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut 
 /// relay, on the calling thread.
 fn block_guest_signals() {
     let mut all = host::host_sigset(u64::MAX);
-    // SAFETY: an initialized signal set; changing this thread's mask.
+    // SAFETY: an initialized signal set.
     unsafe {
         libc::sigaddset(&mut all, host::WAKE_SIGNAL);
         libc::sigaddset(&mut all, host::KILL_RELAY);
-        libc::pthread_sigmask(libc::SIG_BLOCK, &all, std::ptr::null_mut());
     }
+    host::block_signals(&all);
 }
 
 fn mem_error(what: &str, e: i32) -> Error {
@@ -993,9 +993,9 @@ impl Vcpu {
                 // EL1h, interrupts masked.
                 self.set(HV_REG_CPSR, 0x3c5);
             }
+            host::set_signal_mask(&mask);
             // SAFETY: plain host calls; `exit` is HVF's record for this vCPU.
             let (rc, exit) = unsafe {
-                libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut());
                 IN_RUN.with(|r| r.set(true));
                 let rc = hvf(|| hv_vcpu_run(self.id));
                 IN_RUN.with(|r| r.set(false));
@@ -1350,7 +1350,7 @@ struct Spawn {
     /// The creating thread's pointer-authentication keys, which a new
     /// thread starts with as on Linux.
     keys: [u64; 10],
-    tid: i32,
+    tid: thread::NewThread,
     tpidr: u64,
     clear_child_tid: u64,
     sigmask: u64,
@@ -1400,7 +1400,8 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     if let Err(e) = a.thread_check() {
         return err(e);
     }
-    let tid = thread::alloc_tid();
+    let new = thread::alloc_tid();
+    let tid = new.tid;
     // Traced from its start if the tracer follows new threads.
     fwe_kernel::ptrace::new_thread(tid);
     if flags & cl::CLONE_PARENT_SETTID != 0 && ptid != 0 {
@@ -1413,11 +1414,11 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     regs.x[0] = 0;
     regs.sp = stack;
     regs.pc = parent.pc + 4;
-    let pending = thread::register(tid);
+    let pending = thread::register(new);
     let spawn = Box::new(Spawn {
         keys: thread_keys(),
         regs,
-        tid,
+        tid: new,
         tpidr,
         clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { ctid } else { 0 },
         sigmask: thread::mask(),

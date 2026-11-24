@@ -146,6 +146,11 @@ fn sockaddr_to_host(linux: &[u8], host: &mut [u8]) -> Result<(), i32> {
 }
 
 /// Linux value `val` of an option of layout `form` as the host takes it.
+/// The longest value an option converted here takes (`group_source_req`):
+/// as much of a longer one is read, as Linux reads only what the option
+/// takes.
+pub const MOST_VALUE: usize = 264;
+
 pub fn value_to_host(form: Form, val: &[u8]) -> Result<Vec<u8>, i32> {
     #[cfg(target_os = "linux")]
     {

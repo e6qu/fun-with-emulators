@@ -237,7 +237,7 @@ pub fn send(
         // SAFETY: the rest of the same buffers.
         let r = unsafe { libc::writev(fd, rest.as_ptr(), rest.len() as i32) };
         if r < 0 {
-            match host::last_errno() {
+            match host::last_errno().raw() {
                 libc::EINTR => continue,
                 libc::EAGAIN => {
                     let _ = wait(fd, libc::POLLOUT);
@@ -262,7 +262,7 @@ fn read_exact(
     control: (*mut libc::c_void, usize),
     peek: bool,
     committed: bool,
-) -> Result<(usize, usize, i32), i32> {
+) -> Result<(usize, usize, i32), host::HostErrno> {
     let mut got = 0;
     let (mut clen, mut cflags) = (0, 0);
     while got < buf.len() {
@@ -287,10 +287,10 @@ fn read_exact(
         if r < 0 {
             let e = host::last_errno();
             let begun = got > 0 || committed;
-            if begun && e == libc::EINTR {
+            if begun && e.is(libc::EINTR) {
                 continue;
             }
-            if begun && e == libc::EAGAIN {
+            if begun && e.is(libc::EAGAIN) {
                 // The rest of a frame begun is on its way.
                 let _ = wait(fd, libc::POLLIN);
                 continue;
@@ -310,7 +310,7 @@ fn read_exact(
         got = r as usize;
         if got < buf.len() && wait(fd, libc::POLLIN).is_err() && !committed {
             // Not all of it is there yet, and a signal came first.
-            return Err(libc::EINTR);
+            return Err(host::HostErrno::new(libc::EINTR));
         }
     }
     Ok((got, clen, cflags))
@@ -339,7 +339,7 @@ pub fn recv(
     use fwe_abi::socket::{MSG_PEEK, MSG_TRUNC};
     let fail = |e: i64| Received { result: e, controllen: 0, flags: 0 };
     let eof = || Received { result: 0, controllen: 0, flags: 0 };
-    let as_err = |e: i32| fail(err(host::errno_to_linux(e)));
+    let as_err = |e: host::HostErrno| fail(err(e.linux()));
     let peek = linux_flags & MSG_PEEK != 0;
     let nonblock = nonblocking(fd, host_flags);
     let lock = lock_of(fd);

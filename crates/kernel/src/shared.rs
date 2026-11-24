@@ -15,7 +15,6 @@
 //! time. A record of thousands of objects (System V IPC's) so costs a
 //! change what the change holds, not what the record does.
 
-use crate::host::errno_to_linux;
 use crate::procstore::named::{self, Slot};
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
@@ -72,7 +71,9 @@ unsafe extern "C" {
 
 /// Sleep up to `slice` while shared word `word` reads `seen` (its low half,
 /// which every change changes), a shared host address wait any process's
-/// change ends ([`wake_all`]).
+/// change ends ([`wake_all`]). Whose wait it is, its callers say
+/// ([`guest_wait_word`], [`busy_wait_word`]).
+#[cfg_attr(not(target_os = "macos"), allow(clippy::disallowed_methods))]
 fn wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
     #[cfg(target_os = "macos")]
     // SAFETY: a shared word of the store's; the host sleeps while its low
@@ -108,8 +109,21 @@ fn wake_all(word: &AtomicU64) {
     let _ = word;
 }
 
-/// Sleep up to `slice` while shared word `word` reads `seen`.
-pub(crate) fn wait_word_for(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
+/// Sleep up to `slice` while shared word `word` reads `seen`, in a wait of
+/// the guest's own (a blocking call's, a stop), which `/proc` shows.
+pub(crate) fn guest_wait_word(word: &AtomicU64, seen: u64, slice: std::time::Duration) {
+    if word.load(Ordering::Acquire) == seen {
+        wait_word(word, seen, slice);
+    }
+}
+
+/// [`guest_wait_word`] in fwe's own work (`/proc` shows it running).
+pub(crate) fn busy_wait_word(
+    _: &crate::procstore::Busy,
+    word: &AtomicU64,
+    seen: u64,
+    slice: std::time::Duration,
+) {
     if word.load(Ordering::Acquire) == seen {
         wait_word(word, seen, slice);
     }
@@ -129,7 +143,7 @@ pub fn hash(bytes: &[u8]) -> u64 {
 /// name, so a record written by another fwe build is never read as this
 /// one's. Raised whenever a record's encoding or a namespace's initial
 /// contents change.
-pub const FORMAT: u32 = 50;
+pub const FORMAT: u32 = 51;
 
 /// A number no other call of any process gives: for the names of host
 /// objects of fwe's (a System V segment's memory, an eventfd's counter).
@@ -139,7 +153,7 @@ pub fn unique() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos() as u64);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let pid = crate::host::pid() as u64;
+    let pid = crate::host::pid().get() as u64;
     hash(&[now.to_le_bytes(), pid.to_le_bytes(), n.to_le_bytes()].concat())
 }
 
@@ -172,13 +186,13 @@ pub fn lock_exclusive(fd: i32) {
     // SAFETY: plain host calls on the caller's descriptor.
     unsafe {
         while libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) != 0 {
-            match crate::host::last_errno() {
+            match crate::host::last_errno().raw() {
                 libc::EWOULDBLOCK if now() - start <= 1_000_000_000 => libc::sched_yield(),
                 // A signal came: the lock is still to take.
                 libc::EINTR => 0,
                 _ => {
                     while libc::flock(fd, libc::LOCK_EX) != 0
-                        && crate::host::last_errno() == libc::EINTR
+                        && crate::host::last_errno().is(libc::EINTR)
                     {}
                     break;
                 }
@@ -198,7 +212,9 @@ pub fn host_dir(dir: &[u8]) -> Result<(), i32> {
         .recursive(true)
         .mode(0o700)
         .create(std::ffi::OsStr::from_bytes(dir))
-        .map_err(|e| e.raw_os_error().map_or(errno::EIO, errno_to_linux))
+        .map_err(|e| {
+            e.raw_os_error().map_or(errno::EIO, |e| crate::host::HostErrno::new(e).linux())
+        })
 }
 
 /// The identity of the record named `dir`, if there is one.
@@ -346,6 +362,9 @@ impl<T: Data> Record<T> {
     /// journal when it holds every change since, else read whole. What a
     /// change made meanwhile tore is read again.
     fn read_current(&self, copy: Option<&Copy<T>>) -> Result<Copy<T>, i32> {
+        // Read again and again while writers change it, then waiting for
+        // its lock: fwe's work, not a wait of the guest's.
+        let _busy = crate::procstore::Busy::new();
         let mut last = Err(errno::EIO);
         for _ in 0..100 {
             let from = copy.and_then(|c| c.journal);
@@ -620,7 +639,7 @@ pub fn collect() {
             child => {
                 let mut status = 0;
                 while libc::waitpid(child, &mut status, 0) < 0
-                    && crate::host::last_errno() == libc::EINTR
+                    && crate::host::last_errno().is(libc::EINTR)
                 {}
             }
         }

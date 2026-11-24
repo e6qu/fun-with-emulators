@@ -134,9 +134,10 @@ pub fn deliver(inst: &[u8], mask: u32) -> bool {
         post(fd);
         return true;
     }
-    if !crate::procreg::alive((pid, start)) {
+    let Some(pid) = crate::ids::HostPid::new(pid).filter(|&p| crate::procreg::alive((p, start)))
+    else {
         return false;
-    }
+    };
     let value = fd as u32 as u64;
     if crate::signote::queue(pid, fwe_abi::signal::SIGIO, POLL_MSG, value).is_err() {
         return false;

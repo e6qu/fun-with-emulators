@@ -291,7 +291,7 @@ fn abstract_stale(hb: &[u8; SOCKADDR_MAX], len: libc::socklen_t, ty: i32) -> boo
             return false;
         }
         let r = libc::connect(probe, hb.as_ptr().cast(), len);
-        let refused = r < 0 && crate::host::last_errno() == libc::ECONNREFUSED;
+        let refused = r < 0 && crate::host::last_errno().is(libc::ECONNREFUSED);
         libc::close(probe);
         refused
     }
@@ -417,7 +417,7 @@ fn in_dir(dir: Option<&std::os::fd::OwnedFd>, call: impl FnOnce() -> i32) -> i32
             let r = call();
             let e = crate::host::last_errno();
             pthread_fchdir_np(-1);
-            *libc::__error() = e;
+            *libc::__error() = e.raw();
             r
         }
     }
@@ -767,7 +767,7 @@ fn buffer_size(fd: i32, optname: u64, optval: u64, optlen: u64, admin: bool) -> 
             return 0;
         }
         // Past what the host takes: the most it does.
-        if crate::host::last_errno() != libc::ENOBUFS || size <= least {
+        if !crate::host::last_errno().is(libc::ENOBUFS) || size <= least {
             return last_error();
         }
         size /= 2;
@@ -1112,7 +1112,7 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
         && src.get(2) == Some(&0)
         && let Some(names) = abstract_names()
     {
-        let me = crate::host::pid();
+        let me = crate::host::pid().get();
         let name = &src[3..];
         let _ = names.update(|t| {
             t.names.insert(abstract_key(name), (name.to_vec(), me));
@@ -1349,7 +1349,7 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
         return 0;
     }
     let e = crate::host::last_errno();
-    match e {
+    match e.raw() {
         libc::EINTR | libc::EINPROGRESS => {
             connecting(fd, true);
             return err(crate::host::errno_to_linux(e));
@@ -1361,7 +1361,7 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
             return err(crate::host::errno_to_linux(e));
         }
     }
-    if e == libc::EALREADY {
+    if e.is(libc::EALREADY) {
         // SAFETY: plain host call on the guest's socket.
         if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
             connecting(fd, true);
@@ -1384,7 +1384,7 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
     if r != 0 {
         return crate::host::last_error();
     }
-    if so_error != 0 { err(crate::host::errno_to_linux(so_error)) } else { 0 }
+    if so_error != 0 { err(crate::host::HostErrno::new(so_error).linux()) } else { 0 }
 }
 
 /// Unix sockets bound (`local`) or connected to a path the host knows only
@@ -2546,7 +2546,8 @@ pub unsafe fn setsockopt(
         Err(e) => return e,
     };
     if form != Form::Same {
-        let val = guest!(uaccess::read_bytes(optval, optlen as usize));
+        let len = (optlen as usize).min(crate::sockopt::MOST_VALUE);
+        let val = guest!(uaccess::read_bytes(optval, len));
         let host = guest!(crate::sockopt::value_to_host(form, &val));
         if let Some(r) = stream_membership(fd as i32, level, optname, form, &host) {
             return r;
@@ -2694,7 +2695,7 @@ fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
 /// The `ucred` of fwe's process `pid` (a host pid) as the caller sees it:
 /// its effective ids, if fwe has a record of it.
 fn ucred_of(pid: i32) -> Option<[u32; 3]> {
-    let ids = crate::procreg::read(pid)?.ids;
+    let ids = crate::procreg::read(crate::ids::HostPid::new(pid)?)?.ids;
     Some(guest_ucred(pid, ids[1], ids[5]))
 }
 
@@ -3311,10 +3312,13 @@ fn send_control(
 /// ([`crate::scm::prepare`]).
 #[cfg(not(target_os = "linux"))]
 fn host_peer(fd: i32) -> bool {
-    host_peercred(fd).is_ok_and(|(pid, _, _)| pid > 0 && crate::procreg::read(pid).is_none())
+    host_peercred(fd).is_ok_and(|(pid, _, _)| {
+        crate::ids::HostPid::new(pid).is_some_and(|p| crate::procreg::read(p).is_none())
+    })
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
 
@@ -3729,6 +3733,7 @@ mod tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 pub(crate) mod scm_tests {
     use super::*;
 
@@ -3964,6 +3969,7 @@ pub(crate) mod scm_tests {
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod udp_option_tests {
     use super::*;
 
@@ -4331,7 +4337,7 @@ mod creds_tests {
     fn credentials_come_when_asked() {
         let _g = super::scm_tests::serial();
         let sv = pair(SOCK_STREAM);
-        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        let me = crate::pidns::to_guest(crate::host::pid().get()) as u32;
         assert_eq!(send_control(sv[0], &[]), 1);
         let (_, c, _) = recv_control(sv[1], 64, 0);
         assert_eq!(creds_in(&c), None);
@@ -4377,7 +4383,7 @@ mod creds_tests {
         let r = unsafe { sendto(tx as u64, byte.as_ptr() as u64, 1, 0, a.as_ptr() as u64, alen) };
         assert_eq!(r, 1);
         let (_, c, _) = recv_control(rx, 64, 0);
-        let me = crate::pidns::to_guest(crate::host::pid()) as u32;
+        let me = crate::pidns::to_guest(crate::host::pid().get()) as u32;
         assert_eq!(creds_in(&c).map(|c| c[0]), Some(me));
         closed(rx);
         close_all(&[rx, tx]);

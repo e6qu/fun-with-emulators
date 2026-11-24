@@ -37,13 +37,14 @@
 //! already keep it, and those it adopted stay its own, as on Linux, where
 //! an orphan is adopted when its parent ends.
 
+use crate::ids::{HostPid, LinuxSig};
 use crate::procreg::{self, Ended, Proc};
 use std::collections::HashSet;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering::SeqCst};
 
 /// The host pid of this process.
-fn me() -> i32 {
+fn me() -> HostPid {
     crate::host::pid()
 }
 
@@ -80,7 +81,7 @@ fn adopts(p: Proc, bound: Option<Proc>, who: Proc) -> bool {
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
-pub fn adopter(who: Proc, lineage: &[Proc], bound: Option<Proc>) -> Option<i32> {
+pub fn adopter(who: Proc, lineage: &[Proc], bound: Option<Proc>) -> Option<HostPid> {
     candidates(lineage, bound).find(|&p| adopts(p, bound, who)).map(|p| p.0)
 }
 
@@ -115,10 +116,10 @@ fn own_proc() -> Option<Proc> {
     static PID: AtomicI32 = AtomicI32::new(0);
     static START: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let me = me();
-    if PID.load(SeqCst) != me {
+    if PID.load(SeqCst) != me.get() {
         let start = procreg::start_time(me)?;
         START.store(start, SeqCst);
-        PID.store(me, SeqCst);
+        PID.store(me.get(), SeqCst);
     }
     Some((me, START.load(SeqCst)))
 }
@@ -174,11 +175,11 @@ pub fn set_subreaper(on: bool) {
         // adopts it now, and whether that is a reaper below this process
         // (which, when it ends, hands it on to the next reaper up, as on
         // Linux, so it is not declined).
-        let below = |lineage: &[Proc], a: Option<i32>| {
+        let below = |lineage: &[Proc], a: Option<HostPid>| {
             let mine = lineage.iter().position(|&(p, _)| p == me);
             a.is_some_and(|a| lineage.iter().position(|&(p, _)| p == a) < mine)
         };
-        let mut orphans: Vec<(Proc, Option<i32>, bool)> = procreg::all()
+        let mut orphans: Vec<(Proc, Option<HostPid>, bool)> = procreg::all()
             .into_iter()
             .filter(|(_, r)| r.lineage.iter().any(|&(p, _)| p == me) && orphaned(&r.lineage))
             .map(|(pid, r)| {
@@ -215,21 +216,21 @@ fn orphaned(lineage: &[Proc]) -> bool {
 /// The guest's parent of host process `pid`, as a host pid: its parent
 /// while that lives, else the reaper that adopted it. `host_ppid` is the
 /// host's answer, used for a process fwe has no line of ancestors for.
-pub fn parent_of(pid: i32, host_ppid: i32) -> i32 {
+pub fn parent_of(pid: HostPid, host_ppid: i32) -> i32 {
     // This process's own parent, still its parent on the host: alive, and
     // the answer, without reading the record again.
     if pid == me() {
         match own_parent() {
             // The first of its run: the host's answer.
             Some(None) => return host_ppid,
-            Some(Some(p)) if p == host_ppid => return p,
+            Some(Some(p)) if p.get() == host_ppid => return host_ppid,
             _ => {}
         }
     }
     let Some(r) = procreg::read(pid) else { return host_ppid };
     match r.lineage.first() {
-        Some(&p) if procreg::alive(p) => p.0,
-        Some(_) => adopter((pid, r.start), &r.lineage, r.bound).unwrap_or(host_ppid),
+        Some(&p) if procreg::alive(p) => p.0.get(),
+        Some(_) => adopter((pid, r.start), &r.lineage, r.bound).map_or(host_ppid, HostPid::get),
         None => host_ppid,
     }
 }
@@ -237,16 +238,16 @@ pub fn parent_of(pid: i32, host_ppid: i32) -> i32 {
 /// This process's parent as its record names it (fixed as it was made; `None`
 /// for the first process of a run), or `None` without a record yet. Kept
 /// for its pid: a fork child, with a pid of its own, reads its own.
-fn own_parent() -> Option<Option<i32>> {
+fn own_parent() -> Option<Option<HostPid>> {
     static OWN: AtomicU64 = AtomicU64::new(0);
     let me = me();
     let v = OWN.load(SeqCst);
-    if (v >> 32) as i32 == me {
-        return Some((v as i32 != 0).then_some(v as i32));
+    if (v >> 32) as i32 == me.get() {
+        return Some(HostPid::new(v as i32));
     }
-    let parent = procreg::read(me)?.lineage.first().map_or(0, |p| p.0);
-    OWN.store((me as u64) << 32 | parent as u32 as u64, SeqCst);
-    Some((parent != 0).then_some(parent))
+    let parent = procreg::read(me)?.lineage.first().map(|p| p.0);
+    OWN.store((me.get() as u64) << 32 | parent.map_or(0, HostPid::get) as u32 as u64, SeqCst);
+    Some(parent)
 }
 
 /// Whether someone may still reap ended process `e`: its parent, or a
@@ -269,7 +270,7 @@ fn adopted_ended(e: &Ended) -> bool {
 
 /// Whether living process `pid`, whose record is `r`, is one this process
 /// adopted, or a foster child of its.
-fn adopted_live(pid: i32, r: &procreg::ProcRecord) -> bool {
+fn adopted_live(pid: HostPid, r: &procreg::ProcRecord) -> bool {
     let me = me();
     fostered_here(&r.lineage, r.foster)
         || r.lineage.first().is_some_and(|&(p, _)| p != me)
@@ -286,10 +287,10 @@ pub enum Select {
 }
 
 impl Select {
-    fn matches(self, pid: i32, pgid: i32) -> bool {
+    fn matches(self, pid: HostPid, pgid: i32) -> bool {
         match self {
             Select::Any => true,
-            Select::Pid(p) => p == pid,
+            Select::Pid(p) => p == pid.get(),
             Select::Pgid(g) => g == pgid,
         }
     }
@@ -316,8 +317,8 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
         if procreg::take_adopted_end(&e) {
             let first = told.get_or_insert_with(HashSet::new).insert((e.pid, e.start));
             drop(told);
-            crate::pidns::released(&e.numbers, e.pid);
-            crate::pidfd::reaped(e.pid, e.status);
+            crate::pidns::released(&e.numbers, e.pid.get());
+            crate::pidfd::reaped(e.pid.get(), e.status);
             if first && sigchld_taken() {
                 // Reaped before the watcher saw it end: its SIGCHLD is
                 // still owed, as Linux sends it before `wait` can return.
@@ -337,7 +338,7 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
 pub fn reaped_own_child(child: i32) {
     if active() {
         for (pid, r) in procreg::all() {
-            if r.lineage.first().is_some_and(|&(p, _)| p == child) {
+            if r.lineage.first().is_some_and(|&(p, _)| p.get() == child) {
                 procreg::gone(pid);
             }
         }
@@ -356,7 +357,7 @@ pub fn has_live_adopted(sel: Select) -> bool {
     let mut live = false;
     for (pid, r) in procreg::all() {
         // SAFETY: plain host call.
-        let pgid = unsafe { libc::getpgid(pid) };
+        let pgid = unsafe { libc::getpgid(pid.get()) };
         if !adopted_live(pid, &r) {
             continue;
         }
@@ -403,7 +404,7 @@ pub fn take_change(sel: Select, peek: bool, stopped: bool, continued: bool) -> O
 pub fn take_own_change(sel: Select, peek: bool, stopped: bool, continued: bool) -> Option<Ended> {
     for pid in own_children() {
         // SAFETY: plain host call.
-        let pgid = unsafe { libc::getpgid(pid) };
+        let pgid = unsafe { libc::getpgid(pid.get()) };
         if !sel.matches(pid, pgid) {
             continue;
         }
@@ -429,22 +430,21 @@ pub fn take_own_change(sel: Select, peek: bool, stopped: bool, continued: bool) 
 }
 
 /// This process's children on the host.
-fn own_children() -> Vec<i32> {
+fn own_children() -> Vec<HostPid> {
     #[cfg(target_os = "macos")]
     {
         let mut pids = vec![0i32; 256];
         loop {
             let size = (pids.len() * std::mem::size_of::<i32>()) as libc::c_int;
             // SAFETY: a valid buffer of `size` bytes.
-            let n = unsafe { libc::proc_listchildpids(me(), pids.as_mut_ptr().cast(), size) };
+            let n = unsafe { libc::proc_listchildpids(me().get(), pids.as_mut_ptr().cast(), size) };
             if n < 0 {
                 return Vec::new();
             }
             let n = n as usize;
             if n < pids.len() {
                 pids.truncate(n);
-                pids.retain(|&p| p > 0);
-                return pids;
+                return pids.into_iter().filter_map(HostPid::new).collect();
             }
             pids.resize(pids.len() * 2, 0);
         }
@@ -459,9 +459,9 @@ fn own_children() -> Vec<i32> {
 /// (`None`): kept for `wait`, and told with `SIGCHLD` unless the guest
 /// asked not to be (`SA_NOCLDSTOP`).
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-fn changed(pid: i32, r: &procreg::ProcRecord, sig: Option<i32>) {
+fn changed(pid: HostPid, r: &procreg::ProcRecord, sig: Option<i32>) {
     // SAFETY: plain host call.
-    let pgid = unsafe { libc::getpgid(pid) };
+    let pgid = unsafe { libc::getpgid(pid.get()) };
     let e = Ended {
         pid,
         start: r.start,
@@ -487,7 +487,7 @@ fn changed(pid: i32, r: &procreg::ProcRecord, sig: Option<i32>) {
 /// The pid ended process `e` has in the caller's pid namespace.
 pub fn guest_pid(e: &Ended) -> i32 {
     match crate::pidns::current().first() {
-        None => e.pid,
+        None => e.pid.get(),
         Some(ns) => e.number_in(ns.dir()).unwrap_or(0),
     }
 }
@@ -517,7 +517,7 @@ pub fn active() -> bool {
 }
 
 /// The adopted processes whose end the watcher has raised `SIGCHLD` for.
-static NOTIFIED: Mutex<Option<HashSet<(i32, u64)>>> = Mutex::new(None);
+static NOTIFIED: Mutex<Option<HashSet<Proc>>> = Mutex::new(None);
 
 /// Host threads waiting in `wait` (0: a free slot), which the watcher and
 /// a child's stop or continue wake ([`wake_waiters`]): taken and let go
@@ -658,7 +658,8 @@ fn ended_init(init: i32, ns: &[u8]) {
 pub fn init_unreapable(child: i32) -> bool {
     let ns = INITS.lock().unwrap_or_else(|e| e.into_inner()).children.get(&child).cloned();
     let Some(ns) = ns else { return false };
-    let ended = procreg::host_info(child).is_none_or(|(_, _, zombie)| zombie);
+    let ended =
+        HostPid::new(child).and_then(procreg::host_info).is_none_or(|(_, _, zombie)| zombie);
     busy(|| {
         ended
             && crate::shared::Record::<crate::pidns::PidNs>::join(&ns, 0)
@@ -681,7 +682,7 @@ pub fn reaped_child(child: i32) {
     // is not waited for long.
     let until = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while busy(|| crate::pidns::members_alive(&r, child)) && std::time::Instant::now() < until {
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        crate::procstore::Busy::new().sleep(std::time::Duration::from_millis(1));
     }
 }
 
@@ -690,7 +691,7 @@ pub fn reaped_child(child: i32) {
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 fn is_reaper() -> bool {
     let init =
-        crate::pidns::current().first().is_some_and(|ns| ns.get().number_of(me()) == Some(1));
+        crate::pidns::current().first().is_some_and(|ns| ns.get().number_of(me().get()) == Some(1));
     init || fostering() || procreg::own_subreaper()
 }
 
@@ -725,7 +726,8 @@ pub fn start_if_reaper() {
 /// blocked while it checks for a child to report, so none is missed
 /// before [`Waiter::sleep`].
 pub struct Waiter {
-    old: libc::sigset_t,
+    /// Its signals blocked between its looks, until it is dropped.
+    blocked: Option<crate::host::MaskGuard>,
     slot: usize,
 }
 
@@ -743,13 +745,9 @@ impl Waiter {
             std::process::exit(1)
         };
         let mut all = crate::host::host_sigset(u64::MAX);
-        let mut old = crate::host::empty_sigset();
-        // SAFETY: plain host calls on valid signal sets.
-        unsafe {
-            libc::sigaddset(&mut all, crate::host::WAKE_SIGNAL);
-            libc::pthread_sigmask(libc::SIG_BLOCK, &all, &mut old);
-        }
-        Waiter { old, slot }
+        // SAFETY: an initialized signal set.
+        unsafe { libc::sigaddset(&mut all, crate::host::WAKE_SIGNAL) };
+        Waiter { blocked: Some(crate::host::MaskGuard::block(&all)), slot }
     }
 
     /// Wait until a signal arrives: a wake ([`wake_waiters`]), a child's
@@ -769,8 +767,8 @@ impl Default for Waiter {
 
 impl Drop for Waiter {
     fn drop(&mut self) {
-        // SAFETY: restoring the mask saved in `new`.
-        unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &self.old, std::ptr::null_mut()) };
+        // The mask back first, then the slot given up.
+        drop(self.blocked.take());
         WAITERS[self.slot].store(0, SeqCst);
         while WAKING.load(SeqCst) != 0 {
             std::hint::spin_loop();
@@ -815,7 +813,7 @@ fn notify() {
     for e in fresh {
         crate::trace::note_to_file(&format!("reaper: {} ended, adopted", e.pid));
         if crate::host::children_reaped_by_host() && procreg::take_ended(&e) {
-            crate::pidns::released(&e.numbers, e.pid);
+            crate::pidns::released(&e.numbers, e.pid.get());
         }
         // A SIGCHLD ignored is not sent at all (and one left at its
         // default would be dropped): only one the guest takes.
@@ -860,34 +858,34 @@ fn raise(e: &Ended) {
     crate::trace::note_to_file(&format!("reaper: SIGCHLD for {} ({:#x})", e.pid, e.status));
     // An end is what Linux reports before the former parent's own.
     if !is_stop(e.status) && e.status != CONTINUED {
-        REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0), SeqCst);
-        REPORTED.store(e.pid, SeqCst);
+        REPORTED_PARENT.store(e.lineage.first().map_or(0, |p| p.0.get()), SeqCst);
+        REPORTED.store(e.pid.get(), SeqCst);
     }
     let (code, status) = child_code(e.status);
     // The child's real user, as its record kept it; a child's of fwe's.
     // SAFETY: getuid cannot fail.
     let host_user = crate::host::uid_to_initial(unsafe { libc::getuid() });
     let uid = crate::procreg::kept_uid(e.pid).unwrap_or(host_user);
-    let info = crate::thread::SigInfo { code, pid: e.pid, uid, status, value: 0, poll: None };
+    let pid = e.pid.get();
+    let info = crate::thread::SigInfo { code, pid, uid, status, value: 0, poll: None };
     crate::thread::post_process_waking(fwe_abi::signal::SIGCHLD, info);
 }
 
 /// Host process `pid`'s children.
 #[cfg(target_os = "macos")]
-pub fn children(pid: i32) -> Vec<i32> {
+pub fn children(pid: HostPid) -> Vec<HostPid> {
     let mut buf = vec![0i32; 256];
     loop {
         let bytes = (buf.len() * std::mem::size_of::<i32>()) as libc::c_int;
         // SAFETY: a valid out-buffer of `bytes` bytes.
-        let n = unsafe { libc::proc_listchildpids(pid, buf.as_mut_ptr().cast(), bytes) };
+        let n = unsafe { libc::proc_listchildpids(pid.get(), buf.as_mut_ptr().cast(), bytes) };
         if n < 0 {
             return Vec::new();
         }
         let n = n as usize;
         if n < buf.len() {
             buf.truncate(n);
-            buf.retain(|&p| p > 0);
-            return buf;
+            return buf.into_iter().filter_map(HostPid::new).collect();
         }
         buf.resize(buf.len() * 2, 0);
     }
@@ -895,7 +893,7 @@ pub fn children(pid: i32) -> Vec<i32> {
 
 /// Processes this one sent a signal that may stop or continue them, for the
 /// watcher to look at ([`stop_signal_sent`]).
-static SENT: Mutex<Vec<i32>> = Mutex::new(Vec::new());
+static SENT: Mutex<Vec<HostPid>> = Mutex::new(Vec::new());
 
 /// The watcher's kqueue, where a user event wakes it (-1: none).
 #[cfg(target_os = "macos")]
@@ -907,7 +905,7 @@ static WATCH_KQ: AtomicI32 = AtomicI32::new(-1);
 /// tells the watcher of a signal only to a process it follows already, and
 /// an orphan this process just adopted it may not follow yet: the stop
 /// would then be taken for one from before the adoption, never reported.
-pub fn stop_signal_sent(pid: i32) {
+pub fn stop_signal_sent(pid: HostPid) {
     if !active() {
         return;
     }
@@ -953,18 +951,18 @@ mod watch {
 
     struct Watcher {
         kq: i32,
-        watched: HashSet<i32>,
+        watched: HashSet<HostPid>,
         /// Whether each followed process is stopped, as last seen: from
         /// when it is first followed, so a continue is seen as one even
         /// for a process stopped before it was adopted.
-        stopped: std::collections::HashMap<i32, bool>,
+        stopped: std::collections::HashMap<HostPid, bool>,
     }
 
     impl Watcher {
         /// Follow `pid`, its children and theirs: its end, its forks, and
         /// the signals it is sent (which may stop or continue it).
         /// Returns whether one had already gone.
-        fn follow(&mut self, pid: i32) -> bool {
+        fn follow(&mut self, pid: HostPid) -> bool {
             let mut gone = false;
             let mut todo = vec![pid];
             while let Some(p) = todo.pop() {
@@ -973,7 +971,7 @@ mod watch {
                 }
                 crate::trace::note_to_file(&format!("reaper: follows {p}"));
                 let ev = change(
-                    p,
+                    p.get(),
                     libc::EVFILT_PROC,
                     libc::EV_ADD | libc::EV_CLEAR,
                     libc::NOTE_EXIT | libc::NOTE_FORK | libc::NOTE_SIGNAL,
@@ -1008,7 +1006,7 @@ mod watch {
         /// process just forked has not written its record yet: it may be
         /// one of those, and is looked for again soon (nothing else tells
         /// this watcher of it once its parent has gone).
-        fn follow_recorded(&mut self, me: i32) -> bool {
+        fn follow_recorded(&mut self, me: HostPid) -> bool {
             let (all, unwritten) = procreg::all_written();
             for (pid, r) in all {
                 if !self.watched.contains(&pid) && r.lineage.iter().any(|&(p, _)| p == me) {
@@ -1039,7 +1037,7 @@ mod watch {
                 )
             };
             if n < 0 {
-                if crate::host::last_errno() == libc::EINTR {
+                if crate::host::last_errno().is(libc::EINTR) {
                     continue;
                 }
                 return;
@@ -1069,7 +1067,7 @@ mod watch {
         // And the signals it sends that may stop or continue a process
         // ([`stop_signal_sent`]).
         let own = [
-            change(me, libc::EVFILT_PROC, libc::EV_ADD | libc::EV_CLEAR, libc::NOTE_FORK),
+            change(me.get(), libc::EVFILT_PROC, libc::EV_ADD | libc::EV_CLEAR, libc::NOTE_FORK),
             change(libc::SIGCHLD, libc::EVFILT_SIGNAL, libc::EV_ADD | libc::EV_CLEAR, 0),
             change(0, libc::EVFILT_USER, libc::EV_ADD | libc::EV_CLEAR, 0),
         ];
@@ -1093,12 +1091,13 @@ mod watch {
         // Processes whose end was reported while they were still on their
         // way out (not yet zombies): looked at again until they are, since
         // nothing else will be reported for them.
-        let mut ending: HashSet<(i32, Option<u64>)> = HashSet::new();
+        let mut ending: HashSet<(HostPid, Option<u64>)> = HashSet::new();
         // Followed processes sent a signal, looked at until it has stopped
         // or continued them or [`SIGNAL_SETTLES`] has passed. The host
         // tells of a signal sent, not of the stop it makes, which takes
         // effect as the process gets to it: on a busy host, long after.
-        let mut signalled: std::collections::HashMap<i32, std::time::Instant> = Default::default();
+        let mut signalled: std::collections::HashMap<HostPid, std::time::Instant> =
+            Default::default();
         let soon = libc::timespec { tv_sec: 0, tv_nsec: 5_000_000 };
         let later = libc::timespec { tv_sec: 0, tv_nsec: 50_000_000 };
         loop {
@@ -1120,7 +1119,7 @@ mod watch {
                 libc::kevent(kq, std::ptr::null(), 0, evs.as_mut_ptr(), evs.len() as i32, timeout)
             };
             if n < 0 {
-                if crate::host::last_errno() == libc::EINTR {
+                if crate::host::last_errno().is(libc::EINTR) {
                     continue;
                 }
                 RUNNING.store(false, SeqCst);
@@ -1131,7 +1130,7 @@ mod watch {
                     if ev.filter != libc::EVFILT_PROC {
                         continue;
                     }
-                    let pid = ev.ident as i32;
+                    let Some(pid) = HostPid::new(ev.ident as i32) else { continue };
                     if ev.fflags & libc::NOTE_FORK != 0 {
                         for c in children(pid) {
                             w.follow(c);
@@ -1151,7 +1150,7 @@ mod watch {
                 // Those this process signalled itself: followed now if they
                 // are below it and were not, from before the signal (which
                 // the host told nothing of).
-                let sent: Vec<i32> = SENT.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                let sent: Vec<HostPid> = SENT.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 for &pid in &sent {
                     if !w.watched.contains(&pid) {
                         let below = procreg::read(pid)
@@ -1215,29 +1214,33 @@ mod watch {
 static EXIT_SIGNALS: [(std::sync::atomic::AtomicI32, std::sync::atomic::AtomicU64); 64] =
     [const { (std::sync::atomic::AtomicI32::new(0), std::sync::atomic::AtomicU64::new(0)) }; 64];
 
-/// Child `child` (host pid) was made with exit signal `sig`.
+/// Child `child` (host pid) was made with exit signal `sig`: a number
+/// that is no signal (0, or past 64) tells its end with none, as Linux
+/// does.
 pub fn set_exit_signal(child: i32, sig: u64) {
     use std::sync::atomic::Ordering::SeqCst;
-    if sig == fwe_abi::signal::SIGCHLD || exit_signal(child).is_some() {
+    let sig = LinuxSig::new(sig);
+    if sig.map(LinuxSig::get) == Some(fwe_abi::signal::SIGCHLD) || exit_signal(child).is_some() {
         return;
     }
     for (pid, s) in &EXIT_SIGNALS {
         if pid.compare_exchange(0, -1, SeqCst, SeqCst).is_ok() {
-            s.store(sig, SeqCst);
+            s.store(sig.map_or(0, LinuxSig::get), SeqCst);
             pid.store(child, SeqCst);
             return;
         }
     }
 }
 
-/// The signal child `child`'s end is told with, if not `SIGCHLD` (0: none).
-/// Async-signal-safe.
-pub fn exit_signal(child: i32) -> Option<u64> {
+/// The signal child `child`'s end is told with, if not `SIGCHLD` (`None`
+/// in it: none). Async-signal-safe.
+pub fn exit_signal(child: i32) -> Option<Option<LinuxSig>> {
     use std::sync::atomic::Ordering::SeqCst;
     if child <= 0 {
         return None;
     }
-    EXIT_SIGNALS.iter().find(|(pid, _)| pid.load(SeqCst) == child).map(|(_, s)| s.load(SeqCst))
+    let found = EXIT_SIGNALS.iter().find(|(pid, _)| pid.load(SeqCst) == child);
+    found.map(|(_, s)| LinuxSig::new(s.load(SeqCst)))
 }
 
 /// Child `child` was reaped: its exit signal goes.
@@ -1287,11 +1290,11 @@ pub fn child_signal_landed(pid: i32) -> bool {
 pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
     // Its own exit signal, if not SIGCHLD (none: nothing to give).
     let sig = match exit_signal(pid) {
-        Some(0) => return,
-        Some(s) => s,
-        None => fwe_abi::signal::SIGCHLD,
+        Some(None) => return,
+        Some(Some(s)) => s,
+        None => LinuxSig::SIGCHLD,
     };
-    let bit = 1 << (sig - 1);
+    let bit = sig.bit();
     let taken = (crate::signal::caught() | crate::signalfd::watched()) & bit != 0;
     if pid <= 0 {
         return;
@@ -1316,7 +1319,7 @@ pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
         ring_take(&GIVEN, pid);
         return;
     }
-    crate::thread::post_process(sig, info);
+    crate::thread::post_process(sig.get(), info);
 }
 
 #[cfg(test)]
@@ -1325,13 +1328,14 @@ mod tests {
 
     #[test]
     fn candidates_stop_at_the_bound() {
-        let line = [(10, 1), (20, 2), (30, 3), (40, 4)];
+        let p = |n: i32| (HostPid::new(n).unwrap(), n as u64 / 10);
+        let line = [p(10), p(20), p(30), p(40)];
         let all: Vec<Proc> = candidates(&line, None).collect();
-        assert_eq!(all, [(20, 2), (30, 3), (40, 4)]);
-        let bounded: Vec<Proc> = candidates(&line, Some((30, 3))).collect();
-        assert_eq!(bounded, [(20, 2), (30, 3)]);
+        assert_eq!(all, [p(20), p(30), p(40)]);
+        let bounded: Vec<Proc> = candidates(&line, Some(p(30))).collect();
+        assert_eq!(bounded, [p(20), p(30)]);
         // A parent that is the bound (a namespace's init) leaves no one.
-        assert_eq!(candidates(&line, Some((10, 1))).count(), 0);
+        assert_eq!(candidates(&line, Some(p(10))).count(), 0);
     }
 
     #[test]
@@ -1346,7 +1350,7 @@ mod tests {
     #[test]
     fn lists_children() {
         let mut child = std::process::Command::new("/bin/sleep").arg("5").spawn().unwrap();
-        let found = children(me()).contains(&(child.id() as i32));
+        let found = children(me()).contains(&HostPid::new(child.id() as i32).unwrap());
         child.kill().unwrap();
         child.wait().unwrap();
         assert!(found);

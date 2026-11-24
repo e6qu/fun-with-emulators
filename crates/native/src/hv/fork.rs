@@ -231,7 +231,7 @@ fn write_all(fd: i32, mut buf: &[u8]) -> bool {
     while !buf.is_empty() {
         // SAFETY: writing our buffer to our socket.
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-        if n < 0 && host::last_errno() == libc::EINTR {
+        if n < 0 && host::last_errno().is(libc::EINTR) {
             continue;
         }
         if n <= 0 {
@@ -516,7 +516,7 @@ fn read_byte(fd: i32) -> bool {
     loop {
         // SAFETY: reading one byte into a local.
         let n = unsafe { libc::read(fd, (&mut b as *mut u8).cast(), 1) };
-        if n < 0 && host::last_errno() == libc::EINTR {
+        if n < 0 && host::last_errno().is(libc::EINTR) {
             continue;
         }
         return n == 1;
@@ -609,11 +609,12 @@ fn spawn_child(fds: &[(i32, bool)], state: &[u8]) -> Result<i32, String> {
     match r {
         Ok(()) => Ok(pid),
         Err(e) => {
-            // SAFETY: ending and reaping the child that could not be set up.
-            unsafe {
-                libc::kill(pid, libc::SIGKILL);
-                libc::waitpid(pid, std::ptr::null_mut(), 0);
+            // Ended and reaped: the child that could not be set up.
+            if let Some(child) = fwe_kernel::ids::HostPid::new(pid) {
+                fwe_kernel::host::kill_child(child);
             }
+            // SAFETY: reaping the child spawned above.
+            unsafe { libc::waitpid(pid, std::ptr::null_mut(), 0) };
             Err(e)
         }
     }

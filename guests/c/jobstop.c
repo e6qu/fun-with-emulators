@@ -1,5 +1,6 @@
 /* Job-control stops of a child with threads, as Linux makes them: a stop
- * stops every thread (counters they bump stand still), /proc shows it
+ * stops every thread (counters they bump stand still; one that moved is
+ * told, by how much), /proc shows it
  * stopped, the parent's wait reports each stop and continue once, its
  * SIGCHLD tells of them (CLD_STOPPED, CLD_CONTINUED, with the child's pid
  * and the signal) unless SA_NOCLDSTOP asks for none, a stop of SIGTSTP is
@@ -134,7 +135,16 @@ int main(void) {
     int reported = waitpid(child, &status, WUNTRACED) == child && stopped_by(status) == SIGSTOP;
     long before[3] = {count[0], count[1], count[2]};
     usleep(50000);
-    int still = count[0] == before[0] && count[1] == before[1] && count[2] == before[2];
+    long mid[3] = {count[0], count[1], count[2]};
+    int still = mid[0] == before[0] && mid[1] == before[1] && mid[2] == before[2];
+    /* A thread that moved: by how much, and whether it went on moving (a
+     * few steps as the stop was told, or not stopped at all). */
+    if (!still) {
+        usleep(50000);
+        for (int i = 0; i < 3; i++)
+            printf("thread %d: +%ld in the first 50 ms, +%ld in the next\n", i, mid[i] - before[i],
+                   count[i] - mid[i]);
+    }
     char state = state_of(child);
     kill(child, SIGCONT);
     int continued = waitpid(child, &status, WCONTINUED) == child && status == 0xffff;

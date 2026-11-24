@@ -8,6 +8,8 @@
 //! built for `aarch64-unknown-linux-musl`.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
+// The tests signal the fwe processes they start, and their groups.
+#![allow(clippy::disallowed_methods)]
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -2042,6 +2044,19 @@ fn a_connect_is_made_once_however_signals_land() {
     );
 }
 
+/// A tracer of another process's thread finds its stops as Linux
+/// reports them: by its process group (with the thread's user as the
+/// sender), by its thread id in a pid namespace, and in two namespaces at
+/// once, whose threads have the same numbers, each its own.
+#[test]
+fn traced_threads_are_found_by_group_and_in_namespaces() {
+    c_guest_prints(
+        "tracethreads",
+        &[],
+        "by id: 0\nby group: 0\nin a namespace: 0\nside by side: 0 0, same thread numbers: 1\n",
+    );
+}
+
 /// Tracers side by side: each continues its own tracee, stopped; none's
 /// requests reach another's, as their mailboxes' pages are freed and made
 /// again.
@@ -2080,6 +2095,14 @@ fn cgroups_made_and_removed_side_by_side() {
 fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
     c_guest_prints("blockedwake", &[], "taken by the other thread\n");
     c_guest_prints("blockedwake", &["sleeping"], "taken by the other thread\n");
+}
+
+/// A pipe several processes' epoll sets watch with `EPOLLEXCLUSIVE` wakes
+/// exactly one of them for each byte written, as LTP's `epoll_wait16`
+/// checks.
+#[test]
+fn an_exclusive_epoll_wake_reaches_one_waiter() {
+    c_guest_prints("epollx", &[], "each write woke one waiter: yes\n");
 }
 
 /// `SIGURG` a process blocks and reads through a signalfd, sent by another
@@ -6653,6 +6676,7 @@ const PROCSIG: &str = "queued to -1: true\n\
     core of a fault: (11, true), an ELF core true\n\
     core of SIGABRT: (6, true), an ELF core true\n\
     end told with: SIGUSR2, reaped true\n\
+    exit signal 100: reaped true, status 0\n\
     blocked SIGCHLD kept: true\n\
     memory shared: {shared}\n\
     cpu limit: SIGXCPU true, then true\n\

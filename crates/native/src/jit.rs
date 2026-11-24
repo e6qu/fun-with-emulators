@@ -1314,6 +1314,7 @@ fn state() -> Held {
 
 /// [`STATE`] locked, and how long it is held counted by the kind of its
 /// holder.
+#[must_use = "dropped at once, it lets go at once"]
 struct Held {
     /// The lock (none only while [`Held::unlocked`] runs its work).
     s: Option<std::sync::MutexGuard<'static, State>>,

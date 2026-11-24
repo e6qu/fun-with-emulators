@@ -5,9 +5,11 @@
 //! A table in memory every fwe process maps ([`crate::procstore::area`])
 //! holds a slot per pipe some set watches exclusively, by the pipe's host
 //! identity: how many writes it has had, and how many of them a waiter
-//! took. A write counts one more ([`wrote`]); a set whose wait such a
-//! write ended takes one ([`take`]), and one that finds none left was not
-//! the one woken: it waits again ([`wait_for_write`]). A set that finds the
+//! took. A write counts one more ([`wrote`]), once the writer's call
+//! returns; a set whose wait such a write ended takes one ([`take`]), and
+//! one that finds none left (taken by another set, or not counted yet: the
+//! host wakes every set as the write is made) tries again for each write
+//! counted from then on ([`wait_for_write`]). A set that finds the
 //! pipe ready when it asks, without waiting, takes every write there is
 //! ([`take_all`]): the readiness was there before it, for whoever asks. An
 //! edge-triggered set sees a counted pipe readable anew when it was
@@ -187,8 +189,8 @@ pub fn writes(fd: i32) -> Option<u64> {
 /// Wait up to `slice` for a write to `fd` after the `seen`th.
 pub fn wait_for_write(fd: i32, seen: u64, slice: std::time::Duration) {
     match slot_of(fd) {
-        Some(s) => crate::shared::wait_word_for(&s[2], seen, slice),
-        None => std::thread::sleep(slice),
+        Some(s) => crate::shared::guest_wait_word(&s[2], seen, slice),
+        None => crate::procstore::guest_sleep(slice),
     }
 }
 

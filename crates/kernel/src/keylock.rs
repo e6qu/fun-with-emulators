@@ -28,6 +28,7 @@ const NAP_NS: i64 = 200_000;
 
 /// A key's lock, held until dropped; counted for this process's stops
 /// ([`crate::procstore::Holding`]).
+#[must_use = "dropped at once, it lets go at once"]
 pub struct Held {
     holder: &'static AtomicU64,
     _holding: crate::procstore::Holding,
@@ -41,10 +42,10 @@ impl Drop for Held {
 
 /// Whether host process `pid`, a lock's holder, has ended.
 fn ended(pid: u64) -> bool {
-    // SAFETY: signal 0 only asks whether the process exists.
-    pid != 0
-        && unsafe { libc::kill(pid as i32, 0) } != 0
-        && crate::host::last_errno() == libc::ESRCH
+    i32::try_from(pid)
+        .ok()
+        .and_then(crate::ids::HostPid::new)
+        .is_some_and(|p| crate::host::probe(p) == crate::host::Probe::Gone)
 }
 
 /// Take the lock of `key` in `area`'s table, waiting for it if `wait`:
@@ -53,7 +54,7 @@ fn ended(pid: u64) -> bool {
 /// is waited on as a held lock is.
 pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
     let t = crate::procstore::area(area);
-    let me = crate::host::pid() as u64;
+    let me = crate::host::pid().get() as u64;
     let slots = t.len() / SLOT_WORDS;
     let slot = |i: usize| &t[i * SLOT_WORDS..(i + 1) * SLOT_WORDS];
     let take = |h: u64, holder: &AtomicU64| {

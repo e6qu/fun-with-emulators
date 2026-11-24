@@ -990,7 +990,7 @@ pub fn map_image(
     len: u64,
     prot: i32,
     slots: (u32, u32),
-) -> Result<bool, i32> {
+) -> Result<bool, fwe_kernel::host::HostErrno> {
     let Some((layout, file)) = fwe_kernel::prepcache::open_image(key, len) else {
         return Ok(false);
     };
@@ -1018,7 +1018,7 @@ pub fn map_image(
     }
     // SAFETY: the mapping just made.
     if unsafe { libc::mprotect(addr as *mut libc::c_void, len as usize, prot) } != 0 {
-        let e = std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::ENOMEM);
+        let e = fwe_kernel::host::last_errno();
         undo(&regions);
         return Err(e);
     }

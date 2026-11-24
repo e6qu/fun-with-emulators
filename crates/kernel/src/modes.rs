@@ -329,7 +329,7 @@ pub fn set_flag_fd(fd: i32, flag: Flag, on: bool) -> Result<(), i32> {
                 return Err(last());
             }
         } else if libc::fremovexattr(fd, attr.as_ptr(), 0) != 0
-            && crate::host::last_errno() != libc::ENOATTR
+            && !crate::host::last_errno().is(libc::ENOATTR)
         {
             return Err(last());
         }
@@ -349,7 +349,7 @@ pub fn set_flag_path(path: &CStr, flag: Flag, on: bool) -> Result<(), i32> {
                 return Err(last());
             }
         } else if libc::removexattr(path.as_ptr(), attr.as_ptr(), nofollow) != 0
-            && crate::host::last_errno() != libc::ENOATTR
+            && !crate::host::last_errno().is(libc::ENOATTR)
         {
             return Err(last());
         }

@@ -78,7 +78,10 @@ flowchart TD
 - **Translation:** Linux values (errno, flags, clock ids, signals,
   rlimits, ioctls) map to host values in `crates/kernel/src/host.rs`.
   `crates/abi` holds the Linux side; `tools/gen-abi.py` generates system
-  call numbers and errno values from the UAPI headers.
+  call numbers and errno values from the UAPI headers. A host errno is a
+  `host::HostErrno`, which reaches the guest only through `.linux()` (its
+  Linux errno) and compares only with a host constant (`.is(libc::E…)`),
+  so a host number is never returned as Linux's.
 
 ## System calls
 
@@ -483,7 +486,9 @@ and replace processes, and the per-process state it keeps:
     so inherits none held by a thread it lacks; it clears the kernel
     lock's reader counters. A `RwLock` among them is replaced in the child
     rather than unlocked, since on macOS unlocking one walks a queue of
-    waiting threads the child lacks. A process with no other host thread
+    waiting threads the child lacks: every `RwLock` is a
+    `forklock::ForkRwLock`, and `clippy.toml` refuses `std::sync::RwLock`
+    elsewhere. A process with no other host thread
     takes none of them: none can be held, and taking and letting go of
     them would touch, and copy in both processes, the pages they are on.
   - A fork's cost is the pages each process then touches, each a fault in
@@ -611,10 +616,14 @@ host; fwe adds Linux's thread identity and futexes:
   `CLONE_CHILD_CLEARTID` act as on Linux. A new thread starts with its
   creator's thread pointer (without `CLONE_SETTLS`), name, signal mask
   and floating-point control and status registers.
-- Thread ids: the main thread's is the pid; another's comes from its pid
-  namespace or, outside one, from a counter all fwe processes share,
-  numbered from 100000 (past every macOS pid, so a thread number never
-  names another process) and wrapping below 4194304.
+- Thread ids: the main thread's is the pid. Every other thread takes a
+  number from a counter all fwe processes share, numbered from 100000
+  (past every macOS pid, so a thread number never names another process)
+  and wrapping below 4194304: its `Tid`, as Linux's initial pid namespace
+  numbers it, which names it to every other process. Outside a pid
+  namespace of fwe's it is also its thread id; in one, its thread id is a
+  number of the namespace, whose record keeps the `Tid` beside it, so a
+  caller's number for a thread is translated to the `Tid` and back.
 - Futexes (`crates/kernel/src/futex.rs`) wait outside the kernel lock. A
   wake takes waiters oldest first and marks each woken, so it reports
   exactly how many it woke. `FUTEX_WAIT_BITSET`/`WAKE_BITSET` match by
@@ -673,6 +682,22 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   backend always knows whether it interrupted guest code or its own. Each
   thread otherwise runs under a host mask that blocks only the
   guest-blocked signals the host acts on itself.
+- **A handler that interrupted fwe** only records the signal: that code
+  may be in the host allocator, so nothing there allocates or frees
+  (`host::NoAllocation` marks it; a debug build's allocator ends the
+  process if something does, so the tests find it), and calls that might
+  are split from those that cannot (`procstore::mailbox` finds a mailbox,
+  `mailbox_or_make` may make one; `signote::continuing_own` beside
+  `continuing`).
+- **Guards:** fwe's own stacks (each thread's signal stack, and its
+  gate's stack below the gate's block) have an inaccessible
+  `host::GUARD` below them, and the shared memory of every fwe process
+  (the process store, the file store's arenas) one on each side
+  (`host::map_stack`, `host::map_shared_guarded`): a stack that
+  overflows (a handler nested without bound, a guest thread's stack made
+  with no guard of its own) faults there and its process ends, instead of
+  writing over the mapping beside it, which may be memory every fwe
+  process shares.
 - **Parked signals:** a process-wide signal the host holds can sit on a
   thread running fwe's handlers. A native thread entering a system call
   with such a signal parked on it, one the guest catches, takes it off the
@@ -685,6 +710,19 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   thread, with `SIGEMT`. Another process is sent it only if it is a live
   fwe process, one with a record (`host::kill` checks every send): the
   host's default action for `SIGEMT` would end any other.
+- **One process per host signal:** a host process is a `HostPid`
+  (`crates/kernel/src/ids.rs`), a pid above 0, and the host's `kill` is
+  reached only through `host.rs` with one (`kill_process` for fwe's own
+  ends, `signal_named` for the guest's, `probe` to ask whether a process
+  is there), so no number fwe holds reaches a process group or every
+  process on the host. A guest's group or `kill(-1)` is sent to each
+  member. `clippy.toml` refuses `libc::kill` anywhere else.
+- **Host masks put back by scope:** a change of a thread's host mask
+  for a scope is a `host::MaskGuard`, which puts the mask back as it is
+  dropped, on every path out (`sigsuspend`'s and `sigtimedwait`'s checks,
+  a call's temporary mask, a fork, a stop); a change for good is one of
+  `host.rs`'s named calls. `clippy.toml` refuses `libc::pthread_sigmask`
+  and `libc::sigprocmask` anywhere else.
 - **Wake pipes:** every host signal a thread takes writes a byte to that
   thread's pipe (`thread::poke_wait`), and the sleeps, `poll`, `select`
   and the `epoll` waits watch it beside the guest's descriptors
@@ -727,12 +765,13 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   mailbox (up to 64, with sender, code and value) and the target woken
   with `SIGEMT`; its wake handler moves them onto its pending sets. One
   for a thread of another process (`tgkill`, ptrace's attach) is queued
-  with the tid and posted to that thread through a table of the threads'
-  pending sets the handler reads without a lock.
-- **Threads of another process:** thread numbers are taken in blocks of
-  64, each block's process recorded in the process store; a process that
-  has had more than its main thread publishes its tids in an entry of its
-  own there, which `/proc/<pid>/task` lists.
+  with the thread's `Tid` and posted to that thread through a table of the
+  threads' pending sets, by `Tid`, the handler reads without a lock.
+- **Threads of another process:** `Tid`s are taken in blocks of 64, each
+  block's process recorded in the process store; a process that has had
+  more than its main thread publishes its threads' `Tid`s and robust-list
+  heads in entries of its own there, which `/proc/<pid>/task`,
+  `cgroup.threads` and `get_robust_list` read in the reader's numbers.
 - **Orphan ordering:** an adopted orphan's `SIGCHLD` replaces its former
   parent's while that is pending, and absorbs one after it, as Linux
   sends them.
@@ -762,7 +801,9 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 memory or threads, so a tracee does its tracer's work itself:
 
 - **Mailbox:** a page per traced thread in the process store (named by the
-  pid for a main thread, the tid for another), kept while its tracer lives:
+  host pid for a main thread, the `Tid` for another, so tracers in pid
+  namespaces whose threads have the same numbers never share one), kept
+  while its tracer lives:
   a tracee detached or ended marks it so, and its tracer frees it as it next
   looks, so no tracer's request lands in a page made again for another
   tracee. It names the thread's process and holds the stop's wait status,
@@ -785,7 +826,9 @@ memory or threads, so a tracee does its tracer's work itself:
   fetched afresh, in the VM as well). Its `wait4` and `waitid` report a
   tracee's stop from the mailbox before the host's children, looking again
   as tracees stop, and the end of a tracee that is not its child, which
-  the tracee leaves in its mailbox.
+  the tracee leaves in its mailbox. A wait for a process group matches a
+  traced thread by its process's group; a wait for a thread looks only at
+  its mailbox (it is no host child).
 - **Events:** a fork, vfork or clone a tracer follows
   (`PTRACE_O_TRACEFORK` and the like) stops the parent with the event and
   starts the child traced, stopped by `SIGSTOP`, with its parent's options
@@ -1163,9 +1206,15 @@ contents come from is in
   system call, `D` while the host brings in a page for it, and `R` while
   it does fwe's own work, waiting for one of fwe's locks or the host's
   reading and writing of fwe's records (a mark in the process store,
-  `procstore::Busy`), as a Linux task doing its kernel's work is not
+  `procstore::Busy`, which also counts the times it was set: read before
+  and after the host's state, it tells a wait of fwe's that ended between
+  the two), as a Linux task doing its kernel's work is not
   asleep, or before it has gone into the program (a fork's child whose
-  making waits; `procstore::entered` marks it as it goes in).
+  making waits; `procstore::entered` marks it as it goes in). A sleep or
+  shared-word wait of fwe's takes a `Busy` (`Busy::sleep`,
+  `shared::busy_wait_word`); one of the guest's is named so
+  (`procstore::guest_sleep`, `shared::guest_wait_word`), and
+  `clippy.toml` refuses `std::thread::sleep` elsewhere.
 - `cpuinfo` is Linux's arm64 format: BogoMIPS from the host's timer, the
   features of the hwcaps the program was given, the implementer and, for
   a chip Linux knows, the part from `hw.cpufamily`. `/proc/net` is
@@ -1216,7 +1265,9 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
 - **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
   fwe process maps counts, for each pipe a set watches exclusively, its
   writes and the writes a waiter took. A set a write woke reports it only
-  if it takes one; the others wait for the next write. An edge-triggered
+  if it takes one; the others try again at each write counted from then
+  on (the writer counts its write once the host's call returns, after the
+  host woke every set). An edge-triggered
   set sees such a pipe readable anew when written to.
 - **Fork:** of the epoll and timerfd kqueues a fork child rebuilds (see
   [linux-on-macos.md](linux-on-macos.md#waiting-and-events)), a timer
