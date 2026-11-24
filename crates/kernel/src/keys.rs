@@ -1970,6 +1970,20 @@ impl<P: Platform> Kernel<P> {
             Ok(k) => k,
             Err(e) => return err(e),
         };
+        // The lengths are the key's to bound, checked before anything is
+        // read, as Linux checks them (`keyctl_pkey_params_get_2`).
+        let q = match kc::pkey_query(&key, &info) {
+            Ok(q) => q,
+            Err(e) => return err(e),
+        };
+        let (most_in, most_out) = match op {
+            KEYCTL_PKEY_ENCRYPT => (q.max_dec_size, q.max_enc_size),
+            KEYCTL_PKEY_DECRYPT => (q.max_enc_size, q.max_dec_size),
+            _ => (q.max_data_size, q.max_sig_size),
+        };
+        if in_len > usize::from(most_in) || out_len > usize::from(most_out) {
+            return err(errno::EINVAL);
+        }
         let input = guest!(uaccess::read_bytes(a[2], in_len));
         if op == KEYCTL_PKEY_VERIFY {
             let sig = guest!(uaccess::read_bytes(a[3], out_len));

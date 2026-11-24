@@ -502,9 +502,30 @@ pub fn write<T: Copy>(addr: u64, value: T) -> Result<()> {
 
 /// Read `len` bytes from guest address `addr`.
 pub fn read_bytes(addr: u64, len: usize) -> Result<Vec<u8>> {
-    let mut out = vec![0u8; len];
+    // A length the guest chose: one fwe has no memory for fails the call
+    // (`ENOMEM`, as Linux's own allocation for it would), never the
+    // process.
+    let mut out = zeroed(len).ok_or(errno::ENOMEM)?;
     read_into(addr, &mut out)?;
     Ok(out)
+}
+
+/// `len` zero bytes, or `None` if there is no memory for them. Zeroed as
+/// they are allocated (`vec![0; len]` is): the host gives zero pages as
+/// they are touched, so a read that fails early touches no more.
+fn zeroed(len: usize) -> Option<Vec<u8>> {
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let layout = std::alloc::Layout::array::<u8>(len).ok()?;
+    // SAFETY: a layout of non-zero size.
+    let p = unsafe { std::alloc::alloc_zeroed(layout) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: `len` bytes just allocated by the global allocator with this
+    // layout, all initialized (zero).
+    Some(unsafe { Vec::from_raw_parts(p, len, len) })
 }
 
 /// Zero `len` bytes at guest address `addr`.
@@ -802,6 +823,15 @@ mod tests {
         assert_eq!(g2h(0x2_2008), base + 0x2008);
         remove_translation(0x2_0000, 0x3000);
         assert_eq!(host_after(0x2_2000), None);
+    }
+
+    /// A length no memory holds fails the read, not the process.
+    #[test]
+    fn a_read_of_any_length_fails_the_call_at_worst() {
+        let v: u64 = 7;
+        let at = &v as *const u64 as u64;
+        assert_eq!(read_bytes(at, 8).unwrap(), 7u64.to_ne_bytes());
+        assert_eq!(read_bytes(at, 1 << 62), Err(errno::ENOMEM));
     }
 
     #[test]

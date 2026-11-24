@@ -2546,7 +2546,8 @@ pub unsafe fn setsockopt(
         Err(e) => return e,
     };
     if form != Form::Same {
-        let val = guest!(uaccess::read_bytes(optval, optlen as usize));
+        let len = (optlen as usize).min(crate::sockopt::MOST_VALUE);
+        let val = guest!(uaccess::read_bytes(optval, len));
         let host = guest!(crate::sockopt::value_to_host(form, &val));
         if let Some(r) = stream_membership(fd as i32, level, optname, form, &host) {
             return r;
