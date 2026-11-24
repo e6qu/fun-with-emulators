@@ -440,28 +440,22 @@ const DIRS: &[DirDef] = &[
 /// The entries of a synthetic directory `path`, including `.` and `..`, or
 /// `None` if `path` is not a synthetic directory.
 pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
+    let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
+    // The loop devices' directories.
+    if let Some(entries) = crate::loopdev::sys_children(path) {
+        out.extend(entries);
+        return Some(out);
+    }
     let listed = DIRS.iter().find(|(p, _)| *p == path).map(|d| d.1);
-    // The loop devices' directories, and the GPU's.
-    let loops = crate::loopdev::sys_children(path);
-    let gpu = crate::drm::sys_children(path);
-    if listed.is_none() && loops.is_none() && gpu.is_none() && !crate::sysctl::is_dir(path) {
+    if listed.is_none() && !crate::sysctl::is_dir(path) {
         return None;
     }
-    let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
-    let mut add = |name: Vec<u8>, kind: u8| {
-        if !out.iter().any(|(n, _)| *n == name) {
-            out.push((name, kind));
-        }
-    };
-    for (n, t) in listed.unwrap_or_default() {
-        add(n.to_vec(), *t);
-    }
-    for (n, t) in loops.into_iter().chain(gpu).flatten() {
-        add(n, t);
-    }
+    out.extend(listed.unwrap_or_default().iter().map(|(n, t)| (n.to_vec(), *t)));
     // The network namespace's sysctls.
     for (name, dir) in crate::sysctl::children(path) {
-        add(name, if dir { DT_DIR } else { DT_REG });
+        if !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, if dir { DT_DIR } else { DT_REG }));
+        }
     }
     Some(out)
 }
@@ -577,7 +571,6 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         b"/proc/partitions" => Entry::File(crate::loopdev::partitions()),
         p if let Some(e) = crate::loopdev::sys_lookup(p) => e,
-        p if let Some(e) = crate::drm::sys_lookup(p) => e,
         p if is_dir(p) => Entry::Dir,
         _ => Entry::Missing,
     })

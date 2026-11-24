@@ -3,12 +3,10 @@
 # (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, and
 # Weston with its X11 back end, its clients, foot and Xwayland, and
 # glxgears with Mesa's software renderer and Xvfb (an X server with GLX),
-# and Mesa's Venus Vulkan driver (a virtio-gpu's) with vulkaninfo and
-# vkcube, with every package they depend on. Mesa is 3.25's (26.3, whose
-# Venus has a swapchain on any host; 26.1's needs the host's Vulkan to
-# import sync files, which MoltenVK cannot), with the LLVM and musl it is
-# built with. Each line is a path under that URL
-# and the file's SHA-256.
+# and Vulkan's loader with vulkaninfo and vkcube, with every package they
+# depend on. Mesa is 3.25's (26.3, whose Zink is OpenGL on fwe's Vulkan
+# driver), with the LLVM and musl it is built with. Each line is a path
+# under that URL and the file's SHA-256.
 v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 v3.24/main/aarch64/abseil-cpp-raw-logging-internal-20250814.1-r0.apk 30679288b05533c12cd7ccffe2949d852b6df66ed87505af72a4240652cb87dd
 v3.24/main/aarch64/abseil-cpp-strings-20250814.1-r0.apk 8ab707d857ba0953413a2ea07195d1d8aac59f65edbe6fb779534b2549409830
@@ -114,7 +112,6 @@ v3.25/main/aarch64/mesa-gbm-26.3.1-r0.apk 4d8d7220cc9ccef6c00fff4d05c5cf865a4b4e
 v3.25/main/aarch64/mesa-gl-26.3.1-r0.apk a43f98af08bf5620ef88c7b5a112f26ad8e95de7083200d6ec5cae46ff0b8b2e
 v3.25/main/aarch64/mesa-gles-26.3.1-r0.apk f580ff009773d68288dd1078429b8f6fded98aa92435032d8f8e70cc13f81760
 v3.24/community/aarch64/mesa-utils-9.0.0-r6.apk 1a820cf7aff7dacdf959b8295893147ffbdb23df055c7e2b1d4921ba4f10a6b2
-v3.25/main/aarch64/mesa-vulkan-virtio-26.3.1-r0.apk 5b22ecf4136aa57077df8742a8c4030f1fa22f53b113186c4d825aba0aeb297a
 v3.24/main/aarch64/mkfontscale-1.2.4-r0.apk c373d5c19283b41dbb5661dbc3c40ad95368040a848562c673044b8b2462be97
 v3.24/community/aarch64/mtdev-1.1.7-r0.apk f8b79dcbb4f761147ea12bdcc078383ebbd6c94399c76ae73ef79ee3e4ca6ed5
 v3.25/main/aarch64/musl-1.2.6-r6.apk 2d8d10740e7082dd1f4e62ccd1fcf73a39e6f558db8d575ecf8ebad8b0c3afcd

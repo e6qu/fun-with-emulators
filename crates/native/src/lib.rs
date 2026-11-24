@@ -528,7 +528,6 @@ static FWE_EXE: OnceLock<std::path::PathBuf> = OnceLock::new();
 /// working directory could matter.
 pub fn remember_exe() {
     if let Ok(p) = std::env::current_exe() {
-        fwe_kernel::virgl::set_executable(p.clone());
         let _ = FWE_EXE.set(p);
     }
 }

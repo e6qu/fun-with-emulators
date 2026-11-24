@@ -72,9 +72,11 @@ pub fn manifest() -> Result<PathBuf, String> {
     })
 }
 
-/// Whether a driver is there to load.
+/// Whether a driver is there to load (as it was when first asked: the
+/// device is there for the process's life).
 pub fn installed() -> bool {
-    manifest().is_ok_and(|m| m.exists())
+    static INSTALLED: OnceLock<bool> = OnceLock::new();
+    *INSTALLED.get_or_init(|| manifest().is_ok_and(|m| m.exists()))
 }
 
 fn load() -> Result<Driver, String> {

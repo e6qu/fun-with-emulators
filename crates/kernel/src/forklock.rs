@@ -173,11 +173,8 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &thread::PUBLISHED,
         &thread::ROBUST,
         &thread::TID_BLOCK_LEFT,
-        &crate::drm::FILES,
-        &crate::drm::FENCES,
-        &crate::virgl::HELPER,
-        &crate::virgl::CALLS,
         &crate::vulkan::objects::OBJECTS,
+        &crate::vulkan::device::FILES,
     ]);
     v
 }

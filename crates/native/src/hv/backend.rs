@@ -382,11 +382,6 @@ extern "C" fn on_signal(sig: libc::c_int, info: *mut libc::siginfo_t, _ctx: *mut
         if sig == host::KILL_RELAY && !host::kill_relayed() {
             return;
         }
-        // The end of a child of fwe's own is not the guest's.
-        // SAFETY: `info` is valid for SA_SIGINFO handlers.
-        if sig == libc::SIGCHLD && !unsafe { host::sigchld_for_guest(info) } {
-            return;
-        }
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let info = unsafe { host::signal_info(sig, info) };
         // The relayed form of a guest's SIGKILL (see host::KILL_RELAY).
@@ -605,8 +600,9 @@ pub(super) fn become_vm_process() -> Result<(), String> {
     vm::create()?;
     VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     fwe_kernel::forbid_fork();
-    // The guest's memory is the VM's, where the GPU's is not mapped.
-    fwe_kernel::drm::absent();
+    // The guest's memory is the VM's, not the process's the Mac's Vulkan
+    // driver works in.
+    fwe_kernel::vulkan::device::absent();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);

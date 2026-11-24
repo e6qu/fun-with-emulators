@@ -30,7 +30,9 @@
 //!   ends the call with `EINTR`, and the stub makes it again.
 
 pub mod chain;
+pub mod device;
 pub mod driver;
+pub mod files;
 #[rustfmt::skip]
 pub mod generated;
 pub mod objects;

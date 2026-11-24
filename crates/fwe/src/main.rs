@@ -6,7 +6,7 @@ mod json;
 mod pull;
 mod tarlist;
 
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -99,19 +99,6 @@ fn main() -> ExitCode {
         fwe_native::hv::standin_watch(
             &args.get(1).map(|a| a.to_string_lossy()).unwrap_or_default(),
         );
-    }
-    if args.first().is_some_and(|a| a == "--gpu-launch") {
-        // The GPU helper's launcher (see fwe_kernel::virglhelper); not for
-        // direct use.
-        let exe = std::env::current_exe().expect("fwe's own path");
-        fwe_kernel::virglhelper::launch(
-            &exe,
-            args.get(1).map_or(OsStr::new(""), |a| a.as_os_str()),
-        );
-    }
-    if args.first().is_some_and(|a| a == "--gpu-helper") {
-        // The GPU helper (see fwe_kernel::virglhelper); not for direct use.
-        fwe_kernel::virglhelper::serve(args.get(1).map_or(OsStr::new(""), |a| a.as_os_str()));
     }
     if args.first().is_some_and(|a| a == "--hv-fork-child") {
         // A fork child of a VM process (see hv::fork); not for direct use.

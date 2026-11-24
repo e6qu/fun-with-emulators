@@ -10502,21 +10502,72 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     assert_ne!(next.digest, first.digest, "the cube did not turn: {}", gui.report());
 }
 
-/// A fork child of a process using the GPU: its copy of the parent's open
-/// fails, an open of its own has a renderer of its own, and the parent's
-/// open goes on working; the parent's wait sees its child only (not the
-/// processes fwe starts for the renderer).
+/// Vulkan's mock driver (Homebrew's `vulkan-tools`: CPU only, no Metal), as
+/// the Mac's driver for tests that need none of the GPU's work done.
+fn mock_vulkan_driver() -> Option<String> {
+    let m = Path::new("/opt/homebrew/opt/vulkan-tools/lib/mock_icd/VkICD_mock_icd.json");
+    if m.exists() {
+        return Some(m.display().to_string());
+    }
+    eprintln!("skipped: no Vulkan mock driver (brew install vulkan-tools)");
+    None
+}
+
+/// A Linux program's Vulkan loader finds fwe's driver where it looks for
+/// drivers (`/etc/vulkan/icd.d`), and through it the Mac's: here Vulkan's
+/// mock driver, whose device `vulkaninfo` lists.
 #[test]
-fn display_a_fork_child_opens_a_gpu_of_its_own() {
+fn alpine_vulkaninfo_finds_the_macs_driver_through_fwes() {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
         return;
     }
-    c_guest_prints(
-        "gpufork",
-        &[],
-        "child: inherited open ENODEV, own open has a context\n\
-         parent: waited for the child, then no child; its open works\n",
+    let Some(driver) = mock_vulkan_driver() else { return };
+    let root = alpine_root("display");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/vulkaninfo"))
+        .arg("--summary")
+        .env("FWE_VULKAN_DRIVER", &driver)
+        .env("VK_LOADER_DEBUG", "error,warn,driver")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    let out = run_bounded(cmd);
+    let text = stdout(&out);
+    assert!(
+        text.contains("Vulkan Mock Device"),
+        "{text}\n{}",
+        String::from_utf8_lossy(&out.stderr)
     );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A fork child of a process using the GPU device: its copy of the
+/// parent's open and an open of its own fail (the Mac's driver in its
+/// memory is the parent's), an `execve` makes it a process with a device
+/// of its own, and the parent's open goes on working.
+#[test]
+fn gpu_device_across_fork_and_exec() {
+    let Some(driver) = mock_vulkan_driver() else { return };
+    let prog = build_c_dynamic("gpufork", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "gpufork");
+    // Inside the root, where `/proc/self/exe` leads back to it.
+    let inside = root.join("gpufork");
+    std::fs::copy(&prog, &inside).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "parent: the driver works\n\
+         child: inherited open ENODEV, own open ENODEV\n\
+         exec'd child: its own open works\n\
+         parent: child exit 0, its open works\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on

@@ -34,20 +34,33 @@ const MAX_SYMLINKS: u32 = 40;
 /// The loop devices' nodes are there too ([`crate::loopdev::node_named`]).
 const DEVICES: &[&[u8]] = &[b"null", b"zero", b"full", b"random", b"urandom", b"tty"];
 
-/// The standard device node `absolute` (a path in the view) names, by its
-/// path in `…/dev/` (`null`, the GPU's `dri` and `dri/renderD128`), if it
-/// names one. The GPU's are there where it is ([`crate::drm::present`]).
+/// The standard device node `absolute` (a path in the view) names by its
+/// last two components (`…/dev/<name>`), if it names one. The GPU's
+/// (`fwe-gpu`) is there where it is ([`crate::vulkan::device::present`]).
 fn device_name(absolute: &[u8]) -> Option<&[u8]> {
     let (parent, name) = absolute.split_at(absolute.iter().rposition(|&b| b == b'/')? + 1);
-    if parent.ends_with(b"/dev/")
+    (parent.ends_with(b"/dev/")
         && (DEVICES.contains(&name)
             || crate::loopdev::node_named(name).is_some()
-            || (name == b"dri" && crate::drm::present()))
-    {
-        return Some(name);
+            || (name == b"fwe-gpu" && crate::vulkan::device::present())))
+    .then_some(name)
+}
+
+/// fwe's Vulkan driver's files `absolute` names (`…/etc/vulkan/icd.d`, or a
+/// name in it), from `icd.d` on, where the GPU is
+/// ([`crate::vulkan::files`]).
+fn vulkan_name(absolute: &[u8]) -> Option<&[u8]> {
+    let place = crate::vulkan::files::PLACE;
+    let at = if absolute.ends_with(place) {
+        absolute.len() - place.len()
+    } else {
+        let (parent, _) = absolute.split_at(absolute.iter().rposition(|&b| b == b'/')?);
+        parent.ends_with(place).then(|| parent.len() - place.len())?
+    };
+    if !crate::vulkan::device::present() {
+        return None;
     }
-    (parent.ends_with(b"/dev/dri/") && name == b"renderD128" && crate::drm::present())
-        .then(|| &absolute[absolute.len() - b"dri/renderD128".len()..])
+    Some(&absolute[at + b"/etc/vulkan/".len()..])
 }
 
 /// The standard device node `absolute` names in the rootfs's own /dev,
@@ -134,7 +147,12 @@ fn direct_in(v: &View, dirfd: i32, path: &[u8]) -> Option<Direct> {
     let mut names = path.split(|&b| b == b'/').filter(|c| !c.is_empty() && *c != b".");
     let first = names.next()?;
     let more = names.clone().next().is_some();
-    if first == b"dev" || names.clone().any(|c| c == b"..") || first == b".." {
+    // `/dev` and fwe's Vulkan driver's files are fwe's to answer.
+    if first == b"dev"
+        || names.clone().any(|c| c == b"..")
+        || first == b".."
+        || vulkan_name(path).is_some()
+    {
         return None;
     }
     if access_checked(v) {
@@ -2646,37 +2664,32 @@ fn resolve_in(v: &View, dirfd: i32, path: &[u8], follow_final: bool) -> Result<R
         let name = rootfs_device(a, m, &rest, v.root_host)?;
         Some((name.to_vec(), crate::loopdev::node_named(name), ns, m.flags, m.fstype, m.id))
     });
+    // fwe's Vulkan driver's files, in the rootfs's own /etc/vulkan/icd.d,
+    // wherever the rootfs is mounted.
+    let vulkan = absolute.as_deref().and_then(|a| {
+        let name = vulkan_name(a)?;
+        let ns = to_ns(v.proc_root, a);
+        let (m, rest) = table.locate(&ns);
+        (is_rootfs(m, v.root_host) && rest.strip_prefix(b"/etc/vulkan/") == Some(name))
+            .then(|| (name.to_vec(), ns, m.flags, m.fstype, m.id))
+    });
+    if let Some((name, ns, mount_flags, fstype, mount_id)) = vulkan {
+        let (dir, name) = crate::vulkan::files::place(&name)?;
+        return fixed_place(&dir, name, ns, mount_flags, fstype, mount_id);
+    }
     if let Some((name, own, ns, mount_flags, fstype, mount_id)) = device {
-        // The host has no /dev/full and no loop devices: fwe's own nodes
-        // stand in for them.
+        // The host has no /dev/full, no loop devices and no GPU device:
+        // fwe's own nodes stand in for them.
         let own = match (&name[..], own) {
             (b"full", _) => Some(full_node()),
+            (b"fwe-gpu", _) => Some(crate::vulkan::device::node()),
             (_, own) => own,
         };
-        // The GPU's: its directory of nodes, and its node in it.
-        let (dir, name) = match (&name[..], own) {
-            (b"dri", _) => {
-                gpu_devices()?;
-                (fwe_device_dir()?, name)
-            }
-            (b"dri/renderD128", _) => (gpu_devices()?, b"renderD128".to_vec()),
-            (_, Some(node)) => (fwe_device(&name, node)?, name),
-            (_, None) => (b"/dev".to_vec(), name),
+        let dir = match own {
+            Some(node) => fwe_device(&name, node)?,
+            None => b"/dev".to_vec(),
         };
-        let dir = cstr(&dir)?;
-        // SAFETY: plain host call; the result is checked and owned.
-        let dev = unsafe {
-            libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC)
-        };
-        if dev < 0 {
-            return Err(e());
-        }
-        // SAFETY: `dev` is a fresh owned descriptor.
-        let mut r = Resolved::plain(unsafe { OwnedFd::from_raw_fd(dev) }, name);
-        // Where it is in the namespace, which an open of it records.
-        (r.ns_path, r.mount_flags, r.fstype, r.mount_id) =
-            (Some(ns), mount_flags, fstype, mount_id);
-        return Ok(r);
+        return fixed_place(&dir, name, ns, mount_flags, fstype, mount_id);
     }
     let root_ns = v.proc_root.to_vec();
     // The directory with namespace path `ns`, entered from the root.
@@ -3354,31 +3367,39 @@ fn fwe_device(name: &[u8], node: crate::devnodes::Node) -> Result<Vec<u8>, i32> 
     let fd = open_host_dir(&dir)?;
     // Linux's modes: anyone may use /dev/full, only root and the disk
     // group a disk.
-    let perm = if node.kind == crate::devnodes::S_IFCHR && node.major == 1 { 0o666 } else { 0o660 };
+    // Anyone may use the GPU, as a Linux desktop's user may its render node.
+    let anyone = node.kind == crate::devnodes::S_IFCHR && node.major == 1
+        || crate::vulkan::device::is_node(node);
+    let perm = if anyone { 0o666 } else { 0o660 };
     match crate::devnodes::make_exact(fd.as_raw_fd(), &cstr(name)?, node, perm) {
         Ok(()) | Err(errno::EEXIST) => Ok(dir),
         Err(e) => Err(e),
     }
 }
 
-/// fwe's directory of the GPU's nodes (`/dev/dri`), its render node made
-/// in it on first use.
-fn gpu_devices() -> Result<Vec<u8>, i32> {
-    let top = fwe_device_dir()?;
-    let t = cstr(&top)?;
-    // SAFETY: a NUL-terminated path in fwe's private directory.
-    unsafe { libc::mkdir(t.as_ptr(), 0o755) };
-    let dir = mounts::join(&top, b"dri");
-    let d = cstr(&dir)?;
-    // SAFETY: as above.
-    unsafe { libc::mkdir(d.as_ptr(), 0o755) };
-    let fd = open_host_dir(&dir)?;
-    // Anyone may use a render node (Linux's are the render group's, which
-    // a desktop gives its user).
-    match crate::devnodes::make_exact(fd.as_raw_fd(), c"renderD128", crate::drm::node(), 0o666) {
-        Ok(()) | Err(errno::EEXIST) => Ok(dir),
-        Err(e) => Err(e),
+/// Name `name` in host directory `dir`, which fwe shows at namespace path
+/// `ns` in a mount of `mount_flags`, `fstype` and `mount_id` (a device node
+/// of `/dev`, a file of fwe's in `/etc/vulkan/icd.d`).
+fn fixed_place(
+    dir: &[u8],
+    name: Vec<u8>,
+    ns: Vec<u8>,
+    mount_flags: u64,
+    fstype: FsType,
+    mount_id: u32,
+) -> Result<Resolved, i32> {
+    let dir = cstr(dir)?;
+    // SAFETY: plain host call; the result is checked and owned.
+    let fd =
+        unsafe { libc::open(dir.as_ptr(), libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) };
+    if fd < 0 {
+        return Err(e());
     }
+    // SAFETY: `fd` is a fresh owned descriptor.
+    let mut r = Resolved::plain(unsafe { OwnedFd::from_raw_fd(fd) }, name);
+    // Where it is in the namespace, which an open of it records.
+    (r.ns_path, r.mount_flags, r.fstype, r.mount_id) = (Some(ns), mount_flags, fstype, mount_id);
+    Ok(r)
 }
 
 /// fwe's directory of the device nodes Linux has and the host does not.
@@ -4148,10 +4169,9 @@ pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
     if let Some(name) = p.strip_prefix(b"/dev/") {
         return DEVICES.contains(&name).then_some(p);
     }
-    // One of fwe's own nodes (`/dev/full`, a loop device, the GPU's).
+    // One of fwe's own nodes (`/dev/full`, a loop device).
     let (dir, _) = split_host(&p);
-    let own = fwe_device_dir().ok()?;
-    (own == dir || mounts::join(&own, b"dri") == dir).then_some(p)
+    (fwe_device_dir().ok()? == dir).then_some(p)
 }
 
 /// The whole contents of the file `fd` is open on, from its start whatever

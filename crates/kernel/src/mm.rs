@@ -1484,17 +1484,6 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EOPNOTSUPP);
             }
         }
-        // The GPU's memory: a resource's pages, which the renderer keeps.
-        if flags & mman::MAP_ANONYMOUS == 0
-            && let Some(source) = crate::drm::map_source(fd as i32, offset, self.page_up(len))
-        {
-            return match source {
-                Ok(memory) => {
-                    self.map_gpu_memory(addr, len, prot, flags, fd as i32, offset, memory)
-                }
-                Err(e) => err(e),
-            };
-        }
         // Anonymous huge pages: of a size the hardware has (`EINVAL`), and
         // reserved from the pool, which is empty (`vm.nr_hugepages` is 0:
         // fwe has no huge pages to give), so `ENOMEM` unless the mapping
@@ -1711,39 +1700,6 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Map `len` bytes of the GPU's memory (a blob's part, [`crate::drm::map_source`])
-    /// at `addr`, as `mmap` of device descriptor `fd` asked: the blob's
-    /// shared memory object mapped there, the same pages the renderer
-    /// uses. Shared only, and not to run; listed as Linux lists it, the
-    /// device's node at the offset the guest gave.
-    #[allow(clippy::too_many_arguments)]
-    fn map_gpu_memory(
-        &mut self,
-        addr: u64,
-        len: u64,
-        prot: u64,
-        flags: u64,
-        fd: i32,
-        offset: u64,
-        memory: crate::drm::GpuMemory,
-    ) -> i64 {
-        use std::os::fd::AsRawFd;
-        let shared = matches!(flags & mman::MAP_TYPE, mman::MAP_SHARED | mman::MAP_SHARED_VALIDATE);
-        if !shared || prot & mman::PROT_EXEC != 0 {
-            return err(errno::EINVAL);
-        }
-        let Ok(st) = crate::fsops::linux_fstat(fd) else { return err(errno::EBADF) };
-        let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd));
-        let object = crate::maps::Object::file(path, &st, offset);
-        let place = flags & (mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE | mman::MAP_LOCKED);
-        let host = memory.object.as_raw_fd();
-        let r = self.map_shared_memory(addr, len, prot, place, false, host, memory.offset, object);
-        if r >= 0 {
-            crate::drm::mapped(self.page_up(len));
-        }
-        r
-    }
-
     /// Map `len` bytes of a file from `offset` at `addr` (as `mmap` would,
     /// with Linux's `prot` and `flags`) from `pieces`, each a host
     /// descriptor holding a part of the range: one mapped as it is, several
@@ -1781,11 +1737,11 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Map `len` bytes of host shared memory `fd` from `at`, `object`,
-    /// shared, at `addr` (with `flags` Linux's `MAP_FIXED`, or none for
-    /// anywhere), with `prot`, `nowrite` if it may not be made writable: a
-    /// System V segment's attachment, or the GPU's memory, which need none
-    /// of what a guest's mapping of a file of its own looks at.
+    /// Map `len` bytes of host shared memory `fd`, `object`, shared, at
+    /// `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
+    /// with `prot`, `nowrite` if it may not be made writable: a System V
+    /// segment's attachment, which needs none of what a guest's mapping of
+    /// a file of its own looks at.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn map_shared_memory(
         &mut self,
@@ -1795,7 +1751,6 @@ impl<P: Platform> Kernel<P> {
         flags: u64,
         nowrite: bool,
         fd: i32,
-        at: u64,
         object: crate::maps::Object,
     ) -> i64 {
         if too_many_maps(0) {
@@ -1810,7 +1765,7 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EAGAIN);
             }
         }
-        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, at, false);
+        let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0, false);
         if r < 0 {
             return r;
         }

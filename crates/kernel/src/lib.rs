@@ -27,7 +27,6 @@ pub mod creds;
 pub(crate) mod deferred;
 pub mod devnodes;
 pub mod dnotify;
-pub mod drm;
 pub mod epoll;
 pub mod exclusive;
 pub mod fdmarks;
@@ -41,7 +40,6 @@ mod fsops;
 pub mod futex;
 mod handles;
 pub mod host;
-pub mod hostproc;
 pub mod ids;
 pub mod inotify;
 pub mod ipcops;
@@ -75,7 +73,6 @@ pub mod nsfd;
 pub mod nsops;
 mod openat2;
 pub mod overlay;
-pub mod ownchild;
 pub mod owners;
 pub mod pdeath;
 pub mod pidfd;
@@ -132,8 +129,6 @@ pub mod tmpfs;
 pub mod trace;
 pub mod uaccess;
 pub mod userns;
-pub mod virgl;
-pub mod virglhelper;
 pub mod vmas;
 pub mod vulkan;
 pub mod x11;
@@ -2160,6 +2155,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
     }
     if let Some(r) = loopdev::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = vulkan::device::io(nr, &a) {
         return Some(r);
     }
     if let Some(r) = filestore::io::io(nr, &a) {

@@ -158,7 +158,8 @@ pub fn ipc_wakes() -> (u64, u64) {
 
 /// The calls that took longest (number, count, milliseconds), the signals
 /// taken (number, count), what the traps among them were for, the IPC
-/// waiters woken, and the GPU's calls ([`crate::drm::counts`]), as text.
+/// waiters woken, and the Vulkan commands run ([`crate::vulkan::device::counts`]),
+/// as text.
 pub fn calls_and_signals() -> String {
     let mut calls: Vec<(usize, u64, u64)> = (0..CALLS.len())
         .map(|i| (i, CALLS[i].load(Relaxed), CALL_NS[i].load(Relaxed)))
@@ -182,7 +183,7 @@ pub fn calls_and_signals() -> String {
         .map(|(name, n)| format!("{name} {n}"))
         .collect();
     let (woken, retried) = ipc_wakes();
-    let gpu = crate::drm::counts().map(|c| format!("; {c}")).unwrap_or_default();
+    let gpu = crate::vulkan::device::counts().map(|c| format!("; {c}")).unwrap_or_default();
     format!(
         "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}; \
          IPC waiters woken {woken}, of them tried again under the lock {retried}{gpu}",

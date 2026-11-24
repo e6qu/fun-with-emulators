@@ -1288,8 +1288,8 @@ impl<P: Platform> Kernel<P> {
                     if crate::loopdev::is_loop_node(n) {
                         crate::loopdev::opened(device as i32, n);
                     }
-                    if crate::drm::is_node(n) {
-                        crate::drm::opened(device as i32);
+                    if crate::vulkan::device::is_node(n) {
+                        crate::vulkan::device::opened(device as i32);
                     }
                     return device;
                 }
@@ -4706,9 +4706,9 @@ pub(crate) fn open_device(
         return fd as i64;
     }
     // The GPU is its node's descriptor, marked as the device by the caller
-    // ([`crate::drm`]).
-    if crate::drm::is_node(node) {
-        return match crate::drm::check_open() {
+    // ([`crate::vulkan::device`]).
+    if crate::vulkan::device::is_node(node) {
+        return match crate::vulkan::device::check_open() {
             Ok(()) => fd as i64,
             Err(e) => err(e),
         };
@@ -4888,7 +4888,7 @@ fn rename(
     Ok(())
 }
 
-pub(crate) fn make_pipe(fds: &mut [i32; 2], flags: u64) -> Result<(), i32> {
+fn make_pipe(fds: &mut [i32; 2], flags: u64) -> Result<(), i32> {
     // Linux's flags (`O_NOTIFICATION_PIPE` is `O_EXCL`'s bit); a
     // notification pipe needs the watch queue, which a kernel without one
     // refuses with `ENOPKG`.
