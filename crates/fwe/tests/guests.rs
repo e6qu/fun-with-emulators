@@ -10375,6 +10375,99 @@ fn alpine_display_glxgears_turns_by_software() {
     assert!(rate > 1.0, "{rate} frames a second: {}", gui.report());
 }
 
+/// What a program of a display root says, run to its end (within
+/// `secs`): its standard output.
+fn display_output(
+    x: &Xvfb,
+    name: &str,
+    root: &ScratchRoot,
+    args: &[&str],
+    env: &[(&str, &str)],
+    secs: u64,
+) -> String {
+    let mut gui = Gui::start(x, name, root, args[0], &args[1..], env);
+    let began = Instant::now();
+    let status = loop {
+        if let Some(s) = gui.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(secs),
+            "{name} did not end: {}",
+            gui.report()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(status.success(), "{name}: {}", gui.report());
+    std::fs::read_to_string(display_dir().join(format!("{name}.out"))).unwrap()
+}
+
+/// What a program needs to draw with Vulkan on fwe's GPU: Mesa's Venus
+/// driver its only one, and its X11 frames copied to the server (Xvfb has
+/// no DRI3 to share them).
+const VENUS: [(&str, &str); 2] = [
+    ("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/virtio_icd.aarch64.json"),
+    ("MESA_VK_WSI_DEBUG", "sw"),
+];
+
+/// The Vulkan device a program finds is the Mac's GPU, through fwe's
+/// virtio-gpu device and Mesa's Venus driver: `vulkaninfo` names it.
+fn assert_venus_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
+    let name = format!("{test}-vulkaninfo");
+    let info = display_output(x, &name, root, &["/usr/bin/vulkaninfo", "--summary"], &VENUS, 120);
+    let device =
+        info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
+    assert!(
+        device.contains("Venus") && device.contains("Apple"),
+        "the device is not the GPU:\n{info}"
+    );
+}
+
+/// vkcube draws its cube with Vulkan on the Mac's GPU (Mesa's Venus driver
+/// on fwe's virtio-gpu device, its commands run by virglrenderer on
+/// MoltenVK), and it turns.
+#[test]
+fn alpine_display_vkcube_draws_on_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("vkcube");
+    assert_venus_on_the_gpu(&x, &root, "vkcube");
+    let args = ["--wsi", "xcb", "--width", "300", "--height", "300"];
+    let mut gui = Gui::start(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &VENUS);
+    let w = x.window(&mut gui, &["--name", "vkcube"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "vkcube-first");
+    assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "vkcube-next", 10);
+    assert_ne!(next.digest, first.digest, "the cube did not turn: {}", gui.report());
+}
+
+/// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
+/// Vulkan, on the Venus driver, in an X server with GLX (Alpine's Xvfb,
+/// run by fwe), which names the renderer; its gears drawn and turning.
+#[test]
+fn alpine_display_glxgears_draws_on_the_gpu() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    let root = x11_root("glxgears-gpu");
+    let x = Xvfb::in_root(&root);
+    let mut env = VENUS.to_vec();
+    env.push(("MESA_LOADER_DRIVER_OVERRIDE", "zink"));
+    let local = |program: &str| format!("DISPLAY=:{} exec {program}", x.number);
+    let glxinfo = local("/usr/bin/glxinfo -B");
+    let info = display_output(&x, "glxinfo-gpu", &root, &["/bin/sh", "-c", &glxinfo], &env, 120);
+    let renderer = info.lines().find(|l| l.contains("OpenGL renderer string")).unwrap_or_default();
+    assert!(renderer.contains("zink") && renderer.contains("Venus"), "not on the GPU:\n{info}");
+    let command = local("/usr/bin/glxgears -geometry 300x300+0+0");
+    let mut gui = Gui::start(&x, "glxgears-gpu", &root, "/bin/sh", &["-c", &command], &env);
+    let w = x.window(&mut gui, &["--name", "glxgears"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "glxgears-gpu-first");
+    assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "glxgears-gpu-next", 10);
+    assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
+}
+
 /// Wine's Notepad, a Windows program, drawn through Wine's X11 driver in
 /// the VM (Wine needs 4 KiB pages: on the stand-in here): its window drawn,
 /// and what is typed into it shown.

@@ -235,6 +235,11 @@ BUDGETS = {
     "JIT code: a loop (ns)": 1.3,
     # A graphical program's calls to its X server, as a system call is.
     "X request round trip (us)": 1.5,
+    # Vulkan on the GPU: Mesa's Venus driver on fwe's device, its commands
+    # run by virglrenderer on MoltenVK, against MoltenVK's own program
+    # (ROADMAP.md M7 PR 2).
+    "vkcube frame (ms)": 1.5,
+    "Vulkan submission round trip (us)": 1.5,
     "X frame through shared memory (us)": 1.5,
     # Kernel state every process shares, kept in memory as a kernel keeps
     # it (ROADMAP.md M6 PR 2).
@@ -408,6 +413,63 @@ def gears_fwe(a, fwe, guest_env):
     finally:
         xvfb.kill()
         xvfb.wait()
+
+
+VKCUBE = "vkcube frame (ms)"
+# Frames as fast as they are made, not at a display's refresh, of the same
+# size on both sides.
+VKCUBE_ARGS = ["--present_mode", "0", "--width", "300", "--height", "300"]
+# Two runs' frames: their times' difference is the frames' alone.
+VKCUBE_FRAMES = (200, 1200)
+# Mesa's Venus driver, the root's only one, its frames copied to the X
+# server (Xvfb has no DRI3 to share them).
+VENUS_ENV = ["VK_DRIVER_FILES=/usr/share/vulkan/icd.d/virtio_icd.aarch64.json",
+             "MESA_VK_WSI_DEBUG=sw"]
+
+
+def vkcube_ms(cmd, env=None):
+    """vkcube's time per frame as `cmd` runs it: the time of its
+    VKCUBE_FRAMES' more frames, the best of three."""
+    def timed(n):
+        start = time.monotonic()
+        p = subprocess.run(cmd + ["--c", str(n)], env=env, capture_output=True, timeout=600)
+        if p.returncode != 0:
+            said = (p.stdout + p.stderr).decode(errors="replace")[-4000:]
+            sys.exit(f"vkcube ended with {p.returncode}; it said:\n{said}")
+        return time.monotonic() - start
+    few, many = VKCUBE_FRAMES
+    return best(lambda: (timed(many) - timed(few)) * 1000 / (many - few), rounds=3)
+
+
+VK_SUBMIT = "Vulkan submission round trip (us)"
+
+
+def vulkan(a, fwe, guest_env, results):
+    """Vulkan on the GPU: a submission's round trip (tools/bench/vkbench.c)
+    and vkcube's frames. Under fwe, Alpine's programs on fwe's GPU device
+    (Mesa's Venus, virglrenderer on MoltenVK), vkcube at the X server here;
+    natively, the same on MoltenVK (Homebrew's vkcube in a window of
+    macOS's)."""
+    root = alpine_root("display", a.cache)
+    icd = dict(os.environ, VK_ICD_FILENAMES=os.path.join(a.brew, "etc/vulkan/icd.d/MoltenVK_icd.json"))
+    shutil.copy(a.vkbench, os.path.join(root, "tmp/vkbench"))
+    results["fwe"][VK_SUBMIT] = best(lambda: run_bench(
+        guest_env + VENUS_ENV + fwe + ["--root", root], os.path.join(root, "tmp/vkbench"), ["3000"]))
+    results["macOS"][VK_SUBMIT] = best(lambda: float(subprocess.run(
+        [a.vkbench_native, "3000", os.path.join(a.brew, "lib/libvulkan.1.dylib")],
+        env=icd, check=True, capture_output=True, text=True).stdout.split()[-1]))
+    ours = (guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + VENUS_ENV + fwe
+            + ["--root", root, os.path.join(root, "usr/bin/vkcube"), "--wsi", "xcb"] + VKCUBE_ARGS)
+    results["fwe"][VKCUBE] = vkcube_ms(ours)
+    theirs = [os.path.join(a.brew, "bin/vkcube")] + VKCUBE_ARGS
+    results["macOS"][VKCUBE] = vkcube_ms(theirs, icd)
+    # Where its time goes: the device's calls by kind and the memory it
+    # mapped, and fwe's other calls (FWE_TIMING's last mark).
+    timed = ours[:2] + ["FWE_TIMING=1"] + ours[2:] + ["--c", "300"]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace", timeout=600)
+    for line in r.stderr.splitlines():
+        if "timing: exit:" in line:
+            print(f"vkcube: {line}", flush=True)
 
 
 def best(f, rounds=ROUNDS):
@@ -809,6 +871,8 @@ def build(a, fwe, results):
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     postgres(a, fwe, guest_env, results)
     results["fwe"][GEARS] = gears_fwe(a, fwe, guest_env)
+    if not a.no_gpu:
+        vulkan(a, fwe, guest_env, results)
     jdk(a, fwe, guest_env, results)
     host_costs()
     for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
@@ -2178,6 +2242,12 @@ def main():
     mc.add_argument("--brew", required=True, help="Homebrew's prefix: the native programs")
     mc.add_argument("--out", required=True)
     mc.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
+    mc.add_argument("--vkbench", required=True,
+                    help="tools/bench/vkbench.c built for Alpine (musl): run under fwe")
+    mc.add_argument("--vkbench-native", required=True,
+                    help="tools/bench/vkbench.c built for macOS: run natively")
+    mc.add_argument("--no-gpu", action="store_true",
+                    help="no GPU benchmarks: fwe's VM backend has no GPU device")
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)
 

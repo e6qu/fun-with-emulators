@@ -4,9 +4,12 @@
 # framework), then under fwe and natively (`macos`), in one table with
 # fwe's ratio to each and fwe's share of the programs that compute.
 #
-# Needs Lima, Homebrew's builds the native side runs and a password for
-# sudo (DTrace, for fwe's share):
-#     brew install lima llvm@22 python@3.14 sqlite git xz xorg-server
+# Needs Lima, Homebrew's builds the native side runs, the GPU's renderer
+# and a password for sudo (DTrace, for fwe's share):
+#     brew install lima llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 \
+#         luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
+#     brew tap slp/krunkit
+#     HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
 # Run from the repository: sh tools/bench/vm.sh. The VM (fwe-bench) is
 # kept, stopped, for the next run; `limactl delete fwe-bench` removes it.
 # A Linux VM is a hypervisor client: not while fwe's VM tests run.
@@ -47,6 +50,8 @@ limactl shell --workdir "$repo" "$vm" sh -euc "
     command -v docker >/dev/null && command -v gcc >/dev/null && command -v Xvfb >/dev/null ||
         { sudo apt-get update -q && sudo apt-get install -qy docker.io gcc xvfb; }
     gcc -O2 -static-pie -o $out/bench guests/c/bench.c
+    sudo docker run --rm -v $repo:/w:ro -v $out:/out -w /w alpine:3.24 sh -c \
+        'apk add -q gcc musl-dev vulkan-headers && gcc -O2 -o /out/vkbench tools/bench/vkbench.c'
     sudo python3 tools/bench/run.py linux --bench $out/bench --cache $out/cache --xvfb /usr/bin/Xvfb --out $out/linux-vm.json
 "
 limactl stop "$vm"
@@ -54,6 +59,7 @@ limactl stop "$vm"
 # The same Linux build under fwe, its source natively.
 cargo build --release -p fwe
 clang -O2 -Wno-deprecated-declarations -o "$out/bench-mac" guests/c/bench.c
+clang -O2 -I"$(brew --prefix)/include" -o "$out/vkbench-mac" tools/bench/vkbench.c
 with_vm=""
 if $fwe_vm; then
     # Every program in fwe's VM: fwe signed for the hypervisor, called
@@ -63,10 +69,12 @@ if $fwe_vm; then
     chmod +x "$out/fwe-vm"
     python3 tools/bench/run.py macos --fwe "$out/fwe-vm" --bench "$out/bench" \
         --native "$out/bench-mac" --brew "$(brew --prefix)" --cache target/bench-cache \
-        --xvfb "$(brew --prefix)/bin/Xvfb" --out "$out/macos-vm.json" || true
+        --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench "$out/vkbench" \
+        --vkbench-native "$out/vkbench-mac" --no-gpu --out "$out/macos-vm.json" || true
     with_vm="--fwe-vm $out/macos-vm.json"
 fi
 # shellcheck disable=SC2086 # `with_vm` is two words or none
 python3 tools/bench/run.py macos --fwe target/release/fwe --bench "$out/bench" \
     --native "$out/bench-mac" --brew "$(brew --prefix)" --cache target/bench-cache \
-    --xvfb "$(brew --prefix)/bin/Xvfb" --linux-vm "$out/linux-vm.json" $with_vm --out "$out/macos.json"
+    --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench "$out/vkbench" --vkbench-native "$out/vkbench-mac" \
+    --linux-vm "$out/linux-vm.json" $with_vm --out "$out/macos.json"

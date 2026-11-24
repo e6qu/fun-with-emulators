@@ -3,7 +3,8 @@
 # (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, and
 # Weston with its X11 back end, its clients, foot and Xwayland, and
 # glxgears with Mesa's software renderer and Xvfb (an X server with GLX),
-# with every package they depend on. Each line is a path under that URL
+# and Mesa's Venus Vulkan driver (a virtio-gpu's) with vulkaninfo and
+# vkcube, with every package they depend on. Each line is a path under that URL
 # and the file's SHA-256.
 v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 v3.24/main/aarch64/abseil-cpp-raw-logging-internal-20250814.1-r0.apk 30679288b05533c12cd7ccffe2949d852b6df66ed87505af72a4240652cb87dd
@@ -41,6 +42,7 @@ v3.24/main/aarch64/libbsd-0.12.2-r0.apk 1c4129bef0862afa2a7414217e8c3a50609abfe2
 v3.24/main/aarch64/libbz2-1.0.8-r6.apk 28cb76bb6d11d2a55c3061b5fcb2ab84996412a248b2c9fe52bb710d0a2a84e7
 v3.24/community/aarch64/libcamera-0.7.1-r1.apk 892d1f6f01f7c2fc29cf56ec7db92f5d25432036dd741fcec37b86276582876d
 v3.24/community/aarch64/libcamera-ipa-0.7.1-r1.apk 55af4387bee4ad276c4abaf13b1bd20284abda6342f05d056089d28fae4ac668
+v3.24/main/aarch64/libdisplay-info-0.3.0-r0.apk b16c3bd7432f49cc2ad322228c56510932940fec35c2fa43e842d2e3f898a958
 v3.24/main/aarch64/libdrm-2.4.134-r0.apk ad796caa2b8685d8a3d586bc06bb3b710efb497e8503372ac65c93ab7260623b
 v3.24/main/aarch64/libeconf-0.8.3-r0.apk cf0899d49ded0a6891e3cdf1b37887f2ecd77293afe1d8f3cb8937763c83f183
 v3.24/main/aarch64/libelf-0.195-r0.apk 1c108314af454a885ac0b053201db57027470c4f2309412c016897e2a2bf5d0e
@@ -109,6 +111,7 @@ v3.24/main/aarch64/mesa-gbm-26.1.6-r0.apk 3a5487b688e3f072f134133b8a6538d552c9eb
 v3.24/main/aarch64/mesa-gl-26.1.6-r0.apk 580a5cd3e8d31b8774e78ad7a3d5798f667d0ee98d07e8afd0765daf6d450720
 v3.24/main/aarch64/mesa-gles-26.1.6-r0.apk 1553461ee9e91a4d6fad5941d6a98f43e14b0d920c302b5e21504a6411b2183f
 v3.24/community/aarch64/mesa-utils-9.0.0-r6.apk 1a820cf7aff7dacdf959b8295893147ffbdb23df055c7e2b1d4921ba4f10a6b2
+v3.24/main/aarch64/mesa-vulkan-virtio-26.1.6-r0.apk b1a6f4424482c758ed9204ca27ad8d71deded2a4357670c2f988120a7f0aaf72
 v3.24/main/aarch64/mkfontscale-1.2.4-r0.apk c373d5c19283b41dbb5661dbc3c40ad95368040a848562c673044b8b2462be97
 v3.24/community/aarch64/mtdev-1.1.7-r0.apk f8b79dcbb4f761147ea12bdcc078383ebbd6c94399c76ae73ef79ee3e4ca6ed5
 v3.24/main/aarch64/ncurses-terminfo-6.6_p20260516-r0.apk 41471352cac0d4f3db44146280c4c0836770f190c153a920d70c9812ef6ba884
@@ -127,6 +130,8 @@ v3.24/main/aarch64/speexdsp-1.2.1-r2.apk 0989bde366b262de9f8311d3bab67d9fd4f3fcf
 v3.24/main/aarch64/spirv-tools-1.4.341.0-r0.apk 28a3be7fe2552c2c11b33a366c7bf6a67a408d9bf509bfe66aea68bf79467c60
 v3.24/community/aarch64/utf8proc-2.11.3-r0.apk 466273841b3ea938ebac509924d45a9eb426cebcadaee1e4ac6c8557b4cd35cf
 v3.24/main/aarch64/util-macros-1.20.2-r0.apk a0a27ccc4451080025bcc5961e6d621ba5eebd1b88c7b74b84ccc6d07f318b1c
+v3.24/main/aarch64/vulkan-loader-1.4.347-r0.apk b6fc863a1d9f2f8d035bbcf49bf320f3e7212d4f402df80c7f893a4c6e2e0bc1
+v3.24/main/aarch64/vulkan-tools-1.4.347-r0.apk ce40fa155f37ff89bcf07d615fd4e29d68b1a96ea640e05abb80e37d96fcea94
 v3.24/main/aarch64/wayland-libs-client-1.25.0-r0.apk 409b4ad8de59d7b69f7c8add50cc76ef0fe3fe8c80e7854d6fe93c6b1dccc005
 v3.24/main/aarch64/wayland-libs-cursor-1.25.0-r0.apk 22129b3f85ecf905a00436040c4ca3d07a071e700997aebf9bb7a2430cb42946
 v3.24/main/aarch64/wayland-libs-egl-1.25.0-r0.apk c06c148aa8fe57848f1a30ac46b95736b04fb1bf73324ccf29c0bae82ee4a7e7

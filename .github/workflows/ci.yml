@@ -230,7 +230,9 @@ jobs:
   # server (Homebrew's Xvfb, `XVFB`): an X client of fwe's tests, and
   # fetched roots' programs (FWE_DISPLAY_TESTS, not on a development
   # machine), Wine's in the VM, driven with xdotool and checked by what
-  # they draw (libX11, `LIBX11`, takes the screenshots).
+  # they draw (libX11, `LIBX11`, takes the screenshots). Vulkan's and
+  # OpenGL's on the runner's GPU (Metal) through fwe's GPU device, whose
+  # renderer is virglrenderer's Venus on MoltenVK (krunkit's build).
   display:
     name: Display (macos-26)
     runs-on: macos-26
@@ -244,6 +246,11 @@ jobs:
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
       - run: brew install xorg-server xdotool unicorn
+      # The GPU's renderer (its tap's formulas are built from source, not
+      # Homebrew's API).
+      - run: |
+          brew tap slp/krunkit
+          HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
       - name: The display tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
@@ -321,6 +328,8 @@ jobs:
           path: /tmp/bench-cache
           key: bench-linux-cache-${{ hashFiles('tools/bench/run.py') }}
       - run: gcc -O2 -static-pie -o bench guests/c/bench.c
+      # The Vulkan benchmark, for Alpine (it runs in an Alpine root).
+      - run: docker run --rm -v "$PWD:/w" -w /w alpine:3.24 sh -c 'apk add -q gcc musl-dev vulkan-headers && gcc -O2 -o vkbench tools/bench/vkbench.c'
       # An X server for the X benchmarks.
       - run: sudo apt-get update -q && sudo apt-get install -qy xvfb
       - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --xvfb /usr/bin/Xvfb --out linux.json
@@ -329,6 +338,7 @@ jobs:
           name: bench-linux
           path: |
             bench
+            vkbench
             linux.json
 
   # ... then the same program under fwe and its source natively on macOS,
@@ -351,10 +361,16 @@ jobs:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
+      - run: clang -O2 -I"$(brew --prefix)/include" -o vkbench-mac tools/bench/vkbench.c
       # The native side's programs: the clang release Alpine's root has, and
       # the workloads' programs (tools/bench/run.py, BREW), and an X server.
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server
-      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --linux linux.json --out macos.json
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
+      # The GPU's renderer under fwe (its tap's formulas are built from
+      # source, not Homebrew's API).
+      - run: |
+          brew tap slp/krunkit
+          HOMEBREW_NO_INSTALL_FROM_API=1 brew install slp/krunkit/virglrenderer
+      - run: chmod +x bench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:
