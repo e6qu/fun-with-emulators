@@ -372,7 +372,7 @@ pub fn init() {
 }
 
 /// While one lives, the calling thread, if it is its process's main
-/// thread, is in fwe's own work (a shared record read or written under
+/// thread, is in fwe's own work (a shared record read, or written under
 /// its lock), which the host may make it wait for, as a Linux thread
 /// doing its kernel's work is not asleep in a wait of the guest's:
 /// `/proc` shows it running ([`busy`]), where a program waiting for it

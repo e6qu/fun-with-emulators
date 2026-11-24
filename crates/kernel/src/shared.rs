@@ -346,6 +346,9 @@ impl<T: Data> Record<T> {
     /// journal when it holds every change since, else read whole. What a
     /// change made meanwhile tore is read again.
     fn read_current(&self, copy: Option<&Copy<T>>) -> Result<Copy<T>, i32> {
+        // Read again and again while writers change it, then waiting for
+        // its lock: fwe's work, not a wait of the guest's.
+        let _busy = crate::procstore::Busy::new();
         let mut last = Err(errno::EIO);
         for _ in 0..100 {
             let from = copy.and_then(|c| c.journal);
