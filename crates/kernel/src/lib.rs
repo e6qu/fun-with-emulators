@@ -135,6 +135,7 @@ pub mod userns;
 pub mod virgl;
 pub mod virglhelper;
 pub mod vmas;
+pub mod vulkan;
 pub mod x11;
 pub mod xattr;
 

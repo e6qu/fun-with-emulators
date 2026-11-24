@@ -177,6 +177,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &crate::drm::FENCES,
         &crate::virgl::HELPER,
         &crate::virgl::CALLS,
+        &crate::vulkan::objects::OBJECTS,
     ]);
     v
 }
