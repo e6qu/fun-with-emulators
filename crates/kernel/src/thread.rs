@@ -1540,8 +1540,8 @@ pub fn post_landed(sig: u64, info: SigInfo) {
                 return;
             }
             match crate::reaper::exit_signal(info.pid) {
-                Some(0) => return,
-                Some(s) => s,
+                Some(None) => return,
+                Some(Some(s)) => s.get(),
                 None => sig,
             }
         }

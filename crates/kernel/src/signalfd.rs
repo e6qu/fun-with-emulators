@@ -12,6 +12,7 @@
 //! signalfd's pipe holds a byte exactly while the queue holds a record it
 //! watches.
 
+use crate::signal::bit;
 use fwe_abi::{err, errno};
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -48,7 +49,7 @@ impl Reg {
     /// Give each signalfd its readiness byte while the queue holds a
     /// record it watches, and take it away otherwise.
     fn settle(&mut self) {
-        let pending = self.queue.iter().fold(0u64, |m, r| m | bit(signo(r)));
+        let pending = self.queue.iter().fold(0u64, |m, r| m | bit(u64::from(signo(r))));
         for s in self.fds.values_mut() {
             let want = s.mask & pending != 0;
             if want && !s.ready {
@@ -68,11 +69,6 @@ impl Reg {
 /// The signal a record is of.
 fn signo(r: &[u8; SIGINFO_SIZE]) -> u32 {
     u32::from_ne_bytes(r[0..4].try_into().unwrap())
-}
-
-/// Signal `sig`'s bit in a Linux set (none for 0 or past 64).
-fn bit(sig: u32) -> u64 {
-    if (1..=64).contains(&sig) { 1 << (sig - 1) } else { 0 }
 }
 
 static REG: crate::kept::Kept<Option<Reg>> = crate::kept::Kept::new(None);
@@ -259,11 +255,11 @@ pub(crate) fn import(fd: i32, d: &mut crate::snapshot::Dec) -> bool {
 /// Returns whether one watches it.
 pub fn deliver(sig: u64, info: [u8; SIGINFO_SIZE]) -> bool {
     let sig = sig as u32;
-    if bit(sig) == 0 {
+    if bit(u64::from(sig)) == 0 {
         return false;
     }
     with(|m| {
-        if !m.fds.values().any(|s| s.mask & bit(sig) != 0) {
+        if !m.fds.values().any(|s| s.mask & bit(u64::from(sig)) != 0) {
             return false;
         }
         if sig >= SIGRTMIN || !m.queue.iter().any(|r| signo(r) == sig) {
@@ -290,7 +286,7 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
             let mut n = 0;
             let mut at = 0;
             while n < max && at < m.queue.len() {
-                if bit(signo(&m.queue[at])) & mask == 0 {
+                if bit(u64::from(signo(&m.queue[at]))) & mask == 0 {
                     at += 1;
                     continue;
                 }
@@ -319,7 +315,7 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
                 crate::signal::drain_to_signalfd();
                 let ready = with(|m| {
                     let mask = m.fds.get(&fd).map_or(0, |s| s.mask);
-                    m.queue.iter().any(|r| bit(signo(r)) & mask != 0)
+                    m.queue.iter().any(|r| bit(u64::from(signo(r))) & mask != 0)
                 });
                 if ready {
                     continue;
@@ -351,7 +347,7 @@ pub fn try_close(fd: i32) -> Option<i64> {
         let reg = g.as_mut()?;
         let s = reg.fds.remove(&fd)?;
         let watched = reg.fds.values().fold(0, |m, s| m | s.mask);
-        reg.queue.retain(|r| bit(signo(r)) & watched != 0);
+        reg.queue.retain(|r| bit(u64::from(signo(r))) & watched != 0);
         WATCHED.store(watched, Ordering::Release);
         s
     };

@@ -37,7 +37,7 @@
 //! already keep it, and those it adopted stay its own, as on Linux, where
 //! an orphan is adopted when its parent ends.
 
-use crate::ids::HostPid;
+use crate::ids::{HostPid, LinuxSig};
 use crate::procreg::{self, Ended, Proc};
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -1217,29 +1217,33 @@ mod watch {
 static EXIT_SIGNALS: [(std::sync::atomic::AtomicI32, std::sync::atomic::AtomicU64); 64] =
     [const { (std::sync::atomic::AtomicI32::new(0), std::sync::atomic::AtomicU64::new(0)) }; 64];
 
-/// Child `child` (host pid) was made with exit signal `sig`.
+/// Child `child` (host pid) was made with exit signal `sig`: a number
+/// that is no signal (0, or past 64) tells its end with none, as Linux
+/// does.
 pub fn set_exit_signal(child: i32, sig: u64) {
     use std::sync::atomic::Ordering::SeqCst;
-    if sig == fwe_abi::signal::SIGCHLD || exit_signal(child).is_some() {
+    let sig = LinuxSig::new(sig);
+    if sig.map(LinuxSig::get) == Some(fwe_abi::signal::SIGCHLD) || exit_signal(child).is_some() {
         return;
     }
     for (pid, s) in &EXIT_SIGNALS {
         if pid.compare_exchange(0, -1, SeqCst, SeqCst).is_ok() {
-            s.store(sig, SeqCst);
+            s.store(sig.map_or(0, LinuxSig::get), SeqCst);
             pid.store(child, SeqCst);
             return;
         }
     }
 }
 
-/// The signal child `child`'s end is told with, if not `SIGCHLD` (0: none).
-/// Async-signal-safe.
-pub fn exit_signal(child: i32) -> Option<u64> {
+/// The signal child `child`'s end is told with, if not `SIGCHLD` (`None`
+/// in it: none). Async-signal-safe.
+pub fn exit_signal(child: i32) -> Option<Option<LinuxSig>> {
     use std::sync::atomic::Ordering::SeqCst;
     if child <= 0 {
         return None;
     }
-    EXIT_SIGNALS.iter().find(|(pid, _)| pid.load(SeqCst) == child).map(|(_, s)| s.load(SeqCst))
+    let found = EXIT_SIGNALS.iter().find(|(pid, _)| pid.load(SeqCst) == child);
+    found.map(|(_, s)| LinuxSig::new(s.load(SeqCst)))
 }
 
 /// Child `child` was reaped: its exit signal goes.
@@ -1289,11 +1293,11 @@ pub fn child_signal_landed(pid: i32) -> bool {
 pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
     // Its own exit signal, if not SIGCHLD (none: nothing to give).
     let sig = match exit_signal(pid) {
-        Some(0) => return,
-        Some(s) => s,
-        None => fwe_abi::signal::SIGCHLD,
+        Some(None) => return,
+        Some(Some(s)) => s,
+        None => LinuxSig::SIGCHLD,
     };
-    let bit = 1 << (sig - 1);
+    let bit = sig.bit();
     let taken = (crate::signal::caught() | crate::signalfd::watched()) & bit != 0;
     if pid <= 0 {
         return;
@@ -1318,7 +1322,7 @@ pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
         ring_take(&GIVEN, pid);
         return;
     }
-    crate::thread::post_process(sig, info);
+    crate::thread::post_process(sig.get(), info);
 }
 
 #[cfg(test)]

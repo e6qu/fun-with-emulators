@@ -1,11 +1,13 @@
 //! Numbers of different kinds kept apart by their types: a host process's
 //! pid is a [`HostPid`], and a thread as every process can name it is a
 //! [`Tid`]; neither converts from a guest-visible number (one a pid
-//! namespace numbers), or to the other, without saying so. Each is the
-//! bare number in memory (`#[repr(transparent)]`), so a call that takes one
-//! costs what it did with the number.
+//! namespace numbers), or to the other, without saying so. A Linux signal
+//! is a [`LinuxSig`], one of Linux's 64, whose bit in a set it names. Each
+//! is the
+//! bare number in memory (`#[repr(transparent)]`), so a call that takes
+//! one costs what it did with the number.
 
-use std::num::NonZeroI32;
+use std::num::{NonZeroI32, NonZeroU8};
 
 /// A host process: a pid above 0. A number that is not one (0 and the
 /// negative numbers name process groups, or every process, to the host's
@@ -86,6 +88,44 @@ impl Tid {
     }
 }
 
+/// A Linux signal: one of 1 to 64 ([`fwe_abi::signal::NSIG`]). A number
+/// outside them (a `clone`'s exit signal may be any up to 255) has none.
+#[repr(transparent)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct LinuxSig(NonZeroU8);
+
+impl LinuxSig {
+    /// `SIGCHLD`, which tells a child's end unless it chose another.
+    pub const SIGCHLD: LinuxSig = match LinuxSig::new(fwe_abi::signal::SIGCHLD) {
+        Some(s) => s,
+        None => panic!("SIGCHLD is a signal"),
+    };
+
+    /// Linux signal `sig`, if it is one.
+    #[inline]
+    pub const fn new(sig: u64) -> Option<LinuxSig> {
+        if sig == 0 || sig > fwe_abi::signal::NSIG {
+            return None;
+        }
+        match NonZeroU8::new(sig as u8) {
+            Some(s) => Some(LinuxSig(s)),
+            None => None,
+        }
+    }
+
+    /// The signal's number.
+    #[inline]
+    pub const fn get(self) -> u64 {
+        self.0.get() as u64
+    }
+
+    /// Its bit in a Linux signal set.
+    #[inline]
+    pub const fn bit(self) -> u64 {
+        1 << (self.0.get() - 1)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -103,6 +143,17 @@ mod tests {
     fn a_host_pid_or_none_is_the_size_of_a_pid() {
         assert_eq!(size_of::<Option<HostPid>>(), size_of::<libc::pid_t>());
         assert_eq!(size_of::<Option<Tid>>(), size_of::<i32>());
+    }
+
+    #[test]
+    fn a_signal_is_one_of_linuxs_64() {
+        assert_eq!(LinuxSig::new(0), None);
+        assert_eq!(LinuxSig::new(65), None);
+        assert_eq!(LinuxSig::new(255), None);
+        assert_eq!(LinuxSig::new(1).map(LinuxSig::bit), Some(1));
+        assert_eq!(LinuxSig::new(64).map(LinuxSig::bit), Some(1 << 63));
+        assert_eq!(LinuxSig::new(17).map(LinuxSig::get), Some(17));
+        assert_eq!(size_of::<Option<LinuxSig>>(), 1);
     }
 
     #[test]

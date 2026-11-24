@@ -105,8 +105,13 @@ pub fn ignored() -> u64 {
 static WAITERS: [std::sync::atomic::AtomicU32; signal::NSIG as usize] =
     [const { std::sync::atomic::AtomicU32::new(0) }; signal::NSIG as usize];
 
-const fn bit(sig: u64) -> u64 {
-    1 << (sig - 1)
+/// Signal `sig`'s bit in a Linux signal set; none for a number that is no
+/// signal.
+pub(crate) const fn bit(sig: u64) -> u64 {
+    match crate::ids::LinuxSig::new(sig) {
+        Some(s) => s.bit(),
+        None => 0,
+    }
 }
 
 /// A signal frame (or `siginfo`) assembled or parsed in fwe's memory and

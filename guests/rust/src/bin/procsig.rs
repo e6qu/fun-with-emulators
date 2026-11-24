@@ -184,6 +184,15 @@ fn main() {
         println!("end told with: {}, reaped {reaped}", if sig == SIGUSR2 { "SIGUSR2" } else { "other" });
         sigprocmask(1, &usr2, std::ptr::null_mut());
 
+        // A child whose exit signal is no signal (`clone` takes any number
+        // up to 255): its end is told with none, and it is reaped.
+        let pid = syscall(220, 100i64, 0i64, 0i64, 0i64, 0i64) as i32;
+        if pid == 0 {
+            _exit(0);
+        }
+        let reaped = waitpid(pid, &mut status, WALL) == pid;
+        println!("exit signal 100: reaped {reaped}, status {status}");
+
         // A blocked SIGCHLD left at its default action stays pending: a
         // child that ended before the wait began is told of in it.
         let chld = set(&[SIGCHLD]);

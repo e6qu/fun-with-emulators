@@ -6676,6 +6676,7 @@ const PROCSIG: &str = "queued to -1: true\n\
     core of a fault: (11, true), an ELF core true\n\
     core of SIGABRT: (6, true), an ELF core true\n\
     end told with: SIGUSR2, reaped true\n\
+    exit signal 100: reaped true, status 0\n\
     blocked SIGCHLD kept: true\n\
     memory shared: {shared}\n\
     cpu limit: SIGXCPU true, then true\n\
