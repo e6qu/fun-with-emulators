@@ -62,8 +62,7 @@ type ContextCreateFn = unsafe extern "C" fn(u32, u32, u32, *const c_char) -> c_i
 type ContextDestroyFn = unsafe extern "C" fn(u32);
 type SubmitCmdFn = unsafe extern "C" fn(*mut c_void, c_int, c_int) -> c_int;
 type CreateBlobFn = unsafe extern "C" fn(*const BlobArgs) -> c_int;
-type MapFn = unsafe extern "C" fn(u32, *mut *mut c_void, *mut u64) -> c_int;
-type UnmapFn = unsafe extern "C" fn(u32) -> c_int;
+type MapPtrFn = unsafe extern "C" fn(u32, *mut u64) -> c_int;
 type UnrefFn = unsafe extern "C" fn(u32);
 type AttachFn = unsafe extern "C" fn(c_int, c_int);
 type CreateFenceFn = unsafe extern "C" fn(u32, u32, u32, u64) -> c_int;
@@ -77,8 +76,7 @@ struct Api {
     context_destroy: ContextDestroyFn,
     submit_cmd: SubmitCmdFn,
     resource_create_blob: CreateBlobFn,
-    resource_map: MapFn,
-    resource_unmap: UnmapFn,
+    resource_get_map_ptr: MapPtrFn,
     resource_unref: UnrefFn,
     ctx_attach_resource: AttachFn,
     ctx_detach_resource: AttachFn,
@@ -202,11 +200,8 @@ fn load() -> Result<Api, String> {
             resource_create_blob: std::mem::transmute::<*mut c_void, CreateBlobFn>(sym(
                 "virgl_renderer_resource_create_blob",
             )?),
-            resource_map: std::mem::transmute::<*mut c_void, MapFn>(sym(
-                "virgl_renderer_resource_map",
-            )?),
-            resource_unmap: std::mem::transmute::<*mut c_void, UnmapFn>(sym(
-                "virgl_renderer_resource_unmap",
+            resource_get_map_ptr: std::mem::transmute::<*mut c_void, MapPtrFn>(sym(
+                "virgl_renderer_resource_get_map_ptr",
             )?),
             resource_unref: std::mem::transmute::<*mut c_void, UnrefFn>(sym(
                 "virgl_renderer_resource_unref",
@@ -313,22 +308,20 @@ pub fn create_blob(
     done(with(|api| unsafe { (api.resource_create_blob)(&args) })?)
 }
 
-/// Resource `res`'s memory in this process, and its size.
-pub fn map(res: u32) -> Result<(u64, u64), i32> {
-    let (mut p, mut size) = (std::ptr::null_mut::<c_void>(), 0u64);
-    // SAFETY: two out-parameters of this frame.
-    done(with(|api| unsafe { (api.resource_map)(res, &mut p, &mut size) })?)?;
-    if p.is_null() { Err(fwe_abi::errno::EINVAL) } else { Ok((p as u64, size)) }
+/// Resource `res`'s memory in this process, as the renderer keeps it
+/// mapped for as long as the resource lives (Apple's build gives its
+/// address, where others map it on request), the resource's size long.
+pub fn map(res: u32) -> Result<u64, i32> {
+    let mut p = 0u64;
+    // SAFETY: an out-parameter of this frame.
+    done(with(|api| unsafe { (api.resource_get_map_ptr)(res, &mut p) })?)?;
+    if p == 0 { Err(fwe_abi::errno::EINVAL) } else { Ok(p) }
 }
 
-/// Resource `res` is gone: its memory let go, unmapped, and the resource
-/// taken from context `ctx`.
-pub fn unref(ctx: u32, res: u32, mapped: bool) {
-    // SAFETY: a resource `create_blob` made, mapped by `map` if `mapped`.
+/// Resource `res` is gone: taken from context `ctx`, and let go.
+pub fn unref(ctx: u32, res: u32) {
+    // SAFETY: a resource `create_blob` made.
     let _ = with(|api| unsafe {
-        if mapped {
-            (api.resource_unmap)(res);
-        }
         (api.ctx_detach_resource)(ctx as c_int, res as c_int);
         (api.resource_unref)(res);
     });

@@ -135,8 +135,8 @@ fn release(key: u32) {
         return;
     }
     if let Some((ctx, _)) = f.ctx {
-        for (&res, r) in &f.handles {
-            crate::virgl::unref(ctx, res, r.host.is_some());
+        for &res in f.handles.keys() {
+            crate::virgl::unref(ctx, res);
         }
         crate::virgl::context_destroy(ctx);
         context_gone(ctx);
@@ -491,11 +491,11 @@ fn create_blob(key: u32, req: u64, arg: u64) -> Result<i64, i32> {
 fn gem_close(key: u32, handle: u32) -> Result<i64, i32> {
     let mut f = files();
     let file = f.get_mut(&key).ok_or(errno::EBADF)?;
-    let r = file.handles.remove(&handle).ok_or(errno::EINVAL)?;
+    file.handles.remove(&handle).ok_or(errno::EINVAL)?;
     let ctx = file.ctx;
     drop(f);
     if let Some((ctx, _)) = ctx {
-        crate::virgl::unref(ctx, handle, r.host.is_some());
+        crate::virgl::unref(ctx, handle);
     }
     Ok(0)
 }
@@ -526,7 +526,7 @@ pub fn map_source(fd: i32, offset: u64, len: u64) -> Option<Result<u64, i32>> {
         let host = match r.host {
             Some(h) => h,
             None => {
-                let (h, _) = crate::virgl::map(handle)?;
+                let h = crate::virgl::map(handle)?;
                 if let Some(res) = files().get_mut(&key).and_then(|f| f.handles.get_mut(&handle)) {
                     res.host = Some(h);
                 }
