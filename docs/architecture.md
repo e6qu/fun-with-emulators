@@ -483,7 +483,9 @@ and replace processes, and the per-process state it keeps:
     so inherits none held by a thread it lacks; it clears the kernel
     lock's reader counters. A `RwLock` among them is replaced in the child
     rather than unlocked, since on macOS unlocking one walks a queue of
-    waiting threads the child lacks. A process with no other host thread
+    waiting threads the child lacks: every `RwLock` is a
+    `forklock::ForkRwLock`, and `clippy.toml` refuses `std::sync::RwLock`
+    elsewhere. A process with no other host thread
     takes none of them: none can be held, and taking and letting go of
     them would touch, and copy in both processes, the pages they are on.
   - A fork's cost is the pages each process then touches, each a fault in

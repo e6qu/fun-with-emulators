@@ -18,6 +18,10 @@
 //! thread for, and letting it go walks that queue: so one shared with a
 //! fork is a [`ForkRwLock`], which the child replaces with a new lock.
 
+// The one module that holds a `RwLock`: the one a fork's child can let go
+// of ([`ForkRwLock`]), which `clippy.toml` makes every other use.
+#![allow(clippy::disallowed_types)]
+
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::sync::{Mutex, RwLock, RwLockWriteGuard};
