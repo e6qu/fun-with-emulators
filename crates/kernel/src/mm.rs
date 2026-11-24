@@ -29,12 +29,6 @@ pub(crate) struct Ranges {
     /// Linux discards the old address space; fwe's own memory is never in
     /// the set.
     guest: BTreeMap<u64, u64>,
-    /// The host range of the latest mapping the guest made, not yet in
-    /// [`Ranges::guest`]: kept apart until anything else changes or reads
-    /// the set ([`lock_ranges`] puts it in first), so that a mapping
-    /// unmapped at once, as an allocator's often is, costs the set one look
-    /// instead of an insertion and a removal.
-    latest: Option<(u64, u64)>,
     /// Pages of private mappings of files with no name (a memfd, or a file
     /// unlinked once opened: memory shared through it) not yet written,
     /// host addresses. Linux shows such a page what is written to the file
@@ -70,7 +64,6 @@ pub(crate) struct Ranges {
 impl Ranges {
     const NONE: Ranges = Ranges {
         guest: BTreeMap::new(),
-        latest: None,
         file_views: BTreeMap::new(),
         wipe_on_fork: BTreeMap::new(),
         grows_down: BTreeMap::new(),
@@ -80,31 +73,9 @@ impl Ranges {
         guard: BTreeMap::new(),
     };
 
-    /// Put the latest mapping ([`Ranges::latest`]) in the guest's set.
-    fn settle(&mut self) {
-        if let Some((addr, len)) = self.latest.take() {
-            add_range(&mut self.guest, addr, len);
-        }
-    }
-
-    /// The guest mapped host range `[addr, addr + len)`: the latest
-    /// mapping, the one before it put in the set.
-    fn mapped(&mut self, addr: u64, len: u64) {
-        self.settle();
-        self.latest = Some((addr, len));
-    }
-
     /// Forget unmapped memory, `len` bytes at host address `host` and guest
     /// address `guest`, in every set.
     fn forget(&mut self, host: u64, guest: u64, len: u64) {
-        // The latest mapping, unmapped whole, never goes in: the set loses
-        // what it would have replaced, as it would with it put in and taken
-        // out.
-        if self.latest == Some((host, len)) {
-            self.latest = None;
-        } else {
-            self.settle();
-        }
         self.forget_host(host, len);
         remove_range(&mut self.wipe_on_fork, host, len);
         for set in [
@@ -117,15 +88,29 @@ impl Ranges {
             remove_range(set, guest, len);
         }
     }
-}
 
-impl Ranges {
     /// Forget host range `[host, host + len)` of a mapping just made that
     /// failed (`mmap_call`), as its making added it.
     fn forget_host(&mut self, host: u64, len: u64) {
         for set in [&mut self.guest, &mut self.file_views] {
             remove_range(set, host, len);
         }
+    }
+
+    /// Whether any range is marked: a file view, or a range given a
+    /// property by `madvise` or `MAP_GROWSDOWN`.
+    fn marks_any(&self) -> bool {
+        [
+            &self.file_views,
+            &self.wipe_on_fork,
+            &self.grows_down,
+            &self.poisoned,
+            &self.dont_dump,
+            &self.dont_fork,
+            &self.guard,
+        ]
+        .iter()
+        .any(|set| !set.is_empty())
     }
 }
 
@@ -134,25 +119,130 @@ impl Ranges {
 /// every mapping call holds.)
 static ANY_GROWS_DOWN: AtomicBool = AtomicBool::new(false);
 
-/// The address space's ranges; a fork takes the lock with the others
-/// ([`hold`]).
-static RANGES: Mutex<Ranges> = Mutex::new(Ranges::NONE);
-
-/// The ranges, the latest mapping among them.
-#[cfg_attr(
-    target_os = "macos",
-    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
-)]
-fn lock_ranges() -> std::sync::MutexGuard<'static, Ranges> {
-    let mut r = lock_ranges_as_they_are();
-    r.settle();
-    r
+/// The latest mapping the guest made, kept apart from [`Ranges::guest`].
+#[derive(Clone, Copy)]
+struct Latest {
+    /// Its host range.
+    host: u64,
+    len: u64,
+    /// Placed where nothing was (not `MAP_FIXED`): it replaced nothing.
+    fresh: bool,
 }
 
-/// The ranges, the latest mapping still apart ([`Ranges::latest`]), for
-/// [`Ranges::mapped`] and [`Ranges::forget`].
-fn lock_ranges_as_they_are() -> std::sync::MutexGuard<'static, Ranges> {
-    RANGES.lock().unwrap_or_else(|e| e.into_inner())
+/// The address space's ranges, and the latest mapping kept apart from them
+/// without their lock until anything else changes or reads them, so that a
+/// mapping unmapped at once, as an allocator's often is, costs neither the
+/// lock nor the set.
+struct Space {
+    ranges: Mutex<Ranges>,
+    latest: crate::deferred::Deferred<Latest>,
+    /// Whether any range was marked ([`Ranges::marks_any`]) as the lock was
+    /// last let go: until one is, a mapping and its unmapping have nothing
+    /// to look for in the sets but the guest's.
+    marked: AtomicBool,
+}
+
+impl Space {
+    const fn new() -> Space {
+        Space {
+            ranges: Mutex::new(Ranges::NONE),
+            latest: crate::deferred::Deferred::new(Latest { host: 0, len: 0, fresh: false }),
+            marked: AtomicBool::new(false),
+        }
+    }
+
+    /// The ranges, the latest mapping among them.
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    fn lock(&self) -> RangesHeld<'_> {
+        let mut r = self.lock_as_they_are();
+        if let Some(l) = self.latest.take() {
+            add_range(&mut r.guest, l.host, l.len);
+        }
+        r
+    }
+
+    /// The ranges, the latest mapping still apart.
+    fn lock_as_they_are(&self) -> RangesHeld<'_> {
+        RangesHeld { space: self, ranges: self.ranges.lock().unwrap_or_else(|e| e.into_inner()) }
+    }
+
+    /// The guest mapped `latest`, a file view (`view`) or not: kept apart,
+    /// without the lock where nothing is marked (a view among the marks,
+    /// which it may replace), the one before it put in the set.
+    fn mapped(&self, latest: Latest, view: bool) {
+        if !view && !self.marked.load(Ordering::Acquire) && self.latest.put(latest) {
+            return;
+        }
+        let mut r = self.lock();
+        if view {
+            ANY_VIEWS.store(true, std::sync::atomic::Ordering::SeqCst);
+            add_range(&mut r.file_views, latest.host, latest.len);
+        } else {
+            remove_range(&mut r.file_views, latest.host, latest.len);
+        }
+        if !self.latest.put(latest) {
+            add_range(&mut r.guest, latest.host, latest.len);
+        }
+    }
+
+    /// The guest unmapped `len` bytes at host address `host` and guest
+    /// address `guest`: forgotten in every set. The latest mapping, unmapped
+    /// whole, never goes in; placed where nothing was, with nothing
+    /// marked, it is in no set, and the lock is not taken.
+    fn unmapped(&self, host: u64, guest: u64, len: u64) {
+        let mut fresh = false;
+        let taken = self.latest.take_back(|l| {
+            fresh = l.fresh;
+            (l.host, l.len) == (host, len)
+        });
+        if taken && fresh && !self.marked.load(Ordering::Acquire) {
+            return;
+        }
+        // (What it replaced goes all the same, as it would with it put in
+        // and taken out.)
+        let mut r = if taken { self.lock_as_they_are() } else { self.lock() };
+        r.forget(host, guest, len);
+    }
+}
+
+/// The ranges, locked; whether any is marked published as the lock is let
+/// go ([`Space::marked`]).
+#[must_use = "dropped at once, it lets go at once"]
+struct RangesHeld<'a> {
+    space: &'a Space,
+    ranges: std::sync::MutexGuard<'a, Ranges>,
+}
+
+impl std::ops::Deref for RangesHeld<'_> {
+    type Target = Ranges;
+
+    fn deref(&self) -> &Ranges {
+        &self.ranges
+    }
+}
+
+impl std::ops::DerefMut for RangesHeld<'_> {
+    fn deref_mut(&mut self) -> &mut Ranges {
+        &mut self.ranges
+    }
+}
+
+impl Drop for RangesHeld<'_> {
+    fn drop(&mut self) {
+        self.space.marked.store(self.ranges.marks_any(), Ordering::Release);
+    }
+}
+
+/// This process's address space; a fork takes its lock with the others
+/// ([`hold`]).
+static SPACE: Space = Space::new();
+
+/// The ranges, the latest mapping among them.
+fn lock_ranges() -> RangesHeld<'static> {
+    SPACE.lock()
 }
 
 /// Every range of guest memory, `start -> end`.
@@ -1047,29 +1137,40 @@ mod tests {
     /// goes all the same.
     #[test]
     fn latest_mapping_goes_in_unless_unmapped_at_once() {
-        let mut r = Ranges::NONE;
-        r.mapped(0x10000, 0x8000);
-        assert!(r.guest.is_empty());
-        r.mapped(0x20000, 0x4000);
-        assert_eq!(r.guest.iter().collect::<Vec<_>>(), vec![(&0x10000, &0x18000)]);
-        r.forget(0x20000, 0x20000, 0x4000);
-        assert_eq!(r.latest, None);
-        assert_eq!(r.guest.iter().collect::<Vec<_>>(), vec![(&0x10000, &0x18000)]);
+        let s = Space::new();
+        let fresh = |host, len| Latest { host, len, fresh: true };
+        let guest = |s: &Space| s.lock_as_they_are().guest.clone().into_iter().collect::<Vec<_>>();
+        s.mapped(fresh(0x10000, 0x8000), false);
+        assert!(guest(&s).is_empty());
+        s.mapped(fresh(0x20000, 0x4000), false);
+        assert_eq!(guest(&s), vec![(0x10000, 0x18000)]);
+        s.unmapped(0x20000, 0x20000, 0x4000);
+        assert!(!s.latest.is_kept());
+        assert_eq!(guest(&s), vec![(0x10000, 0x18000)]);
         // Fixed over the middle of the first, then unmapped: the middle
         // goes.
-        r.mapped(0x12000, 0x2000);
-        r.forget(0x12000, 0x12000, 0x2000);
-        assert_eq!(
-            r.guest.iter().collect::<Vec<_>>(),
-            vec![(&0x10000, &0x12000), (&0x14000, &0x18000)]
-        );
+        s.mapped(Latest { host: 0x12000, len: 0x2000, fresh: false }, false);
+        s.unmapped(0x12000, 0x12000, 0x2000);
+        assert_eq!(guest(&s), vec![(0x10000, 0x12000), (0x14000, 0x18000)]);
         // Unmapped other than whole: it went in first.
-        r.mapped(0x30000, 0x4000);
-        r.forget(0x30000, 0x30000, 0x2000);
-        r.settle();
+        s.mapped(fresh(0x30000, 0x4000), false);
+        s.unmapped(0x30000, 0x30000, 0x2000);
         assert_eq!(
-            r.guest.iter().collect::<Vec<_>>(),
-            vec![(&0x10000, &0x12000), (&0x14000, &0x18000), (&0x32000, &0x34000)]
+            s.lock().guest.clone().into_iter().collect::<Vec<_>>(),
+            vec![(0x10000, 0x12000), (0x14000, 0x18000), (0x32000, 0x34000)]
+        );
+        // A marked range: mappings take the lock, and their marks go with
+        // them.
+        s.mapped(fresh(0x40000, 0x4000), false);
+        s.lock().dont_fork.insert(0x40000, 0x44000);
+        assert!(s.marked.load(Ordering::Acquire));
+        s.mapped(fresh(0x50000, 0x4000), false);
+        s.unmapped(0x40000, 0x40000, 0x4000);
+        assert!(!s.marked.load(Ordering::Acquire), "the mark went with its range");
+        s.unmapped(0x50000, 0x50000, 0x4000);
+        assert_eq!(
+            s.lock().guest.clone().into_iter().collect::<Vec<_>>(),
+            vec![(0x10000, 0x12000), (0x14000, 0x18000), (0x32000, 0x34000)]
         );
     }
 
@@ -1544,7 +1645,9 @@ impl<P: Platform> Kernel<P> {
         let len = self.page_up(len);
         let prot = prot & (mman::PROT_READ | mman::PROT_WRITE | mman::PROT_EXEC);
         let locked = match st {
-            None => crate::maps::mapped_plain(r as u64, len, prot, shared),
+            None => {
+                crate::maps::mapped_plain(r as u64, len, prot, shared, flags & mman::MAP_FIXED == 0)
+            }
             Some(st) => {
                 let path = self.fs_opt().map_or_else(Vec::new, |f| f.fd_target(fd as i32));
                 let mut record = crate::maps::record();
@@ -2406,16 +2509,10 @@ impl<P: Platform> Kernel<P> {
             let guest = if p == haddr && fixed { addr } else { p };
             // What was owed to the pages replaced goes with them.
             crate::lazycode::unmapped(p, self.page_up(len));
-            {
-                let mut r = lock_ranges_as_they_are();
-                r.mapped(p, self.page_up(len));
-                if view {
-                    ANY_VIEWS.store(true, std::sync::atomic::Ordering::SeqCst);
-                    add_range(&mut r.file_views, p, self.page_up(len));
-                } else {
-                    remove_range(&mut r.file_views, p, self.page_up(len));
-                }
-            }
+            SPACE.mapped(
+                Latest { host: p, len: self.page_up(len), fresh: flags & mman::MAP_FIXED == 0 },
+                view,
+            );
             // Writable and executable: a JIT's code, run by translation
             // where the backend translates it.
             if translated {
@@ -2573,7 +2670,7 @@ impl<P: Platform> Kernel<P> {
         self.platform.unmap_guest(addr, self.page_up(len));
         let r = self.unmap_host(host as u64, len);
         if r == 0 {
-            lock_ranges_as_they_are().forget(host as u64, addr, self.page_up(len));
+            SPACE.unmapped(host as u64, addr, self.page_up(len));
         }
         r
     }

@@ -24,6 +24,7 @@ mod clockset;
 pub mod cloneargs;
 pub mod coredump;
 pub mod creds;
+pub(crate) mod deferred;
 pub mod devnodes;
 pub mod dnotify;
 pub mod epoll;
