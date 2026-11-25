@@ -2159,7 +2159,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   loop device, pseudo-terminal master or synthesized `/proc` directory
   descriptor arrives as the host object behind it; a receiver that is not
   an fwe process sees one more descriptor (the bundle) with any of the
-  descriptors fwe stands in for.
+  descriptors fwe stands in for; `MSG_PEEK` gives no descriptors (Linux
+  gives copies), as macOS gives none on a peek; a socket passed by a
+  sender that ends before its receiver takes it can lose what it held,
+  if macOS collects it in between (the sender holds the bundle that keeps
+  it reachable).
 - Credentials: `SO_PEERCRED` and the credentials a stream's reader gets
   with `SO_PASSCRED` are the peer process's as they are when read (Linux
   takes them at `connect`, and per message on a stream), the process that

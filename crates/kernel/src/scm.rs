@@ -26,6 +26,18 @@
 //! manifest's magic number, takes what it describes, and closes it, so the
 //! guest never sees it. The manifest also carries credentials the sender
 //! gave with `SCM_CREDENTIALS`.
+//!
+//! macOS collects sockets in flight that it finds no process can reach,
+//! and empties them (their data and the descriptors queued in them): it
+//! looks for references only in sockets that are in flight themselves, so
+//! a socket whose sender closed it, passed to a socket that is not in
+//! flight, is emptied by any collection that runs before the receiver
+//! takes it (one runs whenever a Unix socket goes away). Linux collects
+//! only cycles no process can reach. So a message that passes sockets
+//! gets a bundle that holds them too (*keeps*), and the sender holds the
+//! bundle until its receiver has read it ([`PENDING`]): reachable through
+//! it, the sockets are left alone. The receiver closes the keeps as it
+//! takes the message, so no reference outlives it.
 
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
@@ -39,7 +51,7 @@ const UCRED: usize = 12;
 /// fwe's or a program's is given).
 const BUNDLE_MARK: libc::c_int = 196_613;
 /// The manifest's first word.
-const MAGIC: u64 = 0x6677_655f_7363_6d31;
+const MAGIC: u64 = 0x6677_655f_7363_6d32;
 /// Descriptors per datagram of companions in the bundle.
 const CHUNK: usize = 200;
 
@@ -229,8 +241,20 @@ pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Pre
         .filter(|x| x.kind == kind::STORE)
         .map(|x| x.state.clone())
         .collect();
+    // The sockets sent as themselves, kept in the bundle as well, out of
+    // the host's collection (a process of the host's reads no bundle).
+    let keeps: Vec<i32> = if host_peer {
+        Vec::new()
+    } else {
+        host.iter()
+            .zip(&exports)
+            .filter(|(_, x)| !x.as_ref().is_some_and(|x| x.placeholder))
+            .map(|(&fd, _)| fd)
+            .filter(|&fd| is_socket(fd))
+            .collect()
+    };
     let mut p = Prepared { buf: Vec::new(), bundle: None, objects, stored };
-    if creds.is_some() || exports.iter().any(Option::is_some) {
+    if creds.is_some() || exports.iter().any(Option::is_some) || !keeps.is_empty() {
         let ends = match make_bundle() {
             Ok(ends) => ends,
             Err(e) => {
@@ -239,7 +263,7 @@ pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Pre
             }
         };
         p.bundle = Some(ends);
-        if let Err(e) = fill_bundle(ends[0], &exports, creds) {
+        if let Err(e) = fill_bundle(ends[0], &exports, creds, &keeps) {
             // Nothing went: the bundle and what it held go.
             p.unsent();
             return Err(e);
@@ -364,9 +388,22 @@ fn make_bundle() -> Result<[i32; 2], i32> {
     Ok(ends)
 }
 
-/// Write the manifest of `exports` and `creds` to bundle end `w`, then the
-/// descriptors behind them.
-fn fill_bundle(w: i32, exports: &[Option<Export>], creds: Option<Creds>) -> Result<(), i32> {
+/// Whether host descriptor `fd` is a socket.
+fn is_socket(fd: i32) -> bool {
+    // SAFETY: zeroed bytes are a valid `stat`, filled by the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK }
+}
+
+/// Write the manifest of `exports`, `creds` and `keeps` to bundle end `w`,
+/// then the descriptors behind the exports, then the keeps.
+fn fill_bundle(
+    w: i32,
+    exports: &[Option<Export>],
+    creds: Option<Creds>,
+    keeps: &[i32],
+) -> Result<(), i32> {
     let mut e = Enc::new();
     e.u64(MAGIC);
     e.bool(creds.is_some());
@@ -385,9 +422,10 @@ fn fill_bundle(w: i32, exports: &[Option<Export>], creds: Option<Creds>) -> Resu
         e.bytes(&x.state);
         companions.extend_from_slice(&x.companions);
     }
+    e.u32(keeps.len() as u32);
     let manifest = e.into_bytes();
     send_datagram(w, &manifest, &[])?;
-    for chunk in companions.chunks(CHUNK) {
+    for chunk in companions.chunks(CHUNK).chain(keeps.chunks(CHUNK)) {
         send_datagram(w, &[0], chunk)?;
     }
     Ok(())
@@ -410,7 +448,7 @@ fn send_datagram(s: i32, data: &[u8], fds: &[i32]) -> Result<(), i32> {
 
 /// Receive one datagram from bundle `b` (never waiting): its data and the
 /// descriptors with it.
-fn recv_datagram(b: i32, peek: bool) -> Option<(Vec<u8>, Vec<i32>)> {
+fn recv_datagram(b: i32) -> Option<(Vec<u8>, Vec<i32>)> {
     let mut size: libc::c_int = 0;
     let mut l = 4 as libc::socklen_t;
     // SAFETY: valid out-parameters.
@@ -435,7 +473,7 @@ fn recv_datagram(b: i32, peek: bool) -> Option<(Vec<u8>, Vec<i32>)> {
     m.msg_iovlen = 1;
     m.msg_control = ctl.as_mut_ptr().cast();
     m.msg_controllen = ctl.len() as _;
-    let flags = libc::MSG_DONTWAIT | if peek { libc::MSG_PEEK } else { 0 };
+    let flags = libc::MSG_DONTWAIT;
     // SAFETY: a valid message of local buffers.
     let n = unsafe { libc::recvmsg(b, &mut m, flags) };
     if n < 0 {
@@ -476,8 +514,8 @@ struct Manifest {
 }
 
 /// Read bundle `b`'s manifest and the descriptors behind its entries.
-fn read_bundle(b: i32, peek: bool) -> Option<Manifest> {
-    let (data, _) = recv_datagram(b, peek)?;
+fn read_bundle(b: i32) -> Option<Manifest> {
+    let (data, _) = recv_datagram(b)?;
     let mut d = Dec::new(&data);
     if d.u64() != MAGIC {
         return None;
@@ -490,15 +528,18 @@ fn read_bundle(b: i32, peek: bool) -> Option<Manifest> {
         let (index, kind, want) = (d.u32() as usize, d.u8(), d.u32() as usize);
         entries.push(Entry { index, kind, state: d.bytes(), companions: Vec::with_capacity(want) });
     }
+    let keeps = d.u32() as usize;
     if !d.whole() {
         return None;
     }
     let mut fds = Vec::new();
     let total: usize = entries.iter().map(|e| e.companions.capacity()).sum();
-    while fds.len() < total {
-        let Some((_, got)) = recv_datagram(b, peek) else { break };
+    while fds.len() < total + keeps {
+        let Some((_, got)) = recv_datagram(b) else { break };
         fds.extend(got);
     }
+    // The keeps did their part: the message is the receiver's.
+    close_all(fds.split_off(total.min(fds.len())));
     let mut fds = fds.into_iter();
     for e in &mut entries {
         let want = e.companions.capacity();
@@ -526,9 +567,14 @@ pub struct Incoming {
 
 /// Take the host control data `ctl` of a received message, keeping at most
 /// `room` of its descriptors (the rest are closed): the descriptors and
-/// any credentials the sender gave. A bundle is taken and closed;
-/// `peek` reads it without taking it from the queue (`MSG_PEEK`).
+/// any credentials the sender gave. A bundle is taken and closed. A peek
+/// (`peek`, `MSG_PEEK`) takes nothing: macOS gives no descriptors on one
+/// (its control data has only zeroes where they would be), so the
+/// message's descriptors and bundle wait for the receive that takes it.
 pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
+    if peek {
+        return Incoming { fds: Vec::new(), creds: None, dropped: false };
+    }
     // Received without the kernel lock: where a plug put them, in the
     // guest's range once it is gone.
     let mut fds: Vec<i32> = host_fds(ctl).into_iter().map(crate::fdtable::into_range).collect();
@@ -536,7 +582,7 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
     if let Some(&b) = fds.last()
         && is_bundle(b)
     {
-        manifest = read_bundle(b, peek);
+        manifest = read_bundle(b);
         if manifest.is_some() {
             fds.pop();
             close_all([b]);

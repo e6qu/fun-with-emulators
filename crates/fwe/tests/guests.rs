@@ -10975,6 +10975,19 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// A socket passed with `SCM_RIGHTS` and closed by its sender keeps the
+/// data written into it until its receiver takes it, whatever happens
+/// meanwhile: macOS empties such a socket when any Unix socket goes away
+/// (as Firefox's fork server's exec socket was), Linux never does.
+#[test]
+fn a_socket_in_flight_keeps_its_data() {
+    c_guest_prints(
+        "inflight",
+        &[],
+        "socket: data lost in 0 of 10\nsocket and eventfd: data lost in 0 of 10\n",
+    );
+}
+
 /// `SECCOMP_RET_TRAP` as Chromium's and Firefox's sandboxes rely on it:
 /// the call not made, the `SIGSYS`'s call address and the context's pc
 /// both the address after the `svc` (which the sandboxes compare), as is

@@ -1284,10 +1284,20 @@ sees the message:
 | `SOCK_SEQPACKET` socket | itself: its buffer size says what it is |
 | a file of fwe's store (a memfd, a tmpfs or `/dev/shm` file) | the same open file description of the same file, its offset and flags shared; a process of the host's (an X server) is handed the shared memory object of the file's data instead, which it maps, writable only if the description allows writing: the file's first extent, which holds all of a file sized before it held data; one grown past it is refused (`EOPNOTSUPP`) |
 
-The sender holds the bundle's end until the receiver has emptied it: the
-host collects descriptors in flight that no process holds, and a
-collection running while a message is on its way can take one held only
-in flight for unreachable. An epoll descriptor (a kqueue) cannot be passed
+The sender holds the bundle's end until the receiver has emptied it: macOS
+collects sockets in flight it finds no process can reach, emptying their
+data and the descriptors queued in them, and looks for references only in
+sockets that are themselves in flight. A socket passed to one that is not
+in flight and closed by its sender (Firefox's fork server's exec socket)
+would be emptied by any collection before its receiver takes it (one runs
+whenever a Unix socket goes away), where Linux collects only cycles no
+process can reach. So a message that passes sockets always gets a bundle,
+which holds them as well: held by the sender, the bundle is reachable, and
+so is what it holds. The receiver closes those extra references as it
+takes the message, so none outlives it, and a receiver's close gives the
+socket's peer its end of file as on Linux. A peek (`MSG_PEEK`) of a
+message with descriptors gives its data and no descriptors: macOS hands
+none out on a peek, and the receive that takes the message gets them. An epoll descriptor (a kqueue) cannot be passed
 (`EINVAL`), nor can a receiver that is not an fwe process use a bundle
 (it sees one more descriptor). What fwe keeps per process of other
 descriptors stays with their maker: a passed inotify instance receives
