@@ -11014,6 +11014,23 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// `SO_PASSCRED` at the end of a Unix socket's stream: a message carries
+/// credentials, the end none, as crashpad tells the end.
+#[test]
+fn credentials_at_the_end_of_a_unix_socket() {
+    // Linux 7.0's output, on arm64, as root (as the guest runs).
+    c_guest_prints(
+        "credeof",
+        &[],
+        "stream first: 5 bytes, control with credentials: pid mine, uid mine, gid mine\n\
+         stream then: 0 bytes, control with credentials: pid 0, uid mine, gid mine\n\
+         datagram first: 5 bytes, control with credentials: pid mine, uid mine, gid mine\n\
+         datagram then: -1 EAGAIN, control none\n\
+         seqpacket first: 5 bytes, control with credentials: pid mine, uid mine, gid mine\n\
+         seqpacket then: 0 bytes, control none\n",
+    );
+}
+
 /// `SO_PEERGROUPS` gives the peer's supplementary groups as D-Bus reads
 /// them, and another process's `status` lists its groups.
 #[test]

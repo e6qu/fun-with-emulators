@@ -982,6 +982,9 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     fresh(fds[1]);
     socket_made(fds[0], Some(own_ids()));
     socket_made(fds[1], Some(own_ids()));
+    // Each end's peer is this process, as it is now.
+    remember_peer(fds[0], own_peer());
+    remember_peer(fds[1], own_peer());
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -1301,6 +1304,10 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         remember_name(fd as i32, false, &a.guest);
     }
     if r == 0 && family(&hb) == libc::AF_UNIX {
+        // The listener's process, as it is now.
+        if let Ok(peer) = live_peer(fd as i32) {
+            remember_peer(fd as i32, peer);
+        }
         let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
         if crate::x11::is_host_socket(&hb[2..end]) {
             crate::x11::connected(fd as i32, &hb[2..end]);
@@ -1602,6 +1609,12 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
     fresh(r);
     socket_made(r, Some(own_ids()));
+    // The connecting process, as it is now.
+    if family(&hb) == libc::AF_UNIX
+        && let Ok(peer) = live_peer(r)
+    {
+        remember_peer(r, peer);
+    }
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.
@@ -2905,22 +2918,73 @@ fn host_peer_groups(_fd: i32) -> Vec<u32> {
 /// The `ucred` of the process at the other end of Unix socket `fd`, as the
 /// caller sees it: its pid in the caller's pid namespace, its effective
 /// user and group ids (fwe's for it, as `SO_PEERCRED` gives them) in the
-/// caller's user namespace. A process fwe did not start has its host ids
-/// as the guest sees them.
+/// caller's user namespace. They are those of when the connection was made
+/// ([`PEERS`], Linux's `sk_peer_cred`), which outlast the peer; for a
+/// socket this process did not connect (received, or from before an
+/// `execve`), the peer's as it is now. A process fwe did not start has its
+/// host ids as the guest sees them.
 fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
-    let (pid, uid, gid) = host_peercred(fd)?;
-    Ok(ucred_of(pid).unwrap_or([
-        crate::pidns::to_guest(pid) as u32,
-        crate::host::uid_to_linux(uid),
-        crate::host::gid_to_linux(gid),
-    ]))
+    let p = match remembered_peer(fd) {
+        Some(p) => p,
+        None => live_peer(fd)?,
+    };
+    Ok(guest_ucred(p.pid, p.uid, p.gid))
 }
 
-/// The `ucred` of fwe's process `pid` (a host pid) as the caller sees it:
-/// its effective ids, if fwe has a record of it.
-fn ucred_of(pid: i32) -> Option<[u32; 3]> {
-    let ids = crate::procreg::read(crate::ids::HostPid::new(pid)?)?.ids;
-    Some(guest_ucred(pid, ids[1], ids[5]))
+/// A Unix socket's peer process: its host pid and effective user and group
+/// ids as the kernel holds them.
+#[derive(Clone, Copy)]
+struct Peer {
+    pid: i32,
+    uid: u32,
+    gid: u32,
+}
+
+/// The process at the other end of Unix socket `fd` now: its host pid and
+/// effective user and group ids as the kernel holds them (fwe's for it,
+/// else its host ids as Linux ones).
+fn live_peer(fd: i32) -> Result<Peer, i32> {
+    let (pid, uid, gid) = host_peercred(fd)?;
+    let rec = crate::ids::HostPid::new(pid).and_then(crate::procreg::read);
+    Ok(match rec {
+        Some(r) => Peer { pid, uid: r.ids[1], gid: r.ids[5] },
+        None => {
+            Peer { pid, uid: crate::host::uid_to_linux(uid), gid: crate::host::gid_to_linux(gid) }
+        }
+    })
+}
+
+/// Unix sockets' peers, by the socket's inode (the same in a `dup`, and in
+/// a fork child), as they were when the connection was made: host pid and
+/// effective ids ([`live_peer`]).
+static PEERS: std::sync::Mutex<Vec<(u64, Peer)>> = std::sync::Mutex::new(Vec::new());
+
+/// Unix socket `fd`'s connection is made, to `peer` ([`PEERS`]).
+fn remember_peer(fd: i32, peer: Peer) {
+    let Some(ino) = inode(fd) else { return };
+    let mut m = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    // Those of sockets gone: none is open here with its number now.
+    if m.len() >= 64 && m.len().is_power_of_two() {
+        let open: std::collections::HashSet<u64> =
+            crate::fdtable::open_fds().into_iter().filter_map(inode).collect();
+        m.retain(|(n, _)| open.contains(n));
+    }
+    m.retain(|&(n, _)| n != ino);
+    m.push((ino, peer));
+}
+
+/// Unix socket `fd`'s peer as it was when the connection was made, if this
+/// process made it ([`PEERS`]).
+fn remembered_peer(fd: i32) -> Option<Peer> {
+    let ino = inode(fd)?;
+    let m = PEERS.lock().unwrap_or_else(|e| e.into_inner());
+    m.iter().find(|&&(n, _)| n == ino).map(|&(_, p)| p)
+}
+
+/// This process as a peer: its host pid and effective ids.
+fn own_peer() -> Peer {
+    let id = crate::creds::identity();
+    Peer { pid: crate::host::pid().get(), uid: id.uids[1], gid: id.gids[1] }
 }
 
 /// Credentials as the caller sees them: the pid in its pid namespace, the
@@ -3397,6 +3461,8 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
             Err(e) => return e,
         }
     };
+    // The end of the stream (the peer gone), which has no sender.
+    let mut ended = Ended::No;
     let r = if crate::seqpacket::is(fd as i32) {
         let got = crate::seqpacket::recv(
             fd as i32,
@@ -3411,6 +3477,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         hmsg.msg_namelen = 0;
         hmsg.msg_controllen = got.controllen as _;
         hmsg.msg_flags = got.flags;
+        if got.end {
+            ended = Ended::Message;
+        }
         got.result as isize
     } else if ping {
         // SAFETY: `hmsg` references guest iov and local name/control buffers.
@@ -3423,9 +3492,27 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         r as isize
     } else {
         // SAFETY: `hmsg` references guest iov and local name/control buffers.
-        let r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        let mut r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        // A Unix datagram socket whose peer has closed: macOS says so once
+        // (`ECONNRESET`, its error, which this takes); Linux has nothing to
+        // say, and the receive goes on as one with nothing there.
+        if r < 0
+            && crate::host::last_errno().is(libc::ECONNRESET)
+            && kind(fd as i32) == Some((libc::AF_UNIX, libc::SOCK_DGRAM))
+        {
+            // SAFETY: as above.
+            r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        }
         if r < 0 {
             return last_error();
+        }
+        // A stream's nothing, for room to take something, is its end (a
+        // datagram can be empty).
+        if r == 0
+            && hiov.iter().any(|v| v.iov_len > 0)
+            && socket_type(fd as i32) == Some(libc::SOCK_STREAM)
+        {
+            ended = Ended::Stream;
         }
         nl_whole.map_or(r, |w| w as isize)
     };
@@ -3449,7 +3536,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     // Ancillary data back to the guest.
     #[cfg(target_os = "linux")]
     {
-        // Host wrote the guest's Linux-layout control buffer directly.
+        // Host wrote the guest's Linux-layout control buffer directly,
+        // with no credentials at the end itself.
+        let _ = &ended;
         guest!(uaccess::write(msg + 40, hmsg.msg_controllen as u64));
         guest!(uaccess::write(msg + 48, msg_flags_from_host(hmsg.msg_flags)));
     }
@@ -3459,7 +3548,7 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         let got = (hmsg.msg_controllen as usize).min(macbuf.len());
         // Credentials, asked for with `SO_PASSCRED`, come first: those the
         // sender gave, else the peer's (the kernel's, 0, for netlink).
-        let passcred = kept_value(fd as i32, SO_PASSCRED) != 0;
+        let passcred = kept_value(fd as i32, SO_PASSCRED) != 0 && ended != Ended::Message;
         let room = cap.saturating_sub(if passcred { 32 } else { 0 });
         let inc = crate::scm::receive(
             &macbuf[..got],
@@ -3467,6 +3556,8 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
             flags & MSG_PEEK != 0,
         );
         let creds = passcred.then(|| match inc.creds {
+            // No sender: Linux's empty credentials, pid 0 and ids 0.
+            _ if ended == Ended::Stream => guest_ucred(0, 0, 0),
             Some(c) => guest_ucred(c.host_pid, c.uid, c.gid),
             None if crate::netlink::is(fd as i32) => [0, 0, 0],
             // No process to name (a datagram from a program fwe did not
@@ -3490,6 +3581,16 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         guest!(uaccess::write(msg + 48, lflags));
     }
     r as i64
+}
+
+/// Whether a receive met the end of its socket's stream, which has no
+/// sender: a stream's end carries Linux's empty credentials (pid 0, ids
+/// 0) where they are asked for, a message socket's end none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    No,
+    Stream,
+    Message,
 }
 
 /// The host control buffer a receive gives: the host's most descriptors

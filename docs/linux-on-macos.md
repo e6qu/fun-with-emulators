@@ -1351,9 +1351,15 @@ user and group ids as fwe keeps them for it (what it set inside fwe), in
 the caller's user namespace; a peer fwe did not start has its host ids
 as the guest sees them
 ([Host identity](#host-identity-and-machine-state)). They are the peer's
-as they are when asked (Linux's are as they were at `connect` or
-`socketpair`). A socket with no peer process (not Unix, or netlink) gives
-pid 0 and ids -1. **`SO_PEERGROUPS`** gives the same peer's supplementary
+as they were when the connection was made (`socketpair`, `connect`,
+`accept`), as Linux keeps them, and outlast the peer; a socket the process
+did not connect itself (received, or from before an `execve`) gives the
+peer's as they are when asked. A socket with no peer process (not Unix,
+or netlink) gives pid 0 and ids -1. Under `SO_PASSCRED` a message carries
+the same credentials when its sender gave none; the end of a stream
+carries Linux's empty ones (pid 0, ids 0), the end of a `SOCK_SEQPACKET`
+socket none; and a datagram socket whose peer has closed has nothing to
+receive (macOS's one `ECONNRESET` is not the guest's). **`SO_PEERGROUPS`** gives the same peer's supplementary
 groups, which each fwe process publishes in its record (a host process's
 from `LOCAL_PEERCRED`), `ERANGE` with the size needed for a buffer too
 small and `ENODATA` with no peer, as Linux does; the record also gives
