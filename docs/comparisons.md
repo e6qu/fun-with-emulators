@@ -1,9 +1,9 @@
 # fwe and other ways to run Linux programs
 
-This document places fwe among the other ways to run a program built for
-one system on another: what each does, how it differs from fwe, and what
-fwe takes from it. How fwe itself works is in
-[architecture.md](architecture.md) and [linux-on-macos.md](linux-on-macos.md).
+Other ways to run a program built for one system on another: what each
+does, how it differs from fwe, and what fwe takes from it. How fwe
+itself works is in [architecture.md](architecture.md) and
+[linux-on-macos.md](linux-on-macos.md).
 
 ## The design space
 
@@ -30,8 +30,8 @@ Running a Linux program elsewhere comes down to two questions.
   program's system interface (Wine's approach, for Windows).
 
 fwe runs code natively and answers system calls with a userspace
-kernel. Its native backend runs the program inside the `fwe` process,
-diverting each `svc` to fwe's code; its VM backend runs the program in a
+kernel. Its native backend runs the program inside the `fwe` process and
+diverts each `svc` to fwe's code. Its VM backend runs the program in a
 Hypervisor.framework VM with no kernel in it, so each system call leaves
 the VM for the same userspace kernel.
 
@@ -71,15 +71,15 @@ instruction itself: static binaries, Go programs and musl make system
 calls directly, with no library in between. fwe therefore intercepts at
 the instruction (`svc`) and implements the kernel, not a library. What
 processes share (process records, the futex table, namespaces) lives in
-files and memory every fwe process maps, so there is no server process.
+memory every fwe process maps, so there is no server process.
 
 **In common.** Both run code natively in-process, make one host process
-per guest process, and contend with macOS for low addresses: Wine
+per guest process, and contend with macOS for low addresses. Wine
 reserves them with a preloader before macOS takes them; fwe moves a
 static program linked below 4 GiB whose link kept its relocations, and
 runs any other in its VM backend. fwe also runs Linux's Wine itself, in
 the VM backend (CI's `wine` job), so Windows programs run on fwe through
-Wine as they do on Linux.
+Wine as on Linux.
 
 ## Linux in a virtual machine
 
@@ -113,11 +113,10 @@ behaviour that is hard to match.
 
 **For fwe.** WSL1's mechanism is fwe's model, and its weakness is the
 risk this design carries: fidelity in the long tail. fwe measures it
-with LTP and with real programs in CI (Debian's bash, git, apt, Node.js
-and rustc; OpenJDK; Podman, containerd, Docker; Wine). Its file
-operations are the host's own calls on APFS, with no translation layer
-of the kind WSL1 had over NTFS, though fwe still resolves each path
-(mounts, overlays, the root).
+with LTP and with real programs in CI ([README.md](../README.md#status)).
+Its file operations are the host's own calls on APFS, with no
+translation layer of the kind WSL1 had over NTFS, though fwe still
+resolves each path (mounts, overlays, the root).
 
 ### QEMU and KVM
 
@@ -222,11 +221,13 @@ their code as it runs. Both also "thunk" common libraries: a program's
 call into, say, its OpenGL or SDL library goes to the host's native
 arm64 library instead of a translated x86 copy.
 
-**For fwe.** Neither applies to arm64 programs on an arm64 host. Library
-thunking is Wine's idea applied selectively, and could let a guest use
-macOS libraries (Metal through a Vulkan or OpenGL library, say); fwe does
-not do this. FEX or Box64 would be what runs x86 Windows programs under
-Wine, which is not planned for 1.0.
+**For fwe.** Their translation does not apply to arm64 programs on an
+arm64 host. Their thunking does, for the GPU: fwe's Linux Vulkan driver
+packs each Vulkan command a program makes into one `ioctl` on fwe's GPU
+device, and fwe calls the Mac's Vulkan driver (MoltenVK or KosmicKrisp)
+for it in the same process, so the program draws on Metal without a
+translated or emulated GPU. FEX or Box64 would be what runs x86 Windows
+programs under Wine, which is not planned for 1.0.
 
 ### Rosetta 2
 
@@ -300,6 +301,8 @@ fwe is installed (`Formula/fwe.rb`).
 - From **Noah** and **KVM** users: a VM with no kernel for what cannot run
   in-process.
 - From **DynamoRIO**: a code cache for code made at run time.
+- From **FEX** and **Box64**: a guest library thunked to the host's, for
+  Vulkan.
 - From **Rosetta 2**: prepared code kept between runs.
 - From **WSL1**'s successor: the warning to measure fidelity, not assume
   it.
