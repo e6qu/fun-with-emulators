@@ -663,7 +663,7 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
     {
         violation(&format!(
             "hv_vm_unmap of {ipa:#x}+{size:#x}, part of the stage 2 the VM ran with: \
-                 stage 2 may not change while the VM runs"
+                 stage 2 MUST NOT change while the VM runs"
         ));
     }
     let mut ops: Vec<Op> = gone.iter().map(|&(lo, hi)| Op::Unmap(lo, hi)).collect();
@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(
             vm_map(gone, 0x40_0000, 0x4000, all),
             HV_BAD_ARGUMENT,
-            "host memory must be mapped"
+            "unmapped host memory is refused"
         );
 
         assert_eq!(vm_unmap(0x10_0000, 0x8000), HV_BAD_ARGUMENT, "unmap only what is mapped");

@@ -42,14 +42,14 @@ options:
                entitlement)
   --vm         run every program in the VM (the hypervisor backend), not
                only those linked below 4 GiB: for programs that need 4 KiB
-               pages, such as Wine (must come first)
+               pages, such as Wine (goes first)
   --hv-standin run the hypervisor backend on a software stand-in for
                Hypervisor.framework instead of a real VM (for development
-               and tests; needs Unicorn; must come first)
+               and tests; needs Unicorn; goes first)
   --hv-record DEST
                record the hypervisor backend's VM calls, synchronously, to
                file:PATH and/or udp:HOST:PORT (comma separated; also
-               FWE_HV_RECORD; must come first; see docs/hypervisor.md)
+               FWE_HV_RECORD; goes first; see docs/hypervisor.md)
   -h, --help   show this help
   -V, --version
 ";
@@ -113,7 +113,7 @@ fn main() -> ExitCode {
     // Anywhere else they would come too late: `--hv-spike --hv-standin`
     // would reach the real framework first.
     if let Some(late) = late_leading_option(&args) {
-        eprintln!("fwe: {late} must come first\n{USAGE}");
+        eprintln!("fwe: {late} goes before the other options\n{USAGE}");
         return ExitCode::from(2);
     }
     let mut args = args.into_iter().peekable();

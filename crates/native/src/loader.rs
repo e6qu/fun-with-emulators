@@ -60,7 +60,7 @@ impl fmt::Display for LoadError {
         match self {
             LoadError::AddressUnavailable { start, len, reason } => write!(
                 f,
-                "address range {start:#x}-{:#x} required by the executable is not available \
+                "address range {start:#x}-{:#x} that the executable needs is not available \
                  ({reason})",
                 start + len
             ),

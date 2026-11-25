@@ -1,6 +1,12 @@
 //! End-to-end tests: build Linux arm64 programs from `guests/` and run them
 //! under `fwe`.
 //!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in these tests' documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
+//!
 //! Assembly guests are assembled with `clang` and linked with the toolchain's
 //! `rust-lld` three ways: as static executables above 4 GiB, as static
 //! position-independent executables, and (`-low`) at the default low link

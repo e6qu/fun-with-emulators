@@ -123,9 +123,11 @@ updated by [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)):
   reworded ("can" or "might" for a possibility, "needs" or "takes" for
   what a mechanism depends on).
 - A document that uses the key words MUST carry the notice above near its
-  beginning. Code comments are covered by the notice in each crate's root
-  documentation (`lib.rs` or `main.rs`) and in `driver/vulkan/fwe_vk.h` for
-  the C driver.
+  beginning. Code comments are covered by the notice in the root
+  documentation of each crate that uses them (`lib.rs`, `main.rs`, or an
+  integration test's file) and in `driver/vulkan/fwe_vk.h` for the C
+  driver; the comments of `tools/`, the guests' sources and the CI
+  workflows, by the notice of this file.
 - A generated file's comments change through its generator
   (`tools/gen-abi.py`, `tools/gen-vulkan.py`), never by hand.
 
