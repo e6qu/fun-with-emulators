@@ -623,8 +623,21 @@ impl<P: Platform> Kernel<P> {
         for o in &c.options {
             options.push(Self::fs_data(c.kind, o)?);
         }
+        let ns = self.fs().mount_ns().clone();
+        // A tmpfs given a new size or number of inodes holds to it from now
+        // on, as a remount's does.
+        if c.kind == crate::mounts::FsType::Tmpfs
+            && let Ok(o) = crate::tmpfs::parse(&options.join(&b","[..]))
+        {
+            let source =
+                ns.table().mounts.iter().find(|m| m.unique_id() == id).map(|m| m.source.clone());
+            if let Some(crate::mounts::Source::Store(store)) = source {
+                crate::filestore::fs::get(store, false)
+                    .and_then(|f| f.lock()?.limit(o.size, o.inodes))?;
+            }
+        }
 
-        self.fs().mount_ns().clone().update(|t| {
+        ns.update(|t| {
             let m = t.mounts.iter_mut().find(|m| m.unique_id() == id).ok_or(errno::ENOENT)?;
             m.flags = (m.flags | set) & !clear;
             for o in &options {
