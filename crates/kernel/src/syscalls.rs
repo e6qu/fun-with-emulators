@@ -1426,20 +1426,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 fcntl::F_GETFL => {
                     let r = libc::fcntl(fd, libc::F_GETFL);
-                    if r < 0 {
-                        last_error()
-                    } else if let Some(nb) = crate::specialfd::timer_nonblock(fd) {
-                        (fcntl::O_RDWR | if nb { fcntl::O_NONBLOCK } else { 0 }) as i64
-                    } else if let Some(t) = crate::pidfd::of(fd) {
-                        // Read-write, and non-blocking as it was made or set.
-                        (fcntl::O_RDWR | if t.nonblock { fcntl::O_NONBLOCK } else { 0 }) as i64
-                    } else if crate::fdmarks::is_path(fd) {
-                        // An `O_PATH` descriptor's flags: that, and the
-                        // large-file flag every arm64 open has.
-                        (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
-                    } else {
-                        host::status_flags_to_linux(r) as i64
-                    }
+                    if r < 0 { last_error() } else { crate::fdmarks::status_flags(fd, r) as i64 }
                 }
                 fcntl::F_SETFL if crate::specialfd::timer_nonblock(fd).is_some() => {
                     crate::specialfd::set_timer_nonblock(fd, arg & fcntl::O_NONBLOCK != 0);
@@ -1451,6 +1438,9 @@ impl<P: Platform> Kernel<P> {
                 }
                 fcntl::F_SETFL => {
                     let r = libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg));
+                    if r >= 0 {
+                        crate::fdmarks::status_set(fd, arg);
+                    }
                     // An epoll set is a kqueue, which keeps the flags but has
                     // no `FIONBIO` to tell (`ENOTTY`): Linux's set keeps
                     // them as any file's.

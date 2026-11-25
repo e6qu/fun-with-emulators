@@ -1783,7 +1783,7 @@ impl Fs {
                 libc::fcntl(fd, libc::F_GETFD),
             )
         };
-        let mut flags = crate::host::status_flags_to_linux(status);
+        let mut flags = crate::fdmarks::status_flags(fd, status);
         if fd_flags & libc::FD_CLOEXEC != 0 {
             flags |= fcntl::O_CLOEXEC;
         }

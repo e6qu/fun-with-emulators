@@ -543,6 +543,10 @@ impl<P: Platform> Kernel<P> {
         {
             crate::fdmarks::mark(r as i32, crate::fdmarks::Mark::Path);
         }
+        // What `F_GETFL` reports of it ([`crate::fdmarks::status_flags`]).
+        if r >= 0 {
+            crate::fdmarks::open_flags(r as i32, flags);
+        }
         r
     }
 

@@ -1253,7 +1253,8 @@ pub fn write_rusage(out: u64, usage: &libc::rusage) -> crate::uaccess::Result<()
     crate::uaccess::write(out, words)
 }
 
-/// File status flags (`F_GETFL`) from host to Linux.
+/// File status flags (`F_GETFL`) from host to Linux: the access mode and
+/// the modes the host keeps.
 pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
     let mut f = match host & libc::O_ACCMODE {
         libc::O_WRONLY => fcntl::O_WRONLY,
@@ -1270,8 +1271,9 @@ pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
             f |= l;
         }
     }
-    // Linux reports O_LARGEFILE on 64-bit for every open file.
-    f | fcntl::O_LARGEFILE
+    // (`O_LARGEFILE`, which Linux sets on what `open` made only, is the
+    // caller's: [`crate::fdmarks::status_flags`].)
+    f
 }
 
 /// A Linux `struct flock` in host layout, or `EINVAL` for an unknown lock

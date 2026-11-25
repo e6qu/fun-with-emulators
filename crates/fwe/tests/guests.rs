@@ -2215,6 +2215,25 @@ fn an_exclusive_epoll_wake_reaches_one_waiter() {
     c_guest_prints("epollx", &[], "each write woke one waiter: yes\n");
 }
 
+/// `F_GETFL` of each kind of descriptor (guests/c/getfl.c), as Linux
+/// reports it: an open's own flags less those it drops (`O_CLOEXEC`,
+/// `O_CREAT`), `O_LARGEFILE` only on what `open` and `memfd_create` made
+/// (Chromium's GPU sandbox kills a process that sets the bit back on a
+/// socket), and each anonymous file's access mode. Linux prints the same.
+#[test]
+fn file_status_flags_are_linuxs_for_each_kind() {
+    c_guest_prints(
+        "getfl",
+        &[],
+        "file: 0x20002\ndirectory: 0x24000\ndirectory, plain open: 0x20000\n\
+         file, O_CLOEXEC | O_NOFOLLOW: 0x28002\nfile, O_WRONLY | O_APPEND | O_SYNC: 0x121401\n\
+         file, O_NOATIME: 0x60000\nO_PATH | O_DIRECTORY: 0x204000\nO_TMPFILE: 0x424002\n\
+         /dev/null: 0x20002\npipe read end: 0\npipe write end: 0x1\nnamed FIFO: 0x20802\n\
+         TCP socket: 0x2\nUDP socket: 0x2\nsocketpair: 0x2\nepoll: 0x2\neventfd: 0x2\n\
+         signalfd: 0x2\ntimerfd: 0x2\ninotify: 0\nmemfd: 0x20002\npidfd: 0x2\n",
+    );
+}
+
 /// Descriptors without `O_CLOEXEC` keep working across `execve`
 /// (guests/c/execkeep.c): an epoll set and its duplicate, a timerfd that
 /// expired meanwhile, an eventfd's count, a signalfd with its blocked

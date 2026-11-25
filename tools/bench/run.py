@@ -1103,6 +1103,14 @@ def processes_of(p, root=None):
     return [pid for pid in pids if pid > 0 and pid != os.getpid()]
 
 
+def linux_env(**extra):
+    """The environment a guest program of the browser and Electron rows
+    starts with: a Linux one, as `env -i` gives the other rows' guests, not
+    the Mac's (whose `TMPDIR` names a directory the root does not have,
+    where Chromium makes its socket directory), with `extra`."""
+    return dict({"PATH": "/usr/bin:/bin", "HOME": "/root", "LANG": "C.UTF-8"}, **extra)
+
+
 def logged(cmd, key, name, env=None, root=None):
     """The figure `cmd` (a browser loading one of PAGES) logs on its
     standard error as "fwe-bench KEY <number>" (Chromium writes a page's
@@ -1167,7 +1175,7 @@ def browsers(a, fwe, results):
         n = next(runs)
         cmd = fwe + ["--root", root, os.path.join(root, "usr/bin/chromium")] + switches + [
             f"--user-data-dir=/tmp/fwe-bench-{n}", f"file:///tmp/fwe-pages/{page}"]
-        return logged(cmd, key, name, env=env, root=root)
+        return logged(cmd, key, name, env=env or linux_env(), root=root)
 
     def chrome_mac(page, key, name):
         with tempfile.TemporaryDirectory() as profile:
@@ -1178,7 +1186,7 @@ def browsers(a, fwe, results):
     for row, page, key in (("Chromium page load (ms)", "load.html", "load"),
                            ("Chromium video frame (ms)", "frames.html", "frame")):
         # A first run, which also prepares the browser's code: the backends.
-        _, results[BACKEND][row] = chromium(page, key, row, dict(os.environ, FWE_TIMING="1"))
+        _, results[BACKEND][row] = chromium(page, key, row, linux_env(FWE_TIMING="1"))
         ours[row] = best(lambda: chromium(page, key, row)[0], BROWSER_ROUNDS)
         theirs[row] = best(lambda: chrome_mac(page, key, row), BROWSER_ROUNDS)
         print(f"{row}: fwe {ours[row]:.1f}, macOS {theirs[row]:.1f}", flush=True)
@@ -1198,9 +1206,10 @@ def browsers(a, fwe, results):
     if not os.path.isdir(mac_electron):
         zipped = fetch(ELECTRON_MAC[0], ELECTRON_MAC[1], a.cache)
         subprocess.run(["ditto", "-x", "-k", zipped, mac_electron], check=True)
-    env = dict(os.environ, FWE_QUIT_LOADED="1", HOME="/root")
+    guest = linux_env(DISPLAY=os.environ["DISPLAY"], FWE_QUIT_LOADED="1")
+    host = dict(os.environ, FWE_QUIT_LOADED="1")
 
-    def started(cmd, name):
+    def started(cmd, name, env):
         began = time.monotonic()
         r = run_limited(cmd, name, env=env)
         took = (time.monotonic() - began) * 1000
@@ -1209,14 +1218,14 @@ def browsers(a, fwe, results):
         return took
 
     row = "Electron start-up (ms)"
-    results[BACKEND][row] = backends(fwe + ["--root", deb, os.path.join(electron, "electron"),
-                                            "--no-sandbox", "/opt/fwe-hello"])
-    ours[row] = best(lambda: started(
-        fwe + ["--root", deb, os.path.join(electron, "electron"), "--no-sandbox",
-               "/opt/fwe-hello"], row), BROWSER_ROUNDS)
+    ours_cmd = fwe + ["--root", deb, os.path.join(electron, "electron"), "--no-sandbox",
+                      "/opt/fwe-hello"]
+    results[BACKEND][row] = backends(
+        ["env", "-i"] + [f"{k}={v}" for k, v in guest.items()] + ours_cmd)
+    ours[row] = best(lambda: started(ours_cmd, row, guest), BROWSER_ROUNDS)
     theirs[row] = best(lambda: started(
         [os.path.join(mac_electron, "Electron.app/Contents/MacOS/Electron"), "--no-sandbox",
-         ELECTRON_APP], row), BROWSER_ROUNDS)
+         ELECTRON_APP], row, host), BROWSER_ROUNDS)
     print(f"{row}: fwe {ours[row]:.0f}, macOS {theirs[row]:.0f}", flush=True)
 
 

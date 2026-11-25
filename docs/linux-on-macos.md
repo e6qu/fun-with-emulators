@@ -2086,7 +2086,14 @@ starts there fails, with `ESRCH` in its `fd` and `fdinfo` and `ENOENT`
 elsewhere, as on Linux.
 
 **`fcntl`**: `F_GETFL`/`F_SETFL` and `F_GETFD`/`F_SETFD` are translated;
-`F_DUPFD` below the guest's limit only. Record locks and `F_OFD_*` locks
+`F_DUPFD` below the guest's limit only. macOS keeps few of an open's
+flags, so fwe notes the flags each `open` was given and `F_GETFL` (and
+`/proc/<pid>/fdinfo`) reports what Linux keeps of them: all but
+`O_CREAT`, `O_EXCL`, `O_NOCTTY`, `O_TRUNC` and `O_CLOEXEC`, with
+`O_LARGEFILE` (of an `O_PATH` descriptor, only `O_DIRECTORY` and
+`O_NOFOLLOW` beside it); a pipe, a socket and the anonymous files
+(epoll, eventfd, signalfd, timerfd, inotify, pidfd) have no
+`O_LARGEFILE` and Linux's access mode for each. Record locks and `F_OFD_*` locks
 are translated to the host's (macOS's private `F_OFD_*` numbers), a holder
 `F_GETLK` reports by its pid in the caller's pid namespace. Owners
 (`F_SETOWN_EX`), the `F_SETSIG` signal, leases, pipe sizes,
