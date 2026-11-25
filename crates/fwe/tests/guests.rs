@@ -10946,6 +10946,20 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// Firefox's fork server starting a sandboxed content process: the exec
+/// socket the parent sends the server reaches the child it clones into
+/// new namespaces, though that child's `CLONE_FS` chroot helper closes
+/// every descriptor but its own; the helper's `chroot` is the child's.
+#[test]
+fn a_fork_servers_sandboxed_child_reads_its_exec_socket() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "forkserver",
+        &[],
+        "child read: exec info\nchroot answered: yes\nserver: child 0\nparent wrote: 9, server: 0\n",
+    );
+}
+
 /// `/sys/devices/system/cpu` holds the host's CPUs as Linux lays them out:
 /// glibc counts them there, and each CPU's topology and caches agree with
 /// the host's kinds of core (`sysctl hw.perflevel<n>`).
