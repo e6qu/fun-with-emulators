@@ -74,7 +74,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
     // The calling thread's view is what the program runs with.
     k.adopt_thread_view();
-    // A script runs its interpreter.
+    // A script runs its interpreter; the path run by names the program.
+    let run_by = path.clone();
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
     let (file, file_id) = match k.take_exec_file(&path) {
@@ -105,14 +106,24 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         let state = k.exec_state();
         crate::jitcount::write_seen();
         crate::jit::keep_made();
-        return Err(crate::reexec(&path, &args, &env, fs, strace, &state, || {}));
+        // Named as the new fwe will name it (a descriptor's file, by its name).
+        let exe = fs.exec_fd(&path).map_or_else(|| path.clone(), |fd| fs.fd_target(fd));
+        let named = fwe_kernel::fs::exec_name(&run_by, &exe);
+        return Err(crate::reexec(
+            crate::Program { path: &path, named: &named, args: &args, env: &env },
+            fs,
+            strace,
+            &state,
+            || {},
+        ));
     }
     // The old image is untouched on failure, so the guest can handle it.
     fwe_kernel::timing::mark("exec: checked for re-exec");
     fwe_kernel::timing::mark("backend: native");
     crate::check_image(&file, fs).map_err(err)?;
-    // A program with no path (a memfd) is held, for `/proc/self/exe`: the
-    // descriptor it was run through might close on exec.
+    // A program run through a descriptor (a memfd, `/proc/self/exe`) is
+    // held through it, for `/proc/self/exe`: the descriptor it was run
+    // through might close on exec. Another is opened once loaded.
     let exe_fd = match fs.exec_fd(&path) {
         Some(fd) => {
             let held = fwe_kernel::fdtable::dup_reserved(fd).map_err(err)?;
@@ -166,9 +177,22 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if let Some(fs) = k.fs.as_mut() {
         fs.set_exe_fd(exe_fd);
         let exe = fs.exe_fd_target().unwrap_or_else(|| path.clone());
+        let named = fwe_kernel::fs::exec_name(&run_by, &exe);
         // What the process's record tells of it, written once.
         fwe_kernel::procreg::batch(|| {
-            fs.set_proc_info(exe, crate::cmdline(&arg_refs), crate::ncpu(), crate::hostname());
+            fs.set_proc_info(
+                exe,
+                &named,
+                crate::cmdline(&arg_refs),
+                crate::ncpu(),
+                crate::hostname(),
+            );
+            // The program's file, held for `/proc/self/exe`.
+            if exe_fd.is_none()
+                && let Some(fd) = fs.open_program(&path)
+            {
+                fs.set_exe_fd(Some(fd));
+            }
             fs.set_auxv(out.auxv);
             fs.publish();
         });

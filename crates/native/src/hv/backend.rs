@@ -798,7 +798,14 @@ fn start(
     }
 
     let exe = fs.exe_fd_target().unwrap_or_else(|| crate::guest_exe_path(path, options, &fs));
-    fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+    let named = options
+        .comm
+        .clone()
+        .unwrap_or_else(|| fwe_kernel::fs::exec_name(&crate::guest_execfn(path, options), &exe));
+    fs.set_proc_info(exe, &named, cmdline(&arg_bytes), ncpu(), hostname());
+    if let Some(fd) = crate::open_program(path, options, &fs) {
+        fs.set_exe_fd(Some(fd));
+    }
     fs.set_auxv(image.auxv.clone());
     fs.publish();
     thread::init_main(fwe_kernel::pidns::adopt(&fs.ns, 0));
@@ -1260,7 +1267,8 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     let argv = if argv.is_empty() { vec![Vec::new()] } else { argv };
     let guard = kernel();
     let k = guard.as_ref().unwrap();
-    // A script runs its interpreter.
+    // A script runs its interpreter; the path run by names the program.
+    let run_by = path.clone();
     let (path, argv) = match k.exec_target(path, argv) {
         Ok(t) => t,
         Err(e) => return err(e),
@@ -1277,7 +1285,16 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
         teardown();
         record::event("execve", &path);
     };
-    let r = crate::reexec(&path, &argv, &envp, fs, k.tracer, &state, before_exec);
+    // Named as the new fwe will name it (a descriptor's file, by its name).
+    let exe = fs.exec_fd(&path).map_or_else(|| path.clone(), |fd| fs.fd_target(fd));
+    let named = fwe_kernel::fs::exec_name(&run_by, &exe);
+    let r = crate::reexec(
+        crate::Program { path: &path, named: &named, args: &argv, env: &envp },
+        fs,
+        k.tracer,
+        &state,
+        before_exec,
+    );
     if !VM_LIVE.load(std::sync::atomic::Ordering::SeqCst) {
         fatal(&format!(
             "execve {} failed after the VM was destroyed: {r}",

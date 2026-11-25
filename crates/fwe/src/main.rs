@@ -146,7 +146,7 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
+            b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
             | b"--user-dir" | b"--host-display" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
@@ -157,6 +157,8 @@ fn main() -> ExitCode {
                     host_display = Some(value);
                 } else if flag == "--user-dir" {
                     fwe_native::adopt_user_dir(value.as_bytes());
+                } else if flag == "--comm" {
+                    options.comm = Some(value.as_bytes().to_vec());
                 } else if flag == "--cwd" {
                     options.cwd = Some(value.as_bytes().to_vec());
                 } else if flag == "--exec-state" {
@@ -296,8 +298,8 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
             b"--vm" | b"--hv-standin" | b"--hv-record" => {
                 return Some(a.to_string_lossy().into_owned());
             }
-            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
-            | b"--probe" | b"--host-display" => i += 2,
+            b"--root" | b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd"
+            | b"--exe-store" | b"--probe" | b"--host-display" => i += 2,
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
             _ => return None,

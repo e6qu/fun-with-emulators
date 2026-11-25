@@ -296,6 +296,10 @@ pub struct Options {
     pub cwd: Option<Vec<u8>>,
     /// The guest's `argv[0]`, when not the program path.
     pub argv0: Option<OsString>,
+    /// The name of the program's thread, when not the one its path gives
+    /// (the guest's `execve` ran a script, or a program through a
+    /// descriptor; [`fwe_kernel::fs::exec_name`]).
+    pub comm: Option<Vec<u8>>,
     /// What the guest that exec'd this program carries into it
     /// ([`fwe_kernel::Kernel::exec_state`]), hex-encoded.
     pub exec_state: Option<Vec<u8>>,
@@ -538,6 +542,16 @@ pub fn remember_exe() {
     }
 }
 
+/// A program a guest's `execve` runs: its guest path, the name its thread
+/// takes ([`fwe_kernel::fs::exec_name`]), its arguments and environment.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct Program<'a> {
+    pub path: &'a [u8],
+    pub named: &'a [u8],
+    pub args: &'a [Vec<u8>],
+    pub env: &'a [Vec<u8>],
+}
+
 /// `execve` by re-executing fwe on the new program: the new process image is
 /// a fresh fwe, which picks the backend the program needs — the native one,
 /// or the VM for a program linked below 4 GiB — so either backend can exec
@@ -546,14 +560,14 @@ pub fn remember_exe() {
 /// guest's flag is the host's), the signal mask, pending signals and ignored
 /// dispositions; the root filesystem, working directory, `--strace`, `--vm`,
 /// `--hv-standin`, `--hv-record` and fwe's private directory are passed
-/// on, and a program with no path (a memfd) by descriptor (`--exe-fd`).
-/// Other threads end, as on Linux. Returns a Linux errno only if the
-/// program cannot be run; on success it does not return.
+/// on, and a program reached through a descriptor (a memfd, or
+/// `/proc/self/exe`) by descriptor (`--exe-fd`), with the name the guest's
+/// `execve` gives it (`--comm`). Other threads end, as on Linux. Returns a
+/// Linux errno only if the program cannot be run; on success it does not
+/// return.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reexec(
-    path: &[u8],
-    args: &[Vec<u8>],
-    env: &[Vec<u8>],
+    program: Program<'_>,
     fs: &fwe_kernel::Fs,
     strace: Tracer,
     state: &[u8],
@@ -561,6 +575,7 @@ pub(crate) fn reexec(
 ) -> i64 {
     use fwe_abi::{err, errno};
     use std::ffi::CString;
+    let Program { path, named, args, env } = program;
     // A `/proc` link names a program the new fwe would look for in itself.
     let target = fs.exec_target(path);
     let path = &target[..];
@@ -605,6 +620,8 @@ pub(crate) fn reexec(
         argv.push(b"--argv0".to_vec());
         argv.push(a0.clone());
     }
+    argv.push(b"--comm".to_vec());
+    argv.push(named.to_vec());
     // A program with no path goes by descriptor: one of fwe's, kept open
     // across the host `execve`.
     let held = match fs.exec_fd(path).map(fwe_kernel::fdtable::dup_reserved) {
@@ -1312,6 +1329,8 @@ fn start(
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
     fwe_kernel::timing::mark("open_fs");
+    // The path the program is run by, which names it (a script's own).
+    let run_by = guest_execfn(path, options);
     let (path, args, options, (data, data_id)) = script_target(path, args, options, &fs)?;
     let (path, args, options) = (path.as_path(), &args, &options);
     fwe_kernel::timing::mark("read_program");
@@ -1355,7 +1374,12 @@ fn start(
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
-        fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+        let named =
+            options.comm.clone().unwrap_or_else(|| fwe_kernel::fs::exec_name(&run_by, &exe));
+        fs.set_proc_info(exe, &named, cmdline(&arg_bytes), ncpu(), hostname());
+        if let Some(fd) = open_program(path, options, &fs) {
+            fs.set_exe_fd(Some(fd));
+        }
         fs.set_auxv(out.auxv.clone());
         fs.publish();
         // The main thread's id equals the process id, as on Linux: in its
@@ -1381,6 +1405,25 @@ fn start(
 /// The guest's absolute path of the program fwe was asked to run, for
 /// `/proc/self/exe`: the host path, made relative to the root filesystem when
 /// the program lies inside it, its symbolic links followed there.
+/// The program's file, open as fwe's own descriptor, for `/proc/self/exe`
+/// to reach whatever becomes of its path (a file outside the root, too),
+/// as Linux holds a process's `exe_file`; `None` when fwe holds it already
+/// (it was run by descriptor).
+fn open_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Option<i32> {
+    if options.exe_fd.is_some() {
+        return None;
+    }
+    if options.guest_path {
+        return fs.open_program(path.as_os_str().as_bytes());
+    }
+    if let Some(guest) = guest_path_in_root(path, options) {
+        return fs.open_program(&guest);
+    }
+    use std::os::fd::IntoRawFd;
+    let fd = std::fs::File::open(path).ok()?.into_raw_fd();
+    fwe_kernel::fdtable::reserve(fd).ok()
+}
+
 fn guest_exe_path(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Vec<u8> {
     if options.guest_path {
         return path.as_os_str().as_bytes().to_vec();

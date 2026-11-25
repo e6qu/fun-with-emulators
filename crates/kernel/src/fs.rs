@@ -224,6 +224,21 @@ fn components(path: &[u8]) -> Vec<Vec<u8>> {
 
 /// Lexically normalize `path` against the absolute `base`, clamping `..` at
 /// the root. Used for the stored working directory, not for access.
+/// The name `execve` gives the thread of a program run by the path
+/// `run_by`, as Linux's does: the path's last component (`exe` for
+/// `/proc/self/exe`; a script's own, for a script), or, for a program
+/// `execveat` ran through a descriptor (`/dev/fd/N`), the name of the file
+/// `exe` (what the descriptor names), as Linux takes it then.
+pub fn exec_name(run_by: &[u8], exe: &[u8]) -> Vec<u8> {
+    let last = |p: &[u8]| p.rsplit(|&b| b == b'/').next().unwrap_or(p).to_vec();
+    if run_by.starts_with(b"/dev/fd/") {
+        let named = last(exe);
+        named.strip_suffix(b" (deleted)").map_or(named.clone(), <[u8]>::to_vec)
+    } else {
+        last(run_by)
+    }
+}
+
 pub fn normalize(base: &[u8], path: &[u8]) -> Vec<u8> {
     let mut stack: Vec<Vec<u8>> =
         if path.first() == Some(&b'/') { Vec::new() } else { components(base) };
@@ -868,21 +883,24 @@ impl Fs {
     }
 
     /// Set the per-process information the synthetic `/proc` files draw on.
-    /// Record what `/proc/self` reports. A relative `exe` is taken against
-    /// the guest's working directory: `/proc/self/exe` is always absolute.
-    pub fn set_proc_info(&mut self, exe: Vec<u8>, cmdline: Vec<u8>, ncpu: u32, hostname: Vec<u8>) {
+    /// Record what `/proc/self` reports: the program `exe` (a relative one
+    /// is taken against the guest's working directory: `/proc/self/exe` is
+    /// always absolute), its thread's name `named` ([`exec_name`]).
+    pub fn set_proc_info(
+        &mut self,
+        exe: Vec<u8>,
+        named: &[u8],
+        cmdline: Vec<u8>,
+        ncpu: u32,
+        hostname: Vec<u8>,
+    ) {
         let exe = if exe.starts_with(b"/") { exe } else { normalize(&self.cwd, &exe) };
-        // The thread is named after the last component of the path the
-        // program was run by, as Linux's `execve` names it (`exe`, run as
-        // `/proc/self/exe`); after its file's name, run by descriptor.
-        let named = exe.rsplit(|&b| b == b'/').next().unwrap_or(&exe);
-        let named = named.strip_suffix(b" (deleted)").unwrap_or(named).to_vec();
         // The program's own path, not the links it was run through (such as
         // `/proc/self/exe`).
         let exe = if self.proc.exe_fd.is_some() { exe } else { self.program_path(&exe) };
         let exe_fd = self.proc.exe_fd;
         let auxv = std::mem::take(&mut self.proc.auxv);
-        crate::procreg::own_program(&exe, &named, &cmdline);
+        crate::procreg::own_program(&exe, named, &cmdline);
         crate::prmm::reset();
         crate::syscalls::publish_limits();
         // The program's file, for `/proc/self/maps`: through the descriptor
@@ -924,7 +942,7 @@ impl Fs {
         crate::maps::record().set_exe(exe.clone(), id);
         crate::maps::publish();
         self.proc.exe = exe;
-        self.proc.exe_fd = None;
+        self.set_exe_fd(None);
     }
 
     /// The auxiliary vector the running program started with.
@@ -962,8 +980,10 @@ impl Fs {
     }
 
     /// Hold `fd` (fwe's, in the reserved range) as the running program's
-    /// file, for a program with no path; `None` for one that has a path.
-    /// The descriptor held before is closed.
+    /// open file, which `/proc/self/exe` reaches whatever becomes of its
+    /// path, as Linux's `exe_file` is held ([`Fs::open_program`]); set
+    /// before [`Fs::set_proc_info`], for a program with no path, it names
+    /// the program too. The descriptor held before is closed.
     pub fn set_exe_fd(&mut self, fd: Option<i32>) {
         if let Some(old) = self.proc.exe_fd
             && Some(old) != fd
@@ -977,7 +997,7 @@ impl Fs {
         self.proc.exe_fd = fd;
     }
 
-    /// What `/proc/self/exe` names when the program has no path (see
+    /// What the descriptor of the running program names (see
     /// [`set_exe_fd`](Self::set_exe_fd)).
     pub fn exe_fd_target(&self) -> Option<Vec<u8>> {
         self.proc.exe_fd.map(|fd| self.fd_target(fd))
@@ -2135,6 +2155,34 @@ impl Fs {
     /// a `noexec` mount).
     pub fn read(&self, path: &[u8]) -> Result<Vec<u8>, i32> {
         self.read_identified(path).map(|(data, _)| data)
+    }
+
+    /// The program at guest path `path`, open as fwe's own descriptor
+    /// (above the guest's range), to hold as the running program's file
+    /// ([`Fs::set_exe_fd`]); `None` if it cannot be opened (the program was
+    /// read just before, so it is there).
+    pub fn open_program(&self, path: &[u8]) -> Option<i32> {
+        let r = self.resolve(fcntl::AT_FDCWD as i32, path, true).ok()?;
+        if let Some(file) = r.store_file().ok()? {
+            use crate::filestore::desc;
+            let fd = desc::open(file, fcntl::O_CLOEXEC, desc::new_id(0)).ok()?;
+            // Moved above the guest's range, its mark with it.
+            let high = crate::fdtable::dup_reserved(fd).ok();
+            if let Some(h) = high {
+                crate::fdmarks::duplicated(fd, h);
+            }
+            crate::fdmarks::closed(fd);
+            // SAFETY: the descriptor opened above, moved.
+            unsafe { libc::close(fd) };
+            desc::sync(&[]);
+            return high;
+        }
+        let name = r.name_c().ok()?;
+        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
+        let fd = unsafe {
+            libc::openat(r.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
+        };
+        crate::fdtable::reserve(fd).ok()
     }
 
     /// [`Fs::read`], with the identity of the file read, for what is kept

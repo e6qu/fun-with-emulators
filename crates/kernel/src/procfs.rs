@@ -17,8 +17,9 @@ pub struct ProcInfo {
     pub ncpu: u32,
     /// Host name.
     pub hostname: Vec<u8>,
-    /// fwe's descriptor of the running program when it has no path (a
-    /// memfd it was executed from), which `/proc/self/exe` opens.
+    /// fwe's descriptor of the running program, which `/proc/self/exe`
+    /// reaches (the program's file whatever has become of its path, or a
+    /// memfd it was executed from).
     pub exe_fd: Option<i32>,
     /// The auxiliary vector the program started with, as words
     /// (`/proc/self/auxv`).

@@ -5785,6 +5785,7 @@ mod tests {
         let (mut k, _d) = rooted();
         k.fs.as_mut().unwrap().set_proc_info(
             b"/bin/prog".to_vec(),
+            b"prog",
             b"prog\0-x\0".to_vec(),
             4,
             b"host".to_vec(),

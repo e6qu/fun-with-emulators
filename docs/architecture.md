@@ -1134,8 +1134,10 @@ keeping fwe's own descriptors apart and Linux's limits exact
   Linux's mapping, which holds its file, does.
 - **Programs run from a descriptor** (`execveat(fd, "", AT_EMPTY_PATH)`,
   `/dev/fd/N`, a `/proc/self/fd` path, as crun runs its sealed copy) are
-  read through it; fwe keeps a descriptor of the program, which
-  `/proc/self/exe` opens.
+  read through it. fwe keeps a descriptor of every running program, as
+  Linux keeps a process's `exe_file`, which `/proc/self/exe` reaches
+  whatever has become of the program's path (renamed, removed, or outside
+  the root).
 - **Copying** (`crates/kernel/src/splice.rs`): `splice`, `tee` and
   `vmsplice` copy, since the pipes are the host's: from a pipe what it
   holds, into one what room it has, waiting unless asked not to, without
