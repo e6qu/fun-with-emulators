@@ -1,5 +1,11 @@
 # Plan
 
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" in this document are to be interpreted as described in BCP 14
+[RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)
+when, and only when, they appear in all capitals, as shown here.
+
 ## Goal
 
 Unmodified Linux arm64 programs on macOS (Apple Silicon), without a Linux
@@ -58,30 +64,30 @@ Reached when, as [ROADMAP.md](ROADMAP.md) defines them:
 
 ## Principles
 
-- **Compatibility first:** unmodified binaries working, generically;
-  nothing special-cased for one program.
+- **Compatibility first:** unmodified binaries working, generically; fwe
+  MUST NOT special-case anything for one program.
 - **The program's code runs as it is:** fwe changes only what macOS
   forces (system calls, thread-pointer accesses and `x18` uses, each one
   instruction branched to a stub); code made at run time runs from
   translations in fwe's code cache ([docs/jit.md](docs/jit.md)).
-- **The VM is the last resort:** only for a program that cannot run
-  in-process, never to make one faster.
+- **The VM is the last resort:** it is only for a program that cannot run
+  in-process, and MUST NOT be used to make one faster.
 - **Native speed:** fwe's cost is what the layer adds, held to budgets in
   CI.
 - **Work placed explicitly, in fwe or in macOS:** each mechanism either
   does its work in fwe (in the process's memory, or memory every fwe
   process maps) or hands it to macOS (a host call or a host object). Both
-  are valid; the mechanism's documentation says which it uses, and its
-  tests and benchmarks decided it. What Linux keeps in kernel memory stays
-  in memory, never in files on disk.
+  are valid; the mechanism's documentation MUST say which it uses, and its
+  tests and benchmarks decided it. What Linux keeps in kernel memory MUST
+  stay in memory, not in files on disk.
 - **Skip work before speeding it up:** work kept between runs and shared
   between processes, work done only when needed, answers from fwe's own
   caches kept correct against the host. Then what is left is made
   cheaper.
-- **Counted, not assumed:** a cause is found by counting and reproducing;
-  instrumentation, tests and benchmarks are built before the change they
-  judge, and decide which work is done. Work they do not justify is listed
-  as not planned, with its numbers.
+- **Counted, not assumed:** a cause MUST be found by counting and
+  reproducing; instrumentation, tests and benchmarks MUST be built before
+  the change they judge, and decide which work is done. Work they do not
+  justify is listed as not planned, with its numbers.
 - **No blockers:** an implementation problem is something to solve; a
   large redesign is planned and done when it is the way forward.
 
