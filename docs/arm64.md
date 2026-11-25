@@ -28,7 +28,7 @@ below are what `clang` assembles and `llvm-objdump -d` prints.
 Register number 31 means `sp` where an instruction takes a base address
 or adds to the stack (`add x0, sp, #16`, `ldr x0, [sp, #8]`) and `xzr`
 everywhere else (`orr x0, xzr, x1` is `mov x0, x1`; `subs xzr, x0, x1`
-is `cmp x0, x1`). A decoder must know which, instruction by instruction.
+is `cmp x0, x1`). A decoder needs to know which, instruction by instruction.
 
 ## How instructions are encoded
 
@@ -86,7 +86,7 @@ cause in its `ESR` (exception syndrome register), a faulting address in
 `FAR`, and where it happened in `ELR`; `eret` goes back. A program
 reaches the level above it with `svc` (EL0 to EL1) and `hvc` (EL1 to
 EL2), and traps with `brk` or `udf`. Which system registers and
-instructions EL0 may use is the kernel's choice (bits of `SCTLR_EL1`),
+instructions EL0 can use is the kernel's choice (bits of `SCTLR_EL1`),
 which is why Linux and macOS differ on a few of them.
 
 Under Linux and macOS alike, programs run at EL0 and the kernel at EL1.
@@ -105,7 +105,7 @@ is what compiled functions agree on:
 | `x0`–`x7` | arguments and results |
 | `x8` | the address of a structure result (and, on Linux, a system call's number) |
 | `x9`–`x15` | temporaries: the caller saves them if it needs them |
-| `x16`, `x17` (`ip0`, `ip1`) | intra-procedure-call scratch: a linker's veneer or PLT stub may change them between a call and its target |
+| `x16`, `x17` (`ip0`, `ip1`) | intra-procedure-call scratch: a linker's veneer or PLT stub can change them between a call and its target |
 | `x18` | the platform register ([linking.md](linking.md#registers-the-platform-reserves)) |
 | `x19`–`x28` | kept by the callee |
 | `x29`, `x30` | frame pointer and link register, saved by a function that calls others |
@@ -124,7 +124,7 @@ ret
 ```
 
 The standard binds only calls between functions. Code the compiler or a
-JIT writes for itself may keep anything anywhere: HotSpot calls its own
+JIT writes for itself can keep anything anywhere: HotSpot calls its own
 atomic stubs saying they change only `x8`, `x9` and `x30`, so the caller
 keeps other temporaries live across the call.
 
@@ -139,8 +139,8 @@ lets Linux code call macOS libraries directly:
 | | Linux (AAPCS64) | macOS (Apple arm64) |
 |---|---|---|
 | `x18` | a temporary like `x9`–`x15` | reserved: never used, and changed by the kernel at will |
-| `x29` | a frame pointer by convention; may be omitted (`-fomit-frame-pointer`) | must always point at a valid frame record |
-| Below `sp` | nothing: a signal frame may be written there at any moment | a 128-byte red zone a function may use without moving `sp` |
+| `x29` | a frame pointer by convention; can be omitted (`-fomit-frame-pointer`) | always points at a valid frame record |
+| Below `sp` | nothing: a signal frame can be written there at any moment | a 128-byte red zone a function can use without moving `sp` |
 | Variadic arguments (`printf`'s) | passed as the others are: registers first, then the stack | always on the stack, 8 bytes each |
 | `va_list` | a structure: the next stack argument and the unread register areas | a pointer into the stack |
 | Arguments on the stack | each in a slot of 8 bytes | packed at their own alignment (two `char`s share two bytes) |
@@ -185,7 +185,7 @@ A direct branch's target is an offset from the branch, in words:
 | `tbz`, `tbnz` (test one bit) | ±32 KiB |
 | `br`, `blr`, `ret` (through a register) | anywhere |
 
-Code that must reach further goes through a register: a linker inserts a
+Code that needs to reach further goes through a register: a linker inserts a
 *veneer* (`adrp x16, target; add x16, x16, :lo12:target; br x16`),
 which is why `x16` and `x17` are the standard's scratch registers. How
 code reaches data addresses (`adr`, `adrp`, literal loads, `movz` and
@@ -222,7 +222,7 @@ Each has its store (`str`, `stur`, `stp`) and its sizes (`ldrb`,
 
 ## The memory model and barriers
 
-arm64 is weakly ordered: a core's loads and stores may be seen by other
+arm64 is weakly ordered: a core's loads and stores can be seen by other
 cores in another order than the program's, except where the program
 orders them: acquire and release accesses, address and data
 dependencies, and barriers:
@@ -245,7 +245,7 @@ Writing code and running it takes the cache maintenance described in
 | Register | Holds | EL0 under Linux | EL0 under macOS |
 |---|---|---|---|
 | `TPIDR_EL0` | the thread pointer (thread-local storage) | read and write | not kept for programs: macOS uses `TPIDRRO_EL0` |
-| `TPIDRRO_EL0` | a thread pointer the program may only read | read | read: the thread's data (TSD) |
+| `TPIDRRO_EL0` | a thread pointer the program can only read | read | read: the thread's data (TSD) |
 | `CTR_EL0` | cache line sizes, and whether cache maintenance can be skipped (`IDC`, `DIC`) | read | traps |
 | `DCZID_EL0` | the block size `dc zva` zeroes | read | read |
 | `CNTVCT_EL0`, `CNTFRQ_EL0` | the virtual counter and its frequency | read | read |
@@ -264,7 +264,7 @@ What fwe does with each is in
   *hint* space, so a processor or kernel without PAC runs them as `nop`.
   `blraa`, `retaa` and the other combined forms are not hints.
 - **Branch target identification** (BTI, Armv8.5) marks the places an
-  indirect branch may land: `bti c` (`d503245f`) for calls, `bti j` for
+  indirect branch can land: `bti c` (`d503245f`) for calls, `bti j` for
   jumps; on a page mapped *guarded*, an indirect branch to anything else
   traps. `paciasp` counts as a landing pad for calls. `bti` is a hint
   too.
