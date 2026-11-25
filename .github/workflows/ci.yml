@@ -372,7 +372,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/bench-cache
-          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'tools/bench/run.py') }}
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'guests/alpine/fetch/browsers.txt', 'guests/debian/fetch/apps.txt', 'guests/apps/fetch/upstream.txt', 'tools/bench/run.py') }}
       - uses: actions/download-artifact@v4
         with:
           name: bench-linux

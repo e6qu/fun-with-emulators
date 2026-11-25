@@ -127,6 +127,41 @@ def alpine_root(manifest, cache):
         f.write(lines)
     return root
 
+def debian_system(manifest, cache):
+    """The root filesystem of a whole Debian system `manifest` (under
+    guests/debian/fetch) lists, its own C library and shell among them,
+    unpacked into `cache` as the end-to-end tests make theirs: base-files
+    first, whose links (`/lib` to `/usr/lib`) the others' files go through."""
+    lines = open(os.path.join(REPO, "guests/debian/fetch", manifest + ".txt")).read()
+    root = os.path.join(cache, "debian-root-" + manifest)
+    done = os.path.join(root, ".fwe-complete")
+    if os.path.exists(done) and open(done).read() == lines:
+        return root
+    shutil.rmtree(root, ignore_errors=True)
+    os.makedirs(root)
+    debs = []
+    for line in lines.splitlines():
+        if not line.strip() or line.startswith("#"):
+            continue
+        pool, sha256 = line.split()
+        urls = [
+            "https://deb.debian.org/debian/" + pool,
+            "https://snapshot.debian.org/archive/debian/20261101T000000Z/" + pool,
+        ]
+        debs.append(fetch(urls, sha256, cache))
+    debs.sort(key=lambda d: not os.path.basename(d).startswith("base-files_"))
+    for deb in debs:
+        # A .deb is an `ar` archive whose data.tar.* holds the files.
+        with tempfile.TemporaryDirectory(dir=cache) as unpack:
+            subprocess.run(["ar", "x", deb], cwd=unpack, check=True)
+            data = next(f for f in os.listdir(unpack) if f.startswith("data.tar"))
+            subprocess.run(["tar", "xpf", os.path.join(unpack, data), "-C", root], check=True)
+    os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
+    with open(done, "w") as f:
+        f.write(lines)
+    return root
+
+
 # name, arguments to bench, unit
 MICRO = [
     ("getpid", ["getpid", "200000"], "ns"),
@@ -242,6 +277,13 @@ BUDGETS = {
     "Vulkan submission round trip (us)": 1.5,
     "Vulkan frame made and read (us)": 1.5,
     "X frame through shared memory (us)": 1.5,
+    # A browser and an application framework at work (ROADMAP.md M7 PR 3):
+    # Alpine's Chromium against Chrome for Testing of the same release on
+    # macOS, loading a page and decoding and drawing video frames, as a
+    # computing workload is; Electron's start-up, as a program's start is.
+    "Chromium page load (ms)": 1.5,
+    "Chromium video frame (ms)": 1.5,
+    "Electron start-up (ms)": 3.0,
     # Kernel state every process shares, kept in memory as a kernel keeps
     # it (ROADMAP.md M6 PR 2).
     "System V semaphore up+down (ns)": 3.0,
@@ -284,6 +326,26 @@ SHARE_BUDGETS = {
     "Python script (s)": 1.2,
     "xz (s)": 1.2,
 }
+
+# The same browser and framework built for macOS ([`browsers`]): Chrome for
+# Testing of the release Alpine's Chromium is (guests/alpine/fetch/
+# browsers.txt), and Electron's own build of the release the application
+# tests run (guests/apps/fetch/upstream.txt).
+CHROME_MAC = (
+    "https://storage.googleapis.com/chrome-for-testing-public/158.0.8127.36/mac-arm64/"
+    "chrome-mac-arm64.zip",
+    "b86d3b393def1f87d369b022abff0a51acb015d6fcb79ddfd1c379c9d72fbbe2",
+)
+ELECTRON_MAC = (
+    "https://github.com/electron/electron/releases/download/v45.3.0/"
+    "electron-v45.3.0-darwin-arm64.zip",
+    "b0c7cbb70f98ff72beffa98b4c449a7d92d8b51d3d25817cfcdcb6ee2d61711a",
+)
+# The pages the browser loads (guests/apps/pages), and the Electron app.
+PAGES = os.path.join(REPO, "guests/apps/pages")
+ELECTRON_APP = os.path.join(REPO, "guests/apps/electron")
+# Each browser figure's best of so many runs: a run starts a browser.
+BROWSER_ROUNDS = 5
 
 # The workloads (tools/bench/workloads).
 WORKLOADS = os.path.join(REPO, "tools/bench/workloads")
@@ -730,6 +792,7 @@ def macos(a):
     results[BACKEND] = {row: ran for row in ours}
     if not a.no_build:
         build(a, fwe, results)
+        browsers(a, fwe, results)
     if a.linux:
         with open(a.linux) as f:
             results["Linux"] = json.load(f)
@@ -996,18 +1059,7 @@ def run_limited(cmd, name, env=None):
         out, err = p.communicate(timeout=LIMIT)
     except subprocess.TimeoutExpired:
         slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
-        pids, todo = [], [p.pid]
-        while todo:
-            pid = todo.pop()
-            pids.append(pid)
-            kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
-            todo += [int(k) for k in kids.stdout.split()]
-        if "--root" in cmd:
-            root = cmd[cmd.index("--root") + 1]
-            ours = subprocess.run(["pgrep", "-f", "--", f"--root {root} "], capture_output=True,
-                                  text=True)
-            pids += [int(k) for k in ours.stdout.split() if int(k) not in pids]
-        pids = [pid for pid in pids if pid > 0 and pid != os.getpid()]
+        pids = processes_of(p, cmd[cmd.index("--root") + 1] if "--root" in cmd else None)
         for pid in pids:
             path = os.path.abspath(f"bench-{slug}-hung-{pid}.sample")
             subprocess.run(["sample", str(pid), "3", "-file", path], capture_output=True)
@@ -1029,6 +1081,140 @@ def run_limited(cmd, name, env=None):
         sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
                  f"{err[-3000:]}")
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def processes_of(p, root=None):
+    """Process `p` and its descendants, and for a run under fwe every
+    process of fwe's on `root` (a guest's daemon leaves its session):
+    exact pids, never this one or 0."""
+    pids, todo = [], [p.pid]
+    while todo:
+        pid = todo.pop()
+        pids.append(pid)
+        kids = subprocess.run(["pgrep", "-P", str(pid)], capture_output=True, text=True)
+        todo += [int(k) for k in kids.stdout.split()]
+    if root:
+        ours = subprocess.run(["pgrep", "-f", "--", f"--root {root} "], capture_output=True,
+                              text=True)
+        pids += [int(k) for k in ours.stdout.split() if int(k) not in pids]
+    return [pid for pid in pids if pid > 0 and pid != os.getpid()]
+
+
+def logged(cmd, key, name, env=None, root=None):
+    """The figure `cmd` (a browser loading one of PAGES) logs on its
+    standard error as "fwe-bench KEY <number>" (Chromium writes a page's
+    console there with `--enable-logging=stderr`), then the browser's
+    processes ended ([`processes_of`]); and the
+    backends that ran its programs until then, by `FWE_TIMING`'s marks
+    where `env` sets it ([`backends`]). Fails past LIMIT seconds, or on the
+    page's "fwe-bench error"."""
+    p = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True,
+                         errors="replace", start_new_session=True, env=env)
+    found, tail, ran = [], collections.deque(maxlen=40), collections.Counter()
+
+    def read():
+        for line in p.stderr:
+            tail.append(line)
+            ran.update(re.findall(r"timing: backend: (native|vm) ", line))
+            m = re.search(r"fwe-bench (\w+) ([0-9.]+|.*)", line)
+            if m and (m.group(1) == key or m.group(1) == "error"):
+                found.append((m.group(1), m.group(2)))
+                return
+
+    reader = threading.Thread(target=read, daemon=True)
+    reader.start()
+    reader.join(LIMIT)
+    for pid in processes_of(p, root):
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    p.wait()
+    if not found or found[0][0] != key:
+        sys.exit(f"{name}: no figure from {cmd} ({found}); its error output's end:\n"
+                 + "".join(tail))
+    which = ("native" if "native" in ran else "VM") if len(ran) == 1 else (
+        f"native {ran['native']}, VM {ran['vm']}" if ran else "unknown")
+    return float(found[0][1]), which
+
+
+def browsers(a, fwe, results):
+    """Alpine's Chromium under fwe against Chrome for Testing of the same
+    release natively, headless, with the same switches (no sandbox, no GPU:
+    the same work each side): a page loaded (PAGES/load.html) and video
+    frames decoded and drawn (PAGES/frames.html). And Electron's start-up,
+    an app showing a page (ELECTRON_APP) to its page's load, on Debian 13
+    under fwe against Electron's macOS build of the same release."""
+    ours, theirs = results["fwe"], results["macOS"]
+    root = alpine_root("browsers", a.cache)
+    pages = os.path.join(root, "tmp/fwe-pages")
+    shutil.rmtree(pages, ignore_errors=True)
+    shutil.copytree(PAGES, pages)
+    mac = os.path.join(a.cache, "chrome-mac")
+    if not os.path.isdir(mac):
+        zipped = fetch(CHROME_MAC[0], CHROME_MAC[1], a.cache)
+        subprocess.run(["ditto", "-x", "-k", zipped, mac], check=True)
+    chrome = os.path.join(mac, "chrome-mac-arm64", "Google Chrome for Testing.app", "Contents",
+                          "MacOS", "Google Chrome for Testing")
+    switches = ["--headless=new", "--no-sandbox", "--no-first-run", "--disable-gpu",
+                "--enable-logging=stderr", "--v=0"]
+    runs = iter(range(1 << 30))
+
+    def chromium(page, key, name, env=None):
+        n = next(runs)
+        cmd = fwe + ["--root", root, os.path.join(root, "usr/bin/chromium")] + switches + [
+            f"--user-data-dir=/tmp/fwe-bench-{n}", f"file:///tmp/fwe-pages/{page}"]
+        return logged(cmd, key, name, env=env, root=root)
+
+    def chrome_mac(page, key, name):
+        with tempfile.TemporaryDirectory() as profile:
+            cmd = [chrome] + switches + [f"--user-data-dir={profile}",
+                                         "file://" + os.path.join(PAGES, page)]
+            return logged(cmd, key, name)[0]
+
+    for row, page, key in (("Chromium page load (ms)", "load.html", "load"),
+                           ("Chromium video frame (ms)", "frames.html", "frame")):
+        # A first run, which also prepares the browser's code: the backends.
+        _, results[BACKEND][row] = chromium(page, key, row, dict(os.environ, FWE_TIMING="1"))
+        ours[row] = best(lambda: chromium(page, key, row)[0], BROWSER_ROUNDS)
+        theirs[row] = best(lambda: chrome_mac(page, key, row), BROWSER_ROUNDS)
+        print(f"{row}: fwe {ours[row]:.1f}, macOS {theirs[row]:.1f}", flush=True)
+    # Electron: an app showing a page, quitting once it is loaded
+    # (FWE_QUIT_LOADED), on the display of [`x_server`].
+    deb = debian_system("apps", a.cache)
+    upstream = open(os.path.join(REPO, "guests/apps/fetch/upstream.txt")).read().splitlines()
+    url, sha = next(l.split() for l in upstream if "/electron-" in l and not l.startswith("#"))
+    linux_zip = fetch(url, sha, a.cache)
+    electron = os.path.join(deb, "opt/electron")
+    if not os.path.exists(os.path.join(electron, "electron")):
+        subprocess.run(["unzip", "-q", "-o", linux_zip, "-d", electron], check=True)
+    app = os.path.join(deb, "opt/fwe-hello")
+    shutil.rmtree(app, ignore_errors=True)
+    shutil.copytree(ELECTRON_APP, app)
+    mac_electron = os.path.join(a.cache, "electron-mac")
+    if not os.path.isdir(mac_electron):
+        zipped = fetch(ELECTRON_MAC[0], ELECTRON_MAC[1], a.cache)
+        subprocess.run(["ditto", "-x", "-k", zipped, mac_electron], check=True)
+    env = dict(os.environ, FWE_QUIT_LOADED="1", HOME="/root")
+
+    def started(cmd, name):
+        began = time.monotonic()
+        r = run_limited(cmd, name, env=env)
+        took = (time.monotonic() - began) * 1000
+        if r.returncode != 0 or "fwe-hello: page loaded" not in r.stdout:
+            sys.exit(f"{name}: {r.returncode}: {r.stdout[-2000:]}{r.stderr[-3000:]}")
+        return took
+
+    row = "Electron start-up (ms)"
+    results[BACKEND][row] = backends(fwe + ["--root", deb, os.path.join(electron, "electron"),
+                                            "--no-sandbox", "/opt/fwe-hello"])
+    ours[row] = best(lambda: started(
+        fwe + ["--root", deb, os.path.join(electron, "electron"), "--no-sandbox",
+               "/opt/fwe-hello"], row), BROWSER_ROUNDS)
+    theirs[row] = best(lambda: started(
+        [os.path.join(mac_electron, "Electron.app/Contents/MacOS/Electron"), "--no-sandbox",
+         ELECTRON_APP], row), BROWSER_ROUNDS)
+    print(f"{row}: fwe {ours[row]:.0f}, macOS {theirs[row]:.0f}", flush=True)
 
 
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):
