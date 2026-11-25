@@ -2065,7 +2065,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   sockets; `/proc/<pid>/io` counts only
   storage bytes and `statm` only the size and resident set; a thread's
   directory (`task/<tid>`) holds only `comm`, `stat`, `status` and
-  `mem` (the caller's own, `ns` too).
+  `mem` (the caller's own, `ns` too). `/proc/<tid>` of a thread not its
+  process's leader, which `/proc` does not list, is its process's
+  directory with the thread's own `comm`, `stat` and `status`.
 - cgroups: memory, CPU, I/O and other limits are kept and read back but
   not enforced (only `pids.max` and device programs are); a threaded
   cgroup cannot be made (`cgroup.type` refuses `threaded`); there is no

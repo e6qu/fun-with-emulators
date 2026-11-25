@@ -4470,10 +4470,10 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
     }
 }
 
-/// A `/proc` path naming a process by pid: `Ok` with the reader's own as
-/// `/proc/self/...` (any other path unchanged), or `Err` with another's
-/// host pid (if it is in the reader's pid namespace), pid and the rest of
-/// the path.
+/// A `/proc` path naming a process by pid, or a thread by its id: `Ok`
+/// with the reader's own as `/proc/self/...` (any other path unchanged),
+/// or `Err` with another's host pid (if it is in the reader's pid
+/// namespace), pid and the rest of the path.
 #[allow(clippy::type_complexity)]
 fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<crate::ids::HostPid>, i32, Vec<u8>)> {
     let Some(rest) = absolute.strip_prefix(b"/proc/") else { return Ok(absolute.to_vec()) };
@@ -4489,6 +4489,23 @@ fn own_or_other(absolute: &[u8]) -> Result<Vec<u8>, (Option<crate::ids::HostPid>
     };
     if pid == crate::thread::tgid() {
         return Ok([&b"/proc/self"[..], sub].concat());
+    }
+    // A thread other than its process's leader, which `/proc` does not
+    // list but serves: its process's directory, the thread's own `stat`,
+    // `status` and `comm` in it.
+    let thread_file = matches!(sub, b"/stat" | b"/status" | b"/comm");
+    if crate::thread::tids().contains(&pid) {
+        let dir = if thread_file { format!("/proc/self/task/{pid}") } else { "/proc/self".into() };
+        return Ok([dir.as_bytes(), sub].concat());
+    }
+    if let Some((_, owner)) = crate::thread::named(pid) {
+        let leader = crate::pidns::to_guest(owner.get());
+        let sub = if thread_file {
+            [format!("/task/{pid}").as_bytes(), sub].concat()
+        } else {
+            sub.to_vec()
+        };
+        return Err((Some(owner), leader, sub));
     }
     Err((crate::pidns::to_host(pid), pid, sub.to_vec()))
 }

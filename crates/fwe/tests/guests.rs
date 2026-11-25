@@ -11527,6 +11527,21 @@ fn credentials_name_each_messages_sender() {
     );
 }
 
+/// `/proc/<tid>` of a thread not its process's leader: not listed, but
+/// opened, from the process and from another, as Linux serves it.
+#[test]
+fn proc_serves_a_threads_own_directory() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "threadproc",
+        &[],
+        "the thread is not listed in /proc\n\
+         the process: /proc/<tid>/stat: read, names the thread\n\
+         the process: /proc/<pid>/task/<tid>/stat: opened\n\
+         a child: /proc/<tid>/stat: read, names the thread\n",
+    );
+}
+
 /// Names `/proc/sys` lacks are `ENOENT`, as Linux answers them, once
 /// bubblewrap has bound it onto itself through a descriptor of a fresh
 /// `proc` too (libgcrypt, reading `/proc/sys/crypto/fips_enabled` as it
