@@ -11047,6 +11047,40 @@ fn making_an_existing_name_in_a_read_only_mount_is_eexist() {
     );
 }
 
+/// What `poll` and `select` report for pipes and sockets: never `POLLPRI`
+/// but for a TCP socket's urgent data, which a wait for it ends on (NSPR
+/// takes `POLLPRI` on its pipe for an error, and Firefox's socket thread
+/// then remakes the pipe for ever), and a TCP socket hung up only once
+/// shut both ways: with only its peer's end of the stream come, a wait for
+/// urgent data waits its time, `epoll`'s too.
+#[test]
+fn poll_reports_no_urgent_data_for_pipes_and_sockets() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "pollpri",
+        &[],
+        "select: 1, read 1, except 0\n\
+         poll for urgent data: 0, 0\n\
+         pipe empty: 0\n\
+         pipe with data: 0x41\n\
+         pipe with data, writer gone: 0x51\n\
+         stream pair empty: 0\n\
+         stream pair with data: 0x41\n\
+         stream pair with data, writer gone: 0x51\n\
+         datagram pair empty: 0\n\
+         datagram pair with data: 0x41\n\
+         datagram pair with data, writer gone: 0x41\n\
+         tcp empty: 0\n\
+         tcp poll for urgent data: 1, 0x2\n\
+         tcp with urgent data: 0x2\n\
+         tcp select: 1, read 0, except 1\n\
+         tcp with urgent data, peer gone: 0x43\n\
+         tcp peer gone, poll for urgent data: 0, 0, waited its time\n\
+         tcp peer gone, writable: 0x4\n\
+         tcp peer gone, epoll for urgent data: 0, waited its time\n",
+    );
+}
+
 /// Multicast membership on TCP sockets, as Linux 7.0 answers it.
 #[test]
 fn tcp_multicast_membership_as_linux_answers_it() {

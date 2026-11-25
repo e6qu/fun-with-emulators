@@ -293,6 +293,21 @@ pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
 /// timers, can end a millisecond or more late (macOS coalesces timers),
 /// where Linux wakes within its timer slack.
 pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
+    wait_ready_urgent_ns(fds, &[], ns).map(|(n, _)| n)
+}
+
+/// [`wait_ready_ns`], ended as well by urgent data on any of the TCP
+/// sockets `urgent`, which the host's `poll` does not report: the thread's
+/// timer kqueue watches them for it (an exception filter, as fwe's `epoll`
+/// watches them, which fires while the data's mark is ahead) while the
+/// wait lasts. Returns as well those of `urgent` that have urgent data.
+/// (A look of the host's own, an out-of-band `MSG_PEEK`, would spend it:
+/// XNU's `tcp_usr_rcvoob` takes the socket off its mark even then.)
+pub fn wait_ready_urgent_ns(
+    fds: &mut [libc::pollfd],
+    urgent: &[i32],
+    ns: i64,
+) -> Result<(i32, Vec<i32>), i32> {
     use std::time::{Duration, Instant};
     let deadline = (ns >= 0).then(|| Instant::now() + Duration::from_nanos(ns as u64));
     let Some((wake, timer)) = wait_pipe() else {
@@ -303,7 +318,7 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         return if n < 0 {
             Err(crate::host::errno_to_linux(crate::host::last_errno()))
         } else {
-            Ok(n)
+            Ok((n, Vec::new()))
         };
     };
     // Nothing is ready until the host says so (whatever the caller's
@@ -313,12 +328,44 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     }
     let mut all: Vec<libc::pollfd> = fds.to_vec();
     all.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
-    // The timer only for a wait with a deadline: one an earlier wait left
-    // fired (its event unread) keeps the kqueue readable until it is armed
-    // again, which an unbounded wait never does.
-    if timer >= 0 && deadline.is_some() {
+    // The timer kqueue only for a wait with a deadline, or one watching
+    // for urgent data (which spends what the kqueue held first): one an
+    // earlier wait left fired (its event unread) keeps it readable until
+    // it is armed again, which an unbounded wait never does.
+    let watch = timer >= 0 && !urgent.is_empty();
+    if timer >= 0 && (deadline.is_some() || watch) {
         all.push(libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 });
     }
+    if !watch {
+        return wait_on(fds, &mut all, deadline, wake, timer, false);
+    }
+    watch_urgent(timer, urgent, true);
+    // Urgent data there already: what else is ready, without waiting.
+    let mut fired = urgent_fired(timer);
+    let deadline = if fired.is_empty() { deadline } else { Some(Instant::now()) };
+    let r = wait_on(fds, &mut all, deadline, wake, timer, true);
+    let r = r.map(|(n, during)| {
+        fired.extend(during);
+        fired.extend(urgent_fired(timer));
+        (n, fired)
+    });
+    watch_urgent(timer, urgent, false);
+    r
+}
+
+/// The wait of [`wait_ready_urgent_ns`] on `all` (`fds`, then the wake
+/// pipe, then the timer kqueue if it is watched): it ends too when the
+/// kqueue, watching for urgent data (`urgent`), finds some, with the
+/// sockets it found it on.
+fn wait_on(
+    fds: &mut [libc::pollfd],
+    all: &mut [libc::pollfd],
+    deadline: Option<std::time::Instant>,
+    wake: i32,
+    timer: i32,
+    urgent: bool,
+) -> Result<(i32, Vec<i32>), i32> {
+    use std::time::Instant;
     loop {
         // What woke it before is spent; a signal from now on writes again.
         let mut b = [0u8; 64];
@@ -337,12 +384,12 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             None => -1,
             Some(l) if l.is_zero() => 0,
             Some(l) if timer >= 0 => {
-                arm_timer(timer, l);
+                arm_timer(timer, l, urgent);
                 -1
             }
             Some(l) => l.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
         };
-        for p in &mut all {
+        for p in all.iter_mut() {
             p.revents = 0;
         }
         // SAFETY: a valid array of `all.len()` entries.
@@ -352,13 +399,21 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         }
         let ready = all[..fds.len()].iter().filter(|p| p.revents != 0).count() as i32;
         if ready > 0 {
-            for (f, a) in fds.iter_mut().zip(&all) {
+            for (f, a) in fds.iter_mut().zip(all.iter()) {
                 f.revents = a.revents;
             }
-            return Ok(ready);
+            return Ok((ready, Vec::new()));
+        }
+        // Urgent data, or else the deadline's timer or a socket's end of
+        // stream, taken from the kqueue.
+        if urgent && all.last().is_some_and(|p| p.revents != 0) {
+            let fired = urgent_fired(timer);
+            if !fired.is_empty() {
+                return Ok((0, fired));
+            }
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
     }
 }
@@ -390,7 +445,7 @@ pub fn nap_ns(ns: i64) {
         libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 },
     ];
     let (n, ms) = if timer >= 0 {
-        arm_timer(timer, after);
+        arm_timer(timer, after, false);
         (2, -1)
     } else {
         (1, after.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
@@ -405,15 +460,16 @@ pub fn nap_ns(ns: i64) {
 }
 
 /// Set the thread's timer kqueue `kq` to fire once, `after` from now, on
-/// time (`NOTE_CRITICAL`), what it held before spent.
+/// time (`NOTE_CRITICAL`), what it held before spent (but for urgent data
+/// it watches for, `watched`, whose events stay).
 #[cfg(target_os = "macos")]
-fn arm_timer(kq: i32, after: std::time::Duration) {
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+fn arm_timer(kq: i32, after: std::time::Duration, watched: bool) {
     // SAFETY: zeroed kevents are valid out-parameters; plain host calls on
     // the thread's own kqueue.
     unsafe {
-        let mut spent: [libc::kevent; 4] = std::mem::zeroed();
-        libc::kevent(kq, std::ptr::null(), 0, spent.as_mut_ptr(), 4, &zero);
+        if !watched {
+            spend(kq);
+        }
         let ev = libc::kevent {
             ident: 1,
             filter: libc::EVFILT_TIMER,
@@ -427,7 +483,88 @@ fn arm_timer(kq: i32, after: std::time::Duration) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn arm_timer(_: i32, _: std::time::Duration) {}
+fn arm_timer(_: i32, _: std::time::Duration, _: bool) {}
+
+/// Take what the thread's timer kqueue `kq` holds, so that it is not
+/// readable for it.
+#[cfg(target_os = "macos")]
+fn spend(kq: i32) {
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: zeroed kevents are valid out-parameters; a plain host call on
+    // the thread's own kqueue.
+    unsafe {
+        let mut spent: [libc::kevent; 16] = std::mem::zeroed();
+        while libc::kevent(kq, std::ptr::null(), 0, spent.as_mut_ptr(), 16, &zero) == 16 {}
+    }
+}
+
+/// Watch (`on`) or stop watching TCP sockets `fds` for urgent data on the
+/// thread's timer kqueue `kq` ([`wait_ready_urgent_ns`]); what it held
+/// before is spent first, and what fired after.
+#[cfg(target_os = "macos")]
+fn watch_urgent(kq: i32, fds: &[i32], on: bool) {
+    spend(kq);
+    // Cleared once taken: the filter fires as well at the end of the
+    // socket's stream (`EV_EOF`, no `NOTE_OOB`), which is not urgent data.
+    let flags = if on { libc::EV_ADD | libc::EV_CLEAR } else { libc::EV_DELETE };
+    let changes: Vec<libc::kevent> = fds
+        .iter()
+        .map(|&fd| libc::kevent {
+            ident: fd as libc::uintptr_t,
+            filter: libc::EVFILT_EXCEPT,
+            flags: flags | libc::EV_RECEIPT,
+            fflags: libc::NOTE_OOB,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+        .collect();
+    // SAFETY: zeroed kevents are valid out-parameters, one per change
+    // (`EV_RECEIPT` reports each, a gone one's deletion too).
+    unsafe {
+        let mut out: Vec<libc::kevent> = vec![std::mem::zeroed(); changes.len()];
+        libc::kevent(
+            kq,
+            changes.as_ptr(),
+            changes.len() as libc::c_int,
+            out.as_mut_ptr(),
+            out.len() as libc::c_int,
+            std::ptr::null(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_urgent(_: i32, _: &[i32], _: bool) {}
+
+/// The sockets the thread's timer kqueue `kq` saw urgent data on
+/// (`NOTE_OOB`, [`watch_urgent`]), taken from it (with whatever else it
+/// held).
+#[cfg(target_os = "macos")]
+fn urgent_fired(kq: i32) -> Vec<i32> {
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut fired = Vec::new();
+    // SAFETY: zeroed kevents are valid out-parameters; a plain host call on
+    // the thread's own kqueue.
+    unsafe {
+        let mut out: [libc::kevent; 16] = std::mem::zeroed();
+        loop {
+            let n = libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 16, &zero);
+            for e in &out[..n.max(0) as usize] {
+                if e.filter == libc::EVFILT_EXCEPT && e.fflags & libc::NOTE_OOB != 0 {
+                    fired.push(e.ident as i32);
+                }
+            }
+            if n < 16 {
+                return fired;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn urgent_fired(_: i32) -> Vec<i32> {
+    Vec::new()
+}
 
 /// A kqueue for the calling thread's timed waits (-1 where the host has
 /// none, or it cannot be made).

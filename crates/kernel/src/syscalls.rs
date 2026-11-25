@@ -2864,13 +2864,17 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
 /// ([`crate::thread::wait_ready_ns`]), with what is ready as Linux reports
 /// it ([`linux_revents`]): how many descriptors are. A pipe given less than
 /// the host's capacity is not writable while full, which the host does not
-/// know: it is looked at each millisecond until it has room.
+/// know: it is looked at each millisecond until it has room. So is a TCP
+/// socket the host reports hung up where Linux has nothing to report (its
+/// peer's end of the stream come, and not asked to read): the host's
+/// `poll` would end at once each time.
 fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     use std::time::{Duration, Instant};
     let deadline = (ns >= 0).then(|| Instant::now() + Duration::from_nanos(ns as u64));
+    let mut quiet = vec![false; set.len()];
     loop {
         let mut ask = set.to_vec();
-        let mut full = false;
+        let mut full = quiet.contains(&true);
         // An eventfd that can be written to is writable: its pipe's read
         // end, which the host watches, never is.
         let writable: Vec<bool> = set
@@ -2890,8 +2894,17 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
                     || crate::mqueue::is_queue(p.fd)
             })
             .collect();
-        for (p, &s) in ask.iter_mut().zip(&synthetic) {
-            if s {
+        // TCP sockets asked for urgent data, which the host's `poll` does
+        // not report: watched while it waits.
+        let urgent: Vec<i32> = set
+            .iter()
+            .zip(&synthetic)
+            .filter(|&(p, &s)| !s && p.fd >= 0 && p.events & libc::POLLPRI != 0)
+            .map(|(p, _)| p.fd)
+            .filter(|&fd| crate::net::urgent_possible(fd))
+            .collect();
+        for ((p, &s), &q) in ask.iter_mut().zip(&synthetic).zip(&quiet) {
+            if s || q {
                 p.fd = -1;
             }
         }
@@ -2899,6 +2912,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         let ready_now =
             set.iter().zip(&synthetic).any(|(p, &s)| s && p.events & (always | libc::POLLPRI) != 0);
         for p in &mut ask {
+            host_events(p);
             if p.events & libc::POLLOUT != 0 && crate::fdstate::pipe_full(p.fd) {
                 p.events &= !libc::POLLOUT;
                 full = true;
@@ -2919,11 +2933,22 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         } else {
             left
         };
-        crate::thread::wait_ready_ns(&mut ask, wait)?;
-        for (((p, a), &w), &s) in set.iter_mut().zip(&ask).zip(&writable).zip(&synthetic) {
-            p.revents =
-                if s { p.events & always } else { a.revents | if w { libc::POLLOUT } else { 0 } };
+        let (_, fired) = crate::thread::wait_ready_urgent_ns(&mut ask, &urgent, wait)?;
+        for (i, p) in set.iter_mut().enumerate() {
+            let host = if quiet[i] { poll_now(p) } else { ask[i].revents };
+            p.revents = if synthetic[i] {
+                p.events & always
+            } else {
+                host | if writable[i] { libc::POLLOUT } else { 0 }
+            };
             linux_revents(p);
+            if !synthetic[i] && host & libc::POLLHUP != 0 && p.revents == 0 {
+                quiet[i] = true;
+                full = true;
+            }
+            if fired.contains(&p.fd) {
+                p.revents |= libc::POLLPRI;
+            }
             if crate::mountwatch::changed(p.fd) == Some(true) {
                 p.revents |= libc::POLLERR | (p.events & libc::POLLPRI);
             }
@@ -3385,10 +3410,48 @@ fn is_random_device(fd: i32) -> bool {
         .is_some_and(|n| n.major == 1 && (n.minor == 8 || n.minor == 9))
 }
 
-/// What the host reported ready on `p` as Linux reports it: a regular
-/// file is readable and writable but has no urgent data (`POLLPRI`, which
-/// the host gives it), and a pipe or FIFO whose writers have gone with
-/// nothing left to read has hung up (`POLLHUP`) but is not readable.
+/// What the host's `poll` reports ready on `p` now, asked as
+/// [`host_events`] asks it.
+fn poll_now(p: &libc::pollfd) -> libc::c_short {
+    let mut q = *p;
+    host_events(&mut q);
+    q.revents = 0;
+    // SAFETY: one valid entry; no wait.
+    unsafe { libc::poll(&mut q, 1, 0) };
+    q.revents
+}
+
+/// The events of `p` the host is asked for: no urgent data (`POLLPRI`,
+/// `POLLRDBAND`) of a file Linux reports none for (all but a device's),
+/// which macOS would report at once for a pipe holding data
+/// ([`linux_revents`]), so that a wait for it waits. A TCP socket's urgent
+/// data the host's `poll` does not report: [`poll_linux`] watches for it.
+fn host_events(p: &mut libc::pollfd) {
+    if p.events & (libc::POLLPRI | libc::POLLRDBAND) == 0 {
+        return;
+    }
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstat(p.fd, &mut st) } != 0 {
+        return;
+    }
+    if matches!(
+        st.st_mode & libc::S_IFMT,
+        libc::S_IFREG | libc::S_IFIFO | libc::S_IFDIR | libc::S_IFSOCK
+    ) {
+        p.events &= !(libc::POLLPRI | libc::POLLRDBAND);
+    }
+}
+
+/// What the host reported ready on `p` as Linux reports it. Only a TCP
+/// socket's urgent data is `POLLPRI` there (which the caller adds), and
+/// nothing of these files is `POLLRDBAND`: macOS gives both to a regular
+/// file, to a pipe holding data, and to a pipe or socket that has hung up
+/// (NSPR takes `POLLPRI` on its pipe for an error, and Firefox's socket
+/// thread then remakes the pipe for ever). A pipe or FIFO whose writers have gone with nothing left
+/// to read has hung up (`POLLHUP`) but is not readable; a TCP socket has
+/// hung up only once shut both ways ([`crate::net::hung_up`]).
 fn linux_revents(p: &mut libc::pollfd) {
     if p.revents == 0 || p.revents & libc::POLLNVAL != 0 {
         return;
@@ -3400,12 +3463,24 @@ fn linux_revents(p: &mut libc::pollfd) {
         return;
     }
     match st.st_mode & libc::S_IFMT {
-        libc::S_IFREG => p.revents &= !libc::POLLPRI,
-        libc::S_IFIFO if p.revents & libc::POLLHUP != 0 => {
+        libc::S_IFREG => p.revents &= !(libc::POLLPRI | libc::POLLRDBAND),
+        libc::S_IFIFO => {
+            p.revents &= !(libc::POLLPRI | libc::POLLRDBAND);
             let mut queued: libc::c_int = 0;
-            // SAFETY: a valid out-parameter for FIONREAD.
-            if unsafe { libc::ioctl(p.fd, libc::FIONREAD, &mut queued) } == 0 && queued == 0 {
+            if p.revents & libc::POLLHUP != 0
+                // SAFETY: a valid out-parameter for FIONREAD.
+                && unsafe { libc::ioctl(p.fd, libc::FIONREAD, &mut queued) } == 0
+                && queued == 0
+            {
                 p.revents &= !libc::POLLIN;
+            }
+        }
+        // A TCP socket's urgent data is the caller's to add, as the
+        // thread's wait saw it ([`crate::thread::wait_ready_urgent_ns`]).
+        libc::S_IFSOCK => {
+            p.revents &= !(libc::POLLPRI | libc::POLLRDBAND);
+            if p.revents & libc::POLLHUP != 0 && !crate::net::hung_up(p.fd) {
+                p.revents &= !libc::POLLHUP;
             }
         }
         _ => {}

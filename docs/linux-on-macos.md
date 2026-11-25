@@ -1212,7 +1212,11 @@ socket's `EPOLLWRBAND` when writable, as Linux's).
 
 **`epoll_ctl` and the waits** (`crates/kernel/src/epoll.rs`): a socket
 watched only for `EPOLLRDHUP` gets a read filter with a low-water mark no
-read reaches. Events a wait has taken reach the guest even if a further
+read reaches. A TCP socket watched for `EPOLLPRI` gets the exception
+filter for out-of-band data (`NOTE_OOB`), which also reports the end of
+the peer's stream, with no `NOTE_OOB`, for as long as it lasts: no urgent
+data can follow it, so that event turns the filter off until the socket's
+next `epoll_ctl`. Events a wait has taken reach the guest even if a further
 take to fill the guest's buffer is interrupted, so an edge-triggered event
 is never lost (Go's runtime, interrupted by its own preemption signals,
 would otherwise wait for ever on a pipe's end). Cases the host does not
@@ -1223,11 +1227,26 @@ whole milliseconds, `epoll_pwait2`'s too.
 
 **`ppoll`, `pselect6`**: `struct pollfd` is the same on both kernels, so
 the array goes to the host `poll` with its bits translated as above, and
-`linux_revents` corrects the answer: a regular file loses `POLLPRI`, a
-hung-up FIFO with nothing left to read is not readable, and an eventfd
-that can be written is writable (its pipe's read end never is to the
-host). `pselect6` reads at most 1024 descriptors and fails with `EBADF`
-for one of fwe's own. Both write back the time left unless the personality
+`linux_revents` corrects the answer. macOS gives `POLLPRI` and
+`POLLRDBAND` to a regular file, to a pipe holding data and to anything
+hung up, where Linux gives `POLLPRI` only for a TCP socket's urgent data
+(NSPR takes it on its pipe for an error, and Firefox's socket thread then
+remakes the pipe for ever), so fwe asks the host for neither and drops
+them from its answer. The host's `poll` does not report urgent data, so
+while it waits the thread's kqueue watches each TCP socket asked for
+`POLLPRI` with `EVFILT_EXCEPT`/`NOTE_OOB` (as `epoll` does), and the wait
+ends when it fires: a look of the host's own, an out-of-band `MSG_PEEK`,
+would take the socket off its mark. macOS reports `POLLHUP` on a TCP
+socket whose peer has shut its writing side; Linux only once the socket
+is shut both ways or closed, which fwe reads from its TCP state
+(`TCP_CONNECTION_INFO`); such a socket not asked to read, which the host's
+`poll` would report at once each time, is looked at each millisecond
+instead. A hung-up FIFO with nothing left to read is not
+readable, and an eventfd that can be written is writable (its pipe's read
+end never is to the host). `pselect6` turns its exception set into
+`POLLPRI`, so it sees a pipe holding data as Linux does, not exceptional;
+it reads at most 1024 descriptors and fails with `EBADF` for one of fwe's
+own. Both write back the time left unless the personality
 has `STICKY_TIMEOUTS`.
 
 #### Socket calls

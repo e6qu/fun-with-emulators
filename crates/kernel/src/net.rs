@@ -2256,6 +2256,43 @@ fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u
 
 // --- options --------------------------------------------------------------
 
+/// Whether socket `fd` can have urgent data: a TCP one.
+pub(crate) fn urgent_possible(fd: i32) -> bool {
+    ip_stream(fd)
+}
+
+/// Whether socket `fd`, which the host reported hung up, has on Linux:
+/// any but a TCP socket has, and a TCP one once it is shut both ways or
+/// closed (Linux's `tcp_poll`), where the host reports it once its
+/// reading side is shut (the peer's end of the stream).
+pub(crate) fn hung_up(fd: i32) -> bool {
+    if !ip_stream(fd) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `struct tcp_connection_info`'s first byte, the state: closed (0),
+        // FIN_WAIT_1 (6), CLOSING (7), LAST_ACK (8), FIN_WAIT_2 (9) and
+        // TIME_WAIT (10) have sent the end of their stream; the reading
+        // side is shut, as the host reports.
+        let mut info = [0u8; 128];
+        let mut len = info.len() as libc::socklen_t;
+        // SAFETY: a valid out-parameter of its length.
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONNECTION_INFO,
+                info.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        r != 0 || matches!(info[0], 0 | 6..=10)
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
 /// Socket `fd`'s host family and type (`None` if it is not a socket).
 fn kind(fd: i32) -> Option<(i32, i32)> {
     let mut hb = empty_sockaddr();
@@ -3298,6 +3335,18 @@ pub fn at_mark(fd: i32, arg: u64) -> i64 {
     if !ip_stream(fd) {
         return err(errno::ENOTTY);
     }
+    match host_at_mark(fd) {
+        Ok(at) => {
+            guest!(uaccess::write(arg, at));
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// The host's `SIOCATMARK` of socket `fd`: 1 if reading is at the urgent
+/// mark, 0 if not, or the call's error.
+fn host_at_mark(fd: i32) -> Result<i32, i64> {
     let mut at: i32 = 0;
     // macOS's SIOCATMARK, _IOR('s', 7, int).
     #[cfg(not(target_os = "linux"))]
@@ -3306,10 +3355,9 @@ pub fn at_mark(fd: i32, arg: u64) -> i64 {
     let req = 0x8905;
     // SAFETY: a valid out-parameter.
     if unsafe { libc::ioctl(fd, req, &mut at) } < 0 {
-        return last_error();
+        return Err(last_error());
     }
-    guest!(uaccess::write(arg, at));
-    0
+    Ok(at)
 }
 
 /// `fd` is a socket: `EBADF` if it is not open, `ENOTSOCK` if it is

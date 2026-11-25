@@ -1141,7 +1141,11 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             // A socket's priority band is writable as its normal data is.
             libc::EVFILT_WRITE => bits |= WRITE | if is_socket(fd) { EPOLLWRBAND } else { 0 },
             // Urgent data waits.
-            libc::EVFILT_EXCEPT => bits |= EPOLLPRI,
+            libc::EVFILT_EXCEPT if ev.fflags & libc::NOTE_OOB != 0 => bits |= EPOLLPRI,
+            // The end of the socket's stream, which the filter reports as
+            // well, for as long as it lasts: no urgent data follows it, so
+            // the filter is off until the next `epoll_ctl` of the socket.
+            libc::EVFILT_EXCEPT => stop_urgent_watch(epfd, fd),
             // A descriptor fwe reports always ready ([`ctl_always`]).
             libc::EVFILT_USER => bits |= READ | WRITE,
             _ => {}
@@ -1184,6 +1188,22 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
         }
     }
     Ok((ready, n as usize))
+}
+
+/// Turn off the urgent data filter of socket `fd` in kqueue `epfd`.
+#[cfg(not(target_os = "linux"))]
+fn stop_urgent_watch(epfd: i32, fd: i32) {
+    let off = libc::kevent {
+        ident: fd as libc::uintptr_t,
+        filter: libc::EVFILT_EXCEPT,
+        flags: libc::EV_DISABLE | libc::EV_RECEIPT,
+        fflags: libc::NOTE_OOB,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut out = off;
+    // SAFETY: one valid change and room for its receipt; no timeout.
+    unsafe { libc::kevent(epfd, &off, 1, &mut out, 1, std::ptr::null()) };
 }
 
 #[cfg(test)]

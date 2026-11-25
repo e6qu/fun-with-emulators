@@ -735,7 +735,9 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
 - **Wake pipes:** every host signal a thread takes writes a byte to that
   thread's pipe (`thread::poke_wait`), and the sleeps, `poll`, `select`
   and the `epoll` waits watch it beside the guest's descriptors
-  (`thread::wait_ready_ns`), so a signal landing between the check for
+  (`thread::wait_ready_ns`; `wait_ready_urgent_ns` watches TCP sockets
+  for urgent data on the thread's kqueue too, for `poll` and `select`),
+  so a signal landing between the check for
   pending ones and the host wait still ends the wait. Their time is kept
   by a kqueue timer of the thread's with `NOTE_CRITICAL`, which the host
   does not coalesce. A futex wait close to its deadline sleeps the same
