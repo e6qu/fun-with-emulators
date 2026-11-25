@@ -13,7 +13,9 @@
 //! ([`duplicated`]), a `close` one fewer ([`closed`], which hands back the
 //! state with the socket's last descriptor here), `execve` takes the table
 //! along ([`save`], [`load`]), and a socket passed to another process
-//! takes its state in the message's bundle ([`export`], [`import`]). A
+//! takes its state in the message's bundle ([`export`], [`import`]). Each
+//! end knows the process that made or connected it ([`State::maker`]),
+//! which a `fork` child or a process it was passed to is not. A
 //! socket the first program was started with gets its number when fwe
 //! first keeps something of it.
 
@@ -33,6 +35,16 @@ pub(crate) struct State {
     pub v4_view: bool,
     /// A Unix socket's peer when the connection was made.
     pub peer: Option<Peer>,
+    /// The process that made this end of the socket, or connected it (its
+    /// host pid): one that has it otherwise, a `fork` child or a process
+    /// it was passed to, is not its maker, and names itself in what it
+    /// sends where the receiver asks for credentials (`net::creds_for`).
+    pub maker: Option<i32>,
+    /// The peer socket's host identity, once looked up (`net::creds_for`).
+    pub peer_id: Option<u64>,
+    /// Whether the peer asks for credentials, as of a generation of what
+    /// asks (`scm::generation`).
+    pub peer_wants: Option<(u64, bool)>,
 }
 
 /// A Unix socket's peer process: its host pid and effective user and group
@@ -45,9 +57,11 @@ pub(crate) struct Peer {
 }
 
 impl State {
+    /// Whether nothing of it goes to another process ([`export`]): its
+    /// maker and peer's identity are this process's view.
     #[cfg(not(target_os = "linux"))]
     fn is_default(&self) -> bool {
-        *self == State::default()
+        State { maker: None, peer_id: None, peer_wants: None, ..self.clone() } == State::default()
     }
 
     fn encode(&self, e: &mut Enc) {
@@ -71,6 +85,8 @@ impl State {
         e.i32(p.pid);
         e.u32(p.uid);
         e.u32(p.gid);
+        e.bool(self.maker.is_some());
+        e.i32(self.maker.unwrap_or(0));
     }
 
     fn decode(d: &mut Dec) -> State {
@@ -91,7 +107,17 @@ impl State {
         let v4_view = d.bool();
         let some = d.bool();
         let peer = Peer { pid: d.i32(), uid: d.u32(), gid: d.u32() };
-        State { kept, memberships, v4_view, peer: some.then_some(peer) }
+        let made = d.bool();
+        let maker = d.i32();
+        State {
+            kept,
+            memberships,
+            v4_view,
+            peer: some.then_some(peer),
+            maker: made.then_some(maker),
+            peer_id: None,
+            peer_wants: None,
+        }
     }
 }
 
@@ -187,6 +213,18 @@ pub(crate) fn duplicated(old: i32, new: i32) {
     }
 }
 
+/// The descriptors of sockets whose kept option `key` is set (non-zero),
+/// one of each socket.
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn with_kept(key: u64) -> Vec<i32> {
+    let Some(t) = TABLE.if_used() else { return Vec::new() };
+    t.socks
+        .iter()
+        .filter(|(_, (s, _))| s.kept.iter().any(|&(k, v)| k == key && v != 0))
+        .filter_map(|(n, _)| t.fds.iter().find(|&(_, m)| m == n).map(|(&fd, _)| fd))
+        .collect()
+}
+
 /// The table, for the process `execve` makes (or a VM fork child).
 pub(crate) fn save(e: &mut Enc) {
     let t = TABLE.lock();
@@ -234,11 +272,12 @@ pub(crate) fn export(fd: i32) -> Option<Vec<u8>> {
     .flatten()
 }
 
-/// Received socket `fd` (fresh here) had the state `bytes` ([`export`]).
+/// Received socket `fd` (fresh here) had the state `bytes` ([`export`]),
+/// but for its maker and peer's identity: this process did not make it.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn import(fd: i32, bytes: &[u8]) {
     let mut d = Dec::new(bytes);
-    let state = State::decode(&mut d);
+    let state = State { maker: None, peer_id: None, peer_wants: None, ..State::decode(&mut d) };
     if d.whole() {
         let mut t = TABLE.lock();
         t.unmap(fd);
@@ -277,6 +316,9 @@ mod tests {
             }],
             v4_view: true,
             peer: Some(Peer { pid: 7, uid: 1000, gid: 100 }),
+            maker: Some(9),
+            peer_id: None,
+            peer_wants: None,
         };
         let mut e = Enc::new();
         s.encode(&mut e);

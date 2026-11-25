@@ -850,6 +850,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     crate::netns::made(fd);
     fresh(fd);
     socket_made(fd, Some(own_ids()));
+    made_here(fd);
     fd as i64
 }
 
@@ -982,6 +983,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     fresh(fds[1]);
     socket_made(fds[0], Some(own_ids()));
     socket_made(fds[1], Some(own_ids()));
+    made_here(fds[0]);
+    made_here(fds[1]);
     // Each end's peer is this process, as it is now.
     remember_peer(fds[0], own_peer());
     remember_peer(fds[1], own_peer());
@@ -1304,10 +1307,12 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         remember_name(fd as i32, false, &a.guest);
     }
     if r == 0 && family(&hb) == libc::AF_UNIX {
-        // The listener's process, as it is now.
+        // The listener's process, as it is now; this end is this
+        // process's to name in what it sends.
         if let Ok(peer) = live_peer(fd as i32) {
             remember_peer(fd as i32, peer);
         }
+        made_here(fd as i32);
         let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
         if crate::x11::is_host_socket(&hb[2..end]) {
             crate::x11::connected(fd as i32, &hb[2..end]);
@@ -1609,6 +1614,7 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
     fresh(r);
     socket_made(r, Some(own_ids()));
+    made_here(r);
     // The connecting process, as it is now.
     if family(&hb) == libc::AF_UNIX
         && let Ok(peer) = live_peer(r)
@@ -1783,17 +1789,30 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     } else {
         (std::ptr::null(), 0)
     };
-    if crate::seqpacket::is(fd as i32) {
-        let v = guest!(uaccess::host_buffer(buf, len, false));
-        return crate::seqpacket::send(fd as i32, &[v], (std::ptr::null_mut(), 0), hflags);
-    }
     let mut iov = [guest!(uaccess::host_buffer(buf, len, false))];
-    // A datagram to a socket that asked for credentials carries them.
+    // A message to a socket that asked for credentials carries them.
     #[cfg(not(target_os = "linux"))]
     let prepared = match send_control(fd as i32, 0, 0, named.then(|| &hb[..alen as usize])) {
         Ok(p) => p,
         Err(e) => return err(e),
     };
+    if crate::seqpacket::is(fd as i32) {
+        #[cfg(not(target_os = "linux"))]
+        let control = match &prepared {
+            Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len()),
+            None => (std::ptr::null_mut(), 0),
+        };
+        #[cfg(target_os = "linux")]
+        let control = (std::ptr::null_mut(), 0);
+        let r = crate::seqpacket::send(fd as i32, &iov, control, hflags);
+        #[cfg(not(target_os = "linux"))]
+        if r < 0
+            && let Some(p) = prepared
+        {
+            p.unsent();
+        }
+        return r;
+    }
     #[cfg(not(target_os = "linux"))]
     let (ctl_ptr, ctl_len) = match &prepared {
         Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len() as _),
@@ -1906,7 +1925,9 @@ pub fn closed(fd: i32) {
     let last = crate::sockstate::closed(fd);
     #[cfg(not(target_os = "linux"))]
     if last.is_some_and(|s| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
-        passcred_bound(fd, false);
+        for a in askers(fd) {
+            crate::scm::released(a.asker());
+        }
     }
     #[cfg(target_os = "linux")]
     let _ = last;
@@ -1987,23 +2008,220 @@ fn host_unix_path(hb: &[u8]) -> Option<Vec<u8>> {
 #[cfg(not(target_os = "linux"))]
 fn passcred_bound(fd: i32, on: bool) {
     if let Some(path) = dgram_path(fd, false) {
-        crate::scm::wants_creds(&path, on);
+        crate::scm::wants_creds(crate::scm::Asker::Path(&path), on);
     }
 }
 
-/// The credentials a datagram from Unix socket `fd` to host address `to`
-/// (its peer's when `None`) carries unasked: the sender's, when the
-/// receiving socket asked for them ([`crate::scm::wants_creds`]).
+/// What names Unix socket `fd` to a sender ([`crate::scm::Asker`]): its
+/// path, if it is a bound datagram socket, and its identity.
+#[cfg(not(target_os = "linux"))]
+enum OwnedAsker {
+    Path(Vec<u8>),
+    Sock(u64),
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OwnedAsker {
+    fn asker(&self) -> crate::scm::Asker<'_> {
+        match self {
+            OwnedAsker::Path(p) => crate::scm::Asker::Path(p),
+            OwnedAsker::Sock(id) => crate::scm::Asker::Sock(*id),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn askers(fd: i32) -> Vec<OwnedAsker> {
+    let path = dgram_path(fd, false).map(OwnedAsker::Path);
+    let id = socket_ids(fd).map(|(own, _)| OwnedAsker::Sock(own));
+    path.into_iter().chain(id).collect()
+}
+
+/// Socket `fd` came to this process with its state: one that asks for
+/// credentials is held by this process too ([`crate::scm::holds`]).
+pub fn received(fd: i32) {
+    #[cfg(not(target_os = "linux"))]
+    if kept_value(fd, SO_PASSCRED) != 0 {
+        for a in askers(fd) {
+            crate::scm::holds(a.asker());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _ = fd;
+}
+
+/// A `fork` child holds every socket its parent had that asks for
+/// credentials ([`crate::scm::holds`]): it asks while the child has it.
+pub fn forked() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if !crate::scm::any_wanted() {
+            return;
+        }
+        for fd in crate::sockstate::with_kept(SO_PASSCRED) {
+            for a in askers(fd) {
+                crate::scm::holds(a.asker());
+            }
+        }
+    }
+}
+
+/// Unix socket `fd` asks for credentials (`on`), or no longer does: a
+/// process sending to it that is not the maker of its end of the
+/// connection is told by its identity ([`crate::scm`], [`creds_for`]).
+#[cfg(not(target_os = "linux"))]
+fn passcred_socket(fd: i32, on: bool) {
+    if let Some((own, _)) = socket_ids(fd) {
+        crate::scm::wants_creds(crate::scm::Asker::Sock(own), on);
+    }
+}
+
+/// The host identities of Unix socket `fd` and of its peer (0 if it has
+/// none): its protocol control block's and its peer's, as the host gives
+/// them out (permuted, the same to every process), which each end of a
+/// connection sees the other way round.
+#[cfg(target_os = "macos")]
+fn socket_ids(fd: i32) -> Option<(u64, u64)> {
+    // `struct socket_fdinfo` (792 bytes): `psi.soi_pcb` at 168,
+    // `psi.soi_kind` at 256 (`SOCKINFO_UN`, 3, for a Unix socket), and
+    // `psi.soi_proto.pri_un.unsi_conn_pcb` at 272.
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const SOCKINFO_UN: i32 = 3;
+    let mut info = [0u64; 792 / 8];
+    // SAFETY: a buffer of the size given, written by the host.
+    let n = unsafe {
+        libc::proc_pidfdinfo(
+            crate::host::pid().get(),
+            fd,
+            PROC_PIDFDSOCKETINFO,
+            info.as_mut_ptr().cast(),
+            792,
+        )
+    };
+    let kind = (info[256 / 8] & 0xffff_ffff) as i32;
+    (n == 792 && kind == SOCKINFO_UN).then(|| (info[168 / 8], info[272 / 8]))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn socket_ids(_: i32) -> Option<(u64, u64)> {
+    None
+}
+
+/// Unix socket `fd`'s host identity ([`socket_ids`]).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn socket_id(fd: i32) -> Option<u64> {
+    socket_ids(fd).map(|(own, _)| own)
+}
+
+/// The credentials a message from Unix socket `fd` to host address `to`
+/// (its peer when `None`) carries unasked: the sender's, when the
+/// receiving socket asked for them, as Linux gives each message's sender.
+/// A datagram to a bound socket is told by its address
+/// ([`crate::scm::wants_creds`]); otherwise a process that is not the
+/// maker of its end ([`crate::sockstate::State::maker`]: a `fork` child, or
+/// one it was passed to) sends its own to a peer that asked
+/// ([`passcred_socket`]), where the receiver would take the maker's.
 #[cfg(not(target_os = "linux"))]
 fn creds_for(fd: i32, to: Option<&[u8]>) -> Option<crate::scm::Creds> {
     if !crate::scm::any_wanted() {
         return None;
     }
     let path = match to {
-        Some(hb) => host_unix_path(hb)?,
-        None => dgram_path(fd, true)?,
+        Some(hb) => host_unix_path(hb),
+        None => dgram_path(fd, true),
     };
-    crate::scm::creds_wanted(&path).then(crate::scm::own_creds)
+    if path.is_some_and(|p| crate::scm::creds_wanted(crate::scm::Asker::Path(&p))) {
+        return Some(crate::scm::own_creds());
+    }
+    (to.is_none() && peer_wants_creds(fd)).then(crate::scm::own_creds)
+}
+
+/// Whether this process, not the maker of socket `fd`'s end, sends to a
+/// peer that asked for credentials: its identity looked up once, and the
+/// answer kept until what asks changes ([`crate::scm::generation`]).
+#[cfg(not(target_os = "linux"))]
+fn peer_wants_creds(fd: i32) -> bool {
+    let me = crate::host::pid().get();
+    let Some((maker, known)) = crate::sockstate::with(fd, |s| (s.maker, s.peer_id)) else {
+        return false;
+    };
+    if maker == Some(me) {
+        return false;
+    }
+    let generation = crate::scm::generation();
+    if let Some(Some((at, wanted))) = crate::sockstate::with(fd, |s| s.peer_wants)
+        && at == generation
+    {
+        return wanted;
+    }
+    let peer = match known {
+        Some(id) => id,
+        None => match socket_ids(fd) {
+            Some((_, id)) => id,
+            None => return false,
+        },
+    };
+    let wanted = peer != 0 && crate::scm::creds_wanted(crate::scm::Asker::Sock(peer));
+    crate::sockstate::update(fd, |s| {
+        s.peer_id = Some(peer);
+        s.peer_wants = Some((generation, wanted));
+    });
+    wanted
+}
+
+/// Whether a write to socket `fd` carries the sender's credentials
+/// ([`creds_for`]), and so goes as [`write_with_creds`] sends it.
+pub fn writes_creds(fd: i32) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::scm::any_wanted() && peer_wants_creds(fd)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        false
+    }
+}
+
+/// `write`/`writev` of `iov` to Unix socket `fd`, with the sender's
+/// credentials ([`writes_creds`]), as a `sendmsg` with no flags.
+#[cfg(not(target_os = "linux"))]
+pub fn write_with_creds(fd: i32, iov: &[libc::iovec]) -> i64 {
+    let prepared = match send_control(fd, 0, 0, None) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let (ctl, ctl_len) = match &prepared {
+        Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len()),
+        None => (std::ptr::null_mut(), 0),
+    };
+    let r = if crate::seqpacket::is(fd) {
+        crate::seqpacket::send(fd, iov, (ctl, ctl_len), 0)
+    } else {
+        let mut m = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_ptr() as *mut libc::iovec,
+            msg_iovlen: iov.len() as _,
+            msg_control: ctl,
+            msg_controllen: ctl_len as _,
+            msg_flags: 0,
+        };
+        // SAFETY: `m` references the caller's buffers and the control
+        // data made above.
+        unsafe { send_corked(fd, &mut m, 0, 0) }
+    };
+    if r < 0
+        && let Some(p) = prepared
+    {
+        p.unsent();
+    }
+    r
+}
+
+#[cfg(target_os = "linux")]
+pub fn write_with_creds(_: i32, _: &[libc::iovec]) -> i64 {
+    unreachable!("a Linux host attaches credentials itself")
 }
 
 /// Send `msg` on `fd` with the guest's `flags` (the host's `hflags`), as
@@ -2684,7 +2902,9 @@ pub unsafe fn setsockopt(
         let r = keep(key);
         #[cfg(not(target_os = "linux"))]
         if r == 0 && optname == SO_PASSCRED {
-            passcred_bound(fd as i32, kept_value(fd as i32, SO_PASSCRED) != 0);
+            let on = kept_value(fd as i32, SO_PASSCRED) != 0;
+            passcred_bound(fd as i32, on);
+            passcred_socket(fd as i32, on);
         }
         return r;
     }
@@ -2940,6 +3160,16 @@ fn live_peer(fd: i32) -> Result<Peer, i32> {
 /// Unix socket `fd`'s connection is made, to `peer`.
 fn remember_peer(fd: i32, peer: Peer) {
     crate::sockstate::update(fd, |s| s.peer = Some(peer));
+}
+
+/// This process made socket `fd`, or connected it: the end's maker
+/// ([`crate::sockstate::State::maker`]), whose peer is looked up anew.
+fn made_here(fd: i32) {
+    crate::sockstate::update(fd, |s| {
+        s.maker = Some(crate::host::pid().get());
+        s.peer_id = None;
+        s.peer_wants = None;
+    });
 }
 
 /// This process as a peer: its host pid and effective ids.

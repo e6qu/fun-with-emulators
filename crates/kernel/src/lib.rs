@@ -981,6 +981,10 @@ impl<P: Platform> Kernel<P> {
     /// will happen, it also does what closing the message queues'
     /// close-on-exec descriptors does ([`mqueue::exec_closing`]).
     pub fn exec_state(&self) -> Vec<u8> {
+        // What it sent with its messages, for receivers yet to read them:
+        // the bundles it holds close with the exec.
+        #[cfg(not(target_os = "linux"))]
+        scm::settle_pending();
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
         // First, for the new process to size the program's stack by before
@@ -2368,6 +2372,14 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // A Unix socket whose peer asked for the sender's credentials,
+            // which the host does not attach ([`net::writes_creds`]).
+            if net::writes_creds(fd) {
+                return Some(match uaccess::host_buffer(buf, len, false) {
+                    Ok(v) => net::write_with_creds(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             if seqpacket::is(fd) {
                 return Some(match uaccess::host_buffer(buf, len, false) {
                     Ok(v) => seqpacket::write(fd, &[v]),
@@ -2430,6 +2442,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Err(e) => fwe_abi::err(e),
         },
         n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
+            Ok(iov) if net::writes_creds(a[0] as i32) => net::write_with_creds(a[0] as i32, &iov),
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {

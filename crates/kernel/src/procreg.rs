@@ -1883,6 +1883,9 @@ pub fn exiting(status: i32) {
     crate::textbusy::exiting();
     // Its `O_TMPFILE` files' hidden names, as their descriptors close.
     crate::tmpfile::exiting();
+    // What it sent with its messages, for receivers yet to read them.
+    #[cfg(not(target_os = "linux"))]
+    crate::scm::settle_pending();
     // Its files of fwe's store, and their locks.
     crate::filestore::desc::exiting();
     crate::ptrace::exiting(status);

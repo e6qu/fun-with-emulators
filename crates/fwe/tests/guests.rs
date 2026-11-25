@@ -11190,6 +11190,25 @@ fn credentials_at_the_end_of_a_unix_socket() {
     );
 }
 
+/// `SO_PASSCRED` gives each message's sender, a process forked after the
+/// socket pair was made too, whether it is still there when its message is
+/// read or not, where `SO_PEERCRED` names the pair's maker (Chromium's
+/// zygote learns its children's pids so).
+#[test]
+fn credentials_name_each_messages_sender() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "credsender",
+        &[],
+        "stream, sender alive: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         datagram, sender alive: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         seqpacket, sender alive: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         stream, sender gone: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         datagram, sender gone: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         seqpacket, sender gone: 5 bytes, credentials pid the sender's, peer pid mine\n",
+    );
+}
+
 /// `SO_PEERGROUPS` gives the peer's supplementary groups as D-Bus reads
 /// them, and another process's `status` lists its groups.
 #[test]

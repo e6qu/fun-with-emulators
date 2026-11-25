@@ -643,6 +643,8 @@ impl<P: Platform> Kernel<P> {
         // gets to it: whether it is an init, for one, depends on it.
         pidns::set_host(&t.chain, &t.nums, crate::host::pid().get());
         pidns::set_current(t.chain);
+        // It holds its parent's sockets, those that ask for credentials too.
+        crate::net::forked();
         if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
         }

@@ -1306,7 +1306,11 @@ sees the message:
 The sender holds the bundle's end until the receiver has emptied it: macOS
 collects sockets in flight it finds no process can reach, emptying their
 data and the descriptors queued in them, and looks for references only in
-sockets that are themselves in flight. A socket passed to one that is not
+sockets that are themselves in flight. A sender that ends or changes
+program first takes the manifest out of each bundle not yet read into a
+record every fwe process sees, by the bundle's host identity, where its
+receiver finds it, and a bundle that comes empty never reaches the
+guest. A socket passed to one that is not
 in flight and closed by its sender (Firefox's fork server's exec socket)
 would be emptied by any collection before its receiver takes it (one runs
 whenever a Unix socket goes away), where Linux collects only cycles no
@@ -1392,15 +1396,21 @@ Linux checks them (ids the sender's user namespace does not map
 `EINVAL`; another pid without `CAP_SYS_ADMIN`, or ids other than its
 real, effective or saved ones without `CAP_SETUID`/`CAP_SETGID`,
 `EPERM`; a pid nobody has `ESRCH`) and travel in a bundle. A receiver
-that set `SO_PASSCRED` gets an `SCM_CREDENTIALS` message first: those
-given, else, on a connected socket, its peer's as `SO_PEERCRED` gives
-them, else for a datagram to a bound socket that asked for
-them the sender's, which an fwe sender attaches when the address it sends
-to is in a record of such sockets every fwe process sees; a netlink
-socket's come from the kernel (all 0), and a datagram from a program fwe
-did not start has pid 0 and the overflow ids. On a stream, the
-credentials are the peer process's, whichever process holding the peer
-socket wrote.
+that set `SO_PASSCRED` gets an `SCM_CREDENTIALS` message first, as Linux
+gives each message's sender: those given, else the sender's own, which
+an fwe sender attaches where the receiver would not know it, else the
+peer's as `SO_PEERCRED` gives them. A record every fwe process sees names
+the sockets that asked, each with the processes that hold it: a bound
+datagram socket by its address, any socket by its host identity (its
+protocol control block, as `proc_pidfdinfo` gives it, the same to every
+process, and each end of a connection the other's). A sender attaches
+its own to a datagram for an address in the record, and to anything it
+sends on an end it did not make (a `fork` child's, or one it was passed:
+the end's maker is what its peer took at the connection) whose peer is in
+the record (looked up once per socket while the record stays the same;
+a `write` too goes as a `sendmsg` then). A netlink socket's come from
+the kernel (all 0), and a datagram from a program fwe did not start has
+pid 0 and the overflow ids.
 
 #### Other IPC calls
 

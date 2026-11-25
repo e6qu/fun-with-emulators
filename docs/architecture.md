@@ -1406,7 +1406,9 @@ Sockets and terminals are the host's; fwe translates their interfaces
   per socket (`crates/kernel/src/sockstate.rs`): the options fwe keeps,
   multicast groups a TCP socket joined with their source filters
   (`crates/kernel/src/tcpmcast.rs`), whether `IPV6_ADDRFORM` made an
-  IPv6 socket IPv4, and a Unix socket's peer when it was connected. Each
+  IPv6 socket IPv4, a Unix socket's peer when it was connected, and the
+  process that made or connected each end, which a `fork` child or a
+  process it was passed to is not (`SCM_CREDENTIALS`). Each
   socket gets a number when it is made, accepted or received; its
   descriptors map to it through `dup` and `close`, `execve` carries the
   table, and a socket sent with `SCM_RIGHTS` carries its state in the
@@ -2182,11 +2184,11 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   sender that ends before its receiver takes it can lose what it held,
   if macOS collects it in between (the sender holds the bundle that keeps
   it reachable).
-- Credentials: the credentials a stream's reader gets with `SO_PASSCRED`
-  are the peer's as they were when the connection was made (Linux takes
-  them per message, from the process that sent it); an unconnected
-  datagram carries the sender's only to a bound socket that asked for
-  them.
+- Credentials: a message sent on an end by the process that made or
+  connected it carries that process's credentials as they were at the
+  connection (Linux takes them as they are when it sends); an
+  unconnected datagram carries the sender's only to a bound socket that
+  asked for them.
 - Sockets: what fwe keeps of a socket
   ([Sockets and terminals](#sockets-and-terminals)) is each process's
   copy, so a change one process makes is not seen by another that shares
