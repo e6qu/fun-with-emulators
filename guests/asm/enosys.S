@@ -1,4 +1,4 @@
-// An unknown system call must fail with -ENOSYS (-38); exit 0 if it does.
+// An unknown system call fails with -ENOSYS (-38); exit 0 if it does.
     .text
     .globl _start
 _start:

@@ -1,7 +1,7 @@
 /* Calls into code made at run time from many call sites of the program's
  * own code, each a blr through a register of its own, from several threads
  * at once: fwe links each site to the code's translation once it has
- * called in, and every call must still reach its own target. Every line
+ * called in, and every call still reaches its own target. Every line
  * printed is what Linux prints. */
 #include <stdint.h>
 int printf(const char *fmt, ...);

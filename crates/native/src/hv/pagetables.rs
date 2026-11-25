@@ -9,7 +9,7 @@
 //! The tables live in a pool of host memory that is mapped into the VM once
 //! (the VM's stage 2 never changes for them); this module writes the
 //! descriptors in the architecture's format and the hardware walks them.
-//! The rules for editing tables a running vCPU may be walking:
+//! The rules for editing tables a running vCPU might be walking:
 //!
 //! - every descriptor is written with one 64-bit store;
 //! - a new table is filled before it is linked in, with a barrier between;
@@ -18,16 +18,16 @@
 //!   permissions — does, and the change reports it ([`Change::flush`]), so
 //!   the caller has the TLBs invalidated before the guest relies on it;
 //! - a table emptied by an unmapping is only reused after that invalidation
-//!   ([`PageTables::flushed`]), since a walk may still be using it.
+//!   ([`PageTables::flushed`]), since a walk might still be using it.
 
-/// What a guest page may be used for at EL0.
+/// What a guest page can be used for at EL0.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Perms {
     pub read: bool,
     pub write: bool,
     pub exec: bool,
-    /// A BTI guarded page (`PROT_BTI`): indirect branches must land on a
-    /// `bti` landing pad.
+    /// A BTI guarded page (`PROT_BTI`): an indirect branch that does not
+    /// land on a `bti` landing pad traps.
     pub guarded: bool,
 }
 
@@ -42,8 +42,8 @@ impl Perms {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[must_use]
 pub struct Change {
-    /// Some access was taken away: the TLBs must be invalidated before the
-    /// guest may rely on the change.
+    /// Some access was taken away: the TLBs MUST be invalidated before the
+    /// guest relies on the change.
     pub flush: bool,
 }
 
@@ -57,7 +57,7 @@ pub const VA_LIMIT: u64 = 1 << VA_BITS;
 const VALID: u64 = 1 << 0;
 const TABLE: u64 = 1 << 1; // at levels 0-2: a table; at level 3: a page
 const ATTR_NORMAL: u64 = 0 << 2; // MAIR attribute 0: normal write-back
-const AP_EL0: u64 = 1 << 6; // EL0 may access
+const AP_EL0: u64 = 1 << 6; // EL0 can access
 const AP_RO: u64 = 1 << 7; // read-only
 const SH_INNER: u64 = 0b11 << 8;
 const AF: u64 = 1 << 10;
@@ -207,7 +207,7 @@ impl<P: Pool> PageTables<P> {
             let new = page_descriptor(ipa + (at - va), p);
             if let Some((old_ipa, old_p)) = decode(old) {
                 // Anything an old translation allowed that the new one does
-                // not, or a different page, must leave the TLBs.
+                // not, or a different page, has to leave the TLBs.
                 if old_ipa != ipa + (at - va)
                     || (old_p.write && !p.write)
                     || (old_p.exec && !p.exec)

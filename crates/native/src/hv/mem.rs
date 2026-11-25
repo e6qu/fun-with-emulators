@@ -104,7 +104,7 @@ pub struct Segment {
     /// one), and the file offset of `host`.
     pub file: Arc<OwnedFd>,
     pub file_offset: u64,
-    /// Whether the guest opened the file for writing, and so may write the
+    /// Whether the guest opened the file for writing, and so can write the
     /// mapping (the VM's mapping takes writes): as on Linux, a shared
     /// mapping of a file opened read-only can never be made writable.
     pub writable: bool,
@@ -132,7 +132,7 @@ pub struct Mem {
     brk_range: (u64, u64),
     brk_high: u64,
     /// Guest ranges taken out of the tables since the last flush,
-    /// `(start, end, ipa of start, generation)`: a TLB may still hold their
+    /// `(start, end, ipa of start, generation)`: a TLB might still hold their
     /// translations.
     removed: Vec<(u64, u64, u64, u64)>,
     /// Guest ranges whose pages wait for a flush, `(start, end,
@@ -168,7 +168,7 @@ fn page_up(a: u64) -> u64 {
     a.checked_add(PAGE - 1).map_or(!(PAGE - 1), |v| v & !(PAGE - 1))
 }
 
-/// Whether the guest may access guest range `[addr, addr + len)`
+/// Whether the guest can access guest range `[addr, addr + len)`
 /// (writing, with `write`): every page mapped, readable, and writable if
 /// `write`.
 pub fn valid(addr: u64, len: u64, write: bool) -> bool {
@@ -245,7 +245,7 @@ impl Mem {
         }
     }
 
-    /// Put `[start, end)` of `area` into the tables, or — where a TLB may
+    /// Put `[start, end)` of `area` into the tables, or — where a TLB might
     /// still lead its pages elsewhere — once a flush covers that
     /// ([`Mem::deferred`]).
     fn install(&mut self, start: u64, end: u64, area: &Area) -> Result<(), i32> {
@@ -283,7 +283,7 @@ impl Mem {
         vm::map_pages(start, end - start, ipa, vm::perms(prot))
     }
 
-    /// The pages of private file views in `[start, end)` the guest may
+    /// The pages of private file views in `[start, end)` the guest can
     /// write become copies of themselves: what a write makes them.
     fn own_view_pages(&mut self, start: u64, end: u64) -> Result<(), i32> {
         let (lo, hi) = (start & !(PAGE - 1), page_up(end));
@@ -380,7 +380,7 @@ impl Mem {
     /// zeroed now) or free in the slab, else a range elsewhere, translated.
     fn back(&mut self, addr: u64, len: u64, kept: Vec<(u64, u64)>) -> Result<u64, i32> {
         let end = addr + len;
-        // The parts not kept must be free at the same address.
+        // The parts not kept need free memory at the same address.
         let mut gaps = Vec::new();
         let mut at = addr;
         let mut sorted = kept.clone();
@@ -483,7 +483,7 @@ impl Mem {
             }
             return Err(e);
         }
-        // Filled memory was written over what may have been code (the
+        // Filled memory was written over what might have been code (the
         // zeroing of what held data saw to its own pages: `window::zero`).
         // Not the whole of an anonymous mapping: invalidating the cache
         // over memory never touched would make the host commit all of it.
@@ -526,11 +526,11 @@ impl Mem {
         if prot & mman::PROT_WRITE != 0 && !writable {
             return Err(errno::EACCES);
         }
-        // The framework maps only host memory that may be written (see
+        // The framework maps only host memory that can be written (see
         // `standin::host_allows`), which a shared mapping of a file opened
         // read-only is not. Such a mapping is made of the same file opened
         // again for writing (the guest still cannot write it: its page
-        // tables and `mprotect` see to that), or, when the user may not
+        // tables and `mprotect` see to that), or, when the user cannot
         // write the file, of a private copy.
         let (file, private) = if writable {
             (file, false)
@@ -686,8 +686,8 @@ impl Mem {
             }
             let file = file.expect("a file view");
             let source = Source { file: file.clone(), offset };
-            // Mapped as a read-only segment (the guest may write a private
-            // mapping of a file it may only read), then given its
+            // Mapped as a read-only segment (the guest can write a private
+            // mapping of a file it can only read), then given its
             // protections, which the tables give without the write.
             self.map_shared(at, len, prot & !mman::PROT_WRITE, file, offset).and_then(|()| {
                 self.vmas.update(at, at + len, |a| Area {
@@ -928,7 +928,7 @@ impl Mem {
     }
 }
 
-/// fwe wrote `[host, host + len)` of guest memory, which the guest may run
+/// fwe wrote `[host, host + len)` of guest memory, which the guest might run
 /// as code: the instruction cache is made to see it, as Apple's cores do
 /// not keep it coherent with data writes (`CTR_EL0.DIC` is 0) — Linux does
 /// the same when it loads code into a page. The stand-in drops its
@@ -958,7 +958,7 @@ fn is_view(area: &Area) -> bool {
 }
 
 /// A write the guest made at `va` faulted for want of permission: if it is
-/// a page of a private file view it may write, that page becomes a copy of
+/// a page of a private file view it can write, that page becomes a copy of
 /// itself, and the write is tried again (true).
 pub fn view_fault(va: u64) -> bool {
     let mut g = mem();
@@ -1012,7 +1012,7 @@ fn fill(host: u64, len: u64, s: &Source) -> Result<(), i32> {
     Ok(())
 }
 
-/// `file` opened again for reading and writing, if the user may (by its
+/// `file` opened again for reading and writing, if the user can (by its
 /// path, checked to be the same file; a file of fwe's store's data, by
 /// its object's name); `ENOMEM` when fwe has no descriptor left to keep
 /// it in.
@@ -1578,8 +1578,8 @@ pub fn serve_vfork_child(sock: i32) {
 
 /// Whether a mapping at `[addr, addr + len)` can be backed so that it reads
 /// as one with the translated ranges ending and starting at its edges: in
-/// the slab, at its own address; else beside their memory, which must be
-/// free (with both, the two must leave exactly its room between them).
+/// the slab, at its own address; else beside their memory, if that is
+/// free (with both, if the two leave exactly its room between them).
 fn joins(addr: u64, len: u64) -> bool {
     if window::contains(addr, len) {
         return true;

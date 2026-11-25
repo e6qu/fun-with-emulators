@@ -103,7 +103,7 @@ impl Platform for HvPlatform {
 
 // --- Ending a VM process cleanly -----------------------------------------
 //
-// A process must never end, or exec, with its VM alive: misusing the
+// A process MUST NOT end, or exec, with its VM alive: misusing the
 // framework can bring the machine down (see the safety rules in
 // docs/hypervisor.md). So every way out — exit_group, the
 // last thread's exit, a fatal signal's default action, fwe's own fatal errors
@@ -129,8 +129,8 @@ thread_local! {
 }
 
 /// Make framework call `f` on this thread's vCPU. The wake signal that
-/// ends the process destroys a thread's vCPU from its handler, which must
-/// not happen in the middle of a call on it, nor be followed by one: if it
+/// ends the process destroys a thread's vCPU from its handler, which MUST
+/// NOT happen in the middle of a call on it, nor be followed by one: if it
 /// arrives during `f`, the thread destroys its vCPU after `f` and stops;
 /// if it came before, the thread stops instead of making the call.
 ///
@@ -252,7 +252,7 @@ fn stop_others(own: Option<hv_vcpu_t>) {
         }
     }
     if n > 0 {
-        // SAFETY: stopping other threads' vCPUs, which may be running and
+        // SAFETY: stopping other threads' vCPUs, which might be running and
         // are not destroyed before this returns.
         unsafe { hv_vcpus_exit(ids.as_mut_ptr(), n as u32) };
     }
@@ -573,7 +573,7 @@ pub(super) fn become_vm_process() -> Result<(), String> {
     // Code fwe writes (a tracer's breakpoint) is fetched afresh by the VM,
     // and by the stand-in's translations.
     fwe_kernel::procmem::on_code_written(mem::code_written);
-    // From before the VM exists, no host signal may end the process by the
+    // From before the VM exists, no host signal ends the process by the
     // host's default action: every one whose default ends it is caught (for
     // the guest, whose default action tears the VM down first) until the
     // kernel sets the guest's dispositions, which keep that. A fork child,
@@ -942,7 +942,7 @@ impl Vcpu {
         }
         self.set_sys(HV_SYS_REG_SP_EL0, r.sp);
         self.set(HV_REG_PC, r.pc);
-        // EL0t with only the flags EL0 may hold (NZCV, SSBS, DIT, TCO,
+        // EL0t with only the flags EL0 can hold (NZCV, SSBS, DIT, TCO,
         // BTYPE): a signal frame can hold anything, as on Linux, which
         // sanitises it the same way.
         const USER_PSTATE: u64 = 0xf000_0000 | (1 << 12) | (1 << 24) | (1 << 25) | 0xc00;
@@ -1225,7 +1225,7 @@ pub(super) fn fatal(msg: &str) -> ! {
 }
 
 /// `execve(path, argv, envp)`: re-execute fwe on the new program, which
-/// may run here in a VM or natively (see [`crate::reexec`]).
+/// can run here in a VM or natively (see [`crate::reexec`]).
 fn execve(args: &[u64; 6]) -> i64 {
     match uaccess::read_cstr(args[0], uaccess::PATH_MAX) {
         Ok(path) => exec_program(path, args[1], args[2]),
@@ -1391,14 +1391,14 @@ fn clone_checked(vcpu: &Vcpu, parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         if flags & cl::CLONE_SETTLS != 0 { tls } else { vcpu.get_sys(HV_SYS_REG_TPIDR_EL0) };
     if flags & cl::CLONE_THREAD == 0 {
         // A process sharing the memory while both run would put its pages
-        // in two VMs at once, which a VM must never have (see `fork`): only
+        // in two VMs at once, which MUST NOT happen (see `fork`): only
         // a vfork child, which runs while its parent waits, shares it.
         if flags & cl::CLONE_VM != 0 && flags & cl::CLONE_VFORK == 0 {
             return err(errno::ENOSYS);
         }
         return fork::fork(parent, a, tpidr, vcpu.vtimer_offset(), flags & cl::CLONE_VFORK != 0);
     }
-    // The flags a thread may have, its stack and the task limits, as a
+    // The flags a thread can have, its stack and the task limits, as a
     // native thread's.
     if let Err(e) = a.thread_check() {
         return err(e);
@@ -1474,7 +1474,7 @@ extern "C" fn thread_main(arg: *mut libc::c_void) -> *mut libc::c_void {
 }
 
 /// Whether pointer argument `i` of system call `n` points at guest memory
-/// the call may use: a path, readable up to its terminator; a buffer with
+/// the call can use: a path, readable up to its terminator; a buffer with
 /// a length argument, all of it (writable if the host writes it); anything
 /// else, its first byte (`ioctl`'s argument is not checked: it is a
 /// pointer only for some requests). The memory up to a page past it is
@@ -1583,7 +1583,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
         nr::PRCTL => uaccess::prctl_pointer_args(args[0]),
         _ => uaccess::pointer_args(n),
     };
-    // Guest pointers the host is given must be guest memory: the host's
+    // Guest pointers the host is given are guest memory, or the call fails
+    // with `EFAULT`: the host's
     // memory behind them is accessible either way (see `mem`). A vfork
     // child fetches what they reach first.
     uaccess::clear_host_args();
@@ -1594,7 +1595,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
         }
     }
     // A read or write whose buffer spans two translated ranges is cut
-    // where the first ends: a shorter read or write, which Linux may
+    // where the first ends: a shorter read or write, which Linux can
     // make too and a program goes on from (not for a datagram, whose
     // rest would be lost).
     if matches!(n, nr::READ | nr::WRITE | nr::PREAD64 | nr::PWRITE64)
@@ -1604,7 +1605,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     {
         args[2] = args[2].min(uaccess::span(args[1]));
     }
-    // Buffers the host is given whole must have one host address.
+    // Buffers the host is given whole have one host address, or the call
+    // fails with `EINVAL`.
     for (i, &a) in args.iter().enumerate() {
         if mask & (1 << i) != 0 && a != 0 && !one_host_range(n, i, &args) {
             kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EINVAL));

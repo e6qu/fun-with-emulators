@@ -1,4 +1,4 @@
-// x18 must survive through data-processing instructions beyond moves: extract,
+// x18 survives through data-processing instructions beyond moves: extract,
 // conditional select, multiply-add and divide, add/sub with an sp source
 // (including the forms whose sp the stub keeps in a scratch register), loads
 // and stores from sp, moves to and from vector elements, across preemption. Exit 0 if
@@ -33,7 +33,7 @@ _start:
     b.ne    fail
 
     // add/sub with sp as the source: the stub runs with sp lower, so the
-    // offset must be compensated for the result to match.
+    // offset needs compensating for the result to match.
     mov     x11, sp
     add     x18, sp, #0x18
     add     x12, x11, #0x18

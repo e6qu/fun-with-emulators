@@ -50,7 +50,7 @@ static int worker(const char *parent) {
     snprintf(pid, sizeof pid, "%d", getpid());
     int failed = 0;
     for (int round = 0; round < ROUNDS; round++) {
-        /* (The parent may go between, removed by another: made again.) */
+        /* (The parent can go between, removed by another: made again.) */
         int made;
         do {
             if (mkdir(parent, 0755) != 0 && *__errno_location() != EEXIST)

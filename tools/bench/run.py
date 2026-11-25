@@ -201,9 +201,9 @@ MICRO_NATIVE = [
 ]
 
 
-# How many times native macOS's figure fwe's may be, on the same runner
-# (PLAN.md, "Native speed"): system calls 1.5x, the process and thread
-# calls and start-up 3x.
+# How many times native macOS's figure fwe's is allowed to be, on the same
+# runner (PLAN.md, "Native speed"): system calls 1.5x, the process and
+# thread calls and start-up 3x.
 BUDGETS = {
     "startup (ms)": 3.0,
     "getpid (ns)": 1.5,
@@ -254,15 +254,15 @@ BUDGETS = {
     "System V segment made and removed (ns)": 3.0,
 }
 
-# The most fwe's figure may be, in the row's own unit: making a
+# The most fwe's figure is allowed to be, in the row's own unit: making a
 # translation, which running code natively has no counterpart of (a
 # function made and run: the block made for it, placed and linked).
 LIMITS = {
     "JIT code: a function made and run (us)": 2.0,
 }
 
-# How much longer than its own code fwe may make a program that computes
-# take: its share ([`pcs`]), all of a run's samples over those in the
+# How much longer than its own code fwe is allowed to make a program that
+# computes take: its share ([`pcs`]), all of a run's samples over those in the
 # program's own code. Its time against macOS's stays in the table, but
 # that also measures the builds' differences (Alpine's compiler and C
 # library against Homebrew's), not only fwe.
@@ -975,7 +975,7 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     shutil.rmtree(seen, ignore_errors=True)
 
 
-# The most seconds one run of a workload may take: a run that hangs fails
+# The most seconds one run of a workload is allowed to take: a run that hangs fails
 # the benchmarks with where it is, rather than the job's time limit with
 # nothing.
 LIMIT = 300
@@ -1034,10 +1034,10 @@ def run_limited(cmd, name, env=None):
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):
     """Time workload `name`: command `ours` under fwe and `theirs` natively,
     in turns, three rounds, the best of each kept. Each round starts with
-    the directories `fresh` empty. Both must succeed and print the same.
-    Then `ours` once more, traced (fwe's options go in at `at`, after fwe
-    itself), its system calls counted in the log: where fwe's time goes;
-    and, `profiled` (a program in one process), once more sampled, its
+    the directories `fresh` empty. Both are checked to succeed and print
+    the same. Then `ours` once more, traced (fwe's options go in at `at`,
+    after fwe itself), its system calls counted in the log: where fwe's time
+    goes; and, `profiled` (a program in one process), once more sampled, its
     share of fwe's kept with `share` ([`pcs`])."""
     times = {"fwe": [], "macOS": []}
     outs = {}
@@ -1617,7 +1617,7 @@ def pcs(name, cmd, share=False, execname="fwe", jit_map=None):
     except Exception as e:  # noqa: BLE001 (any failure of the reading itself)
         print(f"{name}: no breakdown: {e!r}", file=sys.stderr)
     # The busiest threads', and any of the four busiest that runs mostly
-    # outside the program's code (a program's other threads may spend
+    # outside the program's code (a program's other threads can spend
     # theirs in fwe where its main one does not).
     def outside(pcs_of):
         mine = sum(n for pc, n in pcs_of.items()

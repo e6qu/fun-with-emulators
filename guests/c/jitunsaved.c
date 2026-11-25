@@ -1,5 +1,5 @@
 /* Code made at run time that keeps values in x16 and x17 (as HotSpot's
- * compiled code may: the procedure call standard lets code use them like
+ * compiled code does: the procedure call standard lets code use them like
  * any other register between calls) and goes on into other blocks by
  * direct branches with those values live, into words that do not name
  * them first: each such block is entered with the program's own x16 and

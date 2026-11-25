@@ -149,12 +149,12 @@ pub fn page_dispositions(addr: u64, out: &mut [i32]) {
 /// the host pages that ever held data ([`page_dispositions`]): a page never touched reads as zero already, and writing to it
 /// would make the host commit it. A program that reserves gigabytes and
 /// maps over them (Wine) would otherwise have all of it committed. What is
-/// written may have held code: the caches are told.
+/// written might have held code: the caches are told.
 ///
 /// # Safety
 ///
-/// `[start, end)` is slab memory the caller may write: no vCPU reaches it
-/// through a translation the caller has not accounted for.
+/// `[start, end)` MUST be slab memory the caller can write, which no vCPU
+/// reaches through a translation the caller has not accounted for.
 pub unsafe fn zero(start: u64, end: u64) {
     if end <= start {
         return;
@@ -174,7 +174,7 @@ pub unsafe fn zero(start: u64, end: u64) {
             let (a, b) = (page.max(start), (page + host).min(end));
             // SAFETY: the caller's memory, as the function's contract says.
             unsafe { std::ptr::write_bytes(a as *mut u8, 0, (b - a) as usize) };
-            // It may have held code.
+            // It might have held code.
             super::mem::invalidate_icache(a, b - a);
             wrote = true;
         }

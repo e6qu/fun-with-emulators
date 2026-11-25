@@ -1,5 +1,11 @@
 //! The native execution backend: Linux code runs directly on the CPU inside
 //! this macOS process, with system calls redirected to the kernel layer.
+//!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in this crate's documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod asm;
@@ -271,7 +277,7 @@ impl Platform for NativePlatform {
 /// Trace to the file at `path` (`--strace-file`), every process of the run.
 pub fn trace_to_file(path: &[u8]) -> Result<(), String> {
     // fwe's own descriptors live above the guest's range, which this sets:
-    // the guest must never see, reuse or close the trace file's.
+    // the guest MUST NOT see, reuse or close the trace file's.
     fwe_kernel::fdtable::init();
     fwe_kernel::trace::to_file(path)
 }
@@ -437,7 +443,7 @@ fn read_program(
 /// names, as Linux's `execve` runs one ([`fwe_kernel::Kernel::exec_target`]):
 /// a guest path, given the line's argument if it has one, then the script's
 /// path (its guest path inside the root, otherwise as given), then `args`
-/// but the first; an interpreter may be a script too, five deep.
+/// but the first; an interpreter can be a script too, five deep.
 fn script_target(
     path: &Path,
     args: &[OsString],
@@ -603,8 +609,8 @@ pub(crate) fn reexec(
     // across the host `execve`.
     let held = match fs.exec_fd(path).map(fwe_kernel::fdtable::dup_reserved) {
         Some(Ok(held)) => {
-            // SAFETY: plain host call on fwe's own descriptor; it must
-            // survive the host `execve` (the new fwe takes it over).
+            // SAFETY: plain host call on fwe's own descriptor, which then
+            // survives the host `execve` (the new fwe takes it over).
             unsafe { libc::fcntl(held, libc::F_SETFD, 0) };
             argv.push(b"--exe-fd".to_vec());
             argv.push(held.to_string().into_bytes());
@@ -774,7 +780,7 @@ impl fmt::Display for HostSupport {
 
 /// The macOS custom x18 ABI (macOS 26.4 and later): a per-thread mode in
 /// which x18 is saved and restored like any other register. While it is on,
-/// the thread must not call macOS library code; see `<os/arch/arm64.h>`.
+/// the thread MUST NOT call macOS library code; see `<os/arch/arm64.h>`.
 #[derive(Clone, Copy)]
 pub struct X18Abi {
     set: extern "C" fn(bool),
@@ -799,7 +805,7 @@ impl X18Abi {
 
     /// Run `f` with the custom ABI on and switch it off again, unless the
     /// host already did (switching to the current state aborts). Returns
-    /// `f`'s result and whether the mode was still on. `f` must not call
+    /// `f`'s result and whether the mode was still on. `f` MUST NOT call
     /// macOS library code.
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> (R, bool) {
         self.set_enabled(true);
@@ -1402,7 +1408,7 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
         KERNEL.lock().as_mut().unwrap().ptrace_exec_stop(&mut regs);
         regs
     });
-    // From here on this thread runs guest code, which may use x18 freely;
+    // From here on this thread runs guest code, which can use x18 freely;
     // the trap handlers leave the mode while they run host code. Its waits
     // from here on are the program's.
     fwe_kernel::procstore::entered();

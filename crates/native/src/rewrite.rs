@@ -118,7 +118,7 @@ pub enum Site {
 pub const IC_IVAU: u32 = 0xd50b_7520;
 
 /// Whether `insn` is `ic ivau, xN`: the program invalidating the
-/// instruction cache line at `xN`, as it must after writing code there.
+/// instruction cache line at `xN`, as a program does after writing code there.
 pub fn is_ic_ivau(insn: u32) -> bool {
     insn & !RT_MASK == IC_IVAU
 }
@@ -154,7 +154,7 @@ fn x18_form(insn: u32) -> bool {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Patched {
     pub syscalls: usize,
-    /// Offsets (from the start of the block) of instructions that must be
+    /// Offsets (from the start of the block) of instructions that are
     /// redirected to stubs.
     pub sites: Vec<(u64, Site)>,
     /// Count of instructions that name `x18` but are left alone (the `sp`
@@ -260,7 +260,7 @@ pub fn replay(code: &mut [u8], noted: &[Noted], x18_deferred: usize) -> Option<P
 }
 
 /// Rewrite what can be rewritten in place and collect the rest. `code`
-/// must start at a 4-byte aligned address. `known`, when given, is the
+/// MUST start at a 4-byte aligned address. `known`, when given, is the
 /// `(offset, length)` byte ranges of `code` that are known to be code (the
 /// image's unwind table covers them): a word outside them that looks like
 /// an `x18` instruction is data in practice — a constant table hand-written
@@ -288,7 +288,7 @@ pub fn patch(code: &mut [u8], known: Option<&[(u64, u64)]>) -> Patched {
     let known_code = |i: usize| known.is_some() && is_code[i];
     for (i, word) in code.as_chunks_mut::<4>().0.iter_mut().enumerate() {
         // Words that belong to a literal pool are data, not instructions, and a
-        // constant can encode anything — never rewrite them.
+        // constant can encode anything — they are never rewritten.
         if data[i] {
             continue;
         }
@@ -724,7 +724,7 @@ fn x18_ldr_literal_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
 /// authenticated forms). Loads the target from the slot into `x16` (`x17`
 /// when the modifier is `x16`) and branches with the original's kind:
 /// `x16`/`x17` are the intra-procedure-call scratch registers, dead at any
-/// branch, so no save is needed, and a branch through them may land on a
+/// branch, so no save is needed, and a branch through them can land on a
 /// `bti c`. For the `blr` forms the link register is set to the instruction
 /// after the original branch, and the branch made without link.
 /// Self-terminating (ends in the branch).
@@ -746,7 +746,7 @@ fn free(used: u32) -> impl Iterator<Item = u32> {
     (0u32..=30).filter(move |&r| used & (1 << r) == 0)
 }
 
-/// Stub for a `casp` naming `x18` in a pair or as its base. A pair must be
+/// Stub for a `casp` naming `x18` in a pair or as its base. A pair is
 /// an even-numbered register and the next, so one holding `x18` is replaced
 /// by a free even pair: its first holds `x18`, its second a copy of `x19`,
 /// and both go back after (`x18` to the slot) if the pair is the one
@@ -920,8 +920,8 @@ fn x18_writes_sp_stub(insn: u32, imm: u32) -> Vec<u32> {
 /// Where in [`x18_stub`]'s words for `insn` the instruction itself is: the
 /// words before it only save registers and load `x18`'s value, so a
 /// signal there can undo them; the words after it store `x18` back and
-/// restore the registers, so a signal there must finish them, the
-/// instruction having run (it may be an atomic one).
+/// restore the registers, so a signal there finishes them, the
+/// instruction having run (it might be an atomic one).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn x18_stub_main(insn: u32) -> usize {
     let ops = crate::decode::operands(insn).expect("x18 site must decode");
@@ -1552,7 +1552,7 @@ mod tests {
     #[test]
     fn literal_pool_words_are_not_rewritten() {
         // ldr x0, <+8> makes the two words at offset 8 a literal pool. The
-        // first pool word encodes `movz x18` but must be left as data.
+        // first pool word encodes `movz x18` but is left as data.
         let mut code = words(&[
             0x5800_0040, // ldr x0, #8  (target = this + 8)
             0xd280_0000, // movz x0, #0 (filler)

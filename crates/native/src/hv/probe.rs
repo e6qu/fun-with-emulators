@@ -176,8 +176,8 @@ pub fn map_rules() -> Result<String, String> {
         ("a read-only file, private, as RX", Box::new(|| read_only_file(libc::MAP_PRIVATE)), r | x),
         ("unmapped, as R", Box::new(unmapped), r),
     ];
-    // The signals that end a process wait until the VM is gone: it must
-    // never end with one alive (a CI job's cancel sends SIGTERM).
+    // The signals that end a process wait until the VM is gone: it MUST
+    // NOT end with one alive (a CI job's cancel sends SIGTERM).
     let mut set = fwe_kernel::host::empty_sigset();
     for sig in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP, libc::SIGQUIT] {
         // SAFETY: an initialized signal set.
@@ -218,7 +218,7 @@ fn with_vm(cases: &[(&str, Make, u64)]) -> Result<String, String> {
             out.push_str(&format!("{name}: refused\n"));
         }
         if still_mapped {
-            // Memory the VM may still map is never freed.
+            // Memory the VM might still map is never freed.
             out.push_str(&format!("{name}: could not be unmapped (memory kept)\n"));
         } else if host.owned {
             // SAFETY: freeing our own memory, no longer in the VM.

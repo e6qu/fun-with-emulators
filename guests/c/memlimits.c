@@ -1,4 +1,4 @@
-/* Memory a program may not have and the limits on what it may hold, as
+/* Memory a program cannot have and the limits on what it can hold, as
  * Linux sets them: huge pages from an empty pool (MAP_HUGETLB,
  * SHM_HUGETLB, vm.nr_hugepages, /proc/meminfo), SHM_LOCK charging a
  * segment to its locker's RLIMIT_MEMLOCK, MADV_COLD and MADV_PAGEOUT

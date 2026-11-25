@@ -2,8 +2,8 @@
  * asks for its spaces so), and a second one hinted just past the first
  * (as Go's heap arenas are) continues it: a read into a buffer across the
  * two is one read. A third, mapped (at a fixed address) between two
- * others after them, may be backed apart from both: a read or write
- * across its edges is still whole, each made of as many calls as Linux may need (a shorter count is
+ * others after them, can be backed apart from both: a read or write
+ * across its edges is still whole, each made of as many calls as Linux might need (a shorter count is
  * read or written again from where it ended, as programs do). Every line
  * printed is what Linux prints. */
 int printf(const char *fmt, ...);

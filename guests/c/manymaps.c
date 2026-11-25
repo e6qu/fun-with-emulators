@@ -1,5 +1,5 @@
 /* Many file mappings at once, as compilers and linkers make: fwe's VM
- * backend keeps a descriptor of its own for each, which must never be one
+ * backend keeps a descriptor of its own for each, which is never one
  * the program can name. A vfork child that first takes over the low
  * descriptors (as Go's does, moving its pipes into place) still reaches its
  * parent's memory. A shared mapping of a file opened read-only sees what is

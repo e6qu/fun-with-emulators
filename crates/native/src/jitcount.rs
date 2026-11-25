@@ -14,7 +14,7 @@
 //! translation read) as it
 //! ends or replaces its program, and counts the blocks it made that an
 //! earlier one had: at the same address (and of those, the ones two or
-//! more earlier processes made there, which it should have taken from
+//! more earlier processes made there, which it could have taken from
 //! those kept), or the same words elsewhere.
 //!
 //! With `FWE_JIT_COUNT` set: each block's entries count their runs (its
@@ -380,7 +380,7 @@ fn branched_to(blocks: &[Counted]) -> (u64, [(u64, u64, u64); 3]) {
 }
 
 /// Whether the program's word `w` is one a translation changes: a system
-/// call, a thread-pointer access, a use of `x18` (any word that may name
+/// call, a thread-pointer access, a use of `x18` (any word that might name
 /// it), or a cache flush.
 fn changed_by_translation(w: u32) -> bool {
     w & 0xffe0_001f == 0xd400_0001

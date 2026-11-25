@@ -51,7 +51,7 @@ pub fn give<T>(job: Box<T>) -> Result<libc::pthread_t, Box<T>> {
         parked.given.store(Box::into_raw(job), SeqCst);
         parked.word.store(1, SeqCst);
         // SAFETY: waking the thread waiting on the word, by its address
-        // alone: the thread may have gone on, its `Parked` with it.
+        // alone: the thread might have gone on, its `Parked` with it.
         unsafe { __ulock_wake(UL_COMPARE_AND_WAIT | ULF_NO_ERRNO, word.cast(), 0) };
         return Ok(host);
     }

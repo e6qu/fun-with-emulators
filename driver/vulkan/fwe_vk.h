@@ -4,6 +4,12 @@
  * needs nothing of the C library but dlopen and dlsym, for the window
  * systems' libraries, which it takes where the process has them (weak
  * references; without them there are no window systems). */
+
+/* The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+ * "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+ * "OPTIONAL" in the Vulkan driver's comments are to be interpreted as
+ * described in BCP 14 (RFC 2119, RFC 8174) when, and only when, they appear
+ * in all capitals, as shown here. */
 #pragma once
 
 #include <stddef.h>

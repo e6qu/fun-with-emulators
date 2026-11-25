@@ -1,9 +1,9 @@
 /* A minimal dynamically linked program.
  *
  * It provides its own `_start` and calls two libc functions (`write` and
- * `_exit`) that the dynamic linker must resolve from the shared libc at load
+ * `_exit`) that the dynamic linker resolves from the shared libc at load
  * time. No C runtime startup objects are involved, so this isolates the
- * dynamic linker itself: it must map and self-relocate `ld-musl`, apply this
+ * dynamic linker itself: it maps and self-relocates `ld-musl`, apply this
  * program's `R_AARCH64_JUMP_SLOT` relocations against libc, set up the thread
  * pointer, and transfer control here. */
 

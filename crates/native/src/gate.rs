@@ -10,7 +10,7 @@
 //! nothing but `x0` and no signal is to be delivered, the gate restores the
 //! registers and returns to the stub, which goes on past the site: no host
 //! exception, no signal, no change of the host's signal mask (the guest's
-//! is already in force); so do the calls that may block, which run outside
+//! is already in force); so do the calls that can block, which run outside
 //! the kernel lock. Every other outcome (a call that changes `pc`, `sp` or
 //! the mask, a signal to deliver, a traced or filtered call) takes the
 //! trap: the gate
@@ -401,7 +401,7 @@ core::arch::global_asm!(
     "_fwe_exit_gate:",
     // x16: the way out's address; the program's x16 and x17 in their
     // slots. x0 and x1 go below sp, two scratch registers, through x17
-    // (free here): the program may keep sp off 16-byte alignment, where
+    // (free here): the program can keep sp off 16-byte alignment, where
     // an access through sp faults.
     "sub x17, sp, #16",
     "stp x0, x1, [x17]",

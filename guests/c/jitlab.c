@@ -444,7 +444,7 @@ static int fastcalls_changing(void) {
 static uint32_t movz_x0(unsigned imm) { return 0xd2800000u | (imm << 5); }
 
 int main(void) {
-    /* Memory asked for at 32 TiB first, as a JVM may place its heap or
+    /* Memory asked for at 32 TiB first, as a JVM can place its heap or
      * class space, before any code is made: where fwe keeps its table of
      * translations (which takes its place before the program runs), so
      * this goes elsewhere; Linux would place it there. Nothing printed
@@ -456,7 +456,7 @@ int main(void) {
         perror("mmap");
         return 1;
     }
-    /* What the program's memory must read back as. */
+    /* What the program's memory reads back as. */
     static char expect[1 << 16];
     memcpy(code, jl_begin, len);
     memcpy(expect, jl_begin, len);
@@ -607,7 +607,7 @@ int main(void) {
     memcpy(at(expect, jl_ret1), &one, 4);
     printf("threads: %s\n", atomic_load(&bad) ? "wrong results" : "ok");
 
-    /* Any fault now is one the writers should not take. */
+    /* Any fault now ends the program: the writers take none. */
     sa.sa_sigaction = 0;
     sa.sa_flags = 0;
     sigaction(SIGSEGV, &sa, 0);

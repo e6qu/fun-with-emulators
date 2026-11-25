@@ -1,7 +1,7 @@
 //! `fork` and `vfork` in the VM.
 //!
 //! A host `fork` of a VM process is out of the question: the child could not
-//! use the VM it copied, and a VM process must never fork (see
+//! use the VM it copied, and a VM process MUST NOT fork (see
 //! `docs/hypervisor.md`). Instead the child is a fresh fwe process, started
 //! with `posix_spawn`, that receives the parent's memory and kernel state,
 //! builds a VM of its own around them and resumes the guest where the
@@ -136,8 +136,8 @@ fn task() -> Port {
 
 /// The `msgh_id` of the child's request and of the answer.
 const HANDOFF_ID: i32 = 0x6677_6b01;
-/// Leads the state: the format, and the build that wrote it, which must be
-/// the build reading it.
+/// Leads the state: the format, and the build that wrote it, which is checked
+/// to be the build reading it.
 const STATE_MAGIC: u64 = 0x6677_652d_666f_726b;
 
 fn build_id() -> u64 {
@@ -792,7 +792,7 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     if let Some(fs) = k.fs.as_ref() {
         fwe_kernel::pidns::adopt(&fs.ns, number);
     }
-    // Its own record too: it may end before the parent writes it.
+    // Its own record too: it can end before the parent writes it.
     // With its mappings, for other processes' `/proc/<pid>/maps`.
     let ns = k.fs.as_ref().map(|fs| fs.ns_dirs()).unwrap_or_default();
     let auxv = k.fs.as_ref().map(|fs| fs.auxv().to_vec()).unwrap_or_default();

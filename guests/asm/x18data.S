@@ -1,6 +1,6 @@
 // A word among the code that reads as an x18 instruction (`ldr x0, [x18]`)
-// but is data: no frame description entry covers it, so the rewrite must
-// leave it alone, with section headers or, through PT_GNU_EH_FRAME, without
+// but is data: no frame description entry covers it, so the rewrite
+// leaves it alone, with section headers or, through PT_GNU_EH_FRAME, without
 // them. Exit 0 if it reads back unchanged, 1 otherwise.
     .text
     .globl _start

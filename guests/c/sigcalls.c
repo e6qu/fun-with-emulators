@@ -239,7 +239,7 @@ static void uid_maps(void) {
         char c;
         read(go[0], &c, 1);
         /* Root inside, mapped to the parent's root alone; a namespace
-         * inside this one may name only that id. */
+         * inside this one can name only that id. */
         int inner[2], back[2];
         pipe(inner);
         pipe(back);

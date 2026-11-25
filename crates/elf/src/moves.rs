@@ -1,4 +1,4 @@
-//! Moving a non-PIE executable to another address: what must change, from
+//! Moving a non-PIE executable to another address: what has to change, from
 //! the relocations its link kept (`--emit-relocs`), or why it cannot be.
 //!
 //! arm64 code reaches its own code and data PC-relatively (`adrp`, `adr`,
@@ -171,7 +171,7 @@ pub fn moves(elf: &Elf<'_>, delta: u64) -> Result<Vec<(u64, Patch)>, String> {
                 r::ABS32 | r::ABS16 => {}
                 g @ r::MOVW_UABS_G0..=r::MOVW_UABS_G3 if moves => {
                     // G0, G1 and G2 checked, then their _NC forms, and G3:
-                    // the piece's level, and whether the rest must be 0.
+                    // the piece's level, and whether the rest has to be 0.
                     let (level, checked) = match g - r::MOVW_UABS_G0 {
                         0 => (0, true),
                         1 => (0, false),

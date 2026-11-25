@@ -146,7 +146,7 @@ pub struct Flush {
 }
 
 impl Flush {
-    /// The flush a vCPU must take before resuming the guest, if any.
+    /// The flush a vCPU needs before resuming the guest, if any.
     pub fn needed() -> Option<Flush> {
         let g = GENERATION.load(SeqCst);
         (g != FLUSHED.load(SeqCst)).then_some(Flush { generation: g })
@@ -197,11 +197,11 @@ pub fn page_perms(va: u64) -> Option<Perms> {
 
 /// Have every vCPU invalidate its TLBs before it next runs the guest,
 /// although the tables lost nothing: a TLB holds an entry older than the
-/// tables' (permissions they gave since, which a TLB may keep the old
+/// tables' (permissions they gave since, which a TLB might keep the old
 /// ones of). The generation to wait for.
 pub fn request_flush() -> u64 {
     // Under the tables' lock: an edit owns the generation it bumps to, and
-    // a flush dispatched for this one must not count as covering it.
+    // a flush dispatched for this one does not count as covering it.
     let _t = tables();
     GENERATION.fetch_add(1, SeqCst) + 1
 }
@@ -244,7 +244,7 @@ fn edit<T>(
             Ok(out)
         }
         Err(e) => {
-            // It may have changed some of the range before it failed.
+            // It might have changed some of the range before it failed.
             GENERATION.fetch_add(1, SeqCst);
             Err(e)
         }
@@ -314,7 +314,7 @@ fn segment_flags(writable: bool) -> u64 {
     HV_MEMORY_READ | HV_MEMORY_EXEC | if writable { HV_MEMORY_WRITE } else { 0 }
 }
 
-/// Take the segment at `ipa` out of the VM; the host may then free its
+/// Take the segment at `ipa` out of the VM; the host can then free its
 /// memory (the framework invalidates its translations of it).
 pub fn unmap_segment(ipa: u64) {
     let mut segs = SEGMENTS.lock().unwrap_or_else(|e| e.into_inner());
@@ -327,7 +327,7 @@ pub fn unmap_segment(ipa: u64) {
 // --- Making the VM --------------------------------------------------------------
 
 /// `hvc #2` then `b .`, at each of the sixteen vector entries: `hvc #0` is
-/// avoided, as the framework may take it for a firmware call when `x0`
+/// avoided, as the framework can take it for a firmware call when `x0`
 /// holds a function number (found by Carrick).
 const HVC_2: u32 = 0xd400_0042;
 const B_SELF: u32 = 0x1400_0000;
@@ -477,7 +477,7 @@ pub fn system_registers() -> Vec<(hv_sys_reg_t, u64)> {
         (HV_SYS_REG_TTBR0_EL1, root),
         (HV_SYS_REG_VBAR_EL1, VECTORS),
         (HV_SYS_REG_CPACR_EL1, 0b11 << 20), // FPEN: no FP/SIMD traps
-        (HV_SYS_REG_CNTKCTL_EL1, 0b11),     // EL0 may read the counters
+        (HV_SYS_REG_CNTKCTL_EL1, 0b11),     // EL0 can read the counters
         (HV_SYS_REG_SCTLR_EL1, sctlr),
     ]
 }
