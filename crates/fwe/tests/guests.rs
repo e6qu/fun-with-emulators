@@ -11197,8 +11197,7 @@ fn debian_display_zed_edits_a_file_on_the_gpu() {
     std::fs::write(root.0.join("tmp/nobody/hello.txt"), "fwe\n").unwrap();
     let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
     // As `nobody`: Zed refuses to run as root.
-    let args =
-        as_nobody("/opt/zed.app/libexec/zed-editor", &["--foreground", "/tmp/nobody/hello.txt"]);
+    let args = as_nobody("/opt/zed.app/libexec/zed-editor", &["/tmp/nobody/hello.txt"]);
     let mut gui = Gui::start(&x, "zed", &root, "/usr/bin/setpriv", &args, &env);
     let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
     std::thread::sleep(Duration::from_secs(5));
@@ -11262,7 +11261,8 @@ fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
     let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
         .arg("--root")
         .arg(&scratch.0)
-        .args(["/bin/sh", "-c", &format!("cd /src/{app} && {build}")])
+        .arg(scratch.0.join("bin/busybox"))
+        .args(["sh", "-c", &format!("cd /src/{app} && {build}")])
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/root")
