@@ -28,6 +28,19 @@ debug = 1
 lto = "fat"
 codegen-units = 1
 
+# LTP's runs (CI's `ltp` job): optimized, as a user's fwe is, with the
+# debug build's assertions and overflow checks, which odd arguments find.
+# Some tests take as long as the host's own calls make them: fork14 forks
+# 16384 times with up to 16 TiB reserved, which costs macOS's fork about
+# as long under an optimized fwe as natively (50-60 ms a fork near the
+# end), and a third longer under the debug build.
+[profile.checked]
+inherits = "release"
+debug-assertions = true
+overflow-checks = true
+lto = "off"
+codegen-units = 16
+
 # Preparing guest code scans every word of a program's executable sections,
 # 100 MB and more for rustc's libraries, once per process: optimized even in
 # debug builds, so the end-to-end tests are not dominated by it. Debug

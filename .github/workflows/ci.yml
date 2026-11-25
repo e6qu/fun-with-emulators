@@ -440,7 +440,8 @@ jobs:
       - name: Build LTP
         if: steps.ltp-cache.outputs.cache-hit != 'true'
         run: tools/ltp/build.sh target/ltp
-      - run: cargo build
+      # Optimized, with the debug build's checks (Cargo.toml's `checked`).
+      - run: cargo build --profile checked -p fwe
       # A process may open as many files as a Linux distribution allows
       # (pipe15 opens 8195), not the runner's 10240, of which fwe keeps a
       # quarter for itself.
@@ -451,7 +452,7 @@ jobs:
       - name: Run LTP's system-call tests under fwe
         run: |
           # Four at once: most of a test's time is spent waiting.
-          python3 tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root \
+          python3 tools/ltp/run.py --fwe target/checked/fwe --root target/ltp/root \
             --jobs 4 --results ltp-results.txt --show --shard ${{ matrix.shard }}/8 \
             --memory-log ltp-memory.log
       - if: always()

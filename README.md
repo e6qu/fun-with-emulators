@@ -131,8 +131,8 @@ CI fails if a test in the baseline stops passing:
 
 ```sh
 tools/ltp/build.sh target/ltp      # needs zig 0.17.0: LTP in an Alpine root
-cargo build
-tools/ltp/run.py --fwe target/debug/fwe --root target/ltp/root
+cargo build --profile checked -p fwe   # optimized, its checks kept
+tools/ltp/run.py --fwe target/checked/fwe --root target/ltp/root
 ```
 
 ## License

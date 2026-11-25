@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run LTP's system-call tests under fwe and compare with the baseline.
 
-Usage: tools/ltp/run.py --fwe target/debug/fwe --root OUT/root
+Usage: tools/ltp/run.py --fwe target/checked/fwe --root OUT/root
                         [--baseline tools/ltp/baseline.txt] [--update]
                         [--jobs N] [--only REGEX] [--results FILE]
 
