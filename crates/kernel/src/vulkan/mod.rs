@@ -33,6 +33,8 @@
 //!   a queue's family ([`generated::PARENT`], [`generated::QUEUE_FAMILY`]).
 //! - **Null descriptors** where the driver has none are stand-ins of fwe's
 //!   ([`null`]).
+//! - **Host image copy** is offered for an image only where the driver's
+//!   memory requirements back it ([`hostcopy`]).
 //! - **Waits** with a timeout end at the deadline the stub computed, and
 //!   are made in slices of [`SLICE_NS`]: a signal for the waiting thread
 //!   ends the call with `EINTR`, and the stub makes it again.
@@ -43,6 +45,7 @@ pub mod driver;
 pub mod files;
 #[rustfmt::skip]
 pub mod generated;
+pub mod hostcopy;
 pub mod null;
 pub mod objects;
 
@@ -71,6 +74,7 @@ pub mod result {
     pub const ERROR_INITIALIZATION_FAILED: i32 = -3;
     pub const ERROR_LAYER_NOT_PRESENT: i32 = -6;
     pub const ERROR_EXTENSION_NOT_PRESENT: i32 = -7;
+    pub const ERROR_FORMAT_NOT_SUPPORTED: i32 = -11;
     pub const ERROR_INCOMPATIBLE_DRIVER: i32 = -9;
     pub const ERROR_UNKNOWN: i32 = -13;
 }
@@ -249,12 +253,15 @@ fn special(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Resul
         }
         cmd::vkCreateInstance => objects::create_instance(driver, w),
         cmd::vkCreateDevice => objects::create_device(driver, w),
-        cmd::vkDestroyInstance => plain(driver, index, w),
+        cmd::vkDestroyInstance => {
+            hostcopy::stop(w[0]);
+            plain(driver, index, w)
+        }
         cmd::vkDestroyDevice => {
             null::stop(driver, w[0]);
             plain(driver, index, w)
         }
-        cmd::vkGetPhysicalDeviceFeatures2 => {
+        cmd::vkGetPhysicalDeviceFeatures2 | cmd::vkGetPhysicalDeviceFeatures2KHR => {
             let r = plain(driver, index, w)?;
             null::features(driver, w[0], w[1]);
             Ok(r)
@@ -269,6 +276,9 @@ fn special(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Resul
         | cmd::vkCmdBindVertexBuffers2
         | cmd::vkCreateDescriptorUpdateTemplate
         | cmd::vkDestroyDescriptorUpdateTemplate => null::call(driver, index, w),
+        cmd::vkGetPhysicalDeviceImageFormatProperties
+        | cmd::vkGetPhysicalDeviceImageFormatProperties2
+        | cmd::vkGetPhysicalDeviceImageFormatProperties2KHR => hostcopy::query(driver, index, w),
         cmd::vkWaitForFences
         | cmd::vkWaitSemaphores
         | cmd::vkWaitSemaphoresKHR

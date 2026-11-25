@@ -177,6 +177,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &crate::vulkan::device::FILES,
         &crate::vulkan::null::DEVICES,
         &crate::vulkan::null::TEMPLATES,
+        &crate::vulkan::hostcopy::HELPERS,
     ]);
     v
 }

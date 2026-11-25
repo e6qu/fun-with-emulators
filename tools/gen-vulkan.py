@@ -184,6 +184,10 @@ HOST_SPECIAL = {
     "vkCmdBindVertexBuffers2",
     "vkCreateDescriptorUpdateTemplate",
     "vkDestroyDescriptorUpdateTemplate",
+    # Host image copy as the driver can back it (hostcopy.rs).
+    "vkGetPhysicalDeviceImageFormatProperties",
+    "vkGetPhysicalDeviceImageFormatProperties2",
+    "vkGetPhysicalDeviceImageFormatProperties2KHR",
 }
 
 # The device's interface, between the guest library and fwe (both written

@@ -1992,6 +1992,7 @@ numbers mean nothing there. fwe keeps its own:
   | the driver's descriptors and threads, in the process | the Mac driver's descriptors kept out of the guest's descriptor range; its threads take no signal of the guest's |
   | a swapchain of an X window (xcb, Xlib) | the Mac driver's swapchain of no window; each frame copied to the window with `xcb_put_image` |
   | robustness2's null descriptors | the Mac driver's, or stand-ins of fwe's where it has none (MoltenVK) |
+  | host image copy, as the driver's image format queries report it | offered for an image only as the Mac driver's memory requirements back it: MoltenVK's give a depth-stencil attachment with host transfer no memory type, so fwe reports that unsupported, and reports host transfer as costly where it moves an image out of private memory |
   | the device after `fork` | unusable in the child (macOS's libraries do not work there): its calls `ENODEV` until it calls `execve` |
 
 ### Time, scheduling and limits

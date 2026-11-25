@@ -1577,6 +1577,19 @@ command a program makes to the Mac's Vulkan driver in fwe's process.
   1×1 2D image's view), put in the place of every null handle a
   descriptor write, update template, push descriptor or vertex buffer
   binding has.
+- **Host image copy** (`VK_IMAGE_USAGE_HOST_TRANSFER_BIT`) is offered for
+  an image only as the driver's memory requirements back it
+  (`vulkan/hostcopy.rs`). MoltenVK takes the private memory type from an
+  image with host transfer, so a depth-stencil attachment with it has no
+  memory type and every other image moves to shared memory, while its
+  queries report host transfer as free; Zink adds host transfer wherever
+  a format offers it. fwe answers an image format query of host transfer
+  from `vkGetDeviceImageMemoryRequirements` on a device of its own for
+  the physical device (made as a program first asks, under the kernel
+  lock with the guest's range plugged, and destroyed with the instance):
+  no memory type makes the combination unsupported, and memory types
+  other than without host transfer make `optimalDeviceAccess` and
+  `identicalMemoryLayout` false, so Zink makes such images without it.
 - **MoltenVK on Apple's virtual machines' paravirtual GPU** (GitHub's
   macOS runners) draws nothing from a vertex or index buffer bound 64 KiB
   or more into a memory it made a Metal placement heap, as Zink binds an
