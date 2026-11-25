@@ -3,12 +3,11 @@
 `fwe` runs Linux programs built for arm64 on a Mac with Apple Silicon,
 without a Linux VM: the program's own code runs on the Mac's processor,
 and `fwe` plays the Linux kernel for it. This guide covers installing
-`fwe`, a Linux userland, running programs, Windows programs, programs
-with windows and containers, and what does not work.
+`fwe`, a Linux userland, running programs (Windows programs and programs
+with windows among them) and containers, and what does not work.
 
-CI runs the blocks marked as tested as they are written
-(`user_guide_recipes` in `crates/fwe/tests/guests.rs`); each is followed
-by its output.
+CI runs the blocks marked as tested as they are written, each followed by
+its output (`user_guide_recipes` in `crates/fwe/tests/guests.rs`).
 
 ## Installing
 
@@ -16,13 +15,13 @@ With Homebrew, from the project's repository as a tap:
 
 ```sh
 brew tap e6qu/fwe https://github.com/e6qu/fun-with-emulators
-brew install fwe          # the latest release
-brew install --HEAD fwe   # or the main branch
+brew install --HEAD fwe   # the main branch
 ```
 
 Homebrew builds `fwe` from source and signs it for this Mac with the
 entitlements it needs (the hypervisor, for programs that run in a VM; see
-[Programs linked below 4 GiB](#programs-linked-below-4-gib)).
+[Programs linked below 4 GiB](#programs-linked-below-4-gib)). Once a
+release is published, `brew install fwe` installs it instead.
 
 A release's archive on GitHub holds a signed `fwe`: unpack it and put
 `fwe` on your `PATH`. A release signed without a Developer ID is not
@@ -32,9 +31,11 @@ notarized, and macOS refuses to run it until its quarantine mark is gone:
 xattr -d com.apple.quarantine fwe
 ```
 
-From source, with Rust (rustup's, whose toolchain has `rust-lld`; with
-another, `FWE_LLD` names an `ld.lld`, as Homebrew's `lld` has) and the
-Xcode command line tools' `clang`, which build fwe's Linux Vulkan driver:
+From source, you need Rust 1.95 or later and the Xcode command line
+tools' `clang`, which builds fwe's Linux Vulkan driver. The driver is
+linked by the Rust toolchain's `rust-lld` (rustup's has it); with a
+toolchain that lacks it, set `FWE_LLD` to an `ld.lld`, such as Homebrew's
+`lld`.
 
 ```sh
 cargo build --release -p fwe
@@ -46,12 +47,12 @@ codesign --sign - --force --options runtime \
 
 Linux programs expect a Linux filesystem around them: their libraries,
 `/etc`, `/usr/bin`. `fwe --pull` makes one from a container image: it
-fetches the linux/arm64 variant from the image's registry (Docker Hub
+fetches the image's linux/arm64 variant from its registry (Docker Hub
 unless named otherwise) and unpacks it into a new directory. `--root`
 makes that directory the program's `/`.
 
-A program inside the root is named by its path on the Mac. The
-environment is passed on as it is, so give the program a Linux one with
+A program inside the root is named by its path on the Mac. `fwe` passes
+its environment on as it is, so give the program a Linux one with
 `env -i`, as a login would. This guide uses a shell function for it:
 
 ```sh
@@ -123,27 +124,27 @@ unpacked into a directory serves.
 - **Networking** uses the Mac's: a server listening on a port is
   reachable from the Mac on that port, and outgoing connections go out as
   the Mac's do.
-- **Files** outside the root are out of the program's reach; without
+- **Files** outside the root are out of the program's reach. Without
   `--root`, the program sees the Mac's filesystem as its own.
 
 ### Programs linked below 4 GiB
 
-macOS keeps the lowest 4 GiB of a process's address space for itself, so
-a program linked to load there (a non-PIE executable, such as Debian's
+macOS keeps the lowest 4 GiB of a process's address space for itself. A
+program linked to load there (a non-PIE executable, such as Debian's
 Python, GCC, clang and Go, or Alpine's SBCL) runs in a small VM instead,
-through Hypervisor.framework; `fwe` chooses the VM by itself, and
-`fwe --strace` says why. (A static program linked there with its
-relocations kept, `-Wl,--emit-relocs`, runs natively instead, moved above
-4 GiB.) The VM needs `fwe` signed with the hypervisor entitlement
-(Homebrew's and the releases' are) on a Mac that offers the hypervisor
-(`sysctl kern.hv_support` prints `1`); otherwise `fwe` says the program
+through Hypervisor.framework. `fwe` chooses the VM by itself, and
+`fwe --strace` says why. A static program linked there with its
+relocations kept (`-Wl,--emit-relocs`) runs natively, moved above 4 GiB.
+
+The VM needs `fwe` signed with the hypervisor entitlement (Homebrew's
+and the releases' are) on a Mac that offers the hypervisor
+(`sysctl kern.hv_support` prints `1`). Otherwise `fwe` says the program
 needs the hypervisor backend and exits with status 126. `fwe --vm` runs
 every program in the VM, for programs that need 4 KiB pages, such as
 Wine.
 
-The VM backend is tested only on a software stand-in for
-Hypervisor.framework, since CI's machines offer no hypervisor
-([roadmap](../ROADMAP.md)).
+CI's machines offer no hypervisor, so the VM backend is tested only on a
+software stand-in for Hypervisor.framework ([roadmap](../ROADMAP.md)).
 
 ### Windows programs
 
@@ -157,8 +158,9 @@ env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/
 ```
 
 CI's `wine` job runs `guests/windows/winprog.c` (built with
-`zig cc -target aarch64-windows-gnu`) this way. Programs with windows
-draw through an X server, as Linux's do (below).
+`zig cc -target aarch64-windows-gnu`) this way. Windows programs with
+windows draw through Wine's X11 driver, in the VM, given `DISPLAY` as
+Linux programs are (below).
 
 ### Programs with windows
 
@@ -174,22 +176,23 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
   "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/xterm -fa monospace
 ```
 
-Images go to the server through shared memory (MIT-SHM) where the
-server takes it by descriptor (MIT-SHM 1.2, as Xvfb's does). X11
-clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way, and OpenGL
-through Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`) on a server
-with GLX (Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
-has: start it, and give its programs `DISPLAY=:N` inside, as `sh -c
-'DISPLAY=:1 exec glxgears'`). Windows programs draw through Wine's X11
-driver, in the VM, with `DISPLAY` set the same way.
+X11 clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way. Images go
+to the server through shared memory (MIT-SHM) where the server takes it
+by descriptor (MIT-SHM 1.2, as Xvfb's does). OpenGL on the CPU, through
+Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`), needs a server
+with GLX. Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
+has: start it, and give its programs its display inside, as
+`sh -c 'DISPLAY=:1 exec glxgears'`.
 
-Vulkan programs draw on the Mac's GPU through fwe's own Linux Vulkan
-driver, which fwe puts where a Linux Vulkan loader looks
-(`/etc/vulkan/icd.d`) once the Mac has a Vulkan driver: MoltenVK
-(`brew install molten-vk`), or KosmicKrisp (Homebrew's `mesa`, macOS 26
-and an Apple GPU), which fwe takes first. OpenGL programs use the GPU
-through Mesa's Zink. `VK_DRIVER_FILES` makes fwe's driver the only one a
-program sees (a userland's Mesa drivers draw on the CPU):
+Vulkan programs run natively draw on the Mac's GPU through fwe's own Linux Vulkan
+driver. Once the Mac has a Vulkan driver, fwe puts its own where a Linux
+Vulkan loader looks (`/etc/vulkan/icd.d`) and passes each Vulkan command
+to the Mac's driver. That is KosmicKrisp (Homebrew's `mesa`, on macOS 26
+with an Apple GPU) if installed, else MoltenVK (`brew install
+molten-vk`); `FWE_VULKAN_DRIVER`, in fwe's environment, names another
+driver's manifest. OpenGL programs use the GPU through Mesa's Zink.
+`VK_DRIVER_FILES` makes fwe's driver the only one a program sees (a
+userland's Mesa drivers draw on the CPU):
 
 ```sh
 brew install molten-vk
@@ -199,13 +202,13 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
   "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/vkcube --wsi xcb
 ```
 
-(`MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the GPU, with
-`LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.)
+`MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the GPU, with
+`LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.
 
-CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
-`xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
-against Alpine's, and `vkcube` and glxgears on the runner's GPU, driving
-each with keys and the pointer and checking what it draws.
+CI's `display` job runs `xeyes`, `xclock`, `xterm`, tkinter, PyQt6, GTK's
+demos and Wine's Notepad against Homebrew's Xvfb, glxgears against
+Alpine's, and `vkcube` and glxgears on the runner's GPU. It drives each
+with keys and the pointer and checks what it draws.
 
 ## Containers
 
@@ -239,9 +242,9 @@ hello from a container
 - `--network=none`: a container gets loopback only; a new network
   namespace has nothing else (see below).
 - podman also builds images, pushes and pulls them, and runs rootless as
-  another user, and Docker Engine (`dockerd` with `--bridge=none
-  --iptables=false --storage-driver=overlay2`) runs, builds and composes
-  containers; CI's `podman` and `docker` jobs run them.
+  another user. Docker Engine (`dockerd --bridge=none --iptables=false
+  --ip6tables=false --storage-driver=overlay2`) runs, builds and composes
+  containers. CI's `podman` and `docker` jobs run them.
 
 ## Seeing what a program does
 
@@ -263,8 +266,8 @@ that lacks it, and `--strace` names it.
 - **io_uring** and **fanotify**: refused, and programs fall back to
   ordinary calls and inotify.
 - **Linux's devices and drivers**: no `/dev/kvm`, FUSE or kernel
-  modules, and of GPUs only fwe's (Vulkan through fwe's driver, its
-  windows X11's); files live on the Mac's filesystem, so disk filesystems
+  modules. The only GPU is fwe's (Vulkan through fwe's driver, its
+  windows X11's). Files live on the Mac's filesystem, so disk filesystems
   (ext4, btrfs) and block devices are not there.
 - **Resource limits of cgroups** but the process count: accepted, not
   enforced.
@@ -273,16 +276,17 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **The GPU after `fork`**: a forked child has no GPU (its Vulkan calls
-  fail) until it runs a program with `execve`.
+- **The GPU in the VM, or after `fork`**: a program in the VM has no
+  GPU, nor does a child forked from a process that used it (its Vulkan
+  calls fail) until it runs a program with `execve`.
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are
   the Mac's.
 - **More than 16384 open descriptors** in one process.
-- The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10);
-  where `fwe` differs from Linux in detail is in the
-  [architecture's known limitations](architecture.md#known-limitations).
+The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10);
+where `fwe` differs from Linux in detail is in the
+[architecture's known limitations](architecture.md#known-limitations).
 
 ## Troubleshooting
 
