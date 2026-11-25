@@ -2708,7 +2708,8 @@ and fail with `ENOSYS`, noted under `--strace`, in both backends:
   `move_pages`), `rseq`, `rseq_slice_yield`, `memfd_secret`,
   `map_shadow_stack`: as on a kernel built without them, which
   `/proc/config.gz` says fwe's is for io_uring, perf events, fanotify,
-  userfaultfd, modules, rseq and time namespaces;
+  userfaultfd, modules, rseq, NUMA (so there is no
+  `/sys/devices/system/node`), `memfd_secret` and time namespaces;
 - `lookup_dcookie`, `nfsservctl`: `ENOSYS` on every Linux;
 - `open_tree_attr`, `listns`: Linux has them in every configuration.
 

@@ -255,6 +255,8 @@ CONFIG_CRYPTO_HMAC=y
 # CONFIG_USERFAULTFD is not set
 # CONFIG_TIME_NS is not set
 # CONFIG_RSEQ is not set
+# CONFIG_NUMA is not set
+# CONFIG_SECRETMEM is not set
 ";
 
 /// [`CONFIG`], gzipped as `/proc/config.gz` is (in stored blocks: the
