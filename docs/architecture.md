@@ -554,7 +554,13 @@ is a host `fork` with the kernel's locks held:
 
 A re-exec carries its state the same way (`Kernel::exec_state`); what
 crosses is listed under
-[linux-on-macos.md](linux-on-macos.md#execve).
+[linux-on-macos.md](linux-on-macos.md#execve). Of the descriptor
+registries it carries only the descriptors without close-on-exec, which
+the host's `execve` keeps; fwe's own descriptors behind them (an
+eventfd's pipe and counter, a signalfd's pipe end) are cleared of the
+flag for it and marked again in the new program, and the kqueues it
+closes (epoll sets, timerfds, process descriptors) are made again at
+their numbers, an epoll set's duplicates too.
 
 ### Process records and the process store
 
@@ -1325,7 +1331,11 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
 - **epoll** (`crates/kernel/src/epoll.rs`): `epoll_ctl` checks as Linux
   does, in its order (`EBADF`, `EPERM` for a regular file or directory,
   `EINVAL`, `ELOOP` for loops and nesting past Linux's limit, `EEXIST`,
-  `ENOENT`). A mounts file (`/proc/<pid>/mounts`, `mountinfo`) reports
+  `ENOENT`). A duplicate of an epoll descriptor is the same set: the
+  tables know a set by one open number of it, which each duplicate maps
+  to (`ALIASES`); closing that number hands the set to a duplicate's, and
+  a fork child gets its duplicates again. A mounts file
+  (`/proc/<pid>/mounts`, `mountinfo`) reports
   `POLLERR | POLLPRI` once its namespace's mounts changed since it was
   opened or last polled (`crates/kernel/src/mountwatch.rs`: the namespace
   record's generation, checked in slices).
@@ -1833,8 +1843,8 @@ mark what holds in one backend only.
 - Native: a thread inside fwe's code during a `fork` (in a system call) is
   not stopped, so a write it makes to guest memory then (a `read`
   completing) might or might not reach the child.
-- In a fork child an epoll or timerfd descriptor duplicated with `dup` is
-  gone (only the original number is rebuilt); a timerfd's expiries are
+- In a fork child a timerfd descriptor duplicated with `dup` is gone
+  (only the original number is rebuilt); a timerfd's expiries are
   counted for parent and child apart; the signals moved onto signalfds
   are the child's own copy while the signalfds' readiness pipes are
   shared.

@@ -1270,7 +1270,7 @@ flowchart TD
 |---|---|
 | pid, descriptors without `O_CLOEXEC`, signal mask, pending host signals, ignored dispositions | the host keeps them across its own exec; signals fwe held pending that the guest blocks are moved onto the host first |
 | handled dispositions | reset to default, as on Linux |
-| credentials, capabilities, `RLIMIT_NOFILE`, fwe's own rlimits, umask, mount namespace and root, mount origins of open files, seccomp filters, `no_new_privs`, personality, inotify and namespace descriptors | in place: kept in the process; re-exec: encoded in `--exec-state` |
+| credentials, capabilities, `RLIMIT_NOFILE`, fwe's own rlimits, umask, mount namespace and root, mount origins of open files, seccomp filters, `no_new_privs`, personality; inotify, namespace, process, epoll, eventfd, timerfd and signalfd descriptors without `O_CLOEXEC`, and the signals a signalfd took | in place: kept in the process; re-exec: encoded in `--exec-state` |
 | saved set-user/group ids | become the effective ones, as on Linux |
 | thread and process keyrings | dropped; the session keyring stays |
 | a program run from a descriptor (`execveat(fd, "", AT_EMPTY_PATH)`) | the descriptor kept and passed on with `--exe-fd` |
@@ -1558,7 +1558,9 @@ once), and the first read of a signalfd watching it takes it.
 A host `fork` child gets no kqueues and an `execve` closes them, so epoll
 interest lists, timerfd settings and process descriptors are recorded and
 rebuilt at the same numbers in the child and across a re-executing
-`execve`.
+`execve`, an epoll set's duplicates too. A duplicate of an epoll
+descriptor names the same kqueue on the host, and fwe treats it as the
+same set, as Linux does.
 
 ### IPC
 

@@ -104,11 +104,12 @@ impl<T: Send + Sync + 'static> ForkLock for ForkRwLock<T> {
 /// The locks, as [`hold`] takes them.
 fn locks() -> Vec<&'static dyn ForkLock> {
     use crate::*;
-    let mut v: Vec<&'static dyn ForkLock> = Vec::with_capacity(58);
+    let mut v: Vec<&'static dyn ForkLock> = Vec::with_capacity(59);
     // The host's kqueue behind `epoll` (macOS).
     #[cfg(not(target_os = "linux"))]
     v.extend([
         &epoll::INTEREST as &'static dyn ForkLock,
+        &epoll::ALIASES,
         &epoll::BPF_WATCHED,
         &epoll::EDGES,
         &epoll::ALWAYS,

@@ -2215,6 +2215,45 @@ fn an_exclusive_epoll_wake_reaches_one_waiter() {
     c_guest_prints("epollx", &[], "each write woke one waiter: yes\n");
 }
 
+/// Descriptors without `O_CLOEXEC` keep working across `execve`
+/// (guests/c/execkeep.c): an epoll set and its duplicate, a timerfd that
+/// expired meanwhile, an eventfd's count, a signalfd with its blocked
+/// signal pending; loaded in place, and with a
+/// second thread alive, so fwe re-executes itself. Linux prints the same.
+#[test]
+fn event_descriptors_survive_execve() {
+    let want = "after execve: epoll sees 42, its duplicate 42; timerfd 8 bytes, 1 expiry; \
+                eventfd 8 bytes, count 5; signalfd 128 bytes, signal 10\n";
+    c_guest_prints("execkeep", &[], want);
+    c_guest_prints("execkeep", &["threaded"], want);
+}
+
+/// A duplicated epoll descriptor is the same set (guests/c/epolldup.c), as
+/// Tokio's registry clones it: what is added through either number is
+/// reported through the other, `EEXIST` for an entry added through the
+/// other, the set kept while any number holds it; a fork child's two
+/// numbers are one set too. Linux prints the same.
+#[test]
+fn a_duplicated_epoll_descriptor_is_the_same_set() {
+    let line = |how: &str| {
+        format!(
+            "{how}: add through it 0, seen through the original 7; add through the original 0, \
+             again through it errno 17, seen through it 8; original closed, add 0, seen 9\n"
+        )
+    };
+    c_guest_prints(
+        "epolldup",
+        &[],
+        &[
+            line("dup"),
+            line("dup3"),
+            line("F_DUPFD_CLOEXEC"),
+            "fork child: inherited 5 through the copy, added through the original, seen 6\n".into(),
+        ]
+        .concat(),
+    );
+}
+
 /// `SIGURG` a process blocks and reads through a signalfd, sent by another
 /// process as the receiver starts each wait (PostgreSQL's latches), is read
 /// every time: never left blocked on the host by fwe's look for signals

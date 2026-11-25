@@ -221,7 +221,6 @@ pub(crate) fn read_queue(d: &mut Dec) -> VecDeque<[u8; crate::signalfd::SIGINFO_
 }
 
 /// Whether descriptor `fd` is close-on-exec.
-#[cfg(not(target_os = "linux"))]
 pub(crate) fn cloexec(fd: i32) -> bool {
     // SAFETY: F_GETFD only queries the descriptor.
     let f = unsafe { libc::fcntl(fd, libc::F_GETFD) };

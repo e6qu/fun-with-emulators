@@ -1038,8 +1038,13 @@ impl<P: Platform> Kernel<P> {
         nsfd::save(&mut e);
         mqueue::save(&mut e);
         filestore::desc::save(&mut e);
-        // Process descriptors, which the host exec closes (kqueues).
+        // Process descriptors, eventfds, timerfds, signalfds and epoll
+        // sets, which the host exec closes (kqueues) or fwe alone knows;
+        // the others before the sets that might watch them.
         pidfd::save(&mut e);
+        specialfd::save_exec(&mut e);
+        signalfd::save_exec(&mut e);
+        epoll::save_exec(&mut e);
         // The parent-death signal, whose watch the exec ends.
         pdeath::save(&mut e);
         // The message queues' descriptors the exec closes: their
@@ -1095,6 +1100,9 @@ impl<P: Platform> Kernel<P> {
         mqueue::load(&mut d);
         filestore::desc::load(&mut d);
         pidfd::restore(&mut d, true);
+        specialfd::restore(&mut d);
+        signalfd::restore(&mut d);
+        epoll::restore(&mut d);
         pdeath::restore(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();

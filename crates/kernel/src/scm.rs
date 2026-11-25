@@ -455,8 +455,14 @@ fn import(kind: u8, fd: i32, state: &[u8], companions: Vec<i32>) -> bool {
 pub(crate) fn replace(slot: i32, made: i32) -> bool {
     // SAFETY: plain host calls on descriptors this process holds.
     unsafe {
+        // `dup2` clears close-on-exec; the slot keeps the flag it was
+        // received with (`MSG_CMSG_CLOEXEC`).
+        let flags = libc::fcntl(slot, libc::F_GETFD);
         let r = libc::dup2(made, slot);
         libc::close(made);
+        if r == slot && flags > 0 {
+            libc::fcntl(slot, libc::F_SETFD, flags);
+        }
         r == slot
     }
 }

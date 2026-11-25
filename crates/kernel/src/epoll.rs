@@ -18,6 +18,12 @@
 //! interest list is also recorded here ([`save`], [`restore`]): a fork
 //! child rebuilds its epoll descriptors from it.
 //!
+//! A duplicate of an epoll descriptor (`dup`, `dup3`, `F_DUPFD`) is the
+//! same set, as on Linux (Tokio's registry clones it so): the host's
+//! duplicate names the same kqueue, and the tables here know a set by one
+//! live number of it, which each duplicate maps to ([`ALIASES`]); when that
+//! number is closed and duplicates remain, the set takes one of theirs.
+//!
 //! `epoll_event` arrays are copied in and out of guest memory. The arm64
 //! layout is `{ u32 events; u64 data; }`, not packed as on x86-64: `data`
 //! sits at offset 8 and the stride is 16 bytes.
@@ -36,6 +42,34 @@ fn interest<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Interest>) -> 
     f(g.get_or_insert_with(Default::default))
 }
 
+/// Each duplicate of an epoll descriptor, as (its number, the number the
+/// tables know its set by), which is always open.
+#[cfg(not(target_os = "linux"))]
+pub(crate) static ALIASES: crate::kept::Kept<Vec<(i32, i32)>> = crate::kept::Kept::new(Vec::new());
+
+/// The number the tables know the set descriptor `fd` names by: `fd`
+/// itself unless it is a duplicate.
+#[cfg(not(target_os = "linux"))]
+fn set_of(fd: i32) -> i32 {
+    ALIASES.if_used().and_then(|a| a.iter().find(|k| k.0 == fd).map(|k| k.1)).unwrap_or(fd)
+}
+
+/// Descriptor `new` is a duplicate of `old`: if `old` names an epoll set,
+/// so does `new`.
+pub fn duplicated(old: i32, new: i32) {
+    #[cfg(target_os = "linux")]
+    let _ = (old, new);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let set = set_of(old);
+        if set != new && is_epoll(set) {
+            let mut a = ALIASES.lock();
+            a.retain(|k| k.0 != new);
+            a.push((new, set));
+        }
+    }
+}
+
 /// Whether descriptor `tfd` is in the interest list of epoll descriptor
 /// `efd` (`None`: `efd` is no epoll descriptor of this process's).
 pub fn watches(efd: i32, tfd: i32) -> Option<bool> {
@@ -45,16 +79,33 @@ pub fn watches(efd: i32, tfd: i32) -> Option<bool> {
         None
     }
     #[cfg(not(target_os = "linux"))]
-    interest(|m| m.get(&efd).map(|list| list.contains_key(&tfd)))
+    {
+        let efd = set_of(efd);
+        interest(|m| m.get(&efd).map(|list| list.contains_key(&tfd)))
+    }
 }
 
 /// Descriptor `fd` is being closed: it leaves every interest list (as the
-/// kqueue drops its filters), and if it is an epoll descriptor, its list goes.
+/// kqueue drops its filters), and if it is an epoll descriptor, its list
+/// goes, unless a duplicate of it remains: then the set goes on under that
+/// one's number.
 pub fn closed(fd: i32) {
     #[cfg(target_os = "linux")]
     let _ = fd;
     #[cfg(not(target_os = "linux"))]
     {
+        if let Some(mut a) = ALIASES.if_used() {
+            let duplicate = a.iter().any(|k| k.0 == fd);
+            a.retain(|k| k.0 != fd);
+            if !duplicate && let Some(heir) = a.iter().filter(|k| k.1 == fd).map(|k| k.0).min() {
+                a.retain(|k| k.0 != heir);
+                for k in a.iter_mut().filter(|k| k.1 == fd) {
+                    k.1 = heir;
+                }
+                drop(a);
+                renumber(fd, heir);
+            }
+        }
         if let Some(mut g) = INTEREST.if_used()
             && let Some(m) = g.as_mut()
         {
@@ -94,14 +145,85 @@ pub fn closed(fd: i32) {
     }
 }
 
+/// The set known by number `from` is known by `to` from now on, in every
+/// table (`from` is being closed; `to` is a duplicate of it).
+#[cfg(not(target_os = "linux"))]
+fn renumber(from: i32, to: i32) {
+    interest(|m| {
+        if let Some(list) = m.remove(&from) {
+            m.insert(to, list);
+        }
+    });
+    for k in EDGES.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in HELD.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in WRITES.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in BPF_WATCHED.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in ALWAYS.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+}
+
 /// Write the interest lists into a fork snapshot.
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     #[cfg(target_os = "linux")]
     e.u64(0);
     #[cfg(not(target_os = "linux"))]
     {
-        let mut g = INTEREST.lock();
-        let m = g.get_or_insert_with(Default::default);
+        let lists = interest(|m| m.clone());
+        let aliases = ALIASES.lock().clone();
+        write(e, &lists, &aliases);
+    }
+}
+
+/// Write into an exec state the sets an `execve` that re-executes fwe
+/// keeps (the host's closes every kqueue), for [`restore`] in the new
+/// program: each set with a number without close-on-exec, under that
+/// number, and only the descriptors it watches that survive too, as the
+/// ones the exec closes leave Linux's sets.
+pub(crate) fn save_exec(e: &mut crate::snapshot::Enc) {
+    #[cfg(target_os = "linux")]
+    e.u64(0);
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: F_GETFD only queries the descriptor.
+        let survives = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
+        let all = interest(|m| m.clone());
+        let aliases = ALIASES.lock().clone();
+        let (mut lists, mut kept) = (std::collections::HashMap::new(), Vec::new());
+        for (&set, list) in &all {
+            let mut numbers: Vec<i32> = std::iter::once(set)
+                .chain(aliases.iter().filter(|k| k.1 == set).map(|k| k.0))
+                .filter(|&fd| survives(fd))
+                .collect();
+            numbers.sort();
+            let Some(&first) = numbers.first() else { continue };
+            let named = if numbers.contains(&set) { set } else { first };
+            let list: Interest =
+                list.iter().filter(|&(&fd, _)| survives(fd)).map(|(&k, &v)| (k, v)).collect();
+            lists.insert(named, list);
+            kept.extend(numbers.into_iter().filter(|&fd| fd != named).map(|fd| (fd, named)));
+        }
+        write(e, &lists, &kept);
+    }
+}
+
+/// Write interest lists `m` and duplicates `aliases`, as [`restore`] reads
+/// them.
+#[cfg(not(target_os = "linux"))]
+fn write(
+    e: &mut crate::snapshot::Enc,
+    m: &std::collections::HashMap<i32, Interest>,
+    aliases: &[(i32, i32)],
+) {
+    {
         let mut eps: Vec<&i32> = m.keys().collect();
         eps.sort();
         let ce: Vec<bool> = eps.iter().map(|&&fd| crate::snapshot::cloexec(fd)).collect();
@@ -116,12 +238,19 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 e.u32(events);
                 e.u64(data);
             }
-        })
+        });
+        e.u64(aliases.len() as u64);
+        for &(fd, set) in aliases {
+            e.i32(fd);
+            e.i32(set);
+            e.bool(crate::snapshot::cloexec(fd));
+        }
     }
 }
 
-/// Rebuild every epoll descriptor in a fork child: a fresh kqueue at its
-/// number, with its interest list registered again.
+/// Rebuild every epoll descriptor in a fork child, or in the program an
+/// exec started ([`save_exec`]): a fresh kqueue at its number, with its
+/// interest list registered again, and its duplicates.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -148,6 +277,25 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
             .filter(|&(epfd, c)| crate::snapshot::fresh_kqueue_at(epfd, c))
             .map(|(epfd, _)| epfd)
             .collect();
+        // Each duplicate of a set made here, at its number.
+        let n = d.count(9);
+        let aliases: Vec<(i32, i32, bool)> = (0..n).map(|_| (d.i32(), d.i32(), d.bool())).collect();
+        let mut kept = Vec::new();
+        for &(fd, set, cloexec) in &aliases {
+            // SAFETY: plain host calls on descriptors this process owns; a
+            // number already open is not ours to replace.
+            let made = fresh.contains(&set)
+                && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0
+                && unsafe { libc::dup2(set, fd) } == fd;
+            if made {
+                // SAFETY: as above.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, if cloexec { libc::FD_CLOEXEC } else { 0 })
+                };
+                kept.push((fd, set));
+            }
+        }
+        *ALIASES.lock() = kept;
         // Nested epoll descriptors exist by now, whatever the order.
         for epfd in fresh {
             for (&fd, &(events, data)) in &lists[&epfd] {
@@ -231,8 +379,10 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         let entry = if op == EPOLL_CTL_DEL { None } else { Some(crate::guest!(read_event(event))) };
         // As Linux checks, in its order: both descriptors, whether the
         // target can be watched (a file or directory is always ready, so
-        // it cannot), whether the set is one, nesting, then the entry.
-        let (ep, target) = (epfd as i32, fd as i32);
+        // it cannot), whether the set is one, nesting, then the entry. A
+        // duplicate of a set is the set.
+        let (ep, target) = (set_of(epfd as i32), fd as i32);
+        let epfd = ep as u64;
         // SAFETY: plain host call; F_GETFD only queries.
         if unsafe { libc::fcntl(ep, libc::F_GETFD) } < 0 {
             return err(errno::EBADF);
@@ -260,7 +410,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         {
             return err(errno::EPERM);
         }
-        if ep == target || !is_epoll(ep) {
+        if ep == set_of(target) || !is_epoll(ep) {
             return err(errno::EINVAL);
         }
         // `EPOLLEXCLUSIVE`: only when adding, not of a set, and with no
@@ -273,7 +423,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
                 return err(errno::EINVAL);
             }
         }
-        if op == EPOLL_CTL_ADD && is_epoll(target) && nesting_refused(ep, target) {
+        if op == EPOLL_CTL_ADD && is_epoll(target) && nesting_refused(ep, set_of(target)) {
             return err(errno::ELOOP);
         }
         let listed = interest(|m| m.get(&ep).and_then(|l| l.get(&target)).map(|&(ev, _)| ev));
@@ -339,10 +489,11 @@ fn bpf_watched(ep: i32, fd: i32) -> bool {
     BPF_WATCHED.lock().contains(&(ep, fd))
 }
 
-/// Whether `fd` is an epoll descriptor.
+/// Whether `fd` is an epoll descriptor (a duplicate of one too).
 #[cfg(not(target_os = "linux"))]
 pub fn is_epoll(fd: i32) -> bool {
-    interest(|m| m.contains_key(&fd))
+    let set = set_of(fd);
+    interest(|m| m.contains_key(&set))
 }
 
 /// The most epoll descriptors one path of nested sets can pass through
@@ -355,7 +506,15 @@ const MAX_NESTS: usize = 4;
 /// (`ELOOP`).
 #[cfg(not(target_os = "linux"))]
 fn nesting_refused(ep: i32, target: i32) -> bool {
+    // A list names a set by whichever number of it was added.
+    let aliases: Vec<(i32, i32)> = ALIASES.if_used().map(|a| a.clone()).unwrap_or_default();
+    let set_of = |fd: i32| aliases.iter().find(|k| k.0 == fd).map_or(fd, |k| k.1);
     interest(|m| {
+        let m: std::collections::HashMap<i32, Interest> = m
+            .iter()
+            .map(|(&ep, list)| (ep, list.iter().map(|(&fd, &v)| (set_of(fd), v)).collect()))
+            .collect();
+        let m = &m;
         // The longest path of sets below `from`; `None` if it reaches `ep`.
         fn down(
             m: &std::collections::HashMap<i32, Interest>,
@@ -469,6 +628,8 @@ unsafe fn pwait_ns(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
         if !is_epoll(epfd as i32) {
             return fwe_abi::err(fwe_abi::errno::EINVAL);
         }
+        // A duplicate waits on its set, under the set's number.
+        let epfd = set_of(epfd as i32) as u64;
         // SAFETY: the caller guarantees `events` spans `maxevents` entries.
         unsafe { pwait_kqueue(epfd, events, maxevents, ns) }
     }
@@ -1422,14 +1583,16 @@ mod tests {
     }
 
     /// A fork child rebuilds an epoll descriptor it did not inherit (a
-    /// kqueue) from the recorded interest list, at the same number. The
-    /// test uses a high number of its own, so tests running alongside never
-    /// open a descriptor there, and restores only its own record.
+    /// kqueue) from the recorded interest list, at the same number, and a
+    /// duplicate of it at its number, the same set. The test uses high
+    /// numbers of its own, so tests running alongside never open a
+    /// descriptor there, and restores only its own records.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn interest_list_survives_a_rebuild() {
         let _turn = turn();
         const EP: i32 = 900;
+        const COPY: i32 = 901;
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1442,6 +1605,9 @@ mod tests {
             libc::fcntl(EP, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         interest(|m| m.insert(EP, Interest::new()));
+        // SAFETY: plain host call on the kqueue.
+        assert_eq!(unsafe { libc::dup2(EP, COPY) }, COPY);
+        duplicated(EP, COPY);
         let reg = event(EPOLLIN, 77);
         // SAFETY: a valid event pointer.
         let r = unsafe { ctl(EP as u64, EPOLL_CTL_ADD, fds[0] as u64, &reg as *const _ as u64) };
@@ -1459,9 +1625,16 @@ mod tests {
                 e.u64(data);
             }
         });
-        // As in a child: the kqueue is gone.
+        e.u64(1);
+        e.i32(COPY);
+        e.i32(EP);
+        e.bool(false);
+        // As in a child: the kqueue is gone, under both numbers.
         // SAFETY: closing the kqueue behind the record.
-        unsafe { libc::close(EP) };
+        unsafe {
+            libc::close(EP);
+            libc::close(COPY);
+        }
         let bytes = e.into_bytes();
         let mut d = crate::snapshot::Dec::new(&bytes);
         restore(&mut d);
@@ -1474,10 +1647,18 @@ mod tests {
         // SAFETY: room for one event.
         assert_eq!(unsafe { pwait(EP as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
         assert_eq!(data(&got[0]), 77);
+        // The duplicate is the same set, which outlives the first number.
         closed(EP);
+        // SAFETY: plain host call.
+        unsafe { libc::close(EP) };
+        let mut got = [event(0, 0); 1];
+        // SAFETY: room for one event.
+        assert_eq!(unsafe { pwait(COPY as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
+        assert_eq!(data(&got[0]), 77);
+        closed(COPY);
         // SAFETY: plain host cleanup.
         unsafe {
-            libc::close(EP);
+            libc::close(COPY);
             libc::close(fds[0]);
             libc::close(fds[1]);
         }

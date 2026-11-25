@@ -645,6 +645,7 @@ pub fn forget_closed() {
 
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
+    crate::epoll::duplicated(old, new);
     crate::fdstate::duplicated(old, new);
     crate::sockstate::duplicated(old, new);
     crate::procfile::duplicated(old, new);

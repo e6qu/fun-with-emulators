@@ -304,11 +304,24 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     #[cfg(target_os = "linux")]
     e.u64(0);
     #[cfg(not(target_os = "linux"))]
-    imp::save(e)
+    imp::save(e, false)
 }
 
-/// Rebuild the registry in a fork child from [`save`]'s record: eventfd pipes
-/// are inherited as they are; each timerfd gets a fresh kqueue at its number,
+/// Write into an exec state what of the registry an `execve` that
+/// re-executes fwe keeps, for [`restore`] in the new program: the
+/// descriptors without close-on-exec, each eventfd's pipe and counter
+/// (fwe's own descriptors, made to survive the host's `execve`), and each
+/// timerfd's schedule (its kqueue the host closes).
+pub(crate) fn save_exec(e: &mut crate::snapshot::Enc) {
+    #[cfg(target_os = "linux")]
+    e.u64(0);
+    #[cfg(not(target_os = "linux"))]
+    imp::save(e, true)
+}
+
+/// Rebuild the registry in a fork child from [`save`]'s record, or in the
+/// program an exec started from [`save_exec`]'s: eventfd pipes are
+/// inherited as they are; each timerfd gets a fresh kqueue at its number,
 /// armed for what was left of its time.
 #[cfg_attr(
     target_os = "macos",
@@ -507,11 +520,29 @@ mod imp {
         t.tv_sec.saturating_mul(1_000_000_000) + t.tv_nsec
     }
 
-    pub(super) fn save(e: &mut crate::snapshot::Enc) {
+    pub(super) fn save(e: &mut crate::snapshot::Enc, exec: bool) {
         let mut g = REG.lock();
-        let m = g.get_or_insert_with(HashMap::new);
+        let all = g.get_or_insert_with(HashMap::new);
+        // An exec keeps the descriptors without close-on-exec, and the
+        // companions of each kept eventfd, cleared of the flag for the host
+        // `execve` (set again as the registry is restored).
+        let m: HashMap<i32, &Special> = all
+            .iter()
+            .filter(|&(&fd, _)| !exec || !crate::snapshot::cloexec(fd))
+            .map(|(&fd, s)| (fd, s))
+            .collect();
+        if exec {
+            for s in m.values() {
+                if let Special::Event(ev) = s {
+                    for fd in [ev.wfd, ev.mfd] {
+                        // SAFETY: plain host call on fwe's own descriptor.
+                        unsafe { libc::fcntl(fd, libc::F_SETFD, 0) };
+                    }
+                }
+            }
+        }
         {
-            crate::snapshot::fd_map(e, m, |e, s| match s {
+            crate::snapshot::fd_map(e, &m, |e, s| match s {
                 Special::Event(ev) => {
                     e.u8(0);
                     e.i32(ev.rfd);
@@ -554,6 +585,11 @@ mod imp {
                         .load(std::sync::atomic::Ordering::SeqCst)
                         == MAGIC;
                 let shared = if inherited { at } else { map_shared(mfd).unwrap_or(at) };
+                // fwe's own, out of a program's reach across its `execve`.
+                for fd in [wfd, mfd] {
+                    // SAFETY: plain host call on fwe's own descriptor.
+                    unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+                }
                 Special::Event(EventFd {
                     rfd,
                     wfd,
@@ -833,9 +869,10 @@ mod imp {
         if kq < 0 {
             return last_error();
         }
-        if flags & TFD_CLOEXEC != 0 {
-            set_cloexec(kq);
-        }
+        // The host makes a kqueue close-on-exec; the guest's flag decides.
+        let cloexec = if flags & TFD_CLOEXEC != 0 { libc::FD_CLOEXEC } else { 0 };
+        // SAFETY: plain host call on the descriptor just made.
+        unsafe { libc::fcntl(kq, libc::F_SETFD, cloexec) };
         with_reg(|m| {
             m.insert(
                 kq,
