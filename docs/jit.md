@@ -33,10 +33,20 @@ So fwe changes nothing in that memory and never lets the host run it.
 Memory the program makes executable after mapping it (`mprotect` adding
 `PROT_EXEC`), maps writable and executable at once, or maps from a file
 shared and open for writing (a memfd a JIT maps twice) is mapped on the
-host readable and never executable. Only code that runs is decoded,
-following the program's control flow, so nothing has to tell code from
-data. Rosetta 2 and DynamoRIO run code generated at run time the same
-way.
+host readable and never executable. Code executable already and never
+writable since, made executable again (glibc's dynamic linker adds
+`PROT_BTI` so to every object built for BTI), is unchanged and runs as
+it did. Only code that runs is decoded, following the program's control
+flow, so nothing has to tell code from data. Rosetta 2 and DynamoRIO run
+code generated at run time the same way.
+
+Code fwe prepared that comes to run by translation (made writable and
+executable again, as a text relocation does, or a page of an image no
+stub space reaches) is read as the program wrote it: a site's branch to
+its stub is read as the site's own instruction (`prepare::original`),
+and the pages no stub space reaches hold the program's words again. The
+records of the sites go with the memory when it is unmapped or mapped
+anew.
 
 ## How it runs
 
@@ -573,7 +583,7 @@ In CI, each against what Linux prints:
   and in a fork child, translations kept between runs, with the memory
   reading back as written.
 - **Programs that treat code as text:** a quine and IOCCC winners.
-- **Runtimes:** Node.js 18 (Debian) and 24 (Alpine), OpenJDK 25
+- **Runtimes:** Node.js 20 (Debian) and 24 (Alpine), OpenJDK 25
   (Alpine; [linux-on-macos.md](linux-on-macos.md#java-and-the-jvm)),
   LuaJIT, Racket, GNU Guile and Python's `eval` (Alpine). Alpine's SBCL
   is linked low and runs in the VM, its code as it is.

@@ -1544,6 +1544,45 @@ fn jit_code_using_x18_computes_as_with_another_register() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// The program's own code made executable again (with `PROT_BTI` where
+/// the CPU has BTI), as glibc's dynamic linker does to every object built
+/// for BTI (Debian 13's), runs as it did, prepared, not by translation
+/// (guests/c/textprotect.c).
+#[test]
+fn code_made_executable_again_with_bti_runs_as_prepared() {
+    let prog = build_c("textprotect", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "textprotect-bti");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).arg("bti").env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "before: 41\nmprotect: 0\nafter: 41 1000000\n", "{stderr}");
+    assert!(!stderr.contains("blocks translated"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The program's own code made writable, then executable again, runs by
+/// translation, which reads it as the program wrote it: an instruction
+/// writing `x18` there is the program's, not fwe's branch to its stub, so
+/// `x16`, live across it, keeps its value (guests/c/textprotect.c).
+#[test]
+fn code_made_writable_then_executable_runs_as_written() {
+    let prog = build_c("textprotect", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "textprotect-rewritten");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).arg("rewritten");
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "before: 41\nmprotect: 0\nafter: 41 1000000\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Self-modifying code (guests/c/selfmod.c): an instruction overwritten by
 /// the code just before it, a loop rewriting an instruction of its own
 /// body on every pass, and a function of the program's own text made

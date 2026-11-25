@@ -194,8 +194,11 @@ pub mod mman {
     pub const PROT_READ: u64 = 1;
     pub const PROT_WRITE: u64 = 2;
     pub const PROT_EXEC: u64 = 4;
+    pub const PROT_SEM: u64 = 8;
     pub const PROT_BTI: u64 = 0x10;
     pub const PROT_MTE: u64 = 0x20;
+    pub const PROT_GROWSDOWN: u64 = 0x0100_0000;
+    pub const PROT_GROWSUP: u64 = 0x0200_0000;
 
     pub const MAP_SHARED: u64 = 0x01;
     pub const MAP_PRIVATE: u64 = 0x02;

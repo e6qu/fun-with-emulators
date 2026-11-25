@@ -26,7 +26,8 @@ pub struct Prepared {
     /// Host pages (address, length) of a loaded image holding sites no
     /// stub space reaches: the middle of an image larger than a branch
     /// reaches across, all of it the image's own. Their code is to run by
-    /// translation ([`crate::jit::code`]); their other sites have stubs.
+    /// translation ([`crate::jit::code`]), and they hold the program's own
+    /// words: none of their sites leads to a stub.
     pub beyond: Vec<(u64, u64)>,
 }
 
@@ -289,6 +290,19 @@ pub fn reset() {
     SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     CALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
+}
+
+/// `[addr, addr + len)` is unmapped or mapped anew: the sites noted there
+/// go, so the words a later mapping holds there are taken as they are
+/// ([`original`]).
+pub fn forget(addr: u64, len: u64) {
+    fn gone<V>(m: &mut std::collections::BTreeMap<u64, V>, addr: u64, end: u64) {
+        let mut tail = m.split_off(&addr);
+        m.append(&mut tail.split_off(&end));
+    }
+    let end = addr.saturating_add(len);
+    gone(&mut SITES.lock().unwrap_or_else(|e| e.into_inner()), addr, end);
+    gone(&mut CALL_SITES.lock().unwrap_or_else(|e| e.into_inner()), addr, end);
 }
 
 /// The stub region holding `pc`, if any: (start, end).
@@ -579,6 +593,24 @@ pub unsafe fn prepare(
             Some((a, l)) if *a + *l == p => *l += host_page,
             _ => stats.beyond.push((p, host_page)),
         }
+    }
+    // Those pages run by translation, which reads them as code made at run
+    // time: each word as it is. So they hold the program's own words again,
+    // the sites on them that took stubs (a branch to a stub, taken for a
+    // branch elsewhere, would leave the function with `x16` and `x17` as
+    // the procedure call standard leaves them at a call: clobbered) and the
+    // system calls made traps alike.
+    if !stats.beyond.is_empty() {
+        let translated = |at: u64| stats.beyond.iter().any(|&(a, l)| (a..a + l).contains(&at));
+        for &(off, orig, _) in &patched.noted {
+            if translated(start + off) {
+                // SAFETY: a word of the range, writable (the caller's
+                // guarantee).
+                unsafe { ((start + off) as *mut u32).write(orig) };
+            }
+        }
+        let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
+        sites.retain(|&at, _| !translated(at));
     }
     if let Some(d) = defer {
         // The pages earlier runs wrote as they first ran are written now,

@@ -155,11 +155,11 @@ flowchart TD
 
 | Binary | Example | Backend |
 |---|---|---|
-| dynamic PIE | Debian's `bash`, `git`, coreutils, Node.js | native |
+| dynamic PIE | Debian's `bash`, `git`, coreutils, Node.js, clang | native |
 | static PIE | `musl-gcc -static-pie`, Rust's `+crt-static` with PIE | native |
 | static non-PIE linked at or above 4 GiB | fwe's test guests, linked at 1 TiB (`--image-base=0x10000000000`) | native |
 | static non-PIE linked below 4 GiB, relocations kept (`--emit-relocs`) | fwe's `lowlinked` test guest, at `0x200000` | native, moved |
-| non-PIE linked below 4 GiB, dynamic | Debian's `python3.11`, GCC and clang, at `0x400000` | VM |
+| non-PIE linked below 4 GiB, dynamic | Debian's `python3.13` and GCC, at `0x400000` | VM |
 | non-PIE linked below 4 GiB, static, no relocations kept | static Go programs at `0x10000`; fwe's `rust-low` test guests | VM |
 
 "Low-linked" in this documentation and the tests means the last two rows:
@@ -290,19 +290,19 @@ for a well-known property only.
 | native, little rewriting | Debian's coreutils, bash, git, SQLite, lighttpd, apt (tested) | dynamic PIEs against glibc: the program, `ld-linux` and each library scanned once, then prepared from fwe's record; the rewrites are system calls and thread-pointer accesses |
 | native, Go built as PIE | Alpine's podman (building, pushing, pulling, rootless), containerd and Docker with BuildKit and Compose (tested) | Alpine builds its Go programs as PIEs ([How distributions build their programs](#how-distributions-build-their-programs)); Debian's podman, containerd and runc are non-PIE and need the VM |
 | native, C with musl | Alpine's crun, busybox (tested) | musl PIEs; crun runs its sealed copy from a memfd through `execveat` |
-| native, many libraries | Debian's `cargo` and `rustc` with its LLVM library (tested) | a large dynamic PIE: a few very large libraries, each page's rewrites written only when it first runs |
-| native, JIT | Debian's Node.js 18 with V8 (tested) | V8's generated code run by translation, its memory untouched; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
-| native, JIT | Alpine's Node.js 24 with a current V8 (tested) | the same workload as Node.js 18's: V8's tiers, its compiled regular expressions and WebAssembly, deoptimization, run by translation |
+| native, many libraries | Debian's `cargo` and `rustc` with its LLVM library, and clang 19 with LLVM's (tested) | large dynamic PIEs: a few very large libraries, each page's rewrites written only when it first runs |
+| native, JIT | Debian's Node.js 20 with V8 (tested) | V8's generated code run by translation, its memory untouched; OpenSSL's assembly keeps constant tables among its code, which the unwind-table rule leaves alone |
+| native, JIT | Alpine's Node.js 24 with a current V8 (tested) | the same workload as Node.js 20's: V8's tiers, its compiled regular expressions and WebAssembly, deoptimization, run by translation |
 | native, JIT | Alpine's LuaJIT 2.1 (tested) | its trace compiler's code run by translation; compiled code calling C through its FFI, and C (`qsort`) calling back into Lua |
 | native, compiling as they run | Alpine's Racket 9 (Chez Scheme), GNU Guile 3.0 (tested) | each compiles to machine code as it runs (`eval`, compiled from text, Guile's JIT), run by translation; Racket's heap holds data on the pages of its code, which `read` writes into |
 | native, interpreters making code | Alpine's Python 3.14, Debian's SQLite (tested) | Python's `eval`, `exec` and `compile` make bytecode from text as it runs, and SQLite compiles each statement into a program for its virtual machine; neither makes machine code, so all of it runs as prepared code |
 | native, programs that change themselves | self-modifying code, code on the stack, a program changing and running a copy of its executable, quines, IOCCC winners (tested) | code made executable at run time runs by translation, a translation ending at each `isb`; the IOCCC's entries are fetched from the contest's repository and built as old C |
 | native, JIT | Alpine's OpenJDK 25 with HotSpot (tested) | its compilers' code run by translation, `x18` included, its code cache untouched; see [Java](#java-and-the-jvm) |
 | VM, compiling as it runs | Alpine's SBCL 2.6 (tested) | non-PIE at `0x400000`; compiles each form to machine code as it runs (`compile`, redefinitions, CLOS dispatch), which the VM runs as it is |
-| VM, interpreter | Debian's Python 3.11 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
-| VM, compilers | Debian's GCC 12 (`gcc`, `cc1`, `collect2`) and clang 14 (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
-| VM, Go toolchain | Debian's Go 1.19: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
-| VM, container engine | Debian's podman 4.3 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
+| VM, interpreter | Debian's Python 3.13 (tested) | non-PIE at `0x400000`; its C extension modules loaded as they are |
+| VM, compilers | Debian's GCC 14 (`gcc`, `cc1`, `collect2`) (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
+| VM, Go toolchain | Debian's Go 1.24: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
+| VM, container engine | Debian's podman 5.4 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
 | fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a call into fwe's gate natively, a VM exit in the VM |
 | uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub (in code made executable at run time, its translation's expansion); in the VM `x18` is the guest's own |
@@ -357,7 +357,7 @@ in the VM), and a `tgkill` is posted to that thread and the thread woken
 ([Sending a signal](#sending-a-signal)), which in the VM stops its vCPU
 even in a loop with no system calls.
 
-Debian's Go 1.19 toolchain and the static executables it builds by
+Debian's Go 1.24 toolchain and the static executables it builds by
 default are linked low and run in the VM (tested: `go` builds, runs and
 tests a module with goroutines; it starts its tools with `vfork`). Go
 programs built as PIEs, as Alpine builds podman, containerd and Docker,
@@ -366,7 +366,7 @@ run natively (tested).
 ### Python and other interpreters
 
 An interpreter is an ordinary program to fwe; its scripts are data.
-Debian's Python 3.11 is linked non-PIE at `0x400000` and runs in the VM;
+Debian's Python 3.13 is linked non-PIE at `0x400000` and runs in the VM;
 its test covers C extension modules, threads, sockets, asyncio, `ctypes`
 and libffi closures, signals, `fork`, `subprocess` and a process pool
 sharing POSIX semaphores through `/dev/shm`. A Python built as a PIE runs
@@ -374,7 +374,7 @@ natively, as bash does.
 
 ### Node.js and V8
 
-Debian's Node.js 18 is a dynamic PIE and runs natively (tested: V8's JIT
+Debian's Node.js 20 is a dynamic PIE and runs natively (tested: V8's JIT
 on a hot function, ICU, OpenSSL digests, zlib, timers and promises, a
 child process, an HTTP server and client, and a worker thread). V8's
 generated code runs by translation, its code pages untouched
@@ -608,7 +608,10 @@ patches and copies code there as it runs, and keeps its data beside it.
 Natively it runs by translation into fwe's code cache, the program's
 memory never changed and never executable on the host; the instructions
 above are expanded in the translations, and the program's `ic ivau`
-flushes tell fwe which code changed ([jit.md](jit.md)).
+flushes tell fwe which code changed ([jit.md](jit.md)). Code executable
+already and unwritten since, made executable again, is not new: glibc's
+dynamic linker does so to every object built for BTI (adding
+`PROT_BTI`), and that code runs as prepared.
 
 ### CTR_EL0: emulated when it traps
 
@@ -1025,7 +1028,7 @@ and the per-call differences are in [Address-space layout](#address-space-layout
 | Calls | What fwe does | Host call(s) |
 |---|---|---|
 | `mmap` | Linux's argument checks, then mapped and recorded; executable mappings are mapped writable, their code prepared, then given the asked protections ([The mmap family](#the-mmap-family)). | native: `mmap`, `mprotect`; VM: none (slab and stage 1; a `MAP_SHARED` segment is a host `mmap`) |
-| `munmap`, `mprotect` | Refused on sealed memory (`EPERM`); natively, translations of memory unmapped or reprotected are dropped. | native: `munmap`, `mprotect`; VM: stage-1 edit and TLB flush |
+| `munmap`, `mprotect` | Refused on sealed memory (`EPERM`); `mprotect` takes the protection bits Linux's arm64 takes (read, write, execute, `PROT_SEM`, `PROT_BTI` where BTI is reported; `PROT_GROWSDOWN` from the start of a grows-down mapping; `EINVAL` otherwise); natively, translations of memory unmapped or reprotected are dropped. | native: `munmap`, `mprotect`; VM: stage-1 edit and TLB flush |
 | `mremap` | Linux's checks, then shrink, grow in place, or move. | native: `mmap`, `mach_vm_remap`; VM: stage-1 edit |
 | `brk` | Grows and shrinks inside a reservation made after the image at load. | native: `mmap` (`MAP_FIXED`) in the reservation; VM: stage-1 edit |
 | `madvise` | Advice and each mapping checked as Linux checks them, then as [The mmap family](#the-mmap-family) lists; `MADV_HWPOISON`/`SOFT_OFFLINE` need `CAP_SYS_ADMIN`. | native: `mmap` (fresh pages), `madvise`, `mprotect`; VM: slab edit |
@@ -1600,10 +1603,14 @@ its vCPU's `TPIDR_EL0` (VM). The stubs are under
   `SCTLR_EL1` where the vCPUs offer it and reports `PACA` and `PACG`, with
   random keys per program, a thread's from its creator, a fork child's
   from its parent, new ones for `PR_PAC_RESET_KEYS`.
-- **BTI:** reported in `AT_HWCAP2` where the host has it. In the VM, code
-  of a program built for BTI is mapped guarded (`PROT_BTI`) where Linux
-  maps it so, a signal handler is entered as if by `blr`, and a
-  branch-target exception is `SIGILL`.
+- **BTI:** reported in `AT_HWCAP2` where the host has it, and `mprotect`
+  takes `PROT_BTI` where it is reported (`EINVAL` elsewhere, as Linux's
+  `arch_validate_prot` gives; `PROT_MTE` always). Natively the guard is
+  not enforced, and code made executable again with it (as glibc's
+  dynamic linker does to every object built for BTI) runs as prepared.
+  In the VM, code of a program built for BTI is mapped guarded
+  (`PROT_BTI`) where Linux maps it so, a signal handler is entered as if
+  by `blr`, and a branch-target exception is `SIGILL`.
 
 #### auxv, hwcaps and the vDSO
 
@@ -1749,7 +1756,7 @@ them out on the slab and the guest's page tables:
 | `MAP_SHARED` | shared pages | host `MAP_SHARED`; an executable shared file mapping is made private, since its code is rewritten, but one of a file open for writing (a memfd a JIT maps twice) stays shared and runs by translation | a *segment*: a host shared mapping outside the slab (anonymous shared memory is a host shared memory object with no name), mapped into the VM once |
 | `MAP_FIXED`, `MAP_FIXED_NOREPLACE` | replace / refuse to replace | host `MAP_FIXED`; `NOREPLACE` checks where macOS put it (`EEXIST`) | page-table edit; slab memory at its own address is reused, zeroed |
 | `munmap` | | host `munmap` | pages removed from stage 1, TLBs flushed; the slab range zeroed before reuse |
-| `mprotect` | | host `mprotect`; memory made executable runs by translation, never executable on the host ([Write+exec memory](#writeexec-memory)) | stage-1 permission edit |
+| `mprotect` | | host `mprotect`; memory made executable runs by translation, never executable on the host, but code executable already and unwritten since stays as prepared ([Write+exec memory](#writeexec-memory)) | stage-1 permission edit |
 | `mremap` | grow, shrink, move | shrink; grow in place where the space after it is free (a file mapping with the file's next part, the file reached by its name, or for a file with no name through the descriptor its mapping holds); move with `mach_vm_remap`, which takes the pages, contents and sharing along, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` included; code is not grown or moved (`ENOMEM`) | private memory: shrink, grow in place, or move with `MREMAP_MAYMOVE`; a shared segment cannot grow (`ENOMEM`); no `MREMAP_FIXED`/`MREMAP_DONTUNMAP` (`EINVAL`) |
 | `madvise(MADV_DONTNEED)` | private anonymous pages read as zero again | each private anonymous piece replaced by a fresh mapping (macOS's own keeps the data); a private file mapping keeps its modified pages | private pages read as zero again, or as the file for a private file mapping; shared memory keeps its contents |
 | `madvise` other advice | hints; `MADV_FREE`, `MADV_WIPEONFORK` | hints passed to the host, never failing for mapped memory; advice and mappings checked as Linux checks them; `MADV_WIPEONFORK` ranges zeroed in a fork child | advice and mappings checked as natively, nothing more: no hint reaches the host, `MADV_FREE` frees nothing, a fork child keeps `MADV_WIPEONFORK` memory, `MADV_DONTDUMP` changes no core |

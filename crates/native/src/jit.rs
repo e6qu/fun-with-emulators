@@ -3758,8 +3758,10 @@ impl Calls {
 }
 
 /// The instructions of the block at program address `g`, translated into
-/// `a` (the block placed at `t`); `followed`, code fwe prepared in place
-/// (a library's), read as the program wrote it ([`Body`]).
+/// `a` (the block placed at `t`), each read as the program wrote it
+/// ([`crate::prepare::original`]: code fwe prepared holds its own words at
+/// sites); `followed`, code fwe prepared that runs in place (a library's)
+/// ([`Body`]).
 ///
 /// The program's `x16` and `x17` stay in their slots, where the way in
 /// left them (if `saved`), until an instruction needs them
@@ -3795,7 +3797,7 @@ fn body_of(
     // it: a way out holding it enters there past the load, and a loop
     // that keeps a value in it loads it from its slot only once.
     let mut x18_entry = None;
-    if saved && uses_x18_first(g, followed) {
+    if saved && uses_x18_first(g) {
         load_x18(g, a);
         x18 = Some(false);
         x18_entry = Some(a.len(H));
@@ -3821,7 +3823,7 @@ fn body_of(
         // Where its words begin, and as what, for a conditional branch of
         // the block's to come to.
         c.entries.push((pc, a.len(H), saved, x18.is_some()));
-        let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
+        let w = crate::prepare::original(pc, read(pc));
         // A call (`bl`, `blr`) is made once, with one way back after its
         // `bl` where its return comes ([`RETS`]): where it is made already,
         // in another block's words or in this one's made the other way, the
@@ -3873,7 +3875,7 @@ fn body_of(
         // held in `x17` there.
         let call_at = (call && first).then_some((a.len(H), saved, x18.is_some()));
         if crate::decode::may_name_x18(w) && quiet.is_none() {
-            quiet = Some(overwritten_after(g, followed));
+            quiet = Some(overwritten_after(g));
         }
         let quiet_here = quiet.as_ref().map_or(0, |q| q[((pc - g) / 4) as usize]);
         // `bl`, `blr`
@@ -3988,11 +3990,11 @@ struct Body {
 
 /// Whether the block at `g` names `x18` before it restores the program's
 /// `x16` and `x17` or branches ([`body_of`]).
-fn uses_x18_first(g: u64, followed: bool) -> bool {
+fn uses_x18_first(g: u64) -> bool {
     let page = page_size();
     let mut pc = g;
     for _ in 0..BLOCK_INSNS {
-        let w = if followed { crate::prepare::original(pc, read(pc)) } else { read(pc) };
+        let w = crate::prepare::original(pc, read(pc));
         if in_x17(w).is_some() {
             return true;
         }
@@ -4252,13 +4254,13 @@ fn x18_beside(w: u32, quiet: u32) -> Option<(Vec<u32>, usize)> {
 /// another branch or an instruction [`crate::decode::operands`] does not
 /// know: scratch registers whose values nothing soon waits for. Each
 /// instruction is decoded once, the masks made from the last back.
-fn overwritten_after(g: u64, followed: bool) -> Vec<u32> {
+fn overwritten_after(g: u64) -> Vec<u32> {
     let page = page_size();
     let n = (BLOCK_INSNS + 16).min((((g | (page - 1)) + 1 - g) / 4) as usize);
     // What each instruction reads and writes, or none where the way on
     // stops.
     let effect = |at: u64| -> Option<(u32, u32)> {
-        let w = if followed { crate::prepare::original(at, read(at)) } else { read(at) };
+        let w = crate::prepare::original(at, read(at));
         if w & 0xff00_0000 == 0x5400_0000
             || w & 0xffff_f01f == 0xd503_201f
             || w & 0xffff_f01f == 0xd503_301f

@@ -4404,6 +4404,42 @@ mod tests {
     /// A fixed mapping below `vm.mmap_min_addr` is refused (`EPERM`) to a
     /// caller without `CAP_SYS_RAWIO`, as is a move there; a hint there is
     /// only a hint.
+    /// `mprotect` takes the protection bits Linux's arm64 takes: read,
+    /// write, execute and `PROT_SEM`, and those the CPU offers (none here:
+    /// `PROT_BTI` and `PROT_MTE` are `EINVAL`), `PROT_GROWSDOWN` only on a
+    /// grows-down mapping, `PROT_GROWSUP` never.
+    #[test]
+    fn mprotect_takes_the_protection_bits_linux_does() {
+        use fwe_abi::mman::*;
+        let _g = mapping_lock();
+        let mut k = kernel();
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let len = 0x4000;
+        let p = k.syscall(nr::MMAP, [0, len, PROT_READ | PROT_WRITE, anon, u64::MAX, 0]) as u64;
+        let protect =
+            |k: &mut Kernel<TestPlatform>, prot| k.syscall(nr::MPROTECT, [p, len, prot, 0, 0, 0]);
+        assert_eq!(protect(&mut k, PROT_READ | PROT_SEM), 0);
+        for prot in [
+            PROT_READ | PROT_EXEC | PROT_BTI,
+            PROT_READ | PROT_MTE,
+            PROT_READ | 0x40,
+            PROT_READ | PROT_GROWSUP,
+            PROT_READ | PROT_GROWSDOWN | PROT_GROWSUP,
+            PROT_READ | PROT_GROWSDOWN,
+        ] {
+            assert_eq!(protect(&mut k, prot), err(errno::EINVAL), "{prot:#x}");
+        }
+        assert_eq!(k.syscall(nr::MUNMAP, [p, len, 0, 0, 0, 0]), 0);
+        // A grows-down mapping of two pages: its top page asked for, the
+        // whole of it from its start given.
+        let rw = PROT_READ | PROT_WRITE;
+        let g = k.syscall(nr::MMAP, [0, 2 * len, rw, anon | MAP_GROWSDOWN, u64::MAX, 0]) as u64;
+        assert_eq!(k.syscall(nr::MPROTECT, [g + len, len, PROT_READ | PROT_GROWSDOWN, 0, 0, 0]), 0);
+        let areas = crate::maps::record().areas_in(g, g + 2 * len);
+        assert!(areas.iter().all(|a| a.value.prot == PROT_READ), "{areas:?}");
+        assert_eq!(k.syscall(nr::MUNMAP, [g, 2 * len, 0, 0, 0, 0]), 0);
+    }
+
     #[test]
     fn fixed_mappings_below_mmap_min_addr_need_rawio() {
         use fwe_abi::mman::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};

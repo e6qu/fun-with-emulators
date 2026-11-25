@@ -397,6 +397,22 @@ impl Record {
         self.areas.overlapping(start, start + len).any(|p| p.value.noexec)
     }
 
+    /// Whether every page of `[start, start + len)` is mapped executable
+    /// and not writable: code as it was when made executable, unwritten
+    /// since.
+    pub fn all_code(&self, start: u64, len: u64) -> bool {
+        let mut at = start;
+        for p in self.areas.pieces(start, start + len) {
+            if p.start > at
+                || p.value.prot & (mman::PROT_EXEC | mman::PROT_WRITE) != mman::PROT_EXEC
+            {
+                return false;
+            }
+            at = p.end;
+        }
+        at >= start + len
+    }
+
     pub fn protected(&mut self, start: u64, len: u64, prot: u64) {
         self.areas.update(start, start + len, |a| Area { prot, ..a.clone() });
     }

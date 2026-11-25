@@ -208,6 +208,14 @@ impl Platform for NativePlatform {
         let _ = (addr, len);
     }
 
+    fn cpu_prot(&self) -> u64 {
+        if hwcap::detect().1 & fwe_abi::hwcap2::BTI != 0 { fwe_abi::mman::PROT_BTI } else { 0 }
+    }
+
+    fn code_gone(&mut self, addr: u64, len: u64) {
+        prepare::forget(addr, len);
+    }
+
     fn jit_changed(&mut self, addr: u64, len: u64) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         return jit::changed(addr, len);

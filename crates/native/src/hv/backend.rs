@@ -45,6 +45,10 @@ impl Platform for HvPlatform {
         }
     }
 
+    fn cpu_prot(&self) -> u64 {
+        if vm::features().bti { fwe_abi::mman::PROT_BTI } else { 0 }
+    }
+
     fn prepare_exec(
         &mut self,
         _addr: u64,

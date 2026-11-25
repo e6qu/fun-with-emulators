@@ -2015,6 +2015,37 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        // As Linux checks them: `PROT_GROWSDOWN` takes the range down to
+        // the start of the grows-down mapping it is in, `PROT_GROWSUP`
+        // finds no grows-up mapping on arm64, and the other bits are those
+        // the CPU offers.
+        let grows = prot & (mman::PROT_GROWSDOWN | mman::PROT_GROWSUP);
+        let prot = prot & !grows;
+        let supported = mman::PROT_READ
+            | mman::PROT_WRITE
+            | mman::PROT_EXEC
+            | mman::PROT_SEM
+            | self.platform.cpu_prot();
+        if grows == mman::PROT_GROWSDOWN | mman::PROT_GROWSUP
+            || grows == mman::PROT_GROWSUP
+            || prot & !supported != 0
+        {
+            return err(errno::EINVAL);
+        }
+        let (addr, len) = if grows == mman::PROT_GROWSDOWN {
+            let end = addr.saturating_add(self.page_up(len));
+            let start = lock_ranges()
+                .grows_down
+                .range(..=addr)
+                .next_back()
+                .and_then(|(&s, &e)| (e > addr).then_some(s));
+            match start {
+                Some(s) => (s, end - s),
+                None => return err(errno::EINVAL),
+            }
+        } else {
+            (addr, len)
+        };
         if self.sealed(addr, len) {
             return err(errno::EPERM);
         }
@@ -2117,6 +2148,10 @@ impl<P: Platform> Kernel<P> {
         }
         if r >= 0 {
             crate::maps::publish();
+            // What was there moved (or the old range was emptied).
+            if r as u64 != old {
+                self.platform.code_gone(crate::uaccess::g2h(old), self.page_up(old_len));
+            }
             // Code a JIT moved: translated anew from where it is now.
             if self.platform.translates_jit() {
                 let moved =
@@ -2584,6 +2619,7 @@ impl<P: Platform> Kernel<P> {
             // sets its own).
             self.platform.unmap_guest(addr, self.page_up(len));
             let _ = self.platform.jit_changed(haddr, self.page_up(len));
+            self.platform.code_gone(haddr, self.page_up(len));
         }
         let mut retried = false;
         let guest = 'map: loop {
@@ -2764,6 +2800,7 @@ impl<P: Platform> Kernel<P> {
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
         let _ = self.platform.jit_changed(addr, self.page_up(len));
+        self.platform.code_gone(addr, self.page_up(len));
         crate::lazycode::unmapped(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
@@ -2858,11 +2895,19 @@ impl<P: Platform> Kernel<P> {
             }
         }
         // Code a JIT makes executable runs by translation where the backend
-        // translates it: never executable on the host, nothing written.
+        // translates it: never executable on the host, nothing written. Not
+        // code executable already and unwritten since, made executable
+        // again (glibc's dynamic linker adds `PROT_BTI` to every object
+        // built for it so): it runs as it did, as prepared.
+        let unchanged = prot & (mman::PROT_EXEC | mman::PROT_WRITE) == mman::PROT_EXEC
+            && crate::maps::record().all_code(addr, self.page_up(len));
         let translated = self.platform.translates_jit();
-        if translated {
-            let _ = self.platform.jit_changed(a as u64, self.page_up(len));
-        }
+        let translated = if translated {
+            let held = self.platform.jit_changed(a as u64, self.page_up(len));
+            held || !unchanged
+        } else {
+            false
+        };
         // (Readable: fwe reads the code to translate it.)
         let host = if translated && prot & mman::PROT_EXEC != 0 {
             (final_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ

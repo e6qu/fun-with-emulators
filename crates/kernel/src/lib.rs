@@ -269,6 +269,17 @@ pub trait Platform {
         false
     }
 
+    /// The protection bits beyond read, write, execute and `PROT_SEM` that
+    /// the CPU the guest is given offers (arm64 Linux's
+    /// `arch_validate_prot`): `PROT_BTI` where `AT_HWCAP2` reports BTI.
+    fn cpu_prot(&self) -> u64 {
+        0
+    }
+
+    /// `[addr, addr + len)` (host addresses) is unmapped, or mapped anew:
+    /// what the backend knows of code it prepared there goes with it.
+    fn code_gone(&mut self, _addr: u64, _len: u64) {}
+
     /// `[addr, addr + len)` (host addresses) was just mapped or given
     /// other protections, and the record of mappings says so: a mapping
     /// of a file's pages code was translated from is noted as theirs (an
