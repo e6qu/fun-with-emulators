@@ -1,5 +1,10 @@
 # Plan
 
+What fwe is for, how it gets there, what it covers, what 1.0 means, the
+principles the work follows and how progress is measured. What is done
+and the pull requests left are in [ROADMAP.md](ROADMAP.md); how the work
+is delivered is in [AGENTS.md](AGENTS.md).
+
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
 "OPTIONAL" in this document are to be interpreted as described in BCP 14
@@ -12,17 +17,18 @@ Unmodified Linux arm64 programs on macOS (Apple Silicon), without a Linux
 kernel and faster than a Linux VM on the same Mac: command-line programs
 and toolchains, language runtimes and their JIT compilers, container
 engines and their images, graphical programs, Windows programs through
-Linux's Wine, and gVisor's sandbox. fwe is written in Rust.
+Linux's Wine, and gVisor's sandbox.
 
 ## Approach
 
 fwe implements Linux's user-space ABI on macOS, as Wine implements
 Windows' and WSL1 implemented Linux's on Windows. A program's code runs
-directly on the CPU inside an `fwe` process; its system calls go to fwe's
-kernel layer: processes, threads, memory, files, signals, networking,
+directly on the CPU inside an `fwe` process, one per Linux process; its
+system calls go to fwe's kernel layer: processes, threads, memory, files, signals, networking,
 namespaces and cgroups, with fwe's own `/proc`, `/sys` and `/dev`.
 
 Two backends share that layer:
+
 - **Native**, in-process: every position-independent program, and
   executables whose link kept their relocations, moved above the 4 GiB
   macOS reserves.
@@ -31,7 +37,7 @@ Two backends share that layer:
   4 KiB pages.
 
 A VM running a Linux kernel is a non-goal.
-[docs/architecture.md](docs/architecture.md) describes each part.
+[docs/architecture.md](docs/architecture.md) describes how each part works.
 
 ## Scope
 
@@ -47,7 +53,8 @@ drivers, and x86 binaries (Linux or Windows).
 
 ## 1.0
 
-Reached when, as [ROADMAP.md](ROADMAP.md) defines them:
+Reached when, as [ROADMAP.md](ROADMAP.md)'s pull requests define them:
+
 - the target programs (git, compilers, Node, Go, Rust, apt, a database, a
   web server, a JDK) run unmodified, those in the VM on real hardware;
 - Docker, Podman and containerd build and run images, rootless Podman
@@ -78,7 +85,7 @@ Reached when, as [ROADMAP.md](ROADMAP.md) defines them:
   does its work in fwe (in the process's memory, or memory every fwe
   process maps) or hands it to macOS (a host call or a host object). Both
   are valid; the mechanism's documentation MUST say which it uses, and its
-  tests and benchmarks decided it. What Linux keeps in kernel memory MUST
+  tests and benchmarks decide which. What Linux keeps in kernel memory MUST
   stay in memory, not in files on disk.
 - **Skip work before speeding it up:** work kept between runs and shared
   between processes, work done only when needed, answers from fwe's own
@@ -106,5 +113,3 @@ Reached when, as [ROADMAP.md](ROADMAP.md) defines them:
 - **Instrumentation:** fwe counts its own work (`FWE_TIMING`, the
   translator's counts in [docs/jit.md](docs/jit.md#what-it-costs)), and
   the benchmarks profile each workload in CI.
-
-[AGENTS.md](AGENTS.md) describes how work is delivered.

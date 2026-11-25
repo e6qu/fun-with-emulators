@@ -4,10 +4,11 @@
 without a Linux VM: the program's own code runs on the Mac's processor,
 and `fwe` plays the Linux kernel for it. This guide covers installing
 `fwe`, a Linux userland, running programs (Windows programs and programs
-with windows among them) and containers, and what does not work.
-
-CI runs the blocks marked as tested as they are written, each followed by
-its output (`user_guide_recipes` in `crates/fwe/tests/guests.rs`).
+with windows among them) and containers, and what does not work. How
+`fwe` maps each Linux feature onto macOS is in
+[linux-on-macos.md](linux-on-macos.md). CI runs the recipes marked as
+tested exactly as written and checks the output shown after each
+(`user_guide_recipes` in `crates/fwe/tests/guests.rs`).
 
 The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
@@ -17,7 +18,9 @@ when, and only when, they appear in all capitals, as shown here.
 
 ## Installing
 
-With Homebrew, from the project's repository as a tap:
+### With Homebrew
+
+From the project's repository as a tap:
 
 ```sh
 brew tap e6qu/fwe https://github.com/e6qu/fun-with-emulators
@@ -25,9 +28,11 @@ brew install --HEAD fwe   # the main branch
 ```
 
 Homebrew builds `fwe` from source and signs it for this Mac with the
-entitlements it needs (the hypervisor, for programs that run in a VM; see
-[Programs linked below 4 GiB](#programs-linked-below-4-gib)). Once a
-release is published, `brew install fwe` installs it instead.
+entitlements it needs (the hypervisor's, for programs that run in a VM;
+see [Programs linked below 4 GiB](#programs-linked-below-4-gib)). Once a
+release is published, `brew install fwe` installs that instead.
+
+### From a release
 
 A release's archive on GitHub holds a signed `fwe`: unpack it and put
 `fwe` on your `PATH`. A release signed without a Developer ID is not
@@ -38,11 +43,13 @@ mark, so the mark MUST be removed first:
 xattr -d com.apple.quarantine fwe
 ```
 
-Building from source REQUIRES Rust 1.95 or later and the Xcode command
-line tools' `clang`, which builds fwe's Linux Vulkan driver. The driver
-is linked by the Rust toolchain's `rust-lld` (rustup's has it); with a
+### From source
+
+Building REQUIRES Rust 1.95 or later and the Xcode command line tools'
+`clang`, which builds fwe's Linux Vulkan driver. The Rust toolchain's
+`rust-lld` links the driver (rustup's toolchains have it); with a
 toolchain that lacks it, `FWE_LLD` MUST name an `ld.lld`, such as
-Homebrew's `lld`.
+Homebrew's `lld`. Then build and sign `fwe` with the entitlements:
 
 ```sh
 cargo build --release -p fwe
@@ -53,15 +60,15 @@ codesign --sign - --force --options runtime \
 ## A Linux userland
 
 Linux programs expect a Linux filesystem around them: their libraries,
-`/etc`, `/usr/bin`. `fwe --pull` makes one from a container image: it
-fetches the image's linux/arm64 variant from its registry (Docker Hub
-unless named otherwise) and unpacks it into a new directory. `--root`
-makes that directory the program's `/`.
+`/etc`, `/usr/bin`. `fwe --pull IMAGE DIR` makes one from a container
+image: it fetches the image's linux/arm64 variant from its registry
+(Docker Hub unless named otherwise) and unpacks it into `DIR`, a new or
+empty directory. `--root DIR` makes that directory the program's `/`.
 
 A program inside the root MUST be named by its path on the Mac. `fwe`
 passes its environment on as it is, so the program SHOULD be given a
 Linux one with `env -i`, as a login would. This guide uses a shell
-function for it:
+function for both:
 
 ```sh
 # linux ROOT PROGRAM [ARGS...]: run PROGRAM (a path in ROOT) with ROOT as /.
@@ -95,19 +102,19 @@ git version
 
 For an interactive shell: `linux ~/debian /bin/bash -l`.
 
-What `--pull` does beyond unpacking:
+Beyond unpacking, `--pull`:
 
-- Files owned by users other than root, and set-ID programs (`su`,
-  `passwd`), keep their owners and modes as Linux programs see them, in
+- keeps the owners and modes of files owned by users other than root,
+  and of set-ID programs (`su`, `passwd`), as Linux programs see them, in
   extended attributes `fwe` reads. The guest sees your own files as
-  root's, and runs as root unless it changes user.
-- `/etc/resolv.conf` is written with your Mac's current name servers,
-  and `/etc/hosts` where the image has none, as a container runtime does
-  at a container's start.
-- On a case-insensitive volume (macOS's default), a file whose name
-  differs from another's only in case cannot be kept: `--pull` leaves the
-  later one out and lists it. Debian's image has one such file, a manual
-  page. On a case-sensitive APFS volume nothing is left out:
+  root's, and runs as root unless it changes user;
+- writes `/etc/resolv.conf` with your Mac's current name servers, and
+  `/etc/hosts` where the image has none, as a container runtime does at a
+  container's start;
+- on a case-insensitive volume (macOS's default), leaves out and lists a
+  file whose name differs from another's only in case, which cannot be
+  kept there. Debian's image has one such file, a manual page. On a
+  case-sensitive APFS volume nothing is left out:
 
   ```sh
   hdiutil create -size 20g -fs 'Case-sensitive APFS' -volname linux -type SPARSE linux.sparseimage
@@ -130,6 +137,11 @@ unpacked into a directory serves.
   processes, one `fwe` for each Linux process.
 - **Programs that make code as they run** (the JIT compilers of Node.js,
   Java, LuaJIT, Racket, Guile) run natively too ([jit.md](jit.md)).
+- **Daemons:** one that detaches outlives the `fwe` command that started
+  it, as on Linux. No Linux init or service manager runs; to keep a Linux
+  daemon running as a macOS service, a `launchd` job runs `fwe` with the
+  daemon in the foreground
+  ([init, orphans and daemons](linux-on-macos.md#init-orphans-and-daemons)).
 - **Networking** uses the Mac's: a server listening on a port is
   reachable from the Mac on that port, and outgoing connections go out as
   the Mac's do.
@@ -150,10 +162,9 @@ For the VM, `fwe` MUST be signed with the hypervisor entitlement
 hypervisor (`sysctl kern.hv_support` prints `1`). Otherwise `fwe` says
 the program needs the hypervisor backend and exits with status 126.
 `fwe --vm` runs every program in the VM, for programs that need 4 KiB
-pages, such as Wine.
-
-CI's machines offer no hypervisor, so the VM backend is tested only on a
-software stand-in for Hypervisor.framework ([roadmap](../ROADMAP.md)).
+pages, such as Wine. CI's machines offer no hypervisor, so CI tests the
+VM backend only on a software stand-in for Hypervisor.framework
+([roadmap](../ROADMAP.md)).
 
 ### Windows programs
 
@@ -166,10 +177,10 @@ env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/
   -c 'wine wineboot --init && wine /tmp/winprog.exe'
 ```
 
-CI's `wine` job runs `guests/windows/winprog.c` (built with
-`zig cc -target aarch64-windows-gnu`) this way. Windows programs with
-windows draw through Wine's X11 driver, in the VM, given `DISPLAY` as
-Linux programs are (below).
+`zig cc -target aarch64-windows-gnu` builds such a program from C (CI's
+`wine` job runs `guests/windows/winprog.c` this way). Windows programs
+with windows draw through Wine's X11 driver, in the VM, given `DISPLAY`
+as Linux programs are ([below](#programs-with-windows)).
 
 ### Programs with windows
 
@@ -187,19 +198,25 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
 
 X11 clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way. Images go
 to the server through shared memory (MIT-SHM) where the server takes it
-by descriptor (MIT-SHM 1.2, as Xvfb's does). OpenGL on the CPU, through
-Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`), needs a server
-with GLX. Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
-has: start it, and give its programs its display inside, as
-`sh -c 'DISPLAY=:1 exec glxgears'`.
+by descriptor (MIT-SHM 1.2, as Xvfb's does). Wayland programs run in a
+Weston started in the userland with its X11 back end
+(`weston --backend=x11`), which draws in a window on the X server;
+`--xwayland` adds Xwayland for X11 programs inside it.
+
+OpenGL on the CPU, through Mesa's software renderer
+(`LIBGL_ALWAYS_SOFTWARE=1`), needs a server with GLX. Homebrew's Xvfb
+has none; the userland's own Xvfb, run by fwe, has: start it, and give
+its programs its display inside, as `sh -c 'DISPLAY=:1 exec glxgears'`.
+
+### The GPU
 
 Vulkan programs run natively draw on the Mac's GPU through fwe's own
-Linux Vulkan driver. Once the Mac has a Vulkan driver, fwe puts its own
-where a Linux Vulkan loader looks (`/etc/vulkan/icd.d`) and passes each
-Vulkan command to the Mac's driver. That is KosmicKrisp (Homebrew's `mesa`, on macOS 26
-with an Apple GPU) if installed, else MoltenVK (`brew install
-molten-vk`); `FWE_VULKAN_DRIVER`, in fwe's environment, names another
-driver's manifest. OpenGL programs use the GPU through Mesa's Zink.
+Linux Vulkan driver, which passes each Vulkan command to the Mac's
+Vulkan driver. Once the Mac has one, fwe puts its driver where a Linux
+Vulkan loader looks (`/etc/vulkan/icd.d`). The Mac's driver is
+KosmicKrisp (Homebrew's `mesa`, on macOS 26 with an Apple GPU) if
+installed, else MoltenVK (`brew install molten-vk`); `FWE_VULKAN_DRIVER`,
+in fwe's environment, names another driver's manifest.
 `VK_DRIVER_FILES` makes fwe's driver the only one a program sees (a
 userland's Mesa drivers draw on the CPU):
 
@@ -211,13 +228,9 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
   "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/vkcube --wsi xcb
 ```
 
-`MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the GPU, with
+OpenGL programs use the GPU through Mesa's Zink:
+`MESA_LOADER_DRIVER_OVERRIDE=zink` selects it, with
 `LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.
-
-CI's `display` job runs `xeyes`, `xclock`, `xterm`, tkinter, PyQt6, GTK's
-demos and Wine's Notepad against Homebrew's Xvfb, glxgears against
-Alpine's, and `vkcube` and glxgears on the runner's GPU. It drives each
-with keys and the pointer and checks what it draws.
 
 ## Containers
 
@@ -249,11 +262,12 @@ hello from a container
 
 - `cgroup_manager = "cgroupfs"`: there is no systemd to ask.
 - `--network=none`: a container gets loopback only; a new network
-  namespace has nothing else (see below).
-- podman also builds images, pushes and pulls them, and runs rootless as
-  another user. Docker Engine (`dockerd --bridge=none --iptables=false
-  --ip6tables=false --storage-driver=overlay2`) runs, builds and composes
-  containers. CI's `podman` and `docker` jobs run them.
+  namespace has nothing else ([below](#what-does-not-work)).
+
+podman also builds images, pushes and pulls them, and runs rootless as
+another user. Docker Engine (`dockerd --bridge=none --iptables=false
+--ip6tables=false --storage-driver=overlay2`) runs, builds and composes
+containers. CI's `podman` and `docker` jobs run both.
 
 ## Seeing what a program does
 

@@ -1,10 +1,15 @@
 # Roadmap
 
-The path to [PLAN.md](PLAN.md)'s 1.0, laid out as pull requests in order
-([AGENTS.md](AGENTS.md#development-process)). A pull request is done when
-its **Done when** criteria pass as end-to-end tests and benchmarks in CI;
-a milestone, when its pull requests are merged. Current limitations are
-in [docs/architecture.md](docs/architecture.md#known-limitations).
+The status of each milestone, what is done, and the path to
+[PLAN.md](PLAN.md)'s 1.0 as pull requests in order
+([AGENTS.md](AGENTS.md#development-process)), with what is not planned. A
+pull request is done when its **Done when** criteria pass as end-to-end
+tests and benchmarks in CI; a milestone, when its pull requests are
+merged. What runs unmodified is in [README.md](README.md#status); what
+each Linux mechanism becomes under fwe, in
+[docs/linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces); the
+current limitations, in
+[docs/architecture.md](docs/architecture.md#known-limitations).
 
 ## Status
 
@@ -19,8 +24,6 @@ in [docs/architecture.md](docs/architecture.md#known-limitations).
 | M6 Native speed and coverage | Under way: PRs 1 and 2 done |
 | M7 Graphical programs and sandboxes | Under way: PRs 1 and 2 done |
 | M8 Virtual networking | After 1.0 |
-
-What runs unmodified is in [README.md](README.md#status).
 
 ## Done
 
@@ -63,9 +66,6 @@ What runs unmodified is in [README.md](README.md#status).
   null descriptors where the Mac's driver lacks them; OpenGL through
   Zink; `vkcube` and `glxgears` drawn on it in CI; a Vulkan submission
   and `vkcube`'s frames within 1.5× of the same driver natively.
-
-What each Linux mechanism becomes under fwe is in
-[docs/linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces).
 
 ## Left to 1.0
 
@@ -187,7 +187,9 @@ benchmark beside `runsc` on Linux.
 ### M8 — Virtual networking
 
 Applications on networks of their own, as on a Linux host, the host's
-TCP/IP stack carrying the traffic.
+TCP/IP stack carrying the traffic. Packet-level features (iptables,
+packet sockets, TUN) would need a TCP/IP stack in fwe; they stay out
+unless one proves cheap enough.
 
 #### PR 1 — Addresses per network namespace
 
@@ -205,9 +207,6 @@ bridge at loopback speed within 1.5×.
   those calls; containers reach each other by name; published ports
   listen on the Mac; outgoing connections leave as the Mac's.
 
-Packet-level features (iptables, packet sockets, TUN) would need a TCP/IP
-stack in fwe; they stay out unless one proves cheap enough.
-
 **Done when:** Docker Compose with a bridge network and a Podman pod run,
 reaching each other by name, with a published port reachable from the Mac.
 
@@ -215,6 +214,7 @@ reaching each other by name, with a published port reachable from the Mac.
 
 Calls for these are refused (`ENOSYS`, `EINVAL` or `EPERM`) unless noted,
 so programs that probe for them fall back.
+
 - **io_uring.**
 - **Networking beyond loopback and the host's sockets** (veth, bridges,
   firewalling, packet sockets, SCTP, RDS, TUN, kernel TLS): a new network
