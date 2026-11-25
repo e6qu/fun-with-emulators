@@ -263,7 +263,7 @@ elsewhere. What differs:
       br   x17
   ```
 
-### The data, and what the loader must fix
+### The data, and what is fixed at load time
 
 | | `names` holds, in the file | Dynamic relocations |
 |---|---|---|
