@@ -1108,10 +1108,11 @@ fn jit_code_runs_as_the_program_wrote_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Every instruction naming `x18` that a real binary holds (Alpine's
-/// OpenJDK 25 libjvm.so, listed in tools/x18forms/x18forms.tsv; the guest
-/// generated from it by tools/x18forms/gen.py), rewritten as fwe rewrites
-/// that binary, ends as the same instruction does with another register in
+/// Every instruction naming `x18` that real binaries hold (Alpine's
+/// OpenJDK 25 libjvm.so and Debian 13's git, listed in tools/x18forms; the
+/// guest generated from them by tools/x18forms/gen.py), rewritten as fwe
+/// rewrites those binaries and run by translation as fwe runs code made at
+/// run time, ends as the same instruction does with another register in
 /// `x18`'s place.
 #[test]
 fn x18_instructions_of_a_real_binary_compute_as_with_another_register() {
@@ -1126,14 +1127,15 @@ fn x18_instructions_of_a_real_binary_compute_as_with_another_register() {
     let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
     eprintln!("--- x18forms stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
-    let last = text.lines().last().unwrap_or_default().to_string();
-    assert!(
-        last.starts_with("x18 instructions: ") && {
-            let n: Vec<&str> = last.trim_start_matches("x18 instructions: ").split(' ').collect();
-            n.len() >= 3 && n[0] == n[2]
-        },
-        "{text}"
-    );
+    // Each pass's line: "<what>: <n> of <n> alike", all alike.
+    let alike = |what: &str| {
+        text.lines().any(|l| {
+            let n: Vec<&str> = l.strip_prefix(what).unwrap_or_default().split(' ').collect();
+            n.len() >= 3 && n[0] == n[2] && n[0] != "0"
+        })
+    };
+    assert!(alike("x18 instructions: "), "{text}");
+    assert!(alike("x18 instructions made at run time: "), "{text}");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1577,6 +1579,29 @@ fn code_made_writable_then_executable_runs_as_written() {
     assert_eq!(
         stdout(&out),
         "before: 41\nmprotect: 0\nafter: 41 1000000\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A real program's SHA-1 compression (git's sha1dc, from the vendored
+/// Debian 13 git: GCC 14's code, computing in `x18` among other
+/// registers) copied into memory made executable at run time and run by
+/// translation computes what SHA-1 does (guests/c/jitsha1.c).
+#[test]
+fn jit_code_of_a_real_program_computes_sha1() {
+    let prog = build_c_dynamic("jitsha1", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "jitsha1");
+    std::fs::copy(debian_bin("git"), root.join("git")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    // `sha1_compression_states`: its offset in the file and its length.
+    cmd.arg("--root").arg(&root).arg(&prog).args(["/git", "0x2b7c80", "0x11a8"]);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "sha1 blocks compressed by translation: 2000 of 2000 alike\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -2449,8 +2474,10 @@ fn dynamic_glibc_exit_maps_shared_libc() {
 /// program runs as before.
 #[test]
 fn code_runs_from_its_prepared_image_the_next_time() {
-    let prog = build_c_dynamic("dynhello", Libc::Glibc, true);
     let root = libc_rootfs(Libc::Glibc, "glibc-image");
+    // A copy of its own: other tests run the program built, and prepare it.
+    let prog = root.join("dynhello");
+    std::fs::copy(build_c_dynamic("dynhello", Libc::Glibc, true), &prog).unwrap();
     let run = || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--strace").arg("--root").arg(&root).arg(&prog).arg("again");
@@ -2469,12 +2496,18 @@ fn code_runs_from_its_prepared_image_the_next_time() {
     assert_eq!(stdout(&first), "dynamic hello, again\n");
     assert_eq!(stdout(&second), "dynamic hello, again\n");
     assert!(images(&first).is_empty(), "{}", String::from_utf8_lossy(&first.stderr));
-    // The program, its dynamic linker, and glibc's code.
-    assert_eq!(
-        images(&second),
-        ["exe", "interp", "code"],
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
+    // The program, its dynamic linker, and glibc's code: each mapping of
+    // it (the dynamic linker maps it again with `PROT_BTI` where the CPU
+    // has BTI).
+    let second_err = String::from_utf8_lossy(&second.stderr);
+    let mapped = second_err.lines().filter(|l| l.starts_with("[fwe] code at ")).count();
+    let found = images(&second);
+    assert!(
+        found.len() >= 3
+            && found[..2] == ["exe", "interp"]
+            && found[2..].iter().all(|w| w == "code")
+            && found.len() - 2 == mapped,
+        "{second_err}"
     );
 }
 
@@ -2966,39 +2999,37 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
 
 /// The `.deb` files a manifest lists, fetched on first use and checked
 /// against the SHA-256 recorded there. They come from deb.debian.org, or
-/// from snapshot.debian.org once a newer version has replaced them.
+/// from the snapshot of the archive the manifest names
+/// (snapshot.debian.org) once a newer version has replaced them.
 fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
-    let (_, packages) = manifest(manifest_name);
+    let (list, packages) = manifest(manifest_name);
+    let snapshot = list
+        .lines()
+        .find_map(|l| l.strip_prefix("# snapshot: "))
+        .unwrap_or_else(|| panic!("{manifest_name}: its header names no snapshot"))
+        .trim()
+        .to_string();
     packages
         .iter()
         .map(|(pool, sha256)| {
             let name = Path::new(pool).file_name().unwrap().to_string_lossy().into_owned();
             let urls = [
                 format!("https://deb.debian.org/debian/{pool}"),
-                format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
+                format!("https://snapshot.debian.org/archive/debian/{snapshot}/{pool}"),
             ];
             fetch_pinned(&name, &urls, sha256, manifest_name)
         })
         .collect()
 }
 
-/// A root filesystem of the packages `manifest` lists ([`fetched_debs`]),
-/// unpacked once and cached, plus the vendored glibc runtime and bash.
-fn fetched_root(manifest_name: &str) -> PathBuf {
-    unpacked_debs(manifest_name, true)
-}
-
-/// A root filesystem of a whole system's packages, as `manifest` lists them
-/// (its own C library and shell among them), unpacked once and cached:
-/// base-files first, whose links (`/lib` to `/usr/lib`, Debian 13's) the
-/// others' files go through, as debootstrap unpacks it.
+/// A root filesystem of the whole system `manifest` lists
+/// ([`fetched_debs`]: its own C library and shells among them), unpacked
+/// once and cached: base-files first, whose links (`/lib` to `/usr/lib`)
+/// the others' files go through, as debootstrap unpacks it.
 fn fetched_system(manifest_name: &str) -> PathBuf {
-    unpacked_debs(manifest_name, false)
-}
-
-/// [`fetched_root`] (`vendored`, the vendored runtime added) or
-/// [`fetched_system`].
-fn unpacked_debs(manifest_name: &str, vendored: bool) -> PathBuf {
+    // One test at a time unpacks: two can want the same root.
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest(manifest_name);
     let cache = fetch_cache();
     let root = cache.join(format!("root-{manifest_name}"));
@@ -3011,9 +3042,6 @@ fn unpacked_debs(manifest_name: &str, vendored: bool) -> PathBuf {
     debs.sort_by_key(base);
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).unwrap();
-    if vendored {
-        std::fs::create_dir_all(root.join("lib")).unwrap();
-    }
     for deb in &debs {
         // A .deb is an `ar` archive whose data.tar.* holds the files.
         let unpack = cache.join(format!("unpack-{manifest_name}"));
@@ -3029,21 +3057,7 @@ fn unpacked_debs(manifest_name: &str, vendored: bool) -> PathBuf {
         // narrowed by the umask.
         run_checked(Command::new("tar").arg("xpf").arg(&data).arg("-C").arg(&root));
     }
-    if !vendored {
-        std::fs::create_dir_all(root.join("tmp")).unwrap();
-        std::fs::write(&done, &list).unwrap();
-        return root;
-    }
-    for name in ["ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6"] {
-        std::fs::copy(repo().join("guests/glibc/lib").join(name), root.join("lib").join(name))
-            .unwrap();
-    }
-    std::fs::copy(repo().join("guests/debian/lib/libtinfo.so.6"), root.join("lib/libtinfo.so.6"))
-        .unwrap();
-    std::fs::create_dir_all(root.join("bin")).unwrap();
     std::fs::create_dir_all(root.join("tmp")).unwrap();
-    std::fs::copy(debian_bin("bash"), root.join("bin/bash")).unwrap();
-    let _ = std::os::unix::fs::symlink("bash", root.join("bin/sh"));
     std::fs::write(&done, &list).unwrap();
     root
 }
@@ -4126,7 +4140,7 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Debian's podman 4.3 (fetched: `guests/debian/fetch/podman.txt`), a
+/// Debian's podman 5.4 (fetched: `guests/debian/fetch/podman.txt`), a
 /// non-PIE executable the VM runs, only where `FWE_PODMAN_TESTS` is set
 /// (CI's `podman` job), as root: it loads the standard `alpine` image and
 /// runs a container of it through conmon and crun, which run natively, each
@@ -4141,7 +4155,7 @@ fn debian_podman_runs_in_the_vm() {
         eprintln!("skipped: no hypervisor on this host");
         return;
     };
-    let cached = fetched_root("podman");
+    let cached = fetched_system("podman");
     let root = std::env::temp_dir().join(format!("fwe-debpodman-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
@@ -4419,11 +4433,11 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`) runs the
+/// Debian's Node.js 20 (fetched: `guests/debian/fetch/node.txt`) runs the
 /// Node workload ([`node_runs_the_workload`]).
 #[test]
 fn debian_node_runs_a_workload() {
-    let root = fetched_root("node");
+    let root = fetched_system("node");
     node_runs_the_workload(&root, "debian-node");
 }
 
@@ -4904,7 +4918,7 @@ print("jit", (jit.status()))
 /// has rustc call ld itself with the C runtime's start files.
 #[test]
 fn debian_cargo_builds_and_tests_a_project() {
-    let root = fetched_root("rust");
+    let root = fetched_system("rust");
     let _workload = workload();
     let proj = format!("tmp/fwe-cargo-{}", std::process::id());
     let dir = root.join(&proj);
@@ -4953,7 +4967,7 @@ fn debian_cargo_builds_and_tests_a_project() {
         std::fs::write(dir.join(name), text).unwrap();
     }
     // rustc calls GNU ld directly, with what gcc would add around it.
-    let (gcc, lib) = ("/usr/lib/gcc/aarch64-linux-gnu/12", "/usr/lib/aarch64-linux-gnu");
+    let (gcc, lib) = ("/usr/lib/gcc/aarch64-linux-gnu/14", "/usr/lib/aarch64-linux-gnu");
     let link = format!(
         "-dynamic-linker /lib/ld-linux-aarch64.so.1 {lib}/Scrt1.o {lib}/crti.o \
          {gcc}/crtbeginS.o -L{gcc} -L{lib} -lgcc_s -lc {gcc}/crtendS.o {lib}/crtn.o"
@@ -5011,7 +5025,7 @@ fn debian_apt_installs_and_removes_a_package() {
     // changes it.
     let root = std::env::temp_dir().join(format!("fwe-apt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cpR").arg(fetched_root("apt")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("apt")).arg(&root));
     let _workload = workload();
     let dir = |d: &str| std::fs::create_dir_all(root.join(d)).unwrap();
     for d in [
@@ -5054,13 +5068,24 @@ fn debian_apt_installs_and_removes_a_package() {
     )
     .unwrap();
     std::fs::write(root.join("etc/apt/sources.list"), "deb [trusted=yes] file:/repo ./\n").unwrap();
-    // The dpkg database: glibc installed, as a bootstrapped system has it.
+    // The dpkg database: glibc installed, at the version the root has, as
+    // a bootstrapped system has it.
+    let libc6 = manifest("apt")
+        .1
+        .iter()
+        .find_map(|(pool, _)| {
+            let file = pool.rsplit('/').next()?;
+            file.strip_prefix("libc6_")?.strip_suffix("_arm64.deb").map(str::to_string)
+        })
+        .expect("the apt root's glibc");
     std::fs::write(
         root.join("var/lib/dpkg/status"),
-        "Package: libc6\nStatus: install ok installed\nPriority: optional\n\
-         Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>\n\
-         Architecture: arm64\nMulti-Arch: same\nVersion: 2.36-9+deb12u14\n\
-         Description: GNU C Library: Shared libraries\n\n",
+        format!(
+            "Package: libc6\nStatus: install ok installed\nPriority: optional\n\
+             Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>\n\
+             Architecture: arm64\nMulti-Arch: same\nVersion: {libc6}\n\
+             Description: GNU C Library: Shared libraries\n\n"
+        ),
     )
     .unwrap();
     std::fs::write(root.join("var/lib/dpkg/available"), "").unwrap();
@@ -5101,8 +5126,8 @@ fn debian_apt_installs_and_removes_a_package() {
     for want in [
         "Hello, world!",
         "hello from a package apt installed",
-        "hello 2.10-3 install ok installed",
-        "Removing hello (2.10-3) ...",
+        "hello 2.10-5 install ok installed",
+        "Removing hello (2.10-5) ...",
         "removed",
         "no longer known to dpkg",
     ] {
@@ -7828,7 +7853,7 @@ fn hv_descriptors_and_translated_pointers() {
 }
 
 /// A dynamically linked, non-PIE glibc program at a low address — the shape
-/// of Debian's `python3.11` — runs in the VM: the image at its link address
+/// of Debian's `python3.13` — runs in the VM: the image at its link address
 /// (translated), glibc's dynamic linker and `libc.so.6` mapped by the guest
 /// at the same addresses as in the host, relocations and RELRO applied by
 /// the guest's own `ld.so`.
@@ -7861,7 +7886,7 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     Some(run_hv(cmd, &program.display().to_string()))
 }
 
-/// Debian's Python 3.11 (fetched: `guests/debian/fetch/python.txt`), a
+/// Debian's Python 3.13 (fetched: `guests/debian/fetch/python.txt`), a
 /// non-PIE executable linked at `0x400000`, so the VM runs it: the standard
 /// library's C modules (sqlite3, hashlib on OpenSSL, zlib, bz2, lzma,
 /// decimal, unicodedata), threads, a socket pair, an asyncio server and
@@ -7871,14 +7896,14 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
 /// `/dev/shm` shared by the processes.
 #[test]
 fn hv_debian_python_runs_a_workload() {
-    let root = fetched_root("python");
+    let root = fetched_system("python");
     let _workload = workload();
     let script = format!("/tmp/fwe-python-{}.py", std::process::id());
     std::fs::write(root.join(script.trim_start_matches('/')), PYTHON_WORKLOAD).unwrap();
     let Some(mut cmd) = hv_command() else { return };
     cmd.arg("--root")
         .arg(&root)
-        .arg(root.join("usr/bin/python3.11"))
+        .arg(root.join("usr/bin/python3.13"))
         .arg("-B")
         .arg(&script)
         .env_clear()
@@ -7886,11 +7911,11 @@ fn hv_debian_python_runs_a_workload() {
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
     // The stand-in on a loaded CI runner takes several times as long.
-    let out = run_hv_for(cmd, "python3.11", Duration::from_secs(600));
+    let out = run_hv_for(cmd, "python3.13", Duration::from_secs(600));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     assert_eq!(
         stdout(&out),
-        "executable /usr/bin/python3.11\n\
+        "executable /usr/bin/python3.13\n\
          json {\"a\": [1, 2, {\"b\": null}]}\n\
          re host at user and there at me\n\
          sqlite (100, 4950, '9801')\n\
@@ -7911,7 +7936,7 @@ fn hv_debian_python_runs_a_workload() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// Debian's GCC 12 (fetched: `guests/debian/fetch/gcc.txt`), whose driver,
+/// Debian's GCC 14 (fetched: `guests/debian/fetch/gcc.txt`), whose driver,
 /// `cc1` and `collect2` are non-PIE executables the VM runs, while GNU `as`
 /// and `ld` run natively: a program with a thread and libm compiled and
 /// linked, and one built from a static library made with `ar`, linked as a
@@ -7920,7 +7945,7 @@ fn hv_debian_python_runs_a_workload() {
 /// between the backends.
 #[test]
 fn hv_debian_gcc_builds_c_programs() {
-    let root = fetched_root("gcc");
+    let root = fetched_system("gcc");
     let _workload = workload();
     let proj = format!("tmp/fwe-gcc-{}", std::process::id());
     let dir = root.join(&proj);
@@ -7956,7 +7981,7 @@ int main(int argc, char **argv) {
         (
             "build.sh",
             "set -e\n\
-             cc=aarch64-linux-gnu-gcc-12\n\
+             cc=aarch64-linux-gnu-gcc-14\n\
              $cc -O2 -Wall -o hello hello.c -lm\n\
              ./hello world\n\
              $cc -c -O2 util.c\n\
@@ -7988,13 +8013,12 @@ int main(int argc, char **argv) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Debian's clang 14 (fetched: `guests/debian/fetch/clang.txt`), a non-PIE
-/// executable the VM runs, with LLVM's libraries, GNU `ld` linking
-/// natively: a C program using libm and a C++ one using the standard
-/// library (libstdc++), each compiled, linked and run.
+/// Debian's clang 19 (fetched: `guests/debian/fetch/clang.txt`) with LLVM's
+/// libraries and GNU `ld`, all PIEs: a C program using libm and a C++ one
+/// using the standard library (libstdc++), each compiled, linked and run.
 #[test]
-fn hv_debian_clang_builds_c_and_cpp() {
-    let root = fetched_root("clang");
+fn debian_clang_builds_c_and_cpp() {
+    let root = fetched_system("clang");
     let _workload = workload();
     let proj = format!("tmp/fwe-clang-{}", std::process::id());
     let dir = root.join(&proj);
@@ -8013,25 +8037,23 @@ fn hv_debian_clang_builds_c_and_cpp() {
          std::cout << \"c++ \" << std::accumulate(v.begin(), v.end(), 0) << \"\\n\"; }\n",
     )
     .unwrap();
-    let expected = "clang 1.414\nc++ 6\n";
-    let args = |cmd: &mut Command| {
-        cmd.arg("--root")
-            .arg(&root)
-            .arg("--cwd")
-            .arg(format!("/{proj}"))
-            .arg(root.join("bin/bash"))
-            .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
-            .env_clear()
-            .env("PATH", "/usr/lib/llvm-14/bin:/usr/bin:/bin")
-            .stdin(Stdio::null());
-    };
-    let Some(out) = run_hv_explained(args, "clang", expected) else { return };
-    assert_eq!(stdout(&out), expected);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg("--cwd")
+        .arg(format!("/{proj}"))
+        .arg(root.join("bin/bash"))
+        .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
+        .env_clear()
+        .env("PATH", "/usr/lib/llvm-19/bin:/usr/bin:/bin")
+        .stdin(Stdio::null());
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
+    assert_eq!(stdout(&out), "clang 1.414\nc++ 6\n", "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Debian's Go 1.19 (fetched: `guests/debian/fetch/go.txt`): the `go`
+/// Debian's Go 1.24 (fetched: `guests/debian/fetch/go.txt`): the `go`
 /// command and its `compile` and `link` tools, all executables linked low
 /// that the VM runs, build a module (goroutines, `crypto/sha256`) and run
 /// it (a static executable, in the VM too), then build and run its tests.
@@ -8039,14 +8061,14 @@ fn hv_debian_clang_builds_c_and_cpp() {
 /// meanwhile, and the linker preallocates its output with `fallocate`.
 #[test]
 fn hv_debian_go_builds_and_tests_a_module() {
-    let root = fetched_root("go");
+    let root = fetched_system("go");
     let _workload = workload();
     let proj = format!("tmp/fwe-go-{}", std::process::id());
     let dir = root.join(&proj);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let files = [
-        ("go.mod", "module example.com/hello\n\ngo 1.19\n"),
+        ("go.mod", "module example.com/hello\n\ngo 1.24\n"),
         (
             "main.go",
             r#"package main
@@ -8104,10 +8126,11 @@ func TestSums(t *testing.T) {
         .arg(root.join("bin/bash"))
         .arg("build.sh")
         .env_clear()
-        .env("PATH", "/usr/lib/go-1.19/bin:/usr/bin:/bin")
+        .env("PATH", "/usr/lib/go-1.24/bin:/usr/bin:/bin")
         .env("HOME", format!("/{proj}"))
         .env("GOCACHE", format!("/{proj}/cache"))
         .env("GOPROXY", "off")
+        .env("GOTOOLCHAIN", "local")
         .env("CGO_ENABLED", "0")
         .stdin(Stdio::null());
     // The stand-in on a loaded CI runner takes up to twice as long.

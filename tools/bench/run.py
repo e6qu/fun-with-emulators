@@ -139,6 +139,9 @@ def debian_system(manifest, cache):
         return root
     shutil.rmtree(root, ignore_errors=True)
     os.makedirs(root)
+    # The snapshot of the archive the files are in, for those
+    # deb.debian.org has replaced since (tools/debian-manifest.py).
+    snapshot = next(l.split(": ", 1)[1].strip() for l in lines.splitlines() if l.startswith("# snapshot: "))
     debs = []
     for line in lines.splitlines():
         if not line.strip() or line.startswith("#"):
@@ -146,7 +149,7 @@ def debian_system(manifest, cache):
         pool, sha256 = line.split()
         urls = [
             "https://deb.debian.org/debian/" + pool,
-            "https://snapshot.debian.org/archive/debian/20261101T000000Z/" + pool,
+            "https://snapshot.debian.org/archive/debian/" + snapshot + "/" + pool,
         ]
         debs.append(fetch(urls, sha256, cache))
     debs.sort(key=lambda d: not os.path.basename(d).startswith("base-files_"))

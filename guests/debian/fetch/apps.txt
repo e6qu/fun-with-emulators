@@ -1,10 +1,12 @@
-# Debian 13 (trixie) arm64 packages the application tests fetch from
-# https://deb.debian.org/debian/ and unpack into their root filesystem: a
-# whole system's base (every Essential package: the C library, the shells,
-# coreutils, `setpriv`...) and what Electron, Visual Studio Code and Zed
-# load (GTK 3, NSS, ALSA's library, GBM, the Vulkan loader, WebKitGTK 4.1,
-# fonts and fontconfig, D-Bus), and every package they depend on. Each line is a pool path and the package's
-# SHA-256 from the trixie index.
+# Debian 13 (trixie) arm64 packages of the application tests' root: what
+# Electron, Visual Studio Code and Zed load (GTK 3, NSS, ALSA's library, GBM,
+# the Vulkan loader, WebKitGTK 4.1, libsecret, fonts and fontconfig, D-Bus).
+# Each line is a pool path and the package's SHA-256 from the trixie index,
+# as tools/debian-manifest.py makes them from the seeds below: a whole
+# system (every Essential package) with the seeds and all they depend on.
+# suite: trixie
+# seeds: libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libvulkan1 libwebkit2gtk-4.1-0 libcurl4t64 libnotify4 libxkbcommon-x11-0 libxkbfile1 libxss1 libsecret-1-0 fonts-dejavu-core fontconfig dbus
+# snapshot: 20261124T000000Z
 pool/main/a/aalib/libaa1_1.4p5-51.1+b1_arm64.deb be6b46f64d9ac8f269dcb1bd71715a51597de890fa897151e06a0abcb1b8c4e0
 pool/main/a/abseil/libabsl20240722_20240722.0-4_arm64.deb eb6648c73cd69c577a2bc18c8d66d44de897c0207a734ffdb55f91945404d0ac
 pool/main/a/acl/libacl1_2.3.2-2+b1_arm64.deb 10b2399169e42e6d8db55944116cb2ed61caab997cf700acb83de0b0668e5721

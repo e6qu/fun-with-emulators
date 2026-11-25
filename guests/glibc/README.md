@@ -21,16 +21,18 @@ alone (`Elf::exec_file_ranges`).
 
 ## Provenance
 
-Extracted from Debian 12 (bookworm) `aarch64` packages, glibc `2.36-9+deb12u14`:
+Extracted from Debian 13 (trixie) `aarch64` packages, glibc `2.41-12+deb13u5`:
 
 - `ld-linux-aarch64.so.1`, `libc.so.6`, `libm.so.6` from
-  `libc6_2.36-9+deb12u14_arm64.deb` (SHA-256
-  `01f4330719fd4f65580e16ea5a0527f372fca750e8f588d26deaf09f2d3b1cf4`)
+  `libc6_2.41-12+deb13u5_arm64.deb` (SHA-256
+  `0966fc3da1a26cc57647c68b5736f791b6e7eb498173a7993f63b6c89b4ed4f5`)
 - `Scrt1.o`, `crti.o`, `crtn.o`, `libc_nonshared.a` from
-  `libc6-dev_2.36-9+deb12u14_arm64.deb`
+  `libc6-dev_2.41-12+deb13u5_arm64.deb` (SHA-256
+  `ff13ef61799ef4a9526a9e9568a8b91311f25f4211ea2ab1dd63028c000b0451`)
 
 from `https://deb.debian.org/debian/pool/main/g/glibc/`. The `.deb` files are
-`ar` archives whose `data.tar.xz` holds the files above.
+`ar` archives whose `data.tar.xz` holds the files above; `COPYRIGHT` is the
+package's `usr/share/doc/libc6/copyright`.
 
 ## License
 

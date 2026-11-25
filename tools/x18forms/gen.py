@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
-"""Generate the x18forms guest from x18forms.tsv, into the file the one
-argument names (the end-to-end test does, into its build directory).
+"""Generate the x18forms guest from the lists beside this file, into the
+file the one argument names (the end-to-end test does, into its build
+directory).
 
-x18forms.tsv lists instruction words that name x18 (or w18), one per line:
-the word in hex, its mnemonic and its operands as llvm-objdump prints them.
-They were taken from a real binary (Alpine's OpenJDK 25 libjvm.so, whose
-GCC allocates x18 as Linux allows).
+Each list (*.tsv) holds the distinct instruction words naming x18 (or w18)
+in a real binary, one per line: the word in hex, its mnemonic and its
+operands as llvm-objdump prints them. The binaries were built by GCC,
+which allocates x18 as Linux allows: libjvm.tsv, Alpine's OpenJDK 25
+libjvm.so (GCC 14); git.tsv, Debian 13's git (GCC 14). A word in more
+than one list is tested once.
 
 For each word the guest gets two functions: one runs the word itself (fwe
 rewrites it, as it rewrites the binary's), the other the same instruction
@@ -29,23 +32,32 @@ def registers_named(ops):
 
 
 def entries():
-    for line in (HERE / "x18forms.tsv").read_text().splitlines():
-        word, mnemonic, ops = line.split("\t")
-        if mnemonic in SKIP_MNEMONICS or mnemonic.startswith("b."):
-            continue
-        # A literal load names an address, not a register.
-        if mnemonic.startswith("ldr") and "[" not in ops:
-            continue
-        named = registers_named(ops)
-        # The working register for the renamed copy, and the one holding the
-        # state's address: neither named by the instruction.
-        free = [r for r in range(1, 18) if r not in named]
-        if len(free) < 2:
-            continue
-        rename, base = free[0], free[1]
-        renamed = re.sub(r"\bx18\b", f"x{rename}", ops)
-        renamed = re.sub(r"\bw18\b", f"w{rename}", renamed)
-        yield int(word, 16), mnemonic, ops, f"{mnemonic} {renamed}", rename, base
+    seen = set()
+    for listed in sorted(HERE.glob("*.tsv")):
+        for line in listed.read_text().splitlines():
+            word, mnemonic, ops = line.split("\t")
+            if word in seen:
+                continue
+            seen.add(word)
+            yield from entry(word, mnemonic, ops)
+
+
+def entry(word, mnemonic, ops):
+    if mnemonic in SKIP_MNEMONICS or mnemonic.startswith("b."):
+        return
+    # A literal load names an address, not a register.
+    if mnemonic.startswith("ldr") and "[" not in ops:
+        return
+    named = registers_named(ops)
+    # The working register for the renamed copy, and the one holding the
+    # state's address: neither named by the instruction.
+    free = [r for r in range(1, 18) if r not in named]
+    if len(free) < 2:
+        return
+    rename, base = free[0], free[1]
+    renamed = re.sub(r"\bx18\b", f"x{rename}", ops)
+    renamed = re.sub(r"\bw18\b", f"w{rename}", renamed)
+    yield int(word, 16), mnemonic, ops, f"{mnemonic} {renamed}", rename, base
 
 
 # The state block (see the C side): x[31] at 0, nzcv at 248, sp at 256.
@@ -109,13 +121,21 @@ def body(name, insn, base, rename):
 def main():
     items = list(entries())
     asm = []
+    data = []
     table = []
     for i, (word, mnemonic, ops, renamed, rename, base) in enumerate(items):
         asm += body(f"xf_a{i}", f".inst 0x{word:08x}", base, 18)
         asm += body(f"xf_b{i}", renamed, base, rename)
-        table.append(f'    {{xf_a{i}, xf_b{i}, "{mnemonic} {ops}"}},')
-    decls = "\n".join(f"extern void xf_a{i}(struct state *), xf_b{i}(struct state *);" for i in range(len(items)))
-    asm_text = "\n".join(f'    "{l}\\n"' for l in asm)
+        # The word's copy again, as data: what the guest copies into memory
+        # it makes executable (the copy in the text is as fwe rewrote it).
+        data += body(f"xf_c{i}", f".inst 0x{word:08x}", base, 18) + [f"xf_c{i}_end:"]
+        table.append(f'    {{xf_a{i}, xf_b{i}, xf_c{i}, xf_c{i}_end, "{mnemonic} {ops}"}},')
+    decls = "\n".join(
+        f"extern void xf_a{i}(struct state *), xf_b{i}(struct state *); "
+        f"extern const char xf_c{i}[], xf_c{i}_end[];"
+        for i in range(len(items))
+    )
+    asm_text = "\n".join(f'    "{l}\\n"' for l in asm + [".section .rodata", ".balign 16"] + data)
     template = (HERE / "x18forms.c.in").read_text()
     out = (
         template.replace("@COUNT@", str(len(items)))

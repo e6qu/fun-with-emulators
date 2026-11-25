@@ -3,10 +3,10 @@ Upstream-Contact: git@vger.kernel.org
 Source: https://www.kernel.org/pub/software/scm/git/
 
 Files: *
-Copyright: © 2005-2022, Linus Torvalds and others.
+Copyright: © 2005-2024, Linus Torvalds and others.
 License: GPL-2
 
-Files: reftable/* t/t0032-reftable-unittest.sh
+Files: reftable/* t/unit-tests/t-reftable-*.c
 Copyright: © 2020 Google LLC
 License: BSD-3-clause
  Redistribution and use in source and binary forms, with or without
@@ -178,6 +178,10 @@ Files: t/test-lib-github-workflow-markup.sh t/test-lib-junit.sh
 Copyright: © 2022, Johannes Schindelin
 License: GPL-2+
 
+Files: t/unit-tests/clar/*
+Copyright: © 2011-2015, Vicent Marti
+License: ISC
+
 Files: compat/inet_ntop.c compat/inet_pton.c
 Copyright: © 1996-2001, Internet Software Consortium.
 License: ISC
@@ -216,11 +220,6 @@ License: Apache-2.0
 Files: contrib/credential/gnome-keyring/git-credential-gnome-keyring.c
 Copyright: © 2011, John Szakmeister <john@szakmeister.net>
            © 2012, Philipp A. Hartmann <pah@qo.cx>
-License: GPL-2+
-
-Files: contrib/hg-to-git/hg-to-git.py
-Copyright: © 2007, Stelian Pop <stelian@popies.net>
-Name: hg-to-git.py - A Mercurial to GIT converter
 License: GPL-2+
 
 Files: contrib/mw-to-git/git-*.perl contrib/mw-to-git/t/t*

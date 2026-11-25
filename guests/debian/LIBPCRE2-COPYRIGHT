@@ -93,7 +93,7 @@ License: X11
  tium.
 Comment: FSF changes to this file are in the public domain.
 
-Files: src/sljit/*
+Files: deps/sljit/*
 Copyright: Zoltan Herczeg (hzmester@freemail.hu). All rights reserved.
 License: BSD-2-clause
  Redistribution and use in source and binary forms, with or without modification, are

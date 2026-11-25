@@ -10,7 +10,7 @@ when, and only when, they appear in all capitals, as shown here.
 
 fwe runs a non-position-independent executable linked below 4 GiB that
 it cannot move in a small Hypervisor.framework VM, and picks this
-backend for it by itself: Debian's `python3.11`, GCC and clang and
+backend for it by itself: Debian's `python3.13` and GCC and
 Alpine's `sbcl` at `0x400000`, static Go programs at `0x10000`. macOS
 reserves the low 4 GiB of every arm64 process (`__PAGEZERO`, which
 Apple's loader will not let a program shrink on Apple Silicon); in the

@@ -100,7 +100,7 @@ The [user guide](docs/user-guide.md) covers the rest.
 | `tools/ltp` | Builds LTP and runs its system-call tests against the baseline |
 | `tools/bench` | The benchmarks and their budgets (`run.py`, run in CI), and `vm.sh`, which runs them beside a Linux VM on your Mac |
 | `tools/display` | Screenshots and window closing for the display tests |
-| `tools/x18forms` | Generates the guest that checks each rewritten `x18` form |
+| `tools/x18forms` | Generates the guest that checks each `x18` form real binaries hold, rewritten and translated |
 | `tools/hostmem.py`, `tools/hv-record-listen.py` | The host-memory watch of LTP's runner and the benchmarks; the listener for the hypervisor flight recorder's datagrams |
 | `docs/` | The documents above |
 | `notes/research/` | Dated research notes on other projects, kept as written |
