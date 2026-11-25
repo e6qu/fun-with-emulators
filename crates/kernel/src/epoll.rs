@@ -341,7 +341,7 @@ fn bpf_watched(ep: i32, fd: i32) -> bool {
 
 /// Whether `fd` is an epoll descriptor.
 #[cfg(not(target_os = "linux"))]
-fn is_epoll(fd: i32) -> bool {
+pub fn is_epoll(fd: i32) -> bool {
     interest(|m| m.contains_key(&fd))
 }
 

@@ -1148,10 +1148,6 @@ impl<P: Platform> Kernel<P> {
         if !fdmarks::any_marks() {
             return None;
         }
-        // What Linux does for any descriptor, before the device sees it.
-        if matches!(req, ioctl::FIOCLEX | ioctl::FIONCLEX | ioctl::FIONBIO | ioctl::FIOASYNC) {
-            return None;
-        }
         // An argument that is a number, not a pointer, as the guest gave
         // it (a backend translates the argument as a pointer); a pointer's
         // copies go back to the guest address themselves.

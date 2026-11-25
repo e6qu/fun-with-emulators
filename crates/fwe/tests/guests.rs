@@ -7045,6 +7045,19 @@ fn memfd_locks_hold_between_processes() {
     assert_eq!(memfd("locks"), MEMFD_LOCKS);
 }
 
+/// `FIONBIO`, `FIOCLEX` and `FIONCLEX` set what `fcntl` reads back on a
+/// descriptor of every kind, fwe's stand-ins included (Zed makes its X
+/// connection non-blocking so), as on Linux.
+#[test]
+fn fionbio_and_fioclex_work_on_every_descriptor() {
+    let ok = "FIONBIO 0 0, nonblocking set and cleared; FIOCLEX 0 0, close-on-exec set and cleared";
+    let want: String = ["pipe", "unix socket", "eventfd", "memfd", "timerfd", "epoll", "/dev/null"]
+        .iter()
+        .map(|k| format!("{k}: {ok}\n"))
+        .collect();
+    c_guest_prints("fionbio", &[], &want);
+}
+
 /// A sealed memfd, and a read-only descriptor of it opened through
 /// `/proc/self/fd`, passed over Unix sockets to other processes (one in
 /// new namespaces, one reading a stream after children of the sender's

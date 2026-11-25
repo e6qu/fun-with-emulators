@@ -1450,7 +1450,15 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 fcntl::F_SETFL => {
-                    ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
+                    let r = libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg));
+                    // An epoll set is a kqueue, which keeps the flags but has
+                    // no `FIONBIO` to tell (`ENOTTY`): Linux's set keeps
+                    // them as any file's.
+                    #[cfg(target_os = "macos")]
+                    if r < 0 && host::last_errno().is(libc::ENOTTY) && crate::epoll::is_epoll(fd) {
+                        return 0;
+                    }
+                    ret(r)
                 }
                 fcntl::F_GETLK | fcntl::F_OFD_GETLK => {
                     let asked: fwe_abi::Flock = guest!(uaccess::read(arg));
@@ -1651,6 +1659,32 @@ impl<P: Platform> Kernel<P> {
         size as i64
     }
 
+    /// The requests Linux answers for any file before its own ioctls
+    /// (`do_vfs_ioctl`): close-on-exec and the `O_NONBLOCK` and `O_ASYNC`
+    /// status flags, as `fcntl` sets them, on a descriptor fwe stands in
+    /// for as on any other.
+    fn generic_ioctl(&mut self, fd: i32, req: u64, arg: u64) -> Option<i64> {
+        let flag = match req {
+            ioctl::FIOCLEX => {
+                return Some(self.sys_fcntl(fd as u64, fcntl::F_SETFD, fcntl::FD_CLOEXEC).min(0));
+            }
+            ioctl::FIONCLEX => return Some(self.sys_fcntl(fd as u64, fcntl::F_SETFD, 0).min(0)),
+            ioctl::FIONBIO => fcntl::O_NONBLOCK,
+            ioctl::FIOASYNC => fcntl::O_ASYNC,
+            _ => return None,
+        };
+        let on: i32 = match uaccess::read(arg) {
+            Ok(v) => v,
+            Err(e) => return Some(err(e)),
+        };
+        let fl = self.sys_fcntl(fd as u64, fcntl::F_GETFL, 0);
+        if fl < 0 {
+            return Some(fl);
+        }
+        let fl = if on != 0 { fl as u64 | flag } else { fl as u64 & !flag };
+        Some(self.sys_fcntl(fd as u64, fcntl::F_SETFL, fl).min(0))
+    }
+
     fn sys_ioctl(&mut self, fd: u64, req: u64, arg: u64) -> i64 {
         let fd = fd as i32;
         // The request is 32 bits (an `unsigned int`); a C library passing
@@ -1658,6 +1692,9 @@ impl<P: Platform> Kernel<P> {
         let req = req as u32 as u64;
         if let Err(e) = crate::landlock::may_ioctl(fd, req) {
             return err(e);
+        }
+        if let Some(r) = self.generic_ioctl(fd, req, arg) {
+            return r;
         }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
             return r;
@@ -1781,20 +1818,6 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::FIONREAD => ret(libc::ioctl(fd, libc::FIONREAD, arg as *mut libc::c_int)),
-                ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
-                ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),
-                ioctl::FIONCLEX => ret(libc::fcntl(fd, libc::F_SETFD, 0)),
-                // `O_ASYNC` on or off, as `fcntl` sets it.
-                ioctl::FIOASYNC => {
-                    let on: i32 = guest!(uaccess::read(arg));
-                    let fl = self.sys_fcntl(fd as u64, fcntl::F_GETFL, 0);
-                    if fl < 0 {
-                        return fl;
-                    }
-                    let fl = fl as u64 & !fcntl::O_ASYNC;
-                    let fl = if on != 0 { fl | fcntl::O_ASYNC } else { fl };
-                    self.sys_fcntl(fd as u64, fcntl::F_SETFL, fl).min(0)
-                }
                 _ => {
                     if libc::fcntl(fd, libc::F_GETFD) < 0 {
                         last_error()
