@@ -2007,7 +2007,10 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
 - `/proc/<pid>`, with its `task` directory, covers the processes of the
   reader's pid namespace. A directory there counts its links as Linux's
   do: 2 and its subdirectories (`task`, 2 and the process's threads,
-  which sandboxes read to tell a process is single-threaded). Another process's `mem` (and a thread's,
+  which sandboxes read to tell a process is single-threaded). Each
+  thread's `comm`, `stat` and `status` carry its own name, which crash
+  reporters (crashpad) and `ps -L` read. Each entry has an inode number
+  of its own and its mount's device. Another process's `mem` (and a thread's,
   `task/<tid>/mem`) is read and written as `process_vm_readv` reaches it,
   or through a stopped tracee's mailbox, and its `auxv` is the vector
   its program started with (a fork child's, its parent's), its `environ`

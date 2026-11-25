@@ -328,21 +328,6 @@ pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
     if exiting || crate::signote::kill_noted(t.host) { 0 } else { err(errno::EINVAL) }
 }
 
-/// The host process a `/proc/<pid>` directory descriptor names (which
-/// `pidfd_send_signal` takes as Linux does), if `fd` is one.
-fn proc_dir_target(fd: i32) -> Option<HostPid> {
-    let path = crate::synthdir::path_of(fd)?;
-    let rest = path.strip_prefix(b"/proc/")?;
-    if rest == b"self" || rest == b"thread-self" {
-        return Some(crate::host::pid());
-    }
-    let pid: i32 = std::str::from_utf8(rest).ok()?.parse().ok()?;
-    if pid == thread::tgid() {
-        return Some(crate::host::pid());
-    }
-    crate::pidns::to_host(pid)
-}
-
 impl<P: Platform> Kernel<P> {
     /// `pidfd_open(pid, flags)`.
     pub(crate) fn sys_pidfd_open(&mut self, pid: u64, flags: u64) -> i64 {
@@ -375,6 +360,18 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
+    /// The host process a `/proc/<pid>` directory descriptor names (which
+    /// `pidfd_send_signal` takes as Linux does), if `fd` is one: a
+    /// process's own directory, not a thread's.
+    fn proc_dir_target(&self, fd: i32) -> Option<HostPid> {
+        crate::synthdir::path_of(fd)?;
+        match self.fs().proc_target(fd, b".")? {
+            (None, rest) if rest.is_empty() => Some(crate::host::pid()),
+            (Some(host), rest) if rest.is_empty() => host,
+            _ => None,
+        }
+    }
+
     /// `pidfd_send_signal(pidfd, sig, info, flags)`: as `kill`, or with the
     /// `siginfo` the caller made as `rt_sigqueueinfo`, to the process (or
     /// thread, or process group, as `flags` says) the descriptor names;
@@ -397,7 +394,7 @@ impl<P: Platform> Kernel<P> {
         }
         let (t, gone) = match of(fd) {
             Some(t) => (t, ended(fd)),
-            None => match proc_dir_target(fd) {
+            None => match self.proc_dir_target(fd) {
                 Some(host) => (Target { host, tid: 0, nonblock: false }, false),
                 None => return err(errno::EBADF),
             },

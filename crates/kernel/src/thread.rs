@@ -30,17 +30,80 @@ thread_local! {
     /// `set_tid_address`: futex word cleared and woken when the thread exits.
     static CLEAR_CHILD_TID: Cell<u64> = const { Cell::new(0) };
     static ROBUST_LIST: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
-    /// The name `prctl(PR_SET_NAME)` gave this thread, if any.
-    static NAME: Cell<Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]>> = const { Cell::new(None) };
 }
 
-/// This thread's name as `prctl(PR_SET_NAME)` set it, or `None`.
-pub fn name() -> Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]> {
-    NAME.with(Cell::get)
+/// A thread's name (`comm`), NUL-padded.
+pub type Name = [u8; fwe_abi::prctl::TASK_COMM_LEN];
+
+/// This thread's name as `PR_SET_NAME` or a write to its `comm` set it,
+/// or its creator's when it was made; `None` for one never named.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn name() -> Option<Name> {
+    name_of(tid())
 }
 
-pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
-    NAME.with(|n| n.set(Some(name)));
+/// Thread `tid` of this process's name ([`name`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn name_of(tid: i32) -> Option<Name> {
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter().find(|r| r.tid == tid).and_then(|r| r.name)
+}
+
+/// Name this thread `name` ([`name`]).
+pub fn set_name(name: Name) {
+    set_name_of(tid(), Some(name));
+}
+
+/// Name thread `tid` of this process `name` (`None`: as the program's
+/// file is named): whether it is one of its threads. Other processes see
+/// it in `/proc/<pid>/task/<tid>/comm` ([`published_name`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn set_name_of(tid: i32, name: Option<Name>) -> bool {
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = threads.iter_mut().find(|r| r.tid == tid) else { return false };
+    r.name = name;
+    publish_names(&threads);
+    true
+}
+
+/// Publish the names of this process's threads (`threads`, the registry
+/// held), for another process to read ([`published_name`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn publish_names(threads: &[Registered]) {
+    let b: Vec<u8> = threads
+        .iter()
+        .filter_map(|r| Some((r.id, r.name?)))
+        .flat_map(|(id, name)| id.get().to_ne_bytes().into_iter().chain(name))
+        .collect();
+    let b = (!b.is_empty()).then_some(&b[..]);
+    crate::procstore::put_own(crate::procstore::Kind::ThreadNames, b);
+}
+
+/// The name thread `t` of process `pid` published ([`set_name_of`]).
+pub fn published_name(pid: HostPid, t: Tid) -> Option<Name> {
+    let b = crate::procstore::get_of(crate::procstore::Kind::ThreadNames, pid)?;
+    const ONE: usize = 4 + fwe_abi::prctl::TASK_COMM_LEN;
+    b.as_chunks::<ONE>()
+        .0
+        .iter()
+        .find(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]) == t.get())
+        .map(|c| {
+            let mut name = [0u8; fwe_abi::prctl::TASK_COMM_LEN];
+            name.copy_from_slice(&c[4..]);
+            name
+        })
 }
 
 /// Initialize the thread-group id and the main thread's id (both the host
@@ -58,6 +121,8 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
 pub fn init_main(pid: i32) {
+    // The calling thread's name, which the child's one thread keeps.
+    let name = name();
     TGID.store(pid, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
     ID.with(|t| t.set(0));
@@ -99,6 +164,9 @@ pub fn init_main(pid: i32) {
     crate::posixtimer::forked_child();
     crate::ptrace::forked_child();
     register_current();
+    if name.is_some() {
+        set_name_of(pid, name);
+    }
 }
 
 /// Each waiting thread's wake pipe: the host thread, and the pipe's read
@@ -542,6 +610,7 @@ pub(crate) fn forget_published() {
     crate::procstore::set_own_threads(1);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
     crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    crate::procstore::put_own(crate::procstore::Kind::ThreadNames, None);
     ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
@@ -1169,6 +1238,8 @@ struct Registered {
     /// Its nice value (`setpriority` of its tid), for a thread other than
     /// the main one, whose nice value is the process's record's.
     nice: i32,
+    /// Its name ([`name`]).
+    name: Option<Name>,
 }
 
 /// Every live guest thread's pending set, by tid.
@@ -1242,7 +1313,6 @@ pub(crate) fn thread_reused() {
     ID.with(|t| t.set(0));
     CLEAR_CHILD_TID.with(|c| c.set(0));
     ROBUST_LIST.with(|r| r.set((0, 0)));
-    NAME.with(|n| n.set(None));
     SLACK.with(|s| s.set((DEFAULT_SLACK, DEFAULT_SLACK)));
     HOT.with(|h| {
         h.mask.set(0);
@@ -1318,11 +1388,17 @@ pub fn register(new: NewThread) -> Arc<Pending> {
         // Its filesystem view and namespaces are its creator's.
         crate::threadfs::started(tid);
     }
-    // Its creator's nice value, as Linux's thread inherits it.
-    let nice = if tid != tgid() { nice_of(self::tid()) } else { 0 };
+    // Its creator's nice value and name, as Linux's thread inherits them.
+    let (nice, name) = if tid != tgid() { (nice_of(self::tid()), name()) } else { (0, None) };
     let pending = Arc::new(Pending::new());
-    let entry = Registered { tid, id: new.id, pending: pending.clone(), host: 0, robust: 0, nice };
-    THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    let entry =
+        Registered { tid, id: new.id, pending: pending.clone(), host: 0, robust: 0, nice, name };
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.push(entry);
+    if name.is_some() {
+        publish_names(&threads);
+    }
+    drop(threads);
     directed_add(new.id, Arc::as_ptr(&pending));
     publish_tids(&ids());
     pending
@@ -1371,7 +1447,11 @@ pub fn unregister(pending: &Arc<Pending>) {
         let mut t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
         let gone =
             t.iter().filter(|r| Arc::ptr_eq(&r.pending, pending)).map(|r| (r.tid, r.id)).collect();
+        let named = t.iter().any(|r| Arc::ptr_eq(&r.pending, pending) && r.name.is_some());
         t.retain(|r| !Arc::ptr_eq(&r.pending, pending));
+        if named {
+            publish_names(&t);
+        }
         gone
     };
     for (tid, id) in gone {
@@ -1388,7 +1468,13 @@ pub fn unregister_current() {
     drop_wait_pipe();
     let own = HOT.with(|h| h.own.replace(std::ptr::null()));
     directed_remove(id());
-    THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let named = threads.iter().any(|r| Arc::as_ptr(&r.pending) == own && r.name.is_some());
+    threads.retain(|r| Arc::as_ptr(&r.pending) != own);
+    if named {
+        publish_names(&threads);
+    }
+    drop(threads);
     publish_tids(&ids());
     if tid() != tgid() {
         publish_robust(id(), 0);
@@ -1403,6 +1489,7 @@ pub fn process_ending() {
     crate::procstore::set_own_threads(1);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
     crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    crate::procstore::put_own(crate::procstore::Kind::ThreadNames, None);
 }
 
 // --- signals for a named thread, from a handler ------------------------------------

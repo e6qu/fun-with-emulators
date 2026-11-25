@@ -10946,12 +10946,53 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// Each thread has its own name: set by `PR_SET_NAME` or a write to its
+/// `comm` (another thread's too, as `pthread_setname_np` writes it), its
+/// creator's when it starts, the forking thread's in a fork child, the
+/// program's after `execve`; another process reads each in
+/// `/proc/<pid>/task/<tid>` (crashpad does, of a crashed browser's).
+#[test]
+fn threads_have_names_of_their_own() {
+    let prog = build_c_dynamic("threadnames", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "threadnames");
+    std::fs::copy(&prog, root.join("threadnames")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("threadnames"));
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    // Linux 7.0's output, on arm64.
+    assert_eq!(
+        stdout(&out),
+        "own view of the named thread: named-by-main\n\
+         own view of the inheriting thread: self-named\n\
+         fork child: self-named\n\
+         main comm: threadnames\n\
+         main stat: (threadnames)\n\
+         main status: threadnames\n\
+         self-named comm: self-named\n\
+         self-named stat: (self-named)\n\
+         self-named status: self-named\n\
+         inheriting comm: self-named\n\
+         inheriting stat: (self-named)\n\
+         inheriting status: self-named\n\
+         named by main comm: named-by-main\n\
+         named by main stat: (named-by-main)\n\
+         named by main status: named-by-main\n\
+         after execve: exe\n\
+         child: 0\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// Processes made with `CLONE_FS` share their root, working directory and
 /// umask, across `execve` too; one made without it has its own. Chromium's
 /// sandbox empties its root so: a `CLONE_FS` child's `chroot` to its own
 /// `/proc/self/fdinfo` leaves the parent's root in a directory of a process
-/// that has ended. The program is in its root, as a program is on Linux:
-/// its child runs it again.
+/// that has ended; a descriptor of `/proc` opened before still reaches it.
+/// The program is in its root, as a program is on Linux: its child runs it
+/// again.
 #[test]
 fn clone_fs_shares_the_root_working_directory_and_umask() {
     let prog = build_c_dynamic("clonefs", Libc::Glibc, true);
@@ -10974,7 +11015,11 @@ fn clone_fs_shares_the_root_working_directory_and_umask() {
          /proc: No such process\n\
          /: found\n\
          cwd: /\n\
-         listing /: No such process\n",
+         listing /: No such process\n\
+         /proc's self/fd: listed\n\
+         /proc's self/status: Name\n\
+         in /proc: cwd No such file or directory\n\
+         in /proc: self found\n",
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );

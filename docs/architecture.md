@@ -1210,6 +1210,17 @@ contents come from is in
   `crates/kernel/src/synthdir.rs` serves `getdents64`, `lseek`, `fstat`
   and `close` of the directories from an in-memory list. An unknown path
   is `ENOENT`.
+- **Identity:** each entry has its mount's device number (as
+  `mountinfo` gives it) and an inode number of its own, which `stat` and
+  `getdents64` agree on: 1 for the filesystem's root, as Linux numbers
+  `/proc`'s, and otherwise one made from its path, the reader's process
+  named by its pid (`fs::synthetic_ino`). Tree walks (glibc's `getcwd`
+  fallback, `find`, `du`) tell the entries apart by them.
+- **Paths through a descriptor:** an open directory of fwe's is kept by
+  its path in the mount namespace's view, so a path relative to it
+  resolves in its mount whatever the root has become (Chromium's sandbox
+  reads `/proc` through a descriptor it opened before emptying its
+  root).
 - **Ownership:** a process's `/proc/<pid>` and its contents are owned by
   its effective user and group (root's while it is not dumpable).
 - **Another process's files** come from its records in the process store
@@ -1223,7 +1234,12 @@ contents come from is in
   the arguments and `AT_EXECFN`'s string, read from memory (another
   process's as `process_vm_readv` reaches it); `auxv` the vector the
   program started with. Writing `comm` names the thread as `PR_SET_NAME`
-  does.
+  does; any thread of the process can name another so
+  (`pthread_setname_np`). Each thread's name is in the thread registry
+  (`crates/kernel/src/thread.rs`), inherited by a thread it starts and
+  by a fork child, and published in the process store for
+  `/proc/<pid>/task/<tid>/{comm,stat,status}`; `execve` names the thread
+  after the last component of the path it was given.
 - **The state in `stat`** is the main thread's: `S` while it waits in a
   system call, `D` while the host brings in a page for it, and `R` while
   it does fwe's own work.
@@ -2017,8 +2033,9 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   (another host process is reached by its number, with only its `stat`);
   `/proc/net` there shows the host's interfaces but only fwe's processes'
   sockets, and no route through a gateway; `/proc/<pid>/io` counts only
-  storage bytes and `statm` only the size and resident set; writing
-  another thread's `comm` is refused (`EINVAL`).
+  storage bytes and `statm` only the size and resident set; a thread's
+  directory (`task/<tid>`) holds only `comm`, `stat`, `status` and
+  `mem` (the caller's own, `ns` too).
 - cgroups: memory, CPU, I/O and other limits are kept and read back but
   not enforced (only `pids.max` and device programs are); a threaded
   cgroup cannot be made (`cgroup.type` refuses `threaded`); there is no

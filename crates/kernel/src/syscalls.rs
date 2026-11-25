@@ -1848,13 +1848,15 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             PR_GET_NAME => {
-                // A thread not yet named has the program's file name.
+                // A thread not named since the program started has the
+                // process's name (what `execve` named it).
                 let name = thread::name().unwrap_or_else(|| {
-                    let exe = self.fs().exe();
-                    let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
+                    let comm = crate::procreg::read(crate::host::pid())
+                        .map(|r| r.comm)
+                        .unwrap_or_default();
                     let mut name = [0u8; TASK_COMM_LEN];
-                    let n = base.len().min(TASK_COMM_LEN - 1);
-                    name[..n].copy_from_slice(&base[..n]);
+                    let n = comm.len().min(TASK_COMM_LEN - 1);
+                    name[..n].copy_from_slice(&comm[..n]);
                     name
                 });
                 guest!(uaccess::write(arg2, name));

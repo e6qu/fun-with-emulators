@@ -649,6 +649,8 @@ impl<P: Platform> Kernel<P> {
         thread::set_altstack(Stack { ss_flags: absig::SS_DISABLE, ..Stack::default() });
         thread::set_clear_child_tid(0);
         thread::set_robust_list(0, 0);
+        // Named as the program's file is, from now on.
+        thread::set_name_of(thread::tid(), None);
         acct::exec();
         aio::forget_all();
         // A set-ID program's owner and group, then the saved IDs the

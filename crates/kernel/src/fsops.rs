@@ -859,10 +859,10 @@ impl<P: Platform> Kernel<P> {
                 }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
                     Some(mut entries) => {
-                        let at = self.fs().absolute_path(dirfd as i32, &path).unwrap_or_default();
+                        let at = self.fs().absolute_ns(dirfd as i32, &path).unwrap_or_default();
                         // A `proc` mount's root lists what its options do
                         // not hide from the reader.
-                        let (m, fs_path) = self.fs().mount_of(&at);
+                        let (m, fs_path) = self.fs().mount_of_ns(&at);
                         if m.fstype == crate::mounts::FsType::Proc && fs_path == b"/" {
                             entries.retain(|(n, _)| {
                                 n == b"."
@@ -871,7 +871,8 @@ impl<P: Platform> Kernel<P> {
                                         != Some(errno::ENOENT)
                             });
                         }
-                        let fd = crate::synthdir::open(at, entries);
+                        let fs_path = self.fs().synthetic_fs_path(&m, &fs_path);
+                        let fd = crate::synthdir::open(at, fs_path, entries);
 
                         let fd = self.synthetic_fd(fd, dirfd as i32, &path);
                         if fd >= 0 && self.fs().lists_fds(dirfd as i32, &path) {
@@ -1706,7 +1707,10 @@ impl<P: Platform> Kernel<P> {
             if let Some(e) = self.proc_hidden(dirfd, path) {
                 return Err(e);
             }
-            let st = match entry {
+            // Its own numbers, but a namespace's (its own) and a
+            // directory's ([`Self::synth_dir_stat`] gives them).
+            let numbered = !matches!(entry, Entry::Ns(_) | Entry::Dir);
+            let mut st = match entry {
                 Entry::Ns(n) => ns_stat(n.id),
                 Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                 Entry::Symlink(t) if follow => {
@@ -1731,8 +1735,7 @@ impl<P: Platform> Kernel<P> {
                         );
                     }
                     if crate::synthdir::fstat_is_dir(fd) {
-                        let path = crate::synthdir::path_of(fd).unwrap_or_default();
-                        let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
+                        let stat = self.synth_dir_stat(fd, b".");
                         return Ok((stat, Extra::default()));
                     }
                     let s = stat_fd(fd)?;
@@ -1745,6 +1748,9 @@ impl<P: Platform> Kernel<P> {
                 Entry::Dir => self.synth_dir_stat(dirfd, path),
                 Entry::Missing(e) => return Err(e),
             };
+            if numbered && let Some((dev, ino)) = self.fs().synthetic_identity(dirfd, path) {
+                (st.st_dev, st.st_ino) = (dev, ino);
+            }
             return Ok((self.proc_owned(dirfd, path, st), Extra::default()));
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
@@ -1818,13 +1824,9 @@ impl<P: Platform> Kernel<P> {
             };
         }
         if crate::synthdir::fstat_is_dir(fd as i32) {
-            let path = crate::synthdir::path_of(fd as i32);
-            let mut stat =
-                self.synth_dir_stat(fcntl::AT_FDCWD as i32, path.as_deref().unwrap_or(b""));
+            let stat = self.synth_dir_stat(fd as i32, b".");
             // A process's directory is its user's (newuidmap checks so).
-            if let Some(path) = path {
-                stat = self.proc_owned(fcntl::AT_FDCWD as i32, &path, stat);
-            }
+            let stat = self.proc_owned(fd as i32, b".", stat);
             guest!(uaccess::write(buf, stat));
             return 0;
         }
@@ -1900,8 +1902,7 @@ impl<P: Platform> Kernel<P> {
             }
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {
-                let path = crate::synthdir::path_of(dirfd as i32).unwrap_or_default();
-                let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
+                let stat = self.synth_dir_stat(dirfd as i32, b".");
                 let x = with_mount(statx_of(&stat));
                 guest!(uaccess::write(buf, x));
                 return 0;
@@ -5188,7 +5189,13 @@ impl<P: Platform> Kernel<P> {
                 .filter(|(n, t)| *t == crate::procfs::DT_DIR && n != b"." && n != b"..")
                 .count()
         });
-        Stat { st_nlink: 2 + subdirs as u32, ..synth_stat(fwe_abi::stat::S_IFDIR | 0o555, 0) }
+        let (st_dev, st_ino) = self.fs().synthetic_identity(dirfd, path).unwrap_or_default();
+        Stat {
+            st_dev,
+            st_ino,
+            st_nlink: 2 + subdirs as u32,
+            ..synth_stat(fwe_abi::stat::S_IFDIR | 0o555, 0)
+        }
     }
 }
 

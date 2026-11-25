@@ -889,10 +889,11 @@ fn with_held(pid: HostPid, r: Option<ProcRecord>) -> Option<ProcRecord> {
     }
 }
 
-/// This process runs program `exe` with command line `cmdline`.
-pub fn own_program(exe: &[u8], cmdline: &[u8]) {
-    let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
-    let comm = base[..base.len().min(15)].to_vec();
+/// This process runs the program `exe` (its file's path), by a path whose
+/// last component is `named` (its `comm`, as Linux's `execve` names the
+/// thread), with command line `cmdline`.
+pub fn own_program(exe: &[u8], named: &[u8], cmdline: &[u8]) {
+    let comm = named[..named.len().min(15)].to_vec();
     let (exe, cmdline) = (exe.to_vec(), cmdline.to_vec());
     change_own(move |r| {
         r.exe = exe.clone();
@@ -1941,7 +1942,7 @@ mod tests {
     fn a_batch_writes_once_and_its_changes_are_read_meanwhile() {
         let exe = format!("/batch-test-{}", std::process::id()).into_bytes();
         batch(|| {
-            own_program(&exe, b"batch\0");
+            own_program(&exe, &exe[1..], b"batch\0");
             own_auxv(&[1, 2, 3]);
             // Held back, but this process reads them.
             let held = read(me()).unwrap();

@@ -635,7 +635,7 @@ impl<P: Platform> Kernel<P> {
         // walk finds it ([`crate::fs::ProcPin`]).
         let (ns, is_dir, pin) =
             match self.fs().synthetic_dir(fwe_abi::fcntl::AT_FDCWD as i32, &path) {
-                Some(Ok(d)) => (self.fs().to_ns(&d.guest), true, d.pin),
+                Some(Ok(d)) => (d.ns, true, d.pin),
                 Some(Err(e)) => return err(e),
                 None => match self.mount_path(&path, true) {
                     Ok((ns, is_dir)) => (ns, is_dir, None),

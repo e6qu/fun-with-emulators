@@ -547,35 +547,37 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
         };
     };
     let Some(h) = host_info(host) else { return Entry::Missing(fwe_abi::errno::ENOENT) };
+    // Its credentials, as its `status` shows them.
+    let creds = || {
+        let u = |id| crate::userns::to_ns(id, false);
+        let g = |id| crate::userns::to_ns(id, true);
+        let i = rec.ids;
+        let s = rec.sec;
+        let [effective, permitted, inheritable, bounding, ambient] = s.caps;
+        let tracer = crate::ptrace::tracer_of(host.get());
+        Creds {
+            uids: [u(i[0]), u(i[1]), u(i[2]), u(i[3])],
+            gids: [g(i[4]), g(i[5]), g(i[6]), g(i[7])],
+            groups: Vec::new(),
+            caps: Some(crate::caps::Caps {
+                effective,
+                permitted,
+                inheritable,
+                bounding,
+                ambient,
+                securebits: 0,
+            }),
+            no_new_privs: s.no_new_privs,
+            seccomp: s.seccomp,
+            filters: s.filters,
+            tracer: if tracer == 0 { 0 } else { crate::pidns::to_guest(tracer) },
+            ..Creds::default()
+        }
+    };
     match sub {
         b"" | b"/ns" | b"/task" => Entry::Dir,
         b"/stat" => Entry::File(stat_line(pid, &rec.comm, &h)),
-        b"/status" => Entry::File(status(pid, &rec.comm, &h, &{
-            let u = |id| crate::userns::to_ns(id, false);
-            let g = |id| crate::userns::to_ns(id, true);
-            let i = rec.ids;
-            let s = rec.sec;
-            let [effective, permitted, inheritable, bounding, ambient] = s.caps;
-            let tracer = crate::ptrace::tracer_of(host.get());
-            Creds {
-                uids: [u(i[0]), u(i[1]), u(i[2]), u(i[3])],
-                gids: [g(i[4]), g(i[5]), g(i[6]), g(i[7])],
-                groups: Vec::new(),
-                caps: Some(crate::caps::Caps {
-                    effective,
-                    permitted,
-                    inheritable,
-                    bounding,
-                    ambient,
-                    securebits: 0,
-                }),
-                no_new_privs: s.no_new_privs,
-                seccomp: s.seccomp,
-                filters: s.filters,
-                tracer: if tracer == 0 { 0 } else { crate::pidns::to_guest(tracer) },
-                ..Creds::default()
-            }
-        })),
+        b"/status" => Entry::File(status(pid, &rec.comm, &h, &creds())),
         b"/maps" | b"/smaps" => match crate::mm::MapsView::of(host) {
             Some(v) => Entry::File(v.render(sub == b"/smaps")),
             None => Entry::Missing(fwe_abi::errno::ENOENT),
@@ -635,15 +637,34 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
                         other => other,
                     };
                 }
-                // Its threads, as it published them (the main thread always).
-                let listed = t == pid.to_string().as_bytes()
-                    || std::str::from_utf8(t).ok().and_then(|t| t.parse::<i32>().ok()).is_some_and(
-                        |t| {
-                            let tids = crate::thread::published_tids(host);
-                            tids.into_iter().any(|id| crate::pidns::thread_number(id) == t)
-                        },
-                    );
-                return if listed { Entry::Dir } else { Entry::Missing(fwe_abi::errno::ENOENT) };
+                // Its threads, as it published them (the main thread always),
+                // each with its own name.
+                let (num, file) = match t.iter().position(|&b| b == b'/') {
+                    Some(i) => (&t[..i], &t[i..]),
+                    None => (t, &b""[..]),
+                };
+                let Some(n) = std::str::from_utf8(num).ok().and_then(|n| n.parse::<i32>().ok())
+                else {
+                    return Entry::Missing(fwe_abi::errno::ENOENT);
+                };
+                let thread = if n == pid {
+                    Some(crate::ids::Tid::main_of(host))
+                } else {
+                    let tids = crate::thread::published_tids(host);
+                    tids.into_iter().find(|&id| crate::pidns::thread_number(id) == n)
+                };
+                let Some(thread) = thread else { return Entry::Missing(fwe_abi::errno::ENOENT) };
+                let comm = match crate::thread::published_name(host, thread) {
+                    Some(name) => name.iter().take_while(|&&b| b != 0).copied().collect(),
+                    None => rec.comm.clone(),
+                };
+                return match file {
+                    b"" => Entry::Dir,
+                    b"/comm" => Entry::File([&comm[..], b"\n"].concat()),
+                    b"/stat" => Entry::File(stat_line(n, &comm, &h)),
+                    b"/status" => Entry::File(status(n, &comm, &h, &creds())),
+                    _ => Entry::Missing(fwe_abi::errno::ENOENT),
+                };
             }
             Entry::Missing(fwe_abi::errno::ENOENT)
         }
@@ -661,6 +682,10 @@ pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
                 .map(|n| (n.to_vec(), DT_LNK)),
         ),
         b"/net" => out.extend(crate::procnet::FILES.iter().map(|n| (n.to_vec(), DT_REG))),
+        // A thread's directory: the files of it fwe has.
+        _ if sub.strip_prefix(b"/task/").is_some_and(|t| !t.contains(&b'/')) => {
+            out.extend([&b"comm"[..], b"stat", b"status"].iter().map(|n| (n.to_vec(), DT_REG)))
+        }
         b"/task" => {
             out.push((pid.to_string().into_bytes(), DT_DIR));
             let me = pid.to_string().into_bytes();
@@ -800,13 +825,14 @@ fn comm_write(tid: i32, data: &[u8], len: u64) -> i64 {
     let n = data.len().min(TASK_COMM_LEN - 1);
     let mut name = [0u8; TASK_COMM_LEN];
     name[..n].copy_from_slice(&data[..n]);
-    let main = tid == 0 || tid == crate::thread::tgid();
+    // Any thread of the process's, as Linux allows; the main one's is the
+    // process's too.
+    let tid = if tid == 0 { crate::thread::tgid() } else { tid };
+    let main = tid == crate::thread::tgid();
     if main {
         crate::procreg::own_comm(&name[..n]);
     }
-    if main && crate::thread::tid() == crate::thread::tgid() || tid == crate::thread::tid() {
-        crate::thread::set_name(name);
-    } else if !main {
+    if !crate::thread::set_name_of(tid, Some(name)) && !main {
         return err(errno::EINVAL);
     }
     len as i64
