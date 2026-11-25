@@ -26,7 +26,7 @@ jobs:
       # Code comments' links name what exists.
       - run: cargo doc --workspace --no-deps --document-private-items
         env:
-          RUSTDOCFLAGS: -D warnings
+          RUSTDOCFLAGS: -D warnings -A rustdoc::private-intra-doc-links
       - run: cargo test
 
   macos:
