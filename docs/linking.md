@@ -1,13 +1,13 @@
 # How programs are built and loaded: Linux and macOS on arm64
 
-The concepts behind a program file and its start: object files,
-relocations, linking statically and dynamically, position independence,
-what the code of each kind looks like, virtual memory, ASLR,
-thread-local storage, and how a kernel and a loader start a program,
-each on Linux and on macOS, both on arm64. What fwe does with
-them is in [linux-on-macos.md](linux-on-macos.md); this document is the
-background it assumes, as [arm64.md](arm64.md) is for the instruction
-set and the calling conventions.
+The concepts behind a program file and its start, on Linux and on macOS,
+both on arm64: object files, relocations, linking statically and
+dynamically, position independence, what the code of each kind looks
+like, virtual memory, ASLR, thread-local storage, and how a kernel and a
+loader start a program. What fwe does with them is in
+[linux-on-macos.md](linux-on-macos.md); this document is the background
+it assumes, as [arm64.md](arm64.md) is for the instruction set and the
+calling conventions.
 
 ## From source to a running program
 
@@ -464,8 +464,8 @@ being exploited from user space. Above that, a Linux process owns its
 whole lower address space, which is why Linux toolchains link
 fixed-address executables at `0x400000` or `0x10000`, addresses inside
 macOS's `__PAGEZERO`. A Linux program loaded at such an address cannot
-share a process with macOS code where it was linked: under fwe it is
-moved, if its link kept its relocations, or run in a VM
+share a process with macOS code where it was linked: under fwe a static
+one whose link kept its relocations is moved, and any other runs in a VM
 ([linux-on-macos.md](linux-on-macos.md#the-low-4-gib)).
 
 ## The address space and ASLR
@@ -578,7 +578,7 @@ A Linux arm64 program's instructions run on a Mac's CPU unchanged, but
 its file and its expectations are Linux's: an ELF image, possibly at a
 fixed address inside macOS's `__PAGEZERO`, its own dynamic linker, its
 own system calls, the thread pointer in `TPIDR_EL0`, perhaps `x18`,
-perhaps code it writes as it runs, and pages of 4 KiB. How fwe loads such
+perhaps code it writes as it runs, perhaps pages of 4 KiB. How fwe loads such
 programs, which ones it runs natively and which in a VM, and what it
 rewrites, is in
 [linux-on-macos.md](linux-on-macos.md); how each part is built is in
