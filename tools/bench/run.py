@@ -156,7 +156,8 @@ def debian_system(manifest, cache):
     for deb in debs:
         # A .deb is an `ar` archive whose data.tar.* holds the files.
         with tempfile.TemporaryDirectory(dir=cache) as unpack:
-            subprocess.run(["ar", "x", deb], cwd=unpack, check=True)
+            # (Run where it unpacks, so the archive by its full path.)
+            subprocess.run(["ar", "x", os.path.abspath(deb)], cwd=unpack, check=True)
             data = next(f for f in os.listdir(unpack) if f.startswith("data.tar"))
             subprocess.run(["tar", "xpf", os.path.join(unpack, data), "-C", root], check=True)
     os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
