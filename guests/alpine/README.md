@@ -1,10 +1,11 @@
 # Alpine Linux test fixtures
 
-The container, debugger, Wine, JDK and benchmark tests, and those of
-language runtimes that make code as they run, use Alpine Linux, whose
-`aarch64` programs are built position-independent (GCC's own compilers
-and SBCL aside) and so run in fwe's native backend (Debian's podman,
-containerd and runc are not, and need the VM). Nothing is vendored here.
+The container, debugger, Wine, JDK, display and benchmark tests, and
+those of language runtimes that make code as they run, use Alpine Linux.
+Its `aarch64` programs are built position-independent (GCC's own
+compilers and SBCL aside), so they run in fwe's native backend; Debian's
+podman, containerd and runc are not, and need the VM. Nothing is
+vendored here.
 
 ## Fetched, not vendored
 
@@ -13,8 +14,8 @@ Each file in `fetch/` lists what one test downloads from
 file's SHA-256. The test checks each checksum, unpacks the files in order
 into its root filesystem and caches them under `target/fetched-packages`
 (`FWE_FETCH_CACHE` overrides it; CI caches it). Alpine 3.20 is past its
-end of life, so its files do not change; 3.24 is supported, and a rebuilt
-package there fails its checksum.
+end of life, so its files do not change; 3.24 and 3.25 are supported, and
+a package rebuilt there fails its checksum.
 
 | Manifest | Contents | Size |
 | --- | --- | --- |
@@ -35,7 +36,7 @@ package there fails its checksum.
 | `fetch/guile.txt` | The 3.24.4 minirootfs and GNU Guile 3.0 with libunistring, gmp, the Boehm GC, libstdc++, libgcc and libffi | 17 MB |
 | `fetch/python.txt` | The 3.24.4 minirootfs and Python 3.14 with its libraries (sqlite, readline, ncurses, mpdecimal, libstdc++, libgcc, xz, libffi, expat, bzip2) | 15 MB |
 | `fetch/ptrace.txt` | The minirootfs (the tests' root), strace 6.9 with elfutils' libdw and libelf, gdb 14.2 with the Python 3.12 it embeds, musl's debug information, and their libraries (gmp, mpfr, readline, ncurses, expat, libstdc++, libgcc, OpenSSL, libffi, gdbm, mpdecimal, sqlite, zlib, zstd, xz, bzip2, musl-fts) | 21 MB |
-| `fetch/display.txt` | The 3.24.4 minirootfs, X11 clients (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, Weston 14 with its X11 back end and clients, foot and Xwayland, glxgears with Mesa's software renderer (mesa-utils, mesa-dri-gallium), and their libraries (libX11 and the other X libraries, xcb, Wayland, pixman, cairo, pango, fontconfig, freetype, Mesa, libinput and theirs) | 123 MB |
+| `fetch/display.txt` | The 3.24.4 minirootfs, X11 clients (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, Weston 14 with its X11 back end and clients, foot and Xwayland, glxgears (mesa-utils) with Mesa's drivers (mesa-dri-gallium: its software renderer, and Zink, OpenGL on fwe's Vulkan driver), Xvfb 21.1 (an X server with GLX), Vulkan's loader with vulkaninfo and vkcube (vulkan-tools), and their libraries (libX11 and the other X libraries, xcb, Wayland, pixman, cairo, pango, fontconfig, freetype, libinput and theirs). Mesa is 3.25's (26.3), with the LLVM 23 and musl it is built with | 123 MB |
 | `fetch/toolkits.txt` | The 3.24.4 minirootfs, Python 3.14 with tkinter (Tcl/Tk 8.6), GTK 3's and GTK 4's demo programs with glycin's image loaders, PyQt6 with Qt 6.11's X11 and Wayland platforms, a font, xwd and xdotool, and their libraries (GLib, cairo, pango, gdk-pixbuf, GStreamer, Mesa, LLVM, ICU and theirs) | 242 MB |
 | `fetch/wine-x11.txt` | The 3.24.4 minirootfs, Wine 11.0, and the X libraries, fontconfig and font its X11 driver loads | 85 MB |
 
@@ -77,5 +78,7 @@ GPL-2.0-or-later or LGPL-3.0-or-later; ca-certificates MPL-2.0 and MIT;
 PostgreSQL and libpq the PostgreSQL License; postgresql-common MIT; tzdata
 public domain; libldap OLDAP-2.8; Cyrus SASL BSD-3-Clause-Attribution and
 BSD-4-Clause; liburing LGPL-2.1-or-later or MIT;
-the minirootfs's packages (BusyBox GPL-2.0-only, musl MIT, and others) their
-own.
+the display and toolkit packages (X11's and Wayland's, Weston, foot, Mesa,
+Vulkan's loader and tools, Tcl/Tk, GTK, Qt, PyQt6 and their libraries) and
+the minirootfs's (BusyBox GPL-2.0-only, musl MIT, and others) their own,
+as each package's metadata records them.
