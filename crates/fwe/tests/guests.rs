@@ -11154,6 +11154,155 @@ fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
     }
 }
 
+/// A root for browser test `test`: Alpine's browsers
+/// (`guests/alpine/fetch/browsers.txt`), with the pages of
+/// `guests/apps/pages` in `/tmp/fwe-pages` and `nobody`'s home in
+/// `/tmp/nobody`.
+fn browsers_root(test: &str) -> ScratchRoot {
+    use std::os::unix::fs::PermissionsExt;
+    let root = display_root(&alpine_root("browsers"), test);
+    let pages = root.0.join("tmp/fwe-pages");
+    std::fs::create_dir_all(&pages).unwrap();
+    for e in std::fs::read_dir(repo().join("guests/apps/pages")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), pages.join(e.file_name())).unwrap();
+    }
+    let home = root.0.join("tmp/nobody");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).unwrap();
+    root
+}
+
+/// `/bin/su`'s arguments running `cmd` as `nobody` (Alpine has no
+/// `setpriv`), its home and runtime directory `/tmp/nobody`.
+fn su_nobody(cmd: &str) -> Vec<String> {
+    let cmd = format!("HOME=/tmp/nobody XDG_RUNTIME_DIR=/tmp/nobody exec {cmd}");
+    ["-s", "/bin/sh", "nobody", "-c", &cmd].map(String::from).to_vec()
+}
+
+/// Chromium's switches for a test's run: its profile in `/tmp/nobody`, no
+/// first-run dialogs, its log on standard error.
+const CHROMIUM: &str = "/usr/bin/chromium --no-first-run --user-data-dir=/tmp/nobody/chromium \
+                        --enable-logging=stderr";
+
+/// Chromium, its sandboxes on: its window shows the test page.
+#[test]
+fn alpine_display_chromium_draws_a_page_sandboxed() {
+    let Some(_x) = display_tests() else { return };
+    let root = browsers_root("chromium-page");
+    // The root's Xvfb, which has GLX: Chromium's GPU process falls back to
+    // drawing in software through it.
+    let x = Xvfb::in_root(&root);
+    let args = su_nobody(&format!("{CHROMIUM} file:///tmp/fwe-pages/page.html"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "chromium-page", &root, "/bin/su", &args, &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-page"], 180);
+    shows_the_test_page(&x, &w, "chromium-page", &mut gui);
+}
+
+/// Chromium, its sandboxes on, drawing on the Mac's GPU: ANGLE on Vulkan,
+/// through fwe's driver. The page's WebGL names the GPU, and its window
+/// shows the page.
+#[test]
+fn alpine_display_chromium_draws_on_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = browsers_root("chromium-gpu");
+    let args = su_nobody(&format!(
+        "{CHROMIUM} --use-angle=vulkan --ignore-gpu-blocklist \
+         --enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan \
+         file:///tmp/fwe-pages/gpu.html"
+    ));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "chromium-gpu", &root, "/bin/su", &args, &FWE_VULKAN);
+    let w = x.window(&mut gui, &["--name", "^fwe-gpu: .*Apple"], 180);
+    shows_the_test_page(&x, &w, "chromium-gpu", &mut gui);
+}
+
+/// Chromium plays a video ([`plays_the_test_video`]).
+#[test]
+fn alpine_display_chromium_plays_a_video() {
+    let Some(_x) = display_tests() else { return };
+    let root = browsers_root("chromium-video");
+    let x = Xvfb::in_root(&root);
+    let args = su_nobody(&format!(
+        "{CHROMIUM} --autoplay-policy=no-user-gesture-required file:///tmp/fwe-pages/video.html"
+    ));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &[]);
+    plays_the_test_video(&x, "chromium-video", &mut gui);
+}
+
+/// Firefox's command for a test's run: an instance of its own, its
+/// profile made in its home.
+const FIREFOX: &str = "/usr/bin/firefox --new-instance --no-remote";
+
+/// Firefox, its sandboxes on: its window shows the test page.
+#[test]
+fn alpine_display_firefox_draws_a_page_sandboxed() {
+    let Some(x) = display_tests() else { return };
+    let root = browsers_root("firefox-page");
+    let args = su_nobody(&format!("{FIREFOX} file:///tmp/fwe-pages/page.html"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "firefox-page", &root, "/bin/su", &args, &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-page"], 180);
+    shows_the_test_page(&x, &w, "firefox-page", &mut gui);
+}
+
+/// Firefox, its sandboxes on, drawing on the Mac's GPU: OpenGL by Mesa's
+/// Zink on fwe's Vulkan driver, on the root's Xvfb (which has GLX). The
+/// page's WebGL names the GPU, and its window shows the page.
+#[test]
+fn alpine_display_firefox_draws_on_the_gpu() {
+    let Some(_x) = display_tests() else { return };
+    let root = browsers_root("firefox-gpu");
+    let x = Xvfb::in_root(&root);
+    let args = su_nobody(&format!(
+        "env MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_KOPPER_DRI2=1 \
+         {FIREFOX} file:///tmp/fwe-pages/gpu.html"
+    ));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "firefox-gpu", &root, "/bin/su", &args, &FWE_VULKAN);
+    let w = x.window(&mut gui, &["--name", "^fwe-gpu: .*Apple"], 180);
+    shows_the_test_page(&x, &w, "firefox-gpu", &mut gui);
+}
+
+/// Firefox plays a video ([`plays_the_test_video`]).
+#[test]
+fn alpine_display_firefox_plays_a_video() {
+    let Some(x) = display_tests() else { return };
+    let root = browsers_root("firefox-video");
+    let args = su_nobody(&format!("{FIREFOX} file:///tmp/fwe-pages/video.html"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "firefox-video", &root, "/bin/su", &args, &[]);
+    plays_the_test_video(&x, "firefox-video", &mut gui);
+}
+
+/// A browser showing `guests/apps/pages/video.html` plays its video: the
+/// page says it plays (its title), and what the window shows changes from
+/// one look to the next (the bar crossing the video), the page's own
+/// magenta covering less than all of it.
+fn plays_the_test_video(x: &Xvfb, name: &str, gui: &mut Gui) {
+    let w = x.window(gui, &["--name", "^fwe-video: playing"], 180);
+    let area = (w.w * w.h) as u64;
+    let mut seen = std::collections::BTreeSet::new();
+    for n in 0..8 {
+        let shot = x.shot(&w, &format!("{name}-{n}"));
+        assert!(
+            shot.count(0xff00ff) < area.saturating_sub(200_000),
+            "{name} shows no video: {shot:?}: {}",
+            gui.report()
+        );
+        seen.insert(shot.digest);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    assert!(
+        seen.len() >= 4,
+        "{name}'s video does not move: {} frames: {}",
+        seen.len(),
+        gui.report()
+    );
+}
+
 /// Electron, sandboxed: an app of its own showing a page.
 #[test]
 fn debian_display_electron_app_draws_its_page() {

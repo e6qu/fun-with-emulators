@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+  <!-- A video made and played by the browser: two seconds of frames drawn
+       on a canvas (green, a blue bar crossing it) recorded as WebM (VP8)
+       by MediaRecorder, then played in a loop by a video element, the
+       title then "fwe-video: playing". The tests look at the video drawn:
+       the window's pixels changing as the bar crosses it. -->
+  <head><meta charset="utf-8"><title>fwe-video</title></head>
+  <body style="margin:0;background:#ff00ff">
+    <canvas id="c" width="320" height="240" style="display:none"></canvas>
+    <video id="v" width="640" height="480" muted loop></video>
+    <script>
+      const c = document.getElementById("c"), g = c.getContext("2d");
+      const v = document.getElementById("v");
+      let n = 0;
+      const draw = () => {
+        g.fillStyle = "#00ff00";
+        g.fillRect(0, 0, 320, 240);
+        g.fillStyle = "#0000ff";
+        g.fillRect((n * 8) % 320, 0, 40, 240);
+        n++;
+      };
+      draw();
+      const rec = new MediaRecorder(c.captureStream(30), { mimeType: "video/webm;codecs=vp8" });
+      const parts = [];
+      rec.ondataavailable = (e) => parts.push(e.data);
+      rec.onstop = () => {
+        v.src = URL.createObjectURL(new Blob(parts, { type: "video/webm" }));
+        v.play().then(() => { document.title = "fwe-video: playing"; });
+      };
+      const tick = setInterval(draw, 33);
+      rec.start();
+      setTimeout(() => { clearInterval(tick); rec.stop(); }, 2000);
+    </script>
+  </body>
+</html>
