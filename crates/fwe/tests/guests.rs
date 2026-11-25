@@ -2945,6 +2945,20 @@ fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
 /// A root filesystem of the packages `manifest` lists ([`fetched_debs`]),
 /// unpacked once and cached, plus the vendored glibc runtime and bash.
 fn fetched_root(manifest_name: &str) -> PathBuf {
+    unpacked_debs(manifest_name, true)
+}
+
+/// A root filesystem of a whole system's packages, as `manifest` lists them
+/// (its own C library and shell among them), unpacked once and cached:
+/// base-files first, whose links (`/lib` to `/usr/lib`, Debian 13's) the
+/// others' files go through, as debootstrap unpacks it.
+fn fetched_system(manifest_name: &str) -> PathBuf {
+    unpacked_debs(manifest_name, false)
+}
+
+/// [`fetched_root`] (`vendored`, the vendored runtime added) or
+/// [`fetched_system`].
+fn unpacked_debs(manifest_name: &str, vendored: bool) -> PathBuf {
     let (list, _) = manifest(manifest_name);
     let cache = fetch_cache();
     let root = cache.join(format!("root-{manifest_name}"));
@@ -2952,9 +2966,14 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
     if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
         return root;
     }
-    let debs = fetched_debs(manifest_name);
+    let mut debs = fetched_debs(manifest_name);
+    let base = |d: &PathBuf| !d.file_name().unwrap().to_string_lossy().starts_with("base-files_");
+    debs.sort_by_key(base);
     let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    if vendored {
+        std::fs::create_dir_all(root.join("lib")).unwrap();
+    }
     for deb in &debs {
         // A .deb is an `ar` archive whose data.tar.* holds the files.
         let unpack = cache.join(format!("unpack-{manifest_name}"));
@@ -2969,6 +2988,11 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
         // `-p`: the modes as the archive has them (`/tmp`'s 1777), not
         // narrowed by the umask.
         run_checked(Command::new("tar").arg("xpf").arg(&data).arg("-C").arg(&root));
+    }
+    if !vendored {
+        std::fs::create_dir_all(root.join("tmp")).unwrap();
+        std::fs::write(&done, &list).unwrap();
+        return root;
     }
     for name in ["ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6"] {
         std::fs::copy(repo().join("guests/glibc/lib").join(name), root.join("lib").join(name))
@@ -11052,7 +11076,7 @@ fn alpine_display_gtk4_demo_runs() {
 fn apps_root(test: &str) -> ScratchRoot {
     static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = MAKING.lock().unwrap_or_else(|e| e.into_inner());
-    let root = fetched_root("apps");
+    let root = fetched_system("apps");
     let (list, archives) = manifest_in("apps", "upstream");
     let made = format!(
         "{list}{}",
