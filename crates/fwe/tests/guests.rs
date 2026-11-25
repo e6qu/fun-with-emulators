@@ -11047,6 +11047,98 @@ fn making_an_existing_name_in_a_read_only_mount_is_eexist() {
     );
 }
 
+/// Multicast membership on TCP sockets, as Linux 7.0 answers it.
+#[test]
+fn tcp_multicast_membership_as_linux_answers_it() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "mcasttcp",
+        &[],
+        "IP_ADD_MEMBERSHIP: 71\n\
+         IP_ADD_MEMBERSHIP, no room: 71\n\
+         IP_DROP_MEMBERSHIP: 71\n\
+         IP_ADD_SOURCE_MEMBERSHIP: 0\n\
+         IP_ADD_SOURCE_MEMBERSHIP again: 99\n\
+         IP_DROP_SOURCE_MEMBERSHIP: 0\n\
+         IP_DROP_SOURCE_MEMBERSHIP again: 22\n\
+         MCAST_JOIN_GROUP: 0\n\
+         MCAST_JOIN_GROUP again: 98\n\
+         MCAST_LEAVE_GROUP: 0\n\
+         MCAST_LEAVE_GROUP again: 99\n\
+         MCAST_JOIN_SOURCE_GROUP: 0\n\
+         MCAST_LEAVE_SOURCE_GROUP: 0\n\
+         MCAST_LEAVE_SOURCE_GROUP again: 22\n\
+         MCAST_JOIN_GROUP for blocks: 0\n\
+         MCAST_BLOCK_SOURCE: 0\n\
+         MCAST_BLOCK_SOURCE again: 99\n\
+         MCAST_JOIN_SOURCE_GROUP with sources blocked: 22\n\
+         MCAST_UNBLOCK_SOURCE: 0\n\
+         MCAST_UNBLOCK_SOURCE again: 99\n\
+         MCAST_BLOCK_SOURCE number 11: 105\n\
+         MCAST_MSFILTER include one: 0\n\
+         MCAST_LEAVE_SOURCE_GROUP its source: 0\n\
+         MCAST_LEAVE_GROUP after: 99\n\
+         MCAST_MSFILTER not joined: 22\n\
+         MCAST_MSFILTER mode 5: 22\n\
+         IP_MSFILTER not joined: 22\n\
+         IP_MSFILTER short: 22\n\
+         IP_BLOCK_SOURCE not joined: 22\n\
+         IP_ADD_SOURCE_MEMBERSHIP short: 22\n\
+         MCAST_JOIN_GROUP of an IPv6 address: 22\n\
+         MCAST_JOIN_SOURCE_GROUP of an IPv6 address: 99\n\
+         MCAST_JOIN_GROUP of 127.0.0.1: 22\n\
+         MCAST_LEAVE_GROUP of 127.0.0.1: 99\n\
+         MCAST_JOIN_GROUP short: 22\n\
+         IPV6_ADD_MEMBERSHIP: 71\n\
+         IPV6_ADD_MEMBERSHIP, no room: 22\n\
+         IPV6_DROP_MEMBERSHIP: 71\n\
+         IPv6 MCAST_JOIN_GROUP: 0\n\
+         IPv6 MCAST_JOIN_GROUP again: 98\n\
+         IPv6 MCAST_LEAVE_GROUP: 0\n\
+         IPv6 MCAST_LEAVE_GROUP again: 99\n\
+         IPv6 MCAST_JOIN_GROUP of an IPv4 address: 99\n\
+         IPv6 MCAST_LEAVE_GROUP of fe02::fb: 22\n\
+         MCAST_JOIN_GROUP on an IPv6 socket: 0\n",
+    );
+}
+
+/// What fwe keeps of a socket is shared by its duplicates: a TCP socket's
+/// multicast groups, and `IPV6_ADDRFORM`'s IPv4 view.
+#[test]
+fn a_sockets_duplicates_share_what_fwe_keeps_of_it() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "sockshare",
+        &[],
+        "join: 0\n\
+         join again through a dup: EADDRNOTAVAIL\n\
+         leave through the dup: 0\n\
+         leave again through the socket: errno 22\n\
+         IPV6_ADDRFORM: 0\n\
+         the dup's name: family 2, 16 bytes\n",
+    );
+}
+
+/// Socket options fwe keeps itself are the socket's, as on Linux: a dup
+/// shares them, and a fork child, the program `execve` runs (here through
+/// `/proc/self/exe`, a program outside the root) and a process the socket
+/// is passed to have them.
+#[test]
+fn kept_socket_options_are_the_sockets() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "keptopts",
+        &[],
+        "the socket: passcred 1, priority 5, no_check 1\n\
+         a dup of it: passcred 1, priority 5, no_check 1\n\
+         the socket after the dup's change: passcred 1, priority 3, no_check 1\n\
+         the dup, the socket's descriptor closed: passcred 1, priority 3, no_check 1\n\
+         passed to another process: passcred 1, priority 0, no_check 0\n\
+         in a fork child: passcred 1, priority 3, no_check 1\n\
+         after execve: passcred 1, priority 3, no_check 1\n",
+    );
+}
+
 /// `SO_PASSCRED` at the end of a Unix socket's stream: a message carries
 /// credentials, the end none, as crashpad tells the end.
 #[test]

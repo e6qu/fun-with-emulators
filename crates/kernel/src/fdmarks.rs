@@ -646,6 +646,7 @@ pub fn forget_closed() {
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
     crate::fdstate::duplicated(old, new);
+    crate::sockstate::duplicated(old, new);
     crate::procfile::duplicated(old, new);
     crate::synthdir::duplicated(old, new);
     let mut r = records();

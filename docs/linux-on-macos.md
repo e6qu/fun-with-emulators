@@ -1352,9 +1352,11 @@ the caller's user namespace; a peer fwe did not start has its host ids
 as the guest sees them
 ([Host identity](#host-identity-and-machine-state)). They are the peer's
 as they were when the connection was made (`socketpair`, `connect`,
-`accept`), as Linux keeps them, and outlast the peer; a socket the process
-did not connect itself (received, or from before an `execve`) gives the
-peer's as they are when asked. A socket with no peer process (not Unix,
+`accept`), as Linux keeps them, and outlast the peer; a descriptor of
+the socket made by `dup`, kept through `execve` or received with
+`SCM_RIGHTS` gives the same. A socket fwe did not see connected (one the
+first program was started with) gives the peer's as they are when
+asked. A socket with no peer process (not Unix,
 or netlink) gives pid 0 and ids -1. Under `SO_PASSCRED` a message carries
 the same credentials when its sender gave none; the end of a stream
 carries Linux's empty ones (pid 0, ids 0), the end of a `SOCK_SEQPACKET`
@@ -1372,8 +1374,8 @@ Linux checks them (ids the sender's user namespace does not map
 real, effective or saved ones without `CAP_SETUID`/`CAP_SETGID`,
 `EPERM`; a pid nobody has `ESRCH`) and travel in a bundle. A receiver
 that set `SO_PASSCRED` gets an `SCM_CREDENTIALS` message first: those
-given, else, on a connected socket, its peer process's (pid, real ids as
-fwe keeps them), else for a datagram to a bound socket that asked for
+given, else, on a connected socket, its peer's as `SO_PEERCRED` gives
+them, else for a datagram to a bound socket that asked for
 them the sender's, which an fwe sender attaches when the address it sends
 to is in a record of such sockets every fwe process sees; a netlink
 socket's come from the kernel (all 0), and a datagram from a program fwe
@@ -2111,7 +2113,7 @@ arguments, and Unix-socket names macOS does not support:
 | `SOL_UDP` options | none (macOS's one, `UDP_NOCKSUM`, has `UDP_CORK`'s number) | fwe's: `UDP_CORK` holds sends back until cleared, then sends them as one datagram; `UDP_SEGMENT` cuts a send into datagrams of its size (64 at most, `EINVAL` past them); `UDP_GRO` joins nothing, as Linux need not; `UDP_NO_CHECK6_TX`/`RX` leave checksums to the host; `UDP_ENCAP` (IPsec) and the rest `ENOPROTOOPT` |
 | `SO_SNDBUF`/`SO_RCVBUF` doubled, capped by `wmem_max`/`rmem_max`; the `FORCE` forms with `CAP_NET_ADMIN` | the size as given | Linux's arithmetic, the host's buffer given the result |
 | a level a socket has no layer for | taken or `EINVAL` | `EOPNOTSUPP` to get, `ENOPROTOOPT` to set (`EOPNOTSUPP` on a Unix socket) |
-| multicast membership on a TCP socket | refused | kept by fwe (no multicast reaches one) |
+| multicast membership on a TCP socket | refused | as Linux has it: `IP_ADD_MEMBERSHIP`, `IPV6_ADD_MEMBERSHIP` and their drops `EPROTO`; the source and `MCAST_*` options' groups, filter modes and sources kept by fwe and checked as Linux checks them (no multicast reaches one) |
 | `MSG_MORE` | none | a TCP or UDP send's data held back and sent with the next send without it, as one segment or datagram |
 | a later `connect` of a socket whose connect was interrupted or left in progress (`EINPROGRESS`) waits for the connection under way, then returns 0 (or its error); after that, `EISCONN` | it says `EALREADY` while the connection is made and `EISCONN` once it is | fwe marks the socket connecting and answers a later `connect` (its own rerun after a signal the guest does not see too) as Linux does, waiting for the host's connection if the socket blocks |
 | `connect` to `AF_UNSPEC` | dissolves a datagram socket's peer, reporting an error | a datagram socket's peer forgotten; a TCP socket's connection reset and a fresh host socket put in its place |

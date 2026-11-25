@@ -253,8 +253,21 @@ pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Pre
             .filter(|&fd| is_socket(fd))
             .collect()
     };
+    // What fwe keeps of the sockets sent, which they take along.
+    let states: Vec<(usize, Vec<u8>)> = if host_peer {
+        Vec::new()
+    } else {
+        fds.iter()
+            .enumerate()
+            .filter_map(|(i, &fd)| Some((i, crate::sockstate::export(fd)?)))
+            .collect()
+    };
     let mut p = Prepared { buf: Vec::new(), bundle: None, objects, stored };
-    if creds.is_some() || exports.iter().any(Option::is_some) || !keeps.is_empty() {
+    if creds.is_some()
+        || exports.iter().any(Option::is_some)
+        || !keeps.is_empty()
+        || !states.is_empty()
+    {
         let ends = match make_bundle() {
             Ok(ends) => ends,
             Err(e) => {
@@ -263,7 +276,7 @@ pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Pre
             }
         };
         p.bundle = Some(ends);
-        if let Err(e) = fill_bundle(ends[0], &exports, creds, &keeps) {
+        if let Err(e) = fill_bundle(ends[0], &exports, creds, &keeps, &states) {
             // Nothing went: the bundle and what it held go.
             p.unsent();
             return Err(e);
@@ -403,6 +416,7 @@ fn fill_bundle(
     exports: &[Option<Export>],
     creds: Option<Creds>,
     keeps: &[i32],
+    states: &[(usize, Vec<u8>)],
 ) -> Result<(), i32> {
     let mut e = Enc::new();
     e.u64(MAGIC);
@@ -423,6 +437,11 @@ fn fill_bundle(
         companions.extend_from_slice(&x.companions);
     }
     e.u32(keeps.len() as u32);
+    e.u64(states.len() as u64);
+    for (i, s) in states {
+        e.u32(*i as u32);
+        e.bytes(s);
+    }
     let manifest = e.into_bytes();
     send_datagram(w, &manifest, &[])?;
     for chunk in companions.chunks(CHUNK).chain(keeps.chunks(CHUNK)) {
@@ -506,11 +525,13 @@ struct Entry {
     companions: Vec<i32>,
 }
 
-/// A bundle's contents: the sender's credentials, if it gave any, and
-/// its entries.
+/// A bundle's contents: the sender's credentials, if it gave any, its
+/// entries, and the states of sockets sent ([`crate::sockstate`]), by
+/// index.
 struct Manifest {
     creds: Option<Creds>,
     entries: Vec<Entry>,
+    states: Vec<(usize, Vec<u8>)>,
 }
 
 /// Read bundle `b`'s manifest and the descriptors behind its entries.
@@ -529,6 +550,8 @@ fn read_bundle(b: i32) -> Option<Manifest> {
         entries.push(Entry { index, kind, state: d.bytes(), companions: Vec::with_capacity(want) });
     }
     let keeps = d.u32() as usize;
+    let n = d.count(12);
+    let states = (0..n).map(|_| (d.u32() as usize, d.bytes())).collect();
     if !d.whole() {
         return None;
     }
@@ -545,7 +568,7 @@ fn read_bundle(b: i32) -> Option<Manifest> {
         let want = e.companions.capacity();
         e.companions.extend(fds.by_ref().take(want));
     }
-    Some(Manifest { creds: has.then_some(creds), entries })
+    Some(Manifest { creds: has.then_some(creds), entries, states })
 }
 
 fn close_all(fds: impl IntoIterator<Item = i32>) {
@@ -617,6 +640,11 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         // A socket of a namespace can be a SOCK_SEQPACKET or ping one too.
         if !taken[i] || crate::netns::of(fd).is_some() {
             crate::net::adopt(fd);
+        }
+    }
+    for (i, s) in &m.states {
+        if let Some(&fd) = fds.get(*i) {
+            crate::sockstate::import(fd, s);
         }
     }
     Incoming { fds, creds: m.creds, dropped }

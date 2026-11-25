@@ -119,6 +119,7 @@ pub mod snapshot;
 #[cfg(target_os = "macos")]
 pub mod socketowners;
 pub mod sockopt;
+mod sockstate;
 pub mod specialfd;
 pub mod specialwrite;
 pub mod splice;
@@ -129,6 +130,7 @@ mod syscalls;
 pub mod syscpu;
 pub mod sysctl;
 pub mod sysvipc;
+mod tcpmcast;
 pub mod term;
 pub mod textbusy;
 pub mod thread;
@@ -447,6 +449,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(self.tracer.failures_only);
         e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
+        sockstate::save(e);
         netlink::save(e, false);
         mountapi::save(e);
         inotify::save(e);
@@ -528,6 +531,7 @@ impl<P: Platform> Kernel<P> {
         trace::traces(tracer);
         let trace_file = d.bytes();
         fdmarks::load(d);
+        sockstate::load(d);
         netlink::load(d);
         mountapi::load(d);
         inotify::load(d);
@@ -1009,6 +1013,7 @@ impl<P: Platform> Kernel<P> {
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
         fdmarks::save(&mut e);
+        sockstate::save(&mut e);
         // The netlink sockets' host ends, which survive the host exec.
         netlink::save(&mut e, true);
         mountapi::save(&mut e);
@@ -1066,6 +1071,7 @@ impl<P: Platform> Kernel<P> {
         let umask = d.u32();
         rlimits::load(&mut d);
         fdmarks::load(&mut d);
+        sockstate::load(&mut d);
         netlink::load(&mut d);
         mountapi::load(&mut d);
         inotify::load(&mut d);

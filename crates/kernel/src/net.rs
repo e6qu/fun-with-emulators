@@ -1899,79 +1899,25 @@ fn take_corked(fd: i32) -> Option<Held> {
     CORKED.lock().unwrap_or_else(|e| e.into_inner()).as_mut()?.remove(&fd)
 }
 
-/// The multicast groups TCP sockets joined: (socket, group and
-/// interface as the host lays them out).
-pub(crate) static MEMBERSHIPS: crate::kept::Kept<Vec<(i32, Vec<u8>)>> =
-    crate::kept::Kept::new(Vec::new());
-
-/// A multicast group joined or left on a TCP socket, which Linux allows
-/// (no multicast reaches one) and the host refuses: kept by fwe. Joining
-/// one joined is `EADDRINUSE`, leaving one not joined `EADDRNOTAVAIL`.
-/// `None` for any other socket or option.
-fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) -> Option<i64> {
-    let group = match form {
-        Form::Mreq | Form::GroupReq => host.to_vec(),
-        // The group and interface, without the source.
-        Form::MreqSource => [&host[..4], &host[8..12]].concat(),
-        Form::GroupSourceReq => host[..132].to_vec(),
-        _ => return None,
-    };
-    if !(level == 0 || level == 41) || !ip_stream(fd) {
-        return None;
-    }
-    // IP_ADD_MEMBERSHIP, IP_ADD_SOURCE_MEMBERSHIP, MCAST_JOIN_GROUP,
-    // MCAST_JOIN_SOURCE_GROUP; the leaves; the rest need the group joined.
-    let join = matches!(name, 35 | 39 | 42 | 46);
-    let leave = matches!(name, 36 | 40 | 45 | 47);
-    let mut m = MEMBERSHIPS.lock();
-    let at = m.iter().position(|(f, g)| *f == fd && *g == group);
-    Some(match (at, join, leave) {
-        (Some(_), true, _) => err(errno::EADDRINUSE),
-        (None, true, _) => {
-            m.push((fd, group));
-            0
-        }
-        (Some(i), _, true) => {
-            m.remove(i);
-            0
-        }
-        (Some(_), ..) => 0,
-        (None, ..) => err(errno::EADDRNOTAVAIL),
-    })
-}
-
-/// Socket `fd` was closed: what it held back goes out, as Linux sends it,
-/// and the groups it joined are left.
+/// Socket `fd` was closed: what it held back goes out, as Linux sends it;
+/// with its last descriptor, the groups it joined are left (its state in
+/// [`crate::sockstate`] goes).
 pub fn closed(fd: i32) {
+    let last = crate::sockstate::closed(fd);
     #[cfg(not(target_os = "linux"))]
-    if kept_value(fd, SO_PASSCRED) != 0 {
+    if last.is_some_and(|s| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
         passcred_bound(fd, false);
     }
-    if let Some(mut m) = MEMBERSHIPS.if_used() {
-        m.retain(|(f, _)| *f != fd);
-    }
-    if let Some(mut k) = KEPT_VALUES.if_used() {
-        k.retain(|k| k.0 != fd);
-    }
-    if let Some(mut v) = V4_VIEW.if_used() {
-        v.retain(|&f| f != fd);
-    }
+    #[cfg(target_os = "linux")]
+    let _ = last;
     flush_corked(fd);
 }
 
 /// A new socket is descriptor `fd` (made, accepted or received): what fwe
-/// keeps per descriptor starts empty, whatever a socket that had the
-/// number left (one closed out of fwe's sight).
+/// keeps of a socket starts empty, whatever a socket that had the number
+/// left (one closed out of fwe's sight).
 pub(crate) fn fresh(fd: i32) {
-    if let Some(mut m) = MEMBERSHIPS.if_used() {
-        m.retain(|(f, _)| *f != fd);
-    }
-    if let Some(mut k) = KEPT_VALUES.if_used() {
-        k.retain(|k| k.0 != fd);
-    }
-    if let Some(mut v) = V4_VIEW.if_used() {
-        v.retain(|&f| f != fd);
-    }
+    crate::sockstate::fresh(fd);
     take_corked(fd);
 }
 
@@ -2001,8 +1947,8 @@ fn udp_option(fd: i32, optname: u64) -> i32 {
 
 /// The value fwe keeps for `fd` under `key` ([`kept_key`]), 0 if none.
 fn kept_value(fd: i32, key: u64) -> i32 {
-    let kept = KEPT_VALUES.if_used();
-    kept.and_then(|k| k.iter().find(|v| (v.0, v.1) == (fd, key)).map(|v| v.2)).unwrap_or(0)
+    crate::sockstate::with(fd, |s| s.kept.iter().find(|v| v.0 == key).map_or(0, |v| v.1))
+        .unwrap_or(0)
 }
 
 /// The host path of Unix datagram socket `fd`'s own address (`peer`: its
@@ -2422,7 +2368,7 @@ fn disconnect(fd: i32) -> Option<i64> {
         return None;
     }
     // One IPv6 socket that `IPV6_ADDRFORM` made IPv4 is IPv4 from now on.
-    let fam = if V4_VIEW.lock().contains(&fd) { libc::AF_INET } else { fam };
+    let fam = if v4_viewed(fd) { libc::AF_INET } else { fam };
     // SAFETY: plain host calls; `new` is a fresh socket this owns until it
     // takes `fd`'s place.
     unsafe {
@@ -2451,9 +2397,12 @@ fn disconnect(fd: i32) -> Option<i64> {
         libc::fcntl(fd, libc::F_SETFD, fdfl);
         libc::close(new);
     }
-    V4_VIEW.lock().retain(|&f| f != fd);
+    // A new socket, of the family it was seen as, which joined nothing.
+    crate::sockstate::update(fd, |s| {
+        s.v4_view = false;
+        s.memberships.clear();
+    });
     take_corked(fd);
-    MEMBERSHIPS.lock().retain(|(f, _)| *f != fd);
     Some(0)
 }
 
@@ -2484,8 +2433,8 @@ const ICMP_FILTER: u64 = 1;
 /// one by one); the IPv6 checksum options leave checksums to the host.
 const KEPT_UDP: [u64; 5] = [UDP_CORK, UDP_NO_CHECK6_TX, UDP_NO_CHECK6_RX, UDP_SEGMENT, UDP_GRO];
 
-/// The key [`KEPT_VALUES`] holds option `optname` of `level` under, if it
-/// is one fwe keeps.
+/// The key a socket's kept options ([`crate::sockstate::State::kept`])
+/// hold option `optname` of `level` under, if it is one fwe keeps.
 fn kept_key(level: u64, optname: u64) -> Option<u64> {
     if level == SOL_SOCKET && KEPT.contains(&optname) {
         Some(optname)
@@ -2498,13 +2447,11 @@ fn kept_key(level: u64, optname: u64) -> Option<u64> {
     }
 }
 
-/// The values of kept options set: (socket, [`kept_key`], value).
-pub(crate) static KEPT_VALUES: crate::kept::Kept<Vec<(i32, u64, i32)>> =
-    crate::kept::Kept::new(Vec::new());
-
-/// IPv6 sockets `IPV6_ADDRFORM` made IPv4: the host's socket stays IPv6,
-/// its names are reported as the IPv4 ones they map.
-static V4_VIEW: crate::kept::Kept<Vec<i32>> = crate::kept::Kept::new(Vec::new());
+/// Whether `IPV6_ADDRFORM` made IPv6 socket `fd` IPv4: the host's socket
+/// stays IPv6, its names are reported as the IPv4 ones they map.
+fn v4_viewed(fd: i32) -> bool {
+    crate::sockstate::with(fd, |s| s.v4_view).unwrap_or(false)
+}
 
 /// `IPV6_ADDRFORM` (`optval` `AF_INET`) of socket `fd`, as Linux allows
 /// it: a TCP or UDP IPv6 socket whose peer is IPv4 (an IPv4-mapped address)
@@ -2537,14 +2484,14 @@ fn addrform(fd: i32, optval: u64, optlen: u64) -> i64 {
     if hb[8..18] != [0; 10] || hb[18..20] != [0xff, 0xff] {
         return err(errno::EADDRNOTAVAIL);
     }
-    V4_VIEW.lock().push(fd);
+    crate::sockstate::update(fd, |s| s.v4_view = true);
     0
 }
 
 /// The host name `hb` (of `hl` bytes) of an IPv6 socket `IPV6_ADDRFORM`
 /// made IPv4, as that: the IPv4 address its IPv4-mapped one stands for.
 fn v4_view(fd: i32, hb: &mut [u8; SOCKADDR_MAX], hl: &mut libc::socklen_t) {
-    if family(hb) != libc::AF_INET6 || !V4_VIEW.lock().contains(&fd) {
+    if family(hb) != libc::AF_INET6 || !v4_viewed(fd) {
         return;
     }
     let mut v4 = empty_sockaddr();
@@ -2678,9 +2625,13 @@ pub unsafe fn setsockopt(
         if let Err(e) = socket_fd(fd as i32) {
             return e;
         }
-        let mut k = KEPT_VALUES.lock();
-        k.retain(|&(f, o, _)| (f, o) != (fd as i32, key));
-        k.push((fd as i32, key, v));
+        crate::sockstate::update(fd as i32, |s| {
+            s.kept.retain(|&(o, _)| o != key);
+            // A value of 0 is the default, which is not kept.
+            if v != 0 {
+                s.kept.push((key, v));
+            }
+        });
         0
     };
     if level == SOL_SOCKET
@@ -2721,6 +2672,15 @@ pub unsafe fn setsockopt(
     if let Some(key) = kept_key(level, optname) {
         return keep(key);
     }
+    // Multicast membership of a TCP socket, which fwe keeps.
+    if crate::tcpmcast::is_membership(level, optname) && ip_stream(fd as i32) {
+        let len = (optlen as usize).min(crate::tcpmcast::MOST_VALUE);
+        let val = guest!(uaccess::read_bytes(optval, len));
+        let v6 = kind(fd as i32).is_some_and(|k| k.0 == libc::AF_INET6);
+        if let Some(r) = crate::tcpmcast::setsockopt(fd as i32, level, optname, &val, v6) {
+            return r;
+        }
+    }
     let (hl, ho, form) = match opt_to_host(level, optname) {
         Ok(v) => v,
         Err(e) => return e,
@@ -2729,9 +2689,6 @@ pub unsafe fn setsockopt(
         let len = (optlen as usize).min(crate::sockopt::MOST_VALUE);
         let val = guest!(uaccess::read_bytes(optval, len));
         let host = guest!(crate::sockopt::value_to_host(form, &val));
-        if let Some(r) = stream_membership(fd as i32, level, optname, form, &host) {
-            return r;
-        }
         // SAFETY: a local buffer of its length.
         return ret(unsafe {
             libc::setsockopt(fd as i32, hl, ho, host.as_ptr().cast(), host.len() as libc::socklen_t)
@@ -2792,11 +2749,7 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
                 libc::AF_INET6 => AF_INET6 as i32,
                 f => f,
             },
-            _ => KEPT_VALUES
-                .lock()
-                .iter()
-                .find(|&&(f, o, _)| Some((f, o)) == kept.map(|k| (fd as i32, k)))
-                .map_or(0, |k| k.2),
+            _ => kept.map_or(0, |k| kept_value(fd as i32, k)),
         };
         let n = (len as usize).min(4);
         guest!(uaccess::write_from(optval, &v.to_ne_bytes()[..n]));
@@ -2919,26 +2872,19 @@ fn host_peer_groups(_fd: i32) -> Vec<u32> {
 /// caller sees it: its pid in the caller's pid namespace, its effective
 /// user and group ids (fwe's for it, as `SO_PEERCRED` gives them) in the
 /// caller's user namespace. They are those of when the connection was made
-/// ([`PEERS`], Linux's `sk_peer_cred`), which outlast the peer; for a
-/// socket this process did not connect (received, or from before an
-/// `execve`), the peer's as it is now. A process fwe did not start has its
-/// host ids as the guest sees them.
+/// (kept in [`crate::sockstate`], as Linux's `sk_peer_cred` is), which
+/// outlast the peer; for a socket fwe did not see connected (one the first
+/// program was started with), the peer's as it is now. A process fwe did
+/// not start has its host ids as the guest sees them.
 fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
-    let p = match remembered_peer(fd) {
+    let p = match crate::sockstate::with(fd, |s| s.peer).flatten() {
         Some(p) => p,
         None => live_peer(fd)?,
     };
     Ok(guest_ucred(p.pid, p.uid, p.gid))
 }
 
-/// A Unix socket's peer process: its host pid and effective user and group
-/// ids as the kernel holds them.
-#[derive(Clone, Copy)]
-struct Peer {
-    pid: i32,
-    uid: u32,
-    gid: u32,
-}
+use crate::sockstate::Peer;
 
 /// The process at the other end of Unix socket `fd` now: its host pid and
 /// effective user and group ids as the kernel holds them (fwe's for it,
@@ -2954,31 +2900,9 @@ fn live_peer(fd: i32) -> Result<Peer, i32> {
     })
 }
 
-/// Unix sockets' peers, by the socket's inode (the same in a `dup`, and in
-/// a fork child), as they were when the connection was made: host pid and
-/// effective ids ([`live_peer`]).
-static PEERS: std::sync::Mutex<Vec<(u64, Peer)>> = std::sync::Mutex::new(Vec::new());
-
-/// Unix socket `fd`'s connection is made, to `peer` ([`PEERS`]).
+/// Unix socket `fd`'s connection is made, to `peer`.
 fn remember_peer(fd: i32, peer: Peer) {
-    let Some(ino) = inode(fd) else { return };
-    let mut m = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-    // Those of sockets gone: none is open here with its number now.
-    if m.len() >= 64 && m.len().is_power_of_two() {
-        let open: std::collections::HashSet<u64> =
-            crate::fdtable::open_fds().into_iter().filter_map(inode).collect();
-        m.retain(|(n, _)| open.contains(n));
-    }
-    m.retain(|&(n, _)| n != ino);
-    m.push((ino, peer));
-}
-
-/// Unix socket `fd`'s peer as it was when the connection was made, if this
-/// process made it ([`PEERS`]).
-fn remembered_peer(fd: i32) -> Option<Peer> {
-    let ino = inode(fd)?;
-    let m = PEERS.lock().unwrap_or_else(|e| e.into_inner());
-    m.iter().find(|&&(n, _)| n == ino).map(|&(_, p)| p)
+    crate::sockstate::update(fd, |s| s.peer = Some(peer));
 }
 
 /// This process as a peer: its host pid and effective ids.

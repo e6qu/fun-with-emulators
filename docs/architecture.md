@@ -1401,9 +1401,14 @@ Sockets and terminals are the host's; fwe translates their interfaces
   `crates/kernel/src/sockopt.rs` for the IP, IPv6 and TCP options):
   addresses, flags and options, each call's arguments checked in Linux's
   order before the host sees them. What the host has no place for is kept
-  per descriptor in the process: bytes `MSG_MORE` holds back, multicast
-  groups a TCP socket joined, the options fwe keeps, and which IPv6
-  sockets `IPV6_ADDRFORM` made IPv4.
+  per socket (`crates/kernel/src/sockstate.rs`): the options fwe keeps,
+  multicast groups a TCP socket joined with their source filters
+  (`crates/kernel/src/tcpmcast.rs`), whether `IPV6_ADDRFORM` made an
+  IPv6 socket IPv4, and a Unix socket's peer when it was connected. Each
+  socket gets a number when it is made, accepted or received; its
+  descriptors map to it through `dup` and `close`, `execve` carries the
+  table, and a socket sent with `SCM_RIGHTS` carries its state in the
+  message's bundle. Bytes `MSG_MORE` holds back are kept per descriptor.
 - **Without the kernel lock:** the socket calls run without it, so the
   process's root, working directory and file access (`creds::access`,
   which a connect, send or bind to a Unix socket's node is checked by, as
@@ -2175,15 +2180,17 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   sender that ends before its receiver takes it can lose what it held,
   if macOS collects it in between (the sender holds the bundle that keeps
   it reachable).
-- Credentials: `SO_PEERCRED` and the credentials a stream's reader gets
-  with `SO_PASSCRED` are the peer process's as they are when read (Linux
-  takes them at `connect`, and per message on a stream), the process that
-  made a socket pair for both its ends; an unconnected datagram carries
-  the sender's only to a bound socket that asked for them.
+- Credentials: the credentials a stream's reader gets with `SO_PASSCRED`
+  are the peer's as they were when the connection was made (Linux takes
+  them per message, from the process that sent it); an unconnected
+  datagram carries the sender's only to a bound socket that asked for
+  them.
 - Sockets: what fwe keeps of a socket
-  ([Sockets and terminals](#sockets-and-terminals)) is per descriptor, so
-  a duplicate or another process sharing the socket does not see it; a
-  socket closed with bytes held back sends them without waiting. An
+  ([Sockets and terminals](#sockets-and-terminals)) is each process's
+  copy, so a change one process makes is not seen by another that shares
+  the socket (a fork child's, or one it was sent to, which has it as it
+  was then); a socket closed with bytes held back sends them without
+  waiting. An
   abstract name whose socket is bound but not listening counts as free.
   Options whose data comes in control messages (`IP_PKTINFO`,
   `IP_RECVTTL`, `SO_TIMESTAMP`) are refused, and so are `TCP_INFO`,
