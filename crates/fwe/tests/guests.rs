@@ -11209,6 +11209,129 @@ fn debian_display_zed_edits_a_file_on_the_gpu() {
     assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
 }
 
+/// The app of `guests/apps/<app>` built under fwe on the Alpine root
+/// `guests/alpine/fetch/apps.txt` lists: `build`, a shell command run in a
+/// copy of its sources at `/src/<app>`, fetches what its lock file pins
+/// and makes `output` there. Built once and kept in `target/built-apps`
+/// by the hash of its sources and that manifest (CI caches it); the path
+/// of the program made.
+fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    let src = repo().join("guests/apps").join(app);
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        entries.sort();
+        for e in entries {
+            // (Not a build's output, where the app was built by hand.)
+            if e.is_dir() && e.file_name().is_some_and(|n| n != "target") {
+                files(&e, out)
+            } else if e.is_file() {
+                out.push(e)
+            }
+        }
+    }
+    let mut all = Vec::new();
+    files(&src, &mut all);
+    let (list, _) = manifest_in("alpine", "apps");
+    let mut what = format!("{build}\n{output}\n{list}").into_bytes();
+    for f in &all {
+        what.extend(f.strip_prefix(&src).unwrap().as_os_str().as_encoded_bytes());
+        what.push(0);
+        what.extend(std::fs::read(f).unwrap());
+    }
+    let kept = repo().join("target/built-apps");
+    std::fs::create_dir_all(&kept).unwrap();
+    let hashed = kept.join(format!(".{app}-{}.what", std::process::id()));
+    std::fs::write(&hashed, &what).unwrap();
+    let key = sha256(&hashed);
+    std::fs::remove_file(&hashed).unwrap();
+    let program = kept.join(format!("{app}-{}", &key[..16]));
+    if program.exists() {
+        return program;
+    }
+    let root = alpine_root("apps");
+    let scratch =
+        ScratchRoot(std::env::temp_dir().join(format!("fwe-build-{app}-{}", std::process::id())));
+    let _ = std::fs::remove_dir_all(&scratch.0);
+    run_checked(Command::new("cp").arg("-cpR").arg(&root).arg(&scratch.0));
+    std::fs::create_dir_all(scratch.0.join("src")).unwrap();
+    run_checked(Command::new("cp").arg("-R").arg(&src).arg(scratch.0.join("src").join(app)));
+    let began = Instant::now();
+    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+        .arg("--root")
+        .arg(&scratch.0)
+        .args(["/bin/sh", "-c", &format!("cd /src/{app} && {build}")])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/root")
+        .env("LANG", "C.UTF-8")
+        .output_alone()
+        .unwrap();
+    let tail = |b: &[u8]| {
+        let t = String::from_utf8_lossy(b).into_owned();
+        t[t.len().saturating_sub(8_000)..].to_string()
+    };
+    assert!(
+        out.status.success(),
+        "building {app}: {}: {}{}",
+        out.status,
+        tail(&out.stdout),
+        tail(&out.stderr)
+    );
+    eprintln!("{app} built under fwe in {:.0?}", began.elapsed());
+    let part = kept.join(format!(".{app}-{}.part", std::process::id()));
+    std::fs::copy(scratch.0.join("src").join(app).join(output), &part).unwrap();
+    std::fs::rename(&part, &program).unwrap();
+    program
+}
+
+/// A root for display test `test` of an app of fwe's own built on Alpine
+/// ([`built_app`]): the root `guests/alpine/fetch/apps.txt` lists, with
+/// the app at `/usr/local/bin/<name>`.
+fn alpine_app_root(test: &str, program: &Path, name: &str) -> ScratchRoot {
+    let root = display_root(&alpine_root("apps"), test);
+    let bin = root.0.join("usr/local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(program, bin.join(name)).unwrap();
+    root
+}
+
+/// A Tauri app of fwe's own (`guests/apps/tauri`), built under fwe by
+/// Cargo and rustc, linked by clang: WebKitGTK shows its page.
+#[test]
+fn alpine_display_tauri_app_draws_its_page() {
+    let Some(x) = display_tests() else { return };
+    let program = built_app(
+        "tauri",
+        "RUSTFLAGS=-Clinker=clang cargo build --release --locked",
+        "target/release/fwe-tauri",
+    );
+    let root = alpine_app_root("tauri", &program, "fwe-tauri");
+    let mut gui = Gui::start(&x, "tauri", &root, "/usr/local/bin/fwe-tauri", &[], &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-tauri$"], 180);
+    shows_the_test_page(&x, &w, "tauri", &mut gui);
+}
+
+/// A Wails app of fwe's own (`guests/apps/wails`), built under fwe by Go
+/// with cgo, compiled and linked by clang: WebKitGTK shows its page.
+#[test]
+fn alpine_display_wails_app_draws_its_page() {
+    let Some(x) = display_tests() else { return };
+    let program = built_app(
+        "wails",
+        "CGO_ENABLED=1 CC=clang GOTOOLCHAIN=local GOFLAGS=-mod=mod \
+         go build -buildmode=pie -tags desktop,production,webkit2_41 -ldflags='-s -w' \
+         -o fwe-wails .",
+        "fwe-wails",
+    );
+    let root = alpine_app_root("wails", &program, "fwe-wails");
+    let mut gui = Gui::start(&x, "wails", &root, "/usr/local/bin/fwe-wails", &[], &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-wails$"], 180);
+    shows_the_test_page(&x, &w, "wails", &mut gui);
+}
+
 /// Making a name that exists in or at a read-only mount is `EEXIST`
 /// before `EROFS`, as Linux reports it (bwrap binds a directory twice).
 #[test]

@@ -250,6 +250,11 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+      # The apps of fwe's own the application tests build under fwe.
+      - uses: actions/cache@v4
+        with:
+          path: target/built-apps
+          key: built-apps-${{ hashFiles('guests/apps/tauri/**', 'guests/apps/wails/**', 'guests/alpine/fetch/apps.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
       - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools
       # The Mac's Vulkan drivers, each one's devices, and whether each has
