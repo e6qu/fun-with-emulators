@@ -40,7 +40,7 @@ static RUNS: AtomicU64 = AtomicU64::new(0);
 /// separated). Called at startup.
 pub fn start(spec: &str) -> Result<(), String> {
     // fwe's own descriptors live above the guest's range, which this sets:
-    // the guest must never see, reuse or close the record's.
+    // the guest MUST NOT see, reuse or close the record's.
     fwe_kernel::fdtable::init();
     let mut fds = Vec::new();
     // What is passed on, with each host resolved once, here.
@@ -99,7 +99,7 @@ pub fn start(spec: &str) -> Result<(), String> {
         fds.push((kept, fd.1));
     }
     let _ = SINKS.set(Sinks { spec: resolved.join(","), fds });
-    // No signal for the guest may land on it: the backend relies on the
+    // No signal for the guest lands on it: the backend relies on the
     // host delivering them only to vCPU threads.
     fwe_kernel::host::with_signals_blocked(|| {
         std::thread::Builder::new().name("fwe-hv-record".into()).spawn(|| {
@@ -126,7 +126,7 @@ pub fn spec() -> Option<&'static str> {
     SINKS.get().map(|s| s.spec.as_str())
 }
 
-/// Its descriptors, which a fork child must not be given (it opens its own).
+/// Its descriptors, which a fork child is not given (it opens its own).
 pub fn own_fds() -> Vec<i32> {
     SINKS.get().map(|s| s.fds.iter().map(|&(fd, _)| fd).collect()).unwrap_or_default()
 }
@@ -230,7 +230,7 @@ impl Line {
     }
 
     /// Write the line without waiting for the disk: for what many threads
-    /// record at once while a process ends, which must not hold up its
+    /// record at once while a process ends, so as not to hold up its
     /// teardown. The next synced line (the VM's destruction) puts it on the
     /// disk too; a datagram goes at once either way.
     pub fn emit_unsynced(&mut self) {

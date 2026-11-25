@@ -1,7 +1,7 @@
 /* Threads that first run the same pages of the shared libc at the same
  * moment: with the libc's preparation kept from an earlier run, fwe writes
  * each page of its code as it first runs, and a thread that runs a page
- * while another is writing it must run on, not fault.
+ * while another is writing it runs on, not faults.
  *
  * Built freestanding and linked against the target libc's shared library
  * (no system headers), as the other dynamic guests. Prints "ok". */

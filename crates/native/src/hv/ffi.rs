@@ -167,7 +167,7 @@ pub(super) mod framework {
     /// by value in `q0`, which Rust cannot pass.
     ///
     /// # Safety
-    /// `value` must point to 16 readable bytes; `vcpu` must be the calling
+    /// `value` MUST point to 16 readable bytes; `vcpu` MUST be the calling
     /// thread's vCPU.
     pub unsafe fn set_simd_fp_reg(vcpu: hv_vcpu_t, reg: u32, value: *const u128) -> hv_return_t {
         let Some(f) = table().hv_vcpu_set_simd_fp_reg else { return HV_ERROR };

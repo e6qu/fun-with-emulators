@@ -73,7 +73,7 @@ FAILING_LIMIT = 60
 # run beside them (four at a time, where LTP runs one) would otherwise see
 # and change.
 IPC_TESTS = re.compile(r"^(shm|sem|msg|ipc|mq_)")
-# A test that runs away with processes must not take the host with it: the
+# A test that runs away with processes MUST NOT take the host with it: the
 # tests have this many processes beyond those the user had as the run began
 # (a host's limit counts all of the user's, and a CI runner's user has
 # hundreds of its own; futex_cmp_requeue01 forks a thousand).
@@ -221,8 +221,8 @@ def seconds(etime):
 def others(sid, work):
     """Once a run, at its first timeout: every other fwe process on the
     machine, its state and how long it has run (`T`: stopped), and the
-    stacks of those that may hold what the test waits for (a lock in
-    memory fwe's processes share names its holder, who may be any of
+    stacks of those that might hold what the test waits for (a lock in
+    memory fwe's processes share names its holder, who might be any of
     them): the stopped first, then the oldest."""
     with LOOKED:
         if LOOKED_DONE:
@@ -547,7 +547,7 @@ def main():
 
     # The tests start at nice 0, as on a Linux test machine (their nice
     # checks assume it): a runner started higher in priority (GitHub's
-    # macOS runners start jobs at -10) gives it up, which any process may.
+    # macOS runners start jobs at -10) gives it up, which any process can.
     if os.getpriority(os.PRIO_PROCESS, 0) < 0:
         os.setpriority(os.PRIO_PROCESS, 0, 0)
 
@@ -667,7 +667,7 @@ def main():
     if skipped:
         print(f"skipped, not in the exceptions ({len(skipped)}): " + " ".join(skipped))
     if regressed:
-        # Once more, alone: a test timed against a loaded machine may have
+        # Once more, alone: a test timed against a loaded machine might have
         # missed its moment. One that passes so is named, not failed.
         argv_of = dict(tests)
         work = work_dir(root)
@@ -696,7 +696,7 @@ def main():
         host_late = {n: v for n, v in host_late.items() if v}
         # A host shown to miss LTP's thresholds itself in this run cannot
         # time the rest either: its other timer tests that only slept too
-        # long are named with them (their own rounds may have caught it at
+        # long are named with them (their own rounds might have caught it at
         # a better moment).
         if host_late:
             for n in regressed:

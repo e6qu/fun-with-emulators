@@ -1,8 +1,8 @@
 /* /proc as programs read it: the host's memory in meminfo and sysinfo,
  * cpuinfo in Linux's arm64 format, the process's environ, limits, statm
  * and io, comm and the host name written, another process's cwd, environ,
- * limits and mounts (and EACCES for those only a tracer may read to one
- * that may not trace it), /proc/net, and a directory's link count (the
+ * limits and mounts (and EACCES for those only a tracer can read to one
+ * that cannot trace it), /proc/net, and a directory's link count (the
  * task directory's 2 and its threads, which sandboxes read to tell a
  * process is single-threaded). Runs as root with FWE_PROC=1 in its
  * environment.
@@ -163,7 +163,7 @@ static void other(void) {
     printf("child's mountinfo is ours: %d\n", a > 0 && a == b && memcmp(buf, mine, a) == 0);
     write(done[1], "x", 1);
     reap(pid);
-    /* One that may not trace this process. */
+    /* One that cannot trace this process. */
     pid_t me = getpid();
     fflush(0);
     pid = fork();

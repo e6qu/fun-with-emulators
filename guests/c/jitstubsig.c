@@ -3,8 +3,8 @@
  * a stub of its own), while another thread signals the caller over and
  * over and the handler calls code made at run time too, which sets x16
  * and x17 to values of its own. A signal that lands in the middle of a
- * call must not let the handler's values into the call it interrupted:
- * every call must see the x16 and x17 its caller set. (Once a signal
+ * call does not let the handler's values into the call it interrupted:
+ * every call sees the x16 and x17 its caller set. (Once a signal
  * lands in the code made at run time, the caller goes on by translation
  * and its calls no longer go through the stub: each round is a program
  * of its own, started afresh by execve.) Every line printed is what Linux

@@ -115,7 +115,7 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    /* A portability device must have its subset enabled. */
+    /* A portability device needs its subset enabled. */
     uint32_t dnext = 0;
     vkEnumerateDeviceExtensionProperties(phys, NULL, &dnext, NULL);
     VkExtensionProperties *dext = calloc(dnext ? dnext : 1, sizeof *dext);

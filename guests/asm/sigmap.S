@@ -1,4 +1,4 @@
-// Two edge cases a backend must get right. Exit 0 on success.
+// Two edge cases for a backend to get right. Exit 0 on success.
 // 1 (exit 1/2): a signal blocked while a handler runs, and raised by it, is
 //   delivered as soon as the handler returns, although the program then
 //   spins without system calls.

@@ -18,7 +18,7 @@ _start:
     cmp     x0, #1000
     b.ne    fail
 
-    // setuid(0) must now fail (no longer privileged): expect a negative errno.
+    // setuid(0) now fails (no longer privileged): expect a negative errno.
     mov     x0, #0
     mov     x8, #146                // setuid
     svc     #0

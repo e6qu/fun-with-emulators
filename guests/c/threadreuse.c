@@ -1,5 +1,5 @@
 /* A thread that starts after another ended starts as a new thread, with
- * nothing of the one before: fwe may run it on the host thread the ended
+ * nothing of the one before: fwe can run it on the host thread the ended
  * one left. The first thread of each round sets up a signal stack, a name,
  * a blocked signal and a rounding mode, then ends; the second, made by the
  * main thread once the first is joined, prints what it has: no signal

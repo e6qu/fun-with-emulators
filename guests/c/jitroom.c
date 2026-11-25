@@ -1,7 +1,7 @@
 /* Code made at run time whose every instruction expands the most: functions
  * of back-to-back calls through x16, each translated into one block many
  * times its size. With a small code cache (FWE_JIT_CHUNK) such blocks land
- * at every place in it, the last one too: a translator must give each the
+ * at every place in it, the last one too: a translator gives each the
  * room it takes. Every line printed is what Linux prints. */
 #include <stddef.h>
 #include <stdint.h>

@@ -1,4 +1,4 @@
-// x18 moved to/from floating-point registers (fmov, scvtf, fcvtzs) must use
+// x18 moved to/from floating-point registers (fmov, scvtf, fcvtzs) uses
 // the preserved value, across preemption. Exit 0 on success, 1 otherwise.
     .text
     .globl _start

@@ -1,4 +1,10 @@
 //! `fwe`: run a Linux arm64 executable on macOS.
+//!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in this crate's documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
 
 #[cfg(target_os = "macos")]
 mod alloc;
@@ -77,7 +83,7 @@ fn main() -> ExitCode {
             _ => break,
         }
     }
-    // Once the stand-in, which may follow it, is known.
+    // Once the stand-in, which can follow it, is known.
     if vm {
         if !fwe_native::hv::usable() {
             eprintln!(

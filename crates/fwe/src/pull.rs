@@ -89,8 +89,8 @@ const MANIFEST_TYPES: [&str; 2] = [
     "application/vnd.docker.distribution.manifest.v2+json",
 ];
 
-/// Fetch `image` and unpack it into `dir`, which must not exist or be
-/// empty. Progress goes to standard error.
+/// Fetch `image` and unpack it into `dir`, refused unless it is missing
+/// or empty. Progress goes to standard error.
 pub fn pull(image: &str, dir: &Path) -> Result<(), String> {
     let r = Reference::parse(image)?;
     if std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_some()) {

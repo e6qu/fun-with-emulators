@@ -1,5 +1,11 @@
 //! ELF64 parsing and load planning for Linux arm64 executables.
 //!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in this crate's documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
+//!
 //! This crate is host-independent: it reads an image from bytes and computes
 //! where each segment goes and which protections each host page needs. The
 //! execution backend performs the actual mapping.
@@ -528,7 +534,7 @@ pub struct LoadPlan {
 impl LoadPlan {
     /// Plan the load of `elf` for host pages of `page_size` bytes.
     ///
-    /// Segments are not required to be aligned to `page_size`: a page shared
+    /// Segments need not be aligned to `page_size`: a page shared
     /// by several segments receives the union of their protections.
     pub fn new(elf: &Elf<'_>, page_size: u64) -> LoadPlan {
         assert!(page_size.is_power_of_two());

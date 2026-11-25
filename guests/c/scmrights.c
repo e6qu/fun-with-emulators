@@ -300,7 +300,7 @@ static int recv_creds(int s, unsigned *creds) {
 
 /* SO_PEERCRED names the peer as the guest knows it (its ids after it
  * changed them), SO_PASSCRED brings the sender's credentials, and a
- * sender without privilege may not claim another's. */
+ * sender without privilege cannot claim another's. */
 static int creds(void) {
     struct {
         unsigned short family;

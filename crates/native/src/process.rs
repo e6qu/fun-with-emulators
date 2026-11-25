@@ -94,7 +94,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         return Err(err(fwe_abi::errno::ENOEXEC));
     }
     // A program only the VM can run, an exec from a process with other
-    // threads (which must end), or from one with the Mac's Vulkan driver in
+    // threads (which the exec ends), or from one with the Mac's Vulkan driver in
     // its memory (its threads and objects cannot be carried over): replace
     // this process with a fresh fwe.
     if vm
@@ -112,7 +112,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     fwe_kernel::timing::mark("backend: native");
     crate::check_image(&file, fs).map_err(err)?;
     // A program with no path (a memfd) is held, for `/proc/self/exe`: the
-    // descriptor it was run through may close on exec.
+    // descriptor it was run through might close on exec.
     let exe_fd = match fs.exec_fd(&path) {
         Some(fd) => {
             let held = fwe_kernel::fdtable::dup_reserved(fd).map_err(err)?;
@@ -126,7 +126,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     // The credentials the program starts with, as `exec_reset` makes them.
     let ids = k.exec_aux_ids();
     // The point of no return: the old program's memory goes, and a vfork
-    // parent may resume. The robust futexes its threads hold are released
+    // parent can resume. The robust futexes its threads hold are released
     // first.
     fwe_kernel::release_robust_lists();
     fwe_kernel::timing::mark("exec: checked");
@@ -233,7 +233,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // child execs or exits, which ends the parent's wait. It is made,
         // and the parent's write end closed, under the kernel lock, where
         // every fork is: no other thread's child inherits the write end (the
-        // parent would wait for that child too, which may never end: Go's
+        // parent would wait for that child too, which might never end: Go's
         // runtime starts processes from two threads at once).
         if wait {
             // SAFETY: plain host call with a 2-element array.
@@ -490,7 +490,7 @@ fn fork_with_signals_held(
             held.keep();
             if go[0] >= 0 {
                 libc::close(go[1]);
-                // Until the parent's byte, or its end (should it be gone:
+                // Until the parent's byte, or its end (if it is gone:
                 // then [`GO`], nothing written for it).
                 while libc::read(go[0], (&mut b as *mut u8).cast(), 1) < 0
                     && host::last_errno().is(libc::EINTR)
@@ -729,7 +729,7 @@ fn reaper_wait(
         if fwe_kernel::thread::deliverable() != 0 {
             // A child ready is reported though a signal is pending, as
             // Linux's `wait` does: the reaper raises an adopted one's
-            // SIGCHLD as it records its end, which may be after the look.
+            // SIGCHLD as it records its end, which can be after the look.
             return look().unwrap_or(err(errno::EINTR));
         }
         waiter.sleep();
@@ -945,7 +945,7 @@ fn wait4_host(pid: i32, host_options: i32, wstatus: u64, rusage: u64) -> i64 {
     let mut r = unsafe { libc::wait4(pid, &mut status, host_options, &mut usage) };
     fwe_kernel::timing::mark("wait: host wait returned");
     if r < 0 && host::last_errno().is(libc::EINTR) && host_options & libc::WNOHANG == 0 {
-        // The child's own SIGCHLD may interrupt the wait before the host
+        // The child's own SIGCHLD can interrupt the wait before the host
         // reports the child: Linux reports a child that is ready over the
         // signal, so it is looked for once more.
         // SAFETY: as above.

@@ -2,7 +2,7 @@
  * one sequence of instructions, assembled twice from one macro, once with
  * x18 as its working register and once with x9, copied into memory mapped
  * writable and executable and run from there. Linux lets a program use
- * x18 like any register (JIT compilers allocate it), so both copies must
+ * x18 like any register (JIT compilers allocate it), so both copies
  * compute the same, quietly and with signals landing anywhere in them.
  * Every line printed is what Linux prints. */
 #include <stdatomic.h>

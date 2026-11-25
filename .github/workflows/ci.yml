@@ -405,7 +405,7 @@ jobs:
           if-no-files-found: ignore
 
   # The Linux Test Project's system-call tests (tools/ltp): every test of the
-  # baseline must still pass, and the pass rate is reported.
+  # baseline MUST still pass, and the pass rate is reported.
   ltp:
     name: LTP system calls (macos-26, part ${{ matrix.shard }} of 8)
     runs-on: macos-26
@@ -442,7 +442,7 @@ jobs:
         run: tools/ltp/build.sh target/ltp
       # Optimized, with the debug build's checks (Cargo.toml's `checked`).
       - run: cargo build --profile checked -p fwe
-      # A process may open as many files as a Linux distribution allows
+      # A process can open as many files as a Linux distribution allows
       # (pipe15 opens 8195), not the runner's 10240, of which fwe keeps a
       # quarter for itself.
       - name: Raise the host's open-file limits
@@ -531,7 +531,7 @@ jobs:
           set +e
           FWE_HV_TESTS=1 cargo test -p fwe --test guests hv_ -- --nocapture 2>&1 | tee hv-tests.log
           status=${PIPESTATUS[0]}
-          # They skip silently where the VM cannot run; here they must not.
+          # They skip silently where the VM cannot run; here a skip fails the job.
           if grep -q "skipped:" hv-tests.log; then echo "::error::the VM tests skipped"; exit 1; fi
           exit "$status"
       - name: Close the flight record

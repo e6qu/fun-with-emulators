@@ -2,7 +2,7 @@
  * rounds, as a JIT repoints a call when its target changes (HotSpot's
  * inline caches): a loop calls through one `bl`, which each round points
  * at another function, the cache line flushed. A translator that keeps
- * the loop's head apart from the call must still get to the new target
+ * the loop's head apart from the call still gets to the new target
  * without going into the translator at every call. Every line printed is
  * what Linux prints. */
 #include <stddef.h>
