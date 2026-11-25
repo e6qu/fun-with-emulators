@@ -3464,7 +3464,7 @@ fn write(c: &mut Cache, hot: &[u32], cold: &[u32]) -> (u64, u64) {
     (k.rx + at, k.rx + at_cold)
 }
 
-/// Write a block's `hot` and `cold` words in the cache ([`write`]), synced
+/// Write a block's `hot` and `cold` words in the cache ([`write()`]), synced
 /// for instruction fetch with the words patched since the last sync
 /// ([`State::sync_patched`]), once for all: their executable addresses.
 /// (Room is written again only once the cache is emptied, which syncs the

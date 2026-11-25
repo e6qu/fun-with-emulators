@@ -3,14 +3,14 @@
 //! the program generated, by the program's file and their address; taken
 //! again by a later process (or this one) that comes to the same code, as
 //! prepared images are kept ([`fwe_kernel::prepcache`]). A block taken again is what
-//! [`translate`] made, before it was placed: its words, what each stands
+//! [`super::translate`] made, before it was placed: its words, what each stands
 //! for, its branches to resolve and its calls; placing it is as for a
 //! block just made.
 //!
 //! A record holds the program's words the block was made from (and those
 //! past them its translation looked at), and the calls made in other
 //! blocks' words that its translation went on into
-//! ([`State::calls_made`]): it is taken only where both are as they are now,
+//! ([`super::State::calls_made`]): it is taken only where both are as they are now,
 //! so a block whose code changed, or that the state around it would make
 //! otherwise, is made afresh. Translations depend on fwe's own code and the
 //! thread's slots they name, so the records are kept apart for each build

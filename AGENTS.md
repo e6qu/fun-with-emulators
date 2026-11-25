@@ -35,6 +35,7 @@ outcome-sized pull requests, not small granular ones:
 cargo fmt --all
 cargo clippy --all-targets -- -D warnings
 cargo clippy --all-targets --target aarch64-apple-darwin -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 cargo test                      # end-to-end tests run on macOS arm64 only
 python3 tools/gen-abi.py        # regenerate crates/abi/src/generated.rs
 ```

@@ -114,7 +114,7 @@ const ENDS: [&str; 6] = [
     "the most words a block takes",
 ];
 
-/// The blocks earlier processes made ([`FWE_JIT_SEEN`]), and this one's.
+/// The blocks earlier processes made (`FWE_JIT_SEEN`), and this one's.
 struct Seen {
     dir: std::path::PathBuf,
     /// By program address and hash, how many earlier processes made it.

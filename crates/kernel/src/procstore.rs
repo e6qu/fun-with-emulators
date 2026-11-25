@@ -374,7 +374,7 @@ pub fn init() {
 /// thread, is in fwe's own work (a shared record read, or written under
 /// its lock), which the host may make it wait for, as a Linux thread
 /// doing its kernel's work is not asleep in a wait of the guest's:
-/// `/proc` shows it running ([`busy`]), where a program waiting for it
+/// `/proc` shows it running ([`Busy`]), where a program waiting for it
 /// to sleep (in a semaphore wait it is on its way to, say) would take a
 /// host wait of fwe's for that.
 ///
@@ -473,7 +473,7 @@ pub fn busy_between(before: u32, after: u32) -> bool {
 /// before then is fwe's or the host's work of making it (a fork child
 /// waits for its parent), which Linux shows running: a program waiting
 /// for its child to sleep in a wait it is on its way to would take that
-/// for it ([`has_entered`]). The mark is the process's start, which no
+/// for it ([`not_yet_entered`]). The mark is the process's start, which no
 /// later process with the pid has.
 pub fn entered() {
     let pid = crate::host::pid();

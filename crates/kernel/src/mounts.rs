@@ -8,16 +8,16 @@
 //! view; a process's root is a path in that view too
 //! ([`crate::fs::Fs`]).
 //!
-//! A filesystem is a host directory (the rootfs, a bind mount's source, a
-//! tmpfs's backing directory, all [`Source::Host`]), a stack of them
-//! ([`Source::Overlay`], see [`crate::overlay`]) or one fwe generates
-//! (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`), each reached from
+//! A filesystem is a host directory (the rootfs, a bind mount's source,
+//! [`Source::Host`]), a stack of them ([`Source::Overlay`], see
+//! [`crate::overlay`]), one of fwe's file store in memory (a tmpfs,
+//! [`Source::Store`]) or one fwe generates (`proc`, `sysfs`, `cgroup2`,
+//! `devpts`, `mqueue`), each reached from
 //! [`Mount::root`], the path inside it the mount shows (a bind mount of a
 //! subdirectory).
 //!
-//! The table is the namespace's, shared by every process in it, so it lives
-//! in the host filesystem ([`store`]): each process keeps a copy and
-//! rereads it when another has changed it.
+//! The table is the namespace's, shared by every process in it: a shared
+//! record in memory ([`store`]).
 
 use fwe_abi::errno;
 

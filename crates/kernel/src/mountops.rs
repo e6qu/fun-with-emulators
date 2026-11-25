@@ -1,7 +1,8 @@
 //! `mount`, `umount2`, `pivot_root` and `chroot`, on the mount namespace's
 //! table ([`crate::mounts`]).
 //!
-//! A tmpfs is a fresh directory of fwe's ([`tmpfs_dir`]), the synthetic
+//! A tmpfs is a fresh filesystem of fwe's file store, in memory
+//! ([`crate::filestore`]), the synthetic
 //! filesystems (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`) are fwe's
 //! own, an overlay stacks directories the guest names
 //! ([`crate::overlay`]), and a bind mount shows a directory or file the
