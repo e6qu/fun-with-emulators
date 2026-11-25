@@ -92,7 +92,7 @@ way.
   table. An indirect branch into code that is not
   translated (a library's) restores `x16` and `x17` and goes through the
   program's own register, so every register is as the program left it:
-  code may count on more than the procedure call standard promises
+  code can count on more than the procedure call standard promises
   (HotSpot's atomic stubs clobber only `x8`, `x9` and `x30`, and it keeps
   values in `x16` across them). One through `x18`, or a call through
   `x30`, takes fwe's trap.
@@ -170,7 +170,7 @@ way.
   from code a direct call (`bl`) led to, past a branch through a register
   (a tail call into a JIT's compiled code, as a runtime's entry stubs
   make), the `bl` is linked alike: its stub puts the call's target in
-  `x16`, as a linker's veneer may, and looks that up, so the called code
+  `x16`, as a linker's veneer can, and looks that up, so the called code
   runs by translation and its branches into the JIT's code are lookups.
   Code read through such a site to be translated has its own word back.
   A way in
@@ -199,7 +199,7 @@ way.
   of its conditional branches. A full chunk is followed by a new one,
   or, when at least half of the cache holds translations dropped since,
   the cache is emptied with every other thread stopped, keeping aside
-  the translations a thread may still be in or return into; the code is
+  the translations a thread might still be in or return into; the code is
   translated again as it runs. A fork child gets its own copy of the
   cache.
 
@@ -209,8 +209,8 @@ way.
 
 An arm64 core fetches instructions through an instruction cache of its
 own, beside the data cache its loads and stores go through. A store of
-new code lands in the data cache; the instruction cache may still hold
-the old instructions at that address, and the core may run them. So the
+new code lands in the data cache; the instruction cache might still hold
+the old instructions at that address, and the core might run them. So the
 architecture has a program that writes code make it visible before it
 runs it, with three steps for each cache line it wrote (the line sizes
 are in `CTR_EL0`: 64 bytes on Apple's processors):
@@ -230,7 +230,7 @@ isb               // this core: fetch what follows afresh
 - **`ic ivau`** ("instruction cache invalidate by virtual address to
   the point of unification") discards the line from the instruction
   caches, of every core in the inner shareable domain, so the next fetch
-  there reads the new code. User code may run it (Linux and macOS
+  there reads the new code. User code can run it (Linux and macOS
   allow it at EL0). It names an address, but the instruction cache the
   `CTR_EL0` fwe gives describes is physically indexed and tagged (PIPT,
   as Apple's is), so it works on the memory behind the address: a flush
@@ -244,7 +244,7 @@ isb               // this core: fetch what follows afresh
 compiler-rt), and each JIT's own routine (HotSpot's
 `ICache::invalidate_range`, V8's `FlushInstructionCache`, LuaJIT's
 `lj_mcode_sync`), run this sequence over the range written. A processor
-may report in `CTR_EL0` that it needs part of it no more: `IDC` set,
+can report in `CTR_EL0` that it needs part of it no more: `IDC` set,
 the clean is not needed; `DIC` set, the invalidation is not needed, and
 these routines skip it. The value fwe gives a program that reads
 `CTR_EL0` is Apple's under Linux, with both clear
@@ -269,7 +269,7 @@ fwe takes that flush for the word that the code changed:
   costs anything: a JIT's data beside its code, a constant patched, a
   trampoline's target changed.
 - **Through any mapping.** A JIT that maps its code twice (a memfd,
-  writable and executable) may flush either view, since both are the
+  writable and executable) can flush either view, since both are the
   same memory: a flush through either drops the translations made from
   it.
 - **Taken back if the same again.** A block a flush dropped is kept
@@ -284,7 +284,7 @@ fwe takes that flush for the word that the code changed:
 
 What this does not see is code a program changes without flushing it,
 or that another process writes into it other than through its tracer:
-the old translation keeps running, as stale instructions may on Linux on
+the old translation keeps running, as stale instructions can on Linux on
 a processor that reports `DIC` clear.
 
 ## Inside
@@ -449,7 +449,7 @@ a processor that reports `DIC` clear.
   in `x16`, which `jit::exit` finds in `State::call_stubs`. A
   thread stopped in such a stub is as at the site, which calls again
   (`jit::call_stub_to_guest`):
-  a handler running translated code may save its own `x16` and `x17` in
+  a handler running translated code might save its own `x16` and `x17` in
   the slots meanwhile.
 - **Guest state:** each translated word records what it stands for
   (`Word`: the guest instruction, with `x16` and `x17` saved or not or
@@ -525,9 +525,9 @@ What fwe counts, for the benchmarks to report
   and a hash of the words their translation read, past their own too, as
   a kept record is keyed) and counts those an earlier one made, at the
   same address (and of those, the ones two or more earlier processes made
-  there, which kept translations should have given it) or elsewhere. The
-  benchmarks run each JIT runtime three times so and fail if the third
-  makes any block of generated code two earlier runs made.
+  there, which it could have taken from kept translations) or
+  elsewhere. The benchmarks run each JIT runtime three times so and fail
+  if the third makes any block of generated code two earlier runs made.
 - **`FWE_JIT_COUNT=1`:** blocks count their runs, ways back their returns
   and lookups through a register whether they go where they went last
   (the words then differ). The report adds the blocks that ran, those
