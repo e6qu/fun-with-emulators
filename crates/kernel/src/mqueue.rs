@@ -8,7 +8,7 @@
 //! creator's `RLIMIT_MSGQUEUE`. The record holds the queue's owner,
 //! permissions, attributes, messages (by priority, oldest first within
 //! one), the receivers waiting and the notification registered. Every
-//! send or receive is one change of it, under its lock; one that must wait
+//! send or receive is one change of it, under its lock; one that needs to wait
 //! (a full or empty queue) waits for the record to change and tries again.
 //!
 //! The guest's descriptor stands on `/dev/null`, opened with the guest's
@@ -313,7 +313,7 @@ pub fn forked(child: crate::ids::HostPid) {
     }
 }
 
-/// In a fork child, as it starts: the same, from its side, should it go on
+/// In a fork child, as it starts: the same, from its side, in case it goes on
 /// before its parent counted it.
 pub fn forked_child() {
     hand_on(ipc::me());
@@ -419,7 +419,7 @@ fn read_name(addr: u64) -> Result<Vec<u8>, i32> {
     Ok(name)
 }
 
-/// Whether `creds` may access queue `q` as `want` (`rwx` bits), as a
+/// Whether `creds` can access queue `q` as `want` (`rwx` bits), as a
 /// file's permission is checked.
 fn may(creds: &Creds, q: &Queue, want: u32) -> bool {
     let shift = if creds.fsuid == q.uid {
@@ -1068,7 +1068,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `mq_getsetattr(fd, new, old)`: the queue's attributes, with the
-    /// descriptor's `O_NONBLOCK`, which `new` may change.
+    /// descriptor's `O_NONBLOCK`, which `new` can change.
     pub(crate) fn sys_mq_getsetattr(&mut self, fd: u64, new: u64, old: u64) -> i64 {
         use fwe_abi::fcntl::O_NONBLOCK;
         let set: Option<[i64; 8]> = if new != 0 { Some(guest!(uaccess::read(new))) } else { None };
@@ -1142,7 +1142,7 @@ fn sweep_addresses(ns_dir: &[u8]) {
     }
 }
 
-/// Check `fd` is a netlink socket, as `SIGEV_THREAD`'s `sigev_signo` must
+/// Check `fd` is a netlink socket, as `SIGEV_THREAD`'s `sigev_signo` needs to
 /// name: `EBADF` for no descriptor, `ENOTSOCK` for one that is not a
 /// socket, `ECONNREFUSED` for another socket.
 fn notify_socket(fd: i32) -> Result<(), i32> {

@@ -47,7 +47,7 @@ pub enum Entry {
 
 /// `hidepid=` of a `proc` mount: another's `/proc/<pid>` is open to all
 /// (`off`); its directory listed but nothing in it reached (`EPERM`) by
-/// one who may not trace it (`noaccess`); or not there at all to such a
+/// one who cannot trace it (`noaccess`); or not there at all to such a
 /// reader (`ENOENT`), whom `ptraceable` names as Linux's own check does
 /// and `invisible` likewise.
 pub const HIDEPID_OFF: u8 = 0;
@@ -98,7 +98,7 @@ impl Hiding {
     }
 
     /// What it refuses of `fs_path` (a path in the mount, `/123/status`),
-    /// `traceable` telling whether the reader may trace the process a
+    /// `traceable` telling whether the reader can trace the process a
     /// number names (its own always): `ENOENT` for what it hides, `EPERM`
     /// for what `noaccess` keeps out of; `None` for the rest.
     pub fn refuses(&self, fs_path: &[u8], traceable: impl FnOnce(i32) -> bool) -> Option<i32> {
@@ -522,7 +522,7 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
                 .to_vec(),
         ),
         b"/proc/meminfo" => Entry::File(meminfo()),
-        // The keys the reader may view, which the open gives
+        // The keys the reader can view, which the open gives
         // ([`crate::keys::proc_keys`]); each user's keys and quotas.
         b"/proc/keys" => Entry::File(Vec::new()),
         b"/proc/key-users" => Entry::File(crate::keys::proc_key_users()),
@@ -925,7 +925,7 @@ mod tests {
 
     /// `hidepid=` and `subset=pid` as Linux's `proc` has them: another's
     /// directory hidden (`invisible`, `ptraceable`) or kept out of
-    /// (`noaccess`) for a reader that may not trace it; with `subset=pid`
+    /// (`noaccess`) for a reader that cannot trace it; with `subset=pid`
     /// only the processes' directories and the reader's own links.
     #[test]
     fn hidepid_and_subset_hide_as_linux() {

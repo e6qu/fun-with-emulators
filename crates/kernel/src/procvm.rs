@@ -15,7 +15,7 @@
 use crate::{Kernel, Platform, uaccess};
 use fwe_abi::{err, errno};
 
-/// The most ranges either side may name (`UIO_MAXIOV`).
+/// The most ranges either side can name (`UIO_MAXIOV`).
 const MAX_RANGES: u64 = 1024;
 
 /// A guest's `struct iovec` array at `at` of `count`: `EINVAL` for a
@@ -93,7 +93,7 @@ impl<P: Platform> Kernel<P> {
         };
         let me = crate::host::pid();
         // Only an fwe process can copy its own memory for the caller; any
-        // other is one the caller may not attach to, as `ptrace` has it.
+        // other is one the caller cannot attach to, as `ptrace` has it.
         if host != me && (!crate::host::is_fwe(host) || !self.may_trace(host)) {
             return err(errno::EPERM);
         }

@@ -335,7 +335,7 @@ pub fn forked(child: crate::ids::HostPid) {
     }
 }
 
-/// In a fork child, as it starts: the same, from its side, should it go on
+/// In a fork child, as it starts: the same, from its side, in case it goes on
 /// before its parent counted it.
 pub fn forked_child() {
     hand_on(crate::sysvipc::me());

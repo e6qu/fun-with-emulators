@@ -4,7 +4,7 @@
 //! the root filesystem directory, the pipe ends behind eventfd and signalfd,
 //! the pipe a `vfork` parent waits on, and in the VM backend the file of
 //! each file mapping. Those live in a reserved range above the highest
-//! number the guest may use, up to the host's limit: the guest's
+//! number the guest can use, up to the host's limit: the guest's
 //! `RLIMIT_NOFILE` is virtual. The guest's range ends at [`GUEST_CAP`] at
 //! most, so the range starts low: the host's table grows only as far as
 //! the descriptors in use, and a host `fork` copies all of it.
@@ -12,7 +12,7 @@
 //! `/proc/self/fd` never reach the reserved range, and a system call naming
 //! a descriptor there fails with `EBADF`, as for a descriptor that is not
 //! open. A descriptor of fwe's never goes below the range: when it is full,
-//! what needed one fails. The limit may be raised past the range, up to
+//! what needed one fails. The limit can be raised past the range, up to
 //! `fs.nr_open`, as Linux allows; the descriptors the guest gets stay below
 //! it.
 //!
@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 /// are more ([`init`]).
 pub const RESERVED: i32 = 64;
 
-/// The first descriptor the guest may not use (the guest's hard limit).
+/// The first descriptor the guest cannot use (the guest's hard limit).
 static GUEST_MAX: AtomicI32 = AtomicI32::new(1024);
 /// The guest's virtual `RLIMIT_NOFILE`.
 pub(crate) static LIMIT: Mutex<(u64, u64)> = Mutex::new((1024, 1024));
@@ -44,7 +44,7 @@ static ROOT: AtomicI32 = AtomicI32::new(-1);
 /// The guest's default soft limit, Linux's.
 const DEFAULT_SOFT: u64 = 1024;
 
-/// The most descriptors the guest may have open at once: as many as
+/// The most descriptors the guest can have open at once: as many as
 /// programs a Linux distribution runs count on (LTP's `pipe15` opens
 /// 8195). A host `fork` copies the descriptor table as far as its highest
 /// descriptor, fwe's reserved range just above this: a fork, exit and
@@ -82,7 +82,7 @@ pub fn init() {
     // SAFETY: `lim` is a valid out-parameter.
     unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) };
     let cap = lim.rlim_max.min(max_files_per_proc()).min(1 << 20);
-    // macOS may refuse a soft limit above OPEN_MAX (10240) however high the
+    // macOS can refuse a soft limit above OPEN_MAX (10240) however high the
     // hard limit is; settle for the largest it accepts.
     for want in [cap, 10240, 4096, 2048, 1024 + RESERVED as u64] {
         if want > cap || want <= lim.rlim_cur {
@@ -140,12 +140,12 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     *LIMIT.lock().unwrap_or_else(|e| e.into_inner()) = (d.u64(), d.u64());
 }
 
-/// One past the highest descriptor the guest may use.
+/// One past the highest descriptor the guest can use.
 pub fn guest_max() -> i32 {
     GUEST_MAX.load(Ordering::SeqCst)
 }
 
-/// Whether `fd` names a descriptor the guest may hold: below the reserved
+/// Whether `fd` names a descriptor the guest can hold: below the reserved
 /// range, and not the process's root (negative values, such as
 /// `AT_FDCWD`, are left to the call).
 pub fn guest_visible(fd: i32) -> bool {

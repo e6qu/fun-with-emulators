@@ -13,7 +13,8 @@ pub enum Json {
 }
 
 impl Json {
-    /// Parse `text`, which must be one value (with whitespace around it).
+    /// Parse `text` as one value (with whitespace around it): trailing text
+    /// is an error.
     pub fn parse(text: &str) -> Result<Json, String> {
         let mut p = Parser { s: text.as_bytes(), at: 0 };
         let v = p.value()?;

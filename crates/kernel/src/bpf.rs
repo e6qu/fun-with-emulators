@@ -11,7 +11,7 @@
 //! at run time and stops a program that runs too long, so that a guest's
 //! program can do nothing but answer.
 //!
-//! A socket filter (`BPF_PROG_TYPE_SOCKET_FILTER`) may also load maps
+//! A socket filter (`BPF_PROG_TYPE_SOCKET_FILTER`) can also load maps
 //! ([`crate::bpfmap`]) and call their helpers (lookup, update, delete),
 //! reading and writing a value through the pointer a lookup returns, and
 //! read the packet with `bpf_skb_load_bytes`.
@@ -44,10 +44,10 @@ pub const BPF_DEVCG_ACC_MKNOD: u32 = 1;
 pub const BPF_DEVCG_ACC_READ: u32 = 2;
 pub const BPF_DEVCG_ACC_WRITE: u32 = 4;
 
-/// The most instructions a program may have (Linux's limit for programs an
-/// unprivileged loader may load; device programs are far smaller).
+/// The most instructions a program can have (Linux's limit for programs an
+/// unprivileged loader can load; device programs are far smaller).
 pub const MAX_INSNS: usize = 4096;
-/// The most instructions one run may execute.
+/// The most instructions one run can execute.
 const MAX_STEPS: usize = 1 << 20;
 /// The stack, below the frame pointer.
 const STACK: usize = 512;
@@ -102,13 +102,13 @@ pub fn load(bytes: &[u8]) -> Result<Program, i32> {
     check(bytes, false)
 }
 
-/// [`load`] for a socket filter, which may load a map's descriptor
+/// [`load`] for a socket filter, which can load a map's descriptor
 /// (`BPF_LD_MAP_FD`) and call the map helpers.
 pub fn load_filter(bytes: &[u8]) -> Result<Program, i32> {
     check(bytes, true)
 }
 
-/// The helpers a socket filter may call: `bpf_map_lookup_elem`,
+/// The helpers a socket filter can call: `bpf_map_lookup_elem`,
 /// `bpf_map_update_elem`, `bpf_map_delete_elem`, and
 /// `bpf_skb_load_bytes` ([`HELPER_SKB_LOAD_BYTES`]).
 const HELPER_LOOKUP: i32 = 1;
@@ -126,7 +126,7 @@ fn check(bytes: &[u8], filter: bool) -> Result<Program, i32> {
     }
     let insns: Vec<Insn> = bytes.chunks(8).map(Insn::decode).collect();
     let n = insns.len();
-    // The second halves of 64-bit immediate loads, where no jump may land.
+    // The second halves of 64-bit immediate loads, where no jump can land.
     let mut halves = vec![false; n];
     let mut j = 0;
     while j < n {
@@ -194,7 +194,7 @@ fn check(bytes: &[u8], filter: bool) -> Result<Program, i32> {
         }
         i += 1;
     }
-    // It must end: the last instruction is an exit or an unconditional jump.
+    // It needs to end: the last instruction is an exit or an unconditional jump.
     let last = insns[n - 1];
     if last.code != (CLASS_JMP | 0x90) && last.code != CLASS_JMP {
         return Err(errno::EINVAL);
@@ -416,7 +416,7 @@ fn mem(
     Some(u64::from_le_bytes(b))
 }
 
-/// One ALU operation. A pointer may only move by a number; anything else
+/// One ALU operation. A pointer can only move by a number; anything else
 /// done to one ends the run.
 fn alu(op: u8, wide: bool, dst: Val, src: Val, imm: i32, src_is_x: bool) -> Option<Val> {
     let fit = |v: u64| if wide { v } else { v as u32 as u64 };
@@ -953,7 +953,7 @@ mod tests {
         let ctx = [0u8; 192];
         assert_eq!(exec(&prog, &ctx, &[], &[9, 9, 5, 9]), Some(5));
         assert_eq!(exec(&prog, &ctx, &[], &[9]), Some(99));
-        // A device program may call no helper.
+        // A device program can call no helper.
         assert_eq!(load(&bytes).map(|_| ()), Err(errno::EINVAL));
     }
 

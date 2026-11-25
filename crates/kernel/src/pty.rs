@@ -280,7 +280,7 @@ fn held(path: &[u8]) -> bool {
 }
 
 /// Whether master `fd` is hung up: a guest opened its slave once, and no
-/// guest process holds it now (what the slave wrote may still be waiting).
+/// guest process holds it now (what the slave wrote might still be waiting).
 pub fn hung_up(fd: i32) -> bool {
     master(fd).is_some_and(|m| gone(&m))
 }
@@ -358,7 +358,7 @@ pub fn ptsnum(master_fd: i32) -> Option<u32> {
 /// Release a master fd if it is one of ours (`close`). Returns `Some(0)` then,
 /// `None` for any other descriptor.
 ///
-/// The slave's number stays mapped: another process may still hold the
+/// The slave's number stays mapped: another process might still hold the
 /// master (a fork child closing its copy, as apt's does before opening the
 /// slave by name), and on Linux the slave can be opened as long as any
 /// reference to the master is. Guest numbers are never reused, and once the

@@ -11,7 +11,7 @@
 //! and record locks are apart, as on Linux; a process's and a
 //! description's record locks conflict.
 //!
-//! A lock that must wait sleeps on the filesystem's change word, which a
+//! A lock that needs to wait sleeps on the filesystem's change word, which a
 //! lock let go bumps and wakes ([`super::wait`]): it looks again on each
 //! wake, ends with a signal for the thread (`EINTR`), and between wakes
 //! forgets the holders that ended without letting go. A process's record
@@ -27,7 +27,7 @@ use std::sync::atomic::Ordering::SeqCst;
 /// The end of a lock that runs to the end of the file, however far.
 const FOREVER: u64 = u64::MAX;
 
-/// The largest offset a lock may reach (Linux's `OFFSET_MAX`).
+/// The largest offset a lock can reach (Linux's `OFFSET_MAX`).
 const OFFSET_MAX: u64 = i64::MAX as u64;
 
 /// Whether `a` and `b` are in each other's way: of the same family
@@ -162,7 +162,7 @@ fn take(
             crate::signal::drain_to_signalfd();
         }
         super::wait::wait(fs.changes(), seen, crate::futex::SIGNAL_CHECK);
-        // Nothing let go meanwhile: the holder in the way may have ended
+        // Nothing let go meanwhile: the holder in the way might have ended
         // without letting go.
         reap = fs.changes().load(SeqCst) == seen;
     };

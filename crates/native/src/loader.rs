@@ -60,7 +60,7 @@ impl fmt::Display for LoadError {
         match self {
             LoadError::AddressUnavailable { start, len, reason } => write!(
                 f,
-                "address range {start:#x}-{:#x} required by the executable is not available \
+                "address range {start:#x}-{:#x} that the executable needs is not available \
                  ({reason})",
                 start + len
             ),
@@ -104,7 +104,7 @@ fn host_prot(p: u32) -> libc::c_int {
     h
 }
 
-/// Lowest address a process may map: macOS arm64 reserves the low 4 GiB.
+/// Lowest address a process can map: macOS arm64 reserves the low 4 GiB.
 pub fn host_min_address() -> u64 {
     if cfg!(all(target_os = "macos", target_arch = "aarch64")) { 1 << 32 } else { 0 }
 }
@@ -152,7 +152,7 @@ impl<
 /// Where a position-independent executable is asked to go: two thirds of
 /// the host's 47 bits of address space, as Linux places one in a space of
 /// 47 bits. Far from fwe's own memory and from the mappings left to fwe
-/// ([`fwe_kernel::mm`]), it has free room below it, where a program may
+/// ([`fwe_kernel::mm`]), it has free room below it, where a program can
 /// map memory it wants within a branch's reach of its own code (LuaJIT
 /// probes for its machine code there); its break grows above it.
 pub const PIE_BASE: u64 = 0x5555_5555_0000;
@@ -310,7 +310,7 @@ pub fn load(
 
     // Translate only the executable code, not every byte of an executable
     // segment: a segment can hold data (symbol/string/hash tables, read-only
-    // constants) that must not be rewritten. `exec_ranges` reports the real
+    // constants), which a rewrite would corrupt. `exec_ranges` reports the real
     // code extents from the section headers when present.
     // The unwind table tells code from data placed among it (see
     // `fwe_elf::Elf::unwind_code_ranges`).

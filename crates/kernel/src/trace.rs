@@ -10,7 +10,7 @@ static FILE: OnceLock<(Vec<u8>, i32)> = OnceLock::new();
 
 /// Trace to the file at host path `path`, appended to, each line naming
 /// the process, instead of to standard error: so a run of many processes
-/// (whose standard error another may hold) is traced whole. Called once
+/// (whose standard error another might hold) is traced whole. Called once
 /// the guest's descriptor range is placed ([`crate::fdtable::init`]).
 pub fn to_file(path: &[u8]) -> Result<(), String> {
     let c = std::ffi::CString::new(path).map_err(|e| e.to_string())?;

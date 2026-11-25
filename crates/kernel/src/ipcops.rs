@@ -14,7 +14,7 @@ fn wanted(flags: u64) -> u32 {
     (((flags >> 6) | (flags >> 3) | flags) & 7) as u32
 }
 
-/// The outcome of one try of an operation that may have to wait.
+/// The outcome of one try of an operation that might have to wait.
 enum Try<T> {
     Done(T),
     Wait,
@@ -52,7 +52,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// The common part of the three `*get` calls: the object of `kind` with
-    /// `key`, checked by `more` (a size or count it must have) and the
+    /// `key`, checked by `more` (a size or count it needs to have) and the
     /// caller's permission, or a new one `make` describes.
     fn ipc_get(
         &mut self,
@@ -941,7 +941,7 @@ pub struct IpcContext {
     creds: crate::creds::Creds,
 }
 
-/// Whether system call `nr` is one of the IPC calls that may wait (the
+/// Whether system call `nr` is one of the IPC calls that can wait (the
 /// System V ones and a POSIX message queue's send and receive).
 pub fn waits(nr: u64) -> bool {
     use fwe_abi::nr as n;
@@ -953,7 +953,7 @@ pub fn waits(nr: u64) -> bool {
 
 /// Run waiting IPC call `nr` (see [`waits`]) with `args`, in `ctx`, without
 /// the kernel lock: a semaphore another thread of the process posts, or a
-/// message it sends, must not wait for this one to let go.
+/// message it sends, MUST NOT wait for this one to let go.
 pub fn blocking(ctx: Result<IpcContext, i32>, nr: u64, a: [u64; 6]) -> i64 {
     use fwe_abi::nr as n;
     let ctx = match ctx {
@@ -1003,7 +1003,7 @@ fn huge_segment(flags: u64, creds: &crate::creds::Creds) -> Result<(), i32> {
 /// `shmctl_do_lock`: without `CAP_IPC_LOCK` in the user namespace owning
 /// the IPC namespace, only by the segment's owner or creator, and locking
 /// only with a limit above 0 (`EPERM`). A segment newly locked charges its
-/// pages to the caller's user, whose locked segments must fit the limit
+/// pages to the caller's user, whose locked segments need to fit the limit
 /// unless it has `CAP_IPC_LOCK` (`ENOMEM`, `user_shm_lock`); unlocking (or
 /// removing the segment) gives them back. Locking a locked segment, or
 /// unlocking an unlocked one, changes nothing.

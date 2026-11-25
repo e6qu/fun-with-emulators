@@ -1,4 +1,4 @@
-// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz) must use the preserved
+// x18 read by compare/test branches (cbz/cbnz/tbz/tbnz) uses the preserved
 // value, across preemption. Exit 0 if all branches go the right way, else 1.
     .text
     .globl _start
@@ -6,7 +6,7 @@ _start:
     movz    x18, #0x1818
     movk    x18, #0x1818, lsl #48   // nonzero; bit3 set, bit0 clear
 
-    // spin: each iteration, cbnz and tbnz must both see x18 nonzero / bit3 set
+    // spin: each iteration, cbnz and tbnz both expect x18 nonzero / bit3 set
     movz    x19, #0x1000, lsl #16
 loop:
     cbnz    x18, c1
@@ -21,7 +21,7 @@ c3:
     subs    x19, x19, #1
     b.ne    loop
 
-    // cbz on a zero x18 must be taken
+    // cbz on a zero x18 is expected to be taken
     movz    x18, #0
     cbz     x18, ok
     b       fail

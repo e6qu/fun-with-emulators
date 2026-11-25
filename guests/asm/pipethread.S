@@ -1,4 +1,4 @@
-// A thread blocked in read on a pipe must not stall the thread that writes to
+// A thread blocked in read on a pipe does not stall the thread that writes to
 // it: the child sleeps briefly, then writes a byte; the parent, already blocked
 // in read, receives it. Exit 0 on success, 1 otherwise (a hang is a failure).
     .text

@@ -191,10 +191,10 @@ impl Drop for Stopped {
 /// Stop every other guest thread, and pass each one's registers
 /// (`ARM_THREAD_STATE64`: `x0`-`x28`, `fp`, `lr`, `sp`, `pc`, `cpsr`) to
 /// `visit` while it is stopped. A thread in fwe's code goes on once
-/// visited (it may hold a lock `visit`'s caller needs later, `malloc`'s
+/// visited (it might hold a lock `visit`'s caller needs later, `malloc`'s
 /// say) but waits before it enters guest code again; one in guest code
-/// stays stopped. `visit` runs with threads stopped that may hold any of
-/// fwe's or the host libraries' locks: it must take none, nor allocate.
+/// stays stopped. `visit` runs with threads stopped that might hold any of
+/// fwe's or the host libraries' locks: it MUST take none, nor allocate.
 pub fn stop_others(visit: &mut dyn FnMut(&[u64; 34])) -> Stopped {
     let me = mine();
     let slots = slots();

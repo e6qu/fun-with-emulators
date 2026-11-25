@@ -328,7 +328,7 @@ pub fn rewind_fault(pc: u64, sp: u64) -> Option<rewrite::Rewound> {
     })
 }
 
-/// Whether `pc` may be in a stub for an instruction that writes `sp` from
+/// Whether `pc` might be in a stub for an instruction that writes `sp` from
 /// `x18`. Async-signal-safe.
 pub fn in_sp_stub_region(pc: u64) -> bool {
     use std::sync::atomic::Ordering::SeqCst;
@@ -415,7 +415,7 @@ pub fn keep_hot() {
 /// [`rewrite::patch`]).
 ///
 /// # Safety
-/// The range must be readable and writable guest memory that no thread is
+/// The range MUST be readable and writable guest memory that no thread is
 /// executing.
 pub unsafe fn prepare(
     addr: u64,
@@ -623,7 +623,7 @@ pub unsafe fn prepare(
 /// rest of a large library is left alone.
 ///
 /// # Safety
-/// The pages must be mapped.
+/// The pages MUST be mapped.
 unsafe fn flush_pages(addrs: impl IntoIterator<Item = u64>) {
     let page = fwe_kernel::mm::host_page_size();
     let pages: std::collections::BTreeSet<u64> =
@@ -686,7 +686,7 @@ unsafe fn place_in_image(
 /// `[lo, hi)` and point each site at its stub.
 ///
 /// # Safety
-/// The sites must be writable guest code.
+/// The sites MUST be writable guest code.
 #[allow(clippy::too_many_arguments)]
 unsafe fn redirect(
     base: u64,
@@ -884,7 +884,7 @@ fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> b
     let flags = libc::MAP_PRIVATE | libc::MAP_ANON | if fixed { libc::MAP_FIXED } else { 0 };
     // SAFETY: a fresh anonymous mapping of fwe's where the region was:
     // inside fwe's own reservation with `fixed`, else wherever the host
-    // finds room, which must be that place.
+    // finds room, which is kept only if it is that place.
     let p = unsafe {
         libc::mmap(
             r.at as *mut libc::c_void,
@@ -969,7 +969,7 @@ fn map_image_pages(file: &std::fs::File, addr: u64, len: u64, offset: u64) -> bo
 /// are kept under `key`.
 ///
 /// # Safety
-/// The range must be readable guest memory.
+/// The range MUST be readable guest memory.
 pub unsafe fn keep_image(key: &[u8], addr: u64, len: u64) {
     let Some(regions) = image_regions() else { return };
     let mut e = fwe_kernel::snapshot::Enc::new();
@@ -1032,7 +1032,7 @@ pub fn map_image(
 /// translation, kept under `key` once prepared.
 ///
 /// # Safety
-/// The runs must be readable memory.
+/// The runs MUST be readable memory.
 pub unsafe fn keep_load_image(
     key: &[u8],
     base: u64,
@@ -1076,7 +1076,7 @@ pub struct MappedImage {
 /// ran out, wherever nothing is): the arenas' next free places (after the
 /// image, and the end of what is free before it) and the code to run by
 /// translation, or `None` if there is no such image or a place is taken
-/// (the runs may then hold some of it, to be written over).
+/// (the runs might then hold some of it, to be written over).
 pub fn map_load_image(
     key: &[u8],
     base: u64,
@@ -1171,7 +1171,7 @@ fn find_region(
 /// Invalidate the instruction cache for freshly written code.
 ///
 /// # Safety
-/// The range must be mapped.
+/// The range MUST be mapped.
 #[cfg(target_os = "macos")]
 pub unsafe fn flush_icache(addr: u64, len: u64) {
     unsafe extern "C" {
@@ -1184,7 +1184,7 @@ pub unsafe fn flush_icache(addr: u64, len: u64) {
 /// Invalidate the instruction cache for freshly written code.
 ///
 /// # Safety
-/// The range must be mapped.
+/// The range MUST be mapped.
 #[cfg(not(target_os = "macos"))]
 pub unsafe fn flush_icache(_addr: u64, _len: u64) {}
 

@@ -1,7 +1,7 @@
 // x18 across a signal handler. The handler, entered with SA_SIGINFO, checks
 // that uc_mcontext.regs[18] holds the guest's x18 and uc_mcontext.pc the
 // resume address (at the arm64 frame offsets), sets a flag, and clobbers x18;
-// rt_sigreturn must restore it. Exit 0 on success, 1 otherwise.
+// rt_sigreturn restores it. Exit 0 on success, 1 otherwise.
     .text
     .globl _start
 _start:
@@ -23,12 +23,12 @@ _start:
 
     movz    x18, #0x1818
     movk    x18, #0x1818, lsl #48
-    mov     x10, x18                // the value the handler must see
+    mov     x10, x18                // the value the handler expects
     mov     x8, #172                // getpid
     svc     #0
     mov     x1, #10                 // SIGUSR1
     mov     x8, #129                // kill(pid, SIGUSR1)
-    adr     x12, resumed            // the pc the handler must see
+    adr     x12, resumed            // the pc the handler expects
     svc     #0
 resumed:
     tbnz    x0, #63, fail

@@ -1059,7 +1059,7 @@ mod tests {
     }
 
     /// A netlink socket's own options are Linux's: others are
-    /// `ENOPROTOOPT`, a flag is kept on or off, a group must be one the
+    /// `ENOPROTOOPT`, a flag is kept on or off, a group needs to be one the
     /// family has, `NETLINK_LISTEN_ALL_NSID` needs `CAP_NET_BROADCAST`, and
     /// the groups joined read back as Linux lists them.
     #[test]

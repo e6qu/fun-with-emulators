@@ -44,7 +44,7 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
     }
     // A thread shares the memory: `CloneArgs::check` refused `CLONE_THREAD`
     // without `CLONE_SIGHAND` and `CLONE_VM` (`EINVAL`), as Linux does;
-    // the flags a thread may have, its stack and the task limits are the
+    // the flags a thread can have, its stack and the task limits are the
     // VM's checks too.
     if let Err(e) = a.thread_check() {
         return err(e);

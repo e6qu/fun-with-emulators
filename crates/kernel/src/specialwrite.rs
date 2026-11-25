@@ -52,7 +52,7 @@ pub fn write(fd: i32, src: Source, len: u64) -> Option<i64> {
         },
         Source::Host(iov) => {
             let mut d = Vec::new();
-            // An empty buffer may be at any address, null included.
+            // An empty buffer can be at any address, null included.
             for v in iov.iter().filter(|v| v.iov_len > 0) {
                 let take = v.iov_len.min(MOST - d.len());
                 let at = d.len();

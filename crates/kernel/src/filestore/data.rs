@@ -418,7 +418,7 @@ pub fn each_read(
 ) -> Result<(), i32> {
     each(id, off, len, false, |done, p, n| {
         // SAFETY: `n` bytes of a view that lasts the call; other processes
-        // may write them meanwhile, as they may a file's page.
+        // can write them meanwhile, as they can a file's page.
         f(done, p.map(|p| unsafe { std::slice::from_raw_parts(p, n as usize) }))
     })
 }

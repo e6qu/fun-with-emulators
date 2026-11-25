@@ -98,7 +98,7 @@ fn watch(t: Target) -> Result<i32, i32> {
 }
 
 /// A new descriptor of `t`, close-on-exec if `cloexec`, at a number the
-/// guest may hold.
+/// guest can hold.
 pub fn open(t: Target, cloexec: bool) -> Result<i32, i32> {
     let fd = watch(t)?;
     if fd as u64 >= crate::fdtable::limit().0 {
@@ -118,7 +118,7 @@ pub fn open(t: Target, cloexec: bool) -> Result<i32, i32> {
 }
 
 /// A descriptor made ready for a `CLONE_PIDFD` child before the fork
-/// (close-on-exec, at a number the guest may hold), which [`attach`] makes
+/// (close-on-exec, at a number the guest can hold), which [`attach`] makes
 /// the child's.
 pub fn reserve() -> Result<i32, i32> {
     let fd = imp::reserve()?;
@@ -291,7 +291,7 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec, exec: bool) {
 }
 
 /// `waitid(P_PIDFD, fd, ...)`: the host pid `fd` names, and whether a wait
-/// on it must not block (`PIDFD_NONBLOCK`).
+/// on it does not block (`PIDFD_NONBLOCK`).
 pub fn wait_target(fd: i32) -> Result<(i32, bool), i32> {
     // SAFETY: F_GETFD only queries the descriptor.
     if fd < 0 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
@@ -305,7 +305,7 @@ pub fn wait_target(fd: i32) -> Result<(i32, bool), i32> {
 /// killed, as Linux's: no flags (`EINVAL`); a process descriptor
 /// (`EBADF`), of a process, not another thread (`ESRCH`), not yet reaped
 /// (`ESRCH`); one that has ended already has no memory left (0); else it
-/// must be on its way out, killed (a `SIGKILL` an fwe process sent it) or
+/// needs to be on its way out, killed (a `SIGKILL` an fwe process sent it) or
 /// exiting (`EINVAL`). The host frees an ending process's memory itself,
 /// as it ends: nothing is left for fwe to free first.
 pub fn process_mrelease(fd: u64, flags: u64) -> i64 {
@@ -442,7 +442,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `pidfd_getfd(pidfd, targetfd, flags)`, the part under the kernel
-    /// lock: the target process and that the caller may take its
+    /// lock: the target process and that the caller can take its
     /// descriptors (`PTRACE_MODE_ATTACH_REALCREDS`). For this process
     /// itself, the duplicate made at once.
     pub fn getfd_request(&self, fd: u64, target_fd: u64, flags: u64) -> Result<GetFd, i64> {
@@ -472,7 +472,7 @@ impl<P: Platform> Kernel<P> {
             return Err(i64::from(r));
         }
         // Only an fwe process can be asked for its descriptors; any other is
-        // one the caller may not attach to, as `ptrace` has it.
+        // one the caller cannot attach to, as `ptrace` has it.
         if !crate::host::is_fwe(t.host) || !self.may_trace(t.host) {
             return Err(err(errno::EPERM));
         }

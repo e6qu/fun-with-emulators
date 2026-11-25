@@ -1,5 +1,11 @@
 //! Linux arm64 userspace ABI definitions.
 //!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in this crate's documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
+//!
 //! Numbers and layouts here describe what Linux binaries expect. They are
 //! independent of the host: translation to macOS happens in the kernel crate.
 //!
@@ -697,7 +703,7 @@ pub mod inotify {
 /// Keys and keyrings (`linux/keyctl.h`): `add_key`, `request_key` and
 /// `keyctl`.
 pub mod keyctl {
-    /// The special keyrings a key id may name.
+    /// The special keyrings a key id can name.
     pub const KEY_SPEC_THREAD_KEYRING: i32 = -1;
     pub const KEY_SPEC_PROCESS_KEYRING: i32 = -2;
     pub const KEY_SPEC_SESSION_KEYRING: i32 = -3;

@@ -63,7 +63,7 @@ static int open_device(int stale) {
     if (n < 0) return -1;
     int expected = fd;
     if (__atomic_compare_exchange_n(&device, &expected, (int)n, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
-        /* Not closed: a stale descriptor's number may be the program's own
+        /* Not closed: a stale descriptor's number might be the program's own
          * by now. */
         return (int)n;
     }
@@ -161,7 +161,7 @@ FWE_EXPORT int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
     return FWE_VK_SUCCESS;
 }
 
-/* Command `e`'s function for object `handle`, if a program may have it:
+/* Command `e`'s function for object `handle`, if a program can have it:
  * the driver's command (its stub) or the library's window systems' (wsi.c),
  * where the driver has the command for the object. */
 static fwe_vk_fn given(const struct fwe_vk_entry *e, const void *handle) {

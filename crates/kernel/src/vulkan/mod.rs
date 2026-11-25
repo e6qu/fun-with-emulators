@@ -4,7 +4,7 @@
 //!
 //! - **The guest side** is fwe's Linux Vulkan driver, `libvulkan_fwe.so`
 //!   (`driver/vulkan/`), which the program's own Vulkan loader loads from
-//!   its manifest in `/usr/share/vulkan/icd.d`. Its stub for a command packs
+//!   its manifest in `/etc/vulkan/icd.d` ([`files::PLACE`]). Its stub for a command packs
 //!   the command's arguments into 64-bit words and makes one ioctl on fwe's
 //!   GPU device ([`generated::IOCTL_CALL`]).
 //! - **The call**: fwe calls the driver's function for the command with

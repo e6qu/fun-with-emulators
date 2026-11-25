@@ -201,7 +201,7 @@ mod tests {
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
-        // A slot with no write left to take may go to another pipe when
+        // A slot with no write left to take can go to another pipe when
         // all are in use (the table is the user's, shared by other tests):
         // until this one keeps its own.
         let kept = (0..20).any(|_| {

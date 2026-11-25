@@ -5,7 +5,7 @@
 // read and written through x18, instruction-cache flushes through x18
 // and another register, a thread-pointer write, and a store of x18
 // through a null pointer, whose
-// SIGSEGV handler must see the fault at the store itself with every
+// SIGSEGV handler sees the fault at the store itself with every
 // register and sp as they were, then skips it. A timer's SIGALRM lands
 // throughout. Exit 0 on success, otherwise 1 + the number of the register
 // found wrong (40 for pc, 41 for sp, 42 if the handler did not run, 43 for

@@ -95,7 +95,7 @@ mod imp {
     }
 
     /// # Safety
-    /// `ram` must point to a writable mapping of `RAM_SIZE` bytes.
+    /// `ram` MUST point to a writable mapping of `RAM_SIZE` bytes.
     unsafe fn run(ram: *mut c_void) -> Result<Spike, String> {
         // Lay out guest memory: code at offset 0, message at MSG_OFF.
         // SAFETY: both regions lie within the RAM_SIZE mapping.
@@ -140,8 +140,8 @@ mod imp {
     }
 
     /// # Safety
-    /// `vcpu`/`exit` must come from a successful `hv_vcpu_create`, and `ram`
-    /// must be the mapping handed to `hv_vm_map`.
+    /// `vcpu`/`exit` MUST come from a successful `hv_vcpu_create`, and `ram`
+    /// MUST be the mapping handed to `hv_vm_map`.
     unsafe fn drive(
         vcpu: hv_vcpu_t,
         exit: *mut hv_vcpu_exit_t,

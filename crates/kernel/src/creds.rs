@@ -52,10 +52,10 @@ impl Access {
         }
     }
 
-    /// Whether it may do `want` (`R_OK`, `W_OK`, `X_OK` bits) to a file
+    /// Whether it can do `want` (`R_OK`, `W_OK`, `X_OK` bits) to a file
     /// whose guest metadata (owner and mode) is `st`, as Linux's
     /// permission check has it: `CAP_DAC_OVERRIDE` passes all but running
-    /// a file nobody may run, `CAP_DAC_READ_SEARCH` reading and searching;
+    /// a file nobody can run, `CAP_DAC_READ_SEARCH` reading and searching;
     /// else the owner's, the group's or the others' bits. In a user
     /// namespace of fwe's the capabilities count only for a file whose
     /// owner and group are mapped there.
@@ -157,7 +157,7 @@ pub fn real_uid() -> u32 {
 
 /// What sending credentials (`SCM_CREDENTIALS`) checks of a caller: its
 /// real, effective and saved user and group ids (initial-namespace ids),
-/// and whether it may claim another's (`CAP_SETUID`, `CAP_SETGID` in its
+/// and whether it can claim another's (`CAP_SETUID`, `CAP_SETGID` in its
 /// own user namespace) or another process's pid (`CAP_SYS_ADMIN` in the
 /// user namespace owning its pid namespace), as Linux's `scm_check_creds`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -203,7 +203,7 @@ pub fn identity() -> Identity {
     })
 }
 
-/// Publish the access `c` gives, after a system call that may have
+/// Publish the access `c` gives, after a system call that might have
 /// changed it (written only when it did), and its real user id.
 #[cfg_attr(
     target_os = "macos",
@@ -289,13 +289,13 @@ fn pick(arg: u32, cur: u32) -> u32 {
 }
 
 impl Creds {
-    /// May set any user id (`CAP_SETUID` in its own user namespace; the
-    /// ids it may set are those mapped there).
+    /// Can set any user id (`CAP_SETUID` in its own user namespace; the
+    /// ids it can set are those mapped there).
     fn can_setuid(&self) -> bool {
         self.caps.has(crate::caps::CAP_SETUID)
     }
 
-    /// May set any group id (`CAP_SETGID` in its own user namespace).
+    /// Can set any group id (`CAP_SETGID` in its own user namespace).
     fn can_setgid(&self) -> bool {
         self.caps.has(crate::caps::CAP_SETGID)
     }
@@ -600,7 +600,7 @@ mod tests {
         assert!(who(2, 100, vec![]).permits(&st, 4) && !who(2, 100, vec![]).permits(&st, 2));
         assert!(who(2, 3, vec![100]).permits(&st, 4));
         assert!(!who(2, 3, vec![]).permits(&st, 4));
-        // The capabilities: all but running what nobody may run; reading.
+        // The capabilities: all but running what nobody can run; reading.
         let root = Access { dac_override: true, ..who(0, 0, vec![]) };
         assert!(root.permits(&st, 6) && !root.permits(&st, 1));
         let reader = Access { dac_read_search: true, ..who(2, 3, vec![]) };

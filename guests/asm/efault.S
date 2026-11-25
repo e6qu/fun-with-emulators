@@ -5,7 +5,7 @@
     .text
     .globl _start
 
-// check N: the result in x0 must be -14, else exit N.
+// check N: exit N unless the result in x0 is -14.
 .macro check n
     cmn     x0, #14
     b.eq    1f

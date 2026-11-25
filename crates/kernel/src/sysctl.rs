@@ -8,9 +8,9 @@
 //! initial network namespace's start at Linux's defaults and are kept with
 //! the sysctls of no namespace; fwe acts on them for the guest's sockets in
 //! that namespace as it does in its own (the privileged ports, the buffer
-//! sizes, the listen backlog, who may make a ping socket), and changing
+//! sizes, the listen backlog, who can make a ping socket), and changing
 //! them changes nothing on the host. The initial IPC namespace is fwe's
-//! own, so root may change its limits.
+//! own, so root can change its limits.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::errno;
@@ -136,7 +136,7 @@ const YAMA_SCOPE: &[u8] = b"kernel/yama/ptrace_scope";
 const BPF_DISABLED: &[u8] = b"kernel/unprivileged_bpf_disabled";
 /// `kernel.ns_last_pid`, whose writes are checked as it is written.
 const NS_LAST_PID: &[u8] = b"kernel/ns_last_pid";
-/// `IPCMNI`: the most objects of a kind a namespace may have.
+/// `IPCMNI`: the most objects of a kind a namespace can have.
 const IPCMNI: i64 = 32768;
 
 const SYSCTLS: &[Sysctl] = &[
@@ -255,7 +255,7 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(-1, INT_MAX),
         space: Space::Ipc,
     },
-    // The most AIO events all contexts may hold.
+    // The most AIO events all contexts can hold.
     Sysctl {
         path: b"fs/aio-max-nr",
         default: "65536",
@@ -281,7 +281,7 @@ const SYSCTLS: &[Sysctl] = &[
     // Whether a process that raised privilege, or changed its credentials,
     // stays dumpable: 0 no, 1 yes, 2 for root only (`PR_GET_DUMPABLE` 2).
     Sysctl { path: b"fs/suid_dumpable", default: "0", kind: Kind::Int(0, 2), space: Space::Global },
-    // Yama: who may attach to a process (`ptrace`, `/proc/<pid>/mem`,
+    // Yama: who can attach to a process (`ptrace`, `/proc/<pid>/mem`,
     // `process_vm_readv`): 0 any process of the same ids, 1 only its
     // ancestors and the one it names, 2 only with `CAP_SYS_PTRACE`, 3 none.
     // Setting it takes `CAP_SYS_PTRACE`, and 3 cannot be undone.
@@ -387,11 +387,11 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Global,
     },
     // Kept, with no effect: the page cache is the host's, which only the
-    // host's root may drop.
+    // host's root can drop.
     Sysctl { path: b"vm/drop_caches", default: "0", kind: Kind::Int(1, 4), space: Space::Global },
     // The huge page pool, empty: fwe has no huge pages to give, so a size
     // asked for gets none, as on a Linux that cannot allocate them; and
-    // the group (beside `CAP_IPC_LOCK`) whose members may make
+    // the group (beside `CAP_IPC_LOCK`) whose members can make
     // `SHM_HUGETLB` segments.
     Sysctl { path: b"vm/nr_hugepages", default: "0", kind: Kind::Pool, space: Space::Global },
     Sysctl {
@@ -400,7 +400,7 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(i32::MIN as i64, INT_MAX),
         space: Space::Global,
     },
-    // Pipe buffer pages a user may hold before new pipes get the least
+    // Pipe buffer pages a user can hold before new pipes get the least
     // (soft) or none (hard, 0: no limit), at Linux's defaults. Kept, not
     // enforced: a pipe is a host pipe, whose buffer the host sizes.
     Sysctl {
@@ -415,7 +415,7 @@ const SYSCTLS: &[Sysctl] = &[
         kind: Kind::Int(0, INT_MAX),
         space: Space::Global,
     },
-    // The most descriptors a process may have: its `RLIMIT_NOFILE` and a
+    // The most descriptors a process can have: its `RLIMIT_NOFILE` and a
     // copy of a shared descriptor table are bounded by it.
     Sysctl {
         path: b"fs/nr_open",
@@ -430,7 +430,7 @@ const SYSCTLS: &[Sysctl] = &[
         space: Space::Global,
     },
     // The most namespaces of each kind the user namespace and those below
-    // it may hold, which [`crate::ns::may_make`] holds new ones to: half
+    // it can hold, which [`crate::ns::may_make`] holds new ones to: half
     // of `kernel.threads-max` in the initial one, as on Linux, and no
     // limit of its own in another until set.
     Sysctl {
@@ -821,7 +821,7 @@ fn set_last_pid(v: i32) -> Result<(), i32> {
     })
 }
 
-/// The lowest port a caller without `CAP_NET_BIND_SERVICE` may bind in the
+/// The lowest port a caller without `CAP_NET_BIND_SERVICE` can bind in the
 /// process's network namespace.
 pub fn unprivileged_port_start() -> u16 {
     index(b"/proc/sys/net/ipv4/ip_unprivileged_port_start")

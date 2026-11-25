@@ -1,5 +1,5 @@
-// The program execve'd into by execer: fd 10 must have survived the exec and
-// fd 11 (close-on-exec) must be gone. Then print a line and exit 0.
+// The program execve'd into by execer: fd 10 is expected to have survived the
+// exec and fd 11 (close-on-exec) to be gone. Then print a line and exit 0.
     .text
     .globl _start
 _start:
@@ -7,12 +7,12 @@ _start:
     mov     x1, #1                  // F_GETFD
     mov     x8, #25                 // fcntl
     svc     #0
-    tbnz    x0, #63, fail           // fd 10 must be open
+    tbnz    x0, #63, fail           // fd 10 is expected open
     mov     x0, #11
     mov     x1, #1                  // F_GETFD
     mov     x8, #25                 // fcntl
     svc     #0
-    tbz     x0, #63, fail           // fd 11 must be closed (EBADF)
+    tbz     x0, #63, fail           // fd 11 is expected closed (EBADF)
 
     mov     x0, #1
     adr     x1, msg

@@ -37,7 +37,7 @@
 //!   the program's run-time code (a library's, prepared in place) has 0
 //!   for its translation: the lookup restores `x16` and `x17` and makes
 //!   the program's own branch through its register, so no register
-//!   changes (code may count on that beyond the procedure call standard:
+//!   changes (code can count on that beyond the procedure call standard:
 //!   HotSpot calls its atomic stubs saying they clobber only `x8`, `x9`
 //!   and `x30`). Through `x18`, which has no register to branch through,
 //!   fwe's trap makes it.
@@ -84,7 +84,7 @@
 //! apart in a segment of its chunk ([`Chunk`]). A full chunk is followed
 //! by a new one, or, where at least half of the cache is translations
 //! dropped since, the cache is emptied ([`flush`]): every other thread is
-//! stopped, the blocks a thread may be in or return into are retired, and
+//! stopped, the blocks a thread might be in or return into are retired, and
 //! the rest of the room is reused.
 
 mod kept;
@@ -131,9 +131,9 @@ pub fn in_cache(pc: u64) -> bool {
     CHUNK_RX[..n].iter().any(|c| pc.wrapping_sub(c.load(Ordering::Relaxed)) < size)
 }
 
-/// Whether `pc` may be where [`to_guest`] finds the program's state: in
+/// Whether `pc` can be where [`to_guest`] finds the program's state: in
 /// fwe's code cache, or in a stub region once a call stub was made
-/// ([`link_call_site`]). Not for fwe's own code (it may take locks).
+/// ([`link_call_site`]). Not for fwe's own code (it can take locks).
 pub fn stands_for_program(pc: u64) -> bool {
     in_cache(pc)
         || (CALL_SITES_LINKED.load(Ordering::Relaxed) > 0
@@ -783,7 +783,7 @@ struct Block {
     /// thread's area in `x16`), past the words that load them, if it starts
     /// with them; else 0.
     x18: u64,
-    /// Kept when the cache was emptied, as a thread may still be in it or
+    /// Kept when the cache was emptied, as a thread might still be in it or
     /// return into it: found by no lookup, and its ways out not linked.
     retired: bool,
     /// The program's words it was made from, from `g` on, and whether it
@@ -1324,7 +1324,7 @@ struct Held {
 
 impl Held {
     /// `work` done with the lock let go, and taken again after: the state
-    /// may have changed meanwhile.
+    /// might have changed meanwhile.
     /// (Words patched meanwhile are synced by the next holder: a way out
     /// seen unlinked a while longer only goes through fwe, which finds it
     /// linked; unlinks, of the program's flushes and of emptying the
@@ -1674,7 +1674,7 @@ impl State {
         }
         // Other mappings of translated pages there map something else now.
         // (The pages in the range translated from, not every page of it:
-        // a range may be a reservation of terabytes.)
+        // a range can be a reservation of terabytes.)
         let aliases: Vec<u64> = self.aliases.range(start..end).map(|(&q, _)| q).collect();
         for q in aliases {
             self.aliases.remove(&q);
@@ -2005,7 +2005,7 @@ pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
     // (through a branch on a register, a tail call, as a runtime's entry
     // stubs make). That site looks its target up from now on, as a
     // translation does, so the code it calls runs by translation and its
-    // ways in here are lookups. (Read as the host copies: `lr` may be
+    // ways in here are lookups. (Read as the host copies: `lr` can be
     // anything.)
     let mut linked = false;
     if let Some(site) = call_site(&s, lr.wrapping_sub(4), held) {
@@ -2042,7 +2042,7 @@ struct CallStub {
     out: usize,
 }
 
-/// A call site of code fwe prepared in place that a fetch may have come
+/// A call site of code fwe prepared in place that a fetch might have come
 /// from ([`call_site`]).
 #[derive(Clone, Copy)]
 enum CallSite {
@@ -2052,7 +2052,7 @@ enum CallSite {
     Direct(u64),
 }
 
-/// The call site at `at`, before the thread's `x30`, that a fetch may have
+/// The call site at `at`, before the thread's `x30`, that a fetch might have
 /// come from, `held` the registers holding the fetch's address (as
 /// [`enter`] has them): `blr xN`, `xN` among them; or `bl` to code fwe
 /// prepared in place, whose code came to the fetch.
@@ -2078,7 +2078,7 @@ fn call_site(s: &State, at: u64, held: u32) -> Option<CallSite> {
 /// that looks the target up in the table, as a translation's lookup does,
 /// and goes to its translation, or makes the call as it was (target not
 /// translated, or not yet). A `blr xN`'s leaves every register as the site
-/// would; a `bl`'s puts its target in `x16` first, as a linker's veneer may
+/// would; a `bl`'s puts its target in `x16` first, as a linker's veneer can
 /// (the procedure call standard lets a direct call to other code clobber
 /// `x16` and `x17`), and its lookup reads it there. The site becomes `bl`
 /// to it, made with every other thread stopped. Whether it did.
@@ -2311,7 +2311,7 @@ fn exit_now(regs: &mut Regs) -> bool {
         i = translation(&mut s, to, unsaved);
     }
     // Linked where the target is in reach (in the same chunk), unless the
-    // cache was emptied meanwhile (`at` may be reused) or the block left
+    // cache was emptied meanwhile (`at` can be reused) or the block left
     // since (the lock let go as it was translated).
     let same = s.cache.as_ref().is_some_and(|c| c.flushes == flushes);
     let from_retired = same && from.is_some_and(|f| s.blocks[f].retired);
@@ -2646,7 +2646,7 @@ fn translation(s: &mut Held, g: u64, unsaved: bool) -> usize {
     loop {
         if let Some(&i) = s.by_g.get(&g) {
             if !unsaved || s.blocks[i].unsaved.is_some() {
-                // Its table entry may have gone to another address since
+                // Its table entry might have gone to another address since
                 // (they share entries): it is its own again.
                 publish_block(&s.blocks[i]);
                 return i;
@@ -2696,7 +2696,7 @@ fn translation(s: &mut Held, g: u64, unsaved: bool) -> usize {
             making.add_to(&jitcount::TAKE_NS);
             return r;
         }
-        // Calls made already from the words it may read: made there.
+        // Calls made already from the words it can read: made there.
         let known: Vec<(u64, u64)> = s
             .calls_made
             .range(g..g + 4 * source.len() as u64)
@@ -2750,7 +2750,7 @@ thread_local! {
 /// it returns, the next instruction past a block cut short. Each would be
 /// made at a way out of its own as the program reached it, through the
 /// gate and the lock, one at a time; made now, they are linked at once.
-/// Only code the program goes on to is made (a call may not return: its
+/// Only code the program goes on to is made (a call might not return: its
 /// return site is the program's words, decoded and never run). Whether
 /// the cache was emptied meanwhile (block indices are then another's).
 fn ahead(s: &mut Held, i: usize) -> bool {
@@ -3056,7 +3056,7 @@ fn retarget(w: u32, at: u64, to: u64) -> Option<u32> {
 
 /// Note the other mappings of the file page that program page `p` maps,
 /// as code is first translated from it: a flush through one of them is a
-/// flush of `p`'s code ([`flushed`]); a JIT that maps its code twice may
+/// flush of `p`'s code ([`flushed`]); a JIT that maps its code twice can
 /// flush either.
 fn note_aliases(s: &mut State, p: u64) {
     if s.pages.contains_key(&p) {
@@ -3079,7 +3079,7 @@ fn note_aliases(s: &mut State, p: u64) {
 }
 
 /// The file page (device, inode, offset) program page `p` maps, if it
-/// maps a file shared (which another mapping may map too).
+/// maps a file shared (which another mapping can map too).
 fn shared_page(rec: &fwe_kernel::maps::Held, p: u64) -> Option<(u64, u64, u64)> {
     let a = rec.areas_in(p, p + page_size()).into_iter().next()?;
     let o = &a.value.object;
@@ -3279,7 +3279,7 @@ fn veneer(s: &mut State, to: u64, saved: bool) -> usize {
 }
 
 /// Whether program address `to` holds code fwe prepared in place that a
-/// translation may follow into: in an executable mapping of the program's,
+/// translation can follow into: in an executable mapping of the program's,
 /// and not a stub of fwe's.
 fn followable(to: u64) -> bool {
     !in_cache(to)
@@ -3296,7 +3296,7 @@ fn followable(to: u64) -> bool {
 /// goes in a chunk with room, or a new one. Its chunk's exit stub, and its
 /// parts' addresses.
 fn cache_next(s: &mut State, hot: u64, cold: u64) -> (u64, u64, u64) {
-    // The first segment holds the exit stub; each part may be aligned.
+    // The first segment holds the exit stub; each part can be aligned.
     assert!(
         PREFIX + hot + cold + 8 <= segment(),
         "a block of {hot} and {cold} bytes, larger than a segment"
@@ -3329,7 +3329,7 @@ const SCAN_PIECE: usize = 2048;
 const SCAN_STACK: u64 = 2 << 20;
 
 /// Empty the code cache (every other thread stopped), but for the blocks a
-/// thread may be in or return into: any whose translation a thread's
+/// thread might be in or return into: any whose translation a thread's
 /// registers, the stack it is on, or a gate block (a call's way back)
 /// points into. Those are retired, their ways out unlinked; the room of
 /// every other block is had back, and their code translated again as it
@@ -3464,7 +3464,7 @@ fn write(c: &mut Cache, hot: &[u32], cold: &[u32]) -> (u64, u64) {
     (k.rx + at, k.rx + at_cold)
 }
 
-/// Write a block's `hot` and `cold` words in the cache ([`write`]), synced
+/// Write a block's `hot` and `cold` words in the cache ([`write()`]), synced
 /// for instruction fetch with the words patched since the last sync
 /// ([`State::sync_patched`]), once for all: their executable addresses.
 /// (Room is written again only once the cache is emptied, which syncs the
@@ -3516,7 +3516,7 @@ fn snapshot(g: u64) -> Vec<u32> {
 }
 
 /// `work`, with [`read`] taking the program's words from `g` from `words`:
-/// a translation made from one look at them, which another thread may be
+/// a translation made from one look at them, which another thread might be
 /// changing meanwhile. And how many of them it read, from the first.
 fn with_snapshot<R>(g: u64, words: &[u32], work: impl FnOnce() -> R) -> (R, usize) {
     SNAPSHOT.with(|c| c.set((g, words.as_ptr(), words.len())));
@@ -3849,7 +3849,7 @@ fn body_of(
             c.made.push((pc, (k + if was { 0 } else { SAVE_WORDS }) as u64, held));
         }
         pc += 4;
-        // Ends at a branch out, or at the page's end (the next page may not
+        // Ends at a branch out, or at the page's end (the next page might not
         // be the program's code).
         if ended || pc & (page - 1) == 0 {
             if !ended {
@@ -3981,7 +3981,7 @@ fn is_branch(w: u32) -> bool {
 /// `x18`), and is of a kind known to name no other (a system instruction
 /// other than a hint or a barrier, such as a system call or a read of the
 /// thread pointer, is not; nor a literal load into a vector register,
-/// made through `x16`). Where a field may be a register, it is taken for
+/// made through `x16`). Where a field can be a register, it is taken for
 /// one.
 fn keeps_saved(w: u32, x18: bool) -> bool {
     names_none(w, 1 << 16 | 1 << 17 | if x18 { 0 } else { 1 << 18 }, false)
@@ -3989,7 +3989,7 @@ fn keeps_saved(w: u32, x18: bool) -> bool {
 
 /// Whether the program's instruction `w` names none of the general
 /// registers in `regs` (a bit each), nor `sp` where `sp` counts, as
-/// [`keeps_saved`] tells. Where a field may be a register,
+/// [`keeps_saved`] tells. Where a field can be a register,
 /// it is taken for one.
 fn names_none(w: u32, regs: u32, sp: bool) -> bool {
     let reg = |shift: u32| (w >> shift) & 31;
@@ -4078,7 +4078,7 @@ fn names_none(w: u32, regs: u32, sp: bool) -> bool {
 /// instead, and whether it writes it: where it runs with the program's
 /// `x16` and `x17` saved, as [`keeps_saved`] says but for `x18`, and every
 /// field naming `x18` is known ([`crate::decode::operands`]; not `casp`,
-/// whose pair of registers must be even and consecutive).
+/// whose pair of registers is even and consecutive).
 fn in_x17(w: u32) -> Option<(u32, bool)> {
     if is_branch(w) || crate::decode::x18_casp(w) || !keeps_saved(w, true) {
         return None;
@@ -4857,7 +4857,7 @@ mod tests {
         for w in [0xf860_68b0, 0xf871_68a0, 0xf830_0020] {
             assert!(!keeps_saved(w, false), "{w:08x}");
         }
-        // ldr x0, [x5, w18, uxtw #3]: x18 named, kept only where it may be.
+        // ldr x0, [x5, w18, uxtw #3]: x18 named, kept only where it can be.
         assert!(!keeps_saved(0xf872_58a0, false));
         assert!(keeps_saved(0xf872_58a0, true));
     }

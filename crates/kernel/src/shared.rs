@@ -46,7 +46,7 @@ pub trait Data: Clone + Default + Send + Sync + 'static {
     fn apply(&mut self, _d: &mut Dec) {}
 }
 
-/// The size a journal may reach before the data is written whole, when
+/// The size a journal can reach before the data is written whole, when
 /// the data is smaller.
 const JOURNAL_MIN: usize = 64 << 10;
 
@@ -283,7 +283,7 @@ impl<T: Data> Record<T> {
         Record::named(&fresh_name(kind), 0, || data)
     }
 
-    /// The record named `dir` ([`Record::dir`]), which must exist and hold
+    /// The record named `dir` ([`Record::dir`]), which needs to exist and hold
     /// data of this kind (one a parent process had). It is never written
     /// here.
     pub fn join(dir: &[u8], id: u64) -> Result<Record<T>, i32> {
@@ -537,7 +537,7 @@ impl<T: Data> Record<T> {
 
     /// Change the data with `f`, for every process, if `f` says it changed
     /// it: the generation moves only then (a waiter that looked again and
-    /// must go on waiting changes nothing, so does not wake itself).
+    /// needs to go on waiting changes nothing, so does not wake itself).
     pub fn update_maybe<R>(
         &self,
         f: impl FnOnce(&mut T) -> Result<(R, bool), i32>,
@@ -567,7 +567,7 @@ impl<T: Data> Record<T> {
     }
 }
 
-/// An optional shared record, as a namespace that may be the initial one
+/// A shared record or none, as a namespace that can be the initial one
 /// (`None`) is kept, written into a snapshot or exec state.
 pub fn save_opt<T: Data>(e: &mut Enc, r: &Option<Arc<Record<T>>>) {
     match r {
@@ -647,8 +647,8 @@ pub fn collect() {
 }
 
 /// Close every descriptor inherited, and put `/dev/null` in place of the
-/// standard ones: whoever reads the output of the process that started
-/// [`collect`] must not wait for it too.
+/// standard ones, so that whoever reads the output of the process that started
+/// [`collect`] does not wait for it too.
 fn detach_descriptors() {
     let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
         .into_iter()
@@ -699,7 +699,7 @@ fn collect_in(base: &[u8]) {
         live.extend(r.held);
     }
     // An ended process not yet reaped keeps its numbers, while someone
-    // may still reap it.
+    // can still reap it.
     for e in crate::procreg::all_ended() {
         if crate::reaper::reapable(&e) {
             live.extend(e.numbers.into_iter().map(|(d, _)| d));

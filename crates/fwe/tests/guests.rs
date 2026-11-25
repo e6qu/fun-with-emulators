@@ -1,10 +1,16 @@
 //! End-to-end tests: build Linux arm64 programs from `guests/` and run them
 //! under `fwe`.
 //!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in these tests' documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
+//!
 //! Assembly guests are assembled with `clang` and linked with the toolchain's
 //! `rust-lld` three ways: as static executables above 4 GiB, as static
 //! position-independent executables, and (`-low`) at the default low link
-//! address, which the native backend must reject cleanly. Rust guests are
+//! address, which the native backend rejects cleanly. Rust guests are
 //! built for `aarch64-unknown-linux-musl`.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -45,8 +51,8 @@ impl Alone for Command {
     }
 }
 
-/// How long a guest may run before the harness kills it. A guest should
-/// finish in well under a second; a hang (e.g. a thread that never wakes)
+/// How long a guest can run before the harness kills it. A guest
+/// finishes in well under a second; a hang (e.g. a thread that never wakes)
 /// becomes a fast, visible failure instead of hanging CI.
 const GUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -69,11 +75,11 @@ fn run_bounded(mut cmd: Command) -> Output {
 }
 
 /// [`run_bounded`] for a command that runs VM processes (the hypervisor
-/// backend). A VM process must never be killed with its VM alive, so the
+/// backend). A VM process MUST NOT be killed with its VM alive, so the
 /// command runs in a process group of its own; on timeout the group gets
 /// `SIGTERM`, which every VM process catches to tear its VM down first,
 /// and only a leader still alive 5 s later gets `SIGKILL`. Afterwards no
-/// process of the group may be left (a fork child outliving its test would
+/// process of the group is left (a fork child outliving its test would
 /// keep a VM running alongside the next one): the test fails if one is.
 fn run_vm_bounded(cmd: Command) -> Output {
     run_vm_bounded_for(cmd, GUEST_TIMEOUT)
@@ -326,7 +332,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
         panic!("{why}: the guest was ended");
     }
     // Readers finish once the pipes close: at the exit of the last process
-    // holding them, which may have left the group. One still holding them
+    // holding them, which might have left the group. One still holding them
     // a while later is reported, not waited for.
     let joined = |reader: std::thread::JoinHandle<Vec<u8>>, which: &str| {
         let start = Instant::now();
@@ -478,7 +484,7 @@ fn build_guests() -> &'static Path {
             // Cargo reads guests/rust/.cargo/config.toml from the working
             // directory.
             .current_dir(repo().join("guests/rust"));
-        // Do not inherit the outer build's flags or target settings.
+        // Without the outer build's flags or target settings.
         for (key, _) in std::env::vars() {
             if key.starts_with("CARGO_") || key == "RUSTFLAGS" || key == "RUSTC_WRAPPER" {
                 build.env_remove(key);
@@ -516,7 +522,7 @@ fn stdout(out: &Output) -> String {
 }
 
 /// The root filesystem: an assembly guest writes `/probe` under a `--root`
-/// directory, which must land in the host directory and nowhere else.
+/// directory, which lands in the host directory and nowhere else.
 #[test]
 fn root_filesystem_confines_writes() {
     for name in ["fileio", "fileio-pie"] {
@@ -1047,7 +1053,7 @@ fn signal_handler_runs() {
 }
 
 /// The dynamic loader: a PIE executable names an interpreter via PT_INTERP;
-/// fwe must load the interpreter (from the rootfs) and hand control to it
+/// fwe loads the interpreter (from the rootfs) and hand control to it
 /// with AT_ENTRY pointing at the executable, which the interpreter jumps to.
 #[test]
 fn dynamic_loader_hands_off_to_interpreter() {
@@ -1360,7 +1366,7 @@ fn jit_translations_are_kept_for_the_next_run() {
         assert!(mf + tf > 0 && mg + tg > 0, "no block of the file's code or of generated: {err}");
         counts.push((mf, tf, mg, tg));
     }
-    // (The first run may take some, kept by an earlier one.)
+    // (The first run can take some, kept by an earlier one.)
     let (mf, tf, mg, tg) = counts[0];
     assert_eq!((counts[1].0, counts[1].1), (0, mf + tf), "{counts:?}");
     assert_eq!(counts[1].2 + counts[1].3, mg + tg, "{counts:?}");
@@ -2264,7 +2270,7 @@ fn poll_events_are_linuxs() {
 }
 
 /// `SO_PEERCRED` names the peer by the ids it has in the guest,
-/// `SO_PASSCRED` brings the sender's credentials, and a sender may not
+/// `SO_PASSCRED` brings the sender's credentials, and a sender cannot
 /// claim credentials it lacks (`EPERM`).
 #[test]
 fn unix_socket_credentials_are_the_guests() {
@@ -2273,6 +2279,22 @@ fn unix_socket_credentials_are_the_guests() {
         &["creds"],
         "child: claiming root -1 errno 1\npeer is child 1 uid 1000 gid 1000\n\
          passed 1: child 1 uid 1000 gid 1000\ngiven 1: child 1 uid 1000 gid 1000\n",
+    );
+}
+
+/// A Unix stream socket's connect to a listener whose queue is full, as
+/// Linux answers (macOS refuses it): `EAGAIN` not blocking; waiting while
+/// blocking, until the listener accepts or the send timeout ends
+/// (`EAGAIN`); `ECONNREFUSED` only where nothing listens.
+#[test]
+fn unix_connect_to_a_full_queue_waits() {
+    c_guest_prints(
+        "unixqueue",
+        &[],
+        "a full queue, not blocking: EAGAIN\n\
+         a full queue, with a timeout: EAGAIN, after it\n\
+         a full queue, blocking: connected, once one was accepted\n\
+         no listener: ECONNREFUSED\n",
     );
 }
 
@@ -2469,8 +2491,8 @@ fn debian_coreutils_sort_orders_lines() {
 }
 
 /// Real Debian `ls`: a program with a transitive shared-library graph
-/// (`ls` → `libselinux` → `libpcre2`, plus `libc`). The dynamic linker must
-/// find and map each library from the rootfs, resolving one against another,
+/// (`ls` → `libselinux` → `libpcre2`, plus `libc`). The dynamic linker
+/// finds and maps each library from the rootfs, resolving one against another,
 /// before `ls` lists a directory. With output to a pipe, GNU `ls` prints one
 /// sorted name per line.
 #[test]
@@ -2845,7 +2867,7 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
     }
     // Tests fetch at once, and manifests share packages: each download goes
     // to a name of its own and is renamed into place once it checks out.
-    // (A name of this fetch's own: two tests may fetch the same file.)
+    // (A name of this fetch's own: two tests can fetch the same file.)
     static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
     let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let part = cache.join(format!("{name}.{tag}.{}-{n}.part", std::process::id()));
@@ -2942,7 +2964,7 @@ fn fetched_alpine(manifest_name: &str) -> Vec<PathBuf> {
 /// and cached: the minirootfs, then each package. An `.apk` is gzipped tar
 /// segments, its signature and metadata (dot files) before the files.
 fn alpine_root(manifest_name: &str) -> PathBuf {
-    // One test at a time makes a root: two may want the same one.
+    // One test at a time makes a root: two can want the same one.
     static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest_in("alpine", manifest_name);
@@ -3113,8 +3135,8 @@ fn pulled_images_run() {
 /// The user guide's tested recipes (`docs/user-guide.md`), run as written:
 /// each block marked `<!-- tested: NAME -->` runs in `bash` on the host
 /// (after the guide's `linux` function), in order, sharing a home
-/// directory, with `fwe` on the `PATH`, and must print what the `text`
-/// block after it shows. Only where `FWE_PULL_TESTS` is set (CI): they
+/// directory, with `fwe` on the `PATH`, and passes if it prints what the
+/// `text` block after it shows. Only where `FWE_PULL_TESTS` is set (CI): they
 /// pull images and run their programs.
 #[test]
 fn user_guide_recipes() {
@@ -3769,7 +3791,7 @@ fn alpine_docker_runs_and_builds_images() {
         let _ = daemon.wait();
     }
     eprintln!("--- dockerd log:\n{}", dockerd_log());
-    // The traces and the daemon's log, for CI to keep should a step fail.
+    // The traces and the daemon's log, for CI to keep if a step fails.
     let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("docker-traces");
     let _ = std::fs::remove_dir_all(&kept);
     std::fs::create_dir_all(&kept).unwrap();
@@ -3826,7 +3848,7 @@ const IN_ROOTLESS: &str = "id -u; awk '{print $1, $2, $3}' /proc/self/uid_map; \
 /// and `COPY` from the context) and runs it, pushes it to a registry
 /// (distribution's, running alongside) and pulls it back; then as an
 /// ordinary user, rootless, in a user namespace `newuidmap` maps from
-/// `/etc/subuid` (which it may, by its file capability `cap_setuid`), with
+/// `/etc/subuid` (which it can, by its file capability `cap_setuid`), with
 /// overlay storage in the user's home, it pulls the image from the registry
 /// and runs it, and runs a container whose root is the user.
 #[test]
@@ -3974,7 +3996,7 @@ fn alpine_podman_builds_pulls_and_runs_rootless() {
     // SAFETY: plain call, to the registry this test started.
     unsafe { libc::kill(registry.id() as i32, libc::SIGTERM) };
     let _ = registry.wait();
-    // The traces and logs, for CI to keep should a step fail.
+    // The traces and logs, for CI to keep if a step fails.
     let kept = Path::new(env!("CARGO_TARGET_TMPDIR")).join("podman-traces");
     let _ = std::fs::remove_dir_all(&kept);
     std::fs::create_dir_all(&kept).unwrap();
@@ -4390,7 +4412,7 @@ console.log('child', execFileSync('/bin/sh', ['-c', 'echo $((6 * 7))']).toString
         ),
     )
     .unwrap();
-    // Its calls, for the last of each process should it fail.
+    // Its calls, for the last of each process if it fails.
     let trace = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}.trace"));
     let _ = std::fs::remove_file(&trace);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
@@ -4495,9 +4517,9 @@ fn alpine_luajit_runs_jit_code() {
 
 /// A language runtime of Alpine's that makes code as it runs (fetched:
 /// `guests/alpine/fetch/<manifest>.txt`): `program` under its root, with
-/// `args`, runs `script` (put at `/tmp/<file>`), which must print
+/// `args`, runs `script` (put at `/tmp/<file>`), and checks that it prints
 /// `expected`, what Linux prints. Its calls are kept, and their last shown
-/// should it fail.
+/// if it fails.
 fn alpine_runtime_runs(
     vm: bool,
     manifest: &str,
@@ -5062,7 +5084,7 @@ echo "$REQUEST_METHOD $QUERY_STRING: $(sqlite3 /tmp/db 'select group_concat(who)
     init.args(["/tmp/db", "create table hits(who text); insert into hits values ('init')"]);
     assert_eq!(run_bounded(init).status.code(), Some(0));
 
-    // A port free a moment ago, which another test may take before lighttpd
+    // A port free a moment ago, which another test can take before lighttpd
     // binds it: then lighttpd ends, and another is tried.
     let log_path = root.path("tmp/error.log");
     let mut started = None;
@@ -5455,7 +5477,7 @@ fn hv_a_program_past_the_vms_address_space_is_refused() {
     assert!(err.contains("past the VM's address space"), "{err}");
 }
 
-/// A thread blocked in `read` on a pipe must not hold the kernel lock, or the
+/// A thread blocked in `read` on a pipe does not hold the kernel lock, or the
 /// thread that writes to the pipe could never make its own system call.
 #[test]
 fn blocking_read_does_not_stall_writer_thread() {
@@ -5799,7 +5821,7 @@ fn exec_replaces_the_address_space() {
 
 /// Writable and executable memory, as JIT compilers use it (macOS never maps
 /// memory so): code written there runs, runs again after being rewritten in
-/// place, and may make system calls; `mrs ctr_el0`, which macOS traps at
+/// place, and can make system calls; `mrs ctr_el0`, which macOS traps at
 /// EL0, reads a cache type.
 #[test]
 fn jit_code_runs_from_writable_executable_memory() {
@@ -6242,8 +6264,8 @@ fn process_descriptors_name_processes() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// The `identity` guest's output for check `check` with `args`, which
-/// must exit 0.
+/// The `identity` guest's output for check `check` with `args`, checked to
+/// exit 0.
 fn identity(args: &[&str]) -> String {
     let out = fwe(&rust_guest("identity"), args);
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
@@ -6425,7 +6447,7 @@ fn pid_namespace_init_takes_only_handled_signals() {
     );
 }
 
-/// A signal to a process group reaches each member the sender may
+/// A signal to a process group reaches each member the sender can
 /// signal and no other, as Linux's `kill_pgrp` sends it.
 #[test]
 fn group_kills_check_each_member() {
@@ -7040,7 +7062,7 @@ fn proc_self_fd_lists_and_links_descriptors() {
 }
 
 /// `RLIMIT_NOFILE` is virtual: its hard limit starts where fwe's own range
-/// begins, so `dup2` there fails with `EBADF`; root may raise it as far as
+/// begins, so `dup2` there fails with `EBADF`; root can raise it as far as
 /// `fs.nr_open`, not past it.
 #[test]
 fn descriptor_limit_bounds_the_guest() {
@@ -7151,7 +7173,7 @@ fn hv_mode() -> Option<&'static HvMode> {
         // costs nothing (the self-hosted runner) sets this.
         if std::env::var_os("FWE_HV_TESTS").is_none_or(|v| v != "1") {
             if cfg!(all(target_os = "macos", target_arch = "aarch64")) && unicorn_present() {
-                // A second guard besides the stand-in itself: this fwe must
+                // A second guard besides the stand-in itself: this fwe MUST
                 // be unable to create a real VM.
                 let sig = Command::new("codesign")
                     .args(["-d", "--entitlements", "-", env!("CARGO_BIN_EXE_fwe")])
@@ -7180,8 +7202,8 @@ fn hv_mode() -> Option<&'static HvMode> {
 
 /// `fwe` signed with the hypervisor entitlement, if this host can run a VM.
 fn real_fwe() -> Option<PathBuf> {
-    // Never alongside another hypervisor client, such as Podman's krunkit
-    // (the safety rules in docs/hypervisor.md).
+    // The VM tests MUST NOT run alongside another hypervisor client, such as
+    // Podman's krunkit (the safety rules in docs/hypervisor.md).
     if let Some(other) = other_hypervisor_client() {
         eprintln!(
             "skipped: another hypervisor client is running ({other}); \
@@ -7340,7 +7362,7 @@ fn workload() -> std::sync::MutexGuard<'static, ()> {
 
 /// Held while a VM process runs, so the tests never run more than one at a
 /// time: Hypervisor.framework is shared with whatever else on the machine
-/// uses it, and the tests should not stress it.
+/// uses it, and the tests MUST NOT stress it.
 static ONE_VM: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Run `program` in the VM backend (see [`hv_command`]), or `None` (test
@@ -8526,7 +8548,7 @@ fn capabilities_in_a_user_namespace_cover_what_it_owns() {
     );
 }
 
-/// Who may trace whom, as Linux's `ptrace_may_access` with Yama (scope 1,
+/// Who can trace whom, as Linux's `ptrace_may_access` with Yama (scope 1,
 /// the default) and Landlock decide it for a user without capabilities:
 /// its own child (`TracerPid` then names it), not an undumpable one, not a
 /// sibling unless the sibling names it (`PR_SET_PTRACER`), and nothing
@@ -8546,7 +8568,7 @@ fn ptrace_access_follows_linux_and_yama() {
 /// opened without the right to truncate cannot be truncated through any
 /// descriptor of it, a dup, `F_DUPFD`, or one passed to a process outside
 /// the domain; a device opened without `IOCTL_DEV` takes only the requests
-/// any holder may make; a domain restricting files may not mount; a
+/// any holder can make; a domain restricting files cannot mount; a
 /// signal to a process group or to every process spares those outside a
 /// signal-scoped domain; a datagram to an abstract socket bound outside an
 /// abstract-scoped domain is refused.
@@ -8564,7 +8586,7 @@ fn landlock_follows_open_files_signals_mounts_and_datagrams() {
 }
 
 /// File capabilities (`security.capability`): only revisions 2 and 3, of
-/// their sizes, may be written (`EINVAL`); a change of owner and a write
+/// their sizes, can be written (`EINVAL`); a change of owner and a write
 /// remove them, as Linux's `chown` and `write` do; written in a user
 /// namespace they are kept for its root, revision 2 there and revision 3
 /// naming that root outside.
@@ -9049,7 +9071,7 @@ fn cgroups_limits_freeze_and_delegation() {
 /// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
 /// `comm` and host name written as Linux writes them, another process's
 /// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
-/// a tracer reads, to one that may not trace it), `/proc/net`, and the
+/// a tracer reads, to one that cannot trace it), `/proc/net`, and the
 /// link counts of directories (a process's `task` 2 and its threads).
 #[test]
 fn proc_files_programs_read() {
@@ -9295,7 +9317,7 @@ fn unix_socket_nodes_are_held_to_their_modes() {
     );
 }
 
-/// A socket is its maker's: a user who is not root may `fchmod` the one
+/// A socket is its maker's: a user who is not root can `fchmod` the one
 /// it made, which `fstat` shows and the node bound for it takes (less the
 /// umask).
 #[test]
@@ -9340,7 +9362,7 @@ fn access_times_set_by_reads_leave_change_times() {
 }
 
 /// A set-ID file a user without `CAP_FSETID` changes loses its set-ID bits
-/// (set-group-ID as its group may run it) however it is changed.
+/// (set-group-ID as its group can run it) however it is changed.
 #[test]
 fn set_id_bits_go_with_any_change() {
     assert_eq!(
@@ -9351,7 +9373,7 @@ fn set_id_bits_go_with_any_change() {
 }
 
 /// An `O_TMPFILE` file has no link until given one, which any duplicate
-/// of its descriptor may do; a fork child's close leaves it to its maker;
+/// of its descriptor can do; a fork child's close leaves it to its maker;
 /// one still open as its process ends leaves no hidden file behind.
 #[test]
 fn o_tmpfile_files_have_no_name_until_linked() {
@@ -9541,7 +9563,7 @@ fn signals_limits_and_always_there_calls() {
 }
 
 /// `fs.protected_symlinks` refuses a trailing link in a sticky directory
-/// anyone may write to (not one the path passes through), to `openat2` as
+/// anyone can write to (not one the path passes through), to `openat2` as
 /// to `open`; a `nosymfollow` mount's links are followed by neither;
 /// `linkat` of a descriptor's file (`AT_EMPTY_PATH`) is `EXDEV` across
 /// mounts and held to `fs.protected_hardlinks`, as a path's is.
@@ -9694,7 +9716,7 @@ fn a_host_process_maps_a_memfd_it_is_sent() {
 }
 
 /// `proc`'s `hidepid=invisible` hides another user's process from one who
-/// may not trace it, `noaccess` keeps them out of it (`EPERM`), and
+/// cannot trace it, `noaccess` keeps them out of it (`EPERM`), and
 /// `subset=pid` shows the processes alone; `hidepid=3` is `EINVAL`.
 #[test]
 fn proc_hidepid_and_subset_hide_as_linux() {
@@ -9776,7 +9798,7 @@ impl Xvfb {
         // The servers' socket directory, made once before any starts, as a
         // system makes it at boot: an X server not run as root that finds
         // it made by another starting at the same moment gives up
-        // (`mkdir` fails with `EEXIST` and it may not make it itself).
+        // (`mkdir` fails with `EEXIST` and it cannot make it itself).
         static SOCKETS: OnceLock<()> = OnceLock::new();
         SOCKETS.get_or_init(|| {
             use std::os::unix::fs::PermissionsExt;
@@ -9792,7 +9814,9 @@ impl Xvfb {
         let err = display_dir().join(format!("xvfb-{number}.err"));
         let child = Command::new(xvfb)
             // `-audit 4`: each client the server takes or refuses, and why,
-            // in its log.
+            // in its log. `-noreset`: no reset as the last client goes (a
+            // tool's look at the display, say), which would close the
+            // connections being made then (Xserver(1)).
             .args([
                 &format!(":{number}"),
                 "-screen",
@@ -9800,6 +9824,7 @@ impl Xvfb {
                 "1024x768x24",
                 "-nolisten",
                 "tcp",
+                "-noreset",
                 "-audit",
                 "4",
             ])
@@ -9839,7 +9864,16 @@ impl Xvfb {
             .arg("--root")
             .arg(&root.0)
             .arg(root.0.join("usr/bin/Xvfb"))
-            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-listen", "tcp", "-ac"])
+            .args([
+                &format!(":{number}"),
+                "-screen",
+                "0",
+                "1024x768x24",
+                "-listen",
+                "tcp",
+                "-ac",
+                "-noreset",
+            ])
             .env_clear()
             .env("HOME", "/root")
             .env("PATH", "/usr/bin:/bin")
@@ -10132,7 +10166,7 @@ impl Drop for Gui {
             unsafe { libc::kill(-pgid, libc::SIGTERM) };
             std::thread::sleep(Duration::from_secs(1));
         }
-        // SAFETY: as above; the group's other processes may outlive it.
+        // SAFETY: as above; the group's other processes might outlive it.
         unsafe { libc::kill(-pgid, libc::SIGKILL) };
         let _ = self.child.wait();
     }
@@ -10668,7 +10702,7 @@ fn gpu_driver_fault_on_a_bad_pointer_is_sigsegv() {
 /// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
 /// Vulkan, on fwe's driver, in an X server with GLX (Alpine's Xvfb, run by
 /// fwe), which names the renderer; its gears drawn and turning.
-/// Xvfb has no DRI3, which GLX asks of Zink unless told it may present
+/// Xvfb has no DRI3, which GLX asks of Zink unless told it can present
 /// another way (`LIBGL_KOPPER_DRI2`): Zink then shows its frames through
 /// Vulkan's swapchain, as vkcube does.
 #[test]

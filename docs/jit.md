@@ -15,8 +15,8 @@ the program's memory stays exactly as the program wrote it. In the VM
 backend, code made at run time runs as it is: the guest's `x18` and
 system calls are its own there.
 
-The code is `crates/native/src/jit.rs`; the current limitations are in
-[architecture.md](architecture.md#known-limitations).
+The code is `crates/native/src/jit.rs` and `jit/kept.rs`; the current
+limitations are in [architecture.md](architecture.md#known-limitations).
 
 ## Why translation
 
@@ -64,16 +64,17 @@ way.
   code). A `cbz` or `tbz` of `x18` tests the program's `x18` inline.
 - **Calls and returns.** A call puts the program's own return address in
   `x30`, so the stack holds only the program's addresses. A direct call
-  sets `x16` to it and its `bl` goes to the target's call entry, the word
-  before the target's saved entry, which moves it into `x30` (until the
-  call is linked, the `bl` goes to words out of line that do the same and
-  go into fwe); an indirect call sets `x30` in words out of line its
-  `bl` goes to, after its lookup's first look. The block goes on after
-  the `bl` with the code after the call. A return looks its address up in a table of returns first and,
-  found, goes back to after the call's `bl` with `ret`, which the
-  processor predicts from the `bl` as it predicts a native return. A call
-  is made once: a block that comes to a call another block made already
-  branches into that one's words, so a return address has one way back.
+  sets `x16` to it and its `bl` goes to the target's call entry, the
+  word before the target's saved entry, which moves it into `x30` (until
+  the call is linked, the `bl` goes to words out of line that do the
+  same and go into fwe); an indirect call sets `x30` in words out of
+  line its `bl` goes to, after its lookup's first look. The block goes
+  on after the `bl` with the code after the call. A return looks its
+  address up in a table of returns first and, found, goes back to after
+  the call's `bl` with `ret`, which the processor predicts from the `bl`
+  as it predicts a native return. A call is made once: a block that
+  comes to a call another block made already branches into that one's
+  words, so a return address has one way back.
 - **Indirect branches**, and returns not found among the returns, look
   their target up in a table of translations by program address. One
   16-byte load reads an entry's address and translation together
@@ -91,7 +92,7 @@ way.
   table. An indirect branch into code that is not
   translated (a library's) restores `x16` and `x17` and goes through the
   program's own register, so every register is as the program left it:
-  code may count on more than the procedure call standard promises
+  code can count on more than the procedure call standard promises
   (HotSpot's atomic stubs clobber only `x8`, `x9` and `x30`, and it keeps
   values in `x16` across them). One through `x18`, or a call through
   `x30`, takes fwe's trap.
@@ -100,21 +101,22 @@ way.
   thread's own (reached through `tpidrro_el0`, as `x18`'s is). The
   translation it reaches keeps them there until one of its instructions
   names them or fwe's code for it needs them in their registers (a
-  system call, a read of the thread pointer, another expansion),
-  and restores them there; a way out or the next lookup saves them again
+  system call, a read of the thread pointer, another expansion), and
+  restores them there; a way out or the next lookup saves them again
   only if they were restored. Code that never names them (an
   interpreter's dispatch, calls through pointers, a recursion moving
-  `sp` at each call) runs its calls, returns and lookups with no save
-  or restore between them. A save, with no register free, puts both below
+  `sp` at each call) runs its calls, returns and lookups with no save or
+  restore between them. A save, with no register free, puts both below
   `sp` first (without moving it), then each in its slot: six words; a
   restore is four. A block reached by a direct branch with the program's
   own registers is entered past its restore, or where it starts with
   code that runs either way, at a copy of that code made with them in
   place, which joins the rest at the restore: made only once such a
   branch first comes to it (most blocks are entered only with them
-  saved: by lookups, by branches from code that never names them, and
-  by fwe, which puts them in their slots as it goes on into a block). A fault or signal anywhere
-  in between is delivered with the program's `x16` and `x17`.
+  saved: by lookups, by branches from code that never names them, and by
+  fwe, which puts them in their slots as it goes on into a block). A
+  fault or signal anywhere in between is delivered with the program's
+  `x16` and `x17`.
 - **`x18` in `x17`.** macOS keeps `x18` for itself, and Linux code uses it
   like any other register (HotSpot's C2 allocates it), so outside
   translations each use of `x18` is a stub that reads and writes the
@@ -168,7 +170,7 @@ way.
   from code a direct call (`bl`) led to, past a branch through a register
   (a tail call into a JIT's compiled code, as a runtime's entry stubs
   make), the `bl` is linked alike: its stub puts the call's target in
-  `x16`, as a linker's veneer may, and looks that up, so the called code
+  `x16`, as a linker's veneer can, and looks that up, so the called code
   runs by translation and its branches into the JIT's code are lookups.
   Code read through such a site to be translated has its own word back.
   A way in
@@ -197,7 +199,7 @@ way.
   of its conditional branches. A full chunk is followed by a new one,
   or, when at least half of the cache holds translations dropped since,
   the cache is emptied with every other thread stopped, keeping aside
-  the translations a thread may still be in or return into; the code is
+  the translations a thread might still be in or return into; the code is
   translated again as it runs. A fork child gets its own copy of the
   cache.
 
@@ -207,8 +209,8 @@ way.
 
 An arm64 core fetches instructions through an instruction cache of its
 own, beside the data cache its loads and stores go through. A store of
-new code lands in the data cache; the instruction cache may still hold
-the old instructions at that address, and the core may run them. So the
+new code lands in the data cache; the instruction cache might still hold
+the old instructions at that address, and the core might run them. So the
 architecture has a program that writes code make it visible before it
 runs it, with three steps for each cache line it wrote (the line sizes
 are in `CTR_EL0`: 64 bytes on Apple's processors):
@@ -228,7 +230,7 @@ isb               // this core: fetch what follows afresh
 - **`ic ivau`** ("instruction cache invalidate by virtual address to
   the point of unification") discards the line from the instruction
   caches, of every core in the inner shareable domain, so the next fetch
-  there reads the new code. User code may run it (Linux and macOS
+  there reads the new code. User code can run it (Linux and macOS
   allow it at EL0). It names an address, but the instruction cache the
   `CTR_EL0` fwe gives describes is physically indexed and tagged (PIPT,
   as Apple's is), so it works on the memory behind the address: a flush
@@ -242,7 +244,7 @@ isb               // this core: fetch what follows afresh
 compiler-rt), and each JIT's own routine (HotSpot's
 `ICache::invalidate_range`, V8's `FlushInstructionCache`, LuaJIT's
 `lj_mcode_sync`), run this sequence over the range written. A processor
-may report in `CTR_EL0` that it needs part of it no more: `IDC` set,
+can report in `CTR_EL0` that it needs part of it no more: `IDC` set,
 the clean is not needed; `DIC` set, the invalidation is not needed, and
 these routines skip it. The value fwe gives a program that reads
 `CTR_EL0` is Apple's under Linux, with both clear
@@ -267,7 +269,7 @@ fwe takes that flush for the word that the code changed:
   costs anything: a JIT's data beside its code, a constant patched, a
   trampoline's target changed.
 - **Through any mapping.** A JIT that maps its code twice (a memfd,
-  writable and executable) may flush either view, since both are the
+  writable and executable) can flush either view, since both are the
   same memory: a flush through either drops the translations made from
   it.
 - **Taken back if the same again.** A block a flush dropped is kept
@@ -282,7 +284,7 @@ fwe takes that flush for the word that the code changed:
 
 What this does not see is code a program changes without flushing it,
 or that another process writes into it other than through its tracer:
-the old translation keeps running, as stale instructions may on Linux on
+the old translation keeps running, as stale instructions can on Linux on
 a processor that reports `DIC` clear.
 
 ## Inside
@@ -320,17 +322,17 @@ a processor that reports `DIC` clear.
   conditional branch it is the taken way of, where that reaches, and a
   direct call's `bl`, to the target's call entry (`State::link`, undone
   by `State::unlink`, which puts the first word back and the branch to
-  the way out again). The blocks the target goes on to whatever its conditions are
-  made with it, a few deep (`jit::ahead`), and linked at once. Patched
-  words have their instruction cache lines invalidated together, with
-  one barrier for all (`State::sync_patched`), before the translator's
-  lock is let go; a new block is invalidated as it is written, before it
-  is published. A target that is code not translated is branched to
-  where a branch reaches and `x16` and `x17` are the program's, else
-  through a veneer block (`jit::veneer`). A way out with the program's
-  `x18` held in `x17` (`Word::Out`'s `x18`) is linked past the target's
-  load of it (`Block::x18`, `jit::in_x17`, `jit::put_x18`). A `cbz` or
-  `tbz` of `x18` loads it into `x16` and tests it there.
+  the way out again). The blocks the target goes on to whatever its
+  conditions are made with it, a few deep (`jit::ahead`), and linked at
+  once. Patched words have their instruction cache lines invalidated
+  together, with one barrier for all (`State::sync_patched`), before the
+  translator's lock is let go; a new block is invalidated as it is
+  written, before it is published. A target that is code not translated
+  is branched to where a branch reaches and `x16` and `x17` are the
+  program's, else through a veneer block (`jit::veneer`). A way out with
+  the program's `x18` held in `x17` (`Word::Out`'s `x18`) is linked past
+  the target's load of it (`Block::x18`, `jit::in_x17`, `jit::put_x18`).
+  A `cbz` or `tbz` of `x18` loads it into `x16` and tests it there.
 - **Entries:** a block starts with its call entry (`jit::CALLED`: `x30`
   set from `x16`, where a direct call's `bl` comes in, `Word::Called`),
   then its saved entry, where lookups and direct branches with `x16` and
@@ -378,10 +380,11 @@ a processor that reports `DIC` clear.
   the asm label `TAIL`): the pair's other entry, the table of
   translations, the return made as it is to code not translated, and the
   way into fwe, which `jit::exit` takes as a return. A thread stopped in
-  the tail is as at the return's target. A call made in a block's words is noted (`State::calls_made`,
-  entered with `x16` and `x17` saved); a block translated later that
-  comes to it ends in a way out linked into those words (`Exit::Join`),
-  through fwe again if that block is dropped.
+  the tail is as at the return's target. A call made in a block's words
+  is noted (`State::calls_made`, entered with `x16` and `x17` saved); a
+  block translated later that comes to it ends in a way out linked into
+  those words (`Exit::Join`), through fwe again if that block is
+  dropped.
 - **The code cache's views:** each chunk is mapped twice with
   `mach_vm_remap`, written through the writable view and run from the
   executable one; `jit::in_cache` tells a cache address without a lock.
@@ -397,16 +400,17 @@ a processor that reports `DIC` clear.
 - **Kept translations:** `jit::kept` keeps a block (`kept::keep`) as
   `jit::translate` made it, before it is placed: the program's words it
   was made from and those past them it looked at (`jit::with_snapshot`
-  tells how many it read), where its own end, the calls made in other blocks'
-  words in its words' range (`State::calls_made`), its hot and cold
-  words with their branches still to resolve (`Asm::fixups`), what each
-  word stands for, packed (`Packed::put`), and its calls. The
+  tells how many it read), where its own end, the calls made in other
+  blocks' words in its words' range (`State::calls_made`), its hot and
+  cold words with their branches still to resolve (`Asm::fixups`), what
+  each word stands for, packed (`Packed::put`), and its calls. The
   records are files in fwe's private directory, under
-  `v<format>-translations/<UUID of fwe's image>-<its thread slots>/<device>-<inode>-<load
-  address>/` (the program's own file by its host identity, as the maps
-  record names it by none; code the program generated under its file's,
-  with `ffffffffffffffff` for the address, `kept::generated`): each process adds the records it made as one
-  more file as it ends or replaces its program (a fork child its own
+  `v<format>-translations/<UUID of fwe's image>-<its thread
+  slots>/<device>-<inode>-<load address>/` (the program's own file by
+  its host identity, as the maps record names it by none; code the
+  program generated under its file's, with `ffffffffffffffff` for the
+  address, `kept::generated`): each process adds the records it made as
+  one more file as it ends or replaces its program (a fork child its own
   only), written aside and moved into place, and maps a part's files
   read-only the first time it translates code there; one that finds
   eight merges them into one, keeping an address's newest eight records.
@@ -418,20 +422,19 @@ a processor that reports `DIC` clear.
   of its own, so those left out are spread evenly. A record of generated
   code is written only for a block found there (`kept::keep`), and a
   process looks for one only at the addresses its part's records are
-  for, a set it makes as it maps them.
-  A file's table lists its records in address order, each with a key (how
-  many of the program's words it was made from and their hash,
-  `kept::key_of`), so a look for a block halves the table and reads only
-  the records whose key its words match: no index is made, and a JIT that
-  writes other code at the same addresses run after run costs no more
-  reads. `jit::translation` looks for a record of
-  the code before it translates (`kept::take`; of a block made again for
-  its entry with the program's own `x16` and `x17`, the record with that
-  entry first), and places a block
-  taken (`Asm::restore`) as one just made, the literal of each system
-  call's and flush's stub set to where the gate is in this process (fwe's
-  image lands elsewhere in each, `kept::relocate`). Other builds' records
-  go once they are an hour old.
+  for, a set it makes as it maps them. A file's table lists its records
+  in address order, each with a key (how many of the program's words it
+  was made from and their hash, `kept::key_of`), so a look for a block
+  halves the table and reads only the records whose key its words match:
+  no index is made, and a JIT that writes other code at the same
+  addresses run after run costs no more reads. `jit::translation` looks
+  for a record of the code before it translates (`kept::take`; of a
+  block made again for its entry with the program's own `x16` and `x17`,
+  the record with that entry first), and places a block taken
+  (`Asm::restore`) as one just made, the literal of each system call's
+  and flush's stub set to where the gate is in this process (fwe's image
+  lands elsewhere in each, `kept::relocate`). Other builds' records go
+  once they are an hour old.
 - **Call sites:** a fetch fault whose `x30` follows a `blr xN` in code
   prepared in place, `xN` holding the target, or a `bl` to code prepared
   in place, links that site (`jit::call_site`, `jit::link_call_site`):
@@ -446,16 +449,16 @@ a processor that reports `DIC` clear.
   in `x16`, which `jit::exit` finds in `State::call_stubs`. A
   thread stopped in such a stub is as at the site, which calls again
   (`jit::call_stub_to_guest`):
-  a handler running translated code may save its own `x16` and `x17` in
+  a handler running translated code might save its own `x16` and `x17` in
   the slots meanwhile.
 - **Guest state:** each translated word records what it stands for
   (`Word`: the guest instruction, with `x16` and `x17` saved or not or
-  on their way into their slots, a point inside an expansion before or after its instruction, a lookup, a
-  way out; in an exit stub, the way out in `x16`), so `jit::to_guest`
-  turns a fault, signal, system call or tracer stop there into the guest's
-  state at its instruction: an expansion is undone (`undo`, reading back
-  what it pushed) or finished (`finish`, `step`, carrying out its
-  remaining words).
+  on their way into their slots, a point inside an expansion before or
+  after its instruction, a lookup, a way out; in an exit stub, the way
+  out in `x16`), so `jit::to_guest` turns a fault, signal, system call
+  or tracer stop there into the guest's state at its instruction: an
+  expansion is undone (`undo`, reading back what it pushed) or finished
+  (`finish`, `step`, carrying out its remaining words).
 - **Flushes:** the `ic ivau` stub (`rewrite::flush_stub`) runs the
   instruction (but through `x18`, whose value only the gate knows, which
   the gate invalidates itself) and calls the gate as a system call's
@@ -463,13 +466,14 @@ a processor that reports `DIC` clear.
   address (`rewrite::flush_reg`) and calls `jit::flushed`, which drops
   the blocks made from that line whose words changed
   (`jit::drop_lines`): it unpublishes their entries and re-patches the
-  branches linked to them into ways out. The other mappings of each file page code was translated from
-  are noted as that code is first translated (`jit::note_aliases`) and
-  as new mappings appear (`jit::mapped`), so a line flushed through one
-  drops those of the page translated from. Dropped blocks are kept in
-  `State::dormant` and taken back by `jit::revive`. The kernel tells
-  the backend of the other changes (`Platform::jit_changed`,
-  `jit_discarded`, and `procmem::on_code_written` for its own writes).
+  branches linked to them into ways out. The other mappings of each file
+  page code was translated from are noted as that code is first
+  translated (`jit::note_aliases`) and as new mappings appear
+  (`jit::mapped`), so a line flushed through one drops those of the page
+  translated from. Dropped blocks are kept in `State::dormant` and taken
+  back by `jit::revive`. The kernel tells the backend of the other
+  changes (`Platform::jit_changed`, `jit_discarded`, and
+  `procmem::on_code_written` for its own writes).
 - **Emptying:** when the current chunk is full and dropped or retired
   translations are at least half the cache, `jit::flush` stops every
   other thread (`quiesce::stop_others`) and scans their registers, 2 MiB
@@ -506,23 +510,24 @@ What fwe counts, for the benchmarks to report
   cache lines flushed, blocks dropped and taken back, emptyings of the
   cache, and the translator's lock waited for and held, by holder. Then
   the blocks made from files and from generated code and the time each
-  took, the time of each step of making or taking one (reading its words,
-  looking for a kept one, translating, checking, packing, keeping,
-  finding room, writing, indexing, linking), the program's words a block holds and what ended it, blocks made
-  with a second pass for the program's own `x16` and `x17`, those
-  entered there and those made again for it, blocks made ahead, blocks taken from those kept (the records read and
-  the files mapped to find them), the generated blocks made again where a
-  past process made them (and so kept), and the
-  blocks in use that only a direct branch leads to, by where the branch
-  is (and, with `FWE_JIT_COUNT`, how often they ran: each run a branch
-  from one block into the next that a trace would not take).
+  took, the time of each step of making or taking one (reading its
+  words, looking for a kept one, translating, checking, packing,
+  keeping, finding room, writing, indexing, linking), the program's
+  words a block holds and what ended it, blocks made with a second pass
+  for the program's own `x16` and `x17`, those entered there and those
+  made again for it, blocks made ahead, blocks taken from those kept
+  (the records read and the files mapped to find them), the generated
+  blocks made again where a past process made them (and so kept), and
+  the blocks in use that only a direct branch leads to, by where the
+  branch is (and, with `FWE_JIT_COUNT`, how often they ran: each run a
+  branch from one block into the next that a trace would not take).
 - **`FWE_JIT_SEEN=<dir>`:** each process adds the blocks it made (address
   and a hash of the words their translation read, past their own too, as
   a kept record is keyed) and counts those an earlier one made, at the
   same address (and of those, the ones two or more earlier processes made
-  there, which kept translations should have given it) or elsewhere. The
-  benchmarks run each JIT runtime three times so and fail if the third
-  makes any block of generated code two earlier runs made.
+  there, which it could have taken from kept translations) or
+  elsewhere. The benchmarks run each JIT runtime three times so and fail
+  if the third makes any block of generated code two earlier runs made.
 - **`FWE_JIT_COUNT=1`:** blocks count their runs, ways back their returns
   and lookups through a register whether they go where they went last
   (the words then differ). The report adds the blocks that ran, those
@@ -547,17 +552,16 @@ turn, and a function made and run once).
 
 In CI, each against what Linux prints:
 
-- **Contract tests** (`guests/c/jitlab.c`, `jitstorm.c`, `jitx18.c`,
-  `jitcalls.c`, `jitstubsig.c`, `jittail.c`, `selfmod.c`, `perverse.c`):
+- **Contract tests** (`guests/c/jit*.c`, `selfmod.c`, `perverse.c`):
   calls in and out (with `x16` and `x17` kept through signals whose
   handlers run translated code), branches in through a register (one
-  fault, then linked), indirect branches, PC-relative forms, `x18`, system
-  calls, restarts, signals,
-  faults resumed at a continuation, a tracer's stops, code patched,
-  copied, flushed through either of two views, made executable after it
-  was written, given back and written anew, run by many threads while
-  another patches it, run on the stack and in a fork child, with the
-  memory reading back as written.
+  fault, then linked), indirect branches, loops, PC-relative forms, `x18`,
+  system calls, restarts, signals, faults resumed at a continuation, a
+  tracer's stops, code patched, copied, flushed through either of two
+  views, made executable after it was written, given back and written
+  anew, run by many threads while another patches it, run on the stack
+  and in a fork child, translations kept between runs, with the memory
+  reading back as written.
 - **Programs that treat code as text:** a quine and IOCCC winners.
 - **Runtimes:** Node.js 18 (Debian) and 24 (Alpine), OpenJDK 25
   (Alpine; [linux-on-macos.md](linux-on-macos.md#java-and-the-jvm)),

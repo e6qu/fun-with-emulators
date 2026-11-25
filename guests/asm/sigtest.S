@@ -28,7 +28,7 @@ _start:
     svc     #0
     tbnz    x0, #63, fail
 
-    adr     x10, flag               // handler should have set this
+    adr     x10, flag               // set by the handler
     ldr     w11, [x10]
     cmp     w11, #0x7a
     b.ne    fail

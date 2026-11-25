@@ -148,7 +148,7 @@ int main(void) {
     char state = state_of(child);
     kill(child, SIGCONT);
     int continued = waitpid(child, &status, WCONTINUED) == child && status == 0xffff;
-    /* Every thread runs again: soon, on a host as busy as it may be (a
+    /* Every thread runs again: soon, on a host as busy as it might be (a
      * thread kept stopped never does). */
     int again = 0;
     for (int i = 0; i < 5000 && !again; i++) {

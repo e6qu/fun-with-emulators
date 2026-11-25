@@ -41,16 +41,16 @@ What runs unmodified is in [README.md](README.md#status).
 - **M5 — Release** (but the release itself): benchmarks in CI, the
   system-call gate, the user guide with recipes CI runs, the Homebrew
   formula, `fwe --pull`, a signing and notarizing release workflow.
-- **M6 so far:** benchmark budgets in CI; prepared images kept on disk by
-  file identity; static executables linked below 4 GiB moved above it when
-  their link kept relocations; code made at run time run by translation
-  ([docs/jit.md](docs/jit.md)), its translations kept between runs; a JDK
-  at work within budget; translated code within 1.3× of the same code
-  natively (PR 1). Kernel state in memory every fwe process maps (the
-  process store, shared records, a file store for tmpfs, `/dev/shm`,
-  memfds and the cgroup tree) or in macOS's own objects, none of it on
-  disk; System V semaphores, messages and segments within 3× macOS
-  (PR 2).
+- **M6 PR 1 — Native speed:** benchmark budgets in CI; prepared images
+  kept on disk by file identity; static executables linked below 4 GiB
+  moved above it when their link kept relocations; code made at run time
+  run by translation ([docs/jit.md](docs/jit.md)), its translations kept
+  between runs; a JDK at work within budget; translated code within 1.3×
+  of the same code natively.
+- **M6 PR 2 — Kernel state in memory:** the process store, shared
+  records, a file store for tmpfs, `/dev/shm`, memfds and the cgroup tree
+  in memory every fwe process maps, or in macOS's own objects, none of it
+  on disk; System V semaphores, messages and segments within 3× macOS.
 - **M7 PR 1 — A display:** X11 clients on an X server on the Mac
   (XQuartz, Xvfb), `MIT-SHM` where the server takes segments by
   descriptor; Weston and Xwayland in the guest; demo programs

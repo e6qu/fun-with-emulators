@@ -1,7 +1,8 @@
 //! `mount`, `umount2`, `pivot_root` and `chroot`, on the mount namespace's
 //! table ([`crate::mounts`]).
 //!
-//! A tmpfs is a fresh directory of fwe's ([`tmpfs_dir`]), the synthetic
+//! A tmpfs is a fresh filesystem of fwe's file store, in memory
+//! ([`crate::filestore`]), the synthetic
 //! filesystems (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`) are fwe's
 //! own, an overlay stacks directories the guest names
 //! ([`crate::overlay`]), and a bind mount shows a directory or file the
@@ -70,7 +71,7 @@ impl<P: Platform> Kernel<P> {
         Ok(out.join(&b","[..]))
     }
 
-    /// Whether the caller may change its mount namespace's mounts:
+    /// Whether the caller can change its mount namespace's mounts:
     /// `CAP_SYS_ADMIN` in the user namespace that owns the namespace
     /// (Linux's `may_mount`).
     pub(crate) fn may_mount(&self) -> bool {
@@ -78,8 +79,8 @@ impl<P: Platform> Kernel<P> {
         self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN)
     }
 
-    /// Whether the caller may make a new filesystem of `kind`: every kind
-    /// fwe has is one a user namespace may mount (`FS_USERNS_MOUNT`), with
+    /// Whether the caller can make a new filesystem of `kind`: every kind
+    /// fwe has is one a user namespace can mount (`FS_USERNS_MOUNT`), with
     /// `CAP_SYS_ADMIN` in the user namespace the filesystem belongs to:
     /// the one owning the pid namespace for `proc`, the network namespace
     /// for `sysfs`, the IPC namespace for `mqueue`, the cgroup namespace
@@ -97,7 +98,7 @@ impl<P: Platform> Kernel<P> {
         self.creds.has_in(&owner, crate::caps::CAP_SYS_ADMIN)
     }
 
-    /// The namespace path of `path`, which must exist; `follow` as for
+    /// The namespace path of `path`, which needs to exist; `follow` as for
     /// resolution, a link in `/proc` included (`/proc/self/exe` names the
     /// program's file, `/proc/self/fd/N` the open file's). Fails with
     /// `EINVAL` for one fwe cannot place.
@@ -150,7 +151,7 @@ impl<P: Platform> Kernel<P> {
             };
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
-        // It must exist.
+        // It needs to exist.
         let st = r.lstat().ok_or(errno::ENOENT)?;
         let ns = r.ns_path.ok_or(errno::EINVAL)?;
         Ok((ns, st.st_mode & libc::S_IFMT == libc::S_IFDIR))
@@ -583,7 +584,7 @@ impl<P: Platform> Kernel<P> {
         if !new_dir || !old_dir {
             return err(errno::ENOTDIR);
         }
-        // The mount at the caller's root (which must be one's root) is the
+        // The mount at the caller's root (which needs to be one's root) is the
         // one replaced: the namespace's, or a chroot's.
         let root = self.fs().proc_root().to_vec();
         let cwd_ns = self.fs().to_ns(self.fs().cwd());
@@ -624,7 +625,7 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_chroot(&mut self, path: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if !self.creds.has_own(crate::caps::CAP_SYS_CHROOT) {
-            // Linux looks the directory up, and checks it may be entered,
+            // Linux looks the directory up, and checks it can be entered,
             // before the privilege.
             const X_OK: u64 = 1;
             let r = self.access_path(fwe_abi::fcntl::AT_FDCWD as i32, &path, X_OK, true, true);

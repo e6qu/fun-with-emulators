@@ -1,7 +1,7 @@
 //! Sockets.
 //!
 //! Guest file descriptors are host socket descriptors. On Linux the calls would
-//! be a straight passthrough, but `AF_UNIX` addresses must be rooted under the
+//! be a straight passthrough, but `AF_UNIX` addresses need to be rooted under the
 //! guest rootfs on every host, so all address handling goes through [`to_host`]
 //! and [`to_guest`]. On macOS those also translate the BSD differences:
 //!
@@ -116,7 +116,7 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     Ok(host)
 }
 
-/// Whether the caller may write to the Unix socket file host address `hb`
+/// Whether the caller can write to the Unix socket file host address `hb`
 /// names (`a`'s), which connecting or sending to it needs: as `open`
 /// checks, the caller's file-system ids against the node's guest owner
 /// and mode ([`crate::owners`], [`crate::modes`]), `EACCES` where they
@@ -301,7 +301,7 @@ fn abstract_stale(hb: &[u8; SOCKADDR_MAX], len: libc::socklen_t, ty: i32) -> boo
 /// returning the host length.
 ///
 /// # Safety
-/// `addr` must span `len` readable bytes.
+/// `addr` MUST span `len` readable bytes.
 unsafe fn to_host(
     addr: u64,
     len: u64,
@@ -891,8 +891,8 @@ fn ip_header_len(d: &[u8]) -> usize {
 /// message's buffers (translated guest buffers: a fault there is `EFAULT`).
 ///
 /// # Safety
-/// `hmsg`'s name and control buffers must be valid for writing, and its
-/// `msg_iov` must point to `msg_iovlen` iovecs.
+/// `hmsg`'s name and control buffers MUST be valid for writing, and its
+/// `msg_iov` MUST point to `msg_iovlen` iovecs.
 unsafe fn ping_recvmsg(fd: i32, hmsg: &mut libc::msghdr, hflags: i32, whole: bool) -> i64 {
     // The largest IP datagram.
     let mut d = vec![0u8; 65536];
@@ -940,7 +940,7 @@ pub fn ping_read(fd: i32, iov: &[libc::iovec]) -> i64 {
 /// `socketpair(domain, type, protocol, sv)`.
 ///
 /// # Safety
-/// `sv` must point to two writable `i32`s.
+/// `sv` MUST point to two writable `i32`s.
 pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64 {
     let dom = match check_socket(domain, type_, protocol) {
         Ok(d) => d,
@@ -996,8 +996,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
 /// `bind(fd, addr, addrlen)`.
 ///
 /// # Safety
-/// `addr` must point to `addrlen` readable bytes.
-/// `may_low`: the caller may bind a port below 1024
+/// `addr` MUST point to `addrlen` readable bytes.
+/// `may_low`: the caller can bind a port below 1024
 /// (`CAP_NET_BIND_SERVICE`), as a network namespace of fwe's asks.
 pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) -> i64 {
     let src = match guest_sockaddr(fd as i32, addr, addrlen, true) {
@@ -1146,7 +1146,7 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
         if let Ok(name) = std::ffi::CString::new(&hb[2..end]) {
             use std::os::fd::AsRawFd;
             let dir = a.dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
-            // Not through a link another thread may have put in its place.
+            // Not through a link another thread might have put in its place.
             // SAFETY: a NUL-terminated name, relative to a live directory.
             unsafe {
                 let mut st: libc::stat = std::mem::zeroed();
@@ -1263,7 +1263,7 @@ pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
 /// `connect(fd, addr, addrlen)`.
 ///
 /// # Safety
-/// `addr` must point to `addrlen` readable bytes.
+/// `addr` MUST point to `addrlen` readable bytes.
 pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     if crate::netlink::is(fd as i32) {
         // The kernel (port 0) is the only peer there is.
@@ -1355,6 +1355,16 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
             return err(crate::host::errno_to_linux(e));
         }
         libc::EALREADY | libc::EISCONN if connecting(fd, false) => {}
+        // A Unix stream listener's full queue, which macOS refuses and
+        // Linux waits out.
+        libc::ECONNREFUSED
+            if family(hb) == libc::AF_UNIX
+                && socket_type(fd) == Some(libc::SOCK_STREAM)
+                && node_path(hb, a).is_some_and(|p| listening_at(&p)) =>
+        {
+            connecting(fd, false);
+            return connect_when_room(fd, hb, a);
+        }
         _ => {
             // (A connection under way that failed is told so once.)
             connecting(fd, false);
@@ -1387,6 +1397,160 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
     if so_error != 0 { err(crate::host::HostErrno::new(so_error).linux()) } else { 0 }
 }
 
+/// Connect Unix stream socket `fd` to `hb`, whose listener's queue was
+/// full, as Linux's connect does: `EAGAIN` for a socket that does not
+/// block; for one that does, the connect made again as the queue gains
+/// room, until it is made, the listener goes (its refusal then told), a
+/// signal comes (`EINTR`) or the socket's send timeout ends (`EAGAIN`).
+fn connect_when_room(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
+    // SAFETY: plain host call on the guest's socket.
+    if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
+        return err(errno::EAGAIN);
+    }
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = size_of::<libc::timeval>() as libc::socklen_t;
+    // SAFETY: a valid out-parameter of its length.
+    let until = (unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&raw mut tv).cast(), &mut len)
+    } == 0
+        && (tv.tv_sec, tv.tv_usec) != (0, 0))
+        .then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::new(tv.tv_sec as u64, tv.tv_usec as u32 * 1000)
+        });
+    loop {
+        if crate::thread::deliverable() != 0 {
+            return err(errno::EINTR);
+        }
+        let left = until.map(|u| u.saturating_duration_since(std::time::Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
+            return err(errno::EAGAIN);
+        }
+        let nap = left.map_or(ROOM_NAP_NS, |l| (l.as_nanos() as i64).min(ROOM_NAP_NS));
+        crate::thread::nap_ns(nap);
+        if bind_or_connect(fd, hb, a, false) == 0 {
+            return 0;
+        }
+        let e = crate::host::last_errno();
+        if !e.is(libc::ECONNREFUSED) || !node_path(hb, a).is_some_and(|p| listening_at(&p)) {
+            return err(crate::host::errno_to_linux(e));
+        }
+    }
+}
+
+/// How long a connect waiting for room in a listener's queue sleeps
+/// between its tries: macOS tells no one when a queue gains room.
+const ROOM_NAP_NS: i64 = 2_000_000;
+
+/// Socket `fd`'s host type (`SO_TYPE`).
+fn socket_type(fd: i32) -> Option<i32> {
+    let mut ty: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid out-parameter of its length.
+    (unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&raw mut ty).cast(), &mut len)
+    } == 0)
+        .then_some(ty)
+}
+
+/// Whether a socket listens at host Unix path `path`, as it bound it: what
+/// makes macOS's refusal of a connect to it one of a full queue (XNU's
+/// `unp_connect` refuses with `ECONNREFUSED` both where nothing listens
+/// and where the listener's queue is full). From the host's list of its
+/// Unix stream sockets, which `netstat` reads ([`listener_in`]).
+fn listening_at(path: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let name = c"net.local.stream.pcblist_n";
+        for _ in 0..4 {
+            let mut len = 0usize;
+            // SAFETY: a size query, no buffer.
+            if unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } != 0
+            {
+                return false;
+            }
+            // Room for sockets made between the two calls.
+            len += len / 4;
+            let mut list = vec![0u8; len];
+            // SAFETY: `list` has `len` writable bytes.
+            let r = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    list.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if r == 0 {
+                list.truncate(len);
+                return listener_in(&list, path);
+            }
+            if !crate::host::last_errno().is(libc::ENOMEM) {
+                return false;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether host socket list `list` (`net.local.stream.pcblist_n`'s: a
+/// header, then per socket its records, each beginning with its length and
+/// kind and taking a multiple of 8 bytes, then the header again) has a
+/// socket bound at `path` that listens. XNU's `xunpcb_n` (kind
+/// `XSO_UNPCB`) ends with its bound address and its peer's, 256 bytes
+/// each, the address a `sockaddr_un`; the `xsocket_n` after it (kind
+/// `XSO_SOCKET`, packed to 4 bytes) has `so_options` at byte 20.
+#[cfg(any(target_os = "macos", test))]
+fn listener_in(list: &[u8], path: &[u8]) -> bool {
+    const XSO_SOCKET: u32 = 0x001;
+    const XSO_UNPCB: u32 = 0x200;
+    const ADDRESSES: usize = 512;
+    const SO_OPTIONS: usize = 20;
+    const SO_ACCEPTCONN: u32 = 0x2;
+    let word = |at: usize| list.get(at..at + 4).map(|b| u32::from_ne_bytes(b.try_into().unwrap()));
+    let Some(header) = word(0).map(|h| h as usize) else { return false };
+    let end = list.len().saturating_sub(header);
+    let mut at = header;
+    let mut bound_here = false;
+    while at + 8 <= end {
+        let (Some(len), Some(kind)) = (word(at).map(|l| l as usize), word(at + 4)) else { break };
+        if len < 8 || at + len > end {
+            break;
+        }
+        match kind {
+            XSO_UNPCB if len >= ADDRESSES => {
+                // `sun_len`, `sun_family`, then the path to its NUL.
+                let name = &list[at + len - ADDRESSES + 2..at + len - ADDRESSES / 2];
+                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+                bound_here = name == path;
+            }
+            XSO_SOCKET if bound_here => {
+                if word(at + SO_OPTIONS).is_some_and(|o| o & SO_ACCEPTCONN != 0) {
+                    return true;
+                }
+                bound_here = false;
+            }
+            _ => {}
+        }
+        at += len.next_multiple_of(8);
+    }
+    false
+}
+
 /// Unix sockets bound (`local`) or connected to a path the host knows only
 /// relative to its directory: by descriptor and inode, the guest's path,
 /// which `getsockname` and `getpeername` report.
@@ -1412,7 +1576,7 @@ fn remembered_name(fd: i32, local: bool) -> Option<Vec<u8>> {
 /// `accept4(fd, addr, addrlen, flags)`; `accept` is this with `flags == 0`.
 ///
 /// # Safety
-/// `addr`/`addrlen`, if non-null, must be writable.
+/// `addr`/`addrlen`, if non-null, MUST be writable.
 pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return err(errno::EINVAL);
@@ -1455,7 +1619,7 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
 /// `getsockname`/`getpeername`; `peer` selects which.
 ///
 /// # Safety
-/// `addr`/`addrlen` must be writable.
+/// `addr`/`addrlen` MUST be writable.
 pub unsafe fn getname(fd: u64, addr: u64, addrlen: u64, peer: bool) -> i64 {
     let mut hb = empty_sockaddr();
     let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
@@ -1889,7 +2053,7 @@ fn creds_for(fd: i32, to: Option<&[u8]>) -> Option<crate::scm::Creds> {
 /// without it, as one segment or datagram.
 ///
 /// # Safety
-/// `msg` must reference valid buffers.
+/// `msg` MUST reference valid buffers.
 unsafe fn send_corked(fd: i32, msg: &mut libc::msghdr, flags: u64, hflags: i32) -> i64 {
     #[allow(clippy::unnecessary_cast)] // `msg_iovlen` is an `int` on macOS
     // SAFETY: the caller's guarantee.
@@ -2576,7 +2740,7 @@ pub unsafe fn setsockopt(
 /// `getsockopt`.
 ///
 /// # Safety
-/// `optval`/`optlen` must be writable.
+/// `optval`/`optlen` MUST be writable.
 pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> i64 {
     if level == SOL_SOCKET && optname == SO_PEERCRED {
         if !is_unix(fd as i32) || crate::netlink::is(fd as i32) {
@@ -2860,7 +3024,7 @@ const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
 /// `sendmsg(fd, msg, flags)`.
 ///
 /// # Safety
-/// `msg` must point to a valid `msghdr`.
+/// `msg` MUST point to a valid `msghdr`.
 pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     if flags as u32 as u64 & MSG_CMSG_COMPAT != 0 {
         return err(errno::EINVAL);
@@ -3121,7 +3285,7 @@ fn socket_fd(fd: i32) -> Result<(), i64> {
 /// `recvmsg(fd, msg, flags)`.
 ///
 /// # Safety
-/// `msg` must point to a valid `msghdr` with writable `iov`/`name`.
+/// `msg` MUST point to a valid `msghdr` with writable `iov`/`name`.
 pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     if flags as u32 as u64 & MSG_CMSG_COMPAT != 0 {
         return err(errno::EINVAL);
@@ -3324,6 +3488,57 @@ fn host_peer(fd: i32) -> bool {
 #[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
+
+    /// A host socket list as `net.local.stream.pcblist_n` gives it: per
+    /// socket, its `xunpcb_n` (bound to `path`), its `xsocket_n` (with
+    /// `options`) and a record of another kind, between two headers.
+    fn socket_list(sockets: &[(&[u8], u32)]) -> Vec<u8> {
+        let mut list = Vec::new();
+        let header = |list: &mut Vec<u8>| {
+            list.extend(24u32.to_ne_bytes());
+            list.extend((sockets.len() as u32).to_ne_bytes());
+            list.extend([0u8; 16]);
+        };
+        header(&mut list);
+        for (path, options) in sockets {
+            // `xunpcb_n`: 76 bytes of fields, then the two addresses.
+            let mut unpcb = vec![0u8; 76 + 512];
+            unpcb[0..4].copy_from_slice(&(76u32 + 512).to_ne_bytes());
+            unpcb[4..8].copy_from_slice(&0x200u32.to_ne_bytes());
+            unpcb[76] = 2 + path.len() as u8;
+            unpcb[77] = libc::AF_UNIX as u8;
+            unpcb[78..78 + path.len()].copy_from_slice(path);
+            list.extend(&unpcb);
+            list.extend([0u8; 4]);
+            let mut socket = vec![0u8; 104];
+            socket[0..4].copy_from_slice(&104u32.to_ne_bytes());
+            socket[4..8].copy_from_slice(&0x001u32.to_ne_bytes());
+            socket[20..24].copy_from_slice(&options.to_ne_bytes());
+            list.extend(&socket);
+            // A buffer's record (`xsockbuf_n`, `XSO_RCVBUF`), 8-aligned.
+            let mut buffer = vec![0u8; 36];
+            buffer[0..4].copy_from_slice(&36u32.to_ne_bytes());
+            buffer[4..8].copy_from_slice(&0x002u32.to_ne_bytes());
+            list.extend(&buffer);
+            list.extend([0u8; 4]);
+        }
+        header(&mut list);
+        list
+    }
+
+    /// A listener is found by its bound path and `SO_ACCEPTCONN`; a socket
+    /// at the same path that does not listen (one its queue holds, or one
+    /// bound and never listening) is not one, nor is another path.
+    #[test]
+    fn a_listener_is_found_in_the_hosts_socket_list() {
+        let list = socket_list(&[(b"/tmp/a", 0), (b"/tmp/x11/X70", 0x2), (b"/tmp/x11/X70", 0)]);
+        assert!(listener_in(&list, b"/tmp/x11/X70"));
+        assert!(!listener_in(&list, b"/tmp/a"), "bound, not listening");
+        assert!(!listener_in(&list, b"/tmp/x11/X7"), "another path");
+        assert!(!listener_in(&socket_list(&[(b"/tmp/q", 0)]), b"/tmp/q"), "queued only");
+        assert!(!listener_in(&list[..40], b"/tmp/x11/X70"), "cut short");
+        assert!(!listener_in(&[], b"/tmp/x11/X70"));
+    }
 
     fn close(fd: i64) {
         // SAFETY: plain host close of a socket we opened.
@@ -3713,7 +3928,7 @@ mod tests {
         assert_eq!(got, 1, "recvmsg: {got}");
         assert_eq!(rbuf[0], b'x');
 
-        // The control buffer should carry one SCM_RIGHTS fd (Linux layout).
+        // The control buffer carries one SCM_RIGHTS fd (Linux layout).
         let clen = u64::from_ne_bytes(rhdr[40..48].try_into().unwrap()) as usize;
         assert!(clen >= 20, "controllen: {clen}");
         let newfd = i32::from_ne_bytes([rc[16], rc[17], rc[18], rc[19]]);
@@ -4335,7 +4550,7 @@ mod creds_tests {
     }
 
     /// A socket that asked for credentials receives its peer's, or those
-    /// the sender gave when it may give them.
+    /// the sender gave when it can give them.
     #[test]
     fn credentials_come_when_asked() {
         let _g = super::scm_tests::serial();

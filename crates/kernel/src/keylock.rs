@@ -23,7 +23,7 @@ pub(crate) const fn bytes(slots: usize) -> usize {
 }
 
 /// How long a waiter naps before it looks again (a holder lets go without
-/// a wake: it may have ended).
+/// a wake: it might have ended).
 const NAP_NS: i64 = 200_000;
 
 /// A key's lock, held until dropped; counted for this process's stops
@@ -88,7 +88,7 @@ pub fn lock(area: Area, key: (u64, u64), wait: bool) -> Result<Held, i32> {
         if let Some(i) = found {
             let s = slot(i);
             if take(s[2].load(Ordering::Acquire), &s[2]) {
-                // Still the key's (a slot let go may have been made
+                // Still the key's (a slot let go might have been made
                 // another's meanwhile).
                 if s[0].load(Ordering::Acquire) == key.0 && s[1].load(Ordering::Acquire) == key.1 {
                     return Ok(Held { holder: &s[2], _holding: holding });

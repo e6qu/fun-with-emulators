@@ -158,7 +158,7 @@ pub fn operands(insn: u32) -> Option<Few<Field>> {
 
     // Add/subtract (immediate): op[28:24] = 10001. Rn 31 is `sp`. Rd 31 is `sp`
     // for plain ADD/SUB but `xzr` for the flag-setting ADDS/SUBS (bit 29 = S),
-    // i.e. `cmp`/`cmn` — those must still be rewritten when they read x18.
+    // i.e. `cmp`/`cmn` — those still need rewriting when they read x18.
     if (insn >> 24) & 0x1f == 0b10001 {
         let flag_setting = (insn >> 29) & 1 == 1;
         if reg(insn, RN) == 31 {
@@ -510,7 +510,7 @@ pub enum SpFixup {
     /// Base is `sp`; run this instruction (offset bumped by 32 bytes) instead.
     Adjusted(u32),
     /// Base is `sp` but the bump cannot be encoded (or is a writeback form);
-    /// do not rewrite.
+    /// not rewritten.
     Defer,
 }
 
@@ -599,7 +599,7 @@ pub fn sp_fixup(insn: u32) -> SpFixup {
 }
 
 /// The field of `insn` holding `sp` (`Rn`, or `Rm` for `pacga`) in a form
-/// where a general register may stand in for it, when the stub must do
+/// where a general register can stand in for it, when the stub needs to do
 /// that: [`sp_fixup`] cannot fold the stub's push into an offset. The stub
 /// then holds `sp`'s value on entry in a scratch register and runs the
 /// instruction with that register in the field. These are `add`/`sub`
@@ -662,7 +662,7 @@ pub fn sp_base_scratch(insn: u32) -> bool {
 
 /// Whether `insn` is a `casp` (compare and swap a pair) that names `x18`
 /// in one of its pairs or as its base, which [`operands`] leaves to a stub
-/// of its own: the pairs must stay even-numbered pairs of registers. One
+/// of its own: its pairs stay even-numbered pairs of registers. One
 /// on `sp` is left alone.
 pub fn x18_casp(insn: u32) -> bool {
     insn & 0xbfa0_7c00 == 0x0820_7c00
@@ -880,7 +880,7 @@ fn fields_name_x18(insn: u32) -> bool {
     gpr_fields(insn).is_some_and(|f| f.iter().any(|&s| reg(insn, s) == 18))
 }
 
-/// Whether `insn` may name `x18`: in one of its general-register fields
+/// Whether `insn` might name `x18`: in one of its general-register fields
 /// where its group is known ([`gpr_fields`]), else wherever an instruction
 /// names one ([`may_name_x18`]).
 pub fn may_use_x18(insn: u32) -> bool {

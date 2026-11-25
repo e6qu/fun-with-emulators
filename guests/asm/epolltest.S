@@ -20,7 +20,7 @@ _start:
 
     // Build epoll_event { events = EPOLLIN(1); data = 0x123456789abcdef0 }:
     // on arm64 the struct is not packed, so data sits at offset 8. All 64
-    // bits of it must come back.
+    // bits of it come back.
     adr     x9, ev
     mov     w10, #1                 // EPOLLIN
     str     w10, [x9]
@@ -62,14 +62,14 @@ _start:
     cmp     x0, #1                  // exactly one ready fd
     b.ne    fail
 
-    // obuf[0].events must have EPOLLIN set.
+    // obuf[0].events is expected to have EPOLLIN set.
     adr     x9, obuf
     ldr     w10, [x9]
     and     w10, w10, #1
     cmp     w10, #1
     b.ne    fail
 
-    // obuf[0].data must equal what was registered.
+    // obuf[0].data is expected to equal what was registered.
     ldr     x11, [x9, #8]
     adr     x12, ev
     ldr     x12, [x12, #8]

@@ -10,7 +10,7 @@
 //!   numbered (a listing's position is the number of the last entry it
 //!   gave, which stays good whatever is added or removed meanwhile, as
 //!   Linux's tmpfs cursor does), with an index by name made again from the
-//!   entries whenever it may be wrong ([`Tx::repair`]).
+//!   entries whenever it might be wrong ([`Tx::repair`]).
 //! - **Holders**: each process that has the file open, and how many of its
 //!   descriptors do, so a file with no names left goes once the last
 //!   process holding it lets go or ends.
@@ -35,7 +35,7 @@ pub const S_IFBLK: u32 = 0o060000;
 pub const S_IFIFO: u32 = 0o010000;
 pub const S_IFSOCK: u32 = 0o140000;
 
-/// The hidden attribute marking a file with no names that may be named
+/// The hidden attribute marking a file with no names that can be named
 /// (`linkat`): an `O_TMPFILE` made without `O_EXCL`.
 const LINKABLE: &[u8] = b"\0linkable";
 
@@ -57,7 +57,7 @@ const R_DEV: usize = 9;
 /// The processes waiting for a record lock, and for whose ([`Tx::waiters`]).
 const R_WAIT: usize = 10;
 const R_WAIT_LEN: usize = 11;
-/// The first owner word [`super`] may use for itself.
+/// The first owner word [`super`] can use for itself.
 pub const R_OWNER: usize = 16;
 
 const INODE: u64 = 144;
@@ -885,7 +885,7 @@ impl Tx<'_> {
             self.note_last(other, ndir, nname)?;
             replaced = Some(other);
         }
-        // The entry looked up again: removing the target may have moved
+        // The entry looked up again: removing the target has moved
         // nothing (entries move only as a directory is compacted, on adds).
         let (oslot, oe) = self.find(od, oname).ok_or(errno::ENOENT)?;
         self.remove_entry(od, oslot, oe);
@@ -1325,7 +1325,7 @@ impl Tx<'_> {
         Ok(())
     }
 
-    /// Whether `ino`, with no names, may be named ([`LINKABLE`]).
+    /// Whether `ino`, with no names, can be named ([`LINKABLE`]).
     pub fn linkable(&self, ino: Ino) -> Result<bool, i32> {
         Ok(self.xattrs(ino)?.iter().any(|(n, _)| n == LINKABLE))
     }
@@ -1525,7 +1525,7 @@ impl Tx<'_> {
             .collect()
     }
 
-    /// Make again what may be wrong after a holder died mid-change: each
+    /// Make again what might be wrong after a holder died mid-change: each
     /// directory's index, from its entries.
     pub fn repair(&mut self) {
         let (table, cap) = (self.m.root(R_TABLE), self.m.root(R_CAP));

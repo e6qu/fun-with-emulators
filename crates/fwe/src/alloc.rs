@@ -12,7 +12,7 @@
 //!
 //! A debug build ends the process if a host signal handler that interrupted
 //! fwe's own code allocates or frees ([`fwe_kernel::host::NoAllocation`]):
-//! that code may have been inside the host allocator.
+//! that code might have been inside the host allocator.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 
@@ -26,7 +26,7 @@ const PAGE: usize = 16 << 10;
 pub struct Allocator;
 
 /// In a debug build: end the process, saying why, if the calling thread
-/// is in a signal handler that may not allocate.
+/// is in a signal handler, which MUST NOT allocate.
 #[inline(always)]
 fn not_in_a_handler() {
     #[cfg(debug_assertions)]
@@ -34,7 +34,7 @@ fn not_in_a_handler() {
         const WHY: &[u8] = b"fwe: an allocation in a signal handler that interrupted fwe\n";
         // SAFETY: a write of a static message, then the end of the process
         // by `SIGABRT` at its default action (fwe's handler for it is
-        // where the allocation may be).
+        // where the allocation might be).
         unsafe {
             libc::write(2, WHY.as_ptr().cast(), WHY.len());
             libc::signal(libc::SIGABRT, libc::SIG_DFL);

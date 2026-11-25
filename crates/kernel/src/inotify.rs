@@ -756,7 +756,7 @@ fn read_events(fd: i32, buf: u64, len: u64, wait: bool) -> Option<i64> {
                 }
                 let mask = u32::from_ne_bytes(ev[4..8].try_into().unwrap());
                 if mask == IN_Q_OVERFLOW {
-                    // The overflow, counted apart: one may come again.
+                    // The overflow, counted apart: one can come again.
                     q[1].store(0, Ordering::SeqCst);
                 } else if q[0].fetch_sub(1, Ordering::SeqCst) == 1 {
                     q[2].store(0, Ordering::SeqCst);
@@ -997,7 +997,7 @@ pub(crate) fn load(d: &mut Dec) {
 pub enum Plan {
     /// A close of a descriptor of `s`, open to write or not.
     Close(Subject, bool),
-    /// An open that may create or truncate: whether the file was there.
+    /// An open that can create or truncate: whether the file was there.
     Open { existed: bool, truncates: bool },
     /// An unlink of `s`.
     Unlink(Subject),

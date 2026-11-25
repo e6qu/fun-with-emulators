@@ -19,7 +19,7 @@
 //!
 //! The host's own namespace keeps such a table for one thing the host
 //! refuses there: a port below 1024 on a loopback address, for a caller
-//! that may bind one (`CAP_NET_BIND_SERVICE`) when fwe does not run as
+//! that can bind one (`CAP_NET_BIND_SERVICE`) when fwe does not run as
 //! root. macOS lets anyone bind such a port on the wildcard address but
 //! only root on a given one, where Linux lets the capability do both. The
 //! socket is bound to an ephemeral port of the same address instead, and
@@ -322,7 +322,7 @@ pub struct Plan {
 
 /// Before `bind` of `fd` to the host address `hb` (an inet one): check the
 /// address and make it a host loopback address with an ephemeral port, as
-/// the namespace's port is to be. `may_low` says the caller may bind a
+/// the namespace's port is to be. `may_low` says the caller can bind a
 /// port below 1024.
 pub fn bind_prepare(fd: i32, hb: &mut [u8], may_low: bool) -> Result<Option<Plan>, i32> {
     let Some(net) = current() else { return host_bind_prepare(fd, hb, may_low) };

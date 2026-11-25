@@ -63,7 +63,7 @@ fn main() {
             "-z",
             "relro",
             // Every symbol the library uses is its own (the C library's it
-            // may use are weak): a command of the window systems' that
+            // might use are weak): a command of the window systems' that
             // wsi.c lacks fails here.
             "-z",
             "defs",

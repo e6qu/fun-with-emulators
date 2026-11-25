@@ -36,7 +36,7 @@ pub const SUID_DUMP_USER: u8 = 1;
 pub const SUID_DUMP_ROOT: u8 = 2;
 
 /// Whether the process is dumpable (`PR_SET_DUMPABLE`): what decides a
-/// core dump, who owns its `/proc/<pid>` files and who may trace it. An
+/// core dump, who owns its `/proc/<pid>` files and who can trace it. An
 /// `execve` sets it back to [`SUID_DUMP_USER`], or to `fs.suid_dumpable`
 /// for a program that raised privilege or could not be read, and so does
 /// a change of credentials ([`lose_dumpable`]).

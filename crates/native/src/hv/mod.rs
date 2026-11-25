@@ -19,7 +19,7 @@
 //! guest's mappings first.
 //!
 //! Each guest thread runs on a vCPU of its own; `execve` re-executes fwe.
-//! A VM process never forks on the host and never ends or execs with its VM
+//! A VM process MUST NOT fork on the host, nor end or exec with its VM
 //! alive (see `docs/hypervisor.md`): a guest `fork` or `vfork` starts a
 //! fresh fwe process that takes a copy of the parent's memory, or for
 //! `vfork` fetches it as it goes (see [`fork`]).

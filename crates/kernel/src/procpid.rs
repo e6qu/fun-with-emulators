@@ -290,7 +290,7 @@ pub const FILES: &[(&[u8], u8)] = &[
 ];
 
 /// The files another process's `/proc/<pid>` shows only to a reader that
-/// may read it as a tracer would (`PTRACE_MODE_READ_FSCREDS`), as Linux
+/// can read it as a tracer would (`PTRACE_MODE_READ_FSCREDS`), as Linux
 /// has it: `EACCES` for anyone else.
 pub const TRACER_ONLY: &[&[u8]] = &[b"/maps", b"/smaps", b"/environ", b"/io", b"/cwd", b"/root"];
 

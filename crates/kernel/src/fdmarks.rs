@@ -60,7 +60,7 @@ pub enum Mark {
     /// is `own` (Linux checks the opener's credentials).
     ProcMap { host: crate::ids::HostPid, which: u8, privileged: bool, own: u32 },
     /// `/proc/<pid>/oom_score_adj` (or the older `oom_adj`, `legacy`) of
-    /// host process `host`, opened for writing by a process that may lower
+    /// host process `host`, opened for writing by a process that can lower
     /// it (`privileged`: `CAP_SYS_RESOURCE`).
     OomScore { host: crate::ids::HostPid, legacy: bool, privileged: bool },
     /// `/proc/<pid>/timerslack_ns` of host process `host`, opened for
@@ -68,7 +68,7 @@ pub enum Mark {
     TimerSlack { host: crate::ids::HostPid },
     /// `/proc/<pid>/comm` (or a thread's), opened for writing: of thread
     /// `tid` of this process (0: its main thread), or of another process
-    /// (-1), whose name a write may not change.
+    /// (-1), whose name a write cannot change.
     Comm { tid: i32 },
     /// `/proc/sys/kernel/hostname` (or `domainname`, `domain`), opened for
     /// writing.
@@ -284,7 +284,7 @@ fn identity(fd: i32) -> Option<(u64, u64)> {
 }
 
 /// The host identity of the file `fd` names now, asked of the host: what
-/// a record of it is made with (fwe may have put another file there in
+/// a record of it is made with (fwe might have put another file there in
 /// this call).
 fn identity_now(fd: i32) -> Option<(u64, u64)> {
     forget_identity(fd);

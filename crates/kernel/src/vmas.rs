@@ -18,7 +18,7 @@ pub trait Mapping: Clone + PartialEq + std::fmt::Debug {
     fn at(&self, offset: u64) -> Self;
 
     /// Whether `next` is this mapping seen from `offset` bytes into it
-    /// (`self.at(offset) == *next`), which a mapping may tell without
+    /// (`self.at(offset) == *next`), which a mapping can tell without
     /// making the copy.
     fn continues(&self, offset: u64, next: &Self) -> bool {
         self.at(offset) == *next
@@ -83,7 +83,7 @@ impl<V: Mapping> Vmas<V> {
 
     pub fn pieces(&self, start: u64, end: u64) -> Vec<Piece<V>> {
         let mut out = Vec::new();
-        // The mapping that may begin before `start`.
+        // The mapping that might begin before `start`.
         if let Some((&s, (e, v))) = self.map.range(..start).next_back()
             && *e > start
         {

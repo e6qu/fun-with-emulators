@@ -51,7 +51,7 @@ pub fn default_pipe_size() -> u64 {
     65_536
 }
 
-/// The largest capacity a caller without `CAP_SYS_RESOURCE` may give a pipe
+/// The largest capacity a caller without `CAP_SYS_RESOURCE` can give a pipe
 /// (`fs.pipe-max-size`).
 pub fn pipe_max_size() -> u64 {
     crate::sysctl::number(b"fs/pipe-max-size").map_or(1_048_576, |n| n.max(0) as u64)
@@ -163,7 +163,7 @@ static CAPPED: AtomicBool = AtomicBool::new(false);
 
 /// The page buffers of pipes with less than the host's capacity that this
 /// process wrote, by the pipe's identity: each buffer's end in its page
-/// (where a write may add to it) and the bytes in it not yet read.
+/// (where a write can add to it) and the bytes in it not yet read.
 pub(crate) static BUFFERS: Mutex<Option<HashMap<PipeId, Buffers>>> = Mutex::new(None);
 
 /// One pipe's buffers, oldest first: (end in its page, unread bytes).
@@ -313,7 +313,7 @@ pub fn capped_write(fd: i32, len: u64, mut write: impl FnMut(u64, u64) -> i64) -
 
 /// A capacity asked for, as Linux rounds it in the guest's pages of `page`
 /// bytes: at least a page, and a power of two pages (`None` past what any
-/// pipe may have).
+/// pipe can have).
 pub fn round_pipe_size(size: u64, page: u64) -> Option<u64> {
     if size > 1 << 31 {
         return None;

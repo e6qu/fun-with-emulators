@@ -11,7 +11,7 @@
 //! action where that is ignoring it or continuing. A default action that
 //! ends or stops the process is fwe's to take: a stop is fwe's, its parent
 //! told through its mailbox ([`job_stop`]), unless the parent is a process
-//! that is not fwe's and must see it stop on the host. The host never blocks a
+//! that is not fwe's and needs to see it stop on the host. The host never blocks a
 //! caught signal ([`caught`]): fwe keeps it pending while the guest blocks
 //! it. Signals with no host equivalent (`SIGSTKFLT`, `SIGPWR`, the
 //! real-time signals), and caught ones sent with `tgkill`, are recorded
@@ -365,7 +365,7 @@ pub fn host_continued(sender: i32) -> bool {
 /// sleeps until it is continued or killed, and its parent learns of it
 /// through fwe (an adopter, through its watcher). One whose parent is a
 /// living process that is not fwe's (the first process of a run, under a
-/// shell that must see it stop) stops on the host.
+/// shell that needs to see it stop) stops on the host.
 fn job_stop(platform: &mut impl crate::Platform, sig: u64) {
     if !crate::procreg::stops_in_fwe() {
         if let Some(h) = host::signal_to_host(sig) {
@@ -493,7 +493,7 @@ pub(crate) fn send_unhosted_from(
 /// into the one pending, as Linux merges a `kill`'s.
 fn post_own(sig: u64) -> i64 {
     thread::post_process(sig, own_info(signal::SI_USER));
-    // Any thread may take it: interrupt the others' waits so one that does
+    // Any thread can take it: interrupt the others' waits so one that does
     // not block it notices.
     thread::wake_others(host::WAKE_SIGNAL);
     0
@@ -735,7 +735,7 @@ impl<P: Platform> Kernel<P> {
         }
         if sig == signal::SIGCHLD {
             // Whether the host now reaps the children as they end, which a
-            // reaper adopting one must know (see `reaper`).
+            // reaper adopting one needs to know (see `reaper`).
             crate::procreg::own_autoreap(host::children_reaped_by_host());
         }
     }
@@ -989,7 +989,7 @@ impl<P: Platform> Kernel<P> {
         regs.sp = frame;
         regs.pc = action.handler;
         // Entered as if by `blr`: with BTI in use, the handler's first
-        // instruction must be a landing pad, as Linux makes it.
+        // instruction needs to be a landing pad, as Linux makes it.
         regs.pstate = if BTI.load(std::sync::atomic::Ordering::Relaxed) { BTYPE_C } else { 0 };
         true
     }
@@ -1064,7 +1064,7 @@ impl<P: Platform> Kernel<P> {
     /// `kill(pid, sig)`. A relayed signal is sent as the host signal to the
     /// process `pid` names, this one too ([`Kernel::send_one`]); `0` (the
     /// caller's process group) and `-pgid` send it to each process of the
-    /// group the caller may signal ([`Kernel::kill_group`]). `-1` is every
+    /// group the caller can signal ([`Kernel::kill_group`]). `-1` is every
     /// other process of the caller's pid namespace, or outside one, of the
     /// caller's run of fwe ([`Kernel::kill_every`]): never the host's other
     /// processes. A signal with no host equivalent is posted within this
@@ -1123,9 +1123,9 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `kill(-pgid, sig)` (and `kill(0, sig)`): `sig` to each process of
-    /// host process group `pgid` the caller may signal, this one last, as
+    /// host process group `pgid` the caller can signal, this one last, as
     /// Linux's `kill_pgrp` sends it: 0 if any took it, else the last
-    /// error (`EPERM` when it may signal none; `ESRCH` for an empty
+    /// error (`EPERM` when it can signal none; `ESRCH` for an empty
     /// group). A signal the host lacks reaches only fwe's processes.
     fn kill_group(&mut self, pgid: HostPid, sig: u64) -> i64 {
         let me = me_host();
@@ -1149,7 +1149,7 @@ impl<P: Platform> Kernel<P> {
         if any { 0 } else { last }
     }
 
-    /// Send `sig` (not 0) to host process `target`, which the caller may
+    /// Send `sig` (not 0) to host process `target`, which the caller can
     /// signal: this one, another of fwe's, or one fwe did not start.
     fn send_one(&mut self, target: HostPid, sig: u64) -> i64 {
         let to_self = target == me_host();
@@ -1231,11 +1231,11 @@ impl<P: Platform> Kernel<P> {
         send_unhosted(target, sig, signal::SI_USER, 0)
     }
 
-    /// `kill(-1, sig)`: every process the caller may signal but itself
+    /// `kill(-1, sig)`: every process the caller can signal but itself
     /// and its namespace's init, as on Linux. In a pid namespace of fwe's,
     /// the processes in it; outside one, those of the caller's run of fwe
     /// ([`crate::procreg::run`]), so a guest never signals the host's other
-    /// processes. As on Linux, one the caller may not signal is passed
+    /// processes. As on Linux, one the caller cannot signal is passed
     /// over, and the result is that of the last one signalled otherwise.
     fn kill_every(&mut self, sig: u64) -> i64 {
         let me = me_host();
@@ -1264,7 +1264,7 @@ impl<P: Platform> Kernel<P> {
         if count == 0 { err(errno::ESRCH) } else { ret }
     }
 
-    /// Whether the caller may send `sig` to host process `target` (Linux's
+    /// Whether the caller can send `sig` to host process `target` (Linux's
     /// `check_kill_permission`): when its real or effective user id is the
     /// target's real or saved one, with `CAP_KILL` in the target's user
     /// namespace, or `SIGCONT` within its session; and, in a Landlock
@@ -1299,7 +1299,7 @@ impl<P: Platform> Kernel<P> {
     /// process's queue, the process woken to give it to the thread
     /// ([`crate::signote::queue_thread`]); SIGKILL ends the process.
     fn signal_other_thread(&mut self, owner: HostPid, tid: crate::ids::Tid, sig: u64) -> i64 {
-        // The table of threads may name a process that has gone, its pid
+        // The table of threads might name a process that has gone, its pid
         // since taken by one that is not fwe's.
         if !host::is_fwe(owner) {
             return err(errno::ESRCH);
@@ -1350,8 +1350,8 @@ impl<P: Platform> Kernel<P> {
             };
         }
         // A tid not registered here is not a thread of this process (an
-        // exited one's number may already be another process's pid); with
-        // no process named (`tkill`), it may be another's.
+        // exited one's number might already be another process's pid); with
+        // no process named (`tkill`), it might be another's.
         let Some(host_thread) = thread::host_thread(tid as i32) else {
             return match thread::named(tid as i32) {
                 Some((t, owner)) if tgid == -1 => self.signal_other_thread(owner, t, sig),
@@ -1440,7 +1440,7 @@ impl<P: Platform> Kernel<P> {
 /// [`sigsuspend`]); otherwise it is restored as the call returns.
 ///
 /// # Safety
-/// `set` must be null or point to a guest `sigset_t`.
+/// `set` MUST be null or point to a guest `sigset_t`.
 pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64 {
     if set == 0 {
         return call();
@@ -1465,7 +1465,7 @@ pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64
 /// kernel lock.
 ///
 /// # Safety
-/// `set` must point to a guest `sigset_t`.
+/// `set` MUST point to a guest `sigset_t`.
 pub(crate) unsafe fn sigsuspend(set: u64, size: u64) -> i64 {
     if size != signal::SIGSET_SIZE {
         return err(errno::EINVAL);
@@ -1498,7 +1498,7 @@ pub(crate) unsafe fn sigsuspend(set: u64, size: u64) -> i64 {
 /// its sender, and taken here instead of running a handler.
 ///
 /// # Safety
-/// `set` must point to a guest `sigset_t`, `info` (if non-null) to a
+/// `set` MUST point to a guest `sigset_t`, `info` (if non-null) to a
 /// `siginfo_t`, and `timeout` (if non-null) to a `timespec`.
 pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 {
     use std::time::{Duration, Instant};
@@ -1655,7 +1655,7 @@ mod tests {
         let top = (stack.as_ptr() as u64 + stack.len() as u64) & !15;
         let mut regs = Regs { sp: top, pc: 0x1000, ..Regs::default() };
         regs.x[5] = 0xdead_beef;
-        regs.x[30] = 0xcafe; // caller's lr, must be saved and restored
+        regs.x[30] = 0xcafe; // caller's lr, saved and restored
 
         k.raise_pending(signal::SIGUSR1);
         k.deliver_pending(&mut regs);

@@ -1,6 +1,6 @@
 /* Code made at run time calling, in turn, functions whose addresses differ
  * by a multiple of 4 MiB: a translator that looks targets up by their low
- * bits finds them all in one place. Each call must reach its own function,
+ * bits finds them all in one place. Each call reaches its own function,
  * however many share it. Every line printed is what Linux prints. */
 #include <stddef.h>
 #include <stdint.h>

@@ -19,7 +19,7 @@ const SLOTS: usize = 256;
 pub(crate) const BYTES: usize = crate::keylock::bytes(SLOTS);
 
 /// A write of `len` bytes to `fd` by `write(offset, count)`, if it is a
-/// pipe and a write Linux makes whole that the host may not: whole, the
+/// pipe and a write Linux makes whole that the host might not: whole, the
 /// pipe's other writers waiting. `None` for any other write.
 pub fn whole_write(fd: i32, len: u64, mut write: impl FnMut(u64, u64) -> i64) -> Option<i64> {
     if len <= HOST_PIPE_BUF || len > LINUX_PIPE_BUF {

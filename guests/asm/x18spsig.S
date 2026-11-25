@@ -2,7 +2,7 @@
 // where its stub saved two scratch registers, then reads them back; a
 // signal frame written in between would overwrite them, so the signal's
 // delivery finishes those reads first. A fast interval timer interrupts the
-// loop many times; the registers the stub borrows (x0, x1) must keep their
+// loop many times; the registers the stub borrows (x0, x1) keep their
 // values throughout. Exit 0 if they do, 1 otherwise.
     .text
     .globl _start

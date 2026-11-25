@@ -411,7 +411,7 @@ pub fn create_instance(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32
         .unwrap_or_default();
     let lists = |e: &std::ffi::CStr| listed.iter().any(|(n, _)| n.as_slice() == e.to_bytes());
     // A portability driver's enumeration is the loader's extension, which
-    // a driver called with no loader between may lack: enabled where the
+    // a driver called with no loader between might lack: enabled where the
     // driver lists it.
     let enumeration = c"VK_KHR_portability_enumeration";
     let portability = driver.portability && lists(enumeration);

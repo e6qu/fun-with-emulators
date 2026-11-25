@@ -94,7 +94,7 @@ impl Layout {
     }
 
     /// Linux's `validate_prctl_map_addr`, with `RLIMIT_DATA` `data_limit`:
-    /// every address within the space a mapping may use, the pairs in
+    /// every address within the space a mapping can use, the pairs in
     /// order (`EINVAL`), and the break and data within the limit.
     pub fn validate(&self, data_limit: u64) -> Result<(), i32> {
         let min = crate::mm::MMAP_MIN_ADDR;
@@ -269,7 +269,7 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = l.validate(limit) {
             return err(e);
         }
-        // An address on the stack or among the strings must have a
+        // An address on the stack or among the strings needs a
         // mapping at or above it (`find_vma`).
         if matches!(opt, PR_SET_MM_START_STACK..=PR_SET_MM_ENV_END)
             && !matches!(opt, PR_SET_MM_START_BRK | PR_SET_MM_BRK)
@@ -360,7 +360,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `PR_SET_MM_EXE_FILE`: the program file is the one open as `fd`, a
-    /// regular file the caller may run, on a mount that runs programs
+    /// regular file the caller can run, on a mount that runs programs
     /// (`EACCES`), not open for writing (`EACCES`), and only once the old
     /// program is no longer mapped (`EBUSY`), as Linux's
     /// `prctl_set_mm_exe_file`.

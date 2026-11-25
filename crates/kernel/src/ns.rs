@@ -286,7 +286,7 @@ impl Namespaces {
         Ok(())
     }
 
-    /// Whether the namespaces `flags` asks for may be made (`ENOSPC` if
+    /// Whether the namespaces `flags` asks for can be made (`ENOSPC` if
     /// not): a user namespace no deeper than Linux nests them (32 below
     /// the initial one's child), and of each kind fewer than its
     /// `user.max_<kind>_namespaces` sysctl allows, counting the ones fwe's

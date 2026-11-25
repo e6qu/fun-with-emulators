@@ -5,14 +5,14 @@
 //! A descriptor of either is a host file of nothing that fwe marks
 //! ([`crate::fdmarks::Mark::Mem`], [`crate::fdmarks::Mark::Pagemap`]);
 //! the host keeps its position, and fwe answers its reads and writes. As
-//! Linux's, `mem` reaches memory the process may not write itself: a
+//! Linux's, `mem` reaches memory the process cannot write itself: a
 //! write to private memory that is read-only (a program's code, a private
 //! file mapping) goes in, the page made writable only for it, and never
 //! reaches the file mapped; read-only shared memory is not written (`EIO`),
 //! nor is memory not mapped. A `pagemap` entry has bit 63 if the page is
 //! in memory, bit 61 if it is a file's or shared, bit 56 if it is in
 //! memory and private; the frame number, which Linux gives only to
-//! `CAP_SYS_ADMIN`, is 0. Another process's `mem` (opened by one that may
+//! `CAP_SYS_ADMIN`, is 0. Another process's `mem` (opened by one that can
 //! trace it) reaches its memory as `process_vm_readv` does, or through its
 //! ptrace mailbox when it is the opener's tracee and stopped.
 
@@ -44,7 +44,7 @@ pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
     };
     let fd = a[0] as i32;
     let write = matches!(nr, n::WRITE | n::PWRITE64);
-    // The descriptor must be open for it, as the host knows.
+    // The descriptor needs to be open for it, as the host knows.
     // SAFETY: F_GETFL only queries the descriptor.
     let mode = unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_ACCMODE;
     if mode < 0 {

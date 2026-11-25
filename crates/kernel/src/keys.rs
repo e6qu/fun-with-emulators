@@ -13,7 +13,7 @@
 //! its lock, so what it sees is whole.
 //!
 //! A key is possessed by a process when its thread, process or session
-//! keyring reaches it through keyrings the process may search; possession
+//! keyring reaches it through keyrings the process can search; possession
 //! adds a key's possessor permissions to the user's, group's or others'.
 //! Root bypasses no key permission (as on Linux), but `CAP_SYS_ADMIN`
 //! changes owners and permissions.
@@ -41,7 +41,7 @@ const INVALIDATED: u32 = 4;
 const UID_KEYRING: u32 = 8;
 /// Charged to its owner's quota.
 const IN_QUOTA: u32 = 16;
-/// A keyring `CAP_SYS_ADMIN` may clear, and a key it may invalidate, without
+/// A keyring `CAP_SYS_ADMIN` can clear, and a key it can invalidate, without
 /// the permission (the persistent keyrings).
 const ROOT_CAN_CLEAR: u32 = 32;
 
@@ -60,7 +60,7 @@ const MAX_DESC: usize = 4095;
 /// The kernel's `INVALID_GID` (a user keyring has no group).
 const NO_ID: u32 = u32::MAX;
 
-/// A keyring's restriction on what may be linked into it.
+/// A keyring's restriction on what can be linked into it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Restrict {
     None,
@@ -434,7 +434,7 @@ impl Store {
         }
     }
 
-    /// Whether `uid` may own `more` bytes more (and a key more, if `key`).
+    /// Whether `uid` can own `more` bytes more (and a key more, if `key`).
     fn quota_ok(&self, uid: u32, key: bool, more: u64) -> bool {
         let (n, b) = self.usage(uid);
         let (max_n, max_b) = Self::limits(uid);
@@ -565,7 +565,7 @@ impl Store {
     }
 
     /// The keys the caller possesses: those its thread, process and session
-    /// keyrings reach through keyrings it may search, each searchable
+    /// keyrings reach through keyrings it can search, each searchable
     /// itself.
     fn possessed(&self, c: &Caller) -> Vec<i32> {
         let roots = [self.thread_of(c), self.process_of(c), self.session_of(c)];
@@ -602,7 +602,7 @@ impl Store {
 
     /// Resolve key id `id` for the caller (Linux's `lookup_user_key`): a
     /// special keyring (made if missing and `look` allows), or a key. With
-    /// `need`, the caller must have those permissions (`EACCES`). Returns
+    /// `need`, the caller needs those permissions (`EACCES`). Returns
     /// the serial and whether the caller possesses it.
     fn lookup(&mut self, c: &Caller, id: i32, look: Look, need: u32) -> Result<(i32, bool), i32> {
         let serial = match id {
@@ -682,10 +682,10 @@ impl Store {
     }
 
     /// Join a session keyring: a new anonymous one (`name` none), or the
-    /// keyring named `name` the caller may search, made if there is none.
+    /// keyring named `name` the caller can search, made if there is none.
     fn join(&mut self, c: &Caller, name: Option<&[u8]>) -> Result<i32, i32> {
         // An anonymous one is the process's own, past the quota; a named
-        // one may be joined by others, and is charged.
+        // one can be joined by others, and is charged.
         let anon = (KEY_ALL << KEY_POS_SHIFT) | ((KEY_VIEW | KEY_READ) << KEY_USR_SHIFT);
         let named = anon | (KEY_LINK << KEY_USR_SHIFT);
         let r = match name {
@@ -754,7 +754,7 @@ impl Store {
         1 + below
     }
 
-    /// Whether key `key` may be linked into keyring `ring` by its
+    /// Whether key `key` can be linked into keyring `ring` by its
     /// restriction.
     fn restriction_allows(&self, ring: i32, k: &Key) -> Result<(), i32> {
         let Some(r) = self.keys.get(&ring) else { return Err(errno::ENOKEY) };
@@ -846,7 +846,7 @@ impl Store {
     }
 
     /// Search keyring `ring` (and what it nests) for a key of `kind` and
-    /// `desc`, as the caller may: the key, or the error a state of the best
+    /// `desc`, as the caller can: the key, or the error a state of the best
     /// match gives (revoked, expired, negative), else `ENOKEY`.
     fn search_ring(&self, c: &Caller, ring: i32, kind: &str, desc: &[u8]) -> Result<i32, i32> {
         let now = now();
@@ -1176,7 +1176,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 // An existing usable key of the type and description in the
                 // keyring is updated, if the type allows it and the caller
-                // may write it.
+                // can write it.
                 if crate::keytypes::updatable(&kind)
                     && let Some(&old) = s.keys[&dest].links.iter().find(|l| {
                         s.keys.get(l).is_some_and(|k| {
@@ -1259,7 +1259,7 @@ impl<P: Platform> Kernel<P> {
                     }
                     Err(errno::ENOKEY) if callout.is_some() => {
                         // Constructed: in the destination keyring, which the
-                        // caller must be able to write.
+                        // caller needs to be able to write.
                         let d = match dest {
                             Some(d) => d,
                             None => default_dest(s, &c)?,
@@ -2179,7 +2179,7 @@ fn result(r: Result<Result<i64, i32>, i32>) -> i64 {
     }
 }
 
-/// `/proc/keys`: the keys the reader may view.
+/// `/proc/keys`: the keys the reader can view.
 pub fn proc_keys(c: &Caller) -> Vec<u8> {
     let Some(st) = existing() else { return Vec::new() };
     let s = st.get();

@@ -550,7 +550,7 @@ impl LDir {
     }
 
     /// Make directory `name` in it, for the overlay's own work (its owner
-    /// only may use it).
+    /// alone can use it).
     fn mkdir(&self, name: &[u8]) -> Result<(), i32> {
         match self {
             LDir::Host(fd) => {
@@ -1255,7 +1255,7 @@ fn copy_data(src: &LDir, name: &[u8], sink: &Sink) -> Result<(), i32> {
 
 /// Copy the lower layer's `name` in `src` up to `name` in the upper
 /// layer's `dst`, built in the work directory and moved into place, as
-/// another process's copy of it may be already.
+/// another process's copy of it might be already.
 fn copy_one(l: &Layers, src: &LDir, name: &[u8], dst: &LDir) -> Result<(), i32> {
     let w = work(l)?;
     let tmp = temp_name();
@@ -1603,7 +1603,7 @@ pub fn create(l: &Layers, parent: &[u8], name: &[u8]) -> Result<Created, i32> {
 }
 
 /// Remove `name` from the overlay directory at `parent`: a directory
-/// (`rmdir`, which must show no entries) or another file (`unlink`).
+/// (`rmdir`, which needs it to show no entries) or another file (`unlink`).
 pub fn remove(l: &Layers, parent: &[u8], name: &[u8], rmdir: bool) -> Result<(), i32> {
     let d = open(l, parent)?;
     let found = lookup(l, &d, name)?;
@@ -1715,7 +1715,7 @@ pub fn rename(
         uf.set_attr_of(fname, l.opaque_attr(), b"y")?;
         if let Ok(old) = ut.child(tname) {
             // The upper directory it replaces holds only whiteouts, which
-            // must go for the rename to take its place.
+            // need to go for the rename to take its place.
             old.set_opaque(l)?;
             for (entry, t, _) in old.entries()? {
                 old.remove_tree(&entry, t == libc::DT_DIR);

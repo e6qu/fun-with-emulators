@@ -92,7 +92,7 @@ impl<P: Platform> Kernel<P> {
         crate::procreg::sched(host).unwrap_or_default()
     }
 
-    /// Whether the caller may change process `host`'s scheduling from `cur`
+    /// Whether the caller can change process `host`'s scheduling from `cur`
     /// (nice value `nice_now`) as asked, by Linux's rules for a caller
     /// without `CAP_SYS_NICE`.
     fn sched_allowed(

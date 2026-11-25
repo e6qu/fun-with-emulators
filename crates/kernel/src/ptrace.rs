@@ -160,7 +160,7 @@ const EXITED: u64 = 3;
 const LISTENING: u64 = 4;
 /// Traced no more (detached, or ended with the host's `wait` to tell its
 /// parent): nothing to report. Its tracer frees the mailbox as it next
-/// looks ([`take_stop`]): a tracee never frees one its live tracer may
+/// looks ([`take_stop`]): a tracee never frees one its live tracer might
 /// still be writing to, which would write into another's page made there
 /// meanwhile.
 const GONE: u64 = 5;
@@ -270,7 +270,7 @@ fn tracer() -> i32 {
 }
 
 /// Whether this thread's tracer (if it has one) has `CAP_SYS_PTRACE` in
-/// its user namespace, Linux's `ptracer_capable`: an exec it watches may
+/// its user namespace, Linux's `ptracer_capable`: an exec it watches can
 /// then grant what the program grants. The tracer's capabilities are the
 /// ones its process record holds now.
 pub fn tracer_capable() -> bool {
@@ -639,7 +639,7 @@ pub fn exiting(status: i32) {
     }
 }
 
-/// What a re-executed fwe must know: the tracer (0: none), and whether
+/// What a re-executed fwe needs to know: the tracer (0: none), and whether
 /// it stops at system calls.
 pub fn exec_state() -> (i32, bool) {
     if traced() { (tracer(), stops_at_syscalls()) } else { (0, false) }
@@ -811,7 +811,7 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
                 break Served::Resume(Resume::Cont(0));
             }
             // A stop its tracer has not taken after a whole wait: the
-            // tracer is woken again. Its wake may have come as it was
+            // tracer is woken again. Its wake might have come as it was
             // about to sleep in the host's wait, before it knew it traced
             // this process (whose `PTRACE_TRACEME` it had not seen): that
             // wait slept on, the signal spent.
@@ -989,7 +989,7 @@ fn get_regs(mb: &Page, regs: &mut crate::Regs) {
 // --- single-stepping ------------------------------------------------------------
 //
 // One instruction is run by planting a breakpoint of fwe's (`brk #0x4c59`)
-// where it may go next and going on: a branch's target and the next
+// where it can go next and going on: a branch's target and the next
 // instruction for a conditional one, the register's address for one
 // through a register, the next instruction for any other. Taking that
 // breakpoint puts the instructions back and stops (`TRAP_TRACE`).
@@ -1013,7 +1013,7 @@ pub(crate) fn thread_reused() {
     STEPS.with(|s| s.borrow_mut().clear());
 }
 
-/// Where the instruction `insn` at `pc` may go next, with registers `x`.
+/// Where the instruction `insn` at `pc` can go next, with registers `x`.
 pub fn next_pcs(insn: u32, pc: u64, x: &[u64; 31]) -> Vec<u64> {
     let sext = |v: u32, bits: u32| ((v as i64) << (64 - bits)) >> (64 - bits);
     let rel = |imm: u32, bits: u32| pc.wrapping_add((sext(imm, bits) * 4) as u64);
@@ -1577,7 +1577,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
     }
 
     /// [`stop`], with the calling thread's thread pointer, which the tracer
-    /// may read and change; the host's signal dispositions set again where
+    /// can read and change; the host's signal dispositions set again where
     /// a thread began or ended being traced (the host catches every signal
     /// while one is).
     fn stop_with_tls(
@@ -1769,7 +1769,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         }
     }
 
-    /// Whether the caller may attach to host process `target` as a tracer
+    /// Whether the caller can attach to host process `target` as a tracer
     /// (`PTRACE_MODE_ATTACH_REALCREDS`: `ptrace`, `process_vm_readv`,
     /// `pidfd_getfd`).
     pub(crate) fn may_trace(&self, target: crate::ids::HostPid) -> bool {
@@ -1850,7 +1850,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
         }
     }
 
-    /// Whether the caller may be traced by its parent, host process
+    /// Whether the caller can be traced by its parent, host process
     /// `parent` (`PTRACE_TRACEME`): Yama refuses it at scope 3, and at
     /// scope 2 unless the parent has `CAP_SYS_PTRACE` over the caller;
     /// Landlock unless the parent's domain holds the caller's.

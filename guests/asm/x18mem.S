@@ -1,4 +1,4 @@
-// x18 must survive when spilled to memory and reloaded, across preemption.
+// x18 survives when spilled to memory and reloaded, across preemption.
 // Covers loads/stores with a non-sp base and with an sp base (a stack spill).
 // Exits 0 if x18 is preserved throughout, 1 otherwise.
     .text

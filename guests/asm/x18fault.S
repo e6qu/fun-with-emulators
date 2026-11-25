@@ -1,6 +1,6 @@
 // A load through x18 that faults, as a JIT's implicit null check does
-// (HotSpot loads through a register that may be null and turns the
-// SIGSEGV into a NullPointerException). The handler must see the fault at
+// (HotSpot loads through a register that might be null and turns the
+// SIGSEGV into a NullPointerException). The handler sees the fault at
 // the load itself, every register as it was and sp unchanged, then skips
 // the load; afterwards every register is still as it was. Exit 0 on
 // success, otherwise 1 + the number of the register found wrong (40 for

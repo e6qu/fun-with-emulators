@@ -4,10 +4,10 @@
  * libjvm.so) holds, run twice: as it is (fwe rewrites it, as it rewrites
  * the binary's), and with x18 renamed to a register it does not use (run
  * as it is). Both start from the same registers, flags, stack and memory,
- * from several starting states, and must end the same: registers, flags,
- * stack pointer, memory, and whether the instruction faulted. Linux lets a
- * program use x18 like any register, so on Linux both copies always agree;
- * the line printed is what Linux prints. */
+ * from several starting states, and are checked to end the same:
+ * registers, flags, stack pointer, memory, and whether the instruction
+ * faulted. Linux lets a program use x18 like any register, so on Linux both
+ * copies always agree; the line printed is what Linux prints. */
 #include <stddef.h>
 #include <stdint.h>
 

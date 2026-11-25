@@ -1,4 +1,4 @@
-// x18 must survive preemption. Spins without system calls, checking x18,
+// x18 survives preemption. Spins without system calls, checking x18,
 // then exits 0 if it was preserved and 1 if not.
     .text
     .globl _start

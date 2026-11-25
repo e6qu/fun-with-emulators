@@ -12,7 +12,7 @@
  *   it): what was not changed is taken back, what was is translated
  *   again, and the code cache fills.
  *
- * A signal or fault landing in the middle of an expansion must leave the
+ * A signal or fault landing in the middle of an expansion leaves the
  * code's registers as at its own instruction, so each round's checksum is
  * what a quiet run computed. Every line printed is what Linux prints. */
 #include <stdatomic.h>

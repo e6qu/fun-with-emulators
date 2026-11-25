@@ -1,4 +1,4 @@
-// x18 must survive system calls. Exits 0 if preserved, 1 if not.
+// x18 survives system calls. Exits 0 if preserved, 1 if not.
     .text
     .globl _start
 _start:

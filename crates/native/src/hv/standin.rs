@@ -29,7 +29,7 @@
 //!   sets `ESR_EL1`/`ELR_EL1`/`SPSR_EL1`/`FAR_EL1` and exits with the `hvc`
 //!   syndrome, as fwe's vector makes the real one do. A read of
 //!   `CNTPCT_EL0` and `wfi`/`wfe` exit directly, as under the framework.
-//! - **System registers EL0 may use** behave as on the host: `CNTFRQ_EL0`
+//! - **System registers EL0 can use** behave as on the host: `CNTFRQ_EL0`
 //!   is the host's frequency and `CNTVCT_EL0` the host counter less the
 //!   vCPU's offset; `CTR_EL0` is Apple Silicon's value (as the native
 //!   backend reports it) and `DCZID_EL0` QEMU's 64-byte block, as Apple's.
@@ -38,7 +38,7 @@
 //!
 //! `FWE_STANDIN_DEBUG=1` reports every exception and exit it models.
 //!
-//! Every rule the backend must keep that the stand-in can see is checked:
+//! Every rule the backend MUST keep that the stand-in can see is checked:
 //! a break prints a line starting `fwe hv stand-in: VIOLATION:` and the
 //! tests fail on it. A process that ends, by any means, with its VM alive
 //! is caught by a watcher process started with the VM (`fwe
@@ -156,7 +156,7 @@ const EXCP_DATA_ABORT: u32 = 4;
 const EXCP_BKPT: u32 = 7;
 
 /// Where emulation stops by itself: Unicorn's usual 0 (it translates code
-/// at this address when the CPU halts, so it must be one it can fetch from
+/// at this address when the CPU halts, so it needs to be one it can fetch from
 /// or fault on cleanly). A guest that jumps there gets the instruction abort
 /// the VM gives it, as page 0 is never mapped.
 const UNTIL: u64 = 0;
@@ -279,7 +279,7 @@ fn note(msg: &str) {
 fn say(kind: &str, msg: &str) {
     let mut buf = [0u8; 512];
     let mut n = 0;
-    // The process, as several (a fork's parent and child) may be writing.
+    // The process, as several (a fork's parent and child) might be writing.
     let mut pid = [0u8; 12];
     // SAFETY: plain host call.
     let mut v = unsafe { libc::getpid() } as u32;
@@ -329,7 +329,7 @@ struct Vm {
     ipa_bits: u32,
     /// Stage 2, by start address.
     maps: BTreeMap<u64, Mapping>,
-    /// Stage 2 as it was when a vCPU first ran: it may not change after
+    /// Stage 2 as it was when a vCPU first ran: it MUST NOT change after
     /// (shared segments come and go beside it).
     first_run: Option<Vec<(u64, u64)>>,
     /// The host memory behind each mapping: `(start, end, VM object)` of
@@ -558,7 +558,7 @@ pub fn vm_create(config: hv_vm_config_t) -> hv_return_t {
     HV_SUCCESS
 }
 
-/// Async-signal-safe, as teardown may run in a handler: the records go
+/// Async-signal-safe, as teardown can run in a handler: the records go
 /// with the process.
 pub fn vm_destroy() -> hv_return_t {
     if !VM_LIVE.load(SeqCst) {
@@ -570,8 +570,8 @@ pub fn vm_destroy() -> hv_return_t {
     }
     VM_LIVE.store(false, SeqCst);
     tell_watcher(b'D');
-    // Not a lock a handler may wait on: the records are taken out only if
-    // it is free, and not freed (a handler may not free; a VM is destroyed
+    // Not a lock a handler waits on: the records are taken out only if
+    // it is free, and not freed (a handler MUST NOT free; a VM is destroyed
     // once, and its records go with the process).
     if let Ok(mut g) = VM.try_lock() {
         std::mem::forget(g.take());
@@ -630,7 +630,7 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
     }
     let mut g = vm();
     let Some(v) = g.as_mut() else { return HV_ERROR };
-    // The range must be mapped throughout.
+    // Refused unless the range is mapped throughout.
     let mut at = ipa;
     while at < end {
         match v.maps.range(..=at).next_back() {
@@ -663,7 +663,7 @@ pub fn vm_unmap(ipa: u64, size: usize) -> hv_return_t {
     {
         violation(&format!(
             "hv_vm_unmap of {ipa:#x}+{size:#x}, part of the stage 2 the VM ran with: \
-                 stage 2 may not change while the VM runs"
+                 stage 2 MUST NOT change while the VM runs"
         ));
     }
     let mut ops: Vec<Op> = gone.iter().map(|&(lo, hi)| Op::Unmap(lo, hi)).collect();
@@ -760,7 +760,7 @@ fn apply(ops: Vec<Op>) {
 fn catch_up(v: &Vcpu) {
     let l = log();
     let start = engine(v).applied.max(l.base) - l.base;
-    // Unicorn may run the vCPU's hooks inside these calls: the engine
+    // Unicorn can run the vCPU's hooks inside these calls: the engine
     // lock, which hooks take, is not held across them.
     for &op in &l.ops[start..] {
         apply_op(v.uc, op);
@@ -830,8 +830,8 @@ fn host_allows(host: u64, len: u64, flags: u64) -> Result<(), String> {
         // Inferred from what the real framework did, not documented: it
         // mapped memory whose most was RWX (with any flags) and RW (as R+X,
         // a fork child's code), but refused memory that could only ever be
-        // read (a vfork child's shared code, as R+X). So the host must allow
-        // reading and writing at most, whatever the VM asks for.
+        // read (a vfork child's shared code, as R+X). So the host memory needs
+        // to allow reading and writing at most, whatever the VM asks for.
         let _ = want;
         let rw = libc::PROT_READ | libc::PROT_WRITE;
         if r.max_protection & rw != rw {
@@ -873,7 +873,7 @@ fn ipa_host(ipa: u64) -> Option<u64> {
 #[derive(Debug, Clone, Copy)]
 enum Walked {
     /// A page: its guest-physical address (with the offset), what EL0
-    /// may do with it, and whether it is a BTI guarded page.
+    /// can do with it, and whether it is a BTI guarded page.
     Page { ipa: u64, perms: u32, guarded: bool },
     /// A translation fault at this level.
     Fault { level: u64 },
@@ -1029,7 +1029,7 @@ fn host_regions(host: u64, len: u64) -> Vec<(u64, u64, u32, u8, bool)> {
     out
 }
 
-/// The host memory behind stage 2 must not have been replaced since it was
+/// The host memory behind stage 2 MUST NOT have been replaced since it was
 /// mapped: the framework keeps the pages it found then. Checked now and
 /// then and when stage 2 changes.
 fn check_objects(v: &mut Vm) {
@@ -1175,7 +1175,7 @@ pub fn vcpu_destroy(id: hv_vcpu_t) -> hv_return_t {
         violation("hv_vcpu_destroy of a running vCPU");
         return HV_BUSY;
     }
-    // Never freed: another thread may still hold it (a late
+    // Never freed: another thread might still hold it (a late
     // `hv_vcpus_exit`, a mapping change, a preemption), and a guest makes few
     // enough threads for the leak not to matter in a stand-in.
     VCPUS[id as usize].store(std::ptr::null_mut(), SeqCst);
@@ -1348,7 +1348,7 @@ pub fn vcpu_run(id: hv_vcpu_t) -> hv_return_t {
 /// fwe's TLB stub, `tlbi vmalle1is; dsb ish; isb; eret`.
 const TLB_STUB: [u32; 4] = [0xd508_831f, 0xd503_3b9f, 0xd503_3fdf, 0xd69f_03e0];
 
-/// The vCPU was set to resume at EL1: only fwe's TLB stub may run there.
+/// The vCPU was set to resume at EL1: only fwe's TLB stub runs there.
 /// Carry it out — every emulated CPU's cached translations go — and return
 /// to EL0 as its `eret` does. With the turn held.
 fn enter_el1(v: &Vcpu) -> Result<(), String> {
@@ -1408,7 +1408,7 @@ fn sync(v: &Vcpu) -> Result<(), String> {
             return Err(format!("TCR_EL1 {tcr:#x} is not the 40-bit, 4 KiB-granule regime"));
         }
         // The vector: `hvc #2; b .` at each entry (not `hvc #0`, which the
-        // framework may take for a firmware call).
+        // framework can take for a firmware call).
         let vbar = get(HV_SYS_REG_VBAR_EL1);
         let ttbr0 = get(HV_SYS_REG_TTBR0_EL1);
         for i in 0..16u64 {
@@ -1457,7 +1457,7 @@ fn sync(v: &Vcpu) -> Result<(), String> {
     let l = log();
     engine(v).applied = l.base + l.ops.len();
     drop(l);
-    // As in `catch_up`, hooks may run inside these calls.
+    // As in `catch_up`, hooks can run inside these calls.
     for (lo, hi, h, perms) in pieces {
         // SAFETY: as in vm_map.
         let rc =
@@ -1489,7 +1489,7 @@ fn fetch(d: *mut c_void, pc: u64) -> Option<u32> {
 /// At each block: stop if `hv_vcpus_exit` or another vCPU's turn asks, and
 /// check BTI, which Unicorn's TLB hook cannot tell QEMU about: a block
 /// entered by an indirect branch (`PSTATE.BTYPE` set) on a guarded page
-/// must begin with a landing pad compatible with the branch, or the guest
+/// begins with a landing pad compatible with the branch, or the guest
 /// takes a branch target exception, as the hardware raises it. QEMU sets
 /// `BTYPE` as for branches from unguarded pages (a `br` through a register
 /// other than x16 or x17 gives `0b01`, not `0b11`), so `bti c` and
@@ -2064,7 +2064,7 @@ fn start_watcher() {
         let mut fa: libc::posix_spawn_file_actions_t = std::ptr::null_mut();
         libc::posix_spawn_file_actions_init(&mut fa);
         libc::posix_spawn_file_actions_adddup2(&mut fa, fds[0], 0);
-        // Only its standard input and error: it must hold none of the
+        // Only its standard input and error: it holds none of the
         // guest's descriptors (a pipe it held open would never see EOF).
         posix_spawn_file_actions_addinherit_np(&mut fa, 2);
         let mut attr: libc::posix_spawnattr_t = std::ptr::null_mut();
@@ -2101,7 +2101,7 @@ fn start_watcher() {
     }
 }
 
-/// The stand-in's own descriptor, which a fork child must not be given.
+/// The stand-in's own descriptor, which a fork child is not given.
 pub fn own_fd() -> i32 {
     WATCH_FD.load(SeqCst)
 }
@@ -2219,7 +2219,7 @@ mod tests {
         assert_eq!(
             vm_map(gone, 0x40_0000, 0x4000, all),
             HV_BAD_ARGUMENT,
-            "host memory must be mapped"
+            "unmapped host memory is refused"
         );
 
         assert_eq!(vm_unmap(0x10_0000, 0x8000), HV_BAD_ARGUMENT, "unmap only what is mapped");
@@ -2330,7 +2330,7 @@ mod tests {
         assert_eq!(vm_destroy(), HV_SUCCESS);
     }
 
-    /// Each rule a running VM must keep, broken on purpose: the stand-in
+    /// Each rule a running VM MUST keep, broken on purpose: the stand-in
     /// reports it. (A VM is one per process: one after the other.)
     fn rules_of_a_running_vm() {
         let broken = || VIOLATIONS.load(SeqCst);
@@ -2344,7 +2344,7 @@ mod tests {
         let _ = vcpu_get_sys_reg(id, HV_SYS_REG_ESR_EL1, &mut esr);
         assert_eq!(esr >> 26, 0x15, "an svc");
         assert_eq!(broken(), before, "nothing broken");
-        // Stage 2 may not change once the VM has run.
+        // Stage 2 MUST NOT change once the VM has run.
         assert_eq!(vm_unmap(0, LEN as usize), HV_SUCCESS);
         assert_eq!(broken(), before + 1, "the VM's stage 2 changed while it ran");
         end(id);

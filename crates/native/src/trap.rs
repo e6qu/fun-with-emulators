@@ -90,7 +90,7 @@ fn report(message: &str) {
 /// Read an instruction word, if `addr` is the address of one.
 ///
 /// # Safety
-/// `addr` must be mapped if it is 4-byte aligned.
+/// `addr` MUST be mapped if it is 4-byte aligned.
 unsafe fn insn(addr: u64) -> Option<u32> {
     // SAFETY: guaranteed by the caller.
     addr.is_multiple_of(4).then(|| unsafe { (addr as *const u32).read() })
@@ -156,7 +156,7 @@ fn caught(sig: libc::c_int) -> bool {
 /// blocked it for a moment (each does while it is in fwe's handlers) could
 /// stay pending on a thread that never unblocks it while another thread
 /// accepts it. At a system call, a caught signal pending on the host that
-/// this thread's guest mask blocks may be such a signal: unblocking it
+/// this thread's guest mask blocks might be such a signal: unblocking it
 /// here, in fwe's code, has the host deliver it to [`take_async`] now,
 /// which records it against the process (where Linux keeps it), and the
 /// other threads are woken to take it. A signal with the default action
@@ -170,7 +170,7 @@ fn caught(sig: libc::c_int) -> bool {
 /// only once [`LOOK_EVERY_PER_SECOND`] says it is time again: a thread
 /// making such calls by the thousand (a runtime timing itself at each
 /// step) still looks thousands of times a second. Any other call (one
-/// that may wait, or reads what is pending) looks every time.
+/// that can wait, or reads what is pending) looks every time.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -210,7 +210,7 @@ fn reroute_parked(blocked: u64, glance: impl FnOnce() -> bool) {
     let set = host::host_sigset(parked);
     REROUTING.set(true);
     // The mask as it was is put back, not the signals blocked: a caught
-    // signal the host showed pending may be one this thread never blocked
+    // signal the host showed pending might be one this thread never blocked
     // (it landed during the look, and is delivered as the look returns),
     // which blocked now would wait unseen on the host.
     // The pending signals are delivered to this thread as they unblock.
@@ -301,7 +301,7 @@ unsafe fn return_with_guest_mask(ctx: *mut libc::c_void) {
 }
 
 /// Fwe's own code is running on this thread for the life of the value: it
-/// leaves the custom x18 ABI, so host code may call macOS libraries, and
+/// leaves the custom x18 ABI, so host code can call macOS libraries, and
 /// unblocks the guest's signals so a blocking host call is interruptible. On
 /// drop it blocks signals again and restores both. The guest's x18 is part
 /// of the saved signal context and is restored when the handler returns.
@@ -500,7 +500,7 @@ extern "C" fn fwe_gate_call(b: *mut crate::gate::Block) -> u64 {
 fn flush_line(addr: u64, native: bool) {
     let line = 4 << (crate::hwcap::CTR_EL0 & 15);
     if native {
-        // Code that runs as it is may be there: the host's cache line
+        // Code that runs as it is might be there: the host's cache line
         // too, where it is mapped (as the instruction faults elsewhere,
         // which a stub through `x18` leaves to its translations).
         let mapped = !fwe_kernel::maps::record().areas_in(addr, addr + 1).is_empty();
@@ -669,7 +669,7 @@ fn settle(regs: &mut Regs) {
     {
         // Going on in a translation (a way out's target): a handler's frame
         // holds the guest's state, as at the instruction it stands for, not
-        // fwe's code, which may be gone when the handler returns.
+        // fwe's code, which might be gone when the handler returns.
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         if crate::jit::stands_for_program(regs.pc) {
             crate::jit::to_guest(regs);
@@ -750,7 +750,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // A system call that cannot wait runs with signals still blocked,
-    // unless a tracer or a seccomp filter may make it wait.
+    // unless a tracer or a seccomp filter can make it wait.
     let quick = never_waits(mc.ss.x[8])
         && fwe_kernel::seccomp::mode() == 0
         && !fwe_kernel::ptrace::stops_at_syscalls();
@@ -792,7 +792,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     }
     reroute_parked(thread::mask(), || false);
     // A traced process stopping at system calls: the entry's stop, where
-    // the tracer may change the registers.
+    // the tracer can change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
     if syscall_stops {
         kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, true);
@@ -1000,7 +1000,7 @@ fn take_async(
         // signal. Entering `HostCode` would apply the guest's mask and let
         // signals nest in this handler without bound, each frame further
         // down the thread's signal stack until the host cannot deliver one
-        // and ends the process. That code may be in the host allocator.
+        // and ends the process. That code might be in the host allocator.
         let _no_allocation = host::NoAllocation::enter();
         record();
         if thread::foreign() {
@@ -1084,7 +1084,7 @@ pub(crate) fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
 /// A thread stopped on one of the last two instructions of the stub for an
 /// instruction that writes `sp` from `x18` (`rewrite::x18_writes_sp_stub`):
 /// `mov sp, s1; ldur s1, [s2, #-16]; ldur s2, [s2, #-32]`. Those loads read
-/// the scratch registers back from below the old `sp`, which may be below
+/// the scratch registers back from below the old `sp`, which might be below
 /// the new one too, where a signal frame is about to be written: so they
 /// are made here first, and the thread goes on after them.
 fn finish_sp_stub(regs: &mut Regs) {
@@ -1334,7 +1334,7 @@ fn program_insn(pc: u64) -> Option<(u64, u32)> {
 
 /// A load or store of fwe's own through an `sp` the program keeps off
 /// 16-byte alignment, which the host's alignment check (`SCTLR_EL1.SA0`,
-/// as Linux sets it) faults: Linux programs may keep such an `sp` while
+/// as Linux sets it) faults: Linux programs can keep such an `sp` while
 /// they address memory through other registers (pixman's NEON functions
 /// do), and a stub or translation saving registers below it is fwe's, not
 /// theirs. The access is made here as the host copies (a page the
@@ -1533,7 +1533,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             ss.pc = resume;
             return;
         }
-        // Anywhere else in fwe's own code (the kernel lock may be held):
+        // Anywhere else in fwe's own code (the kernel lock might be held):
         // fatal.
         restore_default(sig);
         return;
@@ -1558,7 +1558,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // the value is emulated.
     if let Some(word) = (sig == libc::SIGILL)
         // SAFETY: a SIGILL's instruction was fetched, so `pc` is mapped (a
-        // fetch's fault may leave it unmapped).
+        // fetch's fault can leave it unmapped).
         .then(|| unsafe { insn(mc.ss.pc) })
         .flatten()
         .filter(|&w| crate::hwcap::is_mrs_ctr_el0(w))
@@ -1829,7 +1829,7 @@ pub fn install_handlers() {
 /// (it is a caller-saved temporary a thread entry does not rely on).
 ///
 /// # Safety
-/// `regs` must point to a valid [`Regs`] describing a runnable guest context.
+/// `regs` MUST point to a valid [`Regs`] describing a runnable guest context.
 #[unsafe(naked)]
 pub unsafe extern "C" fn enter_guest_full(regs: *const Regs) -> ! {
     core::arch::naked_asm!(

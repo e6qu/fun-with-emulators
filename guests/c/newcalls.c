@@ -1,4 +1,4 @@
-/* The system calls of Linux 6.x a program may reach for: the *xattrat
+/* The system calls of Linux 6.x a program can reach for: the *xattrat
  * calls, the futex2 calls, kcmp, process_madvise, clone3 with set_tid,
  * PR_SET_VMA anonymous names; and the calls of features fwe's kernel is
  * built without (modules, io_uring, perf events, fanotify, userfaultfd),

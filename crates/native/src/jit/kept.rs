@@ -3,14 +3,14 @@
 //! the program generated, by the program's file and their address; taken
 //! again by a later process (or this one) that comes to the same code, as
 //! prepared images are kept ([`fwe_kernel::prepcache`]). A block taken again is what
-//! [`translate`] made, before it was placed: its words, what each stands
+//! [`super::translate`] made, before it was placed: its words, what each stands
 //! for, its branches to resolve and its calls; placing it is as for a
 //! block just made.
 //!
 //! A record holds the program's words the block was made from (and those
 //! past them its translation looked at), and the calls made in other
 //! blocks' words that its translation went on into
-//! ([`State::calls_made`]): it is taken only where both are as they are now,
+//! ([`super::State::calls_made`]): it is taken only where both are as they are now,
 //! so a block whose code changed, or that the state around it would make
 //! otherwise, is made afresh. Translations depend on fwe's own code and the
 //! thread's slots they name, so the records are kept apart for each build
@@ -344,7 +344,7 @@ pub(super) fn remapped(addr: u64, len: u64) {
 }
 
 /// A record of part `part` for the block at `g` made from `source` (the
-/// program's words from `g`, as far as a block's translation may read
+/// program's words from `g`, as far as a block's translation can read
 /// them) with the calls in `known` made in other blocks' words, and an
 /// entry with the program's own `x16` and `x17` if `unsaved`; one with
 /// that entry before one without it either way (a block a past process
@@ -778,7 +778,7 @@ fn file_of<'a>(recs: impl ExactSizeIterator<Item = (u64, &'a [u8])> + Clone) -> 
     out
 }
 
-/// The files of records a part may hold before a process adding one merges
+/// The files of records a part can hold before a process adding one merges
 /// them all into one.
 const MERGE_AT: usize = 8;
 
@@ -864,7 +864,7 @@ pub(super) fn write() {
 /// with a salt of this write's (so those left out are spread evenly, the
 /// slots they leave too, and a write leaves out its share of what earlier
 /// writes kept).
-/// Another process writing meanwhile may lose its own: notes only tell
+/// Another process writing meanwhile can lose its own: notes only tell
 /// which blocks to keep.
 fn write_seen(dir: &[u8], noted: &[u64], old: Option<&Seen>) {
     let mut notes: Vec<u64> = noted.to_vec();

@@ -1,4 +1,4 @@
-// TPIDR_EL0 must survive system calls. Exits 0 if preserved, 1 if not.
+// TPIDR_EL0 survives system calls. Exits 0 if preserved, 1 if not.
     .text
     .globl _start
 _start:

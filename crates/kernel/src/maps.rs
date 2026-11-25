@@ -88,10 +88,10 @@ pub struct Area {
     pub prot: u64,
     pub shared: bool,
     pub locked: bool,
-    /// It maps a file of a `noexec` mount, so it may not be made
+    /// It maps a file of a `noexec` mount, so it cannot be made
     /// executable (Linux's `VM_MAYEXEC` clear).
     pub noexec: bool,
-    /// A shared mapping of a file not open for writing, so it may not be
+    /// A shared mapping of a file not open for writing, so it cannot be
     /// made writable (Linux's `VM_MAYWRITE` clear).
     pub nowrite: bool,
     /// Sealed (`mseal`): not to be unmapped, moved, remapped over, have
@@ -350,7 +350,7 @@ impl Record {
     }
 
     /// Whether any of `[start, end)` is sealed, private, anonymous and not
-    /// writable: memory `madvise` may not discard.
+    /// writable: memory `madvise` cannot discard.
     pub fn any_sealed_read_only(&self, start: u64, end: u64) -> bool {
         self.any_sealed
             && self.areas.overlapping(start, end).any(|p| {
@@ -380,7 +380,7 @@ impl Record {
         self.areas.update(start, start + len, |a| Area { nowrite: true, ..a.clone() });
     }
 
-    /// Whether any of `[start, start + len)` may not be made writable.
+    /// Whether any of `[start, start + len)` cannot be made writable.
     pub fn any_nowrite(&self, start: u64, len: u64) -> bool {
         self.areas.overlapping(start, start + len).any(|p| p.value.nowrite)
     }
@@ -720,19 +720,19 @@ pub fn unmapped(start: u64, len: u64) {
 
 /// How many mappings the record holds, without its lock: as of the last
 /// change, the pending one with them, which a call racing with another
-/// thread's map may miss as it would with the lock.
+/// thread's map can miss as it would with the lock.
 pub fn count() -> usize {
     COUNT.load(Relaxed) + usize::from(PENDING.is_kept())
 }
 
 /// Whether mappings made from now on are locked, without the record's
 /// lock: as of the last change, which a call racing with another thread's
-/// `mlockall` may miss as it would with the lock.
+/// `mlockall` can miss as it would with the lock.
 pub fn locks_future() -> bool {
     LOCKS_FUTURE.load(Relaxed)
 }
 
-/// Whether any memory may be sealed, without the record's lock: false
+/// Whether any memory might be sealed, without the record's lock: false
 /// until some was (a seal is made under the kernel lock, which every call
 /// that looks for one holds).
 pub fn may_be_sealed() -> bool {

@@ -261,7 +261,7 @@ fn recently(host: i32, dir: &[u8]) -> Option<i32> {
 
 /// Forget the numbers an adopted process `host` had (`numbers`: by
 /// namespace record), as it is reaped: those, not whatever its host pid
-/// may stand for by now.
+/// might stand for by now.
 pub fn released(numbers: &[(Vec<u8>, i32)], host: i32) {
     for r in current().iter() {
         let Some(&(_, n)) = numbers.iter().find(|(d, _)| d == r.dir()) else { continue };

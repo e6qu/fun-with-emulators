@@ -8,16 +8,16 @@
 //! view; a process's root is a path in that view too
 //! ([`crate::fs::Fs`]).
 //!
-//! A filesystem is a host directory (the rootfs, a bind mount's source, a
-//! tmpfs's backing directory, all [`Source::Host`]), a stack of them
-//! ([`Source::Overlay`], see [`crate::overlay`]) or one fwe generates
-//! (`proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue`), each reached from
+//! A filesystem is a host directory (the rootfs, a bind mount's source,
+//! [`Source::Host`]), a stack of them ([`Source::Overlay`], see
+//! [`crate::overlay`]), one of fwe's file store in memory (a tmpfs,
+//! [`Source::Store`]) or one fwe generates (`proc`, `sysfs`, `cgroup2`,
+//! `devpts`, `mqueue`), each reached from
 //! [`Mount::root`], the path inside it the mount shows (a bind mount of a
 //! subdirectory).
 //!
-//! The table is the namespace's, shared by every process in it, so it lives
-//! in the host filesystem ([`store`]): each process keeps a copy and
-//! rereads it when another has changed it.
+//! The table is the namespace's, shared by every process in it: a shared
+//! record in memory ([`store`]).
 
 use fwe_abi::errno;
 
@@ -58,7 +58,7 @@ pub mod ms {
         | NODIRATIME
         | RELATIME
         | STRICTATIME;
-    /// The flags a less privileged namespace may not clear on a mount it
+    /// The flags a less privileged namespace cannot clear on a mount it
     /// was given ([`super::lock`]).
     pub const LOCKABLE: u64 = RDONLY | NOSUID | NODEV | NOEXEC;
 
@@ -192,14 +192,14 @@ pub struct Mount {
     pub device: Vec<u8>,
     /// The filesystem's options (`mode=755` and the like).
     pub options: Vec<u8>,
-    /// What a less privileged namespace may not change of it ([`lock`]):
-    /// the flags of [`ms::LOCKABLE`] it may not clear, [`LOCK_ATIME`] (its
-    /// access-time mode is fixed) and [`LOCKED`] (it may not be unmounted
+    /// What a less privileged namespace cannot change of it ([`lock`]):
+    /// the flags of [`ms::LOCKABLE`] it cannot clear, [`LOCK_ATIME`] (its
+    /// access-time mode is fixed) and [`LOCKED`] (it cannot be unmounted
     /// or moved apart from its parent, to show what it covers).
     pub locked: u64,
 }
 
-/// A mount's access-time mode may not change ([`Mount::locked`]).
+/// A mount's access-time mode cannot change ([`Mount::locked`]).
 pub const LOCK_ATIME: u64 = 1 << 62;
 /// A mount is locked to its parent ([`Mount::locked`]).
 pub const LOCKED: u64 = 1 << 63;
@@ -223,7 +223,7 @@ impl Mount {
         UNIQUE_ID_BASE + u64::from(self.id)
     }
 
-    /// Whether its per-mount flags may become `flags`: not with a locked
+    /// Whether its per-mount flags can become `flags`: not with a locked
     /// flag cleared or a locked access-time mode changed
     /// (`can_change_locked_flags`).
     pub fn may_set_flags(&self, flags: u64) -> bool {
@@ -312,7 +312,7 @@ impl Mount {
     }
 }
 
-/// `a` and `b` joined with one `/` between them; `b` may be empty or start
+/// `a` and `b` joined with one `/` between them; `b` can be empty or start
 /// with `/`.
 pub fn join(a: &[u8], b: &[u8]) -> Vec<u8> {
     let b = b.strip_prefix(b"/").unwrap_or(b);
@@ -733,7 +733,7 @@ impl Table {
 
     /// Attach detached `tree` ([`Table::copy_tree`], or a new filesystem's
     /// one mount) at `to`, or with `beneath` under the mount at `to`
-    /// (which must be a mount's root, not the namespace's), between it and
+    /// (a mount's root, not the namespace's, else `EINVAL`), between it and
     /// what it is attached to. Returns the root's new id.
     pub fn attach_tree(&mut self, tree: &[Mount], to: &[u8], beneath: bool) -> Result<u32, i32> {
         let Some(top) = tree.first() else { return Err(errno::EINVAL) };
@@ -1293,14 +1293,14 @@ impl Table {
         if n.id == r.id || o.id == r.id {
             return Err(errno::EBUSY);
         }
-        // The caller's root and the new one must be mounts' roots.
+        // The caller's root and the new one need to be mounts' roots.
         if !root_rest.is_empty() || !new_rest.is_empty() {
             return Err(errno::EINVAL);
         }
         if !self.is_below(n.id, r.id) {
             return Err(errno::EINVAL);
         }
-        // `put_old` must be in the new root's tree.
+        // `put_old` needs to be in the new root's tree.
         let Some(put_rel) = under(put_old, &n.point) else { return Err(errno::EINVAL) };
         let (holder, _) = self.locate(put_old);
         let holder = holder.id;
@@ -1316,7 +1316,7 @@ impl Table {
             .collect();
         let r_is_top = r.parent == r.id;
         // The old root's lock to what it covers goes to the new root, as
-        // Linux moves it: the old root, now at `put_old`, may be detached.
+        // Linux moves it: the old root, now at `put_old`, can be detached.
         let r_locked = r.locked & LOCKED;
         for m in self.mounts.iter_mut() {
             if m.id == n.id {

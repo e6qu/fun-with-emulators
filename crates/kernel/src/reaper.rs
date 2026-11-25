@@ -250,7 +250,7 @@ fn own_parent() -> Option<Option<HostPid>> {
     Some(parent)
 }
 
-/// Whether someone may still reap ended process `e`: its parent, or a
+/// Whether someone can still reap ended process `e`: its parent, or a
 /// reaper that adopts it.
 pub fn reapable(e: &Ended) -> bool {
     e.lineage.first().is_some_and(|&p| procreg::alive(p))
@@ -333,7 +333,7 @@ pub fn take_adopted(sel: Select, peek: bool) -> Option<Ended> {
 /// A reaper reaped `child`, a child of its own: what that child left
 /// unreaped is now the reaper's, and owed its SIGCHLD before the `wait`
 /// returns, as Linux hands a parent's zombies on as the parent ends. One
-/// killed outright left no record of its end, which the watcher may not
+/// killed outright left no record of its end, which the watcher might not
 /// have made yet: it is made here.
 pub fn reaped_own_child(child: i32) {
     if active() {
@@ -651,7 +651,7 @@ fn ended_init(init: i32, ns: &[u8]) {
     });
 }
 
-/// Whether a `wait` that must not block (`WNOHANG`) for child `child`
+/// Whether a `wait` that does not block (`WNOHANG`) for child `child`
 /// alone is to report nothing yet: it is a pid namespace's init that has
 /// ended while the rest of its namespace has not (Linux reaps an init only
 /// once its namespace is empty).
@@ -696,7 +696,7 @@ fn is_reaper() -> bool {
 }
 
 /// Start the watcher if this process is a reaper and it has none yet.
-/// Called as a process starts and whenever it may have become one.
+/// Called as a process starts and whenever it might have become one.
 /// The watcher follows processes with `kqueue`, which Linux hosts lack:
 /// there fwe runs only the kernel's unit tests.
 pub fn start_if_reaper() {
@@ -891,7 +891,7 @@ pub fn children(pid: HostPid) -> Vec<HostPid> {
     }
 }
 
-/// Processes this one sent a signal that may stop or continue them, for the
+/// Processes this one sent a signal that can stop or continue them, for the
 /// watcher to look at ([`stop_signal_sent`]).
 static SENT: Mutex<Vec<HostPid>> = Mutex::new(Vec::new());
 
@@ -899,11 +899,11 @@ static SENT: Mutex<Vec<HostPid>> = Mutex::new(Vec::new());
 #[cfg(target_os = "macos")]
 static WATCH_KQ: AtomicI32 = AtomicI32::new(-1);
 
-/// This process is sending host process `pid` a signal that may stop or
+/// This process is sending host process `pid` a signal that can stop or
 /// continue it: when a watcher runs, it looks for the stop or continue, and
 /// takes a stop it finds for this signal's. The host
 /// tells the watcher of a signal only to a process it follows already, and
-/// an orphan this process just adopted it may not follow yet: the stop
+/// an orphan this process just adopted it might not follow yet: the stop
 /// would then be taken for one from before the adoption, never reported.
 pub fn stop_signal_sent(pid: HostPid) {
     if !active() {
@@ -960,7 +960,7 @@ mod watch {
 
     impl Watcher {
         /// Follow `pid`, its children and theirs: its end, its forks, and
-        /// the signals it is sent (which may stop or continue it).
+        /// the signals it is sent (which can stop or continue it).
         /// Returns whether one had already gone.
         fn follow(&mut self, pid: HostPid) -> bool {
             let mut gone = false;
@@ -1003,7 +1003,7 @@ mod watch {
         /// started (a reaper that started again with `execve`), or one
         /// whose parent ended before its fork was seen, so it was no
         /// longer that parent's child on the host. Returns whether a
-        /// process just forked has not written its record yet: it may be
+        /// process just forked has not written its record yet: it might be
         /// one of those, and is looked for again soon (nothing else tells
         /// this watcher of it once its parent has gone).
         fn follow_recorded(&mut self, me: HostPid) -> bool {
@@ -1064,7 +1064,7 @@ mod watch {
         let mut w = Watcher { kq, watched: HashSet::new(), stopped: Default::default() };
         // This process's forks, and the host's SIGCHLD (a child of its own
         // that ended, stopped or continued).
-        // And the signals it sends that may stop or continue a process
+        // And the signals it sends that can stop or continue a process
         // ([`stop_signal_sent`]).
         let own = [
             change(me.get(), libc::EVFILT_PROC, libc::EV_ADD | libc::EV_CLEAR, libc::NOTE_FORK),
@@ -1076,7 +1076,7 @@ mod watch {
         WATCH_KQ.store(kq, SeqCst);
         w.watched.insert(me);
         // A process just forked that has not written its record yet, which
-        // may be one to follow: looked for again until it has.
+        // might be one to follow: looked for again until it has.
         let mut unwritten = busy(|| {
             for c in children(me) {
                 w.follow(c);
@@ -1252,7 +1252,7 @@ pub fn forget_exit_signal(child: i32) {
 }
 
 /// A child's `SIGCHLD`, which Linux sends before `wait` can report the
-/// child, may come from the host after `wait` returned (macOS wakes the
+/// child, can come from the host after `wait` returned (macOS wakes the
 /// waiter first), and interrupt the guest's next call. So a `wait` that
 /// reaps a child whose `SIGCHLD` has not landed yet gives it then
 /// ([`reaped_child_signal`]), and the host's, when it comes, is dropped
@@ -1302,7 +1302,7 @@ pub fn reaped_child_signal(pid: i32, info: crate::thread::SigInfo) {
     if !taken {
         // Neither caught nor watched: Linux discarded it as the child
         // ended unless the thread blocked it then, so the host's landing
-        // later (once the guest may block it) is dropped, unless blocked
+        // later (once the guest can block it) is dropped, unless blocked
         // now, when it stays pending as Linux's would.
         if crate::thread::mask() & bit == 0 {
             ring_put(&GIVEN, &GIVEN_AT, pid);

@@ -10,8 +10,8 @@ GCC allocates x18 as Linux allows).
 For each word the guest gets two functions: one runs the word itself (fwe
 rewrites it, as it rewrites the binary's), the other the same instruction
 with x18 renamed to a register it does not use (which runs as it is). Both
-start from the same registers, flags, stack and memory, and must end the
-same. Branches and pc-relative forms are left out: their result depends on
+start from the same registers, flags, stack and memory, and are checked to end
+the same. Branches and pc-relative forms are left out: their result depends on
 where the copy sits.
 """
 import re
