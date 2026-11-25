@@ -376,6 +376,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18pair",
     "x18fault",
     "x18br",
+    "x18jump",
     "x18fp",
     "x18pc",
     "x18sig",
@@ -5368,6 +5369,15 @@ fn asm_x18_survives_memory_spill() {
     assert_eq!(fwe(&asm_guest("x18mem-pie"), &[]).status.code(), Some(0));
 }
 
+/// A jump table through x18 (`adr x18`, an added scaled index, `br x18`)
+/// reaches each case with `x16` and `x17` as the code left them, and a
+/// call through x18 returns: as clang emits one where x18 is free (V8's
+/// in Electron, its table's base in `x16`).
+#[test]
+fn asm_x18_jump_table_reaches_each_case() {
+    assert_eq!(fwe(&asm_guest("x18jump-pie"), &[]).status.code(), Some(0));
+}
+
 /// x18 through the wider data-processing classes (extract, conditional select,
 /// multiply-add, divide), across preemption.
 #[test]
@@ -7487,6 +7497,7 @@ fn hv_runs_low_assembly_guests() {
         ("x18dp", 0),
         ("x18ldst", 0),
         ("x18br", 0),
+        ("x18jump", 0),
         ("x18fp", 0),
         ("x18pc", 0),
         ("x18sig", 0),

@@ -138,6 +138,7 @@ pub fn stands_for_program(pc: u64) -> bool {
     in_cache(pc)
         || (CALL_SITES_LINKED.load(Ordering::Relaxed) > 0
             && crate::prepare::stub_region(pc).is_some())
+        || x18_branch_site(pc).is_some()
 }
 
 /// Whether `pc` is in a chunk's exit stub ([`exit_stub`]).
@@ -1088,6 +1089,8 @@ static TRANSLATED: AtomicU64 = AtomicU64::new(0);
 static EXITS: AtomicU64 = AtomicU64::new(0);
 /// Of [`EXITS`]: from call stubs ([`link_call_site`]).
 static STUB_EXITS: AtomicU64 = AtomicU64::new(0);
+/// Ways out of a `br x18`'s stub ([`x18_branch_stub`]).
+static X18_BRANCH_EXITS: AtomicU64 = AtomicU64::new(0);
 static ENTERED: AtomicU64 = AtomicU64::new(0);
 /// Of [`EXITS`]: direct branches to code not translated, and indirect
 /// ones (and lookup misses) to it; of [`ENTERED`]: returns (to `x30`).
@@ -1225,13 +1228,14 @@ pub fn counts() -> Option<String> {
     });
     (t > 0).then(|| {
         format!(
-            "JIT code: {t} blocks translated, {} exits through fwe ({} from call stubs; {} direct and {} \
+            "JIT code: {t} blocks translated, {} exits through fwe ({} from call stubs, {} from `br x18`'s stubs; {} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
              {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls through a register from code not translated, {} from code a direct call there led to, {} sites linked, {} whose return is followed), \
              {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
             STUB_EXITS.load(Ordering::Relaxed),
+            X18_BRANCH_EXITS.load(Ordering::Relaxed),
             EXITS_DIRECT_OUT.load(Ordering::Relaxed),
             EXITS_INDIRECT_OUT.load(Ordering::Relaxed),
             EXITS_KNOWN_DIRECT.load(Ordering::Relaxed),
@@ -2215,6 +2219,13 @@ fn exit_now(regs: &mut Regs) -> bool {
         Some(Word::Out { exit, saved, x18, .. }) => (exit, saved, x18),
         // A chunk's return tail's way out: a return through x30.
         _ if in_tail(at) == Some(tail().1) => (Exit::Reg { n: 30, link: None }, true, false),
+        // A `br x18`'s stub's way out: to the program's `x18`, which its
+        // slot holds (the gate took the host's).
+        _ if x18_branch_site(at).is_some_and(|(stub, _)| at == stub + 4 * SAVE_WORDS as u64) => {
+            X18_BRANCH_EXITS.fetch_add(1, Ordering::Relaxed);
+            regs.x[18] = program_x18();
+            (Exit::Reg { n: 18, link: None }, true, false)
+        }
         _ => {
             // A call stub's way out, a lookup's miss: into its call's
             // target, as a translation's call through a register (a `bl`'s
@@ -2364,6 +2375,9 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
 /// stub ([`link_call_site`]): as the program's state at the instruction it
 /// stands for. `false` if `regs.pc` is in neither.
 pub fn to_guest(regs: &mut Regs) -> bool {
+    if x18_branch_to_guest(regs) {
+        return true;
+    }
     let s = state();
     if call_stub_to_guest(&s, regs) {
         return true;
@@ -2458,6 +2472,68 @@ pub fn call_stub_site(pc: u64) -> Option<u64> {
     let s = state();
     let (&stub, c) = s.call_stubs.range(..=pc).next_back()?;
     (((pc - stub) / 4) < c.words.len() as u64).then_some(c.site)
+}
+
+/// The stub for a plain `br x18` at `site`, placed at `stub` (one of
+/// [`crate::rewrite::stub`]'s). A jump table's `br x18` leads to code that
+/// can read `x16` and `x17` as the program left them (clang keeps the
+/// table's base and a case's values there where `x18` is free, as on
+/// Linux), so the branch cannot be made through either, nor through `x18`,
+/// which the host clears whenever it returns to the thread. So the stub
+/// saves the program's `x16` and `x17` in their slots, as a call stub
+/// does ([`save_words`]), and goes into fwe through the exit gate, its way
+/// out at word [`SAVE_WORDS`] ([`OUT`]): [`exit`] takes the program's
+/// `x18` as the target and goes on there by translation, which follows
+/// code fwe prepared in place until it returns to code that runs as it is.
+/// Its last word, never run, branches back past the site, which tells the
+/// site from the stub as any stub's does ([`rewrite::site_of`]).
+pub(crate) fn x18_branch_stub(site: u64, stub: u64) -> Vec<u32> {
+    let mut words = save_words().to_vec();
+    words.push(OUT);
+    materialize(17, crate::gate::exit_address(), &mut words);
+    words.push(GO);
+    let back = stub + 4 * words.len() as u64;
+    words.push(
+        rewrite::branch(back, site + 4).expect("stub placed within branch range of its site"),
+    );
+    words
+}
+
+/// The stub and site of the `br x18` stub ([`x18_branch_stub`]) holding
+/// `pc`, if one does.
+fn x18_branch_site(pc: u64) -> Option<(u64, u64)> {
+    let (stub, words) = crate::prepare::stub_slot(pc)?;
+    let site = rewrite::site_of(words, stub)?;
+    (crate::prepare::site_at(site) == Some(Site::X18 { insn: rewrite::BR_X18 }))
+        .then_some((stub, site))
+}
+
+/// The program's `x18` as its slot holds it, on this thread.
+fn program_x18() -> u64 {
+    let area: u64;
+    // SAFETY: reading this thread's TSD base, which the host keeps in
+    // `tpidrro_el0` (its low bits the processor's number).
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) area, options(nomem, nostack)) };
+    // SAFETY: this thread's own TSD slot.
+    unsafe { (((area & !7) + u64::from(crate::x18_slot())) as *const u64).read() }
+}
+
+/// A thread stopped in a `br x18`'s stub ([`x18_branch_stub`]): as at its
+/// site, which runs the stub again; the program's `x16` and `x17` below
+/// `sp` while the stub saves them, in their slots after.
+fn x18_branch_to_guest(regs: &mut Regs) -> bool {
+    let Some((stub, site)) = x18_branch_site(regs.pc) else { return false };
+    let k = ((regs.pc - stub) / 4) as usize;
+    let sp = regs.sp;
+    // SAFETY: the stack below which the stub's save put them.
+    let below = |off: u64| unsafe { (sp.wrapping_sub(off) as *const u64).read() };
+    if (1..SAVE_WORDS).contains(&k) {
+        (regs.x[16], regs.x[17]) = (below(16), below(8));
+    } else if k >= SAVE_WORDS {
+        (regs.x[16], regs.x[17]) = parked();
+    }
+    regs.pc = site;
+    true
 }
 
 fn call_stub_to_guest(s: &State, regs: &mut Regs) -> bool {

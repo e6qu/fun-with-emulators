@@ -373,6 +373,10 @@ pub fn stub(site: Site, tp_slot: u32, x18_slot: u32, stub: u64, ret: u64) -> Vec
     match site {
         // Indirect and compare/test branches through x18, and system calls:
         // complete stubs of their own, with their own ways out.
+        // A plain `br x18`, which can lead on in the same function with
+        // `x16` and `x17` live: into fwe, and on by translation.
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        Site::X18 { insn: BR_X18 } => return crate::jit::x18_branch_stub(ret - 4, stub),
         Site::X18 { insn } if crate::decode::x18_indirect(insn).is_some() => {
             return x18_indirect_stub(insn, imm(x18_slot), ret);
         }
@@ -720,12 +724,17 @@ fn x18_ldr_literal_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {
     ]
 }
 
-/// Stub for an indirect branch through `x18` (`br`/`blr`/`ret`, and the
-/// authenticated forms). Loads the target from the slot into `x16` (`x17`
-/// when the modifier is `x16`) and branches with the original's kind:
-/// `x16`/`x17` are the intra-procedure-call scratch registers, dead at any
-/// branch, so no save is needed, and a branch through them can land on a
-/// `bti c`. For the `blr` forms the link register is set to the instruction
+/// `br x18`.
+pub const BR_X18: u32 = 0xd61f_0240;
+
+/// Stub for an indirect branch through `x18` that calls, returns or leaves
+/// the function (`blr`, `ret`, and the authenticated forms; a plain `br`
+/// has a stub of its own where fwe translates: `jit::x18_branch_stub`).
+/// Loads the target from the slot into `x16` (`x17` when the modifier is
+/// `x16`) and branches with the original's kind: `x16`/`x17` are the
+/// intra-procedure-call scratch registers, which a call, a return or a
+/// tail call leaves free (a linker's veneer can clobber them), so no save
+/// is needed, and a branch through them can land on a `bti c`. For the `blr` forms the link register is set to the instruction
 /// after the original branch, and the branch made without link.
 /// Self-terminating (ends in the branch).
 fn x18_indirect_stub(insn: u32, imm: u32, ret: u64) -> Vec<u32> {

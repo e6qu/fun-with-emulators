@@ -451,6 +451,15 @@ a processor that reports `DIC` clear.
   (`jit::call_stub_to_guest`):
   a handler running translated code might save its own `x16` and `x17` in
   the slots meanwhile.
+- **`br x18`:** a jump table's branch, prepared with a stub of its own
+  (`jit::x18_branch_stub`): the program's `x16` and `x17` saved as a call
+  stub saves them, and into fwe through the exit gate, its way out after
+  the save; `jit::exit` takes the program's `x18` from its slot as the
+  target and follows it, translated, until the function returns to code
+  that runs as it is. A thread stopped in the stub is as at the site
+  (`jit::x18_branch_to_guest`); the stub's last word, never run, branches
+  back past the site, so `rewrite::site_of` and `prepare::original` tell
+  the site as for any stub.
 - **Guest state:** each translated word records what it stands for
   (`Word`: the guest instruction, with `x16` and `x17` saved or not or
   on their way into their slots, a point inside an expansion before or
@@ -499,6 +508,7 @@ a processor that reports `DIC` clear.
 | a return | a lookup in the table of returns, about seven instructions, and a `ret` the processor predicts; a return the table does not hold looks its target up as an indirect branch does | each time |
 | an indirect branch | an inline look in the near table, about ten instructions, and a save of `x16` and `x17` where the code before it named them; not there, the table's, out of line | each time; a miss in both goes through the exit gate |
 | a call or branch from native code into JIT code | a fault, then a table lookup in the site's stub (a target not translated yet: a call through the exit gate) | a fault once per call site, then linked (a branch no call leads to: followed) |
+| a `br x18` in code that runs as it is | a call through the exit gate, then the function translated | each time the function is entered there from code not translated |
 | `ic ivau` | a call through the gate | each cache line the program flushes |
 | anything else the program writes | nothing | |
 

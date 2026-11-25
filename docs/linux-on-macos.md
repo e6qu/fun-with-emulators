@@ -573,6 +573,15 @@ for the stub's push). `casp` with `x18` in a pair, a load or store of
 `x18` written back onto `sp`, and `sp` written from `x18` have stubs of
 their own.
 
+A branch through `x18` needs another register to branch through. A
+call, a return or a tail call (`blr`, `ret`, the authenticated forms)
+goes through `x16` or `x17`, which the procedure call standard leaves
+free there. A plain `br x18` is how clang ends a jump table where `x18`
+is free, as on Linux: the case it leads to can read `x16` and `x17`
+(V8's tables keep their base in `x16`), so its stub saves them and goes
+into fwe, which goes on at the guest's `x18` by translation, back to
+native code when the function returns ([jit.md](jit.md)).
+
 The stub's pushes go through `sp`, which the hardware checks for 16-byte
 alignment (Linux and macOS both turn the check on). Linux programs can
 keep `sp` off alignment while they address memory through other

@@ -128,6 +128,11 @@ fn note_site(at: u64, site: Site) {
     SITES.lock().unwrap_or_else(|e| e.into_inner()).insert(at, site);
 }
 
+/// What the site at `at` stood for, if it was given a stub.
+pub fn site_at(at: u64) -> Option<Site> {
+    SITES.lock().unwrap_or_else(|e| e.into_inner()).get(&at).copied()
+}
+
 /// Call sites made a `bl` to a call stub ([`call_stub`]), by address: the
 /// word the program wrote there.
 static CALL_SITES: std::sync::Mutex<std::collections::BTreeMap<u64, u32>> =
