@@ -124,13 +124,13 @@ pub struct Caps {
     pub securebits: u32,
 }
 
-/// What fwe's processes may hold in the initial user namespace: every
+/// What fwe's processes can hold in the initial user namespace: every
 /// capability but `CAP_SYS_TIME`, as in a container, since the host's
 /// clock is not fwe's to set.
 pub const INITIAL: u64 = ALL & !(1 << CAP_SYS_TIME);
 
 impl Default for Caps {
-    /// Root's: every capability it may have ([`INITIAL`]), nothing
+    /// Root's: every capability it can have ([`INITIAL`]), nothing
     /// inheritable or ambient.
     fn default() -> Self {
         Caps {
@@ -159,7 +159,7 @@ impl Caps {
     pub fn set(&mut self, effective: u64, permitted: u64, inheritable: u64) -> Result<(), i32> {
         let (effective, permitted, inheritable) =
             (effective & ALL, permitted & ALL, inheritable & ALL);
-        // The inheritable set may only grow within what is permitted, or the
+        // The inheritable set can only grow within what is permitted, or the
         // bounding set with CAP_SETPCAP.
         let inh_limit = if self.has(CAP_SETPCAP) {
             self.inheritable | self.bounding

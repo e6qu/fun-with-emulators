@@ -5,7 +5,7 @@
 //! shared side, alongside the same calls of other threads
 //! ([`Kernel::dispatch_shared`] lists them). Any other call takes the lock
 //! for itself: one that changes that state, or that changes several of
-//! the kernel's registries that must change together (a descriptor and
+//! the kernel's registries that need to change together (a descriptor and
 //! what fwe keeps for it, a mapping and its records). The calls that wait
 //! run without the lock ([`crate::blocking_syscall`]) and take its shared
 //! side to finish, unless a signal is to be delivered.
@@ -22,7 +22,7 @@
 //! that just let it go). Shared sections are short (no call on this side
 //! waits), so a writer spins. A host `fork` is made holding the lock for
 //! writing; the child clears the counters and the count of waiting
-//! readers, which may hold readers of other threads stepping back
+//! readers, which might hold readers of other threads stepping back
 //! ([`KernelLock::forked_child`]), and lets the mutex go as any other.
 
 use crate::{Kernel, Platform, Regs, thread};
@@ -126,7 +126,7 @@ impl<T> Lock<T> {
         }
     }
 
-    /// The value, for this thread alone. The thread must hold no [`Shared`]
+    /// The value, for this thread alone. The thread MUST NOT hold a [`Shared`]
     /// of this lock.
     #[cfg_attr(
         target_os = "macos",
@@ -156,7 +156,7 @@ impl<T> Lock<T> {
             }
         };
         self.writing.store(true, SeqCst);
-        // Only the counters given out may count readers: a thread given one
+        // Only the counters given out can count readers: a thread given one
         // after this look finds `writing` set, and steps back (the given
         // count, the counter and the flag are all sequentially consistent).
         let given = NEXT_SHARD.load(SeqCst).min(SHARDS);
@@ -174,8 +174,8 @@ impl<T> Lock<T> {
         Exclusive { lock: self, _writers: writers }
     }
 
-    /// The value, shared with other threads' readers. The thread must hold
-    /// no other [`Shared`] or [`Exclusive`] of this lock: a writer waiting
+    /// The value, shared with other threads' readers. The thread MUST NOT hold
+    /// another [`Shared`] or [`Exclusive`] of this lock: a writer waiting
     /// between the two would wait for it.
     #[cfg_attr(
         target_os = "macos",
@@ -222,7 +222,7 @@ impl<T> Lock<T> {
 
 impl<P: Platform> KernelLock<P> {
     /// Run the system call named in `regs` as [`Kernel::enter_syscall`]
-    /// does: on the shared side if it is one that may, else exclusively.
+    /// does: on the shared side if it is one that can, else exclusively.
     #[cfg_attr(
         target_os = "macos",
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -242,7 +242,7 @@ impl<P: Platform> KernelLock<P> {
 
     /// Run call `nr` with `args` (already translated for the host) and
     /// return its raw result, as [`Kernel::run_call`] does: shared if it
-    /// may be.
+    /// can be.
     pub fn run_call(&self, nr: u64, args: [u64; 6]) -> i64 {
         if crate::syscalls::shares(nr)
             && let Some(r) = self.shared().as_ref().and_then(|k| k.dispatch_shared(nr, args))

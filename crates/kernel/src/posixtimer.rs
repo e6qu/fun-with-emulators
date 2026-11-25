@@ -14,14 +14,14 @@
 //! timers, and `execve` deletes them.
 //!
 //! What a taken signal needs ([`delivered`]) is kept in atomics: a signal
-//! may be taken in a host signal handler.
+//! can be taken in a host signal handler.
 
 use crate::uaccess;
 use fwe_abi::{err, errno};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
-/// Timers a process may have.
+/// Timers a process can have.
 const MAX: usize = 1024;
 const NS: u64 = 1_000_000_000;
 
@@ -190,7 +190,7 @@ fn run(r: i32) {
 }
 
 /// Raise the signals of the timers that are due: how long until the next
-/// one may be, if any is armed.
+/// one can be, if any is armed.
 fn tick() -> Option<u64> {
     let notes = notify().clone();
     let mut wait: Option<u64> = None;

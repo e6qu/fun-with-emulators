@@ -1,5 +1,5 @@
-//! Permission bits that deny a file's owner, which the host must not
-//! enforce.
+//! Permission bits that deny a file's owner, which fwe keeps from the host so
+//! that it does not enforce them.
 //!
 //! Every guest file is the host user's, so the host checks the owner's
 //! bits on every access; Linux's root passes them (`CAP_DAC_OVERRIDE`), and
@@ -43,13 +43,13 @@ const NODUMP_ATTR: &CStr = c"org.fwe.nodump";
 #[cfg(target_os = "macos")]
 const NOATIME_ATTR: &CStr = c"org.fwe.noatime";
 
-/// What the host's mode must have of guest mode `perm` (its low 12 bits)
+/// What the host's mode needs of guest mode `perm` (its low 12 bits)
 /// for a directory (`dir`) or another file: the owner's read and write,
-/// and search for a directory or execute for a file anyone may run. A
+/// and search for a directory or execute for a file anyone can run. A
 /// file's set-ID bits are never the host's (it drops them from a file of a
 /// group its user is not in, and on any write): they are kept.
 pub fn host_perm(perm: u32, dir: bool) -> u32 {
-    // Execute for anyone is the owner's too: root may run what anyone may.
+    // Execute for anyone is the owner's too: root can run what anyone can.
     let exec = dir || perm & 0o111 != 0;
     let setid = if dir { 0 } else { 0o6000 };
     perm & 0o7777 & !setid | 0o600 | if exec { 0o100 } else { 0 }
@@ -63,7 +63,7 @@ pub fn made_file_perm(perm: u32) -> u32 {
     if p & 0o7000 == 0 && (p & 0o111 == 0 || p & 0o100 != 0) { p } else { host_perm(perm, false) }
 }
 
-/// Set-ID files this process may write (opened to write, or made set-ID
+/// Set-ID files this process can write (opened to write, or made set-ID
 /// while open), by host identity (device, inode): a write to one through
 /// any descriptor, by a caller without `CAP_FSETID`, takes the bits away,
 /// as Linux's does ([`wrote`]).
@@ -83,7 +83,7 @@ fn setid_files() -> std::sync::MutexGuard<'static, Vec<(u64, u64)>> {
     SETID_FILES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// Whether a set-ID file, or one with file capabilities, may be written
+/// Whether a set-ID file, or one with file capabilities, can be written
 /// by this process.
 pub fn setid_open() -> bool {
     SETID_OPEN.load(Ordering::Acquire) != 0 || CAPS_OPEN.load(Ordering::Acquire) != 0
@@ -133,7 +133,7 @@ pub fn opened_for_writing(fd: i32, st: &libc::stat) {
 }
 
 /// The mode `perm` loses by a write of a caller without `CAP_FSETID`: the
-/// set-user-ID bit, and the set-group-ID bit if its group may execute it.
+/// set-user-ID bit, and the set-group-ID bit if its group can execute it.
 pub fn written_perm(perm: u32) -> u32 {
     let mut kept = perm & !0o4000;
     if kept & 0o2010 == 0o2010 {
@@ -466,7 +466,7 @@ pub fn apply(st: &mut libc::stat, perm: u32) {
 }
 
 /// Give the file open as `fd` the guest mode `perm`: on the host, `perm`
-/// with what the owner must have, the rest kept.
+/// with what the owner needs, the rest kept.
 pub fn keep_fd(fd: i32, perm: u32) -> Result<(), i32> {
     let st = fstat(fd)?;
     if st.st_mode & libc::S_IFMT == libc::S_IFSOCK {
@@ -715,7 +715,7 @@ mod tests {
     use std::os::fd::AsRawFd;
 
     /// A write takes set-user-ID away, and set-group-ID where the group
-    /// may run the file (else it marks mandatory locking, kept).
+    /// can run the file (else it marks mandatory locking, kept).
     #[test]
     fn a_write_takes_set_id_bits_away() {
         assert_eq!(written_perm(0o6775), 0o775);

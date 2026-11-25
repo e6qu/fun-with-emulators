@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicU8, Ordering::*};
 const EMPTY: u8 = 0;
 /// A value kept, to read.
 const FULL: u8 = 1;
-/// A thread is writing or reading the value: no other may.
+/// A thread is writing or reading the value: no other can.
 const BUSY: u8 = 2;
 
 /// A value kept apart ([`Deferred::put`]), if any. Each thread that uses

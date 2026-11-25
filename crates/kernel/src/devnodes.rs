@@ -51,7 +51,7 @@ impl Node {
     }
 }
 
-/// Whether the host `stat` says the file may be one of fwe's nodes.
+/// Whether the host `stat` says the file might be one of fwe's nodes.
 pub fn marked(st: &libc::stat) -> bool {
     #[cfg(target_os = "macos")]
     {

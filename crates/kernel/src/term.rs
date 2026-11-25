@@ -11,7 +11,7 @@
 /// `TCGETS`: read terminal attributes into the guest `termios` at `arg`.
 ///
 /// # Safety
-/// `arg` must point to a writable Linux `termios`.
+/// `arg` MUST point to a writable Linux `termios`.
 pub unsafe fn tcgetattr(fd: i32, arg: u64) -> i64 {
     #[cfg(target_os = "linux")]
     // SAFETY: guest and host `termios` share a layout; the host validates arg.
@@ -46,7 +46,7 @@ pub unsafe fn tcgeta(fd: i32, arg: u64) -> i64 {
 /// `termios` at `arg`.
 ///
 /// # Safety
-/// `arg` must point to a readable Linux `termios`.
+/// `arg` MUST point to a readable Linux `termios`.
 pub unsafe fn tcsetattr(fd: i32, action: u64, arg: u64) -> i64 {
     #[cfg(target_os = "linux")]
     // SAFETY: guest and host `termios` share a layout; the host validates arg.

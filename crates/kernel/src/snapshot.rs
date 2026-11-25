@@ -228,7 +228,7 @@ pub(crate) fn cloexec(fd: i32) -> bool {
     f >= 0 && f & libc::FD_CLOEXEC != 0
 }
 
-/// Put a fresh kqueue at descriptor `fd`, which must be free: a fork child's
+/// Put a fresh kqueue at descriptor `fd`, which MUST be free: a fork child's
 /// stand-in for a kqueue the host did not pass on.
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn fresh_kqueue_at(fd: i32, cloexec: bool) -> bool {

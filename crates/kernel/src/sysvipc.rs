@@ -8,7 +8,7 @@
 //! a host shared memory object named for the segment ([`segment_name`]),
 //! which `shmat` maps shared. Every operation is
 //! one change of the record, under its lock, so a semaphore operation or a
-//! message is all or nothing across processes; an operation that must wait
+//! message is all or nothing across processes; an operation that needs to wait
 //! (a semaphore that would go below zero, a full or empty queue) waits for
 //! the record to change and tries again.
 //!
@@ -291,7 +291,7 @@ struct Index {
     holders: BTreeSet<(u8, i32)>,
 }
 
-/// An [`Index`] that reading data may bring up to date.
+/// An [`Index`] that reading data can bring up to date.
 #[derive(Debug, Default)]
 struct Lazy(Mutex<Index>);
 
@@ -400,7 +400,7 @@ impl Ipc {
     }
 
     /// `fs.mqueue.*`: the most queues, the largest `mq_maxmsg` and
-    /// `mq_msgsize` an unprivileged creator may ask, and a queue's when it
+    /// `mq_msgsize` an unprivileged creator can ask, and a queue's when it
     /// asks none.
     pub fn mq_tunable(&self, name: &str) -> i64 {
         use fwe_abi::mqueue as mq;
@@ -1243,7 +1243,7 @@ pub fn owner() -> Vec<u8> {
     current().map_or_else(Vec::new, |r| crate::ns::owner_dir(r.dir()))
 }
 
-/// Whether `creds` may access an object with permission `perm` for `want`
+/// Whether `creds` can access an object with permission `perm` for `want`
 /// (`4` read, `2` write, both `6`): with `CAP_IPC_OWNER` in the user
 /// namespace owning the IPC namespace, or by the owner's, the group's or
 /// others' bits, as `ipcperms` checks.
@@ -1261,7 +1261,7 @@ pub fn permits(creds: &crate::creds::Creds, perm: &Perm, want: u32) -> bool {
     (perm.mode >> shift) & want == want || creds.has_in(&owner(), crate::caps::CAP_IPC_OWNER)
 }
 
-/// Whether `creds` may change or remove an object (`IPC_SET`,
+/// Whether `creds` can change or remove an object (`IPC_SET`,
 /// `IPC_RMID`): its owner or creator, or with `CAP_SYS_ADMIN` in the user
 /// namespace owning the IPC namespace.
 pub fn owns(creds: &crate::creds::Creds, perm: &Perm) -> bool {
@@ -1370,7 +1370,7 @@ pub fn note_detached(addr: u64) {
     ATTACHED.lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
 }
 
-/// Count `n` more attachments of segment `id` for process `p` (`n` may be
+/// Count `n` more attachments of segment `id` for process `p` (`n` can be
 /// negative).
 pub fn attach_count(t: &mut Ipc, id: i32, p: Proc, n: i64) {
     if let Some(Obj { body: Body::Shm(s), .. }) = t.objs.get_mut(&(Kind::Shm as u8, id)) {

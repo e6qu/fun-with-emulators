@@ -34,7 +34,7 @@ impl HostPid {
     /// `fork`).
     ///
     /// # Safety
-    /// `pid` must be above 0.
+    /// `pid` MUST be above 0.
     #[inline]
     pub const unsafe fn new_unchecked(pid: libc::pid_t) -> HostPid {
         // SAFETY: above 0, so not 0, as the caller promises.
@@ -89,7 +89,7 @@ impl Tid {
 }
 
 /// A Linux signal: one of 1 to 64 ([`fwe_abi::signal::NSIG`]). A number
-/// outside them (a `clone`'s exit signal may be any up to 255) has none.
+/// outside them (a `clone`'s exit signal can be any up to 255) has none.
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct LinuxSig(NonZeroU8);

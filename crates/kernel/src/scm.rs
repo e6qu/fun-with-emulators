@@ -84,10 +84,10 @@ pub struct Outgoing {
 }
 
 /// Read a guest control buffer as Linux's `__scm_send` does: each
-/// message's length must fit (`EINVAL`); messages of other levels are
+/// message's length needs to fit (`EINVAL`); messages of other levels are
 /// passed over; at `SOL_SOCKET`, `SCM_RIGHTS` adds descriptors (each open,
 /// `EBADF`; at most [`SCM_MAX_FD`] in all, `EINVAL`), `SCM_CREDENTIALS`
-/// must be a whole `ucred`, and any other type is `EINVAL`.
+/// needs to be a whole `ucred`, and any other type is `EINVAL`.
 pub fn parse(ctl: &[u8]) -> Result<Outgoing, i32> {
     let mut out = Outgoing::default();
     let word32 = |o: usize| i32::from_ne_bytes(ctl[o..o + 4].try_into().unwrap());
@@ -568,7 +568,7 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
     close_all(fds.drain(kept..));
     for (i, &fd) in fds.iter().enumerate() {
         crate::net::fresh(fd);
-        // A socket of a namespace may be a SOCK_SEQPACKET or ping one too.
+        // A socket of a namespace can be a SOCK_SEQPACKET or ping one too.
         if !taken[i] || crate::netns::of(fd).is_some() {
             crate::net::adopt(fd);
         }
@@ -641,7 +641,7 @@ fn put_cmsg(out: &mut Vec<u8>, cap: usize, ty: i32, data: &[u8]) -> bool {
 
 /// Check credentials `[pid, uid, gid]` a sender gives (in its pid and user
 /// namespaces) as Linux's `scm_check_creds` does: ids its namespace does
-/// not map are `EINVAL`; the pid must be its own unless it has
+/// not map are `EINVAL`; the pid needs to be its own unless it has
 /// `CAP_SYS_ADMIN`, the user id its real, effective or saved one unless it
 /// has `CAP_SETUID`, the group id likewise with `CAP_SETGID` (`EPERM`); a
 /// pid no process has is `ESRCH`. Returns them as they travel.

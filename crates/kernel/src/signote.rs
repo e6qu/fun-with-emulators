@@ -9,7 +9,7 @@
 //! So an fwe process that sends another a signal first leaves a note of
 //! itself in the target's mailbox, in the memory every fwe process maps
 //! ([`crate::procstore::mailbox`], given to the target by its first
-//! sender): a few slots per host signal (several processes may send one at
+//! sender): a few slots per host signal (several processes can send one at
 //! once, which the host merges), each with the sender's pid and user (its
 //! guest real uid, an initial-namespace id, [`crate::creds::real_uid`]), when
 //! it was written, and for a signal that carries more than its sender (one
@@ -56,7 +56,7 @@ pub struct Note {
 }
 /// Host signals are numbered below this.
 const SIGNALS: usize = 32;
-/// Slots for each signal: notes of senders whose signals the host may
+/// Slots for each signal: notes of senders whose signals the host might
 /// have merged, taken one at a time.
 const PER_SIGNAL: usize = 8;
 /// A note older than this is not taken for a signal that came with no
@@ -70,7 +70,7 @@ const FRESH_NS: u64 = 10_000_000_000;
 const SENDER_FRESH_NS: u64 = 60_000_000_000;
 
 /// Learn where the process records are (reply sockets are made beside
-/// them). Called as the process starts, before any handler may need it.
+/// them). Called as the process starts, before any handler needs it.
 pub fn init() {
     if DIR.get().is_none()
         && let Some(d) = crate::procreg::records_dir()
@@ -173,7 +173,7 @@ pub fn note_with(target: HostPid, sig: libc::c_int, code: i32, value: u64, uid: 
 /// 0 any), clear this process's note for host signal `sig`.
 /// Async-signal-safe.
 fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
-    // (A fork child's handler may run before it knows its own pid.)
+    // (A fork child's handler can run before it knows its own pid.)
     let mb = crate::procstore::mailbox(crate::host::pid_now())?;
     let slots = slots(mb, sig)?;
     let now = now_ns();
@@ -223,7 +223,7 @@ fn read_note(sig: libc::c_int, clear_if: Option<i32>) -> Option<(Note, u64)> {
 /// then wakes the target with [`crate::host::WAKE_SIGNAL`], whose handler
 /// takes them all, in the order of their tickets ([`drain`]).
 const QUEUE_AT: usize = NOTES_AT + SIGNALS * PER_SIGNAL * SLOT;
-/// Entries in the queue: as many signals as may wait for a process.
+/// Entries in the queue: as many signals as can wait for a process.
 const QUEUE_LEN: usize = 64;
 const ENTRY: usize = 4;
 
@@ -321,7 +321,7 @@ pub fn park_word() -> &'static AtomicU64 {
 
 /// This process is new (a fork child, or a program fwe starts, not one an
 /// `execve` ran): what an earlier process of its number left of its stops
-/// in a mailbox it may share is not its. Async-signal-safe.
+/// in a mailbox it might share is not its. Async-signal-safe.
 pub fn job_reset() {
     let Some(mb) = crate::procstore::mailbox(crate::host::pid_now()) else { return };
     for i in [STOP_AT, STOP_SEEN_AT, CONT_AT, CONT_SEEN_AT] {
@@ -782,7 +782,7 @@ const SUN_PATH: usize = 104;
 /// The path of process `pid`'s reply socket `token`, NUL-terminated, in
 /// `buf`: `<records>/<pid>.fd<token>`, or where that is too long for a
 /// socket's address, `/tmp/fwe-<uid>-fd/<pid>.fd<token>` (a directory only
-/// the user may use, [`fd_reply_socket`]). Its length. Async-signal-safe.
+/// the user can use, [`fd_reply_socket`]). Its length. Async-signal-safe.
 fn reply_path(pid: i32, token: u64, buf: &mut [u8; SUN_PATH]) -> Option<usize> {
     let dir = DIR.get()?;
     let name = |buf: &mut [u8; SUN_PATH], at: &mut usize| {

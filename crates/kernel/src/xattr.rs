@@ -5,7 +5,7 @@
 //! name always starts with one of Linux's namespaces (`user.`, `trusted.`,
 //! `security.`, `system.`), so it never meets the host's own (`com.apple.`)
 //! or fwe's (`org.fwe.`), and a list shows only those in Linux's
-//! namespaces. Linux's rules decide who may do what:
+//! namespaces. Linux's rules decide who can do what:
 //!
 //! - `user.` attributes are for regular files and directories only, and a
 //!   sticky directory's are changed only by its owner (or with
@@ -184,7 +184,7 @@ pub struct Who {
     /// `CAP_SYS_ADMIN`, and `CAP_SETFCAP`.
     pub admin: bool,
     pub setfcap: bool,
-    /// Whether it may read the file, and write it: by its permission
+    /// Whether it can read the file, and write it: by its permission
     /// bits, or passing them.
     pub read_any: bool,
     pub write_any: bool,
@@ -194,12 +194,12 @@ pub struct Who {
 }
 
 impl Who {
-    /// Whether it may do `want` (`R_OK`, `W_OK`) to the file.
+    /// Whether it can do `want` (`R_OK`, `W_OK`) to the file.
     fn bits_allow(&self, want: u32) -> bool {
         if want & 2 != 0 { self.write_any } else { self.read_any }
     }
 
-    /// Whether `name` (in `space`) may be read: `ENODATA` where Linux hides
+    /// Whether `name` (in `space`) can be read: `ENODATA` where Linux hides
     /// it.
     pub fn may_read(&self, space: Space) -> Result<(), i32> {
         match space {
@@ -211,7 +211,7 @@ impl Who {
         }
     }
 
-    /// Whether `name` (in `space`) may be set or removed.
+    /// Whether `name` (in `space`) can be set or removed.
     pub fn may_write(&self, name: &[u8], space: Space) -> Result<(), i32> {
         match space {
             Space::System => Err(errno::EOPNOTSUPP),
@@ -600,7 +600,7 @@ mod tests {
 
     /// A sticky directory's `user.` attributes are changed by its owner
     /// (or with `CAP_FOWNER`) only, whatever its bits allow; read by any
-    /// who may read it (Linux's `xattr_permission`).
+    /// who can read it (Linux's `xattr_permission`).
     #[test]
     fn sticky_directory_attributes_are_the_owners() {
         let tmp = Kind { plain: true, meta: (0o41777, 0, 0) };

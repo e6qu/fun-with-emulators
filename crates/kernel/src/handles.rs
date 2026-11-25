@@ -339,7 +339,7 @@ impl<P: Platform> Kernel<P> {
     /// that same file (no mount over it, under its root). `None` for a file
     /// the caller cannot reach so.
     fn handle_path(&self, anchor: &[u8], fsid: [i32; 2], ino: u64) -> Option<Vec<u8>> {
-        // Its directory's links followed, not the file's own (a handle may
+        // Its directory's links followed, not the file's own (a handle can
         // be of a link).
         let host = path_of(fsid, ino)?;
         let cut = host.iter().rposition(|&b| b == b'/')?;

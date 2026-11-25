@@ -7,7 +7,7 @@
 //! shared [`crate::Kernel`].
 //!
 //! Pending signals are recorded with atomics only, because the backend's
-//! host signal handler records them and may interrupt the thread anywhere.
+//! host signal handler records them and can interrupt the thread anywhere.
 //! Each thread's pending set is also registered by tid so another thread can
 //! direct a signal at it.
 
@@ -49,7 +49,7 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
 /// Also used in a forked child, which starts as a single-threaded process
 /// with no pending signals: the other threads' registrations are dropped.
 ///
-/// A signal that came after the fork, before this (a sender may name the
+/// A signal that came after the fork, before this (a sender can name the
 /// child as soon as the parent's `fork` returns), is kept: the parent's,
 /// which the child does not inherit, are dropped as the fork returns
 /// ([`forked`]).
@@ -764,8 +764,8 @@ const CLAIMED: u64 = 1;
 pub const QUEUE_MAX: usize = 4096;
 
 /// The real-time signals queued behind the one pending of each number, in
-/// every set of the process. Shared, so a set may queue as many as the
-/// process may.
+/// every set of the process. Shared, so a set can queue as many as the
+/// process can.
 static POOL: [Queued; QUEUE_MAX] = [const {
     Queued {
         state: AtomicU64::new(0),
@@ -880,7 +880,7 @@ impl Pending {
 
     /// The oldest signal queued of number `sig`, taken off the queue. Only
     /// the claim of the slot dequeues (a post's, a take's or a
-    /// promotion's), but posts queue as the pool is looked over: one may
+    /// promotion's), but posts queue as the pool is looked over: one can
     /// queue a signal behind the look and then a newer one ahead of it. So
     /// the oldest found is taken once a second look finds none older:
     /// whatever was queued before it is seen by then.
@@ -1003,7 +1003,7 @@ impl Pending {
         if realtime { self.dequeue(sig) } else { None }
     }
 
-    /// Real-time `sig` was queued as the one pending of its number may
+    /// Real-time `sig` was queued as the one pending of its number might
     /// have been taken, its slot emptied: the oldest queued takes the slot.
     /// Async-signal-safe.
     fn promote(&self, sig: u64) {
@@ -1408,7 +1408,7 @@ pub fn process_ending() {
 // --- signals for a named thread, from a handler ------------------------------------
 //
 // A signal another process sends one thread of this one comes through the
-// wake signal's handler ([`crate::signote`]), which must not take the
+// wake signal's handler ([`crate::signote`]), which MUST NOT take the
 // registry's lock: each thread's pending set and host thread are also kept
 // in a table it reads without one, an entry counting its readers so it is
 // not taken away while one reads it.
@@ -1573,7 +1573,7 @@ pub fn post_process(sig: u64, info: SigInfo) {
 
 /// From a thread of fwe's own (the reaper's watcher, the parent-death
 /// watcher): [`post_process`], and every guest thread woken. A wake sent
-/// to the process would reach one thread the host picks, which may block
+/// to the process would reach one thread the host picks, which might block
 /// `sig` and wait on, leaving the one that takes it asleep.
 pub fn post_process_waking(sig: u64, info: SigInfo) {
     if sig == signal::SIGCHLD && crate::trace::file().is_some() {
@@ -1632,7 +1632,7 @@ pub fn host_state(tid: i32) -> Option<(u64, u64, bool)> {
     crate::host::thread_state(host)
 }
 
-/// Whether one more signal may be queued with `extra` more already on
+/// Whether one more signal can be queued with `extra` more already on
 /// their way: fewer are pending in the process, with its POSIX timers'
 /// (each holds one, as Linux allocates it), than `RLIMIT_SIGPENDING`
 /// allows and the pool holds. Linux counts those of the user's processes;
@@ -1643,7 +1643,7 @@ fn room(extra: u64) -> bool {
         && POOL_USED.load(Ordering::Relaxed) + extra < QUEUE_MAX as u64
 }
 
-/// Whether signal `sig` sent with `si_code` `code` may be queued: Linux
+/// Whether signal `sig` sent with `si_code` `code` can be queued: Linux
 /// refuses a real-time one (`EAGAIN`) past `RLIMIT_SIGPENDING`, unless a
 /// `kill` sent it (`SI_USER`), which is merged into the one pending
 /// instead; a standard signal is always taken, one of each number.
@@ -1651,7 +1651,7 @@ pub fn may_queue(sig: u64, code: i32) -> bool {
     sig < signal::SIGRTMIN || code == signal::SI_USER || room(0)
 }
 
-/// Whether a POSIX timer may be made: it holds a signal of the limit's
+/// Whether a POSIX timer can be made: it holds a signal of the limit's
 /// from the start, as Linux allocates it then.
 pub fn may_add_timer() -> bool {
     room(0)
@@ -1659,7 +1659,7 @@ pub fn may_add_timer() -> bool {
 
 /// In the wake handler, for signal `sig` with `code` another process
 /// queued in the mailbox, `taken` taken in this drain already: whether it
-/// may be taken now ([`may_queue`]). One that may not stays in the
+/// can be taken now ([`may_queue`]). One that cannot stays in the
 /// mailbox, and is taken once a signal pending is ([`uncount`]): the
 /// sender found room in the mailbox, so it is not lost. Async-signal-safe.
 pub fn admits(sig: u64, code: i32, taken: u64) -> bool {

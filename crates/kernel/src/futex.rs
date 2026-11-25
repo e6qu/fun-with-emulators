@@ -6,7 +6,7 @@
 //! is the process's: its wait queues live here, outside the kernel lock,
 //! and operate only on raw guest memory (the futex word) and their own
 //! synchronization. A shared one, as Linux keys it by the memory itself,
-//! may be woken from another process that maps the same memory (a
+//! can be woken from another process that maps the same memory (a
 //! process-shared lock, condition or semaphore, in `/dev/shm` or a
 //! `MAP_SHARED` mapping): it waits on the host's own shared address waits
 //! ([`shared`]), which key on the memory too. A backend runs a futex
@@ -94,7 +94,7 @@ impl Park {
 
     /// Wake its thread if it sleeps on its word, once [`Park::mark`]ed:
     /// with the queues let go, as the host's wake is a system call that
-    /// may switch to the thread woken, and every futex call waits for the
+    /// can switch to the thread woken, and every futex call waits for the
     /// queues. (A thread that left its wait meanwhile is woken by none:
     /// the word is the park's, alive while it is held.)
     fn rouse(&self) {
@@ -145,11 +145,11 @@ pub(crate) fn load(uaddr: u64) -> crate::uaccess::Result<u32> {
     crate::uaccess::read(uaddr)
 }
 
-/// Run a `futex` operation. Returns the raw Linux result. Must be called
+/// Run a `futex` operation. Returns the raw Linux result. MUST be called
 /// without the kernel lock held, because `FUTEX_WAIT` blocks.
 ///
 /// # Safety
-/// `uaddr` (and `timeout`, when non-null) must point to valid guest memory.
+/// `uaddr` (and `timeout`, when non-null) MUST point to valid guest memory.
 pub unsafe fn op(uaddr: u64, op: u64, val: u32, timeout: u64) -> i64 {
     if !uaddr.is_multiple_of(4) {
         return err(errno::EINVAL);
@@ -455,7 +455,7 @@ impl Held {
 /// `futex_waitv(waiters, nr, flags, timeout, clockid)`: wait on every
 /// futex of `waiters` at once (while each word holds its value), until a
 /// wake of any of them, whose index is the result, or the absolute
-/// `timeout` on `clockid`. Must be called without the kernel lock held.
+/// `timeout` on `clockid`. MUST be called without the kernel lock held.
 ///
 /// # Safety
 /// The guest pointers are checked as they are read.
@@ -623,7 +623,7 @@ fn owner_died(uaddr: u64, tid: i32, pi: bool, pending: bool) {
     let Ok(mut word) = read::<u32>(uaddr) else { return };
     loop {
         // A lock being taken when the thread ended, its word still 0: a
-        // waiter may have been about to be woken for it.
+        // waiter might have been about to be woken for it.
         if pending && !pi && word == 0 {
             wake_any(uaddr, 1);
             return;
@@ -744,8 +744,8 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
         if me.woken.load(Ordering::SeqCst) {
             return 0;
         }
-        // The word changed under it: a wake it was not counted in may be
-        // on its way (a waiter may always wake spuriously, and its caller
+        // The word changed under it: a wake it was not counted in might be
+        // on its way (a waiter can always wake spuriously, and its caller
         // looks at the word again), so it leaves rather than risk missing
         // one sent under another name for the word.
         if load(uaddr) != Ok(val) {
@@ -753,7 +753,7 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
             return 0;
         }
         // A condition variable is not interrupted by host signals, so wait in
-        // slices and check for a signal the guest should take, which ends the
+        // slices and check for a signal for the guest to take, which ends the
         // wait with EINTR as on Linux.
         if crate::thread::deliverable() != 0 {
             return leave(&mut queues, &me, errno::EINTR);
@@ -805,7 +805,7 @@ pub(crate) fn precise_sleep(d: Duration) {
 type Queues = HashMap<u64, VecDeque<Arc<Waiter>>>;
 
 /// A waiter giving up with `e`: off whichever queue it is on (a requeue
-/// may have moved it), unless a wake claimed it first (then it was woken:
+/// might have moved it), unless a wake claimed it first (then it was woken:
 /// 0).
 fn leave(queues: &mut Queues, me: &Arc<Waiter>, e: i32) -> i64 {
     if me.woken.load(Ordering::SeqCst) {
@@ -839,14 +839,14 @@ fn take(queues: &mut Queues, uaddr: u64, count: u32, bits: u32) -> Vec<Arc<Waite
 }
 
 /// The queue a private futex at `uaddr` is on: its guest address (a
-/// backend may give a call the address it translated, while fwe's own
+/// backend can give a call the address it translated, while fwe's own
 /// wakes, of a thread's `clear_child_tid` word, use the guest's).
 fn key(uaddr: u64) -> u64 {
     crate::uaccess::guest_of(uaddr)
 }
 
 /// A fork child has none of its parent's other threads: their waits are
-/// not its own (a wake must not take them).
+/// not its own (no wake takes them).
 pub fn forked_child() {
     table().lock().clear();
 }
@@ -960,7 +960,7 @@ mod tests {
 
     /// An absolute `FUTEX_WAIT_BITSET` deadline is on CLOCK_MONOTONIC (the
     /// guest's clock for it), not the realtime clock: a deadline a little in
-    /// the future must actually be waited for, not reported expired at once.
+    /// the future is actually waited for, not reported expired at once.
     #[test]
     fn bitset_wait_honours_monotonic_deadline() {
         use fwe_abi::futex::{FUTEX_CLOCK_REALTIME, FUTEX_WAIT_BITSET};

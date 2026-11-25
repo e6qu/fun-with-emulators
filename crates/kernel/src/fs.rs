@@ -945,7 +945,7 @@ impl Fs {
 
     /// Move the root directory descriptor at or above `soft`, a soft
     /// `RLIMIT_NOFILE` about to be set, if it is the process's and below
-    /// it ([`crate::fdtable::root_below`]): the guest may then be given
+    /// it ([`crate::fdtable::root_below`]): the guest can then be given
     /// any number below `soft`. The view published for the socket calls
     /// follows it.
     pub(crate) fn keep_root_above(&mut self, soft: u64) -> Result<(), i32> {
@@ -968,7 +968,7 @@ impl Fs {
     /// ([`crate::threadfs`]), with its own descriptor of the rootfs.
     pub fn copy(&self) -> Result<Fs, i32> {
         // In fwe's own range, out of the guest's reach (a program that
-        // closes or replaces its descriptors must not take the root).
+        // closes or replaces its descriptors cannot take the root).
         let root = crate::fdtable::dup_reserved(self.root.as_raw_fd())?;
         // SAFETY: a fresh descriptor of fwe's, owned by nothing else.
         let root = unsafe { OwnedFd::from_raw_fd(root) };
@@ -2312,9 +2312,9 @@ fn store_here(table: &Table, root_ns: &[u8], fd: i32) -> Result<Option<Here>, i3
     Here::of_store(StoreDir { fs, ino: file.ino }, at).map(Some)
 }
 
-/// Whether the link of status `link` in directory `d` of fwe's store may
+/// Whether the link of status `link` in directory `d` of fwe's store can
 /// be followed by a caller of `fsuid` (`fs.protected_symlinks`): in a
-/// sticky directory others may write, only its owner's or the
+/// sticky directory others can write, only its owner's or the
 /// directory's owner's links (`EACCES`).
 pub(crate) fn may_follow_in_store(
     d: &StoreDir,
@@ -2476,7 +2476,7 @@ pub(crate) fn empty_dir() -> Result<OwnedFd, i32> {
     dup_cloexec(fd)
 }
 
-/// Whether host metadata `st` is of [`empty_dir`], which nothing may
+/// Whether host metadata `st` is of [`empty_dir`], which nothing can
 /// be made in. Its identity is learnt once a process: every change of a
 /// directory asks.
 pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
@@ -2493,10 +2493,10 @@ pub(crate) fn is_empty_dir(st: &libc::stat) -> bool {
     empty.is_some_and(|e| e == id(st))
 }
 
-/// Whether a caller of file-system user `fsuid` may follow the symbolic
+/// Whether a caller of file-system user `fsuid` can follow the symbolic
 /// link `name` in host directory `dir`, the directory open as `parent` as
 /// the guest sees it (an overlay's topmost layer of it), with
-/// `fs.protected_symlinks` on: one in a sticky directory anyone may write
+/// `fs.protected_symlinks` on: one in a sticky directory anyone can write
 /// to only if it is the caller's, or the directory's owner's (`EACCES`).
 /// Linux asks this of a trailing link only, the last name of the path (or
 /// of a trailing link's target), not of one a walk passes through.
@@ -3365,9 +3365,9 @@ fn fwe_device(name: &[u8], node: crate::devnodes::Node) -> Result<Vec<u8>, i32> 
     // SAFETY: a NUL-terminated path in fwe's private directory.
     unsafe { libc::mkdir(d.as_ptr(), 0o755) };
     let fd = open_host_dir(&dir)?;
-    // Linux's modes: anyone may use /dev/full, only root and the disk
+    // Linux's modes: anyone can use /dev/full, only root and the disk
     // group a disk.
-    // Anyone may use the GPU, as a Linux desktop's user may its render node.
+    // Anyone can use the GPU, as a Linux desktop's user can its render node.
     let anyone = node.kind == crate::devnodes::S_IFCHR && node.major == 1
         || crate::vulkan::device::is_node(node);
     let perm = if anyone { 0o666 } else { 0o660 };
@@ -3519,7 +3519,7 @@ pub(crate) fn resolve_host(path: &[u8], follow_final: bool) -> Result<Vec<u8>, i
     let view = published();
     let Some(v) = view.as_ref() else { return Ok(path.to_vec()) };
     let mut r = resolve_in(&v.view(), fcntl::AT_FDCWD as i32, path, follow_final)?;
-    // A bind in an overlay: its directory copied up first, which may be
+    // A bind in an overlay: its directory copied up first, which might be
     // in fwe's store.
     if !follow_final && r.ovl.is_some() {
         r.prepare_bind(v.root_host == b"/")?;
@@ -3584,8 +3584,8 @@ pub(crate) fn forked_child_fifos() {
 }
 
 /// Whether `r` is a FIFO whose open by `flags` [`open_fifo_unlocked`]
-/// waits for: one the caller may open so, by its guest owner and mode
-/// (one it may not is the locked open's to refuse, before it counts as a
+/// waits for: one the caller can open so, by its guest owner and mode
+/// (one it cannot is the locked open's to refuse, before it counts as a
 /// reader or writer). A FIFO is opened to write through a read-only mount
 /// too, and in an overlay's layer as it is.
 fn fifo_to_wait_for(r: &Resolved, flags: u64, host_root: bool) -> bool {
@@ -3756,8 +3756,8 @@ pub(crate) fn reads_only(flags: u64) -> bool {
 /// open takes the descriptor ([`take_fifo`]). Any path is looked at (from
 /// a descriptor too, which the walk starts from as the locked open's
 /// does), and only opens that the locked open would not refuse first: not
-/// one that must make the file (`O_CREAT|O_EXCL`), of a directory, of a
-/// link not to be followed, or of a FIFO the caller may not open so
+/// one that needs to make the file (`O_CREAT|O_EXCL`), of a directory, of a
+/// link not to be followed, or of a FIFO the caller cannot open so
 /// ([`fifo_to_wait_for`]).
 pub(crate) fn open_fifo_unlocked(dirfd: i32, path: u64, flags: u64) -> Result<(), i32> {
     use fwe_abi::fcntl as f;
@@ -4412,7 +4412,7 @@ fn same_file(a: i32, b: i32) -> bool {
 }
 
 /// `dir`, a directory a path was resolved to, moved into fwe's reserved
-/// range: held while the call that resolved it runs, it must not take a
+/// range: held while the call that resolved it runs, it MUST NOT take a
 /// number the guest's next descriptor would (a file that call opens, or
 /// creates, gets the lowest free one, as on Linux). Left where it is if
 /// the range is full.

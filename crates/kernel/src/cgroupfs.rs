@@ -28,7 +28,7 @@
 //! - `cgroup.subtree_control` enables controllers for the children, with
 //!   Linux's rule that a cgroup with processes has none enabled for
 //!   children (the root aside), and its parsing: a controller Linux lacks
-//!   is `EINVAL`, one the cgroup may not use `ENOENT`.
+//!   is `EINVAL`, one the cgroup cannot use `ENOENT`.
 //! - `cgroup.freeze` stops and continues the members of the cgroup and
 //!   those below it, and whoever joins or is forked into a frozen one;
 //!   `cgroup.kill` kills them; `pids.max` limits `fork` and new threads
@@ -130,7 +130,7 @@ pub fn tree_id() -> u64 {
 }
 
 /// The hierarchy, its root's files made on first use: a root directory
-/// root's that only it may change, as Linux makes a hierarchy's root.
+/// root's that only it can change, as Linux makes a hierarchy's root.
 pub fn tree() -> Result<Arc<Fs>, i32> {
     static READY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let f = crate::filestore::fs::lasting(tree_id(), 0o555)?;
@@ -326,7 +326,7 @@ pub fn file_of(fd: i32) -> Option<(Vec<u8>, Vec<u8>)> {
     Some((cgroup_at(file.fs, dir)?, name))
 }
 
-/// The controllers cgroup `cg` may use: all at the root, else those its
+/// The controllers cgroup `cg` can use: all at the root, else those its
 /// parent enables.
 pub fn controllers(cg: &[u8]) -> Vec<String> {
     if cg == b"/" {
@@ -711,7 +711,7 @@ pub fn write(cg: &[u8], name: &[u8], data: &[u8]) -> Result<(), i32> {
 /// Linux's `cgroup_subtree_control_write` reads them: every word `+name`
 /// or `-name` of a controller Linux has (`EINVAL` otherwise, before
 /// anything changes), the last word for a controller winning; enabling
-/// one the cgroup may not use (not in `available`) is `ENOENT`; enabling
+/// one the cgroup cannot use (not in `available`) is `ENOENT`; enabling
 /// what is `enabled` already, or disabling what is not, is nothing.
 fn subtree_changes<'a>(
     text: &'a str,
@@ -764,12 +764,12 @@ fn parse_number(v: &str) -> Option<(Option<u64>, &str)> {
     Some((u64::from_str_radix(&digits[..end], radix).ok(), &digits[end..]))
 }
 
-/// The most `pids.max` may be: Linux's `PIDS_MAX` (`PID_MAX_LIMIT` + 1)
+/// The most `pids.max` can be: Linux's `PIDS_MAX` (`PID_MAX_LIMIT` + 1)
 /// less one.
 const PIDS_MAX: u64 = 4 * 1024 * 1024;
 
 /// A value written to `pids.max`, as Linux's `pids_max_write` takes it:
-/// `max`, or a whole number (an optional sign, then base 0, nothing
+/// `max`, or a whole number (a sign if any, then base 0, nothing
 /// after) from 0 to `PIDS_MAX`; `EINVAL` otherwise (`ERANGE` past 64
 /// bits). The value as the file keeps it.
 fn pids_max(v: &str) -> Result<String, i32> {
@@ -794,7 +794,7 @@ fn pids_max(v: &str) -> Result<String, i32> {
 
 /// A value written to a memory limit (`memory.max` and the like), as
 /// Linux's `page_counter_memparse` takes it: `max`, or a size (base 0,
-/// then an optional `K`, `M`, `G`, `T`, `P` or `E`, in either case, and
+/// then a `K`, `M`, `G`, `T`, `P` or `E` if any, in either case, and
 /// nothing after; `EINVAL` otherwise), kept in whole pages, so the file
 /// reads it rounded down to a page.
 fn memory_limit(v: &str) -> Result<String, i32> {
@@ -824,7 +824,7 @@ fn memory_limit(v: &str) -> Result<String, i32> {
     Ok((pages * 4096).to_string())
 }
 
-/// Whether a process may join cgroup `cg`: not one that enables
+/// Whether a process can join cgroup `cg`: not one that enables
 /// controllers for its children, but at the root (`EBUSY`).
 pub fn may_join(cg: &[u8]) -> Result<(), i32> {
     if cg != b"/" && !read_words(cg, b"cgroup.subtree_control").is_empty() {
@@ -941,7 +941,7 @@ fn looked() -> (bool, bool) {
     (LIMITED.load(Ordering::Acquire), FROZEN.load(Ordering::Acquire))
 }
 
-/// Whether a child may start in cgroup `cg` (this process's own if
+/// Whether a child can start in cgroup `cg` (this process's own if
 /// `None`): within the `pids.max` of it and those above it (`EAGAIN`
 /// otherwise); and whether it starts frozen.
 pub fn fork_checks(cg: Option<&[u8]>) -> Result<bool, i32> {
@@ -960,7 +960,7 @@ pub fn fork_checks(cg: Option<&[u8]>) -> Result<bool, i32> {
     }
 }
 
-/// This process was just forked: it may be in another cgroup than its
+/// This process was just forked: it might be in another cgroup than its
 /// parent (`CLONE_INTO_CGROUP`), so it looks again.
 pub fn forked() {
     SEEN.store(u64::MAX, std::sync::atomic::Ordering::Release);
@@ -973,7 +973,7 @@ pub fn thread_allowed() -> Result<(), i32> {
     if looked().0 { fork_allowed(&current()) } else { Ok(()) }
 }
 
-/// Whether this process may have one more thread: within `RLIMIT_NPROC`
+/// Whether this process can have one more thread: within `RLIMIT_NPROC`
 /// (the tasks of its real user, unless it is exempt) and the `pids.max`
 /// of its cgroups ([`thread_allowed`]); `EAGAIN` otherwise.
 pub fn task_allowed() -> Result<(), i32> {
@@ -1028,7 +1028,7 @@ fn thread_process(tid: i32) -> Result<crate::ids::HostPid, i32> {
 }
 
 /// The root of the cgroup namespace of the process (or of the thread
-/// that runs a call), which a move must stay inside (`nsdelegate`).
+/// that runs a call), which a move needs to stay inside (`nsdelegate`).
 static NS_ROOT: std::sync::Mutex<Vec<u8>> = std::sync::Mutex::new(Vec::new());
 
 /// The process's cgroup namespace's root is cgroup `root`.
@@ -1041,7 +1041,7 @@ fn ns_root() -> Vec<u8> {
     if r.is_empty() { b"/".to_vec() } else { r }
 }
 
-/// Whether the caller may move a process from cgroup `from` to `to`, as
+/// Whether the caller can move a process from cgroup `from` to `to`, as
 /// Linux's delegation has it: both inside its cgroup namespace (the
 /// hierarchy is mounted `nsdelegate`; `ENOENT` otherwise), and write
 /// access to `cgroup.procs` of the cgroup both are in (`EACCES`).
@@ -1063,7 +1063,7 @@ pub fn may_move(from: &[u8], to: &[u8]) -> Result<(), i32> {
     }
 }
 
-/// Whether a cgroup may be made in cgroup `parent`: within the
+/// Whether a cgroup can be made in cgroup `parent`: within the
 /// `cgroup.max.descendants` and `cgroup.max.depth` of it and every cgroup
 /// above it (`EAGAIN` otherwise).
 pub fn may_make(parent: &[u8]) -> Result<(), i32> {
@@ -1167,9 +1167,9 @@ pub fn find(id: u32) -> Option<Vec<u8>> {
         .flatten()
 }
 
-/// Whether this process may make the device access `access`
+/// Whether this process can make the device access `access`
 /// (`BPF_DEVCG_ACC_*`) to device `major:minor` of type `dev_type`: every
-/// device program attached to its cgroup or one above it must allow it.
+/// device program attached to its cgroup or one above it needs to allow it.
 pub fn device_allowed(access: u32, dev_type: u32, major: u32, minor: u32) -> bool {
     let progs: Vec<Vec<u8>> = in_tree(|t| {
         let mut out = Vec::new();
@@ -1318,7 +1318,7 @@ mod tests {
     }
 
     /// `cgroup.subtree_control` refuses an unknown controller (`EINVAL`)
-    /// and enabling one the cgroup may not use (`ENOENT`) before changing
+    /// and enabling one the cgroup cannot use (`ENOENT`) before changing
     /// anything; disabling what is not enabled is nothing.
     #[test]
     fn subtree_control_words() {

@@ -28,7 +28,7 @@ const IOCB_CMD_PWRITEV: u16 = 8;
 const IOCB_FLAG_RESFD: u32 = 1;
 const IOCB_FLAG_IOPRIO: u32 = 2;
 
-/// `RWF_*` flags a request may carry, and those fwe acts on.
+/// `RWF_*` flags a request can carry, and those fwe acts on.
 const RWF_KNOWN: u32 = 0xff;
 const RWF_DSYNC: u32 = 0x2;
 const RWF_SYNC: u32 = 0x4;
@@ -39,7 +39,7 @@ const RWF_APPEND: u32 = 0x10;
 const IOCB_SIZE: usize = 64;
 const EVENT_SIZE: u64 = 32;
 
-/// The most events a context may ask for (`0x10000000 / sizeof(struct
+/// The most events a context can ask for (`0x10000000 / sizeof(struct
 /// io_event)`).
 const MAX_EVENTS: u64 = 0x1000_0000 / EVENT_SIZE;
 

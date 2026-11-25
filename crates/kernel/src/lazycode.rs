@@ -131,7 +131,7 @@ pub fn forked() {
 static LOW: AtomicU64 = AtomicU64::new(u64::MAX);
 static HIGH: AtomicU64 = AtomicU64::new(0);
 
-/// Whether `[addr, addr + len)` may hold a page owed writes or written.
+/// Whether `[addr, addr + len)` might hold a page owed writes or written.
 fn near(addr: u64, len: u64) -> bool {
     addr.saturating_add(len) > LOW.load(Acquire) && addr < HIGH.load(Acquire)
 }

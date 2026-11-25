@@ -80,7 +80,7 @@ pub struct ForkNs {
     /// For such a child: its record and its view as other processes see
     /// it ([`crate::fs::Fs::shared`]), made before the fork (see
     /// [`crate::procreg::Prepared`]); none while a thread has a view of its
-    /// own, which the child may take.
+    /// own, which the child can take.
     prepared: Option<(crate::procreg::Prepared, Option<Vec<u8>>)>,
     /// The parent wrote that record and view for the child, with the
     /// child's start time, before letting it go on
@@ -248,7 +248,7 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// A call that may change the calling thread's root, working directory
+    /// A call that can change the calling thread's root, working directory
     /// or umask: the threads that share them have them too.
     pub(crate) fn view_call(&mut self, call: impl FnOnce(&mut Self) -> i64) -> i64 {
         let r = call(self);
@@ -362,8 +362,8 @@ impl<P: Platform> Kernel<P> {
             line.0.remove(0);
         }
         // The cgroup it starts in: this process's, or with
-        // `CLONE_INTO_CGROUP` the one the descriptor is of, which must be
-        // a cgroup directory a process may join.
+        // `CLONE_INTO_CGROUP` the one the descriptor is of, which needs to be
+        // a cgroup directory a process can join.
         let cgroup = match a.cgroup {
             None => None,
             Some(fd) => {
@@ -601,7 +601,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(fs) = self.fs_opt() {
             fs.ns.activate();
         }
-        // Its own record too: it may end before the parent writes it.
+        // Its own record too: it might end before the parent writes it.
         // With the mappings it inherited, for other processes'
         // `/proc/<pid>/maps`.
         let prepared =
@@ -634,7 +634,7 @@ impl<P: Platform> Kernel<P> {
             crate::reaper::foster_started(&t.line.0);
         }
         if let Some(cg) = &t.cgroup {
-            // Where it starts, should it look before the parent writes it.
+            // Where it starts, in case it looks before the parent writes it.
             let _ = crate::procreg::set_cgroup(crate::host::pid(), cg);
         }
         if t.clear_sighand {

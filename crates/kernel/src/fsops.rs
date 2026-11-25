@@ -199,7 +199,7 @@ fn ns_stat(ino: u64) -> Stat {
 }
 
 /// A process descriptor of host process `host`, as pidfs shows one: a
-/// file only its owner may use, its inode the process's.
+/// file only its owner can use, its inode the process's.
 fn pidfd_stat(host: i32) -> Stat {
     let mut s = synth_stat(fwe_abi::stat::S_IFREG | 0o700, 0);
     s.st_ino = host as u64;
@@ -914,7 +914,7 @@ impl<P: Platform> Kernel<P> {
                 let fd = unsafe { host::openat(d.dir, &d.name, host_flags, 0) };
                 if fd < 0 {
                     // A missing name on a way with no link, as the walk
-                    // finds; a link, or a refusal root may pass, takes the
+                    // finds; a link, or a refusal root can pass, takes the
                     // whole way.
                     let e = host::last_errno();
                     return matches!(e.raw(), libc::ENOENT | libc::ENOTDIR).then(last_error);
@@ -1023,7 +1023,7 @@ impl<P: Platform> Kernel<P> {
             || flags & fcntl::O_TRUNC != 0
             || flags & fcntl::O_TMPFILE == fcntl::O_TMPFILE;
         if writes || flags & fcntl::O_CREAT != 0 {
-            // A file that exists on a read-only mount may still be opened
+            // A file that exists on a read-only mount can still be opened
             // to read with O_CREAT; a device, FIFO or socket to write as
             // well (Linux refuses only regular files, directories and
             // links), and one in an overlay is not copied up to be.
@@ -1073,7 +1073,7 @@ impl<P: Platform> Kernel<P> {
         let mut host_flags = host::open_flags_to_host(flags);
         if flags & fcntl::O_PATH != 0 {
             // The host has no O_PATH: the file is opened to read, which
-            // must not wait as a FIFO's open does for a writer, nor make a
+            // does not wait as a FIFO's open does for a writer, nor makes a
             // terminal the controlling one. The descriptor only names it.
             host_flags |= libc::O_NONBLOCK | libc::O_NOCTTY;
         }
@@ -1084,7 +1084,7 @@ impl<P: Platform> Kernel<P> {
         let asked = mode as u32;
         let mode = if flags & fcntl::O_CREAT != 0 { self.fs().apply_umask(mode as u32) } else { 0 };
         // An existing file's kept mode, for a caller that does not pass
-        // permission bits; a new one is made with what its owner must have
+        // permission bits; a new one is made with what its owner needs
         // on the host ([`crate::modes`]).
         let existing = resolved_stat(&resolved);
         // A lease on the file this open conflicts with is broken first.
@@ -1517,7 +1517,7 @@ impl<P: Platform> Kernel<P> {
                 Err(e) => err(e),
             };
         }
-        // What the path names must be there (`ENOENT`, `ENOTDIR`).
+        // What the path names needs to be there (`ENOENT`, `ENOTDIR`).
         if let Err(e) = r.name_c().and_then(|n| stat_at(r.dir.as_raw_fd(), &n)) {
             return err(e);
         }
@@ -2014,7 +2014,7 @@ impl<P: Platform> Kernel<P> {
         Ok(LinkKind::Symlink(r.readlink()?))
     }
 
-    /// Whether the caller may follow the symbolic link at `abs` as the
+    /// Whether the caller can follow the symbolic link at `abs` as the
     /// last name of a path, as the ordinary walk asks
     /// (`fs.protected_symlinks`, `EACCES`).
     pub(crate) fn may_follow_trailing(&self, abs: &[u8]) -> Result<(), i32> {
@@ -2143,7 +2143,7 @@ impl<P: Platform> Kernel<P> {
 
     pub(crate) fn sys_chdir(&mut self, path: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
-        // The directory itself must be searchable by the caller.
+        // The directory itself needs to be searchable by the caller.
         if let Ok(r) = self.fs().resolve(fcntl::AT_FDCWD as i32, &path, true)
             && let Ok(st) = resolved_guest_stat(&r)
             && st.st_mode & libc::S_IFMT == libc::S_IFDIR
@@ -2590,9 +2590,9 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// Whether the caller may link to the file `old` names, with
+    /// Whether the caller can link to the file `old` names, with
     /// `fs.protected_hardlinks` on: its owner (or `CAP_FOWNER`), or one who
-    /// may read and write it, a regular file that is not set-user-ID or
+    /// can read and write it, a regular file that is not set-user-ID or
     /// set-group-ID and executable by its group (`EPERM`).
     fn may_hardlink(&self, old: &crate::fs::Resolved) -> Result<(), i32> {
         let name = old.name_c()?;
@@ -2991,7 +2991,7 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Whether the caller may do `want` to the file open as `fd`, by its
+    /// Whether the caller can do `want` to the file open as `fd`, by its
     /// guest metadata.
     fn permitted_fd(&self, fd: i32, want: u32) -> Result<(), i32> {
         let st = stat_fd(fd)?;
@@ -3192,7 +3192,7 @@ impl<P: Platform> Kernel<P> {
         };
         let times_ptr = host_times.as_ref().map_or(std::ptr::null(), |t| t.as_ptr());
         // What the times ask of the caller: to set them to now, the
-        // file's owner or one who may write to it (`EACCES`); to set them
+        // file's owner or one who can write to it (`EACCES`); to set them
         // to a time, its owner (`EPERM`); `CAP_FOWNER` passes both.
         let kinds = host_times.map(|t| t.map(|x| x.tv_nsec));
         let explicit =
@@ -3386,7 +3386,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// [`Self::proc_hidden`] of `fs_path` in a `proc` mount of options
-    /// `options`: a process is hidden from a reader that may not trace it
+    /// `options`: a process is hidden from a reader that cannot trace it
     /// (`PTRACE_MODE_READ_FSCREDS`) and is not in the mount's `gid=`.
     fn hidden_in(&self, options: &[u8], fs_path: &[u8]) -> Option<i32> {
         if !options.windows(7).any(|w| w == b"hidepid" || w == b"subset=") {
@@ -3414,7 +3414,7 @@ impl<P: Platform> Kernel<P> {
 
     /// Whether the caller is refused another process's `/proc/<pid>` file
     /// at `path`: one its `proc` mount hides ([`Self::proc_hidden`]), or
-    /// one that only a reader that may trace it reads
+    /// one that only a reader that can trace it reads
     /// ([`crate::procpid::TRACER_ONLY`]): `EACCES` then.
     pub(crate) fn proc_refused(&self, dirfd: i32, path: &[u8]) -> Option<i32> {
         // A path found ahead under no mount but the root's is not in /proc.
@@ -3440,7 +3440,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// For `/proc/<pid>/oom_score_adj` or `oom_adj` at `path`, what a write
-    /// to it acts on, or why it may not be opened to write (another owner's,
+    /// to it acts on, or why it cannot be opened to write (another owner's,
     /// to a caller without `CAP_DAC_OVERRIDE`).
     fn oom_file(&self, dirfd: i32, path: &[u8]) -> Option<Result<crate::fdmarks::Mark, i32>> {
         let p = self.fs().proc_path(dirfd, path).or_else(|| {
@@ -3492,7 +3492,7 @@ impl<P: Platform> Kernel<P> {
 
     /// For another process's `/proc/<pid>/mem` (or a thread's,
     /// `/proc/<pid>/task/<tid>/mem`) at `path`: the tracee it reaches, as
-    /// ptrace names it, if the caller may (it traces it, or may trace
+    /// ptrace names it, if the caller can (it traces it, or can trace
     /// it); `EACCES` if not.
     fn other_mem(&self, dirfd: i32, path: &[u8]) -> Option<Result<i32, i32>> {
         let a = self.fs().absolute_path(dirfd, path)?;
@@ -3515,7 +3515,7 @@ impl<P: Platform> Kernel<P> {
             _ => host.get(),
         };
         // Only an fwe process's memory can be reached (through its mailbox):
-        // any other is one the caller may not attach to.
+        // any other is one the caller cannot attach to.
         if !crate::host::is_fwe(host) {
             return Some(Err(errno::EACCES));
         }
@@ -3928,10 +3928,10 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// Whether the caller may do `want` (`R_OK`, `W_OK`, `X_OK` bits) to a
+    /// Whether the caller can do `want` (`R_OK`, `W_OK`, `X_OK` bits) to a
     /// file whose guest metadata (owner and mode, [`stat_at`]) is `st`, as
     /// Linux's permission check has it: `CAP_DAC_OVERRIDE` passes all but
-    /// running a file nobody may run, `CAP_DAC_READ_SEARCH` reading and
+    /// running a file nobody can run, `CAP_DAC_READ_SEARCH` reading and
     /// searching; else the owner's, the group's or the others' bits, by the
     /// caller's file-system ids and groups.
     pub(crate) fn permits(&self, st: &libc::stat, want: u32) -> bool {
@@ -4083,9 +4083,9 @@ impl<P: Platform> Kernel<P> {
             || want & !4 == 0 && over(crate::caps::CAP_DAC_READ_SEARCH)
     }
 
-    /// Whether the caller may remove (or rename away, or replace) `name`
+    /// Whether the caller can remove (or rename away, or replace) `name`
     /// in directory `dir`: in a sticky directory, only the file's owner,
-    /// the directory's, or a caller with `CAP_FOWNER` may (`EPERM`), as
+    /// the directory's, or a caller with `CAP_FOWNER` can (`EPERM`), as
     /// Linux restricts deletion. Nothing there passes.
     fn may_remove(&self, dir: i32, name: &CString) -> Result<(), i32> {
         let Ok(d) = stat_fd(dir) else { return Ok(()) };
@@ -4096,7 +4096,7 @@ impl<P: Platform> Kernel<P> {
         self.sticky_allows(&d, &f)
     }
 
-    /// Whether a caller may remove (or rename away, or replace) the file of
+    /// Whether a caller can remove (or rename away, or replace) the file of
     /// guest metadata `f` from a directory of guest metadata `d`: the
     /// sticky bit's restriction ([`Self::may_remove`]).
     fn sticky_allows(&self, d: &libc::stat, f: &libc::stat) -> Result<(), i32> {
@@ -4144,7 +4144,7 @@ impl<P: Platform> Kernel<P> {
     /// ([`crate::modes`]).
     /// [`Self::change_in`] the overlay layer's directory `d` (of what `r`
     /// resolved): a host directory, or one of fwe's store, which the caller
-    /// must be able to write and search.
+    /// needs to be able to write and search.
     fn change_in_layer(&self, r: &Resolved, d: &crate::overlay::LDir, op: impl Fn() -> i64) -> i64 {
         match d {
             crate::overlay::LDir::Host(fd) => self.change_in(fd.as_raw_fd(), op),
@@ -4962,7 +4962,7 @@ fn getdents64(fd: i32, buf: u64, count: usize, hide: &dyn Fn(&[u8]) -> bool) -> 
     // The entries listed so far; each one's `d_off` is the count through it.
     let base = listed_of(fd).unwrap_or(0);
     // A translated record can be up to 4 bytes longer than the host's (they
-    // round to 8 and 4 bytes), so a host buffer of `count` bytes may yield a
+    // round to 8 and 4 bytes), so a host buffer of `count` bytes can yield a
     // little more than fits. When it does, the stream is rewound and re-read
     // with exactly the host bytes that did fit.
     let mut size = count;
@@ -5153,7 +5153,7 @@ fn skip_entries(fd: i32, mut n: u64, hide: &dyn Fn(&[u8]) -> bool) -> Result<(),
             continue;
         }
         // Past the last one in this batch: read again just up to it (the
-        // host may give fewer records than the bytes hold; the loop takes
+        // host can give fewer records than the bytes hold; the loop takes
         // the rest).
         // SAFETY: plain host calls on the guest's directory, a buffer of
         // at least `src` bytes.
@@ -5256,7 +5256,7 @@ fn made_not_dir(r: &crate::fs::Resolved, path: &[u8]) -> Result<(), i32> {
 
 /// For a call that removes or renames the name resolved as `r`
 /// ([`crate::fs::Fs::resolve_entry`]): with a trailing slash (`slash`),
-/// the name must be a directory (not a link to one), else `ENOTDIR`.
+/// the name needs to be a directory (not a link to one), else `ENOTDIR`.
 fn removed_dir_only(r: &crate::fs::Resolved, slash: bool) -> Result<(), i32> {
     if !slash {
         return Ok(());
@@ -6028,7 +6028,7 @@ mod tests {
     /// and mode as `open` does: the real ids by default (without the
     /// capabilities of an effective root), the effective ones with
     /// `AT_EACCESS`; the walk searches as the same ids; root passes all but
-    /// running a file nobody may run, and searches a directory of no
+    /// running a file nobody can run, and searches a directory of no
     /// execute bit.
     #[test]
     fn access_checks_the_guests_ids_as_open_does() {
@@ -6068,7 +6068,7 @@ mod tests {
         k.creds.groups = vec![1000, 0];
         assert_eq!(access(&k, &f, R_OK, 0), 0);
         assert_eq!(access(&k, &f, W_OK, 0), err(errno::EACCES));
-        // A directory the caller may not search hides what is in it.
+        // A directory the caller cannot search hides what is in it.
         assert_eq!(access(&k, &inner, F_OK, 0), err(errno::EACCES));
         // An effective root whose real user is not: the real ids, with no
         // capabilities, unless asked for the effective ones.

@@ -206,7 +206,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `kcmp(pid1, pid2, type, idx1, idx2)`: whether the two processes (or
     /// threads) share a resource: 0 if they do, else 1 or 2 by an order of
-    /// the two that stays the same. Both must be the caller's to read as a
+    /// the two that stays the same. Both need to be the caller's to read as a
     /// tracer would (`EPERM`). A process shares its memory, descriptor
     /// table, filesystem view, handlers, I/O context and semaphore undo
     /// list only with its own threads (a fork child has copies); two
@@ -395,7 +395,7 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             // The console's level (`kernel.printk`'s first): off is the
-            // least it may be, the level before kept for on.
+            // least it can be, the level before kept for on.
             SYSLOG_ACTION_CONSOLE_OFF => {
                 let mut p = printk();
                 if SAVED_LEVEL.load(SeqCst) < 0 {
@@ -639,7 +639,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `rt_sigqueueinfo(tgid, sig, info)`: signal `sig` with the siginfo
-    /// the caller made. To another process it may not claim to be from the
+    /// the caller made. To another process it cannot claim to be from the
     /// kernel or `tkill` (`EPERM`).
     pub(crate) fn sys_rt_sigqueueinfo(&mut self, tgid: u64, s: u64, info: u64) -> i64 {
         self.queue_info(tgid as i32, None, s, info)
@@ -680,7 +680,7 @@ impl<P: Platform> Kernel<P> {
         let Some(host) = owner.or_else(|| crate::pidns::to_host(tgid)) else {
             return err(errno::ESRCH);
         };
-        // As `kill` is: only a process the caller may signal.
+        // As `kill` is: only a process the caller can signal.
         if tgid != me && !self.may_signal(host, s) {
             return err(errno::EPERM);
         }
@@ -804,7 +804,7 @@ fn process_barrier() {
         for i in 0..count as usize {
             let t = *list.add(i);
             if t != me {
-                // The registers that may hold pointers: none are wanted,
+                // The registers that might hold pointers: none are wanted,
                 // only the stop that reading them makes.
                 let (mut sp, mut len) = (0usize, 128usize);
                 let mut values = [0usize; 128];

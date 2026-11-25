@@ -1,5 +1,5 @@
 //! `O_TMPFILE`: a file with no name in a directory, which `linkat` with
-//! `AT_EMPTY_PATH` may give one. The host has no such file, so fwe makes
+//! `AT_EMPTY_PATH` can give one. The host has no such file, so fwe makes
 //! it under a hidden name in the directory (one `getdents` leaves out, and
 //! a link count does not count), and removes the name when the last of
 //! the process's descriptors of it is closed, or the process ends; one
@@ -152,7 +152,7 @@ pub fn clear_hidden(parent: i32, name: &std::ffi::CStr) -> bool {
     if cleared {
         for n in &names {
             // SAFETY: a NUL-terminated name in the directory open as `dir`;
-            // one being made may be a directory.
+            // one being made might be a directory.
             if unsafe { libc::unlinkat(dir, n.as_ptr(), 0) } != 0 {
                 // SAFETY: as above.
                 unsafe { libc::unlinkat(dir, n.as_ptr(), libc::AT_REMOVEDIR) };

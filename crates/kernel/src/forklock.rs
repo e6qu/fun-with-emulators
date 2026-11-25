@@ -1,4 +1,4 @@
-//! The locks a host `fork` must not copy held.
+//! The locks a host `fork` MUST NOT copy held.
 //!
 //! A child of a host `fork` has only the forking thread, and a copy of the
 //! parent's memory: a lock another thread held at that instant stays held

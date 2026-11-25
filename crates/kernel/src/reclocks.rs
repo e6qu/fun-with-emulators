@@ -3,7 +3,7 @@
 //! Record locks are the host's (but those of fwe's own file store's files,
 //! which the store keeps: [`crate::filestore::locks`]), and macOS, as Linux, drops all of a
 //! process's locks on a file when the process closes any descriptor of
-//! it. Linux does so only for the guest's own closes; fwe must never close
+//! it. Linux does so only for the guest's own closes; fwe MUST NOT close
 //! a descriptor of a guest's file it opened for its own ends. Most of fwe
 //! reaches guest files without a descriptor (by path or from their
 //! directory: [`crate::host::at_path`]); the few places that open one
@@ -22,7 +22,7 @@ pub fn taken() {
     }
 }
 
-/// Whether the process may hold a record lock: it has taken one since it
+/// Whether the process might hold a record lock: it has taken one since it
 /// began (a fork child holds none of its parent's).
 pub fn held() -> bool {
     HELD.load(Ordering::Relaxed)
