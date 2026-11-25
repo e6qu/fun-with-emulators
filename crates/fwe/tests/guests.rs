@@ -2276,6 +2276,22 @@ fn unix_socket_credentials_are_the_guests() {
     );
 }
 
+/// A Unix stream socket's connect to a listener whose queue is full, as
+/// Linux answers (macOS refuses it): `EAGAIN` not blocking; waiting while
+/// blocking, until the listener accepts or the send timeout ends
+/// (`EAGAIN`); `ECONNREFUSED` only where nothing listens.
+#[test]
+fn unix_connect_to_a_full_queue_waits() {
+    c_guest_prints(
+        "unixqueue",
+        &[],
+        "a full queue, not blocking: EAGAIN\n\
+         a full queue, with a timeout: EAGAIN, after it\n\
+         a full queue, blocking: connected, once one was accepted\n\
+         no listener: ECONNREFUSED\n",
+    );
+}
+
 /// A TCP socket's urgent data reaches `epoll` as `EPOLLPRI`.
 #[test]
 fn urgent_data_is_epollpri() {

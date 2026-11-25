@@ -1355,6 +1355,16 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
             return err(crate::host::errno_to_linux(e));
         }
         libc::EALREADY | libc::EISCONN if connecting(fd, false) => {}
+        // A Unix stream listener's full queue, which macOS refuses and
+        // Linux waits out.
+        libc::ECONNREFUSED
+            if family(hb) == libc::AF_UNIX
+                && socket_type(fd) == Some(libc::SOCK_STREAM)
+                && node_path(hb, a).is_some_and(|p| listening_at(&p)) =>
+        {
+            connecting(fd, false);
+            return connect_when_room(fd, hb, a);
+        }
         _ => {
             // (A connection under way that failed is told so once.)
             connecting(fd, false);
@@ -1385,6 +1395,160 @@ fn connect_host(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
         return crate::host::last_error();
     }
     if so_error != 0 { err(crate::host::HostErrno::new(so_error).linux()) } else { 0 }
+}
+
+/// Connect Unix stream socket `fd` to `hb`, whose listener's queue was
+/// full, as Linux's connect does: `EAGAIN` for a socket that does not
+/// block; for one that does, the connect made again as the queue gains
+/// room, until it is made, the listener goes (its refusal then told), a
+/// signal comes (`EINTR`) or the socket's send timeout ends (`EAGAIN`).
+fn connect_when_room(fd: i32, hb: &[u8; SOCKADDR_MAX], a: &HostAddr) -> i64 {
+    // SAFETY: plain host call on the guest's socket.
+    if unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK != 0 {
+        return err(errno::EAGAIN);
+    }
+    let mut tv = libc::timeval { tv_sec: 0, tv_usec: 0 };
+    let mut len = size_of::<libc::timeval>() as libc::socklen_t;
+    // SAFETY: a valid out-parameter of its length.
+    let until = (unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_SNDTIMEO, (&raw mut tv).cast(), &mut len)
+    } == 0
+        && (tv.tv_sec, tv.tv_usec) != (0, 0))
+        .then(|| {
+            std::time::Instant::now()
+                + std::time::Duration::new(tv.tv_sec as u64, tv.tv_usec as u32 * 1000)
+        });
+    loop {
+        if crate::thread::deliverable() != 0 {
+            return err(errno::EINTR);
+        }
+        let left = until.map(|u| u.saturating_duration_since(std::time::Instant::now()));
+        if left.is_some_and(|l| l.is_zero()) {
+            return err(errno::EAGAIN);
+        }
+        let nap = left.map_or(ROOM_NAP_NS, |l| (l.as_nanos() as i64).min(ROOM_NAP_NS));
+        crate::thread::nap_ns(nap);
+        if bind_or_connect(fd, hb, a, false) == 0 {
+            return 0;
+        }
+        let e = crate::host::last_errno();
+        if !e.is(libc::ECONNREFUSED) || !node_path(hb, a).is_some_and(|p| listening_at(&p)) {
+            return err(crate::host::errno_to_linux(e));
+        }
+    }
+}
+
+/// How long a connect waiting for room in a listener's queue sleeps
+/// between its tries: macOS tells no one when a queue gains room.
+const ROOM_NAP_NS: i64 = 2_000_000;
+
+/// Socket `fd`'s host type (`SO_TYPE`).
+fn socket_type(fd: i32) -> Option<i32> {
+    let mut ty: libc::c_int = 0;
+    let mut len = size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: a valid out-parameter of its length.
+    (unsafe {
+        libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_TYPE, (&raw mut ty).cast(), &mut len)
+    } == 0)
+        .then_some(ty)
+}
+
+/// Whether a socket listens at host Unix path `path`, as it bound it: what
+/// makes macOS's refusal of a connect to it one of a full queue (XNU's
+/// `unp_connect` refuses with `ECONNREFUSED` both where nothing listens
+/// and where the listener's queue is full). From the host's list of its
+/// Unix stream sockets, which `netstat` reads ([`listener_in`]).
+fn listening_at(path: &[u8]) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        let name = c"net.local.stream.pcblist_n";
+        for _ in 0..4 {
+            let mut len = 0usize;
+            // SAFETY: a size query, no buffer.
+            if unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    std::ptr::null_mut(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            } != 0
+            {
+                return false;
+            }
+            // Room for sockets made between the two calls.
+            len += len / 4;
+            let mut list = vec![0u8; len];
+            // SAFETY: `list` has `len` writable bytes.
+            let r = unsafe {
+                libc::sysctlbyname(
+                    name.as_ptr(),
+                    list.as_mut_ptr().cast(),
+                    &mut len,
+                    std::ptr::null_mut(),
+                    0,
+                )
+            };
+            if r == 0 {
+                list.truncate(len);
+                return listener_in(&list, path);
+            }
+            if !crate::host::last_errno().is(libc::ENOMEM) {
+                return false;
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether host socket list `list` (`net.local.stream.pcblist_n`'s: a
+/// header, then per socket its records, each beginning with its length and
+/// kind and taking a multiple of 8 bytes, then the header again) has a
+/// socket bound at `path` that listens. XNU's `xunpcb_n` (kind
+/// `XSO_UNPCB`) ends with its bound address and its peer's, 256 bytes
+/// each, the address a `sockaddr_un`; the `xsocket_n` after it (kind
+/// `XSO_SOCKET`, packed to 4 bytes) has `so_options` at byte 20.
+#[cfg(any(target_os = "macos", test))]
+fn listener_in(list: &[u8], path: &[u8]) -> bool {
+    const XSO_SOCKET: u32 = 0x001;
+    const XSO_UNPCB: u32 = 0x200;
+    const ADDRESSES: usize = 512;
+    const SO_OPTIONS: usize = 20;
+    const SO_ACCEPTCONN: u32 = 0x2;
+    let word = |at: usize| list.get(at..at + 4).map(|b| u32::from_ne_bytes(b.try_into().unwrap()));
+    let Some(header) = word(0).map(|h| h as usize) else { return false };
+    let end = list.len().saturating_sub(header);
+    let mut at = header;
+    let mut bound_here = false;
+    while at + 8 <= end {
+        let (Some(len), Some(kind)) = (word(at).map(|l| l as usize), word(at + 4)) else { break };
+        if len < 8 || at + len > end {
+            break;
+        }
+        match kind {
+            XSO_UNPCB if len >= ADDRESSES => {
+                // `sun_len`, `sun_family`, then the path to its NUL.
+                let name = &list[at + len - ADDRESSES + 2..at + len - ADDRESSES / 2];
+                let name = &name[..name.iter().position(|&b| b == 0).unwrap_or(name.len())];
+                bound_here = name == path;
+            }
+            XSO_SOCKET if bound_here => {
+                if word(at + SO_OPTIONS).is_some_and(|o| o & SO_ACCEPTCONN != 0) {
+                    return true;
+                }
+                bound_here = false;
+            }
+            _ => {}
+        }
+        at += len.next_multiple_of(8);
+    }
+    false
 }
 
 /// Unix sockets bound (`local`) or connected to a path the host knows only
@@ -3324,6 +3488,57 @@ fn host_peer(fd: i32) -> bool {
 #[allow(clippy::disallowed_methods)] // tests sleep as they like
 mod tests {
     use super::*;
+
+    /// A host socket list as `net.local.stream.pcblist_n` gives it: per
+    /// socket, its `xunpcb_n` (bound to `path`), its `xsocket_n` (with
+    /// `options`) and a record of another kind, between two headers.
+    fn socket_list(sockets: &[(&[u8], u32)]) -> Vec<u8> {
+        let mut list = Vec::new();
+        let header = |list: &mut Vec<u8>| {
+            list.extend(24u32.to_ne_bytes());
+            list.extend((sockets.len() as u32).to_ne_bytes());
+            list.extend([0u8; 16]);
+        };
+        header(&mut list);
+        for (path, options) in sockets {
+            // `xunpcb_n`: 76 bytes of fields, then the two addresses.
+            let mut unpcb = vec![0u8; 76 + 512];
+            unpcb[0..4].copy_from_slice(&(76u32 + 512).to_ne_bytes());
+            unpcb[4..8].copy_from_slice(&0x200u32.to_ne_bytes());
+            unpcb[76] = 2 + path.len() as u8;
+            unpcb[77] = libc::AF_UNIX as u8;
+            unpcb[78..78 + path.len()].copy_from_slice(path);
+            list.extend(&unpcb);
+            list.extend([0u8; 4]);
+            let mut socket = vec![0u8; 104];
+            socket[0..4].copy_from_slice(&104u32.to_ne_bytes());
+            socket[4..8].copy_from_slice(&0x001u32.to_ne_bytes());
+            socket[20..24].copy_from_slice(&options.to_ne_bytes());
+            list.extend(&socket);
+            // A buffer's record (`xsockbuf_n`, `XSO_RCVBUF`), 8-aligned.
+            let mut buffer = vec![0u8; 36];
+            buffer[0..4].copy_from_slice(&36u32.to_ne_bytes());
+            buffer[4..8].copy_from_slice(&0x002u32.to_ne_bytes());
+            list.extend(&buffer);
+            list.extend([0u8; 4]);
+        }
+        header(&mut list);
+        list
+    }
+
+    /// A listener is found by its bound path and `SO_ACCEPTCONN`; a socket
+    /// at the same path that does not listen (one its queue holds, or one
+    /// bound and never listening) is not one, nor is another path.
+    #[test]
+    fn a_listener_is_found_in_the_hosts_socket_list() {
+        let list = socket_list(&[(b"/tmp/a", 0), (b"/tmp/x11/X70", 0x2), (b"/tmp/x11/X70", 0)]);
+        assert!(listener_in(&list, b"/tmp/x11/X70"));
+        assert!(!listener_in(&list, b"/tmp/a"), "bound, not listening");
+        assert!(!listener_in(&list, b"/tmp/x11/X7"), "another path");
+        assert!(!listener_in(&socket_list(&[(b"/tmp/q", 0)]), b"/tmp/q"), "queued only");
+        assert!(!listener_in(&list[..40], b"/tmp/x11/X70"), "cut short");
+        assert!(!listener_in(&[], b"/tmp/x11/X70"));
+    }
 
     fn close(fd: i64) {
         // SAFETY: plain host close of a socket we opened.
