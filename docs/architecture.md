@@ -1,5 +1,11 @@
 # Architecture
 
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" in this document are to be interpreted as described in BCP 14
+[RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)
+when, and only when, they appear in all capitals, as shown here.
+
 ## Summary
 
 fwe is a Linux kernel written as an ordinary macOS program. Each guest
@@ -87,7 +93,7 @@ handler, or the VM's run loop), reads the number and arguments from the
 guest's registers and hands them to the kernel crate
 ([linux-on-macos.md](linux-on-macos.md#system-call-entry)). Seccomp
 filters see the call first. The kernel crate then runs it under its lock
-or, for a call that may block, without it:
+or, for a call that can block, without it:
 
 - **The kernel lock** (`crates/kernel/src/klock.rs`) is a read-write lock
   over the process's kernel state.
@@ -129,7 +135,7 @@ or, for a call that may block, without it:
 
 ### Guest memory access
 
-A bad pointer argument must fail the call with `EFAULT`, not crash fwe.
+A bad pointer argument MUST fail the call with `EFAULT`, not crash fwe.
 Every kernel access to guest memory goes through
 `crates/kernel/src/uaccess.rs` (typed values, strings, string arrays,
 byte ranges):
@@ -247,7 +253,7 @@ The pieces:
     with free space past the latest (in the gaps below, a library's code
     could find no stub region in reach); code mapped without a fixed
     address that still finds none is mapped again where there is room;
-  - a large mapping (64 MiB or more) that may hold code (a file's, an
+  - a large mapping (64 MiB or more) that can hold code (a file's, an
     inaccessible one, as a library's span is reserved before its code is
     mapped over it, or an executable one) is placed with room on both
     sides, since code longer than a branch reaches has sites that reach
@@ -260,7 +266,7 @@ The pieces:
   The stub's slot (each stub has one of `STUB_WORDS` words from its
   region's start) gives the site by its branch back, and the registers it
   pushed before the faulting instruction are read back from the stack.
-- **An `sp` off alignment:** a Linux program may keep `sp` off 16-byte
+- **An `sp` off alignment:** a Linux program can keep `sp` off 16-byte
   alignment while it addresses memory through other registers, and the
   host's alignment check faults any access through such an `sp`.
   - Where the access is fwe's (a stub's or call stub's push or pop, a
@@ -511,7 +517,7 @@ and replace processes, and the per-process state it keeps:
     copy as written.
   - **A process with a VM** refuses the native fork (`ENOSYS`).
   - **Other threads:** those running guest code are suspended
-    (`crates/native/src/quiesce.rs`); one in fwe's code (which may hold
+    (`crates/native/src/quiesce.rs`); one in fwe's code (which might hold
     `malloc`'s lock) runs on and waits before re-entering guest code until
     the fork is done.
   - **The child** goes on only once the parent has unblocked signals, so
@@ -520,7 +526,7 @@ and replace processes, and the per-process state it keeps:
     whose signal mask macOS would not restore.
   - **Signals across it:** every signal but `SIGSEGV`, `SIGBUS` and
     `SIGSYS` is held across the host `fork`. One of those sent to the
-    child before it is set up (it may not know its pid yet, and it forgets
+    child before it is set up (it might not know its pid yet, and it forgets
     its parent's pending signals) is kept and posted once it is
     (`trap::post_early`).
 - **VM fork state** (`Kernel::save_for_fork`,
@@ -579,7 +585,7 @@ and replace processes, and the per-process state it keeps:
     its wake handler sends the descriptor as `SCM_RIGHTS` to a datagram
     socket the caller bound beside the process store (or, where that path
     is too long for a socket address, in `/tmp/fwe-<uid>-fd`, which only
-    the user may use).
+    the user can use).
 - **Priorities, policies and limits** (`crates/kernel/src/sched.rs`,
   `rlimits.rs`) are kept in the record with Linux's checks; how each maps
   to the host is in
@@ -634,7 +640,7 @@ host; fwe adds Linux's thread identity and futexes
   - `futex_waitv` waits on up to 128 at once, private ones in the
     process's queues and shared ones in the shared table, and returns the
     index of the one woken.
-  - Waiters check every 20 ms for a signal they should take, and return
+  - Waiters check every 20 ms for a signal they would take, and return
     `EINTR` for it.
 - **Shared futexes** (`crates/kernel/src/sharedfutex.rs`): waiters are in
   a slot table every fwe process maps, keyed by Mach memory object and
@@ -687,11 +693,11 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   thread otherwise runs under a host mask that blocks only the
   guest-blocked signals the host acts on itself.
 - **A handler that interrupted fwe** only records the signal. That code
-  may be in the host allocator, so nothing there allocates or frees
+  might be in the host allocator, so nothing there allocates or frees
   (`host::NoAllocation` marks it; a debug build's allocator ends the
   process if something does, so the tests find it), and calls that might
   are split from those that cannot (`procstore::mailbox` finds a mailbox,
-  `mailbox_or_make` may make one; `signote::continuing_own` beside
+  `mailbox_or_make` can make one; `signote::continuing_own` beside
   `continuing`).
 - **Guards:** fwe's own stacks (each thread's signal stack, and its gate's
   stack below the gate's block) have an inaccessible `host::GUARD` below
@@ -700,7 +706,7 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
   `host::map_shared_guarded`). A stack that overflows (a handler nested
   without bound, a guest thread's stack made with no guard of its own)
   faults there and its process ends, instead of writing over the mapping
-  beside it, which may be memory every fwe process shares.
+  beside it, which can be memory every fwe process shares.
 - **Parked signals:** a process-wide signal the host holds can sit on a
   thread running fwe's handlers. A native thread entering a system call
   with such a signal parked on it, one the guest catches, takes it off the
@@ -758,7 +764,7 @@ the kernel crate (`crates/kernel/src/signal.rs`, `thread.rs`,
     reports, woken by that `SIGCHLD` (`reaper::take_own_change`); an
     adopter's watcher sees an adopted one's.
   - Only a process whose parent is a living process that is not fwe's
-    (the first of a run, under a shell that must see it stop) stops on the
+    (the first of a run, under a shell that needs to see it stop) stops on the
     host, which then ends the stop at the host's `SIGCONT` alone. macOS's
     own stop can leave a process suspended though shown as running when a
     `SIGCONT` comes as it stops (macOS sets the process stopped before it
@@ -863,7 +869,7 @@ memory or threads, so a tracee does its tracer's work itself:
     instead of `SIGSTOP`, and an `execve` stops it only for the exec
     event. A pending guest `SIGKILL` ends any stop.
 - **Single-stepping** plants fwe's breakpoint (`brk #0x4c59`) wherever the
-  instruction may go next (a branch's target and the next instruction, a
+  instruction can go next (a branch's target and the next instruction, a
   register's address), stops when one is hit, and puts the instructions
   back.
 - **Attaching** makes the target's mailbox and sends it `SIGSTOP` as
@@ -871,8 +877,8 @@ memory or threads, so a tracee does its tracer's work itself:
   fwe's can be traced.
 - **Access** (`Kernel::may_access`, Linux's `__ptrace_may_access`), to
   attach (`ptrace`, `/proc/<pid>/mem`, `process_vm_readv`/`writev`,
-  `pidfd_getfd`) or read (`get_robust_list`, a pidfd's namespaces):
-  - the target's real, effective and saved ids must all be the caller's
+  `pidfd_getfd`) or read (`get_robust_list`, a pidfd's namespaces), takes:
+  - the target's real, effective and saved ids all equal to the caller's
     (its file-system ids for a `/proc` file), the target dumpable, and its
     permitted capabilities within the caller's, each else
     `CAP_SYS_PTRACE` in the target's user namespace;
@@ -886,7 +892,7 @@ memory or threads, so a tracee does its tracer's work itself:
   changed it.
   - Dumpable is set again by `execve` (to 1, or to `fs.suid_dumpable`
     after an exec that changed the ids, gained capabilities or ran a
-    program its caller may not read) and lost to `fs.suid_dumpable` by a
+    program its caller cannot read) and lost to `fs.suid_dumpable` by a
     change of effective or file-system ids.
   - An undumpable process's `/proc/<pid>` files are root's of its user
     namespace. `/proc/<pid>/status` shows `TracerPid` from the mailbox.
@@ -978,7 +984,7 @@ keeping fwe's own descriptors apart and Linux's limits exact
   `fork` copies it all).
 - **The guest never reaches the range:** `close_range(3, ~0)`, closing up
   to the limit and listing `/proc/self/fd` stop below it; a call naming
-  one fails with `EBADF`, as does `dup2` onto one. Root may raise the
+  one fails with `EBADF`, as does `dup2` onto one. Root can raise the
   limit past it, up to `fs.nr_open`, as Linux allows; the guest's
   descriptors stay below it. When the range is full, what needed one fails
   as Linux would (`EMFILE` for an `eventfd`, `ENOMEM` for an `mmap`,
@@ -1075,8 +1081,8 @@ keeping fwe's own descriptors apart and Linux's limits exact
   `CAP_SYS_ADMIN`; `user.` ones are for regular files and directories
   only; writing a `security.` one needs `CAP_SYS_ADMIN`, or `CAP_SETFCAP`
   for `security.capability`.
-  - `security.capability`'s value must be revision 2 or 3 of its size
-    (`EINVAL`). It is kept as revision 3 for the root of a writer's user
+  - A `security.capability` value other than revision 2 or 3 of its size
+    fails with `EINVAL`. It is kept as revision 3 for the root of a writer's user
     namespace of fwe's and read back as the reader's namespace sees it.
   - It goes with a change of owner and with the first write to the file
     (any write call, a truncation, a copy or splice into it, a shared
@@ -1160,7 +1166,7 @@ keeping fwe's own descriptors apart and Linux's limits exact
   the host's user flags of the same meaning, which it enforces; no-dump
   and no-access-time are recorded beside the file (see Modes). Setting the
   first two takes `CAP_LINUX_IMMUTABLE`, and such a file's extended
-  attributes cannot change. An append-only file's times may be set to now
+  attributes cannot change. An append-only file's times can be set to now
   (fwe lifts the flag for the change, which the host would refuse), not to
   a given time. `O_NOATIME` (a descriptor's own; the host has none) leaves
   the access time as a `noatime` mount does.
@@ -1319,7 +1325,7 @@ records ([linux-on-macos.md](linux-on-macos.md#other-ipc-calls) has the
 calls):
 
 - **Changes and waits:** a change is made under the record's lock. A call
-  that must wait sleeps on the record's mapped generation word until
+  that has to wait sleeps on the record's mapped generation word until
   another process changes it. Any change wakes every waiter in the
   namespace; a waiter woken tries its operation on the data read without
   the lock first, and takes the lock only if it can now go on, so a
@@ -1330,7 +1336,7 @@ calls):
 - **System V** (`crates/kernel/src/sysvipc.rs`, `ipcops.rs`): the record
   holds keys, owners, permissions, times, semaphore values and undo
   adjustments, messages, and the namespace's limits (`kernel.shmmax`,
-  `kernel.sem`, `kernel.msgmni`…, which root may change).
+  `kernel.sem`, `kernel.msgmni`…, which root can change).
   - The initial namespace's record is the host boot's: no process names
     it, and the collector keeps it until the host restarts.
   - A fork child counts its parent's attachments; `execve` and exit
@@ -1395,7 +1401,7 @@ Sockets and terminals are the host's; fwe translates their interfaces
   terminal requests in `Kernel::sys_ioctl`, ptys in
   `crates/kernel/src/pty.rs` (mapping in
   [linux-on-macos.md](linux-on-macos.md#terminals-and-key-strokes)). A
-  closed pty master keeps its number mapped, since another process may
+  closed pty master keeps its number mapped, since another process might
   still hold it. fwe tells a slave's hang-up itself, by looking at the
   guest processes' descriptors.
 
@@ -1598,7 +1604,7 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
     remount with `size=` or `nr_inodes=` sets a new one.
   - Its root is its maker's, or `uid=` and `gid=`'s, with `mode=`'s mode.
 - **`proc` options** (`crates/kernel/src/procfs.rs`): `hidepid=` hides
-  another process's `/proc/<pid>` from a reader that may not trace it and
+  another process's `/proc/<pid>` from a reader that cannot trace it and
   is not in the mount's `gid=` (`invisible`, `ptraceable`: not listed,
   `ENOENT`; `noaccess`: listed, nothing in it reached, `EPERM`), checked
   at each open, `stat` and listing; `subset=pid` shows only the processes'
@@ -1727,14 +1733,14 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   stub, not its instruction; code it copies from there runs that branch.
 
 **Processes**
-- A process may hold descriptors below 16384 only: root may raise
+- A process can hold descriptors below 16384 only: root can raise
   `RLIMIT_NOFILE` past it, as Linux allows, but an `open` past the 16384th
   descriptor fails with `EMFILE`.
 - A `vfork` child shares the guest's memory but not its mappings (an
   `mmap`, `munmap` or `mprotect` in it stays in the child).
 - Native: a thread inside fwe's code during a `fork` (in a system call) is
   not stopped, so a write it makes to guest memory then (a `read`
-  completing) may or may not reach the child.
+  completing) might or might not reach the child.
 - A fork child: an epoll or timerfd descriptor duplicated with `dup` is
   gone (only the original number is rebuilt); a timerfd's expiries are
   counted for parent and child apart; the signals moved onto signalfds
@@ -1798,7 +1804,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   of another process cannot be named by its tid (`ESRCH`).
 - A CPU affinity is checked and kept per process (a thread's is its
   process's), but threads run on any CPU: macOS has no affinity a process
-  may set. `getcpu` reports the affinity's first CPU, macOS telling no
+  can set. `getcpu` reports the affinity's first CPU, macOS telling no
   thread the CPU it runs on. A process fwe did not start is reported to
   run on every CPU, and setting its affinity changes nothing.
 - Scheduling policies are per process, not per thread, and do not change
@@ -1818,7 +1824,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   keeps modified pages where Linux restores the file's.
 - Native: `PR_PAC_RESET_KEYS` fails with `EINVAL`: guest code runs with
   the host process's pointer-authentication keys, which macOS sets and no
-  process may change.
+  process can change.
 - Native: a program's main stack is mapped as large as its
   `RLIMIT_STACK` from the start (the host committing pages as they are
   used), so `/proc/<pid>/maps` shows all of it where Linux shows what it
@@ -1829,7 +1835,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   the translations made from it whose words changed, which are made again
   as the code runs ([jit.md](jit.md#what-it-costs)).
 - Native: code changed without a flush (`ic ivau`) keeps running as it
-  was translated, as it may on Linux on a processor whose instruction
+  was translated, as it can on Linux on a processor whose instruction
   cache is kept apart (`CTR_EL0.DIC` clear, as fwe reports); so does code
   another process writes through `/proc/<pid>/mem` other than its
   tracer's ([jit.md](jit.md#code-that-changes)).
@@ -1857,7 +1863,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   translated range fails with `EINVAL` (an `iovec`'s, `recvfrom`'s, a
   datagram socket's `read`), but for `read`, `write`, `pread64` and
   `pwrite64` on a file, pipe or stream, which are cut where the range
-  ends (a shorter count, as Linux may give). `ioctl`'s argument is
+  ends (a shorter count, as Linux can give). `ioctl`'s argument is
   translated but not checked against the guest's mappings. A `MAP_FIXED`
   mapping placed exactly where fwe keeps another translated range's
   memory makes their addresses ambiguous within a call that translated a
@@ -1938,12 +1944,12 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - Mountable filesystems are tmpfs, `proc`, `sysfs`, `cgroup2`, `devpts`,
   `mqueue` and overlays, none on a block device (ext4, XFS: `ENODEV`), so
   a loop device holds bytes but no filesystem to mount.
-- A remount may limit a tmpfs that had no limit, or to less than it uses.
+- A remount can limit a tmpfs that had no limit, or to less than it uses.
 - `proc`'s `hidepid=noaccess` lets another's `/proc/<pid>` directory
   itself be opened, not only `stat`ed; what is in it is refused.
 - A new file does not inherit its directory's no-dump and no-access-time
   flags (`chattr +d`, `+A`), as ext4's and tmpfs's do.
-- A loop device's file must stay at its path while attached;
+- A loop device's file MUST stay at its path while attached;
   `LOOP_CLR_FD` detaches at once even while another process has the
   device open; `LO_FLAGS_AUTOCLEAR` detaches nothing on the last close; a
   device maps only where its start in the file falls on a page.
