@@ -2364,10 +2364,15 @@ impl Fs {
     /// [`resolve_in`]): what a bind mount of it shows.
     pub fn device_host(&self, path: &[u8]) -> Option<Vec<u8>> {
         // Through a descriptor of one (`/proc/self/fd/N`, `/dev/fd/N`), as
-        // crun binds `/dev/null` over the files it masks.
+        // crun binds `/dev/null` over the files it masks; not one of fwe's
+        // that a host file stands in for (`/dev/null` behind a directory of
+        // its `/proc`, which bubblewrap binds through its descriptor).
         if let Some(crate::procfs::Entry::Fd { fd, .. }) =
             self.synthetic(fcntl::AT_FDCWD as i32, path)
         {
+            if stands_in(fd) {
+                return None;
+            }
             return device_of_fd(fd);
         }
         let absolute = self.absolute_path(fcntl::AT_FDCWD as i32, path)?;
@@ -4574,6 +4579,16 @@ fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
 
 /// The host file of the standard device node `fd` is open on, if it is
 /// one of them ([`DEVICES`]): what a bind mount or a clone of it shows.
+/// Whether descriptor `fd` is one of fwe's objects that a host file stands
+/// in for (`/dev/null`, a pipe's end): a directory or file of its `/proc`
+/// or `/sys`, an anonymous inode, a message queue.
+pub fn stands_in(fd: i32) -> bool {
+    crate::synthdir::is_synth(fd)
+        || crate::procfile::is(fd)
+        || crate::anonfd::is(fd)
+        || crate::mqueue::is_queue(fd)
+}
+
 pub fn device_of_fd(fd: i32) -> Option<Vec<u8>> {
     let p = fd_path(fd)?;
     if let Some(name) = p.strip_prefix(b"/dev/") {

@@ -2885,15 +2885,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         // host descriptor (`/dev/null`, a pipe's read end) says nothing of
         // it: ready to read and write, as Linux reports a file with no wait
         // of its own, and not asked the host.
-        let synthetic: Vec<bool> = set
-            .iter()
-            .map(|p| {
-                crate::procfile::is(p.fd)
-                    || crate::synthdir::is_synth(p.fd)
-                    || crate::anonfd::is(p.fd)
-                    || crate::mqueue::is_queue(p.fd)
-            })
-            .collect();
+        let synthetic: Vec<bool> = set.iter().map(|p| crate::fs::stands_in(p.fd)).collect();
         // TCP sockets asked for urgent data, which the host's `poll` does
         // not report: watched while it waits.
         let urgent: Vec<i32> = set

@@ -986,8 +986,12 @@ every process of the namespace sees, and fwe checks the privilege
 | `statfs`, `fstatfs` | Sizes and counts the host's; the type is the mount's (ext4 for the rootfs and its binds) with its flags; a tmpfs reports its size and inodes (by default half the memory, and an inode for every two of its pages) and how many are free, and the cgroup hierarchy cgroup2's type; a pipe, socket or anonymous descriptor reports Linux's pipefs, sockfs or anon-inode magic. | `fstatfs` |
 
 **`mount`**: a bind of a directory or file in the guest's tree is a new
-table entry showing it; a bind of a standard device node fwe serves from
-the host shows that host file. `MS_REMOUNT` keeps the mount's access-time
+table entry showing it, named by its path or through a descriptor of it
+(`/proc/self/fd/N`, as bubblewrap binds `/proc/sys` onto itself); a bind
+of a standard device node fwe serves from the host shows that host file,
+through a descriptor too (crun masks files with `/dev/null`), but never
+the host file that stands in for one of fwe's own (`/dev/null` behind a
+directory of its `/proc`). `MS_REMOUNT` keeps the mount's access-time
 mode unless one is named. A mount made under a shared mount propagates to
 its peers and slaves, in this namespace and others
 (`crates/kernel/src/mounts.rs`).

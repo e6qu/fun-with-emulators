@@ -11362,6 +11362,29 @@ fn credentials_name_each_messages_sender() {
     );
 }
 
+/// Names `/proc/sys` lacks are `ENOENT`, as Linux answers them, once
+/// bubblewrap has bound it onto itself through a descriptor of a fresh
+/// `proc` too (libgcrypt, reading `/proc/sys/crypto/fips_enabled` as it
+/// starts, takes any other error for a fatal one), and `/dev/null` bound
+/// through its descriptor masks a file, as crun masks them.
+#[test]
+fn proc_sys_bound_through_a_descriptor_lacks_what_it_lacks() {
+    // Linux 7.0's output, on arm64.
+    let names = "/proc/sys/crypto/fips_enabled: ENOENT\n\
+                 /proc/sys/nope: ENOENT\n\
+                 /proc/sys/nope/deeper: ENOENT\n\
+                 /proc/sys/kernel/nope: ENOENT\n\
+                 /proc/sys/kernel/ostype: 6 bytes: Linux\n";
+    c_guest_prints(
+        "procsys",
+        &[],
+        &format!(
+            "{names}bound: 0 0 0\n{names}fresh proc, bound through a descriptor: 0 0 0\n\
+             {names}masked: 0\n/proc/sys/kernel/ostype: 0 bytes: \n"
+        ),
+    );
+}
+
 /// `SO_PEERGROUPS` gives the peer's supplementary groups as D-Bus reads
 /// them, and another process's `status` lists its groups.
 #[test]
