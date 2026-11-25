@@ -1119,8 +1119,16 @@ pub mod futex {
     pub const FUTEX_REQUEUE: u64 = 3;
     pub const FUTEX_CMP_REQUEUE: u64 = 4;
     pub const FUTEX_WAKE_OP: u64 = 5;
+    /// The priority-inheritance futexes: a lock whose word holds its
+    /// owner's thread id.
+    pub const FUTEX_LOCK_PI: u64 = 6;
+    pub const FUTEX_UNLOCK_PI: u64 = 7;
+    pub const FUTEX_TRYLOCK_PI: u64 = 8;
     pub const FUTEX_WAIT_BITSET: u64 = 9;
     pub const FUTEX_WAKE_BITSET: u64 = 10;
+    pub const FUTEX_WAIT_REQUEUE_PI: u64 = 11;
+    pub const FUTEX_CMP_REQUEUE_PI: u64 = 12;
+    pub const FUTEX_LOCK_PI2: u64 = 13;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
     pub const FUTEX_CLOCK_REALTIME: u64 = 256;
     pub const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);

@@ -679,6 +679,18 @@ to 128 at once, private ones in the process's queues and shared ones in
 the shared table, and returns the index of the one woken. Waiters check
 every 20 ms for a signal they would take, and return `EINTR` for it.
 
+**Priority-inheritance futexes** (`FUTEX_LOCK_PI`, `LOCK_PI2`,
+`TRYLOCK_PI`, `UNLOCK_PI`): the word holds its owner's thread id. A lock
+takes a word with no owner (`FUTEX_OWNER_DIED` kept), and otherwise marks
+it `FUTEX_WAITERS` and waits in the same queues and table, with its
+thread id and no bits, so no wake takes it. An unlock hands the lock to
+the oldest waiter, writing its thread id with `FUTEX_WAITERS`, as Linux
+does; a shared slot is held while the word changes. A waiter whose owner
+has gone takes the lock (Linux's `exit_pi_state_list`); a lock a signal
+interrupts runs again after the handler, `SA_RESTART` or not
+(`signal::restarts_always`). The host schedules no thread by its
+priority for the guest, so no owner is lent one.
+
 **Shared futexes** (`crates/kernel/src/sharedfutex.rs`): waiters are in
 a slot table every fwe process maps, keyed by Mach memory object and
 offset for shared memory and by process and address for private memory.
@@ -1860,6 +1872,9 @@ mark what holds in one backend only.
   held as they were (their next locker waits rather than getting
   `EOWNERDEAD`) and writes no accounting record. A VM process takes a
   `SIGKILL` from fwe as its own ending, with both.
+- `FUTEX_WAIT_REQUEUE_PI` and `FUTEX_CMP_REQUEUE_PI` fail with `ENOSYS`
+  (glibc's condition variables stopped using them in 2.25, and musl's
+  never did).
 - `kcmp` takes two descriptors of the same file in another process for
   one open file.
 - `PIDFD_GET_INFO` gives a wait status only to the process that reaped

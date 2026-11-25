@@ -1207,8 +1207,9 @@ impl<P: Platform> Kernel<P> {
     /// guest handler is about to run, the signal that interrupted it was one
     /// the guest does not see (blocked for a `signalfd`, or ignored), so the
     /// call runs again; if the handler has `SA_RESTART` and the call is one
-    /// Linux restarts, it runs again after the handler returns; otherwise the
-    /// guest gets `EINTR` once the handler returns.
+    /// Linux restarts, or the call is one Linux restarts after any handler
+    /// ([`signal::restarts_always`]), it runs again after the handler
+    /// returns; otherwise the guest gets `EINTR` once the handler returns.
     #[cfg_attr(
         target_os = "macos",
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -1222,6 +1223,7 @@ impl<P: Platform> Kernel<P> {
                 None => true,
                 Some(action) => {
                     action.flags & absig::SA_RESTART != 0 && signal::restartable(nr, args)
+                        || signal::restarts_always(nr, args)
                 }
             };
             if rerun {

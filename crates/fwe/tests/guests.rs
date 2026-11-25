@@ -2086,10 +2086,15 @@ fn a_thread_after_another_ended_starts_afresh() {
 /// glibc root filesystem of its own, and check it exits 0 having printed
 /// `want`.
 fn c_guest_prints(name: &str, args: &[&str], want: &str) {
-    let prog = build_c_dynamic(name, Libc::Glibc, true);
+    c_guest_prints_on(Libc::Glibc, name, args, want);
+}
+
+/// [`c_guest_prints`] on the C library `libc`.
+fn c_guest_prints_on(libc: Libc, name: &str, args: &[&str], want: &str) {
+    let prog = build_c_dynamic(name, libc, true);
     // A root of the case's own: tests of one guest run side by side.
-    let root =
-        libc_rootfs(Libc::Glibc, &[name].iter().chain(args).copied().collect::<Vec<_>>().join("-"));
+    let tag = [name_suffix(libc), name].iter().chain(args).copied().collect::<Vec<_>>().join("-");
+    let root = libc_rootfs(libc, &tag);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg(&prog).args(args);
     let out = run_bounded(cmd);
@@ -2232,6 +2237,24 @@ fn memory_below_sp_is_the_programs() {
          after a thread pointer read: kept\nafter a use of x18: kept\n\
          after a cache flush: kept\nafter a system call in code made at run time: kept\n",
     );
+}
+
+/// Priority-inheritance futexes (guests/c/pifutex.c) as Linux runs them:
+/// a lock handed to its waiter, its errors, a lock a signal interrupts
+/// going on after the handler, and both C libraries' `PTHREAD_PRIO_INHERIT`
+/// mutexes, robust too (musl's tries `FUTEX_LOCK_PI` as one is made, which
+/// PulseAudio asserts on).
+#[test]
+fn priority_inheritance_locks_are_linuxs() {
+    let want = "lock: 0, the owner's: 1\nagain: -35\na waiter marks it: 1\nunlock: 0\n\
+                the waiter's lock: 0, handed to it: 1, then free: 1\n\
+                another's unlock: -1, try: -11, timed lock: -110\n\
+                an owner that never ran: -3\ninterrupted: handler ran 1, then locked: 0\n\
+                setprotocol: 0\ncounted: 8000\n\
+                its owner ended: 130, made consistent: 0, unlocked: 0\n";
+    for libc in [Libc::Glibc, Libc::Musl] {
+        c_guest_prints_on(libc, "pifutex", &[], want);
+    }
 }
 
 /// `F_GETFL` of each kind of descriptor (guests/c/getfl.c), as Linux

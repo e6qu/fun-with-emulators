@@ -2,6 +2,12 @@
 //! also changes a second word atomically and wakes that one's waiters when
 //! its old value meets a comparison; the requeues move waiters to another.
 //!
+//! A priority-inheritance futex (`FUTEX_LOCK_PI` and its kin) is a lock
+//! whose word holds its owner's thread id: a lock waits while another
+//! owns it, and an unlock hands it to the oldest waiter, as Linux does
+//! ([`lock_pi`], [`unlock_pi`]). The host schedules no thread by its
+//! priority for the guest, so there is none to lend the owner.
+//!
 //! A private futex (`FUTEX_PRIVATE_FLAG`, what a process's own locks use)
 //! is the process's: its wait queues live here, outside the kernel lock,
 //! and operate only on raw guest memory (the futex word) and their own
@@ -20,9 +26,12 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// One waiter on a private futex: what it waits for, whether a wake has
-/// claimed it, and where its thread sleeps.
+/// claimed it, and where its thread sleeps. A priority-inheritance lock's
+/// waiter ([`lock_pi`]) waits for no bits, so no wake takes it, and has
+/// its thread id, which an unlock hands the lock to.
 struct Waiter {
     bits: u32,
+    tid: u32,
     woken: AtomicBool,
     park: Arc<Park>,
 }
@@ -251,7 +260,252 @@ pub unsafe fn op_full(uaddr: u64, op: u64, val: u32, timeout: u64, uaddr2: u64, 
                 shared::requeue(uaddr, val, moved, uaddr2)
             }
         }
+        futex::FUTEX_LOCK_PI | futex::FUTEX_LOCK_PI2 | futex::FUTEX_TRYLOCK_PI => {
+            // `FUTEX_LOCK_PI`'s timeout is absolute on CLOCK_REALTIME;
+            // `FUTEX_LOCK_PI2`'s on CLOCK_MONOTONIC unless
+            // FUTEX_CLOCK_REALTIME is set, which only it takes.
+            let realtime = op & futex::FUTEX_CLOCK_REALTIME != 0;
+            let deadline = match cmd {
+                _ if realtime && cmd != futex::FUTEX_LOCK_PI2 => return err(errno::ENOSYS),
+                futex::FUTEX_TRYLOCK_PI => None,
+                futex::FUTEX_LOCK_PI => crate::guest!(wait_deadline_abs(timeout, true)),
+                _ => crate::guest!(wait_deadline_abs(timeout, realtime)),
+            };
+            lock_pi(uaddr, private, deadline, cmd == futex::FUTEX_TRYLOCK_PI)
+        }
+        futex::FUTEX_UNLOCK_PI if op & futex::FUTEX_CLOCK_REALTIME != 0 => err(errno::ENOSYS),
+        futex::FUTEX_UNLOCK_PI => unlock_pi(uaddr, private),
         _ => err(errno::ENOSYS),
+    }
+}
+
+/// Where a priority-inheritance lock's waiter waits: in this process's
+/// queues, or a slot of the shared table ([`shared`]).
+enum PiPlace {
+    Queued(Arc<Waiter>),
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Slot(usize),
+}
+
+impl PiPlace {
+    /// Whether an unlock handed it the lock.
+    fn handed(&self) -> bool {
+        match self {
+            PiPlace::Queued(w) => w.woken.load(Ordering::SeqCst),
+            #[cfg(target_os = "macos")]
+            PiPlace::Slot(i) => shared::woken(*i),
+            #[cfg(not(target_os = "macos"))]
+            PiPlace::Slot(_) => false,
+        }
+    }
+
+    /// Off its queue or slot: whether an unlock handed it the lock first.
+    fn leave(self, queues: &mut Queues) -> bool {
+        match self {
+            PiPlace::Queued(w) => leave(queues, &w, 0) == 0 && w.woken.load(Ordering::SeqCst),
+            #[cfg(target_os = "macos")]
+            PiPlace::Slot(i) => shared::leave(i),
+            #[cfg(not(target_os = "macos"))]
+            PiPlace::Slot(_) => false,
+        }
+    }
+}
+
+/// Whether thread `tid` (as the calling thread names threads) still runs,
+/// in this process or another.
+fn thread_alive(tid: u32) -> bool {
+    crate::thread::host_thread(tid as i32).is_some() || crate::thread::named(tid as i32).is_some()
+}
+
+/// Whether a waiter other than `mine` waits for the priority-inheritance
+/// lock at `uaddr`.
+fn pi_others(uaddr: u64, private: bool, queues: &Queues, mine: Option<&PiPlace>) -> bool {
+    let me = match mine {
+        Some(PiPlace::Queued(w)) => Some(w),
+        _ => None,
+    };
+    let queued = queues
+        .get(&key(uaddr))
+        .is_some_and(|q| q.iter().any(|w| w.tid != 0 && !me.is_some_and(|m| Arc::ptr_eq(m, w))));
+    #[cfg(target_os = "macos")]
+    if !private {
+        let slot = match mine {
+            Some(PiPlace::Slot(i)) => Some(*i),
+            _ => None,
+        };
+        return queued || shared::pi_waiting(uaddr, slot).unwrap_or(false);
+    }
+    let _ = private;
+    queued
+}
+
+/// `FUTEX_LOCK_PI` and `FUTEX_LOCK_PI2` (and, with `try_only`,
+/// `FUTEX_TRYLOCK_PI`) on the word at `uaddr`, as Linux takes a
+/// priority-inheritance lock: a word with no owner becomes the caller's
+/// (its thread id, `FUTEX_OWNER_DIED` kept, `FUTEX_WAITERS` while others
+/// wait); one another thread owns gets `FUTEX_WAITERS` (a try then fails
+/// with `EAGAIN`), and the caller waits until an unlock hands it the lock ([`unlock_pi`]), the
+/// `deadline` passes, or a signal comes (`EINTR`, which the call restarts
+/// from: [`crate::signal::restarts_always`]). `EDEADLK` for the caller's
+/// own lock; `ESRCH` for an owner that has gone, unless others wait for
+/// it, when the lock is the caller's with them, as Linux gives the lock
+/// of a thread that ended to its waiters.
+fn lock_pi(uaddr: u64, private: bool, deadline: Option<Instant>, try_only: bool) -> i64 {
+    use crate::uaccess::cmpxchg_u32;
+    use futex::{FUTEX_OWNER_DIED as DIED, FUTEX_TID_MASK as TID, FUTEX_WAITERS as WAITERS};
+    let me = crate::thread::tid() as u32;
+    let table = table();
+    let park = Park::new();
+    let mut place: Option<PiPlace> = None;
+    // Giving up with `e`, unless an unlock handed it the lock first.
+    let gone = |place: Option<PiPlace>, queues: &mut Queues, e: i32| {
+        if place.is_some_and(|p| p.leave(queues)) { 0 } else { err(e) }
+    };
+    loop {
+        // Whether the owner runs, asked with no lock held (the thread
+        // registry is not looked at under the queues' lock).
+        let owner = match load(uaddr) {
+            Ok(v) => v & TID,
+            Err(e) => return gone(place, &mut table.lock(), e),
+        };
+        let alive = owner == 0 || owner == me || thread_alive(owner);
+        let mut queues = table.lock();
+        if place.as_ref().is_some_and(PiPlace::handed) {
+            return gone(place, &mut queues, errno::EAGAIN);
+        }
+        let v = match load(uaddr) {
+            Ok(v) if v & TID == owner => v,
+            Ok(_) => continue,
+            Err(e) => return gone(place, &mut queues, e),
+        };
+        let others = pi_others(uaddr, private, &queues, place.as_ref());
+        if owner == 0 || !alive && (place.is_some() || others) {
+            // Free, or its owner gone with waiters: the caller's.
+            let new = me | (v & DIED) | if others { WAITERS } else { 0 };
+            match cmpxchg_u32(uaddr, v, new) {
+                Ok(held) if held == v => {
+                    if let Some(p) = place {
+                        p.leave(&mut queues);
+                    }
+                    return 0;
+                }
+                Ok(_) => continue,
+                Err(e) => return gone(place, &mut queues, e),
+            }
+        }
+        if owner == me {
+            return gone(place, &mut queues, errno::EDEADLK);
+        }
+        // Marked first, as Linux marks it before it looks for the owner:
+        // a try, or an owner gone, leaves the mark.
+        if v & WAITERS == 0 {
+            match cmpxchg_u32(uaddr, v, v | WAITERS) {
+                Ok(_) => continue,
+                Err(e) => return gone(place, &mut queues, e),
+            }
+        }
+        if try_only {
+            return err(errno::EAGAIN);
+        }
+        if !alive {
+            return gone(place, &mut queues, errno::ESRCH);
+        }
+        if place.is_none() {
+            place = Some(match pi_enter(uaddr, private, me, &park, &mut queues) {
+                Ok(p) => p,
+                Err(e) => return err(e),
+            });
+        }
+        if crate::thread::deliverable() != 0 {
+            return gone(place, &mut queues, errno::EINTR);
+        }
+        let now = Instant::now();
+        let slice = match deadline {
+            Some(d) if now >= d => return gone(place, &mut queues, errno::ETIMEDOUT),
+            Some(d) => (d - now).min(SIGNAL_CHECK),
+            None => SIGNAL_CHECK,
+        };
+        drop(queues);
+        match &place {
+            #[cfg(target_os = "macos")]
+            Some(PiPlace::Slot(i)) => shared::nap(*i, slice),
+            _ => park.sleep(slice),
+        }
+    }
+}
+
+/// A priority-inheritance lock's waiter for the word at `uaddr`, thread
+/// `tid`, queued: in a slot of the shared table for a shared futex whose
+/// memory has a shared identity, else in this process's queues.
+fn pi_enter(
+    uaddr: u64,
+    private: bool,
+    tid: u32,
+    park: &Arc<Park>,
+    queues: &mut Queues,
+) -> Result<PiPlace, i32> {
+    #[cfg(target_os = "macos")]
+    if !private && let Some(slot) = shared::pi_enter(uaddr, tid) {
+        return slot.map(PiPlace::Slot);
+    }
+    let _ = private;
+    let w = Arc::new(Waiter { bits: 0, tid, woken: AtomicBool::new(false), park: park.clone() });
+    queues.entry(key(uaddr)).or_default().push_back(w.clone());
+    Ok(PiPlace::Queued(w))
+}
+
+/// `FUTEX_UNLOCK_PI` on the word at `uaddr`, the caller's lock (`EPERM`
+/// otherwise): handed to the oldest waiter, its thread id with
+/// `FUTEX_WAITERS` the word, as Linux hands it; with none waiting, the
+/// word is 0.
+fn unlock_pi(uaddr: u64, private: bool) -> i64 {
+    use crate::uaccess::cmpxchg_u32;
+    use futex::{FUTEX_TID_MASK as TID, FUTEX_WAITERS as WAITERS};
+    let me = crate::thread::tid() as u32;
+    let table = table();
+    loop {
+        let mut queues = table.lock();
+        let v = match load(uaddr) {
+            Ok(v) => v,
+            Err(e) => return err(e),
+        };
+        if v & TID != me {
+            return err(errno::EPERM);
+        }
+        let give = |tid: u32| cmpxchg_u32(uaddr, v, tid | WAITERS);
+        #[cfg(target_os = "macos")]
+        if !private {
+            match shared::pi_hand(uaddr, |tid| give(tid) == Ok(v)) {
+                Some(Ok(true)) => return 0,
+                Some(Err(())) => continue,
+                _ => {}
+            }
+        }
+        let _ = private;
+        let k = key(uaddr);
+        let next = queues.get(&k).and_then(|q| q.iter().position(|w| w.tid != 0));
+        if let Some(i) = next {
+            match give(queues[&k][i].tid) {
+                Ok(held) if held == v => {}
+                Ok(_) => continue,
+                Err(e) => return err(e),
+            }
+            let q = queues.get_mut(&k).expect("the queue just looked at");
+            let w = q.remove(i).expect("the waiter just found");
+            if q.is_empty() {
+                queues.remove(&k);
+            }
+            w.woken.store(true, Ordering::SeqCst);
+            w.park.mark();
+            drop(queues);
+            w.park.rouse();
+            return 0;
+        }
+        match cmpxchg_u32(uaddr, v, 0) {
+            Ok(held) if held == v => return 0,
+            Ok(_) => continue,
+            Err(e) => return err(e),
+        }
     }
 }
 
@@ -529,8 +783,12 @@ pub unsafe fn waitv(waiters: u64, nr: u64, flags: u64, timeout: u64, clockid: u6
             continue;
         }
         let _ = (private, val);
-        let me =
-            Arc::new(Waiter { bits: u32::MAX, woken: AtomicBool::new(false), park: park.clone() });
+        let me = Arc::new(Waiter {
+            bits: u32::MAX,
+            tid: 0,
+            woken: AtomicBool::new(false),
+            park: park.clone(),
+        });
         queues.entry(key(uaddr)).or_default().push_back(me.clone());
         held.push(Held::Queued(me));
     }
@@ -738,7 +996,7 @@ pub(crate) fn wait_private_bits(uaddr: u64, val: u32, deadline: Option<Instant>,
         Err(e) => return err(e),
     }
     let park = Park::new();
-    let me = Arc::new(Waiter { bits, woken: AtomicBool::new(false), park: park.clone() });
+    let me = Arc::new(Waiter { bits, tid: 0, woken: AtomicBool::new(false), park: park.clone() });
     queues.entry(key(uaddr)).or_default().push_back(me.clone());
     loop {
         if me.woken.load(Ordering::SeqCst) {
@@ -930,6 +1188,50 @@ mod tests {
     use fwe_abi::futex::{FUTEX_WAIT, FUTEX_WAKE};
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::thread;
+
+    /// A priority-inheritance lock taken and given back by one thread, as
+    /// Linux's: a free word becomes the caller's thread id (an
+    /// `FUTEX_OWNER_DIED` kept), its own lock is `EDEADLK`, another's
+    /// unlock `EPERM`, an owner that never ran `ESRCH` (and `EAGAIN` to a
+    /// try), the word marked `FUTEX_WAITERS` either way, and its unlock
+    /// leaves 0.
+    #[test]
+    fn pi_lock_taken_and_given_back() {
+        use fwe_abi::futex::*;
+        let tid = 0x2bad;
+        crate::thread::set_tid(crate::thread::NewThread {
+            tid,
+            id: crate::ids::Tid::new(tid).unwrap(),
+        });
+        let word = AtomicU32::new(0);
+        let addr = &word as *const _ as u64;
+        let op = |cmd: u64| {
+            // SAFETY: `addr` points to the live word; no timeout.
+            unsafe { op(addr, cmd | FUTEX_PRIVATE_FLAG, 0, 0) }
+        };
+        assert_eq!(op(FUTEX_LOCK_PI), 0);
+        assert_eq!(word.load(Ordering::SeqCst), tid as u32);
+        assert_eq!(op(FUTEX_LOCK_PI), err(errno::EDEADLK));
+        assert_eq!(op(FUTEX_TRYLOCK_PI), err(errno::EDEADLK));
+        assert_eq!(op(FUTEX_LOCK_PI | FUTEX_CLOCK_REALTIME), err(errno::ENOSYS));
+        assert_eq!(op(FUTEX_UNLOCK_PI), 0);
+        assert_eq!(word.load(Ordering::SeqCst), 0);
+        assert_eq!(op(FUTEX_UNLOCK_PI), err(errno::EPERM));
+        // Its owner died (a robust list's release): the next owner's, the
+        // mark kept for it to see.
+        word.store(FUTEX_OWNER_DIED, Ordering::SeqCst);
+        assert_eq!(op(FUTEX_TRYLOCK_PI), 0);
+        assert_eq!(word.load(Ordering::SeqCst), FUTEX_OWNER_DIED | tid as u32);
+        assert_eq!(op(FUTEX_UNLOCK_PI), 0);
+        // A thread id no thread has.
+        let nobody = 0x3fff_fff0;
+        word.store(nobody, Ordering::SeqCst);
+        assert_eq!(op(FUTEX_TRYLOCK_PI), err(errno::EAGAIN));
+        assert_eq!(word.load(Ordering::SeqCst), nobody | FUTEX_WAITERS);
+        assert_eq!(op(FUTEX_LOCK_PI), err(errno::ESRCH));
+        assert_eq!(word.load(Ordering::SeqCst), nobody | FUTEX_WAITERS);
+        assert_eq!(op(FUTEX_UNLOCK_PI), err(errno::EPERM));
+    }
 
     #[test]
     fn wait_returns_eagain_on_mismatch() {

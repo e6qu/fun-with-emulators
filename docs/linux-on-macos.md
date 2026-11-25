@@ -1258,6 +1258,7 @@ futexes have no direct macOS counterpart:
 | Robust futex list | walked as a thread ends: words it owns marked `FUTEX_OWNER_DIED`, a waiter woken | — | the same, as a thread ends and for every thread as the process ends or calls `execve`; not for a native process ended by `SIGKILL`, nor one ended by a signal from outside fwe |
 | futex, private | a wait queue per address | `__ulock_wait`/`__ulock_wake` (private) | fwe's wait queues per process, keyed by address, outside the kernel lock; a wake reports exactly how many it woke ([architecture.md](architecture.md#threads-and-futexes)) |
 | futex, shared | keyed by the page's backing object | `__ulock_wait2` with `UL_COMPARE_AND_WAIT_SHARED` | a table every fwe process maps, keyed as Linux keys a shared futex (Mach memory object and offset) |
+| futex, priority-inheriting (`FUTEX_LOCK_PI`) | a lock whose word holds its owner's thread id, handed to the top waiter as it is unlocked; the owner lent the waiters' priority | `os_unfair_lock` (an owner's id, its waiters' priority lent) | the waiters in the queues or the table above, the lock handed to the oldest as Linux hands it; no priority lent, as fwe schedules no thread by priority |
 
 A new thread starts with its creator's registers and signal mask, `x0` =
 0, the given stack and no alternate stack.

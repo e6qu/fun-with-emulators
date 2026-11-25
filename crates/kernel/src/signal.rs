@@ -577,6 +577,15 @@ pub fn restartable(nr: u64, args: &[u64; 6]) -> bool {
     }
 }
 
+/// Whether Linux restarts system call `nr` after any handler, with
+/// `SA_RESTART` or not (its `ERESTARTNOINTR`): a priority-inheritance
+/// futex's lock, whose absolute timeout stands.
+pub fn restarts_always(nr: u64, args: &[u64; 6]) -> bool {
+    use fwe_abi::futex as f;
+    nr == fwe_abi::nr::FUTEX
+        && matches!(args[1] & f::FUTEX_CMD_MASK, f::FUTEX_LOCK_PI | f::FUTEX_LOCK_PI2)
+}
+
 /// Move pending signals that the calling thread blocks and a `signalfd`
 /// watches onto that `signalfd`, as Linux queues them there.
 pub fn drain_to_signalfd() {
