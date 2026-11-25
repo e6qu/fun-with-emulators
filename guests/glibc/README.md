@@ -6,8 +6,8 @@ linking, which a Debian rootfs needs. macOS has no glibc to build it with.
 
 glibc's dynamic linker and shared libc are separate files, so the linker
 maps `libc.so.6` itself through fwe's `mmap`; that library's code segment
-also holds its symbol, string and hash tables, which the rewrite must
-leave alone (`Elf::exec_file_ranges`).
+also holds its symbol, string and hash tables, which the rewrite leaves
+alone (`Elf::exec_file_ranges`).
 
 | File | Purpose |
 | --- | --- |
