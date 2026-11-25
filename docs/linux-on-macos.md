@@ -2165,7 +2165,7 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 | MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
 | `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
 | Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
-| GPU rendering (`/dev/dri`) | Metal | none: Mesa's software renderer |
+| GPU rendering: a Vulkan driver the loader finds by its manifest in `/usr/share/vulkan/icd.d` or `/etc/vulkan/icd.d`, which talks to the GPU's kernel driver through `/dev/dri` | Metal; Vulkan through MoltenVK or KosmicKrisp, in the process | fwe's Linux Vulkan driver in `/etc/vulkan/icd.d`, whose every command reaches the Mac's Vulkan driver in fwe's process through one ioctl on `/dev/fwe-gpu` (see [Devices](#devices)); OpenGL through Mesa's Zink on it; frames reach the X server as copies |
 
 ### Kernel-wide state
 
@@ -2461,6 +2461,19 @@ numbers mean nothing there. fwe keeps its own:
 - Loop devices are fwe's own block devices 7:N with `/dev/loop-control`
   (10:237), in a shared record (`loopdev.rs`); fwe carries out their
   reads, writes and requests on the attached file.
+- The GPU is fwe's character device 10:241, `/dev/fwe-gpu`, which fwe's
+  Linux Vulkan driver (`/etc/vulkan/icd.d/libvulkan_fwe.so`) opens, there
+  where a Mac Vulkan driver is installed:
+
+  | Linux (a Vulkan driver) | fwe |
+  |---|---|
+  | the loader finds the driver by its manifest | fwe's manifest and library in `/etc/vulkan/icd.d`, a directory fwe answers itself; the root's own drivers stay where they are |
+  | a command, run by the driver in the process | its arguments packed into words and passed with one ioctl; fwe calls the Mac driver's function for it with them, in the same process, the guest's pointers the driver's to read and write |
+  | the driver's descriptors and threads, in the process | the Mac driver's descriptors kept out of the guest's descriptor range; its threads take no signal of the guest's |
+  | a swapchain of an X window (xcb, Xlib) | the Mac driver's swapchain of no window; each frame copied to the window with `xcb_put_image` |
+  | robustness2's null descriptors | the Mac driver's, or stand-ins of fwe's where it has none (MoltenVK) |
+  | buffers bound anywhere in a device memory | the Mac driver's; MoltenVK on the GPU of Apple's virtual machines told to make memory one Metal buffer, not a placement heap, from which it draws nothing past 64 KiB |
+  | the device after `fork` | unusable in the child (macOS's libraries do not work there): its calls `ENODEV` until it calls `execve` |
 
 ### Time, scheduling and limits
 

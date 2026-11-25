@@ -529,7 +529,9 @@ pub struct Incoming {
 /// any credentials the sender gave. A bundle is taken and closed;
 /// `peek` reads it without taking it from the queue (`MSG_PEEK`).
 pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
-    let mut fds = host_fds(ctl);
+    // Received without the kernel lock: where a plug put them, in the
+    // guest's range once it is gone.
+    let mut fds: Vec<i32> = host_fds(ctl).into_iter().map(crate::fdtable::into_range).collect();
     let mut manifest = None;
     if let Some(&b) = fds.last()
         && is_bundle(b)

@@ -1288,6 +1288,9 @@ impl<P: Platform> Kernel<P> {
                     if crate::loopdev::is_loop_node(n) {
                         crate::loopdev::opened(device as i32, n);
                     }
+                    if crate::vulkan::device::is_node(n) {
+                        crate::vulkan::device::opened(device as i32);
+                    }
                     return device;
                 }
             }
@@ -4701,6 +4704,14 @@ pub(crate) fn open_device(
     }
     if !node_file {
         return fd as i64;
+    }
+    // The GPU is its node's descriptor, marked as the device by the caller
+    // ([`crate::vulkan::device`]).
+    if crate::vulkan::device::is_node(node) {
+        return match crate::vulkan::device::check_open() {
+            Ok(()) => fd as i64,
+            Err(e) => err(e),
+        };
     }
     // A loop device is its node's descriptor, marked as the device by the
     // caller ([`crate::loopdev`]).

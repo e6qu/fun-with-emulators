@@ -600,6 +600,9 @@ pub(super) fn become_vm_process() -> Result<(), String> {
     vm::create()?;
     VM_LIVE.store(true, std::sync::atomic::Ordering::SeqCst);
     fwe_kernel::forbid_fork();
+    // The guest's memory is the VM's, not the process's the Mac's Vulkan
+    // driver works in.
+    fwe_kernel::vulkan::device::absent();
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         default_hook(info);

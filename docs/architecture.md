@@ -1407,6 +1407,92 @@ Sockets and terminals are the host's; fwe translates their interfaces:
   (MIT-SHM 1.2) fwe asks it once, on a connection of its own with the
   client's authorization; a server that does not gets the `ShmAttach` as
   it was.
+- The GPU (`crates/kernel/src/vulkan/`, `driver/vulkan/`): Vulkan
+  through fwe's own Linux Vulkan driver, which passes each command a
+  program makes to the Mac's Vulkan driver in fwe's process.
+  - The guest side is `libvulkan_fwe.so`, an aarch64 Linux library built
+    with fwe (`crates/kernel/build.rs`: clang, freestanding, and
+    `rust-lld`) and served with its manifest from `/etc/vulkan/icd.d`, a
+    directory fwe answers itself where a Mac Vulkan driver is installed
+    (`vulkan/files.rs`), so a program's own Vulkan loader finds it beside
+    the root's drivers. It exports the loader's interface (version 5 to
+    7) and nothing else; every command is a stub that packs its
+    arguments into 64-bit words and makes one ioctl on `/dev/fwe-gpu`
+    (char 10:241, mode 0666). Its stubs, and fwe's typed calls of the
+    Mac driver's functions, are generated from Vulkan's registry
+    (`tools/gen-vulkan.py`, which checks every layout it relies on
+    against the headers), so the Mac's calling convention is the
+    compiler's to apply. A timed wait's stub passes an absolute
+    `CLOCK_MONOTONIC` deadline, so a wait restarted after a signal ends
+    when it would have.
+  - The host side (`vulkan/mod.rs`, `objects.rs`) loads the Mac's driver
+    itself, with no loader between: the one `FWE_VULKAN_DRIVER` names (a
+    manifest), else KosmicKrisp (Homebrew's `mesa`), else MoltenVK
+    (Homebrew's `molten-vk`), and negotiates the loader's interface 7
+    with it (MoltenVK gives 5). Handles are the driver's; each object's
+    functions are those its instance or device gave. The guest's
+    pointers are the process's, so the driver reads and writes the
+    guest's memory itself; pages fwe has yet to make writable there are
+    made so first. Instances and devices are made from copies of the
+    guest's create infos whose chains keep only the structures fwe lays
+    out, with no layers, the window systems' extensions replaced by the
+    driver's they are built on, and a portability driver's enumeration
+    (where the driver lists it: it is the loader's) and subset added. No host code calls guest code: allocators reach the
+    driver as NULL, and the extensions whose structures hold callbacks
+    are not offered.
+  - Most commands run without the kernel lock (`vulkan::device::io`),
+    so a program's threads call the driver at once. Those in which the
+    driver opens descriptors of its own (Metal's caches, read-write and
+    not close-on-exec, as a device is made and pipelines are compiled)
+    run under it with every free number of the guest's range taken
+    (`fdtable::plugged`), so those land in fwe's reserved range; a
+    descriptor a call without the lock makes meanwhile (`accept`, one
+    received, a pre-open) moves into the guest's range once the plug is
+    gone (`fdtable::into_range`). An `execve` from a process with the
+    driver in memory starts a fresh fwe, which the driver's descriptors
+    do not reach. Waits with a timeout (fences, semaphores, acquiring an
+    image) run in 5 ms slices and end with `EINTR` when a signal comes
+    for the thread; the stub makes the call again.
+  - Signals: the driver's threads begin with every signal blocked where
+    fwe starts them (making an instance or device); one started later in
+    a guest's call that takes a signal hands it to the process, wakes the
+    guest's threads to take it, and blocks every signal from then on
+    (`thread::foreign`, `trap::take_async`). A fault in the driver on a
+    bad guest pointer ends the process with `SIGSEGV`, as a fault in a
+    Linux driver's code in the process does.
+  - Window systems are the guest library's (`driver/vulkan/wsi.c`): a
+    program's surface is the library's, of an X window (xcb or Xlib), made
+    when the loader asks the driver for one of its own; its
+    swapchain is the driver's, on a surface of no window
+    (`VK_EXT_headless_surface`), so acquiring images and their fences and
+    semaphores are the driver's own. Present copies the image to memory
+    the process reads, on the queue the program presents on, after its
+    semaphores, puts the pixels in the window with `xcb_put_image`, and
+    gives the image back to the driver's swapchain; asking the window's
+    size after each frame paces frames to the X server and reports a
+    resized window (`VK_SUBOPTIMAL_KHR`). The library finds xcb and
+    Xlib, the program's, with `dlopen`; it asks fwe for an object's parent
+    and a queue's family.
+  - Null descriptors (robustness2's `nullDescriptor`, which Zink needs)
+    are fwe's where the driver lacks them (MoltenVK, `vulkan/null.rs`):
+    the feature is reported, taken out of the device's create info, and
+    the device gets stand-ins (a zeroed buffer, two texel buffer views
+    and a 1×1 2D image's view), put in the place of every null handle a
+    descriptor write, update template, push descriptor or vertex buffer
+    binding has.
+  - MoltenVK on the paravirtual GPU of Apple's virtual machines (GitHub's
+    macOS runners) draws nothing from a vertex or index buffer bound 64
+    KiB or more into a memory it made a Metal placement heap, as Zink
+    binds an OpenGL display list's; it draws at every offset on an Apple
+    GPU, and with memory of one Metal buffer on that one. There, fwe
+    makes its instances with `VK_EXT_layer_settings`'
+    `MVK_CONFIG_USE_MTLHEAP` 0 (`vulkan/objects.rs`, after the program's
+    own settings), learnt from the driver's ID and the device's name on
+    the first instance a process makes, which is made again so.
+  - A fork child never calls the driver (macOS's libraries do not work in
+    a fork child): its copies of its parent's opens fail with `ENODEV`,
+    and its own opens are refused while the driver is in its memory; an
+    `execve` gives it a device. In the VM backend there is no device.
 - DNS: the resolver reads `/etc/resolv.conf` and `/etc/hosts` from the
   rootfs (`fwe --pull` writes the host's name servers into it).
 - Terminals: `termios` translation in `crates/kernel/src/term.rs`, the
@@ -1998,8 +2084,20 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   display number a guest names is looked for in its root. A server
   without MIT-SHM 1.2 sees a guest's `ShmAttach` name a segment it cannot
   find, and the client draws without shared memory if it can.
-- No GPU: OpenGL is Mesa's software renderer, and Wayland programs need a
-  compositor run in the guest (Weston, drawing on the X display).
+- The GPU is Vulkan through fwe's driver, OpenGL through Mesa's Zink on
+  it. Its window systems are X11's (xcb and Xlib surfaces, of 24- and
+  32-bit windows, B8G8R8A8 images), each frame copied to the X server;
+  there are no Wayland surfaces. Buffers and semaphores are not shared
+  with other processes (no external memory or semaphore descriptors), and
+  video coding, debug callbacks and the driver's layers are not offered.
+  A null image descriptor fwe stands in for is a 2D image of zeros
+  whatever the shader's image type, and what is written to a stand-in
+  can be read back from it. Memory the driver maps for a program
+  (`vkMapMemory`) is the driver's, placed by the host below the guest's
+  mappings, and is not in `/proc/self/maps`, as fwe's own is not. A fork
+  child has no GPU until it calls `execve`, and the VM backend has none.
+- Wayland programs need a compositor run in the guest (Weston, drawing on
+  the X display).
 
 **IPC and keys**
 - System V: `SHM_INFO` reports no resident pages; a segment stays

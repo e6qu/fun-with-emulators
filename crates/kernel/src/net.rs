@@ -1431,6 +1431,9 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     if r < 0 {
         return last_error();
     }
+    // Made without the kernel lock: where a plug put it, in the guest's
+    // range once it is gone.
+    let r = crate::fdtable::into_range(r);
     // A connection is in its listener's namespace.
     crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
     fresh(r);

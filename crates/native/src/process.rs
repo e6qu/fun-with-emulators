@@ -93,9 +93,14 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if vm && !crate::hv::usable() {
         return Err(err(fwe_abi::errno::ENOEXEC));
     }
-    // A program only the VM can run, or an exec from a process with other
-    // threads (which must end): replace this process with a fresh fwe.
-    if vm || LIVE_THREADS.load(Ordering::SeqCst) > 1 {
+    // A program only the VM can run, an exec from a process with other
+    // threads (which must end), or from one with the Mac's Vulkan driver in
+    // its memory (its threads and objects cannot be carried over): replace
+    // this process with a fresh fwe.
+    if vm
+        || LIVE_THREADS.load(Ordering::SeqCst) > 1
+        || fwe_kernel::vulkan::device::driver_in_memory()
+    {
         fwe_kernel::release_robust_lists();
         let state = k.exec_state();
         crate::jitcount::write_seen();
@@ -388,6 +393,8 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         thread::init_main(shown);
         LIVE_THREADS.store(1, Ordering::SeqCst);
+        // The GPU device's opens, and the Mac's driver, are the parent's.
+        fwe_kernel::vulkan::device::forked_child();
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {
             // Best effort, as for Linux's own write of the word.
             let _ = fwe_kernel::uaccess::write(child_tid, thread::tid());

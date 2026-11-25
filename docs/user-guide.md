@@ -32,7 +32,9 @@ notarized, and macOS refuses to run it until its quarantine mark is gone:
 xattr -d com.apple.quarantine fwe
 ```
 
-From source, with Rust installed:
+From source, with Rust (rustup's, whose toolchain has `rust-lld`; with
+another, `FWE_LLD` names an `ld.lld`, as Homebrew's `lld` has) and the
+Xcode command line tools' `clang`, which build fwe's Linux Vulkan driver:
 
 ```sh
 cargo build --release -p fwe
@@ -178,13 +180,32 @@ clients, Tk (tkinter), GTK 3 and 4 and Qt draw this way, and OpenGL
 through Mesa's software renderer (`LIBGL_ALWAYS_SOFTWARE=1`) on a server
 with GLX (Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
 has: start it, and give its programs `DISPLAY=:N` inside, as `sh -c
-'DISPLAY=:1 exec glxgears'`); there is no GPU yet. Windows programs draw
-through Wine's X11 driver, in the VM, with `DISPLAY` set the same way.
+'DISPLAY=:1 exec glxgears'`). Windows programs draw through Wine's X11
+driver, in the VM, with `DISPLAY` set the same way.
+
+Vulkan programs draw on the Mac's GPU through fwe's own Linux Vulkan
+driver, which fwe puts where a Linux Vulkan loader looks
+(`/etc/vulkan/icd.d`) once the Mac has a Vulkan driver: MoltenVK
+(`brew install molten-vk`), or KosmicKrisp (Homebrew's `mesa`, macOS 26
+and an Apple GPU), which fwe takes first. OpenGL programs use the GPU
+through Mesa's Zink. `VK_DRIVER_FILES` makes fwe's driver the only one a
+program sees (a userland's Mesa drivers draw on the CPU):
+
+```sh
+brew install molten-vk
+linux ~/alpine /bin/sh -c 'apk add -q vulkan-tools'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
+  VK_DRIVER_FILES=/etc/vulkan/icd.d/fwe_icd.aarch64.json \
+  "$(command -v fwe)" --root ~/alpine ~/alpine/usr/bin/vkcube --wsi xcb
+```
+
+(`MESA_LOADER_DRIVER_OVERRIDE=zink` puts OpenGL on the GPU, with
+`LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.)
 
 CI's `display` job runs them against Homebrew's Xvfb (`xeyes`, `xclock`,
 `xterm`, tkinter, PyQt6, GTK's demos and Wine's Notepad) and glxgears
-against Alpine's, driving each with keys and the pointer and checking
-what it draws.
+against Alpine's, and `vkcube` and glxgears on the runner's GPU, driving
+each with keys and the pointer and checking what it draws.
 
 ## Containers
 
@@ -241,8 +262,9 @@ that lacks it, and `--strace` names it.
   start (`--network=none` or the host's network does).
 - **io_uring** and **fanotify**: refused, and programs fall back to
   ordinary calls and inotify.
-- **Linux's devices and drivers**: no `/dev/kvm`, GPU, FUSE or kernel
-  modules; files live on the Mac's filesystem, so disk filesystems
+- **Linux's devices and drivers**: no `/dev/kvm`, FUSE or kernel
+  modules, and of GPUs only fwe's (Vulkan through fwe's driver, its
+  windows X11's); files live on the Mac's filesystem, so disk filesystems
   (ext4, btrfs) and block devices are not there.
 - **Resource limits of cgroups** but the process count: accepted, not
   enforced.
@@ -251,8 +273,8 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; run untrusted code in a
   Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
-- **The GPU**: programs with windows draw by software
-  ([roadmap](../ROADMAP.md#m7--graphical-programs-and-sandboxes)).
+- **The GPU after `fork`**: a forked child has no GPU (its Vulkan calls
+  fail) until it runs a program with `execve`.
 - **Programs for other processors** (x86-64, x86 Windows programs): `fwe`
   runs arm64 code only.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are

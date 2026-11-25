@@ -9791,7 +9791,18 @@ impl Xvfb {
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
         let err = display_dir().join(format!("xvfb-{number}.err"));
         let child = Command::new(xvfb)
-            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-nolisten", "tcp"])
+            // `-audit 4`: each client the server takes or refuses, and why,
+            // in its log.
+            .args([
+                &format!(":{number}"),
+                "-screen",
+                "0",
+                "1024x768x24",
+                "-nolisten",
+                "tcp",
+                "-audit",
+                "4",
+            ])
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(&err).unwrap())
             .spawn()
@@ -10025,8 +10036,23 @@ impl Gui {
         args: &[&str],
         env: &[(&str, &str)],
     ) -> Gui {
+        Gui::start_traced(x, name, root, program, args, env, false)
+    }
+
+    /// As [`Gui::start`], every system call traced if `calls`, else those
+    /// that fail (with fwe's notes, for a failure's report).
+    fn start_traced(
+        x: &Xvfb,
+        name: &str,
+        root: &ScratchRoot,
+        program: &str,
+        args: &[&str],
+        env: &[(&str, &str)],
+        calls: bool,
+    ) -> Gui {
         let dir = display_dir();
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg(if calls { "--strace" } else { "--strace=failures" });
         cmd.arg(format!("--strace-file={}", dir.join(format!("{name}.trace")).display()))
             .arg("--root")
             .arg(&root.0)
@@ -10038,6 +10064,11 @@ impl Gui {
             .env("XDG_RUNTIME_DIR", "/tmp/xdg")
             .env("LANG", "C.UTF-8")
             .env("DISPLAY", x.display());
+        // fwe's own choice of the Mac's Vulkan driver (CI's names MoltenVK:
+        // KosmicKrisp, which fwe takes first, has no device on a runner).
+        if let Some(driver) = std::env::var_os("FWE_VULKAN_DRIVER") {
+            cmd.env("FWE_VULKAN_DRIVER", driver);
+        }
         for (k, v) in env {
             cmd.env(k, v);
         }
@@ -10143,6 +10174,17 @@ impl Xvfb {
     /// The visible window `search` finds (xdotool's search arguments), once
     /// `gui` has made it, within `secs`: the largest, where there are more.
     fn window(&self, gui: &mut Gui, search: &[&str], secs: u64) -> Window {
+        self.window_sized(gui, search, None, secs)
+    }
+
+    /// [`Xvfb::window`], of size `size` (width, height) if given.
+    fn window_sized(
+        &self,
+        gui: &mut Gui,
+        search: &[&str],
+        size: Option<(i32, i32)>,
+        secs: u64,
+    ) -> Window {
         let began = Instant::now();
         loop {
             let mut args = vec!["search", "--onlyvisible"];
@@ -10152,16 +10194,34 @@ impl Xvfb {
                 .lines()
                 .map(|id| self.geometry(id.trim()))
                 .filter(|w| w.w > 1 && w.h > 1)
+                .filter(|w| size.is_none_or(|(sw, sh)| w.w == sw && w.h == sh))
                 .max_by_key(|w| w.w * w.h);
             if let Some(w) = best {
                 return w;
             }
             assert!(!gui.ended(), "no window {search:?}: {}", gui.report());
-            assert!(
-                began.elapsed() < Duration::from_secs(secs),
-                "no window {search:?} after {secs} s: {}",
-                gui.report()
-            );
+            if began.elapsed() >= Duration::from_secs(secs) {
+                // Every window the server has, named or not (`.*` matches
+                // a window with no name too: xdotool matches it as ""; an
+                // empty pattern macOS's regcomp refuses), with its name
+                // and size, and what the search said.
+                let every = self.xdotool(&["search", "--name", ".*"]);
+                let windows: Vec<String> = stdout(&every)
+                    .lines()
+                    .map(|id| {
+                        let name = self.xdotool(&["getwindowname", id.trim()]);
+                        format!("{:?} {:?}", self.geometry(id.trim()), stdout(&name).trim())
+                    })
+                    .collect();
+                panic!(
+                    "no window {search:?} on {} after {secs} s; the search said {:?}; \
+                     its windows: {windows:#?} ({:?}): {}",
+                    self.display(),
+                    String::from_utf8_lossy(&found.stderr),
+                    String::from_utf8_lossy(&every.stderr),
+                    gui.report()
+                );
+            }
             std::thread::sleep(Duration::from_millis(500));
         }
     }
@@ -10373,6 +10433,270 @@ fn alpine_display_glxgears_turns_by_software() {
     };
     eprintln!("glxgears: {rate} frames a second");
     assert!(rate > 1.0, "{rate} frames a second: {}", gui.report());
+}
+
+/// What a program of a display root says, run to its end (within
+/// `secs`): its standard output. Its calls are traced, and the Vulkan
+/// loader says what it finds (`VK_LOADER_DEBUG`), for a failure's report.
+fn display_output(
+    x: &Xvfb,
+    name: &str,
+    root: &ScratchRoot,
+    args: &[&str],
+    env: &[(&str, &str)],
+    secs: u64,
+) -> String {
+    let mut env = env.to_vec();
+    env.push(("VK_LOADER_DEBUG", "error,warn,driver"));
+    let mut gui = Gui::start_traced(x, name, root, args[0], &args[1..], &env, true);
+    let began = Instant::now();
+    let status = loop {
+        if let Some(s) = gui.child.try_wait().unwrap() {
+            break s;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(secs),
+            "{name} did not end: {}",
+            gui.report()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    assert!(status.success(), "{name}: {}", gui.report());
+    std::fs::read_to_string(display_dir().join(format!("{name}.out"))).unwrap()
+}
+
+/// What a program needs to draw with Vulkan on the Mac's GPU: fwe's driver
+/// its only one (the root has Mesa's too, which draw on the CPU).
+const FWE_VULKAN: [(&str, &str); 1] =
+    [("VK_DRIVER_FILES", "/etc/vulkan/icd.d/fwe_icd.aarch64.json")];
+
+/// The Vulkan device a program finds is the Mac's GPU, through fwe's
+/// driver: `vulkaninfo` names it.
+fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
+    let name = format!("{test}-vulkaninfo");
+    let info =
+        display_output(x, &name, root, &["/usr/bin/vulkaninfo", "--summary"], &FWE_VULKAN, 120);
+    let device =
+        info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
+    assert!(device.contains("Apple"), "the device is not the GPU:\n{info}");
+    // All it finds (the X surface's capabilities among it), for a failure
+    // after: in the test's output directory.
+    display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &FWE_VULKAN, 120);
+}
+
+/// vkcube draws its cube with Vulkan on the Mac's GPU (fwe's driver, its
+/// commands run by the Mac's), and it turns.
+#[test]
+fn alpine_display_vkcube_draws_on_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("vkcube");
+    assert_vulkan_on_the_gpu(&x, &root, "vkcube");
+    let args = ["--wsi", "xcb", "--width", "300", "--height", "300"];
+    let mut gui =
+        Gui::start_traced(&x, "vkcube", &root, "/usr/bin/vkcube", &args, &FWE_VULKAN, true);
+    // Its window's name is `_NET_WM_NAME` only, which xdotool does not
+    // read (`WM_NAME`, XGetWMName): the one window of its size here with
+    // no name xdotool sees.
+    let w = x.window_sized(&mut gui, &["--name", "^$"], Some((300, 300)), 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "vkcube-first");
+    assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "vkcube-next", 10);
+    assert_ne!(next.digest, first.digest, "the cube did not turn: {}", gui.report());
+}
+
+/// Vulkan's mock driver (Homebrew's `vulkan-tools`: CPU only, no Metal), as
+/// the Mac's driver for tests that need none of the GPU's work done.
+fn mock_vulkan_driver() -> Option<String> {
+    let m = Path::new("/opt/homebrew/opt/vulkan-tools/lib/mock_icd/VkICD_mock_icd.json");
+    if m.exists() {
+        return Some(m.display().to_string());
+    }
+    eprintln!("skipped: no Vulkan mock driver (brew install vulkan-tools)");
+    None
+}
+
+/// A Linux program's Vulkan loader finds fwe's driver where it looks for
+/// drivers (`/etc/vulkan/icd.d`), and through it the Mac's: here Vulkan's
+/// mock driver, whose device `vulkaninfo` lists, and on an X display, its
+/// surfaces of X windows.
+#[test]
+fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    let Some(driver) = mock_vulkan_driver() else { return };
+    let root = alpine_root("display");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/vulkaninfo"))
+        .arg("--summary")
+        .env("FWE_VULKAN_DRIVER", &driver)
+        .env("VK_LOADER_DEBUG", "error,warn,driver")
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY");
+    let out = run_bounded(cmd);
+    let text = stdout(&out);
+    assert!(
+        text.contains("Vulkan Mock Device"),
+        "{text}\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+
+    // On an X display: the loader asks fwe's driver for a surface of its
+    // own of an X window, which the device presents to.
+    let x = Xvfb::start().expect("XVFB: the display tests need Xvfb");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg(root.join("usr/bin/vulkaninfo"))
+        .env("FWE_VULKAN_DRIVER", &driver)
+        .env("VK_LOADER_DEBUG", "error,warn")
+        .env("DISPLAY", x.display())
+        .env_remove("WAYLAND_DISPLAY");
+    let out = run_bounded(cmd);
+    let text = stdout(&out);
+    let presentable = text.split_once("Presentable Surfaces:").map(|(_, rest)| rest);
+    assert!(
+        presentable
+            .is_some_and(|p| p.contains("VK_KHR_xcb_surface") && p.contains("VK_KHR_xlib_surface")),
+        "no presentable X surfaces:\n{}\n{}",
+        text.lines().take(40).collect::<Vec<_>>().join("\n"),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A fork child of a process using the GPU device: its copy of the
+/// parent's open and an open of its own fail (the Mac's driver in its
+/// memory is the parent's), an `execve` makes it a process with a device
+/// of its own, and the parent's open goes on working.
+#[test]
+fn gpu_device_across_fork_and_exec() {
+    let Some(driver) = mock_vulkan_driver() else { return };
+    let prog = build_c_dynamic("gpufork", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "gpufork");
+    // Inside the root, where `/proc/self/exe` leads back to it.
+    let inside = root.join("gpufork");
+    std::fs::copy(&prog, &inside).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "parent: the driver works\n\
+         child: inherited open ENODEV, own open ENODEV\n\
+         exec'd child: its own open works\n\
+         parent: child exit 0, its open works\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The tests' Mac Vulkan driver (`tests/fake_vulkan_driver.c`), which does
+/// as Metal does under MoltenVK: built for test `test`, with its manifest;
+/// the manifest's path.
+fn fake_vulkan_driver(test: &str) -> PathBuf {
+    let dir = out_dir().join(format!("fake-vulkan-{test}"));
+    std::fs::create_dir_all(&dir).unwrap();
+    let lib = dir.join("libfake_vulkan.dylib");
+    let source = repo().join("crates/fwe/tests/fake_vulkan_driver.c");
+    let status = Command::new("clang")
+        .args(["-dynamiclib", "-O1", "-Wall", "-Wextra", "-Werror", "-o"])
+        .arg(&lib)
+        .arg(&source)
+        .status()
+        .expect("clang runs");
+    assert!(status.success(), "the fake Vulkan driver did not build");
+    let manifest = dir.join("fake_icd.json");
+    std::fs::write(
+        &manifest,
+        format!(
+            "{{\"file_format_version\": \"1.0.1\", \"ICD\": {{\"library_path\": \"{}\", \
+             \"api_version\": \"1.3.0\"}}}}\n",
+            lib.display()
+        ),
+    )
+    .unwrap();
+    manifest
+}
+
+/// What the Mac's Vulkan driver does in fwe's process stays out of the
+/// program's way: the descriptors it opens are not the program's, a signal
+/// the host gives one of its threads reaches the program's waiting thread,
+/// and a wait on a fence that never signals ends at its timeout.
+#[test]
+fn gpu_driver_descriptors_and_threads_are_not_the_programs() {
+    let prog = build_c_dynamic("gpuhygiene", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "gpuhygiene");
+    let manifest = fake_vulkan_driver("hygiene");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).env("FWE_VULKAN_DRIVER", &manifest);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "descriptors: the program's own\n\
+         signal: taken while waiting\n\
+         fence: timed out\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A bad pointer the driver writes through ends the process with SIGSEGV,
+/// as a fault in a Linux driver's code in the process does.
+#[test]
+fn gpu_driver_fault_on_a_bad_pointer_is_sigsegv() {
+    use std::os::unix::process::ExitStatusExt;
+    let prog = build_c_dynamic("gpuhygiene", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "gpuhygiene-fault");
+    let manifest = fake_vulkan_driver("fault");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).arg("fault").env("FWE_VULKAN_DRIVER", &manifest);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(stdout(&out), "", "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(out.status.signal(), Some(libc::SIGSEGV), "{:?}", out.status);
+}
+
+/// glxgears draws with OpenGL on the Mac's GPU: Mesa's Zink, OpenGL on
+/// Vulkan, on fwe's driver, in an X server with GLX (Alpine's Xvfb, run by
+/// fwe), which names the renderer; its gears drawn and turning.
+/// Xvfb has no DRI3, which GLX asks of Zink unless told it may present
+/// another way (`LIBGL_KOPPER_DRI2`): Zink then shows its frames through
+/// Vulkan's swapchain, as vkcube does.
+#[test]
+fn alpine_display_glxgears_draws_on_the_gpu() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    let root = x11_root("glxgears-gpu");
+    let x = Xvfb::in_root(&root);
+    let mut env = FWE_VULKAN.to_vec();
+    env.extend([
+        ("MESA_LOADER_DRIVER_OVERRIDE", "zink"),
+        ("LIBGL_KOPPER_DRI2", "1"),
+        ("LIBGL_DEBUG", "verbose"),
+    ]);
+    let local = |program: &str| format!("DISPLAY=:{} exec {program}", x.number);
+    let glxinfo = local("/usr/bin/glxinfo -B");
+    let info = display_output(&x, "glxinfo-gpu", &root, &["/bin/sh", "-c", &glxinfo], &env, 120);
+    let renderer = info.lines().find(|l| l.contains("OpenGL renderer string")).unwrap_or_default();
+    assert!(renderer.contains("zink") && renderer.contains("Apple"), "not on the GPU:\n{info}");
+    let command = local("/usr/bin/glxgears -geometry 300x300+0+0");
+    let mut gui = Gui::start(&x, "glxgears-gpu", &root, "/bin/sh", &["-c", &command], &env);
+    let w = x.window(&mut gui, &["--name", "glxgears"], 120);
+    std::thread::sleep(Duration::from_secs(2));
+    let first = x.shot(&w, "glxgears-gpu-first");
+    assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
+    let next = x.changes(&w, &first, "glxgears-gpu-next", 10);
+    assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
 }
 
 /// Wine's Notepad, a Windows program, drawn through Wine's X11 driver in

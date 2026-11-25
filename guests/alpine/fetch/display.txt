@@ -3,8 +3,10 @@
 # (xeyes, xclock, xterm, xdpyinfo, xwininfo, xdotool, xwd) with fonts, and
 # Weston with its X11 back end, its clients, foot and Xwayland, and
 # glxgears with Mesa's software renderer and Xvfb (an X server with GLX),
-# with every package they depend on. Each line is a path under that URL
-# and the file's SHA-256.
+# and Vulkan's loader with vulkaninfo and vkcube, with every package they
+# depend on. Mesa is 3.25's (26.3, whose Zink is OpenGL on fwe's Vulkan
+# driver), with the LLVM and musl it is built with. Each line is a path
+# under that URL and the file's SHA-256.
 v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 v3.24/main/aarch64/abseil-cpp-raw-logging-internal-20250814.1-r0.apk 30679288b05533c12cd7ccffe2949d852b6df66ed87505af72a4240652cb87dd
 v3.24/main/aarch64/abseil-cpp-strings-20250814.1-r0.apk 8ab707d857ba0953413a2ea07195d1d8aac59f65edbe6fb779534b2549409830
@@ -26,7 +28,7 @@ v3.24/main/aarch64/fontconfig-2.17.1-r1.apk e4fc46de2fa0dc64ef948aab0798500f784e
 v3.24/community/aarch64/foot-1.27.0-r0.apk 1e3323dad5228a0bf28e2cb5bcf710b7db826e9db5664c05bda6f1462eb42726
 v3.24/main/aarch64/freetype-2.14.3-r0.apk 8f36a4b4b6c75574f2f51d62c3df27d23ec7054ae1cae97d54adad72e725e027
 v3.24/main/aarch64/fribidi-1.0.16-r3.apk b4f41c04682487ccc0d5e304a20f1062ddb47907ffa0a414208512e2c946e4d7
-v3.24/main/aarch64/glib-2.88.1-r1.apk 0ae89191a79ea5d5a02515e41f29b62e5e0a0a80fb059804bbbacac2d77cce4e
+v3.24/main/aarch64/glib-2.88.4-r0.apk 0605a48319f3cca14b3d026175fd7c41a28c854632cda48fc12d1a1318ab5919
 v3.24/main/aarch64/gmp-6.3.0-r4.apk 4dab6e86b850fe1b5bc0cf2fac17efa4d7f648bea44f3d9019694cc1e1cb12b7
 v3.24/main/aarch64/gnutls-3.8.14-r0.apk 08b57e617c3e829736103d62178bf88d7abb5eb0e52e7e98dce65bacf87066a7
 v3.24/main/aarch64/graphene-1.10.8-r5.apk fa6bb42c851531b504eef6ecba80b893c24994d5c3c5e942dac76737f5c5a27c
@@ -41,13 +43,14 @@ v3.24/main/aarch64/libbsd-0.12.2-r0.apk 1c4129bef0862afa2a7414217e8c3a50609abfe2
 v3.24/main/aarch64/libbz2-1.0.8-r6.apk 28cb76bb6d11d2a55c3061b5fcb2ab84996412a248b2c9fe52bb710d0a2a84e7
 v3.24/community/aarch64/libcamera-0.7.1-r1.apk 892d1f6f01f7c2fc29cf56ec7db92f5d25432036dd741fcec37b86276582876d
 v3.24/community/aarch64/libcamera-ipa-0.7.1-r1.apk 55af4387bee4ad276c4abaf13b1bd20284abda6342f05d056089d28fae4ac668
+v3.24/main/aarch64/libdisplay-info-0.3.0-r0.apk b16c3bd7432f49cc2ad322228c56510932940fec35c2fa43e842d2e3f898a958
 v3.24/main/aarch64/libdrm-2.4.134-r0.apk ad796caa2b8685d8a3d586bc06bb3b710efb497e8503372ac65c93ab7260623b
 v3.24/main/aarch64/libeconf-0.8.3-r0.apk cf0899d49ded0a6891e3cdf1b37887f2ecd77293afe1d8f3cb8937763c83f183
 v3.24/main/aarch64/libelf-0.195-r0.apk 1c108314af454a885ac0b053201db57027470c4f2309412c016897e2a2bf5d0e
 v3.24/main/aarch64/libepoxy-1.5.10-r1.apk ddb716957da6c47fbfc68e0b6a4ee87b1d734cc2bce4090d7e695e4aa0216417
 v3.24/community/aarch64/libevdev-1.13.6-r0.apk 7e8f918dcdedbb817148ef46158d1093dac8856d58174d61b89679b06c57d347
 v3.24/main/aarch64/libexpat-2.10.0-r0.apk 99144fe0b1bb9316a3bc30c38707996767806661f4a0456fcf4565ac92e79b0f
-v3.24/main/aarch64/libffi-3.5.2-r1.apk 9a67280b0c7c62db658c2d4d32ed1199903bef859c32dd4245e1a7e35c89ab4b
+v3.24/main/aarch64/libffi-3.8.1-r0.apk f6f6de8c25f181e3c96ee9d1120880565d970a8bf5dd06acbcfb9f2df8159963
 v3.24/main/aarch64/libfontenc-1.1.10-r0.apk 6bb4dc07dbe726931072f4f9a35002e996df575c786ff259608eaea3b18074b6
 v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
 v3.24/main/aarch64/libice-1.1.2-r0.apk 476b272715e49b036767a1d9935b581f5b33fb2bdfa8978244d145bbd1739792
@@ -85,7 +88,7 @@ v3.24/community/aarch64/libxcvt-0.1.3-r0.apk 38febbc5857c3f886789aa1fc0a60046ca3
 v3.24/main/aarch64/libxdmcp-1.1.5-r1.apk 4f6fe6269deadf99d2cd69b0a77cdaae1cab414738edf59df4ae79f4871c7adb
 v3.24/main/aarch64/libxext-1.3.7-r0.apk 06886b15075a537fcd499c243facd0ec8c3e38eddef19be68ef185c079c462e4
 v3.24/main/aarch64/libxfixes-6.0.2-r0.apk 5d389f949f0f0e1753fcbfeeda8f06f12c9f14b13ec1cadb7f553cc8f11420a8
-v3.24/community/aarch64/libxfont2-2.0.8-r0.apk e1d499da6acd64ae8e440c91ad825cdc9d410d1cddd45173e38c1dea574dd13b
+v3.24/community/aarch64/libxfont2-2.0.10-r0.apk cd05e6378e0a529fa0126b5910c5000fc6b61e53080792a13b74fd331616560b
 v3.24/main/aarch64/libxft-2.3.9-r0.apk ec2eabfee31f018976518f95e84e707d4b47d2d4a27180bc171595316c35f385
 v3.24/main/aarch64/libxi-1.8.4-r0.apk 45fa9e7de44b246820922d99570d2e17bb2872d860b49db662ce5b8fdd31072d
 v3.24/main/aarch64/libxinerama-1.1.6-r0.apk 96198e671dbfd58a54fb00d6e70ac05975a18c186e68c987aad72d4614ab4ff3
@@ -101,16 +104,17 @@ v3.24/main/aarch64/libxtst-1.2.6-r0.apk 0f62d243f739d81d0d00199fef918795b8a7cdd7
 v3.24/main/aarch64/libxv-1.0.13-r0.apk fe7de73af00ad70964707ea232ef8ceec8f1f874c054669b3f3ea16249cacf77
 v3.24/main/aarch64/libxxf86vm-1.1.7-r0.apk a85a4f82da77bef6055fe27adf01772acfcdf30cfecd74528149d6793c2685a4
 v3.24/main/aarch64/libyuv-0.0.1928-r0.apk d16c6f425629de40bb307fc582d5985bed7043e5ef82ffee6816556eb03a0f8b
-v3.24/main/aarch64/llvm22-libs-22.1.3-r1.apk 6b1b25fdc82cd6d0e2fb57594d08d405569d4776e4b9c56012bd81f8dd90805a
-v3.24/main/aarch64/mesa-26.1.6-r0.apk 081ea0a54f57373442b539e353a296f178af39a9e5e11da6b571424c398275e5
-v3.24/main/aarch64/mesa-dri-gallium-26.1.6-r0.apk 62cfd817a66b7bf3991e3c5b11c381f6e452e0261b757de9a91e3470d47dc65f
-v3.24/main/aarch64/mesa-egl-26.1.6-r0.apk 6b49e6f263427218289aa19b83aae533d79bda984a430964e2ed21592b4b65eb
-v3.24/main/aarch64/mesa-gbm-26.1.6-r0.apk 3a5487b688e3f072f134133b8a6538d552c9ebc86dedb5f0d54e2566f110f5da
-v3.24/main/aarch64/mesa-gl-26.1.6-r0.apk 580a5cd3e8d31b8774e78ad7a3d5798f667d0ee98d07e8afd0765daf6d450720
-v3.24/main/aarch64/mesa-gles-26.1.6-r0.apk 1553461ee9e91a4d6fad5941d6a98f43e14b0d920c302b5e21504a6411b2183f
+v3.25/main/aarch64/llvm23-libs-23.1.6-r0.apk 05c33a597b9018cfa841275ce3c0308f4d24771bd8af34a64cdabe37f5040e77
+v3.25/main/aarch64/mesa-26.3.1-r0.apk c0d92499933a70bf98c2b624b66b67e607faf6c9993b5daf49b02828972884c3
+v3.25/main/aarch64/mesa-dri-gallium-26.3.1-r0.apk 08619b0148efe7f2b29b0c91ff2713fad6f5f4eb53a9c2ffc9859f94f3ccbc68
+v3.25/main/aarch64/mesa-egl-26.3.1-r0.apk 13a8950c7c46234b1e207266dfe91bee2d40003646854c96568b22a19a937c67
+v3.25/main/aarch64/mesa-gbm-26.3.1-r0.apk 4d8d7220cc9ccef6c00fff4d05c5cf865a4b4e41c14e1e8a323c42543c7f1b58
+v3.25/main/aarch64/mesa-gl-26.3.1-r0.apk a43f98af08bf5620ef88c7b5a112f26ad8e95de7083200d6ec5cae46ff0b8b2e
+v3.25/main/aarch64/mesa-gles-26.3.1-r0.apk f580ff009773d68288dd1078429b8f6fded98aa92435032d8f8e70cc13f81760
 v3.24/community/aarch64/mesa-utils-9.0.0-r6.apk 1a820cf7aff7dacdf959b8295893147ffbdb23df055c7e2b1d4921ba4f10a6b2
 v3.24/main/aarch64/mkfontscale-1.2.4-r0.apk c373d5c19283b41dbb5661dbc3c40ad95368040a848562c673044b8b2462be97
 v3.24/community/aarch64/mtdev-1.1.7-r0.apk f8b79dcbb4f761147ea12bdcc078383ebbd6c94399c76ae73ef79ee3e4ca6ed5
+v3.25/main/aarch64/musl-1.2.6-r6.apk 2d8d10740e7082dd1f4e62ccd1fcf73a39e6f558db8d575ecf8ebad8b0c3afcd
 v3.24/main/aarch64/ncurses-terminfo-6.6_p20260516-r0.apk 41471352cac0d4f3db44146280c4c0836770f190c153a920d70c9812ef6ba884
 v3.24/main/aarch64/ncurses-terminfo-base-6.6_p20260516-r0.apk e0c546b9461bdce206a90bc720cb69aa4628b5a5b8d908c3e5084e00f28f6a9d
 v3.24/main/aarch64/nettle-3.10.2-r0.apk 573c54ecb55b157d9cd5323eb3a9bb9d87b375ee20392a6a9d16c0ba098af9e5
@@ -127,6 +131,8 @@ v3.24/main/aarch64/speexdsp-1.2.1-r2.apk 0989bde366b262de9f8311d3bab67d9fd4f3fcf
 v3.24/main/aarch64/spirv-tools-1.4.341.0-r0.apk 28a3be7fe2552c2c11b33a366c7bf6a67a408d9bf509bfe66aea68bf79467c60
 v3.24/community/aarch64/utf8proc-2.11.3-r0.apk 466273841b3ea938ebac509924d45a9eb426cebcadaee1e4ac6c8557b4cd35cf
 v3.24/main/aarch64/util-macros-1.20.2-r0.apk a0a27ccc4451080025bcc5961e6d621ba5eebd1b88c7b74b84ccc6d07f318b1c
+v3.24/main/aarch64/vulkan-loader-1.4.347-r0.apk b6fc863a1d9f2f8d035bbcf49bf320f3e7212d4f402df80c7f893a4c6e2e0bc1
+v3.24/main/aarch64/vulkan-tools-1.4.347-r0.apk ce40fa155f37ff89bcf07d615fd4e29d68b1a96ea640e05abb80e37d96fcea94
 v3.24/main/aarch64/wayland-libs-client-1.25.0-r0.apk 409b4ad8de59d7b69f7c8add50cc76ef0fe3fe8c80e7854d6fe93c6b1dccc005
 v3.24/main/aarch64/wayland-libs-cursor-1.25.0-r0.apk 22129b3f85ecf905a00436040c4ca3d07a071e700997aebf9bb7a2430cb42946
 v3.24/main/aarch64/wayland-libs-egl-1.25.0-r0.apk c06c148aa8fe57848f1a30ac46b95736b04fb1bf73324ccf29c0bae82ee4a7e7

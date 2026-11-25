@@ -26,7 +26,7 @@
 
 use fwe_abi::resource::RLIM_INFINITY;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 /// The least number of descriptors kept for fwe's own use, above the
 /// guest's range; it takes a quarter of the host's descriptors when there
@@ -229,6 +229,100 @@ pub fn dup_reserved(fd: i32) -> Result<i32, i32> {
         Err(fwe_abi::errno::EBADF)
     } else {
         Err(fwe_abi::errno::EMFILE)
+    }
+}
+
+/// A plug is in place ([`plugged`]).
+static PLUGGED: AtomicBool = AtomicBool::new(false);
+/// The plugs made, the numbers they took and their nanoseconds, for
+/// `FWE_TIMING` ([`plugs`]).
+static PLUGS: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
+
+/// Run `f` with every free number of the guest's range taken, so the
+/// descriptors anything opens meanwhile land out of the guest's reach (in
+/// the reserved range): for a host library that opens descriptors of its
+/// own (the Mac's Vulkan driver's caches). The caller holds the kernel lock,
+/// so no call under it makes a descriptor meanwhile; a call without it
+/// that does moves it into the guest's range once the plug is gone
+/// ([`into_range`]). Each number is taken as the lowest free one, so none
+/// another thread is making is taken over. `EMFILE` if the host's table
+/// has no room left for the plugs.
+pub fn plugged<R>(f: impl FnOnce() -> R) -> Result<R, i32> {
+    let began = std::time::Instant::now();
+    // SAFETY: a constant NUL-terminated path.
+    let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+    if null < 0 {
+        return Err(fwe_abi::errno::EMFILE);
+    }
+    PLUGGED.store(true, Ordering::SeqCst);
+    let max = guest_max();
+    let mut plugs = Vec::new();
+    let full = loop {
+        // SAFETY: a plain host call on fwe's own descriptor.
+        let fd = unsafe { libc::fcntl(null, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            break false;
+        }
+        if fd >= max {
+            // SAFETY: the duplicate just made, fwe's own.
+            unsafe { libc::close(fd) };
+            break true;
+        }
+        plugs.push(fd);
+    };
+    let r = full.then(f);
+    for fd in plugs.iter().copied().chain([null]) {
+        // SAFETY: the plugs made above, fwe's own.
+        unsafe { libc::close(fd) };
+    }
+    PLUGGED.store(false, Ordering::SeqCst);
+    if crate::timing::on() {
+        PLUGS[0].fetch_add(1, Ordering::Relaxed);
+        PLUGS[1].fetch_add(plugs.len() as u64 + u64::from(null < max), Ordering::Relaxed);
+        PLUGS[2].fetch_add(began.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    r.ok_or(fwe_abi::errno::EMFILE)
+}
+
+/// The plugs made ([`plugged`]): how many, the numbers they took, and their
+/// time, as text, if any were.
+pub fn plugs() -> Option<String> {
+    let n = PLUGS[0].load(Ordering::Relaxed);
+    (n > 0).then(|| {
+        format!(
+            "descriptor plugs {n} ({} numbers, {} us)",
+            PLUGS[1].load(Ordering::Relaxed),
+            PLUGS[2].load(Ordering::Relaxed) / 1000
+        )
+    })
+}
+
+/// Descriptor `fd`, which a call made without the kernel lock for the guest
+/// (an `accept`, a received one), in the guest's range: where a plug
+/// ([`plugged`]) put it out of it, moved to the lowest free number once
+/// the plug is gone (a copy of it, the same description, its
+/// close-on-exec kept). Any other is itself.
+pub fn into_range(fd: i32) -> i32 {
+    if fd < 0 || guest_visible(fd) {
+        return fd;
+    }
+    while PLUGGED.load(Ordering::SeqCst) {
+        std::thread::yield_now();
+    }
+    // SAFETY: plain host calls on the descriptor the caller made.
+    unsafe {
+        let cloexec = libc::fcntl(fd, libc::F_GETFD) & libc::FD_CLOEXEC != 0;
+        let low = libc::fcntl(fd, if cloexec { libc::F_DUPFD_CLOEXEC } else { libc::F_DUPFD }, 0);
+        if low < 0 || !guest_visible(low) {
+            // The guest's range is full: the descriptor stays as it is,
+            // for the call to refuse as one past the limit.
+            if low >= 0 {
+                libc::close(low);
+            }
+            return fd;
+        }
+        libc::close(fd);
+        low
     }
 }
 

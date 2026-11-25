@@ -130,6 +130,7 @@ pub mod trace;
 pub mod uaccess;
 pub mod userns;
 pub mod vmas;
+pub mod vulkan;
 pub mod x11;
 pub mod xattr;
 
@@ -376,6 +377,7 @@ pub struct Kernel<P: Platform> {
 
 impl<P: Platform> Kernel<P> {
     pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
+        trace::traces(tracer);
         // Before any handler may need to read a note of a sender.
         signote::init();
         #[cfg(not(test))]
@@ -497,6 +499,7 @@ impl<P: Platform> Kernel<P> {
         let page_size = d.u64();
         let brk = Brk { start: d.u64(), current: d.u64(), limit: d.u64() };
         let tracer = Tracer { enabled: d.bool(), failures_only: d.bool() };
+        trace::traces(tracer);
         let trace_file = d.bytes();
         fdmarks::load(d);
         netlink::load(d);
@@ -2154,6 +2157,9 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         }
     }
     if let Some(r) = loopdev::io(nr, &a) {
+        return Some(r);
+    }
+    if let Some(r) = vulkan::device::io(nr, &a) {
         return Some(r);
     }
     if let Some(r) = filestore::io::io(nr, &a) {

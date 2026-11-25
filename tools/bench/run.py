@@ -235,6 +235,12 @@ BUDGETS = {
     "JIT code: a loop (ns)": 1.3,
     # A graphical program's calls to its X server, as a system call is.
     "X request round trip (us)": 1.5,
+    # Vulkan on the GPU: fwe's Vulkan driver, its commands run by MoltenVK
+    # in fwe's process, against the same program on MoltenVK natively
+    # (ROADMAP.md M7 PR 2).
+    "vkcube frame (ms)": 1.5,
+    "Vulkan submission round trip (us)": 1.5,
+    "Vulkan frame made and read (us)": 1.5,
     "X frame through shared memory (us)": 1.5,
     # Kernel state every process shares, kept in memory as a kernel keeps
     # it (ROADMAP.md M6 PR 2).
@@ -410,6 +416,80 @@ def gears_fwe(a, fwe, guest_env):
         xvfb.wait()
 
 
+VKCUBE = "vkcube frame (ms)"
+# Frames as fast as they are made, not at a display's refresh, of the same
+# size on both sides. (A runner's display paces MoltenVK's frames all the
+# same: natively a frame there is its refresh, 16.7 ms; under fwe the
+# frames are copied to Xvfb, which paces nothing. The same frame's work
+# unpaced on both sides, VK_FRAME, and a submission's round trip,
+# VK_SUBMIT, are what compare the GPU's work.)
+VKCUBE_ARGS = ["--present_mode", "0", "--width", "300", "--height", "300"]
+# Two runs' frames: their times' difference is the frames' alone.
+VKCUBE_FRAMES = (200, 1200)
+# fwe's Vulkan driver, the guest's only one, on MoltenVK (the native side's
+# driver): fwe's environment and the guest's alike.
+def gpu_env(brew):
+    return ["VK_DRIVER_FILES=/etc/vulkan/icd.d/fwe_icd.aarch64.json",
+            "FWE_VULKAN_DRIVER=" + os.path.join(brew, "etc/vulkan/icd.d/MoltenVK_icd.json")]
+
+
+def vkcube_ms(cmd, env=None):
+    """vkcube's time per frame as `cmd` runs it: the time of its
+    VKCUBE_FRAMES' more frames, the best of three."""
+    def timed(n):
+        start = time.monotonic()
+        p = subprocess.run(cmd + ["--c", str(n)], env=env, capture_output=True, timeout=600)
+        if p.returncode != 0:
+            said = (p.stdout + p.stderr).decode(errors="replace")[-4000:]
+            sys.exit(f"vkcube ended with {p.returncode}; it said:\n{said}")
+        return time.monotonic() - start
+    few, many = VKCUBE_FRAMES
+    return best(lambda: (timed(many) - timed(few)) * 1000 / (many - few), rounds=3)
+
+
+VK_SUBMIT = "Vulkan submission round trip (us)"
+VK_FRAME = "Vulkan frame made and read (us)"
+# Each row's mode of tools/bench/vkbench.c, and its count.
+VKBENCH = {VK_SUBMIT: ("submit", "3000"), VK_FRAME: ("frame", "1000")}
+
+
+def vulkan(a, fwe, guest_env, results):
+    """Vulkan on the GPU: a submission's round trip and a frame's work
+    (tools/bench/vkbench.c), and vkcube's frames. Under fwe, Alpine's
+    programs on fwe's Vulkan driver (MoltenVK in fwe's process), vkcube at
+    the X server here; natively, the same on MoltenVK (Homebrew's vkcube in
+    a window of macOS's)."""
+    root = alpine_root("display", a.cache)
+    icd = dict(os.environ, VK_ICD_FILENAMES=os.path.join(a.brew, "etc/vulkan/icd.d/MoltenVK_icd.json"))
+    shutil.copy(a.vkbench, os.path.join(root, "tmp/vkbench"))
+    guest = guest_env + gpu_env(a.brew) + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
+    for row, args in VKBENCH.items():
+        results["fwe"][row] = best(lambda: run_bench(guest[:-1], guest[-1], list(args)))
+        # Where its time goes: the Vulkan commands and their time.
+        r = subprocess.run(guest[:2] + ["FWE_TIMING=1"] + guest[2:] + list(args),
+                           capture_output=True, text=True, errors="replace", timeout=600)
+        for line in r.stderr.splitlines():
+            if "timing: exit:" in line:
+                print(f"{row}: {line}", flush=True)
+        results["macOS"][row] = best(lambda: float(subprocess.run(
+            [a.vkbench_native, *args, os.path.join(a.brew, "lib/libvulkan.1.dylib")],
+            env=icd, check=True, capture_output=True, text=True).stdout.split()[-1]))
+    ours = (guest_env + [f"DISPLAY={os.environ['DISPLAY']}"] + gpu_env(a.brew) + fwe
+            + ["--root", root, os.path.join(root, "usr/bin/vkcube"), "--wsi", "xcb"] + VKCUBE_ARGS)
+    results["fwe"][VKCUBE] = vkcube_ms(ours)
+    # The program itself: Homebrew's `vkcube` command opens its app with
+    # `open`, which takes no arguments for it.
+    theirs = [os.path.join(a.brew, "opt/vulkan-tools/cube/vkcube.app/Contents/MacOS/vkcube")] + VKCUBE_ARGS
+    results["macOS"][VKCUBE] = vkcube_ms(theirs, icd)
+    # Where its time goes: the Vulkan commands, and fwe's other calls
+    # (FWE_TIMING's last mark).
+    timed = ours[:2] + ["FWE_TIMING=1"] + ours[2:] + ["--c", "300"]
+    r = subprocess.run(timed, capture_output=True, text=True, errors="replace", timeout=600)
+    for line in r.stderr.splitlines():
+        if "timing: exit:" in line:
+            print(f"vkcube: {line}", flush=True)
+
+
 def best(f, rounds=ROUNDS):
     return min(f() for _ in range(rounds))
 
@@ -565,7 +645,9 @@ def linux(a):
             try:
                 r[GEARS] = gears_ms(
                     ["docker", "run", "--rm", "--name", "fwe-gears"] + env + [image, "sh", "-c",
-                     "apk add -q xvfb font-misc-misc mesa-utils mesa-dri-gallium"
+                     # Mesa as the root fwe runs it in has it: 3.25's.
+                     "apk add -q -X https://dl-cdn.alpinelinux.org/alpine/v3.25/main"
+                     " xvfb font-misc-misc mesa-utils mesa-dri-gallium"
                      f" && (Xvfb :{GEARS_DISPLAY} -screen 0 1024x768x24 -nolisten tcp"
                      " >/dev/null 2>&1 &)"
                      f" && while [ ! -e {sock} ]; do sleep 0.1; done && {GEARS_CMD}"]
@@ -809,6 +891,8 @@ def build(a, fwe, results):
     workloads(a, fwe, guest_env, os.path.join(native_src, "src"), results)
     postgres(a, fwe, guest_env, results)
     results["fwe"][GEARS] = gears_fwe(a, fwe, guest_env)
+    if not a.no_gpu:
+        vulkan(a, fwe, guest_env, results)
     jdk(a, fwe, guest_env, results)
     host_costs()
     for name, manifest, program, script in [("Node.js", "nodejs", "/usr/bin/node", "bench.js"),
@@ -2178,6 +2262,12 @@ def main():
     mc.add_argument("--brew", required=True, help="Homebrew's prefix: the native programs")
     mc.add_argument("--out", required=True)
     mc.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
+    mc.add_argument("--vkbench", required=True,
+                    help="tools/bench/vkbench.c built for Alpine (musl): run under fwe")
+    mc.add_argument("--vkbench-native", required=True,
+                    help="tools/bench/vkbench.c built for macOS: run natively")
+    mc.add_argument("--no-gpu", action="store_true",
+                    help="no GPU benchmarks: fwe's VM backend has no GPU device")
     a = p.parse_args()
     {"linux": linux, "macos": macos}[a.mode](a)
 

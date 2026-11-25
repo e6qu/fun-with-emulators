@@ -412,6 +412,7 @@ impl<P: Platform> Kernel<P> {
                 crate::inotify::closed(fd);
                 crate::dnotify::closed(fd);
                 crate::loopdev::closed(fd);
+                crate::vulkan::device::fd_closed(fd);
                 let queue = crate::mqueue::closing(fd, &self.creds);
                 let stored = crate::filestore::desc::closing(fd);
                 crate::fdmarks::closed(fd);
@@ -1647,6 +1648,9 @@ impl<P: Platform> Kernel<P> {
             return err(e);
         }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
+            return r;
+        }
+        if let Some(r) = crate::vulkan::device::ioctl(fd, req, arg) {
             return r;
         }
         if let Some(r) = crate::filestore::io::ioctl(fd, req, arg, &self.creds) {

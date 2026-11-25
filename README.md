@@ -49,11 +49,12 @@ What runs unmodified, its output checked in CI:
   (`fwe --vm`, on the stand-in), and Notepad on an X display.
 - **Graphical, natively:** X11 clients, GTK, Qt, Tk and software OpenGL
   drawn on an X server on the Mac, and Weston with Wayland clients and
-  Xwayland.
+  Xwayland; Vulkan (`vkcube`) and OpenGL (`glxgears`, through Zink) on
+  the Mac's GPU.
 - **Conformance:** every LTP system-call test that applies passes.
 
-Native speed, the GPU, browsers, graphical Wine natively and gVisor are
-the work left to 1.0;
+Native speed, browsers, graphical Wine natively and gVisor are the work
+left to 1.0;
 [ROADMAP.md](ROADMAP.md) has the details.
 
 ## Documentation
