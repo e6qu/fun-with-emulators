@@ -10551,6 +10551,21 @@ impl Xvfb {
         Shot { drawn, colours, digest }
     }
 
+    /// Wait up to `secs` for window `w` to have drawn more than `least`
+    /// pixels (a program draws its first frame once it is ready, which
+    /// compiling its shaders on a loaded machine delays): what it shows
+    /// then.
+    fn drawn(&self, w: &Window, name: &str, least: u64, secs: u64) -> Shot {
+        let began = Instant::now();
+        loop {
+            let now = self.shot(w, name);
+            if now.drawn > least || began.elapsed() > Duration::from_secs(secs) {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     /// Wait up to `secs` for window `w` to show something other than
     /// `before` (its digest): what it shows then.
     fn changes(&self, w: &Window, before: &Shot, name: &str, secs: u64) -> Shot {
@@ -10624,8 +10639,7 @@ fn alpine_display_xeyes_follows_the_pointer() {
         assert!(o.status.success());
     };
     pointer(w.x + w.w + 200, w.y + w.h / 2);
-    std::thread::sleep(Duration::from_secs(1));
-    let right = x.shot(&w, "xeyes-right");
+    let right = x.drawn(&w, "xeyes-right", 1000, 60);
     assert!(right.drawn > 1000, "xeyes drew {right:?}: {}", gui.report());
     pointer(w.x, w.y + w.h + 200);
     let down = x.changes(&w, &right, "xeyes-down", 30);
@@ -10641,8 +10655,7 @@ fn alpine_display_xclock_ticks() {
     let args = ["-update", "1", "-geometry", "200x200+0+0"];
     let mut gui = Gui::start(&x, "xclock", &root, "/usr/bin/xclock", &args, &[]);
     let w = x.window(&mut gui, &["--class", "xclock"], 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "xclock-first");
+    let first = x.drawn(&w, "xclock-first", 500, 60);
     assert!(first.drawn > 500, "xclock drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "xclock-next", 10);
     assert_ne!(next.digest, first.digest, "the clock did not tick: {}", gui.report());
@@ -10692,8 +10705,7 @@ fn alpine_display_glxgears_turns_by_software() {
     let command = format!("DISPLAY=:{} exec /usr/bin/glxgears -geometry 300x300+0+0", x.number);
     let mut gui = Gui::start(&x, "glxgears", &root, "/bin/sh", &["-c", &command], &env);
     let w = x.window(&mut gui, &["--name", "glxgears"], 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "glxgears-first");
+    let first = x.drawn(&w, "glxgears-first", 10_000, 60);
     assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "glxgears-next", 10);
     assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
@@ -10795,8 +10807,7 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     // read (`WM_NAME`, XGetWMName): the one window of its size here with
     // no name xdotool sees.
     let w = x.window_sized(&mut gui, &["--name", "^$"], Some((300, 300)), 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "vkcube-first");
+    let first = x.drawn(&w, "vkcube-first", 10_000, 60);
     assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "vkcube-next", 10);
     assert_ne!(next.digest, first.digest, "the cube did not turn: {}", gui.report());
@@ -11016,8 +11027,7 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
     let command = local("/usr/bin/glxgears -geometry 300x300+0+0");
     let mut gui = Gui::start(&x, "glxgears-gpu", &root, "/bin/sh", &["-c", &command], &env);
     let w = x.window(&mut gui, &["--name", "glxgears"], 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "glxgears-gpu-first");
+    let first = x.drawn(&w, "glxgears-gpu-first", 10_000, 60);
     assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "glxgears-gpu-next", 10);
     assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
@@ -11052,8 +11062,7 @@ fn alpine_display_wine_notepad_in_the_vm() {
     assert!(status.success(), "wineboot: {status}: {}", boot.report());
     let mut notepad = wine("notepad", "wine notepad");
     let w = x.window(&mut notepad, &["--name", "Notepad"], 1800);
-    std::thread::sleep(Duration::from_secs(5));
-    let before = x.shot(&w, "notepad-before");
+    let before = x.drawn(&w, "notepad-before", 5000, 120);
     assert!(before.drawn > 5000, "Notepad drew {before:?}: {}", notepad.report());
     x.type_into(&w, "typed into Notepad");
     let after = x.changes(&w, &before, "notepad-typed", 300);
