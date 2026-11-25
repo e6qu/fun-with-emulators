@@ -1330,7 +1330,12 @@ interface with IPv6) in the local table, and in the initial namespace
 the host's routes (`sysctl` `NET_RT_DUMP`) in the main one, without
 what macOS keeps there and Linux does not (the link layer's entries,
 other interfaces' default routes); GLib's network monitor reads them to
-tell the machine is online. Other requests are `EOPNOTSUPP`; multicast groups joined are kept ([Network
+tell the machine is online. `RTM_GETNEIGH` lists the neighbours: none in
+an fwe namespace, the host's ARP and neighbour discovery entries in the
+initial one (`NET_RT_FLAGS` of `RTF_LLINFO`), without its own addresses.
+An address or route dump of a family Linux has no handler for
+(`AF_PACKET`, as Firefox asks) gives every family's, as Linux falls back
+to `AF_UNSPEC`. Other requests are `EOPNOTSUPP`; multicast groups joined are kept ([Network
 events](#network-events)). Such a socket also carries a POSIX message
 queue's `SIGEV_THREAD` notification.
 

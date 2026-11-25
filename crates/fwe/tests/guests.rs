@@ -10975,6 +10975,35 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// rtnetlink dumps by family as Linux answers them: a family it has no
+/// handler for (`AF_PACKET`, as Firefox asks) gives every family's
+/// addresses and routes; neighbours, in a namespace of `lo` alone, none.
+#[test]
+fn netlink_dumps_by_family_as_linux_answers_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "nlfamilies",
+        &[],
+        "initial namespace:\n\x20 addresses family 0: 2:some 10:some\n\
+         \x20 routes family 0: 2:some 10:some\n\
+         \x20 neighbours family 0: answered, each of the family asked for: yes\n\
+         \x20 addresses family 2: 2:some\n\x20 routes family 2: 2:some\n\
+         \x20 neighbours family 2: answered, each of the family asked for: yes\n\
+         \x20 addresses family 10: 10:some\n\x20 routes family 10: 10:some\n\
+         \x20 neighbours family 10: answered, each of the family asked for: yes\n\
+         \x20 addresses family 17: 2:some 10:some\n\
+         \x20 routes family 17: 2:some 10:some\n\
+         \x20 neighbours family 17: answered, each of the family asked for: yes\n\
+         new namespace, lo up:\n\x20 addresses family 0: 2:some 10:some\n\
+         \x20 routes family 0: 2:some 10:some\n\x20 neighbours family 0:\n\
+         \x20 addresses family 2: 2:some\n\x20 routes family 2: 2:some\n\
+         \x20 neighbours family 2:\n\x20 addresses family 10: 10:some\n\
+         \x20 routes family 10: 10:some\n\x20 neighbours family 10:\n\
+         \x20 addresses family 17: 2:some 10:some\n\
+         \x20 routes family 17: 2:some 10:some\n\x20 neighbours family 17:\n",
+    );
+}
+
 /// Writes to a file opened to append go where Linux puts them: at the end
 /// for `pwrite` and an AIO write at an offset, at the offset (or the
 /// file's position) for `RWF_NOAPPEND`, which musl's `pwrite` uses.
