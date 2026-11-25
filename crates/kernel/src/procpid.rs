@@ -537,22 +537,99 @@ pub fn user_record(dirs: &[Vec<u8>]) -> Option<crate::shared::Record<crate::user
     crate::shared::Record::join(d, 0).ok()
 }
 
+/// The files of `/proc/<pid>` of a process fwe has no record of: what the
+/// host tells of any process.
+const HOST_FILES: [&[u8]; 4] = [b"cmdline", b"comm", b"stat", b"status"];
+
+/// The arguments of host process `pid`, each ended with a NUL, as
+/// `/proc/<pid>/cmdline` has them: none where the host keeps them from
+/// this user (another user's process), as Linux shows none for a process
+/// that has no user memory.
+fn host_cmdline(pid: HostPid) -> Vec<u8> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid.get()];
+        let mut len: libc::size_t = 0;
+        // SAFETY: asks for the size only.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                std::ptr::null_mut(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+        {
+            return Vec::new();
+        }
+        let mut buf = vec![0u8; len];
+        // SAFETY: a valid name and out-buffer of `len` bytes.
+        if unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                3,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        } != 0
+            || len < 4
+        {
+            return Vec::new();
+        }
+        // `argc`, the executable's path and its padding of NULs, then the
+        // arguments, each ended with a NUL.
+        let argc = i32::from_ne_bytes([buf[0], buf[1], buf[2], buf[3]]).max(0) as usize;
+        let rest = &buf[4..len];
+        let Some(path_end) = rest.iter().position(|&b| b == 0) else { return Vec::new() };
+        let Some(args) = rest[path_end..].iter().position(|&b| b != 0) else { return Vec::new() };
+        let mut out = Vec::new();
+        let mut at = path_end + args;
+        for _ in 0..argc {
+            let Some(end) = rest[at..].iter().position(|&b| b == 0) else { break };
+            out.extend_from_slice(&rest[at..=at + end]);
+            at += end + 1;
+        }
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = pid;
+        Vec::new()
+    }
+}
+
 /// The entry `sub` (empty for the directory itself) of `/proc/<pid>`, for
 /// process `pid` of the reader's pid namespace behind host pid `host`.
 pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
     let Some(rec) = crate::procreg::read(host) else {
         // A process fwe has no record of (one of another user's, such as
         // the host's process 1, too): that it exists, and what the host
-        // tells of it.
+        // tells of it ([`HOST_FILES`]).
+        let (Some(h), Some(k)) = (host_info(host), crate::procreg::kinfo(host)) else {
+            return Entry::Missing(fwe_abi::errno::ENOENT);
+        };
         return match sub {
-            b"" if crate::host::probe(host).exists() => Entry::Dir,
-            b"/stat" => match host_info(host) {
-                Some(h) => {
-                    let comm = crate::procreg::kinfo(host).map(|k| k.comm).unwrap_or_default();
-                    Entry::File(stat_line(pid, &comm, &h))
-                }
-                None => Entry::Missing(fwe_abi::errno::ENOENT),
-            },
+            b"" => Entry::Dir,
+            b"/stat" => Entry::File(stat_line(pid, &k.comm, &h)),
+            b"/comm" => Entry::File([&k.comm[..], b"\n"].concat()),
+            b"/cmdline" => Entry::File(host_cmdline(host)),
+            b"/status" => {
+                let u = |id| crate::host::uid_to_linux(id);
+                let g = |id| crate::host::gid_to_linux(id);
+                let [r, e, s] = k.uids;
+                let [rg, eg, sg] = k.gids;
+                let creds = Creds {
+                    uids: [u(r), u(e), u(s), u(e)],
+                    gids: [g(rg), g(eg), g(sg), g(eg)],
+                    groups: k.groups.iter().map(|&id| g(id)).collect(),
+                    ..Creds::default()
+                };
+                Entry::File(status(pid, &k.comm, &h, &creds))
+            }
             _ => Entry::Missing(fwe_abi::errno::ENOENT),
         };
     };
@@ -684,7 +761,9 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
 /// The entries of `/proc/<pid>` or one of its directories.
 pub fn children(pid: i32, sub: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
     let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
+    let recorded = || crate::pidns::to_host(pid).and_then(crate::procreg::read).is_some();
     match sub {
+        b"" if !recorded() => out.extend(HOST_FILES.iter().map(|n| (n.to_vec(), DT_REG))),
         b"" => out.extend(FILES.iter().map(|(n, t)| (n.to_vec(), *t))),
         b"/ns" => out.extend(
             [&b"cgroup"[..], b"ipc", b"mnt", b"net", b"pid", b"pid_for_children", b"user", b"uts"]

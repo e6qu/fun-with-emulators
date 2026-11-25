@@ -1243,7 +1243,10 @@ contents come from is in
   reaped, so its `/proc/<pid>` exists with state `Z` (the host answers
   for a zombie only in its `kinfo_proc`). A host process fwe did not start
   (outside a pid namespace any number names the host's, 1 its `launchd`)
-  is a directory with its `stat`.
+  has what the host tells of any process: `stat`, `status` and `comm`
+  from its `kinfo_proc` (its ids mapped as a file owner's are, so another
+  user's are `nobody`'s), and `cmdline` from `KERN_PROCARGS2`, empty for
+  another user's process, whose arguments the host keeps from fwe's.
 - **`environ`** is the environment strings in the initial stack, between
   the arguments and `AT_EXECFN`'s string, read from memory (another
   process's as `process_vm_readv` reaches it); `auxv` the vector the

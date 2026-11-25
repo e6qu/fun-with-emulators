@@ -4,8 +4,10 @@
  * limits and mounts (and EACCES for those only a tracer can read to one
  * that cannot trace it), /proc/net, and a directory's link count (the
  * task directory's 2 and its threads, which sandboxes read to tell a
- * process is single-threaded). Runs as root with FWE_PROC=1 in its
- * environment.
+ * process is single-threaded), and the host's process 1 (launchd,
+ * another user's, which fwe does not run): its name, owner and the files
+ * the host tells of it. Runs as root with FWE_PROC=1 in its environment,
+ * in the initial pid namespace.
  *
  * Built freestanding and linked against the target libc's shared library
  * (no system headers), as the other dynamic guests. */
@@ -16,6 +18,9 @@ int sysinfo(void *info);
 long sysconf(int name);
 ssize_t readlink(const char *path, char *buf, size_t size);
 int uname(void *buf);
+void *opendir(const char *path);
+void *readdir(void *dir);
+int closedir(void *dir);
 
 #define PR_GET_NAME 16
 #define _SC_NPROCESSORS_ONLN 84
@@ -250,6 +255,29 @@ static void counts(void) {
     printf("process directory has subdirectories: %d\n", links(path) > 2);
 }
 
+/* /proc/1: the host's launchd, root's, which fwe shows as nobody's. */
+static void host_init(void) {
+    void *d = opendir("/proc/1");
+    printf("process 1's files:");
+    for (char *e; d && (e = readdir(d));) {
+        /* d_name follows d_ino, d_off, d_reclen and d_type. */
+        if (e[19] != '.') {
+            printf(" %s", e + 19);
+        }
+    }
+    printf("\n");
+    if (d) {
+        closedir(d);
+    }
+    long n = slurp("/proc/1/comm", buf, sizeof buf);
+    buf[n < 0 ? 0 : n] = 0;
+    printf("process 1's comm: %s", buf);
+    printf("process 1's cmdline bytes: %ld\n", slurp("/proc/1/cmdline", buf, sizeof buf));
+    n = slurp("/proc/1/status", buf, sizeof buf);
+    buf[n < 0 ? 0 : n] = 0;
+    printf("process 1's uid and parent: %ld %ld\n", field(buf, "Uid:\t"), field(buf, "PPid:\t"));
+}
+
 int main(void) {
     counts();
     memory();
@@ -257,6 +285,7 @@ int main(void) {
     hostname();
     other();
     net();
+    host_init();
     fflush(0);
     return 0;
 }

@@ -1622,12 +1622,20 @@ pub struct Kinfo {
     /// It is working its way through its exit (`P_WEXIT`).
     pub exiting: bool,
     pub comm: Vec<u8>,
+    /// Its real, effective and saved user ids, as the host has them.
+    pub uids: [u32; 3],
+    /// Its real, effective and saved group ids.
+    pub gids: [u32; 3],
+    /// Its supplementary groups.
+    pub groups: Vec<u32>,
 }
 
 /// Host process `pid`'s `kinfo_proc`, which the libc crate does not
 /// describe (648 bytes: the start time at 0, the flags at 32, the state at
-/// 36, the command name at 243, the parent and process group at 560 and
-/// 564).
+/// 36, the command name at 243; then `kp_eproc`: the real and saved user
+/// and group ids of `e_pcred` at 392 to 404, `e_ucred`'s effective user id
+/// at 420 and its groups, the first the effective group, counted at 424
+/// and from 428; the parent and process group at 560 and 564).
 #[cfg(target_os = "macos")]
 pub fn kinfo(pid: HostPid) -> Option<Kinfo> {
     const SIZE: usize = 648;
@@ -1660,6 +1668,12 @@ pub fn kinfo(pid: HostPid) -> Option<Kinfo> {
         // `P_WEXIT`.
         exiting: i32_at(32) & 0x2000 != 0,
         comm: comm[..comm.iter().position(|&b| b == 0).unwrap_or(comm.len())].to_vec(),
+        uids: [i32_at(392) as u32, i32_at(420) as u32, i32_at(396) as u32],
+        gids: [i32_at(400) as u32, i32_at(428) as u32, i32_at(404) as u32],
+        groups: {
+            let n = (i16::from_ne_bytes([buf[424], buf[425]]).clamp(0, 16)) as usize;
+            (0..n).map(|k| i32_at(428 + 4 * k) as u32).collect()
+        },
     })
 }
 

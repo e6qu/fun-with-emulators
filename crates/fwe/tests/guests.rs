@@ -9253,8 +9253,11 @@ fn cgroups_limits_freeze_and_delegation() {
 /// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
 /// `comm` and host name written as Linux writes them, another process's
 /// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
-/// a tracer reads, to one that cannot trace it), `/proc/net`, and the
-/// link counts of directories (a process's `task` 2 and its threads).
+/// a tracer reads, to one that cannot trace it), `/proc/net`, the
+/// link counts of directories (a process's `task` 2 and its threads), and
+/// the host's process 1, `launchd`, which fwe does not run: its name and
+/// status as the host tells them, owned by `nobody` (another user's), with
+/// no arguments (the host keeps them from other users).
 #[test]
 fn proc_files_programs_read() {
     let out = run_c_guest("procfiles", &[], &[("FWE_PROC", "1")]);
@@ -9294,7 +9297,11 @@ fn proc_files_programs_read() {
     assert_eq!(
         tail,
         format!(
-            "00000000000000000000000000000001 01 80 10 80       lo\nroute: {:<127}\n",
+            "00000000000000000000000000000001 01 80 10 80       lo\nroute: {:<127}\n\
+             process 1's files: cmdline comm stat status\n\
+             process 1's comm: launchd\n\
+             process 1's cmdline bytes: 0\n\
+             process 1's uid and parent: 65534 0\n",
             "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
         )
     );
