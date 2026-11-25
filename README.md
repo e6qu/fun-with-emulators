@@ -117,9 +117,10 @@ and run them under `fwe`. Tests of distribution programs download them
 first (`guests/*/fetch`); the container, Wine, JDK, debugger, display and
 image tests run only where CI sets their variable (`FWE_PODMAN_TESTS` and
 the like). The hypervisor backend's tests run on a software stand-in
-(`brew install unicorn`), never on a real VM unless asked to. Elsewhere
-only the unit tests run. [AGENTS.md](AGENTS.md) lists every check CI
-runs.
+(`brew install unicorn`), and on the real framework only with
+`FWE_HV_TESTS=1`, on a machine meant for it
+([docs/hypervisor.md](docs/hypervisor.md#tests-and-ci)). Elsewhere only
+the unit tests run. [AGENTS.md](AGENTS.md) lists every check CI runs.
 
 The tests, LTP's runner and the benchmarks (`tools/hostmem.py`) watch
 the host's memory: below 20% of it available or above 50% of it wired,

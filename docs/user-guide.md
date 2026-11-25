@@ -9,6 +9,12 @@ with windows among them) and containers, and what does not work.
 CI runs the blocks marked as tested as they are written, each followed by
 its output (`user_guide_recipes` in `crates/fwe/tests/guests.rs`).
 
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+"SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+"OPTIONAL" in this document are to be interpreted as described in BCP 14
+[RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)
+when, and only when, they appear in all capitals, as shown here.
+
 ## Installing
 
 With Homebrew, from the project's repository as a tap:
@@ -25,17 +31,18 @@ release is published, `brew install fwe` installs it instead.
 
 A release's archive on GitHub holds a signed `fwe`: unpack it and put
 `fwe` on your `PATH`. A release signed without a Developer ID is not
-notarized, and macOS refuses to run it until its quarantine mark is gone:
+notarized, and macOS refuses to run it while it carries its quarantine
+mark, so the mark MUST be removed first:
 
 ```sh
 xattr -d com.apple.quarantine fwe
 ```
 
-From source, you need Rust 1.95 or later and the Xcode command line
-tools' `clang`, which builds fwe's Linux Vulkan driver. The driver is
-linked by the Rust toolchain's `rust-lld` (rustup's has it); with a
-toolchain that lacks it, set `FWE_LLD` to an `ld.lld`, such as Homebrew's
-`lld`.
+Building from source REQUIRES Rust 1.95 or later and the Xcode command
+line tools' `clang`, which builds fwe's Linux Vulkan driver. The driver
+is linked by the Rust toolchain's `rust-lld` (rustup's has it); with a
+toolchain that lacks it, `FWE_LLD` MUST name an `ld.lld`, such as
+Homebrew's `lld`.
 
 ```sh
 cargo build --release -p fwe
@@ -51,9 +58,10 @@ fetches the image's linux/arm64 variant from its registry (Docker Hub
 unless named otherwise) and unpacks it into a new directory. `--root`
 makes that directory the program's `/`.
 
-A program inside the root is named by its path on the Mac. `fwe` passes
-its environment on as it is, so give the program a Linux one with
-`env -i`, as a login would. This guide uses a shell function for it:
+A program inside the root MUST be named by its path on the Mac. `fwe`
+passes its environment on as it is, so the program SHOULD be given a
+Linux one with `env -i`, as a login would. This guide uses a shell
+function for it:
 
 ```sh
 # linux ROOT PROGRAM [ARGS...]: run PROGRAM (a path in ROOT) with ROOT as /.
@@ -114,8 +122,9 @@ unpacked into a directory serves.
 
 - **A program built for Linux on arm64** (an ELF file) runs directly:
   `fwe ./program`. A statically linked one needs nothing more; a
-  dynamically linked one needs its dynamic linker and libraries, so copy
-  it into a root of the distribution it was built for and run it there.
+  dynamically linked one needs its dynamic linker and libraries, so it
+  MUST run in a root of the distribution it was built for, copied into
+  it.
 - **Threads, processes, signals, pipes, sockets, terminals and job
   control** behave as on Linux; `fork`, `exec` and `wait` make real Mac
   processes, one `fwe` for each Linux process.
@@ -136,12 +145,12 @@ through Hypervisor.framework. `fwe` chooses the VM by itself, and
 `fwe --strace` says why. A static program linked there with its
 relocations kept (`-Wl,--emit-relocs`) runs natively, moved above 4 GiB.
 
-The VM needs `fwe` signed with the hypervisor entitlement (Homebrew's
-and the releases' are) on a Mac that offers the hypervisor
-(`sysctl kern.hv_support` prints `1`). Otherwise `fwe` says the program
-needs the hypervisor backend and exits with status 126. `fwe --vm` runs
-every program in the VM, for programs that need 4 KiB pages, such as
-Wine.
+For the VM, `fwe` MUST be signed with the hypervisor entitlement
+(Homebrew's and the releases' are) and run on a Mac that offers the
+hypervisor (`sysctl kern.hv_support` prints `1`). Otherwise `fwe` says
+the program needs the hypervisor backend and exits with status 126.
+`fwe --vm` runs every program in the VM, for programs that need 4 KiB
+pages, such as Wine.
 
 CI's machines offer no hypervisor, so the VM backend is tested only on a
 software stand-in for Hypervisor.framework ([roadmap](../ROADMAP.md)).
@@ -184,10 +193,10 @@ with GLX. Homebrew's Xvfb has none; the userland's own Xvfb, run by fwe,
 has: start it, and give its programs its display inside, as
 `sh -c 'DISPLAY=:1 exec glxgears'`.
 
-Vulkan programs run natively draw on the Mac's GPU through fwe's own Linux Vulkan
-driver. Once the Mac has a Vulkan driver, fwe puts its own where a Linux
-Vulkan loader looks (`/etc/vulkan/icd.d`) and passes each Vulkan command
-to the Mac's driver. That is KosmicKrisp (Homebrew's `mesa`, on macOS 26
+Vulkan programs run natively draw on the Mac's GPU through fwe's own
+Linux Vulkan driver. Once the Mac has a Vulkan driver, fwe puts its own
+where a Linux Vulkan loader looks (`/etc/vulkan/icd.d`) and passes each
+Vulkan command to the Mac's driver. That is KosmicKrisp (Homebrew's `mesa`, on macOS 26
 with an Apple GPU) if installed, else MoltenVK (`brew install
 molten-vk`); `FWE_VULKAN_DRIVER`, in fwe's environment, names another
 driver's manifest. OpenGL programs use the GPU through Mesa's Zink.
@@ -273,8 +282,8 @@ that lacks it, and `--strace` names it.
   enforced.
 - **A sandbox**: namespaces, seccomp and the rest keep well-behaved
   programs apart, as containers expect, but a program run natively
-  shares the `fwe` process and acts as your user; run untrusted code in a
-  Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
+  shares the `fwe` process and acts as your user; untrusted code SHOULD
+  run in a Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
 - **The GPU in the VM, or after `fork`**: a program in the VM has no
   GPU, nor does a child forked from a process that used it (its Vulkan
@@ -284,6 +293,7 @@ that lacks it, and `--strace` names it.
 - **Chosen process ids** outside a pid namespace of fwe's: there pids are
   the Mac's.
 - **More than 16384 open descriptors** in one process.
+
 The full list is in the [roadmap](../ROADMAP.md#not-planned-for-10);
 where `fwe` differs from Linux in detail is in the
 [architecture's known limitations](architecture.md#known-limitations).

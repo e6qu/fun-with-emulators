@@ -26,7 +26,7 @@ flowchart LR
   and data in *sections* (`.text` for code, `.data` and `.bss` for
   variables, `.rodata` for constants), a *symbol table* naming what the
   file defines and what it needs, and *relocations*: notes saying "this
-  instruction or word must hold the address of that symbol, once it is
+  instruction or word is to hold the address of that symbol, once it is
   known".
 - **Linking** puts object files together into one image: it lays the
   sections out at addresses, resolves each symbol to an address, and
@@ -56,7 +56,7 @@ carry the same kinds of thing under different names.
 
 An ELF file has two views: *sections* for the linker and *segments* for
 the loader. The loader never needs the section headers, so a stripped
-binary may drop them along with its symbol table. Each `PT_LOAD` segment
+binary can drop them along with its symbol table. Each `PT_LOAD` segment
 says where in memory a range of the file goes and with which
 protections (read, write, execute).
 
@@ -84,7 +84,7 @@ model* (`-mcmodel=large`) builds addresses with `movz`/`movk` instead.
 
 **The GOT** (global offset table) is a table of pointers the loader
 fills in. Code that needs the address of something whose location is
-not known at link time (a symbol in another library, or one that may be
+not known at link time (a symbol in another library, or one that can be
 interposed) loads it from a GOT slot rather than computing it.
 
 **The PLT** (procedure linkage table) holds small stubs for calls into
@@ -137,7 +137,8 @@ program that depends on the libraries present on the system.
 
 ## Position independence
 
-Where an image may be loaded decides how much the loader must fix:
+Where an image can be loaded decides how much fixing up it needs, and
+by whom:
 
 | Kind | ELF type | Loads at | Fixed up by | Built with |
 |---|---|---|---|---|
@@ -218,7 +219,7 @@ records what it still needs as relocations. `main` from `-fPIE`,
 
 - `counter`, defined in this file, is reached PC-relatively: `adrp` to
   its 4 KiB page, then a load at the low 12 bits.
-- `other_value` may live in a shared library, at an address no one knows
+- `other_value` might live in a shared library, at an address no one knows
   until the program runs, so `-fPIE` reaches it through a GOT slot: the
   first `ldr` fetches its address, the second its value. With
   `-fno-pic` the compiler reaches it directly instead, as it does
@@ -369,7 +370,7 @@ flowchart LR
   space in the lower half, one table per process, and the kernel in the
   upper half, shared by all. A context switch changes `TTBR0` only.
 - **Page tables** are trees: each level's entry points to the next
-  level's table, the last to a page. An entry may also stop early and
+  level's table, the last to a page. An entry can also stop early and
   map a whole *block* at once.
 - **The TLB** caches translations. Entries are tagged with an ASID
   (address space ID), so a switch between processes need not flush it;
@@ -412,10 +413,10 @@ assumed 4 KiB pages when built (some memory allocators, for one).
 | `fork` | copies the page tables, marks private pages copy-on-write | the same, through Mach's copy-on-write objects |
 | Growing a mapping in place | `mremap`, which can also move it | no `mremap`; `mach_vm_remap` maps the same pages elsewhere |
 | Heap | `brk` grows a data segment; `malloc` uses it and `mmap` | no `brk`; `malloc` uses `mach_vm_allocate` |
-| Giving pages back | `madvise(MADV_DONTNEED)` drops the pages at once: private anonymous ones read back as zero | `MADV_DONTNEED` and `MADV_FREE` are hints that let the kernel reclaim the pages later; until it does they may keep their contents |
+| Giving pages back | `madvise(MADV_DONTNEED)` drops the pages at once: private anonymous ones read back as zero | `MADV_DONTNEED` and `MADV_FREE` are hints that let the kernel reclaim the pages later; until it does they might keep their contents |
 | Shared memory without a file | `memfd_create`, `shm_open`, a shared anonymous mapping across `fork` | `shm_open`, Mach memory entries passed over Mach ports |
 | Large pages | transparent huge pages (2 MiB with 4 KiB pages), `hugetlbfs` | no user-visible large pages |
-| Code | any mapping may be executable, even writable and executable at once, unless a security module forbids it | every executable page must be covered by a code signature (an ad-hoc one will do; the linker adds it) |
+| Code | any mapping can be executable, even writable and executable at once, unless a security module forbids it | every executable page needs a code signature covering it (an ad-hoc one will do; the linker adds it) |
 | Code written at run time (JIT) | `mmap` writable, then `mprotect` executable, or both at once | `MAP_JIT` memory, switched per thread between writable and executable (`pthread_jit_write_protect_np`); the hardened runtime asks for an entitlement |
 | More memory promised than exists | overcommitted by default (`vm.overcommit_memory`); when memory runs out the OOM killer ends a process | overcommitted too |
 | When memory is short | pages written to swap (`zswap` can compress them first), file pages dropped | pages compressed in memory by the compressor, then written to swap files |
@@ -502,7 +503,7 @@ The arm64 procedure call standard leaves `x18` to the platform:
   toolchains avoid it anyway, but hand-written code and some compilers'
   output use it, and Windows code (under Wine) keeps its thread block
   there.
-- **macOS** reserves `x18`: the kernel may change it at any time, so
+- **macOS** reserves `x18`: the kernel can change it at any time, so
   macOS code never uses it.
 
 Pointer authentication (PAC) signs return addresses and pointers with a
