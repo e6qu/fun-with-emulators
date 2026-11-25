@@ -251,7 +251,11 @@ fn run(key: u32, arg: u64) -> i64 {
     // is traced; a command that failed, and how, otherwise.
     if crate::trace::calls_traced() {
         let name = generated::NAMES.get(command as usize).copied().unwrap_or("fwe's query");
-        crate::trace::note_to_file(&format!("vulkan: {name}{:x?} = {r:#x?}", &w[..count]));
+        let got = match r {
+            Ok(v) => format!("{v:#x}"),
+            Err(e) => format!("errno {e}"),
+        };
+        crate::trace::note_to_file(&format!("vulkan: {name}{:x?} = {got}", &w[..count]));
     } else if crate::trace::file().is_some() {
         let index = command as usize;
         let failed = match r {
