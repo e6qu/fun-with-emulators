@@ -1107,6 +1107,23 @@ pub fn query(areas: &[Piece<Area>], addr: u64, flags: u64) -> Option<&Piece<Area
     }
 }
 
+/// Where `addr` is, for a fault's report: the name of the mapping holding
+/// it and the offset in its file (`/opt/app/app+0x8b1cee8`), or `None`
+/// where nothing is mapped, or where the record is held (by the thread
+/// that faulted, say).
+pub fn place_of(addr: u64) -> Option<String> {
+    let mut held = Held(RECORD.try_lock().ok()?);
+    if let Some(p) = PENDING.take() {
+        held.mapped(p.start, p.len, p.prot, p.shared, None);
+    }
+    let exe = held.exe();
+    let areas = held.areas_in(addr, addr + 1);
+    let a = areas.iter().find(|p| p.start <= addr && addr < p.end)?;
+    let (name, _) = name_of(&a.value, &exe);
+    let off = a.value.file_offset() + (addr - a.start);
+    Some(format!("{}+{off:#x}", String::from_utf8_lossy(name)))
+}
+
 /// What the listing names mapping `a` (empty for plain anonymous memory),
 /// and its file's device and inode.
 pub fn name_of<'a>(a: &'a Area, exe: &Exe<'a>) -> (&'a [u8], (u64, u64)) {

@@ -1678,6 +1678,31 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             mc.ss.fp, mc.ss.lr, mc.ss.sp
         ));
         report(&regs);
+        // Where the program was: pc, lr, and the frames' return addresses.
+        let mut places = format!(
+            "[fwe] pc in {}, lr in {}",
+            fwe_kernel::maps::place_of(mc.ss.pc).as_deref().unwrap_or("?"),
+            fwe_kernel::maps::place_of(mc.ss.lr).as_deref().unwrap_or("?")
+        );
+        let mut fp = mc.ss.fp;
+        for _ in 0..16 {
+            // A frame record: the caller's fp, then its return address.
+            let (Some(next), Some(ret)) = (read_host::<u64>(fp), read_host::<u64>(fp + 8)) else {
+                break;
+            };
+            if ret == 0 {
+                break;
+            }
+            let ret = ret & 0x0000_ffff_ffff_ffff;
+            let at = fwe_kernel::maps::place_of(ret);
+            places.push_str(&format!(", {ret:#x} in {}", at.as_deref().unwrap_or("?")));
+            if next <= fp {
+                break;
+            }
+            fp = next;
+        }
+        places.push('\n');
+        report(&places);
         let mut code = String::from("[fwe] code near pc (pc marked *):");
         for off in (-24i64..=8).map(|k| k * 4) {
             let at = mc.ss.pc.wrapping_add(off as u64);
