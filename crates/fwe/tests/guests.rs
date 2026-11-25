@@ -11597,7 +11597,8 @@ fn debian_display_zed_edits_a_file_on_the_gpu() {
 /// The app of `guests/apps/<app>` built under fwe on the Alpine root
 /// `guests/alpine/fetch/apps.txt` lists: `build`, a shell command run in a
 /// copy of its sources at `/src/<app>`, fetches what its lock file pins
-/// and makes `output` there. Built once and kept in `target/built-apps`
+/// (the root given the Mac's name servers, as `fwe --pull` gives an
+/// image's) and makes `output` there. Built once and kept in `target/built-apps`
 /// by the hash of its sources and that manifest (CI caches it); the path
 /// of the program made.
 /// The longest an app's build under fwe ([`built_app`]) takes: Cargo
@@ -11647,6 +11648,16 @@ fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
     run_checked(Command::new("cp").arg("-cpR").arg(&root).arg(&scratch.0));
     std::fs::create_dir_all(scratch.0.join("src")).unwrap();
     run_checked(Command::new("cp").arg("-R").arg(&src).arg(scratch.0.join("src").join(app)));
+    // The resolver's lines of the Mac's own file, as a container runtime
+    // writes them for a container.
+    let host = std::fs::read_to_string("/etc/resolv.conf").unwrap();
+    let resolv: String = host
+        .lines()
+        .filter(|l| ["nameserver", "search", "domain", "options"].iter().any(|k| l.starts_with(k)))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(resolv.contains("nameserver"), "the Mac names no name server: {host}");
+    std::fs::write(scratch.0.join("etc/resolv.conf"), resolv).unwrap();
     let began = Instant::now();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     // Its failed calls kept with the display tests' files; at the limit,
