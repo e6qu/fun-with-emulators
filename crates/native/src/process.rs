@@ -1,10 +1,7 @@
 //! Process system calls for the native backend: `execve`, `fork` (and the
 //! `vfork`-style `clone`), `wait4` and `waitid`.
 
-use crate::{
-    KERNEL, LIVE_THREADS, NativePlatform, load_image, page_size, thread_pointer_slot, trap,
-    x18_slot,
-};
+use crate::{KERNEL, LIVE_THREADS, NativePlatform, load_image, page_size, trap};
 use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::mm::region;
 use fwe_kernel::reaper;
@@ -70,8 +67,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let k = guard.as_mut().unwrap();
     let page = page_size();
     let strace = k.tracer;
-    let platform =
-        NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
+    let platform = NativePlatform { slots: crate::slots(), page_size: page };
     // The calling thread's view is what the program runs with.
     k.adopt_thread_view();
     // A script runs its interpreter; the path run by names the program.

@@ -93,24 +93,6 @@ pub fn stub_space(code: &[u8], page: u64) -> u64 {
     (sites * (STUB_WORDS as u64) * 4).div_ceil(page) * page + 2 * groups * page
 }
 
-/// The stub regions holding a stub for an instruction that writes `sp`
-/// from `x18`, as `(start, end)` pairs, for a signal to finish such a stub
-/// first ([`in_sp_stub_region`]). Few programs have one; past the table's
-/// room every pc is looked at.
-static SP_STUB_REGIONS: [std::sync::atomic::AtomicU64; 2 * 256] =
-    [const { std::sync::atomic::AtomicU64::new(0) }; 2 * 256];
-static SP_STUB_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
-fn note_sp_stub_region(start: u64, end: u64) {
-    use std::sync::atomic::Ordering::SeqCst;
-    let i = SP_STUB_COUNT.load(SeqCst);
-    if i < SP_STUB_REGIONS.len() / 2 {
-        SP_STUB_REGIONS[2 * i].store(start, SeqCst);
-        SP_STUB_REGIONS[2 * i + 1].store(end, SeqCst);
-    }
-    SP_STUB_COUNT.store(i + 1, SeqCst);
-}
-
 /// Every stub region: start -> end. Stubs sit in slots of
 /// [`STUB_WORDS`] words from their region's start.
 static STUB_REGIONS: std::sync::Mutex<std::collections::BTreeMap<u64, u64>> =
@@ -286,7 +268,6 @@ pub fn call_stub(site: u64, words: &[u32]) -> Option<u64> {
 /// (sites, room for call stubs).
 pub fn reset() {
     STUB_REGIONS.lock().unwrap_or_else(|e| e.into_inner()).clear();
-    SP_STUB_COUNT.store(0, std::sync::atomic::Ordering::SeqCst);
     SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     CALL_SITES.lock().unwrap_or_else(|e| e.into_inner()).clear();
     CALL_STUBS.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -336,30 +317,39 @@ pub fn stub_slot(pc: u64) -> Option<(u64, &'static [u32])> {
     Some((stub, unsafe { std::slice::from_raw_parts(stub as *const u32, STUB_WORDS) }))
 }
 
-/// A fault at `pc` with the stack at `sp`, as if at the site of the stub
-/// `pc` is in, if it is in one ([`rewrite::rewind`]): the program's own
-/// instruction faulted, and its handler sees it there, with its registers.
-pub fn rewind_fault(pc: u64, sp: u64) -> Option<rewrite::Rewound> {
+/// `x` (the program's general registers, `x[18]` its `x18`) of a thread
+/// stopped at `pc` in a stub fwe prepared, made the program's state
+/// ([`rewrite::to_guest`]): as at the stub's site before its instruction,
+/// past it after. The address the thread goes on at, if `pc` is in such a
+/// stub (a `br x18`'s, which goes into fwe, is the translator's:
+/// `jit::to_guest`). Async-signal-safe: it reads this thread's TSD and the
+/// stub, and writes the program's `x18` and thread pointer slots.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub fn stub_to_guest(pc: u64, x: &mut [u64; 31]) -> Option<u64> {
     let (stub, words) = stub_slot(pc)?;
-    rewrite::rewind(words, stub, pc, sp, |off| {
-        // SAFETY: the stack the stub pushed to, below which it faulted.
-        Some(unsafe { ((sp + off) as *const u64).read() })
-    })
-}
-
-/// Whether `pc` might be in a stub for an instruction that writes `sp` from
-/// `x18`. Async-signal-safe.
-pub fn in_sp_stub_region(pc: u64) -> bool {
-    use std::sync::atomic::Ordering::SeqCst;
-    let n = SP_STUB_COUNT.load(SeqCst);
-    if n > SP_STUB_REGIONS.len() / 2 {
-        return true;
+    let site = rewrite::site_of(words, stub)?;
+    let kind = site_at(site)?;
+    if kind == (Site::X18 { insn: rewrite::BR_X18 }) {
+        return None;
     }
-    (0..n).any(|i| {
-        let (start, end) =
-            (SP_STUB_REGIONS[2 * i].load(SeqCst), SP_STUB_REGIONS[2 * i + 1].load(SeqCst));
-        start <= pc && pc < end
-    })
+    let slots = crate::slots();
+    let tsd: u64;
+    // SAFETY: reading this thread's TSD base, which the host keeps in
+    // `tpidrro_el0`.
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) tsd, options(nomem, nostack)) };
+    Some(rewrite::to_guest(
+        words,
+        stub,
+        (site, kind),
+        pc,
+        tsd,
+        (&slots.scratch, slots.x18),
+        x,
+        // SAFETY: this thread's TSD slots, which a stub's words address.
+        |a| unsafe { (a as *const u64).read() },
+        // SAFETY: as above.
+        |a, v| unsafe { (a as *mut u64).write(v) },
+    ))
 }
 
 /// Distance between candidate stub region placements.
@@ -439,7 +429,7 @@ pub fn keep_hot() {
 pub unsafe fn prepare(
     addr: u64,
     len: u64,
-    (slot, x18_slot): (u32, u32),
+    slots: rewrite::Slots,
     page: u64,
     mut arena: Option<&mut StubArena>,
     known: Option<&[(u64, u64)]>,
@@ -527,30 +517,14 @@ pub unsafe fn prepare(
         if let Some(arena) = arena.as_deref_mut() {
             // SAFETY: the sites lie inside the caller's range.
             stats.stubs += unsafe {
-                place_in_image(
-                    start,
-                    group,
-                    (slot, x18_slot),
-                    page,
-                    (start, start + len),
-                    arena,
-                    &mut beyond,
-                )
+                place_in_image(start, group, slots, page, (start, start + len), arena, &mut beyond)
             };
             sites = rest;
             continue;
         }
         // SAFETY: the sites lie inside the caller's range.
         let placed = unsafe {
-            redirect(
-                start,
-                group,
-                (slot, x18_slot),
-                page,
-                (start, start + len),
-                None,
-                defer.as_mut(),
-            )
+            redirect(start, group, slots, page, (start, start + len), None, defer.as_mut())
         };
         match placed {
             Ok(()) => stats.stubs += group.len(),
@@ -571,7 +545,7 @@ pub unsafe fn prepare(
                         redirect(
                             start,
                             &needed,
-                            (slot, x18_slot),
+                            slots,
                             page,
                             (start, start + len),
                             None,
@@ -695,7 +669,7 @@ unsafe fn flush_pages(addrs: impl IntoIterator<Item = u64>) {
 unsafe fn place_in_image(
     base: u64,
     group: &[(u64, Site)],
-    slots: (u32, u32),
+    slots: rewrite::Slots,
     page: u64,
     near: (u64, u64),
     arena: &mut StubArena,
@@ -728,7 +702,7 @@ unsafe fn place_in_image(
 unsafe fn redirect(
     base: u64,
     group: &[(u64, Site)],
-    (slot, x18_slot): (u32, u32),
+    slots: rewrite::Slots,
     page: u64,
     (lo, hi): (u64, u64),
     arena: Option<&mut StubArena>,
@@ -783,7 +757,7 @@ unsafe fn redirect(
     for &(offset, site) in group {
         let at = base + offset;
         note_site(at, site);
-        let words = rewrite::stub(site, slot, x18_slot, cursor, at + 4);
+        let words = rewrite::stub(site, slots, cursor, at + 4);
         for (i, w) in words.iter().enumerate() {
             // SAFETY: inside the region, which is writable.
             unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
@@ -796,12 +770,6 @@ unsafe fn redirect(
             None => unsafe { (at as *mut u32).write(jump) },
         }
         cursor += (STUB_WORDS * 4) as u64;
-    }
-    if group
-        .iter()
-        .any(|&(_, site)| matches!(site, Site::X18 { insn } if crate::decode::x18_writes_sp(insn)))
-    {
-        note_sp_stub_region(region, region + size);
     }
     if let Some(regions) = IMAGE.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         regions.push(ImageRegion {
@@ -917,7 +885,7 @@ fn get_regions(d: &mut fwe_kernel::snapshot::Dec, origin: u64) -> Option<Vec<Ima
 /// Map stub region `r` (exactly where it was, or, without `fixed`, only if
 /// nothing is there) and write its stubs for this process: false if it
 /// cannot be.
-fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> bool {
+fn place_region(r: &ImageRegion, fixed: bool, slots: rewrite::Slots) -> bool {
     let flags = libc::MAP_PRIVATE | libc::MAP_ANON | if fixed { libc::MAP_FIXED } else { 0 };
     // SAFETY: a fresh anonymous mapping of fwe's where the region was:
     // inside fwe's own reservation with `fixed`, else wherever the host
@@ -946,7 +914,7 @@ fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> b
     let mut cursor = r.at;
     for &(at, site) in &r.sites {
         note_site(at, site);
-        for (i, w) in rewrite::stub(site, slot, x18_slot, cursor, at + 4).iter().enumerate() {
+        for (i, w) in rewrite::stub(site, slots, cursor, at + 4).iter().enumerate() {
             // SAFETY: inside the region just mapped, writable.
             unsafe { ((cursor + 4 * i as u64) as *mut u32).write(*w) };
         }
@@ -958,12 +926,6 @@ fn place_region(r: &ImageRegion, fixed: bool, (slot, x18_slot): (u32, u32)) -> b
 /// Make placed stub regions executable and visible to instruction fetch.
 fn finish_regions(regions: &[ImageRegion]) {
     for r in regions {
-        if r.sites
-            .iter()
-            .any(|&(_, s)| matches!(s, Site::X18 { insn } if crate::decode::x18_writes_sp(insn)))
-        {
-            note_sp_stub_region(r.at, r.at + r.size);
-        }
         // SAFETY: a stub region just written.
         unsafe {
             libc::mprotect(
@@ -1026,7 +988,7 @@ pub fn map_image(
     addr: u64,
     len: u64,
     prot: i32,
-    slots: (u32, u32),
+    slots: rewrite::Slots,
 ) -> Result<bool, fwe_kernel::host::HostErrno> {
     let Some((layout, file)) = fwe_kernel::prepcache::open_image(key, len) else {
         return Ok(false);
@@ -1119,7 +1081,7 @@ pub fn map_load_image(
     base: u64,
     (start, end): (u64, u64),
     runs: &[(u64, u64)],
-    slots: (u32, u32),
+    slots: rewrite::Slots,
 ) -> Option<MappedImage> {
     let total = runs.iter().map(|r| r.1).sum();
     let (layout, file) = fwe_kernel::prepcache::open_image(key, total)?;
@@ -1281,7 +1243,18 @@ mod tests {
             unsafe { ((code + 4 * i as u64) as *mut u32).write(*w) };
         }
         // SAFETY: the mapping is ours, writable and not executing.
-        let stats = unsafe { prepare(code, 12, (8, 16), page, None, None, None) }.unwrap();
+        let stats = unsafe {
+            prepare(
+                code,
+                12,
+                rewrite::Slots { tp: 8, x18: 16, scratch: [24, 32, 40] },
+                page,
+                None,
+                None,
+                None,
+            )
+        }
+        .unwrap();
         // The system call has a stub where there is a gate to call.
         let gate = crate::syscall_gate();
         let stubs = if gate == 0 { 2 } else { 3 };
@@ -1297,7 +1270,8 @@ mod tests {
         for site in [code, code + 8] {
             let stub = stub_of(site);
             // The stub ends with a branch back to the instruction after the site.
-            let words = if site == code { 4 } else { 6 };
+            // mrs x9, tpidr_el0 and msr tpidr_el0, x0: four words each.
+            let words = 4;
             let back = read(stub + 4 * (words - 1));
             assert_eq!(rewrite::branch(stub + 4 * (words - 1), site + 4), Some(back));
         }
@@ -1306,8 +1280,8 @@ mod tests {
         } else {
             // Its stub calls the gate, then branches back past it.
             let stub = stub_of(code + 4);
-            assert_eq!(read(stub + 24) as u64 | (read(stub + 28) as u64) << 32, gate);
-            assert_eq!(rewrite::branch(stub + 16, code + 8), Some(read(stub + 16)));
+            assert_eq!(read(stub + 40) as u64 | (read(stub + 44) as u64) << 32, gate);
+            assert_eq!(rewrite::branch(stub + 36, code + 8), Some(read(stub + 36)));
         }
     }
 

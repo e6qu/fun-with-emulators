@@ -131,10 +131,8 @@ static KERNEL: fwe_kernel::KernelLock<NativePlatform> = fwe_kernel::KernelLock::
 
 /// [`Platform`] for guests running natively in this process.
 pub struct NativePlatform {
-    /// Byte offset of the guest thread pointer in the host TSD.
-    pub tp_slot: u32,
-    /// Byte offset of the guest `x18` in the host TSD.
-    pub x18_slot: u32,
+    /// The host TSD slots stubs use ([`slots`]).
+    pub slots: rewrite::Slots,
     pub page_size: u64,
 }
 
@@ -149,10 +147,7 @@ impl NativePlatform {
     ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
-        unsafe {
-            let (tp, x18, page) = (self.tp_slot, self.x18_slot, self.page_size);
-            prepare::prepare(addr, len, (tp, x18), page, arena, known, cache)
-        }
+        unsafe { prepare::prepare(addr, len, self.slots, self.page_size, arena, known, cache) }
     }
 }
 
@@ -227,7 +222,7 @@ impl Platform for NativePlatform {
     }
 
     fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {
-        prepare::map_image(key, addr, len, prot, (self.tp_slot, self.x18_slot))
+        prepare::map_image(key, addr, len, prot, self.slots)
             .map_err(fwe_kernel::host::errno_to_linux)
     }
 
@@ -779,6 +774,41 @@ pub fn parked_slots() -> (u32, u32) {
     })
 }
 
+/// The host TSD slots fwe's stubs keep the program's registers in while
+/// they use the registers themselves (memory below the program's `sp` is
+/// the program's: Go keeps a new thread's start there across its first
+/// system call), as byte offsets from the TSD base, within reach of an
+/// `ldr`/`str` with an unsigned offset from it.
+pub fn scratch_slots() -> [u32; rewrite::SCRATCH] {
+    static SLOTS: OnceLock<[u32; rewrite::SCRATCH]> = OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        std::array::from_fn(|_| {
+            let mut key: libc::pthread_key_t = 0;
+            // SAFETY: creating a key without destructor; it lives forever.
+            let r = unsafe { libc::pthread_key_create(&mut key, None) };
+            assert_eq!(r, 0, "pthread_key_create failed");
+            let off = (key as u32) * 8;
+            assert!(off < 4096 * 8, "TSD key {key} out of an ldr's reach");
+            off
+        })
+    })
+}
+
+/// The TSD slots a stub uses, as byte offsets from the TSD base.
+pub fn slots() -> rewrite::Slots {
+    rewrite::Slots { tp: thread_pointer_slot(), x18: x18_slot(), scratch: scratch_slots() }
+}
+
+/// This thread's TSD slot at byte offset `off` from its base (the host
+/// keeps the base in `tpidrro_el0`, its low bits the processor's number).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn tsd_slot(off: u32) -> *mut u64 {
+    let area: u64;
+    // SAFETY: reading this thread's TSD base.
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) area, options(nomem, nostack)) };
+    ((area & !7) + u64::from(off)) as *mut u64
+}
+
 /// Host features that affect guest compatibility.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct HostSupport {
@@ -1159,7 +1189,7 @@ pub fn load_image(
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
-    let slots = (platform.tp_slot, platform.x18_slot);
+    let slots = platform.slots;
     let load_object = |elf: &Elf, id, at, what: &str| -> Result<loader::Loaded, Error> {
         let loaded = loader::load(elf, page, id, slots, at, |a, l, known, arena, cache| {
             let stats =
@@ -1357,8 +1387,7 @@ fn start(
     let tracer = options.strace;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     trap::set_tracing(tracer.enabled);
-    let platform =
-        NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
+    let platform = NativePlatform { slots: slots(), page_size: page };
 
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();

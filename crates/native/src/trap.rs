@@ -1034,11 +1034,11 @@ fn take_async(
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     let mut regs = regs_from(mc);
-    finish_sp_stub(&mut regs);
-    // In a translation: the guest's state as at the instruction it stands
-    // for, which is what a tracer, a handler's frame or a core sees.
+    // In a stub, or a translation: the guest's state as at the instruction
+    // it stands for, which is what a tracer, a handler's frame or a core
+    // sees.
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::jit::stands_for_program(regs.pc) {
+    if !prepared_to_guest(&mut regs) && crate::jit::stands_for_program(regs.pc) {
         crate::jit::to_guest(&mut regs);
     }
     KERNEL.deliver_pending(&mut regs);
@@ -1080,52 +1080,38 @@ pub(crate) fn read_host<T: Copy + Default>(addr: u64) -> Option<T> {
     }
 }
 
-/// A thread stopped on one of the last two instructions of the stub for an
-/// instruction that writes `sp` from `x18` (`rewrite::x18_writes_sp_stub`):
-/// `mov sp, s1; ldur s1, [s2, #-16]; ldur s2, [s2, #-32]`. Those loads read
-/// the scratch registers back from below the old `sp`, which might be below
-/// the new one too, where a signal frame is about to be written: so they
-/// are made here first, and the thread goes on after them.
-fn finish_sp_stub(regs: &mut Regs) {
-    use crate::rewrite::LDUR;
-    let pc = regs.pc;
-    if !crate::prepare::in_sp_stub_region(pc) {
-        return;
+/// `regs` stopped in a stub fwe prepared: the program's state, as at its
+/// site or past it ([`crate::prepare::stub_to_guest`]). `false` if
+/// `regs.pc` is in none.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+fn prepared_to_guest(regs: &mut Regs) -> bool {
+    match crate::prepare::stub_to_guest(regs.pc, &mut regs.x) {
+        Some(pc) => {
+            regs.pc = pc;
+            true
+        }
+        None => false,
     }
-    let ldur = |imm: i32, n: u32, t: u32| LDUR | ((imm as u32) & 0x1ff) << 12 | n << 5 | t;
-    let mov_to_sp = |n: u32| 0x9100_001f | n << 5;
-    // Read as the host copies, which reports a hole rather than fault: a
-    // fault here, in a signal handler, would end the process.
-    let word = |a: u64| read_host::<u32>(a);
-    let Some(here) = word(pc) else { return };
-    let (n, t) = ((here >> 5) & 0x1f, here & 0x1f);
-    // On the first load: both are left.
-    let first = here == ldur(-16, n, t)
-        && word(pc.wrapping_sub(4)) == Some(mov_to_sp(t))
-        && word(pc + 4) == Some(ldur(-32, n, n));
-    // On the second: the first was made.
-    let second = t == n
-        && here == ldur(-32, n, n)
-        && word(pc.wrapping_sub(4)).is_some_and(|w| {
-            let s1 = w & 0x1f;
-            w == ldur(-16, n, s1) && word(pc.wrapping_sub(8)) == Some(mov_to_sp(s1))
-        });
-    if !first && !second {
-        return;
+}
+
+/// A fault on an access through `x18` (fwe's TSD base, which the host
+/// zeroed when it last entered the kernel): its group starts again from
+/// its `mrs x18` ([`crate::rewrite::TSD18`]), or the gate from its start
+/// ([`crate::gate::restart`]). True if so. Async-signal-safe.
+fn x18_restart(ss: &mut ThreadState, addr: u64) -> bool {
+    if addr >= 1 << 32 {
+        return false;
     }
-    let base = regs.x[n as usize];
-    let read = read_host::<u64>;
-    if first {
-        let (Some(a), Some(b)) = (read(base.wrapping_sub(16)), read(base.wrapping_sub(32))) else {
-            return;
-        };
-        regs.x[t as usize] = a;
-        regs.x[n as usize] = b;
-        regs.pc = pc + 8;
-    } else {
-        let Some(b) = read(base.wrapping_sub(32)) else { return };
-        regs.x[n as usize] = b;
-        regs.pc = pc + 4;
+    if let Some(to) = crate::gate::restart(ss.pc) {
+        ss.pc = to;
+        return true;
+    }
+    match crate::rewrite::restart_at(read_host::<u32>, ss.pc) {
+        Some(to) => {
+            ss.pc = to;
+            true
+        }
+        None => false,
     }
 }
 
@@ -1274,168 +1260,6 @@ pub fn post_early() {
 const ESR_EC_PC_ALIGNMENT: u32 = 0x22;
 const ESR_EC_SP_ALIGNMENT: u32 = 0x26;
 
-fn reg_of(ss: &ThreadState, r: u32) -> u64 {
-    match r {
-        29 => ss.fp,
-        30 => ss.lr,
-        31 => 0,
-        r => ss.x[r as usize],
-    }
-}
-
-fn set_reg(ss: &mut ThreadState, r: u32, v: u64) {
-    match r {
-        29 => ss.fp = v,
-        30 => ss.lr = v,
-        31 => {}
-        r => ss.x[r as usize] = v,
-    }
-}
-
-/// Writes `bytes` at `addr` as the host copies: `false` where the memory
-/// is not mapped writable.
-fn write_host(addr: u64, bytes: &[u8]) -> bool {
-    #[cfg(target_os = "macos")]
-    {
-        unsafe extern "C" {
-            fn mach_vm_write(task: u32, a: u64, data: *const u8, count: u32) -> i32;
-            static mach_task_self_: u32;
-        }
-        // SAFETY: copying `bytes`, which is valid for its length.
-        unsafe { mach_vm_write(mach_task_self_, addr, bytes.as_ptr(), bytes.len() as u32) == 0 }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (addr, bytes);
-        false
-    }
-}
-
-/// The program's instruction a word of fwe's at `pc` (a stub's, or a
-/// translation's) stands for: its address and the word it wrote there.
-fn program_insn(pc: u64) -> Option<(u64, u32)> {
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::jit::in_cache(pc) {
-        // Code made executable at run time is left as the program wrote it.
-        let g = crate::jit::guest_pc(pc)?;
-        return Some((g, read_host::<u32>(g)?));
-    }
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-    if crate::prepare::in_call_stubs(pc) {
-        // A call made a call to its stub: the word the program wrote.
-        let site = crate::jit::call_stub_site(pc)?;
-        return Some((site, crate::prepare::original(site, read_host::<u32>(site)?)));
-    }
-    let (stub, words) = crate::prepare::stub_slot(pc)?;
-    let site = crate::rewrite::site_of(words, stub)?;
-    Some((site, crate::prepare::original(site, read_host::<u32>(site)?)))
-}
-
-/// A load or store of fwe's own through an `sp` the program keeps off
-/// 16-byte alignment, which the host's alignment check (`SCTLR_EL1.SA0`,
-/// as Linux sets it) faults: Linux programs can keep such an `sp` while
-/// they address memory through other registers (pixman's NEON functions
-/// do), and a stub or translation saving registers below it is fwe's, not
-/// theirs. The access is made here as the host copies (a page the
-/// program's stack or a private view would make on a first touch made
-/// first) and the thread goes on past it. Not where the program's own
-/// instruction is addressed through `sp`, which faults on Linux too, nor
-/// in a call into fwe's gate (which works below the program's `sp`; a
-/// flush's is made here: [`unaligned_flush`]). True if handled here.
-fn unaligned_sp_access(ss: &mut ThreadState, esr: u32) -> bool {
-    if (esr >> 26) & 0x3f != ESR_EC_SP_ALIGNMENT || ss.sp & 15 == 0 {
-        return false;
-    }
-    // The access that faulted, and those right after it (a stub's pushes
-    // or pops together): one fault for them all.
-    let mut made = 0;
-    while sp_access_at(ss) {
-        made += 1;
-    }
-    made > 0
-}
-
-/// [`unaligned_sp_access`]'s access at `ss.pc`, if it is fwe's: made, and
-/// `ss` past it.
-fn sp_access_at(ss: &mut ThreadState) -> bool {
-    // SAFETY: the thread fetched the instruction at `pc` (the first), or
-    // it is the next word of the same stub or translation.
-    let word = unsafe { insn(ss.pc) };
-    if word == Some(crate::rewrite::SYSCALL_STUB_ENTRY) {
-        return false;
-    }
-    let Some(acc) = word.and_then(crate::rewrite::sp_access) else { return false };
-    let Some((_, own)) = program_insn(ss.pc) else { return false };
-    if crate::rewrite::uses_sp_base(own) {
-        return false;
-    }
-    let mut at = ss.sp.wrapping_add_signed(acc.at);
-    let mut loaded = [(0, 0); 2];
-    for (i, r) in [Some(acc.rt), acc.rt2].into_iter().flatten().enumerate() {
-        if acc.load {
-            let v = if acc.size == 8 {
-                read_host::<u64>(at)
-            } else {
-                read_host::<u32>(at).map(u64::from)
-            };
-            let Some(v) = v else { return false };
-            loaded[i] = (r, v);
-        } else {
-            let v = reg_of(ss, r).to_le_bytes();
-            let bytes = &v[..acc.size as usize];
-            let made = || kernel().as_mut().is_some_and(|k| k.view_fault(at) || k.stack_fault(at));
-            if !write_host(at, bytes) && !(made() && write_host(at, bytes)) {
-                return false;
-            }
-        }
-        at += acc.size;
-    }
-    if acc.load {
-        // Set once both are loaded: nothing changes where an access fails.
-        for (r, v) in loaded.into_iter().take(1 + usize::from(acc.rt2.is_some())) {
-            set_reg(ss, r, v);
-        }
-    }
-    if let Some(wb) = acc.writeback {
-        ss.sp = ss.sp.wrapping_add_signed(wb);
-    }
-    ss.pc += 4;
-    true
-}
-
-/// A flush stub (`ic ivau`, [`crate::rewrite`]'s or a translation's)
-/// whose call into fwe's gate faulted on an `sp` the program keeps off
-/// alignment: the gate works below the program's `sp`, so the flush is
-/// made here, as the gate makes it, and the thread goes on where the
-/// stub's branch back leads. True if handled here.
-fn unaligned_flush(ss: &mut ThreadState, esr: u32) -> bool {
-    use crate::rewrite::{B, FLUSH_LDR_X30_LIT, SYSCALL_STUB_ENTRY};
-    if (esr >> 26) & 0x3f != ESR_EC_SP_ALIGNMENT || ss.sp & 15 == 0 {
-        return false;
-    }
-    let pc = ss.pc;
-    // SAFETY: the thread fetched the instruction at `pc`.
-    if unsafe { insn(pc) } != Some(SYSCALL_STUB_ENTRY)
-        || read_host::<u32>(pc + 4) != Some(FLUSH_LDR_X30_LIT)
-    {
-        return false;
-    }
-    let Some(rt) = crate::rewrite::flush_reg(|a| read_host::<u32>(a).unwrap_or(0), pc + 12) else {
-        return false;
-    };
-    let Some(back) = read_host::<u32>(pc + 16).filter(|&b| b & 0xfc00_0000 == B) else {
-        return false;
-    };
-    let addr = match rt {
-        31 => 0,
-        18 => guest_x18(),
-        r => reg_of(ss, r),
-    };
-    flush_line(addr, rt == 18);
-    ss.pc = (pc + 16).wrapping_add_signed(i64::from(((back << 6) as i32) >> 4));
-    true
-}
-
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
     fwe_kernel::timing::signal(sig);
     // A process that sends itself one of these signals has it emulated (see
@@ -1476,6 +1300,17 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             return;
         }
     }
+    // An access through `x18` that the host zeroed meanwhile: its group
+    // runs again (in a stub, a translation or the gate).
+    if matches!(sig, libc::SIGSEGV | libc::SIGBUS) {
+        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers;
+        // `info` is valid for them.
+        let (ss, addr) =
+            unsafe { (&mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss, (*info).si_addr() as u64) };
+        if x18_restart(ss, addr) {
+            return;
+        }
+    }
     let in_guest = guest_interrupted(ctx);
     if in_guest {
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
@@ -1485,41 +1320,6 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let addr = unsafe { (*info).si_addr() } as u64;
         if fwe_kernel::lazycode::fault(ss.pc, addr) {
-            return;
-        }
-        // Read as the host copies, which reports a hole rather than fault:
-        // the pc of an instruction-fetch fault is not mapped. The word at
-        // the pc of any other fault was just fetched: read as it is (the
-        // host's copy is a Mach call, on every fault).
-        // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
-        let esr = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).es.esr };
-        let pc = ss.pc;
-        let at_pc = if (esr >> 26) & 0x3f == ESR_EC_INSTRUCTION_ABORT_LOWER {
-            read_host::<u32>(pc)
-        } else {
-            // SAFETY: the thread fetched the instruction at `pc`.
-            unsafe { insn(pc) }
-        };
-        let word = |a: u64| if a == pc { at_pc } else { read_host::<u32>(a) };
-        if let Some(site) = crate::rewrite::syscall_stub_site(word, ss.pc) {
-            // A system call's stub could not save registers below the
-            // guest's sp (none is needed for a system call: musl's thread
-            // exit unmaps its own stack first): it runs as the trap runs it.
-            ss.pc = site;
-            syscall_trap(ctx, true, true);
-            return;
-        }
-        // A call through the gate unmapped the stack the stub saved `x30`
-        // on (musl's thread exit unmaps its own before `exit`): the gate's
-        // block holds the guest's `x30` and `sp` as the call left them.
-        let after_call =
-            ss.pc.checked_sub(12).filter(|_| word(ss.pc) == Some(crate::rewrite::POP32_X30));
-        if let Some(site) = after_call.and_then(|s| crate::rewrite::syscall_stub_site(word, s))
-            && let Some(b) = crate::gate::block()
-        {
-            ss.lr = b.regs.x[30];
-            ss.sp = b.regs.sp;
-            ss.pc = site + 4;
             return;
         }
     }
@@ -1542,16 +1342,6 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     // SAFETY: `info` is valid for SA_SIGINFO handlers.
     let addr = unsafe { (*info).si_addr() } as u64;
-
-    // fwe's own access below an `sp` the program keeps off alignment.
-    if unaligned_flush(&mut mc.ss, mc.es.esr) || unaligned_sp_access(&mut mc.ss, mc.es.esr) {
-        let mut regs = regs_from(mc);
-        settle(&mut regs);
-        regs_to(mc, &regs);
-        // SAFETY: `ctx` is this handler's ucontext.
-        unsafe { return_with_guest_mask(ctx) };
-        return;
-    }
 
     // `mrs <Xt>, ctr_el0`, which Linux lets user space run and macOS traps:
     // the value is emulated.
@@ -1617,13 +1407,8 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // A fault in a stub is the program's own instruction's, at its site
     // (a JIT's null checks fault on purpose, and its handler looks for
     // the instruction it wrote).
-    if let Some(r) = crate::prepare::rewind_fault(regs.pc, regs.sp) {
-        for (reg, value) in r.restored {
-            regs.x[reg as usize] = value;
-        }
-        regs.sp = r.sp;
-        regs.pc = r.site;
-    } else {
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    if !prepared_to_guest(&mut regs) {
         // In a translation: the guest's instruction it stands for.
         crate::jit::to_guest(&mut regs);
     }

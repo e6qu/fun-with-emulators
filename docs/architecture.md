@@ -252,10 +252,10 @@ knows from the file's sections and unwind table. The pieces:
   18 in any register field (bits 0, 5, 10 and 16), nearly every one, is
   passed over without decoding. The scan builds each site's stub.
 - **Decoding** (`crates/native/src/decode.rs`): an instruction naming
-  `x18` is decoded so the stub can substitute a scratch register, adjust
-  an `sp` offset or rebuild a PC-relative or branch form. The forms with
-  stubs of their own (`casp`, writeback onto `sp`, `sp` written from
-  `x18`) are found here.
+  `x18` is decoded so the stub can substitute a scratch register or
+  rebuild a PC-relative or branch form; `sp` stays as it is. The forms
+  decoded apart (`casp`, writeback onto `sp`, `sp` written from `x18`)
+  are found here.
 - **Placing stubs** (`crates/native/src/prepare.rs`): sites are grouped so
   one stub region reaches each group (at most a quarter of the branch
   range apart). The region comes from the loader's arena or is reserved
@@ -274,28 +274,22 @@ knows from the file's sections and unwind table. The pieces:
   than a branch reaches has sites that reach only room below it. Large
   data (a heap, an arena) fills upwards with the rest: adjacent mappings
   are one host region, and a host fork's cost grows with the regions.
-- **Faults in stubs:** a guest fault in a stub region is rewound to its
-  site before it is delivered (`prepare::rewind_fault`, `rewrite::rewind`).
-  The stub's slot (each stub has one of `STUB_WORDS` words from its
-  region's start) gives the site by its branch back, and the registers it
-  pushed before the faulting instruction are read back from the stack.
-- **An `sp` off alignment:** a Linux program can keep `sp` off 16-byte
-  alignment while it addresses memory through other registers, and the
-  host's alignment check faults any access through such an `sp`. Where
-  the access is fwe's (a stub's or call stub's push or pop, a
-  translation's save of `x16` and `x17`), and the program's own
-  instruction there is not addressed through `sp`, the fault handler makes
-  the access as the host copies and goes on past it, with those right
-  after it (`unaligned_sp_access` in `crates/native/src/trap.rs`, decoded
-  by `rewrite::sp_access`): a stub's pushes cost one fault, its pops
-  another. A flush stub's call into the gate, which works below the
-  program's `sp`, is replaced by the flush made in the handler
-  (`unaligned_flush`); a system call's stub takes the trap. The exit gate
-  saves through `x17`, not `sp`.
-- **`sp` written from `x18`:** the stub sets `sp` before it reloads its
-  two scratch registers from below the old `sp`. A signal delivered on
-  those loads has them done first (`finish_sp_stub` in
-  `crates/native/src/trap.rs`), so its frame cannot overwrite them.
+- **Registers kept in TSD slots:** stubs, the gates and translations keep
+  the registers they borrow in three scratch slots of the host thread's
+  TSD (`scratch_slots` in `crates/native/src/lib.rs`), never below the
+  program's `sp`, which is the program's. The first goes through `x18` in
+  a group (`rewrite::TSD18`); a fault on an access through `x18` below
+  4 GiB, where macOS zeroed it entering its kernel, starts the group
+  again from its `mrs` (`x18_restart` in `crates/native/src/trap.rs`,
+  `rewrite::restart_at`, `gate::restart` for the gates' first words).
+- **Faults and signals in stubs:** a thread stopped in a stub is shown as
+  the program is (`prepare::stub_to_guest`, `rewrite::to_guest`). The
+  stub's slot (each stub has one of `STUB_WORDS` words from its region's
+  start) gives the site by its branch back. Before the stub's instruction
+  (`rewrite::main_of`) it is at its site, each register the stub kept and
+  has not taken back read from its slot (`rewrite::undo`); after it, the
+  rest of the stub is carried out on its registers (`rewrite::step`) and
+  it is past it. Translations do the same with the words they hold.
 - **The guest's `x18`:** the trap handler reads it into `Regs` and writes
   it back on return. Correctness never depends on the host preserving
   `x18`. macOS 26.4's custom-`x18` ABI is only probed

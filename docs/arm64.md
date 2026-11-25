@@ -158,8 +158,8 @@ Symbol names and thread-local storage are compared in linking.md
 [Thread-local storage](linking.md#thread-local-storage)). What fwe
 does with these differences is in linux-on-macos.md:
 [`x18` and the thread pointer](linux-on-macos.md#registers-and-the-thread-pointer),
-[stubs that save registers below `sp`](linux-on-macos.md#x18-a-stub-per-use)
-(which Linux's lack of a red zone allows),
+[stubs that keep registers in TSD slots, not below `sp`](linux-on-macos.md#x18-a-stub-per-use)
+(Linux's lack of a red zone lets only a signal frame write there),
 [system calls](linux-on-macos.md#system-call-entry) and
 [signal frames](linux-on-macos.md#dispositions-masks-and-frames). A
 Linux program under fwe calls only Linux code (its own libraries,

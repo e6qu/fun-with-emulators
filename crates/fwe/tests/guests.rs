@@ -121,19 +121,15 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
     run_bounded_inner(cmd, input, limit, false).0
 }
 
-/// The guest's output and its pid, killing it after `limit`. With `vm`, the
-/// command leads its own process group, and a timeout ends the group gently
-/// (see [`run_vm_bounded`]).
-/// At a timeout: the processes running under the guest's root that left
-/// its process group (a daemon's double fork, as podman's conmon), each
+/// At a timeout: the processes of the guest's process group `pgid` (a VM's
+/// fork children among them), and those running under the guest's root
+/// that left it (a daemon's double fork, as podman's conmon), each
 /// sampled: its host threads' stacks, kept in `target/tmp/samples` for CI
 /// to keep, the innermost fwe frame of each printed. They are left running
 /// (a daemon the test goes on using among them).
-fn sample_strays(cmd: &Command) {
+fn sample_strays(cmd: &Command, pgid: u32) {
     let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-    let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
-        return;
-    };
+    let root = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1));
     let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output_alone() else {
         return;
     };
@@ -141,11 +137,15 @@ fn sample_strays(cmd: &Command) {
     let _ = std::fs::create_dir_all(&dir);
     for line in String::from_utf8_lossy(&ps.stdout).lines() {
         let mut f = line.split_whitespace();
-        let (Some(pid), Some(_), command) = (f.next(), f.next(), f.collect::<Vec<_>>().join(" "))
+        let (Some(pid), Some(group), command) =
+            (f.next(), f.next(), f.collect::<Vec<_>>().join(" "))
         else {
             continue;
         };
-        if !command.contains(root.as_str()) || !command.contains("fwe") {
+        // The guest's group (a VM's fork children name no root), and any
+        // process of its root that left the group.
+        let ours = group == pgid.to_string() || root.is_some_and(|r| command.contains(r.as_str()));
+        if !ours || !command.contains("fwe") {
             continue;
         }
         let Ok(pid) = pid.parse::<i32>() else { continue };
@@ -241,6 +241,9 @@ fn host_short_of_memory() -> Option<String> {
     None
 }
 
+/// The guest's output and its pid, killing it after `limit`. With `vm`, the
+/// command leads its own process group, and a timeout ends the group gently
+/// (see [`run_vm_bounded`]).
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -300,7 +303,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                     String::from_utf8_lossy(&ps.stdout)
                 );
             }
-            sample_strays(&cmd);
+            sample_strays(&cmd, child.id());
             if vm {
                 let pgid = child.id() as i32;
                 // SAFETY: SIGTERM to the guest's own process group; VM
@@ -2213,6 +2216,22 @@ fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
 #[test]
 fn an_exclusive_epoll_wake_reaches_one_waiter() {
     c_guest_prints("epollx", &[], "each write woke one waiter: yes\n");
+}
+
+/// Memory below `sp` is the program's (guests/c/belowsp.c): a system call
+/// and each instruction fwe rewrites leave it as it was, in a program's
+/// code and in code made at run time. Go's `runtime.clone` keeps a new
+/// thread's start function there across its first system call. Linux
+/// prints the same.
+#[test]
+fn memory_below_sp_is_the_programs() {
+    c_guest_prints(
+        "belowsp",
+        &[],
+        "below sp after a system call: kept\nafter a thread pointer write: kept\n\
+         after a thread pointer read: kept\nafter a use of x18: kept\n\
+         after a cache flush: kept\nafter a system call in code made at run time: kept\n",
+    );
 }
 
 /// `F_GETFL` of each kind of descriptor (guests/c/getfl.c), as Linux

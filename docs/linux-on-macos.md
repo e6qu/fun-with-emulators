@@ -265,29 +265,33 @@ code the image's unwind table covers, where it cannot be a constant
 
 ```
 site:  b     stub                  ; was svc #0
-stub:  stp   x30, x0, [sp, #-32]!  ; below the guest's sp
+stub:  mrs   x18, tpidrro_el0      ; the host thread's TSD (x18 is fwe's)
+       and   x18, x18, #~7
+       str   x30, [x18, #s30]      ; x30 and x0 kept in TSD slots
+       str   x0, [x18, #s0]
        ldr   x30, =gate
        blr   x30
-       ldr   x30, [sp], #32
+       mrs   x18, tpidrro_el0
+       and   x18, x18, #~7
+       ldr   x30, [x18, #s30]
        b     site + 4
 ```
 
 The gate runs the call on a stack of fwe's, with the number from `x8` and
-arguments from `x0`–`x5`. Two cases take a host signal instead: a call
-made with no usable stack (Linux needs none: musl's thread exit unmaps
-its own stack before its `exit`), where the stub's first store faults,
-and an `svc #0` with no stub within branch range, which is overwritten
-with a breakpoint carrying fwe's mark (`0x4c58`, "LX"):
+arguments from `x0`–`x5`. Like Linux's `svc`, which touches no user
+memory, the stub leaves memory below the program's `sp` alone, and needs
+no stack (musl's thread exit unmaps its own stack before its `exit`).
+How a stub keeps registers through `x18` is under
+[x18](#x18-a-stub-per-use). An `svc #0` with no stub within branch range
+is overwritten with a breakpoint carrying fwe's mark (`0x4c58`, "LX"),
+and takes a host signal:
 
 ```mermaid
 flowchart TD
     svc["guest: svc #0, rewritten at its site"] --> reach{"a stub in branch range?"}
-    reach -- yes --> push{"stub's store below sp works?"}
-    push -- yes --> gate["gate: fwe's stack, number from x8, arguments from x0-x5"]
-    push -- "no: no usable stack" --> fault["fault handler"]
+    reach -- yes --> gate["gate: fwe's stack, number from x8, arguments from x0-x5"]
     reach -- "no: brk #0x4c58" --> trap["SIGTRAP handler"]
     gate --> k["kernel crate runs the call"]
-    fault --> k
     trap --> k
     k --> plain{"from the gate, only x0 and the signal mask changed, no signal to deliver?"}
     plain -- yes --> back["straight back after the svc: no exception, no host signal"]
@@ -326,9 +330,9 @@ mrs  x0, tpidr_el0            b    stub
                               b    <next instruction>
 ```
 
-A write (`msr tpidr_el0, xN`) saves a scratch register below `sp` (Linux
-arm64 has no red zone), finds the slot the same way, stores the value and
-restores the scratch register. A read into `xzr` becomes a `nop`.
+A write (`msr tpidr_el0, xN`) finds the slot through `x18` and stores the
+value there, touching no other register
+([x18](#x18-a-stub-per-use)). A read into `xzr` becomes a `nop`.
 
 ### x18: a stub per use
 
@@ -344,14 +348,15 @@ Linux binary                  under fwe
 ldr  x0, [x18, #8]            b    stub
                               ...
                          stub:
-                              str  x1, [sp, #-16]!      // two scratch registers
-                              str  x2, [sp, #-16]!      // the instruction does not use
-                              mrs  x2, tpidrro_el0
-                              and  x2, x2, #~7
-                              ldr  x1, [x2, #x18_slot]  // x1 = the guest's x18
+                              mrs  x18, tpidrro_el0     // the host thread's TSD
+                              and  x18, x18, #~7
+                              str  x1, [x18, #s0]       // a register the instruction
+                                                        // does not use, kept
+                              ldr  x1, [x18, #x18_slot] // x1 = the guest's x18
                               ldr  x0, [x1, #8]         // the instruction, x18 -> x1
-                              ldr  x2, [sp], #16
-                              ldr  x1, [sp], #16
+                              mrs  x18, tpidrro_el0
+                              and  x18, x18, #~7
+                              ldr  x1, [x18, #s0]       // x1 back
                               b    <next instruction>
 ```
 
@@ -362,10 +367,22 @@ exclusive, acquire/release and LSE atomic form, system-register moves and
 `sys` (`dc civac, x18`), the thread pointer moved through `x18`, the
 pointer-authentication forms, PC-relative
 forms (materialised from the original pc), compare- and test-branches,
-indirect branches through `x18`, and code using `sp` (offsets adjusted
-for the stub's push). `casp` with `x18` in a pair, a load or store of
-`x18` written back onto `sp`, and `sp` written from `x18` have stubs of
-their own.
+indirect branches through `x18`, and code using `sp`, written back or
+written from `x18` included, which runs with `sp` as it is. `casp` with
+`x18` in a pair has a stub of its own, its pairs kept even pairs.
+
+A stub keeps the registers it borrows in TSD slots too, never below
+`sp`: memory below `sp` is the program's, which Linux's system calls and
+every other instruction leave as it was (Go's `clone` keeps a new
+thread's start function below its `sp` across the thread's first system
+call; Linux's lack of a red zone lets only a signal frame go there). The
+first register is kept before any is free, so through `x18`, which is
+fwe's: a group of `mrs x18, tpidrro_el0; and x18, x18, #~7` and loads and
+stores through it. macOS can zero `x18` between any two of them; nothing
+is mapped in the low 4 GiB, so the next access through it faults, and
+fwe's fault handler starts the group again from its `mrs`. Each group
+does the same when run again: a register it both stores and loads is
+loaded by its last access.
 
 A branch through `x18` needs another register to branch through. A
 call, a return or a tail call (`blr`, `ret`, the authenticated forms)
@@ -376,15 +393,13 @@ is free, as on Linux: the case it leads to can read `x16` and `x17`
 into fwe, which goes on at the guest's `x18` by translation, back to
 native code when the function returns ([jit.md](jit.md)).
 
-The stub's pushes go through `sp`, which the hardware checks for 16-byte
-alignment (Linux and macOS both turn the check on). Linux programs can
-keep `sp` off alignment while they address memory through other
+The hardware checks `sp` for 16-byte alignment when memory is addressed
+through it (Linux and macOS both turn the check on), and Linux programs
+can keep `sp` off alignment while they address memory through other
 registers (pixman's NEON functions take `sub sp, sp, #0xe8` and save
-`x18` through `x29`). There fwe's fault handler makes the stub's pushes
-and pops itself, two faults per use
-([architecture.md](architecture.md#rewriting-guest-code)); the program's
-own access through such an `sp` faults as on Linux: `SIGBUS`,
-`BUS_ADRALN`, at `sp`.
+`x18` through `x29`). No stub addresses memory through `sp`, so stubs run
+there as anywhere; the program's own access through such an `sp` faults
+as on Linux: `SIGBUS`, `BUS_ADRALN`, at `sp`.
 
 A system call or signal frame sees the guest's real `x18`, `rt_sigreturn`
 restores it, and a new thread starts with its creator's. A fault or

@@ -114,7 +114,8 @@ anew.
   (single-copy atomic, as the table's writes are), so a match leads to
   the target's own translation. Through `x16` or `x17`, which the lookup
   takes for itself, the target is read again from its slot to compare,
-  the translation kept below `sp` meanwhile.
+  the translation kept in `x18` meanwhile (lost to a kernel entry that
+  zeroes `x18`, it reads as a miss).
   - A lookup looks first in a near table, one entry for each 64 bytes of
     the program's code, which keeps the entries of thousands of
     functions in the data cache, as the full table (an entry for each
@@ -140,8 +141,9 @@ anew.
   saves them again only if they were restored. Code that never names
   them (an interpreter's dispatch, calls through pointers, a recursion
   moving `sp` at each call) runs its calls, returns and lookups with no
-  save or restore between them. A save, with no register free, puts both
-  below `sp` first (without moving it), then each in its slot: six words;
+  save or restore between them. A save, with no register free, stores
+  both through `x18` in one group (as stubs keep registers,
+  [linux-on-macos.md](linux-on-macos.md#x18-a-stub-per-use)): four words;
   a restore is four.
   - A block reached by a direct branch that holds the program's own `x16`
     and `x17` is entered past its restore. Where the block starts with
@@ -167,12 +169,11 @@ anew.
     fast as with any other register. A fault or signal there is
     delivered with the program's `x18` taken from `x17`.
   - Where `x16` and `x17` are the program's (HotSpot allocates them
-    too), an instruction naming `x18` gets one or two scratch registers
-    kept below `sp` without moving it, preferring ones the code after it
-    writes before reading. There is no chain of `sp` updates and no wait
-    for a register loaded back: about twice as fast as a stub's pushes
-    and pops. A fault or signal inside it is delivered as at the
-    instruction, its scratch registers read back.
+    too), an instruction naming `x18` gets a scratch register kept in a
+    TSD slot through `x18`, as a stub's, preferring one the code after it
+    writes before reading, so nothing waits for it to be loaded back. A
+    fault or signal inside it is delivered as at the instruction, its
+    scratch register read back.
 - **Code a translation calls is translated too.** A runtime's helpers in
   its library, the C library, the program's own functions: code fwe
   prepared in place that a translation calls or branches to runs from
@@ -413,7 +414,7 @@ processor that reports `DIC` clear.
     It holds the translation of the address there published last. A
     lookup through `x16`, `x17` or `x18` (`jit::slot_look`), whose
     target is in its slot, reads the entry whole, keeps its translation
-    below `sp`, and reads the target again into `x17` to compare.
+    in `x18`, and reads the target again into `x17` to compare.
   - The table of returns' tail, a return whose first look misses, and
     call sites' stubs look in the table alone.
 - **The table of returns** at 2^45 + 2^44 is laid out as the table of

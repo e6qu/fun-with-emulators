@@ -291,26 +291,23 @@ const TABLE_BITS: u32 = 20;
 const TABLE_SIZE: u64 = 16 << TABLE_BITS;
 
 // Encodings of the lookup sequence and the stubs.
-/// `stp x16, x17, [sp, #-16]`: a save's first word ([`save_words`]).
-const SAVE: u32 = 0xa93f_47f0;
+/// `mrs x18, tpidrro_el0`: a save's first word ([`save_words`]).
+const SAVE: u32 = rewrite::TSD18[0];
 /// Words of a save of the program's `x16` and `x17`, and of their restore.
-const SAVE_WORDS: usize = 6;
+const SAVE_WORDS: usize = 4;
 const RESTORE_WORDS: usize = 4;
 
 /// A save of the program's `x16` and `x17` into their slots of the
-/// thread's area ([`crate::parked_slots`]), with no register free: both
-/// below `sp` first (`sp` unmoved; a thread stopped inside has them there,
-/// [`Word::Stashed`]), then the area's address into `x17` and each into
-/// its slot, `x17`'s through `x16`.
+/// thread's area ([`crate::parked_slots`]), with no register free: a group
+/// through `x18` ([`rewrite::TSD18`]), which leaves both registers as they
+/// were, so a thread stopped inside is as at the save's start.
 fn save_words() -> [u32; SAVE_WORDS] {
     let (s16, s17) = crate::parked_slots();
     [
         SAVE,
-        rewrite::MRS_TPIDRRO | 17,
-        rewrite::AND_NOT7 | (17 << 5) | 17,
-        rewrite::STR_UIMM | ((s16 / 8) << 10) | (17 << 5) | 16,
-        0xf85f_83f0, // ldur x16, [sp, #-8]
-        rewrite::STR_UIMM | ((s17 / 8) << 10) | (17 << 5) | 16,
+        rewrite::TSD18[1],
+        rewrite::STR_UIMM | ((s16 / 8) << 10) | (18 << 5) | 16,
+        rewrite::STR_UIMM | ((s17 / 8) << 10) | (18 << 5) | 17,
     ]
 }
 
@@ -360,11 +357,11 @@ fn park((x16, x17): (u64, u64)) {
 }
 
 /// [`save_words`] into `a`'s section `s`, its first word as `first` (the
-/// program's state as at `g`, or a way out), the rest [`Word::Stashed`].
+/// program's state as at `g`, or a way out), the rest as at `g`.
 fn push_save(a: &mut Asm<Word>, s: Sec, first: Word, g: u64) -> Pos {
     let w = save_words();
     let at = a.push(s, w[0], first);
-    a.extend(s, w[1..].iter().copied(), Word::Stashed(g));
+    a.extend(s, w[1..].iter().copied(), Word::At(g));
     at
 }
 
@@ -409,11 +406,14 @@ const CALLED: u32 = 0xaa10_03fe;
 const CHECK: u32 = 0xca10_0231;
 /// `cbnz x17, #off`
 const MISS: u32 = 0xb500_0011;
-/// `stur x17, [sp, #-16]` and `ldur x17, [sp, #-16]`: an entry's
-/// translation set below `sp` while `x17` reads the target again
-/// ([`slot_look`]), and taken back.
-const STASH: u32 = 0xf81f_03f1;
-const UNSTASH: u32 = 0xf85f_03f1;
+/// `mov x18, x17` and `mov x17, x18`: an entry's translation kept in `x18`
+/// while `x17` reads the target again ([`slot_look`]), and taken back.
+/// The host zeroes `x18` whenever it enters the kernel: a translation
+/// taken back as 0 goes where a target not translated goes ([`OUTSIDE`]),
+/// on as the program branched, or, from the near table, which holds
+/// translations only, to the table's look, as a miss.
+const STASH: u32 = 0xaa11_03f2;
+const UNSTASH: u32 = 0xaa12_03f1;
 /// `br x17`
 const GO: u32 = 0xd61f_0220;
 /// `isb`.
@@ -452,8 +452,8 @@ const fn key_against(n: u32) -> u32 {
 /// for a target in the program's `x<n>` (16, 17 or 18), which its
 /// slot holds while the lookup has the registers: the target loaded into
 /// `x16`, the entry read whole (`x16` its address, `x17` its translation),
-/// the translation set below `sp` (as a save sets the registers there)
-/// while `x17` reads the target again, against the address. Then `x17` is
+/// the translation kept in `x18` ([`STASH`]) while `x17` reads the target
+/// again, against the address. Then `x17` is
 /// 0 where the entry is the target's, and a [`MISS`] follows; found, the
 /// lookup takes the translation back ([`UNSTASH`]), `x16` the target.
 fn slot_look(n: u32, other: bool, near: bool) -> impl Iterator<Item = u32> {
@@ -536,9 +536,6 @@ enum Word {
     /// The program's instruction at `g` (or the start of its stand-in), its
     /// `x16` and `x17` saved in their slots ([`crate::parked_slots`]).
     Saved(u64),
-    /// Inside a save of the program's `x16` and `x17` ([`save_words`]) as
-    /// at `g`: both below `sp`, at `[sp, #-16]` and `[sp, #-8]`.
-    Stashed(u64),
     /// As [`Word::Saved`], the program's `x18` held in `x17` (its slot not
     /// written yet).
     SavedX18(u64),
@@ -562,7 +559,6 @@ enum Packed {
     Saved(u16),
     Called(u16),
     SavedX18(u16),
-    Stashed(u16),
     Undo {
         g: u16,
         start: u32,
@@ -608,7 +604,6 @@ impl Packed {
             Word::Saved(g) => Packed::Saved(off(g)),
             Word::Called(g) => Packed::Called(off(g)),
             Word::SavedX18(g) => Packed::SavedX18(off(g)),
-            Word::Stashed(g) => Packed::Stashed(off(g)),
             Word::Undo { g, start, of } => Packed::Undo {
                 g: off(g),
                 start: u32::try_from((start - t) / 4).expect("an expansion in its block"),
@@ -638,7 +633,6 @@ impl Packed {
             Packed::At(k) => w.extend_from_slice(&[0, k as u8, (k >> 8) as u8]),
             Packed::Saved(k) => w.extend_from_slice(&[1, k as u8, (k >> 8) as u8]),
             Packed::SavedX18(k) => w.extend_from_slice(&[2, k as u8, (k >> 8) as u8]),
-            Packed::Stashed(k) => w.extend_from_slice(&[7, k as u8, (k >> 8) as u8]),
             Packed::Called(k) => w.extend_from_slice(&[8, k as u8, (k >> 8) as u8]),
             Packed::Undo { g, start, of } => {
                 let s = start.to_le_bytes();
@@ -687,7 +681,6 @@ impl Packed {
             0 => (Packed::At(u16_at(1)?), 3),
             1 => (Packed::Saved(u16_at(1)?), 3),
             2 => (Packed::SavedX18(u16_at(1)?), 3),
-            7 => (Packed::Stashed(u16_at(1)?), 3),
             8 => (Packed::Called(u16_at(1)?), 3),
             3 => {
                 let start = u32::from_le_bytes(b.get(3..7)?.try_into().ok()?);
@@ -728,7 +721,6 @@ impl Packed {
             Packed::Saved(k) => Word::Saved(at(k)),
             Packed::Called(k) => Word::Called(at(k)),
             Packed::SavedX18(k) => Word::SavedX18(at(k)),
-            Packed::Stashed(k) => Word::Stashed(at(k)),
             Packed::Undo { g, start, of } => {
                 Word::Undo { g: at(g), start: t + 4 * u64::from(start), of }
             }
@@ -1161,7 +1153,6 @@ pub fn write_map() {
             .enumerate()
             .map(|(k, w)| match w {
                 Word::Undo { of, .. } | Word::Finish { of, .. } => of as u8 as char,
-                Word::Stashed(_) => 'v',
                 _ if insn(k) == SAVE => 'v',
                 _ if restoring[k] => 'r',
                 Word::At(_) => 'a',
@@ -2101,7 +2092,7 @@ fn link_call_site(s: &mut State, site: u64, call: CallSite) -> bool {
     // only to fault).
     let (first, other, go) = if let CallSite::Direct(to) = call {
         // A `bl`'s target, known: the entry's address and the target made
-        // in the words, the translation set below `sp` while `x17` holds
+        // in the words, the translation kept in `x18` while `x17` holds
         // the target, as [`slot_look`] does; found, `x16` the target.
         let at = |other: bool| {
             let e = entry(to) ^ if other { 16 } else { 0 };
@@ -2363,7 +2354,6 @@ pub fn guest_pc(pc: u64) -> Option<u64> {
         | Word::Saved(g)
         | Word::Called(g)
         | Word::SavedX18(g)
-        | Word::Stashed(g)
         | Word::Out { g, .. }
         | Word::Undo { g, .. }
         | Word::Finish { g, .. }
@@ -2405,9 +2395,6 @@ pub fn to_guest(regs: &mut Regs) -> bool {
 /// program's state there: `parked`, the program's `x16` and `x17` as their
 /// slots hold them; `word_at`, what each word of the cache stands for.
 fn as_guest(w: Word, regs: &mut Regs, parked: (u64, u64), word_at: impl Fn(u64) -> Option<Word>) {
-    let sp = regs.sp;
-    // SAFETY: the stack below which a save put the program's registers.
-    let below = |off: u64| unsafe { (sp.wrapping_sub(off) as *const u64).read() };
     match w {
         Word::At(g) => regs.pc = g,
         Word::Out { g, saved: false, .. } => regs.pc = g,
@@ -2423,10 +2410,6 @@ fn as_guest(w: Word, regs: &mut Regs, parked: (u64, u64), word_at: impl Fn(u64) 
         }
         Word::Saved(g) | Word::Out { g, .. } => {
             (regs.x[16], regs.x[17]) = parked;
-            regs.pc = g;
-        }
-        Word::Stashed(g) => {
-            (regs.x[16], regs.x[17]) = (below(16), below(8));
             regs.pc = g;
         }
         Word::Undo { g, start, .. } => {
@@ -2464,8 +2447,8 @@ const IN_SLOT: u8 = 32;
 
 /// `regs` stopped in a call stub ([`link_call_site`]): as at its site,
 /// which calls or branches again (`x30` as a call sets it), the program's `x16`
-/// and `x17` in their registers at its first and last words, below `sp`
-/// in its save, and in their slots after. `false` if `regs.pc` is in none.
+/// and `x17` in their registers in its save and at its last word, and in
+/// their slots between. `false` if `regs.pc` is in none.
 /// The call site whose call stub ([`link_call_site`]) holds `pc`, if
 /// one does.
 pub fn call_stub_site(pc: u64) -> Option<u64> {
@@ -2519,17 +2502,12 @@ fn program_x18() -> u64 {
 }
 
 /// A thread stopped in a `br x18`'s stub ([`x18_branch_stub`]): as at its
-/// site, which runs the stub again; the program's `x16` and `x17` below
-/// `sp` while the stub saves them, in their slots after.
+/// site, which runs the stub again; the program's `x16` and `x17` in their
+/// registers while the stub saves them, in their slots after.
 fn x18_branch_to_guest(regs: &mut Regs) -> bool {
     let Some((stub, site)) = x18_branch_site(regs.pc) else { return false };
     let k = ((regs.pc - stub) / 4) as usize;
-    let sp = regs.sp;
-    // SAFETY: the stack below which the stub's save put them.
-    let below = |off: u64| unsafe { (sp.wrapping_sub(off) as *const u64).read() };
-    if (1..SAVE_WORDS).contains(&k) {
-        (regs.x[16], regs.x[17]) = (below(16), below(8));
-    } else if k >= SAVE_WORDS {
+    if k >= SAVE_WORDS {
         (regs.x[16], regs.x[17]) = parked();
     }
     regs.pc = site;
@@ -2545,12 +2523,7 @@ fn call_stub_to_guest(s: &State, regs: &mut Regs) -> bool {
     if k >= words.len() {
         return false;
     }
-    let sp = regs.sp;
-    // SAFETY: the stack below which the stub's save put them.
-    let below = |off: u64| unsafe { (sp.wrapping_sub(off) as *const u64).read() };
-    if (1..SAVE_WORDS).contains(&k) {
-        (regs.x[16], regs.x[17]) = (below(16), below(8));
-    } else if k != 0 && k != words.len() - 1 {
+    if k >= SAVE_WORDS && k != words.len() - 1 {
         (regs.x[16], regs.x[17]) = parked();
     }
     regs.pc = *site;
@@ -2578,124 +2551,36 @@ fn index_parts(by_t: &mut BTreeMap<u64, usize>, b: &Block, i: usize) {
 }
 
 /// Undo an expansion's words from `start` up to `regs.pc`: each register
-/// it saved and has not restored is read back, and `sp` is as before.
+/// it kept in a scratch slot and has not taken back is read back
+/// ([`rewrite::undo`]).
 fn undo(regs: &mut Regs, start: u64) {
-    // What the expansion saved below `sp`, frame by frame: the registers
-    // and their offsets in the frame, and its size.
-    let mut saved: Vec<(Vec<(u32, u64)>, u64)> = Vec::new();
-    let mut at = start;
-    while at < regs.pc {
-        // SAFETY: a word of fwe's code cache, readable.
-        let w = unsafe { (at as *const u32).read() };
-        if w & !0x1f == rewrite::PUSH {
-            saved.push((vec![(w & 0x1f, 0)], 16));
-        } else if w & !0x1f == STUR_SP_M16 {
-            saved.push((vec![(w & 0x1f, (-16i64) as u64)], 0));
-        } else if w & !0x7c1f == STP_SP_M16 {
-            saved.push((vec![(w & 0x1f, (-16i64) as u64), ((w >> 10) & 0x1f, (-8i64) as u64)], 0));
-        } else if w & !0x7c1f == rewrite::PUSH_PAIR {
-            saved.push((vec![(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)], 16));
-        } else if w == rewrite::SYSCALL_STUB_ENTRY {
-            saved.push((vec![(30, 0), (0, 8)], 32));
-        } else if w & 0xffc0_03ff == rewrite::SUB_SP {
-            // A frame made at once, filled by the stores below.
-            saved.push((Vec::new(), u64::from((w >> 10) & 0xfff)));
-        } else if w & !0x7c1f == rewrite::STP_SP {
-            let frame = &mut saved.last_mut().expect("a frame stored into").0;
-            frame.extend([(w & 0x1f, 0), ((w >> 10) & 0x1f, 8)]);
-        } else if w & 0xffc0_03e0 == rewrite::STR_UIMM | 31 << 5 {
-            let frame = &mut saved.last_mut().expect("a frame stored into").0;
-            frame.push((w & 0x1f, u64::from((w >> 10) & 0xfff) * 8));
-        } else if w & !0x1f == rewrite::POP || w & !0x7c1f == rewrite::POP_PAIR {
-            saved.pop();
-        }
-        at += 4;
-    }
-    for (regs_saved, size) in saved.iter().rev() {
-        for &(r, off) in regs_saved {
-            // SAFETY: the stack the expansion saved registers on.
-            regs.x[r as usize] = unsafe { (regs.sp.wrapping_add(off) as *const u64).read() };
-        }
-        regs.sp += size;
-    }
+    let n = ((regs.pc - start) / 4) as usize;
+    // SAFETY: words of fwe's code cache from the expansion's start, readable.
+    let words = unsafe { std::slice::from_raw_parts(start as *const u32, n) };
+    let scratch = crate::scratch_slots();
+    // SAFETY: this thread's own TSD slots.
+    rewrite::undo(words, &scratch, |off| unsafe { crate::tsd_slot(off).read() }, &mut regs.x);
 }
 
 /// Finish an expansion from `regs.pc`, its instruction having run: its
-/// remaining words (those `ours` says are) store `x18` back, restore saved
-/// registers and move `sp`; they are carried out here, up to its way on (a
-/// branch, or the next instruction's translation).
+/// remaining words (those `ours` says are) store `x18` back and take kept
+/// registers back; they are carried out here ([`rewrite::step`]), up to
+/// its way on (a branch, or the next instruction's translation).
 fn finish(regs: &mut Regs, ours: impl Fn(u64) -> bool) {
+    let tsd = crate::tsd_slot(0) as u64;
+    let x18 = crate::x18_slot();
     while ours(regs.pc) {
         // SAFETY: a word of fwe's code cache, readable.
         let w = unsafe { (regs.pc as *const u32).read() };
-        if !step(regs, w) {
+        // SAFETY: the thread's own TSD slots, which the words address.
+        let read = |a: u64| unsafe { (a as *const u64).read() };
+        // SAFETY: as above.
+        let write = |a: u64, v: u64| unsafe { (a as *mut u64).write(v) };
+        if rewrite::step(w, regs.pc, tsd, x18, &mut regs.x, read, write) != rewrite::Step::Next {
             return;
         }
         regs.pc += 4;
     }
-}
-
-/// Carry out word `w` of an expansion's ending on `regs`, if it is one of
-/// the words they hold; `false` for any other (its way on).
-fn step(regs: &mut Regs, w: u32) -> bool {
-    // A base register: 31 is `sp`.
-    let base = |regs: &Regs, n: u32| if n == 31 { regs.sp } else { regs.x[n as usize] };
-    // SAFETY: the stack the expansion saved registers on, or the thread's
-    // own TSD slots.
-    let read = |a: u64| unsafe { (a as *const u64).read() };
-    let (t, n) = (w & 0x1f, (w >> 5) & 0x1f);
-    if w & !0x1f == rewrite::POP {
-        regs.x[t as usize] = read(regs.sp);
-        regs.sp += 16;
-    } else if w & !0x7c1f == rewrite::POP_PAIR {
-        regs.x[t as usize] = read(regs.sp);
-        regs.x[((w >> 10) & 0x1f) as usize] = read(regs.sp + 8);
-        regs.sp += 16;
-    } else if w == rewrite::POP32_X30 {
-        regs.x[30] = read(regs.sp);
-        regs.sp += 32;
-    } else if w & 0xffc0_0000 == rewrite::STR_UIMM {
-        // `str xT, [xN, #imm]`: storing `x18`'s new value in its slot, or
-        // the thread pointer's in its own.
-        let imm = u64::from((w >> 10) & 0xfff) * 8;
-        let value = regs.x[t as usize];
-        // SAFETY: the thread's own TSD slot, or the stack the expansion
-        // saved registers on.
-        unsafe { ((base(regs, n) + imm) as *mut u64).write(value) };
-        // `regs` carry the guest's `x18` (written back to its slot as the
-        // thread goes on): it is the new value too.
-        if n != 31 && imm == u64::from(crate::x18_slot()) {
-            regs.x[18] = value;
-        }
-    } else if w & 0xffc0_0000 == rewrite::LDR_UIMM {
-        let imm = u64::from((w >> 10) & 0xfff) * 8;
-        regs.x[t as usize] = read(base(regs, n) + imm);
-    } else if w & !0x1f == LDUR_SP_M16 {
-        regs.x[t as usize] = read(regs.sp - 16);
-    } else if w & !0x7c1f == LDP_SP_M16 {
-        regs.x[t as usize] = read(regs.sp - 16);
-        regs.x[((w >> 10) & 0x1f) as usize] = read(regs.sp - 8);
-    } else if w & !0x7c1f == rewrite::LDP_SP {
-        regs.x[t as usize] = read(regs.sp);
-        regs.x[((w >> 10) & 0x1f) as usize] = read(regs.sp + 8);
-    } else if w & 0xffc0_03ff == rewrite::ADD_SP {
-        regs.sp += u64::from((w >> 10) & 0xfff);
-    } else if w & 0xffc0_03ff == rewrite::SUB_SP {
-        regs.sp -= u64::from((w >> 10) & 0xfff);
-    } else if w & !0x03e0 == rewrite::MOV_TO_SP {
-        regs.sp = regs.x[n as usize];
-    } else if w & 0xffe0_ffe0 == rewrite::MOV {
-        regs.x[t as usize] = regs.x[((w >> 16) & 0x1f) as usize];
-    } else if w & 0xffe0_fc00 == rewrite::ADD_REG {
-        let m = ((w >> 16) & 0x1f) as usize;
-        regs.x[t as usize] = regs.x[n as usize].wrapping_add(regs.x[m]);
-    } else if w & 0xffe0_0c00 == rewrite::LDUR {
-        let imm = i64::from(((w >> 12) & 0x1ff) as i32) << 55 >> 55;
-        regs.x[t as usize] = read(base(regs, n).wrapping_add_signed(imm));
-    } else {
-        return false;
-    }
-    true
 }
 
 /// Where a direct branch enters block `i`: with the program's `x16` and
@@ -4182,26 +4067,15 @@ fn x18_as(w: u32, to: u32) -> Option<(u32, bool, bool)> {
     (reads || writes).then_some((renamed, reads, writes))
 }
 
-/// `stur xN, [sp, #-16]`, `stp xN, xM, [sp, #-16]` and the loads back:
-/// registers kept below `sp` without moving it ([`x18_beside`]).
-const STUR_SP_M16: u32 = 0xf81f_03e0;
-const LDUR_SP_M16: u32 = 0xf85f_03e0;
-const STP_SP_M16: u32 = 0xa93f_03e0;
-const LDP_SP_M16: u32 = 0xa97f_03e0;
-
 /// The words standing for the program's instruction `w`, which names
 /// `x18` but not `sp` (nor needs a stack), with the program's `x16` and
 /// `x17` in their registers; `quiet`, the registers the code after it
-/// writes before it reads them ([`overwritten_after`]). One or two
-/// scratch registers are kept below `sp` without moving it (fwe's signal
-/// handlers run on a stack of their own), so no chain of updates of `sp`
-/// runs through them, and are ones the code after it writes before it
-/// reads them where it has such, so nothing waits
-/// for them to be loaded back. The first holds `x18`'s value (from its
-/// slot, the thread's area found through it), the second, where `w`
-/// writes `x18`, the thread's area to store it back. With the index of
-/// `w`'s stand-in among them: before it, the words are undone; after it,
-/// finished ([`undo`], [`finish`]).
+/// writes before it reads them ([`overwritten_after`]). One scratch
+/// register, kept in a scratch slot meanwhile, holds `x18`'s value
+/// ([`rewrite::x18_template`]); it is one the code after it writes before
+/// it reads it where it has such, so nothing waits for it to be loaded
+/// back. With the index of `w`'s stand-in among them: before it, the
+/// words are undone; after it, finished ([`undo`], [`finish`]).
 fn x18_beside(w: u32, quiet: u32) -> Option<(Vec<u32>, usize)> {
     if is_branch(w) || crate::decode::x18_casp(w) || !names_none(w, 0, true) {
         return None;
@@ -4210,42 +4084,12 @@ fn x18_beside(w: u32, quiet: u32) -> Option<(Vec<u32>, usize)> {
     for f in crate::decode::operands(w)? {
         used |= 1 << ((w >> f.shift) & 31);
     }
-    let pick = |used: u32| {
-        let free = !used;
-        if free & quiet != 0 { (free & quiet).trailing_zeros() } else { free.trailing_zeros() }
-    };
-    let s1 = pick(used);
+    let free = !used;
+    let s1 =
+        if free & quiet != 0 { (free & quiet).trailing_zeros() } else { free.trailing_zeros() };
     let (renamed, reads, writes) = x18_as(w, s1)?;
-    let slot = (crate::x18_slot() / 8) << 10;
-    let mut words;
-    let main;
-    if writes {
-        let s2 = pick(used | 1 << s1);
-        words = vec![
-            STP_SP_M16 | s2 << 10 | s1,
-            rewrite::MRS_TPIDRRO | s2,
-            rewrite::AND_NOT7 | s2 << 5 | s2,
-        ];
-        if reads {
-            words.push(rewrite::LDR_UIMM | slot | s2 << 5 | s1);
-        }
-        main = words.len();
-        words.extend([
-            renamed,
-            rewrite::STR_UIMM | slot | s2 << 5 | s1,
-            LDP_SP_M16 | s2 << 10 | s1,
-        ]);
-    } else {
-        words = vec![
-            STUR_SP_M16 | s1,
-            rewrite::MRS_TPIDRRO | s1,
-            rewrite::AND_NOT7 | s1 << 5 | s1,
-            rewrite::LDR_UIMM | slot | s1 << 5 | s1,
-        ];
-        main = words.len();
-        words.extend([renamed, LDUR_SP_M16 | s1]);
-    }
-    Some((words, main))
+    let words = rewrite::x18_template(renamed, s1, reads, writes, crate::slots());
+    Some((words, rewrite::x18_main(reads)))
 }
 
 /// For each instruction from `g` to its page's end (as far as a block
@@ -4523,10 +4367,17 @@ fn one(
                 a.extend(H, words, at_pc(*saved));
             }
             (_, _) => {
-                // A vector register: the address in x16, saved around it.
+                // A vector register: the address in x16, kept in a scratch
+                // slot around it ([`rewrite::TSD18`]).
                 let start = here(a);
-                a.push(H, rewrite::PUSH | 16, Word::At(pc));
+                let s0 = crate::scratch_slots()[0];
+                let (str16, ldr16) = (
+                    rewrite::STR_UIMM | ((s0 / 8) << 10) | (18 << 5) | 16,
+                    rewrite::LDR_UIMM | ((s0 / 8) << 10) | (18 << 5) | 16,
+                );
+                a.push(H, rewrite::TSD18[0], Word::At(pc));
                 let undo = Word::Undo { g: pc, start, of: Of::Load };
+                a.extend(H, [rewrite::TSD18[1], str16], undo);
                 a.extend(H, materialized(16, addr), undo);
                 let load = match opc {
                     0 => 0xbd40_0000,
@@ -4534,7 +4385,11 @@ fn one(
                     _ => 0x3dc0_0000,
                 };
                 a.push(H, load | (16 << 5) | rt, undo);
-                a.push(H, rewrite::POP | 16, Word::Finish { g: pc, of: Of::Load });
+                a.extend(
+                    H,
+                    rewrite::TSD18.into_iter().chain([ldr16]),
+                    Word::Finish { g: pc, of: Of::Load },
+                );
             }
         }
         return false;
@@ -4558,11 +4413,14 @@ fn one(
         }
         let stub_at = here(a);
         let site = Site::Flush { rt: w & rewrite::RT_MASK, gate };
-        let words = rewrite::stub(site, 0, 0, stub_at, stub_at + 40);
+        let ret = stub_at + 4 * rewrite::FLUSH_STUB_WORDS as u64 + 8;
+        let words = rewrite::stub(site, crate::slots(), stub_at, ret);
         for (k, &sw) in words.iter().enumerate() {
             let i = match k {
-                0..=1 => Word::At(pc),
-                2..=3 => Word::Undo { g: pc, start: stub_at, of: Of::Flush },
+                0 => Word::At(pc),
+                k if k <= rewrite::FLUSH_STUB_CALL => {
+                    Word::Undo { g: pc, start: stub_at, of: Of::Flush }
+                }
                 _ => Word::Finish { g: pc, of: Of::Flush },
             };
             a.push(H, sw, i);
@@ -4582,13 +4440,16 @@ fn one(
             let stub_at = here(a);
             // Its way back goes past the program's address of the `svc`,
             // kept after it for the gate ([`syscall_site`]).
-            let words = rewrite::stub(Site::Syscall { gate }, 0, 0, stub_at, stub_at + 40);
+            let ret = stub_at + 4 * rewrite::SYSCALL_STUB_WORDS as u64 + 8;
+            let words = rewrite::stub(Site::Syscall { gate }, crate::slots(), stub_at, ret);
             for (k, &sw) in words.iter().enumerate() {
                 // Before the call returns: undone (the call not made);
                 // after: finished.
                 let i = match k {
                     0 => Word::At(pc),
-                    1..=2 => Word::Undo { g: pc, start: stub_at, of: Of::Syscall },
+                    k if k <= rewrite::SYSCALL_STUB_CALL => {
+                        Word::Undo { g: pc, start: stub_at, of: Of::Syscall }
+                    }
                     _ => Word::Finish { g: pc, of: Of::Syscall },
                 };
                 a.push(H, sw, i);
@@ -4604,8 +4465,7 @@ fn one(
             // Its words write `rt` alone, with `x16` and `x17` in their
             // slots ([`keeps_saved`]): stopped among them, it runs again.
             let site = Site::ReadThreadPointer { rt };
-            let words =
-                rewrite::stub_body(site, crate::thread_pointer_slot(), crate::x18_slot(), pc);
+            let words = rewrite::stub_body(site, crate::slots(), pc);
             a.extend(H, words, at_pc(true));
         } else if rt != 31 {
             expansion(Site::ReadThreadPointer { rt }, pc, here(a), a);
@@ -4751,6 +4611,10 @@ fn lookup(
             a.extend(s, slot_look(n, false, near), before);
             a.branch(s, MISS, Field::Imm19, to, before);
             a.push(s, UNSTASH, before);
+            if near {
+                // A translation lost from `x18` ([`STASH`]): a miss.
+                a.branch(s, OUTSIDE, Field::Imm19, to, before);
+            }
         }
     };
     let to = if in_place { n as u8 } else { 16 };
@@ -4900,21 +4764,14 @@ fn materialized(rd: u32, v: u64) -> impl Iterator<Item = u32> {
 /// [`rewrite::stub_body`] makes it, placed at `start`: it runs on into the
 /// next instruction's translation.
 fn expansion(site: Site, pc: u64, start: u64, a: &mut Asm<Word>) {
-    let (tp, x18) = (crate::thread_pointer_slot(), crate::x18_slot());
-    let words = rewrite::stub_body(site, tp, x18, pc);
+    let words = rewrite::stub_body(site, crate::slots(), pc);
     let of = if matches!(site, Site::X18 { .. }) { Of::X18 } else { Of::ThreadPointer };
     // Where the instruction itself is: undone before, finished after.
-    let main = match site {
-        Site::X18 { insn } => rewrite::x18_special_main(insn).or_else(|| {
-            (crate::decode::x18_adr(insn).is_none() && !crate::decode::x18_ldr_literal(insn))
-                .then(|| rewrite::x18_stub_main(insn))
-        }),
-        _ => None,
-    };
+    let main = rewrite::main_of(site);
     for (k, &sw) in words.iter().enumerate() {
-        let i = match main {
-            _ if k == 0 => Word::At(pc),
-            Some(m) if k > m => Word::Finish { g: pc, of },
+        let i = match k {
+            0 => Word::At(pc),
+            k if k > main => Word::Finish { g: pc, of },
             _ => Word::Undo { g: pc, start, of },
         };
         a.push(H, sw, i);
@@ -4978,7 +4835,6 @@ mod tests {
             Word::Saved(g),
             Word::Called(g0),
             Word::SavedX18(g),
-            Word::Stashed(g),
             Word::Undo { g, start: t + 4 * 70, of: Of::X18 },
             Word::Finish { g, of: Of::Flush },
             Word::Lookup { g, link: None, to: None },
