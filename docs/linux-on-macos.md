@@ -924,7 +924,7 @@ the host reports differently.
 | `file_getattr`, `file_setattr` | The inode flags (immutable, append-only, no-dump, no-access-time) as `fa_xflags`, Linux's checks of the size and flags, in Linux's order (owner, `CAP_LINUX_IMMUTABLE`, then what the filesystem keeps); a change `EROFS` through a read-only mount, an overlay file copied up first; what only XFS keeps (extent sizes, projects) is `EOPNOTSUPP` to set. | `fstatat`, `lchflags` by path (`fstat`, `fchflags` for a descriptor) |
 | `name_to_handle_at`, `open_by_handle_at` | A handle is the host file system id and inode; opening needs `CAP_DAC_READ_SEARCH`, then opens as `openat` (permissions, read-only mounts, `O_PATH`) at the path the caller sees the file at in `mount_fd`'s mount, under its root; a file it cannot see so is `ESTALE`. | `fstatfs`, `fsgetpath`, then as `openat` |
 | `memfd_create` | See [Shared memory and memfd](#shared-memory-and-memfd). | none; `shm_open`, `shm_unlink` for its data at its first write |
-| `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. A run starts in the directory fwe was started in (under `--root`, its path in the root, or `/` where it lies outside). Search permission checked. | `openat` (to check), `fcntl(F_GETPATH)` |
+| `getcwd`, `chdir`, `fchdir` | The working directory is a path fwe keeps; the host's never changes. A run starts in the directory fwe was started in (under `--root`, its path in the root, or `/` where it lies outside). Search permission checked. A directory of fwe's `/proc` or `/sys` can be the working directory or the root: `/proc/self` is the caller's directory then, as Linux's walk finds it, and once that process ends its directory holds nothing: a walk that starts there fails, with `ESRCH` in its `fd` and `fdinfo` and `ENOENT` elsewhere, as on Linux (Chromium's and Firefox's sandboxes empty their roots so). | `openat` (to check), `fcntl(F_GETPATH)` |
 | `umask` | Kept and applied by fwe; fwe's host umask is 0. | none |
 
 **`openat`**: `O_CREAT` is first tried with `O_EXCL`, so fwe knows whether
@@ -978,7 +978,7 @@ every process of the namespace sees, and fwe checks the privilege
 |---|---|---|
 | `mount` | New mounts of `tmpfs`, `proc`, `sysfs`, `cgroup2`, `devpts`, `mqueue` and `overlay` (no cgroup v1: `cgroup` is `ENODEV`, as on a kernel without it); bind (keeping the source's per-mount flags, read-only too, and leaving unbindable submounts behind), move, remount and propagation changes. Other types `ENODEV`. A tmpfs's and a `proc`'s options are checked as Linux checks them (`EINVAL`), a user or group id kept as the initial namespace's. | none; a tmpfs is a new filesystem of fwe's store, in memory ([Kernel-wide state](#kernel-wide-state)) |
 | `umount2` | `MNT_DETACH`, `MNT_FORCE`, `MNT_EXPIRE`, `UMOUNT_NOFOLLOW`; a mount in use is `EBUSY` unless detached (`MNT_FORCE` does not pass it, as on Linux's own file systems). | none |
-| `pivot_root`, `chroot` | The root becomes a path in the namespace's view; the working directory follows `pivot_root` as Linux's. | none |
+| `pivot_root`, `chroot` | The root becomes a path in the namespace's view (a directory of fwe's `/proc` too, see `chdir`); the working directory follows `pivot_root` as Linux's. | none |
 | `fsopen`, `fspick`, `fsconfig`, `fsmount` | A filesystem context is the process's, kept against an anonymous file's descriptor; `FSCONFIG_CMD_CREATE` makes the filesystem as `mount` does; reading the descriptor gives its messages. | an anonymous file |
 | `open_tree`, `move_mount` | A detached tree (`fsmount`, `OPEN_TREE_CLONE`) is kept against an `O_PATH` descriptor of its root; `move_mount` attaches or moves, `MOVE_MOUNT_BENEATH` included. | none |
 | `mount_setattr` | Sets and clears `ro`, `nosuid`, `nodev`, `noexec`, the access-time modes and `nosymfollow`, and propagation, on a mount or tree (`AT_RECURSIVE`); `MOUNT_ATTR_IDMAP` is `EINVAL`. | none |
@@ -2158,7 +2158,9 @@ As on Linux, each thread has its own namespaces
 working directory and umask with the others unless it unshared
 `CLONE_FS` (which `CLONE_NEWNS` implies), and a thread it starts has a
 copy of its view. A `fork` child or a program it runs takes the calling
-thread's.
+thread's. A process made with `CLONE_FS` shares them with its parent, as
+threads do, across `execve`, until either unshares them
+([architecture.md](architecture.md#containers)).
 
 | Namespace | What fwe does |
 |---|---|

@@ -41,8 +41,10 @@ pub enum Entry {
     /// A namespace's file bound to a path (an nsfs mount): opening it
     /// gives a descriptor of the namespace.
     Ns(crate::nsfd::NsRef),
-    /// A path under `/proc` or `/sys` that is not provided (maps to ENOENT).
-    Missing,
+    /// A path under `/proc` or `/sys` that is not there to the caller: the
+    /// errno its lookup fails with (`ENOENT`; `ESRCH` in the descriptor
+    /// directories of a process that has ended, [`crate::fs::ProcPin`]).
+    Missing(i32),
 }
 
 /// `hidepid=` of a `proc` mount: another's `/proc/<pid>` is open to all
@@ -572,7 +574,7 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         b"/proc/partitions" => Entry::File(crate::loopdev::partitions()),
         p if let Some(e) = crate::loopdev::sys_lookup(p) => e,
         p if is_dir(p) => Entry::Dir,
-        _ => Entry::Missing,
+        _ => Entry::Missing(fwe_abi::errno::ENOENT),
     })
 }
 
@@ -918,7 +920,7 @@ mod tests {
     #[test]
     fn unknown_proc_path_is_missing_and_others_fall_through() {
         let info = info();
-        assert!(matches!(lookup(b"/proc/does/not/exist", &info), Some(Entry::Missing)));
+        assert!(matches!(lookup(b"/proc/does/not/exist", &info), Some(Entry::Missing(_))));
         assert!(lookup(b"/etc/passwd", &info).is_none());
         assert!(lookup(b"/home", &info).is_none());
     }

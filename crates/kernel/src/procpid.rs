@@ -541,12 +541,12 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
                     let comm = crate::procreg::kinfo(host).map(|k| k.comm).unwrap_or_default();
                     Entry::File(stat_line(pid, &comm, &h))
                 }
-                None => Entry::Missing,
+                None => Entry::Missing(fwe_abi::errno::ENOENT),
             },
-            _ => Entry::Missing,
+            _ => Entry::Missing(fwe_abi::errno::ENOENT),
         };
     };
-    let Some(h) = host_info(host) else { return Entry::Missing };
+    let Some(h) = host_info(host) else { return Entry::Missing(fwe_abi::errno::ENOENT) };
     match sub {
         b"" | b"/ns" | b"/task" => Entry::Dir,
         b"/stat" => Entry::File(stat_line(pid, &rec.comm, &h)),
@@ -578,7 +578,7 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
         })),
         b"/maps" | b"/smaps" => match crate::mm::MapsView::of(host) {
             Some(v) => Entry::File(v.render(sub == b"/smaps")),
-            None => Entry::Missing,
+            None => Entry::Missing(fwe_abi::errno::ENOENT),
         },
         b"/cmdline" => Entry::File(rec.cmdline.clone()),
         b"/environ" => Entry::File(environ(&rec.auxv, &rec.cmdline, |addr, buf| {
@@ -586,14 +586,14 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
         })),
         b"/limits" => match crate::fs::OtherView::of(host) {
             Some(v) => Entry::File(limits(&v.limits)),
-            None => Entry::Missing,
+            None => Entry::Missing(fwe_abi::errno::ENOENT),
         },
         b"/statm" => Entry::File(statm(host)),
         b"/io" => Entry::File(io(host)),
         b"/comm" => Entry::File([&rec.comm[..], b"\n"].concat()),
         b"/exe" => Entry::Symlink(rec.exe.clone()),
         // Relative to the reader's cgroup namespace (`Fs::synthetic_entry`).
-        b"/cgroup" => Entry::Missing,
+        b"/cgroup" => Entry::Missing(fwe_abi::errno::ENOENT),
         b"/oom_score_adj" | b"/oom_adj" | b"/oom_score" => {
             Entry::File(oom_file(sub, rec.oom_score_adj))
         }
@@ -624,7 +624,7 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
             if let Some(kind) = sub.strip_prefix(b"/ns/") {
                 return match init_ns(kind) {
                     Some(init) => Entry::Symlink(ns_link(kind, &rec.ns, init)),
-                    None => Entry::Missing,
+                    None => Entry::Missing(fwe_abi::errno::ENOENT),
                 };
             }
             if let Some(t) = sub.strip_prefix(b"/task/") {
@@ -643,9 +643,9 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
                             tids.into_iter().any(|id| crate::pidns::thread_number(id) == t)
                         },
                     );
-                return if listed { Entry::Dir } else { Entry::Missing };
+                return if listed { Entry::Dir } else { Entry::Missing(fwe_abi::errno::ENOENT) };
             }
-            Entry::Missing
+            Entry::Missing(fwe_abi::errno::ENOENT)
         }
     }
 }

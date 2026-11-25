@@ -10943,3 +10943,38 @@ fn alpine_display_gtk4_demo_runs() {
     let Some(x) = display_tests() else { return };
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
+
+/// Processes made with `CLONE_FS` share their root, working directory and
+/// umask, across `execve` too; one made without it has its own. Chromium's
+/// sandbox empties its root so: a `CLONE_FS` child's `chroot` to its own
+/// `/proc/self/fdinfo` leaves the parent's root in a directory of a process
+/// that has ended. The program is in its root, as a program is on Linux:
+/// its child runs it again.
+#[test]
+fn clone_fs_shares_the_root_working_directory_and_umask() {
+    let prog = build_c_dynamic("clonefs", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "clonefs");
+    std::fs::copy(&prog, root.join("clonefs")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("clonefs"));
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    // Linux 7.0's output, on arm64.
+    assert_eq!(
+        stdout(&out),
+        "without CLONE_FS: child 0\n\
+         its parent: cwd /, umask 022\n\
+         with CLONE_FS: child 0\n\
+         its parent: cwd /moved, umask 027\n\
+         with CLONE_FS, across execve: child 0\n\
+         its parent: cwd /moved, umask 000\n\
+         Chromium's empty root: child 0\n\
+         /proc: No such process\n\
+         /: found\n\
+         cwd: /\n\
+         listing /: No such process\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}

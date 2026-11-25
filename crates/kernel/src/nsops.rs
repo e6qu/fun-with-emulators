@@ -69,6 +69,9 @@ pub struct ForkNs {
     frozen: bool,
     /// It shares its parent's descriptor table (`CLONE_FILES`).
     files: bool,
+    /// It shares its parent's root, working directory and umask
+    /// (`CLONE_FS`, [`crate::fsshare`]).
+    fs: bool,
     /// The signal its end is told with.
     exit_signal: u64,
     /// `CLONE_PIDFD`: the descriptor made ready for the child, and where it
@@ -134,7 +137,16 @@ impl<P: Platform> Kernel<P> {
         {
             return err(e);
         }
+        // Alone in the process, they stop being another process's
+        // (`CLONE_FS`), once the call succeeds: `CLONE_NEWUSER` unshares
+        // them too.
+        let leaves_fs = flags & (CLONE_FS | CLONE_NEWNS | CLONE_NEWUSER) != 0
+            && crate::threadfs::current().is_none()
+            && crate::thread::live_threads() <= 1;
         if flags & SUPPORTED == 0 {
+            if leaves_fs {
+                crate::fsshare::leave();
+            }
             return 0;
         }
         // A new user namespace needs no privilege, and gives the caller what
@@ -193,6 +205,9 @@ impl<P: Platform> Kernel<P> {
                 }
                 Err(e) => return err(e),
             }
+        }
+        if leaves_fs {
+            crate::fsshare::leave();
         }
         self.namespaces_changed();
         0
@@ -259,13 +274,32 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// After the calling thread changed its root, working directory or
-    /// umask: the threads that share them have them too.
+    /// umask: the threads, and the processes, that share them have them
+    /// too.
     fn share_view(&mut self) {
-        if !crate::threadfs::any() {
-            return;
+        if crate::threadfs::any()
+            && let Ok(from) = self.fs().copy()
+        {
+            crate::threadfs::share_view(&from, self.fs.as_mut());
         }
-        let Ok(from) = self.fs().copy() else { return };
-        crate::threadfs::share_view(&from, self.fs.as_mut());
+        // A thread with a view of its own that it unshared changed only
+        // its own.
+        if crate::fsshare::active()
+            && (crate::threadfs::current().is_none() || crate::threadfs::shares())
+            && let Some(fs) = self.fs.as_ref()
+        {
+            crate::fsshare::changed(fs.shared_view());
+        }
+    }
+
+    /// As a call starts: the root, working directory and umask another
+    /// process that shares them changed them to, in the process's view
+    /// and the views of its threads that share it.
+    pub(crate) fn take_shared_view(&mut self) {
+        let Some(v) = crate::fsshare::take() else { return };
+        let Some(fs) = self.fs.as_mut() else { return };
+        fs.set_shared_view(&v);
+        crate::threadfs::process_view_changed(&v);
     }
 
     /// `sethostname(name, len)`, or `setdomainname` when `!host`.
@@ -451,6 +485,15 @@ impl<P: Platform> Kernel<P> {
         inherit.foster = flags & fwe_abi::clone::CLONE_PARENT != 0;
         let clear_sighand = flags & fwe_abi::clone::CLONE_CLEAR_SIGHAND != 0;
         let exit_signal = flags & fwe_abi::clone::CSIGNAL;
+        // `CLONE_FS`: the record the child shares the view through. The
+        // view of a thread that unshared it is that thread's alone, and the
+        // child's a copy of it.
+        let shares_fs = flags & CLONE_FS != 0
+            && (crate::threadfs::current().is_none() || crate::threadfs::shares());
+        if shares_fs {
+            crate::fsshare::for_fork(self.fs().shared_view())?;
+        }
+        crate::fsshare::fork_shares(shares_fs);
         Ok(ForkNs {
             saved,
             chain,
@@ -463,6 +506,7 @@ impl<P: Platform> Kernel<P> {
             clear_sighand,
             frozen,
             files: flags & fwe_abi::clone::CLONE_FILES != 0,
+            fs: shares_fs,
             exit_signal,
             pidfd: None,
             child_writes: None,
@@ -519,6 +563,7 @@ impl<P: Platform> Kernel<P> {
     /// the child's pid as the parent sees it.
     pub fn fork_parent(&mut self, t: ForkNs, child: i32) -> i32 {
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::fsshare::fork_shares(false);
         if let Some(caps) = t.caps {
             self.creds.caps = caps;
         }
@@ -637,6 +682,9 @@ impl<P: Platform> Kernel<P> {
             // Where it starts, in case it looks before the parent writes it.
             let _ = crate::procreg::set_cgroup(crate::host::pid(), cg);
         }
+        // Its root, working directory and umask: its parent's still, or
+        // its own.
+        crate::fsshare::forked_child(t.fs);
         if t.clear_sighand {
             self.clear_handlers();
         }
@@ -649,6 +697,7 @@ impl<P: Platform> Kernel<P> {
         }
         FILES_SHARED.store(t.files, std::sync::atomic::Ordering::SeqCst);
         CLEAR_SIGHAND.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::fsshare::fork_shares(false);
         crate::reaper::forked_child();
         crate::fs::forked_child_fifos();
         // A reaper: a pid namespace's init, or one its record makes one (the

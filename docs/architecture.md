@@ -1540,6 +1540,16 @@ is mapped is in [linux-on-macos.md](linux-on-macos.md#namespaces):
   file it is an `nsfs` mount whose source is the namespace (the mount
   table keeps its kind, identity and record), which the collector counts
   as live.
+- **A view processes share** (`crates/kernel/src/fsshare.rs`): processes
+  made with `CLONE_FS` share their root, working directory and umask
+  through a shared record they hold. A `chdir`, `fchdir`, `chroot`,
+  `pivot_root` or `umask` writes it; each process takes another's change
+  as its next call starts (a call made on the kernel lock's shared side
+  is then made holding it), and a call made without the lock takes it
+  into the view such calls resolve paths in. `execve` and a VM fork carry
+  the record; `unshare(CLONE_FS)` (or `CLONE_NEWNS`, `CLONE_NEWUSER`)
+  leaves it; `setns` into a mount or user namespace is refused while
+  another live process shares it.
 - **A thread's own view** (`crates/kernel/src/threadfs.rs`): a thread that
   unshares `CLONE_FS` or changes a namespace while others run gets a copy
   of the process's filesystem view (root, working directory, umask, mount
@@ -1738,6 +1748,15 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   descriptor fails with `EMFILE`.
 - A `vfork` child shares the guest's memory but not its mappings (an
   `mmap`, `munmap` or `mprotect` in it stays in the child).
+- A process made with `CLONE_FILES` has a copy of its parent's descriptor
+  table, not the table itself: a descriptor either opens or closes
+  afterwards is its own.
+- A thread that unshared `CLONE_FS` gives a child it makes with
+  `CLONE_FS` a copy of its root, working directory and umask, not its
+  own.
+- A root or working directory in `/proc/<pid>` (outside its `fd` and
+  `fdinfo`) of a process that has ended fails to open with `ENOENT`;
+  Linux opens it and fails to list it.
 - Native: a thread inside fwe's code during a `fork` (in a system call) is
   not stopped, so a write it makes to guest memory then (a `read`
   completing) might or might not reach the child.

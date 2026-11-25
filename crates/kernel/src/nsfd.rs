@@ -324,11 +324,15 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         // A user namespace is joined, as Linux's `userns_install` has it,
-        // only if it is not the caller's own and the caller is a single
-        // thread (`EINVAL`), before the capability is asked for.
+        // only if it is not the caller's own, the caller is a single thread
+        // and no other process shares its root and working directory
+        // (`EINVAL`), before the capability is asked for.
         if n.kind == CLONE_NEWUSER {
             let own = self.fs().ns.user.as_ref().map(|r| r.dir().to_vec());
-            if own == n.dir || crate::thread::live_threads() > 1 {
+            if own == n.dir
+                || crate::thread::live_threads() > 1
+                || crate::fsshare::shared_with_others()
+            {
                 return err(errno::EINVAL);
             }
         }
@@ -342,10 +346,10 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         // A mount namespace is joined by a thread that shares its root and
-        // working directory with no other.
+        // working directory with no other thread or process.
         if n.kind == CLONE_NEWNS
-            && crate::thread::live_threads() > 1
             && (crate::threadfs::current().is_none() || crate::threadfs::shares())
+            && (crate::thread::live_threads() > 1 || crate::fsshare::shared_with_others())
         {
             return err(errno::EINVAL);
         }
@@ -393,7 +397,7 @@ impl<P: Platform> Kernel<P> {
                 let ns = crate::mounts::store::Ns::join(dir, n.id)?;
                 fs.set_mount_ns(Arc::new(ns));
                 // At the namespace's root, as Linux leaves the caller.
-                fs.set_root(b"/".to_vec(), b"/".to_vec());
+                fs.set_root(b"/".to_vec(), b"/".to_vec(), None);
                 fs.set_mounts(0, 0);
             }
         }

@@ -617,6 +617,10 @@ pub struct Fs {
     /// The mount the root was set in (0 when not known), which it stays in
     /// when another is mounted over it.
     root_mount: u32,
+    /// The process whose directory in fwe's `/proc` the root, and the
+    /// working directory, are in, if they are.
+    root_pin: Option<ProcPin>,
+    cwd_pin: Option<ProcPin>,
     umask: u32,
     proc: crate::procfs::ProcInfo,
     /// The process's other namespaces.
@@ -627,6 +631,61 @@ impl Drop for Fs {
     fn drop(&mut self) {
         crate::fdtable::root_closed(self.root.as_raw_fd());
     }
+}
+
+/// A process's directory in fwe's `/proc` (`/proc/<pid>`) that a root or
+/// working directory is in, kept with the process it is of.
+///
+/// Linux finds `/proc/self` as the walk reaches it, so a root changed to
+/// `/proc/self/fdinfo` is that process's directory for good: once the
+/// process ends, the directory is still there, and holds nothing. A walk
+/// that starts in it fails, with `ESRCH` in its `fd` and `fdinfo` (whose
+/// lookups Linux checks against the process), and `ENOENT` elsewhere.
+/// Chromium's and Firefox's sandboxes empty their roots so.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProcPin {
+    /// `/proc/<pid>`, a path in the namespace's view.
+    pub dir: Vec<u8>,
+    /// The process: its host pid and start time.
+    pub host: (i32, u64),
+}
+
+impl ProcPin {
+    /// Whether the process has ended (or its pid is another's now).
+    fn gone(&self) -> bool {
+        !crate::procreg::alive_kept(self.host)
+    }
+
+    pub(crate) fn save(p: &Option<ProcPin>, e: &mut crate::snapshot::Enc) {
+        e.bool(p.is_some());
+        if let Some(p) = p {
+            e.bytes(&p.dir);
+            e.i32(p.host.0);
+            e.u64(p.host.1);
+        }
+    }
+
+    pub(crate) fn load(d: &mut crate::snapshot::Dec) -> Option<ProcPin> {
+        d.bool().then(|| ProcPin { dir: d.bytes(), host: (d.i32(), d.u64()) })
+    }
+}
+
+/// A directory of fwe's own filesystems a path names
+/// ([`Fs::synthetic_dir`]): its guest path, and the process whose `/proc`
+/// directory it is in, if it is in one.
+pub(crate) struct SynthDir {
+    pub guest: Vec<u8>,
+    pub pin: Option<ProcPin>,
+}
+
+/// Where a path's walk starts in a directory of a process that has ended
+/// ([`ProcPin`]): whether the path names that directory itself (it has no
+/// component: Linux checks each one against the directory), and the errno
+/// the walk fails with otherwise.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Gone {
+    pub itself: bool,
+    pub errno: i32,
 }
 
 impl Fs {
@@ -643,6 +702,10 @@ impl Fs {
         e.u64(self.mnt.id());
         e.bytes(&self.proc_root);
         e.u32(self.umask);
+        e.bool(self.cwd_outside.is_some());
+        e.bytes(self.cwd_outside.as_deref().unwrap_or_default());
+        ProcPin::save(&self.root_pin, e);
+        ProcPin::save(&self.cwd_pin, e);
         e.bytes(&self.proc.exe);
         e.bytes(&self.proc.cmdline);
         e.u32(self.proc.ncpu);
@@ -677,16 +740,22 @@ impl Fs {
                 .expect("the initial mount namespace"),
             ),
         };
+        let proc_root = d.bytes();
+        let umask = d.u32();
+        let outside = d.bool();
+        let outside_at = d.bytes();
         Fs {
             root,
             cwd,
             cwd_mount,
-            cwd_outside: None,
+            cwd_outside: outside.then_some(outside_at),
             root_mount,
+            root_pin: ProcPin::load(d),
+            cwd_pin: ProcPin::load(d),
             root_host,
             mnt,
-            proc_root: d.bytes(),
-            umask: d.u32(),
+            proc_root,
+            umask,
             proc: crate::procfs::ProcInfo {
                 exe: d.bytes(),
                 cmdline: d.bytes(),
@@ -709,11 +778,13 @@ impl Fs {
         e.bytes(self.mnt.dir());
         e.u64(self.mnt.id());
         e.bytes(&self.proc_root);
+        ProcPin::save(&self.root_pin, e);
         self.ns.save(e);
     }
 
     pub(crate) fn skip_view(d: &mut crate::snapshot::Dec) {
         let _ = (d.bytes(), d.u64(), d.bytes());
+        let _ = ProcPin::load(d);
         let _ = crate::ns::Namespaces::load(d);
     }
 
@@ -726,6 +797,7 @@ impl Fs {
             return Ok(());
         }
         let (dir, id, root) = (d.bytes(), d.u64(), d.bytes());
+        self.root_pin = ProcPin::load(&mut d);
         if dir != self.mnt.dir() {
             let ns = Ns::join(&dir, id)
                 .map_err(|e| format!("joining the mount namespace: errno {e}"))?;
@@ -768,6 +840,8 @@ impl Fs {
             cwd_mount: 0,
             cwd_outside: None,
             root_mount: 0,
+            root_pin: None,
+            cwd_pin: None,
             root_host,
             mnt,
             proc_root: b"/".to_vec(),
@@ -981,6 +1055,8 @@ impl Fs {
             cwd_mount: self.cwd_mount,
             cwd_outside: self.cwd_outside.clone(),
             root_mount: self.root_mount,
+            root_pin: self.root_pin.clone(),
+            cwd_pin: self.cwd_pin.clone(),
             umask: self.umask,
             proc: self.proc.clone(),
             ns: self.ns.clone(),
@@ -990,12 +1066,34 @@ impl Fs {
     /// Take `from`'s root, working directory and umask: a thread that
     /// shares them changed them ([`crate::threadfs::share_view`]).
     pub fn set_view(&mut self, from: &Fs) {
-        self.proc_root = from.proc_root.clone();
-        self.cwd = from.cwd.clone();
-        self.cwd_mount = from.cwd_mount;
-        self.cwd_outside = from.cwd_outside.clone();
-        self.root_mount = from.root_mount;
-        self.umask = from.umask;
+        self.set_shared_view(&from.shared_view());
+    }
+
+    /// The part of the view threads, and processes made with `CLONE_FS`,
+    /// share: the root, the working directory and the umask.
+    pub fn shared_view(&self) -> crate::fsshare::View {
+        crate::fsshare::View {
+            root: self.proc_root.clone(),
+            cwd: self.cwd.clone(),
+            cwd_outside: self.cwd_outside.clone(),
+            root_mount: self.root_mount,
+            cwd_mount: self.cwd_mount,
+            root_pin: self.root_pin.clone(),
+            cwd_pin: self.cwd_pin.clone(),
+            umask: self.umask,
+        }
+    }
+
+    /// Take `v` ([`Fs::shared_view`] of a view that shares this one's).
+    pub fn set_shared_view(&mut self, v: &crate::fsshare::View) {
+        self.proc_root = v.root.clone();
+        self.cwd = v.cwd.clone();
+        self.cwd_mount = v.cwd_mount;
+        self.cwd_outside = v.cwd_outside.clone();
+        self.root_mount = v.root_mount;
+        self.root_pin = v.root_pin.clone();
+        self.cwd_pin = v.cwd_pin.clone();
+        self.umask = v.umask;
         self.republish();
     }
 
@@ -1014,9 +1112,15 @@ impl Fs {
     /// Make the namespace path `root` the process's root (`chroot`), or
     /// keep it while the namespace's root moved (`pivot_root`), with the
     /// working directory `cwd` from it.
-    pub fn set_root(&mut self, root: Vec<u8>, cwd: Vec<u8>) {
+    /// The process whose directory in fwe's `/proc` the root is in, if it is.
+    pub fn root_pin(&self) -> Option<&ProcPin> {
+        self.root_pin.as_ref()
+    }
+
+    pub fn set_root(&mut self, root: Vec<u8>, cwd: Vec<u8>, pin: Option<ProcPin>) {
         self.proc_root = root;
         self.cwd = cwd;
+        self.root_pin = pin;
         self.republish();
     }
 
@@ -1129,6 +1233,15 @@ impl Fs {
             // Names nothing (`AT_EMPTY_PATH` is the callers' to handle).
             return None;
         }
+        // A walk that starts in a directory of a process that has ended:
+        // the directory, or nothing.
+        if let Some(g) = self.gone_walk(dirfd, path) {
+            return Some(if g.itself {
+                crate::procfs::Entry::Dir
+            } else {
+                crate::procfs::Entry::Missing(g.errno)
+            });
+        }
         // Relative to a detached tree of `proc` or `sysfs` (crun reaches
         // `/proc` through one it makes with `fsmount`): that filesystem's
         // file, whatever is mounted where.
@@ -1161,7 +1274,7 @@ impl Fs {
                 } else if let Some(status) = queue.and_then(crate::mqueue::status_of) {
                     crate::procfs::Entry::File(status)
                 } else {
-                    crate::procfs::Entry::Missing
+                    crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT)
                 });
             }
             _ if is_rootfs(&m, &self.root_host) => {
@@ -1191,7 +1304,7 @@ impl Fs {
                 return Some(match host {
                     Some(h) if sub == b"/fd" => match crate::procreg::read(h) {
                         Some(_) => crate::procfs::Entry::Dir,
-                        None => crate::procfs::Entry::Missing,
+                        None => crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
                     },
                     Some(h) if sub.starts_with(b"/fd/") => self.other_fd(h, &sub[4..]),
                     Some(h) if sub == b"/cgroup" && crate::procreg::read(h).is_some() => {
@@ -1205,7 +1318,7 @@ impl Fs {
                         Some(e) => e,
                         None => crate::procpid::entry(h, pid, &sub),
                     },
-                    None => crate::procfs::Entry::Missing,
+                    None => crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
                 });
             }
         };
@@ -1234,7 +1347,7 @@ impl Fs {
         if let Some(kind) = absolute.strip_prefix(b"/proc/self/ns/") {
             return Some(match self.ns.link(kind, self.mnt.id()) {
                 Some(link) => crate::procfs::Entry::Symlink(link),
-                None => crate::procfs::Entry::Missing,
+                None => crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
             });
         }
         if absolute == b"/proc/self/task" {
@@ -1244,8 +1357,10 @@ impl Fs {
         if let Some(name) = absolute.strip_prefix(b"/proc/self/net/") {
             let net = crate::netns::current();
             return Some(
-                crate::procnet::file(name, net.as_deref(), &|h| self.host_to_guest(h))
-                    .map_or(crate::procfs::Entry::Missing, crate::procfs::Entry::File),
+                crate::procnet::file(name, net.as_deref(), &|h| self.host_to_guest(h)).map_or(
+                    crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
+                    crate::procfs::Entry::File,
+                ),
             );
         }
         if absolute == b"/proc/self/maps" || absolute == b"/proc/self/smaps" {
@@ -1258,7 +1373,7 @@ impl Fs {
                 b"shm" => Kind::Shm,
                 b"sem" => Kind::Sem,
                 b"msg" => Kind::Msg,
-                _ => return Some(crate::procfs::Entry::Missing),
+                _ => return Some(crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT)),
             };
             let r = self.ns.ipc.clone().or_else(crate::sysvipc::initial);
             return Some(crate::procfs::Entry::File(
@@ -1271,7 +1386,7 @@ impl Fs {
                     None => crate::procfs::Entry::Dir,
                     Some(kind) => match self.task_ns_link(tid, kind) {
                         Some(link) => crate::procfs::Entry::Symlink(link),
-                        None => crate::procfs::Entry::Missing,
+                        None => crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
                     },
                 });
             }
@@ -1358,7 +1473,7 @@ impl Fs {
             let fd = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok());
             return Some(match fd.filter(|&fd| self.guest_fd_open(fd)) {
                 Some(fd) => crate::procfs::Entry::File(self.fdinfo(fd)),
-                None => crate::procfs::Entry::Missing,
+                None => crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
             });
         }
         if let Some(n) = absolute.strip_prefix(b"/proc/self/fd/") {
@@ -1371,7 +1486,7 @@ impl Fs {
             });
             return Some(match fd {
                 Some(fd) if open => crate::procfs::Entry::Fd { fd, target: self.fd_target(fd) },
-                _ => crate::procfs::Entry::Missing,
+                _ => crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT),
             });
         }
         crate::procfs::lookup(&absolute, &self.proc)
@@ -1393,13 +1508,15 @@ impl Fs {
                 .and_then(|d| crate::shared::Record::<crate::ns::Net>::join(&d, 0).ok());
             return Some(
                 crate::procnet::file(name, net.as_ref(), &|h| self.host_to_guest(h))
-                    .map_or(Entry::Missing, Entry::File),
+                    .map_or(Entry::Missing(fwe_abi::errno::ENOENT), Entry::File),
             );
         }
         if !matches!(sub, b"/cwd" | b"/root" | b"/mountinfo" | b"/mounts") {
             return None;
         }
-        let Some(v) = OtherView::of(host) else { return Some(Entry::Missing) };
+        let Some(v) = OtherView::of(host) else {
+            return Some(Entry::Missing(fwe_abi::errno::ENOENT));
+        };
         let same = v.mnt == self.mnt.dir();
         let shown =
             |ns: &[u8]| if same { self.from_ns(ns).unwrap_or(ns.to_vec()) } else { ns.to_vec() };
@@ -1408,7 +1525,7 @@ impl Fs {
             b"/root" => Entry::Symlink(shown(&v.root)),
             _ => {
                 let Ok(ns) = crate::mounts::store::Ns::join(&v.mnt, 0) else {
-                    return Some(Entry::Missing);
+                    return Some(Entry::Missing(fwe_abi::errno::ENOENT));
                 };
                 let t = ns.table();
                 Entry::File(if sub == b"/mountinfo" {
@@ -1553,11 +1670,11 @@ impl Fs {
     fn other_fd(&self, host: crate::ids::HostPid, n: &[u8]) -> crate::procfs::Entry {
         use crate::procpid::FdTarget;
         let Some(fd) = std::str::from_utf8(n).ok().and_then(|n| n.parse::<i32>().ok()) else {
-            return crate::procfs::Entry::Missing;
+            return crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT);
         };
         let Some((_, target)) = crate::procpid::fds(host).into_iter().find(|(f, _)| *f == fd)
         else {
-            return crate::procfs::Entry::Missing;
+            return crate::procfs::Entry::Missing(fwe_abi::errno::ENOENT);
         };
         crate::procfs::Entry::Symlink(match target {
             FdTarget::Path(p) => self.host_to_guest(&p).unwrap_or(p),
@@ -2137,6 +2254,16 @@ impl Fs {
 
     /// Set the working directory to the resolved `path`.
     pub fn chdir(&mut self, dirfd: i32, path: &[u8]) -> Result<(), i32> {
+        // A directory of fwe's `/proc` or `/sys`.
+        if let Some(found) = self.synthetic_dir(dirfd, path) {
+            let SynthDir { guest, pin } = found?;
+            self.cwd_mount = self.mnt.table().locate(&self.to_ns(&guest)).0.id;
+            self.cwd_outside = None;
+            self.cwd = guest;
+            self.cwd_pin = pin;
+            self.republish();
+            return Ok(());
+        }
         let resolved = self.resolve(dirfd, path, true)?;
         // Confirm it is a directory we can enter.
         if let Some(d) = &resolved.store {
@@ -2154,6 +2281,7 @@ impl Fs {
         let guest = resolved.ns_path.as_deref().and_then(|ns| self.from_ns(ns));
         self.cwd_mount = resolved.mount_id;
         self.cwd_outside = None;
+        self.cwd_pin = None;
         self.cwd = match guest {
             Some(g) => g,
             None => {
@@ -2171,6 +2299,11 @@ impl Fs {
 
     /// Set the working directory to the host directory `fd` refers to.
     pub fn fchdir(&mut self, fd: i32) -> Result<(), i32> {
+        // A directory of fwe's `/proc` or `/sys`, by its path.
+        if let Some(p) = crate::synthdir::path_of(fd) {
+            return self.chdir(fcntl::AT_FDCWD as i32, &p);
+        }
+        self.cwd_pin = None;
         let table = self.mnt.table();
         // A directory of fwe's store: where it is in the namespace.
         if let Some(here) = store_here(&table, &self.proc_root, fd)? {
@@ -2202,6 +2335,113 @@ impl Fs {
             }
             None => Err(errno::EACCES),
         }
+    }
+}
+
+impl Fs {
+    /// The directory `path` names in fwe's own filesystems (`/proc`,
+    /// `/sys`), their links followed: its guest path as the walk that ends
+    /// there finds it, and the process whose `/proc` directory it is in, if
+    /// it is in one ([`Fs::pin_proc`]). `None` if `path` is not in them.
+    pub(crate) fn synthetic_dir(&self, dirfd: i32, path: &[u8]) -> Option<Result<SynthDir, i32>> {
+        use crate::procfs::Entry;
+        let mut entry = self.synthetic(dirfd, path)?;
+        let mut at = self.absolute(dirfd, path)?;
+        for _ in 0..40 {
+            match entry {
+                Entry::Dir => {
+                    let (guest, pin) = self.pin_proc(&at);
+                    return Some(Ok(SynthDir { guest, pin }));
+                }
+                Entry::Symlink(t) => {
+                    at = if t.first() == Some(&b'/') {
+                        normalize(b"/", &t)
+                    } else {
+                        normalize(&normalize(&at, b".."), &t)
+                    };
+                    entry = self.synthetic(fcntl::AT_FDCWD as i32, &at)?;
+                }
+                Entry::Missing(e) => return Some(Err(e)),
+                Entry::Fd { .. } | Entry::File(_) | Entry::Ns(_) => {
+                    return Some(Err(errno::ENOTDIR));
+                }
+            }
+        }
+        Some(Err(errno::ELOOP))
+    }
+
+    /// The guest path `guest` (a directory of fwe's), with `/proc/self`
+    /// and `/proc/thread-self` taken as this process and thread, as Linux's
+    /// walk finds them, and the process whose `/proc/<pid>` it is in, if it
+    /// is in one ([`ProcPin`]).
+    fn pin_proc(&self, guest: &[u8]) -> (Vec<u8>, Option<ProcPin>) {
+        let ns = self.to_ns(guest);
+        // In a directory pinned already: that process's still (ended, its
+        // pid names no process to look up again).
+        if let Some(p) = [&self.root_pin, &self.cwd_pin]
+            .into_iter()
+            .flatten()
+            .find(|p| mounts::under(&ns, &p.dir).is_some())
+        {
+            return (guest.to_vec(), Some(p.clone()));
+        }
+        let table = self.mnt.table();
+        let (m, rest) = table.locate(&ns);
+        if m.fstype != FsType::Proc || m.root != b"/" {
+            return (guest.to_vec(), None);
+        }
+        let rest = rest.strip_prefix(b"/").unwrap_or(&rest);
+        let (first, sub) = match rest.iter().position(|&b| b == b'/') {
+            Some(i) => (&rest[..i], &rest[i..]),
+            None => (rest, &b""[..]),
+        };
+        let tgid = crate::thread::tgid();
+        let (pid, sub) = match first {
+            b"self" => (tgid, sub.to_vec()),
+            b"thread-self" => {
+                (tgid, [format!("/task/{}", crate::thread::tid()).as_bytes(), sub].concat())
+            }
+            n if !n.is_empty() && n.iter().all(u8::is_ascii_digit) => {
+                match std::str::from_utf8(n).ok().and_then(|n| n.parse().ok()) {
+                    Some(pid) => (pid, sub.to_vec()),
+                    None => return (guest.to_vec(), None),
+                }
+            }
+            _ => return (guest.to_vec(), None),
+        };
+        let Some(host) = crate::pidns::to_host(pid) else { return (guest.to_vec(), None) };
+        let Some(start) = crate::procreg::start_time(host) else { return (guest.to_vec(), None) };
+        let dir = mounts::join(&m.point, format!("/{pid}").as_bytes());
+        match self.from_ns(&[&dir[..], &sub].concat()) {
+            Some(g) => (g, Some(ProcPin { dir, host: (host.get(), start) })),
+            None => (guest.to_vec(), None),
+        }
+    }
+
+    /// Whether the walk of `path` from `dirfd` starts in a directory of a
+    /// process that has ended ([`ProcPin`]): the root (an absolute path) or
+    /// the working directory (a path from `AT_FDCWD`).
+    pub(crate) fn gone_walk(&self, dirfd: i32, path: &[u8]) -> Option<Gone> {
+        if self.root_pin.is_none() && self.cwd_pin.is_none() {
+            return None;
+        }
+        let absolute = path.first() == Some(&b'/');
+        let start = if absolute {
+            self.proc_root.clone()
+        } else if dirfd as i64 == fcntl::AT_FDCWD {
+            self.cwd_outside.clone().unwrap_or_else(|| self.to_ns(&self.cwd))
+        } else {
+            return None;
+        };
+        let pin = [&self.root_pin, &self.cwd_pin]
+            .into_iter()
+            .flatten()
+            .find(|p| mounts::under(&start, &p.dir).is_some() && p.gone())?;
+        let below = mounts::under(&start, &pin.dir)?;
+        let first = below.split(|&b| b == b'/').find(|c| !c.is_empty());
+        let errno =
+            if matches!(first, Some(b"fd" | b"fdinfo")) { errno::ESRCH } else { errno::ENOENT };
+        Some(Gone { itself: absolute && path.iter().all(|&b| b == b'/'), errno })
     }
 }
 
@@ -3486,6 +3726,19 @@ static PUBLISHED: std::sync::Mutex<Option<Published>> = std::sync::Mutex::new(No
 /// made in it ([`ahead::put_direct`]) holds while this has not moved.
 static VIEW_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Bring the published view's root and working directory to `v`, which
+/// another process sharing them changed them to (for a call made without
+/// the kernel lock; the process's [`Fs`] takes it as its next locked call
+/// starts, [`crate::fsshare::take`]).
+pub(crate) fn republish_shared(v: &crate::fsshare::View) {
+    let mut view = published();
+    if let Some(p) = view.as_mut() {
+        VIEW_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+        p.proc_root = v.root.clone();
+        p.cwd = v.cwd.clone();
+    }
+}
+
 fn published() -> std::sync::MutexGuard<'static, Option<Published>> {
     PUBLISHED.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -4053,10 +4306,10 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
         None => (rest, &b""[..]),
     };
     let Some(tid) = std::str::from_utf8(num).ok().and_then(|n| n.parse::<i32>().ok()) else {
-        return Entry::Missing;
+        return Entry::Missing(fwe_abi::errno::ENOENT);
     };
     if !crate::thread::tids().contains(&tid) {
-        return Entry::Missing;
+        return Entry::Missing(fwe_abi::errno::ENOENT);
     }
     let host = crate::host::pid();
     let comm = || {
@@ -4080,7 +4333,7 @@ fn task_entry(rest: &[u8]) -> crate::procfs::Entry {
         }
         b"/comm" => Entry::File([&comm()[..], b"\n"].concat()),
         b"/status" => Entry::File(Vec::new()),
-        _ => Entry::Missing,
+        _ => Entry::Missing(fwe_abi::errno::ENOENT),
     }
 }
 

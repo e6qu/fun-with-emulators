@@ -305,6 +305,11 @@ impl<P: Platform> Kernel<P> {
         if crate::procreg::take_limits_left() {
             self.take_pending_limits();
         }
+        // So does a root, working directory or umask another process that
+        // shares them changed (`CLONE_FS`).
+        if crate::fsshare::active() {
+            self.take_shared_view();
+        }
         // Told of a foster child: the watcher that follows it starts here,
         // under the kernel lock.
         if crate::reaper::watcher_wanted() {
@@ -1005,10 +1010,16 @@ impl<P: Platform> Kernel<P> {
     /// threads' ([`crate::klock`]), if it is one that can: `None` for any
     /// other, which [`Kernel::dispatch`] runs holding the lock for itself.
     /// What [`Kernel::dispatch`] does around a call is done here as far as
-    /// these calls need it; a call that needs to start the reaper's watcher, or
-    /// that Landlock checks, is left to it.
+    /// these calls need it; a call that needs to start the reaper's watcher,
+    /// that Landlock checks, or that comes after another process changed
+    /// the root, working directory or umask this one shares
+    /// ([`crate::fsshare`]), is left to it.
     pub(crate) fn dispatch_shared(&self, n: u64, a: [u64; 6]) -> Option<i64> {
-        if !shares(n) || crate::reaper::watcher_wanted() || crate::landlock::active() {
+        if !shares(n)
+            || crate::reaper::watcher_wanted()
+            || crate::landlock::active()
+            || crate::fsshare::pending()
+        {
             return None;
         }
         crate::maps::flush_before(n);

@@ -53,10 +53,12 @@ fn owners<R>(f: impl FnOnce(&mut HashMap<i32, Own>) -> R) -> R {
     r
 }
 
-/// Show in the process's record the namespaces the threads' own views are
-/// in, which they hold as the process holds its own.
-fn publish_held() {
-    let held: Vec<Vec<u8>> = owners(|o| o.values().flat_map(|w| w.fs.ns_dirs()).collect());
+/// Show in the process's record the shared state it holds besides its
+/// namespaces: those the threads' own views are in, and the record of the
+/// view it shares with other processes ([`crate::fsshare`]).
+pub(crate) fn publish_held() {
+    let mut held: Vec<Vec<u8>> = owners(|o| o.values().flat_map(|w| w.fs.ns_dirs()).collect());
+    held.extend(crate::fsshare::dir());
     crate::procreg::own_held(held);
 }
 
@@ -144,6 +146,20 @@ pub fn share_view(from: &Fs, process: Option<&mut Fs>) {
             if *tid != me && w.shares {
                 w.fs.set_view(from);
             }
+        }
+    });
+}
+
+/// The process's root, working directory and umask became `v` (another
+/// process that shares them changed them): the threads' own views that
+/// share them have them too.
+pub fn process_view_changed(v: &crate::fsshare::View) {
+    if !any() {
+        return;
+    }
+    owners(|o| {
+        for w in o.values_mut().filter(|w| w.shares) {
+            w.fs.set_shared_view(v);
         }
     });
 }

@@ -44,6 +44,7 @@ pub mod filestore;
 mod forklock;
 pub mod fs;
 mod fsops;
+pub mod fsshare;
 pub mod futex;
 mod handles;
 pub mod host;
@@ -448,6 +449,7 @@ impl<P: Platform> Kernel<P> {
             }
             None => e.bool(false),
         }
+        fsshare::save_for_fork(e);
         let c = &self.creds;
         for v in [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid] {
             e.u32(v);
@@ -522,6 +524,7 @@ impl<P: Platform> Kernel<P> {
         coredump::set_dumpable(d.u8());
         rlimits::load(d);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
+        fsshare::load_for_fork(d);
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
         for v in [
@@ -1024,6 +1027,9 @@ impl<P: Platform> Kernel<P> {
         landlock::save(&mut e);
         // Its foster children, still its own to follow.
         e.bool(reaper::fostering());
+        // The root, working directory and umask it shares with other
+        // processes (`CLONE_FS`), shared still.
+        fsshare::save(&mut e);
         e.into_bytes()
     }
 
@@ -1058,6 +1064,7 @@ impl<P: Platform> Kernel<P> {
         let ptracer = d.i32();
         landlock::load(&mut d);
         let fostering = d.bool();
+        fsshare::load(&mut d);
         d.finish()?;
         reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
@@ -1599,6 +1606,12 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         return None;
     }
     let _call = fdmarks::Call::begin();
+    // A root or working directory another process sharing them changed.
+    if fsshare::active()
+        && let Some(v) = fsshare::take_published()
+    {
+        fs::republish_shared(&v);
+    }
     // What other processes can look at, current before this one waits.
     maps::flush_before(nr);
     let noted = atime::before(nr, &a);

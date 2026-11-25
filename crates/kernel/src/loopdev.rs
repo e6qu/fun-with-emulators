@@ -1537,10 +1537,10 @@ pub fn sys_lookup(path: &[u8]) -> Option<Entry> {
                 b"autoclear" => line(u8::from(b.flags & LO_FLAGS_AUTOCLEAR != 0)),
                 b"partscan" => line(u8::from(b.flags & LO_FLAGS_PARTSCAN != 0)),
                 b"dio" => line(u8::from(b.flags & LO_FLAGS_DIRECT_IO != 0)),
-                _ => Entry::Missing,
+                _ => Entry::Missing(fwe_abi::errno::ENOENT),
             }
         }
-        _ => Entry::Missing,
+        _ => Entry::Missing(fwe_abi::errno::ENOENT),
     })
 }
 

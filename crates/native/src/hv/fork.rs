@@ -797,6 +797,9 @@ fn become_child() -> Result<std::convert::Infallible, String> {
     let ns = k.fs.as_ref().map(|fs| fs.ns_dirs()).unwrap_or_default();
     let auxv = k.fs.as_ref().map(|fs| fs.auxv().to_vec()).unwrap_or_default();
     fwe_kernel::procreg::own_line(&line, &inherit, ns, fwe_kernel::maps::forked(), &auxv);
+    // The view it shares with its parent (`CLONE_FS`), held now that its
+    // record is there.
+    fwe_kernel::fsshare::record_written();
     if inherit.foster {
         fwe_kernel::reaper::foster_started(&line.0);
     }

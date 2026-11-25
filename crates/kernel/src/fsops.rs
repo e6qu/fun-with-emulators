@@ -850,6 +850,13 @@ impl<P: Platform> Kernel<P> {
                     // SAFETY: plain host call on an open guest descriptor.
                     ret(unsafe { libc::fcntl(fd, cmd, 0) })
                 }
+                // A directory of a process that has ended holds nothing:
+                // Linux refuses to open it, as it refuses a lookup in it.
+                crate::procfs::Entry::Dir
+                    if let Some(g) = self.fs().gone_walk(dirfd as i32, &path) =>
+                {
+                    err(g.errno)
+                }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
                     Some(mut entries) => {
                         let at = self.fs().absolute_path(dirfd as i32, &path).unwrap_or_default();
@@ -876,7 +883,7 @@ impl<P: Platform> Kernel<P> {
                     }
                     None => err(errno::ENOENT),
                 },
-                crate::procfs::Entry::Missing => err(errno::ENOENT),
+                crate::procfs::Entry::Missing(e) => err(e),
             };
         }
         self.sys_openat_bytes(dirfd, &path, flags, mode)
@@ -1489,7 +1496,7 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_statfs(&mut self, path: u64, buf: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if let Some(entry) = self.fs().synthetic(fcntl::AT_FDCWD as i32, &path) {
-            if matches!(entry, crate::procfs::Entry::Missing) {
+            if matches!(entry, crate::procfs::Entry::Missing(_)) {
                 return err(errno::ENOENT);
             }
             // A filesystem of fwe's: its mount says what it is.
@@ -1736,7 +1743,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
                 Entry::Dir => self.synth_dir_stat(dirfd, path),
-                Entry::Missing => return Err(errno::ENOENT),
+                Entry::Missing(e) => return Err(e),
             };
             return Ok((self.proc_owned(dirfd, path, st), Extra::default()));
         }
@@ -2002,7 +2009,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(_) if magic_link(abs) => Ok(LinkKind::Magic),
                 Entry::Symlink(t) => Ok(LinkKind::Symlink(t)),
                 Entry::Fd { .. } => Ok(LinkKind::Magic),
-                Entry::Missing => Err(errno::ENOENT),
+                Entry::Missing(e) => Err(e),
                 Entry::File(_) | Entry::Dir | Entry::Ns(_) => Ok(LinkKind::None),
             };
         }
@@ -2096,7 +2103,7 @@ impl<P: Platform> Kernel<P> {
                 crate::procfs::Entry::File(_)
                 | crate::procfs::Entry::Dir
                 | crate::procfs::Entry::Ns(_) => err(errno::EINVAL),
-                crate::procfs::Entry::Missing => err(errno::ENOENT),
+                crate::procfs::Entry::Missing(e) => err(e),
             };
         }
         let r = match self.fs().resolve(dirfd as i32, &path, false) {
@@ -2188,8 +2195,8 @@ impl<P: Platform> Kernel<P> {
                 .absolute_path(dirfd as i32, &path)
                 .is_some_and(|a| self.fs().mount_of(&a).0.fstype == crate::mounts::FsType::Sysfs);
             return err(match entry {
-                crate::procfs::Entry::Missing if sysfs => errno::EPERM,
-                crate::procfs::Entry::Missing => errno::ENOENT,
+                crate::procfs::Entry::Missing(_) if sysfs => errno::EPERM,
+                crate::procfs::Entry::Missing(e) => e,
                 _ => errno::EEXIST,
             });
         }
@@ -2643,8 +2650,8 @@ impl<P: Platform> Kernel<P> {
                 .or_else(|| (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten());
             if let Some(now) = now.and_then(|ns| self.fs().from_ns(&ns)) {
                 let fs = self.fs_mut();
-                let root = fs.proc_root().to_vec();
-                fs.set_root(root, now);
+                let (root, pin) = (fs.proc_root().to_vec(), fs.root_pin().cloned());
+                fs.set_root(root, now, pin);
             }
         }
         r

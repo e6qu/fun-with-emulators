@@ -116,7 +116,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(entry) = self.fs().synthetic(dirfd, path) {
             use crate::procfs::Entry;
             return match entry {
-                Entry::Missing => Err(errno::ENOENT),
+                Entry::Missing(e) => Err(e),
                 Entry::Symlink(target) if follow && target.starts_with(b"/") => {
                     self.mount_path(&target, true)
                 }
@@ -616,7 +616,7 @@ impl<P: Platform> Kernel<P> {
         let fs = self.fs_mut();
         let cwd = fs.from_ns(&cwd_ns).unwrap_or_else(|| b"/".to_vec());
         let root_mount = fs.mounts().locate(&root).0.id;
-        fs.set_root(root, cwd);
+        fs.set_root(root, cwd, None);
         fs.set_mounts(root_mount, 0);
         0
     }
@@ -631,10 +631,17 @@ impl<P: Platform> Kernel<P> {
             let r = self.access_path(fwe_abi::fcntl::AT_FDCWD as i32, &path, X_OK, true, true);
             return if r < 0 { r } else { err(errno::EPERM) };
         }
-        let (ns, is_dir) = match self.mount_path(&path, true) {
-            Ok(v) => v,
-            Err(e) => return err(e),
-        };
+        // A directory of fwe's `/proc` is a process's for good, as Linux's
+        // walk finds it ([`crate::fs::ProcPin`]).
+        let (ns, is_dir, pin) =
+            match self.fs().synthetic_dir(fwe_abi::fcntl::AT_FDCWD as i32, &path) {
+                Some(Ok(d)) => (self.fs().to_ns(&d.guest), true, d.pin),
+                Some(Err(e)) => return err(e),
+                None => match self.mount_path(&path, true) {
+                    Ok((ns, is_dir)) => (ns, is_dir, None),
+                    Err(e) => return err(e),
+                },
+            };
         if !is_dir {
             return err(errno::ENOTDIR);
         }
@@ -647,7 +654,7 @@ impl<P: Platform> Kernel<P> {
         let cwd = inside.unwrap_or_else(|| b"/".to_vec());
         let root_mount = fs.mounts().locate(&ns).0.id;
         let cwd_mount = fs.cwd_mount().unwrap_or(0);
-        fs.set_root(ns, cwd);
+        fs.set_root(ns, cwd, pin);
         fs.set_cwd_outside(outside);
         fs.set_mounts(root_mount, cwd_mount);
         0
