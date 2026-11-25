@@ -1,13 +1,14 @@
 # How programs are built and loaded: Linux and macOS on arm64
 
-The concepts behind a program file and its start, on Linux and on macOS,
-both on arm64: object files, relocations, linking statically and
-dynamically, position independence, what the code of each kind looks
-like, virtual memory, ASLR, thread-local storage, and how a kernel and a
-loader start a program. What fwe does with them is in
-[linux-on-macos.md](linux-on-macos.md); this document is the background
-it assumes, as [arm64.md](arm64.md) is for the instruction set and the
-calling conventions.
+This document is background, not fwe: how a program is built and
+started on Linux and on macOS, both on arm64. It covers object files,
+relocations, static and dynamic linking, position independence and the
+code each kind of build makes, virtual memory, `__PAGEZERO`, ASLR,
+thread-local storage, and how a kernel and a loader start a program.
+The instruction set and the calling conventions, `x18` among them, are
+in [arm64.md](arm64.md); what fwe does with all of this is in
+[linux-on-macos.md](linux-on-macos.md), and how it is built in
+[architecture.md](architecture.md).
 
 ## From source to a running program
 
@@ -157,8 +158,8 @@ On arm64 position independence costs almost nothing: code already reaches
 its own code and data PC-relatively, so a PIE differs from a
 fixed-address build mainly in the pointers stored in its data, which the
 loader adjusts once. On 32-bit x86, which has no PC-relative data
-access, it cost a register and several percent, which is why some
-packages still opt out; how distributions build theirs is in
+access, it costs a register and several percent, which is why some
+packages opt out; how distributions build theirs is in
 [linux-on-macos.md](linux-on-macos.md#how-distributions-build-their-programs).
 
 **Link addresses.** A fixed-address executable goes where its linker put
@@ -463,11 +464,31 @@ Linux has a smaller version of the same guard: `vm.mmap_min_addr`
 unprivileged programs, mainly to stop null-pointer bugs in the kernel
 being exploited from user space. Above that, a Linux process owns its
 whole lower address space, which is why Linux toolchains link
-fixed-address executables at `0x400000` or `0x10000`, addresses inside
-macOS's `__PAGEZERO`. A Linux program loaded at such an address cannot
-share a process with macOS code where it was linked: under fwe a static
-one whose link kept its relocations is moved, and any other runs in a VM
-([linux-on-macos.md](linux-on-macos.md#the-low-4-gib)).
+fixed-address executables at `0x400000`, `0x200000` or `0x10000`,
+addresses inside macOS's `__PAGEZERO`:
+
+```mermaid
+flowchart LR
+    subgraph linux["Linux arm64 process, high addresses at the top"]
+        direction TB
+        lstack["stack"]
+        lmmap["mmap area: the dynamic linker, libraries, anonymous mappings, below the stack"]
+        lpie["a PIE and its brk heap, about two thirds up"]
+        lfixed["a fixed-address executable and its brk heap: 0x10000 (Go), 0x200000 (lld), 0x400000 (GNU ld)"]
+        lzero["below vm.mmap_min_addr: unmapped"]
+        lstack ~~~ lmmap ~~~ lpie ~~~ lfixed ~~~ lzero
+    end
+    subgraph mac["macOS arm64 process, high addresses at the top"]
+        direction TB
+        mabove["above 4 GiB: the executable, dyld, libraries, the shared cache, stacks, heap, each randomized"]
+        mzero["0 to 4 GiB: __PAGEZERO, no access"]
+        mabove ~~~ mzero
+    end
+```
+
+A Linux program loaded at such an address cannot share a process with
+macOS code where it was linked; how fwe runs it is in
+[linux-on-macos.md](linux-on-macos.md#the-low-4-gib).
 
 ## The address space and ASLR
 
@@ -495,25 +516,6 @@ from a *thread pointer* register.
 | Thread pointer | `TPIDR_EL0`, read and written by user code (`mrs`/`msr`); the C library sets it per thread | `TPIDRRO_EL0`, read-only to user code, set by the kernel to the thread's own data |
 | Access to a variable | by *TLS model*: local-exec and initial-exec add a fixed offset to the thread pointer; general-dynamic and TLSDESC call into the dynamic linker for libraries loaded later | through a *thread-local variable descriptor*: a call to a function (`tlv_get_addr`) that returns the address |
 
-## Registers the platform reserves
-
-The arm64 procedure call standard leaves `x18` to the platform:
-
-- **Linux** treats `x18` as an ordinary temporary register. Most
-  toolchains avoid it anyway, but hand-written code and some compilers'
-  output use it, and Windows code (under Wine) keeps its thread block
-  there.
-- **macOS** reserves `x18`: the kernel can change it at any time, so
-  macOS code never uses it.
-
-Pointer authentication (PAC) signs return addresses and pointers with a
-key held by the kernel. Linux programs built with
-`-mbranch-protection=standard` sign return addresses with instructions
-that older CPUs treat as no-ops, and mark branch targets for BTI. macOS
-signs pointers throughout (return addresses, function pointers, GOT
-slots) in Apple's own `arm64e` binaries; third-party programs are built
-as plain `arm64`.
-
 ## Starting a program
 
 On Linux:
@@ -528,7 +530,9 @@ sequenceDiagram
     K->>K: builds the stack with argc, argv, envp and the auxiliary vector
     K->>L: starts at the interpreter's entry (a static program starts at its own)
     L->>L: loads the DT_NEEDED libraries, applies relocations, sets up TLS
-    L->>P: runs the .init_array constructors, then _start, __libc_start_main, main
+    L->>L: runs the libraries' constructors (glibc: musl leaves them to __libc_start_main)
+    L->>P: jumps to the program's entry, _start
+    P->>P: __libc_start_main runs the remaining constructors (.init_array), then main
 ```
 
 On macOS:
@@ -572,15 +576,3 @@ keeps the unwind tables in `.eh_frame` (indexed by `.eh_frame_hdr`,
 falling back to `__eh_frame` for functions it cannot describe, and keeps
 full debug information in a separate `.dSYM` bundle rather than in the
 binary.
-
-## What this means for running Linux programs on macOS
-
-A Linux arm64 program's instructions run on a Mac's CPU unchanged, but
-its file and its expectations are Linux's: an ELF image, possibly at a
-fixed address inside macOS's `__PAGEZERO`, its own dynamic linker, its
-own system calls, the thread pointer in `TPIDR_EL0`, perhaps `x18`,
-perhaps code it writes as it runs, perhaps pages of 4 KiB. How fwe loads such
-programs, which ones it runs natively and which in a VM, and what it
-rewrites, is in
-[linux-on-macos.md](linux-on-macos.md); how each part is built is in
-[architecture.md](architecture.md).

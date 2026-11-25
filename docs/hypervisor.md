@@ -6,43 +6,141 @@ The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
 [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119) [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)
 when, and only when, they appear in all capitals, as shown here.
 
+This document holds the rules the VM backend keeps and why misusing
+Hypervisor.framework is dangerous, how to run the backend, how its code
+is laid out, and how it is tested: on a [stand-in](#the-stand-in), on
+[real hardware](#real-hardware-runs-and-the-flight-recorder) and in
+[CI](#tests-and-ci). How the VM is used (vCPUs, fwe's exception vector,
+the two stages of translation, system calls, timers, signals, memory,
+fork and execve) is in
+[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used);
+where the backend differs from Linux, in
+[architecture.md](architecture.md#known-limitations).
+
 ## Summary
 
 fwe runs a non-position-independent executable linked below 4 GiB that
 it cannot move in a small Hypervisor.framework VM, and picks this
-backend for it by itself: Debian's `python3.13` and GCC and
-Alpine's `sbcl` at `0x400000`, static Go programs at `0x10000`. macOS
-reserves the low 4 GiB of every arm64 process (`__PAGEZERO`, which
-Apple's loader will not let a program shrink on Apple Silicon); in the
-VM the guest has an address space of its own. Which programs can be
-moved instead is in [linux-on-macos.md](linux-on-macos.md#the-low-4-gib).
+backend for it by itself: Debian's `python3.13` and GCC and Alpine's
+`sbcl` at `0x400000`, static Go programs at `0x10000`. macOS reserves
+the low 4 GiB of every arm64 process (`__PAGEZERO`, which Apple's loader
+does not let a program shrink on Apple Silicon); in the VM the guest has
+an address space of its own. Which programs can be moved instead is in
+[linux-on-macos.md](linux-on-macos.md#the-low-4-gib).
 
 The VM holds only the guest's CPU and memory, no Linux kernel. Every
 system call leaves the VM for the kernel crate the native backend uses,
 so a program in the VM has the same processes, namespaces, cgroups,
-mounts and files as a native one. How the VM is used (vCPUs, fwe's
-exception vector, the two stages of translation, system calls, timers,
-signals, memory, fork and execve) is in
-[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used);
-where the backend differs from Linux, in
-[architecture.md](architecture.md#known-limitations). This document
-holds the rules the implementation keeps, why misusing the framework is
-dangerous, how the backend is tested on a [stand-in](#the-stand-in) and
-on [real hardware](#real-hardware-runs-and-the-flight-recorder), how to
-[run it](#running-it-apple-silicon-no-root), and its
-[CI](#tests-and-ci).
+mounts and files as a native one.
 
 The framework needs the `com.apple.security.hypervisor` entitlement (an
 ad-hoc signature carrying it is enough) but no root. fwe loads it
 (`dlopen`, every entry point at once) when a process first uses it, so a
 process that runs no VM never pays for it.
 
+## Never end a VM process abnormally
+
+Misusing Hypervisor.framework can bring the whole Mac down, as a watchdog
+reset or a kernel panic with no useful report. The suspects:
+
+- a VM process that ends with its VM alive;
+- several VM processes ending together;
+- a VM that fails to map memory and is then destroyed;
+- private memory mapped into two VMs at once.
+
+The runtimes that run Linux programs this way without such trouble
+(hyper-linux, elfuse, Carrick) all map guest memory into the VM once,
+never change stage 2 or the host memory behind it while the VM runs, and
+give a fork child a copy rather than pages mapped into two VMs. fwe does
+the same, and the backend MUST keep these rules as it changes:
+
+- **A plain `cargo test` MUST NOT start a VM.** The VM tests run on the
+  [stand-in](#the-stand-in), and on the real framework only with
+  `FWE_HV_TESTS=1`, which MUST be set only on a machine whose crash costs
+  nothing.
+- **Every way out MUST tear the VM down first:** `exit_group`, the last
+  thread's `exit`, a fatal signal's default action, fwe's own fatal
+  errors, faults and panics, a start that fails once the VM exists (a
+  program it cannot place), and `execve`. Teardown stops every vCPU, has
+  each thread destroy its own (the framework requires that), then
+  destroys the VM.
+- **Signals whose default action terminates are caught**, so the process
+  dies through teardown. `SIGKILL` cannot be caught, so a guest's
+  `SIGKILL` to an fwe process (by `kill` or `tgkill`, to a process, a
+  group or everyone) is sent as `SIGINFO`, which has no Linux
+  counterpart: a VM process takes it as the guest's `SIGKILL`, tears
+  down, then dies of `SIGKILL`, so its parent sees Linux's status. Only a
+  `SIGKILL` from outside fwe cannot be intercepted.
+- **A VM process MUST NOT fork on the host.** A fork child cannot use the
+  parent's VM (`hv_vm_destroy` fails with `HV_NO_DEVICE`, `hv_vm_create`
+  with `HV_BUSY`), so it would die with a VM it inherited.
+  `fwe_kernel::fork_locked` refuses once a VM exists; a fork child that
+  fails to set up tears down any VM it made before it exits.
+- **Host memory behind the VM MUST NOT be replaced.** Private memory
+  stays in the slab: `munmap`, `mremap`, a `MAP_FIXED` mapping over
+  existing memory and `MADV_DONTNEED` edit stage 1 and zero slab memory,
+  reused only after a TLB flush. Zeros are written only over host pages
+  that ever held data (the host's page dispositions tell), so a range
+  reserved and mapped over (gigabytes, by Wine) takes no memory. A shared
+  segment leaves the VM before its host mapping goes.
+- **A vCPU MUST NOT be destroyed under a call on it.** At the end each
+  thread destroys its own vCPU, from the wake signal's handler if it is
+  blocked elsewhere, but never in the middle of a framework call on it
+  (it does so as the call returns), and no call follows; a vCPU being
+  destroyed is first taken out of other threads' `hv_vcpus_exit`.
+- **The VM tests MUST run one at a time**, never several in parallel. A
+  `fork` test has the parent's and the child's VM processes alive
+  together, as any forking program does; each ends through teardown.
+  Each VM test's processes form a process group: a timeout sends it
+  `SIGTERM` (caught, so every VM is torn down), `SIGKILL` only to a
+  test's first process still alive 5 s later, and a process outliving its
+  test gets `SIGTERM` and fails the test.
+- **A VM MUST NOT run alongside another hypervisor client.** The VM tests
+  skip while one runs (`krunkit`, `vfkit`, QEMU, Lima, UTM, VirtualBox,
+  Parallels, Virtualization.framework VMs); for Podman, `podman machine
+  stop` stops it. The same rule holds for a VM program run by hand.
+
+## Running it (Apple Silicon, no root)
+
+On a machine meant for it (see the rules above), build fwe, sign it with
+the entitlement, and run a low-linked program as any other:
+
+```sh
+cargo build --release -p fwe
+codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
+target/release/fwe ./program-linked-low
+```
+
+- `hypervisor.entitlements` also holds what fwe needs the hardened
+  runtime of a notarized release to allow: executable memory it maps
+  itself (guest code), and loading libraries signed by someone else (the
+  stand-in's Unicorn, the Mac's Vulkan driver). A release and the
+  Homebrew formula sign with it.
+- Without the entitlement, or on a host without hypervisor support
+  (where `sysctl kern.hv_support` is not `1`), fwe explains that the
+  program needs the hypervisor backend and exits with status 126.
+- `fwe --vm program` runs any program in the VM, position-independent or
+  not, and every program it starts; Wine needs it for its 4 KiB pages.
+- `fwe --hv-spike` runs a tiny guest in a VM to check the hypervisor
+  works: it prints `hv: hello from the guest` and reports exit status 42.
+
 ## How it works
 
 The code is in `crates/native/src/hv/`. One requirement shapes it: the
 framework MUST NOT see host memory change behind the VM, and a VM MUST
 NOT outlive its process. So the VM's memory is mapped once, and then
-only the guest's own page tables change.
+only the guest's own page tables change. A VM process's life:
+
+```mermaid
+flowchart TD
+    start["fwe starts a low-linked program, or any under --vm"] --> make["VM made: the slab and fwe's region mapped once (stage 2 fixed)"]
+    make --> first["first vCPU created, program loaded"]
+    first --> loop["each guest thread runs its own vCPU in the run loop"]
+    loop -- "clone" --> thr["new host thread creates its own vCPU"] --> loop
+    loop -- "fork, vfork" --> child["a fresh fwe --hv-fork-child builds a VM of its own"]
+    loop -- "exit_group, last thread's exit, fatal or caught signal, fwe error or panic, execve" --> td["teardown: every vCPU stopped (hv_vcpus_exit), each thread destroys its own, hv_vm_destroy"]
+    td --> gone["the process ends with the guest's status, or re-executes fwe (execve)"]
+```
 
 - **The VM** (`vm.rs`): stage 2 is set up once, when the VM is made, and
   does not change while it runs: the slab (`window.rs`, all private guest
@@ -57,10 +155,10 @@ only the guest's own page tables change.
     goes through the TLB stub on the code page (`tlbi vmalle1is; dsb ish;
     isb; eret`, at EL1). Memory or tables given back are reused only after
     a flush covering the edit that freed them.
-  - A page that would lead a translation possibly still cached elsewhere
+  - A page that would lead a translation that might be cached elsewhere
     goes in only after such a flush (break-before-make); an access
     meanwhile faults and is retried.
-  - A permission fault the tables no longer give (a TLB keeping old
+  - A permission fault the tables do not give (a TLB keeping old
     permissions after `mprotect` widened them) gets one flush and a
     retry.
 - **Memory** (`mem.rs`): the kernel's memory calls go to the backend
@@ -132,67 +230,6 @@ flowchart TD
     deliver --> run
 ```
 
-## Never end a VM process abnormally
-
-Misusing Hypervisor.framework can bring the whole Mac down, as a watchdog
-reset or a kernel panic with no useful report. The suspects:
-- a VM process that ends with its VM alive;
-- several VM processes ending together;
-- a VM that fails to map memory and is then destroyed;
-- private memory mapped into two VMs at once.
-
-The runtimes that run Linux programs this way without such trouble
-(hyper-linux, elfuse, Carrick) all map guest memory into the VM once,
-never change stage 2 or the host memory behind it while the VM runs, and
-give a fork child a copy rather than pages mapped into two VMs. fwe does
-the same, and the backend MUST keep these rules as it changes:
-
-- **A plain `cargo test` MUST NOT start a VM.** The VM tests run on the
-  [stand-in](#the-stand-in), and on the real framework only with
-  `FWE_HV_TESTS=1`, which MUST be set only on a machine whose crash costs
-  nothing.
-- **Every way out MUST tear the VM down first:** `exit_group`, the last
-  thread's `exit`, a fatal signal's default action, fwe's own fatal
-  errors, faults and panics, a start that fails once the VM exists (a
-  program it cannot place), and `execve`. Teardown stops every vCPU, has
-  each thread destroy its own (the framework requires that), then
-  destroys the VM.
-- **Signals whose default action terminates are caught**, so the process
-  dies through teardown. `SIGKILL` cannot be caught, so a guest's
-  `SIGKILL` to an fwe process (by `kill` or `tgkill`, to a process, a
-  group or everyone) is sent as `SIGINFO`, which has no Linux counterpart:
-  a VM process takes it as the guest's `SIGKILL`, tears down, then dies of
-  `SIGKILL`, so its parent sees Linux's status. Only a `SIGKILL` from
-  outside fwe cannot be intercepted.
-- **A VM process MUST NOT fork on the host.** A fork child cannot use the
-  parent's VM (`hv_vm_destroy` fails with `HV_NO_DEVICE`, `hv_vm_create`
-  with `HV_BUSY`), so it would die with a VM it inherited.
-  `fwe_kernel::fork_locked` refuses once a VM exists; a fork child that
-  fails to set up tears down any VM it made before it exits.
-- **Host memory behind the VM MUST NOT be replaced.** Private memory
-  stays in the slab: `munmap`, `mremap`, a `MAP_FIXED` mapping over
-  existing memory and `MADV_DONTNEED` edit stage 1 and zero slab memory,
-  reused only after a TLB flush. Zeros are written only over host pages
-  that ever held data (the host's page dispositions tell), so a range
-  reserved and mapped over (gigabytes, by Wine) takes no memory. A shared
-  segment leaves the VM before its host mapping goes.
-- **A vCPU MUST NOT be destroyed under a call on it.** At the end each
-  thread destroys its own vCPU, from the wake signal's handler if it is
-  blocked elsewhere, but not in the middle of a framework call on it (it
-  does so as the call returns), and no call follows; a vCPU being
-  destroyed is first taken out of other threads' `hv_vcpus_exit`.
-- **The VM tests MUST run one at a time**, not several in parallel. A
-  `fork` test has the parent's and the child's VM processes alive
-  together, as any forking program does; each ends through teardown.
-  Each VM test's processes form a process group: a timeout sends it
-  `SIGTERM` (caught, so every VM is torn down), `SIGKILL` only to a
-  test's first process still alive 5 s later, and a process outliving its
-  test gets `SIGTERM` and fails the test.
-- **A VM MUST NOT run alongside another hypervisor client.** The VM tests
-  skip while one runs (`krunkit`, `vfkit`, QEMU, Lima, UTM, VirtualBox,
-  Parallels, Virtualization.framework VMs); for Podman, `podman machine
-  stop` stops it. The same rule holds for a VM program run by hand.
-
 ## The stand-in
 
 The real framework is unavailable in hosted CI and MUST NOT be used on a
@@ -204,6 +241,7 @@ VM, so it is safe on any Mac and runs in hosted CI; the flag is passed on
 to every fwe a guest's `execve`, `fork` or `vfork` starts.
 
 What it models:
+
 - one VM per process and one vCPU per thread;
 - stage 2 as exactly the memory mapped with `hv_vm_map`, with its flags;
 - stage 1 as fwe's own tables, walked as the hardware walks them, cached
@@ -227,7 +265,8 @@ lock a hook takes is held across them. Emulation is several times slower
 than the CPU, so stand-in guests get a longer test time limit.
 
 The stand-in also checks the rules the backend MUST keep, printing a line
-with `fwe hv stand-in: VIOLATION:` on which the tests fail:
+with `fwe hv stand-in: VIOLATION:`, on which the tests fail:
+
 - a vCPU used from a thread other than its own, a VM destroyed with vCPUs
   alive, a vCPU run before its translation regime is set (40 bits, 4 KiB
   granule) or at EL1 anywhere but the TLB stub;
@@ -248,7 +287,9 @@ The stand-in's unit test breaks each rule on purpose.
 
 A stand-in proves nothing about the real framework: its rules are what
 fwe has seen the framework do, and the kernel crashes the backend might
-cause cannot happen in it. So VM changes MUST also be run on real hardware.
+cause cannot happen in it. So VM changes MUST also be run on real
+hardware.
+
 - **Not modelled:** the virtual timer, the fault address of an alignment
   fault outside the exclusive and atomic instructions, stack-pointer
   alignment checks, and code one vCPU writes for another without a
@@ -287,30 +328,6 @@ the last seconds of the system log, so fwe keeps the evidence itself:
   `fwe --probe hv-map-rules` on the framework and on the stand-in and
   fails if they differ.
 
-## Running it (Apple Silicon, no root)
-
-On a machine meant for it (see the rules above), build fwe, sign it with
-the entitlement, and run a low-linked program as any other:
-
-```sh
-cargo build --release -p fwe
-codesign --sign - --entitlements hypervisor.entitlements --force target/release/fwe
-target/release/fwe ./program-linked-low
-```
-
-- `hypervisor.entitlements` also holds what fwe needs the hardened
-  runtime of a notarized release to allow: executable memory it maps itself
-  (guest code), and loading libraries signed by someone else (the
-  stand-in's Unicorn, the Mac's Vulkan driver). A release and the
-  Homebrew formula sign with it.
-- Without the entitlement, or on a host without hypervisor support
-  (where `sysctl kern.hv_support` is not `1`), fwe explains that the
-  program needs the hypervisor backend and exits with status 126.
-- `fwe --vm program` runs any program in the VM, position-independent or
-  not, and every program it starts; Wine needs it for its 4 KiB pages.
-- `fwe --hv-spike` runs a tiny guest in a VM to check the hypervisor
-  works: it prints `hv: hello from the guest` and reports exit status 42.
-
 ## Tests and CI
 
 The end-to-end tests named `hv_*` run programs in the VM backend
@@ -345,9 +362,10 @@ Apple Silicon runner**, in the `hypervisor` job.
    the probe comparison). The runner service's `PATH` MUST include
    `/opt/homebrew/bin`, which it does not by default.
 4. Set the repository variable `FWE_HV_SELF_HOSTED` to `true`
-   (`Settings → Secrets and variables → Actions → Variables`). Until then
-   the job is skipped, so it never blocks PRs; once set it runs the `hv_`
-   tests with `FWE_HV_TESTS=1` and `fwe --hv-spike` on every push.
+   (`Settings → Secrets and variables → Actions → Variables`). Without
+   it the job is skipped, so it never blocks PRs; with it the job runs
+   the `hv_` tests with `FWE_HV_TESTS=1` and `fwe --hv-spike` on every
+   push.
 5. To stream the record off the machine as well, run
    `tools/hv-record-listen.py PORT` elsewhere and set the repository
    variable `FWE_HV_RECORD_UDP` to `udp:HOST:PORT`.
