@@ -2063,6 +2063,30 @@ fn traced_threads_are_found_by_group_and_in_namespaces() {
     );
 }
 
+/// A tracer that ends without detaching leaves its tracee as Linux does.
+#[test]
+fn a_tracer_that_ends_leaves_its_tracee_as_linux_does() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "tracerends",
+        &[],
+        "left at the attach's stop: running\ncontinued, then left: running\n",
+    );
+}
+
+/// A crash reporter's attach, as crashpad's: to the process, then to each
+/// of its other threads by id, each stop found by a wait for that thread.
+#[test]
+fn a_tracer_attaches_to_each_thread_of_a_stopped_process() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "attachthreads",
+        &[],
+        "process: stopped by 19\nthread in ppoll: stopped by 19\nthread sleeping: stopped by 19\n\
+         tracer: exit 0\n",
+    );
+}
+
 /// Tracers side by side: each continues its own tracee, stopped; none's
 /// requests reach another's, as their mailboxes' pages are freed and made
 /// again.

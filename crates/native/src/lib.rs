@@ -1405,7 +1405,7 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     // first instruction, as after any `execve`.
     let traced = fwe_kernel::ptrace::traced().then(|| {
         let mut regs = fwe_kernel::Regs { sp, pc: entry, ..fwe_kernel::Regs::default() };
-        KERNEL.lock().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+        KERNEL.exec_stops(&mut regs);
         regs
     });
     // From here on this thread runs guest code, which can use x18 freely;

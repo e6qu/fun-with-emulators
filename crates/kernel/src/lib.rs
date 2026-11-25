@@ -622,7 +622,7 @@ impl<P: Platform> Kernel<P> {
 
     /// Run system call `nr` with `args` and return its raw result, without
     /// tracing it or touching registers: for a backend that records the
-    /// result itself with [`Kernel::finish_syscall`].
+    /// result itself with [`Kernel::complete_syscall`].
     pub fn run_call(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         let result = self.dispatch(nr, args);
         self.note_creds();
@@ -1147,10 +1147,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Run the system call named in `regs` (number in `x8`, arguments in
-    /// `x0`–`x5`), store its result and advance past the trap, then deliver a
-    /// pending signal if one is ready. `rt_sigreturn` restores `regs` from the
-    /// signal frame instead.
-    pub fn enter_syscall(&mut self, regs: &mut Regs) {
+    /// `x0`–`x5`), store its result and advance past the trap; the caller
+    /// delivers what is pending ([`klock::KernelLock::deliver_pending`]).
+    /// `rt_sigreturn` restores `regs` from the signal frame instead.
+    pub fn run_syscall(&mut self, regs: &mut Regs) {
         if regs.x[8] == fwe_abi::nr::RT_SIGRETURN {
             if !self.sys_rt_sigreturn(regs) {
                 // A frame the guest cannot read back: Linux kills it.
@@ -1165,13 +1165,14 @@ impl<P: Platform> Kernel<P> {
         let nr = regs.x[8];
         let result = self.dispatch(nr, args);
         self.note_creds();
-        self.finish_syscall(regs, nr, &args, result);
+        self.complete_syscall(regs, nr, &args, result);
     }
 
     /// Record the result of a system call for `--strace`, then store it into
-    /// `regs` and advance past the trap, and deliver a pending signal. Used
-    /// directly by the backend for the system calls it runs outside the
-    /// kernel lock (the blocking ones and `clone`).
+    /// `regs` and advance past the trap; the caller delivers what is pending
+    /// ([`klock::KernelLock::deliver_pending`]). Used directly by the
+    /// backend for the system calls it runs outside the kernel lock (the
+    /// blocking ones and `clone`).
     ///
     /// A call the host interrupted (`EINTR`) is handled as Linux does: if no
     /// guest handler is about to run, the signal that interrupted it was one
@@ -1183,7 +1184,7 @@ impl<P: Platform> Kernel<P> {
         target_os = "macos",
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
-    pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
+    pub fn complete_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.tracer.syscall(nr, args, result);
         // (`restart_syscall`'s own `EINTR` is its answer, not a host's.)
         if result == fwe_abi::err(fwe_abi::errno::EINTR) && nr != fwe_abi::nr::RESTART_SYSCALL {
@@ -1197,12 +1198,26 @@ impl<P: Platform> Kernel<P> {
             if rerun {
                 // Leave pc on the trap and x0 holding the first argument, so
                 // the call is made again (after any handler returns).
-                self.deliver_pending(regs);
                 return;
             }
         }
         regs.x[0] = result as u64;
         regs.pc = regs.pc.wrapping_add(4);
+    }
+
+    /// [`Kernel::run_syscall`], then what is pending delivered holding the
+    /// kernel: the unit tests', which have no lock.
+    #[cfg(test)]
+    pub fn enter_syscall(&mut self, regs: &mut Regs) {
+        self.run_syscall(regs);
+        self.deliver_pending(regs);
+    }
+
+    /// [`Kernel::complete_syscall`], then what is pending delivered holding
+    /// the kernel: the unit tests', which have no lock.
+    #[cfg(test)]
+    pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
+        self.complete_syscall(regs, nr, args, result);
         self.deliver_pending(regs);
     }
 
@@ -1610,7 +1625,7 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// `splice`, `tee`, `vmsplice`, `copy_file_range`): a pipe, socket or
 /// terminal blocks until the other side acts, and the other side can be a
 /// guest thread that needs the lock. Returns `None` for any other call,
-/// which the backend runs under the lock through [`Kernel::enter_syscall`].
+/// which the backend runs under the lock through [`Kernel::run_syscall`].
 ///
 /// # Safety
 /// Pointer arguments MUST reference valid guest memory for the call.

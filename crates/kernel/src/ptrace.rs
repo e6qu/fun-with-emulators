@@ -18,7 +18,12 @@
 //! so the tracer's `wait` learns of a stop from its inbox ([`take_stop`])
 //! before it asks the host about its children.
 //!
-//! A tracee whose tracer has ended goes on as if detached.
+//! A tracee whose tracer has ended goes on as if detached: with the signal
+//! its stop was for, unless the tracer's `wait` took that stop.
+//!
+//! A stop is served without the kernel lock ([`Stop`],
+//! [`crate::klock::KernelLock::serve_stop`]): the process's other threads
+//! go on, and stop for their tracer in their turn.
 
 use crate::ids::HostPid;
 use crate::shared::{busy_wait_word, guest_wait_word, wake_word};
@@ -289,7 +294,7 @@ pub fn tracer_capable() -> bool {
 }
 
 /// The host's signal dispositions are to be set again: a thread began or
-/// ended being traced ([`crate::Kernel::resync_for_tracing`]).
+/// ended being traced ([`crate::Kernel::resync_if_asked`]).
 static RESYNC: AtomicBool = AtomicBool::new(false);
 
 /// This thread traced (or not any more).
@@ -802,9 +807,14 @@ fn serve(mb: &Page, tracer: i32, regs: &mut crate::Regs, tls: &mut u64, passing:
     loop {
         let req = mb.word(W_REQ).load(Ordering::Acquire);
         if req == mb.word(W_DONE).load(Ordering::Acquire) {
+            // The tracer gone: the signal the stop was for is delivered,
+            // unless its `wait` took the stop, which takes the signal with
+            // it (Linux's `wait_task_stopped` clears the code the tracee
+            // resumes with).
             if !alive(tracer) {
+                let reported = mb.word(W_STATE).load(Ordering::Acquire) == REPORTED;
                 end();
-                break Served::Resume(Resume::Cont(passing));
+                break Served::Resume(Resume::Cont(if reported { 0 } else { passing }));
             }
             if killed() {
                 mb.word(W_STATE).store(RUNNING, Ordering::Release);
@@ -1568,204 +1578,209 @@ fn begin_seized() -> bool {
     true
 }
 
-impl<P: crate::Platform> crate::Kernel<P> {
-    /// Every signal caught on the host while traced, and as before after.
-    fn resync_for_tracing(&mut self) {
-        for sig in 1..=fwe_abi::signal::NSIG {
-            self.sync_host_signal(sig);
-        }
+/// A stop for the tracer: its wait status, `siginfo`, event message and
+/// system call stop (1 entry, 2 exit, 0 none). It is made where the kernel
+/// is held and served where it is not
+/// ([`crate::klock::KernelLock::serve_stop`]), as Linux stops a task only
+/// on its way back to user mode, holding no lock: the process's other
+/// threads go on meanwhile, and stop for their tracer in their turn (a
+/// debugger stopping each thread of a process, a crash reporter attaching
+/// to each).
+#[must_use = "a stop is served"]
+#[derive(Clone, Copy)]
+pub struct Stop {
+    status: i32,
+    siginfo: [u8; 128],
+    event: u64,
+    syscall: u64,
+}
+
+impl Stop {
+    /// Wait for the tracer at this stop, with the thread's registers and
+    /// thread pointer, until it says to go on ([`stop`]).
+    pub(crate) fn serve(&self, regs: &mut crate::Regs, tls: &mut u64) -> Resume {
+        stop(regs, tls, self.status, &self.siginfo, self.event, self.syscall)
     }
 
-    /// [`stop`], with the calling thread's thread pointer, which the tracer
-    /// can read and change; the host's signal dispositions set again where
-    /// a thread began or ended being traced (the host catches every signal
-    /// while one is).
-    fn stop_with_tls(
-        &mut self,
-        regs: &mut crate::Regs,
-        status: i32,
-        siginfo: &[u8; 128],
-        event: u64,
-        syscall: u64,
-    ) -> Resume {
-        if RESYNC.swap(false, Ordering::AcqRel) {
-            self.resync_for_tracing();
-        }
-        let mut tls = self.platform.thread_pointer();
-        let before = tls;
-        let r = stop(regs, &mut tls, status, siginfo, event, syscall);
-        if tls != before {
-            self.platform.set_thread_pointer(tls);
-        }
-        if RESYNC.swap(false, Ordering::AcqRel) {
-            self.resync_for_tracing();
-        }
-        r
-    }
-
-    /// A signal-delivery stop for `sig` raised with `info`: the signal to
-    /// deliver after it, as the tracer chose (`None`: none).
-    pub(crate) fn ptrace_signal_stop(
-        &mut self,
-        regs: &mut crate::Regs,
-        sig: u64,
-        info: crate::thread::SigInfo,
-    ) -> Option<(u64, crate::thread::SigInfo)> {
-        let si = crate::signal::siginfo_bytes(sig, info);
-        let r = self.stop_with_tls(regs, stop_status(sig, 0), &si, 0, 0);
-        let to = r.signal();
-        if to == 0 || to > fwe_abi::signal::NSIG {
+    /// A system call's entry stop (`entry`) or exit stop, if the tracer
+    /// stops this thread at system calls (`PTRACE_SYSCALL`).
+    pub fn syscall(entry: bool) -> Option<Stop> {
+        if !stops_at_syscalls() {
             return None;
         }
-        // The same signal carries what the tracer left of its `siginfo`;
-        // another one is raised by the tracer.
-        let info = match get_own_siginfo() {
-            Some(b) if to == sig => crate::signal::siginfo_parse(&b).1,
-            _ => crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() },
-        };
-        Some((to, info))
-    }
-
-    /// The stop after a successful `execve` of a traced process: SIGTRAP,
-    /// or the exec event (`PTRACE_O_TRACEEXEC`); a seized one stops only
-    /// for the event.
-    pub fn ptrace_exec_stop(&mut self, regs: &mut crate::Regs) {
-        if !traced() {
-            return;
-        }
-        self.resync_for_tracing();
-        let trap = fwe_abi::signal::SIGTRAP;
-        let event = if options() & PTRACE_O_TRACEEXEC != 0 { PTRACE_EVENT_EXEC } else { 0 };
-        let legacy_trap = event == 0 && !seized();
-        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-        let si = crate::signal::siginfo_bytes(trap, info);
-        let msg = crate::thread::tgid() as u64;
-        // The exec event comes before the call's exit stop; the SIGTRAP of
-        // a tracee without it, a signal, after.
-        if event != 0 {
-            let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg, 0);
-            if r.signal() != 0 {
-                crate::thread::post_process(r.signal(), info);
-            }
-        }
-        if stops_at_syscalls() {
-            regs.x[0] = 0;
-            self.ptrace_syscall_stop(regs, false);
-        }
-        if legacy_trap {
-            let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, msg, 0);
-            if r.signal() != 0 {
-                crate::thread::post_process(r.signal(), info);
-            }
-        }
+        let good = options() & PTRACE_O_TRACESYSGOOD != 0;
+        let trap = fwe_abi::signal::SIGTRAP | if good { 0x80 } else { 0 };
+        let info =
+            crate::thread::SigInfo { code: fwe_abi::signal::SIGTRAP as i32, ..Default::default() };
+        Some(Stop {
+            status: stop_status(trap, 0),
+            siginfo: crate::signal::siginfo_bytes(fwe_abi::signal::SIGTRAP, info),
+            event: 0,
+            syscall: if entry { 1 } else { 2 },
+        })
     }
 
     /// An event's stop (`event`, `PTRACE_EVENT_*`), with message `msg`
     /// (what `PTRACE_GETEVENTMSG` gives: a new child's pid, an exit
-    /// status).
-    pub fn ptrace_event_stop(&mut self, regs: &mut crate::Regs, event: i32, msg: u64) {
+    /// status), if this thread is traced.
+    pub fn event(event: i32, msg: u64) -> Option<Stop> {
         if !traced() {
-            return;
+            return None;
         }
         let trap = fwe_abi::signal::SIGTRAP;
         let info = crate::thread::SigInfo { code: trap as i32 | event << 8, ..Default::default() };
-        let si = crate::signal::siginfo_bytes(trap, info);
-        let r = self.stop_with_tls(regs, stop_status(trap, event), &si, msg, 0);
-        if r.signal() != 0 {
-            let info =
-                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-            crate::thread::post_process(r.signal(), info);
+        Some(Stop {
+            status: stop_status(trap, event),
+            siginfo: crate::signal::siginfo_bytes(trap, info),
+            event: msg,
+            syscall: 0,
+        })
+    }
+
+    /// The exit event's stop (`PTRACE_O_TRACEEXIT`), as the process ends
+    /// with wait status `status`.
+    pub fn exit(status: i32) -> Option<Stop> {
+        if options() & PTRACE_O_TRACEEXIT == 0 {
+            return None;
+        }
+        Stop::event(PTRACE_EVENT_EXIT, status as u32 as u64)
+    }
+
+    /// A fork's event stop for child `child`, of the event a backend noted
+    /// ([`note_fork`]), and whether the vfork-done stop follows it.
+    pub fn fork() -> Option<(Option<Stop>, u64, bool)> {
+        let (event, flags, child) = take_noted_fork()?;
+        let vfork = flags & fwe_abi::clone::CLONE_VFORK != 0;
+        Some((Stop::event(event, child), child, vfork))
+    }
+
+    /// The vfork-done event's stop (`PTRACE_O_TRACEVFORKDONE`), the child
+    /// `child` having let its parent go on.
+    pub fn vfork_done(child: u64) -> Option<Stop> {
+        if options() & PTRACE_O_TRACEVFORKDONE == 0 {
+            return None;
+        }
+        Stop::event(PTRACE_EVENT_VFORK_DONE, child)
+    }
+
+    /// The stops after a successful `execve` of a traced process that
+    /// surround the call's exit stop ([`Stop::syscall`], which the first
+    /// decides on): the exec event (`PTRACE_O_TRACEEXEC`), and after it the
+    /// SIGTRAP of a tracee without the event, a signal; a seized one stops
+    /// only for the event.
+    pub fn exec() -> [Option<Stop>; 2] {
+        if !traced() {
+            return [None; 2];
+        }
+        let trap = fwe_abi::signal::SIGTRAP;
+        let event = if options() & PTRACE_O_TRACEEXEC != 0 { PTRACE_EVENT_EXEC } else { 0 };
+        let legacy_trap = event == 0 && !seized();
+        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+        let siginfo = crate::signal::siginfo_bytes(trap, info);
+        let msg = crate::thread::tgid() as u64;
+        let at = |event| Stop { status: stop_status(trap, event), siginfo, event: msg, syscall: 0 };
+        [(event != 0).then(|| at(event)), legacy_trap.then(|| at(0))]
+    }
+
+    /// A signal-delivery stop for `sig` raised with `info`.
+    pub(crate) fn signal(sig: u64, info: crate::thread::SigInfo) -> Stop {
+        Stop {
+            status: stop_status(sig, 0),
+            siginfo: crate::signal::siginfo_bytes(sig, info),
+            event: 0,
+            syscall: 0,
+        }
+    }
+
+    /// A stop signal `sig` (with `info`) whose default action stops a
+    /// traced thread: a group-stop, which its tracer sees, as
+    /// `PTRACE_EVENT_STOP` with the signal if it seized the thread, else
+    /// as the signal's stop, and which ends as the tracer says (or,
+    /// listened to, at `SIGCONT`).
+    pub(crate) fn group(sig: u64, info: crate::thread::SigInfo) -> Stop {
+        let event = if seized() { PTRACE_EVENT_STOP } else { 0 };
+        Stop {
+            status: stop_status(sig, event),
+            siginfo: crate::signal::siginfo_bytes(sig, info),
+            event: 0,
+            syscall: 0,
         }
     }
 
     /// fwe's nudge ([`POKE_CODE`]) taken: a seized thread is traced from
     /// now on, and stops if its tracer asked it to (`PTRACE_INTERRUPT`, or
     /// as it first starts), with `PTRACE_EVENT_STOP` and SIGTRAP.
-    pub fn ptrace_poked(&mut self, regs: &mut crate::Regs) {
+    pub(crate) fn poked() -> Option<Stop> {
         if !traced() && !begin_seized() {
-            return;
+            return None;
         }
-        let Some(mb) = open(mailbox_tag(self_id()), None) else { return };
+        let mb = open(mailbox_tag(self_id()), None)?;
         if mb.word(W_INTERRUPT).swap(0, Ordering::AcqRel) != 1 {
-            return;
+            return None;
         }
-        let (status, si, _, _) = trap_stop();
-        let r = self.stop_with_tls(regs, status, &si, 0, 0);
-        if r.signal() != 0 {
-            let info =
-                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-            crate::thread::post_process(r.signal(), info);
-        }
+        let (status, siginfo, event, syscall) = trap_stop();
+        Some(Stop { status, siginfo, event, syscall })
     }
+}
 
-    /// A stop signal `sig` (with `info`) whose default action stops a
-    /// traced thread: a group-stop, which its tracer sees, as
-    /// `PTRACE_EVENT_STOP` with the signal if it seized the thread, else as
-    /// the signal's stop, and which ends as the tracer says (or, listened
-    /// to, at `SIGCONT`).
-    pub fn ptrace_group_stop(
-        &mut self,
-        regs: &mut crate::Regs,
-        sig: u64,
-        info: crate::thread::SigInfo,
-    ) {
-        let si = crate::signal::siginfo_bytes(sig, info);
-        let event = if seized() { PTRACE_EVENT_STOP } else { 0 };
-        let r = self.stop_with_tls(regs, stop_status(sig, event), &si, 0, 0);
-        if r.signal() != 0 {
-            let info =
-                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-            crate::thread::post_process(r.signal(), info);
-        }
+/// After a stop other than a signal's: the signal the tracer resumed the
+/// thread with, if any, raised for the process.
+pub fn raise_resumed(r: Resume) {
+    if r.signal() != 0 {
+        let info = crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
+        crate::thread::post_process(r.signal(), info);
     }
+}
 
-    /// The exit event's stop (`PTRACE_O_TRACEEXIT`), as the process ends
-    /// with wait status `status`.
-    #[cfg_attr(
-        target_os = "macos",
-        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
-    )]
-    pub fn ptrace_exit_stop(&mut self, status: i32) {
-        if traced() && options() & PTRACE_O_TRACEEXIT != 0 {
-            let mut regs = crate::Regs::default();
-            self.ptrace_event_stop(&mut regs, PTRACE_EVENT_EXIT, status as u32 as u64);
-        }
+/// After a signal-delivery stop for `sig`: the signal to deliver, as the
+/// tracer chose (`None`: none). The same signal carries what the tracer
+/// left of its `siginfo`; another one is raised by the tracer.
+pub(crate) fn chosen(sig: u64, r: Resume) -> Option<(u64, crate::thread::SigInfo)> {
+    let to = r.signal();
+    if to == 0 || to > fwe_abi::signal::NSIG {
+        return None;
     }
+    let info = match get_own_siginfo() {
+        Some(b) if to == sig => crate::signal::siginfo_parse(&b).1,
+        _ => crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() },
+    };
+    Some((to, info))
+}
 
-    /// The stops of a fork a backend noted ([`note_fork`]): the parent's
-    /// event, and for a vfork the vfork-done event.
-    pub fn ptrace_fork_stops(&mut self, regs: &mut crate::Regs) {
-        if let Some((event, flags, child)) = take_noted_fork() {
-            self.ptrace_event_stop(regs, event, child);
-            if flags & fwe_abi::clone::CLONE_VFORK != 0 {
-                self.ptrace_vfork_done(regs, child);
+impl<P: crate::Platform> crate::Kernel<P> {
+    /// Every signal caught on the host while traced, and as before after,
+    /// if a thread began or ended being traced since this was last done.
+    pub(crate) fn resync_if_asked(&mut self) {
+        if RESYNC.swap(false, Ordering::AcqRel) {
+            for sig in 1..=fwe_abi::signal::NSIG {
+                self.sync_host_signal(sig);
             }
         }
     }
 
-    /// The vfork-done event's stop (`PTRACE_O_TRACEVFORKDONE`), the
-    /// child `child` having let its parent go on.
-    pub fn ptrace_vfork_done(&mut self, regs: &mut crate::Regs, child: u64) {
-        if traced() && options() & PTRACE_O_TRACEVFORKDONE != 0 {
-            self.ptrace_event_stop(regs, PTRACE_EVENT_VFORK_DONE, child);
+    /// Serve `stop` holding the kernel: only where no other thread of the
+    /// process needs to stop meanwhile (the exit event's stop, as the
+    /// process ends), and in the unit tests, which have no lock.
+    pub(crate) fn stop_held(&mut self, regs: &mut crate::Regs, stop: Stop) -> Resume {
+        self.resync_if_asked();
+        let mut tls = self.platform.thread_pointer();
+        let before = tls;
+        let r = stop.serve(regs, &mut tls);
+        if tls != before {
+            self.platform.set_thread_pointer(tls);
         }
+        self.resync_if_asked();
+        r
     }
 
-    /// A system call's entry stop (`entry`) or exit stop (`PTRACE_SYSCALL`).
-    pub fn ptrace_syscall_stop(&mut self, regs: &mut crate::Regs, entry: bool) {
-        if !stops_at_syscalls() {
-            return;
-        }
-        let good = options() & PTRACE_O_TRACESYSGOOD != 0;
-        let trap = fwe_abi::signal::SIGTRAP | if good { 0x80 } else { 0 };
-        let info =
-            crate::thread::SigInfo { code: fwe_abi::signal::SIGTRAP as i32, ..Default::default() };
-        let si = crate::signal::siginfo_bytes(fwe_abi::signal::SIGTRAP, info);
-        let r = self.stop_with_tls(regs, stop_status(trap, 0), &si, 0, if entry { 1 } else { 2 });
-        if r.signal() != 0 {
-            let info =
-                crate::thread::SigInfo { code: fwe_abi::signal::SI_USER, ..Default::default() };
-            crate::thread::post_process(r.signal(), info);
+    /// The exit event's stop (`PTRACE_O_TRACEEXIT`), as the process ends
+    /// with wait status `status`.
+    pub fn ptrace_exit_stop(&mut self, status: i32) {
+        if traced()
+            && let Some(stop) = Stop::exit(status)
+        {
+            let mut regs = crate::Regs::default();
+            raise_resumed(self.stop_held(&mut regs, stop));
         }
     }
 
@@ -1884,7 +1899,7 @@ impl<P: crate::Platform> crate::Kernel<P> {
             }
             return match traceme(parent.get()) {
                 Ok(()) => {
-                    self.resync_for_tracing();
+                    self.resync_if_asked();
                     0
                 }
                 Err(e) => err(e),

@@ -51,7 +51,7 @@ flowchart TD
 ```
 
 - **The kernel crate** does not depend on how guest code runs. A backend
-  traps a guest system call, calls `Kernel::enter_syscall` with the
+  traps a guest system call, calls `Kernel::run_syscall` with the
   guest's registers, and serves the kernel through `fwe_kernel::Platform`:
   preparing code for execution, ending a thread or the process, setting
   how the host treats a signal and, for the VM, carrying out memory calls
@@ -102,7 +102,7 @@ or, for a call that can block, without it:
     `lseek`) or change only the calling thread's state (`rt_sigprocmask`,
     `sigaltstack`) take its shared side, several threads at once
     (`Kernel::dispatch_shared`).
-  - Every other call holds it alone (`Kernel::enter_syscall`), so a
+  - Every other call holds it alone (`Kernel::run_syscall`), so a
     descriptor or mapping and fwe's record of it change together.
   - A reader writes nothing other readers use: it counts itself in one of
     32 counters, each on its own cache line, and checks a flag only
@@ -413,7 +413,7 @@ shows the stub):
   for, and so does the call. A call that changes the guest's mask sets the
   host thread's to match before the gate returns.
 - **Plain calls only:** the Rust half (`trap::fwe_gate_call`) runs a call
-  through `Kernel::enter_syscall` or `fwe_kernel::blocking_syscall`, as
+  through `Kernel::run_syscall` or `fwe_kernel::blocking_syscall`, as
   the trap does. It leaves to the trap a call a tracer stops at
   (`PTRACE_SYSCALL`), any call once a seccomp filter is set, and the calls
   the trap runs its own way (`execve`, a `clone`/`clone3` of a process or
@@ -830,6 +830,12 @@ memory or threads, so a tracee does its tracer's work itself:
   tracer (the page's generation, `SIGCHLD` and the wake signal) and serves
   requests until told to go on, with the signal the tracer chose and the
   registers as the tracer left them.
+  - A stop is made under the kernel lock and served without it
+    (`ptrace::Stop`, `KernelLock::serve_stop`), as Linux stops a task only
+    on its way back to user mode: the process's other threads go on, and
+    each stops for its tracer in its turn (a debugger stopping every
+    thread, a crash reporter attaching to each). The exit event's stop is
+    the exception, served holding the lock as the process ends.
 - **The tracer** reads and writes registers, `siginfo`, options and the
   signal mask in the mailbox (`PTRACE_GET_SYSCALL_INFO` too, from the
   registers and whether the stop is an entry or exit), and asks the
@@ -875,6 +881,9 @@ memory or threads, so a tracee does its tracer's work itself:
 - **Attaching** makes the target's mailbox and sends it `SIGSTOP` as
   fwe's; the target starts being traced as it takes it. Only a process of
   fwe's can be traced.
+- **A tracer that ends** leaves its tracees detached: a stop its `wait`
+  took goes on with no signal (the wait took it), one it did not take
+  with the signal it was for, as on Linux.
 - **Access** (`Kernel::may_access`, Linux's `__ptrace_may_access`), to
   attach (`ptrace`, `/proc/<pid>/mem`, `process_vm_readv`/`writev`,
   `pidfd_getfd`) or read (`get_robust_list`, a pidfd's namespaces), takes:

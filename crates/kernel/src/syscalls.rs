@@ -2245,7 +2245,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// A call the seccomp filters refused with `action` (not `Allow`): its
-    /// errno, a `SIGSYS`, or the end of the thread or process.
+    /// errno, a `SIGSYS`, or the end of the thread or process; the caller
+    /// delivers what is pending ([`crate::klock::KernelLock::deliver_pending`]).
     pub fn seccomp_refuse(
         &mut self,
         regs: &mut crate::Regs,
@@ -2255,48 +2256,26 @@ impl<P: Platform> Kernel<P> {
     ) {
         use crate::seccomp::Action;
         match action {
-            Action::Allow => self.enter_syscall(regs),
-            Action::Errno(e) => self.finish_syscall(regs, nr, args, err(e)),
+            Action::Allow => self.run_syscall(regs),
+            Action::Errno(e) => self.complete_syscall(regs, nr, args, err(e)),
             Action::Trap(data) => {
                 crate::signal::raise_sigsys(crate::SvcSite(regs.pc), nr, data);
                 // The call is not made; a handler can set what it returns.
                 let x0 = regs.x[0] as i64;
-                self.finish_syscall(regs, nr, args, x0);
+                self.complete_syscall(regs, nr, args, x0);
             }
             // The backends end a thread of several before taking the
             // kernel lock; the last one takes the process with it.
             Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
             Action::KillStrict => self.terminate_by(signal::SIGKILL),
             // No tracer took it: the call fails as Linux fails it then.
-            Action::Trace(_) => self.finish_syscall(regs, nr, args, err(errno::ENOSYS)),
+            Action::Trace(_) => self.complete_syscall(regs, nr, args, err(errno::ENOSYS)),
             // The tracer skipped it: what it left in `x0` is the result.
             Action::Skip => {
                 let x0 = regs.x[0] as i64;
-                self.finish_syscall(regs, nr, args, x0);
+                self.complete_syscall(regs, nr, args, x0);
             }
         }
-    }
-
-    /// `SECCOMP_RET_TRACE` with `data` for the call in `regs`: a tracer
-    /// that asked for it (`PTRACE_O_TRACESECCOMP`) stops the call with
-    /// `PTRACE_EVENT_SECCOMP` (its message `data`) and can change it; then
-    /// the filters run again on what it left, a call it set to -1 being
-    /// skipped, as Linux's `__seccomp_filter` has it. Without such a tracer,
-    /// [`crate::seccomp::Action::Trace`] stands (`ENOSYS`).
-    pub fn seccomp_trace(&mut self, regs: &mut crate::Regs, data: u16) -> crate::seccomp::Action {
-        use crate::seccomp::Action;
-        if !crate::ptrace::traced()
-            || crate::ptrace::options() & crate::ptrace::PTRACE_O_TRACESECCOMP == 0
-        {
-            return Action::Trace(data);
-        }
-        self.ptrace_event_stop(regs, crate::ptrace::PTRACE_EVENT_SECCOMP, u64::from(data));
-        let nr = regs.x[8];
-        if nr as i64 == -1 {
-            return Action::Skip;
-        }
-        let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
-        crate::seccomp::recheck(nr, &args, crate::SvcSite(regs.pc))
     }
 
     /// `reboot(magic, magic2, cmd)`, checked as Linux checks it: the

@@ -818,7 +818,7 @@ fn start(
     let mut regs = Regs { sp: image.sp, pc: entry, ..Regs::default() };
     // A traced program stops for its tracer before its first instruction,
     // as after any `execve`.
-    kernel().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+    KERNEL.exec_stops(&mut regs);
     vcpu.run(regs)
 }
 
@@ -1055,9 +1055,7 @@ impl Vcpu {
                 HV_EXIT_REASON_CANCELED => {
                     // A signal for the guest (or the wake signal).
                     regs = self.regs(self.get(HV_REG_PC), self.get(HV_REG_CPSR));
-                    if let Some(k) = kernel().as_mut() {
-                        k.deliver_pending(&mut regs);
-                    }
+                    KERNEL.deliver_pending(&mut regs);
                 }
                 HV_EXIT_REASON_VTIMER_ACTIVATED => continue,
                 other => fatal(&format!("unexpected VM exit reason {other}")),
@@ -1065,10 +1063,8 @@ impl Vcpu {
             // Whatever the exit, a signal that became deliverable meanwhile
             // (one a sigreturn just unblocked, or one the kernel queued
             // itself) is delivered now, not at the next system call.
-            if thread::deliverable() != 0
-                && let Some(k) = kernel().as_mut()
-            {
-                k.deliver_pending(&mut regs);
+            if thread::deliverable() != 0 {
+                KERNEL.deliver_pending(&mut regs);
             }
             self.set_regs(&regs);
         }
@@ -1199,9 +1195,12 @@ fn stale_permissions(esr: u64, far: u64) -> bool {
 /// Deliver synchronous fault `sig` at `addr` (an abort's syndrome `esr`,
 /// which its handler's frame holds), or die of it.
 fn fault(regs: &mut Regs, sig: u64, addr: u64, esr: Option<u64>) {
-    let mut guard = kernel();
-    let Some(k) = guard.as_mut() else { fatal("fault before the kernel exists") };
-    if !k.deliver_fault(regs, sig, addr, esr) {
+    if kernel().is_none() {
+        fatal("fault before the kernel exists");
+    }
+    if !KERNEL.deliver_fault(regs, sig, addr, esr) {
+        let mut guard = kernel();
+        let Some(k) = guard.as_mut() else { fatal("fault before the kernel exists") };
         if k.tracer.enabled {
             k.tracer.note(&format!(
                 "guest fault: signal {sig} at pc {:#x}, address {addr:#x}",
@@ -1552,7 +1551,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // A traced process stopping at system calls: the entry's stop.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
     if syscall_stops {
-        kernel().as_mut().unwrap().ptrace_syscall_stop(regs, true);
+        KERNEL.syscall_stop(regs, true);
     }
     let mut n = regs.x[8];
     let mut args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
@@ -1561,7 +1560,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
         let mut action = fwe_kernel::seccomp::check(n, &args, fwe_kernel::SvcSite(regs.pc));
         // A tracer's turn (`SECCOMP_RET_TRACE`): the call as it leaves it.
         if let fwe_kernel::seccomp::Action::Trace(data) = action {
-            action = kernel().as_mut().unwrap().seccomp_trace(regs, data);
+            action = KERNEL.seccomp_trace(regs, data);
             n = regs.x[8];
             args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
         }
@@ -1573,6 +1572,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
         }
         if action != fwe_kernel::seccomp::Action::Allow {
             kernel().as_mut().unwrap().seccomp_refuse(regs, n, &args, action);
+            KERNEL.deliver_pending(regs);
             return;
         }
     }
@@ -1590,7 +1590,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     uaccess::clear_host_args();
     for (i, &a) in args.iter().enumerate() {
         if mask & (1 << i) != 0 && a != 0 && !pointer_ok(n, i, &args) {
-            kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EFAULT));
+            kernel().as_mut().unwrap().complete_syscall(regs, n, &args, err(errno::EFAULT));
+            KERNEL.deliver_pending(regs);
             return;
         }
     }
@@ -1609,7 +1610,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     // fails with `EINVAL`.
     for (i, &a) in args.iter().enumerate() {
         if mask & (1 << i) != 0 && a != 0 && !one_host_range(n, i, &args) {
-            kernel().as_mut().unwrap().finish_syscall(regs, n, &args, err(errno::EINVAL));
+            kernel().as_mut().unwrap().complete_syscall(regs, n, &args, err(errno::EINVAL));
+            KERNEL.deliver_pending(regs);
             return;
         }
     }
@@ -1621,7 +1623,8 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     }
     let result = match n {
         nr::RT_SIGRETURN => {
-            kernel().as_mut().unwrap().enter_syscall(regs);
+            kernel().as_mut().unwrap().run_syscall(regs);
+            KERNEL.deliver_pending(regs);
             return;
         }
         nr::EXIT => {
@@ -1686,10 +1689,10 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     KERNEL.finish(regs, n, &args, result);
     // A fork's event stops, the child's pid in `x0`.
     if matches!(n, nr::CLONE | nr::CLONE3) {
-        kernel().as_mut().unwrap().ptrace_fork_stops(regs);
+        KERNEL.fork_stops(regs);
     }
     // The exit's stop, its result in `x0`.
     if syscall_stops {
-        kernel().as_mut().unwrap().ptrace_syscall_stop(regs, false);
+        KERNEL.syscall_stop(regs, false);
     }
 }

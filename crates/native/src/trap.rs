@@ -664,9 +664,7 @@ fn is_brk(word: u32) -> bool {
 /// otherwise wait for the thread's next system call.
 fn settle(regs: &mut Regs) {
     reblock();
-    if thread::deliverable() != 0
-        && let Some(k) = kernel().as_mut()
-    {
+    if thread::deliverable() != 0 {
         // Going on in a translation (a way out's target): a handler's frame
         // holds the guest's state, as at the instruction it stands for, not
         // fwe's code, which might be gone when the handler returns.
@@ -674,7 +672,7 @@ fn settle(regs: &mut Regs) {
         if crate::jit::stands_for_program(regs.pc) {
             crate::jit::to_guest(regs);
         }
-        k.deliver_pending(regs);
+        KERNEL.deliver_pending(regs);
     }
 }
 
@@ -769,9 +767,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
                 crate::jit::to_guest(&mut regs);
             }
             let addr = regs.pc;
-            let delivered = kernel()
-                .as_mut()
-                .is_some_and(|k| k.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr, None));
+            let delivered = KERNEL.deliver_fault(&mut regs, fwe_abi::signal::SIGTRAP, addr, None);
             if delivered {
                 settle(&mut regs);
                 regs_to(mc, &regs);
@@ -795,7 +791,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     // the tracer can change the registers.
     let syscall_stops = fwe_kernel::ptrace::stops_at_syscalls();
     if syscall_stops {
-        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, true);
+        KERNEL.syscall_stop(&mut regs, true);
     }
     let mut nr = regs.x[8];
     let mut args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
@@ -804,7 +800,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         let mut action = fwe_kernel::seccomp::check(nr, &args, fwe_kernel::SvcSite(regs.pc));
         // A tracer's turn (`SECCOMP_RET_TRACE`): the call as it leaves it.
         if let fwe_kernel::seccomp::Action::Trace(data) = action {
-            action = kernel().as_mut().unwrap().seccomp_trace(&mut regs, data);
+            action = KERNEL.seccomp_trace(&mut regs, data);
             nr = regs.x[8];
             args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
         }
@@ -817,6 +813,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         }
         if action != fwe_kernel::seccomp::Action::Allow {
             kernel().as_mut().unwrap().seccomp_refuse(&mut regs, nr, &args, action);
+            KERNEL.deliver_pending(&mut regs);
             settle(&mut regs);
             regs_to(mc, &regs);
             // SAFETY: `ctx` is this handler's ucontext.
@@ -849,9 +846,12 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
             // traced process stops there first.
             Ok(new) => {
                 regs = new;
-                kernel().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+                KERNEL.exec_stops(&mut regs);
             }
-            Err(r) => kernel().as_mut().unwrap().finish_syscall(&mut regs, nr, &args, r),
+            Err(r) => {
+                kernel().as_mut().unwrap().complete_syscall(&mut regs, nr, &args, r);
+                KERNEL.deliver_pending(&mut regs);
+            }
         }
         settle(&mut regs);
         regs_to(mc, &regs);
@@ -877,19 +877,15 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
             }
             Err(e) => fwe_abi::err(e),
         };
-        let mut guard = kernel();
-        let k = guard.as_mut().unwrap();
-        k.finish_syscall(&mut regs, nr, &args, r);
-        // The parent's event stop, the child's pid its message.
+        kernel().as_mut().unwrap().complete_syscall(&mut regs, nr, &args, r);
+        // The parent's event stop, the child's pid its message, before
+        // what is pending is delivered, as Linux's in the call.
         if r > 0
             && let Some((e, flags)) = event
         {
-            k.ptrace_event_stop(&mut regs, e, r as u64);
-            if flags & fwe_abi::clone::CLONE_VFORK != 0 {
-                k.ptrace_vfork_done(&mut regs, r as u64);
-            }
+            KERNEL.clone_stops(&mut regs, e, r as u64, flags & fwe_abi::clone::CLONE_VFORK != 0);
         }
-        drop(guard);
+        KERNEL.deliver_pending(&mut regs);
     } else if nr == fwe_abi::nr::WAIT4 {
         // wait4 blocks; run it without the kernel lock.
         let r = crate::process::do_wait4(&regs);
@@ -916,10 +912,13 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
         kernel().as_mut().unwrap().catch_for_wait(want);
         // SAFETY: guest pointers in `args` reference guest memory.
         let r = unsafe { fwe_kernel::signal::sigtimedwait(args[0], args[1], args[2], args[3]) };
-        let mut guard = kernel();
-        let k = guard.as_mut().unwrap();
-        k.end_wait(want);
-        k.finish_syscall(&mut regs, nr, &args, r);
+        {
+            let mut guard = kernel();
+            let k = guard.as_mut().unwrap();
+            k.end_wait(want);
+            k.complete_syscall(&mut regs, nr, &args, r);
+        }
+        KERNEL.deliver_pending(&mut regs);
     } else if let Some(r) = {
         // SAFETY: guest pointers in `args` reference guest memory.
         unsafe { fwe_kernel::blocking_syscall(nr, args) }
@@ -931,7 +930,7 @@ fn syscall_trap(ctx: *mut libc::c_void, in_guest: bool, known: bool) {
     fwe_kernel::timing::call_done(nr, began);
     // The exit's stop, its result in `x0`.
     if syscall_stops {
-        kernel().as_mut().unwrap().ptrace_syscall_stop(&mut regs, false);
+        KERNEL.syscall_stop(&mut regs, false);
     }
     settle(&mut regs);
     regs_to(mc, &regs);
@@ -1029,8 +1028,9 @@ fn take_async(
     record();
     // Guest code holds none of fwe's locks, so taking the kernel lock here
     // cannot deadlock against this thread.
-    let mut guard = kernel();
-    let Some(k) = guard.as_mut() else { return };
+    if kernel().is_none() {
+        return;
+    }
     // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
     let mc = unsafe { &mut *(*(ctx as *mut Ucontext)).uc_mcontext };
     let mut regs = regs_from(mc);
@@ -1041,8 +1041,7 @@ fn take_async(
     if crate::jit::stands_for_program(regs.pc) {
         crate::jit::to_guest(&mut regs);
     }
-    k.deliver_pending(&mut regs);
-    drop(guard);
+    KERNEL.deliver_pending(&mut regs);
     settle(&mut regs);
     regs_to(mc, &regs);
     // SAFETY: `ctx` is this handler's ucontext.
@@ -1643,7 +1642,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     };
     // The fault's syndrome, as the host had it from the processor.
     let esr = Some(u64::from(mc.es.esr));
-    let delivered = kernel().as_mut().is_some_and(|k| k.deliver_fault(&mut regs, lsig, addr, esr));
+    let delivered = KERNEL.deliver_fault(&mut regs, lsig, addr, esr);
     if delivered {
         settle(&mut regs);
         regs_to(mc, &regs);
