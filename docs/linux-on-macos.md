@@ -1973,6 +1973,60 @@ the flags and pid arguments need translating:
 What comes back (the status word, `rusage`, `SIGCHLD`) is under
 [Children ending](#children-ending).
 
+#### Init, orphans and daemons
+
+fwe boots no Linux system. No Linux init runs before a program, and
+nothing is started at boot: a run is the program fwe is given and what it
+starts. Which process is process 1, and who adopts an orphan, depends on
+the pid namespace:
+
+| | Linux | macOS | fwe |
+|---|---|---|---|
+| process 1 | the init the kernel starts (systemd, OpenRC's `init`, a container's init) | `launchd` | outside a pid namespace, the host's `launchd` (`/proc/1` shows its name and status, as another user's process); in a pid namespace fwe makes, the namespace's first process |
+| an orphan's new parent | the nearest child subreaper, else its namespace's init | `launchd` | the same as Linux's, kept by fwe ([orphans and reapers](#orphans-and-reapers)); outside any reaper, 1, `launchd` |
+| a namespace's init | takes only the signals it handles; its end kills the namespace | — | the same ([Sending a signal](#sending-a-signal), [Namespaces](#namespaces)) |
+| a service manager | systemd, OpenRC, runit, s6 | `launchd` | none of fwe's: a program starts and supervises its daemons as on Linux, inside the run (conmon for podman's containers, containerd's shims) |
+
+The tests run containers' first processes as their pid namespaces' inits
+(runc's container init, and the command `podman run` and `docker run`
+start), conmon adopting a container's processes as a subreaper, and
+`catatonit` as podman's pause process. No test runs a Linux init system
+(systemd, OpenRC, runit, s6).
+
+A daemon that detaches (a double `fork` and `setsid`) is a host process
+like any other, so it outlives the `fwe` command that started it, as a
+Linux daemon outlives its shell. Its parent is then 1 (`launchd`), and on
+the host it is an `fwe` process whose arguments name the program:
+
+```mermaid
+flowchart LR
+    subgraph before["while the shell runs"]
+        L1["launchd (1)"] --> S["fwe: sh"] --> D1["fwe: the daemon"]
+    end
+    subgraph after["after the shell exits"]
+        L2["launchd (1)"] --> D2["fwe: the daemon"]
+    end
+    before --> after
+```
+
+To keep a Linux daemon running as a service, a `launchd` job (a
+LaunchAgent or LaunchDaemon) runs `fwe` with the daemon in the
+foreground, as the program the job names; `launchd` then does what
+systemd would:
+
+| A service's need | systemd, on Linux | `launchd`, running fwe |
+|---|---|---|
+| start, and restart when it ends | `Restart=` | `KeepAlive`; the guest's exit status is `fwe`'s |
+| stop | `SIGTERM`, then `SIGKILL` after `TimeoutStopSec` | `SIGTERM`, which the guest gets as Linux's ([A process killed from the host](#a-process-killed-from-the-host)), then `SIGKILL` after `ExitTimeOut` |
+| its output | the journal | `StandardOutPath`, `StandardErrorPath` |
+| sockets it is given (socket activation) | `LISTEN_FDS` | not passed: `launchd`'s `Sockets` reach a job only through `launch_activate_socket`, a macOS call a Linux program does not make |
+| readiness (`sd_notify`) | `NOTIFY_SOCKET` | none |
+
+A daemon that runs in the VM (a non-PIE program linked low) MUST end on
+`SIGTERM` within the job's `ExitTimeOut`: the `SIGKILL` that follows ends
+its process with its VM alive, which can bring the machine down
+([hypervisor.md](hypervisor.md#never-end-a-vm-process-abnormally)).
+
 #### ptrace
 
 macOS gives no process another's memory or threads without the debugger
