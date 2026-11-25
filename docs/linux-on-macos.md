@@ -1312,8 +1312,15 @@ up gives as Linux does, and `RTM_NEWADDR` gives as bubblewrap does); in
 the initial namespace they describe the host's interfaces and addresses
 (from `getifaddrs`, `lo0` as `lo`), as `SIOCGIFCONF` and the other
 interface requests do, so `getifaddrs` in the guest lists them; bringing
-`lo` up changes nothing, and any other change is `EPERM`. Other requests
-are `EOPNOTSUPP`; multicast groups joined are kept ([Network
+`lo` up changes nothing, and any other change is `EPERM`. `RTM_GETROUTE`
+dumps the namespace's routes or finds the one to an address (`ip route
+get`), as Linux's tables hold them (`crates/kernel/src/routes.rs`): each
+address's own routes (`local`, its network's broadcast, `ff00::/8` on an
+interface with IPv6) in the local table, and in the initial namespace
+the host's routes (`sysctl` `NET_RT_DUMP`) in the main one, without
+what macOS keeps there and Linux does not (the link layer's entries,
+other interfaces' default routes); GLib's network monitor reads them to
+tell the machine is online. Other requests are `EOPNOTSUPP`; multicast groups joined are kept ([Network
 events](#network-events)). Such a socket also carries a POSIX message
 queue's `SIGEV_THREAD` notification.
 
@@ -2025,7 +2032,9 @@ macOS has no `/proc` or `/sys`; fwe serves them as filesystems of its own:
   acts on.
 - `/proc/net` is the reader's network namespace: a namespace of fwe's
   has `lo` alone; the initial one shows the host's interfaces
-  (`getifaddrs`, `lo0` as `lo`) and the routes of their own networks.
+  (`getifaddrs`, `lo0` as `lo`). `route` and `ipv6_route` show the
+  namespace's routes, as netlink's `RTM_GETROUTE` does (see
+  `socket(AF_NETLINK)`).
   The sockets are fwe's processes' in the namespace, as the host reports
   each (`PROC_PIDFDSOCKETINFO`), with the namespace's port numbers.
 - `/proc/self/fd/N`, `cwd` and `root` behave as magic links.

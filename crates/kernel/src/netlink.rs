@@ -11,8 +11,10 @@
 //! `RTM_NEWLINK` brings up or down and `RTM_NEWADDR` gives its own
 //! addresses, 127.0.0.1/8 and ::1/128 (both with `CAP_NET_ADMIN`; bringing
 //! it up gives them too, as Linux does), and whose addresses `RTM_GETADDR`
-//! lists; any other request, or address, is answered with `EOPNOTSUPP`, as
-//! the kernel answers one it has no handler for.
+//! lists; `RTM_GETROUTE` dumps the namespace's routes or finds the one to
+//! an address ([`crate::routes`]); any other request, or address, is
+//! answered with `EOPNOTSUPP`, as the kernel answers one it has no handler
+//! for.
 //!
 //! In the initial network namespace, whose interfaces are the host's, fwe
 //! describes each of them ([`crate::host::interfaces`], the host's `lo0`
@@ -57,6 +59,20 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
+/// Route attributes (`RTA_*`).
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PRIORITY: u16 = 6;
+const RTA_PREFSRC: u16 = 7;
+const RTA_TABLE: u16 = 15;
+const RTA_PREF: u16 = 20;
+/// A route found for one address (`ip route get`): `RTM_F_CLONED`, and
+/// `RTCF_LOCAL` for a local one.
+const RTM_F_CLONED: u32 = 0x200;
+const RTCF_LOCAL: u32 = 0x8000_0000;
 
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
@@ -732,8 +748,15 @@ fn attrs(b: &[u8], fixed: usize) -> Vec<(u16, &[u8])> {
 fn interfaces(
     net: &Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
 ) -> Vec<Interface> {
-    let Some(net) = net else { return crate::host::interfaces() };
-    vec![lo(&net.get())]
+    match net {
+        Some(net) => namespace_interfaces(&net.get()),
+        None => crate::host::interfaces(),
+    }
+}
+
+/// The interfaces of a namespace of fwe's (`n`): its `lo`.
+pub(crate) fn namespace_interfaces(n: &crate::ns::Net) -> Vec<Interface> {
+    vec![lo(n)]
 }
 
 /// `::1`.
@@ -763,6 +786,32 @@ fn lo(n: &crate::ns::Net) -> Interface {
         hw_addr: vec![0; 6],
         addrs,
     }
+}
+
+/// A route's `RTM_NEWROUTE` body (`rtmsg` and its attributes), with
+/// `flags`.
+fn route_body(r: &crate::routes::Route, flags: u32) -> Vec<u8> {
+    let mut b = vec![r.family, r.prefix, 0, 0, r.table, r.protocol, r.scope, r.kind];
+    b.extend_from_slice(&flags.to_ne_bytes());
+    attr(&mut b, RTA_TABLE, &u32::from(r.table).to_ne_bytes());
+    if r.prefix > 0 {
+        attr(&mut b, RTA_DST, &r.dst);
+    }
+    if let Some(m) = r.metric {
+        attr(&mut b, RTA_PRIORITY, &m.to_ne_bytes());
+    }
+    if let Some(src) = &r.prefsrc {
+        attr(&mut b, RTA_PREFSRC, src);
+    }
+    if let Some(g) = &r.gateway {
+        attr(&mut b, RTA_GATEWAY, g);
+    }
+    attr(&mut b, RTA_OIF, &r.oif.to_ne_bytes());
+    if r.family == 10 {
+        // `ICMPV6_ROUTER_PREF_MEDIUM`.
+        attr(&mut b, RTA_PREF, &[0]);
+    }
+    b
 }
 
 /// An interface's `RTM_NEWLINK` body.
@@ -874,7 +923,7 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             message(NLMSG_ERROR, flags, seq, port, &b)
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-        let links = if matches!(ty, RTM_GETLINK | RTM_NEWLINK | RTM_GETADDR) {
+        let links = if matches!(ty, RTM_GETLINK | RTM_NEWLINK | RTM_GETADDR | RTM_GETROUTE) {
             interfaces(&net)
         } else {
             Vec::new()
@@ -931,6 +980,55 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
                 Ok(out)
             }
             RTM_NEWADDR => new_addr(&net, admin, flags, body),
+            RTM_GETROUTE => {
+                let host = if net.is_none() { crate::host::routes() } else { Vec::new() };
+                let routes = crate::routes::table(&links, &host);
+                let family = body.first().copied().unwrap_or(0);
+                if dump {
+                    let mut out: Vec<Vec<u8>> = routes
+                        .iter()
+                        .filter(|r| family == 0 || r.family == family)
+                        .map(|r| message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &route_body(r, 0)))
+                        .collect();
+                    out.push(done());
+                    Ok(out)
+                } else {
+                    let to =
+                        attrs(body, 12).into_iter().find(|&(t, _)| t == RTA_DST).map(|(_, v)| v);
+                    match to.filter(|a| a.len() == 4 || a.len() == 16) {
+                        None => Err(errno::EINVAL),
+                        Some(addr) => match crate::routes::lookup(&routes, addr) {
+                            None => Err(errno::ENETUNREACH),
+                            Some(r) => {
+                                let local = r.kind == crate::routes::RTN_LOCAL;
+                                let found = crate::routes::Route {
+                                    table: crate::routes::MAIN,
+                                    protocol: 0,
+                                    scope: 0,
+                                    dst: addr.to_vec(),
+                                    prefix: (addr.len() * 8) as u8,
+                                    prefsrc: if local {
+                                        r.prefsrc.clone()
+                                    } else {
+                                        crate::routes::source(&links, r.oif, addr)
+                                    },
+                                    metric: None,
+                                    ..r.clone()
+                                };
+                                let flags = RTM_F_CLONED
+                                    | if local && addr.len() == 4 { RTCF_LOCAL } else { 0 };
+                                Ok(vec![message(
+                                    RTM_NEWROUTE,
+                                    0,
+                                    seq,
+                                    port,
+                                    &route_body(&found, flags),
+                                )])
+                            }
+                        },
+                    }
+                }
+            }
             _ => Err(errno::EOPNOTSUPP),
         };
         match result {

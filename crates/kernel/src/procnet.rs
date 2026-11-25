@@ -1,10 +1,10 @@
 //! `/proc/net` (`/proc/<pid>/net`): a network namespace's interfaces,
 //! routes and sockets, as the files Linux writes show them.
 //!
-//! A namespace of fwe's has `lo` alone, up or down as it was set, and no
-//! routes. The initial namespace's interfaces are the host's (`lo0` named
-//! `lo`), with the host's counters, and its routes are those of each
-//! interface's own network (no gateway). The sockets are those fwe's
+//! A namespace of fwe's has `lo` alone, up or down as it was set. The
+//! initial namespace's interfaces are the host's (`lo0` named `lo`), with
+//! the host's counters. The routes are the namespace's tables
+//! ([`crate::routes`]). The sockets are those fwe's
 //! processes in the namespace hold, as the host reports each
 //! (`PROC_PIDFDSOCKETINFO`), with the namespace's port numbers; the
 //! initial namespace shows fwe's processes' sockets, not the rest of the
@@ -14,8 +14,18 @@ use crate::ns::Net;
 use crate::shared::Record;
 
 /// The files of the directory.
-pub const FILES: &[&[u8]] =
-    &[b"dev", b"if_inet6", b"route", b"snmp", b"tcp", b"tcp6", b"udp", b"udp6", b"unix"];
+pub const FILES: &[&[u8]] = &[
+    b"dev",
+    b"if_inet6",
+    b"ipv6_route",
+    b"route",
+    b"snmp",
+    b"tcp",
+    b"tcp6",
+    b"udp",
+    b"udp6",
+    b"unix",
+];
 
 /// One of a namespace's sockets.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -54,6 +64,7 @@ pub fn file(name: &[u8], net: Option<&Record<Net>>, guest: GuestPath) -> Option<
         b"dev" => dev(net),
         b"if_inet6" => if_inet6(net),
         b"route" => route(net),
+        b"ipv6_route" => ipv6_route(net),
         b"snmp" => snmp(&sockets(net, guest)),
         b"tcp" | b"tcp6" | b"udp" | b"udp6" => inet(name, &sockets(net, guest)),
         b"unix" => unix(&sockets(net, guest)),
@@ -61,15 +72,13 @@ pub fn file(name: &[u8], net: Option<&Record<Net>>, guest: GuestPath) -> Option<
     })
 }
 
-/// A host interface: its Linux name, index, flags, IPv4 and IPv6
-/// addresses (with prefix lengths) and counters (received bytes, packets,
-/// errors, drops; sent bytes, packets, errors; collisions).
+/// A host interface: its Linux name, index, IPv6 addresses (with prefix
+/// lengths) and counters (received bytes, packets, errors, drops; sent
+/// bytes, packets, errors; collisions).
 #[derive(Clone, Debug, Default)]
 struct Iface {
     name: Vec<u8>,
     index: u32,
-    up: bool,
-    v4: Vec<([u8; 4], [u8; 4])>,
     v6: Vec<([u8; 16], u8)>,
     counters: [u64; 8],
 }
@@ -84,8 +93,6 @@ fn ifaces(net: Option<&Record<Net>>) -> Vec<Iface> {
             vec![Iface {
                 name: b"lo".to_vec(),
                 index: 1,
-                up: n.lo_up,
-                v4: if n.lo_v4 { vec![([127, 0, 0, 1], [255, 0, 0, 0])] } else { Vec::new() },
                 v6: if n.lo_v6 { vec![(v6, 128)] } else { Vec::new() },
                 counters: [0; 8],
             }]
@@ -120,26 +127,12 @@ fn host_ifaces() -> Vec<Iface> {
             }
         };
         let iface = &mut out[i];
-        iface.up |= ifa.ifa_flags & libc::IFF_UP as u32 != 0;
         if ifa.ifa_addr.is_null() {
             continue;
         }
         // SAFETY: a socket address of at least its header.
         let family = i32::from(unsafe { (*ifa.ifa_addr).sa_family });
         match family {
-            libc::AF_INET => {
-                // SAFETY: an `AF_INET` address and mask.
-                let (a, m) = unsafe {
-                    let a = &*(ifa.ifa_addr as *const libc::sockaddr_in);
-                    let m = if ifa.ifa_netmask.is_null() {
-                        0
-                    } else {
-                        (*(ifa.ifa_netmask as *const libc::sockaddr_in)).sin_addr.s_addr
-                    };
-                    (a.sin_addr.s_addr.to_ne_bytes(), m.to_ne_bytes())
-                };
-                iface.v4.push((a, m));
-            }
             libc::AF_INET6 => {
                 // SAFETY: an `AF_INET6` address and mask.
                 let (a, prefix) = unsafe {
@@ -231,30 +224,82 @@ fn if_inet6(net: Option<&Record<Net>>) -> Vec<u8> {
     out
 }
 
+/// The namespace's routes ([`crate::routes`]), and its interfaces.
+fn routes(net: Option<&Record<Net>>) -> (Vec<crate::routes::Route>, Vec<crate::host::Interface>) {
+    let (ifs, host) = match net {
+        Some(n) => (crate::netlink::namespace_interfaces(&n.get()), Vec::new()),
+        None => (crate::host::interfaces(), crate::host::routes()),
+    };
+    (crate::routes::table(&ifs, &host), ifs)
+}
+
+/// A line of `/proc/net/route`, padded to 127 characters, as Linux pads
+/// each.
+fn padded(line: String) -> Vec<u8> {
+    format!("{line:<127}\n").into_bytes()
+}
+
+/// The main table's IPv4 routes: `RTF_UP`, with `RTF_GATEWAY` for one
+/// through a gateway and `RTF_HOST` for one to a single address. Nothing,
+/// not even its header, while a namespace has no IPv4 tables yet (until
+/// `lo` has its address), as Linux shows a main table it has not made.
 fn route(net: Option<&Record<Net>>) -> Vec<u8> {
-    let mut out =
-        b"Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
-            .to_vec();
-    // Linux keeps a loopback's routes in its local table, which this file
-    // does not show.
-    if net.is_some() {
-        return out;
+    if net.is_some_and(|n| !n.get().lo_v4) {
+        return Vec::new();
     }
-    for i in ifaces(None).iter().filter(|i| i.up && i.name != b"lo") {
-        for (a, m) in &i.v4 {
-            let dest: [u8; 4] = std::array::from_fn(|k| a[k] & m[k]);
-            out.extend_from_slice(
-                format!(
-                    "{}\t{:08X}\t00000000\t0001\t0\t0\t0\t{:08X}\t0\t0\t0\n",
-                    String::from_utf8_lossy(&i.name),
-                    u32::from_ne_bytes(dest),
-                    u32::from_ne_bytes(*m)
-                )
-                .as_bytes(),
-            );
-        }
+    let mut out = padded(
+        "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
+            .into(),
+    );
+    let (routes, ifs) = routes(net);
+    let word = |a: &[u8]| u32::from_ne_bytes(a.try_into().unwrap_or([0; 4]));
+    for r in routes.iter().filter(|r| r.family == 2 && r.table == crate::routes::MAIN) {
+        let Some(f) = ifs.iter().find(|f| f.index == r.oif) else { continue };
+        let mask = if r.prefix == 0 { 0 } else { u32::MAX << (32 - u32::from(r.prefix)) };
+        let flags =
+            1 | if r.gateway.is_some() { 2 } else { 0 } | if r.prefix == 32 { 4 } else { 0 };
+        out.extend(padded(format!(
+            "{}\t{:08X}\t{:08X}\t{flags:04X}\t0\t0\t{}\t{:08X}\t0\t0\t0",
+            String::from_utf8_lossy(&f.name),
+            word(&r.dst),
+            r.gateway.as_deref().map_or(0, word),
+            r.metric.unwrap_or(0),
+            u32::from_ne_bytes(mask.to_be_bytes()),
+        )));
     }
     out
+}
+
+/// The IPv6 routes, each table's in turn, ending with its rejecting
+/// entry, as Linux lists them: destination, its prefix, source (none),
+/// next hop, metric, references, uses, flags (`RTF_UP`, `RTF_GATEWAY`,
+/// `RTF_NONEXTHOP` for one on the link, `RTF_LOCAL`) and interface.
+fn ipv6_route(net: Option<&Record<Net>>) -> Vec<u8> {
+    let (routes, ifs) = routes(net);
+    let hex = |a: &[u8]| a.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let zero = hex(&[0; 16]);
+    let mut out = String::new();
+    for table in [crate::routes::MAIN, crate::routes::LOCAL] {
+        for r in routes.iter().filter(|r| r.family == 10 && r.table == table) {
+            let Some(f) = ifs.iter().find(|f| f.index == r.oif) else { continue };
+            let flags: u32 = 0x1
+                | if r.gateway.is_some() { 0x2 } else { 0x20_0000 }
+                | if r.kind == crate::routes::RTN_LOCAL { 0x8000_0000 } else { 0 };
+            out.push_str(&format!(
+                "{} {:02x} {zero} 00 {} {:08x} 00000001 00000000 {flags:08x} {:>8}\n",
+                hex(&r.dst),
+                r.prefix,
+                r.gateway.as_deref().map_or(zero.clone(), hex),
+                r.metric.unwrap_or(0),
+                String::from_utf8_lossy(&f.name)
+            ));
+        }
+        // `ip6_null_entry`: unreachable, the loopback's.
+        out.push_str(&format!(
+            "{zero} 00 {zero} 00 {zero} ffffffff 00000001 00000000 00200200       lo\n"
+        ));
+    }
+    out.into_bytes()
 }
 
 /// An address as `/proc/net/tcp` writes it: each 32-bit word of it in

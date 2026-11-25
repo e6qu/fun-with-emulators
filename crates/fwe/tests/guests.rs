@@ -10946,6 +10946,30 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// A network namespace's routes, as netlink dumps and finds them and
+/// `/proc/net` shows them: a new namespace's, none until `lo` is up, then
+/// `lo`'s local ones (GLib's network monitor dumps them); the initial
+/// namespace's main table, the host's routes.
+#[test]
+fn routes_are_dumped_found_and_listed_as_linux_has_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "routes",
+        &[],
+        "host: dump 0, main routes: yes, each on an interface: yes\n\
+         new namespace, lo down:\n  dump: 0\n  /proc/net/route: 0 lines, padded: yes\n\
+         \x20 /proc/net/ipv6_route: 2 lines\nlo up:\n\
+         \x20 local table local 127.0.0.0/8 scope 254 oif 1\n\
+         \x20 local table local 127.0.0.1/32 scope 254 oif 1\n\
+         \x20 broadcast table local 127.255.255.255/32 scope 253 oif 1\n\
+         \x20 local table local ::1/128 scope 0 oif 1\n  dump: 0\nIPv6 alone:\n\
+         \x20 local table local ::1/128 scope 0 oif 1\n  dump: 0\n\
+         \x20 /proc/net/route: 1 lines, padded: yes\n  /proc/net/ipv6_route: 3 lines\n\
+         get 127.0.0.1:\n  local table main 127.0.0.1/32 scope 0 oif 1 cached\n  error: 0\n\
+         get 8.8.8.8:\n  error: -101\nchild: 0\n",
+    );
+}
+
 /// Firefox's fork server starting a sandboxed content process: the exec
 /// socket the parent sends the server reaches the child it clones into
 /// new namespaces, though that child's `CLONE_FS` chroot helper closes

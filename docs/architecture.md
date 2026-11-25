@@ -2033,7 +2033,7 @@ Where fwe differs from Linux in ways a Linux program could notice. The
 - `/proc` in the initial pid namespace lists only fwe's processes
   (another host process is reached by its number, with only its `stat`);
   `/proc/net` there shows the host's interfaces but only fwe's processes'
-  sockets, and no route through a gateway; `/proc/<pid>/io` counts only
+  sockets; `/proc/<pid>/io` counts only
   storage bytes and `statm` only the size and resident set; a thread's
   directory (`task/<tid>`) holds only `comm`, `stat`, `status` and
   `mem` (the caller's own, `ns` too).

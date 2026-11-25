@@ -102,6 +102,7 @@ pub mod pty;
 pub mod reaper;
 pub mod reclocks;
 pub mod rlimits;
+pub mod routes;
 mod sched;
 #[cfg(not(target_os = "linux"))]
 pub mod scm;
