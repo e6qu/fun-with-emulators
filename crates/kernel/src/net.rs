@@ -2749,6 +2749,9 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
         }
         return peercred(fd as i32, optval, optlen);
     }
+    if level == SOL_SOCKET && optname == fwe_abi::socket::SO_PEERGROUPS {
+        return peergroups(fd as i32, optval, optlen);
+    }
     if let Some(e) = level_refused(fd as i32, level, true) {
         return e;
     }
@@ -2843,6 +2846,60 @@ fn peercred(fd: i32, optval: u64, optlen: u64) -> i64 {
         Ok(cred) => write_ucred(optval, optlen, cred),
         Err(e) => err(e),
     }
+}
+
+/// `SO_PEERGROUPS`: the supplementary groups of the process at the other
+/// end of Unix socket `fd`, in the caller's user namespace, as Linux's
+/// `sock_getsockopt` gives them: `ENODATA` with no peer, `ERANGE` with
+/// the size needed at `optlen` for a buffer too small.
+fn peergroups(fd: i32, optval: u64, optlen: u64) -> i64 {
+    let Ok(len) = uaccess::read::<u32>(optlen) else { return err(errno::EFAULT) };
+    if !is_unix(fd) || crate::netlink::is(fd) {
+        return err(errno::ENODATA);
+    }
+    let Ok((pid, _, _)) = host_peercred(fd) else { return err(errno::ENODATA) };
+    let groups: Vec<u32> = match crate::ids::HostPid::new(pid).and_then(crate::procreg::groups) {
+        Some(g) => g.into_iter().map(|g| crate::userns::to_ns(g, true)).collect(),
+        None => host_peer_groups(fd).into_iter().map(crate::host::gid_to_linux).collect(),
+    };
+    let need = 4 * groups.len() as u32;
+    if len < need {
+        guest!(uaccess::write(optlen, need));
+        return err(errno::ERANGE);
+    }
+    let bytes: Vec<u8> = groups.iter().flat_map(|g| g.to_ne_bytes()).collect();
+    guest!(uaccess::write_from(optval, &bytes));
+    guest!(uaccess::write(optlen, need));
+    0
+}
+
+/// The supplementary groups of a host process at the other end of Unix
+/// socket `fd` (macOS's `LOCAL_PEERCRED`: its groups after its effective
+/// group).
+#[cfg(target_os = "macos")]
+fn host_peer_groups(fd: i32) -> Vec<u32> {
+    const SOL_LOCAL: i32 = 0;
+    const LOCAL_PEERCRED: i32 = 1;
+    // SAFETY: zeroed bytes are a valid `xucred`, which the call fills.
+    let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // SAFETY: valid out-parameters of the given length.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERCRED,
+            (&mut cred as *mut libc::xucred).cast(),
+            &mut len,
+        )
+    };
+    let n = (cred.cr_ngroups.max(0) as usize).min(cred.cr_groups.len());
+    if r != 0 || n < 2 { Vec::new() } else { cred.cr_groups[1..n].to_vec() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_peer_groups(_fd: i32) -> Vec<u32> {
+    Vec::new()
 }
 
 /// The `ucred` of the process at the other end of Unix socket `fd`, as the

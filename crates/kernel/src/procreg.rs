@@ -61,6 +61,9 @@ pub struct ProcRecord {
     /// saved and filesystem user ids, then the same of groups): what its
     /// files in `/proc` are owned by.
     pub ids: [u32; 8],
+    /// Its supplementary groups (initial namespace ids): what
+    /// `SO_PEERGROUPS` and its `/proc/<pid>/status` give.
+    pub groups: Vec<u32>,
     /// Resource limits another process set for it with `prlimit`
     /// (resource, soft, hard), which it takes up at its next system call
     /// (it is woken to, [`crate::signote::limits_set`]).
@@ -337,6 +340,10 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     for id in r.ids {
         e.u32(id);
     }
+    e.u64(r.groups.len() as u64);
+    for &g in &r.groups {
+        e.u32(g);
+    }
     e.u64(r.limits.len() as u64);
     for &(res, soft, hard) in &r.limits {
         e.u32(res);
@@ -488,6 +495,8 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     for id in &mut ids {
         *id = d.u32();
     }
+    let n = d.count(4);
+    let groups = (0..n).map(|_| d.u32()).collect();
     let n = d.count(20);
     let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let nice = d.i32();
@@ -522,6 +531,7 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
         oom_score_adj,
         oom_score_adj_min,
         ids,
+        groups,
         limits,
         nice,
         sched,
@@ -783,7 +793,13 @@ fn fresh(pid: HostPid, start: u64) -> ProcRecord {
         autoreap: false,
         oom_score_adj: 0,
         oom_score_adj_min: 0,
-        ids: [0; 8],
+        // A process's first credentials, until it publishes its own: those
+        // fwe starts a program with.
+        ids: {
+            let c = crate::creds::Creds::default();
+            [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid]
+        },
+        groups: crate::creds::Creds::default().groups().to_vec(),
         limits: Vec::new(),
         // As the host started it (`nice fwe ...`).
         nice: crate::host::nice_of(pid),
@@ -943,6 +959,7 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 #[derive(Clone, Debug, Default)]
 pub struct Inherit {
     ids: [u32; 8],
+    groups: Vec<u32>,
     /// The child's security state: the forking process's, with the
     /// capabilities the child has (every one, in a new user namespace).
     pub sec: Security,
@@ -983,6 +1000,7 @@ fn inherit_of(r: &ProcRecord) -> Inherit {
     let slack = crate::thread::slack();
     Inherit {
         ids: r.ids,
+        groups: r.groups.clone(),
         sec: r.sec,
         oom: (r.oom_score_adj, r.oom_score_adj_min),
         nice,
@@ -998,6 +1016,10 @@ fn inherit_of(r: &ProcRecord) -> Inherit {
 pub fn save_inherit(e: &mut Enc, i: &Inherit) {
     for id in i.ids {
         e.u32(id);
+    }
+    e.u64(i.groups.len() as u64);
+    for &g in &i.groups {
+        e.u32(g);
     }
     e.i32(i.oom.0);
     e.i32(i.oom.1);
@@ -1024,6 +1046,8 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     for id in &mut ids {
         *id = d.u32();
     }
+    let n = d.count(4);
+    let groups = (0..n).map(|_| d.u32()).collect();
     let oom = (d.i32(), d.i32());
     let nice = d.i32();
     let sched = Sched::decode(d);
@@ -1034,12 +1058,13 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let n = d.count(20);
     let rlimits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let sec = Security::decode(d);
-    Inherit { ids, sec, oom, nice, sched, slack, foster, affinity, rlimits }
+    Inherit { ids, groups, sec, oom, nice, sched, slack, foster, affinity, rlimits }
 }
 
 /// Set `r`'s inherited part.
 fn apply(r: &mut ProcRecord, i: &Inherit) {
     r.ids = i.ids;
+    r.groups = i.groups.clone();
     (r.oom_score_adj, r.oom_score_adj_min) = i.oom;
     r.nice = i.nice;
     r.sched = i.sched;
@@ -1259,9 +1284,20 @@ pub fn kept_uid(pid: HostPid) -> Option<u32> {
     read_any(pid).map(|r| r.ids[0])
 }
 
-/// This process's ids are now `ids` ([`ProcRecord::ids`]).
-pub fn set_own_ids(ids: [u32; 8]) {
-    let _ = change(me(), |r| r.ids = ids);
+/// This process's ids are now `ids` ([`ProcRecord::ids`]), its
+/// supplementary groups `groups`.
+pub fn set_own_ids(ids: [u32; 8], groups: &[u32]) {
+    let _ = change(me(), |r| {
+        r.ids = ids;
+        if r.groups != groups {
+            r.groups = groups.to_vec();
+        }
+    });
+}
+
+/// Host process `pid`'s supplementary groups, if fwe has a record of it.
+pub fn groups(pid: HostPid) -> Option<Vec<u32>> {
+    read(pid).map(|r| r.groups)
 }
 
 /// Host process `pid`'s main thread's timer slack and its default.

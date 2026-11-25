@@ -565,7 +565,7 @@ pub fn entry(host: HostPid, pid: i32, sub: &[u8]) -> Entry {
         Creds {
             uids: [u(i[0]), u(i[1]), u(i[2]), u(i[3])],
             gids: [g(i[4]), g(i[5]), g(i[6]), g(i[7])],
-            groups: Vec::new(),
+            groups: rec.groups.iter().map(|&id| g(id)).collect(),
             caps: Some(crate::caps::Caps {
                 effective,
                 permitted,

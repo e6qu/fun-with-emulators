@@ -1315,6 +1315,7 @@ pub mod socket {
     pub const SO_LINGER: u64 = 13;
     pub const SO_PASSCRED: u64 = 16;
     pub const SO_PEERCRED: u64 = 17;
+    pub const SO_PEERGROUPS: u64 = 59;
     pub const SO_REUSEPORT: u64 = 15;
     pub const SO_RCVTIMEO: u64 = 20;
     pub const SO_SNDTIMEO: u64 = 21;

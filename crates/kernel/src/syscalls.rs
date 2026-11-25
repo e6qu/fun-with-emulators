@@ -1337,7 +1337,8 @@ impl<P: Platform> Kernel<P> {
                 None => return err(errno::EINVAL),
             }
         }
-        self.creds.setgroups(v)
+        let r = self.creds.setgroups(v);
+        self.ids_changed(r)
     }
 
     fn sys_dup3(&mut self, old: u64, new: u64, flags: u64) -> i64 {
@@ -2366,9 +2367,10 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn ids_changed(&self, r: i64) -> i64 {
         if r >= 0 {
             let c = &self.creds;
-            crate::procreg::set_own_ids([
-                c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
-            ]);
+            crate::procreg::set_own_ids(
+                [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid],
+                c.groups(),
+            );
         }
         r
     }

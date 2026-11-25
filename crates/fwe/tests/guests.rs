@@ -10975,6 +10975,19 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// `SO_PEERGROUPS` gives the peer's supplementary groups as D-Bus reads
+/// them, and another process's `status` lists its groups.
+#[test]
+fn peer_groups_and_another_processs_groups() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "peergroups",
+        &[],
+        "no room: -1 ERANGE, needed: the groups' size\npeer's groups: 0, getgroups' own: yes\n\
+         unconnected: -1 ENODATA\nTCP: -1 ENODATA\nchild's status lists the groups: yes\n",
+    );
+}
+
 /// rtnetlink dumps by family as Linux answers them: a family it has no
 /// handler for (`AF_PACKET`, as Firefox asks) gives every family's
 /// addresses and routes; neighbours, in a namespace of `lo` alone, none.

@@ -1353,7 +1353,11 @@ as the guest sees them
 ([Host identity](#host-identity-and-machine-state)). They are the peer's
 as they are when asked (Linux's are as they were at `connect` or
 `socketpair`). A socket with no peer process (not Unix, or netlink) gives
-pid 0 and ids -1.
+pid 0 and ids -1. **`SO_PEERGROUPS`** gives the same peer's supplementary
+groups, which each fwe process publishes in its record (a host process's
+from `LOCAL_PEERCRED`), `ERANGE` with the size needed for a buffer too
+small and `ENODATA` with no peer, as Linux does; the record also gives
+another process's `Groups:` in `/proc/<pid>/status`.
 
 **`SO_PASSCRED`, `SCM_CREDENTIALS`**: the host attaches no credentials to
 what is sent, so fwe does. Credentials a sender gives are checked as
