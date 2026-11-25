@@ -2211,12 +2211,6 @@ impl<P: Platform> Kernel<P> {
         if let Some(d) = r.store.clone().filter(|_| r.ovl.is_none()) {
             return self.store_mkdir(&r, &d, mode as u32);
         }
-        if let Err(e) = r.writable() {
-            return err(e);
-        }
-        if r.mount_root {
-            return err(errno::EEXIST);
-        }
         if let Err(e) = r.prepare(Change::Create) {
             return err(e);
         }
@@ -2541,6 +2535,11 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = made_not_dir(&new, &newpath) {
             return err(e);
         }
+        // A name there already, before another mount (as Linux's
+        // `filename_create` comes before its mount check).
+        if new.exists() {
+            return err(errno::EEXIST);
+        }
         if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
@@ -2552,9 +2551,6 @@ impl<P: Platform> Kernel<P> {
                 Ok((ino, _)) => ino,
                 Err(e) => return err(e),
             };
-            if new.mount_root {
-                return err(errno::EEXIST);
-            }
             return self.store_link(od.fs.id, ino, &new, nd, false);
         }
         if old.ovl.is_some() != new.ovl.is_some() {
@@ -2569,9 +2565,6 @@ impl<P: Platform> Kernel<P> {
         let (mut old, mut new) = (old, new);
         if let Err(e) = old.prepare(Change::Modify) {
             return err(e);
-        }
-        if new.mount_root {
-            return err(errno::EEXIST);
         }
         if let Err(e) = new.prepare(Change::Create) {
             return err(e);
@@ -4238,7 +4231,7 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        if new.mount_root {
+        if new.exists() {
             return err(errno::EEXIST);
         }
         // In an overlay whose upper layer is the file's filesystem.
@@ -4271,6 +4264,9 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        if new.exists() {
+            return err(errno::EEXIST);
+        }
         let old_mount = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
         if old_mount != new.mount_id && old_mount != 0 && new.mount_id != 0 {
             return err(errno::EXDEV);
@@ -4280,9 +4276,6 @@ impl<P: Platform> Kernel<P> {
             if let Err(e) = checked {
                 return err(e);
             }
-        }
-        if new.mount_root {
-            return err(errno::EEXIST);
         }
         if let Err(e) = new.prepare(Change::Create) {
             return err(e);
@@ -4650,7 +4643,6 @@ impl<P: Platform> Kernel<P> {
         if r.mount_root && !mount_root_ok {
             return Err(errno::EBUSY);
         }
-        r.writable()?;
         r.prepare(how)?;
         Ok(r)
     }

@@ -372,6 +372,15 @@ impl Resolved {
 
     /// The host's `lstat` of the name: as the lookup saw it, or looked at
     /// now.
+    /// Something is there under the name (a mount's root too).
+    pub fn exists(&self) -> bool {
+        self.mount_root
+            || match &self.ovl {
+                Some(o) => !matches!(o.found, overlay::Found::Missing),
+                None => self.lstat().is_some(),
+            }
+    }
+
     pub(crate) fn lstat(&self) -> Option<libc::stat> {
         if let Some(seen) = self.seen {
             return seen.ok();
@@ -398,6 +407,12 @@ impl Resolved {
     /// call acts. A call that makes a file calls [`finish`](Self::finish)
     /// once it has.
     pub fn prepare(&mut self, how: Change) -> Result<(), i32> {
+        // A name to make that is there already is `EEXIST` before a
+        // read-only mount's `EROFS`, as Linux's `filename_create` looks it
+        // up first.
+        if how == Change::Create && self.exists() {
+            return Err(errno::EEXIST);
+        }
         self.writable()?;
         // fwe's store makes and changes its files itself.
         if self.store.is_some() && self.ovl.is_none() {

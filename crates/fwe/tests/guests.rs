@@ -11014,6 +11014,39 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// Making a name that exists in or at a read-only mount is `EEXIST`
+/// before `EROFS`, as Linux reports it (bwrap binds a directory twice).
+#[test]
+fn making_an_existing_name_in_a_read_only_mount_is_eexist() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "mkexist",
+        &[],
+        "mkdirat of the root from its parent: EEXIST\n\
+         mkdir of the read-only mount's root: EEXIST\n\
+         mkdir of a directory in it: EEXIST\n\
+         mkdir of a file in it: EEXIST\n\
+         mkdir of a new name in it: EROFS\n\
+         mknod of a file in it: EEXIST\n\
+         mknod of a new name in it: EROFS\n\
+         symlink at a file in it: EEXIST\n\
+         symlink at a new name in it: EROFS\n\
+         link to a file in it: EEXIST\n\
+         link to a new name in it: EROFS\n\
+         in a tmpfs:\n\
+         mkdir of the read-only mount's root: EEXIST\n\
+         mkdir of a directory in it: EEXIST\n\
+         mkdir of a file in it: EEXIST\n\
+         mkdir of a new name in it: EROFS\n\
+         mknod of a file in it: EEXIST\n\
+         mknod of a new name in it: EROFS\n\
+         symlink at a file in it: EEXIST\n\
+         symlink at a new name in it: EROFS\n\
+         link to a file in it: EEXIST\n\
+         link to a new name in it: EROFS\n",
+    );
+}
+
 /// `SO_PASSCRED` at the end of a Unix socket's stream: a message carries
 /// credentials, the end none, as crashpad tells the end.
 #[test]
