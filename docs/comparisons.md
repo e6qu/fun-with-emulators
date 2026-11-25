@@ -46,11 +46,15 @@ the VM for the same userspace kernel.
 | WSL2 | natively, in one Linux VM | Linux | yes | no | shared into the VM |
 | QEMU (system) | emulated, or natively with KVM/HVF | Linux, in the emulated machine | yes | no | shared into the VM |
 | Noah | natively, in a VM per process | a userspace kernel, on VM exits | no | yes | directly |
-| gVisor | natively | its userspace kernel (the Sentry) | no (on a Linux host) | yes | through its Gofer |
+| gVisor | natively | its userspace kernel (the Sentry) | no (on a Linux host) | one per address space; the Sentry's tasks are goroutines | through its Gofer, or the Sentry's own `*at` calls |
+| Gramine | natively | a library OS in the process, under a patched C library | no | yes | the mounts its manifest names |
+| User-Mode Linux | natively, under ptrace or seccomp | Linux itself, built to run as host processes | yes | per address space | its own file systems, `hostfs` |
+| illumos lx zones | natively | a Linux brand in the illumos kernel, with a user-space library for the rest | no | yes | the zone's own |
 | QEMU user mode | translated as it runs | the host Linux kernel, through a thin layer | host's | yes | directly |
 | DynamoRIO | copied into a code cache as it runs | the host kernel | host's | yes | directly |
 | FEX, Box64 | translated as it runs | the host Linux kernel | host's | yes | directly |
-| FreeBSD Linuxulator | natively | a Linux personality in FreeBSD's kernel | no | yes | directly, `/compat/linux` first |
+| FreeBSD Linuxulator, NetBSD `compat_linux` | natively | a Linux personality in the BSD kernel | no | yes | directly, `/compat/linux` (`/emul/linux`) first |
+| Darling (the reverse: macOS programs on Linux) | natively | a macOS C library over Linux's calls, and a server for Mach's | — (macOS) | yes | in a Linux container of its own |
 | Homebrew, Nix | rebuilt for macOS | macOS | — | yes | directly |
 | Rosetta 2 | translated ahead of time, and as it runs | macOS (it changes the CPU, not the OS) | — | yes | directly |
 
@@ -165,11 +169,15 @@ gVisor is a Linux kernel written in Go, the Sentry, that runs Linux
 programs on Linux hosts as a security sandbox: their system calls go to
 the Sentry instead of the host kernel, which they reach only through a
 small set of the Sentry's own calls, and files through a separate
-process (the Gofer). Its "platforms" divert the calls: `ptrace`, KVM (the
-program runs in a VM, as in fwe's VM backend), and `systrap`, which uses
-seccomp to catch the first call at each site and then patches the
-`syscall` instruction into a jump to a stub, as fwe's native backend
-rewrites `svc` into a branch to its gate.
+process (the Gofer), or with the Sentry's own descriptor-relative calls
+on the mounts the Gofer hands it (directfs). Its "platforms" divert the
+calls: KVM (the program runs in a VM, as in fwe's VM backend, the Sentry
+acting as its guest kernel and its VMM), and `systrap`, the default,
+which uses seccomp to turn each call into a `SIGSYS` its stub hands to
+the Sentry and, on x86-64 only, patches the `syscall` sequence into a
+jump to a trampoline, as fwe's native backend rewrites `svc` into a
+branch to its gate. On arm64 every call takes the signal. The older
+`ptrace` platform is no longer supported.
 
 **How fwe differs.** gVisor's purpose is isolation on a Linux host, so it
 keeps the program away from the host kernel and its memory. fwe's
@@ -179,6 +187,51 @@ hostile program (see
 [Isolation and security](linux-on-macos.md#isolation-and-security)).
 The two compose: `runsc` is a Linux program, and running it on fwe, its
 `systrap` platform included, is a 1.0 goal (M7).
+
+### User-Mode Linux and LKL
+
+User-Mode Linux is Linux itself ported to run as host processes (the
+`um` architecture): the guest's programs run in host processes it traces
+with ptrace's `PTRACE_SYSEMU`, or since 2025 under a seccomp filter of a
+stub's, and every system call is Linux's own code. It boots a
+distribution, whose init is its process 1. LKL builds Linux as a library
+an application links and calls, with no guest processes at all.
+
+**How fwe differs.** Both get Linux's behaviour exactly by running
+Linux's code, at the price of running a second kernel with its own
+memory management and scheduler over the host's. fwe's processes,
+threads, memory and files are the host's own, with Linux's semantics
+added where they differ.
+
+### Gramine
+
+Gramine (formerly Graphene) is a library OS: a Linux kernel interface
+inside each process, reached through a patched glibc or musl (or seccomp
+trapping a raw `syscall`), over a narrow host interface; its main use is
+running Linux programs in Intel SGX enclaves. Each guest process is a
+host process; `fork` sends a checkpoint of the process to a new one, the
+first process hands out the virtual pids, and the files a program sees
+are the mounts its manifest declares. Shared futexes, System V shared
+memory and `unshare` are not implemented.
+
+**How fwe differs.** fwe needs no patched C library: it catches the
+`svc` instruction itself, so static programs, Go's and any raw system
+call work. Its kernel state shared between processes (futexes, System V
+IPC, namespaces) is in memory they all map, not handed around by
+messages.
+
+### Darling: the reverse direction
+
+Darling runs macOS programs on Linux. Its own `libsystem_kernel` turns
+BSD calls into Linux's, and Mach traps become messages to
+`darlingserver`, a user-space server built from XNU's source (it
+replaced a Linux kernel module in 2022). A macOS program's raw system
+call, made without the library, fails. Its programs run in a Linux
+container whose process 1 is macOS's `launchd`.
+
+**How fwe differs.** macOS's stable interface is its C library, as
+Windows' is its DLLs, so Darling intercepts there, as Wine does; Linux's
+is the instruction, so fwe intercepts there.
 
 ## Translating or instrumenting code
 
@@ -255,9 +308,13 @@ kernel that translate arguments, structures, errno values and signals to
 FreeBSD's implementation. A Linux userland is installed under
 `/compat/linux`, which path lookups try first, so a Linux program finds
 its `ld.so` and libraries there; `linprocfs` and `linsysfs` provide
-`/proc` and `/sys`. NetBSD's `compat_linux` works the same way; OpenBSD
-removed its version in 2014; illumos had the same idea as "lx" branded
-zones.
+`/proc` and `/sys`. Linux threads are FreeBSD threads, and services
+are FreeBSD's: its init and `rc` stay process 1. Namespaces are not
+emulated (`unshare` and `setns` are stubs); jails isolate instead.
+
+NetBSD's `compat_linux` works the same way, on aarch64 too, its Linux
+tree under `/emul/linux`. OpenBSD removed its i386-only version in
+OpenBSD 6.0 (2016), unmaintained and little used.
 
 **How fwe differs.** fwe is this design moved out of the kernel, because
 macOS does not let a program add a system-call table (kernel extensions
@@ -274,6 +331,22 @@ fwe builds:
 | `/proc`, `/sys` | `linprocfs`, `linsysfs` | fwe's synthetic files |
 | containers | Linux's namespaces largely absent | namespaces, cgroups and mounts of fwe's own |
 
+### illumos lx branded zones
+
+illumos runs a Linux distribution in a zone with the lx brand: a Linux
+call traps into the illumos kernel, whose brand module serves what it
+can and sends the rest back out to a user-space library in the process,
+on a stack of its own. The brand has its own `/proc`, `/sys` and
+cgroups, and the zone is the container (Joyent's Docker service ran
+images as lx zones). Its `lxinit` sets up the zone and then runs the
+distribution's own `/sbin/init`, systemd included, telling it that it is
+in a container. Sun added lx in 2006 and removed it in 2010; Joyent
+revived it in 2014, and it is maintained; it runs x86 programs.
+
+**For fwe.** lx is the nearest design to fwe's: a Linux personality with
+containers built in, part of it in user space. fwe puts all of it in user
+space, and runs no Linux init (see [init and services](#init-and-services)).
+
 ## Rebuilding for macOS: Homebrew and Nix
 
 Homebrew and Nix build programs for macOS from source (or install builds
@@ -289,6 +362,143 @@ Linux packages on a Mac with a Linux VM (its `linux-builder`).
 Homebrew's builds are also what fwe's benchmarks compare against, and how
 fwe is installed (`Formula/fwe.rb`).
 
+## A Linux kernel outside Linux, part by part
+
+How the systems that answer Linux's system calls without Linux's kernel
+do each part of a kernel's job: fwe; gVisor; WSL1; the BSDs' Linux
+personalities (FreeBSD's Linuxulator, NetBSD's `compat_linux`); illumos's
+lx zones; Noah; Gramine. Wine and Darling appear where they show another
+way. fwe's side is detailed in [linux-on-macos.md](linux-on-macos.md) and
+[architecture.md](architecture.md).
+
+### Where the kernel is, and how a call reaches it
+
+| | Where the Linux kernel's code is | How a system call reaches it |
+|---|---|---|
+| fwe | a library in each guest's own host process; what processes share, in memory they all map | `svc` rewritten into a branch to fwe's gate, or a trap where it cannot be rewritten; in the VM, a VM exit |
+| gVisor | the Sentry, a separate Go process | systrap: seccomp's `SIGSYS`, the site patched into a jump on x86-64; KVM: a VM exit |
+| WSL1 | `lxcore.sys`, in the NT kernel | NT passes a pico process's calls to it |
+| Linuxulator, NetBSD | the BSD kernel | the trap, through a second system-call table chosen at `execve` |
+| illumos lx | the illumos kernel, and a library in the process | the trap; what the kernel does not serve goes back out to the library |
+| Noah | a macOS process per guest process | a VM exit (`syscall` left disabled, so it faults) |
+| Gramine | a library OS in the process | a call from a patched C library, or seccomp trapping a raw `syscall` |
+| Wine, Darling | libraries in the process, and a server process | a function call into the replaced system library |
+
+### Processes, threads and fork
+
+| | A process, a thread | `fork` | Pids |
+|---|---|---|---|
+| fwe | a host process, a host thread | the host's `fork`, fwe's state copied; in the VM a new fwe process sent the parent's memory | the host's; numbered from 1 in a pid namespace of fwe's |
+| gVisor | a goroutine of the Sentry per task, a stub process per address space | the Sentry copies the address space, copy-on-write | the Sentry's |
+| WSL1 | an NT process and thread | NT's own, extended for WSL | lxcore's |
+| Linuxulator, NetBSD | a BSD process and thread (an LWP) | the BSD kernel's | the BSD kernel's |
+| illumos lx | an illumos process and LWP | the kernel's | the kernel's |
+| Noah | a macOS process, a vCPU on a host thread | the VM torn down, the host's `fork`, the VM rebuilt in both (not with threads) | the host's |
+| Gramine | a host process (an enclave under SGX) | a checkpoint sent to a new process | virtual, handed out by the first process |
+
+### Signals and memory
+
+| | Signals | Memory |
+|---|---|---|
+| fwe | fwe's handlers record them and build Linux's frame; signals macOS lacks go through mailboxes of fwe's | the host's `mmap` at the guest's addresses (16 KiB pages); in the VM, stage-1 page tables of fwe's (4 KiB) |
+| gVisor | the Sentry's own queues and frames | the Sentry's own VMAs over a memory file mapped into the stubs |
+| WSL1 | lxcore | NT's memory manager, given 4 KiB granularity for pico processes |
+| Linuxulator, NetBSD | numbers translated, Linux's frame built by the kernel | the BSD kernel's, flags translated |
+| illumos lx | every signal first to the library, on its own stack | the kernel's |
+| Noah | host handlers set a bit; the frame is built before the next VM entry | identity-mapped guest tables, `hv_vm_map` per call |
+| Gramine | the library OS builds the frame; host signals ignored but `SIGTERM` | host mappings; `mprotect` ignored under SGX without EDMM |
+
+### Files, `/proc` and `/sys`
+
+| | The guest's files | `/proc`, `/sys` |
+|---|---|---|
+| fwe | the host's files, the root (`--root`) the whole view, through fwe's mount tables per namespace; owners and modes the host cannot hold kept in extended attributes; tmpfs, `/dev/shm` and memfds in a store of fwe's in shared memory | fwe's own |
+| gVisor | its own VFS: host files through the Gofer or directfs, a writable overlay over the root | the Sentry's own |
+| WSL1 | its own VFS: VolFs keeps Linux's metadata in NTFS extended attributes; DrvFs for Windows' drives | lxcore's own |
+| Linuxulator, NetBSD | the host's VFS, `/compat/linux` (`/emul/linux`) tried first | `linprocfs` and `linsysfs`; NetBSD's procfs in Linux's form |
+| illumos lx | the zone's own root | the brand's own |
+| Noah | its own resolver: `/Users`, `/dev` and `/tmp` the host's, the rest under `~/.noah/tree` | none |
+| Gramine | the mounts the manifest declares, fixed; `chown` does nothing | a few files |
+
+### Sharing between processes, namespaces and cgroups
+
+| | Futexes, System V IPC | Namespaces, cgroups, containers |
+|---|---|---|
+| fwe | shared futexes and semaphores on macOS's `__ulock` calls, System V and POSIX objects in shared records | every namespace but time's; cgroup v2's tree, freezing, killing, delegation and `pids.max` enforced, other controllers' limits kept but not enforced; Podman, Docker, containerd and runc run |
+| gVisor | its own | most namespaces, cgroupfs and cgroup2fs; it is itself a container runtime (`runsc`), and Docker runs inside it |
+| WSL1 | lxcore's own, built release by release | mount namespaces only |
+| Linuxulator, NetBSD | translated to the BSD kernel's | none (stubs); jails instead |
+| illumos lx | the kernel's, with epoll and inotify added | the zone is the container; cgroups emulated |
+| Noah | macOS's System V objects; futexes within a process only | none |
+| Gramine | private futexes only; no System V shared memory | none |
+
+### Init and services
+
+| | Process 1 | An orphan goes to | Services |
+|---|---|---|---|
+| fwe | the host's `launchd`, or a pid namespace's first process | Linux's adopter (subreaper or namespace init), else `launchd` | `launchd` jobs running `fwe`; no Linux init ([linux-on-macos.md](linux-on-macos.md#init-orphans-and-daemons)) |
+| gVisor | the container's entrypoint | Linux's adopter, by the Sentry's rules | the container's |
+| WSL1 | Microsoft's own `/init` | `/init` | none: no systemd (WSL2, a real Linux kernel, added it in 2022) |
+| Linuxulator, NetBSD | the BSD's `init` | the BSD's `init` | the BSD's `rc` |
+| illumos lx | the distribution's own `/sbin/init`, systemd included | that init | the distribution's |
+| Noah | none | the host's `launchd` | none |
+| Gramine | the entrypoint | the host, which reaps them | none |
+| Darling | macOS's `launchd`, in a Linux pid namespace | `launchd` | macOS's daemons, started by `launchd` |
+
+### Isolation, language and state
+
+| | Isolation | Language, size | State |
+|---|---|---|---|
+| fwe | none by design: the native backend shares fwe's address space ([Isolation and security](linux-on-macos.md#isolation-and-security)) | Rust, about 4.9 MB of kernel crate source | active |
+| gVisor | a sandbox: the Sentry itself under seccomp, no call passed through | Go, about 7.3 MB in `pkg/sentry` | active |
+| WSL1 | the NT kernel's; lxcore in ring 0 | C, closed (left out when WSL was opened in 2025) | superseded by WSL2 |
+| Linuxulator, NetBSD | the BSD kernel's; jails | C, about 1.8 MB (FreeBSD) | active; FreeBSD's arm64 since 12.0, NetBSD's since 10 |
+| illumos lx | zones | C | active, x86 |
+| Noah | none | C, about 0.5 MB | archived in 2020 |
+| Gramine | against a hostile host, under SGX | C, about 3.2 MB | active |
+
+In-kernel personalities have tended to end or close: OpenBSD dropped its
+own in 2016, Sun dropped lx in 2010, and WSL1's lxcore stayed closed
+when WSL was opened. The user-space designs (gVisor, Wine, Gramine,
+User-Mode Linux, Darling, which moved its kernel module to a user-space
+server) are all maintained.
+
+### Sources
+
+Each as read on 2026-11-25 (sizes are bytes of source, counted then).
+
+- gVisor: [platforms](https://gvisor.dev/docs/architecture_guide/platforms/),
+  [systrap](https://gvisor.dev/blog/2023/04/28/systrap-release/),
+  [directfs](https://gvisor.dev/blog/2023/06/27/directfs/),
+  [security](https://gvisor.dev/docs/architecture_guide/security/),
+  [system calls](https://gvisor.dev/docs/user_guide/compatibility/linux/amd64/),
+  [`task_exit.go`](https://github.com/google/gvisor/blob/master/pkg/sentry/kernel/task_exit.go).
+- WSL1: [pico processes](https://learn.microsoft.com/en-us/archive/blogs/wsl/pico-process-overview),
+  [system calls](https://learn.microsoft.com/en-us/archive/blogs/wsl/wsl-system-calls),
+  [file systems](https://learn.microsoft.com/en-us/archive/blogs/wsl/wsl-file-system-support),
+  [release notes](https://learn.microsoft.com/en-us/windows/wsl/release-notes),
+  [systemd in WSL2](https://devblogs.microsoft.com/commandline/systemd-support-is-now-available-in-wsl/),
+  [WSL opened](https://blogs.windows.com/windowsdeveloper/2025/05/19/the-windows-subsystem-for-linux-is-now-open-source/).
+- FreeBSD: [linux(4)](https://man.freebsd.org/cgi/man.cgi?query=linux&sektion=4),
+  [Linux emulation](https://docs.freebsd.org/en/articles/linux-emulation/),
+  [`linux_dummy.c`](https://cgit.freebsd.org/src/plain/sys/compat/linux/linux_dummy.c),
+  [1:1 threads](https://reviews.freebsd.org/rS283383).
+  NetBSD: [compat_linux(8)](https://man.netbsd.org/compat_linux.8).
+  OpenBSD: [6.0](https://www.openbsd.org/60.html).
+- illumos lx: [lx(7)](https://smartos.org/man/7/lx),
+  [`lx_brand.c`](https://github.com/TritonDataCenter/illumos-joyent/blob/master/usr/src/uts/common/brand/lx/os/lx_brand.c),
+  [`lxinit.c`](https://github.com/TritonDataCenter/illumos-joyent/blob/master/usr/src/lib/brand/lx/lx_init/lxinit.c).
+- Noah: [source](https://github.com/linux-noah/noah).
+  Gramine: [features](https://gramine.readthedocs.io/en/stable/devel/features.html),
+  [Graphene (EuroSys 2014)](https://www.cs.unc.edu/~porter/pubs/tsai14graphene.pdf).
+- User-Mode Linux: [the kernel's guide](https://docs.kernel.org/virt/uml/user_mode_linux_howto_v2.html).
+  LKL: [source](https://github.com/lkl/linux).
+- Wine: [`signal_arm64.c`](https://github.com/wine-mirror/wine/blob/master/dlls/ntdll/unix/signal_arm64.c),
+  [wineserver(1)](https://man.archlinux.org/man/wineserver.1.en).
+  Darling: [system calls](https://docs.darlinghq.org/internals/basics/system-call-emulation.html),
+  [darlingserver](https://docs.darlinghq.org/internals/darlingserver/index.html),
+  [containers](https://docs.darlinghq.org/internals/basics/containerization.html).
+
 ## What fwe takes from each
 
 - From **Wine** and **WSL1**: native execution in-process, one host
@@ -296,6 +506,8 @@ fwe is installed (`Formula/fwe.rb`).
   one of them.
 - From **FreeBSD's Linuxulator**: a Linux personality over the host's own
   services, and a separate Linux userland as the program's view.
+- From **illumos's lx zones**: containers as part of the personality,
+  with their own `/proc`, `/sys` and cgroups.
 - From **gVisor**: a Linux kernel as an ordinary program, and diverting
   system calls by patching the instruction into a jump.
 - From **Noah** and **KVM** users: a VM with no kernel for what cannot run
