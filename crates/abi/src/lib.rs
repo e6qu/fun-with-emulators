@@ -298,6 +298,8 @@ pub mod rwf {
     pub const SYNC: u64 = 0x04;
     pub const NOWAIT: u64 = 0x08;
     pub const APPEND: u64 = 0x10;
+    /// Not at the end, for a descriptor opened to append (Linux 6.9).
+    pub const NOAPPEND: u64 = 0x20;
 }
 
 pub mod fcntl {

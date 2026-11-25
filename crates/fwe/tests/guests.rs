@@ -10975,6 +10975,22 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// Writes to a file opened to append go where Linux puts them: at the end
+/// for `pwrite` and an AIO write at an offset, at the offset (or the
+/// file's position) for `RWF_NOAPPEND`, which musl's `pwrite` uses.
+#[test]
+fn appending_writes_and_rwf_noappend() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "noappend",
+        &[],
+        "pwrite at 0: aaaa (position 0)\npwritev2 at 1, RWF_NOAPPEND: 2\nthen: aXYa (position 0)\n\
+         pwritev2 at the position, RWF_NOAPPEND: 1\nthen: ZXYa (position 1)\n\
+         pwritev2 at 0: 1\nthen: ZXYab (position 1)\nAIO at 0: 1\nthen: ZXYabc (position 1)\n\
+         AIO at 2, RWF_NOAPPEND: 1\nthen: ZXDabc (position 1)\n",
+    );
+}
+
 /// A socket passed with `SCM_RIGHTS` and closed by its sender keeps the
 /// data written into it until its receiver takes it, whatever happens
 /// meanwhile: macOS empties such a socket when any Unix socket goes away

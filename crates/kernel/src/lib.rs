@@ -2000,7 +2000,8 @@ fn vectored_at(
         Ok(v) => v,
         Err(e) => return err(e),
     };
-    if flags & !(rwf::HIPRI | rwf::DSYNC | rwf::SYNC | rwf::NOWAIT | rwf::APPEND) != 0
+    if flags & !(rwf::HIPRI | rwf::DSYNC | rwf::SYNC | rwf::NOWAIT | rwf::APPEND | rwf::NOAPPEND)
+        != 0
         || (flags & rwf::APPEND != 0 && !write)
     {
         return err(errno::EOPNOTSUPP);
@@ -2023,12 +2024,26 @@ fn vectored_at(
             return err(errno::EAGAIN);
         }
     }
-    let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
-    let n = iov.len() as i32;
     // Linux appends to a file opened to append whatever the offset, as
-    // its `pwrite` does.
+    // its `pwrite` does, unless the call says `RWF_NOAPPEND` (`RWF_APPEND`
+    // wins over it).
+    let opened_to_append = status & libc::O_APPEND != 0;
+    let appends = write && opened_to_append && kind == libc::S_IFREG && flags & rwf::NOAPPEND == 0;
+    let n = iov.len() as i32;
     let r = if flags & rwf::APPEND != 0 || appends {
         append_vectored(fd, &iov, offset)
+    } else if write && opened_to_append && offset == -1 {
+        // At the file's position, which the host's `O_APPEND` would pass
+        // over: written there, and the position moved past it.
+        // SAFETY: plain host calls; the iovecs are checked host buffers.
+        unsafe {
+            let at = libc::lseek(fd, 0, libc::SEEK_CUR);
+            let r = if at < 0 { -1 } else { libc::pwritev(fd, iov.as_ptr(), n, at) };
+            if r > 0 {
+                libc::lseek(fd, at + r as libc::off_t, libc::SEEK_SET);
+            }
+            r
+        }
     } else if offset == -1 {
         // SAFETY: the iovecs are checked host buffers.
         unsafe {

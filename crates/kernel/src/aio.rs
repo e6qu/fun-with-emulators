@@ -34,6 +34,7 @@ const RWF_DSYNC: u32 = 0x2;
 const RWF_SYNC: u32 = 0x4;
 const RWF_NOWAIT: u32 = 0x8;
 const RWF_APPEND: u32 = 0x10;
+const RWF_NOAPPEND: u32 = 0x20;
 
 /// `struct iocb` and `struct io_event`.
 const IOCB_SIZE: usize = 64;
@@ -181,7 +182,17 @@ fn transfer(fd: i32, write: bool, buf: u64, len: u64, offset: i64, flags: u32) -
     transfer_vec(fd, write, &[io], offset, flags)
 }
 
+/// A request's transfer at `offset`: a write to a descriptor opened to
+/// append goes at the end, as Linux's does, unless it says `RWF_NOAPPEND`.
 fn transfer_vec(fd: i32, write: bool, iov: &[libc::iovec], offset: i64, flags: u32) -> i64 {
+    let flags = if write
+        && flags & RWF_NOAPPEND == 0
+        && open_flags(fd).is_ok_and(|f| f & libc::O_APPEND != 0)
+    {
+        flags | RWF_APPEND
+    } else {
+        flags
+    };
     let is_stream = stream(fd);
     let n = iov.len() as libc::c_int;
     let want = if write { libc::POLLOUT } else { libc::POLLIN };
@@ -195,8 +206,13 @@ fn transfer_vec(fd: i32, write: bool, iov: &[libc::iovec], offset: i64, flags: u
             (true, true) => libc::writev(fd, iov.as_ptr(), n),
             (false, false) => libc::preadv(fd, iov.as_ptr(), n, offset),
             (true, false) if flags & RWF_APPEND != 0 => {
-                let end = libc::lseek(fd, 0, libc::SEEK_END);
-                libc::pwritev(fd, iov.as_ptr(), n, end)
+                // At the end, the file's position left where it is.
+                let mut st: libc::stat = std::mem::zeroed();
+                if libc::fstat(fd, &mut st) != 0 {
+                    -1
+                } else {
+                    libc::pwritev(fd, iov.as_ptr(), n, st.st_size)
+                }
             }
             (true, false) => libc::pwritev(fd, iov.as_ptr(), n, offset),
         }
