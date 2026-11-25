@@ -11420,6 +11420,10 @@ fn debian_display_zed_edits_a_file_on_the_gpu() {
 /// and makes `output` there. Built once and kept in `target/built-apps`
 /// by the hash of its sources and that manifest (CI caches it); the path
 /// of the program made.
+/// The longest an app's build under fwe ([`built_app`]) takes: Cargo
+/// building Tauri's crates, natively some minutes on CI's runners.
+const APP_BUILD_LIMIT: Duration = Duration::from_secs(40 * 60);
+
 fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
     static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
@@ -11464,7 +11468,12 @@ fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
     std::fs::create_dir_all(scratch.0.join("src")).unwrap();
     run_checked(Command::new("cp").arg("-R").arg(&src).arg(scratch.0.join("src").join(app)));
     let began = Instant::now();
-    let out = Command::new(env!("CARGO_BIN_EXE_fwe"))
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    // Its failed calls kept with the display tests' files; at the limit,
+    // its processes are listed and sampled ([`run_bounded_for`]).
+    let trace = display_dir().join(format!("build-{app}.trace"));
+    cmd.arg("--strace=failures")
+        .arg(format!("--strace-file={}", trace.display()))
         .arg("--root")
         .arg(&scratch.0)
         .arg(scratch.0.join("bin/busybox"))
@@ -11472,9 +11481,8 @@ fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
         .env_clear()
         .env("PATH", "/usr/bin:/bin")
         .env("HOME", "/root")
-        .env("LANG", "C.UTF-8")
-        .output_alone()
-        .unwrap();
+        .env("LANG", "C.UTF-8");
+    let out = run_bounded_for(cmd, &[], APP_BUILD_LIMIT);
     let tail = |b: &[u8]| {
         let t = String::from_utf8_lossy(b).into_owned();
         t[t.len().saturating_sub(8_000)..].to_string()
