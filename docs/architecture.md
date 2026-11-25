@@ -1550,7 +1550,13 @@ How a Linux program's display and GPU map onto the Mac's is in
   - **A fork child** never calls the driver (macOS's libraries do not work
     in a fork child): its copies of its parent's opens fail with
     `ENODEV`, and its own opens are refused while the driver is in its
-    memory; an `execve` gives it a device. In the VM backend there is no
+    memory; an `execve` gives it a device, in a fresh fwe if its parent
+    had the driver. A program started in place in the child of a parent
+    without the driver (Chromium's GPU process) loads it there: fwe's
+    executable carries the Objective-C runtime's mark that classes'
+    `+initialize` is safe in a fork child (`__DATA,__objc_fork_ok`, in
+    `crates/fwe/src/main.rs`), which the runtime otherwise refuses in the
+    child of any process that had threads. In the VM backend there is no
     device.
 
 ## Containers

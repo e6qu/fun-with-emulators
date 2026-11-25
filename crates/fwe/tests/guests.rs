@@ -10572,6 +10572,24 @@ fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
     display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &FWE_VULKAN, 120);
 }
 
+/// A program a threaded process's fork child starts in place (as Chromium
+/// starts its GPU process) finds the Mac's GPU through fwe's driver: the
+/// Mac's driver, whose Objective-C classes initialize as it starts, runs
+/// in a fork child of a process that had threads (guests/c/threadfork.c).
+#[test]
+fn alpine_display_a_threaded_programs_fork_child_execs_onto_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("threadfork");
+    let prog = build_c("threadfork", Libc::Musl, true, true);
+    std::fs::copy(&prog, root.0.join("usr/bin/threadfork")).unwrap();
+    let args = ["/usr/bin/threadfork", "/usr/bin/vulkaninfo", "--summary"];
+    let info = display_output(&x, "threadfork", &root, &args, &FWE_VULKAN, 120);
+    let device =
+        info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
+    assert!(device.contains("Apple"), "the device is not the GPU:\n{info}");
+    assert!(info.ends_with("child: exit 0\n"), "{info}");
+}
+
 /// vkcube draws its cube with Vulkan on the Mac's GPU (fwe's driver, its
 /// commands run by the Mac's), and it turns.
 #[test]
