@@ -1447,7 +1447,10 @@ How a Linux program's display and GPU map onto the Mac's is in
     directory fwe answers itself where a Mac Vulkan driver is installed
     (`vulkan/files.rs`), so a program's own Vulkan loader finds it beside
     the root's drivers. It exports the loader's interface (version 5 to
-    7) and nothing else. Every command is a stub that packs its arguments
+    7) and nothing else, and is linked to bind to itself (`-Bsymbolic`),
+    so the loader's functions of the same names, in the process's global
+    scope when a program links the loader, never stand in for its own.
+    Every command is a stub that packs its arguments
     into 64-bit words and makes one ioctl on `/dev/fwe-gpu` (char 10:241,
     mode 0666).
   - **Generated calls:** the stubs, and fwe's typed calls of the Mac

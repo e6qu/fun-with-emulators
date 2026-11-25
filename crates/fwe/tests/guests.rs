@@ -10607,6 +10607,33 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
 }
 
+/// A program with the Vulkan loader among its libraries, as WebKitGTK's
+/// and Mesa's are (the loader's `vkGetDeviceProcAddr` in the global
+/// scope): a device made through fwe's driver gives its queue, the
+/// driver's functions its own.
+#[test]
+fn alpine_display_vulkan_through_a_loader_in_the_global_scope() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    let Some(driver) = mock_vulkan_driver() else { return };
+    let root = alpine_root("display");
+    let prog = build_c_dynamic("vkglobal", Libc::Musl, true);
+    let inside = root.join("tmp/vkglobal");
+    std::fs::copy(&prog, &inside).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_file(&inside);
+    assert_eq!(
+        stdout(&out),
+        "instance: 0\nphysical device: found\ndevice: 0\nqueue: taken\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
 /// A fork child of a process using the GPU device: its copy of the
 /// parent's open and an open of its own fail (the Mac's driver in its
 /// memory is the parent's), an `execve` makes it a process with a device
