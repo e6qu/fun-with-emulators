@@ -329,9 +329,12 @@ def backends(cmd, fresh=()):
 def x_server(xvfb):
     """A headless X server (`xvfb`, an Xvfb) for the X benchmarks, at a
     display of its own on its Unix socket only: `DISPLAY` names it to every
-    program run here. Stopped when this ends."""
+    program run here. Stopped when this ends. Never reset (`-noreset`): a
+    reset as the last client goes would close connections being made and
+    compile its keymap again, inside a measurement."""
     n = 57
-    p = subprocess.Popen([xvfb, f":{n}", "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+    p = subprocess.Popen([xvfb, f":{n}", "-screen", "0", "1024x768x24", "-nolisten", "tcp",
+                          "-noreset"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     atexit.register(lambda: (p.terminate(), p.wait()))
     deadline = time.monotonic() + 30
@@ -400,7 +403,7 @@ def gears_fwe(a, fwe, guest_env):
     err = tempfile.TemporaryFile()
     xvfb = subprocess.Popen(
         in_root + [os.path.join(root, "usr/bin/Xvfb"), f":{GEARS_DISPLAY}",
-                   "-screen", "0", "1024x768x24", "-nolisten", "tcp"],
+                   "-screen", "0", "1024x768x24", "-nolisten", "tcp", "-noreset"],
         stdout=subprocess.DEVNULL, stderr=err)
     try:
         deadline = time.monotonic() + 120
@@ -648,7 +651,7 @@ def linux(a):
                      # Mesa as the root fwe runs it in has it: 3.25's.
                      "apk add -q -X https://dl-cdn.alpinelinux.org/alpine/v3.25/main"
                      " xvfb font-misc-misc mesa-utils mesa-dri-gallium"
-                     f" && (Xvfb :{GEARS_DISPLAY} -screen 0 1024x768x24 -nolisten tcp"
+                     f" && (Xvfb :{GEARS_DISPLAY} -screen 0 1024x768x24 -nolisten tcp -noreset"
                      " >/dev/null 2>&1 &)"
                      f" && while [ ! -e {sock} ]; do sleep 0.1; done && {GEARS_CMD}"]
                 )

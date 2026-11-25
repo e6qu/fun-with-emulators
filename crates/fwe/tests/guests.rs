@@ -9808,7 +9808,9 @@ impl Xvfb {
         let err = display_dir().join(format!("xvfb-{number}.err"));
         let child = Command::new(xvfb)
             // `-audit 4`: each client the server takes or refuses, and why,
-            // in its log.
+            // in its log. `-noreset`: no reset as the last client goes (a
+            // tool's look at the display, say), which would close the
+            // connections being made then (Xserver(1)).
             .args([
                 &format!(":{number}"),
                 "-screen",
@@ -9816,6 +9818,7 @@ impl Xvfb {
                 "1024x768x24",
                 "-nolisten",
                 "tcp",
+                "-noreset",
                 "-audit",
                 "4",
             ])
@@ -9855,7 +9858,16 @@ impl Xvfb {
             .arg("--root")
             .arg(&root.0)
             .arg(root.0.join("usr/bin/Xvfb"))
-            .args([&format!(":{number}"), "-screen", "0", "1024x768x24", "-listen", "tcp", "-ac"])
+            .args([
+                &format!(":{number}"),
+                "-screen",
+                "0",
+                "1024x768x24",
+                "-listen",
+                "tcp",
+                "-ac",
+                "-noreset",
+            ])
             .env_clear()
             .env("HOME", "/root")
             .env("PATH", "/usr/bin:/bin")
