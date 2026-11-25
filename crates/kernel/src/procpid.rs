@@ -107,7 +107,13 @@ pub fn host_info(pid: HostPid) -> Option<HostInfo> {
             nice: crate::procreg::nice(pid),
             threads: if have_task { t.pti_threadnum as u64 } else { 1 },
             rss_bytes: if have_task { t.pti_resident_size } else { 0 },
-            vsize: if have_task { t.pti_virtual_size } else { 0 },
+            // A process of fwe's maps what its guest mapped, as Linux
+            // counts it; the host's count holds fwe's reservations too.
+            vsize: crate::maps::mapped_bytes(pid).unwrap_or(if have_task {
+                t.pti_virtual_size
+            } else {
+                0
+            }),
             utime: if have_task { ns_to_ticks(mach_to_ns(t.pti_total_user)) } else { 0 },
             stime: if have_task { ns_to_ticks(mach_to_ns(t.pti_total_system)) } else { 0 },
             start: ticks_since_boot(started),
@@ -364,9 +370,10 @@ pub fn limits(limits: &[(u64, u64)]) -> Vec<u8> {
     out.into_bytes()
 }
 
-/// `/proc/<pid>/statm` of host process `host`, in pages: its size and
-/// resident set as the host has them (`/proc/<pid>/status` reports the
-/// same); the shared, text and data counts are not kept (0).
+/// `/proc/<pid>/statm` of host process `host`, in pages: its size (what
+/// its guest mapped) and resident set (the host's count)
+/// (`/proc/<pid>/status` reports the same); the shared, text and data
+/// counts are not kept (0).
 pub fn statm(host: HostPid) -> Vec<u8> {
     let h = host_info(host).unwrap_or_default();
     let page = crate::maps::page_size().max(1);

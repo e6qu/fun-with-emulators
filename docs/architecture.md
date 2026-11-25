@@ -1826,8 +1826,8 @@ Where fwe differs from Linux in ways a Linux program could notice. The
   process ends (Linux sends it when the parent thread does).
 
 **Resources**
-- The limits the host keeps (`RLIMIT_FSIZE`, `RLIMIT_DATA`, `RLIMIT_AS`),
-  and the CPU and process-count limits fwe keeps on top of the host's,
+- The limit the host keeps (`RLIMIT_FSIZE`), and the CPU and
+  process-count limits fwe keeps on top of the host's,
   cannot be raised past the host's hard limit, even by root.
 - A limit set on another process with `prlimit` takes effect at its next
   system call, which it is woken to make if it waits in one: one running

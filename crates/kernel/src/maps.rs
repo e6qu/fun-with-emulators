@@ -140,6 +140,12 @@ impl Area {
         }
     }
 
+    /// Data, as Linux counts it against `RLIMIT_DATA`: writable, private,
+    /// not the stack.
+    pub fn data(&self) -> bool {
+        self.prot & mman::PROT_WRITE != 0 && !self.shared && self.object.name != Name::Stack
+    }
+
     /// Private anonymous memory (the break and the stack too): what
     /// `MADV_DONTNEED` zero-fills, and `MADV_FREE` and `MADV_WIPEONFORK`
     /// take.
@@ -528,6 +534,23 @@ impl Record {
     pub fn locked_in(&self, start: u64, end: u64) -> u64 {
         let pieces = self.areas.pieces(start, end);
         pieces.iter().filter(|p| p.value.locked).map(|p| p.end - p.start).sum()
+    }
+
+    /// How many bytes are mapped, and how many of them are data (Linux's
+    /// `data_vm`: writable, private, not the stack), in `[start, end)`, or
+    /// in all with `None`.
+    pub fn sizes(&self, within: Option<(u64, u64)>) -> (u64, u64) {
+        let count = |pieces: &mut dyn Iterator<Item = (u64, &Area)>| {
+            pieces.fold((0, 0), |(all, data), (len, a)| {
+                (all + len, data + if a.data() { len } else { 0 })
+            })
+        };
+        match within {
+            Some((start, end)) => count(
+                &mut self.areas.pieces(start, end).iter().map(|p| (p.end - p.start, &p.value)),
+            ),
+            None => count(&mut self.areas.iter().map(|p| (p.end - p.start, p.value))),
+        }
     }
 
     /// How many bytes are mapped.
@@ -921,6 +944,16 @@ fn decode_published(body: &[u8]) -> Option<Published> {
     let translations = (0..n).map(|_| (d.u64(), d.u64(), d.u64())).collect();
     d.finish().ok()?;
     Some(Published { record, page, tracked, translations })
+}
+
+/// How many bytes host process `pid` has mapped, if it is a process of
+/// fwe's: this one's as its record has them, another's as it published
+/// them.
+pub fn mapped_bytes(pid: crate::ids::HostPid) -> Option<u64> {
+    if pid == crate::host::pid() {
+        return Some(record().total_bytes());
+    }
+    of_process(pid).map(|p| p.record.total_bytes())
 }
 
 /// The mappings host process `pid` published, if it is a process of

@@ -2454,14 +2454,14 @@ numbers mean nothing there. fwe keeps its own:
 |---|---|---|
 | `RLIMIT_CPU` | **enforced** | the soft limit the host's, the hard limit fwe's ([Where each signal comes from](#where-each-signal-comes-from)) |
 | `RLIMIT_FSIZE` | **host** | `SIGXFSZ`, `EFBIG`; never above the host's hard limit |
-| `RLIMIT_DATA` | **host** | set on the fwe process; the guest's `brk` is not held to it |
-| `RLIMIT_STACK` | **emulated** natively; VM **kept** | the main stack's size ([auxv, hwcaps and the vDSO](#auxv-hwcaps-and-the-vdso)) |
+| `RLIMIT_DATA` | **enforced** | kept by fwe (macOS refuses any finite one): the guest's writable private mappings, as Linux counts `data_vm`, at `mmap`, `mprotect`, `mremap` and `brk` (`ENOMEM`; `brk` stays), and the data segment with the break at `brk` and `PR_SET_MM`; a soft limit of 0 lets data up to the hard one, as Linux lets Valgrind's |
+| `RLIMIT_STACK` | **emulated** natively; VM **kept** | the main stack's size ([auxv, hwcaps and the vDSO](#auxv-hwcaps-and-the-vdso)), and how far a `MAP_GROWSDOWN` mapping grows |
 | `RLIMIT_CORE` | **emulated** | fwe writes core files and cuts them at it |
 | `RLIMIT_RSS`, `RLIMIT_LOCKS`, `RLIMIT_RTTIME` | **kept** | Linux ignores the first two too; there is no real-time scheduling to time |
 | `RLIMIT_NPROC` | **enforced** | the user's threads across fwe's processes, at `fork` (`EAGAIN`) and at a native thread's creation, not a VM thread's; a `set*uid` to a user past it fails the next `execve` (`EAGAIN`) while the user still is |
 | `RLIMIT_NOFILE` | **enforced** | virtual, below fwe's reserved descriptors, capped by `fs.nr_open` |
 | `RLIMIT_MEMLOCK` | **enforced** | `mlock*`, `MAP_LOCKED`, `MCL_FUTURE`, `SHM_LOCK`; `CAP_IPC_LOCK` exempt |
-| `RLIMIT_AS` | **host** | set on the fwe process, so fwe's own reservations count |
+| `RLIMIT_AS` | **enforced** | kept by fwe (macOS refuses any finite one): the guest's mappings, at `mmap`, `mremap`, `brk` and a `MAP_GROWSDOWN` mapping's growth (`ENOMEM`, or the fault's `SIGSEGV`), not fwe's own reservations |
 | `RLIMIT_SIGPENDING` | **enforced** | per process, not per user ([Dispositions, masks and frames](#dispositions-masks-and-frames)) |
 | `RLIMIT_MSGQUEUE` | **enforced** | at `mq_open`, per user within the IPC namespace |
 | `RLIMIT_NICE`, `RLIMIT_RTPRIO` | **enforced** | bound lowering nice and real-time priorities on the kept values |
@@ -2678,7 +2678,7 @@ Details: [/proc, /sys and /dev](#proc-sys-and-dev),
 | Mechanism | Status | Notes |
 |---|---|---|
 | `/proc/<pid>` | **emulated** | in the initial pid namespace only fwe's processes (another host process: its `stat` only) |
-| `stat`, `status`, `statm`, `io` | **host** with **emulated** | state, times and memory from the host; ids, capabilities, tracer and seccomp from fwe; `io` storage bytes only |
+| `stat`, `status`, `statm`, `io` | **host** with **emulated** | state, times and the resident set from the host; the size (`VmSize`) of the guest's mappings, ids, capabilities, tracer and seccomp from fwe; `io` storage bytes only |
 | `cmdline`, `environ`, `auxv`, `maps`, `smaps`, `mem`, `fd`, `fdinfo`, `ns`, `cgroup`, `limits`, `mountinfo`, `cwd`, `root`, `task` | **emulated** | |
 | `uid_map`, `gid_map`, `setgroups` | **enforced** | |
 | `oom_score_adj`, `timerslack_ns` | **kept** | |

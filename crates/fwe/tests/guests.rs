@@ -9111,8 +9111,10 @@ fn proc_files_programs_read() {
     );
     assert_eq!(
         tail,
-        "00000000000000000000000000000001 01 80 10 80       lo\n\
-         route: Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        format!(
+            "00000000000000000000000000000001 01 80 10 80       lo\nroute: {:<127}\n",
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
+        )
     );
     assert_eq!(out.status.code(), Some(0));
 }
@@ -10944,6 +10946,26 @@ fn alpine_display_gtk3_demo_runs() {
 fn alpine_display_gtk4_demo_runs() {
     let Some(x) = display_tests() else { return };
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
+}
+
+/// `RLIMIT_DATA` and `RLIMIT_AS`, which macOS refuses to set, kept and
+/// enforced as Linux enforces them (Chromium's sandbox lowers the data
+/// limit): data at `mmap`, `mprotect` and `brk`, the whole size at `mmap`
+/// and `mremap`, a soft data limit of 0 as Valgrind's; `VmSize` is the
+/// program's mappings.
+#[test]
+fn memory_limits_are_enforced_as_linux_enforces_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "datalimits",
+        &[],
+        "data: unlimited\nas: unlimited\nset data 64 MiB: 0\n128 MiB private writable: ENOMEM\n\
+         16 MiB private writable: ok\n128 MiB shared writable: ok\n128 MiB private read-only: ok\n\
+         made writable: ENOMEM\n16 MiB of it made writable: ok\nbrk by 128 MiB: refused\n\
+         brk by 1 MiB: grown\nVmSize below 1 GiB: yes\nset as: 0\n128 MiB inaccessible: ok\n\
+         512 MiB inaccessible: ENOMEM\ngrown to 512 MiB: ENOMEM\ngrown to 128 MiB: ok\n\
+         set data 0, hard 64 MiB: 0\n32 MiB private writable: ok\n128 MiB private writable: ENOMEM\n",
+    );
 }
 
 /// A network namespace's routes, as netlink dumps and finds them and

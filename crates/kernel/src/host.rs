@@ -254,9 +254,7 @@ pub fn thread_state(t: libc::pthread_t) -> Option<(u64, u64, bool)> {
 pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
     Some(match resource {
         resource::RLIMIT_FSIZE => libc::RLIMIT_FSIZE as libc::c_int,
-        resource::RLIMIT_DATA => libc::RLIMIT_DATA as libc::c_int,
         resource::RLIMIT_NOFILE => libc::RLIMIT_NOFILE as libc::c_int,
-        resource::RLIMIT_AS => libc::RLIMIT_AS as libc::c_int,
         _ => return None,
     })
 }
