@@ -293,8 +293,9 @@ target/release/fwe ./program-linked-low
 
 - `hypervisor.entitlements` also holds what the hardened runtime of a
   notarized release must allow fwe: executable memory it maps itself
-  (guest code), and loading a library signed by someone else (the
-  stand-in's Unicorn). A release and the Homebrew formula sign with it.
+  (guest code), and loading libraries signed by someone else (the
+  stand-in's Unicorn, the Mac's Vulkan driver). A release and the
+  Homebrew formula sign with it.
 - Without the entitlement, or on a host without hypervisor support
   (`sysctl kern.hv_support` must be `1`), fwe explains that the program
   needs the hypervisor backend and exits with status 126.
