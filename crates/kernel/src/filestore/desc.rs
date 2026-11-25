@@ -429,7 +429,13 @@ pub(crate) fn export(fd: i32) -> Option<crate::scm::Export> {
     let token = crate::shared::unique();
     let held =
         d.file.fs().and_then(|fs| fs.lock()?.hold(d.file.ino, (IN_FLIGHT, token), &[(d.id, 1)]));
-    if held.is_err() {
+    if let Err(e) = held {
+        if crate::trace::file().is_some() {
+            crate::trace::note_to_file(&format!(
+                "descriptor {fd} of the store goes without its file: holding it for the \
+                 message failed ({e})"
+            ));
+        }
         return None;
     }
     let mut e = Enc::default();

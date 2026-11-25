@@ -7035,6 +7035,39 @@ fn memfd_locks_hold_between_processes() {
     assert_eq!(memfd("locks"), MEMFD_LOCKS);
 }
 
+/// A sealed memfd, and a read-only descriptor of it opened through
+/// `/proc/self/fd`, passed over Unix sockets to other processes (one in
+/// new namespaces, one reading a stream after children of the sender's
+/// ended or started a program) keep the file's seals and size there
+/// (Firefox maps only memory whose size is sealed), and the read-only one
+/// maps only to read; as on Linux.
+#[test]
+fn memfd_seals_hold_in_a_process_it_is_passed_to() {
+    c_guest_prints(
+        "memfdpass",
+        &[],
+        "noexec memfd: seals 0x20, reopened read-only: yes\n\
+         size sealed: 0\n\
+         reopened read-only: yes\n\
+         read-only, here: seals 0x6, size 65536\n\
+         frozen: 0\n\
+         writable, here: seals 0x17, size 65536\n\
+         writable, there: seals 0x17, size 65536\n\
+         read-only, there: seals 0x17, size 65536\n\
+         read there: fwe\n\
+         mapped to write through the read-only one: no\n\
+         writable, in new namespaces: seals 0x17, size 65536\n\
+         read-only, in new namespaces: seals 0x17, size 65536\n\
+         in new namespaces: exit 0\n\
+         child: exit 0\n\
+         a child ended, another ran a program: exit 0\n\
+         read 3000 bytes with 2 descriptors, seals 0x17 0x17\n\
+         read 3000 bytes with 2 descriptors, seals 0x17 0x17\n\
+         read 3000 bytes with 2 descriptors, seals 0x17 0x17\n\
+         reader: exit 0\n",
+    );
+}
+
 /// What the `memfd` guest's `seals` scenario prints: a memfd named as
 /// Linux names it, and each seal holding.
 const MEMFD_SEALS: &str = "\

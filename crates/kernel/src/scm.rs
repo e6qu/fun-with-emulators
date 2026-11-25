@@ -723,6 +723,13 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         manifest = read_bundle(b);
         fds.pop();
         close_all([b]);
+        if manifest.is_none() && crate::trace::file().is_some() {
+            crate::trace::note_to_file(&format!(
+                "a received message's bundle held no manifest: its {} descriptors are \
+                 taken as host objects",
+                fds.len()
+            ));
+        }
     }
     let Some(m) = manifest else {
         let kept = fds.len().min(room);
@@ -742,6 +749,12 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         match fds.get(e.index) {
             Some(&fd) if e.index < kept => {
                 taken[e.index] = import(e.kind, fd, &e.state, e.companions);
+                if !taken[e.index] && crate::trace::file().is_some() {
+                    crate::trace::note_to_file(&format!(
+                        "received descriptor {} (kind {}) was not taken as what it stands for",
+                        e.index, e.kind
+                    ));
+                }
             }
             // Not delivered, or not there: what came for it goes.
             _ => close_all(e.companions),
