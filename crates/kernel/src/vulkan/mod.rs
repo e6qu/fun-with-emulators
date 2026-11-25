@@ -130,9 +130,37 @@ fn plain(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Result<
 /// ([`crate::mm::host_writes`]), each structure of the `pNext` chains the
 /// driver fills too.
 fn outputs_writable(index: usize, w: &[u64; MOST_ARGS]) {
-    if !crate::mm::host_writes_watched() {
-        return;
+    if crate::mm::host_writes_watched() {
+        each_output(index, w, crate::mm::host_writes);
     }
+}
+
+/// What command `index` wrote to the guest's memory, in hex by range, for
+/// a trace of every command ([`device`]).
+pub(crate) fn written(index: usize, w: &[u64; MOST_ARGS]) -> String {
+    /// The most of one range shown.
+    const SHOWN: u64 = 512;
+    let mut out = String::new();
+    each_output(index, w, |addr, len| {
+        let Ok(bytes) = crate::uaccess::read_bytes(addr, len.min(SHOWN) as usize) else {
+            out.push_str(&format!(" {addr:#x}: unreadable;"));
+            return;
+        };
+        out.push_str(&format!(" {addr:#x}:"));
+        for b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        if len > SHOWN {
+            out.push_str(&format!("..(+{})", len - SHOWN));
+        }
+        out.push(';');
+    });
+    out
+}
+
+/// Each guest range command `index` writes, as `(address, length)`, the
+/// structures of the `pNext` chains the driver fills included.
+fn each_output(index: usize, w: &[u64; MOST_ARGS], mut range: impl FnMut(u64, u64)) {
     let read_count = |addr: u64, width: u64| match width {
         8 => crate::uaccess::read::<u64>(addr).unwrap_or(0),
         _ => u64::from(crate::uaccess::read::<u32>(addr).unwrap_or(0)),
@@ -145,18 +173,18 @@ fn outputs_writable(index: usize, w: &[u64; MOST_ARGS]) {
             return;
         }
         let count = count.min(1 << 20);
-        crate::mm::host_writes(addr, count.saturating_mul(size));
+        range(addr, count.saturating_mul(size));
         if chained {
             for i in 0..count {
-                chain_writable(addr + i * size);
+                chain(addr + i * size, &mut range);
             }
         }
     });
 }
 
-/// Make the structures of the `pNext` chain of guest structure `addr`
-/// writable by the host.
-fn chain_writable(addr: u64) {
+/// Each structure of the `pNext` chain of guest structure `addr`, as
+/// `(address, size)`.
+fn chain(addr: u64, range: &mut impl FnMut(u64, u64)) {
     let mut at = crate::uaccess::read::<u64>(addr + 8).unwrap_or(0);
     for _ in 0..256 {
         if at == 0 {
@@ -164,7 +192,7 @@ fn chain_writable(addr: u64) {
         }
         let Ok(stype) = crate::uaccess::read::<u32>(at) else { return };
         if let Some(size) = generated::struct_size(stype) {
-            crate::mm::host_writes(at, size);
+            range(at, size);
         }
         at = crate::uaccess::read::<u64>(at + 8).unwrap_or(0);
     }

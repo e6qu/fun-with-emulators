@@ -247,15 +247,19 @@ fn run(key: u32, arg: u64) -> i64 {
     let began = crate::timing::call_began();
     let r = super::call(command, &w);
     counted(command as usize, began);
-    // In a trace to a file: every command and its result where every call
-    // is traced; a command that failed, and how, otherwise.
+    // In a trace to a file: every command, its result and what it wrote
+    // where every call is traced; a command that failed, and how, otherwise.
     if crate::trace::calls_traced() {
         let name = generated::NAMES.get(command as usize).copied().unwrap_or("fwe's query");
         let got = match r {
             Ok(v) => format!("{v:#x}"),
             Err(e) => format!("errno {e}"),
         };
-        crate::trace::note_to_file(&format!("vulkan: {name}{:x?} = {got}", &w[..count]));
+        let wrote = match r {
+            Ok(_) => super::written(command as usize, &w),
+            Err(_) => String::new(),
+        };
+        crate::trace::note_to_file(&format!("vulkan: {name}{:x?} = {got}{wrote}", &w[..count]));
     } else if crate::trace::file().is_some() {
         let index = command as usize;
         let failed = match r {
