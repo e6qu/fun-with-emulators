@@ -413,7 +413,7 @@ assumed 4 KiB pages when built (some memory allocators, for one).
 | `fork` | copies the page tables, marks private pages copy-on-write | the same, through Mach's copy-on-write objects |
 | Growing a mapping in place | `mremap`, which can also move it | no `mremap`; `mach_vm_remap` maps the same pages elsewhere |
 | Heap | `brk` grows a data segment; `malloc` uses it and `mmap` | no `brk`; `malloc` uses `mach_vm_allocate` |
-| Giving pages back | `madvise(MADV_DONTNEED)` drops the pages at once: private anonymous ones read back as zero | `MADV_DONTNEED` and `MADV_FREE` are hints that let the kernel reclaim the pages later; until it does they may keep their contents |
+| Giving pages back | `madvise(MADV_DONTNEED)` drops the pages at once: private anonymous ones read back as zero | `MADV_DONTNEED` and `MADV_FREE` are hints that let the kernel reclaim the pages later; until it does they might keep their contents |
 | Shared memory without a file | `memfd_create`, `shm_open`, a shared anonymous mapping across `fork` | `shm_open`, Mach memory entries passed over Mach ports |
 | Large pages | transparent huge pages (2 MiB with 4 KiB pages), `hugetlbfs` | no user-visible large pages |
 | Code | any mapping can be executable, even writable and executable at once, unless a security module forbids it | every executable page needs a code signature covering it (an ad-hoc one will do; the linker adds it) |
