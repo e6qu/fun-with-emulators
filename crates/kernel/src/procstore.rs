@@ -20,7 +20,7 @@
 //!   to a pid as it is first sent a signal through one, and taken back
 //!   with its record, or once its process is gone.
 //! - **Busy marks**, one for each host pid: its main thread is in fwe's
-//!   own work, which the host may make it wait for ([`Busy`]).
+//!   own work, which the host can make it wait for ([`Busy`]).
 //! - **Entry marks**, one for each host pid: the start of the process
 //!   whose main thread has gone into the program ([`entered`]).
 //! - **Tasks**, one word for each host pid: its real user, as its record
@@ -58,7 +58,7 @@ pub enum Kind {
     /// Its mount namespace, root, working directory and resource limits,
     /// for `/proc/<pid>/{cwd,root,mountinfo,limits}` ([`crate::fs::Fs::share`]).
     View = 4,
-    /// Its Landlock domain's layers, for whether it may signal or trace
+    /// Its Landlock domain's layers, for whether it can signal or trace
     /// another ([`crate::landlock`]).
     Landlock = 5,
 }
@@ -306,7 +306,7 @@ fn map() -> Result<Store, String> {
             return Err(format!("{name} is {} bytes, not {SIZE}", st.st_size));
         }
         // Between guards: every fwe process's records, which a stack
-        // overflowing beside them must not reach.
+        // overflowing beside them cannot reach.
         let mapped = crate::host::map_shared_guarded(fd, SIZE);
         libc::close(fd);
         match mapped {
@@ -320,7 +320,7 @@ fn map() -> Result<Store, String> {
 /// size: another process making it at once sizes it, and its size is 0
 /// until that process's `ftruncate` is done (this one's is refused
 /// meanwhile). `None` if it cannot be looked at.
-// Its sleep is unmarked: the store it is sized for may be this process's,
+// Its sleep is unmarked: the store it is sized for might be this process's,
 // which a busy mark is kept in.
 #[allow(clippy::disallowed_methods)]
 pub(crate) fn sized(fd: i32) -> Option<libc::stat> {
@@ -351,28 +351,28 @@ fn mapped() -> Option<&'static Store> {
     STORE.get()
 }
 
-/// Whether the store is mapped ([`init`]): a mailbox may then be made from
+/// Whether the store is mapped ([`init`]): a mailbox can then be made from
 /// a signal handler ([`mailbox`]).
 pub fn is_mapped() -> bool {
     STORE.get().is_some()
 }
 
-/// End the process: the store cannot do what it must.
+/// End the process: the store cannot do its work.
 fn fatal(why: std::fmt::Arguments) -> ! {
     eprintln!("fwe: {why}");
     std::process::exit(1)
 }
 
-/// Map the store now, before a signal handler may need it.
+/// Map the store now, before a signal handler needs it.
 pub fn init() {
     store();
-    // A process before this one with the pid may have ended busy.
+    // A process before this one with the pid might have ended busy.
     not_busy();
 }
 
 /// While one lives, the calling thread, if it is its process's main
 /// thread, is in fwe's own work (a shared record read, or written under
-/// its lock), which the host may make it wait for, as a Linux thread
+/// its lock), which the host can make it wait for, as a Linux thread
 /// doing its kernel's work is not asleep in a wait of the guest's:
 /// `/proc` shows it running ([`Busy`]), where a program waiting for it
 /// to sleep (in a semaphore wait it is on its way to, say) would take a
@@ -627,7 +627,7 @@ impl Store {
         self.at(TAKEN_AT + word * 8)
     }
 
-    /// The lowest word of the block bitmap that may have a free block.
+    /// The lowest word of the block bitmap that might have a free block.
     fn free_hint(&self) -> &AtomicU32 {
         self.at(FREE_HINT_AT)
     }
@@ -793,7 +793,7 @@ pub fn mailbox(pid: HostPid) -> Option<&'static [AtomicU64]> {
 }
 
 /// [`mailbox`], given one now if it has none (a sender's). Not in a
-/// signal handler: it may map the store, and ends the process if every
+/// signal handler: it can map the store, and ends the process if every
 /// mailbox is taken.
 pub fn mailbox_or_make(pid: HostPid) -> Option<&'static [AtomicU64]> {
     mailbox_in(store(), pid, true)
@@ -1147,7 +1147,7 @@ fn hold(word: &'static AtomicU32) -> Held {
 
 /// Hold the lock `word` of shared memory of fwe's (its holder's host pid,
 /// 0: free) while the result lives, and whether it was taken over from a
-/// holder that died holding it (which may have left a change half made).
+/// holder that died holding it (which might have left a change half made).
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")

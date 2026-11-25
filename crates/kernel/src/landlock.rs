@@ -14,7 +14,7 @@
 //!   (decided as a file is opened, and marked on its open file
 //!   description, [`opened`]), and moving a file between directories
 //!   (`REFER` in both, or `EXDEV`). A denied access is `EACCES`. A domain
-//!   that restricts files may not mount (`EPERM`).
+//!   that restricts files cannot mount (`EPERM`).
 //! - **TCP ports:** `bind` and `connect` to a port a rule names.
 //! - **Scopes:** a signal, or a connection or datagram to an abstract
 //!   socket, to a process outside a scoping layer's domain is `EPERM`, and
@@ -64,7 +64,7 @@ const MASK_SCOPE: u64 = 3;
 const CREATE_RULESET_VERSION: u64 = 1;
 const RULE_PATH_BENEATH: u64 = 1;
 const RULE_NET_PORT: u64 = 2;
-/// The most layers a domain may have.
+/// The most layers a domain can have.
 const MAX_LAYERS: usize = 16;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -346,7 +346,7 @@ pub fn may_trace(target: crate::ids::HostPid) -> Result<(), i32> {
 }
 
 /// `PTRACE_TRACEME` with host process `parent` as tracer: the parent's
-/// domain must be this process's or one this one's is nested in.
+/// domain needs to be this process's or one this one's is nested in.
 pub fn may_be_traced_by(parent: crate::ids::HostPid) -> Result<(), i32> {
     let theirs = chain_of(parent);
     if theirs.is_empty() {
@@ -517,7 +517,7 @@ pub fn may_ftruncate(fd: i32) -> Result<(), i32> {
 }
 
 /// `ioctl(fd, req)`: `EACCES` for a device opened without `IOCTL_DEV`,
-/// but for the requests any holder may make (the descriptor's flags, the
+/// but for the requests any holder can make (the descriptor's flags, the
 /// file system's), as Linux's `is_masked_device_ioctl` lists them.
 pub fn may_ioctl(fd: i32, req: u64) -> Result<(), i32> {
     use fwe_abi::ioctl::*;

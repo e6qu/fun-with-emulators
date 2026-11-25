@@ -177,7 +177,7 @@ pub fn uid_to_linux(uid: u32) -> u32 {
 }
 
 /// [`uid_to_linux`] in the initial user namespace's terms: what a signal
-/// handler may compute (it takes no lock), translated when the guest is
+/// handler can compute (it takes no lock), translated when the guest is
 /// given it.
 pub fn uid_to_initial(uid: u32) -> u32 {
     if uid == euid() { 0 } else { OVERFLOW_ID }
@@ -335,7 +335,7 @@ pub const WAKE_SIGNAL: libc::c_int = libc::SIGEMT;
 pub const WAKE_SIGNAL: libc::c_int = libc::SIGPWR;
 
 /// What a guest's `SIGKILL` to an fwe process is sent as. `SIGKILL` itself
-/// cannot be caught, and a hypervisor-backend process must never die with
+/// cannot be caught, and a hypervisor-backend process MUST NOT die with
 /// its VM alive, so fwe processes are sent this instead (a host signal with
 /// no Linux counterpart): a VM process takes it as the guest's `SIGKILL`,
 /// tearing its VM down before it dies of `SIGKILL`, and a native one
@@ -488,7 +488,7 @@ pub fn kill_self(sig: libc::c_int) {
 
 /// The host's `SIGKILL` to `child`, a child of this process it reaps next
 /// (one it could not finish setting up): the host's own, never relayed, as
-/// the child may not yet take fwe's relay.
+/// the child might not take fwe's relay yet.
 pub fn kill_child(child: HostPid) {
     raw_kill(child.get(), libc::SIGKILL);
 }
@@ -497,7 +497,7 @@ pub fn kill_child(child: HostPid) {
 /// with signal 0).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Probe {
-    /// There, and this user may signal it.
+    /// There, and this user can signal it.
     Live,
     /// There (a zombie is), but not this user's to signal.
     NoPermission,
@@ -581,7 +581,7 @@ pub fn dev_of(st: &libc::stat) -> u64 {
 /// a stop's end, a tracer's `SIGCHLD`, a cgroup's kill, a lease's or a
 /// message queue's notice, a wake): only to one of fwe's processes
 /// ([`is_fwe`]: its record's, of a process that started when this one
-/// did), as a pid kept from a process that ended may be the host's now
+/// did), as a pid kept from a process that ended might be the host's now
 /// (`ESRCH`). One refused is told on the standard error, with where it
 /// was sent from. A guest's own signal to a process it names goes by
 /// [`signal_named`]; whether a process is there, by [`probe`].
@@ -596,8 +596,8 @@ pub fn kill_process(pid: HostPid, sig: libc::c_int) -> i64 {
 }
 
 /// A guest's signal `sig` to host process `pid`, which it named (`kill`,
-/// `rt_sigqueueinfo`) and may signal: one of fwe's or one of the host's,
-/// as a Linux process signals any it may.
+/// `rt_sigqueueinfo`) and can signal: one of fwe's or one of the host's,
+/// as a Linux process signals any it can.
 pub fn signal_named(pid: HostPid, sig: libc::c_int) -> i64 {
     kill(pid, sig)
 }
@@ -675,7 +675,7 @@ pub fn nice_of(pid: HostPid) -> i32 {
 
 /// Give host process `pid` (one of fwe's) nice value `nice`, which the
 /// host scheduler then applies. The host lets a user raise a process's
-/// nice value but not lower it (only its root may), so a guest's lowering
+/// nice value but not lower it (only its root can), so a guest's lowering
 /// stands in fwe's record while the host process keeps the value it had:
 /// Linux's result is the guest's, the host's limit is the host's.
 pub fn set_nice(pid: HostPid, nice: i32) {
@@ -696,8 +696,8 @@ thread_local! {
 }
 
 /// While one lives, the calling thread is in a host signal handler that
-/// interrupted fwe's own code, which may be inside the host allocator:
-/// nothing may allocate or free. A debug build's allocator ends the
+/// interrupted fwe's own code, which might be inside the host allocator:
+/// the thread MUST NOT allocate or free. A debug build's allocator ends the
 /// process if something does ([`allocation_forbidden`]), so the tests find
 /// it. Neither `Send` nor `Sync`: the mark is its thread's.
 pub struct NoAllocation(std::marker::PhantomData<*const ()>);
@@ -879,7 +879,7 @@ pub fn host_sigset(mask: u64) -> libc::sigset_t {
 /// pending, with its sender, which macOS forgets of a signal it holds
 /// blocked. A `signalfd` reads them from there too. What stays blocked on
 /// the host is the signals whose default action or ignoring the host
-/// applies itself, which must wait while the guest blocks them.
+/// applies itself, which need to wait while the guest blocks them.
 pub fn host_mask_for(mask: u64) -> libc::sigset_t {
     host_sigset(mask & !(crate::signal::caught() | crate::signalfd::watched()))
 }
@@ -1098,7 +1098,7 @@ pub unsafe fn signal_info(
     {
         /// macOS's `SI_USER`.
         const SENT: i32 = 0x10001;
-        // A signal another process sent may come with its sender and a
+        // A signal another process sent can come with its sender and a
         // code of 0, with no sender (as when the sender has ended), or with
         // the code and pid of the sender's exit when it ended right after
         // sending. A note names its sender, so one that sender left is
@@ -1114,7 +1114,7 @@ pub unsafe fn signal_info(
         // The host's own SIGIO, for a descriptor's readiness: Linux's is the
         // kernel's, from no process. Every fwe process that sends one leaves
         // a note, so one without is the host's, whatever code and sender it
-        // comes with: macOS may give it those of a SIGCHLD just raised (a
+        // comes with: macOS can give it those of a SIGCHLD just raised (a
         // child that wrote to the pipe and ended).
         if sig == libc::SIGIO && note.is_none() && code != SENT {
             return crate::thread::SigInfo { code: signal::SI_KERNEL, ..Default::default() };
@@ -2614,7 +2614,7 @@ pub enum Rename {
     Replace,
     /// Fails with `EEXIST` (Linux's `RENAME_NOREPLACE`), atomically.
     NoReplace,
-    /// Swaps the two, both of which must exist (`RENAME_EXCHANGE`).
+    /// Swaps the two, both of which need to exist (`RENAME_EXCHANGE`).
     Exchange,
 }
 
@@ -2718,7 +2718,7 @@ pub fn clone_name_at(
 /// ([`map_stack`], [`map_shared_guarded`]): a stack that overflows (a
 /// handler nested without bound, a guest thread's stack made with no guard
 /// of its own) faults in it, and its process ends, instead of writing over
-/// the next mapping, which may be memory every fwe process shares.
+/// the next mapping, which might be memory every fwe process shares.
 pub const GUARD: usize = 64 << 10;
 
 /// A new stack of `size` bytes (a multiple of the host page) with
@@ -2788,7 +2788,7 @@ pub fn map_shared_guarded(fd: i32, size: usize) -> Result<usize, HostErrno> {
 /// fwe's own keeps them so (a guest's signal is a guest thread's to take),
 /// and a guest thread takes the guest's mask once its thread-local storage
 /// is made. A signal handled before then would have the host make that
-/// storage in the handler, in `malloc`, which the thread may be in
+/// storage in the handler, in `malloc`, which the thread might be in
 /// already, making it for the thread's own first access.
 pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
     let _blocked = MaskGuard::set(&full_sigset());
@@ -2796,7 +2796,7 @@ pub fn with_signals_blocked<R>(f: impl FnOnce() -> R) -> R {
 }
 
 /// This process's host pid as the kernel has it now, asked each time: in
-/// a signal handler, which may run in a fork child before its
+/// a signal handler, which can run in a fork child before its
 /// `pthread_atfork` handlers have forgotten the parent's [`pid`] (or
 /// libc its own copy). Async-signal-safe.
 pub fn pid_now() -> HostPid {

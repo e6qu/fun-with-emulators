@@ -15,7 +15,7 @@ use fwe_abi::{err, errno, fcntl};
 const FS_IMMUTABLE_FL: u32 = 0x10;
 const FS_APPEND_FL: u32 = 0x20;
 
-/// The seals a file of a tmpfs starts with: none may be added
+/// The seals a file of a tmpfs starts with: none can be added
 /// (`F_SEAL_SEAL`), as Linux's tmpfs makes its files.
 const TMPFS_SEALS: u32 = fcntl::F_SEAL_SEAL;
 
@@ -111,9 +111,9 @@ impl<P: Platform> Kernel<P> {
         (c.fsuid, gid, kept)
     }
 
-    /// Whether the caller may make or remove a name in directory `dir` of
+    /// Whether the caller can make or remove a name in directory `dir` of
     /// fwe's store: the mount is writable (`EROFS`), the directory is there
-    /// still (`ENOENT`) and the caller may write and search it (`EACCES`).
+    /// still (`ENOENT`) and the caller can write and search it (`EACCES`).
     pub(crate) fn store_may_change(&self, r: &Resolved, d: &StoreDir) -> Result<Stat, i32> {
         r.writable()?;
         let st = d.fs.lock()?.stat(d.ino)?;
@@ -126,7 +126,7 @@ impl<P: Platform> Kernel<P> {
         Ok(st)
     }
 
-    /// Whether the caller may remove (or rename away, or replace) `ino`
+    /// Whether the caller can remove (or rename away, or replace) `ino`
     /// from directory `d`: in a sticky directory, only its owner, the
     /// directory's, or a caller with `CAP_FOWNER` over it (`EPERM`); an
     /// immutable or append-only file or directory, not at all (`EPERM`).
@@ -428,7 +428,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `O_TMPFILE` in directory `d` of fwe's store (what was resolved, `.`
     /// of the directory itself): a regular file with no name, which
-    /// `linkat` may name unless `O_EXCL`.
+    /// `linkat` can name unless `O_EXCL`.
     pub(crate) fn store_tmpfile(
         &mut self,
         r: &Resolved,
@@ -805,7 +805,7 @@ impl<P: Platform> Kernel<P> {
         if flags & EXCHANGE != 0 && target.is_none() {
             return err(errno::ENOENT);
         }
-        // `RENAME_WHITEOUT` is for those who may make device nodes.
+        // `RENAME_WHITEOUT` is for those who can make device nodes.
         if flags & WHITEOUT != 0 && !self.creds.has(crate::caps::CAP_MKNOD) {
             return err(errno::EPERM);
         }

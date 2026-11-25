@@ -264,7 +264,7 @@ impl<P: Platform> Kernel<P> {
         })
     }
 
-    /// Whether the caller may join namespace `n`, as Linux's `setns` has
+    /// Whether the caller can join namespace `n`, as Linux's `setns` has
     /// it: `CAP_SYS_ADMIN` in a user namespace it joins; for another kind,
     /// `CAP_SYS_ADMIN` in the user namespace that owns it and in its own
     /// (and for a mount namespace `CAP_SYS_CHROOT` in its own too).

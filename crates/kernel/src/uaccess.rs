@@ -1,7 +1,7 @@
 //! Access to guest memory from the kernel layer.
 //!
 //! Guest addresses are host addresses, so the kernel can read and write guest
-//! memory directly — but a guest may pass any pointer, and a bad one must
+//! memory directly — but a guest can pass any pointer, and a bad one MUST
 //! make the system call fail with `EFAULT`, not crash fwe. Every read and
 //! write the kernel itself makes of guest memory goes through this module.
 //! On macOS on Apple Silicon the copies run in a small assembly routine;
@@ -190,8 +190,8 @@ fn run(addr: u64) -> (u64, u64) {
 }
 
 /// [`run`] without waiting for the table: `None` while it is being
-/// changed. For a signal handler, which must not wait on a lock its own
-/// thread may hold.
+/// changed. For a signal handler, which MUST NOT wait on a lock its own
+/// thread might hold.
 pub fn try_run(addr: u64) -> Option<(u64, u64)> {
     let t = TABLE.try_read().ok()?;
     let i = t.partition_point(|x| x.hi <= addr);
@@ -249,20 +249,20 @@ pub fn guest_of(addr: u64) -> u64 {
     })
 }
 
-/// Whether the guest may access `[addr, addr + len)` (for writing, with
+/// Whether the guest can access `[addr, addr + len)` (for writing, with
 /// `write`), as the backend's registered validator says.
 type Validator = fn(u64, u64, bool) -> bool;
 
 static VALIDATOR: std::sync::OnceLock<Validator> = std::sync::OnceLock::new();
 
-/// Have every copy of guest memory first ask `f` whether the guest may
-/// access the range, failing with `EFAULT` where it may not. For a backend
+/// Have every copy of guest memory first ask `f` whether the guest can
+/// access the range, failing with `EFAULT` where it cannot. For a backend
 /// whose host memory stays accessible where the guest's is not.
 pub fn set_validator(f: Validator) {
     let _ = VALIDATOR.set(f);
 }
 
-/// Whether the guest may access `[addr, addr + len)` (writing, with
+/// Whether the guest can access `[addr, addr + len)` (writing, with
 /// `write`): always, without a validator (the host faults instead).
 pub fn valid(addr: u64, len: u64, write: bool) -> bool {
     if write {
@@ -334,7 +334,7 @@ mod imp {
     /// Copy `len` bytes; false if an access faulted.
     ///
     /// # Safety
-    /// Whichever side is fwe's own memory must be valid for `len` bytes.
+    /// Whichever side is fwe's own memory MUST be valid for `len` bytes.
     pub unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
         // SAFETY: the routine only touches the two ranges; a fault in it is
         // recovered by the backend (see `fixup`).
@@ -345,7 +345,7 @@ mod imp {
     /// the access faulted.
     ///
     /// # Safety
-    /// `ptr` must be 4-byte aligned; a fault there is recovered.
+    /// `ptr` MUST be 4-byte aligned; a fault there is recovered.
     pub unsafe fn cas32(ptr: *mut u32, expected: u32, new: u32) -> Option<u32> {
         let mut old = 0u32;
         // SAFETY: the routine touches only `ptr` and `old`; a fault at
@@ -366,7 +366,7 @@ mod imp {
     /// Copy `len` bytes (unchecked on this host).
     ///
     /// # Safety
-    /// Both ranges must be valid for `len` bytes.
+    /// Both ranges MUST be valid for `len` bytes.
     pub unsafe fn copy(dst: *mut u8, src: *const u8, len: usize) -> bool {
         // SAFETY: guaranteed by the caller.
         unsafe { std::ptr::copy(src, dst, len) };
@@ -376,7 +376,7 @@ mod imp {
     /// Compare-and-swap the word at `ptr` (unchecked on this host).
     ///
     /// # Safety
-    /// `ptr` must be valid and 4-byte aligned.
+    /// `ptr` MUST be valid and 4-byte aligned.
     pub unsafe fn cas32(ptr: *mut u32, expected: u32, new: u32) -> Option<u32> {
         use std::sync::atomic::{AtomicU32, Ordering::SeqCst};
         // SAFETY: guaranteed by the caller.
@@ -404,7 +404,7 @@ fn check(ok: bool) -> Result<()> {
 /// run by run of one translation: into the guest with `to_guest`.
 ///
 /// # Safety
-/// `buf` must be valid for `len` bytes.
+/// `buf` MUST be valid for `len` bytes.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -540,7 +540,7 @@ pub fn read_cstr(addr: u64, max: usize) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     let mut at = addr;
     loop {
-        // Never cross into the next page in one copy: it may be unmapped
+        // A copy MUST NOT cross into the next page: it might be unmapped
         // although the string ends before it.
         let n = PIECE.min(PAGE - at % PAGE) as usize;
         let piece = &mut piece[..n];
@@ -577,12 +577,12 @@ pub fn read_cstr_array(addr: u64, max_each: usize) -> Result<Vec<Vec<u8>>> {
 
 /// A guest `iovec` array of `count` entries at `addr`, with each buffer's
 /// address translated, ready to hand to the host, which writes into the
-/// buffers with `write`. Each buffer must be guest memory (`EFAULT`), in
+/// buffers with `write`. Each buffer needs to be guest memory (`EFAULT`), in
 /// one translated range or none (`EINVAL`: the host is given one address
 /// for it).
 /// The guest buffer of `len` bytes at `base` (written to if `write`) as
 /// a host `iovec`, checked as [`host_iovecs`] checks each of its own.
-/// `base` may be a pointer argument the backend translated already
+/// `base` can be a pointer argument the backend translated already
 /// ([`host_arg`]): it stands for the guest address it came from.
 pub fn host_buffer(base: u64, len: u64, write: bool) -> Result<libc::iovec> {
     let base = guest_of(base);
@@ -723,7 +723,7 @@ pub fn futex_pointer_args(op: u64) -> u8 {
     use fwe_abi::futex::*;
     match op & FUTEX_CMD_MASK {
         FUTEX_WAIT | FUTEX_WAIT_BITSET => 0b1001,
-        // A wake uses only the word: the other arguments may hold anything.
+        // A wake uses only the word: the other arguments can hold anything.
         FUTEX_WAKE | FUTEX_WAKE_BITSET => 0b1,
         _ => 0b1_0001,
     }

@@ -1,6 +1,12 @@
 //! The Linux kernel layer: Linux system call semantics implemented on top of
 //! the host.
 //!
+//! The key words "MUST", "MUST NOT", "REQUIRED", "SHALL", "SHALL NOT",
+//! "SHOULD", "SHOULD NOT", "RECOMMENDED", "NOT RECOMMENDED", "MAY", and
+//! "OPTIONAL" in this crate's documentation and comments are to be
+//! interpreted as described in BCP 14 (RFC 2119, RFC 8174) when, and only
+//! when, they appear in all capitals, as shown here.
+//!
 //! The kernel is independent of how guest code is executed. An execution
 //! backend traps guest system calls and calls [`Kernel::syscall`], and
 //! provides the few operations the kernel needs from it through [`Platform`].
@@ -8,7 +14,8 @@
 //! Guest addresses are host addresses: every backend maps guest memory at the
 //! same virtual addresses in the host process, so guest pointers can be used
 //! directly and are often handed straight to host system calls, which validate
-//! them.
+//! them. The exceptions are the ranges a VM backend backs with host memory
+//! elsewhere, which [`uaccess`] translates.
 
 pub mod acct;
 pub mod aio;
@@ -203,7 +210,7 @@ pub trait Platform {
 
     /// Make guest code in `[addr, addr + len)` safe to execute. `known`,
     /// when given, is the address ranges the file's unwind table says hold
-    /// code; other bytes of the range may be data placed among the code.
+    /// code; other bytes of the range might be data placed among the code.
     ///
     /// The memory is readable and writable when this is called; the kernel
     /// applies the final protections afterwards. A failure carries the
@@ -307,7 +314,7 @@ pub trait Platform {
     fn replacing_guest(&mut self, _addr: u64, _len: u64) {}
 
     /// The host memory behind `[addr, addr + len)` was replaced by fresh
-    /// pages (`MADV_DONTNEED`); a VM mapping of it must follow.
+    /// pages (`MADV_DONTNEED`); a VM maps it again.
     fn remapped_guest(&mut self, _addr: u64, _len: u64) {}
 
     /// Where to put a guest mapping of `len` bytes the guest did not place
@@ -342,7 +349,7 @@ pub trait Platform {
     fn set_thread_pointer(&mut self, _tp: u64) {}
 }
 
-/// How the host should treat one signal on the guest's behalf.
+/// How the host treats one signal on the guest's behalf.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostSignal {
     /// The host's default action, which matches Linux's for every relayed
@@ -378,7 +385,7 @@ pub struct Kernel<P: Platform> {
 impl<P: Platform> Kernel<P> {
     pub fn new(platform: P, page_size: u64, brk: Brk, fs: Option<Fs>, tracer: Tracer) -> Self {
         trace::traces(tracer);
-        // Before any handler may need to read a note of a sender.
+        // Before any handler needs to read a note of a sender.
         signote::init();
         #[cfg(not(test))]
         rlimits::host_core_off();
@@ -667,7 +674,7 @@ impl<P: Platform> Kernel<P> {
     /// with effective ids other than the real ones, gained capabilities
     /// over the `permitted` set it had, or could not be read by its caller
     /// (`unreadable`): then as `fs.suid_dumpable` says); and for an exec
-    /// that raised privilege (`secure`), the personality flags it must not
+    /// that raised privilege (`secure`), the personality flags it does not
     /// inherit (`PER_CLEAR_ON_SETID`) and the parent-death signal gone.
     /// Others see the result ([`crate::procreg::Security`]).
     fn after_exec(&mut self, secure: bool, unreadable: bool, permitted: u64) {
@@ -739,11 +746,11 @@ impl<P: Platform> Kernel<P> {
         Ok(target)
     }
 
-    /// Whether the caller may run the program at guest path `path`: only a
+    /// Whether the caller can run the program at guest path `path`: only a
     /// regular file whose bits let it (`EACCES`; root needs one execute
     /// bit set), and that no process has open for writing (`ETXTBSY`).
     /// What running it grants ([`ExecPrivs`]) is noted for the exec.
-    /// The program file at `path`, which the caller may run
+    /// The program file at `path`, which the caller can run
     /// ([`Kernel::may_exec`]): its contents, read through the one
     /// descriptor its checks were made on (`None` with no filesystem).
     fn exec_file(&self, path: &[u8]) -> Result<Option<ExecFile>, i32> {
@@ -777,7 +784,7 @@ impl<P: Platform> Kernel<P> {
             return filestore::io::read_file(file, r.mount_flags).map(|d| Some((d, None)));
         }
         let name = r.name_c()?;
-        // Not waiting for a writer, should it be a FIFO (refused below).
+        // Not waiting for a writer, in case it is a FIFO (refused below).
         // SAFETY: a NUL-terminated name in a live directory; the result is
         // checked and owned.
         let fd = unsafe {
@@ -876,7 +883,7 @@ impl<P: Platform> Kernel<P> {
         if written() {
             return Err(errno::ETXTBSY);
         }
-        // A program its caller may not read leaves it undumpable (its
+        // A program its caller cannot read leaves it undumpable (its
         // memory would show the program).
         let unreadable = !self.permits(st, 4);
         // A `nosuid` mount grants nothing, as Linux's `mnt_may_suid`.
@@ -910,8 +917,8 @@ impl<P: Platform> Kernel<P> {
     /// `#!` runs its interpreter (the line's first word, up to 255 bytes in)
     /// with the rest of the line as one argument if there is any, then
     /// `path` as given (`/dev/fd/N` for a descriptor), then `args` but the
-    /// first; an interpreter may be a script too, five deep. Each must be
-    /// one the caller may run ([`Kernel::may_exec`], which notes what the
+    /// first; an interpreter can be a script too, five deep. Each needs to be
+    /// one the caller can run ([`Kernel::may_exec`], which notes what the
     /// last grants: a script's own set-ID bits grant nothing).
     pub fn exec_target(
         &self,
@@ -1180,10 +1187,10 @@ impl<P: Platform> Kernel<P> {
     }
 }
 
-/// A script's interpreter and its optional argument.
+/// A script's interpreter and its argument, if any.
 pub type Interpreter = (Vec<u8>, Option<Vec<u8>>);
 
-/// The interpreter and its optional argument a script's first bytes
+/// The interpreter and its argument, if any, a script's first bytes
 /// `head` name (`#!interpreter [argument]`), or `None` for a file that is
 /// no script. `ENOEXEC` for a `#!` line with no interpreter.
 pub fn script_interpreter(head: &[u8]) -> Result<Option<Interpreter>, i32> {
@@ -1264,13 +1271,13 @@ pub fn release_robust_lists() {
 
 /// What running a program grants ([`Kernel::may_exec`] notes it): the
 /// owner and group of a set-ID program, and its file capabilities; and
-/// whether its caller may not read it.
+/// whether its caller cannot read it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ExecPrivs {
     uid: Option<u32>,
     gid: Option<u32>,
     caps: Option<caps::FileCaps>,
-    /// For an unsafe exec, the most capabilities it may leave: the
+    /// For an unsafe exec, the most capabilities it can leave: the
     /// caller's permitted set.
     cap_limit: Option<u64>,
     unreadable: bool,
@@ -1479,7 +1486,7 @@ pub(crate) fn exec_state_body(state: &[u8]) -> Result<snapshot::Dec<'_>, String>
 pub(crate) const EXEC_STATE_MAGIC: u64 = 0x6677_652d_6578_6563;
 
 /// Refuse every host `fork` from now on: a process running its guest in a
-/// Hypervisor.framework VM must never fork, as the child would inherit a VM
+/// Hypervisor.framework VM MUST NOT fork, as the child would inherit a VM
 /// it cannot own.
 pub fn forbid_fork() {
     NO_FORK.store(true, std::sync::atomic::Ordering::SeqCst);
@@ -1569,18 +1576,18 @@ pub fn wake_futex(addr: u64, count: u32) {
     futex::wake_any(addr, count);
 }
 
-/// Run a system call that must not hold the kernel lock because it can block:
+/// Run a system call that MUST NOT hold the kernel lock because it can block:
 /// `futex`, the sleeps, `epoll_pwait`, `ppoll`, `rt_sigsuspend`, the socket
 /// calls that wait, `flock` and `fcntl`'s `F_SETLKW` and `F_OFD_SETLKW`
 /// (waiting for another process's lock), `read`/`write` and their vectored
 /// and positioned forms, and the copies between descriptors (`sendfile`,
 /// `splice`, `tee`, `vmsplice`, `copy_file_range`): a pipe, socket or
-/// terminal blocks until the other side acts, and the other side may be a
+/// terminal blocks until the other side acts, and the other side can be a
 /// guest thread that needs the lock. Returns `None` for any other call,
 /// which the backend runs under the lock through [`Kernel::enter_syscall`].
 ///
 /// # Safety
-/// Pointer arguments must reference valid guest memory for the call.
+/// Pointer arguments MUST reference valid guest memory for the call.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -1592,7 +1599,7 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         return None;
     }
     let _call = fdmarks::Call::begin();
-    // What other processes may look at, current before this one waits.
+    // What other processes can look at, current before this one waits.
     maps::flush_before(nr);
     let noted = atime::before(nr, &a);
     // SAFETY: the caller's guarantee, passed on.
@@ -1655,7 +1662,7 @@ fn is_regular(fd: i32) -> bool {
 /// `count` bytes from `input` to `output`, from the offset at `in_off` (a
 /// guest pointer, updated, leaving the file's own offset alone) or the
 /// file's, and for `copy_file_range` to the one at `out_off` likewise.
-/// The input must be a regular file or a block device (a loop device), as
+/// The input needs to be a regular file or a block device (a loop device), as
 /// Linux has it; `copy_file_range` needs both to be regular files. Returns
 /// the bytes copied, or an errno when none were.
 /// The host status of the file open as `fd` (a file of fwe's store's as
@@ -2016,7 +2023,7 @@ fn vectored_at(
 }
 
 /// A vectored read (or `write`) of no buffers: nothing moves, but the
-/// descriptor must be open for it, as on Linux (the host refuses the
+/// descriptor needs to be open for it, as on Linux (the host refuses the
 /// call outright).
 /// The `n` bytes from byte `at` of the buffers `iov`.
 /// The bytes host buffers `iov` hold, in order.
@@ -2228,7 +2235,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
         n::EPOLL_PWAIT2 => unsafe {
             signal::with_call_mask(a[4], || epoll::pwait2(a[0], a[1], a[2], a[3]))
         },
-        // read/write on an eventfd/timerfd/signalfd can block and must not hold
+        // read/write on an eventfd/timerfd/signalfd can block and MUST NOT hold
         // the kernel lock; `try_*` returns None for any other descriptor, so a
         // normal read/write falls through to the locked host path.
         n::READ => {

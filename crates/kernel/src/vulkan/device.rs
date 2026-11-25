@@ -97,7 +97,7 @@ pub fn fd_closed(fd: i32) {
     }
 }
 
-/// The device may be opened: it is there, and the driver is not a fork
+/// The device can be opened: it is there, and the driver is not a fork
 /// parent's.
 pub fn check_open() -> Result<(), i32> {
     if !present() || FORKED_WITH_DRIVER.load(Relaxed) {

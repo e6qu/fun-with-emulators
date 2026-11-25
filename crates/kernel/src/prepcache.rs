@@ -188,7 +188,7 @@ fn path_of(key: &[u8]) -> Option<Vec<u8>> {
     Some([&d[..], name.as_bytes()].concat())
 }
 
-/// Remove the entries made more than `age` ago (their files may be gone
+/// Remove the entries made more than `age` ago (their files might be gone
 /// or changed; one still in use is made again), and at once each image
 /// whose file is gone or changed: an image is as large as the code it
 /// holds, and a fresh copy of a library (a test's root, a container's

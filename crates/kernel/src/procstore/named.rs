@@ -21,7 +21,7 @@
 //! A reader takes no lock: it copies the bytes it wants and reads the
 //! slot's sequence number again, which a writer makes odd while it puts
 //! other bytes in their place, and copies again if a change came between.
-//! An append to the journal changes no byte a reader may be reading (the
+//! An append to the journal changes no byte a reader might be reading (the
 //! journal's length, set last, says how far its bytes go), so needs no
 //! sequence number.
 
@@ -357,7 +357,7 @@ impl Slot {
             // Not counted while it waits (a stop of this process need not
             // wait for another's lock). Woken as it is let go; a while at
             // most, to look at the holder again: still held by the same, it
-            // may have died.
+            // might have died.
             drop(holding);
             wait(word, cur | WAITED, 10_000_000);
             if word.load(SeqCst) == cur | WAITED && !holder_live(cur & !WAITED) {

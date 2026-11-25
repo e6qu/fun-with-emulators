@@ -8,12 +8,12 @@
 //! One lock ([`Arena::lock`]) guards it all: a reader holds it too. The
 //! lock names its holder's pid, and is taken over from a holder that died
 //! holding it; a change is marked in progress while the lock is held, so
-//! the one that takes it over knows the holder may have left a change half
+//! the one that takes it over knows the holder might have left a change half
 //! made ([`Mem::repairs`]).
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering::SeqCst};
 
-/// The bytes an arena may hold: metadata only (file data is in objects of
+/// The bytes an arena can hold: metadata only (file data is in objects of
 /// its own, [`super::data`]).
 pub const SIZE: usize = 1 << 32;
 
@@ -107,7 +107,7 @@ impl Arena {
             return Err(fwe_abi::errno::EIO);
         }
         // Between guards: files every fwe process shares, which a stack
-        // overflowing beside them must not reach.
+        // overflowing beside them cannot reach.
         let base =
             crate::host::map_shared_guarded(raw, SIZE).map_err(crate::host::errno_to_linux)?;
         drop(fd);

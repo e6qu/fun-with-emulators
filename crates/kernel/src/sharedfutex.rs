@@ -1,5 +1,5 @@
 //! Shared futexes: those without `FUTEX_PRIVATE_FLAG`, which Linux keys by
-//! the memory the futex word is in, so a process may wait on a word in
+//! the memory the futex word is in, so a process can wait on a word in
 //! memory it shares with another (a `MAP_SHARED` mapping, a file in
 //! `/dev/shm`) and be woken from there: process-shared locks, conditions
 //! and semaphores, and test harnesses that count whom they woke.
@@ -77,7 +77,7 @@ struct Header {
     high: AtomicU32,
 }
 
-/// The slots that may be in use: those up to the highest ever taken.
+/// The slots that might be in use: those up to the highest ever taken.
 fn in_use(t: &[Slot]) -> &[Slot] {
     let high = header().map_or(t.len(), |h| h.high.load(SeqCst) as usize);
     &t[..high.min(t.len())]
@@ -124,14 +124,14 @@ fn map_table() -> Option<usize> {
 }
 
 /// Where guest address `uaddr` is in the host's address space (a backend
-/// may have given the call it already translated).
+/// might have given the call it already translated).
 fn host_of(uaddr: u64) -> u64 {
     crate::uaccess::g2h(crate::uaccess::guest_of(uaddr))
 }
 
 /// The key of the futex word at host address `host`, as Linux tells
 /// futexes apart: shared memory by what it is, private memory by process
-/// and address. The word must have been read first (a shared page the
+/// and address. The word MUST have been read first (a shared page the
 /// process has not touched has no memory object yet, so no identity).
 fn key_of(host: u64) -> Option<[u64; 2]> {
     Some(match crate::mm::region::sharing(host)? {

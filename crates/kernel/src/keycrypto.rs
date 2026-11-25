@@ -1649,7 +1649,7 @@ pub fn keyring_signer_matches(subject: &Asym, candidate: &Asym) -> bool {
 
 /// Whether the key a keyring search found for `subject`'s signer is kept:
 /// when `subject` names both an issuer-and-serial and a key identifier,
-/// the key's subject key identifier must match the latter. Linux gives
+/// the key's subject key identifier needs to match the latter. Linux gives
 /// `ENOKEY` when it is not.
 pub fn keyring_signer_accepted(subject: &Asym, found: &Asym) -> bool {
     let [a0, a1, _] = auth_ids(subject);
@@ -2261,7 +2261,7 @@ struct EncParsed<'a> {
 }
 
 /// `valid_master_desc`: "user:" or "trusted:" and a name; on update the
-/// prefix must stay the same.
+/// prefix needs to stay the same.
 fn valid_master_desc(new: &[u8], orig: Option<&[u8]>) -> Result<(), i32> {
     let prefix_len = if new.starts_with(b"trusted:") {
         8
@@ -3200,7 +3200,7 @@ mod tests {
         assert_eq!(pkey_decrypt(&cert, "enc=pkcs1", &ct, 256), Err(EINVAL));
         assert_eq!(pkey_encrypt(&cert, "enc=pkcs1", &[1; 246], 256, &mut random), Err(EOVERFLOW));
         assert_eq!(pkey_encrypt(&cert, "enc=pkcs1", msg, 300, &mut random), Err(EINVAL));
-        // Raw RSA: the integer itself, which must lie in 1 < m < n - 1.
+        // Raw RSA: the integer itself, which needs to lie in 1 < m < n - 1.
         let mut m = vec![0u8; 256];
         m[255] = 42;
         let ct = pkey_encrypt(&cert, "enc=raw", &m, 256, &mut random).unwrap();

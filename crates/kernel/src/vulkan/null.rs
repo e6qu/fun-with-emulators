@@ -13,7 +13,7 @@
 //!   buffers), fwe passes the driver a copy with the stand-in in its place
 //!   ([`call`]); calls with no null handle pass as they are. A null image
 //!   reads as zeros of the stand-in's 2D view whatever the shader's image
-//!   type, and a null buffer as zeros: what is written to a stand-in may be
+//!   type, and a null buffer as zeros: what is written to a stand-in can be
 //!   read back from it, where Linux's drivers would drop the writes.
 
 use super::chain::Copies;
@@ -609,7 +609,7 @@ pub(super) fn start(driver: &Driver, device: u64, pd: u64) -> Result<(), i32> {
 
 fn make(driver: &Driver, device: u64, pd: u64, d: &mut Dummies) -> Result<(), i32> {
     let out = |h: &mut u64| h as *mut u64 as u64;
-    // The buffer: every use a null buffer or texel buffer may stand for.
+    // The buffer: every use a null buffer or texel buffer can stand for.
     let info = BufferInfo {
         s_type: 12,
         next: 0,

@@ -9,7 +9,7 @@
 //! asks the reading one, which is readable once its writers have gone (and
 //! not before one has been there), as Linux's is. fwe waits that watch a
 //! FIFO's read end look with it between short slices ([`probe`]). It reads
-//! nothing, so another reader of the FIFO (a process may hold one only to
+//! nothing, so another reader of the FIFO (a process can hold one only to
 //! keep it open) loses no data to the look.
 //!
 //! Anonymous pipes need none of this: the host reports their writer's end.
@@ -104,7 +104,7 @@ pub fn watched(fd: i32) -> bool {
 }
 
 /// Whether `fd`, a descriptor [`watched`] says is, has hung up (a pty
-/// master's slave may have left data to read, as Linux reports it).
+/// master's slave might have left data to read, as Linux reports it).
 pub fn hung_up(fd: i32) -> bool {
     if crate::pty::is_master(fd) {
         return crate::pty::hung_up(fd);

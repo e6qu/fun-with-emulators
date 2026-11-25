@@ -131,7 +131,7 @@ pub fn check_send(nr: u64, msg: u64, vlen: u64, addr: u64, len: u64) -> Result<(
     }
 }
 
-/// `sendmmsg` of `vlen` messages at `vec`: how many may be sent before
+/// `sendmmsg` of `vlen` messages at `vec`: how many can be sent before
 /// the first that goes out of the domain's abstract-socket scope (`None`
 /// for all of them).
 pub fn sendable_messages(vec: u64, vlen: u64) -> Option<u64> {
@@ -352,7 +352,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 Ok(none)
             }
-            // A domain that restricts the file system may not change what
+            // A domain that restricts the file system cannot change what
             // its paths reach (Linux's `sb_mount`, `move_mount`,
             // `sb_umount` and `sb_pivotroot` hooks).
             nr::MOUNT | nr::UMOUNT2 | nr::PIVOT_ROOT | nr::MOVE_MOUNT if ll::handles_fs() => {

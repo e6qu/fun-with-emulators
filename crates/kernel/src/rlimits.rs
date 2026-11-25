@@ -2,7 +2,7 @@
 //!
 //! - those the host has no counterpart of (`RLIMIT_NICE`, `RLIMIT_RTPRIO`,
 //!   `RLIMIT_MSGQUEUE` and the like);
-//! - `RLIMIT_MEMLOCK`, since Linux's root may lock more than the host
+//! - `RLIMIT_MEMLOCK`, since Linux's root can lock more than the host
 //!   lets fwe wire, and fwe counts the guest's locked memory itself (see
 //!   `Kernel::sys_mlock`);
 //! - `RLIMIT_CORE`, since fwe writes the guest's core dumps (the host's
@@ -16,8 +16,8 @@
 //!   the process with `SIGKILL` ([`cpu_signal`]);
 //! - `RLIMIT_NPROC`, which fwe enforces at `fork` by the user's fwe
 //!   processes, and at the `execve` after a `set*uid` made the process a
-//!   user already past it ([`exec_allowed`]), so a privileged guest may
-//!   raise it as Linux lets it (the host's, which only the host's root may
+//!   user already past it ([`exec_allowed`]), so a privileged guest can
+//!   raise it as Linux lets it (the host's, which only the host's root can
 //!   raise, applies as well).
 //!
 //! Each starts at Linux's default (the core, stack and process limits at
@@ -73,7 +73,7 @@ const SIGPENDING_DEFAULT: u64 = 63_432;
 static SIGPENDING: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(SIGPENDING_DEFAULT);
 
-/// The soft `RLIMIT_SIGPENDING`: how many signals may be pending
+/// The soft `RLIMIT_SIGPENDING`: how many signals can be pending
 /// ([`crate::thread::may_queue`]). Async-signal-safe.
 pub fn sigpending() -> u64 {
     SIGPENDING.load(std::sync::atomic::Ordering::Relaxed)

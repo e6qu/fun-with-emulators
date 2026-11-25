@@ -17,11 +17,6 @@ fn fill(field: &mut [u8; UTSNAME_LEN], s: &[u8]) {
     field[..n].copy_from_slice(&s[..n]);
 }
 
-/// `clock_nanosleep`, as a free function so the backend can run it without
-/// the kernel lock (it blocks).
-///
-/// # Safety
-/// `req` and, when non-zero, `rem` must point to valid guest `Timespec`s.
 /// `flock(fd, op)`. Waiting for the lock blocks, so the backends run it
 /// without the kernel lock ([`crate::blocking_syscall`]).
 pub(crate) fn flock(fd: u64, op: u64) -> i64 {
@@ -74,6 +69,11 @@ pub(crate) fn set_record_lock(fd: i32, cmd: u64, arg: u64) -> i64 {
     r
 }
 
+/// `clock_nanosleep`, as a free function so the backend can run it without
+/// the kernel lock (it blocks).
+///
+/// # Safety
+/// `req` and, when non-zero, `rem` MUST point to valid guest `Timespec`s.
 pub(crate) unsafe fn clock_nanosleep(id: u64, flags: u64, req: u64, rem: u64) -> i64 {
     const TIMER_ABSTIME: u64 = 1;
     // A thread's CPU-time clock cannot be slept on (a C library turns
@@ -190,7 +190,7 @@ pub(crate) fn plain_memory(n: u64, a: &[u64; 6]) -> bool {
         || n == nr::MMAP && a[3] & fwe_abi::mman::MAP_ANONYMOUS != 0
 }
 
-/// Whether call `nr` may change what [`crate::procreg::Security`] holds,
+/// Whether call `nr` can change what [`crate::procreg::Security`] holds,
 /// or the credentials Linux's `commit_creds` watches.
 fn changes_security(nr: u64) -> bool {
     matches!(
@@ -212,7 +212,7 @@ fn changes_security(nr: u64) -> bool {
 }
 
 impl<P: Platform> Kernel<P> {
-    /// Whether the caller may make a socket of `domain`, `type_` and
+    /// Whether the caller can make a socket of `domain`, `type_` and
     /// `protocol` (one the host can make, checked after): a raw IP socket
     /// takes `CAP_NET_RAW` in the user namespace owning the network
     /// namespace (`EPERM`); an ICMP datagram ("ping") socket a group in
@@ -252,7 +252,7 @@ impl<P: Platform> Kernel<P> {
         ([c.euid, c.egid, c.fsuid, c.fsgid], c.caps.permitted)
     }
 
-    /// After call `nr`, which may have changed the security state, from
+    /// After call `nr`, which might have changed the security state, from
     /// `before` ([`Kernel::cred_marks`]): a change of the ids, or a gain of
     /// capabilities (other than a new user namespace's, which Linux's
     /// `commit_creds` counts as none), makes the process dumpable only as
@@ -685,7 +685,7 @@ impl<P: Platform> Kernel<P> {
                     (Err(e), _) => return err(e),
                 };
                 // A child of the caller's session that has run a program of
-                // its own may not be moved (`EACCES`), whatever the group:
+                // its own cannot be moved (`EACCES`), whatever the group:
                 // Linux tells that before the group's checks, the host after.
                 // SAFETY: plain host calls.
                 let (me, sid) = unsafe { (libc::getpid(), libc::getsid(0)) };
@@ -793,7 +793,7 @@ impl<P: Platform> Kernel<P> {
                 thread::set_robust_list(a[0], a[1]);
                 0
             }
-            // Any thread's list, another process's to a caller that may
+            // Any thread's list, another process's to a caller that can
             // trace it; the length is always the head's size, as Linux's.
             nr::GET_ROBUST_LIST => {
                 let pid = a[0] as i32;
@@ -972,7 +972,7 @@ impl<P: Platform> Kernel<P> {
             nr::RT_SIGACTION => self.sys_rt_sigaction(a[0], a[1], a[2], a[3]),
             nr::KILL => self.sys_kill(a[0] as i32 as i64, a[1]),
             nr::TKILL => self.sys_tgkill(-1, a[0] as i32 as i64, a[1]),
-            // A tgid must name a process (`tkill` passes -1 for any).
+            // A tgid needs to name a process (`tkill` passes -1 for any).
             nr::TGKILL if (a[0] as i32) <= 0 => err(errno::EINVAL),
             nr::TGKILL => self.sys_tgkill(a[0] as i32 as i64, a[1] as i32 as i64, a[2]),
             nr::RT_SIGPENDING => self.sys_rt_sigpending(a[0], a[1]),
@@ -1002,11 +1002,11 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Run call `n` on the kernel lock's shared side, alongside other
-    /// threads' ([`crate::klock`]), if it is one that may: `None` for any
+    /// threads' ([`crate::klock`]), if it is one that can: `None` for any
     /// other, which [`Kernel::dispatch`] runs holding the lock for itself.
     /// What [`Kernel::dispatch`] does around a call is done here as far as
-    /// these calls need it; a call that must start the reaper's watcher, or
-    /// that Landlock must check, is left to it.
+    /// these calls need it; a call that needs to start the reaper's watcher, or
+    /// that Landlock checks, is left to it.
     pub(crate) fn dispatch_shared(&self, n: u64, a: [u64; 6]) -> Option<i64> {
         if !shares(n) || crate::reaper::watcher_wanted() || crate::landlock::active() {
             return None;
@@ -1901,7 +1901,7 @@ impl<P: Platform> Kernel<P> {
             PR_GET_THP_DISABLE if arg2 | arg3 | arg4 | arg5 != 0 => err(errno::EINVAL),
             PR_GET_THP_DISABLE => i64::from(THP_DISABLE.load(Relaxed)),
             // The CPU's speculation is the host's to control: no misfeature
-            // is reported as one the process may change.
+            // is reported as one the process can change.
             PR_GET_SPECULATION_CTRL if arg3 | arg4 | arg5 != 0 => err(errno::EINVAL),
             PR_GET_SPECULATION_CTRL => match arg2 {
                 PR_SPEC_STORE_BYPASS | PR_SPEC_INDIRECT_BRANCH | PR_SPEC_L1D_FLUSH => {
@@ -1934,7 +1934,7 @@ impl<P: Platform> Kernel<P> {
             }
             PR_SET_DUMPABLE => err(errno::EINVAL),
             PR_GET_DUMPABLE => i64::from(crate::coredump::dumpable()),
-            // Yama: the process (and those below it) that may trace this
+            // Yama: the process (and those below it) that can trace this
             // one where `kernel.yama.ptrace_scope` is 1; any with
             // `PR_SET_PTRACER_ANY` (-1); none with 0.
             PR_SET_PTRACER => match arg2 {
@@ -2245,7 +2245,7 @@ impl<P: Platform> Kernel<P> {
             Action::Errno(e) => self.finish_syscall(regs, nr, args, err(e)),
             Action::Trap(data) => {
                 crate::signal::raise_sigsys(regs.pc, nr, data);
-                // The call is not made; a handler may set what it returns.
+                // The call is not made; a handler can set what it returns.
                 let x0 = regs.x[0] as i64;
                 self.finish_syscall(regs, nr, args, x0);
             }
@@ -2265,7 +2265,7 @@ impl<P: Platform> Kernel<P> {
 
     /// `SECCOMP_RET_TRACE` with `data` for the call in `regs`: a tracer
     /// that asked for it (`PTRACE_O_TRACESECCOMP`) stops the call with
-    /// `PTRACE_EVENT_SECCOMP` (its message `data`) and may change it; then
+    /// `PTRACE_EVENT_SECCOMP` (its message `data`) and can change it; then
     /// the filters run again on what it left, a call it set to -1 being
     /// skipped, as Linux's `__seccomp_filter` has it. Without such a tracer,
     /// [`crate::seccomp::Action::Trace`] stands (`ENOSYS`).
@@ -2337,7 +2337,7 @@ impl<P: Platform> Kernel<P> {
         }
     }
 
-    /// A call that may have changed the caller's ids returned `r`: other
+    /// A call that might have changed the caller's ids returned `r`: other
     /// processes see the ids it now has ([`crate::procreg::ProcRecord::ids`]).
     /// [`Kernel::ids_changed`] after a `set*uid` (result `r`) of a process
     /// whose real user was `old`: a new real user past `RLIMIT_NPROC`
@@ -2483,7 +2483,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `sched_setaffinity(pid, len, mask)`: checked as Linux checks it (the
-    /// mask must name an online CPU; another user's process needs
+    /// mask needs to name an online CPU; another user's process needs
     /// `CAP_SYS_NICE`) and kept in the record of the process named, which
     /// `sched_getaffinity` then reports, in it or any other. The host has
     /// no affinity to set: threads still run on any CPU, and a process fwe
@@ -2836,7 +2836,7 @@ impl<P: Platform> Kernel<P> {
         }
         let set = guest!(uaccess::read::<u64>(mask));
         let r = crate::signalfd::signalfd4(fd as i32, set, flags);
-        // A watched signal must reach the backend even when its disposition
+        // A watched signal needs to reach the backend even when its disposition
         // would let the host drop it.
         self.sync_all_host_signals();
         r
@@ -2877,7 +2877,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     loop {
         let mut ask = set.to_vec();
         let mut full = false;
-        // An eventfd that may be written to is writable: its pipe's read
+        // An eventfd that can be written to is writable: its pipe's read
         // end, which the host watches, never is.
         let writable: Vec<bool> = set
             .iter()
@@ -3105,7 +3105,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EINVAL);
         }
         // `file_setattr` takes the attributes first: those past the 24
-        // bytes it knows must be zero.
+        // bytes it knows need to be zero.
         let wanted = if set {
             let given = guest!(uaccess::read_bytes(attr, size as usize));
             if given[VER0 as usize..].iter().any(|&b| b != 0) {
@@ -3544,7 +3544,7 @@ unsafe fn pselect6_wait(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
 /// [`crate::blocking_syscall`]; it touches no kernel state.
 ///
 /// # Safety
-/// `fds` must point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
+/// `fds` MUST point to `nfds` guest `pollfd`s and `timeout`, when non-null, to
 /// a guest `Timespec`, where the time left is written back.
 pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
     // SAFETY: the caller's guarantee, passed on.
@@ -3557,7 +3557,7 @@ pub(crate) unsafe fn ppoll(fds: u64, nfds: u64, timeout: u64) -> i64 {
 /// As for [`ppoll`].
 unsafe fn ppoll_wait(fds: u64, nfds: u64, timeout: u64) -> i64 {
     const _: () = assert!(size_of::<Pollfd>() == size_of::<libc::pollfd>());
-    // More than a process may have open, before the array is read.
+    // More than a process can have open, before the array is read.
     if nfds > crate::fdtable::limit().0 {
         return err(errno::EINVAL);
     }
@@ -4235,7 +4235,7 @@ fn is_dir_fd(fd: i32) -> bool {
     unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFDIR }
 }
 
-/// Whether call `n` may change which memory is mapped, or how.
+/// Whether call `n` can change which memory is mapped, or how.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -4298,7 +4298,7 @@ mod tests {
     /// Held by a test that maps memory through the kernel: the tests share
     /// the process's address space and its record of the guest's mappings,
     /// and one that unmaps, moves or probes an address it gave up (as
-    /// `mremap` of a moved range does) must not reach another's mapping the
+    /// `mremap` of a moved range does) MUST NOT reach another's mapping the
     /// host put there meanwhile.
     fn mapping_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -4971,7 +4971,7 @@ mod tests {
     fn no_guest_pid_signals_the_hosts_processes() {
         let _held = crate::thread::signals_held();
         let mut k = kernel();
-        // `SI_QUEUE`: a code a process may send (with the kernel's own,
+        // `SI_QUEUE`: a code a process can send (with the kernel's own,
         // `SI_USER`, Linux refuses any but the caller itself first).
         let mut info = [0u8; 128];
         info[8..12].copy_from_slice(&(-1i32).to_ne_bytes());
@@ -4987,7 +4987,7 @@ mod tests {
         for pid in [-1, 0, -5] {
             assert_eq!(HostPid::new(pid), None);
         }
-        // tgkill's thread group must be a process.
+        // tgkill's thread group needs to be a process.
         assert_eq!(k.syscall(nr::TGKILL, [-1i64 as u64, 1, 0, 0, 0, 0]), err(errno::EINVAL));
     }
 
@@ -5054,8 +5054,8 @@ mod tests {
         assert!(user_ms(&fresh.1) < 20, "a new thread's own: {}", user_ms(&fresh.1));
     }
 
-    /// A signal to a process group goes to each member the caller may
-    /// signal: one whose only member it may not (a process fwe has no
+    /// A signal to a process group goes to each member the caller can
+    /// signal: one whose only member it cannot (a process fwe has no
     /// record of counts as root's) gives `EPERM` and signals nothing, as
     /// Linux's `kill_pgrp`.
     #[test]
@@ -5107,7 +5107,7 @@ mod tests {
     }
 
     /// Large data mappings left to fwe lie side by side, one host region
-    /// (each a host fork copies); a large reservation, which a loader may
+    /// (each a host fork copies); a large reservation, which a loader can
     /// map code into, gets room for stubs on both sides.
     #[test]
     fn large_data_lies_side_by_side_and_reservations_get_room() {

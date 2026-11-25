@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 /// The id an unmapped one shows as.
 pub const OVERFLOW: u32 = 65534;
 
-/// The most lines a map may have.
+/// The most lines a map can have.
 const MAX_EXTENTS: usize = 340;
 
 /// One line of a map: `count` ids from `inside` are the parent's from
@@ -127,7 +127,7 @@ pub fn nested() -> bool {
     NESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
-/// Whether the process may make a user namespace below its own: not from
+/// Whether the process can make a user namespace below its own: not from
 /// inside a `chroot` (`chrooted`), which it could leave with the
 /// capabilities the new namespace gives (`EPERM`).
 pub fn may_make(chrooted: bool) -> Result<(), i32> {
@@ -303,7 +303,7 @@ pub fn setgroups_allowed() -> bool {
 }
 
 /// A map written to a namespace (`gid` for `gid_map`) as text, by a writer
-/// that `privileged` (has `CAP_SETUID`/`CAP_SETGID`) or else may map only
+/// that `privileged` (has `CAP_SETUID`/`CAP_SETGID`) or else can map only
 /// its own (initial namespace's) id `own` (in its parent's terms `own_ns`).
 pub fn write_map(
     ns: &Record<UserNs>,
@@ -319,7 +319,7 @@ pub fn write_map(
         let [i, o, c] = w[..] else { return Err(errno::EINVAL) };
         let parse = |s: &str| s.parse::<u32>().map_err(|_| errno::EINVAL);
         let (i, o, c) = (parse(i)?, parse(o)?, parse(c)?);
-        // Linux takes ids up to 2^32 - 2: an extent may not reach 2^32 - 1.
+        // Linux takes ids up to 2^32 - 2: an extent cannot reach 2^32 - 1.
         if c == 0 || i.checked_add(c).is_none() || o.checked_add(c).is_none() {
             return Err(errno::EINVAL);
         }
@@ -336,7 +336,7 @@ pub fn write_map(
     if map.is_empty() || map.len() > MAX_EXTENTS {
         return Err(errno::EINVAL);
     }
-    // Each extent's ids must be the parent namespace's, all within one
+    // Each extent's ids need to be the parent namespace's, all within one
     // extent of its map (Linux's `map_id_range_down` of the parent's map,
     // for every writer): the initial namespace has them all.
     if let Some((dir, _)) = &ns.get().parent {

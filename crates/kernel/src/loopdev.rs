@@ -6,7 +6,7 @@
 //! devices exist and what each is attached to (the file's host path and
 //! identity, the guest path it was attached by, the offset, size limit,
 //! flags and block size). A process reads and writes a device through the
-//! file at that path, opened for the call, so the file must stay at its
+//! file at that path, opened for the call, so the file MUST stay at its
 //! path while attached (Linux holds it open; fwe cannot reach one unlinked).
 //!
 //! The device nodes are fwe's ([`crate::devnodes`]): block 7:N and
@@ -62,7 +62,7 @@ const DEFAULT_RA_PAGES: u64 = 32;
 const MAX_BLOCK_SIZE: u64 = 64 * 1024;
 /// The most sectors one request carries (`BLKSECTGET`).
 const MAX_SECTORS: u16 = 2560;
-/// The flags `LOOP_SET_STATUS` sets, those it may clear, and those
+/// The flags `LOOP_SET_STATUS` sets, those it can clear, and those
 /// `LOOP_CONFIGURE` takes.
 const SETTABLE: u32 = LO_FLAGS_AUTOCLEAR | LO_FLAGS_PARTSCAN;
 const CLEARABLE: u32 = LO_FLAGS_AUTOCLEAR;
@@ -278,7 +278,7 @@ fn alive(pid: i32) -> bool {
 }
 
 /// Descriptor `fd` is being closed: a device this process ran down
-/// ([`Device::rundown`]) may be attached again once none of its
+/// ([`Device::rundown`]) can be attached again once none of its
 /// descriptors holds it.
 pub fn closed(fd: i32) {
     let Some(Mark::Loop(n)) = fdmarks::marked(fd) else { return };
@@ -788,7 +788,7 @@ pub fn fallocate(fd: i32, mode: u64, offset: u64, len: u64) -> Option<i64> {
 
 /// What a mapping of loop device descriptor `fd` maps instead: the attached
 /// file, open as `fd` is, and where the device starts in it (`None` for
-/// another descriptor). The device's start must fall on a page of
+/// another descriptor). The device's start needs to fall on a page of
 /// `page_size` bytes, the host's mappings' grain (`EINVAL`).
 pub fn map_source(fd: i32, page_size: u64) -> Option<Result<(OwnedFd, u64), i32>> {
     let Some(n) = opened_on(fd)? else { return Some(Err(errno::ENODEV)) };
@@ -951,7 +951,7 @@ fn status_old(n: u32, b: &Binding) -> Result<Vec<u8>, i32> {
 }
 
 /// The flags `LOOP_SET_STATUS` leaves a device with `prev` set when asked
-/// for `new`: those it may set as asked, except that what it may not clear
+/// for `new`: those it can set as asked, except that what it cannot clear
 /// stays set, and the rest as they were.
 fn status_flags(prev: u32, new: u32) -> u32 {
     (new & SETTABLE) | (prev & !SETTABLE) | (prev & !CLEARABLE)
@@ -1651,8 +1651,8 @@ mod tests {
 
     #[test]
     fn set_status_keeps_what_it_may_not_change() {
-        // Read-only stays; partition scanning may be set, not cleared;
-        // autoclear may be both.
+        // Read-only stays; partition scanning can be set, not cleared;
+        // autoclear can be both.
         let apply = status_flags;
         let all = LO_FLAGS_AUTOCLEAR | LO_FLAGS_PARTSCAN | LO_FLAGS_READ_ONLY | LO_FLAGS_DIRECT_IO;
         assert_eq!(apply(0, all), LO_FLAGS_AUTOCLEAR | LO_FLAGS_PARTSCAN);

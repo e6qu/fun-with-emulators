@@ -54,7 +54,7 @@ pub struct ProcRecord {
     pub autoreap: bool,
     /// Its `oom_score_adj` (-1000 to 1000), which its children inherit.
     pub oom_score_adj: i32,
-    /// The least `oom_score_adj` it may set without `CAP_SYS_RESOURCE`: the
+    /// The least `oom_score_adj` it can set without `CAP_SYS_RESOURCE`: the
     /// last one a privileged process set it to (inherited too).
     pub oom_score_adj_min: i32,
     /// Its user and group ids, as the kernel holds them (real, effective,
@@ -82,7 +82,7 @@ pub struct ProcRecord {
     /// (`PR_SET_TIMERSLACK`, `/proc/<pid>/timerslack_ns`), in nanoseconds.
     pub slack: (u64, u64),
     /// Whether it has run a program of its own since its fork (Linux's
-    /// `PF_FORKNOEXEC` cleared): a parent may no longer move it to another
+    /// `PF_FORKNOEXEC` cleared): a parent can no longer move it to another
     /// process group.
     pub execed: bool,
     /// The auxiliary vector its program started with (`/proc/<pid>/auxv`,
@@ -114,7 +114,7 @@ pub struct Security {
     pub caps: [u64; 5],
     /// Its dumpable value ([`crate::coredump::dumpable`]).
     pub dumpable: u8,
-    /// The host pid of the process that may trace it besides its
+    /// The host pid of the process that can trace it besides its
     /// ancestors (`PR_SET_PTRACER`), -1 for any, 0 for none.
     pub ptracer: i32,
     pub no_new_privs: bool,
@@ -560,7 +560,7 @@ pub fn forget_end(pid: HostPid) {
 /// Forget host process `pid` (it ended), whose record's lock is `held`.
 /// Where a new process has the pid already, only the old one's record
 /// goes: the files beside it (its mailbox and mappings) are the new one's
-/// now, which may have opened them before it wrote its own record.
+/// now, which might have opened them before it wrote its own record.
 pub fn remove(held: &crate::procstore::Held, pid: HostPid) {
     crate::procstore::remove(held, pid);
     if start_time(pid).is_some() {
@@ -634,7 +634,7 @@ fn listed(wait: bool) -> (Vec<(HostPid, ProcRecord)>, bool) {
         }
         // A zombie has ended (Linux lists it in no cgroup either): its
         // record goes, and how it ended is kept for whoever reaps it.
-        // Read again once before it is taken for gone: another process may
+        // Read again once before it is taken for gone: another process might
         // have been replacing the record, or the host not yet answered.
         let live = || read(pid).filter(|r| alive((pid, r.start)));
         match live().or_else(live) {
@@ -804,7 +804,7 @@ fn fresh(pid: HostPid, start: u64) -> ProcRecord {
 /// none).
 fn change(pid: HostPid, f: impl FnOnce(&mut ProcRecord)) -> Result<(), i32> {
     let start = start_time(pid).ok_or(fwe_abi::errno::ESRCH)?;
-    // Under the record's lock: a parent and its child may change one.
+    // Under the record's lock: a parent and its child can change one.
     let held = crate::procstore::lock(pid).ok_or(fwe_abi::errno::ESRCH)?;
     let mut r = with_held(pid, read_any(pid).filter(|r| r.start == start))
         .unwrap_or_else(|| fresh(pid, start));
@@ -1075,7 +1075,7 @@ pub fn forked(
         with_own(|r| (r.comm.clone(), r.cmdline.clone(), r.exe.clone())).unwrap_or_default();
     let cgroup = cgroup.map_or_else(own_cgroup, <[u8]>::to_vec);
     // Kept what the child has already written of itself (its program,
-    // and its namespaces and cgroup, which it may have changed since).
+    // and its namespaces and cgroup, which it might have changed since).
     let _ = change(child, |r| {
         let child_wrote = !r.lineage.is_empty();
         if !child_wrote || r.cgroup.is_empty() {
@@ -1087,7 +1087,7 @@ pub fn forked(
         if r.exe.is_empty() {
             (r.comm, r.cmdline, r.exe) = (comm, cmdline, exe);
         }
-        // What the child wrote of itself already stands: it may have
+        // What the child wrote of itself already stands: it might have
         // changed it since.
         if r.lineage.is_empty() {
             apply(r, inherit);
@@ -1274,14 +1274,14 @@ pub fn set_slack(pid: HostPid, value: u64) -> Result<(), i32> {
     change(pid, |r| r.slack.0 = if value == 0 { r.slack.1 } else { value })
 }
 
-/// Host process `pid`'s `oom_score_adj` and the least it may set without
+/// Host process `pid`'s `oom_score_adj` and the least it can set without
 /// `CAP_SYS_RESOURCE`.
 pub fn oom_score_adj_range(pid: HostPid) -> (i32, i32) {
     read(pid).map_or((0, 0), |r| (r.oom_score_adj, r.oom_score_adj_min))
 }
 
 /// Set host process `pid`'s `oom_score_adj`, and, set by a privileged
-/// process (`floor`), the least it may set without privilege.
+/// process (`floor`), the least it can set without privilege.
 pub fn set_oom_score_adj(pid: HostPid, value: i32, floor: bool) -> Result<(), i32> {
     change(pid, |r| {
         r.oom_score_adj = value;
@@ -1510,8 +1510,8 @@ pub fn host_stopped(pid: HostPid) -> bool {
 /// Whether this process stops in fwe: its parent is one of fwe's, which
 /// learns of its stops through fwe (a foster child's, `CLONE_PARENT`,
 /// follows it as a reaper does), or it has none on the host (an orphan,
-/// `launchd`'s, which a reaper of fwe's may have adopted). Not where a
-/// living process that is not fwe's (a shell) must see it stop.
+/// `launchd`'s, which a reaper of fwe's might have adopted). Not where a
+/// living process that is not fwe's (a shell) needs to see it stop.
 pub fn stops_in_fwe() -> bool {
     crate::host::parent_pid().is_some_and(|p| p.get() == 1 || crate::host::is_fwe(p))
 }
@@ -1758,7 +1758,7 @@ pub fn all_ended() -> Vec<Ended> {
 }
 
 /// The records of processes with host pid `pid` that ended and are not yet
-/// reaped (an older one may have had its number).
+/// reaped (an older one might have had its number).
 fn ended_of(pid: HostPid) -> Vec<Ended> {
     ended_where(|p| p == pid)
 }

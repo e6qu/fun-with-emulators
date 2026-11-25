@@ -14,7 +14,7 @@
 pub const MAP: u8 = b'm';
 pub const PROG: u8 = b'p';
 
-/// Whether host `st` may be one of these objects (a host shared memory
+/// Whether host `st` might be one of these objects (a host shared memory
 /// object's: no file type, inode 0), before asking its name ([`identify`]).
 pub fn may_be(st: &libc::stat) -> bool {
     st.st_mode & libc::S_IFMT == 0 && st.st_ino == 0
@@ -73,7 +73,7 @@ impl Mapping {
         }
         let mut b = vec![0u8; len];
         // SAFETY: inside the mapping, which lives as long as `self`; other
-        // processes may write it meanwhile, as they may Linux's map.
+        // processes can write it meanwhile, as they can Linux's map.
         unsafe { std::ptr::copy_nonoverlapping((self.at + at) as *const u8, b.as_mut_ptr(), len) };
         Some(b)
     }

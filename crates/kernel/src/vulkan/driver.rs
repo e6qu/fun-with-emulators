@@ -41,7 +41,7 @@ pub struct Driver {
 }
 
 // SAFETY: the driver's functions are callable from any thread (Vulkan's
-// rules on which objects calls may share are the program's to keep, as
+// rules on which objects calls can share are the program's to keep, as
 // they are with a loader's driver).
 unsafe impl Send for Driver {}
 // SAFETY: as above; nothing in `Driver` changes after loading.
@@ -90,7 +90,7 @@ fn load() -> Result<Driver, String> {
     let c = CString::new(path.as_os_str().as_encoded_bytes())
         .map_err(|_| format!("{}: a NUL in the library's path", manifest.display()))?;
     // SAFETY: a NUL-terminated path. The library is never closed: its
-    // objects live as long as the process may use them.
+    // objects live as long as the process might use them.
     let lib = unsafe { libc::dlopen(c.as_ptr(), libc::RTLD_NOW | libc::RTLD_LOCAL) };
     if lib.is_null() {
         // SAFETY: `dlerror` returns the last error's text or NULL.

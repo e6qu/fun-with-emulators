@@ -1,7 +1,7 @@
 //! Sockets.
 //!
 //! Guest file descriptors are host socket descriptors. On Linux the calls would
-//! be a straight passthrough, but `AF_UNIX` addresses must be rooted under the
+//! be a straight passthrough, but `AF_UNIX` addresses need to be rooted under the
 //! guest rootfs on every host, so all address handling goes through [`to_host`]
 //! and [`to_guest`]. On macOS those also translate the BSD differences:
 //!
@@ -116,7 +116,7 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     Ok(host)
 }
 
-/// Whether the caller may write to the Unix socket file host address `hb`
+/// Whether the caller can write to the Unix socket file host address `hb`
 /// names (`a`'s), which connecting or sending to it needs: as `open`
 /// checks, the caller's file-system ids against the node's guest owner
 /// and mode ([`crate::owners`], [`crate::modes`]), `EACCES` where they
@@ -301,7 +301,7 @@ fn abstract_stale(hb: &[u8; SOCKADDR_MAX], len: libc::socklen_t, ty: i32) -> boo
 /// returning the host length.
 ///
 /// # Safety
-/// `addr` must span `len` readable bytes.
+/// `addr` MUST span `len` readable bytes.
 unsafe fn to_host(
     addr: u64,
     len: u64,
@@ -891,8 +891,8 @@ fn ip_header_len(d: &[u8]) -> usize {
 /// message's buffers (translated guest buffers: a fault there is `EFAULT`).
 ///
 /// # Safety
-/// `hmsg`'s name and control buffers must be valid for writing, and its
-/// `msg_iov` must point to `msg_iovlen` iovecs.
+/// `hmsg`'s name and control buffers MUST be valid for writing, and its
+/// `msg_iov` MUST point to `msg_iovlen` iovecs.
 unsafe fn ping_recvmsg(fd: i32, hmsg: &mut libc::msghdr, hflags: i32, whole: bool) -> i64 {
     // The largest IP datagram.
     let mut d = vec![0u8; 65536];
@@ -940,7 +940,7 @@ pub fn ping_read(fd: i32, iov: &[libc::iovec]) -> i64 {
 /// `socketpair(domain, type, protocol, sv)`.
 ///
 /// # Safety
-/// `sv` must point to two writable `i32`s.
+/// `sv` MUST point to two writable `i32`s.
 pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64 {
     let dom = match check_socket(domain, type_, protocol) {
         Ok(d) => d,
@@ -996,8 +996,8 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
 /// `bind(fd, addr, addrlen)`.
 ///
 /// # Safety
-/// `addr` must point to `addrlen` readable bytes.
-/// `may_low`: the caller may bind a port below 1024
+/// `addr` MUST point to `addrlen` readable bytes.
+/// `may_low`: the caller can bind a port below 1024
 /// (`CAP_NET_BIND_SERVICE`), as a network namespace of fwe's asks.
 pub unsafe fn bind(fd: u64, addr: u64, addrlen: u64, may_low: bool, umask: u32) -> i64 {
     let src = match guest_sockaddr(fd as i32, addr, addrlen, true) {
@@ -1146,7 +1146,7 @@ fn bind_name(fd: u64, src: Vec<u8>, may_low: bool, umask: u32) -> i64 {
         if let Ok(name) = std::ffi::CString::new(&hb[2..end]) {
             use std::os::fd::AsRawFd;
             let dir = a.dir.as_ref().map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
-            // Not through a link another thread may have put in its place.
+            // Not through a link another thread might have put in its place.
             // SAFETY: a NUL-terminated name, relative to a live directory.
             unsafe {
                 let mut st: libc::stat = std::mem::zeroed();
@@ -1263,7 +1263,7 @@ pub unsafe fn listen(fd: u64, backlog: u64) -> i64 {
 /// `connect(fd, addr, addrlen)`.
 ///
 /// # Safety
-/// `addr` must point to `addrlen` readable bytes.
+/// `addr` MUST point to `addrlen` readable bytes.
 pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
     if crate::netlink::is(fd as i32) {
         // The kernel (port 0) is the only peer there is.
@@ -1576,7 +1576,7 @@ fn remembered_name(fd: i32, local: bool) -> Option<Vec<u8>> {
 /// `accept4(fd, addr, addrlen, flags)`; `accept` is this with `flags == 0`.
 ///
 /// # Safety
-/// `addr`/`addrlen`, if non-null, must be writable.
+/// `addr`/`addrlen`, if non-null, MUST be writable.
 pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     if flags & !(SOCK_NONBLOCK | SOCK_CLOEXEC) != 0 {
         return err(errno::EINVAL);
@@ -1619,7 +1619,7 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
 /// `getsockname`/`getpeername`; `peer` selects which.
 ///
 /// # Safety
-/// `addr`/`addrlen` must be writable.
+/// `addr`/`addrlen` MUST be writable.
 pub unsafe fn getname(fd: u64, addr: u64, addrlen: u64, peer: bool) -> i64 {
     let mut hb = empty_sockaddr();
     let mut hl: libc::socklen_t = SOCKADDR_MAX as libc::socklen_t;
@@ -2053,7 +2053,7 @@ fn creds_for(fd: i32, to: Option<&[u8]>) -> Option<crate::scm::Creds> {
 /// without it, as one segment or datagram.
 ///
 /// # Safety
-/// `msg` must reference valid buffers.
+/// `msg` MUST reference valid buffers.
 unsafe fn send_corked(fd: i32, msg: &mut libc::msghdr, flags: u64, hflags: i32) -> i64 {
     #[allow(clippy::unnecessary_cast)] // `msg_iovlen` is an `int` on macOS
     // SAFETY: the caller's guarantee.
@@ -2740,7 +2740,7 @@ pub unsafe fn setsockopt(
 /// `getsockopt`.
 ///
 /// # Safety
-/// `optval`/`optlen` must be writable.
+/// `optval`/`optlen` MUST be writable.
 pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen: u64) -> i64 {
     if level == SOL_SOCKET && optname == SO_PEERCRED {
         if !is_unix(fd as i32) || crate::netlink::is(fd as i32) {
@@ -3024,7 +3024,7 @@ const MSG_CMSG_COMPAT: u64 = 0x8000_0000;
 /// `sendmsg(fd, msg, flags)`.
 ///
 /// # Safety
-/// `msg` must point to a valid `msghdr`.
+/// `msg` MUST point to a valid `msghdr`.
 pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     if flags as u32 as u64 & MSG_CMSG_COMPAT != 0 {
         return err(errno::EINVAL);
@@ -3285,7 +3285,7 @@ fn socket_fd(fd: i32) -> Result<(), i64> {
 /// `recvmsg(fd, msg, flags)`.
 ///
 /// # Safety
-/// `msg` must point to a valid `msghdr` with writable `iov`/`name`.
+/// `msg` MUST point to a valid `msghdr` with writable `iov`/`name`.
 pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     if flags as u32 as u64 & MSG_CMSG_COMPAT != 0 {
         return err(errno::EINVAL);
@@ -3928,7 +3928,7 @@ mod tests {
         assert_eq!(got, 1, "recvmsg: {got}");
         assert_eq!(rbuf[0], b'x');
 
-        // The control buffer should carry one SCM_RIGHTS fd (Linux layout).
+        // The control buffer carries one SCM_RIGHTS fd (Linux layout).
         let clen = u64::from_ne_bytes(rhdr[40..48].try_into().unwrap()) as usize;
         assert!(clen >= 20, "controllen: {clen}");
         let newfd = i32::from_ne_bytes([rc[16], rc[17], rc[18], rc[19]]);
@@ -4550,7 +4550,7 @@ mod creds_tests {
     }
 
     /// A socket that asked for credentials receives its peer's, or those
-    /// the sender gave when it may give them.
+    /// the sender gave when it can give them.
     #[test]
     fn credentials_come_when_asked() {
         let _g = super::scm_tests::serial();

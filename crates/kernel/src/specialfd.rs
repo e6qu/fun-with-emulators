@@ -26,7 +26,7 @@
 //! lock to post would deadlock. Both return `None` for a descriptor that is not
 //! one of ours, so the caller falls back to the normal host `read`/`write`.
 
-/// Whether `fd` is an emulated eventfd that may be written to: its count
+/// Whether `fd` is an emulated eventfd that can be written to: its count
 /// short of its maximum (its pipe's read end, which the guest holds, never
 /// is writable to the host).
 pub fn eventfd_writable(fd: i32) -> bool {
@@ -81,7 +81,7 @@ pub fn set_timer_nonblock(fd: i32, on: bool) -> bool {
 /// ours (possibly blocking without the kernel lock); `None` otherwise.
 ///
 /// # Safety
-/// `buf` must point to `len` writable guest bytes.
+/// `buf` MUST point to `len` writable guest bytes.
 pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
     #[cfg(target_os = "linux")]
     {
@@ -99,7 +99,7 @@ pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
 /// [`try_read`].
 ///
 /// # Safety
-/// `buf` must point to `len` readable guest bytes.
+/// `buf` MUST point to `len` readable guest bytes.
 pub unsafe fn try_write(fd: i32, buf: u64, len: u64) -> Option<i64> {
     #[cfg(target_os = "linux")]
     {
@@ -187,7 +187,7 @@ pub unsafe fn timerfd_create(clockid: u64, flags: u64) -> i64 {
 /// `timerfd_settime(fd, flags, new_value, old_value)`.
 ///
 /// # Safety
-/// `new_value` must point to a valid `itimerspec`; `old_value`, if non-null, to
+/// `new_value` MUST point to a valid `itimerspec`; `old_value`, if non-null, to
 /// writable space for one.
 pub unsafe fn timerfd_settime(fd: u64, flags: u64, new_value: u64, old_value: u64) -> i64 {
     #[cfg(target_os = "linux")]
@@ -234,7 +234,7 @@ pub fn timer_ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
 /// `timerfd_gettime(fd, curr_value)`.
 ///
 /// # Safety
-/// `curr_value` must point to writable space for an `itimerspec`.
+/// `curr_value` MUST point to writable space for an `itimerspec`.
 pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
     #[cfg(target_os = "linux")]
     // SAFETY: the host validates the itimerspec pointer.
@@ -817,7 +817,7 @@ mod imp {
     pub unsafe fn timerfd_create(clockid: u64, flags: u64) -> i64 {
         use fwe_abi::clock::*;
         use fwe_abi::timerfd::*;
-        // The clocks a timer may follow, and the flags Linux knows.
+        // The clocks a timer can follow, and the flags Linux knows.
         let clocks = [
             CLOCK_REALTIME,
             CLOCK_MONOTONIC,
@@ -1135,7 +1135,7 @@ mod imp {
         // descriptor does not block); a signal the guest handles ends the
         // wait (`EINTR`). Reads are looked for every millisecond: a count
         // this near its maximum is rare, and the wait keeps no hold on the
-        // counter, which a close may unmap.
+        // counter, which a close can unmap.
         loop {
             let r = add_to(fd, add);
             if r != err(errno::EAGAIN) {
@@ -1469,7 +1469,7 @@ mod tests {
         let mut cur = [0i64; 4];
         // SAFETY: `cur` is a writable itimerspec.
         assert_eq!(unsafe { timerfd_gettime(fd as u64, cur.as_mut_ptr() as u64) }, 0);
-        // A loaded host may sleep longer than asked: what is left is
+        // A loaded host can sleep longer than asked: what is left is
         // measured against the time that passed.
         let passed = set.elapsed().as_nanos() as i64;
         if passed >= 420_000_000 {

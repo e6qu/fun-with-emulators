@@ -171,7 +171,7 @@ impl Space {
 
     /// The guest mapped `latest`, a file view (`view`) or not: kept apart,
     /// without the lock where nothing is marked (a view among the marks,
-    /// which it may replace), the one before it put in the set.
+    /// which it can replace), the one before it put in the set.
     fn mapped(&self, latest: Latest, view: bool) {
         if !view && !self.marked.load(Ordering::Acquire) && self.latest.put(latest) {
             return;
@@ -366,7 +366,7 @@ fn zero_guest(start: u64, len: u64) {
     }
 }
 
-/// `vm.mmap_min_addr`: the lowest address a mapping may be made at
+/// `vm.mmap_min_addr`: the lowest address a mapping can be made at
 /// without `CAP_SYS_RAWIO` (Linux's arm64 default).
 pub const MMAP_MIN_ADDR: u64 = 65536;
 
@@ -387,7 +387,7 @@ impl<P: Platform> Kernel<P> {
 
 /// In a fork child: the ranges given `MADV_WIPEONFORK` are zero, as Linux
 /// gives the child new memory there. They are zeroed in place, the
-/// mappings left as they are (a backend may map the memory itself),
+/// mappings left as they are (a backend can map the memory itself),
 /// writable for the moment if they are not.
 #[cfg_attr(
     target_os = "macos",
@@ -960,7 +960,7 @@ pub mod region {
         pub start: u64,
         pub size: u64,
         pub protection: c_int,
-        /// The most `protection` may become.
+        /// The most `protection` can become.
         pub max_protection: c_int,
         /// A file (an external pager) backs the region.
         file_backed: bool,
@@ -1296,7 +1296,7 @@ fn parse_exec_ranges(fd: i32) -> Option<ExecFile> {
     // Mapped for the parse and unmapped at once, rather than read into a
     // buffer: a library can be 100 MB, and a freed buffer that size stays
     // reserved by the host's allocator, right beside the code, where the
-    // rewrite's stubs must be placed.
+    // rewrite's stubs need to be placed.
     // SAFETY: a fresh read-only private mapping of the whole file.
     let map = unsafe {
         libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ, libc::MAP_PRIVATE, fd, 0)
@@ -1431,7 +1431,7 @@ impl<P: Platform> Kernel<P> {
         r
     }
 
-    /// Whether the caller may map at fixed address `addr`: at or above
+    /// Whether the caller can map at fixed address `addr`: at or above
     /// `vm.mmap_min_addr`, or with `CAP_SYS_RAWIO` in the initial user
     /// namespace, as Linux's `cap_mmap_addr` (`EPERM` otherwise).
     fn may_map_at(&self, addr: u64) -> bool {
@@ -1511,7 +1511,7 @@ impl<P: Platform> Kernel<P> {
         if flags & (mman::MAP_FIXED | mman::MAP_FIXED_NOREPLACE) != 0 && !self.may_map_at(addr) {
             return err(errno::EPERM);
         }
-        // A mapping made locked (`MAP_LOCKED`, or after `MCL_FUTURE`) must
+        // A mapping made locked (`MAP_LOCKED`, or after `MCL_FUTURE`) needs to
         // fit `RLIMIT_MEMLOCK` with what is locked already (`EAGAIN`);
         // `MAP_LOCKED` with a limit of 0 is refused outright (`EPERM`).
         let map_locked = flags & mman::MAP_LOCKED != 0;
@@ -1538,7 +1538,7 @@ impl<P: Platform> Kernel<P> {
             return err(errno::EPERM);
         }
         // A file of fwe's store maps its data (host shared memory objects,
-        // each at the file's own offsets), which may never be made writable
+        // each at the file's own offsets), which can never be made writable
         // once its contents are sealed; a loop device maps the file it
         // shows.
         let stored = if flags & mman::MAP_ANONYMOUS == 0 {
@@ -1571,7 +1571,7 @@ impl<P: Platform> Kernel<P> {
             }
             None => (None, false),
         };
-        // A shared mapping of a file open only for reading may not be made
+        // A shared mapping of a file open only for reading cannot be made
         // writable later.
         // SAFETY: F_GETFL only queries the descriptor.
         let nowrite = flags & mman::MAP_ANONYMOUS == 0
@@ -1739,7 +1739,7 @@ impl<P: Platform> Kernel<P> {
 
     /// Map `len` bytes of host shared memory `fd`, `object`, shared, at
     /// `addr` (with `flags` Linux's `MAP_FIXED`, or none for anywhere),
-    /// with `prot`, `nowrite` if it may not be made writable: a System V
+    /// with `prot`, `nowrite` if it cannot be made writable: a System V
     /// segment's attachment, which needs none of what a guest's mapping of
     /// a file of its own looks at.
     #[allow(clippy::too_many_arguments)]
@@ -1787,7 +1787,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Whether `[addr, addr + len)` (page-aligned `addr`) has a sealed
-    /// mapping (`mseal`), which most changes may not touch (`EPERM`).
+    /// mapping (`mseal`), which most changes cannot touch (`EPERM`).
     fn sealed(&self, addr: u64, len: u64) -> bool {
         addr & (self.page_size - 1) == 0
             && crate::maps::may_be_sealed()
@@ -1795,7 +1795,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `mseal(addr, len, flags)`: seal the mappings of the range, every
-    /// page of which must be mapped.
+    /// page of which needs to be mapped.
     pub(crate) fn sys_mseal(&mut self, addr: u64, len: u64, flags: u64) -> i64 {
         if flags != 0 || addr & (self.page_size - 1) != 0 {
             return err(errno::EINVAL);
@@ -2103,7 +2103,7 @@ impl<P: Platform> Kernel<P> {
         if usize < size_of {
             return err(errno::EINVAL);
         }
-        // A larger structure's extra bytes must be zero.
+        // A larger structure's extra bytes need to be zero.
         match crate::uaccess::read_bytes(arg + size_of, (usize - size_of) as usize) {
             Ok(rest) if rest.iter().any(|&b| b != 0) => return err(errno::E2BIG),
             Ok(_) => {}
@@ -2221,7 +2221,7 @@ impl<P: Platform> Kernel<P> {
 /// of guest memory `[start, start + len)`, as Linux's locked memory is
 /// kept in: as far as the host lets a user process (its
 /// `vm.user_wire_limit`). Linux's result is the guest's whatever the
-/// host's: root may lock more than the host lets fwe wire. Whether the
+/// host's: root can lock more than the host lets fwe wire. Whether the
 /// host wired (or unwired) all of it.
 fn wire(start: u64, len: u64, on: bool) -> bool {
     let mut all = true;
@@ -2287,11 +2287,11 @@ fn populate(start: u64, len: u64, page: u64) {
 
 /// Where the host is asked to put a mapping the guest left to it (2 TiB):
 /// above the program, its break and fwe's own memory, below the top of
-/// the address space a guest may use.
+/// the address space a guest can use.
 const MMAP_HINT: u64 = 0x200_0000_0000;
 
 /// The size from which a mapping left to fwe is placed with room on both
-/// sides ([`Kernel::roomy_place`]): code within it may be longer than a
+/// sides ([`Kernel::roomy_place`]): code within it can be longer than a
 /// branch reaches, once its stubs' reach is counted.
 const ROOMY_FROM: u64 = 64 << 20;
 
@@ -2317,7 +2317,7 @@ impl<P: Platform> Kernel<P> {
             map_fixed_anon(old_end, new_end - old_end, libc::PROT_READ | libc::PROT_WRITE)
                 && self.platform.map_guest(old_end, new_end - old_end, rw).is_ok()
         } else if new_end < old_end {
-            // Released pages must read as zero if the break grows again.
+            // Released pages need to read as zero if the break grows again.
             self.platform.unmap_guest(new_end, old_end - new_end);
             map_fixed_anon(new_end, old_end - new_end, libc::PROT_NONE)
         } else {
@@ -2385,7 +2385,7 @@ impl<P: Platform> Kernel<P> {
                 && self.page_up(len) >= ROOMY_FROM
                 && (!anonymous || prot == mman::PROT_NONE || prot & mman::PROT_EXEC != 0)
             {
-                // A large mapping of a file, or an inaccessible one, may be
+                // A large mapping of a file, or an inaccessible one, can be
                 // a library's whole span, reserved before its code is
                 // mapped over it at a fixed address, as dynamic loaders do;
                 // large executable memory is code itself. Code longer than
@@ -2405,7 +2405,7 @@ impl<P: Platform> Kernel<P> {
             } else if addr == 0 {
                 // Left to the host, a mapping goes in the first gap it fits,
                 // among the program's image, its break and fwe's own memory,
-                // where code may find no room for its stubs within reach (a
+                // where code might find no room for its stubs within reach (a
                 // library a dynamic loader maps). From a place well above
                 // them, mappings fill upwards, the space past the latest one
                 // free.
@@ -2472,7 +2472,7 @@ impl<P: Platform> Kernel<P> {
         }
         let mut retried = false;
         let guest = 'map: loop {
-            // SAFETY: guest-requested mapping. MAP_FIXED may replace guest memory,
+            // SAFETY: guest-requested mapping. MAP_FIXED can replace guest memory,
             // which is the guest's own business, exactly as on Linux.
             let p = unsafe {
                 libc::mmap(
@@ -2755,7 +2755,7 @@ impl<P: Platform> Kernel<P> {
             final_prot(prot)
         };
         // A file view's pages (none once made executable) never writable on
-        // the host: its object may be open only for reading, which the host
+        // the host: its object might be open only for reading, which the host
         // refuses to map writable (`EACCES`).
         let mut views = if prot & mman::PROT_EXEC == 0 { views } else { Vec::new() };
         views.sort_unstable();
@@ -2824,7 +2824,7 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// A write the guest made at host address `addr` faulted: if it is a
-    /// page of a file view not yet written that the guest may write, the
+    /// page of a file view not yet written that the guest can write, the
     /// page becomes a copy of itself (see [`Ranges::file_views`]), and the write is
     /// tried again.
     pub fn view_fault(&mut self, addr: u64) -> bool {
@@ -2896,10 +2896,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// `mlock`, `mlock2` (`flags`) and `munlock` (`lock` false): the range,
-    /// widened to whole pages, must be mapped, and a caller without
-    /// `CAP_IPC_LOCK` may lock no more than its `RLIMIT_MEMLOCK` (none at
+    /// widened to whole pages, needs to be mapped, and a caller without
+    /// `CAP_IPC_LOCK` can lock no more than its `RLIMIT_MEMLOCK` (none at
     /// all if that is 0). The host wires the pages as far as it lets a
-    /// user process ([`wire`]); Linux's root may lock far more, and what a
+    /// user process ([`wire`]); Linux's root can lock far more, and what a
     /// program sees of a locked page is the same.
     fn mlock_call(&mut self, addr: u64, len: u64, flags: u64, lock: bool) -> i64 {
         if lock && flags & !mman::MLOCK_ONFAULT != 0 {
@@ -2942,7 +2942,7 @@ impl<P: Platform> Kernel<P> {
             if soft == 0 {
                 return err(errno::EPERM);
             }
-            // Locking what is mapped now must fit the limit.
+            // Locking what is mapped now needs to fit the limit.
             if flags & mman::MCL_CURRENT != 0 && crate::maps::record().total_bytes() > soft {
                 return err(errno::ENOMEM);
             }
@@ -3021,7 +3021,7 @@ impl<P: Platform> Kernel<P> {
                 return Err(errno::EINVAL);
             }
             // MADV_REMOVE frees the file's blocks: only through a shared
-            // mapping that may write it.
+            // mapping that can write it.
             if advice == mman::MADV_REMOVE && !(a.shared && !a.nowrite) {
                 return Err(errno::EACCES);
             }
@@ -3149,7 +3149,7 @@ impl<P: Platform> Kernel<P> {
             }
             mman::MADV_NORMAL | mman::MADV_RANDOM | mman::MADV_SEQUENTIAL | mman::MADV_WILLNEED => {
                 // Hints, which Linux takes for any mapped memory (the host
-                // refuses some, for memory it may not read).
+                // refuses some, for memory it cannot read).
                 // SAFETY: advisory call on guest memory; values match the host's.
                 unsafe {
                     libc::madvise(host as *mut libc::c_void, len as usize, advice as libc::c_int)
@@ -3191,7 +3191,7 @@ impl<P: Platform> Kernel<P> {
     /// aligned old address, `MREMAP_FIXED` and `MREMAP_DONTUNMAP` only with
     /// `MREMAP_MAYMOVE` (the latter keeping the size), a new length, an
     /// aligned new address that does not overlap the old range (`EINVAL`);
-    /// then the old range, which must be mapped, one mapping without a gap
+    /// then the old range, which needs to be mapped, one mapping without a gap
     /// (`EFAULT`).
     fn mremap_check(
         &self,

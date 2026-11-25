@@ -209,7 +209,7 @@ pub unsafe fn create1(flags: u64) -> i64 {
 /// `epoll_ctl(epfd, op, fd, event)`.
 ///
 /// # Safety
-/// `event` must point to a valid `epoll_event` unless `op` is `EPOLL_CTL_DEL`.
+/// `event` MUST point to a valid `epoll_event` unless `op` is `EPOLL_CTL_DEL`.
 pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
     #[cfg(target_os = "linux")]
     {
@@ -345,7 +345,7 @@ fn is_epoll(fd: i32) -> bool {
     interest(|m| m.contains_key(&fd))
 }
 
-/// The most epoll descriptors one path of nested sets may pass through
+/// The most epoll descriptors one path of nested sets can pass through
 /// beyond the first (Linux's `EPOLL_MAX_NESTS`).
 #[cfg(not(target_os = "linux"))]
 const MAX_NESTS: usize = 4;
@@ -400,7 +400,7 @@ fn nesting_refused(ep: i32, target: i32) -> bool {
 /// This can block, so the backend runs it outside the kernel lock.
 ///
 /// # Safety
-/// `events` must point to space for `maxevents` `epoll_event`s; `sigmask`, if
+/// `events` MUST point to space for `maxevents` `epoll_event`s; `sigmask`, if
 /// non-null, to a Linux `sigset_t` of `sigsetsize` bytes.
 pub unsafe fn pwait(
     epfd: u64,
@@ -440,7 +440,7 @@ pub unsafe fn pwait2(epfd: u64, events: u64, maxevents: u64, timeout: u64) -> i6
 /// for ever).
 ///
 /// # Safety
-/// `events` must point to space for `maxevents` `epoll_event`s.
+/// `events` MUST point to space for `maxevents` `epoll_event`s.
 unsafe fn pwait_ns(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
     if (maxevents as libc::c_int) <= 0 {
         return fwe_abi::err(fwe_abi::errno::EINVAL);

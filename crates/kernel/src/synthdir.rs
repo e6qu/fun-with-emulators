@@ -128,7 +128,7 @@ pub fn is_synth(fd: i32) -> bool {
 /// Serve `getdents64` for a synthetic directory. `Some` if `fd` is one of ours.
 ///
 /// # Safety
-/// `buf` must point to `count` writable bytes.
+/// `buf` MUST point to `count` writable bytes.
 pub unsafe fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
     const HEADER: usize = fwe_abi::DIRENT64_HEADER; // 19
     if !is_synth(fd) {

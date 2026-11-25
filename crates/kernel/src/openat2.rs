@@ -57,7 +57,7 @@ const VALID_OPEN_FLAGS: u64 = fcntl::O_ACCMODE
     | fcntl::O_SYNC
     | fcntl::O_PATH
     | fcntl::O_TMPFILE;
-/// What `O_PATH` may come with.
+/// What `O_PATH` can come with.
 const O_PATH_FLAGS: u64 = fcntl::O_DIRECTORY | fcntl::O_NOFOLLOW | fcntl::O_PATH | fcntl::O_CLOEXEC;
 
 impl<P: Platform> Kernel<P> {

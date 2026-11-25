@@ -3,7 +3,7 @@
 //! Each lease is kept in a record every fwe process shares: the file (host
 //! device and inode), the process and descriptor holding it, its type, the
 //! signal its holder chose (`F_SETSIG`), and while it is being broken what
-//! it must become and by when. An open of the file that conflicts with a
+//! it becomes and by when. An open of the file that conflicts with a
 //! lease (any open, with a write lease; one to write, or a truncation, with
 //! a read lease) breaks it: the holder is sent its signal (`SIGIO` by
 //! default, or the chosen one with the descriptor, as `POLL_MSG`), and the
@@ -28,7 +28,7 @@ struct Lease {
     kind: i16,
     /// The signal its holder chose (0: `SIGIO`).
     sig: u32,
-    /// Being broken: what it must become (`F_RDLCK`, or `F_UNLCK`), and
+    /// Being broken: what it becomes (`F_RDLCK`, or `F_UNLCK`), and
     /// when it is taken away, in seconds since the epoch.
     breaking: Option<(i16, u64)>,
 }
@@ -114,7 +114,7 @@ fn tidy(l: &mut Leases, now: u64) {
 }
 
 /// The lease descriptor `fd` holds, as `F_GETLEASE` reports it: while it
-/// is being broken, what it must become.
+/// is being broken, what it becomes.
 pub fn get(fd: i32) -> i16 {
     let Some(r) = existing() else { return fcntl::F_UNLCK };
     let (pid, start) = me();
@@ -129,7 +129,7 @@ pub fn get(fd: i32) -> i16 {
 
 /// `F_SETLEASE` of `kind` on descriptor `fd` (of file `dev`, `ino`), the
 /// checks of the caller and its own descriptors made: while the lease is
-/// being broken, only to what it must become (or below), else `EAGAIN`.
+/// being broken, only to what it becomes (or below), else `EAGAIN`.
 pub fn set(fd: i32, dev: u64, ino: u64, kind: i16) -> Result<(), i32> {
     let r = record().ok_or(errno::ENOMEM)?;
     let (pid, start) = me();

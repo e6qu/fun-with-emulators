@@ -273,7 +273,7 @@ pub fn deliver(sig: u64, info: [u8; SIGINFO_SIZE]) -> bool {
 /// Handle `read` on a signalfd. `Some` if `fd` is one of ours.
 ///
 /// # Safety
-/// `buf` must span `len` writable bytes.
+/// `buf` MUST span `len` writable bytes.
 pub unsafe fn try_read(fd: i32, buf: u64, len: u64) -> Option<i64> {
     let rfd = with(|m| m.fds.get(&fd).map(|s| s.rfd))?;
     if (len as usize) < SIGINFO_SIZE {

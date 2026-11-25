@@ -25,7 +25,7 @@ pub struct CloneArgs {
     pub set_tid_size: usize,
 }
 
-/// The flags a thread (`CLONE_THREAD`) may be made with in fwe: the set
+/// The flags a thread (`CLONE_THREAD`) can be made with in fwe: the set
 /// the C libraries' thread creation uses.
 pub const THREAD_FLAGS: u64 = CLONE_VM
     | CLONE_FS
@@ -265,7 +265,7 @@ mod tests {
         assert_eq!(p(&args(&[0, 0, 0, 0, 0, 0, 0, 0, at, 33]), 88), Err(errno::EINVAL));
         let got = p(&args(&[0, 0, 0, 0, 17, 0, 0, 0, at, 2]), 88).unwrap();
         assert_eq!((got.set_tid_size, &got.set_tid[..2]), (2, &pids[..]));
-        // Unknown trailing fields must be zero.
+        // Unknown trailing fields need to be zero.
         let mut big = args(&[]);
         big.extend([0, 7]);
         assert_eq!(p(&big, 104), Err(errno::E2BIG));

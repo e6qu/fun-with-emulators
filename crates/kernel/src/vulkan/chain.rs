@@ -16,7 +16,7 @@ use crate::uaccess;
 use fwe_abi::errno;
 
 /// The most structures a chain is followed through: a chain is the
-/// guest's, and may loop.
+/// guest's, and can loop.
 const MOST: usize = 256;
 
 /// Copies of structures, kept as long as the call that uses them.

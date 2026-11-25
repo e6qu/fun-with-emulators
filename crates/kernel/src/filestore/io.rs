@@ -491,7 +491,7 @@ pub fn add_seals(fd: i32, add: u64) -> Option<i64> {
 /// descriptor of a regular file of the store sent to it (`SCM_RIGHTS`):
 /// the file's data, a host shared memory object it maps as the guest does
 /// (an X server, a memfd's pages), opened as the description is, for
-/// reading and for writing if it may write: the file's first extent, which
+/// reading and for writing if it can write: the file's first extent, which
 /// holds all it holds if it was sized before it held data
 /// ([`data::make`]); one that grew past it lies in more than one object,
 /// which no single descriptor hands over (`EOPNOTSUPP`). `None` for
@@ -528,7 +528,7 @@ pub fn host_object(fd: i32) -> Option<Result<std::os::fd::OwnedFd, i32>> {
 /// descriptors of the file's data to map, each with the range of the file
 /// it holds there, mapped at the file's own offsets (its extents' objects,
 /// made if the file had none), open for writing only for a shared mapping
-/// of a descriptor that may write, and whether a shared mapping may never
+/// of a descriptor that can write, and whether a shared mapping can never
 /// be made writable (the contents are sealed).
 ///
 /// See [`host_object`] for what a host process is handed.
@@ -548,7 +548,7 @@ pub fn map_source(
             return Err(errno::EACCES);
         }
         let shared = flags & mman::MAP_TYPE != mman::MAP_PRIVATE;
-        // A shared mapping to write needs a descriptor that may, before any
+        // A shared mapping to write needs a descriptor that can, before any
         // seal is looked at.
         if shared && prot & mman::PROT_WRITE != 0 && !writes {
             return Err(errno::EACCES);
@@ -581,11 +581,11 @@ pub fn map_source(
 
 /// What [`map_source`] maps: the objects holding the file's data, each
 /// with the range of the file `[start, end)` it holds there, and whether a
-/// shared mapping may never be made writable.
+/// shared mapping can never be made writable.
 pub type MapPieces = (Vec<(std::os::fd::OwnedFd, u64, u64)>, bool);
 
 /// `fchmod` of a descriptor of the store (`None` for another) to `mode`,
-/// the bits the caller may give: refused (`EPERM`) where it changes the
+/// the bits the caller can give: refused (`EPERM`) where it changes the
 /// execute bits of a file sealed against it (`F_SEAL_EXEC`).
 pub fn fchmod(fd: i32, mode: u32) -> Option<i64> {
     Some(chmod_file(desc::of(fd)?, mode))
