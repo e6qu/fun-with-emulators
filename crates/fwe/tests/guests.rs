@@ -9987,32 +9987,34 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
     static PREPARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     {
         let _one = PREPARING.lock().unwrap_or_else(|e| e.into_inner());
+        // Each where its package's trigger would run: the program there,
+        // and what it works on.
+        let triggers: &[(&str, &[&str], &str)] = &[
+            ("usr/bin/gdk-pixbuf-query-loaders", &["--update-cache"], "usr/lib/gdk-pixbuf-2.0"),
+            (
+                "usr/bin/glib-compile-schemas",
+                &["/usr/share/glib-2.0/schemas"],
+                "usr/share/glib-2.0/schemas",
+            ),
+            // The X server's own fonts' indexes (its default, `fixed`).
+            ("usr/bin/mkfontscale", &["/usr/share/fonts/misc"], "usr/share/fonts/misc"),
+            ("usr/bin/mkfontdir", &["/usr/share/fonts/misc"], "usr/share/fonts/misc"),
+            ("usr/bin/fc-cache", &["-f"], "etc/fonts"),
+            ("usr/bin/update-mime-database", &["/usr/share/mime"], "usr/share/mime"),
+            // The machine's id, which D-Bus's package makes as it is
+            // installed.
+            ("usr/bin/dbus-uuidgen", &["--ensure=/etc/machine-id"], "usr/share/dbus-1"),
+        ];
+        // A root made ready by another list of them is made ready again.
         let stamp = cached.join(".fwe-display-ready");
-        if !stamp.exists() {
+        let made = format!("{triggers:?}");
+        if std::fs::read_to_string(&stamp).ok().as_deref() != Some(made.as_str()) {
             for d in ["root", "tmp/xdg", "tmp/.X11-unix"] {
                 std::fs::create_dir_all(cached.join(d)).unwrap();
             }
             run_checked(Command::new("chmod").arg("700").arg(cached.join("tmp/xdg")));
             run_checked(Command::new("chmod").arg("1777").arg(cached.join("tmp/.X11-unix")));
-            // Each where its package's trigger would run: the program
-            // there, and what it works on.
-            for (prog, args, on) in [
-                (
-                    "usr/bin/gdk-pixbuf-query-loaders",
-                    &["--update-cache"][..],
-                    "usr/lib/gdk-pixbuf-2.0",
-                ),
-                (
-                    "usr/bin/glib-compile-schemas",
-                    &["/usr/share/glib-2.0/schemas"][..],
-                    "usr/share/glib-2.0/schemas",
-                ),
-                // The X server's own fonts' indexes (its default, `fixed`).
-                ("usr/bin/mkfontscale", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
-                ("usr/bin/mkfontdir", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
-                ("usr/bin/fc-cache", &["-f"][..], "etc/fonts"),
-                ("usr/bin/update-mime-database", &["/usr/share/mime"][..], "usr/share/mime"),
-            ] {
+            for &(prog, args, on) in triggers {
                 if !cached.join(prog).exists() || !cached.join(on).exists() {
                     continue;
                 }
@@ -10027,7 +10029,7 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
                     .unwrap();
                 assert!(out.status.success(), "{prog}: {}", String::from_utf8_lossy(&out.stderr));
             }
-            std::fs::write(&stamp, "").unwrap();
+            std::fs::write(&stamp, &made).unwrap();
         }
     }
     let root = std::env::temp_dir().join(format!("fwe-display-{test}-{}", std::process::id()));
