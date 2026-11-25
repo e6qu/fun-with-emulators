@@ -10946,6 +10946,38 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// `/sys/devices/system/cpu` holds the host's CPUs as Linux lays them out:
+/// glibc counts them there, and each CPU's topology and caches agree with
+/// the host's kinds of core (`sysctl hw.perflevel<n>`).
+#[test]
+fn sys_lists_the_hosts_cpus_their_clusters_and_caches() {
+    let host = |name: &str| {
+        let out = Command::new("sysctl").args(["-n", name]).output_alone().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    };
+    let n = host("hw.activecpu").unwrap();
+    // The efficiency cores' (the last level's), as CPU 0 is one of them;
+    // none where the levels do not add up to the CPUs.
+    let levels = host("hw.nperflevels").unwrap_or(0);
+    let counted: u64 =
+        (0..levels).filter_map(|i| host(&format!("hw.perflevel{i}.logicalcpu"))).sum();
+    let (l1d, line) = if levels > 0 && counted == n {
+        let l1d = host(&format!("hw.perflevel{}.l1dcachesize", levels - 1)).unwrap();
+        (format!("{}K", l1d / 1024), host("hw.cachelinesize").unwrap().to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    let range = if n == 1 { "0".to_string() } else { format!("0-{}", n - 1) };
+    c_guest_prints(
+        "syscpu",
+        &[],
+        &format!(
+            "cpus: {n}\nconf: {n}, online: {n}\nonline list: {range}, present: {range}\n\
+             L1d: {l1d}, line: {line}\nconsistent: yes\n"
+        ),
+    );
+}
+
 /// Each thread has its own name: set by `PR_SET_NAME` or a write to its
 /// `comm` (another thread's too, as `pthread_setname_np` writes it), its
 /// creator's when it starts, the forking thread's in a fork child, the

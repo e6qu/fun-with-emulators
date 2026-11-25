@@ -1206,7 +1206,8 @@ contents come from is in
 
 - **Serving:** a path in a `proc` or `sysfs` mount is answered by
   `crates/kernel/src/procfs.rs` (`procpid.rs` for another process's
-  `/proc/<pid>`) from an anonymous seekable descriptor;
+  `/proc/<pid>`, `syscpu.rs` for `/sys/devices/system/cpu`) from an
+  anonymous seekable descriptor;
   `crates/kernel/src/synthdir.rs` serves `getdents64`, `lseek`, `fstat`
   and `close` of the directories from an in-memory list. An unknown path
   is `ENOENT`.

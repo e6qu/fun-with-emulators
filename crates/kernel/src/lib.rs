@@ -125,6 +125,7 @@ pub mod storenodes;
 mod storeops;
 pub mod synthdir;
 mod syscalls;
+pub mod syscpu;
 pub mod sysctl;
 pub mod sysvipc;
 pub mod term;

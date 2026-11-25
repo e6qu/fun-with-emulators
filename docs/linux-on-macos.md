@@ -3174,5 +3174,6 @@ machine as a Linux machine with the host's CPUs, uptime and load:
 | online CPUs (`sysconf`) | counted | `/proc/cpuinfo`, `/proc/stat`, `sched_getaffinity`, `sysinfo` |
 | CPU features (`hw.optional.*`) | `AT_HWCAP`/`AT_HWCAP2` ([auxv](#auxv-hwcaps-and-the-vdso)) | the hwcaps; `/proc/cpuinfo`'s `Features` names them |
 | timer frequency, chip (`hw.tbfrequency`, `hw.cpufamily`, `hw.perflevel1.logicalcpu`) | read | `/proc/cpuinfo`'s BogoMIPS, and its CPU part for a chip Linux knows (the efficiency cores first) |
+| kinds of core and their caches (`hw.perflevel<n>`: cores, L1 and L2 sizes, cores per L2; `hw.cachelinesize`) | read | `/sys/devices/system/cpu`: `online`, `possible`, `present`, and each CPU's `topology` (a cluster is the cores sharing an L2, in one package) and `cache/index0`-`2` (L1 data and instruction, L2), as Linux lays them out from a device tree; the associativity and frequencies, which the host does not tell, are left out, and `cpu_capacity` is 1024 for each |
 | boot time, uptime, load averages, per-CPU times | read from the host | `/proc/uptime`, `/proc/loadavg`, `/proc/stat`, `sysinfo` |
 | another process's state, times and memory (`proc_pidinfo`) | read from the host | `/proc/<pid>/stat` and the like |

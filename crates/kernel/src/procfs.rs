@@ -436,15 +436,16 @@ const DIRS: &[DirDef] = &[
     (b"/sys/fs/cgroup", &[]),
     (b"/sys/devices", &[(b"system", DT_DIR), (b"virtual", DT_DIR)]),
     (b"/sys/devices/system", &[(b"cpu", DT_DIR)]),
-    (b"/sys/devices/system/cpu", &[(b"online", DT_REG), (b"possible", DT_REG)]),
 ];
 
 /// The entries of a synthetic directory `path`, including `.` and `..`, or
 /// `None` if `path` is not a synthetic directory.
 pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
     let mut out = vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR)];
-    // The loop devices' directories.
-    if let Some(entries) = crate::loopdev::sys_children(path) {
+    // The loop devices' directories, and the CPUs'.
+    if let Some(entries) =
+        crate::loopdev::sys_children(path).or_else(|| crate::syscpu::children(path))
+    {
         out.extend(entries);
         return Some(out);
     }
@@ -463,7 +464,9 @@ pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
 }
 
 fn is_dir(path: &[u8]) -> bool {
-    DIRS.iter().any(|(p, _)| *p == path) || crate::sysctl::is_dir(path)
+    DIRS.iter().any(|(p, _)| *p == path)
+        || crate::sysctl::is_dir(path)
+        || matches!(crate::syscpu::lookup(path), Some(Entry::Dir))
 }
 
 /// Look up `path` (an absolute, normalized guest path). Returns `None` if the
@@ -568,9 +571,8 @@ pub fn lookup(path: &[u8], info: &ProcInfo) -> Option<Entry> {
         }
         // No newline, as Linux writes it.
         b"/sys/kernel/security/lsm" => Entry::File(b"capability,landlock,yama".to_vec()),
-        b"/sys/devices/system/cpu/online" | b"/sys/devices/system/cpu/possible" => {
-            Entry::File(cpu_range(info.ncpu))
-        }
+        // The CPUs, their topology and caches.
+        p if let Some(e) = crate::syscpu::lookup(p) => e,
         b"/proc/partitions" => Entry::File(crate::loopdev::partitions()),
         p if let Some(e) = crate::loopdev::sys_lookup(p) => e,
         p if is_dir(p) => Entry::Dir,
@@ -769,11 +771,6 @@ fn stat(ncpu: u32) -> Vec<u8> {
     out
 }
 
-fn cpu_range(ncpu: u32) -> Vec<u8> {
-    let n = ncpu.max(1);
-    if n == 1 { b"0\n".to_vec() } else { format!("0-{}\n", n - 1).into_bytes() }
-}
-
 /// The online CPUs.
 pub fn ncpu_hint() -> u32 {
     // SAFETY: plain host call.
@@ -865,7 +862,7 @@ mod tests {
             matches!(lookup(b"/proc/sys/kernel/ostype", &info), Some(Entry::File(c)) if c == b"Linux\n")
         );
         assert!(
-            matches!(lookup(b"/sys/devices/system/cpu/online", &info), Some(Entry::File(c)) if c == b"0-3\n")
+            matches!(lookup(b"/sys/devices/system/cpu/online", &info), Some(Entry::File(c)) if *c == format!("0-{}\n", ncpu_hint() - 1).into_bytes())
         );
     }
 

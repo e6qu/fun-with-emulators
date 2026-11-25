@@ -1642,6 +1642,52 @@ pub fn cpu_identity() -> CpuIdentity {
     }
 }
 
+/// One kind of the host's cores: how many, and the caches each has (bytes;
+/// 0 where the host does not say), the L2 shared by `per_l2` of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreKind {
+    pub cpus: u32,
+    pub l1i: u64,
+    pub l1d: u64,
+    pub l2: u64,
+    pub per_l2: u32,
+}
+
+/// The host's cores by kind, efficiency cores first (as `/proc/cpuinfo`
+/// numbers them, from `hw.perflevel<n>`, 0 the fastest), and the cache
+/// line's size; one kind of `ncpu` cores where the host has no levels.
+pub fn core_kinds(ncpu: u32) -> (Vec<CoreKind>, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        let line = sysctl_u64(c"hw.cachelinesize").unwrap_or(64);
+        let levels = sysctl_u64(c"hw.nperflevels").unwrap_or(0);
+        let level = |i: u64, what: &str| {
+            std::ffi::CString::new(format!("hw.perflevel{i}.{what}"))
+                .ok()
+                .and_then(|c| sysctl_u64(&c))
+        };
+        let kinds: Vec<CoreKind> = (0..levels)
+            .rev()
+            .map(|i| CoreKind {
+                cpus: level(i, "logicalcpu").unwrap_or(0) as u32,
+                l1i: level(i, "l1icachesize").unwrap_or(0),
+                l1d: level(i, "l1dcachesize").unwrap_or(0),
+                l2: level(i, "l2cachesize").unwrap_or(0),
+                per_l2: level(i, "cpusperl2").unwrap_or(0) as u32,
+            })
+            .filter(|k| k.cpus > 0)
+            .collect();
+        if kinds.iter().map(|k| k.cpus).sum::<u32>() == ncpu {
+            return (kinds, line);
+        }
+        (vec![CoreKind { cpus: ncpu, ..CoreKind::default() }], line)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (vec![CoreKind { cpus: ncpu, ..CoreKind::default() }], 64)
+    }
+}
+
 /// The bytes host process `pid` had read from and written to storage.
 pub fn disk_io(pid: i32) -> (u64, u64) {
     #[cfg(target_os = "macos")]
