@@ -426,10 +426,18 @@ const DIRS: &[DirDef] = &[
             (b"devices", DT_DIR),
             (b"fs", DT_DIR),
             (b"block", DT_DIR),
+            (b"bus", DT_DIR),
+            (b"class", DT_DIR),
             (b"dev", DT_DIR),
             (b"kernel", DT_DIR),
         ],
     ),
+    // The buses and classes of the devices there are: the CPUs, the loop
+    // devices (block devices).
+    (b"/sys/bus", &[(b"cpu", DT_DIR)]),
+    (b"/sys/bus/cpu", &[(b"devices", DT_DIR), (b"drivers", DT_DIR)]),
+    (b"/sys/bus/cpu/drivers", &[]),
+    (b"/sys/class", &[(b"block", DT_DIR)]),
     (b"/sys/kernel", &[(b"security", DT_DIR)]),
     // securityfs: the security modules, Linux's capabilities and Landlock.
     (b"/sys/kernel/security", &[(b"lsm", DT_REG)]),

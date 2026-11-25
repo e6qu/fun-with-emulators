@@ -2711,7 +2711,7 @@ Details: [/proc, /sys and /dev](#proc-sys-and-dev),
 | `mounts`, `partitions`, `keys`, `sysvipc`, `net` | **emulated** | from fwe's records, per namespace |
 | `modules`, `kallsyms`, `swaps`, `kmsg`, `vmstat`, `zoneinfo`, `interrupts`, `diskstats`, `locks`, `pressure` | **refused** | `ENOENT` |
 | `/proc/sys` | **enforced** | the sysctls fwe acts on: network, IPC, `user.max_*`, UTS names, and global ones (`fs`, `kernel.keys`, `core_pattern`, `printk`, `yama`, `unprivileged_bpf_disabled`, `pid_max`, `vm.max_map_count`); `vm.drop_caches` **kept**; others constant (writes `EACCES`) or absent (`ENOENT`) |
-| `/sys` | **emulated** | `fs/cgroup`, `kernel/security/lsm`, `devices/system/cpu` (host counts), the loop devices; `class`, `bus`, `module`, `fs/bpf`, `kernel/mm` `ENOENT`; `debugfs`, `securityfs` mounts `ENODEV` |
+| `/sys` | **emulated** | `fs/cgroup`, `kernel/security/lsm`, `devices/system/cpu` (host counts), the loop devices; `bus/cpu` and `class/block` linking to them (which sandboxes bind: WebKit's and Flatpak's `bwrap`); `bus` and `class` hold no others; `module`, `firmware`, `fs/bpf`, `kernel/mm` `ENOENT`; `debugfs`, `securityfs` mounts `ENODEV` |
 | `/dev/null`, `zero`, `random`, `urandom`, `tty` | **host** | |
 | `/dev/full`, `ptmx`, `pts`, `loop-control`, `loopN`, `shm`, `mqueue`, `fd` | **emulated** | |
 | `/dev/kvm`, `fuse`, `net/tun`, `dri`, `mem`, `kmsg`, `console`, `userfaultfd` | **refused** | `ENOENT` (`ENXIO` for a node made for them) |

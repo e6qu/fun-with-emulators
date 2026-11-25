@@ -2063,6 +2063,21 @@ fn traced_threads_are_found_by_group_and_in_namespaces() {
     );
 }
 
+/// `/sys`'s buses and classes, which sandboxes bind (WebKit's, Flatpak's
+/// `bwrap`): the CPU bus links each CPU's device.
+#[test]
+fn sys_buses_and_classes_as_sandboxes_bind_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "sysbus",
+        &[],
+        "/sys has bus: 1, class: 1, block: 1, dev: 1, devices: 1\n\
+         /sys/bus has cpu: 1; /sys/class has block: 1\n\
+         cpu0 links to: ../../../devices/system/cpu/cpu0\nthrough it, a directory: yes\n\
+         the bus lists every CPU: yes\n",
+    );
+}
+
 /// A tracer that ends without detaching leaves its tracee as Linux does.
 #[test]
 fn a_tracer_that_ends_leaves_its_tracee_as_linux_does() {

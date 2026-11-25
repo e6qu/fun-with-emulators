@@ -9,14 +9,17 @@
 //! (`cache/index0` to `index2`); what the host does not tell (the
 //! associativity, the frequencies) is left out, as Linux leaves out what
 //! its firmware does not describe. `cpu_capacity` is 1024 for each, as on
-//! a machine whose firmware gives no relative capacities.
+//! a machine whose firmware gives no relative capacities. The `cpu` bus
+//! (`/sys/bus/cpu/devices`) links to each.
 
 use crate::host::CoreKind;
-use crate::procfs::{DT_DIR, DT_REG, Entry};
+use crate::procfs::{DT_DIR, DT_LNK, DT_REG, Entry};
 use std::sync::OnceLock;
 
 /// The directory itself.
 const DIR: &[u8] = b"/sys/devices/system/cpu";
+/// The `cpu` bus's devices: a link to each CPU's directory.
+const BUS: &[u8] = b"/sys/bus/cpu/devices";
 /// The highest CPU number the kernel could have (`NR_CPUS` - 1), as an
 /// arm64 distribution's kernel is built.
 const KERNEL_MAX: u32 = 511;
@@ -142,6 +145,21 @@ const CACHE: &[&[u8]] =
 
 /// What the tree holds at `path`, if `path` is in it.
 pub fn lookup(path: &[u8]) -> Option<Entry> {
+    if let Some(rest) = path.strip_prefix(BUS) {
+        if rest.is_empty() {
+            return Some(Entry::Dir);
+        }
+        let name = rest.strip_prefix(b"/")?;
+        let n = std::str::from_utf8(name.strip_prefix(b"cpu")?).ok()?.parse::<u32>().ok();
+        return Some(
+            match n.filter(|&n| n < layout().n() && name == format!("cpu{n}").as_bytes()) {
+                Some(n) => {
+                    Entry::Symlink(format!("../../../devices/system/cpu/cpu{n}").into_bytes())
+                }
+                None => Entry::Missing(fwe_abi::errno::ENOENT),
+            },
+        );
+    }
     let rest = path.strip_prefix(DIR)?;
     if !rest.is_empty() && !rest.starts_with(b"/") {
         return None;
@@ -210,6 +228,9 @@ fn cache_entry(l: &Layout, cpu: u32, sub: &[u8]) -> Option<Entry> {
 /// The entries of the tree's directory `path` (`.` and `..` aside), if
 /// `path` is one of them.
 pub fn children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
+    if path == BUS {
+        return Some((0..layout().n()).map(|i| (format!("cpu{i}").into_bytes(), DT_LNK)).collect());
+    }
     let rest = path.strip_prefix(DIR)?;
     let l = layout();
     let files = |names: &[&[u8]]| names.iter().map(|n| (n.to_vec(), DT_REG)).collect::<Vec<_>>();
