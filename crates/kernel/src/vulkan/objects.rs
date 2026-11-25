@@ -244,17 +244,159 @@ fn field<T: Copy>(info: *mut u8, offset: usize) -> *mut T {
     unsafe { info.add(offset).cast() }
 }
 
+/// The driver is MoltenVK on the paravirtual GPU of Apple's virtual
+/// machines (as GitHub's macOS runners have), which needs [`no_heaps`]:
+/// learnt from the first instance made.
+static MOLTENVK_PARAVIRTUAL: OnceLock<bool> = OnceLock::new();
+
+/// The name Metal gives the GPU of Apple's virtual machines.
+const PARAVIRTUAL_GPU: &[u8] = b"Apple Paravirtual device";
+/// `VK_DRIVER_ID_MOLTENVK`.
+const MOLTENVK: u32 = 14;
+
+/// One of `VkLayerSettingsCreateInfoEXT`'s settings (`VkLayerSettingEXT`).
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(super) struct LayerSetting {
+    layer: *const std::ffi::c_char,
+    name: *const std::ffi::c_char,
+    kind: u32,
+    count: u32,
+    values: *const c_void,
+}
+
+/// `VK_STRUCTURE_TYPE_LAYER_SETTINGS_CREATE_INFO_EXT`.
+const LAYER_SETTINGS: u32 = 1_000_496_000;
+/// `VK_LAYER_SETTING_TYPE_INT32_EXT`.
+const SETTING_INT32: u32 = 1;
+/// `MVK_CONFIG_USE_MTLHEAP_NEVER`.
+static NO_HEAPS: i32 = 0;
+
+/// MoltenVK's setting that its device memory is no Metal placement heap.
+///
+/// On the paravirtual GPU, MoltenVK (1.4.2) draws nothing from a vertex or
+/// index buffer bound 64 KiB or more into a memory that is a placement
+/// heap, as Zink binds an OpenGL display list's; memory that is one Metal
+/// buffer, as with this setting, draws. The same program draws at every
+/// offset on an Apple GPU (an M4 Pro), and buffers Metal places in a heap
+/// there read right on the paravirtual GPU: the fault is in MoltenVK's heap
+/// path on that GPU.
+pub(super) fn no_heaps() -> LayerSetting {
+    LayerSetting {
+        layer: c"MoltenVK".as_ptr(),
+        name: c"MVK_CONFIG_USE_MTLHEAP".as_ptr(),
+        kind: SETTING_INT32,
+        count: 1,
+        values: (&raw const NO_HEAPS).cast(),
+    }
+}
+
+/// Whether a device of `instance` (just made) is MoltenVK's on the
+/// paravirtual GPU: its driver's ID and its name, from
+/// `vkGetPhysicalDeviceProperties2` with `VkPhysicalDeviceDriverProperties`.
+fn moltenvk_paravirtual(driver: &Driver, instance: u64) -> bool {
+    let enumerate = proc_addr(driver, instance, "vkEnumeratePhysicalDevices");
+    let properties = proc_addr(driver, instance, "vkGetPhysicalDeviceProperties2");
+    if enumerate == 0 || properties == 0 {
+        return false;
+    }
+    type Enumerate = unsafe extern "C" fn(u64, *mut u32, *mut u64) -> i32;
+    type Properties = unsafe extern "C" fn(u64, *mut u8);
+    // SAFETY: the driver's functions, by their names.
+    let (enumerate, properties) = unsafe {
+        (
+            std::mem::transmute::<usize, Enumerate>(enumerate),
+            std::mem::transmute::<usize, Properties>(properties),
+        )
+    };
+    let mut count = 0u32;
+    // SAFETY: the instance's count, into fwe's variable.
+    if unsafe { enumerate(instance, &mut count, std::ptr::null_mut()) } < 0 {
+        return false;
+    }
+    let mut devices = vec![0u64; count as usize];
+    // SAFETY: room for `count` devices.
+    if unsafe { enumerate(instance, &mut count, devices.as_mut_ptr()) } < 0 {
+        return false;
+    }
+    devices.truncate(count as usize);
+    devices.iter().any(|&pd| {
+        // `VkPhysicalDeviceDriverProperties` (536 bytes, its ID at 16), and
+        // `VkPhysicalDeviceProperties2` (840 bytes) chaining it, its
+        // properties at 16 and in them the device's name at 20.
+        let mut ids = vec![0u8; 536];
+        ids[0..4].copy_from_slice(&1_000_196_000u32.to_ne_bytes());
+        let mut p = vec![0u8; 840];
+        p[0..4].copy_from_slice(&1_000_059_001u32.to_ne_bytes());
+        p[8..16].copy_from_slice(&(ids.as_mut_ptr() as u64).to_ne_bytes());
+        // SAFETY: a device of the instance's, and room for the structures.
+        unsafe { properties(pd, p.as_mut_ptr()) };
+        let id = u32::from_ne_bytes(ids[16..20].try_into().expect("four bytes"));
+        let name = &p[16 + 20..16 + 20 + 256];
+        let len = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+        id == MOLTENVK && &name[..len] == PARAVIRTUAL_GPU
+    })
+}
+
+/// In the chain from `first` (copies of fwe's): `setting` added to the
+/// program's own layer settings, after them so that it holds, or a
+/// structure of fwe's with it put first. The chain's first structure.
+pub(super) fn with_setting(
+    copies: &mut Copies,
+    first: u64,
+    setting: LayerSetting,
+) -> Result<u64, i32> {
+    let mut at = first;
+    while at != 0 {
+        // SAFETY: a structure of the copied chain, its type at 0 and next at 8.
+        let (stype, next) =
+            unsafe { (*field::<u32>(at as *mut u8, 0), *field::<u64>(at as *mut u8, 8)) };
+        if stype == LAYER_SETTINGS {
+            // SAFETY: a copy of the program's `VkLayerSettingsCreateInfoEXT`:
+            // its count at 16, its settings (the program's) at 24.
+            unsafe {
+                let s = at as *mut u8;
+                let n = *field::<u32>(s, 16) as usize;
+                let theirs = uaccess::read_bytes(
+                    *field::<u64>(s, 24),
+                    n.min(1 << 12) * size_of::<LayerSetting>(),
+                )
+                .map_err(|_| errno::EFAULT)?;
+                let mut all = theirs;
+                all.extend_from_slice(std::slice::from_raw_parts(
+                    (&raw const setting).cast::<u8>(),
+                    size_of::<LayerSetting>(),
+                ));
+                *field::<u32>(s, 16) = (all.len() / size_of::<LayerSetting>()) as u32;
+                *field::<u64>(s, 24) = copies.bytes(&all) as u64;
+            }
+            return Ok(first);
+        }
+        at = next;
+    }
+    let settings = copies.bytes(
+        // SAFETY: the setting's bytes, a plain C structure.
+        unsafe {
+            std::slice::from_raw_parts((&raw const setting).cast::<u8>(), size_of::<LayerSetting>())
+        },
+    );
+    let mut info = [0u8; 32];
+    info[0..4].copy_from_slice(&LAYER_SETTINGS.to_ne_bytes());
+    info[8..16].copy_from_slice(&first.to_ne_bytes());
+    info[16..20].copy_from_slice(&1u32.to_ne_bytes());
+    info[24..32].copy_from_slice(&(settings as u64).to_ne_bytes());
+    Ok(copies.bytes(&info) as u64)
+}
+
 /// `vkCreateInstance(pCreateInfo, pAllocator, pInstance)`: from a copy of
 /// the guest's create info, its chain the structures fwe passes on, its
 /// extensions the driver's (a portability driver's enumeration added), no
-/// layers.
+/// layers. MoltenVK on the paravirtual GPU is told to keep its device
+/// memory out of placement heaps ([`no_heaps`]): the first instance a
+/// process makes there is made again so.
 pub fn create_instance(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32> {
-    // A portability driver's enumeration is the loader's extension, which
-    // a driver called with no loader between may lack: enabled where the
-    // driver lists it.
-    let enumeration = c"VK_KHR_portability_enumeration";
-    let portability = driver.portability
-        && global(driver, cmd::vkEnumerateInstanceExtensionProperties).is_some_and(|f| {
+    let listed = global(driver, cmd::vkEnumerateInstanceExtensionProperties)
+        .map(|f| {
             super::host_extensions(|count, props| {
                 // SAFETY: the driver's function, with valid out-parameters.
                 unsafe {
@@ -265,43 +407,86 @@ pub fn create_instance(driver: &Driver, w: &[u64; MOST_ARGS]) -> Result<u64, i32
                     ) as i32
                 }
             })
-            .iter()
-            .any(|(n, _)| n.as_slice() == enumeration.to_bytes())
-        });
-    let mut copies = Copies::default();
-    let info = copies.structure(w[0], INSTANCE_INFO)?;
-    // SAFETY: `info` is a copy of the guest's `VkInstanceCreateInfo`.
-    unsafe {
-        let next = *field::<u64>(info, 8);
-        *field::<u64>(info, 8) = copies.chain(next, |_| true)?;
-        let names = chain::read_names(*field::<u64>(info, 56), *field::<u32>(info, 48))?;
-        let names = super::host_names(names);
-        let mut extra = Vec::new();
-        if portability && !names.iter().any(|n| n.as_slice() == enumeration.to_bytes()) {
-            extra.push(enumeration);
-            *field::<u32>(info, 16) |= ENUMERATE_PORTABILITY;
-        }
-        let (list, len) = copies.names(&names, &extra);
-        *field::<u32>(info, 48) = len;
-        *field::<u64>(info, 56) = list;
-        *field::<u32>(info, 32) = 0;
-        *field::<u64>(info, 40) = 0;
-    }
-    let f = global(driver, cmd::vkCreateInstance).ok_or(errno::EINVAL)?;
-    let mut instance = 0u64;
-    // Threads the driver starts take no signal the guest's thread had
-    // unblocked ([`crate::host::with_signals_blocked`]).
-    let r = crate::host::with_signals_blocked(|| {
-        // SAFETY: the driver's vkCreateInstance, with a create info of the
-        // guest's copied and an out-parameter of fwe's.
+        })
+        .unwrap_or_default();
+    let lists = |e: &std::ffi::CStr| listed.iter().any(|(n, _)| n.as_slice() == e.to_bytes());
+    // A portability driver's enumeration is the loader's extension, which
+    // a driver called with no loader between may lack: enabled where the
+    // driver lists it.
+    let enumeration = c"VK_KHR_portability_enumeration";
+    let portability = driver.portability && lists(enumeration);
+    let settings = c"VK_EXT_layer_settings";
+    let make = |heaps_off: bool| -> Result<(u64, u64), i32> {
+        let mut copies = Copies::default();
+        let info = copies.structure(w[0], INSTANCE_INFO)?;
+        // SAFETY: `info` is a copy of the guest's `VkInstanceCreateInfo`.
         unsafe {
-            generated::call(
-                cmd::vkCreateInstance,
-                f,
-                &words(&[info as u64, 0, &mut instance as *mut u64 as u64]),
-            )
+            let next = *field::<u64>(info, 8);
+            let mut chain = copies.chain(next, |_| true)?;
+            if heaps_off {
+                chain = with_setting(&mut copies, chain, no_heaps())?;
+            }
+            *field::<u64>(info, 8) = chain;
+            let names = chain::read_names(*field::<u64>(info, 56), *field::<u32>(info, 48))?;
+            let names = super::host_names(names);
+            let named = |e: &std::ffi::CStr| names.iter().any(|n| n.as_slice() == e.to_bytes());
+            let mut extra = Vec::new();
+            if portability && !named(enumeration) {
+                extra.push(enumeration);
+                *field::<u32>(info, 16) |= ENUMERATE_PORTABILITY;
+            }
+            if heaps_off && !named(settings) {
+                extra.push(settings);
+            }
+            let (list, len) = copies.names(&names, &extra);
+            *field::<u32>(info, 48) = len;
+            *field::<u64>(info, 56) = list;
+            *field::<u32>(info, 32) = 0;
+            *field::<u64>(info, 40) = 0;
         }
-    });
+        let f = global(driver, cmd::vkCreateInstance).ok_or(errno::EINVAL)?;
+        let mut instance = 0u64;
+        // Threads the driver starts take no signal the guest's thread had
+        // unblocked ([`crate::host::with_signals_blocked`]).
+        let r = crate::host::with_signals_blocked(|| {
+            // SAFETY: the driver's vkCreateInstance, with a create info of
+            // the guest's copied and an out-parameter of fwe's.
+            unsafe {
+                generated::call(
+                    cmd::vkCreateInstance,
+                    f,
+                    &words(&[info as u64, 0, &mut instance as *mut u64 as u64]),
+                )
+            }
+        });
+        Ok((r, instance))
+    };
+    let known = MOLTENVK_PARAVIRTUAL.get().copied();
+    // MoltenVK on the paravirtual GPU needs the setting, which needs the
+    // extension: without it, it cannot draw right there.
+    if known == Some(true) && !lists(settings) {
+        return Ok(result::ERROR_INCOMPATIBLE_DRIVER as u32 as u64);
+    }
+    let (mut r, mut instance) = make(known == Some(true))?;
+    if known.is_none() && r as u32 as i32 == result::SUCCESS {
+        let on_it = moltenvk_paravirtual(driver, instance);
+        let _ = MOLTENVK_PARAVIRTUAL.set(on_it);
+        if on_it {
+            let destroy = proc_addr(driver, instance, "vkDestroyInstance");
+            if destroy != 0 {
+                type Destroy = unsafe extern "C" fn(u64, *const c_void);
+                // SAFETY: the driver's vkDestroyInstance, on the instance it
+                // just made, which nothing else has.
+                unsafe {
+                    std::mem::transmute::<usize, Destroy>(destroy)(instance, std::ptr::null())
+                };
+            }
+            if !lists(settings) {
+                return Ok(result::ERROR_INCOMPATIBLE_DRIVER as u32 as u64);
+            }
+            (r, instance) = make(true)?;
+        }
+    }
     if r as u32 as i32 == result::SUCCESS {
         add(instance, Arc::new(instance_table(driver, instance)), 0, 0);
         uaccess::write(w[2], instance).map_err(|_| errno::EFAULT)?;

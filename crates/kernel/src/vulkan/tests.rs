@@ -377,3 +377,64 @@ fn null_handles_in_template_data_are_stand_ins() {
     assert_eq!(word(&fixed, 48 + 8), 0xd0);
     assert_eq!(word(&fixed, 48), 0x5a);
 }
+
+/// fwe's MoltenVK setting in an instance's chain: a structure of its own
+/// first where the program gives no settings; after the program's own, so
+/// that it holds, where it does.
+#[test]
+fn moltenvk_is_told_no_heaps_after_the_programs_own_settings() {
+    use super::objects::{no_heaps, with_setting};
+    let setting_bytes = 32usize;
+    let name_of = |setting: &[u8]| {
+        // SAFETY: a NUL-terminated name of a setting the test made.
+        unsafe { std::ffi::CStr::from_ptr(word(setting, 8) as *const std::ffi::c_char) }
+            .to_str()
+            .unwrap()
+            .to_string()
+    };
+    // No settings: one of fwe's, first, the chain after it.
+    let mut copies = super::chain::Copies::default();
+    // A structure of another type (VkValidationFeaturesEXT's), the chain.
+    let mut other = [0u8; 16];
+    other[0..4].copy_from_slice(&1_000_247_000u32.to_ne_bytes());
+    let chain = copies.bytes(&other) as u64;
+    let first = with_setting(&mut copies, chain, no_heaps()).unwrap();
+    let info = crate::uaccess::read_bytes(first, 32).unwrap();
+    assert_eq!(u32::from_ne_bytes(info[0..4].try_into().unwrap()), 1_000_496_000);
+    assert_eq!(word(&info, 8), chain, "the chain goes on after it");
+    assert_eq!(u32::from_ne_bytes(info[16..20].try_into().unwrap()), 1);
+    let ours = crate::uaccess::read_bytes(word(&info, 24), setting_bytes).unwrap();
+    assert_eq!(name_of(&ours), "MVK_CONFIG_USE_MTLHEAP");
+    assert_eq!(
+        crate::uaccess::read::<i32>(word(&ours, 24)).unwrap(),
+        0,
+        "MVK_CONFIG_USE_MTLHEAP_NEVER"
+    );
+
+    // The program's settings (a copy of its structure in the chain): kept,
+    // fwe's after them.
+    let theirs_name = c"MVK_CONFIG_LOG_LEVEL";
+    let level = 3i32;
+    let theirs: [u64; 4] = [
+        c"MoltenVK".as_ptr() as u64,
+        theirs_name.as_ptr() as u64,
+        1 | (1u64 << 32),
+        &level as *const i32 as u64,
+    ];
+    let mut copies = super::chain::Copies::default();
+    let mut structure = [0u8; 32];
+    structure[0..4].copy_from_slice(&1_000_496_000u32.to_ne_bytes());
+    structure[16..20].copy_from_slice(&1u32.to_ne_bytes());
+    structure[24..32].copy_from_slice(&(theirs.as_ptr() as u64).to_ne_bytes());
+    let copied = copies.bytes(&structure) as u64;
+    assert_eq!(
+        with_setting(&mut copies, copied, no_heaps()).unwrap(),
+        copied,
+        "no structure added"
+    );
+    let info = crate::uaccess::read_bytes(copied, 32).unwrap();
+    assert_eq!(u32::from_ne_bytes(info[16..20].try_into().unwrap()), 2);
+    let both = crate::uaccess::read_bytes(word(&info, 24), 2 * setting_bytes).unwrap();
+    assert_eq!(name_of(&both[..32]), "MVK_CONFIG_LOG_LEVEL", "the program's first");
+    assert_eq!(name_of(&both[32..]), "MVK_CONFIG_USE_MTLHEAP", "fwe's last, so it holds");
+}

@@ -1480,6 +1480,15 @@ Sockets and terminals are the host's; fwe translates their interfaces:
     and a 1×1 2D image's view), put in the place of every null handle a
     descriptor write, update template, push descriptor or vertex buffer
     binding has.
+  - MoltenVK on the paravirtual GPU of Apple's virtual machines (GitHub's
+    macOS runners) draws nothing from a vertex or index buffer bound 64
+    KiB or more into a memory it made a Metal placement heap, as Zink
+    binds an OpenGL display list's; it draws at every offset on an Apple
+    GPU, and with memory of one Metal buffer on that one. There, fwe
+    makes its instances with `VK_EXT_layer_settings`'
+    `MVK_CONFIG_USE_MTLHEAP` 0 (`vulkan/objects.rs`, after the program's
+    own settings), learnt from the driver's ID and the device's name on
+    the first instance a process makes, which is made again so.
   - A fork child never calls the driver (macOS's libraries do not work in
     a fork child): its copies of its parent's opens fail with `ENODEV`,
     and its own opens are refused while the driver is in its memory; an

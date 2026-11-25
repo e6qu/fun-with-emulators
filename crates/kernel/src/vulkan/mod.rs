@@ -71,6 +71,7 @@ pub mod result {
     pub const ERROR_INITIALIZATION_FAILED: i32 = -3;
     pub const ERROR_LAYER_NOT_PRESENT: i32 = -6;
     pub const ERROR_EXTENSION_NOT_PRESENT: i32 = -7;
+    pub const ERROR_INCOMPATIBLE_DRIVER: i32 = -9;
     pub const ERROR_UNKNOWN: i32 = -13;
 }
 
