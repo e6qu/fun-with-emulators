@@ -89,9 +89,11 @@ EL2), and traps with `brk` or `udf`. Which system registers and
 instructions EL0 may use is the kernel's choice (bits of `SCTLR_EL1`),
 which is why Linux and macOS differ on a few of them.
 
-Under Linux and macOS alike, programs run at EL0 and the kernel at EL1;
-macOS's kernel also runs Hypervisor.framework's VMs, whose guest kernel
-code runs at EL1 under it ([hypervisor.md](hypervisor.md)).
+Under Linux and macOS alike, programs run at EL0 and the kernel at EL1.
+A Hypervisor.framework VM has an EL1 and EL0 of its own under macOS's
+kernel; fwe's runs the guest program at EL0 and only a page of fwe's
+code at EL1
+([linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used)).
 
 ## The procedure call standard
 

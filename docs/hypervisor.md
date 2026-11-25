@@ -3,28 +3,28 @@
 ## Summary
 
 fwe runs a non-position-independent executable linked below 4 GiB that
-it cannot move, such as Debian's `python3.11`, GCC and clang and Alpine's
-`sbcl` at `0x400000` or static Go programs at `0x10000`, in a small
-Hypervisor.framework VM, and picks this backend for it automatically.
-macOS reserves the low 4 GiB of every arm64 process (`__PAGEZERO`, which
-Apple's loader will not let a program shrink on Apple Silicon), and such
-a program cannot be moved above it (which ones can:
-[linux-on-macos.md](linux-on-macos.md#the-low-4-gib)); in the VM the
-guest has an address space of its own.
+it cannot move in a small Hypervisor.framework VM, and picks this
+backend for it by itself: Debian's `python3.11`, GCC and clang and
+Alpine's `sbcl` at `0x400000`, static Go programs at `0x10000`. macOS
+reserves the low 4 GiB of every arm64 process (`__PAGEZERO`, which
+Apple's loader will not let a program shrink on Apple Silicon); in the
+VM the guest has an address space of its own. Which programs can be
+moved instead is in [linux-on-macos.md](linux-on-macos.md#the-low-4-gib).
 
-The VM holds only the guest's CPU and memory, no Linux kernel: every
-system call leaves the VM for the same kernel crate the native backend
-uses, so a program in the VM has the same processes, namespaces, cgroups,
+The VM holds only the guest's CPU and memory, no Linux kernel. Every
+system call leaves the VM for the kernel crate the native backend uses,
+so a program in the VM has the same processes, namespaces, cgroups,
 mounts and files as a native one. How the VM is used (vCPUs, fwe's
 exception vector, the two stages of translation, system calls, timers,
 signals, memory, fork and execve) is in
-[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used); where the backend differs from Linux, in
+[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used);
+where the backend differs from Linux, in
 [architecture.md](architecture.md#known-limitations). This document
 holds the rules the implementation keeps, why misusing the framework is
 dangerous, how the backend is tested on a [stand-in](#the-stand-in) and
 on [real hardware](#real-hardware-runs-and-the-flight-recorder), how to
-[run it](#running-it-apple-silicon-no-root), and the [CI](#tests-and-ci)
-arrangement.
+[run it](#running-it-apple-silicon-no-root), and its
+[CI](#tests-and-ci).
 
 The framework needs the `com.apple.security.hypervisor` entitlement (an
 ad-hoc signature carrying it is enough) but no root. fwe loads it
@@ -46,31 +46,35 @@ only the guest's own page tables change.
   host memory behind stage 2 must not change either.
 - **Stage 1** (`pagetables.rs`): 4 KiB pages in a 40-bit space, each with
   its EL0 permissions and BTI guard, written with single 64-bit stores, a
-  new table filled before it is linked in. Taking access away bumps a
-  generation; a vCPU resuming after that goes through the TLB stub on the
-  code page (`tlbi vmalle1is; dsb ish; isb; eret`, at EL1), and memory or
-  tables given back are reused only after a flush covering the edit that
-  freed them. A page that would lead a translation possibly still cached
-  elsewhere goes in only after such a flush (break-before-make); an access
-  meanwhile faults and is retried. A permission fault the tables no longer
-  give (a TLB keeping old permissions after `mprotect` widened them) gets
-  one flush and a retry.
+  new table filled before it is linked in.
+  - Taking access away bumps a generation; a vCPU resuming after that
+    goes through the TLB stub on the code page (`tlbi vmalle1is; dsb ish;
+    isb; eret`, at EL1). Memory or tables given back are reused only after
+    a flush covering the edit that freed them.
+  - A page that would lead a translation possibly still cached elsewhere
+    goes in only after such a flush (break-before-make); an access
+    meanwhile faults and is retried.
+  - A permission fault the tables no longer give (a TLB keeping old
+    permissions after `mprotect` widened them) gets one flush and a
+    retry.
 - **Memory** (`mem.rs`): the kernel's memory calls go to the backend
   (`Platform::memory`), which keeps the guest's mappings
-  (`crates/kernel/src/vmas.rs`) and edits stage 1. A `MAP_FIXED` mapping
-  over slab memory at its own address keeps using that memory, zeroed, so
-  translated ranges stay rare; a hint whose range is free is taken as a
-  fixed mapping would be, as Linux takes it, where it can read as one
-  with the translated ranges beside it: one that continues a translated
-  range (or that one continues) gets its memory right beside the
-  other's, and the two become one, so a buffer across them is one host
-  buffer. Where that memory is taken, the mapping goes where the VM
-  places mappings, as a hint allows, and a read or write across it is cut
-  at its edge (a shorter count). The framework maps only host memory that
-  may be written, which a shared mapping of a file opened read-only is
-  not: such a segment is made of the same file opened again for writing
-  (checked to be the same file; an `mprotect` asking to write fails with
-  `EACCES`), or, for a file the user may not write, of a private copy.
+  (`crates/kernel/src/vmas.rs`) and edits stage 1.
+  - A `MAP_FIXED` mapping over slab memory at its own address keeps
+    using that memory, zeroed, so translated ranges stay rare.
+  - A hint whose range is free is taken as a fixed mapping, as Linux
+    takes it, where the result can read as one with the translated
+    ranges beside it: a mapping that continues a translated range (or
+    that one continues) gets its memory right beside the other's, and
+    the two become one, so a buffer across them is one host buffer.
+    Where that memory is taken, the mapping goes where the VM places
+    mappings, as a hint allows, and a read or write across it is cut at
+    its edge (a shorter count).
+  - The framework maps only host memory that may be written, which a
+    shared mapping of a file opened read-only is not. Such a segment is
+    made of the same file opened again for writing (checked to be the
+    same file; an `mprotect` asking to write fails with `EACCES`), or,
+    for a file the user may not write, of a private copy.
 - **Pointer authentication and BTI**, where the vCPUs' ID registers offer
   them (see [linux-on-macos.md](linux-on-macos.md#cache-maintenance-pac-and-bti)).
 - **Signals, threads, `execve` and `fork`:** a signal stops the vCPU with
@@ -178,9 +182,9 @@ the same, and keeps these rules when the backend changes:
   later, and a process outliving its test gets `SIGTERM` and fails the
   test.
 - **Never alongside another hypervisor client.** The VM tests skip while
-  one runs (`krunkit`, `vfkit`, QEMU, Virtualization.framework VMs); for
-  Podman, run `podman machine stop` first. The same goes for running a VM
-  program by hand.
+  one runs (`krunkit`, `vfkit`, QEMU, Lima, UTM, VirtualBox, Parallels,
+  Virtualization.framework VMs); for Podman, run `podman machine stop`
+  first. The same goes for running a VM program by hand.
 
 ## The stand-in
 
@@ -289,8 +293,9 @@ target/release/fwe ./program-linked-low
 
 - `hypervisor.entitlements` also holds what the hardened runtime of a
   notarized release must allow fwe: executable memory it maps itself
-  (guest code), and loading a library signed by someone else (the
-  stand-in's Unicorn). A release and the Homebrew formula sign with it.
+  (guest code), and loading libraries signed by someone else (the
+  stand-in's Unicorn, the Mac's Vulkan driver). A release and the
+  Homebrew formula sign with it.
 - Without the entitlement, or on a host without hypervisor support
   (`sysctl kern.hv_support` must be `1`), fwe explains that the program
   needs the hypervisor backend and exits with status 126.
