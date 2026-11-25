@@ -74,5 +74,11 @@ int main(void) {
     write(p[1], "x", 1);
     waitpid(pid, 0, 0);
     printf("child's status lists the groups: %s\n", strcmp(a, b) == 0 ? "yes" : "no");
+    /* The line as Linux writes it: each group then a space. */
+    char want[512] = "Groups:\t";
+    int at = 8;
+    for (int i = 0; i < n; i++) at += snprintf(want + at, sizeof want - at, "%u ", mine[i]);
+    if (n == 0) snprintf(want + at, sizeof want - at, " ");
+    printf("each group then a space: %s\n", strcmp(a, want) == 0 ? "yes" : "no");
     return 0;
 }

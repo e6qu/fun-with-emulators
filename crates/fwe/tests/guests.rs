@@ -11023,7 +11023,8 @@ fn peer_groups_and_another_processs_groups() {
         "peergroups",
         &[],
         "no room: -1 ERANGE, needed: the groups' size\npeer's groups: 0, getgroups' own: yes\n\
-         unconnected: -1 ENODATA\nTCP: -1 ENODATA\nchild's status lists the groups: yes\n",
+         unconnected: -1 ENODATA\nTCP: -1 ENODATA\nchild's status lists the groups: yes\n\
+         each group then a space: yes\n",
     );
 }
 

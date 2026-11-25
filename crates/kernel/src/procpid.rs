@@ -445,7 +445,10 @@ pub fn status(pid: i32, comm: &[u8], h: &HostInfo, c: &Creds) -> Vec<u8> {
         _ => "S (sleeping)",
     };
     let ids = |v: &[u32; 4]| v.iter().map(u32::to_string).collect::<Vec<_>>().join("\t");
-    let groups = c.groups.iter().map(u32::to_string).collect::<Vec<_>>().join(" ");
+    // Each group then a space, and a space with none, as Linux writes the
+    // line (crash reporters parse it so).
+    let groups = c.groups.iter().map(|g| format!("{g} ")).collect::<String>();
+    let groups = if groups.is_empty() { " ".to_string() } else { groups };
     let caps = c.caps.map_or_else(
         || {
             format!(
