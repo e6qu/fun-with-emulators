@@ -1,0 +1,7 @@
+# Release archives the application tests fetch from their makers, for
+# Linux on arm64: Electron 45.3.0, Visual Studio Code 1.145.3 and Zed
+# 1.27.0. Each line is the archive's URL and its SHA-256 as its maker
+# publishes it.
+https://github.com/electron/electron/releases/download/v45.3.0/electron-v45.3.0-linux-arm64.zip a79c1e639f4a02d5039eca296144d74c87da3018410e7d86c421efdc2c7df64c
+https://vscode.download.prss.microsoft.com/dbazure/download/stable/dcd3ad6e368fbe19d03f37054a40dbaf40d676f4/code-stable-arm64-1794014945.tar.gz 1fe639e74fb6eb64a081fafe352dbf978c9fe4f2b324822c5ee0d335b72ad961
+https://github.com/zed-industries/zed/releases/download/v1.27.0/zed-linux-aarch64.tar.gz 9e4f8b182f41d4cd434cbbc6d1562329a33ef048d65a39bae0665465d0a638bb

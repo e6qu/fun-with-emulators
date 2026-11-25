@@ -1,0 +1,6 @@
+{
+  "name": "fwe-hello",
+  "version": "1.0.0",
+  "description": "A window showing one page, which the application tests look at",
+  "main": "main.js"
+}

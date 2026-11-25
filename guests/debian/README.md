@@ -98,6 +98,7 @@ it). Nothing fetched is redistributed in this repository.
 | `fetch/clang.txt` | clang 14 with LLVM 14 and its libraries, GNU binutils, and the glibc, GCC and libstdc++ files a program builds and links with | 63 MB |
 | `fetch/go.txt` | Go 1.19: the `go` command, its tools and the standard library's sources | 74 MB |
 | `fetch/podman.txt` | podman 4.3, conmon, crun, catatonit, the containers configuration, and the libraries they load (gpgme, libseccomp, libsubid, devmapper, glib, libsystemd, yajl and theirs) | 14 MB |
+| `fetch/apps.txt` | What the application tests' programs load: GTK 3, NSS, ALSA's library, GBM, the Vulkan loader, WebKitGTK 4.1, fonts and fontconfig, D-Bus, `setpriv` (util-linux), and their libraries ([`guests/apps`](../apps/README.md)) | 172 MB |
 
 ## License
 

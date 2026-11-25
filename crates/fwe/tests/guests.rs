@@ -10030,10 +10030,21 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
         let _one = PREPARING.lock().unwrap_or_else(|e| e.into_inner());
         // Each where its package's trigger would run: the program there,
         // and what it works on.
+        // (Alpine's paths, then Debian's.)
         let triggers: &[(&str, &[&str], &str)] = &[
             ("usr/bin/gdk-pixbuf-query-loaders", &["--update-cache"], "usr/lib/gdk-pixbuf-2.0"),
             (
+                "usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders",
+                &["--update-cache"],
+                "usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0",
+            ),
+            (
                 "usr/bin/glib-compile-schemas",
+                &["/usr/share/glib-2.0/schemas"],
+                "usr/share/glib-2.0/schemas",
+            ),
+            (
+                "usr/lib/aarch64-linux-gnu/glib-2.0/glib-compile-schemas",
                 &["/usr/share/glib-2.0/schemas"],
                 "usr/share/glib-2.0/schemas",
             ),
@@ -11012,6 +11023,148 @@ fn alpine_display_gtk3_demo_runs() {
 fn alpine_display_gtk4_demo_runs() {
     let Some(x) = display_tests() else { return };
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
+}
+
+/// A root for test `test` of the application tests: the Debian packages
+/// `guests/debian/fetch/apps.txt` lists, with the archives
+/// `guests/apps/fetch/upstream.txt` lists unpacked into `/opt` (Electron's
+/// into `/opt/electron`, the others as they unpack), the Electron app of
+/// `guests/apps/electron` in `/opt/fwe-hello`, and users `root` and
+/// `nobody`, whose home `/tmp/nobody` is.
+fn apps_root(test: &str) -> ScratchRoot {
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    let root = fetched_root("apps");
+    let (list, archives) = manifest_in("apps", "upstream");
+    let made = format!(
+        "{list}{}",
+        std::fs::read_to_string(repo().join("guests/apps/electron/main.js")).unwrap()
+    );
+    let stamp = root.join("opt/.fwe-apps");
+    if std::fs::read_to_string(&stamp).ok().as_deref() != Some(made.as_str()) {
+        let _ = std::fs::remove_dir_all(root.join("opt"));
+        std::fs::create_dir_all(root.join("opt/electron")).unwrap();
+        for (url, sha256) in &archives {
+            let name = url.rsplit('/').next().unwrap();
+            let file = fetch_pinned(name, std::slice::from_ref(url), sha256, "apps");
+            if name.ends_with(".zip") {
+                run_checked(
+                    Command::new("unzip")
+                        .arg("-q")
+                        .arg(&file)
+                        .arg("-d")
+                        .arg(root.join("opt/electron")),
+                );
+            } else {
+                run_checked(
+                    Command::new("tar").arg("xzf").arg(&file).arg("-C").arg(root.join("opt")),
+                );
+            }
+        }
+        run_checked(
+            Command::new("cp")
+                .arg("-R")
+                .arg(repo().join("guests/apps/electron"))
+                .arg(root.join("opt/fwe-hello")),
+        );
+        std::fs::write(
+            root.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/tmp/nobody:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("etc/group"), "root:x:0:\nnogroup:x:65534:\n").unwrap();
+        std::fs::write(&stamp, &made).unwrap();
+    }
+    let scratch = display_root(&root, test);
+    let home = scratch.0.join("tmp/nobody");
+    std::fs::create_dir_all(&home).unwrap();
+    run_checked(Command::new("chmod").arg("777").arg(&home));
+    scratch
+}
+
+/// `program` with `args`, run as `nobody` (`setpriv`), so that a Chromium's
+/// sandbox, which refuses root, is on: the program and arguments for
+/// [`Gui::start`].
+fn as_nobody<'a>(program: &'a str, args: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec!["--reuid=65534", "--regid=65534", "--clear-groups", "--", program];
+    v.extend(args);
+    v
+}
+
+/// What a window showing the test page (magenta, with "fwe" in green, as
+/// `guests/apps/electron/index.html` has it) shows, checked: mostly the
+/// page's magenta, and the green of its text.
+fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
+    let began = Instant::now();
+    loop {
+        let shot = x.shot(w, name);
+        let (magenta, green) = (shot.count(0xff00ff), shot.count(0x00ff00));
+        let area = (w.w * w.h) as u64;
+        if magenta > area / 2 && green > 2_000 {
+            return;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(120),
+            "{name} shows {magenta} magenta and {green} green pixels of {area}: {shot:?}: {}",
+            gui.report()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// Electron, sandboxed: an app of its own showing a page.
+#[test]
+fn debian_display_electron_app_draws_its_page() {
+    let Some(x) = display_tests() else { return };
+    let root = apps_root("electron");
+    let args = as_nobody("/opt/electron/electron", &["/opt/fwe-hello"]);
+    let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
+    let mut gui = Gui::start(&x, "electron", &root, "/usr/bin/setpriv", &args, &env);
+    let w = x.window(&mut gui, &["--name", "^fwe-hello$"], 180);
+    shows_the_test_page(&x, &w, "electron", &mut gui);
+}
+
+/// Visual Studio Code, sandboxed: its window opens a file and shows it,
+/// and typing into it changes what it shows.
+#[test]
+fn debian_display_vscode_edits_a_file() {
+    let Some(x) = display_tests() else { return };
+    let root = apps_root("vscode");
+    std::fs::write(root.0.join("tmp/nobody/hello.txt"), "fwe\n").unwrap();
+    let args = as_nobody(
+        "/opt/VSCode-linux-arm64/code",
+        &["--user-data-dir=/tmp/nobody/code", "--disable-workspace-trust", "/tmp/nobody/hello.txt"],
+    );
+    let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
+    let mut gui = Gui::start(&x, "vscode", &root, "/usr/bin/setpriv", &args, &env);
+    let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
+    std::thread::sleep(Duration::from_secs(5));
+    let before = x.shot(&w, "vscode-before");
+    assert!(before.drawn > 50_000, "VS Code drew {before:?}: {}", gui.report());
+    x.type_into(&w, "typed under fwe");
+    let after = x.changes(&w, &before, "vscode-typed", 60);
+    assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
+}
+
+/// Zed, drawn on the GPU through fwe's Vulkan driver: its window opens a
+/// file and shows it, and typing into it changes what it shows.
+#[test]
+fn debian_display_zed_edits_a_file_on_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = apps_root("zed");
+    std::fs::write(root.0.join("tmp/nobody/hello.txt"), "fwe\n").unwrap();
+    let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
+    // As `nobody`: Zed refuses to run as root.
+    let args =
+        as_nobody("/opt/zed.app/libexec/zed-editor", &["--foreground", "/tmp/nobody/hello.txt"]);
+    let mut gui = Gui::start(&x, "zed", &root, "/usr/bin/setpriv", &args, &env);
+    let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
+    std::thread::sleep(Duration::from_secs(5));
+    let before = x.shot(&w, "zed-before");
+    assert!(before.drawn > 50_000, "Zed drew {before:?}: {}", gui.report());
+    x.type_into(&w, "typed under fwe");
+    let after = x.changes(&w, &before, "zed-typed", 60);
+    assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
 }
 
 /// Making a name that exists in or at a read-only mount is `EEXIST`
