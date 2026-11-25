@@ -2298,8 +2298,11 @@ macOS has no seccomp. fwe runs each filter, classic BPF over Linux's
 `seccomp_data` (`AUDIT_ARCH_AARCH64`), before either backend routes a call
 (`crates/kernel/src/seccomp.rs`), so none escapes it; the action of
 highest precedence wins. Filters apply to every thread of the process and
-are kept across `fork` and `execve`. `SECCOMP_RET_TRAP` raises `SIGSYS`
-with Linux's `_sigsys` fields; `SECCOMP_RET_TRACE` stops a tracer that set
+are kept across `fork` and `execve`. The filters' instruction pointer,
+like a `SIGSYS`'s call address and its handler's pc, is the address after
+the `svc`, as Linux reports it (sandboxes compare the two).
+`SECCOMP_RET_TRAP` raises `SIGSYS` with Linux's `_sigsys` fields;
+`SECCOMP_RET_TRACE` stops a tracer that set
 `PTRACE_O_TRACESECCOMP` (`PTRACE_EVENT_SECCOMP`, the filter's data as its
 message), which can change the call or skip it (number -1), and the
 filters then run again on what it left; without such a tracer it fails the

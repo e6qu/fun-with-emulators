@@ -617,8 +617,9 @@ fn guest_pid(host: i32) -> i32 {
 const SYS_SECCOMP: i32 = 1;
 
 /// The `SIGSYS` a seccomp filter's `SECCOMP_RET_TRAP` raises for call `nr`
-/// at `pc`, with the filter's `data`.
-pub(crate) fn raise_sigsys(pc: u64, nr: u64, data: u16) {
+/// made at `site`, with the filter's `data`.
+pub(crate) fn raise_sigsys(site: crate::SvcSite, nr: u64, data: u16) {
+    let pc = site.reported();
     let info = SigInfo {
         code: SYS_SECCOMP,
         pid: pc as u32 as i32,

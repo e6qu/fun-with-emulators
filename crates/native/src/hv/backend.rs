@@ -1558,7 +1558,7 @@ fn syscall(vcpu: &Vcpu, regs: &mut Regs) {
     let mut args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
     // The process's seccomp filters decide first, for every call.
     if fwe_kernel::seccomp::mode() != 0 {
-        let mut action = fwe_kernel::seccomp::check(n, &args, regs.pc);
+        let mut action = fwe_kernel::seccomp::check(n, &args, fwe_kernel::SvcSite(regs.pc));
         // A tracer's turn (`SECCOMP_RET_TRACE`): the call as it leaves it.
         if let fwe_kernel::seccomp::Action::Trace(data) = action {
             action = kernel().as_mut().unwrap().seccomp_trace(regs, data);

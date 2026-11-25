@@ -153,6 +153,21 @@ pub use trace::Tracer;
 use fwe_abi::{Sigaction, Stack, signal as absig};
 use std::os::fd::AsRawFd;
 
+/// Where a guest's system call was made: the address of its `svc`, where
+/// [`Regs::pc`] points while fwe handles the call. Linux reports the
+/// address after it (the exception's return address) to seccomp filters,
+/// in a `SIGSYS`'s `si_call_addr` and in the handler's context alike, so
+/// that is the one address this gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvcSite(pub u64);
+
+impl SvcSite {
+    /// The address Linux reports for the call: the one after the `svc`.
+    pub fn reported(self) -> u64 {
+        self.0.wrapping_add(4)
+    }
+}
+
 /// The guest's register file, as the backend exposes it to the kernel for one
 /// trap. `x[30]` is the link register; `pstate` is the condition/execution
 /// state (`cpsr`). The general-purpose registers come first, at fixed offsets

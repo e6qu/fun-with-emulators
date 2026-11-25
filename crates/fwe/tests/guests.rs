@@ -10948,6 +10948,23 @@ fn alpine_display_gtk4_demo_runs() {
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
 }
 
+/// `SECCOMP_RET_TRAP` as Chromium's and Firefox's sandboxes rely on it:
+/// the call not made, the `SIGSYS`'s call address and the context's pc
+/// both the address after the `svc` (which the sandboxes compare), as is
+/// the filter's instruction pointer; the handler sets the result.
+#[test]
+fn seccomp_traps_report_the_address_after_the_call() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "seccomptrap",
+        &[],
+        "filter: 0\ntrapped call returns: 42\n\
+         signal 31, code 1, syscall 173, data 7, arch 0xc00000b7\n\
+         call address is after the svc: yes\ncontext pc is after the svc: yes\ncontext x8: 173\n\
+         filter's instruction pointer is after the svc: yes\n",
+    );
+}
+
 /// `RLIMIT_DATA` and `RLIMIT_AS`, which macOS refuses to set, kept and
 /// enforced as Linux enforces them (Chromium's sandbox lowers the data
 /// limit): data at `mmap`, `mprotect` and `brk`, the whole size at `mmap`

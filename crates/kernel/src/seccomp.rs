@@ -273,16 +273,16 @@ pub fn filter_count() -> u32 {
     STATE.read().unwrap_or_else(|e| e.into_inner()).filters.len() as u32
 }
 
-/// The action for call `nr` with `args` at `pc`.
-pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
-    decide(nr, args, pc, false)
+/// The action for call `nr` with `args`, made at `site`.
+pub fn check(nr: u64, args: &[u64; 6], site: crate::SvcSite) -> Action {
+    decide(nr, args, site.reported(), false)
 }
 
 /// The action for call `nr` with `args` at `pc` once a tracer has seen it
 /// (`SECCOMP_RET_TRACE`): the filters run again on what it left, and
 /// tracing again allows it, as Linux's recheck after the tracer has it.
-pub fn recheck(nr: u64, args: &[u64; 6], pc: u64) -> Action {
-    decide(nr, args, pc, true)
+pub fn recheck(nr: u64, args: &[u64; 6], site: crate::SvcSite) -> Action {
+    decide(nr, args, site.reported(), true)
 }
 
 /// Whether answer `ret`, from a filter installed with

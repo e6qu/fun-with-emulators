@@ -2257,7 +2257,7 @@ impl<P: Platform> Kernel<P> {
             Action::Allow => self.enter_syscall(regs),
             Action::Errno(e) => self.finish_syscall(regs, nr, args, err(e)),
             Action::Trap(data) => {
-                crate::signal::raise_sigsys(regs.pc, nr, data);
+                crate::signal::raise_sigsys(crate::SvcSite(regs.pc), nr, data);
                 // The call is not made; a handler can set what it returns.
                 let x0 = regs.x[0] as i64;
                 self.finish_syscall(regs, nr, args, x0);
@@ -2295,7 +2295,7 @@ impl<P: Platform> Kernel<P> {
             return Action::Skip;
         }
         let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
-        crate::seccomp::recheck(nr, &args, regs.pc)
+        crate::seccomp::recheck(nr, &args, crate::SvcSite(regs.pc))
     }
 
     /// `reboot(magic, magic2, cmd)`, checked as Linux checks it: the
