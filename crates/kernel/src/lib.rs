@@ -19,6 +19,8 @@
 
 pub mod acct;
 pub mod aio;
+#[cfg(test)]
+mod alone;
 pub mod anonfd;
 pub mod atime;
 pub mod bpf;

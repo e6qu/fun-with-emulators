@@ -4453,6 +4453,10 @@ mod tests {
     /// saved IDs becoming the effective ones, and a bad record is refused.
     #[test]
     fn exec_state_carries_credentials() {
+        // Restoring loads the process's tables of a re-executed fwe.
+        if !crate::alone::in_own_process(module_path!(), "exec_state_carries_credentials") {
+            return;
+        }
         let mut k = kernel();
         // Groups first: once the user IDs drop root, they cannot change.
         assert_eq!(k.creds.setgroups(vec![5, 6]), 0);
@@ -4475,6 +4479,13 @@ mod tests {
     /// credentials agree, and the exec is a secure one.
     #[test]
     fn exec_state_carries_what_the_program_grants() {
+        // Restoring loads the process's tables of a re-executed fwe.
+        if !crate::alone::in_own_process(
+            module_path!(),
+            "exec_state_carries_what_the_program_grants",
+        ) {
+            return;
+        }
         let mut k = kernel();
         assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
         crate::EXEC_PRIVS.with(|p| p.set(crate::ExecPrivs { uid: Some(0), ..Default::default() }));
