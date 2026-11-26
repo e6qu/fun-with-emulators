@@ -158,4 +158,4 @@ v3.24/community/aarch64/xwd-1.0.9-r2.apk 2f482f15b8248d1bd1462567b8a996eebd80446
 v3.24/community/aarch64/xwininfo-1.1.6-r0.apk bd6df066680bacd790f9b97d2d089b05db6d0aa60e9c1ff48c974c6d316eaf32
 v3.24/main/aarch64/xz-libs-5.8.4-r0.apk 9be375832e747afe14f98e400e8b55d8f6fde25e41663090c81600628daab093
 v3.24/main/aarch64/yaml-0.2.5-r2.apk fb6587c62fbd339d934ca9feb387aa9b3b2003710a1081d8287a4ec49a3d658f
-v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818
+v3.24/main/aarch64/zstd-libs-1.6.0-r1.apk 923a9b5fffbc8272ce65b67fa7f768a9e3ea55c395b36030dc11635f29645eae

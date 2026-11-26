@@ -409,4 +409,4 @@ v3.24/main/aarch64/zlib-1.4-r0.apk d3e30d012a3445222b0b4a28f1d4d97ce67387f8b4856
 v3.24/main/aarch64/zlib-dev-1.4-r0.apk a74c9e3ca4e52700066c6cfee6a965dc1bc2e5e7896f987625afd9fdb121ada3
 v3.24/main/aarch64/zstd-1.6.0-r1.apk 4f1eadcfaa4c63dbb4b5560aa7d3103f624207c6274f2b19530aa1f811e3c130
 v3.24/main/aarch64/zstd-dev-1.6.0-r1.apk af2ebb719e619a9d9cd1d31a847fab81f40bc12bd6f3a05ae8eba5570dc32d06
-v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818
+v3.24/main/aarch64/zstd-libs-1.6.0-r1.apk 923a9b5fffbc8272ce65b67fa7f768a9e3ea55c395b36030dc11635f29645eae
