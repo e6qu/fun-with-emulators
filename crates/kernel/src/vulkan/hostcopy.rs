@@ -133,7 +133,7 @@ fn make(driver: &Driver, pd: u64) -> Helper {
         Some(unsafe { generated::call(index, f, &words(args)) })
     };
     // `VkPhysicalDeviceProperties` (824 bytes), its `apiVersion` first.
-    let mut properties = vec![0u8; 824];
+    let mut properties = super::Structure::<824>::zeroed();
     if call(cmd::vkGetPhysicalDeviceProperties, &[pd, properties.as_mut_ptr() as u64]).is_none() {
         return none;
     }
@@ -163,16 +163,17 @@ fn make(driver: &Driver, pd: u64) -> Helper {
         }
         names.push(c"VK_KHR_maintenance4".as_ptr());
     }
-    let mut features = vec![0u8; 220];
+    // `VkPhysicalDeviceFeatures` (220 bytes, in 224).
+    let mut features = super::Structure::<224>::zeroed();
     if call(cmd::vkGetPhysicalDeviceFeatures, &[pd, features.as_mut_ptr() as u64]).is_none() {
         return none;
     }
     let priority = 1.0f32;
-    let mut queue = [0u8; 40];
+    let mut queue = super::Structure::<40>::zeroed();
     queue[..4].copy_from_slice(&QUEUE_CREATE_INFO.to_ne_bytes());
     queue[24..28].copy_from_slice(&1u32.to_ne_bytes());
     queue[32..40].copy_from_slice(&(&raw const priority as u64).to_ne_bytes());
-    let mut info = [0u8; 72];
+    let mut info = super::Structure::<72>::zeroed();
     info[..4].copy_from_slice(&DEVICE_CREATE_INFO.to_ne_bytes());
     info[20..24].copy_from_slice(&1u32.to_ne_bytes());
     info[24..32].copy_from_slice(&(queue.as_ptr() as u64).to_ne_bytes());
@@ -237,8 +238,8 @@ struct Asked {
     flags: u32,
     /// Its `VkImageFormatListCreateInfo` and `VkImageStencilUsageCreateInfo`
     /// (which an image's create info takes too), copied.
-    list: Option<[u8; 32]>,
-    stencil: Option<[u8; 24]>,
+    list: Option<super::Structure<32>>,
+    stencil: Option<super::Structure<24>>,
 }
 
 fn asked(index: usize, w: &[u64; MOST_ARGS]) -> Option<Asked> {
@@ -290,7 +291,7 @@ impl Helper {
             l[8..16].copy_from_slice(&next.to_ne_bytes());
             next = l.as_ptr() as u64;
         }
-        let mut info = [0u8; 88];
+        let mut info = super::Structure::<88>::zeroed();
         let mut put = |at: usize, v: u32| info[at..at + 4].copy_from_slice(&v.to_ne_bytes());
         put(0, IMAGE_CREATE_INFO);
         put(16, a.flags);
@@ -305,13 +306,13 @@ impl Helper {
         put(52, a.tiling);
         put(56, usage);
         info[8..16].copy_from_slice(&next.to_ne_bytes());
-        let mut asked = [0u8; 32];
+        let mut asked = super::Structure::<32>::zeroed();
         asked[..4].copy_from_slice(&DEVICE_IMAGE_REQUIREMENTS.to_ne_bytes());
         asked[16..24].copy_from_slice(&(info.as_ptr() as u64).to_ne_bytes());
         // A disjoint image's first plane (`VK_IMAGE_ASPECT_PLANE_0_BIT`).
         let plane: u32 = if a.flags & DISJOINT != 0 { 0x10 } else { 0 };
         asked[24..28].copy_from_slice(&plane.to_ne_bytes());
-        let mut got = [0u8; 40];
+        let mut got = super::Structure::<40>::zeroed();
         got[..4].copy_from_slice(&REQUIREMENTS2.to_ne_bytes());
         type Requirements = unsafe extern "C" fn(u64, *const u8, *mut u8);
         // SAFETY: the driver's `vkGetDeviceImageMemoryRequirements` for

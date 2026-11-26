@@ -324,9 +324,9 @@ fn moltenvk_paravirtual(driver: &Driver, instance: u64) -> bool {
         // `VkPhysicalDeviceDriverProperties` (536 bytes, its ID at 16), and
         // `VkPhysicalDeviceProperties2` (840 bytes) chaining it, its
         // properties at 16 and in them the device's name at 20.
-        let mut ids = vec![0u8; 536];
+        let mut ids = super::Structure::<536>::zeroed();
         ids[0..4].copy_from_slice(&1_000_196_000u32.to_ne_bytes());
-        let mut p = vec![0u8; 840];
+        let mut p = super::Structure::<840>::zeroed();
         p[0..4].copy_from_slice(&1_000_059_001u32.to_ne_bytes());
         p[8..16].copy_from_slice(&(ids.as_mut_ptr() as u64).to_ne_bytes());
         // SAFETY: a device of the instance's, and room for the structures.

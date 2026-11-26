@@ -62,6 +62,33 @@ pub enum Level {
     Device,
 }
 
+/// A Vulkan structure fwe makes for the driver, as its bytes: aligned as
+/// the driver reads it (its pointers and 64-bit handles at multiples of 8),
+/// which a plain byte array is not.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct Structure<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> Structure<N> {
+    pub(crate) const fn zeroed() -> Self {
+        Structure([0; N])
+    }
+}
+
+impl<const N: usize> std::ops::Deref for Structure<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> std::ops::DerefMut for Structure<N> {
+    fn deref_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+}
+
 /// How long one slice of a wait is: the longest a signal waits for a thread
 /// waiting on the GPU.
 pub const SLICE_NS: u64 = 5_000_000;
