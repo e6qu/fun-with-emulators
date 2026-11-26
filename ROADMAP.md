@@ -22,7 +22,7 @@ current limitations, in
 | M4 Compatibility | Done |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way: PRs 1 and 2 done |
-| M7 Graphical programs and sandboxes | Under way: PRs 1 and 2 done |
+| M7 Graphical programs and sandboxes | Under way: PRs 1, 2 and 3 done |
 | M8 Virtual networking | After 1.0 |
 
 ## Done
@@ -66,6 +66,13 @@ current limitations, in
   null descriptors where the Mac's driver lacks them; OpenGL through
   Zink; `vkcube` and `glxgears` drawn on it in CI; a Vulkan submission
   and `vkcube`'s frames within 1.5× of the same driver natively.
+- **M7 PR 3 — Browsers and application frameworks:** Chromium and
+  Firefox, sandboxes on, showing a page and playing a video; Electron,
+  Visual Studio Code and Zed (by lavapipe) on Debian 13, the editors
+  saving what is typed into them; Tauri and Wails apps of fwe's own built
+  under fwe, drawing through WebKitGTK; Chromium's page load and video
+  frames benchmarked against Chrome for Testing on macOS, Electron's
+  start-up against its macOS build.
 
 ## Left to 1.0
 
@@ -149,21 +156,25 @@ reason.
 **Done when:** Wine's test program runs natively in CI and its benchmarks
 hold 1.5×.
 
+#### PR 8 — Large images natively
+
+- [ ] **Counted:** per process, the code run by translation because no
+  stub space reaches it, the code that translation follows into from
+  there, and the time taken bringing in translations kept by earlier
+  runs.
+- [ ] **No band beyond reach:** every site of an image whose code is
+  wider than a branch reaches across (Chromium's 224 MiB) gets a stub, or
+  the code beyond reach and what it calls costs as native code does.
+- [ ] **Kept translations brought in at the cost of a native page's first
+  run,** not one lookup per block.
+
+**Done when:** Chromium's page load holds 1.5× Chrome for Testing on
+macOS, its budget back from 2.5×.
+
 ### M7 — Graphical programs and sandboxes
 
 CI starts an X server and drives each program with synthetic input,
 checking what it draws by screenshot.
-
-#### PR 3 — Browsers and application frameworks
-
-- [ ] **Browsers:** Chrome or Chromium, and Firefox, sandboxes on,
-  browsing local pages and playing video.
-- [ ] **Frameworks:** an Electron app and Visual Studio Code; Zed; a Tauri
-  and a Wails app (WebKitGTK).
-- [ ] **Benchmarks:** a page load and video frames against the same
-  browser on macOS; an Electron app's start-up.
-
-**Done when:** these run in CI, driven and checked by what they draw.
 
 #### PR 4 — Graphical Wine
 

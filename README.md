@@ -60,10 +60,14 @@ What runs unmodified, its output checked in CI:
   on an X server on the Mac; Weston with Wayland clients and Xwayland;
   Vulkan (`vkcube`) and OpenGL (`glxgears`, through Zink) on the Mac's
   GPU, through fwe's own Vulkan driver.
+- **Browsers and applications, natively:** Chromium and Firefox with
+  their sandboxes, showing pages and playing video; Electron, Visual
+  Studio Code and Zed editing files; Tauri and Wails apps, built under fwe,
+  drawing through WebKitGTK.
 - **Conformance:** every LTP system-call test that applies passes.
 
-Native speed, browsers, graphical Wine natively and gVisor are left to
-1.0 ([ROADMAP.md](ROADMAP.md)).
+Native speed, graphical Wine natively, gVisor and programs on the GPU
+through MoltenVK are left to 1.0 ([ROADMAP.md](ROADMAP.md)).
 
 ## Usage
 

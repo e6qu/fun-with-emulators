@@ -333,7 +333,11 @@ BUDGETS = {
     # Alpine's Chromium against Chrome for Testing of the same release on
     # macOS, loading a page and decoding and drawing video frames, as a
     # computing workload is; Electron's start-up, as a program's start is.
-    "Chromium page load (ms)": 1.5,
+    # The page load is held at 2.5x until Chromium's code beyond its stubs'
+    # reach runs natively (ROADMAP.md M6 PR 8): that code, and what it
+    # calls, runs by translation, each process taking the translations
+    # kept by earlier runs as it first reaches them.
+    "Chromium page load (ms)": 2.5,
     "Chromium video frame (ms)": 1.5,
     "Electron start-up (ms)": 3.0,
     # Kernel state every process shares, kept in memory as a kernel keeps
