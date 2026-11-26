@@ -180,7 +180,7 @@ fn each_output(index: usize, w: &[u64; MOST_ARGS], mut range: impl FnMut(u64, u6
         range(addr, count.saturating_mul(size));
         if chained {
             for i in 0..count {
-                chain(addr + i * size, &mut range);
+                each_chained(addr + i * size, &mut range);
             }
         }
     });
@@ -188,7 +188,7 @@ fn each_output(index: usize, w: &[u64; MOST_ARGS], mut range: impl FnMut(u64, u6
 
 /// Each structure of the `pNext` chain of guest structure `addr`, as
 /// `(address, size)`.
-fn chain(addr: u64, range: &mut impl FnMut(u64, u64)) {
+fn each_chained(addr: u64, range: &mut impl FnMut(u64, u64)) {
     let mut at = crate::uaccess::read::<u64>(addr + 8).unwrap_or(0);
     for _ in 0..256 {
         if at == 0 {
