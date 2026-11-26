@@ -277,13 +277,16 @@ pub fn reset() {
 /// go, so the words a later mapping holds there are taken as they are
 /// ([`original`]).
 pub fn forget(addr: u64, len: u64) {
-    fn gone<V>(m: &mut std::collections::BTreeMap<u64, V>, addr: u64, end: u64) {
-        let mut tail = m.split_off(&addr);
-        m.append(&mut tail.split_off(&end));
-    }
     let end = addr.saturating_add(len);
     gone(&mut SITES.lock().unwrap_or_else(|e| e.into_inner()), addr, end);
     gone(&mut CALL_SITES.lock().unwrap_or_else(|e| e.into_inner()), addr, end);
+}
+
+/// The entries of `m` from `addr` to `end` gone, at the cost of those
+/// there (most unmapped memory held no code): a split and a rejoin would
+/// cost every site of the program at each `munmap`.
+fn gone<V>(m: &mut std::collections::BTreeMap<u64, V>, addr: u64, end: u64) {
+    m.extract_if(addr..end, |_, _| true).for_each(drop);
 }
 
 /// The stub region holding `pc`, if any: (start, end).
@@ -1190,6 +1193,17 @@ pub unsafe fn flush_icache(_addr: u64, _len: u64) {}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forgetting_a_range_keeps_what_is_outside_it() {
+        let mut m: std::collections::BTreeMap<u64, u32> =
+            [(0x1000, 1), (0x2000, 2), (0x2ffc, 3), (0x3000, 4)].into();
+        super::gone(&mut m, 0x2000, 0x3000);
+        assert_eq!(m.into_iter().collect::<Vec<_>>(), [(0x1000, 1), (0x3000, 4)]);
+        let mut empty: std::collections::BTreeMap<u64, u32> = [(0x1000, 1)].into();
+        super::gone(&mut empty, 0x5000, 0x6000);
+        assert_eq!(empty.len(), 1);
+    }
 
     #[test]
     fn stub_space_estimate() {
