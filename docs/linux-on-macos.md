@@ -2219,7 +2219,7 @@ without the kernel lock.
 | `getppid` | The parent, or the reaper that adopted the process; 0 for one outside the pid namespace. A process that asks often has a thread of fwe's watch the parent's end (`kqueue`, as for the parent-death signal) and the answer kept while the parent lives. | `getppid`, then `kqueue` |
 | `getpgid`, `getsid`, `setpgid`, `setsid` | The host's ([Job control and ptys](#job-control-and-ptys)); `setpgid` of a child that has exec'd fails with `EACCES` first, as on Linux. | `getpgid`, `getsid`, `setpgid`, `setsid` |
 | `set_tid_address`, `set_robust_list`, `get_robust_list` | Kept per thread; another thread's robust list, for a caller allowed to trace it, is read from the process's registry, or for another process from its entry in the process records' memory, which its threads write. | none |
-| `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`, `WAKE_OP` (the second word changed with an atomic compare-and-swap); the PI operations and `FUTEX_FD` fail with `ENOSYS`, as without `CONFIG_FUTEX_PI`. | `__ulock_wait2`/`__ulock_wake` for shared futexes |
+| `futex` | `WAIT`, `WAKE`, their `_BITSET` forms, `REQUEUE`, `CMP_REQUEUE`, `WAKE_OP` (the second word changed with an atomic compare-and-swap); the priority-inheritance locks `LOCK_PI`, `LOCK_PI2`, `TRYLOCK_PI` and `UNLOCK_PI` (see futex, priority-inheriting); `WAIT_REQUEUE_PI` and `CMP_REQUEUE_PI` fail with `ENOSYS`, and `FUTEX_FD` too, as on every Linux since 2.6.26. | `__ulock_wait2`/`__ulock_wake` for shared futexes |
 | `futex_waitv` | Up to 128 32-bit futexes, private and shared, on `CLOCK_MONOTONIC` or `CLOCK_REALTIME`. | as `futex` |
 | `futex_wake`, `futex_wait`, `futex_requeue` | As `FUTEX_WAKE_BITSET`, `FUTEX_WAIT_BITSET` (an absolute timeout on the clock given) and `FUTEX_CMP_REQUEUE`, on 32-bit futexes (another size or NUMA `EINVAL`); a requeue's two futexes are both private or both shared (`EINVAL` otherwise). | as `futex` |
 | `kcmp` | Memory, descriptor table, filesystem view, handlers, I/O context and undo list are shared only by a process's threads; two descriptors are one open file if they name the same socket or pipe, or the same file and (in the caller) share their status flags; `KCMP_EPOLL_TFD` for the caller's own epoll descriptors (`ENOENT` for another's); a caller allowed to trace neither process `EPERM`. | `proc_pidinfo`, `proc_pidfdinfo`, `fcntl` |
@@ -3471,5 +3471,6 @@ and fail with `ENOSYS`, noted under `--strace`, in both backends:
 Some dispatched calls are refused whatever their arguments, once checked,
 each as its row says: `clock_settime`, `settimeofday`, and `adjtimex`,
 `clock_adjtime` with a change; `reboot` but Ctrl-Alt-Del on or off;
-`pkey_alloc`; `lsm_get_self_attr`, `lsm_set_self_attr`; `futex`'s PI
-operations and `FUTEX_FD`; `CLONE_NEWTIME`; `personality(PER_LINUX32)`.
+`pkey_alloc`; `lsm_get_self_attr`, `lsm_set_self_attr`; `futex`'s
+requeue-PI operations and `FUTEX_FD`; `CLONE_NEWTIME`;
+`personality(PER_LINUX32)`.
