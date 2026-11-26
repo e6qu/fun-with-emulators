@@ -1,12 +1,13 @@
 # Debian 13 (trixie) arm64 packages of the application tests' root: what
 # Electron, Visual Studio Code and Zed load (GTK 3, NSS, ALSA's library, GBM,
-# the Vulkan loader, WebKitGTK 4.1, libsecret, fonts and fontconfig, D-Bus).
+# the Vulkan loader and Mesa's software Vulkan driver, WebKitGTK 4.1,
+# libsecret, fonts and fontconfig, D-Bus).
 # Each line is a pool path and the package's SHA-256 from the trixie index,
 # as tools/debian-manifest.py makes them from the seeds below: a whole
 # system (every Essential package) with the seeds and all they depend on.
 # suite: trixie
-# seeds: libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libvulkan1 libwebkit2gtk-4.1-0 libcurl4t64 libnotify4 libxkbcommon-x11-0 libxkbfile1 libxss1 libsecret-1-0 fonts-dejavu-core fontconfig dbus
-# snapshot: 20261124T000000Z
+# seeds: libgtk-3-0t64 libnss3 libasound2t64 libgbm1 libvulkan1 mesa-vulkan-drivers libwebkit2gtk-4.1-0 libcurl4t64 libnotify4 libxkbcommon-x11-0 libxkbfile1 libxss1 libsecret-1-0 fonts-dejavu-core fontconfig dbus
+# snapshot: 20261125T000000Z
 pool/main/a/aalib/libaa1_1.4p5-51.1+b1_arm64.deb be6b46f64d9ac8f269dcb1bd71715a51597de890fa897151e06a0abcb1b8c4e0
 pool/main/a/abseil/libabsl20240722_20240722.0-4_arm64.deb eb6648c73cd69c577a2bc18c8d66d44de897c0207a734ffdb55f91945404d0ac
 pool/main/a/acl/libacl1_2.3.2-2+b1_arm64.deb 10b2399169e42e6d8db55944116cb2ed61caab997cf700acb83de0b0668e5721
@@ -240,6 +241,7 @@ pool/main/m/mesa/libgbm1_25.0.7-2+deb13u1_arm64.deb 2beb8d20ca715a01b7b2352c1167
 pool/main/m/mesa/libgl1-mesa-dri_25.0.7-2+deb13u1_arm64.deb 628245ff9d8e4f11edb66c0854915018402853e0eb588343d472111f6c4fb582
 pool/main/m/mesa/libglx-mesa0_25.0.7-2+deb13u1_arm64.deb 18c02afcdd88f547ba66d3ae9290f93ab155381bf8d96b0127f9028374acfc64
 pool/main/m/mesa/mesa-libgallium_25.0.7-2+deb13u1_arm64.deb a27576030704ff305adaef8bd143954b281680861d5bfe21aabd7d376a939149
+pool/main/m/mesa/mesa-vulkan-drivers_25.0.7-2+deb13u1_arm64.deb b73e1b64f26d55c981339533f3eb64397fda4a8e86dd5593ed15e1c48711141d
 pool/main/m/mpfr4/libmpfr6_4.2.2-1_arm64.deb 628a4ef58cc6815880f72e9d3953984a379a017e4042bc575f1fcbf3954d79ac
 pool/main/m/mpg123/libmpg123-0t64_1.32.10-1+deb13u1_arm64.deb d284df39ff3b64f1cdf274352613c52534c55eed82c3a2ff0fc7ba154acd7bf0
 pool/main/n/ncurses/libncurses6_6.5+20250216-2_arm64.deb 259fe5736ebb105df7c6a7b5cc6231a8743666f5f57885f6c7989babe2fc0082

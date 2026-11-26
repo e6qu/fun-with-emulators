@@ -10636,6 +10636,23 @@ impl Xvfb {
         }
     }
 
+    /// Wait up to `secs` for window `w` to stop changing but for a caret's
+    /// blink (its drawn pixels within 500 of each other for four shots
+    /// half a second apart): a program that has drawn its window can still
+    /// be moving its focus, and keys typed then go elsewhere.
+    fn settled(&self, w: &Window, name: &str, secs: u64) -> Shot {
+        let began = Instant::now();
+        let mut last = self.shot(w, name);
+        let mut still = 0;
+        while still < 3 && began.elapsed() < Duration::from_secs(secs) {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = self.shot(w, name);
+            still = if now.drawn.abs_diff(last.drawn) < 500 { still + 1 } else { 0 };
+            last = now;
+        }
+        last
+    }
+
     /// Wait up to `secs` for window `w` to show something other than
     /// `before` (its digest): what it shows then.
     fn changes(&self, w: &Window, before: &Shot, name: &str, secs: u64) -> Shot {
@@ -10650,19 +10667,11 @@ impl Xvfb {
     }
 
     /// Keys typed into window `w` (focused first: there is no window
-    /// manager to give it the focus).
+    /// manager to give it the focus), through the server as a keyboard's
+    /// are (XTEST): toolkits that drop sent events (`XSendEvent`'s) take
+    /// them.
     fn type_into(&self, w: &Window, text: &str) {
-        let out = self.xdotool(&[
-            "windowfocus",
-            "--sync",
-            &w.id,
-            "type",
-            "--delay",
-            "40",
-            "--window",
-            &w.id,
-            text,
-        ]);
+        let out = self.xdotool(&["windowfocus", "--sync", &w.id, "type", "--delay", "40", text]);
         assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
     }
 
@@ -11524,46 +11533,100 @@ fn debian_display_electron_app_draws_its_page() {
     shows_the_test_page(&x, &w, "electron", &mut gui);
 }
 
+/// A file `nobody` can change, holding "fwe", in directory `dir` (made, and
+/// `nobody`'s to make files in: an editor saves by making a new file beside
+/// the old).
+fn editable_file(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let file = dir.join("hello.txt");
+    std::fs::write(&file, "fwe\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+    file
+}
+
+/// An editor showing `file` in window `w` (once it has drawn it) edits it:
+/// what is typed at its start, then saved (`ctrl+s`), is in the file.
+fn saves_what_is_typed(x: &Xvfb, w: &Window, gui: &mut Gui, file: &Path, name: &str) {
+    let before = x.drawn(w, &format!("{name}-before"), 50_000, 120);
+    assert!(before.drawn > 50_000, "{name} drew {before:?}: {}", gui.report());
+    x.settled(w, &format!("{name}-before"), 60);
+    x.type_into(w, "typed under fwe");
+    x.key_into(w, "ctrl+s");
+    let began = Instant::now();
+    let saved = loop {
+        let now = std::fs::read_to_string(file).unwrap();
+        if now.contains("typed under fwe") || began.elapsed() > Duration::from_secs(60) {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let after = x.shot(w, &format!("{name}-typed"));
+    assert_eq!(
+        saved,
+        "typed under fwefwe\n",
+        "{name} saved {saved:?} ({after:?}): {}",
+        gui.report()
+    );
+}
+
 /// Visual Studio Code, sandboxed: its window opens a file and shows it,
-/// and typing into it changes what it shows.
+/// and what is typed into it is saved.
 #[test]
 fn debian_display_vscode_edits_a_file() {
     let Some(x) = display_tests() else { return };
     let root = apps_root("vscode");
-    std::fs::write(root.0.join("tmp/nobody/hello.txt"), "fwe\n").unwrap();
+    let file = editable_file(&root.0.join("tmp/nobody/project"));
     let args = as_nobody(
         "/opt/VSCode-linux-arm64/code",
-        &["--user-data-dir=/tmp/nobody/code", "--disable-workspace-trust", "/tmp/nobody/hello.txt"],
+        &[
+            "--user-data-dir=/tmp/nobody/code",
+            "--disable-workspace-trust",
+            // No first-run welcome, which takes the focus from the file.
+            "--skip-welcome",
+            "/tmp/nobody/project/hello.txt",
+        ],
     );
     let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
     let mut gui = Gui::start(&x, "vscode", &root, "/usr/bin/setpriv", &args, &env);
     let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
-    std::thread::sleep(Duration::from_secs(5));
-    let before = x.shot(&w, "vscode-before");
-    assert!(before.drawn > 50_000, "VS Code drew {before:?}: {}", gui.report());
-    x.type_into(&w, "typed under fwe");
-    let after = x.changes(&w, &before, "vscode-typed", 60);
-    assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
+    saves_what_is_typed(&x, &w, &mut gui, &file, "vscode");
 }
 
-/// Zed, drawn on the GPU through fwe's Vulkan driver: its window opens a
-/// file and shows it, and typing into it changes what it shows.
+/// Zed, drawn by Mesa's software Vulkan driver (lavapipe): its window opens
+/// a file and shows it, and what is typed into it is saved. (On the GPU,
+/// MoltenVK cannot compile its vertex shader: ROADMAP's M7 PR 6.)
 #[test]
-fn debian_display_zed_edits_a_file_on_the_gpu() {
+fn debian_display_zed_edits_a_file() {
     let Some(x) = display_tests() else { return };
     let root = apps_root("zed");
-    std::fs::write(root.0.join("tmp/nobody/hello.txt"), "fwe\n").unwrap();
-    let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
+    let file = editable_file(&root.0.join("tmp/nobody/project"));
+    // The file is opened in a project, which is trusted (Zed asks
+    // otherwise, a file on its own too, and keys typed go to its
+    // question), and Zed looks for no update.
+    let settings = root.0.join("tmp/nobody/.config/zed");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(
+        settings.join("settings.json"),
+        r#"{ "session": { "trust_all_worktrees": true }, "auto_update": false }"#,
+    )
+    .unwrap();
+    let env = [
+        ("HOME", "/tmp/nobody"),
+        ("XDG_RUNTIME_DIR", "/tmp/nobody"),
+        ("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/lvp_icd.aarch64.json"),
+        // Zed asks before it draws by software otherwise.
+        ("ZED_ALLOW_EMULATED_GPU", "1"),
+    ];
     // As `nobody`: Zed refuses to run as root.
-    let args = as_nobody("/opt/zed.app/libexec/zed-editor", &["/tmp/nobody/hello.txt"]);
+    let args = as_nobody(
+        "/opt/zed.app/libexec/zed-editor",
+        &["/tmp/nobody/project", "/tmp/nobody/project/hello.txt"],
+    );
     let mut gui = Gui::start(&x, "zed", &root, "/usr/bin/setpriv", &args, &env);
     let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
-    std::thread::sleep(Duration::from_secs(5));
-    let before = x.shot(&w, "zed-before");
-    assert!(before.drawn > 50_000, "Zed drew {before:?}: {}", gui.report());
-    x.type_into(&w, "typed under fwe");
-    let after = x.changes(&w, &before, "zed-typed", 60);
-    assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
+    saves_what_is_typed(&x, &w, &mut gui, &file, "zed");
 }
 
 /// The longest an app's build under fwe ([`built_app`]) takes: Cargo

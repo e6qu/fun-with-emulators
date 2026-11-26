@@ -302,6 +302,10 @@ that lacks it, and `--strace` names it.
 - **OpenGL 3 and WebGL on the GPU, with MoltenVK**: Zink gives OpenGL
   2.1 and OpenGL ES 2.0 there, so browsers draw WebGL in software (Mesa's
   llvmpipe, without `MESA_LOADER_DRIVER_OVERRIDE=zink`).
+- **Zed on the GPU, with MoltenVK**: MoltenVK cannot compile Zed's
+  shaders; Zed draws by software through Mesa's lavapipe
+  (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json` and
+  `ZED_ALLOW_EMULATED_GPU=1`).
 - **The GPU in the VM, or after `fork`**: a program in the VM has no
   GPU, nor does a child forked from a process that used it (its Vulkan
   calls fail) until it runs a program with `execve`.

@@ -2272,6 +2272,11 @@ mark what holds in one backend only.
   GPU, Chromium's GPU process composites in software, and Firefox's
   antialiased WebGL 1 draws nothing: ES 2.0 makes it a multisampled
   drawing buffer it has no blit to resolve.
+- MoltenVK 1.4.2 cannot compile Zed's vertex shader: its translation to
+  Metal passes a structure's array member where a function takes an
+  `spvUnsafeArray`, which Metal's compiler refuses, so the pipeline fails
+  (`VK_ERROR_INITIALIZATION_FAILED`) and Zed draws nothing on the GPU; it
+  draws through Mesa's lavapipe.
 - GPU buffers and semaphores are not shared with other processes (no
   external memory or semaphore descriptors), and video coding, debug
   callbacks and the driver's layers are not offered.
