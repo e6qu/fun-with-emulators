@@ -227,6 +227,16 @@ pub(crate) fn cloexec(fd: i32) -> bool {
     f >= 0 && f & libc::FD_CLOEXEC != 0
 }
 
+/// What a process restoring fwe's records has of the process that saved
+/// them: its memory (the child of a host `fork`, fwe's own shared mappings
+/// where they were), or only its descriptors (a VM's fork child, started
+/// anew, and a program `execve` started), fwe's mappings made again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Restoring {
+    SameMemory,
+    NewProcess,
+}
+
 /// Put a fresh kqueue at descriptor `fd`, which MUST be free: a fork child's
 /// stand-in for a kqueue the host did not pass on.
 #[cfg(not(target_os = "linux"))]

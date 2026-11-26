@@ -599,7 +599,7 @@ impl<P: Platform> Kernel<P> {
             // (above the guest's descriptors, now placed).
             let _ = trace::to_file(&trace_file);
         }
-        specialfd::restore(d);
+        specialfd::restore(d, snapshot::Restoring::NewProcess);
         signalfd::restore(d);
         synthdir::restore(d);
         procfile::restore(d);
@@ -1102,7 +1102,7 @@ impl<P: Platform> Kernel<P> {
         mqueue::load(&mut d);
         filestore::desc::load(&mut d);
         pidfd::restore(&mut d, true);
-        specialfd::restore(&mut d);
+        specialfd::restore(&mut d, snapshot::Restoring::NewProcess);
         signalfd::restore(&mut d);
         epoll::restore(&mut d);
         pdeath::restore(&mut d);
@@ -1639,7 +1639,7 @@ pub fn kqueue_state() -> Vec<u8> {
 /// recorded.
 pub fn restore_kqueues(state: &[u8]) {
     let mut d = snapshot::Dec::new(state);
-    specialfd::restore(&mut d);
+    specialfd::restore(&mut d, snapshot::Restoring::SameMemory);
     epoll::restore(&mut d);
     pidfd::restore(&mut d, false);
 }

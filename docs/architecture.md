@@ -1357,7 +1357,9 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
 - **eventfd and timerfd** (`crates/kernel/src/specialfd.rs`) live in a
   process-global registry that `read`, `write` and `close` consult first.
   An eventfd's counter is a host shared memory object with no name,
-  mapped, with a lock word. The counter counts its writes too: an
+  mapped, with a lock word: a host fork's child keeps its parent's
+  mapping, and a VM's fork child or a program an `execve` started maps it
+  again. The counter counts its writes too: an
   edge-triggered set sees the eventfd readable anew on each, as Linux
   wakes its waiters on each, though the pipe holds its one byte
   throughout. Of the epoll and timerfd kqueues a fork child rebuilds, a
