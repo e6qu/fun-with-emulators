@@ -149,6 +149,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &crate::filestore::desc::DESCS,
         &crate::filestore::desc::HELD,
         &crate::filestore::desc::PLACES,
+        &crate::filestore::desc::SYNCING,
         &atime::NOATIME_FDS,
         &modes::SETID_FILES,
         &modes::CAPS_FILES,

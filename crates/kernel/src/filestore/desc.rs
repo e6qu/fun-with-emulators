@@ -74,6 +74,13 @@ type Counts = Vec<(u64, u32)>;
 /// told ([`sync`]), and the data object it keeps mapped for each.
 pub(crate) static HELD: Mutex<BTreeMap<File, (Counts, u64)>> = Mutex::new(BTreeMap::new());
 
+/// Held by a [`sync`] from its look at the descriptors to its last count
+/// told, so counts land in the order they were looked at: one looked at
+/// before a descriptor was made, told after the count that has it, would
+/// take the file's holder away (a memfd would go with its descriptor
+/// open). Taken with no other lock held.
+pub(crate) static SYNCING: Mutex<()> = Mutex::new(());
+
 fn descs<R>(f: impl FnOnce(&mut BTreeMap<u32, Desc>) -> R) -> R {
     f(&mut DESCS.lock().unwrap_or_else(|e| e.into_inner()))
 }
@@ -175,8 +182,10 @@ const EXE_KEY: u32 = u32::MAX;
 /// counts carry over the host `execve`).
 pub fn adopt_exe(fd: i32, file: File, id: u64) {
     ANY.store(true, Ordering::Relaxed);
-    descs(|m| m.insert(EXE_KEY, Desc { file, id, path: false }));
-    fdmarks::mark(fd, Mark::Store(EXE_KEY));
+    descs(|m| {
+        m.insert(EXE_KEY, Desc { file, id, path: false });
+        fdmarks::mark(fd, Mark::Store(EXE_KEY));
+    });
 }
 
 /// Host descriptor `fd` (a `/dev/null`) is description `id` of `file`
@@ -184,8 +193,13 @@ pub fn adopt_exe(fd: i32, file: File, id: u64) {
 fn adopt(fd: i32, file: File, id: u64, path: bool) {
     ANY.store(true, Ordering::Relaxed);
     let k = NEXT_KEY.fetch_add(1, Ordering::Relaxed);
-    descs(|m| m.insert(k, Desc { file, id, path }));
-    fdmarks::mark(fd, Mark::Store(k));
+    // The entry and its mark under the table's lock: a [`sync`] meanwhile
+    // finds both or neither, never the entry without its mark (which it
+    // would take for one whose descriptor went).
+    descs(|m| {
+        m.insert(k, Desc { file, id, path });
+        fdmarks::mark(fd, Mark::Store(k));
+    });
 }
 
 /// Tell each file whose count of this process's descriptors changed what
@@ -198,20 +212,26 @@ pub fn sync(skip: &[i32]) {
     if !ANY.load(Ordering::Relaxed) {
         return;
     }
+    let _one = SYNCING.lock().unwrap_or_else(|e| e.into_inner());
     let mut now: BTreeMap<File, BTreeMap<u64, u32>> = BTreeMap::new();
     let mut keys = BTreeSet::new();
-    for (fd, mark) in fdmarks::marks() {
-        let Mark::Store(k) = mark else { continue };
-        if skip.contains(&fd) || key_of(fd) != Some(k) {
-            continue;
+    // The marks looked at and the entries without one dropped under the
+    // table's lock, which [`adopt`] makes an entry and its mark under: one
+    // made meanwhile is not taken for one whose descriptor went.
+    descs(|m| {
+        for (fd, mark) in fdmarks::marks() {
+            let Mark::Store(k) = mark else { continue };
+            if skip.contains(&fd) || key_of(fd) != Some(k) {
+                continue;
+            }
+            keys.insert(k);
+            if let Some(d) = m.get(&k) {
+                *now.entry(d.file).or_default().entry(d.id).or_default() += 1;
+            }
         }
-        keys.insert(k);
-        if let Some(d) = descs(|m| m.get(&k).copied()) {
-            *now.entry(d.file).or_default().entry(d.id).or_default() += 1;
-        }
-    }
-    descs(|m| m.retain(|k, _| keys.contains(k)));
-    PLACES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keys.contains(k));
+        m.retain(|k, _| keys.contains(k));
+        PLACES.lock().unwrap_or_else(|e| e.into_inner()).retain(|k, _| keys.contains(k));
+    });
     let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
     let me = crate::sysvipc::me();
     let files: BTreeSet<File> = held.keys().chain(now.keys()).copied().collect();
@@ -486,5 +506,81 @@ pub(crate) fn unsent(state: &[u8]) {
     let (_, _, token) = (d.u64(), d.bool(), d.u64());
     if let Ok(fs) = file.fs() {
         let_go_in_flight(&fs, file.ino, token);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A description made while another thread counts the process's
+    /// descriptors ([`sync`], which a close or a duplicate starts) stays
+    /// known: its descriptor names its file.
+    #[test]
+    fn a_description_made_during_a_count_stays() {
+        // A file of no filesystem: its counts go nowhere, its description
+        // is kept all the same.
+        let file = File { fs: u64::MAX, ino: 7 };
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let counter = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    sync(&[]);
+                    std::thread::yield_now();
+                }
+            })
+        };
+        let mut lost = 0;
+        for _ in 0..2000 {
+            let fd = open(file, 0, new_id(0)).unwrap();
+            if of(fd) != Some(file) {
+                lost += 1;
+            }
+            fdmarks::closed(fd);
+            // SAFETY: the descriptor opened above.
+            unsafe { libc::close(fd) };
+        }
+        stop.store(true, Ordering::Relaxed);
+        counter.join().unwrap();
+        assert_eq!(lost, 0, "descriptions lost of 2000");
+    }
+
+    /// Counts made beside one another land in the order they were looked
+    /// at: a new memfd stays while its descriptor is open, though others
+    /// count all the while.
+    #[test]
+    fn a_new_file_stays_while_others_count() {
+        let creds = crate::creds::Creds::default();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let counters: Vec<_> = (0..2)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        sync(&[]);
+                        std::thread::yield_now();
+                    }
+                })
+            })
+            .collect();
+        let mut gone = 0;
+        for _ in 0..5000 {
+            let fd = crate::memfd::create(b"stays", fwe_abi::memfd::MFD_ALLOW_SEALING, &creds);
+            assert!(fd >= 0, "{fd}");
+            let fd = fd as i32;
+            if crate::memfd::get_seals(fd) != 0 {
+                gone += 1;
+            }
+            fdmarks::closed(fd);
+            // SAFETY: the memfd made above.
+            unsafe { libc::close(fd) };
+            sync(&[]);
+        }
+        stop.store(true, Ordering::Relaxed);
+        for c in counters {
+            c.join().unwrap();
+        }
+        assert_eq!(gone, 0, "new files gone of 5000");
     }
 }
