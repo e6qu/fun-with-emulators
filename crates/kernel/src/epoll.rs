@@ -15,6 +15,10 @@
 //! ([`crate::fdstate::pipe_full`]) is not writable while full, which the
 //! host does not know: its `EVFILT_WRITE` events are dropped then.
 //!
+//! A set's changes and the taking of its events, which disarms the
+//! one-shot entries they report, are made one at a time ([`SETS`]), the
+//! waits without it.
+//!
 //! A kqueue is not passed on to a child process, so each epoll descriptor's
 //! interest list is also recorded here ([`save`], [`restore`]): a fork
 //! child rebuilds its epoll descriptors from it.
@@ -378,6 +382,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         use fwe_abi::epoll::*;
         use fwe_abi::{err, errno};
         let entry = if op == EPOLL_CTL_DEL { None } else { Some(crate::guest!(read_event(event))) };
+        let _sets = sets();
         // As Linux checks, in its order: both descriptors, whether the
         // target can be watched (a file or directory is always ready, so
         // it cannot), whether the set is one, nesting, then the entry. A
@@ -476,6 +481,20 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         }
         r
     }
+}
+
+/// Changes to epoll sets, and the taking of their events with what that
+/// does to them (a one-shot entry disarmed by its report): one at a time,
+/// as Linux's epoll lock makes them, so an `EPOLL_CTL_MOD` that re-arms an
+/// entry is never undone by the disarming of a report taken before it (a
+/// waiter that re-armed after `EAGAIN` would never be woken). The waits
+/// themselves are made without it.
+#[cfg(not(target_os = "linux"))]
+pub(crate) static SETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(not(target_os = "linux"))]
+fn sets() -> std::sync::MutexGuard<'static, ()> {
+    SETS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// The bpf objects each set watches (set, descriptor): always in error, as
@@ -829,6 +848,9 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
         (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
     let slice = i64::from(crate::fifo::SLICE_MS) * 1_000_000;
     loop {
+        // What fwe looks at itself is taken as the host's events are
+        // ([`SETS`]).
+        let sets = sets();
         // FIFOs whose writers have gone, pty masters whose slave hung up.
         let mut ready: Vec<(i32, u32, u64)> = Vec::new();
         for &(fd, data, ev) in &fifos {
@@ -863,6 +885,12 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             }
         }
         ready.truncate(max);
+        for &(fd, ..) in &ready {
+            if fifos.iter().chain(&mounts).any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
+                disarm(ep, fd);
+            }
+        }
+        drop(sets);
         let wait = if ready.is_empty() {
             match deadline {
                 None => slice,
@@ -884,11 +912,6 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             match ready.iter_mut().find(|r| r.0 == fd) {
                 Some(r) => r.1 |= bits,
                 None => ready.push((fd, bits, data)),
-            }
-        }
-        for &(fd, ..) in &ready {
-            if fifos.iter().chain(&mounts).any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
-                disarm(ep, fd);
             }
         }
         if !ready.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -1310,6 +1333,9 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             Err(e) => return Err(fwe_abi::err(e)),
         }
     }
+    // From the taking of the events to the disarming of the one-shot
+    // entries they report.
+    let _sets = sets();
     let before = reads_before(epfd);
     let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `out` holds `room` entries; `ts` is a valid timespec.
@@ -1494,6 +1520,67 @@ mod tests {
         assert_eq!({ got[0].events } & EPOLLPRI, EPOLLPRI);
         closed(ep as i32);
         for fd in [srv, cli, conn, ep as i32] {
+            // SAFETY: the descriptors made here.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A one-shot entry re-armed while another thread takes the set's
+    /// events stays armed: the arming the last `EPOLL_CTL_MOD` made is
+    /// reported, by that thread's wait or a later one (async-io re-arms a
+    /// source from the thread that got `EAGAIN`, while its reactor waits).
+    #[test]
+    fn a_re_arming_is_never_undone_by_a_report_taken_before_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _turn = turn();
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        // Readable throughout: never read.
+        // SAFETY: a one-byte local buffer.
+        assert_eq!(unsafe { libc::write(wr, b"x".as_ptr().cast(), 1) }, 1);
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) } as u64;
+        let arm = |op, data| {
+            let reg = event(EPOLLIN | EPOLLONESHOT, data);
+            // SAFETY: a valid epoll_event.
+            assert_eq!(unsafe { ctl(ep, op, rd as u64, &reg as *const _ as u64) }, 0);
+        };
+        let take = |ms| {
+            let mut got = [event(0, 0); 4];
+            // SAFETY: room for 4 events.
+            let n = unsafe { pwait(ep, got.as_mut_ptr() as u64, 4, ms, 0, 0) };
+            got[..n.max(0) as usize].iter().map(data).collect::<Vec<u64>>()
+        };
+        arm(EPOLL_CTL_ADD, 0);
+        for round in 0..300u64 {
+            let stop = AtomicBool::new(false);
+            let last = round * 100 + 99;
+            let seen = std::thread::scope(|s| {
+                let waiter = s.spawn(|| {
+                    let mut seen = Vec::new();
+                    while !stop.load(Ordering::Acquire) {
+                        seen.extend(take(5));
+                    }
+                    seen
+                });
+                for i in 0..100 {
+                    arm(EPOLL_CTL_MOD, round * 100 + i);
+                }
+                stop.store(true, Ordering::Release);
+                waiter.join().unwrap()
+            });
+            let after = take(0);
+            assert!(
+                seen.contains(&last) || after.contains(&last),
+                "round {round}: the last arming ({last}) went unreported (the waiter saw {:?}, a \
+                 wait after it {after:?})",
+                seen.iter().rev().take(4).collect::<Vec<_>>()
+            );
+        }
+        closed(ep as i32);
+        for fd in [rd, wr, ep as i32] {
             // SAFETY: the descriptors made here.
             unsafe { libc::close(fd) };
         }

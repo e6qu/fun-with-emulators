@@ -108,7 +108,8 @@ fn locks() -> Vec<&'static dyn ForkLock> {
     // The host's kqueue behind `epoll` (macOS).
     #[cfg(not(target_os = "linux"))]
     v.extend([
-        &epoll::INTEREST as &'static dyn ForkLock,
+        &epoll::SETS as &'static dyn ForkLock,
+        &epoll::INTEREST,
         &epoll::ALIASES,
         &epoll::BPF_WATCHED,
         &epoll::EDGES,

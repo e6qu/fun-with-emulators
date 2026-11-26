@@ -1345,7 +1345,11 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   a pipe's read end readable once it holds more than when last reported,
   less what the process has read through that descriptor since (counted
   as each read returns, `read_from`), so a write that refills a drained
-  pipe is an edge, as on Linux. A mounts file
+  pipe is an edge, as on Linux. Changes to a set and the taking of its
+  events, with the disarming of the one-shot entries they report, are
+  made one at a time (`SETS`), as Linux's epoll lock makes them: an
+  `EPOLL_CTL_MOD` that re-arms an entry while another thread takes the
+  set's events stays armed. A mounts file
   (`/proc/<pid>/mounts`, `mountinfo`) reports
   `POLLERR | POLLPRI` once its namespace's mounts changed since it was
   opened or last polled (`crates/kernel/src/mountwatch.rs`: the namespace
