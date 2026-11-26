@@ -1199,6 +1199,8 @@ def browsers(a, fwe, results):
     linux_zip = fetch(url, sha, a.cache)
     electron = os.path.join(deb, "opt/electron")
     if not os.path.exists(os.path.join(electron, "electron")):
+        # The root has no /opt; unzip makes only the last directory.
+        os.makedirs(electron, exist_ok=True)
         subprocess.run(["unzip", "-q", "-o", linux_zip, "-d", electron], check=True)
     app = os.path.join(deb, "opt/fwe-hello")
     shutil.rmtree(app, ignore_errors=True)
