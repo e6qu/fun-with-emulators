@@ -1,10 +1,14 @@
 <!doctype html>
 <html>
-  <!-- A video made and played by the browser: two seconds of frames drawn
-       on a canvas (green, a blue bar crossing it) recorded as WebM (VP8)
-       by MediaRecorder, then played in a loop by a video element, the
-       title then "fwe-video: playing". The tests look at the video drawn:
-       the window's pixels changing as the bar crosses it. -->
+  <!-- A video made and played by the browser: frames drawn on a canvas
+       (green, a blue bar crossing it) recorded as WebM (VP8) by
+       MediaRecorder, then played in a loop by a video element, the title
+       then "fwe-video: playing". The recording ends once 60 frames are
+       drawn after its first data (not after a fixed time, which a slow
+       start would leave empty). A failure puts what was recorded in the
+       title: "fwe-video: failed: <error>, <parts> parts, <bytes> bytes".
+       The console has each part's size and time. The tests look at the
+       video drawn: the window's pixels changing as the bar crosses it. -->
   <head><meta charset="utf-8"><title>fwe-video</title></head>
   <body style="margin:0;background:#ff00ff">
     <canvas id="c" width="320" height="240" style="display:none"></canvas>
@@ -21,16 +25,37 @@
         n++;
       };
       draw();
+      const t0 = performance.now();
+      const log = (m) => console.log(`fwe-video: ${m} at ${Math.round(performance.now() - t0)} ms`);
       const rec = new MediaRecorder(c.captureStream(30), { mimeType: "video/webm;codecs=vp8" });
       const parts = [];
-      rec.ondataavailable = (e) => parts.push(e.data);
-      rec.onstop = () => {
-        v.src = URL.createObjectURL(new Blob(parts, { type: "video/webm" }));
-        v.play().then(() => { document.title = "fwe-video: playing"; });
+      let bytes = 0, first = -1;
+      const failed = (e) => {
+        document.title = `fwe-video: failed: ${e}, ${parts.length} parts, ${bytes} bytes`;
+        log(document.title);
       };
-      const tick = setInterval(draw, 33);
-      rec.start();
-      setTimeout(() => { clearInterval(tick); rec.stop(); }, 2000);
+      rec.ondataavailable = (e) => {
+        parts.push(e.data);
+        bytes += e.data.size;
+        if (e.data.size > 0 && first < 0) first = n;
+        log(`part of ${e.data.size} bytes, ${n} frames drawn`);
+      };
+      rec.onerror = (e) => failed(`recorder: ${e.error && e.error.name}`);
+      rec.onstop = () => {
+        log("stopped");
+        v.onerror = () => failed(`video: ${v.error && v.error.code} ${v.error && v.error.message}`);
+        v.src = URL.createObjectURL(new Blob(parts, { type: "video/webm" }));
+        v.play().then(() => { document.title = "fwe-video: playing"; log("playing"); }, (e) => failed(e.name));
+      };
+      const tick = setInterval(() => {
+        draw();
+        if (first >= 0 && n - first >= 60) {
+          clearInterval(tick);
+          rec.stop();
+        }
+      }, 33);
+      rec.start(250);
+      log("recording");
     </script>
   </body>
 </html>
