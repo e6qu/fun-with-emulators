@@ -2273,9 +2273,11 @@ impl<P: Platform> Kernel<P> {
             Action::Errno(e) => self.complete_syscall(regs, nr, args, err(e)),
             Action::Trap(data) => {
                 crate::signal::raise_sigsys(crate::SvcSite(regs.pc), nr, data);
-                // The call is not made; a handler can set what it returns.
-                let x0 = regs.x[0] as i64;
-                self.complete_syscall(regs, nr, args, x0);
+                // The call is not made: `x0` keeps its first argument, as
+                // Linux's does, for a handler to set what it returns, and
+                // it is not restarted whatever that holds.
+                self.tracer.not_made(nr, args, "seccomp's SIGSYS");
+                regs.pc = regs.pc.wrapping_add(4);
             }
             // The backends end a thread of several before taking the
             // kernel lock; the last one takes the process with it.

@@ -76,33 +76,7 @@ impl Tracer {
         if !self.enabled || self.failures_only && !(-4095..0).contains(&result) {
             return;
         }
-        let mut line = String::with_capacity(128);
-        match syscall_name(nr) {
-            Some(name) => line.push_str(name),
-            None => {
-                let _ = write!(line, "syscall_{nr}");
-            }
-        }
-        line.push('(');
-        let strings = string_args(nr);
-        for (i, a) in args.iter().enumerate() {
-            if i > 0 {
-                line.push_str(", ");
-            }
-            // A path or name, as the guest wrote it.
-            match crate::uaccess::read_cstr(*a, 256)
-                .ok()
-                .filter(|_| *a != 0 && strings & (1 << i) != 0)
-            {
-                Some(text) => {
-                    let _ = write!(line, "{:?}", String::from_utf8_lossy(&text));
-                }
-                None => {
-                    let _ = write!(line, "{a:#x}");
-                }
-            }
-        }
-        line.push_str(") = ");
+        let mut line = call_line(nr, args);
         if (-4095..0).contains(&result) {
             let e = (-result) as i32;
             let _ = write!(line, "-1 {} ({e})", errno_name(e).unwrap_or("E?"));
@@ -111,6 +85,16 @@ impl Tracer {
         }
         returned(&mut line, nr, args, result);
         self.write_line(&line);
+    }
+
+    /// A call that was not made, and why (`seccomp's SIGSYS`): `= ?`, as
+    /// it returns nothing of its own.
+    pub fn not_made(&self, nr: u64, args: &[u64; 6], why: &str) {
+        if self.enabled && !self.failures_only {
+            let mut line = call_line(nr, args);
+            let _ = write!(line, "? ({why})");
+            self.write_line(&line);
+        }
     }
 
     pub fn note(&self, message: &str) {
@@ -140,9 +124,45 @@ impl Tracer {
     }
 }
 
+/// A call's name and arguments, up to its ` = `.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn call_line(nr: u64, args: &[u64; 6]) -> String {
+    let mut line = String::with_capacity(128);
+    match syscall_name(nr) {
+        Some(name) => line.push_str(name),
+        None => {
+            let _ = write!(line, "syscall_{nr}");
+        }
+    }
+    line.push('(');
+    let strings = string_args(nr);
+    for (i, a) in args.iter().enumerate() {
+        if i > 0 {
+            line.push_str(", ");
+        }
+        // A path or name, as the guest wrote it.
+        match crate::uaccess::read_cstr(*a, 256).ok().filter(|_| *a != 0 && strings & (1 << i) != 0)
+        {
+            Some(text) => {
+                let _ = write!(line, "{:?}", String::from_utf8_lossy(&text));
+            }
+            None => {
+                let _ = write!(line, "{a:#x}");
+            }
+        }
+    }
+    line.push_str(") = ");
+    line
+}
+
 /// What a call gave back or was given in memory that says what happened:
-/// a `ppoll`'s returned events (each descriptor's, up to 16), and a Unix
-/// socket's address in `connect` and `bind` (`@` for an abstract name).
+/// a `ppoll`'s returned events (each descriptor's, up to 16), a Unix
+/// socket's address in `connect` and `bind` (`@` for an abstract name),
+/// and the descriptors a `sendmsg` sent or a `recvmsg` received
+/// (`SCM_RIGHTS`), each memfd and other file of fwe's store marked.
 fn returned(line: &mut String, nr: u64, args: &[u64; 6], result: i64) {
     use fwe_abi::nr as n;
     match nr {
@@ -157,6 +177,7 @@ fn returned(line: &mut String, nr: u64, args: &[u64; 6], result: i64) {
             }
             line.push(']');
         }
+        n::SENDMSG | n::RECVMSG if result >= 0 => passed_fds(line, args[1]),
         n::CONNECT | n::BIND => {
             let len = args[2].min(110) as usize;
             let Ok(addr) = crate::uaccess::read_bytes(args[1], len) else { return };
@@ -171,6 +192,51 @@ fn returned(line: &mut String, nr: u64, args: &[u64; 6], result: i64) {
         }
         _ => {}
     }
+}
+
+/// The descriptors of the `SCM_RIGHTS` messages of `msghdr` `msg`, as
+/// ` [fds 3 4(memfd) 5(store)]`.
+fn passed_fds(line: &mut String, msg: u64) {
+    // `struct msghdr`: its control buffer at 32 and length at 40.
+    let Ok(hdr) = crate::uaccess::read::<[u64; 6]>(msg) else { return };
+    let (control, len) = (hdr[4], hdr[5].min(4096) as usize);
+    if control == 0 || len < 16 {
+        return;
+    }
+    let Ok(buf) = crate::uaccess::read_bytes(control, len) else { return };
+    let mut fds = Vec::new();
+    let mut at = 0;
+    // Each `struct cmsghdr`: its length (8 bytes), level and type, then
+    // its data, the next at an 8-byte boundary.
+    while at + 16 <= buf.len() {
+        let clen = u64::from_ne_bytes(buf[at..at + 8].try_into().expect("eight bytes")) as usize;
+        let level = i32::from_ne_bytes(buf[at + 8..at + 12].try_into().expect("four bytes"));
+        let kind = i32::from_ne_bytes(buf[at + 12..at + 16].try_into().expect("four bytes"));
+        if clen < 16 || at + clen > buf.len() {
+            break;
+        }
+        if level == fwe_abi::socket::SOL_SOCKET as i32 && kind == 1 {
+            for c in buf[at + 16..at + clen].as_chunks::<4>().0 {
+                fds.push(i32::from_ne_bytes(*c));
+            }
+        }
+        at += clen.next_multiple_of(8);
+    }
+    if fds.is_empty() {
+        return;
+    }
+    line.push_str(" [fds");
+    for fd in fds {
+        let kind = if crate::memfd::name(fd).is_some() {
+            "(memfd)"
+        } else if crate::filestore::desc::of(fd).is_some() {
+            "(store)"
+        } else {
+            ""
+        };
+        let _ = write!(line, " {fd}{kind}");
+    }
+    line.push(']');
 }
 
 /// Which arguments of system call `nr` are strings: a bit for each.

@@ -12045,17 +12045,19 @@ fn a_socket_in_flight_keeps_its_data() {
 /// `SECCOMP_RET_TRAP` as Chromium's and Firefox's sandboxes rely on it:
 /// the call not made, the `SIGSYS`'s call address and the context's pc
 /// both the address after the `svc` (which the sandboxes compare), as is
-/// the filter's instruction pointer; the handler sets the result.
+/// the filter's instruction pointer; the handler sets the result, and a
+/// trapped call is not restarted, whatever its `x0` holds.
 #[test]
 fn seccomp_traps_report_the_address_after_the_call() {
-    // Linux 7.0's output, on arm64.
+    // Linux 7.1's output, on arm64.
     c_guest_prints(
         "seccomptrap",
         &[],
         "filter: 0\ntrapped call returns: 42\n\
          signal 31, code 1, syscall 173, data 7, arch 0xc00000b7\n\
          call address is after the svc: yes\ncontext pc is after the svc: yes\ncontext x8: 173\n\
-         filter's instruction pointer is after the svc: yes\n",
+         filter's instruction pointer is after the svc: yes\n\
+         a trapped read whose first argument is -EINTR returns: -4, its handler run 1 time(s)\n",
     );
 }
 
