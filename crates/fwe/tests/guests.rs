@@ -10491,6 +10491,8 @@ struct Window {
 /// What a window shows ([`Xvfb::shot`], from `tools/display/shot.py`).
 #[derive(Debug)]
 struct Shot {
+    /// How many pixels it has: the window's on the screen.
+    pixels: u64,
     /// How many of its pixels are not its most common colour.
     drawn: u64,
     /// How many pixels each colour has.
@@ -10609,7 +10611,14 @@ impl Xvfb {
             })
             .collect();
         let digest = text.lines().find_map(|l| l.strip_prefix("digest ")).unwrap().to_string();
-        Shot { drawn, colours, digest }
+        let pixels = text
+            .lines()
+            .next()
+            .and_then(|l| l.split(" of ").nth(1))
+            .and_then(|p| p.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        Shot { pixels, drawn, colours, digest }
     }
 
     /// Wait up to `secs` for window `w` to have drawn more than `least`
@@ -11378,7 +11387,7 @@ fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
     loop {
         let shot = x.shot(w, name);
         let (magenta, green) = (shot.count(0xff00ff), shot.count(0x00ff00));
-        let area = (w.w * w.h) as u64;
+        let area = shot.pixels;
         if magenta > area / 2 && green > 2_000 {
             return;
         }
@@ -11484,12 +11493,11 @@ fn alpine_display_firefox_plays_a_video() {
 /// magenta covering less than all of it.
 fn plays_the_test_video(x: &Xvfb, name: &str, gui: &mut Gui) {
     let w = x.window(gui, &["--name", "^fwe-video: playing"], 180);
-    let area = (w.w * w.h) as u64;
     let mut seen = std::collections::BTreeSet::new();
     for n in 0..8 {
         let shot = x.shot(&w, &format!("{name}-{n}"));
         assert!(
-            shot.count(0xff00ff) < area.saturating_sub(200_000),
+            shot.count(0xff00ff) < shot.pixels.saturating_sub(200_000),
             "{name} shows no video: {shot:?}: {}",
             gui.report()
         );
@@ -11558,6 +11566,10 @@ fn debian_display_zed_edits_a_file_on_the_gpu() {
     assert_ne!(after.digest, before.digest, "typing changed nothing: {}", gui.report());
 }
 
+/// The longest an app's build under fwe ([`built_app`]) takes: Cargo
+/// building Tauri's crates, natively some minutes on CI's runners.
+const APP_BUILD_LIMIT: Duration = Duration::from_secs(40 * 60);
+
 /// The app of `guests/apps/<app>` built under fwe on the Alpine root
 /// `guests/alpine/fetch/apps.txt` lists: `build`, a shell command run in a
 /// copy of its sources at `/src/<app>`, fetches what its lock file pins
@@ -11565,10 +11577,6 @@ fn debian_display_zed_edits_a_file_on_the_gpu() {
 /// image's) and makes `output` there. Built once and kept in `target/built-apps`
 /// by the hash of its sources and that manifest (CI caches it); the path
 /// of the program made.
-/// The longest an app's build under fwe ([`built_app`]) takes: Cargo
-/// building Tauri's crates, natively some minutes on CI's runners.
-const APP_BUILD_LIMIT: Duration = Duration::from_secs(40 * 60);
-
 fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
     static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _one = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
