@@ -1340,7 +1340,12 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   `ENOENT`). A duplicate of an epoll descriptor is the same set: the
   tables know a set by one open number of it, which each duplicate maps
   to (`ALIASES`); closing that number hands the set to a duplicate's, and
-  a fork child gets its duplicates again. A mounts file
+  a fork child gets its duplicates again. The host's edge-triggered read
+  filter fires after a read of a pipe too: an edge-triggered set reports
+  a pipe's read end readable once it holds more than when last reported,
+  less what the process has read through that descriptor since (counted
+  as each read returns, `read_from`), so a write that refills a drained
+  pipe is an edge, as on Linux. A mounts file
   (`/proc/<pid>/mounts`, `mountinfo`) reports
   `POLLERR | POLLPRI` once its namespace's mounts changed since it was
   opened or last polled (`crates/kernel/src/mountwatch.rs`: the namespace
@@ -2183,6 +2188,11 @@ mark what holds in one backend only.
   wakes every waiter, which then race for what is there (a non-blocking
   `accept` the others lose fails with `EAGAIN`); the host tells no waiter
   that another took it.
+- An edge-triggered set sees a pipe written to anew only by what it holds
+  and what the process read through the descriptor it watches: reads
+  through a duplicate of the read end, or by another process sharing
+  it, go uncounted, and a write that leaves the pipe holding no more
+  than when last reported is then no edge.
 - `EPOLLPRI` reports a TCP socket's urgent data (and a mounts file's
   change); on another socket it reports nothing.
 - inotify: a change by a program fwe does not run raises no event;

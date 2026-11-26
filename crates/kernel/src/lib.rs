@@ -1721,6 +1721,19 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     if r > 0 && matches!(nr, fwe_abi::nr::WRITE | fwe_abi::nr::WRITEV) {
         exclusive::wrote(a[0] as i32);
     }
+    // What a pipe's reader took (a splice or vmsplice out of one too).
+    if r > 0
+        && matches!(
+            nr,
+            fwe_abi::nr::READ
+                | fwe_abi::nr::READV
+                | fwe_abi::nr::PREADV2
+                | fwe_abi::nr::SPLICE
+                | fwe_abi::nr::VMSPLICE
+        )
+    {
+        epoll::read_from(a[0] as i32, r as u64);
+    }
     let r = fdmarks::linux_result(nr, a, r);
     let r = net::linux_read_error(nr, a[0] as i32, r);
     let r = net::linux_send_error(nr, a[0] as i32, r);

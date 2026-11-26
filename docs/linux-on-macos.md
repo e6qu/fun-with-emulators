@@ -1559,7 +1559,7 @@ arm64, its `data` the filter's `udata`):
 | epoll | kqueue |
 |---|---|
 | `EPOLLIN`, `EPOLLOUT` | `EVFILT_READ`, `EVFILT_WRITE` |
-| `EPOLLET` | `EV_CLEAR`; a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen |
+| `EPOLLET` | `EV_CLEAR`; a pipe's read end, which the host reports again after a read, is reported only once it holds more than when last seen, less what the process read through that descriptor since |
 | `EPOLLONESHOT` | `EV_ONESHOT` |
 | `EPOLLPRI` on a TCP socket | `EVFILT_EXCEPT` with `NOTE_OOB` (its urgent data) |
 | `EPOLLEXCLUSIVE` | none: a count of a pipe's writes every fwe process shares, of which each woken set takes one to report it ([architecture.md](architecture.md#event-descriptors-and-inotify)) |

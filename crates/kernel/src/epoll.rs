@@ -8,7 +8,8 @@
 //! `udata`. `EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`.
 //! The host's edge-triggered read filter on a pipe fires after a read too,
 //! which Linux's does not: the read end is reported only once it holds more
-//! than when last seen; an eventfd's (whose pipe holds one byte while its
+//! than when last seen, less what this process read through that
+//! descriptor since ([`read_from`]); an eventfd's (whose pipe holds one byte while its
 //! count is not 0) once written to, every write being an edge to Linux,
 //! whatever the count was. A pipe with a capacity smaller than the host's
 //! ([`crate::fdstate::pipe_full`]) is not writable while full, which the
@@ -118,7 +119,7 @@ pub fn closed(fd: i32) {
             e.retain(|k| k.0 != fd && k.1 != fd);
         }
         if let Some(mut h) = HELD.if_used() {
-            h.retain(|k| k.0 != fd && k.1 != fd);
+            h.retain(|k| k.set != fd && k.fd != fd);
         }
         if let Some(mut w) = BPF_WATCHED.if_used() {
             w.retain(|k| k.0 != fd && k.1 != fd);
@@ -157,8 +158,8 @@ fn renumber(from: i32, to: i32) {
     for k in EDGES.lock().iter_mut().filter(|k| k.0 == from) {
         k.0 = to;
     }
-    for k in HELD.lock().iter_mut().filter(|k| k.0 == from) {
-        k.0 = to;
+    for k in HELD.lock().iter_mut().filter(|k| k.set == from) {
+        k.set = to;
     }
     for k in WRITES.lock().iter_mut().filter(|k| k.0 == from) {
         k.0 = to;
@@ -1021,15 +1022,55 @@ fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn edge_clear(epfd: i32, fd: i32) {
     EDGES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
-    HELD.lock().retain(|k| (k.0, k.1) != (epfd, fd));
+    HELD.lock().retain(|k| (k.set, k.fd) != (epfd, fd));
     WRITES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
 }
 
 /// What edge-triggered pipe read ends in epoll sets held when last
-/// reported: (set, descriptor, bytes).
+/// reported, and what was read of them since.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static HELD: crate::kept::Kept<Vec<(i32, i32, i64)>> =
-    crate::kept::Kept::new(Vec::new());
+pub(crate) static HELD: crate::kept::Kept<Vec<Seen>> = crate::kept::Kept::new(Vec::new());
+
+/// A pipe's read end as an edge-triggered set last reported it
+/// ([`pipe_grew`]).
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct Seen {
+    set: i32,
+    fd: i32,
+    /// What it held then.
+    bytes: i64,
+    /// The bytes this process has read through `fd` since the set first
+    /// saw it, a running count ([`read_from`]).
+    read: u64,
+    /// `read` just before the host was asked for the events of that
+    /// report: reads after it can have come after the host counted
+    /// `bytes`.
+    read_then: u64,
+}
+
+/// `n` bytes were read through descriptor `fd`: a pipe's read end an
+/// edge-triggered set watches holds that much less than it last saw, and
+/// a write that refills it is an edge, though the pipe holds no more than
+/// then.
+pub fn read_from(fd: i32, n: u64) {
+    #[cfg(target_os = "linux")]
+    let _ = (fd, n);
+    #[cfg(not(target_os = "linux"))]
+    if let Some(mut h) = HELD.if_used() {
+        for k in h.iter_mut().filter(|k| k.fd == fd) {
+            k.read += n;
+        }
+    }
+}
+
+/// The reads counted so far of each pipe set `epfd` watches by edge,
+/// taken just before the host is asked for its events ([`pipe_grew`]).
+#[cfg(not(target_os = "linux"))]
+fn reads_before(epfd: i32) -> Vec<(i32, u64)> {
+    HELD.if_used()
+        .map(|h| h.iter().filter(|k| k.set == epfd).map(|k| (k.fd, k.read)).collect())
+        .unwrap_or_default()
+}
 
 /// The writes each set saw counted of each pipe watched exclusively it
 /// watches: `(epfd, fd, writes)`.
@@ -1039,9 +1080,10 @@ pub(crate) static WRITES: crate::kept::Kept<Vec<(i32, i32, u64)>> =
 
 /// Whether a pipe read end `fd` holding `bytes` has had data written since
 /// set `epfd` last saw it, which is an edge to Linux (the host's
-/// edge-triggered read filter fires on reads too).
+/// edge-triggered read filter fires on reads too). `before` holds the
+/// reads counted just before the host counted `bytes` ([`reads_before`]).
 #[cfg(not(target_os = "linux"))]
-fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
+fn pipe_grew(epfd: i32, fd: i32, bytes: i64, before: &[(i32, u64)]) -> bool {
     // A pipe whose writes are counted (an eventfd's, each of whose writes
     // is an edge to Linux even when the count was not 0, or one watched
     // exclusively): written to since, whatever it holds now.
@@ -1059,15 +1101,23 @@ fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
             }
         };
     }
+    // A read since that the snapshot missed (the set's first look at the
+    // pipe, made after it) counts whole.
+    let then = before.iter().find(|b| b.0 == fd).map_or(0, |b| b.1);
     let mut h = HELD.lock();
-    match h.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
+    match h.iter_mut().find(|k| (k.set, k.fd) == (epfd, fd)) {
         Some(k) => {
-            let grew = bytes > k.2;
-            k.2 = bytes;
-            grew
+            // What it would hold had nothing been written since: what it
+            // held, less every read that can have come after the host
+            // counted that (a read the count did show makes no more than
+            // an edge Linux would not report).
+            let left = k.bytes - (k.read - k.read_then) as i64;
+            k.bytes = bytes;
+            k.read_then = then;
+            bytes > left
         }
         None => {
-            h.push((epfd, fd, bytes));
+            h.push(Seen { set: epfd, fd, bytes, read: 0, read_then: 0 });
             true
         }
     }
@@ -1260,6 +1310,7 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             Err(e) => return Err(fwe_abi::err(e)),
         }
     }
+    let before = reads_before(epfd);
     let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `out` holds `room` entries; `ts` is a valid timespec.
     let n = unsafe {
@@ -1290,7 +1341,7 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             libc::EVFILT_READ
                 if ev.flags & libc::EV_CLEAR != 0
                     && is_pipe(fd)
-                    && !pipe_grew(epfd, fd, ev.data as i64) => {}
+                    && !pipe_grew(epfd, fd, ev.data as i64, &before) => {}
             libc::EVFILT_READ => bits |= READ,
             // A pipe whose readers have gone is an error to write to; a
             // socket whose writing side is shut stays writable (a write
@@ -1443,6 +1494,54 @@ mod tests {
         assert_eq!({ got[0].events } & EPOLLPRI, EPOLLPRI);
         closed(ep as i32);
         for fd in [srv, cli, conn, ep as i32] {
+            // SAFETY: the descriptors made here.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A pipe watched edge-triggered is readable anew when written to after
+    /// a read drained it, though it holds less than when last reported
+    /// (Go's runtime reads a child's output so); the read itself is no
+    /// edge.
+    #[test]
+    fn a_drained_pipe_written_again_is_an_edge() {
+        let _turn = turn();
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) };
+        let reg = event(EPOLLIN | EPOLLET, 9);
+        // SAFETY: a valid epoll_event.
+        assert_eq!(unsafe { ctl(ep as u64, EPOLL_CTL_ADD, rd as u64, &reg as *const _ as u64) }, 0);
+        let mut got = [event(0, 0); 2];
+        // SAFETY: room for 2 events.
+        let mut wait = |ms| unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, ms, 0, 0) };
+        let write = |n: usize| {
+            // SAFETY: a local buffer of `n` bytes.
+            unsafe { libc::write(wr, [7u8; 8].as_ptr().cast(), n) }
+        };
+        let mut buf = [0u8; 8];
+        for round in 0..3 {
+            assert_eq!(write(4), 4);
+            assert_eq!(wait(1000), 1, "write {round}");
+            // Drained, as the guest's read counts it.
+            // SAFETY: a local buffer of its size.
+            let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert_eq!(n, 4);
+            crate::linux_result(fwe_abi::nr::READ, &[rd as u64, 0, 8, 0, 0, 0], n as i64);
+            assert_eq!(wait(0), 0, "after the read {round}");
+            // Less than the pipe held when last reported.
+            assert_eq!(write(2), 2);
+            assert_eq!(wait(1000), 1, "a smaller write {round}");
+            // SAFETY: a local buffer of its size.
+            let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert_eq!(n, 2);
+            crate::linux_result(fwe_abi::nr::READ, &[rd as u64, 0, 8, 0, 0, 0], n as i64);
+        }
+        closed(ep as i32);
+        for fd in [rd, wr, ep as i32] {
             // SAFETY: the descriptors made here.
             unsafe { libc::close(fd) };
         }
