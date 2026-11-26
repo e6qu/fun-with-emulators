@@ -3037,11 +3037,32 @@ SQL
 }
 
 /// Where fetched packages are cached (`FWE_FETCH_CACHE`, or under
-/// `target/`), so a test downloads each only once.
+/// `target/`), so a test downloads each only once. It holds the files
+/// fetched and nothing unpacked from them ([`unpacked_roots`]): CI caches
+/// it, and a cache restored over what is there can leave half of it.
 fn fetch_cache() -> PathBuf {
     std::env::var_os("FWE_FETCH_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo().join("target/fetched-packages"))
+}
+
+/// Where the roots unpacked from fetched packages are kept, apart from
+/// the packages ([`fetch_cache`]). A root is whole only with its mark
+/// ([`COMPLETE`]), an attribute no cache's archive keeps: a root a cache
+/// gave back, whole or not, is unpacked again.
+fn unpacked_roots() -> PathBuf {
+    repo().join("target/fetched-roots")
+}
+
+/// `root` made an empty directory, whatever was there: its read-only
+/// directories (`/proc`, `/sys`) made writable first, which would stop a
+/// removal halfway.
+fn emptied(root: &Path) {
+    if root.symlink_metadata().is_ok() {
+        run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(root));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    std::fs::create_dir_all(root).unwrap();
 }
 
 /// The files listed in `guests/<distro>/fetch/<manifest>.txt` (paths and
@@ -3131,22 +3152,19 @@ fn fetched_system(manifest_name: &str) -> PathBuf {
     static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest(manifest_name);
-    let cache = fetch_cache();
-    let root = cache.join(format!("root-{manifest_name}"));
-    let done = root.join(".fwe-complete");
-    if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
+    let roots = unpacked_roots();
+    let root = roots.join(format!("root-{manifest_name}"));
+    if completed(&root).as_deref() == Some(list.as_str()) {
         return root;
     }
     let mut debs = fetched_debs(manifest_name);
     let base = |d: &PathBuf| !d.file_name().unwrap().to_string_lossy().starts_with("base-files_");
     debs.sort_by_key(base);
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(&root).unwrap();
+    emptied(&root);
     for deb in &debs {
         // A .deb is an `ar` archive whose data.tar.* holds the files.
-        let unpack = cache.join(format!("unpack-{manifest_name}"));
-        let _ = std::fs::remove_dir_all(&unpack);
-        std::fs::create_dir_all(&unpack).unwrap();
+        let unpack = roots.join(format!("unpack-{manifest_name}"));
+        emptied(&unpack);
         run_checked(Command::new("ar").arg("x").arg(deb).current_dir(&unpack));
         let data = std::fs::read_dir(&unpack)
             .unwrap()
@@ -3158,7 +3176,7 @@ fn fetched_system(manifest_name: &str) -> PathBuf {
         run_checked(Command::new("tar").arg("xpf").arg(&data).arg("-C").arg(&root));
     }
     std::fs::create_dir_all(root.join("tmp")).unwrap();
-    std::fs::write(&done, &list).unwrap();
+    mark_completed(&root, &list);
     root
 }
 
@@ -3188,22 +3206,14 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     // How it is unpacked counts too: a root unpacked another way is
     // unpacked again.
     let list = format!("{list}\nunpacked with the archive's modes\n");
-    let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
-    // The mark that it is whole is an extended attribute of its own: a
-    // copy that lost them (CI's cache keeps none) is unpacked again, as
-    // its files' are gone too.
+    let root = unpacked_roots().join(format!("alpine-root-{manifest_name}"));
     if completed(&root).as_deref() == Some(list.as_str()) {
         return root;
     }
     let files = fetched_alpine(manifest_name);
     // What is there goes whole: unpacking over it keeps its directories'
-    // modes, and its read-only ones (`/proc`, `/sys`) stop a removal
-    // halfway unless made writable first.
-    if root.exists() {
-        run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&root));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-    std::fs::create_dir_all(&root).unwrap();
+    // modes.
+    emptied(&root);
     for f in &files {
         run_checked(
             // With the files' extended attributes (a program's file
@@ -3223,7 +3233,9 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     root
 }
 
-/// The attribute that marks an unpacked root whole ([`alpine_root`]).
+/// The attribute that marks an unpacked root whole ([`alpine_root`],
+/// [`fetched_system`]): a copy that lost its attributes (CI's caches keep
+/// none) is unpacked again, as its files can be gone too.
 const COMPLETE: &std::ffi::CStr = c"user.fwe-complete";
 
 /// The manifest an unpacked root was marked whole with, if any.
@@ -10913,10 +10925,11 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
         return;
     }
     let Some(driver) = mock_vulkan_driver() else { return };
-    let root = alpine_root("display");
+    let scratch = display_root(&alpine_root("display"), "vulkaninfo");
+    let root = &scratch.0;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root")
-        .arg(&root)
+        .arg(root)
         .arg(root.join("usr/bin/vulkaninfo"))
         .arg("--summary")
         .env("FWE_VULKAN_DRIVER", &driver)
@@ -10937,7 +10950,7 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
     let x = Xvfb::start().expect("XVFB: the display tests need Xvfb");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root")
-        .arg(&root)
+        .arg(root)
         .arg(root.join("usr/bin/vulkaninfo"))
         .env("FWE_VULKAN_DRIVER", &driver)
         .env("VK_LOADER_DEBUG", "error,warn")
@@ -10966,14 +10979,14 @@ fn alpine_display_vulkan_through_a_loader_in_the_global_scope() {
         return;
     }
     let Some(driver) = mock_vulkan_driver() else { return };
-    let root = alpine_root("display");
+    let scratch = display_root(&alpine_root("display"), "vkglobal");
+    let root = &scratch.0;
     let prog = build_c_dynamic("vkglobal", Libc::Musl, true);
     let inside = root.join("tmp/vkglobal");
     std::fs::copy(&prog, &inside).unwrap();
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
+    cmd.arg("--root").arg(root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
     let out = run_bounded(cmd);
-    let _ = std::fs::remove_file(&inside);
     assert_eq!(
         stdout(&out),
         "instance: 0\nphysical device: found\ndevice: 0\nqueue: taken\n",
@@ -11676,11 +11689,9 @@ fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
     if program.exists() {
         return program;
     }
-    let root = alpine_root("apps");
-    let scratch =
-        ScratchRoot(std::env::temp_dir().join(format!("fwe-build-{app}-{}", std::process::id())));
-    let _ = std::fs::remove_dir_all(&scratch.0);
-    run_checked(Command::new("cp").arg("-cpR").arg(&root).arg(&scratch.0));
+    // A copy made as a display test's is, once the cached root is ready
+    // ([`display_root`]): never while a test makes it ready.
+    let scratch = display_root(&alpine_root("apps"), &format!("build-{app}"));
     std::fs::create_dir_all(scratch.0.join("src")).unwrap();
     run_checked(Command::new("cp").arg("-R").arg(&src).arg(scratch.0.join("src").join(app)));
     // The resolver's lines of the Mac's own file, as a container runtime

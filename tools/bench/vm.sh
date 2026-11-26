@@ -50,7 +50,7 @@ limactl shell --workdir "$repo" "$vm" sh -euc "
     gcc -O2 -static-pie -o $out/bench guests/c/bench.c
     sudo docker run --rm -v $repo:/w:ro -v $out:/out -w /w alpine:3.24 sh -c \
         'apk add -q gcc musl-dev vulkan-headers && gcc -O2 -o /out/vkbench tools/bench/vkbench.c'
-    sudo python3 tools/bench/run.py linux --bench $out/bench --cache $out/cache --xvfb /usr/bin/Xvfb --out $out/linux-vm.json
+    sudo python3 tools/bench/run.py linux --bench $out/bench --cache $out/cache --roots $out/roots --xvfb /usr/bin/Xvfb --out $out/linux-vm.json
 "
 limactl stop "$vm"
 
@@ -67,12 +67,13 @@ if $fwe_vm; then
     chmod +x "$out/fwe-vm"
     python3 tools/bench/run.py macos --fwe "$out/fwe-vm" --bench "$out/bench" \
         --native "$out/bench-mac" --brew "$(brew --prefix)" --cache target/bench-cache \
-        --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench "$out/vkbench" \
+        --roots target/bench-roots --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench "$out/vkbench" \
         --vkbench-native "$out/vkbench-mac" --no-gpu --out "$out/macos-vm.json" || true
     with_vm="--fwe-vm $out/macos-vm.json"
 fi
 # shellcheck disable=SC2086 # `with_vm` is two words or none
 python3 tools/bench/run.py macos --fwe target/release/fwe --bench "$out/bench" \
     --native "$out/bench-mac" --brew "$(brew --prefix)" --cache target/bench-cache \
-    --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench "$out/vkbench" --vkbench-native "$out/vkbench-mac" \
+    --roots target/bench-roots --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench "$out/vkbench" \
+    --vkbench-native "$out/vkbench-mac" \
     --linux-vm "$out/linux-vm.json" $with_vm --out "$out/macos.json"

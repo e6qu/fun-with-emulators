@@ -3,20 +3,21 @@
 project's build and programs' realistic workloads, under fwe, natively on
 macOS and natively on Linux.
 
-    run.py linux --bench BENCH --cache DIR --xvfb XVFB --out linux.json
+    run.py linux --bench BENCH --cache DIR --roots DIR --xvfb XVFB --out linux.json
         On arm64 Linux: BENCH (guests/c/bench.c, built static-pie) runs
         natively; Lua is built, and the workloads run, in an Alpine 3.24
         container (docker).
 
     run.py macos --fwe FWE --bench BENCH --native NATIVE --brew PREFIX
-                 --cache DIR --xvfb XVFB [--linux linux.json] [--no-build]
-                 --out macos.json
+                 --cache DIR --roots DIR --xvfb XVFB [--linux linux.json]
+                 [--no-build] --out macos.json
         On macOS: BENCH (the Linux build) runs under FWE; NATIVE (the same
         source built for macOS) runs natively. Lua is built with clang under
         FWE in an Alpine root (guests/alpine/fetch/clang.txt, fetched into
-        DIR), and natively with Homebrew's clang of the same release (under
-        PREFIX); the workloads (tools/bench/workloads: Lua, Python, SQLite,
-        git and xz) run under FWE in an Alpine root of those programs
+        the --cache DIR and unpacked in the --roots DIR, which no cache
+        keeps), and natively with Homebrew's clang of the same release
+        (under PREFIX); the workloads (tools/bench/workloads: Lua,
+        Python, SQLite, git and xz) run under FWE in an Alpine root of those programs
         (guests/alpine/fetch/workloads.txt) and natively with Homebrew's
         builds of them, each side's output checked against the other's.
         `--linux-vm` adds the same benchmarks run in a Linux VM on the
@@ -103,15 +104,50 @@ def fetch(urls, sha256, cache):
     return path
 
 
-def alpine_root(manifest, cache):
-    """The root filesystem `manifest` (under guests/alpine/fetch) lists,
-    unpacked in order into `cache`, as the end-to-end tests make theirs."""
-    lines = open(os.path.join(REPO, "guests/alpine/fetch", manifest + ".txt")).read()
-    root = os.path.join(cache, "alpine-root-" + manifest)
-    done = os.path.join(root, ".fwe-complete")
-    if os.path.exists(done) and open(done).read() == lines:
+def removed(path):
+    """`path` gone, whatever it is: its read-only directories (a root's
+    `/proc`, `/sys`) made writable first, which would stop a removal
+    halfway."""
+    if os.path.lexists(path):
+        subprocess.run(["chmod", "-R", "u+rwX", path], check=True)
+        shutil.rmtree(path)
+
+
+def made_whole(dest, make):
+    """`dest` as `make(part)` makes it in `part`, put in place only once
+    whole (a run stopped halfway leaves no `dest` to be taken for it)."""
+    part = dest + ".part"
+    removed(part)
+    make(part)
+    removed(dest)
+    os.rename(part, dest)
+    return dest
+
+
+def roots_made(roots, name, lines):
+    """The root `name` in `roots` if it was made from `lines` (a manifest's
+    text, kept in it as `.fwe-made`), else None and nothing there. The
+    roots are apart from the downloads' cache, which CI keeps: a cache
+    restored over what is there can leave half of it."""
+    root = os.path.join(roots, name)
+    made = os.path.join(root, ".fwe-made")
+    if os.path.exists(made) and open(made).read() == lines:
         return root
-    shutil.rmtree(root, ignore_errors=True)
+    removed(root)
+    return None
+
+
+def alpine_root(manifest, cache, roots):
+    """The root filesystem `manifest` (under guests/alpine/fetch) lists,
+    fetched into `cache` and unpacked in order in `roots`, as the
+    end-to-end tests make theirs."""
+    lines = open(os.path.join(REPO, "guests/alpine/fetch", manifest + ".txt")).read()
+    name = "alpine-root-" + manifest
+    return roots_made(roots, name, lines) or made_whole(
+        os.path.join(roots, name), lambda root: unpack_alpine(lines, cache, root))
+
+
+def unpack_alpine(lines, cache, root):
     os.makedirs(root)
     for line in lines.splitlines():
         if not line.strip() or line.startswith("#"):
@@ -123,21 +159,22 @@ def alpine_root(manifest, cache):
         # `-p`: the modes as the archive has them (`/tmp`'s 1777), not
         # narrowed by the umask.
         subprocess.run(["tar", "--xattrs", "-xpzf", f] + args + ["-C", root], check=True)
-    with open(done, "w") as f:
+    with open(os.path.join(root, ".fwe-made"), "w") as f:
         f.write(lines)
-    return root
 
-def debian_system(manifest, cache):
+def debian_system(manifest, cache, roots):
     """The root filesystem of a whole Debian system `manifest` (under
     guests/debian/fetch) lists, its own C library and shell among them,
-    unpacked into `cache` as the end-to-end tests make theirs: base-files
-    first, whose links (`/lib` to `/usr/lib`) the others' files go through."""
+    fetched into `cache` and unpacked in `roots` as the end-to-end tests
+    make theirs: base-files first, whose links (`/lib` to `/usr/lib`) the
+    others' files go through."""
     lines = open(os.path.join(REPO, "guests/debian/fetch", manifest + ".txt")).read()
-    root = os.path.join(cache, "debian-root-" + manifest)
-    done = os.path.join(root, ".fwe-complete")
-    if os.path.exists(done) and open(done).read() == lines:
-        return root
-    shutil.rmtree(root, ignore_errors=True)
+    name = "debian-root-" + manifest
+    return roots_made(roots, name, lines) or made_whole(
+        os.path.join(roots, name), lambda root: unpack_debian(lines, cache, roots, root))
+
+
+def unpack_debian(lines, cache, roots, root):
     os.makedirs(root)
     # The snapshot of the archive the files are in, for those
     # deb.debian.org has replaced since (tools/debian-manifest.py).
@@ -155,15 +192,26 @@ def debian_system(manifest, cache):
     debs.sort(key=lambda d: not os.path.basename(d).startswith("base-files_"))
     for deb in debs:
         # A .deb is an `ar` archive whose data.tar.* holds the files.
-        with tempfile.TemporaryDirectory(dir=cache) as unpack:
+        with tempfile.TemporaryDirectory(dir=roots) as unpack:
             # (Run where it unpacks, so the archive by its full path.)
             subprocess.run(["ar", "x", os.path.abspath(deb)], cwd=unpack, check=True)
             data = next(f for f in os.listdir(unpack) if f.startswith("data.tar"))
             subprocess.run(["tar", "xpf", os.path.join(unpack, data), "-C", root], check=True)
     os.makedirs(os.path.join(root, "tmp"), exist_ok=True)
-    with open(done, "w") as f:
+    with open(os.path.join(root, ".fwe-made"), "w") as f:
         f.write(lines)
-    return root
+
+
+def unzipped_mac(archive, name, a):
+    """A macOS app's archive (`archive`: its URL and SHA-256), fetched into
+    the cache and unpacked by `ditto` (its links and attributes as the
+    archive has them) in `name` in the roots."""
+    dest = os.path.join(a.roots, name)
+    if os.path.isdir(dest):
+        return dest
+    zipped = fetch(archive[0], archive[1], a.cache)
+    return made_whole(dest, lambda part: subprocess.run(["ditto", "-x", "-k", zipped, part],
+                                                        check=True))
 
 
 # name, arguments to bench, unit
@@ -453,7 +501,7 @@ def gears_fwe(a, fwe, guest_env):
     """glxgears under fwe, on Alpine's Xvfb run by fwe in the same root (a
     display of the root's own); against the same two programs in a Linux
     container, there being no macOS build of them."""
-    root = alpine_root("display", a.cache)
+    root = alpine_root("display", a.cache, a.roots)
     in_root = guest_env + fwe + ["--root", root]
     x11 = os.path.join(root, "tmp/.X11-unix")
     os.makedirs(x11, exist_ok=True)
@@ -528,7 +576,7 @@ def vulkan(a, fwe, guest_env, results):
     programs on fwe's Vulkan driver (MoltenVK in fwe's process), vkcube at
     the X server here; natively, the same on MoltenVK (Homebrew's vkcube in
     a window of macOS's)."""
-    root = alpine_root("display", a.cache)
+    root = alpine_root("display", a.cache, a.roots)
     icd = dict(os.environ, VK_ICD_FILENAMES=os.path.join(a.brew, "etc/vulkan/icd.d/MoltenVK_icd.json"))
     shutil.copy(a.vkbench, os.path.join(root, "tmp/vkbench"))
     guest = guest_env + gpu_env(a.brew) + fwe + ["--root", root, os.path.join(root, "tmp/vkbench")]
@@ -856,7 +904,7 @@ def build(a, fwe, results):
     (Apple's clang is another, faster build of it). Then the workloads,
     the Lua script with the Lua each side built."""
     lua = fetch(*LUA, a.cache)
-    root = alpine_root("clang", a.cache)
+    root = alpine_root("clang", a.cache, a.roots)
     tmp = os.path.join(root, "tmp")
     os.makedirs(tmp, exist_ok=True)
     shutil.rmtree(os.path.join(tmp, "lua-5.4.7"), ignore_errors=True)
@@ -1007,7 +1055,7 @@ def jit_runtime(a, fwe, guest_env, results, name, manifest, program, script):
     the third making none that two earlier made at the same address from
     the same words (it takes them, kept); then once with its blocks
     counting their runs (`FWE_JIT_COUNT`)."""
-    root = alpine_root(manifest, a.cache)
+    root = alpine_root(manifest, a.cache, a.roots)
     shutil.copytree(WORKLOADS, os.path.join(root, "tmp/wl"), dirs_exist_ok=True)
     ours = guest_env + fwe + ["--root", root, os.path.join(root, program.lstrip("/")),
                               f"/tmp/wl/{script}"]
@@ -1158,14 +1206,11 @@ def browsers(a, fwe, results):
     an app showing a page (ELECTRON_APP) to its page's load, on Debian 13
     under fwe against Electron's macOS build of the same release."""
     ours, theirs = results["fwe"], results["macOS"]
-    root = alpine_root("browsers", a.cache)
+    root = alpine_root("browsers", a.cache, a.roots)
     pages = os.path.join(root, "tmp/fwe-pages")
     shutil.rmtree(pages, ignore_errors=True)
     shutil.copytree(PAGES, pages)
-    mac = os.path.join(a.cache, "chrome-mac")
-    if not os.path.isdir(mac):
-        zipped = fetch(CHROME_MAC[0], CHROME_MAC[1], a.cache)
-        subprocess.run(["ditto", "-x", "-k", zipped, mac], check=True)
+    mac = unzipped_mac(CHROME_MAC, "chrome-mac", a)
     chrome = os.path.join(mac, "chrome-mac-arm64", "Google Chrome for Testing.app", "Contents",
                           "MacOS", "Google Chrome for Testing")
     switches = ["--headless=new", "--no-sandbox", "--no-first-run", "--disable-gpu",
@@ -1193,22 +1238,20 @@ def browsers(a, fwe, results):
         print(f"{row}: fwe {ours[row]:.1f}, macOS {theirs[row]:.1f}", flush=True)
     # Electron: an app showing a page, quitting once it is loaded
     # (FWE_QUIT_LOADED), on the display of [`x_server`].
-    deb = debian_system("apps", a.cache)
+    deb = debian_system("apps", a.cache, a.roots)
     upstream = open(os.path.join(REPO, "guests/apps/fetch/upstream.txt")).read().splitlines()
     url, sha = next(l.split() for l in upstream if "/electron-" in l and not l.startswith("#"))
     linux_zip = fetch(url, sha, a.cache)
     electron = os.path.join(deb, "opt/electron")
-    if not os.path.exists(os.path.join(electron, "electron")):
+    if not os.path.isdir(electron):
         # The root has no /opt; unzip makes only the last directory.
-        os.makedirs(electron, exist_ok=True)
-        subprocess.run(["unzip", "-q", "-o", linux_zip, "-d", electron], check=True)
+        os.makedirs(os.path.dirname(electron), exist_ok=True)
+        made_whole(electron, lambda part: subprocess.run(
+            ["unzip", "-q", linux_zip, "-d", part], check=True))
     app = os.path.join(deb, "opt/fwe-hello")
     shutil.rmtree(app, ignore_errors=True)
     shutil.copytree(ELECTRON_APP, app)
-    mac_electron = os.path.join(a.cache, "electron-mac")
-    if not os.path.isdir(mac_electron):
-        zipped = fetch(ELECTRON_MAC[0], ELECTRON_MAC[1], a.cache)
-        subprocess.run(["ditto", "-x", "-k", zipped, mac_electron], check=True)
+    mac_electron = unzipped_mac(ELECTRON_MAC, "electron-mac", a)
     guest = linux_env(DISPLAY=os.environ["DISPLAY"], FWE_QUIT_LOADED="1")
     host = dict(os.environ, FWE_QUIT_LOADED="1")
 
@@ -2119,7 +2162,7 @@ def jdk(a, fwe, guest_env, results):
     """OpenJDK 25 at work: `javac` compiling the application in
     tools/bench/workloads/jdk, then `java` running it, under fwe in its
     Alpine root, and natively with Homebrew's build of the same release."""
-    root = alpine_root("jdk", a.cache)
+    root = alpine_root("jdk", a.cache, a.roots)
     tmp = os.path.join(root, "tmp")
     src = os.path.join(tmp, "jdksrc")
     shutil.rmtree(src, ignore_errors=True)
@@ -2268,7 +2311,7 @@ def postgres(a, fwe, guest_env, results):
     segment, its shared memory and semaphores, a process for each client):
     under fwe in its Alpine root, natively with Homebrew's build of the
     same release."""
-    root = alpine_root("postgres", a.cache)
+    root = alpine_root("postgres", a.cache, a.roots)
     shutil.copy(os.path.join(WORKLOADS, "postgres.sh"), os.path.join(root, "tmp"))
     # PostgreSQL runs as no root: its user, as the package's install script
     # (not run when the root is unpacked) makes it, and the workload run as
@@ -2294,7 +2337,7 @@ def workloads(a, fwe, guest_env, lua_src, results):
     """The workloads of Python, SQLite, git and xz: under fwe in their
     Alpine root, natively with Homebrew's builds of them. git and xz work on
     the Lua sources in `lua_src` (copied into the root)."""
-    root = alpine_root("workloads", a.cache)
+    root = alpine_root("workloads", a.cache, a.roots)
     tmp = os.path.join(root, "tmp")
     shutil.copytree(WORKLOADS, os.path.join(tmp, "wl"), dirs_exist_ok=True)
     src = os.path.join(tmp, "luasrc")
@@ -2451,14 +2494,18 @@ def main():
     sub = p.add_subparsers(dest="mode", required=True)
     lx = sub.add_parser("linux")
     lx.add_argument("--bench", required=True)
-    lx.add_argument("--cache", required=True)
+    lx.add_argument("--cache", required=True, help="where downloads are kept")
+    lx.add_argument("--roots", required=True,
+                    help="where what is unpacked from them is kept, apart from them")
     lx.add_argument("--out", required=True)
     lx.add_argument("--xvfb", required=True, help="an Xvfb, for the X benchmarks")
     mc = sub.add_parser("macos")
     mc.add_argument("--fwe", required=True)
     mc.add_argument("--bench", required=True)
     mc.add_argument("--native", required=True)
-    mc.add_argument("--cache", required=True)
+    mc.add_argument("--cache", required=True, help="where downloads are kept")
+    mc.add_argument("--roots", required=True,
+                    help="where what is unpacked from them is kept, apart from them")
     mc.add_argument("--linux")
     mc.add_argument("--linux-vm", help="results of `linux` in a Linux VM on this Mac (vm.sh)")
     mc.add_argument("--fwe-vm", help="results of `macos` with fwe's VM backend (vm.sh)")

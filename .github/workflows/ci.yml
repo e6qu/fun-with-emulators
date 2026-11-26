@@ -47,7 +47,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: sw_vers && uname -m && clang --version
       # The VM backend's tests run on the software stand-in for
       # Hypervisor.framework here, which needs Unicorn; the GPU device's on
@@ -146,7 +146,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: cargo test -p fwe --test guests -- alpine_strace alpine_gdb --nocapture
         env:
           FWE_DEBUGGER_TESTS: "1"
@@ -163,7 +163,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: cargo test -p fwe --test guests -- alpine_docker --nocapture
         env:
           FWE_DOCKER_TESTS: "1"
@@ -189,7 +189,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
       - run: cargo test -p fwe --test guests -- alpine_podman_builds debian_podman_runs_in_the_vm --nocapture
         env:
@@ -216,7 +216,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       - run: brew list unicorn >/dev/null 2>&1 || brew install unicorn
       - run: brew list zig >/dev/null 2>&1 || brew install zig
       - run: cargo test -p fwe --test guests -- alpine_wine --nocapture
@@ -249,7 +249,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       # The apps of fwe's own the application tests build under fwe.
       - uses: actions/cache@v4
         with:
@@ -295,7 +295,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/fetched-packages
-          key: fetched-packages-${{ hashFiles('guests/*/fetch/*.txt') }}
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
       - name: The JDK
         env:
           FWE_JDK_TESTS: "1"
@@ -349,7 +349,7 @@ jobs:
       - run: docker run --rm -v "$PWD:/w" -w /w alpine:3.24 sh -c 'apk add -q gcc musl-dev vulkan-headers && gcc -O2 -o vkbench tools/bench/vkbench.c'
       # An X server for the X benchmarks.
       - run: sudo apt-get update -q && sudo apt-get install -qy xvfb
-      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --xvfb /usr/bin/Xvfb --out linux.json
+      - run: python3 tools/bench/run.py linux --bench ./bench --cache /tmp/bench-cache --roots "$RUNNER_TEMP/bench-roots" --xvfb /usr/bin/Xvfb --out linux.json
       - uses: actions/upload-artifact@v4
         with:
           name: bench-linux
@@ -383,7 +383,7 @@ jobs:
       - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
       # The Vulkan benchmark for macOS, with Homebrew's headers.
       - run: clang -O2 -I"$(brew --prefix)/include" -o vkbench-mac tools/bench/vkbench.c
-      - run: chmod +x bench vkbench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json
+      - run: chmod +x bench vkbench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --roots "$RUNNER_TEMP/bench-roots" --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json
       - if: always()
         uses: actions/upload-artifact@v4
         with:
