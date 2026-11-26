@@ -163,8 +163,8 @@ checking what it draws by screenshot.
 - [ ] **Benchmarks:** a page load and video frames against the same
   browser on macOS; an Electron app's start-up.
 
-**Done when:** these run in CI on the GPU, driven and checked by what
-they draw.
+**Done when:** these run in CI, driven and checked by what they draw,
+Zed on the GPU.
 
 #### PR 4 — Graphical Wine
 
@@ -181,6 +181,18 @@ they draw.
 
 **Done when:** CI runs the JDK workload through `runsc` on fwe, its
 benchmark beside `runsc` on Linux.
+
+#### PR 6 — Browsers on the GPU
+
+- [ ] **OpenGL 3 and OpenGL ES 3 on MoltenVK:** fwe's Vulkan driver
+  gives what Zink and ANGLE need for them and MoltenVK lacks: transform
+  feedback, and triangles whose flat values come from their last vertex.
+- [ ] **Browsers on the GPU:** Firefox's WebGL 1 and 2 by Zink, and
+  Chromium's GPU process by ANGLE on Vulkan, drawing pages on the Mac's
+  GPU.
+
+**Done when:** both browsers' WebGL names the Mac's GPU and draws the
+test page in CI, antialiased, and Chromium composites on the GPU.
 
 ## After 1.0
 

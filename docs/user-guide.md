@@ -299,6 +299,9 @@ that lacks it, and `--strace` names it.
   shares the `fwe` process and acts as your user; untrusted code SHOULD
   run in a Linux VM ([isolation and security](linux-on-macos.md#isolation-and-security),
   [comparisons](comparisons.md)).
+- **OpenGL 3 and WebGL on the GPU, with MoltenVK**: Zink gives OpenGL
+  2.1 and OpenGL ES 2.0 there, so browsers draw WebGL in software (Mesa's
+  llvmpipe, without `MESA_LOADER_DRIVER_OVERRIDE=zink`).
 - **The GPU in the VM, or after `fork`**: a program in the VM has no
   GPU, nor does a child forked from a process that used it (its Vulkan
   calls fail) until it runs a program with `execve`.

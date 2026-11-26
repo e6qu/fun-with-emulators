@@ -2251,6 +2251,13 @@ mark what holds in one backend only.
   32-bit windows, B8G8R8A8 images), each frame copied to the X server;
   there are no Wayland surfaces, so Wayland programs need a compositor run
   in the guest (Weston, drawing on the X display).
+- On MoltenVK, Zink gives OpenGL 2.1 and OpenGL ES 2.0: OpenGL 3.0 and
+  ES 3.0 need transform feedback, which MoltenVK has not, and ANGLE's ES
+  3.0 on Vulkan needs triangles whose flat values come from their last
+  vertex, which MoltenVK's do not. So browsers offer no WebGL 2 on the
+  GPU, Chromium's GPU process composites in software, and Firefox's
+  antialiased WebGL 1 draws nothing: ES 2.0 makes it a multisampled
+  drawing buffer it has no blit to resolve.
 - GPU buffers and semaphores are not shared with other processes (no
   external memory or semaphore descriptors), and video coding, debug
   callbacks and the driver's layers are not offered.

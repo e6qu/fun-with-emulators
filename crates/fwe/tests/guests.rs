@@ -11437,24 +11437,6 @@ fn alpine_display_chromium_draws_a_page_sandboxed() {
     shows_the_test_page(&x, &w, "chromium-page", &mut gui);
 }
 
-/// Chromium, its sandboxes on, drawing on the Mac's GPU: ANGLE on Vulkan,
-/// through fwe's driver. The page's WebGL names the GPU, and its window
-/// shows the page.
-#[test]
-fn alpine_display_chromium_draws_on_the_gpu() {
-    let Some(x) = display_tests() else { return };
-    let root = browsers_root("chromium-gpu");
-    let args = su_nobody(&format!(
-        "{CHROMIUM} --use-angle=vulkan --ignore-gpu-blocklist \
-         --enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan \
-         file:///tmp/fwe-pages/gpu.html"
-    ));
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut gui = Gui::start(&x, "chromium-gpu", &root, "/bin/su", &args, &FWE_VULKAN);
-    let w = x.window(&mut gui, &["--name", "^fwe-gpu: .*Apple"], 180);
-    shows_the_test_page(&x, &w, "chromium-gpu", &mut gui);
-}
-
 /// Chromium plays a video ([`plays_the_test_video`]).
 #[test]
 fn alpine_display_chromium_plays_a_video() {
@@ -11483,24 +11465,6 @@ fn alpine_display_firefox_draws_a_page_sandboxed() {
     let mut gui = Gui::start(&x, "firefox-page", &root, "/bin/su", &args, &[]);
     let w = x.window(&mut gui, &["--name", "^fwe-page"], 180);
     shows_the_test_page(&x, &w, "firefox-page", &mut gui);
-}
-
-/// Firefox, its sandboxes on, drawing on the Mac's GPU: OpenGL by Mesa's
-/// Zink on fwe's Vulkan driver, on the root's Xvfb (which has GLX). The
-/// page's WebGL names the GPU, and its window shows the page.
-#[test]
-fn alpine_display_firefox_draws_on_the_gpu() {
-    let Some(_x) = display_tests() else { return };
-    let root = browsers_root("firefox-gpu");
-    let x = Xvfb::in_root(&root);
-    let args = su_nobody(&format!(
-        "env MESA_LOADER_DRIVER_OVERRIDE=zink LIBGL_KOPPER_DRI2=1 \
-         {FIREFOX} file:///tmp/fwe-pages/gpu.html"
-    ));
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut gui = Gui::start(&x, "firefox-gpu", &root, "/bin/su", &args, &FWE_VULKAN);
-    let w = x.window(&mut gui, &["--name", "^fwe-gpu: .*Apple"], 180);
-    shows_the_test_page(&x, &w, "firefox-gpu", &mut gui);
 }
 
 /// Firefox plays a video ([`plays_the_test_video`]).
