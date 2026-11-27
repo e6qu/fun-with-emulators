@@ -3645,6 +3645,7 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
         cmd.envs(pulse.env());
         let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        eprintln!("PROBE {:?} said: {}", &args[..1], String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         stdout(&out)
     };
@@ -3654,11 +3655,13 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     // (900 of them): all are recorded.
     // PipeWire and its session manager, for as long as pw-play plays.
     let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
-        pipewire 2>/tmp/pipewire.err & p=$!
+        PIPEWIRE_DEBUG='3,mod.pulse-tunnel:5' pipewire 2>/tmp/pipewire.err & p=$!
         until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done
         wireplumber 2>/tmp/wireplumber.err & w=$!
         until pw-cli ls Node 2>/dev/null | grep -q 'node.name = \"mac\"'; do sleep 0.1; done
-        pw-play --target mac /tmp/tone.wav; r=$?
+        pw-top -b -n 12 > /tmp/pwtop.txt 2>&1 & t=$!
+        PIPEWIRE_DEBUG=3 pw-play --target mac /tmp/tone.wav; r=$?
+        sleep 1; kill $t; cat /tmp/pwtop.txt >&2
         kill $w $p; wait; exit $r";
     for player in [
         &["/usr/bin/paplay", "/tmp/tone.wav"][..],
