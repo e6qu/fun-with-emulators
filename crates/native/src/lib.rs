@@ -611,6 +611,11 @@ pub(crate) fn reexec(
         argv.push(b"--host-display".to_vec());
         argv.push(display.to_vec());
     }
+    // (Its file's path, never a cookie: arguments are for anyone to read.)
+    if let Some(authority) = fwe_kernel::x11::host_authority() {
+        argv.push(b"--host-xauthority".to_vec());
+        argv.push(authority.to_vec());
+    }
     // fwe's private directory, which the new fwe would otherwise look up
     // again (slowly).
     if let Some(dir) = fwe_kernel::fs::host_dir() {

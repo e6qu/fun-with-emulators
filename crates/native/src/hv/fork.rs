@@ -437,9 +437,11 @@ pub(super) fn fork(
         e2.u64(STATE_MAGIC);
         e2.u64(build_id());
         e2.bytes(&fwe_kernel::fs::host_dir().unwrap_or_default());
-        // The host display, which a new fwe takes from its environment
-        // or its arguments and the child gets from neither.
+        // The host display and its authorizations' file, which a new fwe
+        // takes from its environment or its arguments and the child gets
+        // from neither.
         e2.bytes(fwe_kernel::x11::host_value().unwrap_or_default());
+        e2.bytes(fwe_kernel::x11::host_authority().unwrap_or_default());
         e2.u64(fds.len() as u64);
         for &(fd, cloexec) in &fds {
             e2.i32(fd);
@@ -750,7 +752,11 @@ fn become_child() -> Result<std::convert::Infallible, String> {
         fwe_kernel::fs::adopt_host_dir(dir);
     }
     let display = d.bytes();
-    fwe_kernel::x11::set_host((!display.is_empty()).then_some(&display[..]));
+    let authority = d.bytes();
+    fwe_kernel::x11::set_host(
+        (!display.is_empty()).then_some(&display[..]),
+        (!authority.is_empty()).then_some(&authority[..]),
+    );
     let n = d.count(5);
     let fds: Vec<(i32, bool)> = (0..n).map(|_| (d.i32(), d.bool())).collect();
     for (fd, cloexec) in fds {
