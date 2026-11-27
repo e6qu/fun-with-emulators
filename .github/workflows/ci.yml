@@ -239,6 +239,9 @@ jobs:
   # OpenGL's on the runner's GPU (Metal), through fwe's Vulkan driver on
   # MoltenVK: the runner's KosmicKrisp (Homebrew's Mesa, which xorg-server
   # brings) finds no device on its paravirtual GPU, so MoltenVK is named.
+  # Their sound, and that of Linux's sound clients (FWE_SOUND_TESTS), on
+  # the Mac's PulseAudio server (Homebrew's, `PULSEAUDIO`), recorded from
+  # its null sink.
   display:
     name: Display (macos-26)
     runs-on: macos-26
@@ -256,7 +259,7 @@ jobs:
           path: target/built-apps
           key: built-apps-${{ hashFiles('guests/apps/tauri/**', 'guests/apps/wails/**', 'guests/alpine/fetch/apps.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
-      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools
+      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools pulseaudio
       # The Mac's Vulkan drivers, each one's devices, and whether each has
       # what Zink needs (robustness2's nullDescriptor): a record of the
       # runner, which fails nothing.
@@ -267,14 +270,16 @@ jobs:
             VK_DRIVER_FILES="$icd" vulkaninfo 2>&1 \
               | grep -E "deviceName|driverName|apiVersion|nullDescriptor|ERROR|Cannot" | sort -u || true
           done
-      - name: The display tests
+      - name: The display and sound tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
           export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
           export FWE_VULKAN_DRIVER="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
-          cargo test -p fwe --test guests -- display_ --nocapture
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          cargo test -p fwe --test guests -- display_ sound_ --nocapture
         env:
           FWE_DISPLAY_TESTS: "1"
+          FWE_SOUND_TESTS: "1"
       # What each program said, its calls and its screenshots.
       - if: failure()
         uses: actions/upload-artifact@v4
