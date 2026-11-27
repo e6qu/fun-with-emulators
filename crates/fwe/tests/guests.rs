@@ -3659,14 +3659,15 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     assert!(info.contains("Server String: unix:/run/pulse/native"), "{info}");
     // A second of tone is 44100 frames, those at its zero crossings silent
     // (900 of them): all are recorded.
-    // PipeWire and its session manager, for as long as pw-play plays.
+    // PipeWire and its session manager, for as long as pw-play plays and
+    // the tunnel then holds (its latency, a second; twice that is waited).
     let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
         PIPEWIRE_DEBUG='3,mod.pulse-tunnel:5' pipewire 2>/tmp/pipewire.err & p=$!
         until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done
         wireplumber 2>/tmp/wireplumber.err & w=$!
         until pw-cli ls Node 2>/dev/null | grep -q 'node.name = \"mac\"'; do sleep 0.1; done
         pw-top -b -n 12 > /tmp/pwtop.txt 2>&1 & t=$!
-        PIPEWIRE_DEBUG=3 pw-play --target mac /tmp/tone.wav; r=$?
+        PIPEWIRE_DEBUG=3 pw-play --target mac /tmp/tone.wav; r=$?; sleep 2
         sleep 1; kill $t; cat /tmp/pwtop.txt >&2
         kill $w $p; wait; exit $r";
     for player in [
