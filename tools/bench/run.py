@@ -46,6 +46,7 @@ import ctypes
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -350,6 +351,9 @@ BUDGETS = {
     # 1.2-1.5x macOS's System V segment, and fwe's four calls' work comes
     # on top of it (docs/linux-on-macos.md).
     "System V segment made and removed (ns)": 3.0,
+    # A sound stream's latency on the Mac's PulseAudio server ([`sound`]),
+    # as a program's system calls are.
+    "sound stream latency (ms)": 1.5,
 }
 
 # The most fwe's figure is allowed to be, in the row's own unit: making a
@@ -849,6 +853,7 @@ def macos(a):
     if not a.no_build:
         build(a, fwe, results)
         browsers(a, fwe, results)
+        sound(a, fwe, results)
     if a.linux:
         with open(a.linux) as f:
             results["Linux"] = json.load(f)
@@ -1277,6 +1282,100 @@ def browsers(a, fwe, results):
         [os.path.join(mac_electron, "Electron.app/Contents/MacOS/Electron"), "--no-sandbox",
          ELECTRON_APP], row, host), BROWSER_ROUNDS)
     print(f"{row}: fwe {ours[row]:.0f}, macOS {theirs[row]:.0f}", flush=True)
+
+
+# What [`sound`] plays: a tone of so many seconds, at a latency of so many
+# milliseconds (at 20 the null sink runs streams dry natively as well).
+SOUND_SECS = 10
+SOUND_MS = 40
+
+
+def pulse_server(brew):
+    """Homebrew's PulseAudio server with one null sink (rendering 50 ms
+    ahead: `norewinds`, as the sound tests' server), its socket and cookie
+    in a directory of its own: the process, and the environment its
+    clients reach it with (fwe passes it on to its guests)."""
+    d = tempfile.mkdtemp(prefix="fwe-pa-")
+    sock = os.path.join(d, "native")
+    err = open(os.path.join(d, "server.err"), "w")
+    p = subprocess.Popen(
+        [os.path.join(brew, "opt/pulseaudio/bin/pulseaudio"), "-n", "--daemonize=no",
+         "--exit-idle-time=-1", "--use-pid-file=no",
+         "-L", "module-null-sink sink_name=nul norewinds=1",
+         "-L", f"module-native-protocol-unix socket={sock}"],
+        env={"HOME": d}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err)
+    began = time.monotonic()
+    while not os.path.exists(sock):
+        if p.poll() is not None or time.monotonic() - began > 30:
+            p.kill()
+            sys.exit("no PulseAudio server: " + open(os.path.join(d, "server.err")).read())
+        time.sleep(0.1)
+    env = {"PULSE_SERVER": "unix:" + sock,
+           "PULSE_COOKIE": os.path.join(d, ".config/pulse/cookie")}
+    return p, env
+
+
+def played(cmd, env, name):
+    """`pacat -v`'s run as `cmd`: the median latency it reported (ms) and
+    the underruns after its stream began (the first report)."""
+    r = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, errors="replace", timeout=120)
+    said = r.stderr.replace("\r", "\n")
+    if r.returncode != 0:
+        sys.exit(f"{name}: pacat ended with {r.returncode}: {said[-3000:]}")
+    latencies, underruns = [], 0
+    for line in said.splitlines():
+        m = re.search(r"Latency: (\d+) usec", line)
+        if m:
+            latencies.append(int(m.group(1)) / 1000)
+        elif latencies and "underrun" in line:
+            underruns += 1
+    if not latencies:
+        sys.exit(f"{name}: pacat reported no latency: {said[-3000:]}")
+    return statistics.median(latencies), underruns
+
+
+def sound(a, fwe, results):
+    """A sound stream on the Mac's PulseAudio server (ROADMAP.md M7 PR 7):
+    Debian's `pacat` under fwe against Homebrew's, the same PulseAudio
+    release's built for macOS, each playing the same tone to the same
+    server at the same latency: the latency each reports (its buffer and
+    the sink's), and how often it ran dry. The underruns have no budget:
+    the server's sink thread, scheduled late, runs a stream dry under fwe
+    and natively alike (on a development Mac, 2 runs of 27 under fwe and 1
+    of 27 natively ran dry once)."""
+    root = debian_system("sound", a.cache, a.roots)
+    frames = 44100 * SOUND_SECS
+    tone = b"".join(struct.pack("<hh", v, v) for v in (
+        int(8000 * math.sin(2 * math.pi * 440 * i / 44100)) for i in range(frames)))
+    with open(os.path.join(root, "tmp/fwe-tone.raw"), "wb") as f:
+        f.write(tone)
+    native_tone = os.path.join(a.roots, "fwe-tone.raw")
+    with open(native_tone, "wb") as f:
+        f.write(tone)
+    server, env = pulse_server(a.brew)
+    try:
+        args = ["-v", f"--latency-msec={SOUND_MS}", "--format=s16le", "--rate=44100",
+                "--channels=2"]
+        ours = fwe + ["--root", root, os.path.join(root, "usr/bin/pacat")] + args + [
+            "/tmp/fwe-tone.raw"]
+        theirs = [os.path.join(a.brew, "opt/pulseaudio/bin/pacat")] + args + [native_tone]
+        runs = {"fwe": [], "macOS": []}
+        # Each round under fwe, then natively: the runner's load falls on
+        # both alike.
+        for _ in range(3):
+            runs["fwe"].append(played(ours, linux_env(**env), "fwe"))
+            runs["macOS"].append(played(theirs, dict(os.environ, **env), "macOS"))
+        results[BACKEND]["sound stream latency (ms)"] = backends(
+            ["env", "-i"] + [f"{k}={v}" for k, v in linux_env(**env).items()] + ours[:-1]
+            + ["/dev/null"])
+    finally:
+        server.kill()
+        server.wait()
+    for side, got in runs.items():
+        results[side]["sound stream latency (ms)"] = min(l for l, _ in got)
+        results[side]["sound underruns"] = sum(u for _, u in got)
+        print(f"sound {side}: {got}", flush=True)
 
 
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):

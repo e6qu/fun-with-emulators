@@ -377,15 +377,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/bench-cache
-          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'guests/alpine/fetch/browsers.txt', 'guests/debian/fetch/apps.txt', 'guests/apps/fetch/upstream.txt', 'tools/bench/run.py') }}
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'guests/alpine/fetch/browsers.txt', 'guests/debian/fetch/apps.txt', 'guests/debian/fetch/sound.txt', 'guests/apps/fetch/upstream.txt', 'tools/bench/run.py') }}
       - uses: actions/download-artifact@v4
         with:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
       # The native side's programs: the clang release Alpine's root has, and
-      # the workloads' programs (tools/bench/run.py, BREW), and an X server.
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
+      # the workloads' programs (tools/bench/run.py, BREW), an X server, and
+      # a PulseAudio server and its client.
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers pulseaudio
       # The Vulkan benchmark for macOS, with Homebrew's headers.
       - run: clang -O2 -I"$(brew --prefix)/include" -o vkbench-mac tools/bench/vkbench.c
       - run: chmod +x bench vkbench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --roots "$RUNNER_TEMP/bench-roots" --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json
