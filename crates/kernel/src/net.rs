@@ -4504,6 +4504,31 @@ pub(crate) mod scm_tests {
 
     #[cfg(target_os = "macos")]
     #[test]
+    fn an_eventfd_closed_once_sent_arrives_at_its_number() {
+        let _g = serial();
+        // SAFETY: no pointers.
+        let fd = unsafe { crate::specialfd::eventfd2(0, fwe_abi::eventfd::EFD_NONBLOCK) } as i32;
+        let sv = pair(SOCK_STREAM);
+        assert_eq!(send_control(sv[0], &rights(&[fd])), 1);
+        assert_eq!(crate::specialfd::try_close(fd), Some(0));
+        let (r, control, _) = recv_control(sv[1], 4096, 0);
+        assert_eq!(r, 1);
+        close_all(&sv);
+        let got = fds_in(&control);
+        assert_eq!(crate::specialfd::anon_name(got[0]), Some("[eventfd]"));
+        let seven = 7u64;
+        // SAFETY: 8 readable bytes.
+        let wrote = unsafe { crate::specialfd::try_write(got[0], &seven as *const u64 as u64, 8) };
+        assert_eq!(wrote, Some(8));
+        let mut v = 0u64;
+        // SAFETY: 8 writable bytes.
+        let read = unsafe { crate::specialfd::try_read(got[0], &mut v as *mut u64 as u64, 8) };
+        assert_eq!((read, v), (Some(8), 7));
+        assert_eq!(crate::specialfd::try_close(got[0]), Some(0));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
     fn a_passed_timerfd_keeps_its_schedule() {
         let _g = serial();
         use fwe_abi::timerfd::TFD_NONBLOCK;

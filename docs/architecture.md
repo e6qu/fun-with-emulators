@@ -1363,9 +1363,13 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   again. The counter counts its writes too: an
   edge-triggered set sees the eventfd readable anew on each, as Linux
   wakes its waiters on each, though the pipe holds its one byte
-  throughout. Of the epoll and timerfd kqueues a fork child rebuilds, a
-  timer keeps its schedule, and one with an expiry due and unread is
-  readable in the child at once.
+  throughout. A duplicate (`dup`, `dup3`, `F_DUPFD`) is the same open
+  file: an eventfd's holds the pipe's write end and the counter as the
+  original does (all its state is in them), and a timerfd's shares the
+  schedule and the kqueue. Of the epoll and timerfd kqueues a fork child
+  rebuilds (one for a timerfd and its duplicates), a timer keeps its
+  schedule, and one with an expiry due and unread is readable in the
+  child at once.
 - **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
   fwe process maps counts, for each pipe a set watches exclusively, its
   writes and the writes a waiter took. A set a write woke reports it only
