@@ -1,27 +1,41 @@
-name: probe-openttd
+name: probe-openttd-sound
 on:
   push:
     branches: [probe-media]
 jobs:
-  openttd:
+  linux:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - name: OpenTTD under Wine natively, without and with a sound server
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD:/work:ro" -v "$PWD/out:/out" alpine:3.24 sh /work/tools/probe-ottd-linux.sh
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux
+          path: out
+  mac:
     runs-on: macos-26
-    timeout-minutes: 120
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: brew install --cask xquartz
       - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Utilities/XQuartz.app
-      - run: brew install xdotool unicorn libx11
+      - run: brew install unicorn pulseaudio
       - run: cargo build --release -p fwe
-      - name: OpenTTD on the stand-in, both drivers
+      - name: OpenTTD on the stand-in, without and with a sound server
         run: |
           /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
           for i in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
-          tools/probe-openttd.sh
+          tools/probe-ottd-mac.sh
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: openttd
+          name: mac
           path: |
             out
             xquartz.log
