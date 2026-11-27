@@ -3728,7 +3728,7 @@ fn readme_examples() {
         let size = parts.next().unwrap_or_default();
         let flags: Vec<&str> = parts.collect();
         assert!(flags.iter().all(|f| matches!(*f, "vm" | "sound")), "{marker}");
-        if name != "openttd" {
+        if name != "openttd" && name != "putty" {
             continue;
         }
         let (in_vm, sound) = (flags.contains(&"vm"), flags.contains(&"sound"));
