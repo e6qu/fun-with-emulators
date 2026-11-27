@@ -9,7 +9,8 @@ or with `window`, window `id` itself (XQuartz's root shows none of its
 windows: each keeps its own pixels), as much of it as is on the screen
 (X gives no pixels of a window's part beyond it), and writes it to
 `out.png`. An X error ends it with the screen's and the window's
-geometry. Prints its size and how many of its
+geometry; a window that is no more (a program can make a new one in its
+place), with status 2. Prints its size and how many of its
 pixels are not its most common colour (what was drawn on the
 background); then `colour <rrggbb> <n>` for each colour of the whole
 image, most common first (the first 32), and `digest <hex>`, a hash of
@@ -34,9 +35,43 @@ class XImage(ctypes.Structure):
                 ("bytes_per_line", ctypes.c_int), ("bits_per_pixel", ctypes.c_int)]
 
 
-def grab(lib, display, rect=None, window=None):
+# X's error for a window that is not there.
+BAD_WINDOW = 3
+# The exit status for a window that is no more.
+GONE = 2
+
+
+def connect(lib, display):
+    """libX11 `lib` and a connection to `display`, whose X errors are kept
+    in the list returned (not Xlib's exit)."""
     x = ctypes.CDLL(lib)
     x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    errors = []
+
+    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XErrorEvent))
+    def on_error(_display, event):
+        e = event.contents
+        errors.append((e.error_code, e.request_code))
+        return 0
+    # Kept alive as long as the library is.
+    x.fwe_on_error = on_error
+    x.XSetErrorHandler(on_error)
+    d = x.XOpenDisplay(display.encode())
+    if not d:
+        sys.exit(f"cannot open display {display}")
+    return x, d, errors
+
+
+def fail(errors, what):
+    """End with `what` and the X errors: status GONE if the window was
+    not there."""
+    print(f"{what}: X errors (code, request) {errors}", file=sys.stderr)
+    sys.exit(GONE if any(code == BAD_WINDOW for code, _ in errors) else 1)
+
+
+def grab(lib, display, rect=None, window=None):
+    x, d, errors = connect(lib, display)
     x.XOpenDisplay.argtypes = [ctypes.c_char_p]
     x.XDefaultRootWindow.restype = ctypes.c_ulong
     x.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
@@ -48,18 +83,6 @@ def grab(lib, display, rect=None, window=None):
         ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
         ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
     x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
-    # An X error is kept, not Xlib's exit: the image is then absent.
-    errors = []
-
-    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XErrorEvent))
-    def on_error(_display, event):
-        e = event.contents
-        errors.append(f"X error {e.error_code} of request {e.request_code}")
-        return 0
-    x.XSetErrorHandler(on_error)
-    d = x.XOpenDisplay(display.encode())
-    if not d:
-        sys.exit(f"cannot open display {display}")
     sw, sh = x.XDisplayWidth(d, 0), x.XDisplayHeight(d, 0)
     left, top, w, h = 0, 0, sw, sh
     drawable = root = x.XDefaultRootWindow(d)
@@ -85,7 +108,7 @@ def grab(lib, display, rect=None, window=None):
     got = x.XGetImage(d, drawable, left, top, w, h, 0xFFFFFFFF, 2)
     x.XSync(d, 0)
     if not got or errors:
-        sys.exit(f"no image of {w}x{h} at {left},{top} of {where}: {errors}")
+        fail(errors, f"no image of {w}x{h} at {left},{top} of {where}")
     img = got.contents
     if img.bits_per_pixel != 32:
         sys.exit(f"{img.bits_per_pixel} bits a pixel: only 32 are read")
@@ -115,17 +138,12 @@ class XWindowAttributes(ctypes.Structure):
 
 
 def window_size(lib, display, window):
-    x = ctypes.CDLL(lib)
-    x.XOpenDisplay.restype = ctypes.c_void_p
-    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x, d, errors = connect(lib, display)
     x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
                                        ctypes.POINTER(XWindowAttributes)]
-    d = x.XOpenDisplay(display.encode())
-    if not d:
-        sys.exit(f"cannot open display {display}")
     a = XWindowAttributes()
-    if not x.XGetWindowAttributes(d, window, ctypes.byref(a)):
-        sys.exit(f"no window {window:#x}")
+    if not x.XGetWindowAttributes(d, window, ctypes.byref(a)) or errors:
+        fail(errors, f"no window {window:#x}")
     return a.width, a.height
 
 
