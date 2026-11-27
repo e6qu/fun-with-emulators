@@ -3771,8 +3771,8 @@ fn readme_examples() {
             // Its downloads and installs first: Wine's on the stand-in
             // take the longest.
             let secs = if in_vm { 3600 } else { 1200 };
-            let w = x.window_sized(&mut gui, &["--name", search], size, secs);
-            let drawn = x.drawn(&w, &shot, 10_000, 300);
+            x.window_sized(&mut gui, &["--name", search], size, secs);
+            let drawn = x.drawn_found(&mut gui, &["--name", search], size, &shot, 10_000, 300);
             assert!(drawn.drawn > 10_000, "{name} drew {drawn:?}: {}", gui.report());
             if sound {
                 // What it plays a while after: on the stand-in, a while
@@ -11022,6 +11022,12 @@ impl XServer {
 
     /// What window `w` shows now, its screenshot saved as `<name>.png`.
     fn shot(&self, w: &Window, name: &str) -> Shot {
+        self.shot_of(w, name).unwrap_or_else(|| panic!("window {} is gone", w.id))
+    }
+
+    /// What window `w` shows now, its screenshot saved as `<name>.png`;
+    /// `None` if it is no more (`shot.py`'s status 2).
+    fn shot_of(&self, w: &Window, name: &str) -> Option<Shot> {
         let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
         let png = display_dir().join(format!("{name}.png"));
         // Its place on the root window; on XQuartz, whose root shows none
@@ -11038,6 +11044,9 @@ impl XServer {
             .args(&place)
             .output_alone()
             .unwrap();
+        if out.status.code() == Some(2) {
+            return None;
+        }
         assert!(out.status.success(), "shot.py: {}", String::from_utf8_lossy(&out.stderr));
         let text = stdout(&out);
         let drawn = text
@@ -11063,7 +11072,33 @@ impl XServer {
             .and_then(|p| p.split(' ').next())
             .and_then(|n| n.parse().ok())
             .unwrap();
-        Shot { pixels, drawn, colours, digest }
+        Some(Shot { pixels, drawn, colours, digest })
+    }
+
+    /// Wait up to `secs` for the window `search` finds ([`Self::window_sized`],
+    /// of `size` if given) to have drawn more than `least` pixels: what it
+    /// shows then. The window is found again for each shot, as a program can
+    /// make a new one in its place (OpenTTD's Windows build does as it sizes
+    /// its window).
+    fn drawn_found(
+        &self,
+        gui: &mut Gui,
+        search: &[&str],
+        size: Option<(i32, i32)>,
+        name: &str,
+        least: u64,
+        secs: u64,
+    ) -> Shot {
+        let began = Instant::now();
+        loop {
+            let w = self.window_sized(gui, search, size, secs);
+            let late = began.elapsed() > Duration::from_secs(secs);
+            match self.shot_of(&w, name) {
+                Some(now) if now.drawn > least || late => return now,
+                None if late => panic!("window {} is gone: {}", w.id, gui.report()),
+                _ => std::thread::sleep(Duration::from_millis(500)),
+            }
+        }
     }
 
     /// Wait up to `secs` for window `w` to have drawn more than `least`

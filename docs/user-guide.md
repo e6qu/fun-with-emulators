@@ -273,6 +273,23 @@ env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --root ~/debian ~/debia
   -D pulse /usr/share/sounds/alsa/Front_Center.wav
 ```
 
+PipeWire's tunnel to the Mac's server is a module in PipeWire's
+configuration, in the userland's `~/.config/pipewire/pipewire.conf.d/mac.conf`:
+
+```
+context.modules = [
+  { name = libpipewire-module-pulse-tunnel
+    args = { tunnel.mode = sink, pulse.server.address = "unix:/run/pulse/native",
+             pulse.latency = 1000, node.name = mac } }
+]
+```
+
+The tunnel keeps half its `pulse.latency` at the Mac's server and as much
+of its own, and fills with silence what the server asks for before it has
+it. Its default, 200 ms, leaves gaps when the Mac is busy; a second does
+not. A sound's last `pulse.latency` is not played once its program has
+stopped.
+
 ## Containers
 
 podman runs in a userland that has it, as root, with containers made by
