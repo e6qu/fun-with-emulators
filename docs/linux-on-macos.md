@@ -1628,11 +1628,27 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 | Linux | macOS | fwe |
 |---|---|---|
 | `DISPLAY=:N`, the server's socket `/tmp/.X11-unix/XN` and the abstract name `@/tmp/.X11-unix/XN` libxcb tries first | the host server's socket: Xvfb's or Xorg's `/tmp/.X11-unix/XN`, XQuartz's launchd socket `/private/tmp/com.apple.launchd.…/org.xquartz:N` | either name, in any root and from every process of the run (a VM's fork children too), reaches the host server's socket; the guest's `DISPLAY` is `:N` (XQuartz's path shortened to it) |
+| the client's authorization: the cookie for the display in its user's Xauthority file (`XAUTHORITY`, else `~/.Xauthority`), which a server that checks cookies needs | XQuartz checks them, its cookies in the Mac user's Xauthority file; Xvfb, run without one, takes any client | a setup with no authorization goes with the Mac user's cookie for the display (fwe's `XAUTHORITY`, else `.Xauthority` in the user's home), as `ssh -X` authorizes a forwarded client; one with an authorization of its own goes as it is |
 | another display, its socket in the guest's `/tmp/.X11-unix` (an Xwayland a compositor starts, an Xvfb the guest runs) | — | the guest's own, a Unix socket in its root like any other (a server's TCP port is the host's) |
 | MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
 | `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
 | Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
 | GPU rendering: a Vulkan driver the loader finds by its manifest in `/usr/share/vulkan/icd.d` or `/etc/vulkan/icd.d`, which talks to the GPU's kernel driver through `/dev/dri` | Metal; Vulkan through MoltenVK or KosmicKrisp, in the process | fwe's Linux Vulkan driver in `/etc/vulkan/icd.d`, whose every command reaches the Mac's Vulkan driver in fwe's process through one ioctl on `/dev/fwe-gpu` (see [Devices](#devices)); OpenGL through Mesa's Zink on it; frames reach the X server as copies |
+
+#### Sound
+
+A Linux program plays sound through a sound server it reaches by a Unix
+socket (PulseAudio, or PipeWire's PulseAudio layer), or through ALSA's
+devices. macOS has neither, but runs PulseAudio (Homebrew's, playing on
+CoreAudio). fwe hands the guest the Mac's server as the system-wide one
+(`crates/kernel/src/pulse.rs`):
+
+| Linux | macOS | fwe |
+|---|---|---|
+| a client finds its server by `PULSE_SERVER`, its user's runtime directory, then the system server's socket `/run/pulse/native` | Homebrew's server's socket at `~/.config/pulse/HOST-runtime/native`, or where `PULSE_SERVER` names one | the system server's socket, `/run/pulse/native` or `/var/run/pulse/native`, in any root, reaches the Mac's server: the one fwe's `PULSE_SERVER` names (a Unix socket), else the default one; where fwe's names one, the guest's `PULSE_SERVER` is `unix:/run/pulse/native` |
+| the client's `AUTH`: its cookie, and shared memory and memfds offered for the sound | the server knows a client only by its cookie (it takes no socket credentials), and maps no segment of fwe's | the first packet goes with the Mac user's cookie (fwe's `PULSE_COOKIE`, else `.config/pulse/cookie` in the user's home) and no shared memory offered: the sound travels over the socket |
+| ALSA's programs: a device in `/dev/snd`, or ALSA's PulseAudio plugin (`-D pulse`) | no ALSA | no `/dev/snd`: they play through the plugin |
+| PipeWire's programs: the PipeWire daemon, which plays on ALSA or forwards to a PulseAudio server (`libpipewire-module-pulse-tunnel`) | none | the daemon in the guest, with its PulseAudio tunnel to the system server's socket |
 
 ### Kernel-wide state
 

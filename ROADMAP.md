@@ -22,7 +22,7 @@ current limitations, in
 | M4 Compatibility | Done |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way: PRs 1 and 2 done |
-| M7 Graphical programs and sandboxes | Under way: PRs 1, 2 and 3 done |
+| M7 Graphical programs and sandboxes | Under way: PRs 1, 2, 3 and 7 done |
 | M8 Virtual networking | After 1.0 |
 
 ## Done
@@ -73,6 +73,15 @@ current limitations, in
   under fwe, drawing through WebKitGTK; Chromium's page load and video
   frames benchmarked against Chrome for Testing on macOS, Electron's
   start-up against its macOS build.
+- **M7 PR 7 — Sound:** PulseAudio's, ALSA's (through ALSA's PulseAudio
+  plugin) and PipeWire's (through its PulseAudio tunnel) programs play
+  on a PulseAudio server on the Mac, which a guest reaches at the system
+  server's socket, its first packet sent with the Mac user's cookie and
+  no shared memory; Chromium and Firefox play the test video's sound,
+  Extreme Tux Racer and Xonotic their music, OpenTTD for Windows its
+  sounds in the VM, checked in CI by what the server's null sink
+  records; a stream's latency and underruns benchmarked against the same
+  PulseAudio release's client on macOS.
 
 ## Left to 1.0
 
@@ -230,29 +239,14 @@ programs need on the GPU is made to work on it.
 - [ ] **Zed on the GPU:** its shaders compile on MoltenVK, whose
   translation to Metal passes a structure's array member where a
   function takes `spvUnsafeArray` (Metal's compiler refuses it).
+- [ ] **Games' OpenGL on the GPU:** Extreme Tux Racer and Xonotic
+  through Zink, one of Tux Racer's shaders not building on MoltenVK
+  now, so the README's examples draw on the GPU rather than in Xephyr
+  on the CPU.
 
 **Done when:** both browsers' WebGL names the Mac's GPU and draws the
-test page in CI, antialiased, Chromium composites on the GPU, and Zed
-edits a file on the GPU.
-
-#### PR 7 — Sound
-
-Played by a PulseAudio server on the Mac (Homebrew's, on CoreAudio), as
-the X server draws the windows: guests' programs reach it through the
-socket fwe passes them, as they reach the display.
-
-- [ ] **PulseAudio's clients:** the server's socket in the guest's
-  runtime directory and `PULSE_SERVER`; what the protocol passes
-  (credentials, descriptors, shared memory and memfds) as the Mac's
-  server takes it.
-- [ ] **ALSA's programs** through ALSA's PulseAudio plugin; PipeWire's
-  through its PulseAudio layer.
-- [ ] **Benchmarks:** a stream's latency and underruns against the same
-  program's macOS build where there is one.
-
-**Done when:** Firefox and Chromium play the test video with its sound
-and an ALSA program plays a tone, checked in CI by what the Mac's
-server's monitor of its null sink records.
+test page in CI, antialiased, Chromium composites on the GPU, Zed edits
+a file on the GPU, and the README's games draw on it.
 
 ### Across milestones — every test, every run
 

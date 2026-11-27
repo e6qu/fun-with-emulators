@@ -13,7 +13,8 @@
 //! (its authorization), then each request's header and length. A setup
 //! with no authorization is sent with the host user's for the display (the
 //! entry for this host and the display's number in the Xauthority file X's
-//! library would read, [`user_authority`]), as `ssh -X` authorizes a
+//! library would read: fwe's `XAUTHORITY`, else `.Xauthority` in the
+//! user's home, [`authority_file`]), as `ssh -X` authorizes a
 //! forwarded client: a guest runs as the host user, who has the display,
 //! and a server that checks cookies (XQuartz) takes it with no cookie in
 //! the guest's root. A setup with an authorization of its own is sent as it

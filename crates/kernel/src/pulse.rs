@@ -10,7 +10,7 @@
 //! `unix:/run/pulse/native` where fwe's names a server ([`GUEST_SERVER`]).
 //!
 //! Such a socket's first packet from the client, its `AUTH` command
-//! ([`Auth`]), is sent with two changes ([`write`]):
+//! ([`Auth`]), is sent with two changes ([`write()`]):
 //! - **the Mac user's cookie** (`PULSE_COOKIE`, or `.config/pulse/cookie`
 //!   in the home, [`cookie_file`]) for the guest's: on macOS the server
 //!   knows its clients only by the cookie (Linux's also takes the

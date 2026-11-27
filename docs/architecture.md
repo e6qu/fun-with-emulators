@@ -1498,7 +1498,7 @@ Sockets and terminals are the host's; fwe translates their interfaces
   still hold it. fwe tells a slave's hang-up itself, by looking at the
   guest processes' descriptors.
 
-## Displays and the GPU
+## Displays, sound and the GPU
 
 How a Linux program's display and GPU map onto the Mac's is in
 [linux-on-macos.md](linux-on-macos.md#displays).
@@ -1626,6 +1626,40 @@ command a program makes to the Mac's Vulkan driver in fwe's process.
   `ENODEV`; its `execve` starts a fresh fwe, as every fork child's does
   ([execve in linux-on-macos.md](linux-on-macos.md#execve)), whose
   opens work. In the VM backend there is no device.
+
+### Sound
+
+`crates/kernel/src/pulse.rs`: the Mac's PulseAudio server is the guest's
+system-wide one. The server is the one fwe's `PULSE_SERVER` names (a
+Unix socket; fwe passes it, and `PULSE_COOKIE`, on to the fwe an
+`execve` starts, as the X display), else the socket Homebrew's server
+makes in the user's home (`.config/pulse/HOST-runtime/native`), found
+when a guest first names it. A guest `connect` to the system server's
+socket (`/run/pulse/native`, `/var/run/pulse/native`) reaches it
+(`net::root_unix_path`), and the connection is noted by its socket's
+inode (`pulse::connected`). Its first packet, the client's `AUTH`, goes
+changed as it is written (`pulse::write`, before `x11::write` in
+`write`, `writev`, `sendto` and `sendmsg`): the Mac user's cookie (from
+`PULSE_COOKIE`, else `.config/pulse/cookie` in the home) in the guest's
+place, and the offer of shared memory and memfds taken out, so the sound
+goes over the socket. A packet written in pieces is changed as each
+piece passes, and a short send keeps what was sent. Later packets go as
+they are.
+
+ALSA's programs play through ALSA's PulseAudio plugin, PipeWire's
+through PipeWire's daemon in the guest and its PulseAudio tunnel to the
+system server's socket; PipeWire's graph wakes on eventfds and timerfds
+it duplicates, which share their counter and schedule
+([Event descriptors](#event-descriptors-and-inotify)).
+
+Limitations:
+
+- There is no ALSA device (`/dev/snd`): a program that opens one finds
+  none, and only ALSA's PulseAudio plugin plays.
+- The Mac's server takes no shared memory of the guest's, so every
+  client's sound is copied through the socket.
+- A server named by TCP (`PULSE_SERVER=tcp:…`) is reached as any host
+  connection, its cookie the guest's own.
 
 ## Containers
 
@@ -2293,5 +2327,3 @@ mark what holds in one backend only.
   `/proc/self/maps`, as fwe's own is not.
 - A fork child has no GPU until it calls `execve`, and the VM backend has
   none.
-- There is no sound: no ALSA device (`/dev/snd`) and no PulseAudio
-  server, so programs play nothing (PulseAudio's clients find no server).

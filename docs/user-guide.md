@@ -168,19 +168,21 @@ VM backend only on a software stand-in for Hypervisor.framework
 
 ### Windows programs
 
-Windows programs built for ARM64 run through Alpine's Wine, in the VM:
+Windows programs built for ARM64 run through Alpine's Wine, in the VM.
+Wine's own Notepad, on the display ([below](#programs-with-windows)):
 
 ```sh
-linux ~/alpine /bin/sh -c 'apk add -q wine'
-cp winprog.exe ~/alpine/tmp/
-env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --vm --root ~/alpine ~/alpine/bin/sh \
-  -c 'wine wineboot --init && wine /tmp/winprog.exe'
+linux ~/alpine /bin/sh -c 'apk add -q wine font-dejavu'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
+  "$(command -v fwe)" --vm --root ~/alpine ~/alpine/bin/sh -c 'wine notepad'
 ```
 
+A program of your own runs as `wine /path/in/the/root/program.exe`; the
+[README's examples](../README.md#examples) run PuTTY and OpenTTD so.
 `zig cc -target aarch64-windows-gnu` builds such a program from C (CI's
 `wine` job runs `guests/windows/winprog.c` this way). Windows programs
-with windows draw through Wine's X11 driver, in the VM, given `DISPLAY`
-as Linux programs are ([below](#programs-with-windows)).
+draw through Wine's X11 driver and play sound through its PulseAudio
+driver, as Linux programs do ([Sound](#sound)).
 
 ### Programs with windows
 
@@ -188,7 +190,10 @@ Linux programs draw their windows through an X server on the Mac:
 XQuartz (`brew install --cask xquartz`), or any X server listening on a
 Unix socket. `fwe` gives a program the display its own `DISPLAY` names,
 which XQuartz sets for every program you start once it is installed; the
-program sees it as Linux's display `:0` (`:N` for the Mac's `:N`):
+program sees it as Linux's display `:0` (`:N` for the Mac's `:N`).
+XQuartz lets in only clients with its cookie: a program that brings none
+is sent with yours, from `~/.Xauthority` (or the file `XAUTHORITY`
+names in fwe's environment), as `ssh -X` sends a forwarded program's:
 
 ```sh
 linux ~/alpine /bin/sh -c 'apk add -q xeyes xterm font-dejavu'
@@ -204,9 +209,19 @@ Weston started in the userland with its X11 back end
 `--xwayland` adds Xwayland for X11 programs inside it.
 
 OpenGL on the CPU, through Mesa's software renderer
-(`LIBGL_ALWAYS_SOFTWARE=1`), needs a server with GLX. Homebrew's Xvfb
-has none; the userland's own Xvfb, run by fwe, has: start it, and give
-its programs its display inside, as `sh -c 'DISPLAY=:1 exec glxgears'`.
+(`LIBGL_ALWAYS_SOFTWARE=1`), needs a server with GLX that Mesa can use.
+Homebrew's Xvfb has no GLX, and Mesa finds none of XQuartz's GLX
+configurations usable; the userland's own X servers have it, run by fwe:
+Xephyr, which shows its screen in a window on XQuartz, or Xvfb. Start
+one, and give its programs its display inside, as the
+[README's games](../README.md#extreme-tux-racer) do:
+
+```sh
+linux ~/alpine /bin/sh -c 'apk add -q xorg-server-xephyr mesa-dri-gallium mesa-demos'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" "$(command -v fwe)" --root ~/alpine ~/alpine/bin/sh -c \
+  'Xephyr :1 -screen 800x600 & until [ -S /tmp/.X11-unix/X1 ]; do sleep 0.1; done
+   DISPLAY=:1 LIBGL_ALWAYS_SOFTWARE=1 glxgears; kill $!'
+```
 
 ### The GPU
 
@@ -231,6 +246,32 @@ env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" \
 OpenGL programs use the GPU through Mesa's Zink:
 `MESA_LOADER_DRIVER_OVERRIDE=zink` selects it, with
 `LIBGL_KOPPER_DRI2=1` on a server without DRI3, as Xvfb is.
+
+### Sound
+
+Programs play sound through PulseAudio on the Mac, which plays it on
+CoreAudio:
+
+```sh
+brew install pulseaudio
+brew services start pulseaudio
+```
+
+`fwe` hands its programs the server your own PulseAudio programs find
+(its socket in `~/.config/pulse`), or the Unix socket `PULSE_SERVER`
+names in fwe's environment, with your cookie (`~/.config/pulse/cookie`,
+or `PULSE_COOKIE`). A program finds it as Linux's system-wide server,
+with no setting in the userland. PulseAudio's programs play on it
+directly, ALSA's through ALSA's PulseAudio plugin, and PipeWire's
+through a PipeWire daemon in the userland with its PulseAudio tunnel:
+
+```sh
+linux ~/debian /bin/sh -c 'apt-get install -qq -y pulseaudio-utils alsa-utils libasound2-plugins'
+env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --root ~/debian ~/debian/usr/bin/paplay \
+  /usr/share/sounds/alsa/Front_Center.wav
+env -i HOME=/root PATH=/usr/bin:/bin "$(command -v fwe)" --root ~/debian ~/debian/usr/bin/aplay \
+  -D pulse /usr/share/sounds/alsa/Front_Center.wav
+```
 
 ## Containers
 
@@ -306,8 +347,8 @@ that lacks it, and `--strace` names it.
   shaders; Zed draws by software through Mesa's lavapipe
   (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json` and
   `ZED_ALLOW_EMULATED_GPU=1`).
-- **Sound**: programs find no PulseAudio server and no ALSA device
-  (`/dev/snd`), so they play nothing.
+- **ALSA's devices** (`/dev/snd`): ALSA's programs play only through
+  ALSA's PulseAudio plugin ([Sound](#sound)).
 - **The GPU in the VM, or after `fork`**: a program in the VM has no
   GPU, nor does a child forked from a process that used it (its Vulkan
   calls fail) until it runs a program with `execve`.
