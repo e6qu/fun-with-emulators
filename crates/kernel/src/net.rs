@@ -65,13 +65,14 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     if raw.is_empty() {
         return Ok(Vec::new()); // unnamed / autobind
     }
-    // The host display's socket, by either of its names ([`crate::x11`]).
+    // The host display's socket, by either of its names ([`crate::x11`]),
+    // and the Mac's sound server's ([`crate::pulse`]).
     let name = if raw[0] == 0 {
         &raw[1..]
     } else {
         &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]
     };
-    if let Some(host) = crate::x11::host_socket(name) {
+    if let Some(host) = crate::x11::host_socket(name).or_else(|| crate::pulse::host_socket(name)) {
         return Ok(host);
     }
     if raw[0] == 0 {
@@ -1317,6 +1318,9 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         if crate::x11::is_host_socket(&hb[2..end]) {
             crate::x11::connected(fd as i32, &hb[2..end]);
         }
+        if crate::pulse::is_host_socket(&hb[2..end]) {
+            crate::pulse::connected(fd as i32);
+        }
     }
     if r == 0 {
         crate::netns::used(fd as i32);
@@ -1838,8 +1842,12 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
             // SAFETY: `hmsg` references the guest buffer and the local name.
             unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) }
         };
-        // An X connection's requests, followed ([`crate::x11`]).
-        r = if ctl_len == 0 && !named {
+        // The first packet to the Mac's sound server, changed
+        // ([`crate::pulse`]); an X connection's requests, followed
+        // ([`crate::x11`]).
+        r = if let Some(r) = crate::pulse::write(fd as i32, &iov, &mut send) {
+            r
+        } else if ctl_len == 0 && !named {
             crate::x11::write(fd as i32, &iov, &mut send).unwrap_or_else(|| send(&iov))
         } else {
             let r = send(&iov);
@@ -3452,9 +3460,13 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
                 // buffers.
                 unsafe { send_corked(fd as i32, &mut m, flags, msg_flags_to_host(flags)) }
             };
-            // An X connection's requests, followed ([`crate::x11`]): one
+            // The first packet to the Mac's sound server, changed
+            // ([`crate::pulse`]), with its control data (its credentials);
+            // an X connection's requests, followed ([`crate::x11`]): one
             // with control data or an address goes as it is.
-            r = if ctl_len == 0 && name_ptr.is_null() {
+            r = if let Some(r) = crate::pulse::write(fd as i32, &hiov, send) {
+                r
+            } else if ctl_len == 0 && name_ptr.is_null() {
                 crate::x11::write(fd as i32, &hiov, send).unwrap_or_else(|| send(&hiov))
             } else {
                 let r = send(&hiov);

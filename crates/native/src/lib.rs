@@ -616,6 +616,14 @@ pub(crate) fn reexec(
         argv.push(b"--host-xauthority".to_vec());
         argv.push(authority.to_vec());
     }
+    if let Some(server) = fwe_kernel::pulse::host_server() {
+        argv.push(b"--host-pulse".to_vec());
+        argv.push(server.to_vec());
+    }
+    if let Some(cookie) = fwe_kernel::pulse::host_cookie() {
+        argv.push(b"--host-pulse-cookie".to_vec());
+        argv.push(cookie.to_vec());
+    }
     // fwe's private directory, which the new fwe would otherwise look up
     // again (slowly).
     if let Some(dir) = fwe_kernel::fs::host_dir() {

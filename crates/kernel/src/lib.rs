@@ -101,6 +101,7 @@ pub mod procstore;
 pub mod procvm;
 pub mod ptrace;
 pub mod pty;
+pub mod pulse;
 pub mod reaper;
 pub mod reclocks;
 pub mod rlimits;
@@ -2391,12 +2392,15 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             if let Some(r) = specialwrite::write(fd, specialwrite::Source::Guest(buf), len) {
                 return Some(r);
             }
-            // An X connection's requests, followed ([`x11`]).
+            // An X connection's requests, and the first packet to the Mac's
+            // sound server, followed ([`x11`], [`pulse`]).
             let iov = [libc::iovec { iov_base: buf as *mut _, iov_len: len as usize }];
-            if let Some(r) = x11::write(fd, &iov, |p| {
-                // SAFETY: a part of the guest's buffer; the host checks it.
+            let send = |p: &[libc::iovec]| {
+                // SAFETY: a part of the guest's buffer, or fwe's copy of it;
+                // the host checks it.
                 host::ret(unsafe { libc::writev(fd, p.as_ptr(), p.len() as i32) } as i64)
-            }) {
+            };
+            if let Some(r) = pulse::write(fd, &iov, send).or_else(|| x11::write(fd, &iov, send)) {
                 return Some(r);
             }
             if netlink::is(fd) {
@@ -2482,13 +2486,18 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {
-                // An X connection's requests, followed ([`x11`]).
-                if let Some(r) = x11::write(a[0] as i32, &iov, |p| {
-                    // SAFETY: a part of the same buffers; the host checks them.
+                // An X connection's requests, and the first packet to the
+                // Mac's sound server, followed ([`x11`], [`pulse`]).
+                let send = |p: &[libc::iovec]| {
+                    // SAFETY: a part of the same buffers, or fwe's copy of
+                    // them; the host checks them.
                     host::ret(
                         unsafe { libc::writev(a[0] as i32, p.as_ptr(), p.len() as i32) } as i64
                     )
-                }) {
+                };
+                let fd = a[0] as i32;
+                if let Some(r) = pulse::write(fd, &iov, send).or_else(|| x11::write(fd, &iov, send))
+                {
                     return Some(r);
                 }
                 let total = specialwrite::total(&iov);

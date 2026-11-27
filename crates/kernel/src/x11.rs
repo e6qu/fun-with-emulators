@@ -76,8 +76,8 @@ pub fn guest_display(value: &[u8]) -> Vec<u8> {
     }
 }
 
-/// The host display: as `DISPLAY` names it, the display, and the host
-/// user's Xauthority file.
+/// The host display: as `DISPLAY` names it, the display, and the
+/// `XAUTHORITY` fwe was given, if any.
 struct Host {
     value: Vec<u8>,
     display: Display,
@@ -87,16 +87,17 @@ struct Host {
 static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host display is the one `value` (fwe's `DISPLAY` as the first fwe
-/// was given it) names, if any, its authorizations in the host file
-/// `authority` ([`user_authority`] of the first fwe); set as fwe starts,
-/// and passed on to the fwe a guest's `execve` starts ([`host_value`],
-/// [`host_authority`]), whose environment is the guest's.
+/// was given it) names, if any, its authorizations in the file
+/// `authority` names (the first fwe's `XAUTHORITY`) or else the user's
+/// ([`authority_file`]); set as fwe starts, and passed on to the fwe a
+/// guest's `execve` starts ([`host_value`], [`host_authority`]), whose
+/// environment is the guest's.
 pub fn set_host(value: Option<&[u8]>, authority: Option<&[u8]>) {
     let host = value.and_then(|v| {
         parse(v).map(|display| Host {
             value: v.to_vec(),
             display,
-            authority: authority.map(<[u8]>::to_vec),
+            authority: authority.filter(|a| !a.is_empty()).map(<[u8]>::to_vec),
         })
     });
     let _ = HOST.set(host);
@@ -107,7 +108,7 @@ pub fn host_value() -> Option<&'static [u8]> {
     HOST.get().and_then(Option::as_ref).map(|h| &h.value[..])
 }
 
-/// The host user's Xauthority file, to pass on.
+/// The `XAUTHORITY` the first fwe was given, to pass on.
 pub fn host_authority() -> Option<&'static [u8]> {
     HOST.get().and_then(Option::as_ref).and_then(|h| h.authority.as_deref())
 }
@@ -116,24 +117,15 @@ fn host_display() -> Option<&'static Display> {
     HOST.get().and_then(Option::as_ref).map(|h| &h.display)
 }
 
-/// The host user's Xauthority file: `XAUTHORITY`, or `.Xauthority` in the
-/// user's home, as X's library finds it, but for the home being the
+/// The host user's Xauthority file, as X's library finds it: `XAUTHORITY`,
+/// or `.Xauthority` in the user's home, but for the home being the
 /// password database's: fwe's `HOME` is the guest's (`/root`, say), as a
 /// forwarded client's is not the X server's user's.
-pub fn user_authority() -> Option<Vec<u8>> {
-    use std::os::unix::ffi::OsStrExt;
-    if let Some(file) = std::env::var_os("XAUTHORITY").filter(|f| !f.is_empty()) {
-        return Some(file.as_bytes().to_vec());
+fn authority_file() -> Option<Vec<u8>> {
+    if let Some(file) = host_authority() {
+        return Some(file.to_vec());
     }
-    // SAFETY: getpwuid takes no pointers; its result is read at once, on
-    // the thread that starts fwe, before any other runs.
-    let pw = unsafe { libc::getpwuid(libc::getuid()) };
-    if pw.is_null() {
-        return None;
-    }
-    // SAFETY: a password entry's home, a C string while the entry lives.
-    let home = unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_bytes();
-    Some([home, b"/.Xauthority"].concat())
+    Some([crate::host::user_home()?, b"/.Xauthority"].concat())
 }
 
 /// The authorization name X's library offers servers it has a cookie for.
@@ -181,7 +173,7 @@ fn hostname() -> Vec<u8> {
 /// Xauthority file has one.
 fn host_cookie() -> Option<(Vec<u8>, Vec<u8>)> {
     use std::os::unix::ffi::OsStrExt;
-    let file = std::fs::read(std::ffi::OsStr::from_bytes(host_authority()?)).ok()?;
+    let file = std::fs::read(std::ffi::OsStr::from_bytes(&authority_file()?)).ok()?;
     cookie_in(&file, host_display()?.number, &hostname())
 }
 

@@ -123,6 +123,9 @@ fn main() -> ExitCode {
     // fwe that re-executes this one.
     let mut host_display: Option<OsString> = None;
     let mut host_authority: Option<OsString> = None;
+    // The Mac's sound server and its user's cookie, likewise.
+    let mut host_pulse: Option<OsString> = None;
+    let mut host_pulse_cookie: Option<OsString> = None;
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {
             b"--strace" => options.strace.enabled = true,
@@ -149,8 +152,17 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
-            | b"--user-dir" | b"--host-display" | b"--host-xauthority" => {
+            b"--cwd"
+            | b"--argv0"
+            | b"--comm"
+            | b"--exec-state"
+            | b"--exe-fd"
+            | b"--exe-store"
+            | b"--user-dir"
+            | b"--host-display"
+            | b"--host-xauthority"
+            | b"--host-pulse"
+            | b"--host-pulse-cookie" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
@@ -160,6 +172,10 @@ fn main() -> ExitCode {
                     host_display = Some(value);
                 } else if flag == "--host-xauthority" {
                     host_authority = Some(value);
+                } else if flag == "--host-pulse" {
+                    host_pulse = Some(value);
+                } else if flag == "--host-pulse-cookie" {
+                    host_pulse_cookie = Some(value);
                 } else if flag == "--user-dir" {
                     fwe_native::adopt_user_dir(value.as_bytes());
                 } else if flag == "--comm" {
@@ -268,23 +284,38 @@ fn main() -> ExitCode {
     };
     let path = PathBuf::from(program);
     // The host display and its authorizations' file: fwe's `DISPLAY` and
-    // its user's Xauthority file, or for an fwe re-executed on a guest's
-    // program (whose environment is the guest's) those given.
-    let (host, authority) = if options.guest_path {
-        (host_display, host_authority.map(|a| a.as_bytes().to_vec()))
+    // `XAUTHORITY`; the Mac's sound server and its cookie's file: fwe's
+    // `PULSE_SERVER` (a Unix socket's) and `PULSE_COOKIE`. For an fwe
+    // re-executed on a guest's program (whose environment is the
+    // guest's), those given.
+    let bytes = |v: Option<OsString>| v.map(|v| v.as_bytes().to_vec());
+    let named_pulse = if options.guest_path {
+        bytes(host_pulse)
     } else {
-        let display = std::env::var_os("DISPLAY");
-        let authority = display.as_ref().and_then(|_| fwe_kernel::x11::user_authority());
-        (display, authority)
+        std::env::var_os("PULSE_SERVER").and_then(|s| fwe_kernel::pulse::named_server(s.as_bytes()))
+    };
+    let (host, authority, pulse_cookie) = if options.guest_path {
+        (host_display, bytes(host_authority), bytes(host_pulse_cookie))
+    } else {
+        (
+            std::env::var_os("DISPLAY"),
+            bytes(std::env::var_os("XAUTHORITY")),
+            bytes(std::env::var_os("PULSE_COOKIE")),
+        )
     };
     fwe_kernel::x11::set_host(host.as_ref().map(|v| v.as_bytes()), authority.as_deref());
+    fwe_kernel::pulse::set_host(named_pulse.as_deref(), pulse_cookie.as_deref());
     // The guest's environment is fwe's, but for the host display, which
-    // the guest knows by its number ([`fwe_kernel::x11`]).
+    // the guest knows by its number ([`fwe_kernel::x11`]), and the Mac's
+    // sound server, which it knows by the system server's socket
+    // ([`fwe_kernel::pulse`]).
     let env: Vec<OsString> = std::env::vars_os()
         .map(|(k, v)| {
             use std::os::unix::ffi::{OsStrExt, OsStringExt};
             let v = if k == "DISPLAY" {
                 OsString::from_vec(fwe_kernel::x11::guest_display(v.as_bytes()))
+            } else if k == "PULSE_SERVER" && !options.guest_path && named_pulse.is_some() {
+                OsString::from_vec(fwe_kernel::pulse::GUEST_SERVER.to_vec())
             } else {
                 v
             };
@@ -310,8 +341,18 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
             b"--vm" | b"--hv-standin" | b"--hv-record" => {
                 return Some(a.to_string_lossy().into_owned());
             }
-            b"--root" | b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd"
-            | b"--exe-store" | b"--probe" | b"--host-display" | b"--host-xauthority"
+            b"--root"
+            | b"--cwd"
+            | b"--argv0"
+            | b"--comm"
+            | b"--exec-state"
+            | b"--exe-fd"
+            | b"--exe-store"
+            | b"--probe"
+            | b"--host-display"
+            | b"--host-xauthority"
+            | b"--host-pulse"
+            | b"--host-pulse-cookie"
             | b"--user-dir" => i += 2,
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
