@@ -3608,12 +3608,17 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
 
 /// The README's examples (`README.md`), run as written on the XQuartz
 /// display `FWE_README_DISPLAY` names (`:N`, a server running already):
-/// each block marked `<!-- example: NAME, window "SEARCH"[ WxH][, vm] -->`
-/// runs in `bash`, in order, sharing a home directory, with `fwe` on the
-/// `PATH`, until a window xdotool finds by `--name SEARCH` (of that size,
-/// if given) has drawn; then its processes are ended. A block marked `vm`
-/// runs only where `FWE_README_VM` is set (CI), its `fwe` on the
-/// hypervisor stand-in: VM programs are not run on a development Mac.
+/// each block marked `<!-- example: NAME, window "SEARCH"[ WxH][, vm][,
+/// sound] -->` runs in `bash`, in order, sharing a home directory, with
+/// `fwe` on the `PATH`, until a window xdotool finds by `--name SEARCH`
+/// (of that size, if given) has drawn; then its processes are ended. A
+/// block marked `vm` runs only where `FWE_README_VM` is set (CI), its
+/// `fwe` on the hypervisor stand-in: VM programs are not run on a
+/// development Mac. Their sound goes to a PulseAudio server of the test's
+/// (`PULSEAUDIO`), which the `fwe` on the `PATH` names (`PULSE_SERVER`,
+/// as a Mac's environment can, the README's `env -i` keeping fwe's
+/// environment from the guest); a block marked `sound` has to have played
+/// some once its window has drawn.
 #[test]
 fn readme_examples() {
     let Some(display) = std::env::var("FWE_README_DISPLAY").ok() else {
@@ -3621,6 +3626,7 @@ fn readme_examples() {
         return;
     };
     let x = XServer::running(&display);
+    let pulse = PulseServer::start("readme");
     let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
     let home = std::env::temp_dir().join(format!("fwe-readme-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
@@ -3635,13 +3641,11 @@ fn readme_examples() {
         let marker = &readme[i..i + readme[i..].find(" -->").unwrap()];
         let (name, rest) = marker.split_once(", window \"").expect("NAME, window \"SEARCH\"");
         let (search, rest) = rest.split_once('"').unwrap();
-        let (size, in_vm) = match rest.trim().split_once(',') {
-            Some((size, flag)) => {
-                assert_eq!(flag.trim(), "vm", "{marker}");
-                (size.trim(), true)
-            }
-            None => (rest.trim(), false),
-        };
+        let mut parts = rest.split(',').map(str::trim);
+        let size = parts.next().unwrap_or_default();
+        let flags: Vec<&str> = parts.collect();
+        assert!(flags.iter().all(|f| matches!(*f, "vm" | "sound")), "{marker}");
+        let (in_vm, sound) = (flags.contains(&"vm"), flags.contains(&"sound"));
         let size = (!size.is_empty()).then(|| {
             let (w, h) = size.split_once('x').unwrap();
             (w.parse().unwrap(), h.parse().unwrap())
@@ -3654,23 +3658,26 @@ fn readme_examples() {
             eprintln!("skipped: README example {name} runs in the VM (FWE_README_VM)");
             continue;
         }
-        // `fwe` on the PATH: the stand-in's for the VM.
+        // `fwe` on the PATH, naming the test's sound server: the
+        // stand-in's for the VM.
         let bin = home.join(format!(".fwe-{name}"));
         std::fs::create_dir_all(&bin).unwrap();
         let fwe = bin.join("fwe");
-        if in_vm {
-            let line = match hv_mode().expect("FWE_README_VM: the VM examples need a hypervisor") {
+        let line = if in_vm {
+            match hv_mode().expect("FWE_README_VM: the VM examples need a hypervisor") {
                 HvMode::Real(signed) => format!("exec '{}' \"$@\"", signed.display()),
                 HvMode::Standin => {
                     format!("exec '{}' --hv-standin \"$@\"", env!("CARGO_BIN_EXE_fwe"))
                 }
-            };
-            std::fs::write(&fwe, format!("#!/bin/sh\n{line}\n")).unwrap();
-            std::fs::set_permissions(&fwe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
-                .unwrap();
+            }
         } else {
-            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fwe"), &fwe).unwrap();
-        }
+            format!("exec '{}' \"$@\"", env!("CARGO_BIN_EXE_fwe"))
+        };
+        let names: String =
+            pulse.env().iter().map(|(k, v)| format!("export {k}='{v}'\n")).collect();
+        std::fs::write(&fwe, format!("#!/bin/sh\n{names}{line}\n")).unwrap();
+        std::fs::set_permissions(&fwe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
         let mut cmd = Command::new("bash");
         cmd.args(["-euo", "pipefail", "-c", script]);
         cmd.env_clear().env("HOME", &home).env("DISPLAY", x.display());
@@ -3684,6 +3691,13 @@ fn readme_examples() {
             let w = x.window_sized(&mut gui, &["--name", search], size, secs);
             let drawn = x.drawn(&w, &shot, 10_000, 300);
             assert!(drawn.drawn > 10_000, "{name} drew {drawn:?}: {}", gui.report());
+            if sound {
+                // What it plays a while after: on the stand-in, a while
+                // longer.
+                let secs = if in_vm { 120 } else { 20 };
+                let frames = pulse.recorded(|| std::thread::sleep(Duration::from_secs(secs)));
+                assert!(frames > 4_410, "{name} played {frames} frames: {}", gui.report());
+            }
         }));
         if drew.is_err() {
             failed.push(name.to_string());
@@ -3692,7 +3706,11 @@ fn readme_examples() {
     }
     run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&home));
     let _ = std::fs::remove_dir_all(&home);
-    let want: &[&str] = if vm { &["tuxracer", "vkcube", "putty"] } else { &["tuxracer", "vkcube"] };
+    let want: &[&str] = if vm {
+        &["tuxracer", "xonotic", "vkcube", "putty", "openttd"]
+    } else {
+        &["tuxracer", "xonotic", "vkcube"]
+    };
     assert_eq!(ran, want);
     assert!(failed.is_empty(), "README examples that failed: {failed:?}");
 }

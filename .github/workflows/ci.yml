@@ -287,6 +287,40 @@ jobs:
           name: display
           path: target/tmp/display
 
+  # The README's examples as written (README.md), on XQuartz's own server
+  # (`Xquartz`, as a Mac user's display is), their sound on Homebrew's
+  # PulseAudio (`PULSEAUDIO`), checked by xdotool and screenshots (libX11,
+  # `LIBX11`); its VM examples on the hypervisor stand-in (Unicorn). vkcube
+  # draws through fwe's Vulkan driver on MoltenVK, the Vulkan driver a user
+  # installs.
+  readme:
+    name: README examples (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install --cask xquartz
+      - run: brew install xdotool unicorn molten-vk pulseaudio
+      - name: The README's examples
+        run: |
+          /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
+          for _ in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          cargo test -p fwe --test guests -- --exact readme_examples --nocapture
+        env:
+          FWE_README_DISPLAY: ":4"
+          FWE_README_VM: "1"
+      # What each example said and its screenshots, and the server's log.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme
+          path: |
+            target/tmp/display
+            xquartz.log
+
   # Alpine's OpenJDK (fetched) compiling and running a multi-threaded
   # application natively: HotSpot's JIT, threads and garbage collector.
   # It runs here only (FWE_JDK_TESTS), not on a development machine.
