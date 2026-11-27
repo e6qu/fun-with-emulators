@@ -1,18 +1,20 @@
 <!doctype html>
 <html>
   <!-- A video made and played by the browser: frames drawn on a canvas
-       (green, a blue bar crossing it) recorded as WebM (VP8) by
-       MediaRecorder, then played in a loop by a video element, the title
-       then "fwe-video: playing". The recording ends once 60 frames are
+       (green, a blue bar crossing it) and a 440 Hz tone (Web Audio's
+       oscillator) recorded as WebM (VP8 and Opus) by MediaRecorder, then
+       played with its sound in a loop by a video element, the title then
+       "fwe-video: playing". The recording ends once 60 frames are
        drawn after its first data (not after a fixed time, which a slow
        start would leave empty). A failure puts what was recorded in the
        title: "fwe-video: failed: <error>, <parts> parts, <bytes> bytes".
        The console has each part's size and time. The tests look at the
-       video drawn: the window's pixels changing as the bar crosses it. -->
+       video drawn (the window's pixels changing as the bar crosses it)
+       and listen to it (what the sound server records). -->
   <head><meta charset="utf-8"><title>fwe-video</title></head>
   <body style="margin:0;background:#ff00ff">
     <canvas id="c" width="320" height="240" style="display:none"></canvas>
-    <video id="v" width="640" height="480" muted loop></video>
+    <video id="v" width="640" height="480" loop></video>
     <script>
       const c = document.getElementById("c"), g = c.getContext("2d");
       const v = document.getElementById("v");
@@ -27,7 +29,16 @@
       draw();
       const t0 = performance.now();
       const log = (m) => console.log(`fwe-video: ${m} at ${Math.round(performance.now() - t0)} ms`);
-      const rec = new MediaRecorder(c.captureStream(30), { mimeType: "video/webm;codecs=vp8" });
+      // The tone, recorded with the frames: the video's sound.
+      const ac = new AudioContext();
+      const tone = ac.createOscillator();
+      tone.frequency.value = 440;
+      const sound = ac.createMediaStreamDestination();
+      tone.connect(sound);
+      tone.start();
+      const stream = c.captureStream(30);
+      for (const t of sound.stream.getAudioTracks()) stream.addTrack(t);
+      const rec = new MediaRecorder(stream, { mimeType: "video/webm;codecs=vp8,opus" });
       const parts = [];
       let bytes = 0, first = -1;
       const failed = (e) => {
@@ -55,7 +66,7 @@
         }
       }, 33);
       rec.start(250);
-      log("recording");
+      log(`recording, audio ${ac.state}`);
     </script>
   </body>
 </html>

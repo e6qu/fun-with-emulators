@@ -3413,7 +3413,7 @@ fn user_guide_recipes() {
 }
 
 /// The Mac's PulseAudio server for the sound tests: Homebrew's (`PULSEAUDIO`
-/// names it; the tests skip without it), with one null sink, its socket and
+/// names it), with one null sink, its socket and
 /// cookie in a directory of its own; ended when dropped. The sink renders
 /// 50 ms ahead (`norewinds`): by default, with no stream asking for a
 /// latency, it renders two seconds ahead, and a stream that then asks for
@@ -3428,11 +3428,10 @@ struct PulseServer {
 }
 
 impl PulseServer {
-    fn start(test: &str) -> Option<PulseServer> {
-        let Some(bin) = std::env::var_os("PULSEAUDIO").map(PathBuf::from) else {
-            eprintln!("skipped: set PULSEAUDIO to Homebrew's pulseaudio to run the sound tests");
-            return None;
-        };
+    fn start(test: &str) -> PulseServer {
+        let bin = std::env::var_os("PULSEAUDIO").map(PathBuf::from).unwrap_or_else(|| {
+            panic!("the sound tests need PULSEAUDIO: the path of Homebrew's pulseaudio")
+        });
         // Short, as a socket's path is at most 104 bytes on macOS.
         let dir = std::env::temp_dir().join(format!("fwe-pa-{test}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3461,7 +3460,7 @@ impl PulseServer {
             assert!(began.elapsed() < Duration::from_secs(30), "no pulseaudio: {}", said());
             std::thread::sleep(Duration::from_millis(100));
         }
-        Some(server)
+        server
     }
 
     /// fwe's environment for its programs to reach this server, as a Mac's
@@ -3556,7 +3555,7 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     if !fetched_program_tests("FWE_SOUND_TESTS") {
         return;
     }
-    let Some(pulse) = PulseServer::start("clients") else { return };
+    let pulse = PulseServer::start("clients");
     let root = std::env::temp_dir().join(format!("fwe-sound-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("sound")).arg(&root));
@@ -11784,8 +11783,9 @@ fn shows_the_test_page(x: &XServer, w: &Window, name: &str, gui: &mut Gui) {
 
 /// A root for browser test `test`: Alpine's browsers
 /// (`guests/alpine/fetch/browsers.txt`), with the pages of
-/// `guests/apps/pages` in `/tmp/fwe-pages` and `nobody`'s home in
-/// `/tmp/nobody`.
+/// `guests/apps/pages` in `/tmp/fwe-pages`, `nobody`'s home in
+/// `/tmp/nobody`, and Firefox letting a page play sound unasked (its
+/// `media.autoplay` preferences, as Chromium's `--autoplay-policy` does).
 fn browsers_root(test: &str) -> ScratchRoot {
     use std::os::unix::fs::PermissionsExt;
     let root = display_root(&alpine_root("browsers"), test);
@@ -11798,6 +11798,15 @@ fn browsers_root(test: &str) -> ScratchRoot {
     let home = root.0.join("tmp/nobody");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let prefs = root.0.join("usr/lib/firefox/defaults/pref");
+    std::fs::create_dir_all(&prefs).unwrap();
+    std::fs::write(
+        prefs.join("fwe-autoplay.js"),
+        "pref(\"media.autoplay.default\", 0);\n\
+         pref(\"media.autoplay.blocking_policy\", 0);\n\
+         pref(\"media.autoplay.block-webaudio\", false);\n",
+    )
+    .unwrap();
     root
 }
 
@@ -11828,18 +11837,21 @@ fn alpine_display_chromium_draws_a_page_sandboxed() {
     shows_the_test_page(&x, &w, "chromium-page", &mut gui);
 }
 
-/// Chromium plays a video ([`plays_the_test_video`]).
+/// Chromium plays a video with its sound ([`plays_the_test_video`]).
 #[test]
-fn alpine_display_chromium_plays_a_video() {
+fn alpine_display_chromium_plays_a_video_with_its_sound() {
     let Some(_x) = display_tests() else { return };
+    let pulse = PulseServer::start("chromium");
     let root = browsers_root("chromium-video");
     let x = XServer::in_root(&root);
     let args = su_nobody(&format!(
         "{CHROMIUM} --autoplay-policy=no-user-gesture-required file:///tmp/fwe-pages/video.html"
     ));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &[]);
-    plays_the_test_video(&x, "chromium-video", &mut gui);
+    let env = pulse.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &env);
+    plays_the_test_video(&x, "chromium-video", &mut gui, &pulse);
 }
 
 /// Firefox's command for a test's run: an instance of its own, its
@@ -11858,22 +11870,26 @@ fn alpine_display_firefox_draws_a_page_sandboxed() {
     shows_the_test_page(&x, &w, "firefox-page", &mut gui);
 }
 
-/// Firefox plays a video ([`plays_the_test_video`]).
+/// Firefox plays a video with its sound ([`plays_the_test_video`]).
 #[test]
-fn alpine_display_firefox_plays_a_video() {
+fn alpine_display_firefox_plays_a_video_with_its_sound() {
     let Some(x) = display_tests() else { return };
+    let pulse = PulseServer::start("firefox");
     let root = browsers_root("firefox-video");
     let args = su_nobody(&format!("{FIREFOX} file:///tmp/fwe-pages/video.html"));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut gui = Gui::start(&x, "firefox-video", &root, "/bin/su", &args, &[]);
-    plays_the_test_video(&x, "firefox-video", &mut gui);
+    let env = pulse.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut gui = Gui::start(&x, "firefox-video", &root, "/bin/su", &args, &env);
+    plays_the_test_video(&x, "firefox-video", &mut gui, &pulse);
 }
 
 /// A browser showing `guests/apps/pages/video.html` plays its video: the
-/// page says it plays (its title), and what the window shows changes from
-/// one look to the next (the bar crossing the video), the page's own
-/// magenta covering less than all of it.
-fn plays_the_test_video(x: &XServer, name: &str, gui: &mut Gui) {
+/// page says it plays (its title), what the window shows changes from one
+/// look to the next (the bar crossing the video), the page's own magenta
+/// covering less than all of it, and the Mac's sound server `pulse` plays
+/// its tone (a second of sound in three).
+fn plays_the_test_video(x: &XServer, name: &str, gui: &mut Gui, pulse: &PulseServer) {
     let w = x.window(gui, &["--name", "^fwe-video: playing"], 180);
     let mut seen = std::collections::BTreeSet::new();
     for n in 0..8 {
@@ -11890,6 +11906,12 @@ fn plays_the_test_video(x: &XServer, name: &str, gui: &mut Gui) {
         seen.len() >= 4,
         "{name}'s video does not move: {} frames: {}",
         seen.len(),
+        gui.report()
+    );
+    let frames = pulse.recorded(|| std::thread::sleep(Duration::from_secs(3)));
+    assert!(
+        frames > 44_100,
+        "{name}'s video is silent: {frames} frames of sound: {}",
         gui.report()
     );
 }
