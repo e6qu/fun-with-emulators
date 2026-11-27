@@ -2527,7 +2527,7 @@ sees the message:
 | netlink socket | the same socket, answered through the same host end, for the namespace it was made in |
 | process descriptor | a kqueue of its own watching the same process (a `PIDFD_THREAD` one of another process's thread watches that process) |
 | `SOCK_SEQPACKET` socket | itself: its buffer size says what it is |
-| a file of fwe's store (a memfd, a tmpfs or `/dev/shm` file) | the same open file description of the same file, its offset and flags shared; a process of the host's (an X server) is handed the shared memory object of the file's data instead, which it maps, writable only if the description allows writing: the file's first extent, which holds all of a file sized before it held data; one grown past it is refused (`EOPNOTSUPP`) |
+| a file of fwe's store (a memfd, a tmpfs or `/dev/shm` file) | the same open file description of the same file, its offset and flags shared; a process of the host's (an X server: a peer that was no process of fwe's when the connection was made) is handed the shared memory object of the file's data instead, which it maps, writable only if the description allows writing: the file's first extent, which holds all of a file sized before it held data; one grown past it is refused (`EOPNOTSUPP`) |
 
 macOS collects sockets in flight that it finds no process can reach,
 emptying their data and the descriptors queued in them, and looks for
@@ -2604,7 +2604,9 @@ none went). `recvmmsg` honours `MSG_WAITFORONE`, checks its timeout after
 each message as Linux does, and stops after urgent data.
 
 **`getsockopt(SO_PEERCRED)`**: the peer process from the host's
-`LOCAL_PEERPID`, its pid in the caller's pid namespace and its effective
+`LOCAL_PEERPID` as the connection is made (later it names the last
+process to use the peer's socket, which can be a `fork` child gone
+since), its pid in the caller's pid namespace and its effective
 user and group ids as fwe keeps them for it (what it set inside fwe), in
 the caller's user namespace; a peer fwe did not start has its host ids
 as the guest sees them

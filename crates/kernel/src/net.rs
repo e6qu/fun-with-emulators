@@ -3088,7 +3088,14 @@ fn peergroups(fd: i32, optval: u64, optlen: u64) -> i64 {
     if !is_unix(fd) || crate::netlink::is(fd) {
         return err(errno::ENODATA);
     }
-    let Ok((pid, _, _)) = host_peercred(fd) else { return err(errno::ENODATA) };
+    // The peer as it was when the connection was made, as for `SO_PEERCRED`.
+    let pid = match crate::sockstate::with(fd, |s| s.peer).flatten() {
+        Some(p) => p.pid,
+        None => match live_peer(fd) {
+            Ok(p) => p.pid,
+            Err(_) => return err(errno::ENODATA),
+        },
+    };
     let groups: Vec<u32> = match crate::ids::HostPid::new(pid).and_then(crate::procreg::groups) {
         Some(g) => g.into_iter().map(|g| crate::userns::to_ns(g, true)).collect(),
         None => host_peer_groups(fd).into_iter().map(crate::host::gid_to_linux).collect(),
@@ -3153,15 +3160,20 @@ use crate::sockstate::Peer;
 
 /// The process at the other end of Unix socket `fd` now: its host pid and
 /// effective user and group ids as the kernel holds them (fwe's for it,
-/// else its host ids as Linux ones).
+/// else its host ids as Linux ones), and whether it is a process of the
+/// host's. Right as a connection is made (the host's answer is the last
+/// process to use the peer's socket).
 fn live_peer(fd: i32) -> Result<Peer, i32> {
     let (pid, uid, gid) = host_peercred(fd)?;
     let rec = crate::ids::HostPid::new(pid).and_then(crate::procreg::read);
     Ok(match rec {
-        Some(r) => Peer { pid, uid: r.ids[1], gid: r.ids[5] },
-        None => {
-            Peer { pid, uid: crate::host::uid_to_linux(uid), gid: crate::host::gid_to_linux(gid) }
-        }
+        Some(r) => Peer { pid, host: false, uid: r.ids[1], gid: r.ids[5] },
+        None => Peer {
+            pid,
+            host: true,
+            uid: crate::host::uid_to_linux(uid),
+            gid: crate::host::gid_to_linux(gid),
+        },
     })
 }
 
@@ -3183,7 +3195,7 @@ fn made_here(fd: i32) {
 /// This process as a peer: its host pid and effective ids.
 fn own_peer() -> Peer {
     let id = crate::creds::identity();
-    Peer { pid: crate::host::pid().get(), uid: id.uids[1], gid: id.gids[1] }
+    Peer { pid: crate::host::pid().get(), host: false, uid: id.uids[1], gid: id.gids[1] }
 }
 
 /// Credentials as the caller sees them: the pid in its pid namespace, the
@@ -3848,12 +3860,15 @@ fn send_control(
 
 /// Whether the peer of connected Unix socket `fd` is a process of the
 /// host's, not fwe's (an X server, say): it reads no bundle
-/// ([`crate::scm::prepare`]).
+/// ([`crate::scm::prepare`]). As it was when the connection was made
+/// ([`crate::sockstate::Peer`]); for a socket fwe did not see connected
+/// (one the first program was started with), as the host tells now.
 #[cfg(not(target_os = "linux"))]
 fn host_peer(fd: i32) -> bool {
-    host_peercred(fd).is_ok_and(|(pid, _, _)| {
-        crate::ids::HostPid::new(pid).is_some_and(|p| crate::procreg::read(p).is_none())
-    })
+    match crate::sockstate::with(fd, |s| s.peer).flatten() {
+        Some(p) => p.host,
+        None => live_peer(fd).is_ok_and(|p| p.host),
+    }
 }
 
 #[cfg(test)]
@@ -4500,6 +4515,36 @@ pub(crate) mod scm_tests {
         assert_eq!(r, Some(err(errno::EAGAIN)));
         assert_eq!(crate::specialfd::try_close(got[0]), Some(0));
         assert_eq!(crate::specialfd::try_close(fd), Some(0));
+    }
+
+    /// A socket pair's peer is this process's, as it was when the pair was
+    /// made, whatever process used the other end since: macOS names the
+    /// last one (a fork child, here, gone since), which is no process of
+    /// fwe's, and a message to a host process's socket carries no bundle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peer_is_as_the_connection_found_it() {
+        // A fork child: the test runs alone in a process of its own.
+        if !crate::alone::in_own_process(module_path!(), "a_peer_is_as_the_connection_found_it") {
+            return;
+        }
+        let sv = pair(SOCK_STREAM);
+        // SAFETY: the child only sends a byte and ends.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: a one-byte send on an inherited socket, then the end.
+            unsafe {
+                libc::send(sv[1], b"x".as_ptr().cast(), 1, 0);
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting for the child just made.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        let (pid, _, _) = host_peercred(sv[0]).unwrap();
+        assert_eq!(pid, child, "macOS names the last process to use the peer");
+        assert!(!host_peer(sv[0]), "the peer is taken for a process of the host's");
+        close_all(&sv);
     }
 
     #[cfg(target_os = "macos")]

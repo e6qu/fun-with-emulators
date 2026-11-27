@@ -48,10 +48,16 @@ pub(crate) struct State {
 }
 
 /// A Unix socket's peer process: its host pid and effective user and group
-/// ids as the kernel holds them.
+/// ids as the kernel holds them, and whether it is a process of the host's
+/// (not fwe's: an X server, say), which reads no bundle (`scm::prepare`).
+/// All are as they were when the connection was made: what the host gives
+/// later is the last process to use the peer's socket (macOS's
+/// `LOCAL_PEERPID` is the socket's `last_pid`), which can be any that had
+/// it, gone since.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Peer {
     pub pid: i32,
+    pub host: bool,
     pub uid: u32,
     pub gid: u32,
 }
@@ -81,8 +87,9 @@ impl State {
         }
         e.bool(self.v4_view);
         e.bool(self.peer.is_some());
-        let p = self.peer.unwrap_or(Peer { pid: 0, uid: 0, gid: 0 });
+        let p = self.peer.unwrap_or(Peer { pid: 0, host: false, uid: 0, gid: 0 });
         e.i32(p.pid);
+        e.bool(p.host);
         e.u32(p.uid);
         e.u32(p.gid);
         e.bool(self.maker.is_some());
@@ -106,7 +113,7 @@ impl State {
             .collect();
         let v4_view = d.bool();
         let some = d.bool();
-        let peer = Peer { pid: d.i32(), uid: d.u32(), gid: d.u32() };
+        let peer = Peer { pid: d.i32(), host: d.bool(), uid: d.u32(), gid: d.u32() };
         let made = d.bool();
         let maker = d.i32();
         State {
@@ -315,7 +322,7 @@ mod tests {
                 sources: vec![vec![10, 0, 0, 1]],
             }],
             v4_view: true,
-            peer: Some(Peer { pid: 7, uid: 1000, gid: 100 }),
+            peer: Some(Peer { pid: 7, host: true, uid: 1000, gid: 100 }),
             maker: Some(9),
             peer_id: None,
             peer_wants: None,
