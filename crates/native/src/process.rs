@@ -6,7 +6,7 @@ use fwe_abi::{clone as cl, err, errno};
 use fwe_kernel::mm::region;
 use fwe_kernel::reaper;
 use fwe_kernel::{Platform, Regs, host, thread};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `execve(path, argv, envp)`: replace the current program image with a new
 /// one and start it. Returns a negative errno on failure; on success it does
@@ -18,14 +18,19 @@ use std::sync::atomic::Ordering;
 /// in its place, so a program can exec one linked at the same addresses —
 /// itself, for instance. A failure after that point is fatal, as on Linux.
 /// Descriptors marked close-on-exec are closed. A program only the VM can
-/// run, or an `execve` from a process with other live threads, re-executes
-/// fwe instead ([`crate::reexec`]).
+/// run, or an `execve` from a host fork child (not exec'd since its fork),
+/// from a process with other live threads or from one with the Mac's
+/// Vulkan driver loaded, re-executes fwe instead ([`crate::reexec`]).
 pub fn do_execve(regs: &Regs) -> Result<Regs, i64> {
     use fwe_kernel::uaccess;
     let path = uaccess::read_cstr(regs.x[0], uaccess::PATH_MAX).map_err(err)?;
     let (args, env) = read_exec_args(regs.x[1], regs.x[2])?;
     exec_program(path, args, env)
 }
+
+/// This process is a host fork child, not exec'd since: its `execve`
+/// re-executes fwe ([`do_execve`]).
+static FORK_CHILD: AtomicBool = AtomicBool::new(false);
 
 /// Linux's limit on one argument or environment string.
 const ARG_MAX: usize = 128 * 1024;
@@ -90,11 +95,20 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     if vm && !crate::hv::usable() {
         return Err(err(fwe_abi::errno::ENOEXEC));
     }
-    // A program only the VM can run, an exec from a process with other
-    // threads (which the exec ends), or from one with the Mac's Vulkan driver in
-    // its memory (its threads and objects cannot be carried over): replace
-    // this process with a fresh fwe.
+    // A native program is checked here, whether it is loaded in place or by
+    // a fresh fwe: the old image is untouched on failure, so the guest can
+    // handle it.
+    if !vm {
+        crate::check_image(&file, fs).map_err(err)?;
+    }
+    // A program only the VM can run; an exec from a host fork child (macOS's
+    // libraries work only in a process exec'd since its fork: Metal's shader
+    // compiler is out of a fork child's reach), from a process with other
+    // threads (which the exec ends), or from one with the Mac's Vulkan
+    // driver loaded (its threads and objects cannot be carried over):
+    // replace this process with a fresh fwe.
     if vm
+        || FORK_CHILD.load(Ordering::SeqCst)
         || LIVE_THREADS.load(Ordering::SeqCst) > 1
         || fwe_kernel::vulkan::device::driver_in_memory()
     {
@@ -113,10 +127,8 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
             || {},
         ));
     }
-    // The old image is untouched on failure, so the guest can handle it.
     fwe_kernel::timing::mark("exec: checked for re-exec");
     fwe_kernel::timing::mark("backend: native");
-    crate::check_image(&file, fs).map_err(err)?;
     // A program run through a descriptor (a memfd, `/proc/self/exe`) is
     // held through it, for `/proc/self/exe`: the descriptor it was run
     // through might close on exec. Another is opened once loaded.
@@ -413,6 +425,7 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         }
         thread::init_main(shown);
         LIVE_THREADS.store(1, Ordering::SeqCst);
+        FORK_CHILD.store(true, Ordering::SeqCst);
         // The GPU device's opens, and the Mac's driver, are the parent's.
         fwe_kernel::vulkan::device::forked_child();
         if flags & cl::CLONE_CHILD_SETTID != 0 && child_tid != 0 {

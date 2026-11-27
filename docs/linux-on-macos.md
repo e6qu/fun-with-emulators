@@ -227,8 +227,9 @@ rewritten as it is mapped executable.
 A program can `execve` one of the other kind: a shell in the VM runs a
 native `ls`, a native `make` runs a low-linked `gcc`. fwe then re-executes
 itself on the new program, and the fresh `fwe` decides again; only a
-native program execing a native one can be replaced in place
-([execve](#execve) has when, and what crosses).
+native program execing a native one, in a process that is not a fork
+child, can be replaced in place ([execve](#execve) has when, and what
+crosses).
 
 ## Which instructions get translated, and how
 
@@ -708,7 +709,7 @@ for a well-known property only.
 | VM, compilers | Debian's GCC 14 (`gcc`, `cc1`, `collect2`) (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
 | VM, Go toolchain | Debian's Go 1.24: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
 | VM, container engine | Debian's podman 5.4 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
-| fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
+| fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` in a fork child re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a call into fwe's gate natively, a VM exit in the VM |
 | uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub (in code made executable at run time, its translation's expansion); in the VM `x18` is the guest's own |
 
@@ -1272,15 +1273,21 @@ A new thread starts with its creator's registers and signal mask, `x0` =
 Linux replaces the address space in place. fwe does so where it can
 ([Across execve](#across-execve) says when); otherwise it runs the host's
 `execve` on `fwe` itself, passing what has to survive on the command line,
-and the new fwe picks the backend:
+and the new fwe picks the backend. A host fork child always takes the
+host's `execve`: macOS's libraries work in a process only once it has
+been exec'd since its fork (in a fork child, Metal's shader compiler is
+out of reach), so a program a shell starts gets a process they work in.
+That costs about 2 ms more per `execve` than loading in place:
 
 ```mermaid
 flowchart TD
-    e["guest execve(path)"] --> how{"VM backend, program needs the VM, other live threads, or the Mac's Vulkan driver in memory?"}
-    how -- no --> chk{"new program valid? (arm64 ELF that fits, interpreter exists)"}
+    e["guest execve(path)"] --> vm{"program needs the VM, or VM backend?"}
+    vm -- no --> chk{"new program valid? (arm64 ELF that fits, interpreter exists)"}
     chk -- no --> fail["error returned, caller intact"]
-    chk -- yes --> inplace["native, in place: unmap tracked guest memory, close CLOEXEC fds, load new image, all registers zero"]
-    how -- yes --> elf{"an ELF file?"}
+    chk -- yes --> how{"a host fork child, other live threads, or the Mac's Vulkan driver loaded?"}
+    how -- no --> inplace["native, in place: unmap tracked guest memory, close CLOEXEC fds, load new image, all registers zero"]
+    how -- yes --> reexec
+    vm -- yes --> elf{"an ELF file?"}
     elf -- no --> fail
     elf -- yes --> reexec["host execve of fwe itself with --exec-state, --guest-path, --root, --cwd, --argv0 and the trace and VM options"]
     reexec --> pick["new fwe picks the backend the program needs"]

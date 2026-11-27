@@ -1,9 +1,10 @@
-/* fwe's GPU device across fork and exec: a fork child of a process using
- * the Mac's Vulkan driver never calls it (its copy of the parent's open and
- * an open of its own fail with ENODEV); after an execve it is a fresh
- * process, whose own open works; the parent's open goes on working. The
- * driver's one ioctl is used directly, its interface from fwe's driver's
- * generated header.
+/* fwe's GPU device across fork and exec: a fork child never calls the
+ * Mac's Vulkan driver (its copy of the parent's open and an open of its
+ * own fail with ENODEV), whether its parent used the driver or, with
+ * `fresh`, never opened the device; after an execve it is a fresh process,
+ * whose own open works; the parent's open goes on working. The driver's
+ * one ioctl is used directly, its interface from fwe's driver's generated
+ * header.
  *
  * Built freestanding and linked against the target libc's shared library
  * (no system headers), as the other dynamic guests. */
@@ -45,18 +46,21 @@ static const char *outcome(long r) {
 static int open_device(void) { return open("/dev/fwe-gpu", O_RDWR | O_CLOEXEC); }
 
 int main(int argc, char **argv) {
-    if (argc > 1) {
+    if (argc > 1 && !strcmp(argv[1], "exec")) {
         printf("exec'd child: its own open %s\n", outcome(version(open_device())));
         return 0;
     }
-    int fd = open_device();
-    printf("parent: the driver %s\n", outcome(version(fd)));
+    int fresh = argc > 1 && !strcmp(argv[1], "fresh");
+    int fd = fresh ? -1 : open_device();
+    if (!fresh) printf("parent: the driver %s\n", outcome(version(fd)));
     fflush(0);
     pid_t pid = fork();
     if (pid == 0) {
-        long inherited = version(fd);
         long own = version(open_device());
-        printf("child: inherited open %s, own open %s\n", outcome(inherited), outcome(own));
+        if (fresh)
+            printf("child: own open %s\n", outcome(own));
+        else
+            printf("child: inherited open %s, own open %s\n", outcome(version(fd)), outcome(own));
         fflush(0);
         char *again[] = {argv[0], "exec", 0};
         execv("/proc/self/exe", again);
@@ -65,6 +69,9 @@ int main(int argc, char **argv) {
     }
     int status = 0;
     waitpid(pid, &status, 0);
-    printf("parent: child exit %d, its open %s\n", (status >> 8) & 0xff, outcome(version(fd)));
+    if (fresh)
+        printf("parent: child exit %d\n", (status >> 8) & 0xff);
+    else
+        printf("parent: child exit %d, its open %s\n", (status >> 8) & 0xff, outcome(version(fd)));
     return 0;
 }

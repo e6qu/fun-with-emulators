@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """The X server's screen as a PNG:
-`shot.py <libX11> <display> <out.png> [<x> <y> <w> <h>]`.
+`shot.py <libX11> <display> <out.png> [<x> <y> <w> <h> | window <id>]`.
 
 Grabs the root window of `display` (a 24- or 32-bit TrueColor screen, as
 Xvfb's is) through libX11 (`libX11`, the host's), or the rectangle of it
 given, as much of it as is on the screen (a window can reach past it),
-and writes it to `out.png`. Prints its size and how many of its
+or with `window`, window `id` itself (XQuartz's root shows none of its
+windows: each keeps its own pixels), and writes it to `out.png`. Prints its size and how many of its
 pixels are not its most common colour (what was drawn on the
 background); then `colour <rrggbb> <n>` for each colour of the whole
 image, most common first (the first 32), and `digest <hex>`, a hash of
@@ -30,7 +31,7 @@ class XImage(ctypes.Structure):
                 ("bytes_per_line", ctypes.c_int), ("bits_per_pixel", ctypes.c_int)]
 
 
-def grab(lib, display, rect=None):
+def grab(lib, display, rect=None, window=None):
     x = ctypes.CDLL(lib)
     x.XOpenDisplay.restype = ctypes.c_void_p
     x.XOpenDisplay.argtypes = [ctypes.c_char_p]
@@ -45,13 +46,19 @@ def grab(lib, display, rect=None):
         sys.exit(f"cannot open display {display}")
     sw, sh = x.XDisplayWidth(d, 0), x.XDisplayHeight(d, 0)
     left, top, w, h = 0, 0, sw, sh
-    if rect:
+    drawable = x.XDefaultRootWindow(d)
+    if window is not None:
+        drawable, (w, h) = window, rect[2:]
+    elif rect:
         x0, y0, rw, rh = rect
         left, top = max(0, x0), max(0, y0)
         w, h = min(sw, x0 + rw) - left, min(sh, y0 + rh) - top
         if w <= 0 or h <= 0:
             sys.exit(f"{rw}x{rh} at {x0},{y0} is off the {sw}x{sh} screen")
-    img = x.XGetImage(d, x.XDefaultRootWindow(d), left, top, w, h, 0xFFFFFFFF, 2).contents
+    got = x.XGetImage(d, drawable, left, top, w, h, 0xFFFFFFFF, 2)
+    if not got:
+        sys.exit(f"no image of {w}x{h} at {left},{top} of {drawable:#x}")
+    img = got.contents
     if img.bits_per_pixel != 32:
         sys.exit(f"{img.bits_per_pixel} bits a pixel: only 32 are read")
     raw = ctypes.string_at(img.data, img.bytes_per_line * h)
@@ -63,6 +70,28 @@ def grab(lib, display, rect=None):
         rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]
         rows.append(bytes(rgb))
     return w, h, rows
+
+
+class XWindowAttributes(ctypes.Structure):
+    # The leading fields of Xlib's XWindowAttributes, as far as the size;
+    # room for the rest.
+    _fields_ = [("x", ctypes.c_int), ("y", ctypes.c_int), ("width", ctypes.c_int),
+                ("height", ctypes.c_int), ("rest", ctypes.c_char * 256)]
+
+
+def window_size(lib, display, window):
+    x = ctypes.CDLL(lib)
+    x.XOpenDisplay.restype = ctypes.c_void_p
+    x.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x.XGetWindowAttributes.argtypes = [ctypes.c_void_p, ctypes.c_ulong,
+                                       ctypes.POINTER(XWindowAttributes)]
+    d = x.XOpenDisplay(display.encode())
+    if not d:
+        sys.exit(f"cannot open display {display}")
+    a = XWindowAttributes()
+    if not x.XGetWindowAttributes(d, window, ctypes.byref(a)):
+        sys.exit(f"no window {window:#x}")
+    return a.width, a.height
 
 
 def png(path, w, h, rows):
@@ -77,8 +106,13 @@ def png(path, w, h, rows):
 
 def main():
     lib, display, out = sys.argv[1:4]
-    rect = tuple(int(v) for v in sys.argv[4:8]) if len(sys.argv) >= 8 else None
-    w, h, rows = grab(lib, display, rect)
+    if sys.argv[4:5] == ["window"]:
+        # The window's size, from its attributes.
+        window = int(sys.argv[5], 0)
+        w, h, rows = grab(lib, display, (0, 0) + window_size(lib, display, window), window)
+    else:
+        rect = tuple(int(v) for v in sys.argv[4:8]) if len(sys.argv) >= 8 else None
+        w, h, rows = grab(lib, display, rect)
     png(out, w, h, rows)
     counts = collections.Counter(r[i:i + 3] for r in rows for i in range(0, 3 * w, 3))
     background, n = counts.most_common(1)[0]

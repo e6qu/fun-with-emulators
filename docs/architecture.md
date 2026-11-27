@@ -220,11 +220,12 @@ Around the load:
   exec leaves them (`AuxIds`): the kernel computes them before an
   in-place `execve` loads the program, and a re-executed fwe reads them
   from its exec state before its kernel exists, in either backend.
-- **Checks before an `execve`:** an in-place `execve` checks the new
-  program first (an arm64 ELF that fits the address space, with a dynamic
-  linker that exists), so a bad one fails with the caller intact. A
-  re-exec checks only that it is an ELF file before the host `execve`, so
-  a later failure ends the process.
+- **Checks before an `execve`:** an `execve` of a native program checks
+  the new program first (an arm64 ELF that fits the address space, with a
+  dynamic linker that exists), whether it is loaded in place or by a
+  re-executed fwe, so a bad one fails with the caller intact. One of a
+  program for the VM checks only that it is an ELF file before the host
+  `execve`, so a later failure ends the process.
 - **Busy programs** (`crates/kernel/src/textbusy.rs`): a page every fwe
   process maps holds each process's program and a ring of files recently
   opened for writing. Opening a running program's file to write, or
@@ -1610,19 +1611,17 @@ command a program makes to the Mac's Vulkan driver in fwe's process.
   (`vulkan/objects.rs`, after the program's own settings), learnt from
   the driver's ID and the device's name on the first instance a process
   makes, which is made again so.
-- **`execve`** from a process with the driver in memory starts a fresh
+- **`execve`** from a process with the driver loaded starts a fresh
   fwe, with the driver's descriptors made close-on-exec
-  (`vulkan::device::before_exec`). A fork child never calls the driver
-  (macOS's libraries do not work in a fork child): its copies of its
-  parent's opens fail with `ENODEV`, and its own opens are refused while
-  the driver is in its memory; an `execve` gives it a device, in a fresh
-  fwe if its parent had the driver. A program started in place in the
-  child of a parent without the driver (Chromium's GPU process) loads it
-  there: fwe's executable carries the Objective-C runtime's mark that
-  classes' `+initialize` is safe in a fork child (`__DATA,__objc_fork_ok`,
-  in `crates/fwe/src/main.rs`), which the runtime otherwise refuses in the
-  child of any process that had threads. In the VM backend there is no
-  device.
+  (`vulkan::device::before_exec`). A fork child never calls the driver:
+  macOS's libraries work in a process only once it has been exec'd (in a
+  fork child, a pipeline Metal has not compiled before fails with
+  `XPC_ERROR_CONNECTION_INVALID`: its shader compiler is out of reach),
+  and the driver's threads and objects in its memory are its parent's.
+  Its copies of its parent's opens, and its own opens, fail with
+  `ENODEV`; its `execve` starts a fresh fwe, as every fork child's does
+  ([execve in linux-on-macos.md](linux-on-macos.md#execve)), whose
+  opens work. In the VM backend there is no device.
 
 ## Containers
 

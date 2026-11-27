@@ -83,6 +83,69 @@ fwe --strace ./hello                       # with its system calls traced
 The [user guide](docs/user-guide.md) covers installing, userlands,
 programs, containers and what does not work.
 
+## Examples
+
+Programs with windows draw on XQuartz (`brew install --cask xquartz`,
+then log out and back in, so programs get its `DISPLAY`). Each example
+runs a userland's programs with a Linux environment (`env -i`), as the
+[user guide](docs/user-guide.md#a-linux-userland) explains. CI runs every
+example as written here, on XQuartz, and checks that its window draws.
+
+### Extreme Tux Racer
+
+A Debian game drawn with OpenGL. Mesa finds none of XQuartz's GLX
+configurations usable, so the game draws in Xephyr, the userland's own
+X server, which shows its screen in an XQuartz window. Mesa renders on
+the CPU: through Zink, on the Mac's GPU, one of the game's shaders does
+not yet build on MoltenVK ([M7 PR 6](ROADMAP.md)). There is no sound yet
+([M7 PR 7](ROADMAP.md)).
+
+<!-- example: tuxracer, window "Extreme Tux Racer" -->
+```sh
+[ -d ~/debian ] || fwe --pull debian:trixie ~/debian
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/debian ~/debian/bin/sh -c \
+  'apt-get update -qq && apt-get install -qq -y --no-install-recommends extremetuxracer xserver-xephyr libgl1-mesa-dri'
+env -i HOME=/root PATH=/usr/games:/usr/bin:/bin DISPLAY="$DISPLAY" "$(command -v fwe)" --root ~/debian ~/debian/bin/sh -c \
+  'Xephyr :1 -screen 1024x768 -title "Extreme Tux Racer" & until [ -S /tmp/.X11-unix/X1 ]; do sleep 0.1; done
+   DISPLAY=:1 LIBGL_ALWAYS_SOFTWARE=1 etr; kill $!'
+```
+
+### vkcube, on the GPU
+
+Vulkan programs draw on the Mac's GPU through fwe's own Vulkan driver,
+on MoltenVK (`brew install molten-vk`), and show their frames on XQuartz
+directly:
+
+<!-- example: vkcube, window "^$" 500x500 -->
+```sh
+[ -d ~/debian ] || fwe --pull debian:trixie ~/debian
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/debian ~/debian/bin/sh -c \
+  'apt-get update -qq && apt-get install -qq -y --no-install-recommends vulkan-tools'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" VK_DRIVER_FILES=/etc/vulkan/icd.d/fwe_icd.aarch64.json \
+  "$(command -v fwe)" --root ~/debian ~/debian/usr/bin/vkcube --wsi xcb
+```
+
+### PuTTY, a Windows program
+
+PuTTY's build for Windows on Arm, run by Alpine's Wine. Wine needs 4 KiB
+pages, so it runs in fwe's VM (`--vm`), which needs `fwe` signed with
+the hypervisor entitlement (Homebrew's is) on a Mac that offers the
+hypervisor ([user guide](docs/user-guide.md#programs-linked-below-4-gib)).
+The VM has been tested only on CI's software stand-in for
+Hypervisor.framework. Once Wine runs natively
+([M6 PR 7](ROADMAP.md)), the example runs without `--vm`.
+
+<!-- example: putty, window "PuTTY Configuration", vm -->
+```sh
+[ -d ~/alpine ] || fwe --pull alpine:3.24 ~/alpine
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/alpine ~/alpine/bin/sh -c \
+  'apk add -q wine font-dejavu libxcursor libxi libxinerama libxrandr libxcomposite'
+curl -fsSL -o ~/alpine/root/putty.exe https://the.earth.li/~sgtatham/putty/0.83/wa64/putty.exe
+echo "19a81aee36bcfcc5f9bb3401529458bbe8ea88a8478291ce2300058f4cb64a00  $HOME/alpine/root/putty.exe" | shasum -a 256 -c
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" WINEDLLOVERRIDES="mscoree,mshtml=" \
+  "$(command -v fwe)" --vm --root ~/alpine ~/alpine/bin/sh -c 'wine /root/putty.exe'
+```
+
 ## Testing
 
 ```sh

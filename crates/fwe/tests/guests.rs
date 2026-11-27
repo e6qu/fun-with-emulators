@@ -3412,6 +3412,97 @@ fn user_guide_recipes() {
     assert!(failed.is_empty(), "guide recipes that failed: {failed:?}");
 }
 
+/// The README's examples (`README.md`), run as written on the XQuartz
+/// display `FWE_README_DISPLAY` names (`:N`, a server running already):
+/// each block marked `<!-- example: NAME, window "SEARCH"[ WxH][, vm] -->`
+/// runs in `bash`, in order, sharing a home directory, with `fwe` on the
+/// `PATH`, until a window xdotool finds by `--name SEARCH` (of that size,
+/// if given) has drawn; then its processes are ended. A block marked `vm`
+/// runs only where `FWE_README_VM` is set (CI), its `fwe` on the
+/// hypervisor stand-in: VM programs are not run on a development Mac.
+#[test]
+fn readme_examples() {
+    let Some(display) = std::env::var("FWE_README_DISPLAY").ok() else {
+        eprintln!("skipped: set FWE_README_DISPLAY to an XQuartz display to run them");
+        return;
+    };
+    let x = XServer::running(&display);
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let home = std::env::temp_dir().join(format!("fwe-readme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let vm = std::env::var_os("FWE_README_VM").is_some();
+    let mut ran = Vec::new();
+    // Every example runs, so one run of CI shows each that fails.
+    let mut failed = Vec::new();
+    let mut at = 0;
+    while let Some(i) = readme[at..].find("<!-- example: ") {
+        let i = i + at + "<!-- example: ".len();
+        let marker = &readme[i..i + readme[i..].find(" -->").unwrap()];
+        let (name, rest) = marker.split_once(", window \"").expect("NAME, window \"SEARCH\"");
+        let (search, rest) = rest.split_once('"').unwrap();
+        let (size, in_vm) = match rest.trim().split_once(',') {
+            Some((size, flag)) => {
+                assert_eq!(flag.trim(), "vm", "{marker}");
+                (size.trim(), true)
+            }
+            None => (rest.trim(), false),
+        };
+        let size = (!size.is_empty()).then(|| {
+            let (w, h) = size.split_once('x').unwrap();
+            (w.parse().unwrap(), h.parse().unwrap())
+        });
+        let start = i + readme[i..].find("```sh\n").unwrap() + "```sh\n".len();
+        let end = start + readme[start..].find("\n```").unwrap();
+        let script = &readme[start..end];
+        at = end;
+        if in_vm && !vm {
+            eprintln!("skipped: README example {name} runs in the VM (FWE_README_VM)");
+            continue;
+        }
+        // `fwe` on the PATH: the stand-in's for the VM.
+        let bin = home.join(format!(".fwe-{name}"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let fwe = bin.join("fwe");
+        if in_vm {
+            let line = match hv_mode().expect("FWE_README_VM: the VM examples need a hypervisor") {
+                HvMode::Real(signed) => format!("exec '{}' \"$@\"", signed.display()),
+                HvMode::Standin => {
+                    format!("exec '{}' --hv-standin \"$@\"", env!("CARGO_BIN_EXE_fwe"))
+                }
+            };
+            std::fs::write(&fwe, format!("#!/bin/sh\n{line}\n")).unwrap();
+            std::fs::set_permissions(&fwe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+                .unwrap();
+        } else {
+            std::os::unix::fs::symlink(env!("CARGO_BIN_EXE_fwe"), &fwe).unwrap();
+        }
+        let mut cmd = Command::new("bash");
+        cmd.args(["-euo", "pipefail", "-c", script]);
+        cmd.env_clear().env("HOME", &home).env("DISPLAY", x.display());
+        cmd.env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()));
+        let shot = format!("readme-{name}");
+        let drew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut gui = Gui::run(&shot, cmd);
+            // Its downloads and installs first: Wine's on the stand-in
+            // take the longest.
+            let secs = if in_vm { 3600 } else { 1200 };
+            let w = x.window_sized(&mut gui, &["--name", search], size, secs);
+            let drawn = x.drawn(&w, &shot, 10_000, 300);
+            assert!(drawn.drawn > 10_000, "{name} drew {drawn:?}: {}", gui.report());
+        }));
+        if drew.is_err() {
+            failed.push(name.to_string());
+        }
+        ran.push(name.to_string());
+    }
+    run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&home));
+    let _ = std::fs::remove_dir_all(&home);
+    let want: &[&str] = if vm { &["tuxracer", "vkcube", "putty"] } else { &["tuxracer", "vkcube"] };
+    assert_eq!(ran, want);
+    assert!(failed.is_empty(), "README examples that failed: {failed:?}");
+}
+
 /// Run `args` (a program of the root, then its arguments) in a copy of the
 /// `ptrace` manifest's Alpine root, with `/prog` the given program, if
 /// any: its output, and the root's file `keep` (if any) as it was left.
@@ -10083,19 +10174,29 @@ fn hv_fault_frames_hold_the_syndrome() {
     assert_eq!(stdout(&out), FAULT_ESR, "{}", String::from_utf8_lossy(&out.stderr));
 }
 
-/// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
-/// names it; the tests skip without it, as on a development machine),
-/// listening on its Unix socket only, at a display number of its own; or
-/// a root's own Xvfb run by fwe ([`Xvfb::in_root`]).
-struct Xvfb {
+/// An X server for the display tests, at a display number of its own
+/// ([`Run`] says whose it is).
+struct XServer {
     number: u32,
-    child: std::process::Child,
-    /// Run by fwe in a root: the host's tools reach it over TCP.
-    in_root: bool,
+    run: Run,
 }
 
-impl Xvfb {
-    fn start() -> Option<Xvfb> {
+/// Who runs an X server, and how the host's tools reach it.
+enum Run {
+    /// Homebrew's Xvfb, headless, started by the tests (`XVFB` names it;
+    /// the tests skip without it, as on a development machine), listening
+    /// on its Unix socket only ([`XServer::start`]).
+    Host(std::process::Child),
+    /// A root's own Xvfb run by fwe, in a process group of its own: the
+    /// host's tools reach it over TCP ([`XServer::in_root`]).
+    InRoot(std::process::Child),
+    /// A server running already, which the tests leave running: XQuartz,
+    /// on its Unix socket ([`XServer::running`]).
+    Running,
+}
+
+impl XServer {
+    fn start() -> Option<XServer> {
         let Some(xvfb) = std::env::var_os("XVFB") else {
             eprintln!("skipped: set XVFB to an Xvfb to run the display tests");
             return None;
@@ -10137,11 +10238,11 @@ impl Xvfb {
             .stderr(std::fs::File::create(&err).unwrap())
             .spawn()
             .unwrap();
-        let mut x = Xvfb { number, child, in_root: false };
+        let mut x = XServer { number, run: Run::Host(child) };
         let began = Instant::now();
         while !socket.exists() {
             let said = || std::fs::read_to_string(&err).unwrap_or_default();
-            if let Some(status) = x.child.try_wait().unwrap() {
+            if let Some(status) = x.ended() {
                 panic!("Xvfb :{number} ended ({status}): {}", said());
             }
             assert!(
@@ -10157,8 +10258,8 @@ impl Xvfb {
     /// The root's own Xvfb (Alpine's, which has GLX, as Homebrew's has
     /// not), run by fwe in `root`, in a process group of its own: the
     /// root's programs reach it as `:N` (its socket in the root's
-    /// `/tmp/.X11-unix`), the host's tools over TCP ([`Xvfb::display`]).
-    fn in_root(root: &ScratchRoot) -> Xvfb {
+    /// `/tmp/.X11-unix`), the host's tools over TCP ([`XServer::display`]).
+    fn in_root(root: &ScratchRoot) -> XServer {
         use std::os::unix::process::CommandExt;
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let number = 170 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10188,7 +10289,7 @@ impl Xvfb {
             .process_group(0)
             .spawn_alone()
             .unwrap();
-        let x = Xvfb { number, child, in_root: true };
+        let x = XServer { number, run: Run::InRoot(child) };
         let began = Instant::now();
         while std::net::TcpStream::connect(("127.0.0.1", 6000 + number as u16)).is_err() {
             let err = std::fs::read_to_string(dir.join(format!("{name}.err"))).unwrap_or_default();
@@ -10201,28 +10302,54 @@ impl Xvfb {
         x
     }
 
+    /// The server running already at `display` (`:N`), left running.
+    fn running(display: &str) -> XServer {
+        let number = display
+            .strip_prefix(':')
+            .and_then(|n| n.split('.').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{display}: not a local display (:N)"));
+        assert!(
+            Path::new(&format!("/tmp/.X11-unix/X{number}")).exists(),
+            "no X server at {display}"
+        );
+        XServer { number, run: Run::Running }
+    }
+
+    /// How the server the tests started ended, if it has.
+    fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        match &mut self.run {
+            Run::Host(child) | Run::InRoot(child) => child.try_wait().unwrap(),
+            Run::Running => None,
+        }
+    }
+
     /// The display as the host's tools (and fwe's `DISPLAY`) name it.
     fn display(&self) -> String {
-        if self.in_root {
-            format!("127.0.0.1:{}", self.number)
-        } else {
-            format!(":{}", self.number)
+        match self.run {
+            Run::InRoot(_) => format!("127.0.0.1:{}", self.number),
+            Run::Host(_) | Run::Running => format!(":{}", self.number),
         }
     }
 }
 
-impl Drop for Xvfb {
+impl Drop for XServer {
     fn drop(&mut self) {
-        if self.in_root {
-            let pgid = self.child.id() as i32;
-            assert!(pgid > 1);
-            // SAFETY: signals to the process group this test made (its
-            // leader is the child), never pid 0, 1 or -1.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        } else {
-            let _ = self.child.kill();
+        match &mut self.run {
+            Run::InRoot(child) => {
+                let pgid = child.id() as i32;
+                assert!(pgid > 1);
+                // SAFETY: signals to the process group this test made (its
+                // leader is the child), never pid 0, 1 or -1.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                let _ = child.wait();
+            }
+            Run::Host(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Run::Running => {}
         }
-        let _ = self.child.wait();
     }
 }
 
@@ -10236,7 +10363,7 @@ impl Drop for Xvfb {
 #[test]
 fn display_x11_client_draws_through_shared_memory() {
     let prog = build_c("x11shm", Libc::Musl, true, true);
-    let Some(x) = Xvfb::start() else { return };
+    let Some(x) = XServer::start() else { return };
     let root = libc_rootfs(Libc::Musl, "x11shm");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg(&prog).env("DISPLAY", x.display());
@@ -10257,7 +10384,7 @@ fn display_x11_client_draws_through_shared_memory() {
 #[test]
 fn display_x11_client_draws_from_a_fork_child_in_the_vm() {
     let prog = build_c("x11shm", Libc::Musl, true, true);
-    let Some(x) = Xvfb::start() else { return };
+    let Some(x) = XServer::start() else { return };
     let root = libc_rootfs(Libc::Musl, "vm-x11shm");
     let Some(mut cmd) = hv_command() else { return };
     cmd.arg("--vm").arg("--root").arg(&root).arg(&prog).arg("fork").env("DISPLAY", x.display());
@@ -10276,11 +10403,11 @@ fn display_x11_client_draws_from_a_fork_child_in_the_vm() {
 /// X server: only where `FWE_DISPLAY_TESTS` is set (CI's `display` job,
 /// with Homebrew's Xvfb, xdotool and libX11: `XVFB`, `LIBX11`), never on a
 /// development machine.
-fn display_tests() -> Option<Xvfb> {
+fn display_tests() -> Option<XServer> {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
         return None;
     }
-    Some(Xvfb::start().expect("XVFB: the display tests need Xvfb"))
+    Some(XServer::start().expect("XVFB: the display tests need Xvfb"))
 }
 
 /// A root of its own for display test `test`, cloned from `cached` (a
@@ -10381,7 +10508,7 @@ fn display_dir() -> PathBuf {
 
 impl Gui {
     fn start(
-        x: &Xvfb,
+        x: &XServer,
         name: &str,
         root: &ScratchRoot,
         program: &str,
@@ -10394,7 +10521,7 @@ impl Gui {
     /// As [`Gui::start`], every system call traced if `calls`, else those
     /// that fail (with fwe's notes, for a failure's report).
     fn start_traced(
-        x: &Xvfb,
+        x: &XServer,
         name: &str,
         root: &ScratchRoot,
         program: &str,
@@ -10500,7 +10627,7 @@ struct Window {
     h: i32,
 }
 
-/// What a window shows ([`Xvfb::shot`], from `tools/display/shot.py`).
+/// What a window shows ([`XServer::shot`], from `tools/display/shot.py`).
 #[derive(Debug)]
 struct Shot {
     /// How many pixels it has: the window's on the screen.
@@ -10519,7 +10646,7 @@ impl Shot {
     }
 }
 
-impl Xvfb {
+impl XServer {
     /// Homebrew's xdotool on this server.
     fn xdotool(&self, args: &[&str]) -> Output {
         Command::new("xdotool").args(args).env("DISPLAY", self.display()).output_alone().unwrap()
@@ -10531,7 +10658,7 @@ impl Xvfb {
         self.window_sized(gui, search, None, secs)
     }
 
-    /// [`Xvfb::window`], of size `size` (width, height) if given.
+    /// [`XServer::window`], of size `size` (width, height) if given.
     fn window_sized(
         &self,
         gui: &mut Gui,
@@ -10596,13 +10723,18 @@ impl Xvfb {
     fn shot(&self, w: &Window, name: &str) -> Shot {
         let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
         let png = display_dir().join(format!("{name}.png"));
-        let (x, y, ww, hh) = (w.x.to_string(), w.y.to_string(), w.w.to_string(), w.h.to_string());
+        // Its place on the root window; on XQuartz, whose root shows none
+        // of its windows, the window itself.
+        let place = match self.run {
+            Run::Host(_) | Run::InRoot(_) => [w.x, w.y, w.w, w.h].map(|v| v.to_string()).to_vec(),
+            Run::Running => vec!["window".to_string(), w.id.clone()],
+        };
         let out = Command::new("python3")
             .arg(repo().join("tools/display/shot.py"))
             .arg(lib)
             .arg(self.display())
             .arg(&png)
-            .args([&x, &y, &ww, &hh])
+            .args(&place)
             .output_alone()
             .unwrap();
         assert!(out.status.success(), "shot.py: {}", String::from_utf8_lossy(&out.stderr));
@@ -10791,7 +10923,7 @@ fn alpine_display_glxgears_turns_by_software() {
         return;
     }
     let root = x11_root("glxgears");
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let env = [("LIBGL_ALWAYS_SOFTWARE", "1"), ("GALLIUM_DRIVER", "llvmpipe")];
     let command = format!("DISPLAY=:{} exec /usr/bin/glxgears -geometry 300x300+0+0", x.number);
     let mut gui = Gui::start(&x, "glxgears", &root, "/bin/sh", &["-c", &command], &env);
@@ -10821,7 +10953,7 @@ fn alpine_display_glxgears_turns_by_software() {
 /// `secs`): its standard output. Its calls are traced, and the Vulkan
 /// loader says what it finds (`VK_LOADER_DEBUG`), for a failure's report.
 fn display_output(
-    x: &Xvfb,
+    x: &XServer,
     name: &str,
     root: &ScratchRoot,
     args: &[&str],
@@ -10854,7 +10986,7 @@ const FWE_VULKAN: [(&str, &str); 1] =
 
 /// The Vulkan device a program finds is the Mac's GPU, through fwe's
 /// driver: `vulkaninfo` names it.
-fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
+fn assert_vulkan_on_the_gpu(x: &XServer, root: &ScratchRoot, test: &str) {
     let name = format!("{test}-vulkaninfo");
     let info =
         display_output(x, &name, root, &["/usr/bin/vulkaninfo", "--summary"], &FWE_VULKAN, 120);
@@ -10866,10 +10998,10 @@ fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
     display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &FWE_VULKAN, 120);
 }
 
-/// A program a threaded process's fork child starts in place (as Chromium
-/// starts its GPU process) finds the Mac's GPU through fwe's driver: the
-/// Mac's driver, whose Objective-C classes initialize as it starts, runs
-/// in a fork child of a process that had threads (guests/c/threadfork.c).
+/// A program a threaded process's fork child execs (as Chromium starts its
+/// GPU process) finds the Mac's GPU through fwe's driver
+/// (guests/c/threadfork.c): the Mac's driver, whose Objective-C classes
+/// initialize as it starts, runs in the fresh process the `execve` makes.
 #[test]
 fn alpine_display_a_threaded_programs_fork_child_execs_onto_the_gpu() {
     let Some(x) = display_tests() else { return };
@@ -10882,6 +11014,25 @@ fn alpine_display_a_threaded_programs_fork_child_execs_onto_the_gpu() {
         info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
     assert!(device.contains("Apple"), "the device is not the GPU:\n{info}");
     assert!(info.ends_with("child: exit 0\n"), "{info}");
+}
+
+/// A program a shell starts (its fork child's `execve`) compiles a shader
+/// Metal has never compiled (guests/c/vkcompile.c, its entry point named
+/// anew each run): Metal's shader compiler works only in a process exec'd
+/// since its fork, as the fresh process that `execve` makes is.
+#[test]
+fn alpine_display_a_shells_child_compiles_a_new_shader_on_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("vkcompile");
+    let prog = build_c_dynamic("vkcompile", Libc::Musl, true);
+    std::fs::copy(&prog, root.0.join("usr/bin/vkcompile")).unwrap();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let digits = format!("{:010}", nanos.as_nanos() % 10_000_000_000);
+    // Not the shell's last command, so the shell forks to run it.
+    let command = format!("/usr/bin/vkcompile {digits}; echo \"exit $?\"");
+    let args = ["/bin/sh", "-c", &command];
+    let out = display_output(&x, "vkcompile", &root, &args, &FWE_VULKAN, 120);
+    assert!(out.ends_with("compute pipeline: 0\nexit 0\n"), "{out}");
 }
 
 /// vkcube draws its cube with Vulkan on the Mac's GPU (fwe's driver, its
@@ -10947,7 +11098,7 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
 
     // On an X display: the loader asks fwe's driver for a surface of its
     // own of an X window, which the device presents to.
-    let x = Xvfb::start().expect("XVFB: the display tests need Xvfb");
+    let x = XServer::start().expect("XVFB: the display tests need Xvfb");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root")
         .arg(root)
@@ -10996,10 +11147,11 @@ fn alpine_display_vulkan_through_a_loader_in_the_global_scope() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// A fork child of a process using the GPU device: its copy of the
-/// parent's open and an open of its own fail (the Mac's driver in its
-/// memory is the parent's), an `execve` makes it a process with a device
-/// of its own, and the parent's open goes on working.
+/// A fork child has no GPU device until it is exec'd (macOS's libraries,
+/// Metal's shader compiler among them, work only in a process exec'd since
+/// its fork): its copy of its parent's open and an open of its own fail,
+/// whether or not the parent used the device; an `execve` makes it a
+/// process with a device of its own, and the parent's open goes on working.
 #[test]
 fn gpu_device_across_fork_and_exec() {
     let Some(driver) = mock_vulkan_driver() else { return };
@@ -11008,20 +11160,33 @@ fn gpu_device_across_fork_and_exec() {
     // Inside the root, where `/proc/self/exe` leads back to it.
     let inside = root.join("gpufork");
     std::fs::copy(&prog, &inside).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
-    let out = run_bounded(cmd);
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&inside).args(args).env("FWE_VULKAN_DRIVER", &driver);
+        run_bounded(cmd)
+    };
+    let used = run(&[]);
+    let fresh = run(&["fresh"]);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
-        stdout(&out),
+        stdout(&used),
         "parent: the driver works\n\
          child: inherited open ENODEV, own open ENODEV\n\
          exec'd child: its own open works\n\
          parent: child exit 0, its open works\n",
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&used.stderr)
     );
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(used.status.code(), Some(0));
+    assert_eq!(
+        stdout(&fresh),
+        "child: own open ENODEV\n\
+         exec'd child: its own open works\n\
+         parent: child exit 0\n",
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.status.code(), Some(0));
 }
 
 /// The tests' Mac Vulkan driver (`tests/fake_vulkan_driver.c`), which does
@@ -11104,7 +11269,7 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
         return;
     }
     let root = x11_root("glxgears-gpu");
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let mut env = FWE_VULKAN.to_vec();
     env.extend([
         ("MESA_LOADER_DRIVER_OVERRIDE", "zink"),
@@ -11230,7 +11395,7 @@ fn toolkits_root(test: &str) -> ScratchRoot {
 /// A program of a toolkit's that draws a 200×100 block of #3366cc and,
 /// when `q` is pressed, writes `/tmp/keyed` and ends: its window drawn,
 /// then the key taken.
-fn toolkit_draws_and_takes_a_key(x: &Xvfb, name: &str, root: &ScratchRoot, gui: Gui) {
+fn toolkit_draws_and_takes_a_key(x: &XServer, name: &str, root: &ScratchRoot, gui: Gui) {
     let mut gui = gui;
     let w = x.window(&mut gui, &["--name", "fwe-toolkit"], 180);
     std::thread::sleep(Duration::from_secs(1));
@@ -11300,7 +11465,7 @@ fn alpine_display_qt_draws_and_takes_a_key() {
 /// A GTK demo program (`gtk3-demo`, `gtk4-demo`): its window drawn, typing
 /// into it searching its list of demos (what it shows changes), and
 /// Ctrl+Q ending it.
-fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
+fn gtk_demo(x: &XServer, name: &str, env: &[(&str, &str)]) {
     let root = toolkits_root(name);
     let mut gui = Gui::start(x, name, &root, &format!("/usr/bin/{name}"), &[], env);
     let w = x.window(&mut gui, &["--class", name], 180);
@@ -11404,7 +11569,7 @@ fn as_nobody<'a>(program: &'a str, args: &[&'a str]) -> Vec<&'a str> {
 /// What a window showing the test page (magenta, with "fwe" in green, as
 /// `guests/apps/electron/index.html` has it) shows, checked: mostly the
 /// page's magenta, and the green of its text.
-fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
+fn shows_the_test_page(x: &XServer, w: &Window, name: &str, gui: &mut Gui) {
     let began = Instant::now();
     loop {
         let shot = x.shot(w, name);
@@ -11460,7 +11625,7 @@ fn alpine_display_chromium_draws_a_page_sandboxed() {
     let root = browsers_root("chromium-page");
     // The root's Xvfb, which has GLX: Chromium's GPU process falls back to
     // drawing in software through it.
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let args = su_nobody(&format!("{CHROMIUM} file:///tmp/fwe-pages/page.html"));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut gui = Gui::start(&x, "chromium-page", &root, "/bin/su", &args, &[]);
@@ -11473,7 +11638,7 @@ fn alpine_display_chromium_draws_a_page_sandboxed() {
 fn alpine_display_chromium_plays_a_video() {
     let Some(_x) = display_tests() else { return };
     let root = browsers_root("chromium-video");
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let args = su_nobody(&format!(
         "{CHROMIUM} --autoplay-policy=no-user-gesture-required file:///tmp/fwe-pages/video.html"
     ));
@@ -11513,7 +11678,7 @@ fn alpine_display_firefox_plays_a_video() {
 /// page says it plays (its title), and what the window shows changes from
 /// one look to the next (the bar crossing the video), the page's own
 /// magenta covering less than all of it.
-fn plays_the_test_video(x: &Xvfb, name: &str, gui: &mut Gui) {
+fn plays_the_test_video(x: &XServer, name: &str, gui: &mut Gui) {
     let w = x.window(gui, &["--name", "^fwe-video: playing"], 180);
     let mut seen = std::collections::BTreeSet::new();
     for n in 0..8 {
@@ -11561,7 +11726,7 @@ fn editable_file(dir: &Path) -> PathBuf {
 
 /// An editor showing `file` in window `w` (once it has drawn it) edits it:
 /// what is typed at its start, then saved (`ctrl+s`), is in the file.
-fn saves_what_is_typed(x: &Xvfb, w: &Window, gui: &mut Gui, file: &Path, name: &str) {
+fn saves_what_is_typed(x: &XServer, w: &Window, gui: &mut Gui, file: &Path, name: &str) {
     let before = x.drawn(w, &format!("{name}-before"), 50_000, 120);
     assert!(before.drawn > 50_000, "{name} drew {before:?}: {}", gui.report());
     x.settled(w, &format!("{name}-before"), 60);
