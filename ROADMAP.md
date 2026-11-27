@@ -169,7 +169,7 @@ hold 1.5×.
   run,** not one lookup per block.
 
 **Done when:** Chromium's page load holds 1.5× Chrome for Testing on
-macOS, its budget back from 2.5×.
+macOS, its budget back from 3×.
 
 ### M7 — Graphical programs and sandboxes
 

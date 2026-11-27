@@ -487,8 +487,8 @@ call there keeps its trap, and the pages holding its other sites run by
 translation, as a JIT's code does ([docs/jit.md](jit.md)); native code's
 calls into them fault once and are then linked. What that code calls runs
 by translation too, and each process takes the translations earlier runs
-kept as it first reaches them: in CI Chromium loads a page in 2.3 times
-the time Chrome for Testing takes on macOS; on a development Mac a page
+kept as it first reaches them: in CI Chromium loads a page in 2.3 to 2.6
+times the time Chrome for Testing takes on macOS; on a development Mac a page
 loaded again by the same renderer takes 1.9 times. `--strace` notes how
 much ("KiB of code beyond its stubs' reach"). For code mapped later, fwe
 reserves regions near the code, and code the guest let fwe place that
