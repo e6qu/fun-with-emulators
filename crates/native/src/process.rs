@@ -64,6 +64,34 @@ pub fn do_execveat(regs: &Regs) -> Result<Regs, i64> {
     exec_program(path, args, env)
 }
 
+/// Replace this process with a fresh fwe running `path` (a guest path, run
+/// by `run_by`), checked, given its arguments and environment ([`crate::reexec`]):
+/// in the VM if `vm`. Returns a negated errno if it cannot be.
+fn start_fresh(
+    k: &mut fwe_kernel::Kernel<NativePlatform>,
+    vm: bool,
+    path: &[u8],
+    run_by: &[u8],
+    args: &[Vec<u8>],
+    env: &[Vec<u8>],
+) -> i64 {
+    // A program only the VM can run, where there is none: the exec fails
+    // while the caller is intact (podman's pause process then waits in a
+    // loop of its own, say), rather than once it has gone.
+    if vm && !crate::hv::usable() {
+        return err(fwe_abi::errno::ENOEXEC);
+    }
+    fwe_kernel::release_robust_lists();
+    let state = k.exec_state();
+    crate::jitcount::write_seen();
+    crate::jit::keep_made();
+    let fs = k.fs.as_ref().expect("filesystem configured");
+    // Named as the new fwe will name it (a descriptor's file, by its name).
+    let exe = fs.exec_fd(path).map_or_else(|| path.to_vec(), |fd| fs.fd_target(fd));
+    let named = fwe_kernel::fs::exec_name(run_by, &exe);
+    crate::reexec(crate::Program { path, named: &named, args, env }, fs, k.tracer, &state, || {})
+}
+
 /// Replace the program with `path` (a guest path), given its arguments and
 /// environment. Returns the new program's registers, or a negated errno
 /// while the old program is still intact.
@@ -79,53 +107,52 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
     let run_by = path.clone();
     let (path, args) = k.exec_target(path, args).map_err(err)?;
     let fs = k.fs.as_ref().expect("filesystem configured");
-    let (file, file_id) = match k.take_exec_file(&path) {
+    // An exec from a host fork child (macOS's libraries work only in a
+    // process exec'd since its fork: Metal's shader compiler is out of a
+    // fork child's reach), from a process with other threads (which the
+    // exec ends), or from one with the Mac's Vulkan driver loaded (its
+    // threads and objects cannot be carried over) is run by a fresh fwe,
+    // which replaces this process; as is a program only the VM can run.
+    let fresh = FORK_CHILD.load(Ordering::SeqCst)
+        || LIVE_THREADS.load(Ordering::SeqCst) > 1
+        || fwe_kernel::vulkan::device::driver_in_memory();
+    // A program is checked here, whether it is loaded in place or by a
+    // fresh fwe: the old image is untouched on failure, so the guest can
+    // handle it.
+    // Open through the descriptor its checks were made on.
+    let program = match k.take_exec_file(&path) {
         Some(file) => file,
-        None => fs.read_identified(&path).map_err(err)?,
+        None => fs.program_file(&path).map_err(err)?,
     };
+    if fresh {
+        // The fresh fwe reads the program itself: its checks here read its
+        // first bytes, unless whether it runs here depends on the rest.
+        let (head, len) = program.head().map_err(err)?;
+        fwe_kernel::timing::mark("exec: head read");
+        let head = fwe_elf::Head::parse(&head, len).map_err(|_| err(fwe_abi::errno::ENOEXEC))?;
+        if crate::hv::vm_always() || !crate::loader::low(&head) {
+            let vm = crate::hv::vm_always();
+            if vm {
+                k.tracer.note("runs in the VM: every program runs in the VM (--vm)");
+            } else {
+                crate::check_head(&head, fs).map_err(err)?;
+            }
+            return Err(start_fresh(k, vm, &path, &run_by, &args, &env));
+        }
+    }
+    let (file, file_id) = (program.read_all().map_err(err)?, program.id());
+    drop(program);
     fwe_kernel::timing::mark("exec: read");
     let vm_reason = crate::vm_reason(&file);
     if let Some(why) = &vm_reason {
         k.tracer.note(&format!("runs in the VM: {why}"));
     }
     let vm = vm_reason.is_some();
-    // A program only the VM can run, where there is none: the exec fails
-    // while the caller is intact (podman's pause process then waits in a
-    // loop of its own, say), rather than once it has gone.
-    if vm && !crate::hv::usable() {
-        return Err(err(fwe_abi::errno::ENOEXEC));
-    }
-    // A native program is checked here, whether it is loaded in place or by
-    // a fresh fwe: the old image is untouched on failure, so the guest can
-    // handle it.
     if !vm {
         crate::check_image(&file, fs).map_err(err)?;
     }
-    // A program only the VM can run; an exec from a host fork child (macOS's
-    // libraries work only in a process exec'd since its fork: Metal's shader
-    // compiler is out of a fork child's reach), from a process with other
-    // threads (which the exec ends), or from one with the Mac's Vulkan
-    // driver loaded (its threads and objects cannot be carried over):
-    // replace this process with a fresh fwe.
-    if vm
-        || FORK_CHILD.load(Ordering::SeqCst)
-        || LIVE_THREADS.load(Ordering::SeqCst) > 1
-        || fwe_kernel::vulkan::device::driver_in_memory()
-    {
-        fwe_kernel::release_robust_lists();
-        let state = k.exec_state();
-        crate::jitcount::write_seen();
-        crate::jit::keep_made();
-        // Named as the new fwe will name it (a descriptor's file, by its name).
-        let exe = fs.exec_fd(&path).map_or_else(|| path.clone(), |fd| fs.fd_target(fd));
-        let named = fwe_kernel::fs::exec_name(&run_by, &exe);
-        return Err(crate::reexec(
-            crate::Program { path: &path, named: &named, args: &args, env: &env, file: &file },
-            fs,
-            strace,
-            &state,
-            || {},
-        ));
+    if vm || fresh {
+        return Err(start_fresh(k, vm, &path, &run_by, &args, &env));
     }
     fwe_kernel::timing::mark("exec: checked for re-exec");
     fwe_kernel::timing::mark("backend: native");

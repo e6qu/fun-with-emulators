@@ -909,13 +909,24 @@ pub fn read_at(fd: i32, off: u64, len: u64) -> Option<Result<Vec<u8>, i32>> {
 /// The whole of regular file `file`, read through a mount with `flags`:
 /// what fwe reads of it for itself (a program to run).
 pub fn read_file(file: File, flags: u64) -> Result<Vec<u8>, i32> {
+    read_file_at(file, flags, 0, u64::MAX)
+}
+
+/// Up to `len` bytes at `off` of regular file `file`, read through a
+/// mount with `flags` ([`read_file`]).
+pub fn read_file_at(file: File, flags: u64, off: u64, len: u64) -> Result<Vec<u8>, i32> {
     in_file(file, |file, t| {
-        let (object, n) = t.readable(file.ino, 0, u64::MAX)?;
+        let (object, n) = t.readable(file.ino, off, len)?;
         t.accessed(file.ino, flags)?;
         let mut out = vec![0u8; n as usize];
-        data::read(object, 0, &mut out)?;
+        data::read(object, off, &mut out)?;
         Ok(out)
     })
+}
+
+/// The size of file `file`.
+pub fn size(file: File) -> Result<u64, i32> {
+    in_file(file, |file, t| Ok(t.stat(file.ino)?.size))
 }
 
 /// Whether a description open for writing holds `file`, in a process that

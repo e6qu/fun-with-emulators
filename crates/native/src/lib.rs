@@ -553,9 +553,6 @@ pub(crate) struct Program<'a> {
     pub named: &'a [u8],
     pub args: &'a [Vec<u8>],
     pub env: &'a [Vec<u8>],
-    /// The program's file, as the caller read it (a big program's is read
-    /// once, not again here).
-    pub file: &'a [u8],
 }
 
 /// `execve` by re-executing fwe on the new program: the new process image is
@@ -568,9 +565,10 @@ pub(crate) struct Program<'a> {
 /// `--hv-standin`, `--hv-record` and fwe's private directory are passed
 /// on, and a program reached through a descriptor (a memfd, or
 /// `/proc/self/exe`) by descriptor (`--exe-fd`), with the name the guest's
-/// `execve` gives it (`--comm`). Other threads end, as on Linux. Returns a
-/// Linux errno only if the program cannot be run; on success it does not
-/// return.
+/// `execve` gives it (`--comm`). Other threads end, as on Linux. The
+/// caller has checked the program (what the fresh fwe reads of it, it
+/// reads itself). Returns a Linux errno only if the program cannot be run;
+/// on success it does not return.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reexec(
     program: Program<'_>,
@@ -581,13 +579,10 @@ pub(crate) fn reexec(
 ) -> i64 {
     use fwe_abi::{err, errno};
     use std::ffi::CString;
-    let Program { path, named, args, env, file } = program;
+    let Program { path, named, args, env } = program;
     // A `/proc` link names a program the new fwe would look for in itself.
     let target = fs.exec_target(path);
     let path = &target[..];
-    if Elf::parse(file).is_err() {
-        return err(errno::ENOEXEC);
-    }
     let Some(fwe) = FWE_EXE.get() else { return err(errno::ENOEXEC) };
     let mut argv: Vec<Vec<u8>> = vec![fwe.as_os_str().as_bytes().to_vec()];
     argv.extend(hv::passed_on());
@@ -678,6 +673,7 @@ pub(crate) fn reexec(
     // The Mac's Vulkan driver's descriptors, which it does not close on exec.
     fwe_kernel::vulkan::device::before_exec(held);
     fwe_kernel::host::hand_over_for_exec();
+    fwe_kernel::timing::mark("exec: host execve");
     // SAFETY: NUL-terminated argument and environment arrays of C strings
     // that live across the call.
     unsafe { libc::execve(pargs[0], pargs.as_ptr(), penv.as_ptr()) };
@@ -1170,12 +1166,26 @@ pub fn check_image(file: &[u8], fs: &fwe_kernel::Fs) -> Result<(), i32> {
     if loader::moved(&elf, page_size()).is_some_and(|m| m.is_err()) {
         return Err(errno::ENOEXEC);
     }
-    if let Some(ip) = elf.interpreter().map_err(|_| errno::ENOEXEC)? {
-        let idata = fs.read(ip)?;
-        let ielf = Elf::parse(&idata).map_err(|_| errno::ELIBBAD)?;
-        if !ielf.is_pie() {
-            return Err(errno::ELIBBAD);
-        }
+    check_interpreter(elf.interpreter().map_err(|_| errno::ENOEXEC)?, fs)
+}
+
+/// [`check_image`] of a program a fresh fwe runs, by its file's first
+/// bytes (`head`): one not linked into the low 4 GiB without being
+/// position-independent ([`loader::low`]), whose check needs the whole.
+pub fn check_head(head: &fwe_elf::Head<'_>, fs: &fwe_kernel::Fs) -> Result<(), i32> {
+    debug_assert!(!loader::low(head));
+    check_interpreter(head.interpreter(), fs)
+}
+
+/// That a program's dynamic linker `ip`, if it has one, exists and is
+/// position-independent, by its file's first bytes.
+fn check_interpreter(ip: Option<&[u8]>, fs: &fwe_kernel::Fs) -> Result<(), i32> {
+    use fwe_abi::errno;
+    let Some(ip) = ip else { return Ok(()) };
+    let (head, len) = fs.read_program_head(ip)?;
+    let ihead = fwe_elf::Head::parse(&head, len).map_err(|_| errno::ELIBBAD)?;
+    if !ihead.is_pie() {
+        return Err(errno::ELIBBAD);
     }
     Ok(())
 }

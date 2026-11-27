@@ -2191,29 +2191,48 @@ impl Fs {
         &self,
         path: &[u8],
     ) -> Result<(Vec<u8>, Option<crate::prepcache::FileId>), i32> {
+        let file = self.program_file(path)?;
+        Ok((file.read_all()?, file.id()))
+    }
+
+    /// [`ProgramFile::head`] of the program at guest path `path`.
+    pub fn read_program_head(&self, path: &[u8]) -> Result<(Vec<u8>, u64), i32> {
+        self.program_file(path)?.head()
+    }
+
+    /// The program at guest path `path`, open to be read, not from a mount
+    /// that runs nothing.
+    pub fn program_file(&self, path: &[u8]) -> Result<ProgramFile, i32> {
+        self.file_to_read(path, true)
+    }
+
+    /// The file at guest path `path`, open to be read: a `/proc` file fwe
+    /// makes, a descriptor's file, a file of fwe's store, or a host file.
+    /// To be `run` as a program, not from a mount that runs nothing.
+    fn file_to_read(&self, path: &[u8], run: bool) -> Result<ProgramFile, i32> {
         if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
             use crate::procfs::Entry;
             return match entry {
-                Entry::File(data) => Ok((data, None)),
+                Entry::File(data) => Ok(ProgramFile::Made(data)),
                 Entry::Fd { fd, .. } => {
                     // Through the descriptor: only a regular file is run.
                     if !regular_fd(fd) {
                         return Err(errno::EACCES);
                     }
-                    read_all(fd).map(|d| (d, crate::prepcache::FileId::of_fd(fd)))
+                    Ok(ProgramFile::Guest(fd))
                 }
-                Entry::Symlink(t) if t.starts_with(b"/") => self.read_identified(&t),
+                Entry::Symlink(t) if t.starts_with(b"/") => self.file_to_read(&t, run),
                 Entry::Dir => Err(errno::EISDIR),
                 _ => Err(errno::ENOENT),
             };
         }
         let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
         // Nothing is run from a mount that runs nothing.
-        if resolved.mount_flags & mounts::ms::NOEXEC != 0 {
+        if run && resolved.mount_flags & mounts::ms::NOEXEC != 0 {
             return Err(errno::EACCES);
         }
         if let Some(file) = resolved.store_file()? {
-            return crate::filestore::io::read_file(file, resolved.mount_flags).map(|d| (d, None));
+            return Ok(ProgramFile::Store(file, resolved.mount_flags));
         }
         let name = resolved.name_c()?;
         // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
@@ -2224,9 +2243,7 @@ impl Fs {
             return Err(e());
         }
         // SAFETY: `fd` is a fresh owned descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        let id = crate::prepcache::FileId::of_fd(fd.as_raw_fd());
-        Ok((read_all(fd.as_raw_fd())?, id))
+        Ok(ProgramFile::Host(unsafe { OwnedFd::from_raw_fd(fd) }))
     }
 
     /// `/proc/self/maps`, or with `smaps` `/proc/self/smaps`: the guest's
@@ -2238,43 +2255,9 @@ impl Fs {
 
     /// The first `len` bytes (or fewer, at its end) of the regular file
     /// `path` names, as [`Fs::read`] finds it (a descriptor's file for
-    /// `/dev/fd/N`).
+    /// `/dev/fd/N`), from a mount that runs programs or not.
     pub fn read_head(&self, path: &[u8], len: usize) -> Result<Vec<u8>, i32> {
-        if let Some(entry) = self.synthetic(fcntl::AT_FDCWD as i32, path) {
-            use crate::procfs::Entry;
-            return match entry {
-                Entry::File(mut data) => {
-                    data.truncate(len);
-                    Ok(data)
-                }
-                Entry::Fd { fd, .. } => {
-                    if !regular_fd(fd) {
-                        return Err(errno::EACCES);
-                    }
-                    pread_head(fd, len)
-                }
-                Entry::Symlink(t) if t.starts_with(b"/") => self.read_head(&t, len),
-                Entry::Dir => Err(errno::EISDIR),
-                _ => Err(errno::ENOENT),
-            };
-        }
-        let resolved = self.resolve(fcntl::AT_FDCWD as i32, path, true)?;
-        if let Some(file) = resolved.store_file()? {
-            let mut data = crate::filestore::io::read_file(file, resolved.mount_flags)?;
-            data.truncate(len);
-            return Ok(data);
-        }
-        let name = resolved.name_c()?;
-        // SAFETY: `name` is NUL-terminated; `dir` is a live directory fd.
-        let fd = unsafe {
-            libc::openat(resolved.dir.as_raw_fd(), name.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC)
-        };
-        if fd < 0 {
-            return Err(e());
-        }
-        // SAFETY: `fd` is a fresh owned descriptor.
-        let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-        pread_head(fd.as_raw_fd(), len)
+        self.file_to_read(path, false)?.read_at(0, len as u64)
     }
 
     /// The device and inode numbers of the file `path` names, following
@@ -4570,30 +4553,6 @@ fn regular_fd(fd: i32) -> bool {
         .is_ok_and(|st| st.st_mode & fwe_abi::stat::S_IFMT == fwe_abi::stat::S_IFREG)
 }
 
-/// The first `len` bytes of the file open as `fd` (fewer at its end), read
-/// from its start without moving its offset.
-fn pread_head(fd: i32, len: usize) -> Result<Vec<u8>, i32> {
-    if let Some(r) = crate::filestore::io::read_at(fd, 0, len as u64) {
-        return r;
-    }
-    let mut out = vec![0u8; len];
-    let mut at = 0;
-    while at < len {
-        // SAFETY: reading into the rest of `out`.
-        let n =
-            unsafe { libc::pread(fd, out[at..].as_mut_ptr().cast(), len - at, at as libc::off_t) };
-        if n < 0 {
-            return Err(e());
-        }
-        if n == 0 {
-            break;
-        }
-        at += n as usize;
-    }
-    out.truncate(at);
-    Ok(out)
-}
-
 /// The host file of the standard device node `fd` is open on, if it is
 /// one of them ([`DEVICES`]): what a bind mount or a clone of it shows.
 /// Whether descriptor `fd` is one of fwe's objects that a host file stands
@@ -4635,9 +4594,140 @@ pub fn read_all_path(path: &[u8]) -> Result<Vec<u8>, i32> {
     read_all(fd.as_raw_fd())
 }
 
-/// The whole of the file open on `fd`, into memory sized for it at once (a
-/// program's bytes, grown as they were read, were copied at every
-/// doubling).
+/// A file fwe reads for itself (a program to run), open to be read
+/// ([`Fs::program_file`]).
+pub enum ProgramFile {
+    /// One of fwe's own, made in memory (a `/proc` file).
+    Made(Vec<u8>),
+    /// The file of a guest's descriptor (a `/dev/fd` name), not owned here.
+    Guest(i32),
+    /// A file of fwe's store, through a mount with these flags.
+    Store(crate::filestore::desc::File, u64),
+    /// A host file, opened here.
+    Host(OwnedFd),
+}
+
+impl ProgramFile {
+    /// Its descriptor, for a descriptor's or a host file.
+    fn fd(&self) -> Option<i32> {
+        match self {
+            ProgramFile::Guest(fd) => Some(*fd),
+            ProgramFile::Host(fd) => Some(fd.as_raw_fd()),
+            ProgramFile::Made(_) | ProgramFile::Store(..) => None,
+        }
+    }
+
+    /// Its identity, for what is kept of it ([`crate::prepcache`]): `None`
+    /// for one of fwe's own.
+    pub fn id(&self) -> Option<crate::prepcache::FileId> {
+        self.fd().and_then(crate::prepcache::FileId::of_fd)
+    }
+
+    /// Its size.
+    fn size(&self) -> Result<u64, i32> {
+        match self {
+            ProgramFile::Made(data) => Ok(data.len() as u64),
+            ProgramFile::Store(file, _) => crate::filestore::io::size(*file),
+            _ => {
+                let fd = self.fd().expect("a descriptor's file");
+                if let Some(st) = crate::filestore::io::stat(fd) {
+                    return st.map(|st| st.st_size as u64);
+                }
+                // SAFETY: zeroed bytes are a valid `stat`; `fstat` fills it.
+                let mut st: libc::stat = unsafe { std::mem::zeroed() };
+                // SAFETY: a valid out-parameter.
+                if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                    return Err(e());
+                }
+                Ok(st.st_size.max(0) as u64)
+            }
+        }
+    }
+
+    /// Up to `len` bytes at `off` (fewer at the file's end).
+    pub fn read_at(&self, off: u64, len: u64) -> Result<Vec<u8>, i32> {
+        match self {
+            ProgramFile::Made(data) => {
+                let from = (off as usize).min(data.len());
+                Ok(data[from..from + (len as usize).min(data.len() - from)].to_vec())
+            }
+            ProgramFile::Store(file, flags) => {
+                crate::filestore::io::read_file_at(*file, *flags, off, len)
+            }
+            _ => {
+                let fd = self.fd().expect("a descriptor's file");
+                if let Some(r) = crate::filestore::io::read_at(fd, off, len) {
+                    return r;
+                }
+                pread_upto(fd, off, len, len.min(1 << 16) as usize)
+            }
+        }
+    }
+
+    /// The whole file.
+    pub fn read_all(&self) -> Result<Vec<u8>, i32> {
+        match self {
+            ProgramFile::Made(data) => Ok(data.clone()),
+            ProgramFile::Store(file, flags) => crate::filestore::io::read_file(*file, *flags),
+            _ => read_all(self.fd().expect("a descriptor's file")),
+        }
+    }
+
+    /// Its first bytes, as many as the checks of a program before it runs
+    /// read ([`fwe_elf::head_len`]), and its length: what is read of a
+    /// program a fresh fwe reads itself.
+    pub fn head(&self) -> Result<(Vec<u8>, u64), i32> {
+        let len = self.size()?;
+        // The ELF header and, in every linker's layout, the program headers
+        // and the dynamic linker's path.
+        let mut head = self.read_at(0, len.min(4096))?;
+        loop {
+            let want = fwe_elf::head_len(&head).min(len);
+            let have = head.len() as u64;
+            if want <= have {
+                return Ok((head, len));
+            }
+            let more = self.read_at(have, want - have)?;
+            // (A file cut short as it is read: what was read is checked.)
+            if more.is_empty() {
+                return Ok((head, len));
+            }
+            head.extend_from_slice(&more);
+        }
+    }
+}
+
+/// Up to `len` bytes at `off` of host file `fd` (fewer at its end), read
+/// straight into memory first sized for `expect` bytes.
+fn pread_upto(fd: i32, off: u64, len: u64, expect: usize) -> Result<Vec<u8>, i32> {
+    let mut data: Vec<u8> = Vec::with_capacity(expect);
+    loop {
+        let left = len - data.len() as u64;
+        if left == 0 {
+            return Ok(data);
+        }
+        if data.len() == data.capacity() {
+            data.reserve(left.min(1 << 16) as usize);
+        }
+        let room = data.spare_capacity_mut();
+        let n = room.len().min(left as usize);
+        // SAFETY: `n` bytes of the vector's allocation past its length.
+        let r = unsafe {
+            libc::pread(fd, room.as_mut_ptr().cast(), n, (off + data.len() as u64) as libc::off_t)
+        };
+        if r < 0 {
+            return Err(e());
+        }
+        if r == 0 {
+            return Ok(data);
+        }
+        // SAFETY: `pread` wrote the `r` bytes past the length.
+        unsafe { data.set_len(data.len() + r as usize) };
+    }
+}
+
+/// The whole of the file open on `fd`, read straight into memory sized
+/// for it at once.
 fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
     if let Some(r) = crate::filestore::io::read_at(fd, 0, u64::MAX) {
         return r;
@@ -4647,21 +4737,9 @@ fn read_all(fd: i32) -> Result<Vec<u8>, i32> {
     // SAFETY: a valid out-parameter.
     let size =
         if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_size.max(0) as usize } else { 0 };
-    let mut data = Vec::with_capacity(size);
-    let mut chunk = [0u8; 65536];
-    loop {
-        // SAFETY: reading into a valid local buffer.
-        let n = unsafe {
-            libc::pread(fd, chunk.as_mut_ptr().cast(), chunk.len(), data.len() as libc::off_t)
-        };
-        if n < 0 {
-            return Err(e());
-        }
-        if n == 0 {
-            return Ok(data);
-        }
-        data.extend_from_slice(&chunk[..n as usize]);
-    }
+    // (A byte more: the read that finds the end needs room, and growing
+    // the memory then would copy all of it.)
+    pread_upto(fd, 0, u64::MAX, size + 1)
 }
 
 /// fwe's private directory on the host (`fwe-<uid>` in the user's
@@ -5053,6 +5131,52 @@ mod tests {
             fs.synthetic(fcntl::AT_FDCWD as i32, b"/dev/fd/1"),
             Some(crate::procfs::Entry::Fd { fd: 1, .. })
         ));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A program's first bytes are read as far as the checks of its
+    /// `execve` read, from a host file and through a descriptor; its whole
+    /// is read as before.
+    #[test]
+    fn a_program_is_read_as_far_as_its_checks_need() {
+        let root = std::env::temp_dir().join(format!("fwe-fs-head-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        // An ELF image whose dynamic linker's path lies past the 4 KiB read
+        // first: a loadable segment of the whole file, then `PT_INTERP`.
+        let interp = b"/lib/ld-musl-aarch64.so.1\0";
+        let mut file = vec![0u8; 0x6000];
+        file[..7].copy_from_slice(b"\x7fELF\x02\x01\x01");
+        file[16..18].copy_from_slice(&fwe_elf::ET_DYN.to_le_bytes());
+        file[18..20].copy_from_slice(&fwe_elf::EM_AARCH64.to_le_bytes());
+        file[32..40].copy_from_slice(&64u64.to_le_bytes());
+        file[54..56].copy_from_slice(&56u16.to_le_bytes());
+        file[56..58].copy_from_slice(&2u16.to_le_bytes());
+        let phdr = |at: usize, kind: u32, offset: u64, size: u64, file: &mut Vec<u8>| {
+            file[at..at + 4].copy_from_slice(&kind.to_le_bytes());
+            file[at + 8..at + 16].copy_from_slice(&offset.to_le_bytes());
+            file[at + 16..at + 24].copy_from_slice(&offset.to_le_bytes());
+            file[at + 32..at + 40].copy_from_slice(&size.to_le_bytes());
+            file[at + 40..at + 48].copy_from_slice(&size.to_le_bytes());
+        };
+        phdr(64, fwe_elf::PT_LOAD, 0, 0x6000, &mut file);
+        phdr(120, fwe_elf::PT_INTERP, 0x5000, interp.len() as u64, &mut file);
+        file[0x5000..0x5000 + interp.len()].copy_from_slice(interp);
+        std::fs::write(root.join("bin/prog"), &file).unwrap();
+        let fs = Fs::new(Some(root.to_str().unwrap().as_bytes())).unwrap();
+        let want = (file[..0x5000 + interp.len()].to_vec(), file.len() as u64);
+        let read = fs.read_program_head(b"/bin/prog").unwrap();
+        assert_eq!(read, want);
+        let head = fwe_elf::Head::parse(&read.0, read.1).unwrap();
+        assert_eq!(head.interpreter(), Some(&interp[..interp.len() - 1]));
+        assert_eq!(fs.read(b"/bin/prog").unwrap(), file);
+        assert_eq!(fs.read_head(b"/bin/prog", 16).unwrap(), &file[..16]);
+        // Through a descriptor of the test's own.
+        let prog = std::fs::File::open(root.join("bin/prog")).unwrap();
+        let by_fd = format!("/dev/fd/{}", prog.as_raw_fd());
+        assert_eq!(fs.read_program_head(by_fd.as_bytes()).unwrap(), want);
+        assert_eq!(fs.read(by_fd.as_bytes()).unwrap(), file);
+        drop(prog);
         let _ = std::fs::remove_dir_all(&root);
     }
 
