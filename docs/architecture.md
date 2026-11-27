@@ -1508,7 +1508,11 @@ How a Linux program's display and GPU map onto the Mac's is in
 `crates/kernel/src/x11.rs`: a guest `connect` to the host's display
 (`net::root_unix_path`) reaches the server's socket. On such a connection
 fwe follows the client's bytes as it writes them: the setup (its
-authorization), then each request's header and length. A `ShmAttach`
+authorization), then each request's header and length. A write finds its
+connection by the socket's number in fwe's table of sockets
+(`sockstate::Followed`), with no question to the host, and the following
+ends with the socket's last descriptor; a process with no connection
+followed pays one load per write. A `ShmAttach`
 names a System V segment, which the server would look up among the
 host's; fwe's are files of its own, so it is sent as `ShmAttachFd` with
 the segment's file, which the server maps as the guest has it. Whether
@@ -1636,8 +1640,9 @@ Unix socket; fwe passes it, and `PULSE_COOKIE`, on to the fwe an
 makes in the user's home (`.config/pulse/HOST-runtime/native`), found
 when a guest first names it. A guest `connect` to the system server's
 socket (`/run/pulse/native`, `/var/run/pulse/native`) reaches it
-(`net::root_unix_path`), and the connection is noted by its socket's
-inode (`pulse::connected`). Its first packet, the client's `AUTH`, goes
+(`net::root_unix_path`), and the connection is followed
+(`pulse::connected`, `sockstate::Followed`) until its first packet has
+gone. Its first packet, the client's `AUTH`, goes
 changed as it is written (`pulse::write`, before `x11::write` in
 `write`, `writev`, `sendto` and `sendmsg`): the Mac user's cookie (from
 `PULSE_COOKIE`, else `.config/pulse/cookie` in the home) in the guest's

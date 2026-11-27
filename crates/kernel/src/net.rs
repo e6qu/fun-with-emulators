@@ -1927,12 +1927,17 @@ fn take_corked(fd: i32) -> Option<Held> {
 }
 
 /// Socket `fd` was closed: what it held back goes out, as Linux sends it;
-/// with its last descriptor, the groups it joined are left (its state in
-/// [`crate::sockstate`] goes).
+/// with its last descriptor, the groups it joined are left, and its state
+/// in [`crate::sockstate`] and fwe's following of its bytes
+/// ([`crate::x11`], [`crate::pulse`]) go.
 pub fn closed(fd: i32) {
     let last = crate::sockstate::closed(fd);
+    if let Some((n, _)) = last {
+        crate::x11::gone(n);
+        crate::pulse::gone(n);
+    }
     #[cfg(not(target_os = "linux"))]
-    if last.is_some_and(|s| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
+    if last.is_some_and(|(_, s)| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
         for a in askers(fd) {
             crate::scm::released(a.asker());
         }

@@ -6,7 +6,10 @@ Grabs the root window of `display` (a 24- or 32-bit TrueColor screen, as
 Xvfb's is) through libX11 (`libX11`, the host's), or the rectangle of it
 given, as much of it as is on the screen (a window can reach past it),
 or with `window`, window `id` itself (XQuartz's root shows none of its
-windows: each keeps its own pixels), and writes it to `out.png`. Prints its size and how many of its
+windows: each keeps its own pixels), as much of it as is on the screen
+(X gives no pixels of a window's part beyond it), and writes it to
+`out.png`. An X error ends it with the screen's and the window's
+geometry. Prints its size and how many of its
 pixels are not its most common colour (what was drawn on the
 background); then `colour <rrggbb> <n>` for each colour of the whole
 image, most common first (the first 32), and `digest <hex>`, a hash of
@@ -41,14 +44,38 @@ def grab(lib, display, rect=None, window=None):
     x.XGetImage.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
                             ctypes.c_uint, ctypes.c_uint, ctypes.c_ulong, ctypes.c_int]
     x.XDisplayWidth.argtypes = x.XDisplayHeight.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x.XTranslateCoordinates.argtypes = [
+        ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong, ctypes.c_int, ctypes.c_int,
+        ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_ulong)]
+    x.XSync.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    # An X error is kept, not Xlib's exit: the image is then absent.
+    errors = []
+
+    @ctypes.CFUNCTYPE(ctypes.c_int, ctypes.c_void_p, ctypes.POINTER(XErrorEvent))
+    def on_error(_display, event):
+        e = event.contents
+        errors.append(f"X error {e.error_code} of request {e.request_code}")
+        return 0
+    x.XSetErrorHandler(on_error)
     d = x.XOpenDisplay(display.encode())
     if not d:
         sys.exit(f"cannot open display {display}")
     sw, sh = x.XDisplayWidth(d, 0), x.XDisplayHeight(d, 0)
     left, top, w, h = 0, 0, sw, sh
-    drawable = x.XDefaultRootWindow(d)
+    drawable = root = x.XDefaultRootWindow(d)
+    where = f"the {sw}x{sh} screen"
     if window is not None:
-        drawable, (w, h) = window, rect[2:]
+        # The window's place on the screen, and its part there.
+        rx, ry, child = ctypes.c_int(), ctypes.c_int(), ctypes.c_ulong()
+        x.XTranslateCoordinates(d, window, root, 0, 0, ctypes.byref(rx), ctypes.byref(ry),
+                                ctypes.byref(child))
+        ww, wh = rect[2:]
+        drawable, rx, ry = window, rx.value, ry.value
+        left, top = max(0, -rx), max(0, -ry)
+        w, h = min(ww, sw - rx) - left, min(wh, sh - ry) - top
+        where = f"window {window:#x}, {ww}x{wh} at {rx},{ry} of the {sw}x{sh} screen"
+        if w <= 0 or h <= 0:
+            sys.exit(f"{where}: none of it is on the screen")
     elif rect:
         x0, y0, rw, rh = rect
         left, top = max(0, x0), max(0, y0)
@@ -56,8 +83,9 @@ def grab(lib, display, rect=None, window=None):
         if w <= 0 or h <= 0:
             sys.exit(f"{rw}x{rh} at {x0},{y0} is off the {sw}x{sh} screen")
     got = x.XGetImage(d, drawable, left, top, w, h, 0xFFFFFFFF, 2)
-    if not got:
-        sys.exit(f"no image of {w}x{h} at {left},{top} of {drawable:#x}")
+    x.XSync(d, 0)
+    if not got or errors:
+        sys.exit(f"no image of {w}x{h} at {left},{top} of {where}: {errors}")
     img = got.contents
     if img.bits_per_pixel != 32:
         sys.exit(f"{img.bits_per_pixel} bits a pixel: only 32 are read")
@@ -70,6 +98,13 @@ def grab(lib, display, rect=None, window=None):
         rgb[0::3], rgb[1::3], rgb[2::3] = line[2::4], line[1::4], line[0::4]
         rows.append(bytes(rgb))
     return w, h, rows
+
+
+class XErrorEvent(ctypes.Structure):
+    _fields_ = [("type", ctypes.c_int), ("display", ctypes.c_void_p),
+                ("resourceid", ctypes.c_ulong), ("serial", ctypes.c_ulong),
+                ("error_code", ctypes.c_ubyte), ("request_code", ctypes.c_ubyte),
+                ("minor_code", ctypes.c_ubyte)]
 
 
 class XWindowAttributes(ctypes.Structure):
