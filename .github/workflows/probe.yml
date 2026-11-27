@@ -1,35 +1,34 @@
-name: probe-media
+name: probe-openttd
 on:
   push:
     branches: [probe-media]
 jobs:
-  media:
+  openttd:
     runs-on: macos-26
-    timeout-minutes: 60
+    timeout-minutes: 150
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - uses: actions/cache@v4
-        with:
-          path: target/fetched-packages
-          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: brew install pulseaudio
-      - run: cargo test -p fwe --test guests --no-run
-      - name: The sound clients, three times, whole
-        env:
-          FWE_SOUND_TESTS: "1"
+      - run: brew install --cask xquartz
+      - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Utilities/XQuartz.app
+      - run: brew install xdotool unicorn molten-vk pulseaudio
+      - name: OpenTTD's example, watched
         run: |
+          /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
+          for i in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
+          mkdir -p screens
+          ( for k in $(seq 100); do screencapture -x screens/screen-$k.png 2>> screens/err.txt; DISPLAY=:4 /opt/X11/bin/xwininfo -root -tree > screens/tree-$k.txt 2>&1; sleep 60; done ) &
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
           export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
-          for i in 1 2 3; do
-            echo "=== run $i"
-            cargo test -q -p fwe --test guests -- --exact sound_clients_play_on_the_macs_pulseaudio_server --nocapture > run-$i.txt 2>&1 || true
-            cp target/tmp/display/pulse-clients.err pulse-$i.err || true
-            grep -a -E "frames of sound|test result" run-$i.txt | sed -E 's/\["\/bin\/sh".*exit \$r"\]/[pw-play]/' | cut -c1-300
-          done
+          cargo test -p fwe --test guests -- --exact readme_examples --nocapture 2>&1 | grep -a -E "PROBE|panicked|test result|failed" | cut -c1-400
+        env:
+          FWE_README_DISPLAY: ":4"
+          FWE_README_VM: "1"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: media
+          name: openttd
           path: |
-            run-*.txt
-            pulse-*.err
+            target/tmp/display
+            screens
+            xquartz.log
