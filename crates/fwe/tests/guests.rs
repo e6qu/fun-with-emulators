@@ -6350,6 +6350,12 @@ fn exec_replaces_the_address_space() {
     assert_eq!(signals("vfork-exec"), "hello from the spawned child\nexited 0\n");
     // Threads that vfork at once: none waits for another's child.
     assert_eq!(signals("vfork-concurrent"), "each vfork returned once its child exec'd: true\n");
+    // A vfork child that forks and exits: the grandchild holds nothing
+    // the vfork waits on.
+    assert_eq!(
+        signals("vfork-fork-exit"),
+        "vfork child exited: exited 0\nthe vfork returned at its child's exit: true\n"
+    );
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
 

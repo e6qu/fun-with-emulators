@@ -1201,8 +1201,10 @@ are the child's own.
 
 **vfork** (`CLONE_VM | CLONE_VFORK`, used by `posix_spawn`, `vfork`, Go's
 `os/exec`): the same host fork with the guest's private memory inherited
-by sharing. The parent waits on a close-on-exec pipe only the child holds,
-so it resumes when the child execs or exits and sees what the child wrote.
+by sharing. The parent waits on a pipe only the child holds (its `execve`
+closes it, and a child it forks does not keep it), so it resumes when the
+child execs or exits, whatever the child started, and sees what the child
+wrote.
 fwe's own memory is not shared, so the child's `mmap` and `munmap` stay
 its own. Natively, `CLONE_VM` without `CLONE_VFORK` is the same fork
 without the wait; the VM backend refuses it (`ENOSYS`), since the same

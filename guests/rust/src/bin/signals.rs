@@ -902,6 +902,30 @@ fn main() {
             let slowest = threads.into_iter().map(|t| t.join().unwrap()).max().unwrap();
             println!("each vfork returned once its child exec'd: {}", slowest.as_millis() < 1500);
         }
+        // A vfork child that forks a child of its own and exits, as
+        // busybox's `timeout` starts its watcher: the vfork returns at the
+        // vfork child's exit, while the grandchild goes on.
+        "vfork-fork-exit" => {
+            unsafe extern "C" {
+                fn vfork() -> i32;
+            }
+            let start = std::time::Instant::now();
+            // SAFETY: the child only forks and exits.
+            let pid = unsafe { vfork() };
+            if pid == 0 {
+                // SAFETY: the grandchild only sleeps and exits.
+                unsafe {
+                    if fork() == 0 {
+                        std::thread::sleep(std::time::Duration::from_secs(3));
+                        _exit(0)
+                    }
+                    _exit(0)
+                }
+            }
+            let took = start.elapsed();
+            println!("vfork child exited: {}", describe(wait_status(pid)));
+            println!("the vfork returned at its child's exit: {}", took.as_millis() < 1500);
+        }
         "linger" => std::thread::sleep(std::time::Duration::from_millis(2000)),
         "spawned" => println!("hello from the spawned child"),
         // Code written into writable and executable memory, as a JIT

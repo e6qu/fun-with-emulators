@@ -416,6 +416,15 @@ pub fn do_fork(parent: &Regs, a: fwe_kernel::CloneArgs, share: bool, wait: bool)
         // blocked mask and alternate stack carry over; pending signals do
         // not.
         trap::ensure_thread_altstack();
+        // The write end of this process's own vfork parent's pipe, if it is
+        // a vfork child, is not the new child's: its parent waits for this
+        // process's exec or exit, not for the child's (busybox's `timeout`
+        // forks a watcher from its vfork child, which then exits).
+        let inherited = VFORK_DONE.load(Ordering::SeqCst);
+        if inherited >= 0 {
+            // SAFETY: fwe's own descriptor, the copy the fork gave this child.
+            unsafe { libc::close(inherited) };
+        }
         if wait {
             // SAFETY: closing the read end the parent uses.
             unsafe { libc::close(done[0]) };
