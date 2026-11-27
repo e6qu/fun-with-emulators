@@ -181,9 +181,12 @@ hold 1.5×.
   the code beyond reach and what it calls costs as native code does.
 - [ ] **Kept translations brought in at the cost of a native page's first
   run,** not one lookup per block.
+- [ ] **A video frame's cost found:** where fwe's 1.4-1.8 ms per decoded
+  and drawn frame goes against macOS's 0.56-1.27 ms (translated code,
+  the media thread's hand-offs to the main thread), counted, and cut.
 
-**Done when:** Chromium's page load holds 1.5× Chrome for Testing on
-macOS, its budget back from 3×.
+**Done when:** Chromium's page load and video frame each hold 1.5× Chrome
+for Testing on macOS, their budgets back from 3×.
 
 #### PR 9 — Steady benchmarks
 
