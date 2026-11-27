@@ -1110,8 +1110,8 @@ def run_limited(cmd, name, env=None):
     environment `env`, or this one's), for at most LIMIT seconds. Past
     them, each of its processes is sampled
     (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
-    on top of its threads' stacks printed), they are ended, and the
-    benchmarks fail. Its processes are its descendants and, for a run under
+    on top of its threads' stacks printed), the host's Unix sockets are
+    listed ([`hung_sockets`]), they are ended, and the benchmarks fail. Its processes are its descendants and, for a run under
     fwe, every process of fwe's on its root: a daemon a guest started (a
     database's server) has left the session and its parent."""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1132,6 +1132,7 @@ def run_limited(cmd, name, env=None):
             top = text.split("Sort by top of stack", 1)[-1].split("\n\n", 1)[0].splitlines()[1:25]
             print(f"{name}: process {pid} after {LIMIT} s, on top of its stacks:\n"
                   + "\n".join(top), file=sys.stderr)
+        hung_sockets(slug, name, pids)
         os.killpg(p.pid, signal.SIGKILL)
         for pid in pids:
             try:
@@ -1142,6 +1143,30 @@ def run_limited(cmd, name, env=None):
         sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
                  f"{err[-3000:]}")
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def hung_sockets(slug, name, pids):
+    """Every Unix socket of the host's processes (`lsof -U`, kept as
+    `bench-<slug>-hung.sockets`, uploaded with the results), and for each
+    of `pids`' sockets with a peer, which processes hold that peer: a
+    process that waits on its socket for the end of a peer that has gone
+    waits for whoever holds the peer still."""
+    r = subprocess.run(["lsof", "-U", "-n", "-P"], capture_output=True, text=True,
+                       errors="replace")
+    with open(os.path.abspath(f"bench-{slug}-hung.sockets"), "w") as f:
+        f.write(r.stdout)
+    rows = [l.split() for l in r.stdout.splitlines()[1:]]
+    # COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME: DEVICE is the
+    # socket, NAME `->0x...` its peer.
+    holders = collections.defaultdict(set)
+    for row in rows:
+        if len(row) >= 6:
+            holders[row[5]].add(f"{row[0]} {row[1]} fd {row[3]}")
+    for row in rows:
+        if len(row) >= 9 and row[1].isdigit() and int(row[1]) in pids and row[-1].startswith("->"):
+            peer = row[-1][2:]
+            print(f"{name}: process {row[1]} fd {row[3]} (socket {row[5]}): its peer {peer} "
+                  f"held by {sorted(holders.get(peer, [])) or 'no process'}", file=sys.stderr)
 
 
 def processes_of(p, root=None):

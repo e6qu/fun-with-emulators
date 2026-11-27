@@ -441,6 +441,7 @@ jobs:
           path: |
             macos.json
             bench-*.sample
+            bench-*.sockets
             bench-*.vmmap
             bench-*.pcs
             bench-*.trace
