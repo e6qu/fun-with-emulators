@@ -20,8 +20,6 @@ struct Spawn {
     clear_child_tid: u64,
     /// The creating thread's blocked mask, which the new thread inherits.
     sigmask: u64,
-    /// The creating thread's name (`PR_SET_NAME`), which it inherits.
-    name: Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]>,
     /// The creating thread's floating-point control and status registers,
     /// as Linux copies them.
     fp: (u64, u64),
@@ -73,7 +71,6 @@ pub fn do_clone(parent: &Regs, a: fwe_kernel::CloneArgs) -> i64 {
         tls: if flags & cl::CLONE_SETTLS != 0 { tls } else { thread_pointer() },
         clear_child_tid: if flags & cl::CLONE_CHILD_CLEARTID != 0 { child_tid } else { 0 },
         sigmask: thread::mask(),
-        name: thread::name(),
         fp: fp_controls(),
         pending: thread::register(new),
     });
@@ -157,9 +154,6 @@ pub(crate) fn wait_for_next() {
 /// Become the guest thread `spawn` describes.
 fn run(spawn: Box<Spawn>) -> ! {
     thread::set_tid(spawn.tid);
-    if let Some(name) = spawn.name {
-        thread::set_name(name);
-    }
     let (fpcr, fpsr) = spawn.fp;
     // SAFETY: the guest's floating-point controls, which fwe's own code
     // runs under too (the system-call gate leaves them as they are).

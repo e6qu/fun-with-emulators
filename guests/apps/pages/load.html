@@ -1,0 +1,36 @@
+<!doctype html>
+<html>
+  <!-- The benchmarks' page load: a page whose script makes a table of 4000
+       styled rows, laid out and painted. It logs the time from the
+       navigation's start to the first frame drawn after the load event:
+       "fwe-bench load <ms>". -->
+  <head>
+    <meta charset="utf-8">
+    <title>fwe-load</title>
+    <style>
+      body { font: 13px sans-serif; margin: 0; background: #ff00ff; }
+      td { padding: 2px 6px; border-bottom: 1px solid #ccc; }
+      tr:nth-child(odd) td { background: #f4f4f4; }
+      .n { text-align: right; font-variant-numeric: tabular-nums; }
+    </style>
+  </head>
+  <body>
+    <table id="t"></table>
+    <script>
+      const t = document.getElementById("t");
+      const rows = [];
+      for (let i = 0; i < 4000; i++) {
+        let h = 0;
+        for (let k = 0; k < 64; k++) h = (h * 31 + i * k) | 0;
+        rows.push(`<tr><td class="n">${i}</td><td>row ${i}</td><td class="n">${h}</td>` +
+                  `<td>${(h >>> 0).toString(16)}</td></tr>`);
+      }
+      t.innerHTML = rows.join("");
+      addEventListener("load", () => {
+        requestAnimationFrame(() => requestAnimationFrame(() => {
+          console.log("fwe-bench load " + performance.now().toFixed(1));
+        }));
+      });
+    </script>
+  </body>
+</html>

@@ -194,8 +194,11 @@ pub mod mman {
     pub const PROT_READ: u64 = 1;
     pub const PROT_WRITE: u64 = 2;
     pub const PROT_EXEC: u64 = 4;
+    pub const PROT_SEM: u64 = 8;
     pub const PROT_BTI: u64 = 0x10;
     pub const PROT_MTE: u64 = 0x20;
+    pub const PROT_GROWSDOWN: u64 = 0x0100_0000;
+    pub const PROT_GROWSUP: u64 = 0x0200_0000;
 
     pub const MAP_SHARED: u64 = 0x01;
     pub const MAP_PRIVATE: u64 = 0x02;
@@ -298,6 +301,8 @@ pub mod rwf {
     pub const SYNC: u64 = 0x04;
     pub const NOWAIT: u64 = 0x08;
     pub const APPEND: u64 = 0x10;
+    /// Not at the end, for a descriptor opened to append (Linux 6.9).
+    pub const NOAPPEND: u64 = 0x20;
 }
 
 pub mod fcntl {
@@ -1114,8 +1119,16 @@ pub mod futex {
     pub const FUTEX_REQUEUE: u64 = 3;
     pub const FUTEX_CMP_REQUEUE: u64 = 4;
     pub const FUTEX_WAKE_OP: u64 = 5;
+    /// The priority-inheritance futexes: a lock whose word holds its
+    /// owner's thread id.
+    pub const FUTEX_LOCK_PI: u64 = 6;
+    pub const FUTEX_UNLOCK_PI: u64 = 7;
+    pub const FUTEX_TRYLOCK_PI: u64 = 8;
     pub const FUTEX_WAIT_BITSET: u64 = 9;
     pub const FUTEX_WAKE_BITSET: u64 = 10;
+    pub const FUTEX_WAIT_REQUEUE_PI: u64 = 11;
+    pub const FUTEX_CMP_REQUEUE_PI: u64 = 12;
+    pub const FUTEX_LOCK_PI2: u64 = 13;
     pub const FUTEX_PRIVATE_FLAG: u64 = 128;
     pub const FUTEX_CLOCK_REALTIME: u64 = 256;
     pub const FUTEX_CMD_MASK: u64 = !(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME);
@@ -1313,6 +1326,7 @@ pub mod socket {
     pub const SO_LINGER: u64 = 13;
     pub const SO_PASSCRED: u64 = 16;
     pub const SO_PEERCRED: u64 = 17;
+    pub const SO_PEERGROUPS: u64 = 59;
     pub const SO_REUSEPORT: u64 = 15;
     pub const SO_RCVTIMEO: u64 = 20;
     pub const SO_SNDTIMEO: u64 = 21;

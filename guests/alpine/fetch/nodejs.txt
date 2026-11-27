@@ -5,7 +5,7 @@
 # locale data. Each line is a path under that URL and the file's SHA-256.
 v3.24/releases/aarch64/alpine-minirootfs-3.24.4-aarch64.tar.gz 4b14c18f7e90a063b61462ea1462a5732c154bf6adad594974fe6487cd98a8de
 v3.24/main/aarch64/nodejs-24.22.3-r0.apk e5d0dc9749acedadb08ddd48fab57c1c842e0361dc49e7206269bdd2751e29fc
-v3.24/main/aarch64/zstd-libs-1.5.7-r2.apk 2bb5136c89f5b0bbe1554c8915a3b520d5aa63ae2a51d4d821eb81698db5a818
+v3.24/main/aarch64/zstd-libs-1.6.0-r1.apk 923a9b5fffbc8272ce65b67fa7f768a9e3ea55c395b36030dc11635f29645eae
 v3.24/main/aarch64/libstdc++-15.2.0-r5.apk 2302e766d4e4926038ec166ecb85837ee884576115236ddb565e3a5fca4a11d7
 v3.24/main/aarch64/libgcc-15.2.0-r5.apk 369aaa6e9d099a737bad6dd3e6c2fe7bb1547ca26d22b94ee0411228f709b403
 v3.24/main/aarch64/sqlite-libs-3.53.4-r0.apk b39d8d73c1208838a436f2d481ba605b52a095f8d6ff781556eafc81cd1a13e9

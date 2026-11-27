@@ -133,6 +133,10 @@ pub(crate) struct Record {
     mark: Option<Mark>,
     /// For a socket made in a network namespace of fwe's, that namespace.
     net: Option<Net>,
+    /// The flags the guest opened it with (Linux's), less `O_DIRECT` and
+    /// `O_NOATIME` as `F_SETFL` changed them since: what Linux keeps of
+    /// them, `F_GETFL` reports ([`status_flags`]).
+    open: Option<u64>,
 }
 
 /// The network namespace a socket was made in, which it stays in
@@ -368,8 +372,8 @@ pub fn opened_as(
     let origin = Some(Origin { mount, flags, fstype, ns_path, ovl, stand_in: None });
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
-    let (mark, net) = had.map_or((None, None), |rec| (rec.mark, rec.net));
-    insert(&mut r, fd, Record { dev, ino, origin, mark, net });
+    let (mark, net, open) = had.map_or((None, None, None), |rec| (rec.mark, rec.net, rec.open));
+    insert(&mut r, fd, Record { dev, ino, origin, mark, net, open });
 }
 
 /// The record of `fd` that is of the file `dev`, `ino`, which a new
@@ -503,7 +507,92 @@ pub fn opened_in_tree(fd: i32, mount: u32, flags: u64, fstype: FsType) {
     let Some((dev, ino)) = identity_now(fd) else { return };
     let origin =
         Some(Origin { mount, flags, fstype, ns_path: Vec::new(), ovl: None, stand_in: None });
-    insert(&mut records(), fd, Record { dev, ino, origin, mark: None, net: None });
+    insert(&mut records(), fd, Record { dev, ino, origin, mark: None, net: None, open: None });
+}
+
+/// The guest opened `fd` with `flags` (Linux's open flags): noted on the
+/// record its open made, or on a new one.
+pub fn open_flags(fd: i32, flags: u64) {
+    let mut r = records();
+    if let Some(rec) = r.get_mut(&fd) {
+        rec.open = Some(flags);
+        return;
+    }
+    let Some((dev, ino)) = identity_now(fd) else { return };
+    insert(&mut r, fd, Record { dev, ino, origin: None, mark: None, net: None, open: Some(flags) });
+}
+
+/// `F_SETFL` gave `fd` status flags `flags` (Linux's): of those its record
+/// keeps, `O_DIRECT` and `O_NOATIME` change (the host keeps neither).
+pub fn status_set(fd: i32, flags: u64) {
+    use fwe_abi::fcntl::{O_DIRECT, O_NOATIME};
+    let mut r = records();
+    if let Some(rec) = r.get_mut(&fd)
+        && let Some(open) = rec.open.as_mut()
+    {
+        *open = *open & !(O_DIRECT | O_NOATIME) | flags & (O_DIRECT | O_NOATIME);
+    }
+}
+
+/// Descriptor `fd`'s file status flags as Linux reports them (`F_GETFL`,
+/// `/proc/<pid>/fdinfo`), `host` being the host's `F_GETFL`: for a
+/// descriptor the guest opened, the flags it opened it with that Linux
+/// keeps (not `O_CREAT`, `O_EXCL`, `O_NOCTTY`, `O_TRUNC` or `O_CLOEXEC`;
+/// of an `O_PATH` descriptor, only `O_DIRECTORY` and `O_NOFOLLOW` beside
+/// it), with `O_LARGEFILE` and the append, non-blocking and asynchronous
+/// modes as they are now; for the others, what Linux gives each kind:
+/// `O_LARGEFILE` only where an `open` (or `memfd_create`) made it, not on
+/// a pipe or a socket, and the anonymous files' access modes (epoll,
+/// eventfd, signalfd, timerfd and process descriptors read-write,
+/// inotify read-only).
+pub fn status_flags(fd: i32, host: libc::c_int) -> u64 {
+    use fwe_abi::fcntl::*;
+    let status = crate::host::status_flags_to_linux(host);
+    let nonblock = status & O_NONBLOCK;
+    if let Some(nb) = crate::specialfd::timer_nonblock(fd) {
+        return O_RDWR | if nb { O_NONBLOCK } else { 0 };
+    }
+    if let Some(t) = crate::pidfd::of(fd) {
+        return O_RDWR | if t.nonblock { O_NONBLOCK } else { 0 };
+    }
+    if crate::specialfd::eventfd_writes(fd).is_some()
+        || crate::signalfd::is_signalfd(fd)
+        || epoll_set(fd)
+    {
+        return O_RDWR | nonblock;
+    }
+    if crate::inotify::instance_of(fd).is_some() {
+        return O_RDONLY | nonblock;
+    }
+    let rec = record(fd);
+    if let Some(open) = rec.as_ref().and_then(|r| r.open) {
+        if open & O_PATH != 0 {
+            return open & (O_PATH | O_DIRECTORY | O_NOFOLLOW);
+        }
+        let now = O_APPEND | O_NONBLOCK | O_ASYNC;
+        let gone = O_CREAT | O_EXCL | O_NOCTTY | O_TRUNC | O_CLOEXEC;
+        return open & !(gone | now) | status & now | O_LARGEFILE;
+    }
+    if rec.is_some_and(|r| r.mark == Some(Mark::Path)) {
+        return O_PATH;
+    }
+    // SAFETY: an all-zero stat is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    let kind = if unsafe { libc::fstat(fd, &mut st) } == 0 { st.st_mode & libc::S_IFMT } else { 0 };
+    let made_otherwise = kind == libc::S_IFSOCK || kind == libc::S_IFIFO && origin(fd).is_none();
+    if made_otherwise { status } else { status | O_LARGEFILE }
+}
+
+/// Whether `fd` is an epoll set (a kqueue, on macOS).
+fn epoll_set(fd: i32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    crate::epoll::is_epoll(fd)
 }
 
 /// The namespace paths descriptors were opened at, each made `moved(path)`
@@ -523,8 +612,8 @@ pub fn mark(fd: i32, mark: Mark) {
     let Some((dev, ino)) = identity_now(fd) else { return };
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
-    let (origin, net) = had.map_or((None, None), |rec| (rec.origin, rec.net));
-    insert(&mut r, fd, Record { dev, ino, origin, mark: Some(mark), net });
+    let (origin, net, open) = had.map_or((None, None, None), |rec| (rec.origin, rec.net, rec.open));
+    insert(&mut r, fd, Record { dev, ino, origin, mark: Some(mark), net, open });
 }
 
 /// How many sockets were ever pinned to a network namespace of fwe's, so
@@ -540,8 +629,9 @@ pub fn pin_net(fd: i32, net: Option<std::sync::Arc<crate::shared::Record<crate::
     let Some((dev, ino)) = identity_now(fd) else { return };
     let mut r = records();
     let had = kept(&r, fd, dev, ino);
-    let (origin, mark) = had.map_or((None, None), |rec| (rec.origin, rec.mark));
-    insert(&mut r, fd, Record { dev, ino, origin, mark, net: net.map(Net) });
+    let (origin, mark, open) =
+        had.map_or((None, None, None), |rec| (rec.origin, rec.mark, rec.open));
+    insert(&mut r, fd, Record { dev, ino, origin, mark, net: net.map(Net), open });
 }
 
 /// The network namespace of fwe's socket `fd` belongs to (`None`: the
@@ -645,7 +735,9 @@ pub fn forget_closed() {
 
 /// `new` is a duplicate of `old`.
 pub fn duplicated(old: i32, new: i32) {
+    crate::epoll::duplicated(old, new);
     crate::fdstate::duplicated(old, new);
+    crate::sockstate::duplicated(old, new);
     crate::procfile::duplicated(old, new);
     crate::synthdir::duplicated(old, new);
     let mut r = records();
@@ -778,6 +870,8 @@ pub fn save(e: &mut Enc) {
             e.u8(key);
         }
         crate::shared::save_opt(e, &rec.net.as_ref().map(|n| n.0.clone()));
+        e.bool(rec.open.is_some());
+        e.u64(rec.open.unwrap_or(0));
     }
 }
 
@@ -839,7 +933,9 @@ pub fn load(d: &mut Dec) {
             _ => None,
         };
         let net = crate::shared::load_opt(d).ok().flatten().map(Net);
-        insert(&mut r, fd, Record { dev, ino, origin, mark, net });
+        let (some, flags) = (d.bool(), d.u64());
+        let open = some.then_some(flags);
+        insert(&mut r, fd, Record { dev, ino, origin, mark, net, open });
     }
 }
 

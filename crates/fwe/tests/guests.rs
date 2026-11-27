@@ -121,19 +121,15 @@ fn run_bounded_for(cmd: Command, input: &[u8], limit: Duration) -> Output {
     run_bounded_inner(cmd, input, limit, false).0
 }
 
-/// The guest's output and its pid, killing it after `limit`. With `vm`, the
-/// command leads its own process group, and a timeout ends the group gently
-/// (see [`run_vm_bounded`]).
-/// At a timeout: the processes running under the guest's root that left
-/// its process group (a daemon's double fork, as podman's conmon), each
+/// At a timeout: the processes of the guest's process group `pgid` (a VM's
+/// fork children among them), and those running under the guest's root
+/// that left it (a daemon's double fork, as podman's conmon), each
 /// sampled: its host threads' stacks, kept in `target/tmp/samples` for CI
 /// to keep, the innermost fwe frame of each printed. They are left running
 /// (a daemon the test goes on using among them).
-fn sample_strays(cmd: &Command) {
+fn sample_strays(cmd: &Command, pgid: u32) {
     let args: Vec<_> = cmd.get_args().map(|a| a.to_string_lossy().into_owned()).collect();
-    let Some(root) = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1)) else {
-        return;
-    };
+    let root = args.iter().position(|a| a == "--root").and_then(|i| args.get(i + 1));
     let Ok(ps) = Command::new("ps").args(["-A", "-o", "pid=,pgid=,command="]).output_alone() else {
         return;
     };
@@ -141,11 +137,15 @@ fn sample_strays(cmd: &Command) {
     let _ = std::fs::create_dir_all(&dir);
     for line in String::from_utf8_lossy(&ps.stdout).lines() {
         let mut f = line.split_whitespace();
-        let (Some(pid), Some(_), command) = (f.next(), f.next(), f.collect::<Vec<_>>().join(" "))
+        let (Some(pid), Some(group), command) =
+            (f.next(), f.next(), f.collect::<Vec<_>>().join(" "))
         else {
             continue;
         };
-        if !command.contains(root.as_str()) || !command.contains("fwe") {
+        // The guest's group (a VM's fork children name no root), and any
+        // process of its root that left the group.
+        let ours = group == pgid.to_string() || root.is_some_and(|r| command.contains(r.as_str()));
+        if !ours || !command.contains("fwe") {
             continue;
         }
         let Ok(pid) = pid.parse::<i32>() else { continue };
@@ -241,6 +241,9 @@ fn host_short_of_memory() -> Option<String> {
     None
 }
 
+/// The guest's output and its pid, killing it after `limit`. With `vm`, the
+/// command leads its own process group, and a timeout ends the group gently
+/// (see [`run_vm_bounded`]).
 fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) -> (Output, i32) {
     use std::io::{Read, Write};
     use std::os::unix::process::CommandExt;
@@ -300,7 +303,7 @@ fn run_bounded_inner(mut cmd: Command, input: &[u8], limit: Duration, vm: bool) 
                     String::from_utf8_lossy(&ps.stdout)
                 );
             }
-            sample_strays(&cmd);
+            sample_strays(&cmd, child.id());
             if vm {
                 let pgid = child.id() as i32;
                 // SAFETY: SIGTERM to the guest's own process group; VM
@@ -376,6 +379,7 @@ const ASM_GUESTS: &[&str] = &[
     "x18pair",
     "x18fault",
     "x18br",
+    "x18jump",
     "x18fp",
     "x18pc",
     "x18sig",
@@ -1107,10 +1111,11 @@ fn jit_code_runs_as_the_program_wrote_it() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Every instruction naming `x18` that a real binary holds (Alpine's
-/// OpenJDK 25 libjvm.so, listed in tools/x18forms/x18forms.tsv; the guest
-/// generated from it by tools/x18forms/gen.py), rewritten as fwe rewrites
-/// that binary, ends as the same instruction does with another register in
+/// Every instruction naming `x18` that real binaries hold (Alpine's
+/// OpenJDK 25 libjvm.so and Debian 13's git, listed in tools/x18forms; the
+/// guest generated from them by tools/x18forms/gen.py), rewritten as fwe
+/// rewrites those binaries and run by translation as fwe runs code made at
+/// run time, ends as the same instruction does with another register in
 /// `x18`'s place.
 #[test]
 fn x18_instructions_of_a_real_binary_compute_as_with_another_register() {
@@ -1125,14 +1130,15 @@ fn x18_instructions_of_a_real_binary_compute_as_with_another_register() {
     let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
     eprintln!("--- x18forms stderr:\n{}", String::from_utf8_lossy(&out.stderr));
     let text = stdout(&out);
-    let last = text.lines().last().unwrap_or_default().to_string();
-    assert!(
-        last.starts_with("x18 instructions: ") && {
-            let n: Vec<&str> = last.trim_start_matches("x18 instructions: ").split(' ').collect();
-            n.len() >= 3 && n[0] == n[2]
-        },
-        "{text}"
-    );
+    // Each pass's line: "<what>: <n> of <n> alike", all alike.
+    let alike = |what: &str| {
+        text.lines().any(|l| {
+            let n: Vec<&str> = l.strip_prefix(what).unwrap_or_default().split(' ').collect();
+            n.len() >= 3 && n[0] == n[2] && n[0] != "0"
+        })
+    };
+    assert!(alike("x18 instructions: "), "{text}");
+    assert!(alike("x18 instructions made at run time: "), "{text}");
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1541,6 +1547,68 @@ fn jit_code_using_x18_computes_as_with_another_register() {
     );
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The program's own code made executable again (with `PROT_BTI` where
+/// the CPU has BTI), as glibc's dynamic linker does to every object built
+/// for BTI (Debian 13's), runs as it did, prepared, not by translation
+/// (guests/c/textprotect.c).
+#[test]
+fn code_made_executable_again_with_bti_runs_as_prepared() {
+    let prog = build_c("textprotect", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "textprotect-bti");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).arg("bti").env("FWE_TIMING", "1");
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(stdout(&out), "before: 41\nmprotect: 0\nafter: 41 1000000\n", "{stderr}");
+    assert!(!stderr.contains("blocks translated"), "{stderr}");
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// The program's own code made writable, then executable again, runs by
+/// translation, which reads it as the program wrote it: an instruction
+/// writing `x18` there is the program's, not fwe's branch to its stub, so
+/// `x16`, live across it, keeps its value (guests/c/textprotect.c).
+#[test]
+fn code_made_writable_then_executable_runs_as_written() {
+    let prog = build_c("textprotect", Libc::Musl, true, true);
+    let root = libc_rootfs(Libc::Musl, "textprotect-rewritten");
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(&prog).arg("rewritten");
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "before: 41\nmprotect: 0\nafter: 41 1000000\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// A real program's SHA-1 compression (git's sha1dc, from the vendored
+/// Debian 13 git: GCC 14's code, computing in `x18` among other
+/// registers) copied into memory made executable at run time and run by
+/// translation computes what SHA-1 does (guests/c/jitsha1.c).
+#[test]
+fn jit_code_of_a_real_program_computes_sha1() {
+    let prog = build_c_dynamic("jitsha1", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "jitsha1");
+    std::fs::copy(debian_bin("git"), root.join("git")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    // `sha1_compression_states`: its offset in the file and its length.
+    cmd.arg("--root").arg(&root).arg(&prog).args(["/git", "0x2b7c80", "0x11a8"]);
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    assert_eq!(
+        stdout(&out),
+        "sha1 blocks compressed by translation: 2000 of 2000 alike\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// Self-modifying code (guests/c/selfmod.c): an instruction overwritten by
@@ -2018,10 +2086,15 @@ fn a_thread_after_another_ended_starts_afresh() {
 /// glibc root filesystem of its own, and check it exits 0 having printed
 /// `want`.
 fn c_guest_prints(name: &str, args: &[&str], want: &str) {
-    let prog = build_c_dynamic(name, Libc::Glibc, true);
+    c_guest_prints_on(Libc::Glibc, name, args, want);
+}
+
+/// [`c_guest_prints`] on the C library `libc`.
+fn c_guest_prints_on(libc: Libc, name: &str, args: &[&str], want: &str) {
+    let prog = build_c_dynamic(name, libc, true);
     // A root of the case's own: tests of one guest run side by side.
-    let root =
-        libc_rootfs(Libc::Glibc, &[name].iter().chain(args).copied().collect::<Vec<_>>().join("-"));
+    let tag = [name_suffix(libc), name].iter().chain(args).copied().collect::<Vec<_>>().join("-");
+    let root = libc_rootfs(libc, &tag);
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg(&prog).args(args);
     let out = run_bounded(cmd);
@@ -2060,6 +2133,45 @@ fn traced_threads_are_found_by_group_and_in_namespaces() {
         "tracethreads",
         &[],
         "by id: 0\nby group: 0\nin a namespace: 0\nside by side: 0 0, same thread numbers: 1\n",
+    );
+}
+
+/// `/sys`'s buses and classes, which sandboxes bind (WebKit's, Flatpak's
+/// `bwrap`): the CPU bus links each CPU's device.
+#[test]
+fn sys_buses_and_classes_as_sandboxes_bind_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "sysbus",
+        &[],
+        "/sys has bus: 1, class: 1, block: 1, dev: 1, devices: 1\n\
+         /sys/bus has cpu: 1; /sys/class has block: 1\n\
+         cpu0 links to: ../../../devices/system/cpu/cpu0\nthrough it, a directory: yes\n\
+         the bus lists every CPU: yes\n",
+    );
+}
+
+/// A tracer that ends without detaching leaves its tracee as Linux does.
+#[test]
+fn a_tracer_that_ends_leaves_its_tracee_as_linux_does() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "tracerends",
+        &[],
+        "left at the attach's stop: running\ncontinued, then left: running\n",
+    );
+}
+
+/// A crash reporter's attach, as crashpad's: to the process, then to each
+/// of its other threads by id, each stop found by a wait for that thread.
+#[test]
+fn a_tracer_attaches_to_each_thread_of_a_stopped_process() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "attachthreads",
+        &[],
+        "process: stopped by 19\nthread in ppoll: stopped by 19\nthread sleeping: stopped by 19\n\
+         tracer: exit 0\n",
     );
 }
 
@@ -2109,6 +2221,98 @@ fn a_blocked_signal_goes_to_a_thread_that_takes_it() {
 #[test]
 fn an_exclusive_epoll_wake_reaches_one_waiter() {
     c_guest_prints("epollx", &[], "each write woke one waiter: yes\n");
+}
+
+/// Memory below `sp` is the program's (guests/c/belowsp.c): a system call
+/// and each instruction fwe rewrites leave it as it was, in a program's
+/// code and in code made at run time. Go's `runtime.clone` keeps a new
+/// thread's start function there across its first system call. Linux
+/// prints the same.
+#[test]
+fn memory_below_sp_is_the_programs() {
+    c_guest_prints(
+        "belowsp",
+        &[],
+        "below sp after a system call: kept\nafter a thread pointer write: kept\n\
+         after a thread pointer read: kept\nafter a use of x18: kept\n\
+         after a cache flush: kept\nafter a system call in code made at run time: kept\n",
+    );
+}
+
+/// Priority-inheritance futexes (guests/c/pifutex.c) as Linux runs them:
+/// a lock handed to its waiter, its errors, a lock a signal interrupts
+/// going on after the handler, and both C libraries' `PTHREAD_PRIO_INHERIT`
+/// mutexes, robust too (musl's tries `FUTEX_LOCK_PI` as one is made, which
+/// PulseAudio asserts on).
+#[test]
+fn priority_inheritance_locks_are_linuxs() {
+    let want = "lock: 0, the owner's: 1\nagain: -35\na waiter marks it: 1\nunlock: 0\n\
+                the waiter's lock: 0, handed to it: 1, then free: 1\n\
+                another's unlock: -1, try: -11, timed lock: -110\n\
+                an owner that never ran: -3\ninterrupted: handler ran 1, then locked: 0\n\
+                setprotocol: 0\ncounted: 8000\n\
+                its owner ended: 130, made consistent: 0, unlocked: 0\n";
+    for libc in [Libc::Glibc, Libc::Musl] {
+        c_guest_prints_on(libc, "pifutex", &[], want);
+    }
+}
+
+/// `F_GETFL` of each kind of descriptor (guests/c/getfl.c), as Linux
+/// reports it: an open's own flags less those it drops (`O_CLOEXEC`,
+/// `O_CREAT`), `O_LARGEFILE` only on what `open` and `memfd_create` made
+/// (Chromium's GPU sandbox kills a process that sets the bit back on a
+/// socket), and each anonymous file's access mode. Linux prints the same.
+#[test]
+fn file_status_flags_are_linuxs_for_each_kind() {
+    c_guest_prints(
+        "getfl",
+        &[],
+        "file: 0x20002\ndirectory: 0x24000\ndirectory, plain open: 0x20000\n\
+         file, O_CLOEXEC | O_NOFOLLOW: 0x28002\nfile, O_WRONLY | O_APPEND | O_SYNC: 0x121401\n\
+         file, O_NOATIME: 0x60000\nO_PATH | O_DIRECTORY: 0x204000\nO_TMPFILE: 0x424002\n\
+         /dev/null: 0x20002\npipe read end: 0\npipe write end: 0x1\nnamed FIFO: 0x20802\n\
+         TCP socket: 0x2\nUDP socket: 0x2\nsocketpair: 0x2\nepoll: 0x2\neventfd: 0x2\n\
+         signalfd: 0x2\ntimerfd: 0x2\ninotify: 0\nmemfd: 0x20002\npidfd: 0x2\n",
+    );
+}
+
+/// Descriptors without `O_CLOEXEC` keep working across `execve`
+/// (guests/c/execkeep.c): an epoll set and its duplicate, a timerfd that
+/// expired meanwhile, an eventfd's count, a signalfd with its blocked
+/// signal pending; loaded in place, and with a
+/// second thread alive, so fwe re-executes itself. Linux prints the same.
+#[test]
+fn event_descriptors_survive_execve() {
+    let want = "after execve: epoll sees 42, its duplicate 42; timerfd 8 bytes, 1 expiry; \
+                eventfd 8 bytes, count 5; signalfd 128 bytes, signal 10\n";
+    c_guest_prints("execkeep", &[], want);
+    c_guest_prints("execkeep", &["threaded"], want);
+}
+
+/// A duplicated epoll descriptor is the same set (guests/c/epolldup.c), as
+/// Tokio's registry clones it: what is added through either number is
+/// reported through the other, `EEXIST` for an entry added through the
+/// other, the set kept while any number holds it; a fork child's two
+/// numbers are one set too. Linux prints the same.
+#[test]
+fn a_duplicated_epoll_descriptor_is_the_same_set() {
+    let line = |how: &str| {
+        format!(
+            "{how}: add through it 0, seen through the original 7; add through the original 0, \
+             again through it errno 17, seen through it 8; original closed, add 0, seen 9\n"
+        )
+    };
+    c_guest_prints(
+        "epolldup",
+        &[],
+        &[
+            line("dup"),
+            line("dup3"),
+            line("F_DUPFD_CLOEXEC"),
+            "fork child: inherited 5 through the copy, added through the original, seen 6\n".into(),
+        ]
+        .concat(),
+    );
 }
 
 /// `SIGURG` a process blocks and reads through a signalfd, sent by another
@@ -2370,8 +2574,10 @@ fn dynamic_glibc_exit_maps_shared_libc() {
 /// program runs as before.
 #[test]
 fn code_runs_from_its_prepared_image_the_next_time() {
-    let prog = build_c_dynamic("dynhello", Libc::Glibc, true);
     let root = libc_rootfs(Libc::Glibc, "glibc-image");
+    // A copy of its own: other tests run the program built, and prepare it.
+    let prog = root.join("dynhello");
+    std::fs::copy(build_c_dynamic("dynhello", Libc::Glibc, true), &prog).unwrap();
     let run = || {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--strace").arg("--root").arg(&root).arg(&prog).arg("again");
@@ -2390,12 +2596,18 @@ fn code_runs_from_its_prepared_image_the_next_time() {
     assert_eq!(stdout(&first), "dynamic hello, again\n");
     assert_eq!(stdout(&second), "dynamic hello, again\n");
     assert!(images(&first).is_empty(), "{}", String::from_utf8_lossy(&first.stderr));
-    // The program, its dynamic linker, and glibc's code.
-    assert_eq!(
-        images(&second),
-        ["exe", "interp", "code"],
-        "{}",
-        String::from_utf8_lossy(&second.stderr)
+    // The program, its dynamic linker, and glibc's code: each mapping of
+    // it (the dynamic linker maps it again with `PROT_BTI` where the CPU
+    // has BTI).
+    let second_err = String::from_utf8_lossy(&second.stderr);
+    let mapped = second_err.lines().filter(|l| l.starts_with("[fwe] code at ")).count();
+    let found = images(&second);
+    assert!(
+        found.len() >= 3
+            && found[..2] == ["exe", "interp"]
+            && found[2..].iter().all(|w| w == "code")
+            && found.len() - 2 == mapped,
+        "{second_err}"
     );
 }
 
@@ -2825,11 +3037,32 @@ SQL
 }
 
 /// Where fetched packages are cached (`FWE_FETCH_CACHE`, or under
-/// `target/`), so a test downloads each only once.
+/// `target/`), so a test downloads each only once. It holds the files
+/// fetched and nothing unpacked from them ([`unpacked_roots`]): CI caches
+/// it, and a cache restored over what is there can leave half of it.
 fn fetch_cache() -> PathBuf {
     std::env::var_os("FWE_FETCH_CACHE")
         .map(PathBuf::from)
         .unwrap_or_else(|| repo().join("target/fetched-packages"))
+}
+
+/// Where the roots unpacked from fetched packages are kept, apart from
+/// the packages ([`fetch_cache`]). A root is whole only with its mark
+/// ([`COMPLETE`]), an attribute no cache's archive keeps: a root a cache
+/// gave back, whole or not, is unpacked again.
+fn unpacked_roots() -> PathBuf {
+    repo().join("target/fetched-roots")
+}
+
+/// `root` made an empty directory, whatever was there: its read-only
+/// directories (`/proc`, `/sys`) made writable first, which would stop a
+/// removal halfway.
+fn emptied(root: &Path) {
+    if root.symlink_metadata().is_ok() {
+        run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(root));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+    std::fs::create_dir_all(root).unwrap();
 }
 
 /// The files listed in `guests/<distro>/fetch/<manifest>.txt` (paths and
@@ -2887,40 +3120,51 @@ fn fetch_pinned(name: &str, urls: &[String], sha256_hex: &str, tag: &str) -> Pat
 
 /// The `.deb` files a manifest lists, fetched on first use and checked
 /// against the SHA-256 recorded there. They come from deb.debian.org, or
-/// from snapshot.debian.org once a newer version has replaced them.
+/// from the snapshot of the archive the manifest names
+/// (snapshot.debian.org) once a newer version has replaced them.
 fn fetched_debs(manifest_name: &str) -> Vec<PathBuf> {
-    let (_, packages) = manifest(manifest_name);
+    let (list, packages) = manifest(manifest_name);
+    let snapshot = list
+        .lines()
+        .find_map(|l| l.strip_prefix("# snapshot: "))
+        .unwrap_or_else(|| panic!("{manifest_name}: its header names no snapshot"))
+        .trim()
+        .to_string();
     packages
         .iter()
         .map(|(pool, sha256)| {
             let name = Path::new(pool).file_name().unwrap().to_string_lossy().into_owned();
             let urls = [
                 format!("https://deb.debian.org/debian/{pool}"),
-                format!("https://snapshot.debian.org/archive/debian/20261101T000000Z/{pool}"),
+                format!("https://snapshot.debian.org/archive/debian/{snapshot}/{pool}"),
             ];
             fetch_pinned(&name, &urls, sha256, manifest_name)
         })
         .collect()
 }
 
-/// A root filesystem of the packages `manifest` lists ([`fetched_debs`]),
-/// unpacked once and cached, plus the vendored glibc runtime and bash.
-fn fetched_root(manifest_name: &str) -> PathBuf {
+/// A root filesystem of the whole system `manifest` lists
+/// ([`fetched_debs`]: its own C library and shells among them), unpacked
+/// once and cached: base-files first, whose links (`/lib` to `/usr/lib`)
+/// the others' files go through, as debootstrap unpacks it.
+fn fetched_system(manifest_name: &str) -> PathBuf {
+    // One test at a time unpacks: two can want the same root.
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _making = MAKING.lock().unwrap_or_else(|e| e.into_inner());
     let (list, _) = manifest(manifest_name);
-    let cache = fetch_cache();
-    let root = cache.join(format!("root-{manifest_name}"));
-    let done = root.join(".fwe-complete");
-    if std::fs::read_to_string(&done).ok().as_deref() == Some(list.as_str()) {
+    let roots = unpacked_roots();
+    let root = roots.join(format!("root-{manifest_name}"));
+    if completed(&root).as_deref() == Some(list.as_str()) {
         return root;
     }
-    let debs = fetched_debs(manifest_name);
-    let _ = std::fs::remove_dir_all(&root);
-    std::fs::create_dir_all(root.join("lib")).unwrap();
+    let mut debs = fetched_debs(manifest_name);
+    let base = |d: &PathBuf| !d.file_name().unwrap().to_string_lossy().starts_with("base-files_");
+    debs.sort_by_key(base);
+    emptied(&root);
     for deb in &debs {
         // A .deb is an `ar` archive whose data.tar.* holds the files.
-        let unpack = cache.join(format!("unpack-{manifest_name}"));
-        let _ = std::fs::remove_dir_all(&unpack);
-        std::fs::create_dir_all(&unpack).unwrap();
+        let unpack = roots.join(format!("unpack-{manifest_name}"));
+        emptied(&unpack);
         run_checked(Command::new("ar").arg("x").arg(deb).current_dir(&unpack));
         let data = std::fs::read_dir(&unpack)
             .unwrap()
@@ -2931,17 +3175,8 @@ fn fetched_root(manifest_name: &str) -> PathBuf {
         // narrowed by the umask.
         run_checked(Command::new("tar").arg("xpf").arg(&data).arg("-C").arg(&root));
     }
-    for name in ["ld-linux-aarch64.so.1", "libc.so.6", "libm.so.6"] {
-        std::fs::copy(repo().join("guests/glibc/lib").join(name), root.join("lib").join(name))
-            .unwrap();
-    }
-    std::fs::copy(repo().join("guests/debian/lib/libtinfo.so.6"), root.join("lib/libtinfo.so.6"))
-        .unwrap();
-    std::fs::create_dir_all(root.join("bin")).unwrap();
     std::fs::create_dir_all(root.join("tmp")).unwrap();
-    std::fs::copy(debian_bin("bash"), root.join("bin/bash")).unwrap();
-    let _ = std::os::unix::fs::symlink("bash", root.join("bin/sh"));
-    std::fs::write(&done, &list).unwrap();
+    mark_completed(&root, &list);
     root
 }
 
@@ -2971,22 +3206,14 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     // How it is unpacked counts too: a root unpacked another way is
     // unpacked again.
     let list = format!("{list}\nunpacked with the archive's modes\n");
-    let root = fetch_cache().join(format!("alpine-root-{manifest_name}"));
-    // The mark that it is whole is an extended attribute of its own: a
-    // copy that lost them (CI's cache keeps none) is unpacked again, as
-    // its files' are gone too.
+    let root = unpacked_roots().join(format!("alpine-root-{manifest_name}"));
     if completed(&root).as_deref() == Some(list.as_str()) {
         return root;
     }
     let files = fetched_alpine(manifest_name);
     // What is there goes whole: unpacking over it keeps its directories'
-    // modes, and its read-only ones (`/proc`, `/sys`) stop a removal
-    // halfway unless made writable first.
-    if root.exists() {
-        run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&root));
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-    std::fs::create_dir_all(&root).unwrap();
+    // modes.
+    emptied(&root);
     for f in &files {
         run_checked(
             // With the files' extended attributes (a program's file
@@ -3006,7 +3233,9 @@ fn alpine_root(manifest_name: &str) -> PathBuf {
     root
 }
 
-/// The attribute that marks an unpacked root whole ([`alpine_root`]).
+/// The attribute that marks an unpacked root whole ([`alpine_root`],
+/// [`fetched_system`]): a copy that lost its attributes (CI's caches keep
+/// none) is unpacked again, as its files can be gone too.
 const COMPLETE: &std::ffi::CStr = c"user.fwe-complete";
 
 /// The manifest an unpacked root was marked whole with, if any.
@@ -4023,7 +4252,7 @@ fn shell_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "'\\''"))
 }
 
-/// Debian's podman 4.3 (fetched: `guests/debian/fetch/podman.txt`), a
+/// Debian's podman 5.4 (fetched: `guests/debian/fetch/podman.txt`), a
 /// non-PIE executable the VM runs, only where `FWE_PODMAN_TESTS` is set
 /// (CI's `podman` job), as root: it loads the standard `alpine` image and
 /// runs a container of it through conmon and crun, which run natively, each
@@ -4038,7 +4267,7 @@ fn debian_podman_runs_in_the_vm() {
         eprintln!("skipped: no hypervisor on this host");
         return;
     };
-    let cached = fetched_root("podman");
+    let cached = fetched_system("podman");
     let root = std::env::temp_dir().join(format!("fwe-debpodman-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     run_checked(Command::new("cp").arg("-cpR").arg(&cached).arg(&root));
@@ -4316,11 +4545,11 @@ fn alpine_jdk_compiles_and_runs_a_multithreaded_application() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// Debian's Node.js 18 (fetched: `guests/debian/fetch/node.txt`) runs the
+/// Debian's Node.js 20 (fetched: `guests/debian/fetch/node.txt`) runs the
 /// Node workload ([`node_runs_the_workload`]).
 #[test]
 fn debian_node_runs_a_workload() {
-    let root = fetched_root("node");
+    let root = fetched_system("node");
     node_runs_the_workload(&root, "debian-node");
 }
 
@@ -4801,7 +5030,7 @@ print("jit", (jit.status()))
 /// has rustc call ld itself with the C runtime's start files.
 #[test]
 fn debian_cargo_builds_and_tests_a_project() {
-    let root = fetched_root("rust");
+    let root = fetched_system("rust");
     let _workload = workload();
     let proj = format!("tmp/fwe-cargo-{}", std::process::id());
     let dir = root.join(&proj);
@@ -4850,7 +5079,7 @@ fn debian_cargo_builds_and_tests_a_project() {
         std::fs::write(dir.join(name), text).unwrap();
     }
     // rustc calls GNU ld directly, with what gcc would add around it.
-    let (gcc, lib) = ("/usr/lib/gcc/aarch64-linux-gnu/12", "/usr/lib/aarch64-linux-gnu");
+    let (gcc, lib) = ("/usr/lib/gcc/aarch64-linux-gnu/14", "/usr/lib/aarch64-linux-gnu");
     let link = format!(
         "-dynamic-linker /lib/ld-linux-aarch64.so.1 {lib}/Scrt1.o {lib}/crti.o \
          {gcc}/crtbeginS.o -L{gcc} -L{lib} -lgcc_s -lc {gcc}/crtendS.o {lib}/crtn.o"
@@ -4908,7 +5137,7 @@ fn debian_apt_installs_and_removes_a_package() {
     // changes it.
     let root = std::env::temp_dir().join(format!("fwe-apt-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
-    run_checked(Command::new("cp").arg("-cpR").arg(fetched_root("apt")).arg(&root));
+    run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("apt")).arg(&root));
     let _workload = workload();
     let dir = |d: &str| std::fs::create_dir_all(root.join(d)).unwrap();
     for d in [
@@ -4951,13 +5180,24 @@ fn debian_apt_installs_and_removes_a_package() {
     )
     .unwrap();
     std::fs::write(root.join("etc/apt/sources.list"), "deb [trusted=yes] file:/repo ./\n").unwrap();
-    // The dpkg database: glibc installed, as a bootstrapped system has it.
+    // The dpkg database: glibc installed, at the version the root has, as
+    // a bootstrapped system has it.
+    let libc6 = manifest("apt")
+        .1
+        .iter()
+        .find_map(|(pool, _)| {
+            let file = pool.rsplit('/').next()?;
+            file.strip_prefix("libc6_")?.strip_suffix("_arm64.deb").map(str::to_string)
+        })
+        .expect("the apt root's glibc");
     std::fs::write(
         root.join("var/lib/dpkg/status"),
-        "Package: libc6\nStatus: install ok installed\nPriority: optional\n\
-         Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>\n\
-         Architecture: arm64\nMulti-Arch: same\nVersion: 2.36-9+deb12u14\n\
-         Description: GNU C Library: Shared libraries\n\n",
+        format!(
+            "Package: libc6\nStatus: install ok installed\nPriority: optional\n\
+             Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>\n\
+             Architecture: arm64\nMulti-Arch: same\nVersion: {libc6}\n\
+             Description: GNU C Library: Shared libraries\n\n"
+        ),
     )
     .unwrap();
     std::fs::write(root.join("var/lib/dpkg/available"), "").unwrap();
@@ -4998,8 +5238,8 @@ fn debian_apt_installs_and_removes_a_package() {
     for want in [
         "Hello, world!",
         "hello from a package apt installed",
-        "hello 2.10-3 install ok installed",
-        "Removing hello (2.10-3) ...",
+        "hello 2.10-5 install ok installed",
+        "Removing hello (2.10-5) ...",
         "removed",
         "no longer known to dpkg",
     ] {
@@ -5303,6 +5543,15 @@ fn asm_x18_survives_preemption() {
 #[test]
 fn asm_x18_survives_memory_spill() {
     assert_eq!(fwe(&asm_guest("x18mem-pie"), &[]).status.code(), Some(0));
+}
+
+/// A jump table through x18 (`adr x18`, an added scaled index, `br x18`)
+/// reaches each case with `x16` and `x17` as the code left them, and a
+/// call through x18 returns: as clang emits one where x18 is free (V8's
+/// in Electron, its table's base in `x16`).
+#[test]
+fn asm_x18_jump_table_reaches_each_case() {
+    assert_eq!(fwe(&asm_guest("x18jump-pie"), &[]).status.code(), Some(0));
 }
 
 /// x18 through the wider data-processing classes (extract, conditional select,
@@ -6563,6 +6812,7 @@ const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown pa
     listmount: listed true\n\
     beneath: 0, top first true, then the copy true\n\
     fspick: 0, read-only true, then rw\n\
+    fspick size: 0 0, holds 2048 KiB\n\
     mount_setattr: 0, nodev true, shared true\n\
     propagation: into the copied namespace true, unmount too true\n\
     enforced: nodev true, noexec true (mprotect too true), nosymfollow true\n\
@@ -6572,7 +6822,8 @@ const MOUNTAPI: &str = "fsopen: config 0, bogus -1, logged \"e tmpfs: Unknown pa
 
 /// The new mount API: a tmpfs made through a filesystem context and
 /// attached from a detached mount, a detached copy attached beneath
-/// another mount, `fspick`, `mount_setattr`, `statx`, `statmount` and
+/// another mount, `fspick` (a flag, and a tmpfs's size, which it holds
+/// to), `mount_setattr`, `statx`, `statmount` and
 /// `listmount` agreeing on the mount, a mount under a shared one
 /// propagating into a copied namespace, the `nodev`, `noexec` and
 /// `nosymfollow` flags acted on, and a busy mount refused.
@@ -6970,6 +7221,52 @@ seen: 0 type 1 start 1 len 4 pid -1
 #[test]
 fn memfd_locks_hold_between_processes() {
     assert_eq!(memfd("locks"), MEMFD_LOCKS);
+}
+
+/// `FIONBIO`, `FIOCLEX` and `FIONCLEX` set what `fcntl` reads back on a
+/// descriptor of every kind, fwe's stand-ins included (Zed makes its X
+/// connection non-blocking so), as on Linux.
+#[test]
+fn fionbio_and_fioclex_work_on_every_descriptor() {
+    let ok = "FIONBIO 0 0, nonblocking set and cleared; FIOCLEX 0 0, close-on-exec set and cleared";
+    let want: String = ["pipe", "unix socket", "eventfd", "memfd", "timerfd", "epoll", "/dev/null"]
+        .iter()
+        .map(|k| format!("{k}: {ok}\n"))
+        .collect();
+    c_guest_prints("fionbio", &[], &want);
+}
+
+/// A sealed memfd, and a read-only descriptor of it opened through
+/// `/proc/self/fd`, passed over Unix sockets to other processes (one in
+/// new namespaces, one reading a stream after children of the sender's
+/// ended or started a program) keep the file's seals and size there
+/// (Firefox maps only memory whose size is sealed), and the read-only one
+/// maps only to read; as on Linux.
+#[test]
+fn memfd_seals_hold_in_a_process_it_is_passed_to() {
+    c_guest_prints(
+        "memfdpass",
+        &[],
+        "noexec memfd: seals 0x20, reopened read-only: yes\n\
+         size sealed: 0\n\
+         reopened read-only: yes\n\
+         read-only, here: seals 0x6, size 65536\n\
+         frozen: 0\n\
+         writable, here: seals 0x17, size 65536\n\
+         writable, there: seals 0x17, size 65536\n\
+         read-only, there: seals 0x17, size 65536\n\
+         read there: fwe\n\
+         mapped to write through the read-only one: no\n\
+         writable, in new namespaces: seals 0x17, size 65536\n\
+         read-only, in new namespaces: seals 0x17, size 65536\n\
+         in new namespaces: exit 0\n\
+         child: exit 0\n\
+         a child ended, another ran a program: exit 0\n\
+         read 3000 bytes with 2 descriptors, seals 0x17 0x17\n\
+         read 3000 bytes with 2 descriptors, seals 0x17 0x17\n\
+         read 3000 bytes with 2 descriptors, seals 0x17 0x17\n\
+         reader: exit 0\n",
+    );
 }
 
 /// What the `memfd` guest's `seals` scenario prints: a memfd named as
@@ -7391,6 +7688,7 @@ fn hv_runs_low_assembly_guests() {
         ("x18dp", 0),
         ("x18ldst", 0),
         ("x18br", 0),
+        ("x18jump", 0),
         ("x18fp", 0),
         ("x18pc", 0),
         ("x18sig", 0),
@@ -7669,7 +7967,7 @@ fn hv_descriptors_and_translated_pointers() {
 }
 
 /// A dynamically linked, non-PIE glibc program at a low address — the shape
-/// of Debian's `python3.11` — runs in the VM: the image at its link address
+/// of Debian's `python3.13` — runs in the VM: the image at its link address
 /// (translated), glibc's dynamic linker and `libc.so.6` mapped by the guest
 /// at the same addresses as in the host, relocations and RELRO applied by
 /// the guest's own `ld.so`.
@@ -7702,7 +8000,7 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
     Some(run_hv(cmd, &program.display().to_string()))
 }
 
-/// Debian's Python 3.11 (fetched: `guests/debian/fetch/python.txt`), a
+/// Debian's Python 3.13 (fetched: `guests/debian/fetch/python.txt`), a
 /// non-PIE executable linked at `0x400000`, so the VM runs it: the standard
 /// library's C modules (sqlite3, hashlib on OpenSSL, zlib, bz2, lzma,
 /// decimal, unicodedata), threads, a socket pair, an asyncio server and
@@ -7712,14 +8010,14 @@ fn fwe_hv_in(root: &Path, program: &Path, args: &[&str]) -> Option<Output> {
 /// `/dev/shm` shared by the processes.
 #[test]
 fn hv_debian_python_runs_a_workload() {
-    let root = fetched_root("python");
+    let root = fetched_system("python");
     let _workload = workload();
     let script = format!("/tmp/fwe-python-{}.py", std::process::id());
     std::fs::write(root.join(script.trim_start_matches('/')), PYTHON_WORKLOAD).unwrap();
     let Some(mut cmd) = hv_command() else { return };
     cmd.arg("--root")
         .arg(&root)
-        .arg(root.join("usr/bin/python3.11"))
+        .arg(root.join("usr/bin/python3.13"))
         .arg("-B")
         .arg(&script)
         .env_clear()
@@ -7727,11 +8025,11 @@ fn hv_debian_python_runs_a_workload() {
         .env("HOME", "/tmp")
         .stdin(Stdio::null());
     // The stand-in on a loaded CI runner takes several times as long.
-    let out = run_hv_for(cmd, "python3.11", Duration::from_secs(600));
+    let out = run_hv_for(cmd, "python3.13", Duration::from_secs(600));
     let _ = std::fs::remove_file(root.join(script.trim_start_matches('/')));
     assert_eq!(
         stdout(&out),
-        "executable /usr/bin/python3.11\n\
+        "executable /usr/bin/python3.13\n\
          json {\"a\": [1, 2, {\"b\": null}]}\n\
          re host at user and there at me\n\
          sqlite (100, 4950, '9801')\n\
@@ -7752,7 +8050,7 @@ fn hv_debian_python_runs_a_workload() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// Debian's GCC 12 (fetched: `guests/debian/fetch/gcc.txt`), whose driver,
+/// Debian's GCC 14 (fetched: `guests/debian/fetch/gcc.txt`), whose driver,
 /// `cc1` and `collect2` are non-PIE executables the VM runs, while GNU `as`
 /// and `ld` run natively: a program with a thread and libm compiled and
 /// linked, and one built from a static library made with `ar`, linked as a
@@ -7761,7 +8059,7 @@ fn hv_debian_python_runs_a_workload() {
 /// between the backends.
 #[test]
 fn hv_debian_gcc_builds_c_programs() {
-    let root = fetched_root("gcc");
+    let root = fetched_system("gcc");
     let _workload = workload();
     let proj = format!("tmp/fwe-gcc-{}", std::process::id());
     let dir = root.join(&proj);
@@ -7797,7 +8095,7 @@ int main(int argc, char **argv) {
         (
             "build.sh",
             "set -e\n\
-             cc=aarch64-linux-gnu-gcc-12\n\
+             cc=aarch64-linux-gnu-gcc-14\n\
              $cc -O2 -Wall -o hello hello.c -lm\n\
              ./hello world\n\
              $cc -c -O2 util.c\n\
@@ -7829,13 +8127,12 @@ int main(int argc, char **argv) {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Debian's clang 14 (fetched: `guests/debian/fetch/clang.txt`), a non-PIE
-/// executable the VM runs, with LLVM's libraries, GNU `ld` linking
-/// natively: a C program using libm and a C++ one using the standard
-/// library (libstdc++), each compiled, linked and run.
+/// Debian's clang 19 (fetched: `guests/debian/fetch/clang.txt`) with LLVM's
+/// libraries and GNU `ld`, all PIEs: a C program using libm and a C++ one
+/// using the standard library (libstdc++), each compiled, linked and run.
 #[test]
-fn hv_debian_clang_builds_c_and_cpp() {
-    let root = fetched_root("clang");
+fn debian_clang_builds_c_and_cpp() {
+    let root = fetched_system("clang");
     let _workload = workload();
     let proj = format!("tmp/fwe-clang-{}", std::process::id());
     let dir = root.join(&proj);
@@ -7854,25 +8151,23 @@ fn hv_debian_clang_builds_c_and_cpp() {
          std::cout << \"c++ \" << std::accumulate(v.begin(), v.end(), 0) << \"\\n\"; }\n",
     )
     .unwrap();
-    let expected = "clang 1.414\nc++ 6\n";
-    let args = |cmd: &mut Command| {
-        cmd.arg("--root")
-            .arg(&root)
-            .arg("--cwd")
-            .arg(format!("/{proj}"))
-            .arg(root.join("bin/bash"))
-            .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
-            .env_clear()
-            .env("PATH", "/usr/lib/llvm-14/bin:/usr/bin:/bin")
-            .stdin(Stdio::null());
-    };
-    let Some(out) = run_hv_explained(args, "clang", expected) else { return };
-    assert_eq!(stdout(&out), expected);
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root")
+        .arg(&root)
+        .arg("--cwd")
+        .arg(format!("/{proj}"))
+        .arg(root.join("bin/bash"))
+        .args(["-c", "set -e; clang -O2 -o a a.c -lm; ./a; clang++ -O2 -o b b.cpp; ./b"])
+        .env_clear()
+        .env("PATH", "/usr/lib/llvm-19/bin:/usr/bin:/bin")
+        .stdin(Stdio::null());
+    let out = run_bounded_for(cmd, &[], Duration::from_secs(300));
+    assert_eq!(stdout(&out), "clang 1.414\nc++ 6\n", "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.status.code(), Some(0));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
-/// Debian's Go 1.19 (fetched: `guests/debian/fetch/go.txt`): the `go`
+/// Debian's Go 1.24 (fetched: `guests/debian/fetch/go.txt`): the `go`
 /// command and its `compile` and `link` tools, all executables linked low
 /// that the VM runs, build a module (goroutines, `crypto/sha256`) and run
 /// it (a static executable, in the VM too), then build and run its tests.
@@ -7880,14 +8175,14 @@ fn hv_debian_clang_builds_c_and_cpp() {
 /// meanwhile, and the linker preallocates its output with `fallocate`.
 #[test]
 fn hv_debian_go_builds_and_tests_a_module() {
-    let root = fetched_root("go");
+    let root = fetched_system("go");
     let _workload = workload();
     let proj = format!("tmp/fwe-go-{}", std::process::id());
     let dir = root.join(&proj);
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let files = [
-        ("go.mod", "module example.com/hello\n\ngo 1.19\n"),
+        ("go.mod", "module example.com/hello\n\ngo 1.24\n"),
         (
             "main.go",
             r#"package main
@@ -7945,10 +8240,11 @@ func TestSums(t *testing.T) {
         .arg(root.join("bin/bash"))
         .arg("build.sh")
         .env_clear()
-        .env("PATH", "/usr/lib/go-1.19/bin:/usr/bin:/bin")
+        .env("PATH", "/usr/lib/go-1.24/bin:/usr/bin:/bin")
         .env("HOME", format!("/{proj}"))
         .env("GOCACHE", format!("/{proj}/cache"))
         .env("GOPROXY", "off")
+        .env("GOTOOLCHAIN", "local")
         .env("CGO_ENABLED", "0")
         .stdin(Stdio::null());
     // The stand-in on a loaded CI runner takes up to twice as long.
@@ -9071,8 +9367,11 @@ fn cgroups_limits_freeze_and_delegation() {
 /// Linux's arm64 format, the process's `environ`, `limits`, `statm`, `io`,
 /// `comm` and host name written as Linux writes them, another process's
 /// `cwd`, `environ`, `limits` and `mountinfo` (and `EACCES` for what only
-/// a tracer reads, to one that cannot trace it), `/proc/net`, and the
-/// link counts of directories (a process's `task` 2 and its threads).
+/// a tracer reads, to one that cannot trace it), `/proc/net`, the
+/// link counts of directories (a process's `task` 2 and its threads), and
+/// the host's process 1, `launchd`, which fwe does not run: its name and
+/// status as the host tells them, owned by `nobody` (another user's), with
+/// no arguments (the host keeps them from other users).
 #[test]
 fn proc_files_programs_read() {
     let out = run_c_guest("procfiles", &[], &[("FWE_PROC", "1")]);
@@ -9111,8 +9410,14 @@ fn proc_files_programs_read() {
     );
     assert_eq!(
         tail,
-        "00000000000000000000000000000001 01 80 10 80       lo\n\
-         route: Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT\n"
+        format!(
+            "00000000000000000000000000000001 01 80 10 80       lo\nroute: {:<127}\n\
+             process 1's files: cmdline comm stat status\n\
+             process 1's comm: launchd\n\
+             process 1's cmdline bytes: 0\n\
+             process 1's uid and parent: 65534 0\n",
+            "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask\t\tMTU\tWindow\tIRTT"
+        )
     );
     assert_eq!(out.status.code(), Some(0));
 }
@@ -9987,32 +10292,45 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
     static PREPARING: std::sync::Mutex<()> = std::sync::Mutex::new(());
     {
         let _one = PREPARING.lock().unwrap_or_else(|e| e.into_inner());
+        // Each where its package's trigger would run: the program there,
+        // and what it works on.
+        // (Alpine's paths, then Debian's.)
+        let triggers: &[(&str, &[&str], &str)] = &[
+            ("usr/bin/gdk-pixbuf-query-loaders", &["--update-cache"], "usr/lib/gdk-pixbuf-2.0"),
+            (
+                "usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0/gdk-pixbuf-query-loaders",
+                &["--update-cache"],
+                "usr/lib/aarch64-linux-gnu/gdk-pixbuf-2.0",
+            ),
+            (
+                "usr/bin/glib-compile-schemas",
+                &["/usr/share/glib-2.0/schemas"],
+                "usr/share/glib-2.0/schemas",
+            ),
+            (
+                "usr/lib/aarch64-linux-gnu/glib-2.0/glib-compile-schemas",
+                &["/usr/share/glib-2.0/schemas"],
+                "usr/share/glib-2.0/schemas",
+            ),
+            // The X server's own fonts' indexes (its default, `fixed`).
+            ("usr/bin/mkfontscale", &["/usr/share/fonts/misc"], "usr/share/fonts/misc"),
+            ("usr/bin/mkfontdir", &["/usr/share/fonts/misc"], "usr/share/fonts/misc"),
+            ("usr/bin/fc-cache", &["-f"], "etc/fonts"),
+            ("usr/bin/update-mime-database", &["/usr/share/mime"], "usr/share/mime"),
+            // The machine's id, which D-Bus's package makes as it is
+            // installed.
+            ("usr/bin/dbus-uuidgen", &["--ensure=/etc/machine-id"], "usr/share/dbus-1"),
+        ];
+        // A root made ready by another list of them is made ready again.
         let stamp = cached.join(".fwe-display-ready");
-        if !stamp.exists() {
+        let made = format!("{triggers:?}");
+        if std::fs::read_to_string(&stamp).ok().as_deref() != Some(made.as_str()) {
             for d in ["root", "tmp/xdg", "tmp/.X11-unix"] {
                 std::fs::create_dir_all(cached.join(d)).unwrap();
             }
             run_checked(Command::new("chmod").arg("700").arg(cached.join("tmp/xdg")));
             run_checked(Command::new("chmod").arg("1777").arg(cached.join("tmp/.X11-unix")));
-            // Each where its package's trigger would run: the program
-            // there, and what it works on.
-            for (prog, args, on) in [
-                (
-                    "usr/bin/gdk-pixbuf-query-loaders",
-                    &["--update-cache"][..],
-                    "usr/lib/gdk-pixbuf-2.0",
-                ),
-                (
-                    "usr/bin/glib-compile-schemas",
-                    &["/usr/share/glib-2.0/schemas"][..],
-                    "usr/share/glib-2.0/schemas",
-                ),
-                // The X server's own fonts' indexes (its default, `fixed`).
-                ("usr/bin/mkfontscale", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
-                ("usr/bin/mkfontdir", &["/usr/share/fonts/misc"][..], "usr/share/fonts/misc"),
-                ("usr/bin/fc-cache", &["-f"][..], "etc/fonts"),
-                ("usr/bin/update-mime-database", &["/usr/share/mime"][..], "usr/share/mime"),
-            ] {
+            for &(prog, args, on) in triggers {
                 if !cached.join(prog).exists() || !cached.join(on).exists() {
                     continue;
                 }
@@ -10027,7 +10345,7 @@ fn display_root(cached: &Path, test: &str) -> ScratchRoot {
                     .unwrap();
                 assert!(out.status.success(), "{prog}: {}", String::from_utf8_lossy(&out.stderr));
             }
-            std::fs::write(&stamp, "").unwrap();
+            std::fs::write(&stamp, &made).unwrap();
         }
     }
     let root = std::env::temp_dir().join(format!("fwe-display-{test}-{}", std::process::id()));
@@ -10185,6 +10503,8 @@ struct Window {
 /// What a window shows ([`Xvfb::shot`], from `tools/display/shot.py`).
 #[derive(Debug)]
 struct Shot {
+    /// How many pixels it has: the window's on the screen.
+    pixels: u64,
     /// How many of its pixels are not its most common colour.
     drawn: u64,
     /// How many pixels each colour has.
@@ -10303,7 +10623,46 @@ impl Xvfb {
             })
             .collect();
         let digest = text.lines().find_map(|l| l.strip_prefix("digest ")).unwrap().to_string();
-        Shot { drawn, colours, digest }
+        let pixels = text
+            .lines()
+            .next()
+            .and_then(|l| l.split(" of ").nth(1))
+            .and_then(|p| p.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap();
+        Shot { pixels, drawn, colours, digest }
+    }
+
+    /// Wait up to `secs` for window `w` to have drawn more than `least`
+    /// pixels (a program draws its first frame once it is ready, which
+    /// compiling its shaders on a loaded machine delays): what it shows
+    /// then.
+    fn drawn(&self, w: &Window, name: &str, least: u64, secs: u64) -> Shot {
+        let began = Instant::now();
+        loop {
+            let now = self.shot(w, name);
+            if now.drawn > least || began.elapsed() > Duration::from_secs(secs) {
+                return now;
+            }
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
+    /// Wait up to `secs` for window `w` to stop changing but for a caret's
+    /// blink (its drawn pixels within 500 of each other for four shots
+    /// half a second apart): a program that has drawn its window can still
+    /// be moving its focus, and keys typed then go elsewhere.
+    fn settled(&self, w: &Window, name: &str, secs: u64) -> Shot {
+        let began = Instant::now();
+        let mut last = self.shot(w, name);
+        let mut still = 0;
+        while still < 3 && began.elapsed() < Duration::from_secs(secs) {
+            std::thread::sleep(Duration::from_millis(500));
+            let now = self.shot(w, name);
+            still = if now.drawn.abs_diff(last.drawn) < 500 { still + 1 } else { 0 };
+            last = now;
+        }
+        last
     }
 
     /// Wait up to `secs` for window `w` to show something other than
@@ -10320,19 +10679,11 @@ impl Xvfb {
     }
 
     /// Keys typed into window `w` (focused first: there is no window
-    /// manager to give it the focus).
+    /// manager to give it the focus), through the server as a keyboard's
+    /// are (XTEST): toolkits that drop sent events (`XSendEvent`'s) take
+    /// them.
     fn type_into(&self, w: &Window, text: &str) {
-        let out = self.xdotool(&[
-            "windowfocus",
-            "--sync",
-            &w.id,
-            "type",
-            "--delay",
-            "40",
-            "--window",
-            &w.id,
-            text,
-        ]);
+        let out = self.xdotool(&["windowfocus", "--sync", &w.id, "type", "--delay", "40", text]);
         assert!(out.status.success(), "xdotool type: {}", String::from_utf8_lossy(&out.stderr));
     }
 
@@ -10379,8 +10730,7 @@ fn alpine_display_xeyes_follows_the_pointer() {
         assert!(o.status.success());
     };
     pointer(w.x + w.w + 200, w.y + w.h / 2);
-    std::thread::sleep(Duration::from_secs(1));
-    let right = x.shot(&w, "xeyes-right");
+    let right = x.drawn(&w, "xeyes-right", 1000, 60);
     assert!(right.drawn > 1000, "xeyes drew {right:?}: {}", gui.report());
     pointer(w.x, w.y + w.h + 200);
     let down = x.changes(&w, &right, "xeyes-down", 30);
@@ -10396,8 +10746,7 @@ fn alpine_display_xclock_ticks() {
     let args = ["-update", "1", "-geometry", "200x200+0+0"];
     let mut gui = Gui::start(&x, "xclock", &root, "/usr/bin/xclock", &args, &[]);
     let w = x.window(&mut gui, &["--class", "xclock"], 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "xclock-first");
+    let first = x.drawn(&w, "xclock-first", 500, 60);
     assert!(first.drawn > 500, "xclock drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "xclock-next", 10);
     assert_ne!(next.digest, first.digest, "the clock did not tick: {}", gui.report());
@@ -10447,8 +10796,7 @@ fn alpine_display_glxgears_turns_by_software() {
     let command = format!("DISPLAY=:{} exec /usr/bin/glxgears -geometry 300x300+0+0", x.number);
     let mut gui = Gui::start(&x, "glxgears", &root, "/bin/sh", &["-c", &command], &env);
     let w = x.window(&mut gui, &["--name", "glxgears"], 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "glxgears-first");
+    let first = x.drawn(&w, "glxgears-first", 10_000, 60);
     assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "glxgears-next", 10);
     assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
@@ -10518,6 +10866,24 @@ fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
     display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &FWE_VULKAN, 120);
 }
 
+/// A program a threaded process's fork child starts in place (as Chromium
+/// starts its GPU process) finds the Mac's GPU through fwe's driver: the
+/// Mac's driver, whose Objective-C classes initialize as it starts, runs
+/// in a fork child of a process that had threads (guests/c/threadfork.c).
+#[test]
+fn alpine_display_a_threaded_programs_fork_child_execs_onto_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("threadfork");
+    let prog = build_c("threadfork", Libc::Musl, true, true);
+    std::fs::copy(&prog, root.0.join("usr/bin/threadfork")).unwrap();
+    let args = ["/usr/bin/threadfork", "/usr/bin/vulkaninfo", "--summary"];
+    let info = display_output(&x, "threadfork", &root, &args, &FWE_VULKAN, 120);
+    let device =
+        info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
+    assert!(device.contains("Apple"), "the device is not the GPU:\n{info}");
+    assert!(info.ends_with("child: exit 0\n"), "{info}");
+}
+
 /// vkcube draws its cube with Vulkan on the Mac's GPU (fwe's driver, its
 /// commands run by the Mac's), and it turns.
 #[test]
@@ -10532,8 +10898,7 @@ fn alpine_display_vkcube_draws_on_the_gpu() {
     // read (`WM_NAME`, XGetWMName): the one window of its size here with
     // no name xdotool sees.
     let w = x.window_sized(&mut gui, &["--name", "^$"], Some((300, 300)), 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "vkcube-first");
+    let first = x.drawn(&w, "vkcube-first", 10_000, 60);
     assert!(first.drawn > 10_000, "vkcube drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "vkcube-next", 10);
     assert_ne!(next.digest, first.digest, "the cube did not turn: {}", gui.report());
@@ -10560,10 +10925,11 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
         return;
     }
     let Some(driver) = mock_vulkan_driver() else { return };
-    let root = alpine_root("display");
+    let scratch = display_root(&alpine_root("display"), "vulkaninfo");
+    let root = &scratch.0;
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root")
-        .arg(&root)
+        .arg(root)
         .arg(root.join("usr/bin/vulkaninfo"))
         .arg("--summary")
         .env("FWE_VULKAN_DRIVER", &driver)
@@ -10584,7 +10950,7 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
     let x = Xvfb::start().expect("XVFB: the display tests need Xvfb");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root")
-        .arg(&root)
+        .arg(root)
         .arg(root.join("usr/bin/vulkaninfo"))
         .env("FWE_VULKAN_DRIVER", &driver)
         .env("VK_LOADER_DEBUG", "error,warn")
@@ -10601,6 +10967,33 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// A program with the Vulkan loader among its libraries, as WebKitGTK's
+/// and Mesa's are (the loader's `vkGetDeviceProcAddr` in the global
+/// scope): a device made through fwe's driver gives its queue, the
+/// driver's functions its own.
+#[test]
+fn alpine_display_vulkan_through_a_loader_in_the_global_scope() {
+    if !fetched_program_tests("FWE_DISPLAY_TESTS") {
+        return;
+    }
+    let Some(driver) = mock_vulkan_driver() else { return };
+    let scratch = display_root(&alpine_root("display"), "vkglobal");
+    let root = &scratch.0;
+    let prog = build_c_dynamic("vkglobal", Libc::Musl, true);
+    let inside = root.join("tmp/vkglobal");
+    std::fs::copy(&prog, &inside).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
+    let out = run_bounded(cmd);
+    assert_eq!(
+        stdout(&out),
+        "instance: 0\nphysical device: found\ndevice: 0\nqueue: taken\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
 }
 
 /// A fork child of a process using the GPU device: its copy of the
@@ -10726,8 +11119,7 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
     let command = local("/usr/bin/glxgears -geometry 300x300+0+0");
     let mut gui = Gui::start(&x, "glxgears-gpu", &root, "/bin/sh", &["-c", &command], &env);
     let w = x.window(&mut gui, &["--name", "glxgears"], 120);
-    std::thread::sleep(Duration::from_secs(2));
-    let first = x.shot(&w, "glxgears-gpu-first");
+    let first = x.drawn(&w, "glxgears-gpu-first", 10_000, 60);
     assert!(first.drawn > 10_000, "glxgears drew {first:?}: {}", gui.report());
     let next = x.changes(&w, &first, "glxgears-gpu-next", 10);
     assert_ne!(next.digest, first.digest, "the gears did not turn: {}", gui.report());
@@ -10762,8 +11154,7 @@ fn alpine_display_wine_notepad_in_the_vm() {
     assert!(status.success(), "wineboot: {status}: {}", boot.report());
     let mut notepad = wine("notepad", "wine notepad");
     let w = x.window(&mut notepad, &["--name", "Notepad"], 1800);
-    std::thread::sleep(Duration::from_secs(5));
-    let before = x.shot(&w, "notepad-before");
+    let before = x.drawn(&w, "notepad-before", 5000, 120);
     assert!(before.drawn > 5000, "Notepad drew {before:?}: {}", notepad.report());
     x.type_into(&w, "typed into Notepad");
     let after = x.changes(&w, &before, "notepad-typed", 300);
@@ -10942,4 +11333,946 @@ fn alpine_display_gtk3_demo_runs() {
 fn alpine_display_gtk4_demo_runs() {
     let Some(x) = display_tests() else { return };
     gtk_demo(&x, "gtk4-demo", &[("GDK_BACKEND", "x11"), ("GSK_RENDERER", "cairo")]);
+}
+
+/// A root for test `test` of the application tests: the Debian packages
+/// `guests/debian/fetch/apps.txt` lists, with the archives
+/// `guests/apps/fetch/upstream.txt` lists unpacked into `/opt` (Electron's
+/// into `/opt/electron`, the others as they unpack), the Electron app of
+/// `guests/apps/electron` in `/opt/fwe-hello`, and users `root` and
+/// `nobody`, whose home `/tmp/nobody` is.
+fn apps_root(test: &str) -> ScratchRoot {
+    static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    let root = fetched_system("apps");
+    let (list, archives) = manifest_in("apps", "upstream");
+    let made = format!(
+        "{list}{}",
+        std::fs::read_to_string(repo().join("guests/apps/electron/main.js")).unwrap()
+    );
+    let stamp = root.join("opt/.fwe-apps");
+    if std::fs::read_to_string(&stamp).ok().as_deref() != Some(made.as_str()) {
+        let _ = std::fs::remove_dir_all(root.join("opt"));
+        std::fs::create_dir_all(root.join("opt/electron")).unwrap();
+        for (url, sha256) in &archives {
+            let name = url.rsplit('/').next().unwrap();
+            let file = fetch_pinned(name, std::slice::from_ref(url), sha256, "apps");
+            if name.ends_with(".zip") {
+                run_checked(
+                    Command::new("unzip")
+                        .arg("-q")
+                        .arg(&file)
+                        .arg("-d")
+                        .arg(root.join("opt/electron")),
+                );
+            } else {
+                run_checked(
+                    Command::new("tar").arg("xzf").arg(&file).arg("-C").arg(root.join("opt")),
+                );
+            }
+        }
+        run_checked(
+            Command::new("cp")
+                .arg("-R")
+                .arg(repo().join("guests/apps/electron"))
+                .arg(root.join("opt/fwe-hello")),
+        );
+        std::fs::write(
+            root.join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nnobody:x:65534:65534:nobody:/tmp/nobody:/bin/sh\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("etc/group"), "root:x:0:\nnogroup:x:65534:\n").unwrap();
+        std::fs::write(&stamp, &made).unwrap();
+    }
+    let scratch = display_root(&root, test);
+    let home = scratch.0.join("tmp/nobody");
+    std::fs::create_dir_all(&home).unwrap();
+    run_checked(Command::new("chmod").arg("777").arg(&home));
+    scratch
+}
+
+/// `program` with `args`, run as `nobody` (`setpriv`), so that a Chromium's
+/// sandbox, which refuses root, is on: the program and arguments for
+/// [`Gui::start`].
+fn as_nobody<'a>(program: &'a str, args: &[&'a str]) -> Vec<&'a str> {
+    let mut v = vec!["--reuid=65534", "--regid=65534", "--clear-groups", "--", program];
+    v.extend(args);
+    v
+}
+
+/// What a window showing the test page (magenta, with "fwe" in green, as
+/// `guests/apps/electron/index.html` has it) shows, checked: mostly the
+/// page's magenta, and the green of its text.
+fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
+    let began = Instant::now();
+    loop {
+        let shot = x.shot(w, name);
+        let (magenta, green) = (shot.count(0xff00ff), shot.count(0x00ff00));
+        let area = shot.pixels;
+        if magenta > area / 2 && green > 2_000 {
+            return;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(120),
+            "{name} shows {magenta} magenta and {green} green pixels of {area}: {shot:?}: {}",
+            gui.report()
+        );
+        std::thread::sleep(Duration::from_secs(1));
+    }
+}
+
+/// A root for browser test `test`: Alpine's browsers
+/// (`guests/alpine/fetch/browsers.txt`), with the pages of
+/// `guests/apps/pages` in `/tmp/fwe-pages` and `nobody`'s home in
+/// `/tmp/nobody`.
+fn browsers_root(test: &str) -> ScratchRoot {
+    use std::os::unix::fs::PermissionsExt;
+    let root = display_root(&alpine_root("browsers"), test);
+    let pages = root.0.join("tmp/fwe-pages");
+    std::fs::create_dir_all(&pages).unwrap();
+    for e in std::fs::read_dir(repo().join("guests/apps/pages")).unwrap() {
+        let e = e.unwrap();
+        std::fs::copy(e.path(), pages.join(e.file_name())).unwrap();
+    }
+    let home = root.0.join("tmp/nobody");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).unwrap();
+    root
+}
+
+/// `/bin/su`'s arguments running `cmd` as `nobody` (Alpine has no
+/// `setpriv`), its home and runtime directory `/tmp/nobody`.
+fn su_nobody(cmd: &str) -> Vec<String> {
+    let cmd = format!("HOME=/tmp/nobody XDG_RUNTIME_DIR=/tmp/nobody exec {cmd}");
+    ["-s", "/bin/sh", "nobody", "-c", &cmd].map(String::from).to_vec()
+}
+
+/// Chromium's switches for a test's run: its profile in `/tmp/nobody`, no
+/// first-run dialogs, its log on standard error.
+const CHROMIUM: &str = "/usr/bin/chromium --no-first-run --user-data-dir=/tmp/nobody/chromium \
+                        --enable-logging=stderr";
+
+/// Chromium, its sandboxes on: its window shows the test page.
+#[test]
+fn alpine_display_chromium_draws_a_page_sandboxed() {
+    let Some(_x) = display_tests() else { return };
+    let root = browsers_root("chromium-page");
+    // The root's Xvfb, which has GLX: Chromium's GPU process falls back to
+    // drawing in software through it.
+    let x = Xvfb::in_root(&root);
+    let args = su_nobody(&format!("{CHROMIUM} file:///tmp/fwe-pages/page.html"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "chromium-page", &root, "/bin/su", &args, &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-page"], 180);
+    shows_the_test_page(&x, &w, "chromium-page", &mut gui);
+}
+
+/// Chromium plays a video ([`plays_the_test_video`]).
+#[test]
+fn alpine_display_chromium_plays_a_video() {
+    let Some(_x) = display_tests() else { return };
+    let root = browsers_root("chromium-video");
+    let x = Xvfb::in_root(&root);
+    let args = su_nobody(&format!(
+        "{CHROMIUM} --autoplay-policy=no-user-gesture-required file:///tmp/fwe-pages/video.html"
+    ));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &[]);
+    plays_the_test_video(&x, "chromium-video", &mut gui);
+}
+
+/// Firefox's command for a test's run: an instance of its own, its
+/// profile made in its home.
+const FIREFOX: &str = "/usr/bin/firefox --new-instance --no-remote";
+
+/// Firefox, its sandboxes on: its window shows the test page.
+#[test]
+fn alpine_display_firefox_draws_a_page_sandboxed() {
+    let Some(x) = display_tests() else { return };
+    let root = browsers_root("firefox-page");
+    let args = su_nobody(&format!("{FIREFOX} file:///tmp/fwe-pages/page.html"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "firefox-page", &root, "/bin/su", &args, &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-page"], 180);
+    shows_the_test_page(&x, &w, "firefox-page", &mut gui);
+}
+
+/// Firefox plays a video ([`plays_the_test_video`]).
+#[test]
+fn alpine_display_firefox_plays_a_video() {
+    let Some(x) = display_tests() else { return };
+    let root = browsers_root("firefox-video");
+    let args = su_nobody(&format!("{FIREFOX} file:///tmp/fwe-pages/video.html"));
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut gui = Gui::start(&x, "firefox-video", &root, "/bin/su", &args, &[]);
+    plays_the_test_video(&x, "firefox-video", &mut gui);
+}
+
+/// A browser showing `guests/apps/pages/video.html` plays its video: the
+/// page says it plays (its title), and what the window shows changes from
+/// one look to the next (the bar crossing the video), the page's own
+/// magenta covering less than all of it.
+fn plays_the_test_video(x: &Xvfb, name: &str, gui: &mut Gui) {
+    let w = x.window(gui, &["--name", "^fwe-video: playing"], 180);
+    let mut seen = std::collections::BTreeSet::new();
+    for n in 0..8 {
+        let shot = x.shot(&w, &format!("{name}-{n}"));
+        assert!(
+            shot.count(0xff00ff) < shot.pixels.saturating_sub(200_000),
+            "{name} shows no video: {shot:?}: {}",
+            gui.report()
+        );
+        seen.insert(shot.digest);
+        std::thread::sleep(Duration::from_millis(400));
+    }
+    assert!(
+        seen.len() >= 4,
+        "{name}'s video does not move: {} frames: {}",
+        seen.len(),
+        gui.report()
+    );
+}
+
+/// Electron, sandboxed: an app of its own showing a page.
+#[test]
+fn debian_display_electron_app_draws_its_page() {
+    let Some(x) = display_tests() else { return };
+    let root = apps_root("electron");
+    let args = as_nobody("/opt/electron/electron", &["/opt/fwe-hello"]);
+    let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
+    let mut gui = Gui::start(&x, "electron", &root, "/usr/bin/setpriv", &args, &env);
+    let w = x.window(&mut gui, &["--name", "^fwe-hello$"], 180);
+    shows_the_test_page(&x, &w, "electron", &mut gui);
+}
+
+/// A file `nobody` can change, holding "fwe", in directory `dir` (made, and
+/// `nobody`'s to make files in: an editor saves by making a new file beside
+/// the old).
+fn editable_file(dir: &Path) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let file = dir.join("hello.txt");
+    std::fs::write(&file, "fwe\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o666)).unwrap();
+    file
+}
+
+/// An editor showing `file` in window `w` (once it has drawn it) edits it:
+/// what is typed at its start, then saved (`ctrl+s`), is in the file.
+fn saves_what_is_typed(x: &Xvfb, w: &Window, gui: &mut Gui, file: &Path, name: &str) {
+    let before = x.drawn(w, &format!("{name}-before"), 50_000, 120);
+    assert!(before.drawn > 50_000, "{name} drew {before:?}: {}", gui.report());
+    x.settled(w, &format!("{name}-before"), 60);
+    x.type_into(w, "typed under fwe");
+    x.key_into(w, "ctrl+s");
+    let began = Instant::now();
+    let saved = loop {
+        let now = std::fs::read_to_string(file).unwrap();
+        if now.contains("typed under fwe") || began.elapsed() > Duration::from_secs(60) {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    };
+    let after = x.shot(w, &format!("{name}-typed"));
+    assert_eq!(
+        saved,
+        "typed under fwefwe\n",
+        "{name} saved {saved:?} ({after:?}): {}",
+        gui.report()
+    );
+}
+
+/// Visual Studio Code, sandboxed: its window opens a file and shows it,
+/// and what is typed into it is saved.
+#[test]
+fn debian_display_vscode_edits_a_file() {
+    let Some(x) = display_tests() else { return };
+    let root = apps_root("vscode");
+    let file = editable_file(&root.0.join("tmp/nobody/project"));
+    let args = as_nobody(
+        "/opt/VSCode-linux-arm64/code",
+        &[
+            "--user-data-dir=/tmp/nobody/code",
+            "--disable-workspace-trust",
+            // No first-run welcome, which takes the focus from the file.
+            "--skip-welcome",
+            "/tmp/nobody/project/hello.txt",
+        ],
+    );
+    let env = [("HOME", "/tmp/nobody"), ("XDG_RUNTIME_DIR", "/tmp/nobody")];
+    let mut gui = Gui::start(&x, "vscode", &root, "/usr/bin/setpriv", &args, &env);
+    let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
+    saves_what_is_typed(&x, &w, &mut gui, &file, "vscode");
+}
+
+/// Zed, drawn by Mesa's software Vulkan driver (lavapipe): its window opens
+/// a file and shows it, and what is typed into it is saved. (On the GPU,
+/// MoltenVK cannot compile its vertex shader: ROADMAP's M7 PR 6.)
+#[test]
+fn debian_display_zed_edits_a_file() {
+    let Some(x) = display_tests() else { return };
+    let root = apps_root("zed");
+    let file = editable_file(&root.0.join("tmp/nobody/project"));
+    // The file is opened in a project, which is trusted (Zed asks
+    // otherwise, a file on its own too, and keys typed go to its
+    // question), and Zed looks for no update.
+    let settings = root.0.join("tmp/nobody/.config/zed");
+    std::fs::create_dir_all(&settings).unwrap();
+    std::fs::write(
+        settings.join("settings.json"),
+        r#"{ "session": { "trust_all_worktrees": true }, "auto_update": false }"#,
+    )
+    .unwrap();
+    let env = [
+        ("HOME", "/tmp/nobody"),
+        ("XDG_RUNTIME_DIR", "/tmp/nobody"),
+        ("VK_DRIVER_FILES", "/usr/share/vulkan/icd.d/lvp_icd.aarch64.json"),
+        // Zed asks before it draws by software otherwise.
+        ("ZED_ALLOW_EMULATED_GPU", "1"),
+    ];
+    // As `nobody`: Zed refuses to run as root.
+    let args = as_nobody(
+        "/opt/zed.app/libexec/zed-editor",
+        &["/tmp/nobody/project", "/tmp/nobody/project/hello.txt"],
+    );
+    let mut gui = Gui::start(&x, "zed", &root, "/usr/bin/setpriv", &args, &env);
+    let w = x.window(&mut gui, &["--name", "hello.txt"], 300);
+    saves_what_is_typed(&x, &w, &mut gui, &file, "zed");
+}
+
+/// The longest an app's build under fwe ([`built_app`]) takes: Cargo
+/// building Tauri's crates, natively some minutes on CI's runners.
+const APP_BUILD_LIMIT: Duration = Duration::from_secs(40 * 60);
+
+/// The app of `guests/apps/<app>` built under fwe on the Alpine root
+/// `guests/alpine/fetch/apps.txt` lists: `build`, a shell command run in a
+/// copy of its sources at `/src/<app>`, fetches what its lock file pins
+/// (the root given the Mac's name servers, as `fwe --pull` gives an
+/// image's) and makes `output` there. Built once and kept in `target/built-apps`
+/// by the hash of its sources and that manifest (CI caches it); the path
+/// of the program made.
+fn built_app(app: &str, build: &str, output: &str) -> PathBuf {
+    static BUILDING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _one = BUILDING.lock().unwrap_or_else(|e| e.into_inner());
+    let src = repo().join("guests/apps").join(app);
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        let mut entries: Vec<_> =
+            std::fs::read_dir(dir).unwrap().map(|e| e.unwrap().path()).collect();
+        entries.sort();
+        for e in entries {
+            // (Not a build's output, where the app was built by hand.)
+            if e.is_dir() && e.file_name().is_some_and(|n| n != "target") {
+                files(&e, out)
+            } else if e.is_file() {
+                out.push(e)
+            }
+        }
+    }
+    let mut all = Vec::new();
+    files(&src, &mut all);
+    let (list, _) = manifest_in("alpine", "apps");
+    let mut what = format!("{build}\n{output}\n{list}").into_bytes();
+    for f in &all {
+        what.extend(f.strip_prefix(&src).unwrap().as_os_str().as_encoded_bytes());
+        what.push(0);
+        what.extend(std::fs::read(f).unwrap());
+    }
+    let kept = repo().join("target/built-apps");
+    std::fs::create_dir_all(&kept).unwrap();
+    let hashed = kept.join(format!(".{app}-{}.what", std::process::id()));
+    std::fs::write(&hashed, &what).unwrap();
+    let key = sha256(&hashed);
+    std::fs::remove_file(&hashed).unwrap();
+    let program = kept.join(format!("{app}-{}", &key[..16]));
+    if program.exists() {
+        return program;
+    }
+    // A copy made as a display test's is, once the cached root is ready
+    // ([`display_root`]): never while a test makes it ready.
+    let scratch = display_root(&alpine_root("apps"), &format!("build-{app}"));
+    std::fs::create_dir_all(scratch.0.join("src")).unwrap();
+    run_checked(Command::new("cp").arg("-R").arg(&src).arg(scratch.0.join("src").join(app)));
+    // The resolver's lines of the Mac's own file, as a container runtime
+    // writes them for a container.
+    let host = std::fs::read_to_string("/etc/resolv.conf").unwrap();
+    let resolv: String = host
+        .lines()
+        .filter(|l| ["nameserver", "search", "domain", "options"].iter().any(|k| l.starts_with(k)))
+        .map(|l| format!("{l}\n"))
+        .collect();
+    assert!(resolv.contains("nameserver"), "the Mac names no name server: {host}");
+    std::fs::write(scratch.0.join("etc/resolv.conf"), resolv).unwrap();
+    let began = Instant::now();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    // Its failed calls kept with the display tests' files; at the limit,
+    // its processes are listed and sampled ([`run_bounded_for`]).
+    let trace = display_dir().join(format!("build-{app}.trace"));
+    cmd.arg("--strace=failures")
+        .arg(format!("--strace-file={}", trace.display()))
+        .arg("--root")
+        .arg(&scratch.0)
+        .arg(scratch.0.join("bin/busybox"))
+        .args(["sh", "-c", &format!("cd /src/{app} && {build}")])
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .env("HOME", "/root")
+        .env("LANG", "C.UTF-8");
+    let out = run_bounded_for(cmd, &[], APP_BUILD_LIMIT);
+    let tail = |b: &[u8]| {
+        let t = String::from_utf8_lossy(b).into_owned();
+        t[t.len().saturating_sub(8_000)..].to_string()
+    };
+    assert!(
+        out.status.success(),
+        "building {app}: {}: {}{}",
+        out.status,
+        tail(&out.stdout),
+        tail(&out.stderr)
+    );
+    eprintln!("{app} built under fwe in {:.0?}", began.elapsed());
+    let part = kept.join(format!(".{app}-{}.part", std::process::id()));
+    std::fs::copy(scratch.0.join("src").join(app).join(output), &part).unwrap();
+    std::fs::rename(&part, &program).unwrap();
+    program
+}
+
+/// A root for display test `test` of an app of fwe's own built on Alpine
+/// ([`built_app`]): the root `guests/alpine/fetch/apps.txt` lists, with
+/// the app at `/usr/local/bin/<name>`.
+fn alpine_app_root(test: &str, program: &Path, name: &str) -> ScratchRoot {
+    let root = display_root(&alpine_root("apps"), test);
+    let bin = root.0.join("usr/local/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    std::fs::copy(program, bin.join(name)).unwrap();
+    root
+}
+
+/// A Tauri app of fwe's own (`guests/apps/tauri`), built under fwe by
+/// Cargo and rustc, linked by clang: WebKitGTK shows its page.
+#[test]
+fn alpine_display_tauri_app_draws_its_page() {
+    let Some(x) = display_tests() else { return };
+    let program = built_app(
+        "tauri",
+        "RUSTFLAGS=-Clinker=clang cargo build --release --locked",
+        "target/release/fwe-tauri",
+    );
+    let root = alpine_app_root("tauri", &program, "fwe-tauri");
+    let mut gui = Gui::start(&x, "tauri", &root, "/usr/local/bin/fwe-tauri", &[], &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-tauri$"], 180);
+    shows_the_test_page(&x, &w, "tauri", &mut gui);
+}
+
+/// A Wails app of fwe's own (`guests/apps/wails`), built under fwe by Go
+/// with cgo, compiled and linked by clang: WebKitGTK shows its page.
+#[test]
+fn alpine_display_wails_app_draws_its_page() {
+    let Some(x) = display_tests() else { return };
+    let program = built_app(
+        "wails",
+        "CGO_ENABLED=1 CC=clang GOTOOLCHAIN=local GOFLAGS=-mod=mod \
+         go build -buildmode=pie -tags desktop,production,webkit2_41 -ldflags='-s -w' \
+         -o fwe-wails .",
+        "fwe-wails",
+    );
+    let root = alpine_app_root("wails", &program, "fwe-wails");
+    let mut gui = Gui::start(&x, "wails", &root, "/usr/local/bin/fwe-wails", &[], &[]);
+    let w = x.window(&mut gui, &["--name", "^fwe-wails$"], 180);
+    shows_the_test_page(&x, &w, "wails", &mut gui);
+}
+
+/// Making a name that exists in or at a read-only mount is `EEXIST`
+/// before `EROFS`, as Linux reports it (bwrap binds a directory twice).
+#[test]
+fn making_an_existing_name_in_a_read_only_mount_is_eexist() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "mkexist",
+        &[],
+        "mkdirat of the root from its parent: EEXIST\n\
+         mkdir of the read-only mount's root: EEXIST\n\
+         mkdir of a directory in it: EEXIST\n\
+         mkdir of a file in it: EEXIST\n\
+         mkdir of a new name in it: EROFS\n\
+         mknod of a file in it: EEXIST\n\
+         mknod of a new name in it: EROFS\n\
+         symlink at a file in it: EEXIST\n\
+         symlink at a new name in it: EROFS\n\
+         link to a file in it: EEXIST\n\
+         link to a new name in it: EROFS\n\
+         in a tmpfs:\n\
+         mkdir of the read-only mount's root: EEXIST\n\
+         mkdir of a directory in it: EEXIST\n\
+         mkdir of a file in it: EEXIST\n\
+         mkdir of a new name in it: EROFS\n\
+         mknod of a file in it: EEXIST\n\
+         mknod of a new name in it: EROFS\n\
+         symlink at a file in it: EEXIST\n\
+         symlink at a new name in it: EROFS\n\
+         link to a file in it: EEXIST\n\
+         link to a new name in it: EROFS\n",
+    );
+}
+
+/// What `poll` and `select` report for pipes and sockets: never `POLLPRI`
+/// but for a TCP socket's urgent data, which a wait for it ends on (NSPR
+/// takes `POLLPRI` on its pipe for an error, and Firefox's socket thread
+/// then remakes the pipe for ever), and a TCP socket hung up only once
+/// shut both ways: with only its peer's end of the stream come, a wait for
+/// urgent data waits its time, `epoll`'s too.
+#[test]
+fn poll_reports_no_urgent_data_for_pipes_and_sockets() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "pollpri",
+        &[],
+        "select: 1, read 1, except 0\n\
+         poll for urgent data: 0, 0\n\
+         pipe empty: 0\n\
+         pipe with data: 0x41\n\
+         pipe with data, writer gone: 0x51\n\
+         stream pair empty: 0\n\
+         stream pair with data: 0x41\n\
+         stream pair with data, writer gone: 0x51\n\
+         datagram pair empty: 0\n\
+         datagram pair with data: 0x41\n\
+         datagram pair with data, writer gone: 0x41\n\
+         tcp empty: 0\n\
+         tcp poll for urgent data: 1, 0x2\n\
+         tcp with urgent data: 0x2\n\
+         tcp select: 1, read 0, except 1\n\
+         tcp with urgent data, peer gone: 0x43\n\
+         tcp peer gone, poll for urgent data: 0, 0, waited its time\n\
+         tcp peer gone, writable: 0x4\n\
+         tcp peer gone, epoll for urgent data: 0, waited its time\n",
+    );
+}
+
+/// Multicast membership on TCP sockets, as Linux 7.0 answers it.
+#[test]
+fn tcp_multicast_membership_as_linux_answers_it() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "mcasttcp",
+        &[],
+        "IP_ADD_MEMBERSHIP: 71\n\
+         IP_ADD_MEMBERSHIP, no room: 71\n\
+         IP_DROP_MEMBERSHIP: 71\n\
+         IP_ADD_SOURCE_MEMBERSHIP: 0\n\
+         IP_ADD_SOURCE_MEMBERSHIP again: 99\n\
+         IP_DROP_SOURCE_MEMBERSHIP: 0\n\
+         IP_DROP_SOURCE_MEMBERSHIP again: 22\n\
+         MCAST_JOIN_GROUP: 0\n\
+         MCAST_JOIN_GROUP again: 98\n\
+         MCAST_LEAVE_GROUP: 0\n\
+         MCAST_LEAVE_GROUP again: 99\n\
+         MCAST_JOIN_SOURCE_GROUP: 0\n\
+         MCAST_LEAVE_SOURCE_GROUP: 0\n\
+         MCAST_LEAVE_SOURCE_GROUP again: 22\n\
+         MCAST_JOIN_GROUP for blocks: 0\n\
+         MCAST_BLOCK_SOURCE: 0\n\
+         MCAST_BLOCK_SOURCE again: 99\n\
+         MCAST_JOIN_SOURCE_GROUP with sources blocked: 22\n\
+         MCAST_UNBLOCK_SOURCE: 0\n\
+         MCAST_UNBLOCK_SOURCE again: 99\n\
+         MCAST_BLOCK_SOURCE number 11: 105\n\
+         MCAST_MSFILTER include one: 0\n\
+         MCAST_LEAVE_SOURCE_GROUP its source: 0\n\
+         MCAST_LEAVE_GROUP after: 99\n\
+         MCAST_MSFILTER not joined: 22\n\
+         MCAST_MSFILTER mode 5: 22\n\
+         IP_MSFILTER not joined: 22\n\
+         IP_MSFILTER short: 22\n\
+         IP_BLOCK_SOURCE not joined: 22\n\
+         IP_ADD_SOURCE_MEMBERSHIP short: 22\n\
+         MCAST_JOIN_GROUP of an IPv6 address: 22\n\
+         MCAST_JOIN_SOURCE_GROUP of an IPv6 address: 99\n\
+         MCAST_JOIN_GROUP of 127.0.0.1: 22\n\
+         MCAST_LEAVE_GROUP of 127.0.0.1: 99\n\
+         MCAST_JOIN_GROUP short: 22\n\
+         IPV6_ADD_MEMBERSHIP: 71\n\
+         IPV6_ADD_MEMBERSHIP, no room: 22\n\
+         IPV6_DROP_MEMBERSHIP: 71\n\
+         IPv6 MCAST_JOIN_GROUP: 0\n\
+         IPv6 MCAST_JOIN_GROUP again: 98\n\
+         IPv6 MCAST_LEAVE_GROUP: 0\n\
+         IPv6 MCAST_LEAVE_GROUP again: 99\n\
+         IPv6 MCAST_JOIN_GROUP of an IPv4 address: 99\n\
+         IPv6 MCAST_LEAVE_GROUP of fe02::fb: 22\n\
+         MCAST_JOIN_GROUP on an IPv6 socket: 0\n",
+    );
+}
+
+/// What fwe keeps of a socket is shared by its duplicates: a TCP socket's
+/// multicast groups, and `IPV6_ADDRFORM`'s IPv4 view.
+#[test]
+fn a_sockets_duplicates_share_what_fwe_keeps_of_it() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "sockshare",
+        &[],
+        "join: 0\n\
+         join again through a dup: EADDRNOTAVAIL\n\
+         leave through the dup: 0\n\
+         leave again through the socket: errno 22\n\
+         IPV6_ADDRFORM: 0\n\
+         the dup's name: family 2, 16 bytes\n",
+    );
+}
+
+/// Socket options fwe keeps itself are the socket's, as on Linux: a dup
+/// shares them, and a fork child, the program `execve` runs (here through
+/// `/proc/self/exe`, a program outside the root) and a process the socket
+/// is passed to have them.
+#[test]
+fn kept_socket_options_are_the_sockets() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "keptopts",
+        &[],
+        "the socket: passcred 1, priority 5, no_check 1\n\
+         a dup of it: passcred 1, priority 5, no_check 1\n\
+         the socket after the dup's change: passcred 1, priority 3, no_check 1\n\
+         the dup, the socket's descriptor closed: passcred 1, priority 3, no_check 1\n\
+         passed to another process: passcred 1, priority 0, no_check 0\n\
+         in a fork child: passcred 1, priority 3, no_check 1\n\
+         after execve: passcred 1, priority 3, no_check 1\n",
+    );
+}
+
+/// `SO_PASSCRED` at the end of a Unix socket's stream: a message carries
+/// credentials, the end none, as crashpad tells the end.
+#[test]
+fn credentials_at_the_end_of_a_unix_socket() {
+    // Linux 7.0's output, on arm64, as root (as the guest runs).
+    c_guest_prints(
+        "credeof",
+        &[],
+        "stream first: 5 bytes, control with credentials: pid mine, uid mine, gid mine\n\
+         stream then: 0 bytes, control with credentials: pid 0, uid mine, gid mine\n\
+         datagram first: 5 bytes, control with credentials: pid mine, uid mine, gid mine\n\
+         datagram then: -1 EAGAIN, control none\n\
+         seqpacket first: 5 bytes, control with credentials: pid mine, uid mine, gid mine\n\
+         seqpacket then: 0 bytes, control none\n",
+    );
+}
+
+/// `SO_PASSCRED` gives each message's sender, a process forked after the
+/// socket pair was made too, whether it is still there when its message is
+/// read or not, where `SO_PEERCRED` names the pair's maker (Chromium's
+/// zygote learns its children's pids so).
+#[test]
+fn credentials_name_each_messages_sender() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "credsender",
+        &[],
+        "stream, sender alive: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         datagram, sender alive: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         seqpacket, sender alive: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         stream, sender gone: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         datagram, sender gone: 5 bytes, credentials pid the sender's, peer pid mine\n\
+         seqpacket, sender gone: 5 bytes, credentials pid the sender's, peer pid mine\n",
+    );
+}
+
+/// `/proc/<tid>` of a thread not its process's leader: not listed, but
+/// opened, from the process and from another, as Linux serves it.
+#[test]
+fn proc_serves_a_threads_own_directory() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "threadproc",
+        &[],
+        "the thread is not listed in /proc\n\
+         the process: /proc/<tid>/stat: read, names the thread\n\
+         the process: /proc/<pid>/task/<tid>/stat: opened\n\
+         a child: /proc/<tid>/stat: read, names the thread\n",
+    );
+}
+
+/// Names `/proc/sys` lacks are `ENOENT`, as Linux answers them, once
+/// bubblewrap has bound it onto itself through a descriptor of a fresh
+/// `proc` too (libgcrypt, reading `/proc/sys/crypto/fips_enabled` as it
+/// starts, takes any other error for a fatal one), and `/dev/null` bound
+/// through its descriptor masks a file, as crun masks them.
+#[test]
+fn proc_sys_bound_through_a_descriptor_lacks_what_it_lacks() {
+    // Linux 7.0's output, on arm64.
+    let names = "/proc/sys/crypto/fips_enabled: ENOENT\n\
+                 /proc/sys/nope: ENOENT\n\
+                 /proc/sys/nope/deeper: ENOENT\n\
+                 /proc/sys/kernel/nope: ENOENT\n\
+                 /proc/sys/kernel/ostype: 6 bytes: Linux\n";
+    c_guest_prints(
+        "procsys",
+        &[],
+        &format!(
+            "{names}bound: 0 0 0\n{names}fresh proc, bound through a descriptor: 0 0 0\n\
+             {names}masked: 0\n/proc/sys/kernel/ostype: 0 bytes: \n"
+        ),
+    );
+}
+
+/// `SO_PEERGROUPS` gives the peer's supplementary groups as D-Bus reads
+/// them, and another process's `status` lists its groups.
+#[test]
+fn peer_groups_and_another_processs_groups() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "peergroups",
+        &[],
+        "no room: -1 ERANGE, needed: the groups' size\npeer's groups: 0, getgroups' own: yes\n\
+         unconnected: -1 ENODATA\nTCP: -1 ENODATA\nchild's status lists the groups: yes\n\
+         each group then a space: yes\n",
+    );
+}
+
+/// rtnetlink dumps by family as Linux answers them: a family it has no
+/// handler for (`AF_PACKET`, as Firefox asks) gives every family's
+/// addresses and routes; neighbours, in a namespace of `lo` alone, none.
+#[test]
+fn netlink_dumps_by_family_as_linux_answers_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "nlfamilies",
+        &[],
+        "initial namespace:\n\x20 addresses family 0: 2:some 10:some\n\
+         \x20 routes family 0: 2:some 10:some\n\
+         \x20 neighbours family 0: answered, each of the family asked for: yes\n\
+         \x20 addresses family 2: 2:some\n\x20 routes family 2: 2:some\n\
+         \x20 neighbours family 2: answered, each of the family asked for: yes\n\
+         \x20 addresses family 10: 10:some\n\x20 routes family 10: 10:some\n\
+         \x20 neighbours family 10: answered, each of the family asked for: yes\n\
+         \x20 addresses family 17: 2:some 10:some\n\
+         \x20 routes family 17: 2:some 10:some\n\
+         \x20 neighbours family 17: answered, each of the family asked for: yes\n\
+         new namespace, lo up:\n\x20 addresses family 0: 2:some 10:some\n\
+         \x20 routes family 0: 2:some 10:some\n\x20 neighbours family 0:\n\
+         \x20 addresses family 2: 2:some\n\x20 routes family 2: 2:some\n\
+         \x20 neighbours family 2:\n\x20 addresses family 10: 10:some\n\
+         \x20 routes family 10: 10:some\n\x20 neighbours family 10:\n\
+         \x20 addresses family 17: 2:some 10:some\n\
+         \x20 routes family 17: 2:some 10:some\n\x20 neighbours family 17:\n",
+    );
+}
+
+/// Writes to a file opened to append go where Linux puts them: at the end
+/// for `pwrite` and an AIO write at an offset, at the offset (or the
+/// file's position) for `RWF_NOAPPEND`, which musl's `pwrite` uses.
+#[test]
+fn appending_writes_and_rwf_noappend() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "noappend",
+        &[],
+        "pwrite at 0: aaaa (position 0)\npwritev2 at 1, RWF_NOAPPEND: 2\nthen: aXYa (position 0)\n\
+         pwritev2 at the position, RWF_NOAPPEND: 1\nthen: ZXYa (position 1)\n\
+         pwritev2 at 0: 1\nthen: ZXYab (position 1)\nAIO at 0: 1\nthen: ZXYabc (position 1)\n\
+         AIO at 2, RWF_NOAPPEND: 1\nthen: ZXDabc (position 1)\n",
+    );
+}
+
+/// A socket passed with `SCM_RIGHTS` and closed by its sender keeps the
+/// data written into it until its receiver takes it, whatever happens
+/// meanwhile: macOS empties such a socket when any Unix socket goes away
+/// (as Firefox's fork server's exec socket was), Linux never does.
+#[test]
+fn a_socket_in_flight_keeps_its_data() {
+    c_guest_prints(
+        "inflight",
+        &[],
+        "socket: data lost in 0 of 10\nsocket and eventfd: data lost in 0 of 10\n",
+    );
+}
+
+/// `SECCOMP_RET_TRAP` as Chromium's and Firefox's sandboxes rely on it:
+/// the call not made, the `SIGSYS`'s call address and the context's pc
+/// both the address after the `svc` (which the sandboxes compare), as is
+/// the filter's instruction pointer; the handler sets the result, and a
+/// trapped call is not restarted, whatever its `x0` holds.
+#[test]
+fn seccomp_traps_report_the_address_after_the_call() {
+    // Linux 7.1's output, on arm64.
+    c_guest_prints(
+        "seccomptrap",
+        &[],
+        "filter: 0\ntrapped call returns: 42\n\
+         signal 31, code 1, syscall 173, data 7, arch 0xc00000b7\n\
+         call address is after the svc: yes\ncontext pc is after the svc: yes\ncontext x8: 173\n\
+         filter's instruction pointer is after the svc: yes\n\
+         a trapped read whose first argument is -EINTR returns: -4, its handler run 1 time(s)\n",
+    );
+}
+
+/// `RLIMIT_DATA` and `RLIMIT_AS`, which macOS refuses to set, kept and
+/// enforced as Linux enforces them (Chromium's sandbox lowers the data
+/// limit): data at `mmap`, `mprotect` and `brk`, the whole size at `mmap`
+/// and `mremap`, a soft data limit of 0 as Valgrind's; `VmSize` is the
+/// program's mappings.
+#[test]
+fn memory_limits_are_enforced_as_linux_enforces_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "datalimits",
+        &[],
+        "data: unlimited\nas: unlimited\nset data 64 MiB: 0\n128 MiB private writable: ENOMEM\n\
+         16 MiB private writable: ok\n128 MiB shared writable: ok\n128 MiB private read-only: ok\n\
+         made writable: ENOMEM\n16 MiB of it made writable: ok\nbrk by 128 MiB: refused\n\
+         brk by 1 MiB: grown\nVmSize below 1 GiB: yes\nset as: 0\n128 MiB inaccessible: ok\n\
+         512 MiB inaccessible: ENOMEM\ngrown to 512 MiB: ENOMEM\ngrown to 128 MiB: ok\n\
+         set data 0, hard 64 MiB: 0\n32 MiB private writable: ok\n128 MiB private writable: ENOMEM\n",
+    );
+}
+
+/// A network namespace's routes, as netlink dumps and finds them and
+/// `/proc/net` shows them: a new namespace's, none until `lo` is up, then
+/// `lo`'s local ones (GLib's network monitor dumps them); the initial
+/// namespace's main table, the host's routes.
+#[test]
+fn routes_are_dumped_found_and_listed_as_linux_has_them() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "routes",
+        &[],
+        "host: dump 0, main routes: yes, each on an interface: yes\n\
+         new namespace, lo down:\n  dump: 0\n  /proc/net/route: 0 lines, padded: yes\n\
+         \x20 /proc/net/ipv6_route: 2 lines\nlo up:\n\
+         \x20 local table local 127.0.0.0/8 scope 254 oif 1\n\
+         \x20 local table local 127.0.0.1/32 scope 254 oif 1\n\
+         \x20 broadcast table local 127.255.255.255/32 scope 253 oif 1\n\
+         \x20 local table local ::1/128 scope 0 oif 1\n  dump: 0\nIPv6 alone:\n\
+         \x20 local table local ::1/128 scope 0 oif 1\n  dump: 0\n\
+         \x20 /proc/net/route: 1 lines, padded: yes\n  /proc/net/ipv6_route: 3 lines\n\
+         get 127.0.0.1:\n  local table main 127.0.0.1/32 scope 0 oif 1 cached\n  error: 0\n\
+         get 8.8.8.8:\n  error: -101\nchild: 0\n",
+    );
+}
+
+/// Firefox's fork server starting a sandboxed content process: the exec
+/// socket the parent sends the server reaches the child it clones into
+/// new namespaces, though that child's `CLONE_FS` chroot helper closes
+/// every descriptor but its own; the helper's `chroot` is the child's.
+#[test]
+fn a_fork_servers_sandboxed_child_reads_its_exec_socket() {
+    // Linux 7.0's output, on arm64.
+    c_guest_prints(
+        "forkserver",
+        &[],
+        "child read: exec info\nchroot answered: yes\nserver: child 0\nparent wrote: 9, server: 0\n",
+    );
+}
+
+/// `/sys/devices/system/cpu` holds the host's CPUs as Linux lays them out:
+/// glibc counts them there, and each CPU's topology and caches agree with
+/// the host's kinds of core (`sysctl hw.perflevel<n>`).
+#[test]
+fn sys_lists_the_hosts_cpus_their_clusters_and_caches() {
+    let host = |name: &str| {
+        let out = Command::new("sysctl").args(["-n", name]).output_alone().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok()
+    };
+    let n = host("hw.activecpu").unwrap();
+    // The efficiency cores' (the last level's), as CPU 0 is one of them;
+    // none where the levels do not add up to the CPUs.
+    let levels = host("hw.nperflevels").unwrap_or(0);
+    let counted: u64 =
+        (0..levels).filter_map(|i| host(&format!("hw.perflevel{i}.logicalcpu"))).sum();
+    let (l1d, line) = if levels > 0 && counted == n {
+        let l1d = host(&format!("hw.perflevel{}.l1dcachesize", levels - 1)).unwrap();
+        (format!("{}K", l1d / 1024), host("hw.cachelinesize").unwrap().to_string())
+    } else {
+        (String::new(), String::new())
+    };
+    let range = if n == 1 { "0".to_string() } else { format!("0-{}", n - 1) };
+    c_guest_prints(
+        "syscpu",
+        &[],
+        &format!(
+            "cpus: {n}\nconf: {n}, online: {n}\nonline list: {range}, present: {range}\n\
+             L1d: {l1d}, line: {line}\nconsistent: yes\n"
+        ),
+    );
+}
+
+/// Each thread has its own name: set by `PR_SET_NAME` or a write to its
+/// `comm` (another thread's too, as `pthread_setname_np` writes it), its
+/// creator's when it starts, the forking thread's in a fork child, the
+/// program's after `execve`; another process reads each in
+/// `/proc/<pid>/task/<tid>` (crashpad does, of a crashed browser's).
+#[test]
+fn threads_have_names_of_their_own() {
+    let prog = build_c_dynamic("threadnames", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "threadnames");
+    std::fs::copy(&prog, root.join("threadnames")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("threadnames"));
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    // Linux 7.0's output, on arm64.
+    assert_eq!(
+        stdout(&out),
+        "own view of the named thread: named-by-main\n\
+         own view of the inheriting thread: self-named\n\
+         fork child: self-named\n\
+         main comm: threadnames\n\
+         main stat: (threadnames)\n\
+         main status: threadnames\n\
+         self-named comm: self-named\n\
+         self-named stat: (self-named)\n\
+         self-named status: self-named\n\
+         inheriting comm: self-named\n\
+         inheriting stat: (self-named)\n\
+         inheriting status: self-named\n\
+         named by main comm: named-by-main\n\
+         named by main stat: (named-by-main)\n\
+         named by main status: named-by-main\n\
+         after execve: exe\n\
+         child: 0\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
+}
+
+/// Processes made with `CLONE_FS` share their root, working directory and
+/// umask, across `execve` too; one made without it has its own. Chromium's
+/// sandbox empties its root so: a `CLONE_FS` child's `chroot` to its own
+/// `/proc/self/fdinfo` leaves the parent's root in a directory of a process
+/// that has ended; a descriptor of `/proc` opened before still reaches it.
+/// The program is in its root, as a program is on Linux: its child runs it
+/// again.
+#[test]
+fn clone_fs_shares_the_root_working_directory_and_umask() {
+    let prog = build_c_dynamic("clonefs", Libc::Glibc, true);
+    let root = libc_rootfs(Libc::Glibc, "clonefs");
+    std::fs::copy(&prog, root.join("clonefs")).unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+    cmd.arg("--root").arg(&root).arg(root.join("clonefs"));
+    let out = run_bounded(cmd);
+    let _ = std::fs::remove_dir_all(&root);
+    // Linux 7.0's output, on arm64.
+    assert_eq!(
+        stdout(&out),
+        "without CLONE_FS: child 0\n\
+         its parent: cwd /, umask 022\n\
+         with CLONE_FS: child 0\n\
+         its parent: cwd /moved, umask 027\n\
+         with CLONE_FS, across execve: child 0\n\
+         its parent: cwd /moved, umask 000\n\
+         Chromium's empty root: child 0\n\
+         /proc: No such process\n\
+         /: found\n\
+         cwd: /\n\
+         listing /: No such process\n\
+         /proc's self/fd: listed\n\
+         /proc's self/status: Name\n\
+         in /proc: cwd No such file or directory\n\
+         in /proc: self found\n",
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(out.status.code(), Some(0));
 }

@@ -1148,10 +1148,6 @@ impl<P: Platform> Kernel<P> {
         if !fdmarks::any_marks() {
             return None;
         }
-        // What Linux does for any descriptor, before the device sees it.
-        if matches!(req, ioctl::FIOCLEX | ioctl::FIONCLEX | ioctl::FIONBIO | ioctl::FIOASYNC) {
-            return None;
-        }
         // An argument that is a number, not a pointer, as the guest gave
         // it (a backend translates the argument as a pointer); a pointer's
         // copies go back to the guest address themselves.
@@ -1471,11 +1467,13 @@ fn device_numbered(l: &Loops, numbers: &[u8]) -> Option<u32> {
     (l.devices.contains_key(&n) && n.to_string() == minor).then_some(n)
 }
 
-/// A path under a device's directory in `/sys/block` or `/sys/dev/block`
-/// as the path in its own directory (which those link to).
+/// A path under a device's directory in `/sys/block`, `/sys/class/block`
+/// or `/sys/dev/block` as the path in its own directory (which those link
+/// to).
 fn canonical(l: &Loops, path: &[u8]) -> Option<(u32, Vec<u8>)> {
     for (base, by_name) in [
         (&b"/sys/block/"[..], true),
+        (b"/sys/class/block/", true),
         (b"/sys/dev/block/", false),
         (b"/sys/devices/virtual/block/", true),
     ] {
@@ -1499,8 +1497,14 @@ pub fn sys_lookup(path: &[u8]) -> Option<Entry> {
     if !path.starts_with(b"/sys/") {
         return None;
     }
-    if matches!(path, b"/sys/block" | b"/sys/dev" | b"/sys/dev/block" | b"/sys/devices/virtual")
-        || path == DEVICES_DIR
+    if matches!(
+        path,
+        b"/sys/block"
+            | b"/sys/class/block"
+            | b"/sys/dev"
+            | b"/sys/dev/block"
+            | b"/sys/devices/virtual"
+    ) || path == DEVICES_DIR
     {
         return Some(Entry::Dir);
     }
@@ -1511,7 +1515,7 @@ pub fn sys_lookup(path: &[u8]) -> Option<Entry> {
     let link = |up: &str| Entry::Symlink(format!("{up}devices/virtual/block/loop{n}").into_bytes());
     Some(match sub.as_slice() {
         b"" if path.starts_with(b"/sys/block/") => link("../"),
-        b"" if path.starts_with(b"/sys/dev/") => link("../../"),
+        b"" if path.starts_with(b"/sys/dev/") || path.starts_with(b"/sys/class/") => link("../../"),
         b"" | b"/queue" => Entry::Dir,
         b"/loop" if b.is_some() => Entry::Dir,
         b"/dev" => line(format!("{MAJOR}:{n}")),
@@ -1537,10 +1541,10 @@ pub fn sys_lookup(path: &[u8]) -> Option<Entry> {
                 b"autoclear" => line(u8::from(b.flags & LO_FLAGS_AUTOCLEAR != 0)),
                 b"partscan" => line(u8::from(b.flags & LO_FLAGS_PARTSCAN != 0)),
                 b"dio" => line(u8::from(b.flags & LO_FLAGS_DIRECT_IO != 0)),
-                _ => Entry::Missing,
+                _ => Entry::Missing(fwe_abi::errno::ENOENT),
             }
         }
-        _ => Entry::Missing,
+        _ => Entry::Missing(fwe_abi::errno::ENOENT),
     })
 }
 
@@ -1553,7 +1557,7 @@ pub fn sys_children(path: &[u8]) -> Option<Vec<(Vec<u8>, u8)>> {
     let l = state().ok()?;
     let names = |kind| l.devices.keys().map(|n| (format!("loop{n}").into_bytes(), kind)).collect();
     Some(match path {
-        b"/sys/block" => names(DT_LNK),
+        b"/sys/block" | b"/sys/class/block" => names(DT_LNK),
         b"/sys/dev" => vec![(b"block".to_vec(), DT_DIR)],
         b"/sys/dev/block" => {
             l.devices.keys().map(|n| (format!("{MAJOR}:{n}").into_bytes(), DT_LNK)).collect()

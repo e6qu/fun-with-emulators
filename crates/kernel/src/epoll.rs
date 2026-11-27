@@ -8,15 +8,26 @@
 //! `udata`. `EPOLLET` maps to `EV_CLEAR` and `EPOLLONESHOT` to `EV_ONESHOT`.
 //! The host's edge-triggered read filter on a pipe fires after a read too,
 //! which Linux's does not: the read end is reported only once it holds more
-//! than when last seen; an eventfd's (whose pipe holds one byte while its
+//! than when last seen, less what this process read through that
+//! descriptor since ([`read_from`]); an eventfd's (whose pipe holds one byte while its
 //! count is not 0) once written to, every write being an edge to Linux,
 //! whatever the count was. A pipe with a capacity smaller than the host's
 //! ([`crate::fdstate::pipe_full`]) is not writable while full, which the
 //! host does not know: its `EVFILT_WRITE` events are dropped then.
 //!
+//! A set's changes and the taking of its events, which disarms the
+//! one-shot entries they report, are made one at a time ([`SETS`]), the
+//! waits without it.
+//!
 //! A kqueue is not passed on to a child process, so each epoll descriptor's
 //! interest list is also recorded here ([`save`], [`restore`]): a fork
 //! child rebuilds its epoll descriptors from it.
+//!
+//! A duplicate of an epoll descriptor (`dup`, `dup3`, `F_DUPFD`) is the
+//! same set, as on Linux (Tokio's registry clones it so): the host's
+//! duplicate names the same kqueue, and the tables here know a set by one
+//! live number of it, which each duplicate maps to ([`ALIASES`]); when that
+//! number is closed and duplicates remain, the set takes one of theirs.
 //!
 //! `epoll_event` arrays are copied in and out of guest memory. The arm64
 //! layout is `{ u32 events; u64 data; }`, not packed as on x86-64: `data`
@@ -36,6 +47,34 @@ fn interest<R>(f: impl FnOnce(&mut std::collections::HashMap<i32, Interest>) -> 
     f(g.get_or_insert_with(Default::default))
 }
 
+/// Each duplicate of an epoll descriptor, as (its number, the number the
+/// tables know its set by), which is always open.
+#[cfg(not(target_os = "linux"))]
+pub(crate) static ALIASES: crate::kept::Kept<Vec<(i32, i32)>> = crate::kept::Kept::new(Vec::new());
+
+/// The number the tables know the set descriptor `fd` names by: `fd`
+/// itself unless it is a duplicate.
+#[cfg(not(target_os = "linux"))]
+fn set_of(fd: i32) -> i32 {
+    ALIASES.if_used().and_then(|a| a.iter().find(|k| k.0 == fd).map(|k| k.1)).unwrap_or(fd)
+}
+
+/// Descriptor `new` is a duplicate of `old`: if `old` names an epoll set,
+/// so does `new`.
+pub fn duplicated(old: i32, new: i32) {
+    #[cfg(target_os = "linux")]
+    let _ = (old, new);
+    #[cfg(not(target_os = "linux"))]
+    {
+        let set = set_of(old);
+        if set != new && is_epoll(set) {
+            let mut a = ALIASES.lock();
+            a.retain(|k| k.0 != new);
+            a.push((new, set));
+        }
+    }
+}
+
 /// Whether descriptor `tfd` is in the interest list of epoll descriptor
 /// `efd` (`None`: `efd` is no epoll descriptor of this process's).
 pub fn watches(efd: i32, tfd: i32) -> Option<bool> {
@@ -45,16 +84,33 @@ pub fn watches(efd: i32, tfd: i32) -> Option<bool> {
         None
     }
     #[cfg(not(target_os = "linux"))]
-    interest(|m| m.get(&efd).map(|list| list.contains_key(&tfd)))
+    {
+        let efd = set_of(efd);
+        interest(|m| m.get(&efd).map(|list| list.contains_key(&tfd)))
+    }
 }
 
 /// Descriptor `fd` is being closed: it leaves every interest list (as the
-/// kqueue drops its filters), and if it is an epoll descriptor, its list goes.
+/// kqueue drops its filters), and if it is an epoll descriptor, its list
+/// goes, unless a duplicate of it remains: then the set goes on under that
+/// one's number.
 pub fn closed(fd: i32) {
     #[cfg(target_os = "linux")]
     let _ = fd;
     #[cfg(not(target_os = "linux"))]
     {
+        if let Some(mut a) = ALIASES.if_used() {
+            let duplicate = a.iter().any(|k| k.0 == fd);
+            a.retain(|k| k.0 != fd);
+            if !duplicate && let Some(heir) = a.iter().filter(|k| k.1 == fd).map(|k| k.0).min() {
+                a.retain(|k| k.0 != heir);
+                for k in a.iter_mut().filter(|k| k.1 == fd) {
+                    k.1 = heir;
+                }
+                drop(a);
+                renumber(fd, heir);
+            }
+        }
         if let Some(mut g) = INTEREST.if_used()
             && let Some(m) = g.as_mut()
         {
@@ -67,7 +123,7 @@ pub fn closed(fd: i32) {
             e.retain(|k| k.0 != fd && k.1 != fd);
         }
         if let Some(mut h) = HELD.if_used() {
-            h.retain(|k| k.0 != fd && k.1 != fd);
+            h.retain(|k| k.set != fd && k.fd != fd);
         }
         if let Some(mut w) = BPF_WATCHED.if_used() {
             w.retain(|k| k.0 != fd && k.1 != fd);
@@ -94,14 +150,85 @@ pub fn closed(fd: i32) {
     }
 }
 
+/// The set known by number `from` is known by `to` from now on, in every
+/// table (`from` is being closed; `to` is a duplicate of it).
+#[cfg(not(target_os = "linux"))]
+fn renumber(from: i32, to: i32) {
+    interest(|m| {
+        if let Some(list) = m.remove(&from) {
+            m.insert(to, list);
+        }
+    });
+    for k in EDGES.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in HELD.lock().iter_mut().filter(|k| k.set == from) {
+        k.set = to;
+    }
+    for k in WRITES.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in BPF_WATCHED.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+    for k in ALWAYS.lock().iter_mut().filter(|k| k.0 == from) {
+        k.0 = to;
+    }
+}
+
 /// Write the interest lists into a fork snapshot.
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     #[cfg(target_os = "linux")]
     e.u64(0);
     #[cfg(not(target_os = "linux"))]
     {
-        let mut g = INTEREST.lock();
-        let m = g.get_or_insert_with(Default::default);
+        let lists = interest(|m| m.clone());
+        let aliases = ALIASES.lock().clone();
+        write(e, &lists, &aliases);
+    }
+}
+
+/// Write into an exec state the sets an `execve` that re-executes fwe
+/// keeps (the host's closes every kqueue), for [`restore`] in the new
+/// program: each set with a number without close-on-exec, under that
+/// number, and only the descriptors it watches that survive too, as the
+/// ones the exec closes leave Linux's sets.
+pub(crate) fn save_exec(e: &mut crate::snapshot::Enc) {
+    #[cfg(target_os = "linux")]
+    e.u64(0);
+    #[cfg(not(target_os = "linux"))]
+    {
+        // SAFETY: F_GETFD only queries the descriptor.
+        let survives = |fd: i32| unsafe { libc::fcntl(fd, libc::F_GETFD) } == 0;
+        let all = interest(|m| m.clone());
+        let aliases = ALIASES.lock().clone();
+        let (mut lists, mut kept) = (std::collections::HashMap::new(), Vec::new());
+        for (&set, list) in &all {
+            let mut numbers: Vec<i32> = std::iter::once(set)
+                .chain(aliases.iter().filter(|k| k.1 == set).map(|k| k.0))
+                .filter(|&fd| survives(fd))
+                .collect();
+            numbers.sort();
+            let Some(&first) = numbers.first() else { continue };
+            let named = if numbers.contains(&set) { set } else { first };
+            let list: Interest =
+                list.iter().filter(|&(&fd, _)| survives(fd)).map(|(&k, &v)| (k, v)).collect();
+            lists.insert(named, list);
+            kept.extend(numbers.into_iter().filter(|&fd| fd != named).map(|fd| (fd, named)));
+        }
+        write(e, &lists, &kept);
+    }
+}
+
+/// Write interest lists `m` and duplicates `aliases`, as [`restore`] reads
+/// them.
+#[cfg(not(target_os = "linux"))]
+fn write(
+    e: &mut crate::snapshot::Enc,
+    m: &std::collections::HashMap<i32, Interest>,
+    aliases: &[(i32, i32)],
+) {
+    {
         let mut eps: Vec<&i32> = m.keys().collect();
         eps.sort();
         let ce: Vec<bool> = eps.iter().map(|&&fd| crate::snapshot::cloexec(fd)).collect();
@@ -116,12 +243,19 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
                 e.u32(events);
                 e.u64(data);
             }
-        })
+        });
+        e.u64(aliases.len() as u64);
+        for &(fd, set) in aliases {
+            e.i32(fd);
+            e.i32(set);
+            e.bool(crate::snapshot::cloexec(fd));
+        }
     }
 }
 
-/// Rebuild every epoll descriptor in a fork child: a fresh kqueue at its
-/// number, with its interest list registered again.
+/// Rebuild every epoll descriptor in a fork child, or in the program an
+/// exec started ([`save_exec`]): a fresh kqueue at its number, with its
+/// interest list registered again, and its duplicates.
 #[cfg_attr(
     target_os = "macos",
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
@@ -148,6 +282,25 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
             .filter(|&(epfd, c)| crate::snapshot::fresh_kqueue_at(epfd, c))
             .map(|(epfd, _)| epfd)
             .collect();
+        // Each duplicate of a set made here, at its number.
+        let n = d.count(9);
+        let aliases: Vec<(i32, i32, bool)> = (0..n).map(|_| (d.i32(), d.i32(), d.bool())).collect();
+        let mut kept = Vec::new();
+        for &(fd, set, cloexec) in &aliases {
+            // SAFETY: plain host calls on descriptors this process owns; a
+            // number already open is not ours to replace.
+            let made = fresh.contains(&set)
+                && unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0
+                && unsafe { libc::dup2(set, fd) } == fd;
+            if made {
+                // SAFETY: as above.
+                unsafe {
+                    libc::fcntl(fd, libc::F_SETFD, if cloexec { libc::FD_CLOEXEC } else { 0 })
+                };
+                kept.push((fd, set));
+            }
+        }
+        *ALIASES.lock() = kept;
         // Nested epoll descriptors exist by now, whatever the order.
         for epfd in fresh {
             for (&fd, &(events, data)) in &lists[&epfd] {
@@ -229,10 +382,13 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         use fwe_abi::epoll::*;
         use fwe_abi::{err, errno};
         let entry = if op == EPOLL_CTL_DEL { None } else { Some(crate::guest!(read_event(event))) };
+        let _sets = sets();
         // As Linux checks, in its order: both descriptors, whether the
         // target can be watched (a file or directory is always ready, so
-        // it cannot), whether the set is one, nesting, then the entry.
-        let (ep, target) = (epfd as i32, fd as i32);
+        // it cannot), whether the set is one, nesting, then the entry. A
+        // duplicate of a set is the set.
+        let (ep, target) = (set_of(epfd as i32), fd as i32);
+        let epfd = ep as u64;
         // SAFETY: plain host call; F_GETFD only queries.
         if unsafe { libc::fcntl(ep, libc::F_GETFD) } < 0 {
             return err(errno::EBADF);
@@ -260,7 +416,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
         {
             return err(errno::EPERM);
         }
-        if ep == target || !is_epoll(ep) {
+        if ep == set_of(target) || !is_epoll(ep) {
             return err(errno::EINVAL);
         }
         // `EPOLLEXCLUSIVE`: only when adding, not of a set, and with no
@@ -273,7 +429,7 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
                 return err(errno::EINVAL);
             }
         }
-        if op == EPOLL_CTL_ADD && is_epoll(target) && nesting_refused(ep, target) {
+        if op == EPOLL_CTL_ADD && is_epoll(target) && nesting_refused(ep, set_of(target)) {
             return err(errno::ELOOP);
         }
         let listed = interest(|m| m.get(&ep).and_then(|l| l.get(&target)).map(|&(ev, _)| ev));
@@ -327,6 +483,20 @@ pub unsafe fn ctl(epfd: u64, op: u64, fd: u64, event: u64) -> i64 {
     }
 }
 
+/// Changes to epoll sets, and the taking of their events with what that
+/// does to them (a one-shot entry disarmed by its report): one at a time,
+/// as Linux's epoll lock makes them, so an `EPOLL_CTL_MOD` that re-arms an
+/// entry is never undone by the disarming of a report taken before it (a
+/// waiter that re-armed after `EAGAIN` would never be woken). The waits
+/// themselves are made without it.
+#[cfg(not(target_os = "linux"))]
+pub(crate) static SETS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(not(target_os = "linux"))]
+fn sets() -> std::sync::MutexGuard<'static, ()> {
+    SETS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The bpf objects each set watches (set, descriptor): always in error, as
 /// Linux polls a map without events of its own.
 #[cfg(not(target_os = "linux"))]
@@ -339,10 +509,11 @@ fn bpf_watched(ep: i32, fd: i32) -> bool {
     BPF_WATCHED.lock().contains(&(ep, fd))
 }
 
-/// Whether `fd` is an epoll descriptor.
+/// Whether `fd` is an epoll descriptor (a duplicate of one too).
 #[cfg(not(target_os = "linux"))]
-fn is_epoll(fd: i32) -> bool {
-    interest(|m| m.contains_key(&fd))
+pub fn is_epoll(fd: i32) -> bool {
+    let set = set_of(fd);
+    interest(|m| m.contains_key(&set))
 }
 
 /// The most epoll descriptors one path of nested sets can pass through
@@ -355,7 +526,15 @@ const MAX_NESTS: usize = 4;
 /// (`ELOOP`).
 #[cfg(not(target_os = "linux"))]
 fn nesting_refused(ep: i32, target: i32) -> bool {
+    // A list names a set by whichever number of it was added.
+    let aliases: Vec<(i32, i32)> = ALIASES.if_used().map(|a| a.clone()).unwrap_or_default();
+    let set_of = |fd: i32| aliases.iter().find(|k| k.0 == fd).map_or(fd, |k| k.1);
     interest(|m| {
+        let m: std::collections::HashMap<i32, Interest> = m
+            .iter()
+            .map(|(&ep, list)| (ep, list.iter().map(|(&fd, &v)| (set_of(fd), v)).collect()))
+            .collect();
+        let m = &m;
         // The longest path of sets below `from`; `None` if it reaches `ep`.
         fn down(
             m: &std::collections::HashMap<i32, Interest>,
@@ -469,6 +648,8 @@ unsafe fn pwait_ns(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
         if !is_epoll(epfd as i32) {
             return fwe_abi::err(fwe_abi::errno::EINVAL);
         }
+        // A duplicate waits on its set, under the set's number.
+        let epfd = set_of(epfd as i32) as u64;
         // SAFETY: the caller guarantees `events` spans `maxevents` entries.
         unsafe { pwait_kqueue(epfd, events, maxevents, ns) }
     }
@@ -667,6 +848,9 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
         (ns >= 0).then(|| std::time::Instant::now() + std::time::Duration::from_nanos(ns as u64));
     let slice = i64::from(crate::fifo::SLICE_MS) * 1_000_000;
     loop {
+        // What fwe looks at itself is taken as the host's events are
+        // ([`SETS`]).
+        let sets = sets();
         // FIFOs whose writers have gone, pty masters whose slave hung up.
         let mut ready: Vec<(i32, u32, u64)> = Vec::new();
         for &(fd, data, ev) in &fifos {
@@ -701,6 +885,12 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             }
         }
         ready.truncate(max);
+        for &(fd, ..) in &ready {
+            if fifos.iter().chain(&mounts).any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
+                disarm(ep, fd);
+            }
+        }
+        drop(sets);
         let wait = if ready.is_empty() {
             match deadline {
                 None => slice,
@@ -722,11 +912,6 @@ unsafe fn pwait_kqueue(epfd: u64, events: u64, maxevents: u64, ns: i64) -> i64 {
             match ready.iter_mut().find(|r| r.0 == fd) {
                 Some(r) => r.1 |= bits,
                 None => ready.push((fd, bits, data)),
-            }
-        }
-        for &(fd, ..) in &ready {
-            if fifos.iter().chain(&mounts).any(|f| f.0 == fd && f.2 & EPOLLONESHOT != 0) {
-                disarm(ep, fd);
             }
         }
         if !ready.is_empty() || deadline.is_some_and(|d| std::time::Instant::now() >= d) {
@@ -860,15 +1045,55 @@ fn edge(epfd: i32, fd: i32, bits: u32) -> bool {
 #[cfg(not(target_os = "linux"))]
 fn edge_clear(epfd: i32, fd: i32) {
     EDGES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
-    HELD.lock().retain(|k| (k.0, k.1) != (epfd, fd));
+    HELD.lock().retain(|k| (k.set, k.fd) != (epfd, fd));
     WRITES.lock().retain(|k| (k.0, k.1) != (epfd, fd));
 }
 
 /// What edge-triggered pipe read ends in epoll sets held when last
-/// reported: (set, descriptor, bytes).
+/// reported, and what was read of them since.
 #[cfg(not(target_os = "linux"))]
-pub(crate) static HELD: crate::kept::Kept<Vec<(i32, i32, i64)>> =
-    crate::kept::Kept::new(Vec::new());
+pub(crate) static HELD: crate::kept::Kept<Vec<Seen>> = crate::kept::Kept::new(Vec::new());
+
+/// A pipe's read end as an edge-triggered set last reported it
+/// ([`pipe_grew`]).
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct Seen {
+    set: i32,
+    fd: i32,
+    /// What it held then.
+    bytes: i64,
+    /// The bytes this process has read through `fd` since the set first
+    /// saw it, a running count ([`read_from`]).
+    read: u64,
+    /// `read` just before the host was asked for the events of that
+    /// report: reads after it can have come after the host counted
+    /// `bytes`.
+    read_then: u64,
+}
+
+/// `n` bytes were read through descriptor `fd`: a pipe's read end an
+/// edge-triggered set watches holds that much less than it last saw, and
+/// a write that refills it is an edge, though the pipe holds no more than
+/// then.
+pub fn read_from(fd: i32, n: u64) {
+    #[cfg(target_os = "linux")]
+    let _ = (fd, n);
+    #[cfg(not(target_os = "linux"))]
+    if let Some(mut h) = HELD.if_used() {
+        for k in h.iter_mut().filter(|k| k.fd == fd) {
+            k.read += n;
+        }
+    }
+}
+
+/// The reads counted so far of each pipe set `epfd` watches by edge,
+/// taken just before the host is asked for its events ([`pipe_grew`]).
+#[cfg(not(target_os = "linux"))]
+fn reads_before(epfd: i32) -> Vec<(i32, u64)> {
+    HELD.if_used()
+        .map(|h| h.iter().filter(|k| k.set == epfd).map(|k| (k.fd, k.read)).collect())
+        .unwrap_or_default()
+}
 
 /// The writes each set saw counted of each pipe watched exclusively it
 /// watches: `(epfd, fd, writes)`.
@@ -878,9 +1103,10 @@ pub(crate) static WRITES: crate::kept::Kept<Vec<(i32, i32, u64)>> =
 
 /// Whether a pipe read end `fd` holding `bytes` has had data written since
 /// set `epfd` last saw it, which is an edge to Linux (the host's
-/// edge-triggered read filter fires on reads too).
+/// edge-triggered read filter fires on reads too). `before` holds the
+/// reads counted just before the host counted `bytes` ([`reads_before`]).
 #[cfg(not(target_os = "linux"))]
-fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
+fn pipe_grew(epfd: i32, fd: i32, bytes: i64, before: &[(i32, u64)]) -> bool {
     // A pipe whose writes are counted (an eventfd's, each of whose writes
     // is an edge to Linux even when the count was not 0, or one watched
     // exclusively): written to since, whatever it holds now.
@@ -898,15 +1124,23 @@ fn pipe_grew(epfd: i32, fd: i32, bytes: i64) -> bool {
             }
         };
     }
+    // A read since that the snapshot missed (the set's first look at the
+    // pipe, made after it) counts whole.
+    let then = before.iter().find(|b| b.0 == fd).map_or(0, |b| b.1);
     let mut h = HELD.lock();
-    match h.iter_mut().find(|k| (k.0, k.1) == (epfd, fd)) {
+    match h.iter_mut().find(|k| (k.set, k.fd) == (epfd, fd)) {
         Some(k) => {
-            let grew = bytes > k.2;
-            k.2 = bytes;
-            grew
+            // What it would hold had nothing been written since: what it
+            // held, less every read that can have come after the host
+            // counted that (a read the count did show makes no more than
+            // an edge Linux would not report).
+            let left = k.bytes - (k.read - k.read_then) as i64;
+            k.bytes = bytes;
+            k.read_then = then;
+            bytes > left
         }
         None => {
-            h.push((epfd, fd, bytes));
+            h.push(Seen { set: epfd, fd, bytes, read: 0, read_then: 0 });
             true
         }
     }
@@ -1099,6 +1333,10 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             Err(e) => return Err(fwe_abi::err(e)),
         }
     }
+    // From the taking of the events to the disarming of the one-shot
+    // entries they report.
+    let _sets = sets();
+    let before = reads_before(epfd);
     let ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
     // SAFETY: `out` holds `room` entries; `ts` is a valid timespec.
     let n = unsafe {
@@ -1129,7 +1367,7 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             libc::EVFILT_READ
                 if ev.flags & libc::EV_CLEAR != 0
                     && is_pipe(fd)
-                    && !pipe_grew(epfd, fd, ev.data as i64) => {}
+                    && !pipe_grew(epfd, fd, ev.data as i64, &before) => {}
             libc::EVFILT_READ => bits |= READ,
             // A pipe whose readers have gone is an error to write to; a
             // socket whose writing side is shut stays writable (a write
@@ -1141,7 +1379,11 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
             // A socket's priority band is writable as its normal data is.
             libc::EVFILT_WRITE => bits |= WRITE | if is_socket(fd) { EPOLLWRBAND } else { 0 },
             // Urgent data waits.
-            libc::EVFILT_EXCEPT => bits |= EPOLLPRI,
+            libc::EVFILT_EXCEPT if ev.fflags & libc::NOTE_OOB != 0 => bits |= EPOLLPRI,
+            // The end of the socket's stream, which the filter reports as
+            // well, for as long as it lasts: no urgent data follows it, so
+            // the filter is off until the next `epoll_ctl` of the socket.
+            libc::EVFILT_EXCEPT => stop_urgent_watch(epfd, fd),
             // A descriptor fwe reports always ready ([`ctl_always`]).
             libc::EVFILT_USER => bits |= READ | WRITE,
             _ => {}
@@ -1184,6 +1426,22 @@ fn kevent_take(epfd: i32, room: usize, ns: i64) -> Result<(Ready, usize), i64> {
         }
     }
     Ok((ready, n as usize))
+}
+
+/// Turn off the urgent data filter of socket `fd` in kqueue `epfd`.
+#[cfg(not(target_os = "linux"))]
+fn stop_urgent_watch(epfd: i32, fd: i32) {
+    let off = libc::kevent {
+        ident: fd as libc::uintptr_t,
+        filter: libc::EVFILT_EXCEPT,
+        flags: libc::EV_DISABLE | libc::EV_RECEIPT,
+        fflags: libc::NOTE_OOB,
+        data: 0,
+        udata: std::ptr::null_mut(),
+    };
+    let mut out = off;
+    // SAFETY: one valid change and room for its receipt; no timeout.
+    unsafe { libc::kevent(epfd, &off, 1, &mut out, 1, std::ptr::null()) };
 }
 
 #[cfg(test)]
@@ -1262,6 +1520,115 @@ mod tests {
         assert_eq!({ got[0].events } & EPOLLPRI, EPOLLPRI);
         closed(ep as i32);
         for fd in [srv, cli, conn, ep as i32] {
+            // SAFETY: the descriptors made here.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A one-shot entry re-armed while another thread takes the set's
+    /// events stays armed: the arming the last `EPOLL_CTL_MOD` made is
+    /// reported, by that thread's wait or a later one (async-io re-arms a
+    /// source from the thread that got `EAGAIN`, while its reactor waits).
+    #[test]
+    fn a_re_arming_is_never_undone_by_a_report_taken_before_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let _turn = turn();
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        // Readable throughout: never read.
+        // SAFETY: a one-byte local buffer.
+        assert_eq!(unsafe { libc::write(wr, b"x".as_ptr().cast(), 1) }, 1);
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) } as u64;
+        let arm = |op, data| {
+            let reg = event(EPOLLIN | EPOLLONESHOT, data);
+            // SAFETY: a valid epoll_event.
+            assert_eq!(unsafe { ctl(ep, op, rd as u64, &reg as *const _ as u64) }, 0);
+        };
+        let take = |ms| {
+            let mut got = [event(0, 0); 4];
+            // SAFETY: room for 4 events.
+            let n = unsafe { pwait(ep, got.as_mut_ptr() as u64, 4, ms, 0, 0) };
+            got[..n.max(0) as usize].iter().map(data).collect::<Vec<u64>>()
+        };
+        arm(EPOLL_CTL_ADD, 0);
+        for round in 0..300u64 {
+            let stop = AtomicBool::new(false);
+            let last = round * 100 + 99;
+            let seen = std::thread::scope(|s| {
+                let waiter = s.spawn(|| {
+                    let mut seen = Vec::new();
+                    while !stop.load(Ordering::Acquire) {
+                        seen.extend(take(5));
+                    }
+                    seen
+                });
+                for i in 0..100 {
+                    arm(EPOLL_CTL_MOD, round * 100 + i);
+                }
+                stop.store(true, Ordering::Release);
+                waiter.join().unwrap()
+            });
+            let after = take(0);
+            assert!(
+                seen.contains(&last) || after.contains(&last),
+                "round {round}: the last arming ({last}) went unreported (the waiter saw {:?}, a \
+                 wait after it {after:?})",
+                seen.iter().rev().take(4).collect::<Vec<_>>()
+            );
+        }
+        closed(ep as i32);
+        for fd in [rd, wr, ep as i32] {
+            // SAFETY: the descriptors made here.
+            unsafe { libc::close(fd) };
+        }
+    }
+
+    /// A pipe watched edge-triggered is readable anew when written to after
+    /// a read drained it, though it holds less than when last reported
+    /// (Go's runtime reads a child's output so); the read itself is no
+    /// edge.
+    #[test]
+    fn a_drained_pipe_written_again_is_an_edge() {
+        let _turn = turn();
+        let mut fds = [0i32; 2];
+        // SAFETY: plain host call with a 2-element array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (rd, wr) = (fds[0], fds[1]);
+        // SAFETY: create1 takes no pointers.
+        let ep = unsafe { create1(0) };
+        let reg = event(EPOLLIN | EPOLLET, 9);
+        // SAFETY: a valid epoll_event.
+        assert_eq!(unsafe { ctl(ep as u64, EPOLL_CTL_ADD, rd as u64, &reg as *const _ as u64) }, 0);
+        let mut got = [event(0, 0); 2];
+        // SAFETY: room for 2 events.
+        let mut wait = |ms| unsafe { pwait(ep as u64, got.as_mut_ptr() as u64, 2, ms, 0, 0) };
+        let write = |n: usize| {
+            // SAFETY: a local buffer of `n` bytes.
+            unsafe { libc::write(wr, [7u8; 8].as_ptr().cast(), n) }
+        };
+        let mut buf = [0u8; 8];
+        for round in 0..3 {
+            assert_eq!(write(4), 4);
+            assert_eq!(wait(1000), 1, "write {round}");
+            // Drained, as the guest's read counts it.
+            // SAFETY: a local buffer of its size.
+            let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert_eq!(n, 4);
+            crate::linux_result(fwe_abi::nr::READ, &[rd as u64, 0, 8, 0, 0, 0], n as i64);
+            assert_eq!(wait(0), 0, "after the read {round}");
+            // Less than the pipe held when last reported.
+            assert_eq!(write(2), 2);
+            assert_eq!(wait(1000), 1, "a smaller write {round}");
+            // SAFETY: a local buffer of its size.
+            let n = unsafe { libc::read(rd, buf.as_mut_ptr().cast(), buf.len()) };
+            assert_eq!(n, 2);
+            crate::linux_result(fwe_abi::nr::READ, &[rd as u64, 0, 8, 0, 0, 0], n as i64);
+        }
+        closed(ep as i32);
+        for fd in [rd, wr, ep as i32] {
             // SAFETY: the descriptors made here.
             unsafe { libc::close(fd) };
         }
@@ -1402,14 +1769,16 @@ mod tests {
     }
 
     /// A fork child rebuilds an epoll descriptor it did not inherit (a
-    /// kqueue) from the recorded interest list, at the same number. The
-    /// test uses a high number of its own, so tests running alongside never
-    /// open a descriptor there, and restores only its own record.
+    /// kqueue) from the recorded interest list, at the same number, and a
+    /// duplicate of it at its number, the same set. The test uses high
+    /// numbers of its own, so tests running alongside never open a
+    /// descriptor there, and restores only its own records.
     #[cfg(not(target_os = "linux"))]
     #[test]
     fn interest_list_survives_a_rebuild() {
         let _turn = turn();
         const EP: i32 = 900;
+        const COPY: i32 = 901;
         let mut fds = [0i32; 2];
         // SAFETY: plain host call with a 2-element array.
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
@@ -1422,6 +1791,9 @@ mod tests {
             libc::fcntl(EP, libc::F_SETFD, libc::FD_CLOEXEC);
         }
         interest(|m| m.insert(EP, Interest::new()));
+        // SAFETY: plain host call on the kqueue.
+        assert_eq!(unsafe { libc::dup2(EP, COPY) }, COPY);
+        duplicated(EP, COPY);
         let reg = event(EPOLLIN, 77);
         // SAFETY: a valid event pointer.
         let r = unsafe { ctl(EP as u64, EPOLL_CTL_ADD, fds[0] as u64, &reg as *const _ as u64) };
@@ -1439,9 +1811,16 @@ mod tests {
                 e.u64(data);
             }
         });
-        // As in a child: the kqueue is gone.
+        e.u64(1);
+        e.i32(COPY);
+        e.i32(EP);
+        e.bool(false);
+        // As in a child: the kqueue is gone, under both numbers.
         // SAFETY: closing the kqueue behind the record.
-        unsafe { libc::close(EP) };
+        unsafe {
+            libc::close(EP);
+            libc::close(COPY);
+        }
         let bytes = e.into_bytes();
         let mut d = crate::snapshot::Dec::new(&bytes);
         restore(&mut d);
@@ -1454,10 +1833,18 @@ mod tests {
         // SAFETY: room for one event.
         assert_eq!(unsafe { pwait(EP as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
         assert_eq!(data(&got[0]), 77);
+        // The duplicate is the same set, which outlives the first number.
         closed(EP);
+        // SAFETY: plain host call.
+        unsafe { libc::close(EP) };
+        let mut got = [event(0, 0); 1];
+        // SAFETY: room for one event.
+        assert_eq!(unsafe { pwait(COPY as u64, got.as_mut_ptr() as u64, 1, 1000, 0, 0) }, 1);
+        assert_eq!(data(&got[0]), 77);
+        closed(COPY);
         // SAFETY: plain host cleanup.
         unsafe {
-            libc::close(EP);
+            libc::close(COPY);
             libc::close(fds[0]);
             libc::close(fds[1]);
         }

@@ -21,10 +21,14 @@
 use crate::snapshot::{Dec, Enc};
 use std::os::unix::ffi::OsStrExt;
 
-/// What names a file's contents: device, inode, size and modification
-/// time, as `fstat` reports them.
+/// What names a file's contents: device, inode, size, and modification
+/// and change times, as `fstat` reports them. The change time tells a file
+/// from an earlier one whose inode number it was given, with the same size
+/// and modification time (a copy keeps the time it copies, and packages
+/// built to be reproducible give every file the same one): a file's change
+/// time is set as it is made, and no program sets it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct FileId([u64; 5]);
+pub struct FileId([u64; 7]);
 
 impl FileId {
     /// The identity of the regular file open as `fd`.
@@ -50,6 +54,8 @@ impl FileId {
             st.st_size as u64,
             st.st_mtime as u64,
             st.st_mtime_nsec as u64,
+            st.st_ctime as u64,
+            st.st_ctime_nsec as u64,
         ]))
     }
 
@@ -233,12 +239,12 @@ fn image_source(entry: &[u8]) -> Option<FileId> {
     if k.bytes() != b"image" {
         return None;
     }
-    Some(FileId([k.u64(), k.u64(), k.u64(), k.u64(), k.u64()]))
+    Some(FileId(std::array::from_fn(|_| k.u64())))
 }
 
 impl FileId {
     /// Whether the file is still there, unchanged: found by its device and
-    /// inode (`/.vol` on macOS), with the same size and modification time.
+    /// inode (`/.vol` on macOS), with the same size and times.
     fn exists(&self) -> bool {
         #[cfg(target_os = "macos")]
         {

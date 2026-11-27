@@ -850,6 +850,7 @@ pub unsafe fn socket(domain: u64, type_: u64, protocol: u64) -> i64 {
     crate::netns::made(fd);
     fresh(fd);
     socket_made(fd, Some(own_ids()));
+    made_here(fd);
     fd as i64
 }
 
@@ -982,6 +983,11 @@ pub unsafe fn socketpair(domain: u64, type_: u64, protocol: u64, sv: u64) -> i64
     fresh(fds[1]);
     socket_made(fds[0], Some(own_ids()));
     socket_made(fds[1], Some(own_ids()));
+    made_here(fds[0]);
+    made_here(fds[1]);
+    // Each end's peer is this process, as it is now.
+    remember_peer(fds[0], own_peer());
+    remember_peer(fds[1], own_peer());
     if uaccess::write(sv, fds).is_err() {
         // SAFETY: closing the sockets just made.
         unsafe {
@@ -1301,6 +1307,12 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         remember_name(fd as i32, false, &a.guest);
     }
     if r == 0 && family(&hb) == libc::AF_UNIX {
+        // The listener's process, as it is now; this end is this
+        // process's to name in what it sends.
+        if let Ok(peer) = live_peer(fd as i32) {
+            remember_peer(fd as i32, peer);
+        }
+        made_here(fd as i32);
         let end = hb[2..].iter().position(|&b| b == 0).map_or(hb.len(), |e| e + 2);
         if crate::x11::is_host_socket(&hb[2..end]) {
             crate::x11::connected(fd as i32, &hb[2..end]);
@@ -1602,6 +1614,13 @@ pub unsafe fn accept4(fd: u64, addr: u64, addrlen: u64, flags: u64) -> i64 {
     crate::fdmarks::pin_net(r, crate::netns::of(fd as i32));
     fresh(r);
     socket_made(r, Some(own_ids()));
+    made_here(r);
+    // The connecting process, as it is now.
+    if family(&hb) == libc::AF_UNIX
+        && let Ok(peer) = live_peer(r)
+    {
+        remember_peer(r, peer);
+    }
     crate::netns::to_guest(r, &mut hb, false);
     if crate::seqpacket::is(fd as i32) {
         // A connection of a SOCK_SEQPACKET listener is one too.
@@ -1770,17 +1789,30 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
     } else {
         (std::ptr::null(), 0)
     };
-    if crate::seqpacket::is(fd as i32) {
-        let v = guest!(uaccess::host_buffer(buf, len, false));
-        return crate::seqpacket::send(fd as i32, &[v], (std::ptr::null_mut(), 0), hflags);
-    }
     let mut iov = [guest!(uaccess::host_buffer(buf, len, false))];
-    // A datagram to a socket that asked for credentials carries them.
+    // A message to a socket that asked for credentials carries them.
     #[cfg(not(target_os = "linux"))]
     let prepared = match send_control(fd as i32, 0, 0, named.then(|| &hb[..alen as usize])) {
         Ok(p) => p,
         Err(e) => return err(e),
     };
+    if crate::seqpacket::is(fd as i32) {
+        #[cfg(not(target_os = "linux"))]
+        let control = match &prepared {
+            Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len()),
+            None => (std::ptr::null_mut(), 0),
+        };
+        #[cfg(target_os = "linux")]
+        let control = (std::ptr::null_mut(), 0);
+        let r = crate::seqpacket::send(fd as i32, &iov, control, hflags);
+        #[cfg(not(target_os = "linux"))]
+        if r < 0
+            && let Some(p) = prepared
+        {
+            p.unsent();
+        }
+        return r;
+    }
     #[cfg(not(target_os = "linux"))]
     let (ctl_ptr, ctl_len) = match &prepared {
         Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len() as _),
@@ -1886,79 +1918,27 @@ fn take_corked(fd: i32) -> Option<Held> {
     CORKED.lock().unwrap_or_else(|e| e.into_inner()).as_mut()?.remove(&fd)
 }
 
-/// The multicast groups TCP sockets joined: (socket, group and
-/// interface as the host lays them out).
-pub(crate) static MEMBERSHIPS: crate::kept::Kept<Vec<(i32, Vec<u8>)>> =
-    crate::kept::Kept::new(Vec::new());
-
-/// A multicast group joined or left on a TCP socket, which Linux allows
-/// (no multicast reaches one) and the host refuses: kept by fwe. Joining
-/// one joined is `EADDRINUSE`, leaving one not joined `EADDRNOTAVAIL`.
-/// `None` for any other socket or option.
-fn stream_membership(fd: i32, level: u64, name: u64, form: Form, host: &[u8]) -> Option<i64> {
-    let group = match form {
-        Form::Mreq | Form::GroupReq => host.to_vec(),
-        // The group and interface, without the source.
-        Form::MreqSource => [&host[..4], &host[8..12]].concat(),
-        Form::GroupSourceReq => host[..132].to_vec(),
-        _ => return None,
-    };
-    if !(level == 0 || level == 41) || !ip_stream(fd) {
-        return None;
-    }
-    // IP_ADD_MEMBERSHIP, IP_ADD_SOURCE_MEMBERSHIP, MCAST_JOIN_GROUP,
-    // MCAST_JOIN_SOURCE_GROUP; the leaves; the rest need the group joined.
-    let join = matches!(name, 35 | 39 | 42 | 46);
-    let leave = matches!(name, 36 | 40 | 45 | 47);
-    let mut m = MEMBERSHIPS.lock();
-    let at = m.iter().position(|(f, g)| *f == fd && *g == group);
-    Some(match (at, join, leave) {
-        (Some(_), true, _) => err(errno::EADDRINUSE),
-        (None, true, _) => {
-            m.push((fd, group));
-            0
-        }
-        (Some(i), _, true) => {
-            m.remove(i);
-            0
-        }
-        (Some(_), ..) => 0,
-        (None, ..) => err(errno::EADDRNOTAVAIL),
-    })
-}
-
-/// Socket `fd` was closed: what it held back goes out, as Linux sends it,
-/// and the groups it joined are left.
+/// Socket `fd` was closed: what it held back goes out, as Linux sends it;
+/// with its last descriptor, the groups it joined are left (its state in
+/// [`crate::sockstate`] goes).
 pub fn closed(fd: i32) {
+    let last = crate::sockstate::closed(fd);
     #[cfg(not(target_os = "linux"))]
-    if kept_value(fd, SO_PASSCRED) != 0 {
-        passcred_bound(fd, false);
+    if last.is_some_and(|s| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
+        for a in askers(fd) {
+            crate::scm::released(a.asker());
+        }
     }
-    if let Some(mut m) = MEMBERSHIPS.if_used() {
-        m.retain(|(f, _)| *f != fd);
-    }
-    if let Some(mut k) = KEPT_VALUES.if_used() {
-        k.retain(|k| k.0 != fd);
-    }
-    if let Some(mut v) = V4_VIEW.if_used() {
-        v.retain(|&f| f != fd);
-    }
+    #[cfg(target_os = "linux")]
+    let _ = last;
     flush_corked(fd);
 }
 
 /// A new socket is descriptor `fd` (made, accepted or received): what fwe
-/// keeps per descriptor starts empty, whatever a socket that had the
-/// number left (one closed out of fwe's sight).
+/// keeps of a socket starts empty, whatever a socket that had the number
+/// left (one closed out of fwe's sight).
 pub(crate) fn fresh(fd: i32) {
-    if let Some(mut m) = MEMBERSHIPS.if_used() {
-        m.retain(|(f, _)| *f != fd);
-    }
-    if let Some(mut k) = KEPT_VALUES.if_used() {
-        k.retain(|k| k.0 != fd);
-    }
-    if let Some(mut v) = V4_VIEW.if_used() {
-        v.retain(|&f| f != fd);
-    }
+    crate::sockstate::fresh(fd);
     take_corked(fd);
 }
 
@@ -1988,8 +1968,8 @@ fn udp_option(fd: i32, optname: u64) -> i32 {
 
 /// The value fwe keeps for `fd` under `key` ([`kept_key`]), 0 if none.
 fn kept_value(fd: i32, key: u64) -> i32 {
-    let kept = KEPT_VALUES.if_used();
-    kept.and_then(|k| k.iter().find(|v| (v.0, v.1) == (fd, key)).map(|v| v.2)).unwrap_or(0)
+    crate::sockstate::with(fd, |s| s.kept.iter().find(|v| v.0 == key).map_or(0, |v| v.1))
+        .unwrap_or(0)
 }
 
 /// The host path of Unix datagram socket `fd`'s own address (`peer`: its
@@ -2028,23 +2008,220 @@ fn host_unix_path(hb: &[u8]) -> Option<Vec<u8>> {
 #[cfg(not(target_os = "linux"))]
 fn passcred_bound(fd: i32, on: bool) {
     if let Some(path) = dgram_path(fd, false) {
-        crate::scm::wants_creds(&path, on);
+        crate::scm::wants_creds(crate::scm::Asker::Path(&path), on);
     }
 }
 
-/// The credentials a datagram from Unix socket `fd` to host address `to`
-/// (its peer's when `None`) carries unasked: the sender's, when the
-/// receiving socket asked for them ([`crate::scm::wants_creds`]).
+/// What names Unix socket `fd` to a sender ([`crate::scm::Asker`]): its
+/// path, if it is a bound datagram socket, and its identity.
+#[cfg(not(target_os = "linux"))]
+enum OwnedAsker {
+    Path(Vec<u8>),
+    Sock(u64),
+}
+
+#[cfg(not(target_os = "linux"))]
+impl OwnedAsker {
+    fn asker(&self) -> crate::scm::Asker<'_> {
+        match self {
+            OwnedAsker::Path(p) => crate::scm::Asker::Path(p),
+            OwnedAsker::Sock(id) => crate::scm::Asker::Sock(*id),
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn askers(fd: i32) -> Vec<OwnedAsker> {
+    let path = dgram_path(fd, false).map(OwnedAsker::Path);
+    let id = socket_ids(fd).map(|(own, _)| OwnedAsker::Sock(own));
+    path.into_iter().chain(id).collect()
+}
+
+/// Socket `fd` came to this process with its state: one that asks for
+/// credentials is held by this process too ([`crate::scm::holds`]).
+pub fn received(fd: i32) {
+    #[cfg(not(target_os = "linux"))]
+    if kept_value(fd, SO_PASSCRED) != 0 {
+        for a in askers(fd) {
+            crate::scm::holds(a.asker());
+        }
+    }
+    #[cfg(target_os = "linux")]
+    let _ = fd;
+}
+
+/// A `fork` child holds every socket its parent had that asks for
+/// credentials ([`crate::scm::holds`]): it asks while the child has it.
+pub fn forked() {
+    #[cfg(not(target_os = "linux"))]
+    {
+        if !crate::scm::any_wanted() {
+            return;
+        }
+        for fd in crate::sockstate::with_kept(SO_PASSCRED) {
+            for a in askers(fd) {
+                crate::scm::holds(a.asker());
+            }
+        }
+    }
+}
+
+/// Unix socket `fd` asks for credentials (`on`), or no longer does: a
+/// process sending to it that is not the maker of its end of the
+/// connection is told by its identity ([`crate::scm`], [`creds_for`]).
+#[cfg(not(target_os = "linux"))]
+fn passcred_socket(fd: i32, on: bool) {
+    if let Some((own, _)) = socket_ids(fd) {
+        crate::scm::wants_creds(crate::scm::Asker::Sock(own), on);
+    }
+}
+
+/// The host identities of Unix socket `fd` and of its peer (0 if it has
+/// none): its protocol control block's and its peer's, as the host gives
+/// them out (permuted, the same to every process), which each end of a
+/// connection sees the other way round.
+#[cfg(target_os = "macos")]
+fn socket_ids(fd: i32) -> Option<(u64, u64)> {
+    // `struct socket_fdinfo` (792 bytes): `psi.soi_pcb` at 168,
+    // `psi.soi_kind` at 256 (`SOCKINFO_UN`, 3, for a Unix socket), and
+    // `psi.soi_proto.pri_un.unsi_conn_pcb` at 272.
+    const PROC_PIDFDSOCKETINFO: libc::c_int = 3;
+    const SOCKINFO_UN: i32 = 3;
+    let mut info = [0u64; 792 / 8];
+    // SAFETY: a buffer of the size given, written by the host.
+    let n = unsafe {
+        libc::proc_pidfdinfo(
+            crate::host::pid().get(),
+            fd,
+            PROC_PIDFDSOCKETINFO,
+            info.as_mut_ptr().cast(),
+            792,
+        )
+    };
+    let kind = (info[256 / 8] & 0xffff_ffff) as i32;
+    (n == 792 && kind == SOCKINFO_UN).then(|| (info[168 / 8], info[272 / 8]))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn socket_ids(_: i32) -> Option<(u64, u64)> {
+    None
+}
+
+/// Unix socket `fd`'s host identity ([`socket_ids`]).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn socket_id(fd: i32) -> Option<u64> {
+    socket_ids(fd).map(|(own, _)| own)
+}
+
+/// The credentials a message from Unix socket `fd` to host address `to`
+/// (its peer when `None`) carries unasked: the sender's, when the
+/// receiving socket asked for them, as Linux gives each message's sender.
+/// A datagram to a bound socket is told by its address
+/// ([`crate::scm::wants_creds`]); otherwise a process that is not the
+/// maker of its end ([`crate::sockstate::State::maker`]: a `fork` child, or
+/// one it was passed to) sends its own to a peer that asked
+/// ([`passcred_socket`]), where the receiver would take the maker's.
 #[cfg(not(target_os = "linux"))]
 fn creds_for(fd: i32, to: Option<&[u8]>) -> Option<crate::scm::Creds> {
     if !crate::scm::any_wanted() {
         return None;
     }
     let path = match to {
-        Some(hb) => host_unix_path(hb)?,
-        None => dgram_path(fd, true)?,
+        Some(hb) => host_unix_path(hb),
+        None => dgram_path(fd, true),
     };
-    crate::scm::creds_wanted(&path).then(crate::scm::own_creds)
+    if path.is_some_and(|p| crate::scm::creds_wanted(crate::scm::Asker::Path(&p))) {
+        return Some(crate::scm::own_creds());
+    }
+    (to.is_none() && peer_wants_creds(fd)).then(crate::scm::own_creds)
+}
+
+/// Whether this process, not the maker of socket `fd`'s end, sends to a
+/// peer that asked for credentials: its identity looked up once, and the
+/// answer kept until what asks changes ([`crate::scm::generation`]).
+#[cfg(not(target_os = "linux"))]
+fn peer_wants_creds(fd: i32) -> bool {
+    let me = crate::host::pid().get();
+    let Some((maker, known)) = crate::sockstate::with(fd, |s| (s.maker, s.peer_id)) else {
+        return false;
+    };
+    if maker == Some(me) {
+        return false;
+    }
+    let generation = crate::scm::generation();
+    if let Some(Some((at, wanted))) = crate::sockstate::with(fd, |s| s.peer_wants)
+        && at == generation
+    {
+        return wanted;
+    }
+    let peer = match known {
+        Some(id) => id,
+        None => match socket_ids(fd) {
+            Some((_, id)) => id,
+            None => return false,
+        },
+    };
+    let wanted = peer != 0 && crate::scm::creds_wanted(crate::scm::Asker::Sock(peer));
+    crate::sockstate::update(fd, |s| {
+        s.peer_id = Some(peer);
+        s.peer_wants = Some((generation, wanted));
+    });
+    wanted
+}
+
+/// Whether a write to socket `fd` carries the sender's credentials
+/// ([`creds_for`]), and so goes as [`write_with_creds`] sends it.
+pub fn writes_creds(fd: i32) -> bool {
+    #[cfg(not(target_os = "linux"))]
+    {
+        crate::scm::any_wanted() && peer_wants_creds(fd)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = fd;
+        false
+    }
+}
+
+/// `write`/`writev` of `iov` to Unix socket `fd`, with the sender's
+/// credentials ([`writes_creds`]), as a `sendmsg` with no flags.
+#[cfg(not(target_os = "linux"))]
+pub fn write_with_creds(fd: i32, iov: &[libc::iovec]) -> i64 {
+    let prepared = match send_control(fd, 0, 0, None) {
+        Ok(p) => p,
+        Err(e) => return err(e),
+    };
+    let (ctl, ctl_len) = match &prepared {
+        Some(p) => (p.buf.as_ptr() as *mut libc::c_void, p.buf.len()),
+        None => (std::ptr::null_mut(), 0),
+    };
+    let r = if crate::seqpacket::is(fd) {
+        crate::seqpacket::send(fd, iov, (ctl, ctl_len), 0)
+    } else {
+        let mut m = libc::msghdr {
+            msg_name: std::ptr::null_mut(),
+            msg_namelen: 0,
+            msg_iov: iov.as_ptr() as *mut libc::iovec,
+            msg_iovlen: iov.len() as _,
+            msg_control: ctl,
+            msg_controllen: ctl_len as _,
+            msg_flags: 0,
+        };
+        // SAFETY: `m` references the caller's buffers and the control
+        // data made above.
+        unsafe { send_corked(fd, &mut m, 0, 0) }
+    };
+    if r < 0
+        && let Some(p) = prepared
+    {
+        p.unsent();
+    }
+    r
+}
+
+#[cfg(target_os = "linux")]
+pub fn write_with_creds(_: i32, _: &[libc::iovec]) -> i64 {
+    unreachable!("a Linux host attaches credentials itself")
 }
 
 /// Send `msg` on `fd` with the guest's `flags` (the host's `hflags`), as
@@ -2297,6 +2474,43 @@ fn recvfrom_host(fd: u64, buf: u64, len: u64, hflags: i32, addr: u64, addrlen: u
 
 // --- options --------------------------------------------------------------
 
+/// Whether socket `fd` can have urgent data: a TCP one.
+pub(crate) fn urgent_possible(fd: i32) -> bool {
+    ip_stream(fd)
+}
+
+/// Whether socket `fd`, which the host reported hung up, has on Linux:
+/// any but a TCP socket has, and a TCP one once it is shut both ways or
+/// closed (Linux's `tcp_poll`), where the host reports it once its
+/// reading side is shut (the peer's end of the stream).
+pub(crate) fn hung_up(fd: i32) -> bool {
+    if !ip_stream(fd) {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `struct tcp_connection_info`'s first byte, the state: closed (0),
+        // FIN_WAIT_1 (6), CLOSING (7), LAST_ACK (8), FIN_WAIT_2 (9) and
+        // TIME_WAIT (10) have sent the end of their stream; the reading
+        // side is shut, as the host reports.
+        let mut info = [0u8; 128];
+        let mut len = info.len() as libc::socklen_t;
+        // SAFETY: a valid out-parameter of its length.
+        let r = unsafe {
+            libc::getsockopt(
+                fd,
+                libc::IPPROTO_TCP,
+                libc::TCP_CONNECTION_INFO,
+                info.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        r != 0 || matches!(info[0], 0 | 6..=10)
+    }
+    #[cfg(not(target_os = "macos"))]
+    true
+}
+
 /// Socket `fd`'s host family and type (`None` if it is not a socket).
 fn kind(fd: i32) -> Option<(i32, i32)> {
     let mut hb = empty_sockaddr();
@@ -2409,7 +2623,7 @@ fn disconnect(fd: i32) -> Option<i64> {
         return None;
     }
     // One IPv6 socket that `IPV6_ADDRFORM` made IPv4 is IPv4 from now on.
-    let fam = if V4_VIEW.lock().contains(&fd) { libc::AF_INET } else { fam };
+    let fam = if v4_viewed(fd) { libc::AF_INET } else { fam };
     // SAFETY: plain host calls; `new` is a fresh socket this owns until it
     // takes `fd`'s place.
     unsafe {
@@ -2438,9 +2652,12 @@ fn disconnect(fd: i32) -> Option<i64> {
         libc::fcntl(fd, libc::F_SETFD, fdfl);
         libc::close(new);
     }
-    V4_VIEW.lock().retain(|&f| f != fd);
+    // A new socket, of the family it was seen as, which joined nothing.
+    crate::sockstate::update(fd, |s| {
+        s.v4_view = false;
+        s.memberships.clear();
+    });
     take_corked(fd);
-    MEMBERSHIPS.lock().retain(|(f, _)| *f != fd);
     Some(0)
 }
 
@@ -2471,8 +2688,8 @@ const ICMP_FILTER: u64 = 1;
 /// one by one); the IPv6 checksum options leave checksums to the host.
 const KEPT_UDP: [u64; 5] = [UDP_CORK, UDP_NO_CHECK6_TX, UDP_NO_CHECK6_RX, UDP_SEGMENT, UDP_GRO];
 
-/// The key [`KEPT_VALUES`] holds option `optname` of `level` under, if it
-/// is one fwe keeps.
+/// The key a socket's kept options ([`crate::sockstate::State::kept`])
+/// hold option `optname` of `level` under, if it is one fwe keeps.
 fn kept_key(level: u64, optname: u64) -> Option<u64> {
     if level == SOL_SOCKET && KEPT.contains(&optname) {
         Some(optname)
@@ -2485,13 +2702,11 @@ fn kept_key(level: u64, optname: u64) -> Option<u64> {
     }
 }
 
-/// The values of kept options set: (socket, [`kept_key`], value).
-pub(crate) static KEPT_VALUES: crate::kept::Kept<Vec<(i32, u64, i32)>> =
-    crate::kept::Kept::new(Vec::new());
-
-/// IPv6 sockets `IPV6_ADDRFORM` made IPv4: the host's socket stays IPv6,
-/// its names are reported as the IPv4 ones they map.
-static V4_VIEW: crate::kept::Kept<Vec<i32>> = crate::kept::Kept::new(Vec::new());
+/// Whether `IPV6_ADDRFORM` made IPv6 socket `fd` IPv4: the host's socket
+/// stays IPv6, its names are reported as the IPv4 ones they map.
+fn v4_viewed(fd: i32) -> bool {
+    crate::sockstate::with(fd, |s| s.v4_view).unwrap_or(false)
+}
 
 /// `IPV6_ADDRFORM` (`optval` `AF_INET`) of socket `fd`, as Linux allows
 /// it: a TCP or UDP IPv6 socket whose peer is IPv4 (an IPv4-mapped address)
@@ -2524,14 +2739,14 @@ fn addrform(fd: i32, optval: u64, optlen: u64) -> i64 {
     if hb[8..18] != [0; 10] || hb[18..20] != [0xff, 0xff] {
         return err(errno::EADDRNOTAVAIL);
     }
-    V4_VIEW.lock().push(fd);
+    crate::sockstate::update(fd, |s| s.v4_view = true);
     0
 }
 
 /// The host name `hb` (of `hl` bytes) of an IPv6 socket `IPV6_ADDRFORM`
 /// made IPv4, as that: the IPv4 address its IPv4-mapped one stands for.
 fn v4_view(fd: i32, hb: &mut [u8; SOCKADDR_MAX], hl: &mut libc::socklen_t) {
-    if family(hb) != libc::AF_INET6 || !V4_VIEW.lock().contains(&fd) {
+    if family(hb) != libc::AF_INET6 || !v4_viewed(fd) {
         return;
     }
     let mut v4 = empty_sockaddr();
@@ -2665,9 +2880,13 @@ pub unsafe fn setsockopt(
         if let Err(e) = socket_fd(fd as i32) {
             return e;
         }
-        let mut k = KEPT_VALUES.lock();
-        k.retain(|&(f, o, _)| (f, o) != (fd as i32, key));
-        k.push((fd as i32, key, v));
+        crate::sockstate::update(fd as i32, |s| {
+            s.kept.retain(|&(o, _)| o != key);
+            // A value of 0 is the default, which is not kept.
+            if v != 0 {
+                s.kept.push((key, v));
+            }
+        });
         0
     };
     if level == SOL_SOCKET
@@ -2683,7 +2902,9 @@ pub unsafe fn setsockopt(
         let r = keep(key);
         #[cfg(not(target_os = "linux"))]
         if r == 0 && optname == SO_PASSCRED {
-            passcred_bound(fd as i32, kept_value(fd as i32, SO_PASSCRED) != 0);
+            let on = kept_value(fd as i32, SO_PASSCRED) != 0;
+            passcred_bound(fd as i32, on);
+            passcred_socket(fd as i32, on);
         }
         return r;
     }
@@ -2708,6 +2929,15 @@ pub unsafe fn setsockopt(
     if let Some(key) = kept_key(level, optname) {
         return keep(key);
     }
+    // Multicast membership of a TCP socket, which fwe keeps.
+    if crate::tcpmcast::is_membership(level, optname) && ip_stream(fd as i32) {
+        let len = (optlen as usize).min(crate::tcpmcast::MOST_VALUE);
+        let val = guest!(uaccess::read_bytes(optval, len));
+        let v6 = kind(fd as i32).is_some_and(|k| k.0 == libc::AF_INET6);
+        if let Some(r) = crate::tcpmcast::setsockopt(fd as i32, level, optname, &val, v6) {
+            return r;
+        }
+    }
     let (hl, ho, form) = match opt_to_host(level, optname) {
         Ok(v) => v,
         Err(e) => return e,
@@ -2716,9 +2946,6 @@ pub unsafe fn setsockopt(
         let len = (optlen as usize).min(crate::sockopt::MOST_VALUE);
         let val = guest!(uaccess::read_bytes(optval, len));
         let host = guest!(crate::sockopt::value_to_host(form, &val));
-        if let Some(r) = stream_membership(fd as i32, level, optname, form, &host) {
-            return r;
-        }
         // SAFETY: a local buffer of its length.
         return ret(unsafe {
             libc::setsockopt(fd as i32, hl, ho, host.as_ptr().cast(), host.len() as libc::socklen_t)
@@ -2749,6 +2976,9 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
         }
         return peercred(fd as i32, optval, optlen);
     }
+    if level == SOL_SOCKET && optname == fwe_abi::socket::SO_PEERGROUPS {
+        return peergroups(fd as i32, optval, optlen);
+    }
     if let Some(e) = level_refused(fd as i32, level, true) {
         return e;
     }
@@ -2776,11 +3006,7 @@ pub unsafe fn getsockopt(fd: u64, level: u64, optname: u64, optval: u64, optlen:
                 libc::AF_INET6 => AF_INET6 as i32,
                 f => f,
             },
-            _ => KEPT_VALUES
-                .lock()
-                .iter()
-                .find(|&&(f, o, _)| Some((f, o)) == kept.map(|k| (fd as i32, k)))
-                .map_or(0, |k| k.2),
+            _ => kept.map_or(0, |k| kept_value(fd as i32, k)),
         };
         let n = (len as usize).min(4);
         guest!(uaccess::write_from(optval, &v.to_ne_bytes()[..n]));
@@ -2845,25 +3071,111 @@ fn peercred(fd: i32, optval: u64, optlen: u64) -> i64 {
     }
 }
 
+/// `SO_PEERGROUPS`: the supplementary groups of the process at the other
+/// end of Unix socket `fd`, in the caller's user namespace, as Linux's
+/// `sock_getsockopt` gives them: `ENODATA` with no peer, `ERANGE` with
+/// the size needed at `optlen` for a buffer too small.
+fn peergroups(fd: i32, optval: u64, optlen: u64) -> i64 {
+    let Ok(len) = uaccess::read::<u32>(optlen) else { return err(errno::EFAULT) };
+    if !is_unix(fd) || crate::netlink::is(fd) {
+        return err(errno::ENODATA);
+    }
+    let Ok((pid, _, _)) = host_peercred(fd) else { return err(errno::ENODATA) };
+    let groups: Vec<u32> = match crate::ids::HostPid::new(pid).and_then(crate::procreg::groups) {
+        Some(g) => g.into_iter().map(|g| crate::userns::to_ns(g, true)).collect(),
+        None => host_peer_groups(fd).into_iter().map(crate::host::gid_to_linux).collect(),
+    };
+    let need = 4 * groups.len() as u32;
+    if len < need {
+        guest!(uaccess::write(optlen, need));
+        return err(errno::ERANGE);
+    }
+    let bytes: Vec<u8> = groups.iter().flat_map(|g| g.to_ne_bytes()).collect();
+    guest!(uaccess::write_from(optval, &bytes));
+    guest!(uaccess::write(optlen, need));
+    0
+}
+
+/// The supplementary groups of a host process at the other end of Unix
+/// socket `fd` (macOS's `LOCAL_PEERCRED`: its groups after its effective
+/// group).
+#[cfg(target_os = "macos")]
+fn host_peer_groups(fd: i32) -> Vec<u32> {
+    const SOL_LOCAL: i32 = 0;
+    const LOCAL_PEERCRED: i32 = 1;
+    // SAFETY: zeroed bytes are a valid `xucred`, which the call fills.
+    let mut cred: libc::xucred = unsafe { std::mem::zeroed() };
+    let mut len = std::mem::size_of::<libc::xucred>() as libc::socklen_t;
+    // SAFETY: valid out-parameters of the given length.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            SOL_LOCAL,
+            LOCAL_PEERCRED,
+            (&mut cred as *mut libc::xucred).cast(),
+            &mut len,
+        )
+    };
+    let n = (cred.cr_ngroups.max(0) as usize).min(cred.cr_groups.len());
+    if r != 0 || n < 2 { Vec::new() } else { cred.cr_groups[1..n].to_vec() }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn host_peer_groups(_fd: i32) -> Vec<u32> {
+    Vec::new()
+}
+
 /// The `ucred` of the process at the other end of Unix socket `fd`, as the
 /// caller sees it: its pid in the caller's pid namespace, its effective
 /// user and group ids (fwe's for it, as `SO_PEERCRED` gives them) in the
-/// caller's user namespace. A process fwe did not start has its host ids
-/// as the guest sees them.
+/// caller's user namespace. They are those of when the connection was made
+/// (kept in [`crate::sockstate`], as Linux's `sk_peer_cred` is), which
+/// outlast the peer; for a socket fwe did not see connected (one the first
+/// program was started with), the peer's as it is now. A process fwe did
+/// not start has its host ids as the guest sees them.
 fn peer_ucred(fd: i32) -> Result<[u32; 3], i32> {
-    let (pid, uid, gid) = host_peercred(fd)?;
-    Ok(ucred_of(pid).unwrap_or([
-        crate::pidns::to_guest(pid) as u32,
-        crate::host::uid_to_linux(uid),
-        crate::host::gid_to_linux(gid),
-    ]))
+    let p = match crate::sockstate::with(fd, |s| s.peer).flatten() {
+        Some(p) => p,
+        None => live_peer(fd)?,
+    };
+    Ok(guest_ucred(p.pid, p.uid, p.gid))
 }
 
-/// The `ucred` of fwe's process `pid` (a host pid) as the caller sees it:
-/// its effective ids, if fwe has a record of it.
-fn ucred_of(pid: i32) -> Option<[u32; 3]> {
-    let ids = crate::procreg::read(crate::ids::HostPid::new(pid)?)?.ids;
-    Some(guest_ucred(pid, ids[1], ids[5]))
+use crate::sockstate::Peer;
+
+/// The process at the other end of Unix socket `fd` now: its host pid and
+/// effective user and group ids as the kernel holds them (fwe's for it,
+/// else its host ids as Linux ones).
+fn live_peer(fd: i32) -> Result<Peer, i32> {
+    let (pid, uid, gid) = host_peercred(fd)?;
+    let rec = crate::ids::HostPid::new(pid).and_then(crate::procreg::read);
+    Ok(match rec {
+        Some(r) => Peer { pid, uid: r.ids[1], gid: r.ids[5] },
+        None => {
+            Peer { pid, uid: crate::host::uid_to_linux(uid), gid: crate::host::gid_to_linux(gid) }
+        }
+    })
+}
+
+/// Unix socket `fd`'s connection is made, to `peer`.
+fn remember_peer(fd: i32, peer: Peer) {
+    crate::sockstate::update(fd, |s| s.peer = Some(peer));
+}
+
+/// This process made socket `fd`, or connected it: the end's maker
+/// ([`crate::sockstate::State::maker`]), whose peer is looked up anew.
+fn made_here(fd: i32) {
+    crate::sockstate::update(fd, |s| {
+        s.maker = Some(crate::host::pid().get());
+        s.peer_id = None;
+        s.peer_wants = None;
+    });
+}
+
+/// This process as a peer: its host pid and effective ids.
+fn own_peer() -> Peer {
+    let id = crate::creds::identity();
+    Peer { pid: crate::host::pid().get(), uid: id.uids[1], gid: id.gids[1] }
 }
 
 /// Credentials as the caller sees them: the pid in its pid namespace, the
@@ -3253,6 +3565,18 @@ pub fn at_mark(fd: i32, arg: u64) -> i64 {
     if !ip_stream(fd) {
         return err(errno::ENOTTY);
     }
+    match host_at_mark(fd) {
+        Ok(at) => {
+            guest!(uaccess::write(arg, at));
+            0
+        }
+        Err(e) => e,
+    }
+}
+
+/// The host's `SIOCATMARK` of socket `fd`: 1 if reading is at the urgent
+/// mark, 0 if not, or the call's error.
+fn host_at_mark(fd: i32) -> Result<i32, i64> {
     let mut at: i32 = 0;
     // macOS's SIOCATMARK, _IOR('s', 7, int).
     #[cfg(not(target_os = "linux"))]
@@ -3261,10 +3585,9 @@ pub fn at_mark(fd: i32, arg: u64) -> i64 {
     let req = 0x8905;
     // SAFETY: a valid out-parameter.
     if unsafe { libc::ioctl(fd, req, &mut at) } < 0 {
-        return last_error();
+        return Err(last_error());
     }
-    guest!(uaccess::write(arg, at));
-    0
+    Ok(at)
 }
 
 /// `fd` is a socket: `EBADF` if it is not open, `ENOTSOCK` if it is
@@ -3340,6 +3663,8 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
             Err(e) => return e,
         }
     };
+    // The end of the stream (the peer gone), which has no sender.
+    let mut ended = Ended::No;
     let r = if crate::seqpacket::is(fd as i32) {
         let got = crate::seqpacket::recv(
             fd as i32,
@@ -3354,6 +3679,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         hmsg.msg_namelen = 0;
         hmsg.msg_controllen = got.controllen as _;
         hmsg.msg_flags = got.flags;
+        if got.end {
+            ended = Ended::Message;
+        }
         got.result as isize
     } else if ping {
         // SAFETY: `hmsg` references guest iov and local name/control buffers.
@@ -3366,9 +3694,27 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         r as isize
     } else {
         // SAFETY: `hmsg` references guest iov and local name/control buffers.
-        let r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        let mut r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        // A Unix datagram socket whose peer has closed: macOS says so once
+        // (`ECONNRESET`, its error, which this takes); Linux has nothing to
+        // say, and the receive goes on as one with nothing there.
+        if r < 0
+            && crate::host::last_errno().is(libc::ECONNRESET)
+            && kind(fd as i32) == Some((libc::AF_UNIX, libc::SOCK_DGRAM))
+        {
+            // SAFETY: as above.
+            r = unsafe { libc::recvmsg(fd as i32, &mut hmsg, msg_flags_to_host(flags)) };
+        }
         if r < 0 {
             return last_error();
+        }
+        // A stream's nothing, for room to take something, is its end (a
+        // datagram can be empty).
+        if r == 0
+            && hiov.iter().any(|v| v.iov_len > 0)
+            && socket_type(fd as i32) == Some(libc::SOCK_STREAM)
+        {
+            ended = Ended::Stream;
         }
         nl_whole.map_or(r, |w| w as isize)
     };
@@ -3392,7 +3738,9 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
     // Ancillary data back to the guest.
     #[cfg(target_os = "linux")]
     {
-        // Host wrote the guest's Linux-layout control buffer directly.
+        // Host wrote the guest's Linux-layout control buffer directly,
+        // with no credentials at the end itself.
+        let _ = &ended;
         guest!(uaccess::write(msg + 40, hmsg.msg_controllen as u64));
         guest!(uaccess::write(msg + 48, msg_flags_from_host(hmsg.msg_flags)));
     }
@@ -3402,7 +3750,7 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         let got = (hmsg.msg_controllen as usize).min(macbuf.len());
         // Credentials, asked for with `SO_PASSCRED`, come first: those the
         // sender gave, else the peer's (the kernel's, 0, for netlink).
-        let passcred = kept_value(fd as i32, SO_PASSCRED) != 0;
+        let passcred = kept_value(fd as i32, SO_PASSCRED) != 0 && ended != Ended::Message;
         let room = cap.saturating_sub(if passcred { 32 } else { 0 });
         let inc = crate::scm::receive(
             &macbuf[..got],
@@ -3410,6 +3758,8 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
             flags & MSG_PEEK != 0,
         );
         let creds = passcred.then(|| match inc.creds {
+            // No sender: Linux's empty credentials, pid 0 and ids 0.
+            _ if ended == Ended::Stream => guest_ucred(0, 0, 0),
             Some(c) => guest_ucred(c.host_pid, c.uid, c.gid),
             None if crate::netlink::is(fd as i32) => [0, 0, 0],
             // No process to name (a datagram from a program fwe did not
@@ -3433,6 +3783,16 @@ pub unsafe fn recvmsg(fd: u64, msg: u64, flags: u64) -> i64 {
         guest!(uaccess::write(msg + 48, lflags));
     }
     r as i64
+}
+
+/// Whether a receive met the end of its socket's stream, which has no
+/// sender: a stream's end carries Linux's empty credentials (pid 0, ids
+/// 0) where they are asked for, a message socket's end none.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Ended {
+    No,
+    Stream,
+    Message,
 }
 
 /// The host control buffer a receive gives: the host's most descriptors

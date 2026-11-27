@@ -14,6 +14,10 @@
 //!   limit macOS does not enforce: past the soft limit fwe has the host
 //!   signal again every second, as Linux does, and at the hard limit ends
 //!   the process with `SIGKILL` ([`cpu_signal`]);
+//! - `RLIMIT_AS` and `RLIMIT_DATA`, which macOS refuses to set below
+//!   infinity (`EINVAL`), and which would also bound fwe's own memory:
+//!   fwe enforces them on the guest's mappings and break as Linux's
+//!   `may_expand_vm` and `check_data_rlimit` do ([`memory`]);
 //! - `RLIMIT_NPROC`, which fwe enforces at `fork` by the user's fwe
 //!   processes, and at the `execve` after a `set*uid` made the process a
 //!   user already past it ([`exec_allowed`]), so a privileged guest can
@@ -72,6 +76,48 @@ const SIGPENDING_DEFAULT: u64 = 63_432;
 /// lock.
 static SIGPENDING: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(SIGPENDING_DEFAULT);
+
+/// The soft `RLIMIT_AS` and the soft and hard `RLIMIT_DATA`, for the
+/// memory calls to read without the lock.
+static MEMORY: [std::sync::atomic::AtomicU64; 3] = [
+    std::sync::atomic::AtomicU64::new(r::RLIM_INFINITY),
+    std::sync::atomic::AtomicU64::new(r::RLIM_INFINITY),
+    std::sync::atomic::AtomicU64::new(r::RLIM_INFINITY),
+];
+
+/// The memory limits the guest's mappings fit: `RLIMIT_AS`'s soft limit,
+/// and `RLIMIT_DATA`'s soft and hard ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Memory {
+    pub space: u64,
+    pub data: u64,
+    pub data_hard: u64,
+}
+
+impl Memory {
+    /// Whether no limit is set.
+    pub fn none(&self) -> bool {
+        self.space == r::RLIM_INFINITY && self.data == r::RLIM_INFINITY
+    }
+}
+
+/// The memory limits now.
+pub fn memory() -> Memory {
+    use std::sync::atomic::Ordering::Relaxed;
+    Memory {
+        space: MEMORY[0].load(Relaxed),
+        data: MEMORY[1].load(Relaxed),
+        data_hard: MEMORY[2].load(Relaxed),
+    }
+}
+
+/// Keep the memory limits' copies as `l` has them.
+fn memory_from(l: &[(u64, u64); COUNT]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    MEMORY[0].store(l[r::RLIMIT_AS as usize].0, Relaxed);
+    MEMORY[1].store(l[r::RLIMIT_DATA as usize].0, Relaxed);
+    MEMORY[2].store(l[r::RLIMIT_DATA as usize].1, Relaxed);
+}
 
 /// The soft `RLIMIT_SIGPENDING`: how many signals can be pending
 /// ([`crate::thread::may_queue`]). Async-signal-safe.
@@ -160,6 +206,7 @@ pub fn set(res: u64, soft: u64, hard: u64, privileged: bool) -> Result<(), i32> 
             return Err(errno::EPERM);
         }
         *slot = (soft, hard);
+        memory_from(l);
         Ok(())
     })?;
     if res == r::RLIMIT_CPU {
@@ -236,6 +283,7 @@ pub fn load(d: &mut Dec) {
         *slot = (d.u64(), d.u64());
     }
     *LIMITS.lock().unwrap_or_else(|e| e.into_inner()) = Some(l);
+    memory_from(&l);
     let (soft, hard) = l[r::RLIMIT_CPU as usize];
     cpu_to_host(soft, hard);
     SIGPENDING.store(l[r::RLIMIT_SIGPENDING as usize].0, std::sync::atomic::Ordering::Relaxed);
@@ -259,7 +307,7 @@ mod tests {
     fn limits_are_set_as_linux_sets_them() {
         assert!(kept(r::RLIMIT_MEMLOCK) && kept(r::RLIMIT_NICE));
         assert!(kept(r::RLIMIT_STACK) && kept(r::RLIMIT_CORE));
-        assert!(!kept(r::RLIMIT_NOFILE) && !kept(r::RLIMIT_AS));
+        assert!(!kept(r::RLIMIT_NOFILE) && kept(r::RLIMIT_AS) && kept(r::RLIMIT_DATA));
         let res = r::RLIMIT_RTTIME;
         let (_, hard) = get(res);
         assert_eq!(set(res, 10, 5, true), Err(errno::EINVAL));

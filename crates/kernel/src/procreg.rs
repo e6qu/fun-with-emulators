@@ -61,6 +61,9 @@ pub struct ProcRecord {
     /// saved and filesystem user ids, then the same of groups): what its
     /// files in `/proc` are owned by.
     pub ids: [u32; 8],
+    /// Its supplementary groups (initial namespace ids): what
+    /// `SO_PEERGROUPS` and its `/proc/<pid>/status` give.
+    pub groups: Vec<u32>,
     /// Resource limits another process set for it with `prlimit`
     /// (resource, soft, hard), which it takes up at its next system call
     /// (it is woken to, [`crate::signote::limits_set`]).
@@ -337,6 +340,10 @@ fn encode(r: &ProcRecord) -> Vec<u8> {
     for id in r.ids {
         e.u32(id);
     }
+    e.u64(r.groups.len() as u64);
+    for &g in &r.groups {
+        e.u32(g);
+    }
     e.u64(r.limits.len() as u64);
     for &(res, soft, hard) in &r.limits {
         e.u32(res);
@@ -488,6 +495,8 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
     for id in &mut ids {
         *id = d.u32();
     }
+    let n = d.count(4);
+    let groups = (0..n).map(|_| d.u32()).collect();
     let n = d.count(20);
     let limits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let nice = d.i32();
@@ -522,6 +531,7 @@ fn decode(bytes: &[u8]) -> Option<ProcRecord> {
         oom_score_adj,
         oom_score_adj_min,
         ids,
+        groups,
         limits,
         nice,
         sched,
@@ -783,7 +793,13 @@ fn fresh(pid: HostPid, start: u64) -> ProcRecord {
         autoreap: false,
         oom_score_adj: 0,
         oom_score_adj_min: 0,
-        ids: [0; 8],
+        // A process's first credentials, until it publishes its own: those
+        // fwe starts a program with.
+        ids: {
+            let c = crate::creds::Creds::default();
+            [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid]
+        },
+        groups: crate::creds::Creds::default().groups().to_vec(),
         limits: Vec::new(),
         // As the host started it (`nice fwe ...`).
         nice: crate::host::nice_of(pid),
@@ -889,10 +905,11 @@ fn with_held(pid: HostPid, r: Option<ProcRecord>) -> Option<ProcRecord> {
     }
 }
 
-/// This process runs program `exe` with command line `cmdline`.
-pub fn own_program(exe: &[u8], cmdline: &[u8]) {
-    let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
-    let comm = base[..base.len().min(15)].to_vec();
+/// This process runs the program `exe` (its file's path), by a path whose
+/// last component is `named` (its `comm`, as Linux's `execve` names the
+/// thread), with command line `cmdline`.
+pub fn own_program(exe: &[u8], named: &[u8], cmdline: &[u8]) {
+    let comm = named[..named.len().min(15)].to_vec();
     let (exe, cmdline) = (exe.to_vec(), cmdline.to_vec());
     change_own(move |r| {
         r.exe = exe.clone();
@@ -942,6 +959,7 @@ pub fn own_namespaces(ns: Vec<Vec<u8>>) {
 #[derive(Clone, Debug, Default)]
 pub struct Inherit {
     ids: [u32; 8],
+    groups: Vec<u32>,
     /// The child's security state: the forking process's, with the
     /// capabilities the child has (every one, in a new user namespace).
     pub sec: Security,
@@ -982,6 +1000,7 @@ fn inherit_of(r: &ProcRecord) -> Inherit {
     let slack = crate::thread::slack();
     Inherit {
         ids: r.ids,
+        groups: r.groups.clone(),
         sec: r.sec,
         oom: (r.oom_score_adj, r.oom_score_adj_min),
         nice,
@@ -997,6 +1016,10 @@ fn inherit_of(r: &ProcRecord) -> Inherit {
 pub fn save_inherit(e: &mut Enc, i: &Inherit) {
     for id in i.ids {
         e.u32(id);
+    }
+    e.u64(i.groups.len() as u64);
+    for &g in &i.groups {
+        e.u32(g);
     }
     e.i32(i.oom.0);
     e.i32(i.oom.1);
@@ -1023,6 +1046,8 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     for id in &mut ids {
         *id = d.u32();
     }
+    let n = d.count(4);
+    let groups = (0..n).map(|_| d.u32()).collect();
     let oom = (d.i32(), d.i32());
     let nice = d.i32();
     let sched = Sched::decode(d);
@@ -1033,12 +1058,13 @@ pub fn load_inherit(d: &mut Dec) -> Inherit {
     let n = d.count(20);
     let rlimits = (0..n).map(|_| (d.u32(), d.u64(), d.u64())).collect();
     let sec = Security::decode(d);
-    Inherit { ids, sec, oom, nice, sched, slack, foster, affinity, rlimits }
+    Inherit { ids, groups, sec, oom, nice, sched, slack, foster, affinity, rlimits }
 }
 
 /// Set `r`'s inherited part.
 fn apply(r: &mut ProcRecord, i: &Inherit) {
     r.ids = i.ids;
+    r.groups = i.groups.clone();
     (r.oom_score_adj, r.oom_score_adj_min) = i.oom;
     r.nice = i.nice;
     r.sched = i.sched;
@@ -1258,9 +1284,20 @@ pub fn kept_uid(pid: HostPid) -> Option<u32> {
     read_any(pid).map(|r| r.ids[0])
 }
 
-/// This process's ids are now `ids` ([`ProcRecord::ids`]).
-pub fn set_own_ids(ids: [u32; 8]) {
-    let _ = change(me(), |r| r.ids = ids);
+/// This process's ids are now `ids` ([`ProcRecord::ids`]), its
+/// supplementary groups `groups`.
+pub fn set_own_ids(ids: [u32; 8], groups: &[u32]) {
+    let _ = change(me(), |r| {
+        r.ids = ids;
+        if r.groups != groups {
+            r.groups = groups.to_vec();
+        }
+    });
+}
+
+/// Host process `pid`'s supplementary groups, if fwe has a record of it.
+pub fn groups(pid: HostPid) -> Option<Vec<u32>> {
+    read(pid).map(|r| r.groups)
 }
 
 /// Host process `pid`'s main thread's timer slack and its default.
@@ -1585,12 +1622,20 @@ pub struct Kinfo {
     /// It is working its way through its exit (`P_WEXIT`).
     pub exiting: bool,
     pub comm: Vec<u8>,
+    /// Its real, effective and saved user ids, as the host has them.
+    pub uids: [u32; 3],
+    /// Its real, effective and saved group ids.
+    pub gids: [u32; 3],
+    /// Its supplementary groups.
+    pub groups: Vec<u32>,
 }
 
 /// Host process `pid`'s `kinfo_proc`, which the libc crate does not
 /// describe (648 bytes: the start time at 0, the flags at 32, the state at
-/// 36, the command name at 243, the parent and process group at 560 and
-/// 564).
+/// 36, the command name at 243; then `kp_eproc`: the real and saved user
+/// and group ids of `e_pcred` at 392 to 404, `e_ucred`'s effective user id
+/// at 420 and its groups, the first the effective group, counted at 424
+/// and from 428; the parent and process group at 560 and 564).
 #[cfg(target_os = "macos")]
 pub fn kinfo(pid: HostPid) -> Option<Kinfo> {
     const SIZE: usize = 648;
@@ -1623,6 +1668,12 @@ pub fn kinfo(pid: HostPid) -> Option<Kinfo> {
         // `P_WEXIT`.
         exiting: i32_at(32) & 0x2000 != 0,
         comm: comm[..comm.iter().position(|&b| b == 0).unwrap_or(comm.len())].to_vec(),
+        uids: [i32_at(392) as u32, i32_at(420) as u32, i32_at(396) as u32],
+        gids: [i32_at(400) as u32, i32_at(428) as u32, i32_at(404) as u32],
+        groups: {
+            let n = (i16::from_ne_bytes([buf[424], buf[425]]).clamp(0, 16)) as usize;
+            (0..n).map(|k| i32_at(428 + 4 * k) as u32).collect()
+        },
     })
 }
 
@@ -1846,6 +1897,9 @@ pub fn exiting(status: i32) {
     crate::textbusy::exiting();
     // Its `O_TMPFILE` files' hidden names, as their descriptors close.
     crate::tmpfile::exiting();
+    // What it sent with its messages, for receivers yet to read them.
+    #[cfg(not(target_os = "linux"))]
+    crate::scm::settle_pending();
     // Its files of fwe's store, and their locks.
     crate::filestore::desc::exiting();
     crate::ptrace::exiting(status);
@@ -1941,7 +1995,7 @@ mod tests {
     fn a_batch_writes_once_and_its_changes_are_read_meanwhile() {
         let exe = format!("/batch-test-{}", std::process::id()).into_bytes();
         batch(|| {
-            own_program(&exe, b"batch\0");
+            own_program(&exe, &exe[1..], b"batch\0");
             own_auxv(&[1, 2, 3]);
             // Held back, but this process reads them.
             let held = read(me()).unwrap();

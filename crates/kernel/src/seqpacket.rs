@@ -318,11 +318,13 @@ fn read_exact(
 
 /// What [`recv`] took: the bytes given (or the message's length, with
 /// `MSG_TRUNC`), and the control length and host message flags for the
-/// guest's `msghdr`.
+/// guest's `msghdr`; or the end of the stream (`end`: the peer gone, no
+/// message, which carries no credentials).
 pub struct Received {
     pub result: i64,
     pub controllen: usize,
     pub flags: i32,
+    pub end: bool,
 }
 
 /// Take one message into `iov` (host buffers, checked), its descriptors
@@ -337,8 +339,8 @@ pub fn recv(
     host_flags: i32,
 ) -> Received {
     use fwe_abi::socket::{MSG_PEEK, MSG_TRUNC};
-    let fail = |e: i64| Received { result: e, controllen: 0, flags: 0 };
-    let eof = || Received { result: 0, controllen: 0, flags: 0 };
+    let fail = |e: i64| Received { result: e, controllen: 0, flags: 0, end: false };
+    let eof = || Received { result: 0, controllen: 0, flags: 0, end: true };
     let as_err = |e: host::HostErrno| fail(err(e.linux()));
     let peek = linux_flags & MSG_PEEK != 0;
     let nonblock = nonblocking(fd, host_flags);
@@ -420,7 +422,7 @@ pub fn recv(
         flags |= libc::MSG_TRUNC;
     }
     let result = if truncated && linux_flags & MSG_TRUNC != 0 { len } else { at };
-    Received { result: result as i64, controllen, flags }
+    Received { result: result as i64, controllen, flags, end: false }
 }
 
 /// `read`/`readv` of a `SOCK_SEQPACKET` socket: one message.

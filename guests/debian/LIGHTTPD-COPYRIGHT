@@ -3,12 +3,30 @@ Upstream-Name: lighttpd
 
 Files: *
 Copyright: 2004 Jan Kneschke, incremental
-           2016-2022 Glenn Strauss <gstrauss@gluelogic.com>
+           2016-2023 Glenn Strauss <gstrauss@gluelogic.com>
 License: BSD-3-clause
+
+Files: debian/lighty-enable-mod
+Copyright: Copyright (c) 2006 Krzysztof Krzyzaniak
+License: GPL or Artistic
+ You may distribute under the terms of either the GNU General Public
+ License[1] or the Artistic License[2].
+ .
+ [1] http://www.gnu.org/licenses/gpl.html
+ [2] http://www.perl.com/pub/a/language/misc/Artistic.html
+Comment:
+ On Debian GNU/Linux systems, the complete text of the GNU General
+ Public License version 1 can be found in '/usr/share/common-licenses/GPL-1'
+ and the Artistic Licence in '/usr/share/common-licenses/Artistic'.
 
 Files: src/compat/fastcgi.h
 Copyright: Copyright (c) 1995-1996 Open Market, Inc
 License: Open-Market
+
+Files: src/compat/sys/queue.h
+Copyright: Copyright (c) 1991, 1993
+           The Regents of the University of California.  All rights reserved.
+License: BSD-3-clause
 
 Files: src/algo_md5.h src/algo_md5.c
 Copyright: Copyright (c) 1991-2, RSA Data Security , Inc.  All rights reserved.
@@ -23,7 +41,7 @@ Files: src/algo_xxhash.*
 Copyright: 2012-2020 Yann Collet
 License: BSD-2-clause
 
-Files: src/lemon.c src/lempar.c src/configparser.c
+Files: src/lemon.c src/lempar.c
 Copyright: -
 License: public-domain
  The author disclaims copyright to this source code.

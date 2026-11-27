@@ -254,9 +254,7 @@ pub fn thread_state(t: libc::pthread_t) -> Option<(u64, u64, bool)> {
 pub fn rlimit_to_host(resource: u64) -> Option<libc::c_int> {
     Some(match resource {
         resource::RLIMIT_FSIZE => libc::RLIMIT_FSIZE as libc::c_int,
-        resource::RLIMIT_DATA => libc::RLIMIT_DATA as libc::c_int,
         resource::RLIMIT_NOFILE => libc::RLIMIT_NOFILE as libc::c_int,
-        resource::RLIMIT_AS => libc::RLIMIT_AS as libc::c_int,
         _ => return None,
     })
 }
@@ -1255,7 +1253,8 @@ pub fn write_rusage(out: u64, usage: &libc::rusage) -> crate::uaccess::Result<()
     crate::uaccess::write(out, words)
 }
 
-/// File status flags (`F_GETFL`) from host to Linux.
+/// File status flags (`F_GETFL`) from host to Linux: the access mode and
+/// the modes the host keeps.
 pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
     let mut f = match host & libc::O_ACCMODE {
         libc::O_WRONLY => fcntl::O_WRONLY,
@@ -1272,8 +1271,9 @@ pub fn status_flags_to_linux(host: libc::c_int) -> u64 {
             f |= l;
         }
     }
-    // Linux reports O_LARGEFILE on 64-bit for every open file.
-    f | fcntl::O_LARGEFILE
+    // (`O_LARGEFILE`, which Linux sets on what `open` made only, is the
+    // caller's: [`crate::fdmarks::status_flags`].)
+    f
 }
 
 /// A Linux `struct flock` in host layout, or `EINVAL` for an unknown lock
@@ -1640,6 +1640,307 @@ pub fn cpu_identity() -> CpuIdentity {
     {
         CpuIdentity { bogomips: 48.0, implementer: 0x61, ..Default::default() }
     }
+}
+
+/// One kind of the host's cores: how many, and the caches each has (bytes;
+/// 0 where the host does not say), the L2 shared by `per_l2` of them.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CoreKind {
+    pub cpus: u32,
+    pub l1i: u64,
+    pub l1d: u64,
+    pub l2: u64,
+    pub per_l2: u32,
+}
+
+/// The host's cores by kind, efficiency cores first (as `/proc/cpuinfo`
+/// numbers them, from `hw.perflevel<n>`, 0 the fastest), and the cache
+/// line's size; one kind of `ncpu` cores where the host has no levels.
+pub fn core_kinds(ncpu: u32) -> (Vec<CoreKind>, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        let line = sysctl_u64(c"hw.cachelinesize").unwrap_or(64);
+        let levels = sysctl_u64(c"hw.nperflevels").unwrap_or(0);
+        let level = |i: u64, what: &str| {
+            std::ffi::CString::new(format!("hw.perflevel{i}.{what}"))
+                .ok()
+                .and_then(|c| sysctl_u64(&c))
+        };
+        let kinds: Vec<CoreKind> = (0..levels)
+            .rev()
+            .map(|i| CoreKind {
+                cpus: level(i, "logicalcpu").unwrap_or(0) as u32,
+                l1i: level(i, "l1icachesize").unwrap_or(0),
+                l1d: level(i, "l1dcachesize").unwrap_or(0),
+                l2: level(i, "l2cachesize").unwrap_or(0),
+                per_l2: level(i, "cpusperl2").unwrap_or(0) as u32,
+            })
+            .filter(|k| k.cpus > 0)
+            .collect();
+        if kinds.iter().map(|k| k.cpus).sum::<u32>() == ncpu {
+            return (kinds, line);
+        }
+        (vec![CoreKind { cpus: ncpu, ..CoreKind::default() }], line)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (vec![CoreKind { cpus: ncpu, ..CoreKind::default() }], 64)
+    }
+}
+
+/// A route of the host's own table, as Linux's main table would hold it
+/// ([`routes`]): its family (`AF_INET`, `AF_INET6` as Linux numbers
+/// them), destination and prefix, gateway (`None`: the destination is on
+/// the link) and interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostRoute {
+    pub family: u16,
+    pub dst: Vec<u8>,
+    pub prefix: u8,
+    pub gateway: Option<Vec<u8>>,
+    pub index: u32,
+}
+
+/// A routing-table dump of the host's (`sysctl` `[CTL_NET, PF_ROUTE, 0,
+/// family, op, arg]`): its messages.
+#[cfg(target_os = "macos")]
+fn route_sysctl(family: i32, op: i32, arg: i32) -> Option<Vec<u8>> {
+    let mib = [libc::CTL_NET, libc::PF_ROUTE, 0, family, op, arg];
+    let mut len = 0usize;
+    // SAFETY: a size query: no buffer.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_ptr().cast_mut(),
+            6,
+            std::ptr::null_mut(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 || len == 0 {
+        return None;
+    }
+    // Room for entries added meanwhile.
+    len += len / 2;
+    let mut buf = vec![0u8; len];
+    // SAFETY: `buf` has `len` writable bytes, which the call fills.
+    let r = unsafe {
+        libc::sysctl(
+            mib.as_ptr().cast_mut(),
+            6,
+            buf.as_mut_ptr().cast(),
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if r != 0 {
+        return None;
+    }
+    buf.truncate(len);
+    Some(buf)
+}
+
+/// The messages of a routing-table dump: each header, and the addresses
+/// that follow it, by their bit (`RTAX_DST`, `RTAX_GATEWAY`,
+/// `RTAX_NETMASK`...).
+#[cfg(target_os = "macos")]
+fn route_messages(buf: &[u8]) -> Vec<(libc::rt_msghdr, [Option<&[u8]>; 8])> {
+    let header = size_of::<libc::rt_msghdr>();
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + header <= buf.len() {
+        // SAFETY: `header` bytes are there; an unaligned read of plain data.
+        let m: libc::rt_msghdr = unsafe { std::ptr::read_unaligned(buf[at..].as_ptr().cast()) };
+        let len = m.rtm_msglen as usize;
+        if len < header || at + len > buf.len() {
+            break;
+        }
+        let msg = &buf[at..at + len];
+        at += len;
+        // Each address padded to 4 bytes.
+        let mut addrs: [Option<&[u8]>; 8] = [None; 8];
+        let mut p = header;
+        for (bit, slot) in addrs.iter_mut().enumerate() {
+            if m.rtm_addrs & (1 << bit) == 0 {
+                continue;
+            }
+            let Some(&sa_len) = msg.get(p) else { break };
+            let end = (p + sa_len as usize).min(msg.len());
+            *slot = Some(&msg[p..end]);
+            p += if sa_len == 0 { 4 } else { (sa_len as usize).div_ceil(4) * 4 };
+        }
+        out.push((m, addrs));
+    }
+    out
+}
+
+/// An address's `n` bytes from a `sockaddr_in` (at 4) or `sockaddr_in6`
+/// (at 8): a mask can be cut short, its rest zero.
+#[cfg(target_os = "macos")]
+fn sockaddr_bytes(sa: &[u8], n: usize) -> Vec<u8> {
+    let off = if n == 4 { 4 } else { 8 };
+    let mut a = vec![0u8; n];
+    for (i, b) in sa.iter().skip(off).take(n).enumerate() {
+        a[i] = *b;
+    }
+    a
+}
+
+/// An IP address of `n` bytes from its socket address: a link-local IPv6
+/// address carries its interface in its third and fourth bytes (KAME's),
+/// which are not the address's.
+#[cfg(target_os = "macos")]
+fn sockaddr_ip(sa: &[u8], n: usize) -> Vec<u8> {
+    let mut a = sockaddr_bytes(sa, n);
+    if n == 16 && a[0] == 0xfe && a[1] & 0xc0 == 0x80 {
+        a[2] = 0;
+        a[3] = 0;
+    }
+    a
+}
+
+/// The host's routes (`sysctl` `NET_RT_DUMP`) that Linux's main table
+/// would hold. What macOS keeps there and Linux does not is left out: the
+/// loopback's (Linux's are made of its own), the link layer's entries
+/// and their clones, multicast and broadcast routes, the default routes
+/// of interfaces other than the primary one (`RTF_IFSCOPE`), and a host
+/// route to an address of the host's own (Linux's local table holds
+/// those). A gateway that is the interface's own address, or a link,
+/// makes a route on the link.
+pub fn routes() -> Vec<HostRoute> {
+    #[cfg(target_os = "macos")]
+    {
+        let ifs = interfaces();
+        let lo = ifs.iter().find(|i| i.name == b"lo").map(|i| i.index);
+        let own: Vec<Vec<u8>> =
+            ifs.into_iter().flat_map(|i| i.addrs.into_iter().map(|a| a.addr)).collect();
+        let mut out = Vec::new();
+        for (family, linux) in [(libc::AF_INET, 2u16), (libc::AF_INET6, 10u16)] {
+            if let Some(buf) = route_sysctl(family, libc::NET_RT_DUMP, 0) {
+                out.extend(parse_routes(&buf, linux, &own, lo));
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// The routes of a `NET_RT_DUMP` of `family` (Linux's number), as
+/// [`routes`] keeps them; `own` the host's addresses, `lo` its loopback's
+/// index.
+#[cfg(target_os = "macos")]
+fn parse_routes(buf: &[u8], family: u16, own: &[Vec<u8>], lo: Option<u32>) -> Vec<HostRoute> {
+    let n = if family == 2 { 4 } else { 16 };
+    let af = if n == 4 { libc::AF_INET } else { libc::AF_INET6 };
+    let mut out = Vec::new();
+    for (m, [dst, gateway, mask, ..]) in route_messages(buf) {
+        let skip =
+            libc::RTF_WASCLONED | libc::RTF_LLINFO | libc::RTF_MULTICAST | libc::RTF_BROADCAST;
+        if m.rtm_flags & libc::RTF_UP == 0 || m.rtm_flags & skip != 0 {
+            continue;
+        }
+        let Some(dst) = dst.filter(|d| d.get(1).is_some_and(|&f| i32::from(f) == af)) else {
+            continue;
+        };
+        let dst = sockaddr_ip(dst, n);
+        let prefix = if m.rtm_flags & libc::RTF_HOST != 0 {
+            (n * 8) as u8
+        } else {
+            mask.map_or(0, |m| ip_mask_len(&sockaddr_bytes(m, n)))
+        };
+        let index = u32::from(m.rtm_index);
+        let loopback = Some(index) == lo;
+        let own_dst = prefix as usize == n * 8 && own.contains(&dst);
+        let scoped_default = prefix == 0 && m.rtm_flags & libc::RTF_IFSCOPE != 0;
+        let limited = n == 4 && dst == [255; 4];
+        if loopback
+            || own_dst
+            || scoped_default
+            || limited
+            || (n == 4 && dst[0] >= 224 && dst[0] < 240)
+        {
+            continue;
+        }
+        let gateway = gateway
+            .filter(|g| g.get(1).is_some_and(|&f| i32::from(f) != libc::AF_LINK))
+            .map(|g| sockaddr_ip(g, n))
+            .filter(|g| !own.contains(g));
+        out.push(HostRoute { family, dst, prefix, gateway, index });
+    }
+    out
+}
+
+/// A neighbour of the host's (an ARP or neighbour discovery entry): its
+/// family (Linux's number), address, link-layer address (empty while it
+/// is being resolved), interface and whether it was set by hand.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostNeighbour {
+    pub family: u16,
+    pub addr: Vec<u8>,
+    pub lladdr: Vec<u8>,
+    pub index: u32,
+    pub permanent: bool,
+}
+
+/// The host's neighbours (`sysctl` `NET_RT_FLAGS` of `RTF_LLINFO`), as
+/// Linux's neighbour tables hold them: not the host's own addresses, nor
+/// broadcast or multicast entries, nor the loopback's.
+pub fn neighbours() -> Vec<HostNeighbour> {
+    #[cfg(target_os = "macos")]
+    {
+        let ifs = interfaces();
+        let lo = ifs.iter().find(|i| i.name == b"lo").map(|i| i.index);
+        let own: Vec<Vec<u8>> =
+            ifs.into_iter().flat_map(|i| i.addrs.into_iter().map(|a| a.addr)).collect();
+        let mut out = Vec::new();
+        for (family, linux, n) in [(libc::AF_INET, 2u16, 4), (libc::AF_INET6, 10u16, 16)] {
+            let Some(buf) = route_sysctl(family, libc::NET_RT_FLAGS, libc::RTF_LLINFO) else {
+                continue;
+            };
+            for (m, [dst, gateway, ..]) in route_messages(&buf) {
+                if m.rtm_flags & (libc::RTF_BROADCAST | libc::RTF_MULTICAST) != 0 {
+                    continue;
+                }
+                let Some(dst) = dst.filter(|d| d.get(1).is_some_and(|&f| i32::from(f) == family))
+                else {
+                    continue;
+                };
+                let addr = sockaddr_ip(dst, n);
+                let index = u32::from(m.rtm_index);
+                if own.contains(&addr) || Some(index) == lo || (n == 16 && addr[0] == 0xff) {
+                    continue;
+                }
+                // A `sockaddr_dl`: its name's and address's lengths at 5
+                // and 6, the name then the address from 8.
+                let lladdr = gateway
+                    .filter(|g| g.len() >= 8 && i32::from(g[1]) == libc::AF_LINK)
+                    .map(|g| {
+                        let (nlen, alen) = (g[5] as usize, g[6] as usize);
+                        g.get(8 + nlen..8 + nlen + alen).unwrap_or_default().to_vec()
+                    })
+                    .unwrap_or_default();
+                let permanent = m.rtm_flags & libc::RTF_STATIC != 0;
+                out.push(HostNeighbour { family: linux, addr, lladdr, index, permanent });
+            }
+        }
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Vec::new()
+    }
+}
+
+/// The length of the prefix mask `m` sets.
+#[cfg(target_os = "macos")]
+fn ip_mask_len(m: &[u8]) -> u8 {
+    m.iter().map(|b| b.leading_ones()).take_while(|&o| o == 8).count() as u8 * 8
+        + m.iter().map(|b| b.leading_ones() as u8).find(|&o| o < 8).unwrap_or(0)
 }
 
 /// The bytes host process `pid` had read from and written to storage.

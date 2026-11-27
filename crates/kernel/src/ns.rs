@@ -289,9 +289,10 @@ impl Namespaces {
     /// Whether the namespaces `flags` asks for can be made (`ENOSPC` if
     /// not): a user namespace no deeper than Linux nests them (32 below
     /// the initial one's child), and of each kind fewer than its
-    /// `user.max_<kind>_namespaces` sysctl allows, counting the ones fwe's
-    /// processes are in. The limits are those of the initial user
-    /// namespace, for every user and namespace.
+    /// `user.max_<kind>_namespaces` sysctl allows in the maker's user
+    /// namespace and in each one above it, counting at each the live
+    /// namespaces of the kind (those fwe's processes are in or hold)
+    /// owned by it or by one below it, as Linux counts them.
     pub fn may_make(&self, flags: u64) -> Result<(), i32> {
         const KINDS: [(u64, &str); 7] = [
             (CLONE_NEWUSER, "user"),

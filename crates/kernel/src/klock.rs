@@ -221,7 +221,7 @@ impl<T> Lock<T> {
 }
 
 impl<P: Platform> KernelLock<P> {
-    /// Run the system call named in `regs` as [`Kernel::enter_syscall`]
+    /// Run the system call named in `regs` as [`Kernel::run_syscall`]
     /// does: on the shared side if it is one that can, else exclusively.
     #[cfg_attr(
         target_os = "macos",
@@ -237,7 +237,8 @@ impl<P: Platform> KernelLock<P> {
                 return;
             }
         }
-        self.lock().as_mut().expect("kernel initialized").enter_syscall(regs);
+        self.lock().as_mut().expect("kernel initialized").run_syscall(regs);
+        self.deliver_pending(regs);
     }
 
     /// Run call `nr` with `args` (already translated for the host) and
@@ -253,7 +254,7 @@ impl<P: Platform> KernelLock<P> {
     }
 
     /// Store the result of a call run without the lock, as
-    /// [`Kernel::finish_syscall`] does: on the shared side, unless the call
+    /// [`Kernel::complete_syscall`] does: on the shared side, unless the call
     /// was interrupted or a signal is to be delivered.
     pub fn finish(&self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.finish_holding(self.shared(), regs, nr, args, result);
@@ -281,20 +282,169 @@ impl<P: Platform> KernelLock<P> {
                 return;
             }
             drop(shared);
-            if let Some(k) = self.lock().as_mut() {
-                k.deliver_pending(regs);
-            }
+            self.deliver_pending(regs);
             return;
         }
         drop(shared);
-        self.lock().as_mut().expect("kernel initialized").finish_syscall(regs, nr, args, result);
+        self.lock().as_mut().expect("kernel initialized").complete_syscall(regs, nr, args, result);
+        self.deliver_pending(regs);
+    }
+
+    /// Serve the tracer's `stop` of this thread without the lock: the
+    /// thread pointer read before it and written back after under the
+    /// lock, which the wait for the tracer does not hold, so the
+    /// process's other threads go on, and stop for their tracer in their
+    /// turn (each attached to, or each sent `SIGSTOP`, by a debugger that
+    /// waits for each).
+    pub fn serve_stop(&self, regs: &mut Regs, stop: crate::ptrace::Stop) -> crate::ptrace::Resume {
+        let mut tls = {
+            let mut held = self.lock();
+            let k = held.as_mut().expect("kernel initialized");
+            k.resync_if_asked();
+            k.platform.thread_pointer()
+        };
+        let before = tls;
+        let r = stop.serve(regs, &mut tls);
+        let mut held = self.lock();
+        let k = held.as_mut().expect("kernel initialized");
+        if tls != before {
+            k.platform.set_thread_pointer(tls);
+        }
+        k.resync_if_asked();
+        r
+    }
+
+    /// Serve `stop`, if there is one, raising a signal the tracer resumed
+    /// with ([`crate::ptrace::raise_resumed`]).
+    fn serve_and_raise(&self, regs: &mut Regs, stop: Option<crate::ptrace::Stop>) {
+        if let Some(stop) = stop {
+            crate::ptrace::raise_resumed(self.serve_stop(regs, stop));
+        }
+    }
+
+    /// Act on the ready pending signals before returning to the guest
+    /// ([`Kernel::deliver_step`]), each tracer's stop they make served
+    /// without the lock ([`KernelLock::serve_stop`]).
+    #[cfg_attr(
+        target_os = "macos",
+        unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+    )]
+    pub fn deliver_pending(&self, regs: &mut Regs) {
+        let mut carried = None;
+        loop {
+            let met = match self.lock().as_mut() {
+                Some(k) => k.deliver_step(regs, carried.take()),
+                None => return,
+            };
+            let Some(met) = met else { return };
+            let r = self.serve_stop(regs, met.stop);
+            carried = met.after(r);
+        }
+    }
+
+    /// Deliver synchronous fault signal `sig` (at `addr`, of syndrome `esr`
+    /// where the fault has one) to a guest handler, returning `true` if a
+    /// handler was entered, or the tracer took it; when `false`, the caller
+    /// takes the default action (terminate). A tracer sees it first (a
+    /// breakpoint's SIGTRAP, say, or the step it asked for), its stop served
+    /// without the lock, and the guest goes on as it leaves the registers,
+    /// or takes the signal it chooses.
+    pub fn deliver_fault(&self, regs: &mut Regs, sig: u64, addr: u64, esr: Option<u64>) -> bool {
+        use fwe_abi::signal::SIGTRAP;
+        if crate::ptrace::traced() {
+            // A breakpoint of a step a tracer asked for: the step's stop.
+            if sig == SIGTRAP && crate::ptrace::step_hit(regs.pc) {
+                const TRAP_TRACE: i32 = 2;
+                let info = thread::SigInfo { code: TRAP_TRACE, ..thread::SigInfo::default() };
+                let r = self.serve_stop(regs, crate::ptrace::Stop::signal(sig, info));
+                if let Some((s, i)) = crate::ptrace::chosen(sig, r) {
+                    thread::post_process(s, i);
+                }
+                return true;
+            }
+            let info = crate::signal::fault_info(sig, addr, esr);
+            let r = self.serve_stop(regs, crate::ptrace::Stop::signal(sig, info));
+            match crate::ptrace::chosen(sig, r) {
+                None => return true,
+                Some((s, i)) if s != sig => {
+                    thread::post_process(s, i);
+                    return true;
+                }
+                Some(_) => {}
+            }
+        }
+        let info = crate::signal::fault_info(sig, addr, esr);
+        self.lock().as_mut().is_some_and(|k| k.deliver_to_handler(regs, sig, info, addr, esr))
+    }
+
+    /// A system call's entry stop (`entry`) or exit stop, if the tracer
+    /// stops this thread at system calls (`PTRACE_SYSCALL`).
+    pub fn syscall_stop(&self, regs: &mut Regs, entry: bool) {
+        self.serve_and_raise(regs, crate::ptrace::Stop::syscall(entry));
+    }
+
+    /// `SECCOMP_RET_TRACE` with `data` for the call in `regs`: a tracer
+    /// that asked for these events (`PTRACE_O_TRACESECCOMP`) stops there,
+    /// and can change the call or skip it (`x8` -1); the filters then look
+    /// again at what it left. With no such tracer, `Trace` stands.
+    pub fn seccomp_trace(&self, regs: &mut Regs, data: u16) -> crate::seccomp::Action {
+        use crate::seccomp::Action;
+        if !crate::ptrace::traced()
+            || crate::ptrace::options() & crate::ptrace::PTRACE_O_TRACESECCOMP == 0
+        {
+            return Action::Trace(data);
+        }
+        let event = crate::ptrace::PTRACE_EVENT_SECCOMP;
+        self.serve_and_raise(regs, crate::ptrace::Stop::event(event, u64::from(data)));
+        let nr = regs.x[8];
+        if nr as i64 == -1 {
+            return Action::Skip;
+        }
+        let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
+        crate::seccomp::recheck(nr, &args, crate::SvcSite(regs.pc))
+    }
+
+    /// The stops of a fork a backend noted ([`crate::ptrace::note_fork`]):
+    /// the parent's event, the child's pid its message, and for a vfork
+    /// the vfork-done event.
+    pub fn fork_stops(&self, regs: &mut Regs) {
+        if let Some((event, child, vfork)) = crate::ptrace::Stop::fork() {
+            self.serve_and_raise(regs, event);
+            if vfork {
+                self.serve_and_raise(regs, crate::ptrace::Stop::vfork_done(child));
+            }
+        }
+    }
+
+    /// A clone's event stop (`event`, a `PTRACE_EVENT_*` the tracer asked
+    /// for), the child `child` its message; for a vfork (`vfork`), the
+    /// vfork-done event's after it.
+    pub fn clone_stops(&self, regs: &mut Regs, event: i32, child: u64, vfork: bool) {
+        self.serve_and_raise(regs, crate::ptrace::Stop::event(event, child));
+        if vfork {
+            self.serve_and_raise(regs, crate::ptrace::Stop::vfork_done(child));
+        }
+    }
+
+    /// The stops after a successful `execve` of a traced process
+    /// ([`crate::ptrace::Stop::exec`]); its exit stop's result in `x0`, 0.
+    pub fn exec_stops(&self, regs: &mut Regs) {
+        let [event, trap] = crate::ptrace::Stop::exec();
+        self.serve_and_raise(regs, event);
+        // Whether it stops at the call's exit is as the tracer left it at
+        // the event.
+        if let Some(exit) = crate::ptrace::Stop::syscall(false) {
+            regs.x[0] = 0;
+            self.serve_and_raise(regs, Some(exit));
+        }
+        self.serve_and_raise(regs, trap);
     }
 }
 
 impl<P: Platform> Kernel<P> {
     /// After a call run on the shared side: what delivering pending signals
     /// does short of delivering one. `false` when a signal is ready, for
-    /// [`Kernel::deliver_pending`] under the exclusive lock.
+    /// [`KernelLock::deliver_pending`].
     pub(crate) fn settle_shared(&self) -> bool {
         let (pending, _, saved) = thread::after_call(crate::host::WAKE_SIGNAL);
         // With nothing pending there is nothing for a signalfd and nothing

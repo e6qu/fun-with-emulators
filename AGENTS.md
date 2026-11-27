@@ -136,6 +136,11 @@ updated by [RFC 8174](https://www.rfc-editor.org/rfc/rfc8174)):
 - Every `unsafe` block MUST have a `// SAFETY:` comment.
 - Linux ABI values live in `crates/abi`; host translation lives in
   `crates/kernel/src/host.rs`.
+- Unit tests MUST NOT interfere with one another: a test whose work
+  changes what is the whole test process's (tables a re-executed fwe
+  loads, the file store's numbering) runs in a process of its own
+  (`crate::alone::in_own_process`), and a test touches only descriptors
+  it made.
 - A new system call MUST get a unit test in the kernel crate where
   possible, and a guest program plus end-to-end test when its behaviour
   depends on the backend.

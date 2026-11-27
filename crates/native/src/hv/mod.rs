@@ -1,6 +1,6 @@
 //! The hypervisor backend: Linux programs the native backend cannot map —
 //! non-PIE executables linked into the low 4 GiB that macOS reserves in
-//! every process (Debian's `python3.11` at `0x400000`, static Go at
+//! every process (Debian's `python3.13` at `0x400000`, static Go at
 //! `0x10000`) — run in a Hypervisor.framework VM instead.
 //!
 //! The guest runs at EL0 under a minimal EL1 (see [`vm`]): its own `svc #0`

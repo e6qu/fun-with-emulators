@@ -14,8 +14,11 @@ use std::collections::HashMap;
 
 #[derive(Clone)]
 struct Dir {
-    /// Its guest path, for paths relative to it.
+    /// Its path in the mount namespace's view, for paths relative to it.
     path: Vec<u8>,
+    /// Its path in its filesystem as fwe's `/proc` or `/sys` names it
+    /// (`/proc/42/fd`), which its entries' inode numbers are made from.
+    fs_path: Vec<u8>,
     /// `(name, d_type)` entries, including `.` and `..`.
     entries: Vec<(Vec<u8>, u8)>,
 }
@@ -46,6 +49,7 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     with(|m| {
         crate::snapshot::fd_map(e, m, |e, dir| {
             e.bytes(&dir.path);
+            e.bytes(&dir.fs_path);
             e.u64(dir.entries.len() as u64);
             for (name, t) in &dir.entries {
                 e.bytes(name);
@@ -58,17 +62,18 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
 /// Rebuild the registry in a fork child.
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     let reg = crate::snapshot::read_fd_map(d, |d| {
-        let path = d.bytes();
+        let (path, fs_path) = (d.bytes(), d.bytes());
         let n = d.count(9);
         let entries = (0..n).map(|_| (d.bytes(), d.u8())).collect();
-        Dir { path, entries }
+        Dir { path, fs_path, entries }
     });
     with(|m| *m = reg);
 }
 
-/// Open the synthetic directory at guest path `path` with the given
-/// entries, returning a guest fd.
-pub fn open(path: Vec<u8>, entries: Vec<(Vec<u8>, u8)>) -> i64 {
+/// Open the synthetic directory at `path` (in the mount namespace's view;
+/// `fs_path` in its filesystem, see [`crate::fs::synthetic_ino`]) with the
+/// given entries, returning a guest fd.
+pub fn open(path: Vec<u8>, fs_path: Vec<u8>, entries: Vec<(Vec<u8>, u8)>) -> i64 {
     // Reserve a real, unique descriptor number backed by /dev/null.
     // SAFETY: a constant NUL-terminated path and plain open flags.
     let fd = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
@@ -76,7 +81,7 @@ pub fn open(path: Vec<u8>, entries: Vec<(Vec<u8>, u8)>) -> i64 {
         return last_error();
     }
     ANY.store(true, std::sync::atomic::Ordering::SeqCst);
-    with(|m| m.insert(fd, Dir { path, entries }));
+    with(|m| m.insert(fd, Dir { path, fs_path, entries }));
     fd as i64
 }
 
@@ -153,7 +158,13 @@ pub unsafe fn getdents64(fd: i32, buf: u64, count: u64) -> Option<i64> {
             let start = out.len();
             out.resize(start + reclen, 0);
             let rec = &mut out[start..];
-            rec[0..8].copy_from_slice(&1u64.to_ne_bytes()); // d_ino (arbitrary nonzero)
+            // d_ino, as `stat` of the entry gives it.
+            let ino = match &name[..] {
+                b"." => crate::fs::synthetic_ino(&dir.fs_path),
+                b".." => crate::fs::synthetic_ino(&crate::fs::normalize(&dir.fs_path, b"..")),
+                _ => crate::fs::synthetic_ino(&crate::mounts::join(&dir.fs_path, name)),
+            };
+            rec[0..8].copy_from_slice(&ino.to_ne_bytes());
             rec[8..16].copy_from_slice(&((offset + 1) as i64).to_ne_bytes()); // d_off
             rec[16..18].copy_from_slice(&(reclen as u16).to_ne_bytes());
             rec[18] = *dtype;
@@ -212,7 +223,7 @@ mod tests {
     fn lists_entries_and_rewinds() {
         let entries =
             vec![(b".".to_vec(), DT_DIR), (b"..".to_vec(), DT_DIR), (b"cpuinfo".to_vec(), DT_REG)];
-        let fd = open(b"/proc".to_vec(), entries) as i32;
+        let fd = open(b"/proc".to_vec(), b"/proc".to_vec(), entries) as i32;
         assert!(fd >= 0);
         assert!(is_synth(fd));
 
@@ -223,6 +234,13 @@ mod tests {
         // Parse the three records and check the names.
         let names = parse_names(&buf[..n as usize]);
         assert_eq!(names, vec![b".".to_vec(), b"..".to_vec(), b"cpuinfo".to_vec()]);
+        // Each entry's inode, as `stat` gives it: the root's is 1.
+        let first = u64::from_ne_bytes(buf[0..8].try_into().unwrap());
+        assert_eq!(first, 1);
+        let reclen = |at: usize| u16::from_ne_bytes([buf[at + 16], buf[at + 17]]) as usize;
+        let third = reclen(0) + reclen(reclen(0));
+        let ino = u64::from_ne_bytes(buf[third..third + 8].try_into().unwrap());
+        assert_eq!(ino, crate::fs::synthetic_ino(b"/proc/cpuinfo"));
 
         // At EOF the next call returns 0.
         // SAFETY: 256 writable bytes.
@@ -240,7 +258,8 @@ mod tests {
 
     #[test]
     fn tiny_buffer_is_einval() {
-        let fd = open(b"/proc".to_vec(), vec![(b"cpuinfo".to_vec(), DT_REG)]) as i32;
+        let fd =
+            open(b"/proc".to_vec(), b"/proc".to_vec(), vec![(b"cpuinfo".to_vec(), DT_REG)]) as i32;
         let mut buf = [0u8; 8];
         // SAFETY: buffer too small for one record.
         assert_eq!(unsafe { getdents64(fd, buf.as_mut_ptr() as u64, 8) }, Some(err(errno::EINVAL)));

@@ -170,7 +170,7 @@ pub fn load(
     elf: &Elf<'_>,
     page_size: u64,
     file: Option<fwe_kernel::prepcache::FileId>,
-    slots: (u32, u32),
+    slots: crate::rewrite::Slots,
     at: Option<u64>,
     mut prepare_exec: impl PrepareFn,
 ) -> Result<Loaded, LoadError> {

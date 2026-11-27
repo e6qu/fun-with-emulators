@@ -8,6 +8,29 @@
 
 #[cfg(target_os = "macos")]
 mod alloc;
+
+/// The mark that Objective-C classes' `+initialize` is safe in a fork child
+/// of one of fwe's processes that had threads (objc4 reads it from the
+/// executable: `hasForkOkSection`). The runtime otherwise refuses any such
+/// `+initialize`, in case the fork came while one ran: it would refuse the
+/// Mac's Vulkan driver in a program a threaded process's child starts in
+/// place (Chromium's GPU process). No fork comes while one runs: fwe runs
+/// Objective-C code only through the Mac's Vulkan driver, a child forked
+/// while the driver was in its parent never calls into it, and its
+/// `execve` starts a fresh process (`vulkan::device::driver_in_memory`).
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__DATA,__objc_fork_ok")]
+static OBJC_FORK_OK: [u32; 1] = [1];
+
+/// The Objective-C image information clang writes for each image with
+/// Objective-C in it (version 0; flags: class properties in categories),
+/// without which the runtime looks at no section of the executable,
+/// [`OBJC_FORK_OK`] among them.
+#[cfg(target_os = "macos")]
+#[used]
+#[unsafe(link_section = "__DATA,__objc_imageinfo,regular,no_dead_strip")]
+static OBJC_IMAGE_INFO: [u32; 2] = [0, 64];
 mod json;
 mod pull;
 mod tarlist;
@@ -146,7 +169,7 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
+            b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
             | b"--user-dir" | b"--host-display" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
@@ -157,6 +180,8 @@ fn main() -> ExitCode {
                     host_display = Some(value);
                 } else if flag == "--user-dir" {
                     fwe_native::adopt_user_dir(value.as_bytes());
+                } else if flag == "--comm" {
+                    options.comm = Some(value.as_bytes().to_vec());
                 } else if flag == "--cwd" {
                     options.cwd = Some(value.as_bytes().to_vec());
                 } else if flag == "--exec-state" {
@@ -296,8 +321,8 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
             b"--vm" | b"--hv-standin" | b"--hv-record" => {
                 return Some(a.to_string_lossy().into_owned());
             }
-            b"--root" | b"--cwd" | b"--argv0" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
-            | b"--probe" | b"--host-display" => i += 2,
+            b"--root" | b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd"
+            | b"--exe-store" | b"--probe" | b"--host-display" => i += 2,
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
             _ => return None,

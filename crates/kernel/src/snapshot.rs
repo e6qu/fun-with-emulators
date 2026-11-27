@@ -221,11 +221,20 @@ pub(crate) fn read_queue(d: &mut Dec) -> VecDeque<[u8; crate::signalfd::SIGINFO_
 }
 
 /// Whether descriptor `fd` is close-on-exec.
-#[cfg(not(target_os = "linux"))]
 pub(crate) fn cloexec(fd: i32) -> bool {
     // SAFETY: F_GETFD only queries the descriptor.
     let f = unsafe { libc::fcntl(fd, libc::F_GETFD) };
     f >= 0 && f & libc::FD_CLOEXEC != 0
+}
+
+/// What a process restoring fwe's records has of the process that saved
+/// them: its memory (the child of a host `fork`, fwe's own shared mappings
+/// where they were), or only its descriptors (a VM's fork child, started
+/// anew, and a program `execve` started), fwe's mappings made again.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum Restoring {
+    SameMemory,
+    NewProcess,
 }
 
 /// Put a fresh kqueue at descriptor `fd`, which MUST be free: a fork child's

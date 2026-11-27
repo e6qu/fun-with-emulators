@@ -68,6 +68,9 @@ fn main() {
             "-z",
             "defs",
             "--no-undefined-version",
+            // Its own functions' addresses are its own, whatever a program
+            // or another library defines of the same name.
+            "-Bsymbolic",
             "-o",
         ])
         .arg(out.join("libvulkan_fwe.so"))

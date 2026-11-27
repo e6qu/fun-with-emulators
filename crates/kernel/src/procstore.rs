@@ -61,8 +61,18 @@ pub enum Kind {
     /// Its Landlock domain's layers, for whether it can signal or trace
     /// another ([`crate::landlock`]).
     Landlock = 5,
+    /// Its threads' names, for `/proc/<pid>/task/<tid>/comm`
+    /// ([`crate::thread`]).
+    ThreadNames = 6,
 }
-const KINDS: usize = 6;
+const KINDS: usize = 7;
+
+impl Kind {
+    /// The kinds a process writes of itself, besides its record: what its
+    /// pid keeps none of once forgotten.
+    pub(crate) const OWN: [Kind; KINDS - 1] =
+        [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View, Kind::Landlock, Kind::ThreadNames];
+}
 /// Ended accounts kept at once.
 const ENDED: usize = 4096;
 /// A block's size, and how many there are (records of 256 MiB at most).
@@ -1234,7 +1244,7 @@ pub fn remove(_held: &Held, pid: HostPid) {
             w.store(0, SeqCst);
         }
     }
-    for kind in [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View] {
+    for kind in Kind::OWN {
         if let Some(e) = s.entry_of(kind, pid) {
             let (old, old_len) = replace(e, 0, 0);
             s.free_chain(old, old_len as usize);
@@ -1528,7 +1538,7 @@ mod tests {
     fn a_forgotten_pid_keeps_no_entry_of_any_kind() {
         let me = crate::host::pid();
         let s = store();
-        let kinds = [Kind::Threads, Kind::Robust, Kind::Maps, Kind::View];
+        let kinds = Kind::OWN;
         let saved: Vec<Option<Vec<u8>>> = kinds.iter().map(|&k| get_of(k, me)).collect();
         for &k in &kinds {
             put_own(k, Some(&[1u8; 5000]));

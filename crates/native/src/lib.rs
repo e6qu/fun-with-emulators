@@ -131,10 +131,8 @@ static KERNEL: fwe_kernel::KernelLock<NativePlatform> = fwe_kernel::KernelLock::
 
 /// [`Platform`] for guests running natively in this process.
 pub struct NativePlatform {
-    /// Byte offset of the guest thread pointer in the host TSD.
-    pub tp_slot: u32,
-    /// Byte offset of the guest `x18` in the host TSD.
-    pub x18_slot: u32,
+    /// The host TSD slots stubs use ([`slots`]).
+    pub slots: rewrite::Slots,
     pub page_size: u64,
 }
 
@@ -149,10 +147,7 @@ impl NativePlatform {
     ) -> Result<prepare::Prepared, prepare::NoStubSpace> {
         // SAFETY: callers pass guest memory that was just made readable and
         // writable and is not executing yet.
-        unsafe {
-            let (tp, x18, page) = (self.tp_slot, self.x18_slot, self.page_size);
-            prepare::prepare(addr, len, (tp, x18), page, arena, known, cache)
-        }
+        unsafe { prepare::prepare(addr, len, self.slots, self.page_size, arena, known, cache) }
     }
 }
 
@@ -208,6 +203,14 @@ impl Platform for NativePlatform {
         let _ = (addr, len);
     }
 
+    fn cpu_prot(&self) -> u64 {
+        if hwcap::detect().1 & fwe_abi::hwcap2::BTI != 0 { fwe_abi::mman::PROT_BTI } else { 0 }
+    }
+
+    fn code_gone(&mut self, addr: u64, len: u64) {
+        prepare::forget(addr, len);
+    }
+
     fn jit_changed(&mut self, addr: u64, len: u64) -> bool {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         return jit::changed(addr, len);
@@ -219,7 +222,7 @@ impl Platform for NativePlatform {
     }
 
     fn map_image(&mut self, key: &[u8], addr: u64, len: u64, prot: i32) -> Result<bool, i32> {
-        prepare::map_image(key, addr, len, prot, (self.tp_slot, self.x18_slot))
+        prepare::map_image(key, addr, len, prot, self.slots)
             .map_err(fwe_kernel::host::errno_to_linux)
     }
 
@@ -296,6 +299,10 @@ pub struct Options {
     pub cwd: Option<Vec<u8>>,
     /// The guest's `argv[0]`, when not the program path.
     pub argv0: Option<OsString>,
+    /// The name of the program's thread, when not the one its path gives
+    /// (the guest's `execve` ran a script, or a program through a
+    /// descriptor; [`fwe_kernel::fs::exec_name`]).
+    pub comm: Option<Vec<u8>>,
     /// What the guest that exec'd this program carries into it
     /// ([`fwe_kernel::Kernel::exec_state`]), hex-encoded.
     pub exec_state: Option<Vec<u8>>,
@@ -538,6 +545,16 @@ pub fn remember_exe() {
     }
 }
 
+/// A program a guest's `execve` runs: its guest path, the name its thread
+/// takes ([`fwe_kernel::fs::exec_name`]), its arguments and environment.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) struct Program<'a> {
+    pub path: &'a [u8],
+    pub named: &'a [u8],
+    pub args: &'a [Vec<u8>],
+    pub env: &'a [Vec<u8>],
+}
+
 /// `execve` by re-executing fwe on the new program: the new process image is
 /// a fresh fwe, which picks the backend the program needs — the native one,
 /// or the VM for a program linked below 4 GiB — so either backend can exec
@@ -546,14 +563,14 @@ pub fn remember_exe() {
 /// guest's flag is the host's), the signal mask, pending signals and ignored
 /// dispositions; the root filesystem, working directory, `--strace`, `--vm`,
 /// `--hv-standin`, `--hv-record` and fwe's private directory are passed
-/// on, and a program with no path (a memfd) by descriptor (`--exe-fd`).
-/// Other threads end, as on Linux. Returns a Linux errno only if the
-/// program cannot be run; on success it does not return.
+/// on, and a program reached through a descriptor (a memfd, or
+/// `/proc/self/exe`) by descriptor (`--exe-fd`), with the name the guest's
+/// `execve` gives it (`--comm`). Other threads end, as on Linux. Returns a
+/// Linux errno only if the program cannot be run; on success it does not
+/// return.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 pub(crate) fn reexec(
-    path: &[u8],
-    args: &[Vec<u8>],
-    env: &[Vec<u8>],
+    program: Program<'_>,
     fs: &fwe_kernel::Fs,
     strace: Tracer,
     state: &[u8],
@@ -561,6 +578,7 @@ pub(crate) fn reexec(
 ) -> i64 {
     use fwe_abi::{err, errno};
     use std::ffi::CString;
+    let Program { path, named, args, env } = program;
     // A `/proc` link names a program the new fwe would look for in itself.
     let target = fs.exec_target(path);
     let path = &target[..];
@@ -605,6 +623,8 @@ pub(crate) fn reexec(
         argv.push(b"--argv0".to_vec());
         argv.push(a0.clone());
     }
+    argv.push(b"--comm".to_vec());
+    argv.push(named.to_vec());
     // A program with no path goes by descriptor: one of fwe's, kept open
     // across the host `execve`.
     let held = match fs.exec_fd(path).map(fwe_kernel::fdtable::dup_reserved) {
@@ -752,6 +772,41 @@ pub fn parked_slots() -> (u32, u32) {
         };
         (key(), key())
     })
+}
+
+/// The host TSD slots fwe's stubs keep the program's registers in while
+/// they use the registers themselves (memory below the program's `sp` is
+/// the program's: Go keeps a new thread's start there across its first
+/// system call), as byte offsets from the TSD base, within reach of an
+/// `ldr`/`str` with an unsigned offset from it.
+pub fn scratch_slots() -> [u32; rewrite::SCRATCH] {
+    static SLOTS: OnceLock<[u32; rewrite::SCRATCH]> = OnceLock::new();
+    *SLOTS.get_or_init(|| {
+        std::array::from_fn(|_| {
+            let mut key: libc::pthread_key_t = 0;
+            // SAFETY: creating a key without destructor; it lives forever.
+            let r = unsafe { libc::pthread_key_create(&mut key, None) };
+            assert_eq!(r, 0, "pthread_key_create failed");
+            let off = (key as u32) * 8;
+            assert!(off < 4096 * 8, "TSD key {key} out of an ldr's reach");
+            off
+        })
+    })
+}
+
+/// The TSD slots a stub uses, as byte offsets from the TSD base.
+pub fn slots() -> rewrite::Slots {
+    rewrite::Slots { tp: thread_pointer_slot(), x18: x18_slot(), scratch: scratch_slots() }
+}
+
+/// This thread's TSD slot at byte offset `off` from its base (the host
+/// keeps the base in `tpidrro_el0`, its low bits the processor's number).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+pub(crate) fn tsd_slot(off: u32) -> *mut u64 {
+    let area: u64;
+    // SAFETY: reading this thread's TSD base.
+    unsafe { std::arch::asm!("mrs {}, tpidrro_el0", out(reg) area, options(nomem, nostack)) };
+    ((area & !7) + u64::from(off)) as *mut u64
 }
 
 /// Host features that affect guest compatibility.
@@ -1134,7 +1189,7 @@ pub fn load_image(
     let interp_path = elf.interpreter().map_err(Error::Elf)?.map(<[u8]>::to_vec);
 
     let strace = tracer.enabled;
-    let slots = (platform.tp_slot, platform.x18_slot);
+    let slots = platform.slots;
     let load_object = |elf: &Elf, id, at, what: &str| -> Result<loader::Loaded, Error> {
         let loaded = loader::load(elf, page, id, slots, at, |a, l, known, arena, cache| {
             let stats =
@@ -1312,6 +1367,8 @@ fn start(
     // The root filesystem; also used to find the dynamic linker.
     let mut fs = open_fs(options)?;
     fwe_kernel::timing::mark("open_fs");
+    // The path the program is run by, which names it (a script's own).
+    let run_by = guest_execfn(path, options);
     let (path, args, options, (data, data_id)) = script_target(path, args, options, &fs)?;
     let (path, args, options) = (path.as_path(), &args, &options);
     fwe_kernel::timing::mark("read_program");
@@ -1330,8 +1387,7 @@ fn start(
     let tracer = options.strace;
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
     trap::set_tracing(tracer.enabled);
-    let platform =
-        NativePlatform { tp_slot: thread_pointer_slot(), x18_slot: x18_slot(), page_size: page };
+    let platform = NativePlatform { slots: slots(), page_size: page };
 
     let arg_bytes: Vec<&[u8]> = args.iter().map(|a| a.as_bytes()).collect();
     let env_bytes: Vec<&[u8]> = env.iter().map(|e| e.as_bytes()).collect();
@@ -1355,7 +1411,12 @@ fn start(
     // What the process's record tells of it, written once.
     fwe_kernel::procreg::batch(|| {
         let exe = fs.exe_fd_target().unwrap_or_else(|| guest_exe_path(path, options, &fs));
-        fs.set_proc_info(exe, cmdline(&arg_bytes), ncpu(), hostname());
+        let named =
+            options.comm.clone().unwrap_or_else(|| fwe_kernel::fs::exec_name(&run_by, &exe));
+        fs.set_proc_info(exe, &named, cmdline(&arg_bytes), ncpu(), hostname());
+        if let Some(fd) = open_program(path, options, &fs) {
+            fs.set_exe_fd(Some(fd));
+        }
         fs.set_auxv(out.auxv.clone());
         fs.publish();
         // The main thread's id equals the process id, as on Linux: in its
@@ -1381,6 +1442,25 @@ fn start(
 /// The guest's absolute path of the program fwe was asked to run, for
 /// `/proc/self/exe`: the host path, made relative to the root filesystem when
 /// the program lies inside it, its symbolic links followed there.
+/// The program's file, open as fwe's own descriptor, for `/proc/self/exe`
+/// to reach whatever becomes of its path (a file outside the root, too),
+/// as Linux holds a process's `exe_file`; `None` when fwe holds it already
+/// (it was run by descriptor).
+fn open_program(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Option<i32> {
+    if options.exe_fd.is_some() {
+        return None;
+    }
+    if options.guest_path {
+        return fs.open_program(path.as_os_str().as_bytes());
+    }
+    if let Some(guest) = guest_path_in_root(path, options) {
+        return fs.open_program(&guest);
+    }
+    use std::os::fd::IntoRawFd;
+    let fd = std::fs::File::open(path).ok()?.into_raw_fd();
+    fwe_kernel::fdtable::reserve(fd).ok()
+}
+
 fn guest_exe_path(path: &Path, options: &Options, fs: &fwe_kernel::Fs) -> Vec<u8> {
     if options.guest_path {
         return path.as_os_str().as_bytes().to_vec();
@@ -1405,7 +1485,7 @@ fn enter(sp: u64, entry: u64) -> Result<std::convert::Infallible, Error> {
     // first instruction, as after any `execve`.
     let traced = fwe_kernel::ptrace::traced().then(|| {
         let mut regs = fwe_kernel::Regs { sp, pc: entry, ..fwe_kernel::Regs::default() };
-        KERNEL.lock().as_mut().unwrap().ptrace_exec_stop(&mut regs);
+        KERNEL.exec_stops(&mut regs);
         regs
     });
     // From here on this thread runs guest code, which can use x18 freely;

@@ -30,17 +30,80 @@ thread_local! {
     /// `set_tid_address`: futex word cleared and woken when the thread exits.
     static CLEAR_CHILD_TID: Cell<u64> = const { Cell::new(0) };
     static ROBUST_LIST: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
-    /// The name `prctl(PR_SET_NAME)` gave this thread, if any.
-    static NAME: Cell<Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]>> = const { Cell::new(None) };
 }
 
-/// This thread's name as `prctl(PR_SET_NAME)` set it, or `None`.
-pub fn name() -> Option<[u8; fwe_abi::prctl::TASK_COMM_LEN]> {
-    NAME.with(Cell::get)
+/// A thread's name (`comm`), NUL-padded.
+pub type Name = [u8; fwe_abi::prctl::TASK_COMM_LEN];
+
+/// This thread's name as `PR_SET_NAME` or a write to its `comm` set it,
+/// or its creator's when it was made; `None` for one never named.
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn name() -> Option<Name> {
+    name_of(tid())
 }
 
-pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
-    NAME.with(|n| n.set(Some(name)));
+/// Thread `tid` of this process's name ([`name`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn name_of(tid: i32) -> Option<Name> {
+    let threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.iter().find(|r| r.tid == tid).and_then(|r| r.name)
+}
+
+/// Name this thread `name` ([`name`]).
+pub fn set_name(name: Name) {
+    set_name_of(tid(), Some(name));
+}
+
+/// Name thread `tid` of this process `name` (`None`: as the program's
+/// file is named): whether it is one of its threads. Other processes see
+/// it in `/proc/<pid>/task/<tid>/comm` ([`published_name`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+pub fn set_name_of(tid: i32, name: Option<Name>) -> bool {
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(r) = threads.iter_mut().find(|r| r.tid == tid) else { return false };
+    r.name = name;
+    publish_names(&threads);
+    true
+}
+
+/// Publish the names of this process's threads (`threads`, the registry
+/// held), for another process to read ([`published_name`]).
+#[cfg_attr(
+    target_os = "macos",
+    unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
+)]
+fn publish_names(threads: &[Registered]) {
+    let b: Vec<u8> = threads
+        .iter()
+        .filter_map(|r| Some((r.id, r.name?)))
+        .flat_map(|(id, name)| id.get().to_ne_bytes().into_iter().chain(name))
+        .collect();
+    let b = (!b.is_empty()).then_some(&b[..]);
+    crate::procstore::put_own(crate::procstore::Kind::ThreadNames, b);
+}
+
+/// The name thread `t` of process `pid` published ([`set_name_of`]).
+pub fn published_name(pid: HostPid, t: Tid) -> Option<Name> {
+    let b = crate::procstore::get_of(crate::procstore::Kind::ThreadNames, pid)?;
+    const ONE: usize = 4 + fwe_abi::prctl::TASK_COMM_LEN;
+    b.as_chunks::<ONE>()
+        .0
+        .iter()
+        .find(|c| i32::from_ne_bytes([c[0], c[1], c[2], c[3]]) == t.get())
+        .map(|c| {
+            let mut name = [0u8; fwe_abi::prctl::TASK_COMM_LEN];
+            name.copy_from_slice(&c[4..]);
+            name
+        })
 }
 
 /// Initialize the thread-group id and the main thread's id (both the host
@@ -58,6 +121,8 @@ pub fn set_name(name: [u8; fwe_abi::prctl::TASK_COMM_LEN]) {
     unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
 )]
 pub fn init_main(pid: i32) {
+    // The calling thread's name, which the child's one thread keeps.
+    let name = name();
     TGID.store(pid, Ordering::SeqCst);
     TID.with(|t| t.set(pid));
     ID.with(|t| t.set(0));
@@ -99,6 +164,9 @@ pub fn init_main(pid: i32) {
     crate::posixtimer::forked_child();
     crate::ptrace::forked_child();
     register_current();
+    if name.is_some() {
+        set_name_of(pid, name);
+    }
 }
 
 /// Each waiting thread's wake pipe: the host thread, and the pipe's read
@@ -225,6 +293,21 @@ pub fn wait_ready(fds: &mut [libc::pollfd], ms: i32) -> Result<i32, i32> {
 /// timers, can end a millisecond or more late (macOS coalesces timers),
 /// where Linux wakes within its timer slack.
 pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
+    wait_ready_urgent_ns(fds, &[], ns).map(|(n, _)| n)
+}
+
+/// [`wait_ready_ns`], ended as well by urgent data on any of the TCP
+/// sockets `urgent`, which the host's `poll` does not report: the thread's
+/// timer kqueue watches them for it (an exception filter, as fwe's `epoll`
+/// watches them, which fires while the data's mark is ahead) while the
+/// wait lasts. Returns as well those of `urgent` that have urgent data.
+/// (A look of the host's own, an out-of-band `MSG_PEEK`, would spend it:
+/// XNU's `tcp_usr_rcvoob` takes the socket off its mark even then.)
+pub fn wait_ready_urgent_ns(
+    fds: &mut [libc::pollfd],
+    urgent: &[i32],
+    ns: i64,
+) -> Result<(i32, Vec<i32>), i32> {
     use std::time::{Duration, Instant};
     let deadline = (ns >= 0).then(|| Instant::now() + Duration::from_nanos(ns as u64));
     let Some((wake, timer)) = wait_pipe() else {
@@ -235,7 +318,7 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         return if n < 0 {
             Err(crate::host::errno_to_linux(crate::host::last_errno()))
         } else {
-            Ok(n)
+            Ok((n, Vec::new()))
         };
     };
     // Nothing is ready until the host says so (whatever the caller's
@@ -245,12 +328,44 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     }
     let mut all: Vec<libc::pollfd> = fds.to_vec();
     all.push(libc::pollfd { fd: wake, events: libc::POLLIN, revents: 0 });
-    // The timer only for a wait with a deadline: one an earlier wait left
-    // fired (its event unread) keeps the kqueue readable until it is armed
-    // again, which an unbounded wait never does.
-    if timer >= 0 && deadline.is_some() {
+    // The timer kqueue only for a wait with a deadline, or one watching
+    // for urgent data (which spends what the kqueue held first): one an
+    // earlier wait left fired (its event unread) keeps it readable until
+    // it is armed again, which an unbounded wait never does.
+    let watch = timer >= 0 && !urgent.is_empty();
+    if timer >= 0 && (deadline.is_some() || watch) {
         all.push(libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 });
     }
+    if !watch {
+        return wait_on(fds, &mut all, deadline, wake, timer, false);
+    }
+    watch_urgent(timer, urgent, true);
+    // Urgent data there already: what else is ready, without waiting.
+    let mut fired = urgent_fired(timer);
+    let deadline = if fired.is_empty() { deadline } else { Some(Instant::now()) };
+    let r = wait_on(fds, &mut all, deadline, wake, timer, true);
+    let r = r.map(|(n, during)| {
+        fired.extend(during);
+        fired.extend(urgent_fired(timer));
+        (n, fired)
+    });
+    watch_urgent(timer, urgent, false);
+    r
+}
+
+/// The wait of [`wait_ready_urgent_ns`] on `all` (`fds`, then the wake
+/// pipe, then the timer kqueue if it is watched): it ends too when the
+/// kqueue, watching for urgent data (`urgent`), finds some, with the
+/// sockets it found it on.
+fn wait_on(
+    fds: &mut [libc::pollfd],
+    all: &mut [libc::pollfd],
+    deadline: Option<std::time::Instant>,
+    wake: i32,
+    timer: i32,
+    urgent: bool,
+) -> Result<(i32, Vec<i32>), i32> {
+    use std::time::Instant;
     loop {
         // What woke it before is spent; a signal from now on writes again.
         let mut b = [0u8; 64];
@@ -269,12 +384,12 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
             None => -1,
             Some(l) if l.is_zero() => 0,
             Some(l) if timer >= 0 => {
-                arm_timer(timer, l);
+                arm_timer(timer, l, urgent);
                 -1
             }
             Some(l) => l.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32,
         };
-        for p in &mut all {
+        for p in all.iter_mut() {
             p.revents = 0;
         }
         // SAFETY: a valid array of `all.len()` entries.
@@ -284,13 +399,21 @@ pub fn wait_ready_ns(fds: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         }
         let ready = all[..fds.len()].iter().filter(|p| p.revents != 0).count() as i32;
         if ready > 0 {
-            for (f, a) in fds.iter_mut().zip(&all) {
+            for (f, a) in fds.iter_mut().zip(all.iter()) {
                 f.revents = a.revents;
             }
-            return Ok(ready);
+            return Ok((ready, Vec::new()));
+        }
+        // Urgent data, or else the deadline's timer or a socket's end of
+        // stream, taken from the kqueue.
+        if urgent && all.last().is_some_and(|p| p.revents != 0) {
+            let fired = urgent_fired(timer);
+            if !fired.is_empty() {
+                return Ok((0, fired));
+            }
         }
         if deadline.is_some_and(|d| Instant::now() >= d) {
-            return Ok(0);
+            return Ok((0, Vec::new()));
         }
     }
 }
@@ -322,7 +445,7 @@ pub fn nap_ns(ns: i64) {
         libc::pollfd { fd: timer, events: libc::POLLIN, revents: 0 },
     ];
     let (n, ms) = if timer >= 0 {
-        arm_timer(timer, after);
+        arm_timer(timer, after, false);
         (2, -1)
     } else {
         (1, after.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32)
@@ -337,15 +460,16 @@ pub fn nap_ns(ns: i64) {
 }
 
 /// Set the thread's timer kqueue `kq` to fire once, `after` from now, on
-/// time (`NOTE_CRITICAL`), what it held before spent.
+/// time (`NOTE_CRITICAL`), what it held before spent (but for urgent data
+/// it watches for, `watched`, whose events stay).
 #[cfg(target_os = "macos")]
-fn arm_timer(kq: i32, after: std::time::Duration) {
-    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+fn arm_timer(kq: i32, after: std::time::Duration, watched: bool) {
     // SAFETY: zeroed kevents are valid out-parameters; plain host calls on
     // the thread's own kqueue.
     unsafe {
-        let mut spent: [libc::kevent; 4] = std::mem::zeroed();
-        libc::kevent(kq, std::ptr::null(), 0, spent.as_mut_ptr(), 4, &zero);
+        if !watched {
+            spend(kq);
+        }
         let ev = libc::kevent {
             ident: 1,
             filter: libc::EVFILT_TIMER,
@@ -359,7 +483,88 @@ fn arm_timer(kq: i32, after: std::time::Duration) {
 }
 
 #[cfg(not(target_os = "macos"))]
-fn arm_timer(_: i32, _: std::time::Duration) {}
+fn arm_timer(_: i32, _: std::time::Duration, _: bool) {}
+
+/// Take what the thread's timer kqueue `kq` holds, so that it is not
+/// readable for it.
+#[cfg(target_os = "macos")]
+fn spend(kq: i32) {
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: zeroed kevents are valid out-parameters; a plain host call on
+    // the thread's own kqueue.
+    unsafe {
+        let mut spent: [libc::kevent; 16] = std::mem::zeroed();
+        while libc::kevent(kq, std::ptr::null(), 0, spent.as_mut_ptr(), 16, &zero) == 16 {}
+    }
+}
+
+/// Watch (`on`) or stop watching TCP sockets `fds` for urgent data on the
+/// thread's timer kqueue `kq` ([`wait_ready_urgent_ns`]); what it held
+/// before is spent first, and what fired after.
+#[cfg(target_os = "macos")]
+fn watch_urgent(kq: i32, fds: &[i32], on: bool) {
+    spend(kq);
+    // Cleared once taken: the filter fires as well at the end of the
+    // socket's stream (`EV_EOF`, no `NOTE_OOB`), which is not urgent data.
+    let flags = if on { libc::EV_ADD | libc::EV_CLEAR } else { libc::EV_DELETE };
+    let changes: Vec<libc::kevent> = fds
+        .iter()
+        .map(|&fd| libc::kevent {
+            ident: fd as libc::uintptr_t,
+            filter: libc::EVFILT_EXCEPT,
+            flags: flags | libc::EV_RECEIPT,
+            fflags: libc::NOTE_OOB,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        })
+        .collect();
+    // SAFETY: zeroed kevents are valid out-parameters, one per change
+    // (`EV_RECEIPT` reports each, a gone one's deletion too).
+    unsafe {
+        let mut out: Vec<libc::kevent> = vec![std::mem::zeroed(); changes.len()];
+        libc::kevent(
+            kq,
+            changes.as_ptr(),
+            changes.len() as libc::c_int,
+            out.as_mut_ptr(),
+            out.len() as libc::c_int,
+            std::ptr::null(),
+        );
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn watch_urgent(_: i32, _: &[i32], _: bool) {}
+
+/// The sockets the thread's timer kqueue `kq` saw urgent data on
+/// (`NOTE_OOB`, [`watch_urgent`]), taken from it (with whatever else it
+/// held).
+#[cfg(target_os = "macos")]
+fn urgent_fired(kq: i32) -> Vec<i32> {
+    let zero = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut fired = Vec::new();
+    // SAFETY: zeroed kevents are valid out-parameters; a plain host call on
+    // the thread's own kqueue.
+    unsafe {
+        let mut out: [libc::kevent; 16] = std::mem::zeroed();
+        loop {
+            let n = libc::kevent(kq, std::ptr::null(), 0, out.as_mut_ptr(), 16, &zero);
+            for e in &out[..n.max(0) as usize] {
+                if e.filter == libc::EVFILT_EXCEPT && e.fflags & libc::NOTE_OOB != 0 {
+                    fired.push(e.ident as i32);
+                }
+            }
+            if n < 16 {
+                return fired;
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn urgent_fired(_: i32) -> Vec<i32> {
+    Vec::new()
+}
 
 /// A kqueue for the calling thread's timed waits (-1 where the host has
 /// none, or it cannot be made).
@@ -542,6 +747,7 @@ pub(crate) fn forget_published() {
     crate::procstore::set_own_threads(1);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
     crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    crate::procstore::put_own(crate::procstore::Kind::ThreadNames, None);
     ROBUST.lock().unwrap_or_else(|e| e.into_inner()).clear();
 }
 
@@ -1169,6 +1375,8 @@ struct Registered {
     /// Its nice value (`setpriority` of its tid), for a thread other than
     /// the main one, whose nice value is the process's record's.
     nice: i32,
+    /// Its name ([`name`]).
+    name: Option<Name>,
 }
 
 /// Every live guest thread's pending set, by tid.
@@ -1242,7 +1450,6 @@ pub(crate) fn thread_reused() {
     ID.with(|t| t.set(0));
     CLEAR_CHILD_TID.with(|c| c.set(0));
     ROBUST_LIST.with(|r| r.set((0, 0)));
-    NAME.with(|n| n.set(None));
     SLACK.with(|s| s.set((DEFAULT_SLACK, DEFAULT_SLACK)));
     HOT.with(|h| {
         h.mask.set(0);
@@ -1318,11 +1525,17 @@ pub fn register(new: NewThread) -> Arc<Pending> {
         // Its filesystem view and namespaces are its creator's.
         crate::threadfs::started(tid);
     }
-    // Its creator's nice value, as Linux's thread inherits it.
-    let nice = if tid != tgid() { nice_of(self::tid()) } else { 0 };
+    // Its creator's nice value and name, as Linux's thread inherits them.
+    let (nice, name) = if tid != tgid() { (nice_of(self::tid()), name()) } else { (0, None) };
     let pending = Arc::new(Pending::new());
-    let entry = Registered { tid, id: new.id, pending: pending.clone(), host: 0, robust: 0, nice };
-    THREADS.lock().unwrap_or_else(|e| e.into_inner()).push(entry);
+    let entry =
+        Registered { tid, id: new.id, pending: pending.clone(), host: 0, robust: 0, nice, name };
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    threads.push(entry);
+    if name.is_some() {
+        publish_names(&threads);
+    }
+    drop(threads);
     directed_add(new.id, Arc::as_ptr(&pending));
     publish_tids(&ids());
     pending
@@ -1371,7 +1584,11 @@ pub fn unregister(pending: &Arc<Pending>) {
         let mut t = THREADS.lock().unwrap_or_else(|e| e.into_inner());
         let gone =
             t.iter().filter(|r| Arc::ptr_eq(&r.pending, pending)).map(|r| (r.tid, r.id)).collect();
+        let named = t.iter().any(|r| Arc::ptr_eq(&r.pending, pending) && r.name.is_some());
         t.retain(|r| !Arc::ptr_eq(&r.pending, pending));
+        if named {
+            publish_names(&t);
+        }
         gone
     };
     for (tid, id) in gone {
@@ -1388,7 +1605,13 @@ pub fn unregister_current() {
     drop_wait_pipe();
     let own = HOT.with(|h| h.own.replace(std::ptr::null()));
     directed_remove(id());
-    THREADS.lock().unwrap_or_else(|e| e.into_inner()).retain(|r| Arc::as_ptr(&r.pending) != own);
+    let mut threads = THREADS.lock().unwrap_or_else(|e| e.into_inner());
+    let named = threads.iter().any(|r| Arc::as_ptr(&r.pending) == own && r.name.is_some());
+    threads.retain(|r| Arc::as_ptr(&r.pending) != own);
+    if named {
+        publish_names(&threads);
+    }
+    drop(threads);
     publish_tids(&ids());
     if tid() != tgid() {
         publish_robust(id(), 0);
@@ -1403,6 +1626,7 @@ pub fn process_ending() {
     crate::procstore::set_own_threads(1);
     crate::procstore::put_own(crate::procstore::Kind::Threads, None);
     crate::procstore::put_own(crate::procstore::Kind::Robust, None);
+    crate::procstore::put_own(crate::procstore::Kind::ThreadNames, None);
 }
 
 // --- signals for a named thread, from a handler ------------------------------------

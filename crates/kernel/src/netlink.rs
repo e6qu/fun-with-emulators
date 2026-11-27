@@ -11,8 +11,12 @@
 //! `RTM_NEWLINK` brings up or down and `RTM_NEWADDR` gives its own
 //! addresses, 127.0.0.1/8 and ::1/128 (both with `CAP_NET_ADMIN`; bringing
 //! it up gives them too, as Linux does), and whose addresses `RTM_GETADDR`
-//! lists; any other request, or address, is answered with `EOPNOTSUPP`, as
-//! the kernel answers one it has no handler for.
+//! lists; `RTM_GETROUTE` dumps the namespace's routes or finds the one to
+//! an address ([`crate::routes`]); `RTM_GETNEIGH` the host's neighbours
+//! in the initial namespace, none in one of fwe's; any other request, or
+//! address, is
+//! answered with `EOPNOTSUPP`, as the kernel answers one it has no handler
+//! for.
 //!
 //! In the initial network namespace, whose interfaces are the host's, fwe
 //! describes each of them ([`crate::host::interfaces`], the host's `lo0`
@@ -57,6 +61,30 @@ const RTM_NEWLINK: u16 = 16;
 const RTM_GETLINK: u16 = 18;
 const RTM_NEWADDR: u16 = 20;
 const RTM_GETADDR: u16 = 22;
+const RTM_NEWROUTE: u16 = 24;
+const RTM_GETROUTE: u16 = 26;
+const RTM_NEWNEIGH: u16 = 28;
+const RTM_GETNEIGH: u16 = 30;
+/// Neighbour attributes (`NDA_*`) and states (`NUD_*`).
+const NDA_DST: u16 = 1;
+const NDA_LLADDR: u16 = 2;
+const NDA_CACHEINFO: u16 = 3;
+const NDA_PROBES: u16 = 4;
+const NUD_INCOMPLETE: u16 = 0x01;
+const NUD_REACHABLE: u16 = 0x02;
+const NUD_PERMANENT: u16 = 0x80;
+/// Route attributes (`RTA_*`).
+const RTA_DST: u16 = 1;
+const RTA_OIF: u16 = 4;
+const RTA_GATEWAY: u16 = 5;
+const RTA_PRIORITY: u16 = 6;
+const RTA_PREFSRC: u16 = 7;
+const RTA_TABLE: u16 = 15;
+const RTA_PREF: u16 = 20;
+/// A route found for one address (`ip route get`): `RTM_F_CLONED`, and
+/// `RTCF_LOCAL` for a local one.
+const RTM_F_CLONED: u32 = 0x200;
+const RTCF_LOCAL: u32 = 0x8000_0000;
 
 const NLM_F_MULTI: u16 = 2;
 const NLM_F_ACK: u16 = 4;
@@ -732,8 +760,15 @@ fn attrs(b: &[u8], fixed: usize) -> Vec<(u16, &[u8])> {
 fn interfaces(
     net: &Option<std::sync::Arc<crate::shared::Record<crate::ns::Net>>>,
 ) -> Vec<Interface> {
-    let Some(net) = net else { return crate::host::interfaces() };
-    vec![lo(&net.get())]
+    match net {
+        Some(net) => namespace_interfaces(&net.get()),
+        None => crate::host::interfaces(),
+    }
+}
+
+/// The interfaces of a namespace of fwe's (`n`): its `lo`.
+pub(crate) fn namespace_interfaces(n: &crate::ns::Net) -> Vec<Interface> {
+    vec![lo(n)]
 }
 
 /// `::1`.
@@ -763,6 +798,67 @@ fn lo(n: &crate::ns::Net) -> Interface {
         hw_addr: vec![0; 6],
         addrs,
     }
+}
+
+/// The family an address or route dump of `family` covers: one Linux has
+/// no handler for (`AF_PACKET`, as Firefox asks) is dumped as
+/// `AF_UNSPEC`, every family, as Linux's `rtnetlink_rcv_msg` falls back to
+/// it; one it has (MPLS's, multicast routing's, the bridge's...) and fwe
+/// has nothing of stays itself, and so dumps nothing.
+fn dump_family(family: u8) -> u8 {
+    const HANDLED: [u8; 8] = [2, 7, 10, 28, 35, 45, 128, 129];
+    if HANDLED.contains(&family) { family } else { 0 }
+}
+
+/// A neighbour's `RTM_NEWNEIGH` body (`ndmsg` and its attributes).
+fn neighbour_body(n: &crate::host::HostNeighbour) -> Vec<u8> {
+    let state = if n.permanent {
+        NUD_PERMANENT
+    } else if n.lladdr.is_empty() {
+        NUD_INCOMPLETE
+    } else {
+        NUD_REACHABLE
+    };
+    let mut b = vec![n.family as u8, 0, 0, 0];
+    b.extend_from_slice(&(n.index as i32).to_ne_bytes());
+    b.extend_from_slice(&state.to_ne_bytes());
+    // No flags; `RTN_UNICAST`.
+    b.extend_from_slice(&[0, 1]);
+    attr(&mut b, NDA_DST, &n.addr);
+    if !n.lladdr.is_empty() {
+        attr(&mut b, NDA_LLADDR, &n.lladdr);
+    }
+    // When it was confirmed, used and updated, and its references: not
+    // kept by the host.
+    attr(&mut b, NDA_CACHEINFO, &[0; 16]);
+    attr(&mut b, NDA_PROBES, &0u32.to_ne_bytes());
+    b
+}
+
+/// A route's `RTM_NEWROUTE` body (`rtmsg` and its attributes), with
+/// `flags`.
+fn route_body(r: &crate::routes::Route, flags: u32) -> Vec<u8> {
+    let mut b = vec![r.family, r.prefix, 0, 0, r.table, r.protocol, r.scope, r.kind];
+    b.extend_from_slice(&flags.to_ne_bytes());
+    attr(&mut b, RTA_TABLE, &u32::from(r.table).to_ne_bytes());
+    if r.prefix > 0 {
+        attr(&mut b, RTA_DST, &r.dst);
+    }
+    if let Some(m) = r.metric {
+        attr(&mut b, RTA_PRIORITY, &m.to_ne_bytes());
+    }
+    if let Some(src) = &r.prefsrc {
+        attr(&mut b, RTA_PREFSRC, src);
+    }
+    if let Some(g) = &r.gateway {
+        attr(&mut b, RTA_GATEWAY, g);
+    }
+    attr(&mut b, RTA_OIF, &r.oif.to_ne_bytes());
+    if r.family == 10 {
+        // `ICMPV6_ROUTER_PREF_MEDIUM`.
+        attr(&mut b, RTA_PREF, &[0]);
+    }
+    b
 }
 
 /// An interface's `RTM_NEWLINK` body.
@@ -874,7 +970,10 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
             message(NLMSG_ERROR, flags, seq, port, &b)
         };
         let dump = flags & NLM_F_DUMP == NLM_F_DUMP;
-        let links = if matches!(ty, RTM_GETLINK | RTM_NEWLINK | RTM_GETADDR) {
+        let links = if matches!(
+            ty,
+            RTM_GETLINK | RTM_NEWLINK | RTM_GETADDR | RTM_GETROUTE | RTM_GETNEIGH
+        ) {
             interfaces(&net)
         } else {
             Vec::new()
@@ -921,7 +1020,7 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
                 }
             }
             RTM_GETADDR => {
-                let family = body.first().copied().unwrap_or(0);
+                let family = dump_family(body.first().copied().unwrap_or(0));
                 let mut out: Vec<Vec<u8>> = links
                     .iter()
                     .flat_map(|f| addr_bodies(f, family))
@@ -931,6 +1030,77 @@ pub fn send(fd: i32, data: &[u8]) -> i64 {
                 Ok(out)
             }
             RTM_NEWADDR => new_addr(&net, admin, flags, body),
+            RTM_GETROUTE => {
+                let host = if net.is_none() { crate::host::routes() } else { Vec::new() };
+                let routes = crate::routes::table(&links, &host);
+                let family = dump_family(body.first().copied().unwrap_or(0));
+                if dump {
+                    let mut out: Vec<Vec<u8>> = routes
+                        .iter()
+                        .filter(|r| family == 0 || r.family == family)
+                        .map(|r| message(RTM_NEWROUTE, NLM_F_MULTI, seq, port, &route_body(r, 0)))
+                        .collect();
+                    out.push(done());
+                    Ok(out)
+                } else {
+                    let to =
+                        attrs(body, 12).into_iter().find(|&(t, _)| t == RTA_DST).map(|(_, v)| v);
+                    match to.filter(|a| a.len() == 4 || a.len() == 16) {
+                        None => Err(errno::EINVAL),
+                        Some(addr) => match crate::routes::lookup(&routes, addr) {
+                            None => Err(errno::ENETUNREACH),
+                            Some(r) => {
+                                let local = r.kind == crate::routes::RTN_LOCAL;
+                                let found = crate::routes::Route {
+                                    table: crate::routes::MAIN,
+                                    protocol: 0,
+                                    scope: 0,
+                                    dst: addr.to_vec(),
+                                    prefix: (addr.len() * 8) as u8,
+                                    prefsrc: if local {
+                                        r.prefsrc.clone()
+                                    } else {
+                                        crate::routes::source(&links, r.oif, addr)
+                                    },
+                                    metric: None,
+                                    ..r.clone()
+                                };
+                                let flags = RTM_F_CLONED
+                                    | if local && addr.len() == 4 { RTCF_LOCAL } else { 0 };
+                                Ok(vec![message(
+                                    RTM_NEWROUTE,
+                                    0,
+                                    seq,
+                                    port,
+                                    &route_body(&found, flags),
+                                )])
+                            }
+                        },
+                    }
+                }
+            }
+            RTM_GETNEIGH => {
+                // A namespace of fwe's has `lo` alone, which has none.
+                let all = if net.is_none() { crate::host::neighbours() } else { Vec::new() };
+                let family = body.first().copied().unwrap_or(0);
+                let mine = all.iter().filter(|n| family == 0 || u16::from(family) == n.family);
+                if dump {
+                    let mut out: Vec<Vec<u8>> = mine
+                        .map(|n| message(RTM_NEWNEIGH, NLM_F_MULTI, seq, port, &neighbour_body(n)))
+                        .collect();
+                    out.push(done());
+                    Ok(out)
+                } else {
+                    let to =
+                        attrs(body, 12).into_iter().find(|&(t, _)| t == NDA_DST).map(|(_, v)| v);
+                    match mine.into_iter().find(|n| Some(&n.addr[..]) == to) {
+                        Some(n) => {
+                            Ok(vec![message(RTM_NEWNEIGH, 0, seq, port, &neighbour_body(n))])
+                        }
+                        None => Err(errno::ENOENT),
+                    }
+                }
+            }
             _ => Err(errno::EOPNOTSUPP),
         };
         match result {

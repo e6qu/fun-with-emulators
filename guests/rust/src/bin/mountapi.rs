@@ -1,7 +1,8 @@
 //! The new mount API, in a mount namespace of the program's own: a tmpfs
 //! made with `fsopen`, `fsconfig` and `fsmount` and attached with
 //! `move_mount`; a detached copy of it (`open_tree`) attached beneath
-//! another mount; a reconfiguration through `fspick`; `mount_setattr`;
+//! another mount; a reconfiguration through `fspick`, of its flags and
+//! of its size; `mount_setattr`;
 //! the mounts as `statx`, `statmount` and `listmount` report them; a mount
 //! under a shared one reaching a child's copy of the namespace; and the
 //! mount flags and a busy mount enforced. It prints what it observed.
@@ -378,6 +379,15 @@ fn main() {
         syscall(SYS_FSCONFIG, pick, FSCONFIG_CMD_RECONFIGURE, 0usize, 0usize, 0);
         close(pick);
         println!("fspick: {r}, read-only {ro}, then {}", &options_of(&a)[..2]);
+        // A new size through fspick, which the tmpfs then holds to
+        // (`statfs`: `f_bsize` and `f_blocks`, its second and third words).
+        let pick = syscall(SYS_FSPICK, AT_FDCWD, c(&a).as_ptr(), 0u32) as i32;
+        let set = syscall(SYS_FSCONFIG, pick, FSCONFIG_SET_STRING, c("size").as_ptr(), c("2M").as_ptr(), 0);
+        let r = syscall(SYS_FSCONFIG, pick, FSCONFIG_CMD_RECONFIGURE, 0usize, 0usize, 0);
+        close(pick);
+        let mut st = [0u64; 15];
+        syscall(43, c(&a).as_ptr(), st.as_mut_ptr());
+        println!("fspick size: {set} {r}, holds {} KiB", st[1] * st[2] / 1024);
 
         // mount_setattr: a flag and the propagation.
         let attr = [MOUNT_ATTR_NODEV, 0, MS_SHARED, 0];

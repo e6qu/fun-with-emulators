@@ -543,6 +543,10 @@ impl<P: Platform> Kernel<P> {
         {
             crate::fdmarks::mark(r as i32, crate::fdmarks::Mark::Path);
         }
+        // What `F_GETFL` reports of it ([`crate::fdmarks::status_flags`]).
+        if r >= 0 {
+            crate::fdmarks::open_flags(r as i32, flags);
+        }
         r
     }
 
@@ -850,12 +854,19 @@ impl<P: Platform> Kernel<P> {
                     // SAFETY: plain host call on an open guest descriptor.
                     ret(unsafe { libc::fcntl(fd, cmd, 0) })
                 }
+                // A directory of a process that has ended holds nothing:
+                // Linux refuses to open it, as it refuses a lookup in it.
+                crate::procfs::Entry::Dir
+                    if let Some(g) = self.fs().gone_walk(dirfd as i32, &path) =>
+                {
+                    err(g.errno)
+                }
                 crate::procfs::Entry::Dir => match self.fs().synth_children(dirfd as i32, &path) {
                     Some(mut entries) => {
-                        let at = self.fs().absolute_path(dirfd as i32, &path).unwrap_or_default();
+                        let at = self.fs().absolute_ns(dirfd as i32, &path).unwrap_or_default();
                         // A `proc` mount's root lists what its options do
                         // not hide from the reader.
-                        let (m, fs_path) = self.fs().mount_of(&at);
+                        let (m, fs_path) = self.fs().mount_of_ns(&at);
                         if m.fstype == crate::mounts::FsType::Proc && fs_path == b"/" {
                             entries.retain(|(n, _)| {
                                 n == b"."
@@ -864,7 +875,8 @@ impl<P: Platform> Kernel<P> {
                                         != Some(errno::ENOENT)
                             });
                         }
-                        let fd = crate::synthdir::open(at, entries);
+                        let fs_path = self.fs().synthetic_fs_path(&m, &fs_path);
+                        let fd = crate::synthdir::open(at, fs_path, entries);
 
                         let fd = self.synthetic_fd(fd, dirfd as i32, &path);
                         if fd >= 0 && self.fs().lists_fds(dirfd as i32, &path) {
@@ -876,7 +888,7 @@ impl<P: Platform> Kernel<P> {
                     }
                     None => err(errno::ENOENT),
                 },
-                crate::procfs::Entry::Missing => err(errno::ENOENT),
+                crate::procfs::Entry::Missing(e) => err(e),
             };
         }
         self.sys_openat_bytes(dirfd, &path, flags, mode)
@@ -1489,7 +1501,7 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_statfs(&mut self, path: u64, buf: u64) -> i64 {
         let path = guest!(uaccess::read_cstr(path, uaccess::PATH_MAX));
         if let Some(entry) = self.fs().synthetic(fcntl::AT_FDCWD as i32, &path) {
-            if matches!(entry, crate::procfs::Entry::Missing) {
+            if matches!(entry, crate::procfs::Entry::Missing(_)) {
                 return err(errno::ENOENT);
             }
             // A filesystem of fwe's: its mount says what it is.
@@ -1699,7 +1711,10 @@ impl<P: Platform> Kernel<P> {
             if let Some(e) = self.proc_hidden(dirfd, path) {
                 return Err(e);
             }
-            let st = match entry {
+            // Its own numbers, but a namespace's (its own) and a
+            // directory's ([`Self::synth_dir_stat`] gives them).
+            let numbered = !matches!(entry, Entry::Ns(_) | Entry::Dir);
+            let mut st = match entry {
                 Entry::Ns(n) => ns_stat(n.id),
                 Entry::File(c) => synth_stat(st::S_IFREG | 0o444, c.len() as u64),
                 Entry::Symlink(t) if follow => {
@@ -1724,8 +1739,7 @@ impl<P: Platform> Kernel<P> {
                         );
                     }
                     if crate::synthdir::fstat_is_dir(fd) {
-                        let path = crate::synthdir::path_of(fd).unwrap_or_default();
-                        let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
+                        let stat = self.synth_dir_stat(fd, b".");
                         return Ok((stat, Extra::default()));
                     }
                     let s = stat_fd(fd)?;
@@ -1736,8 +1750,11 @@ impl<P: Platform> Kernel<P> {
                 }
                 Entry::Fd { target, .. } => synth_stat(st::S_IFLNK | 0o700, target.len() as u64),
                 Entry::Dir => self.synth_dir_stat(dirfd, path),
-                Entry::Missing => return Err(errno::ENOENT),
+                Entry::Missing(e) => return Err(e),
             };
+            if numbered && let Some((dev, ino)) = self.fs().synthetic_identity(dirfd, path) {
+                (st.st_dev, st.st_ino) = (dev, ino);
+            }
             return Ok((self.proc_owned(dirfd, path, st), Extra::default()));
         }
         let r = self.fs().resolve(dirfd, path, follow)?;
@@ -1811,13 +1828,9 @@ impl<P: Platform> Kernel<P> {
             };
         }
         if crate::synthdir::fstat_is_dir(fd as i32) {
-            let path = crate::synthdir::path_of(fd as i32);
-            let mut stat =
-                self.synth_dir_stat(fcntl::AT_FDCWD as i32, path.as_deref().unwrap_or(b""));
+            let stat = self.synth_dir_stat(fd as i32, b".");
             // A process's directory is its user's (newuidmap checks so).
-            if let Some(path) = path {
-                stat = self.proc_owned(fcntl::AT_FDCWD as i32, &path, stat);
-            }
+            let stat = self.proc_owned(fd as i32, b".", stat);
             guest!(uaccess::write(buf, stat));
             return 0;
         }
@@ -1893,8 +1906,7 @@ impl<P: Platform> Kernel<P> {
             }
             // A synthetic directory's descriptor, as `fstat` reports it.
             if crate::synthdir::fstat_is_dir(dirfd as i32) {
-                let path = crate::synthdir::path_of(dirfd as i32).unwrap_or_default();
-                let stat = self.synth_dir_stat(fcntl::AT_FDCWD as i32, &path);
+                let stat = self.synth_dir_stat(dirfd as i32, b".");
                 let x = with_mount(statx_of(&stat));
                 guest!(uaccess::write(buf, x));
                 return 0;
@@ -2002,7 +2014,7 @@ impl<P: Platform> Kernel<P> {
                 Entry::Symlink(_) if magic_link(abs) => Ok(LinkKind::Magic),
                 Entry::Symlink(t) => Ok(LinkKind::Symlink(t)),
                 Entry::Fd { .. } => Ok(LinkKind::Magic),
-                Entry::Missing => Err(errno::ENOENT),
+                Entry::Missing(e) => Err(e),
                 Entry::File(_) | Entry::Dir | Entry::Ns(_) => Ok(LinkKind::None),
             };
         }
@@ -2096,7 +2108,7 @@ impl<P: Platform> Kernel<P> {
                 crate::procfs::Entry::File(_)
                 | crate::procfs::Entry::Dir
                 | crate::procfs::Entry::Ns(_) => err(errno::EINVAL),
-                crate::procfs::Entry::Missing => err(errno::ENOENT),
+                crate::procfs::Entry::Missing(e) => err(e),
             };
         }
         let r = match self.fs().resolve(dirfd as i32, &path, false) {
@@ -2188,8 +2200,8 @@ impl<P: Platform> Kernel<P> {
                 .absolute_path(dirfd as i32, &path)
                 .is_some_and(|a| self.fs().mount_of(&a).0.fstype == crate::mounts::FsType::Sysfs);
             return err(match entry {
-                crate::procfs::Entry::Missing if sysfs => errno::EPERM,
-                crate::procfs::Entry::Missing => errno::ENOENT,
+                crate::procfs::Entry::Missing(_) if sysfs => errno::EPERM,
+                crate::procfs::Entry::Missing(e) => e,
                 _ => errno::EEXIST,
             });
         }
@@ -2202,12 +2214,6 @@ impl<P: Platform> Kernel<P> {
         // In fwe's store (a tmpfs).
         if let Some(d) = r.store.clone().filter(|_| r.ovl.is_none()) {
             return self.store_mkdir(&r, &d, mode as u32);
-        }
-        if let Err(e) = r.writable() {
-            return err(e);
-        }
-        if r.mount_root {
-            return err(errno::EEXIST);
         }
         if let Err(e) = r.prepare(Change::Create) {
             return err(e);
@@ -2533,6 +2539,11 @@ impl<P: Platform> Kernel<P> {
         if let Err(e) = made_not_dir(&new, &newpath) {
             return err(e);
         }
+        // A name there already, before another mount (as Linux's
+        // `filename_create` comes before its mount check).
+        if new.exists() {
+            return err(errno::EEXIST);
+        }
         if old.mount_id != new.mount_id && old.mount_id != 0 && new.mount_id != 0 {
             // Across mounts, even of one filesystem.
             return err(errno::EXDEV);
@@ -2544,9 +2555,6 @@ impl<P: Platform> Kernel<P> {
                 Ok((ino, _)) => ino,
                 Err(e) => return err(e),
             };
-            if new.mount_root {
-                return err(errno::EEXIST);
-            }
             return self.store_link(od.fs.id, ino, &new, nd, false);
         }
         if old.ovl.is_some() != new.ovl.is_some() {
@@ -2561,9 +2569,6 @@ impl<P: Platform> Kernel<P> {
         let (mut old, mut new) = (old, new);
         if let Err(e) = old.prepare(Change::Modify) {
             return err(e);
-        }
-        if new.mount_root {
-            return err(errno::EEXIST);
         }
         if let Err(e) = new.prepare(Change::Create) {
             return err(e);
@@ -2643,8 +2648,8 @@ impl<P: Platform> Kernel<P> {
                 .or_else(|| (flags & RENAME_EXCHANGE != 0).then(|| moved(&to, &from)).flatten());
             if let Some(now) = now.and_then(|ns| self.fs().from_ns(&ns)) {
                 let fs = self.fs_mut();
-                let root = fs.proc_root().to_vec();
-                fs.set_root(root, now);
+                let (root, pin) = (fs.proc_root().to_vec(), fs.root_pin().cloned());
+                fs.set_root(root, now, pin);
             }
         }
         r
@@ -4230,7 +4235,7 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
-        if new.mount_root {
+        if new.exists() {
             return err(errno::EEXIST);
         }
         // In an overlay whose upper layer is the file's filesystem.
@@ -4263,6 +4268,9 @@ impl<P: Platform> Kernel<P> {
             Ok(r) => r,
             Err(e) => return err(e),
         };
+        if new.exists() {
+            return err(errno::EEXIST);
+        }
         let old_mount = crate::fdmarks::origin(fd).map_or(0, |o| o.mount);
         if old_mount != new.mount_id && old_mount != 0 && new.mount_id != 0 {
             return err(errno::EXDEV);
@@ -4272,9 +4280,6 @@ impl<P: Platform> Kernel<P> {
             if let Err(e) = checked {
                 return err(e);
             }
-        }
-        if new.mount_root {
-            return err(errno::EEXIST);
         }
         if let Err(e) = new.prepare(Change::Create) {
             return err(e);
@@ -4642,7 +4647,6 @@ impl<P: Platform> Kernel<P> {
         if r.mount_root && !mount_root_ok {
             return Err(errno::EBUSY);
         }
-        r.writable()?;
         r.prepare(how)?;
         Ok(r)
     }
@@ -5181,7 +5185,13 @@ impl<P: Platform> Kernel<P> {
                 .filter(|(n, t)| *t == crate::procfs::DT_DIR && n != b"." && n != b"..")
                 .count()
         });
-        Stat { st_nlink: 2 + subdirs as u32, ..synth_stat(fwe_abi::stat::S_IFDIR | 0o555, 0) }
+        let (st_dev, st_ino) = self.fs().synthetic_identity(dirfd, path).unwrap_or_default();
+        Stat {
+            st_dev,
+            st_ino,
+            st_nlink: 2 + subdirs as u32,
+            ..synth_stat(fwe_abi::stat::S_IFDIR | 0o555, 0)
+        }
     }
 }
 
@@ -5779,6 +5789,7 @@ mod tests {
         let (mut k, _d) = rooted();
         k.fs.as_mut().unwrap().set_proc_info(
             b"/bin/prog".to_vec(),
+            b"prog",
             b"prog\0-x\0".to_vec(),
             4,
             b"host".to_vec(),

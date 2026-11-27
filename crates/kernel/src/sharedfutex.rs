@@ -50,8 +50,12 @@ struct Slot {
     /// while it is filled in, [`WAITING`], [`MOVING`] while a requeue
     /// changes its key, [`WOKEN`].
     state: AtomicU32,
-    /// The `FUTEX_WAIT_BITSET` bits it waits for (all, for `FUTEX_WAIT`).
+    /// The `FUTEX_WAIT_BITSET` bits it waits for (all, for `FUTEX_WAIT`;
+    /// none, for a priority-inheritance lock, which no wake takes).
     bits: AtomicU32,
+    /// A priority-inheritance lock's waiter's thread id, which an unlock
+    /// hands the lock to ([`pi_hand`]); 0 for any other.
+    tid: AtomicU32,
     /// The host pid of the process waiting.
     owner: AtomicU32,
     /// When it came, from [`Header::tickets`]: the oldest is woken first.
@@ -183,7 +187,7 @@ pub fn process_started() {
 
 /// Take a free slot for this waiter, filled in and waiting: its index and
 /// state. With none free, those of processes that have gone are freed.
-fn take_slot(t: &[Slot], key: [u64; 2], bits: u32) -> Option<(usize, u32)> {
+fn take_slot(t: &[Slot], key: [u64; 2], bits: u32, tid: u32) -> Option<(usize, u32)> {
     for round in 0..2 {
         for (i, s) in t.iter().enumerate() {
             let cur = s.state.load(SeqCst);
@@ -200,6 +204,7 @@ fn take_slot(t: &[Slot], key: [u64; 2], bits: u32) -> Option<(usize, u32)> {
             s.key[0].store(key[0], SeqCst);
             s.key[1].store(key[1], SeqCst);
             s.bits.store(bits, SeqCst);
+            s.tid.store(tid, SeqCst);
             s.owner.store(pid, SeqCst);
             s.owner_start.store(start, SeqCst);
             let h = header()?;
@@ -254,7 +259,7 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
     let (Some(t), Some(key)) = (table(), key_of(host_of(uaddr))) else {
         return crate::futex::wait_private_bits(uaddr, val, deadline, bits);
     };
-    let Some((i, _)) = take_slot(t, key, bits) else {
+    let Some((i, _)) = take_slot(t, key, bits, 0) else {
         return err(errno::ENOMEM);
     };
     let slot = &t[i];
@@ -321,7 +326,94 @@ pub fn wait(uaddr: u64, val: u32, deadline: Option<Instant>, bits: u32) -> i64 {
 /// has no shared identity (a private futex's queue then takes it).
 pub fn enter(uaddr: u64) -> Option<Result<usize, i32>> {
     let (t, key) = (table()?, key_of(host_of(uaddr))?);
-    Some(take_slot(t, key, u32::MAX).map(|(i, _)| i).ok_or(errno::ENOMEM))
+    Some(take_slot(t, key, u32::MAX, 0).map(|(i, _)| i).ok_or(errno::ENOMEM))
+}
+
+/// A priority-inheritance lock's waiter, thread `tid`, on the shared
+/// futex at guest `uaddr` (its word read first): the slot it waits in, or
+/// `None` where the word's memory has no shared identity.
+pub fn pi_enter(uaddr: u64, tid: u32) -> Option<Result<usize, i32>> {
+    let (t, key) = (table()?, key_of(host_of(uaddr))?);
+    Some(take_slot(t, key, 0, tid).map(|(i, _)| i).ok_or(errno::ENOMEM))
+}
+
+/// Sleep in slot `i` ([`pi_enter`]) for at most `most`, or until it is
+/// woken.
+pub fn nap(i: usize, most: std::time::Duration) {
+    let Some(t) = table() else { return };
+    let s = &t[i];
+    let cur = s.state.load(SeqCst);
+    if st(cur) != WAITING {
+        return;
+    }
+    // SAFETY: the slot's word, in fwe's shared table; the host sleeps
+    // while it still reads `cur`.
+    unsafe {
+        __ulock_wait2(
+            UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO,
+            s.state.as_ptr().cast(),
+            cur as u64,
+            most.as_nanos().max(1) as u64,
+            0,
+        )
+    };
+}
+
+/// The priority-inheritance lock waiters of `key`, oldest first: each
+/// one's index and state. A slot left by a process that has gone is
+/// freed on the way.
+fn pi_waiters(t: &[Slot], key: [u64; 2]) -> Vec<(usize, u32)> {
+    let mut waiting: Vec<(u32, usize, u32)> = Vec::new();
+    for (i, s) in in_use(t).iter().enumerate() {
+        let state = s.state.load(SeqCst);
+        if st(state) != WAITING
+            || s.tid.load(SeqCst) == 0
+            || s.key[0].load(SeqCst) != key[0]
+            || s.key[1].load(SeqCst) != key[1]
+        {
+            continue;
+        }
+        if !owner_alive(s) {
+            free(s, state);
+            continue;
+        }
+        waiting.push((s.ticket.load(SeqCst), i, state));
+    }
+    waiting.sort_by_key(|w| w.0);
+    waiting.into_iter().map(|(_, i, state)| (i, state)).collect()
+}
+
+/// Whether a priority-inheritance lock's waiter other than slot `mine`
+/// waits on the shared futex at guest `uaddr`; `None` where the word's
+/// memory has no shared identity.
+pub fn pi_waiting(uaddr: u64, mine: Option<usize>) -> Option<bool> {
+    let (t, key) = (table()?, key_of(host_of(uaddr))?);
+    Some(pi_waiters(t, key).iter().any(|&(i, _)| Some(i) != mine))
+}
+
+/// Hand the priority-inheritance lock at guest `uaddr` to its oldest
+/// waiter: `give` makes the word that waiter's thread id's, `false` if the
+/// word changed meanwhile. `Some(Ok(true))` once handed (the waiter woken),
+/// `Some(Ok(false))` with no waiter, `Some(Err(()))` if the word or the
+/// waiter changed (to look again), `None` where the word's memory has no
+/// shared identity.
+pub fn pi_hand(uaddr: u64, give: impl FnOnce(u32) -> bool) -> Option<Result<bool, ()>> {
+    let (t, key) = (table()?, key_of(host_of(uaddr))?);
+    let Some(&(i, state)) = pi_waiters(t, key).first() else { return Some(Ok(false)) };
+    let s = &t[i];
+    // Held while the word changes, so its waiter does not leave meanwhile
+    // ([`give_back`] waits it out).
+    if s.state.compare_exchange(state, with_state(state, MOVING), SeqCst, SeqCst).is_err() {
+        return Some(Err(()));
+    }
+    if !give(s.tid.load(SeqCst)) {
+        s.state.store(state, SeqCst);
+        return Some(Err(()));
+    }
+    s.state.store(with_state(state, WOKEN), SeqCst);
+    // SAFETY: wakes whoever sleeps on the slot's word; reads nothing.
+    unsafe { __ulock_wake(UL_COMPARE_AND_WAIT_SHARED | ULF_NO_ERRNO, s.state.as_ptr().cast(), 0) };
+    Some(Ok(true))
 }
 
 /// Whether slot `i` ([`enter`]) has been woken.

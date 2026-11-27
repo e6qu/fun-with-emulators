@@ -305,6 +305,11 @@ impl<P: Platform> Kernel<P> {
         if crate::procreg::take_limits_left() {
             self.take_pending_limits();
         }
+        // So does a root, working directory or umask another process that
+        // shares them changed (`CLONE_FS`).
+        if crate::fsshare::active() {
+            self.take_shared_view();
+        }
         // Told of a foster child: the watcher that follows it starts here,
         // under the kernel lock.
         if crate::reaper::watcher_wanted() {
@@ -1005,10 +1010,16 @@ impl<P: Platform> Kernel<P> {
     /// threads' ([`crate::klock`]), if it is one that can: `None` for any
     /// other, which [`Kernel::dispatch`] runs holding the lock for itself.
     /// What [`Kernel::dispatch`] does around a call is done here as far as
-    /// these calls need it; a call that needs to start the reaper's watcher, or
-    /// that Landlock checks, is left to it.
+    /// these calls need it; a call that needs to start the reaper's watcher,
+    /// that Landlock checks, or that comes after another process changed
+    /// the root, working directory or umask this one shares
+    /// ([`crate::fsshare`]), is left to it.
     pub(crate) fn dispatch_shared(&self, n: u64, a: [u64; 6]) -> Option<i64> {
-        if !shares(n) || crate::reaper::watcher_wanted() || crate::landlock::active() {
+        if !shares(n)
+            || crate::reaper::watcher_wanted()
+            || crate::landlock::active()
+            || crate::fsshare::pending()
+        {
             return None;
         }
         crate::maps::flush_before(n);
@@ -1326,7 +1337,8 @@ impl<P: Platform> Kernel<P> {
                 None => return err(errno::EINVAL),
             }
         }
-        self.creds.setgroups(v)
+        let r = self.creds.setgroups(v);
+        self.ids_changed(r)
     }
 
     fn sys_dup3(&mut self, old: u64, new: u64, flags: u64) -> i64 {
@@ -1414,20 +1426,7 @@ impl<P: Platform> Kernel<P> {
                 }
                 fcntl::F_GETFL => {
                     let r = libc::fcntl(fd, libc::F_GETFL);
-                    if r < 0 {
-                        last_error()
-                    } else if let Some(nb) = crate::specialfd::timer_nonblock(fd) {
-                        (fcntl::O_RDWR | if nb { fcntl::O_NONBLOCK } else { 0 }) as i64
-                    } else if let Some(t) = crate::pidfd::of(fd) {
-                        // Read-write, and non-blocking as it was made or set.
-                        (fcntl::O_RDWR | if t.nonblock { fcntl::O_NONBLOCK } else { 0 }) as i64
-                    } else if crate::fdmarks::is_path(fd) {
-                        // An `O_PATH` descriptor's flags: that, and the
-                        // large-file flag every arm64 open has.
-                        (fcntl::O_PATH | fcntl::O_LARGEFILE) as i64
-                    } else {
-                        host::status_flags_to_linux(r) as i64
-                    }
+                    if r < 0 { last_error() } else { crate::fdmarks::status_flags(fd, r) as i64 }
                 }
                 fcntl::F_SETFL if crate::specialfd::timer_nonblock(fd).is_some() => {
                     crate::specialfd::set_timer_nonblock(fd, arg & fcntl::O_NONBLOCK != 0);
@@ -1438,7 +1437,18 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 fcntl::F_SETFL => {
-                    ret(libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg)))
+                    let r = libc::fcntl(fd, libc::F_SETFL, host::settable_flags_to_host(arg));
+                    if r >= 0 {
+                        crate::fdmarks::status_set(fd, arg);
+                    }
+                    // An epoll set is a kqueue, which keeps the flags but has
+                    // no `FIONBIO` to tell (`ENOTTY`): Linux's set keeps
+                    // them as any file's.
+                    #[cfg(target_os = "macos")]
+                    if r < 0 && host::last_errno().is(libc::ENOTTY) && crate::epoll::is_epoll(fd) {
+                        return 0;
+                    }
+                    ret(r)
                 }
                 fcntl::F_GETLK | fcntl::F_OFD_GETLK => {
                     let asked: fwe_abi::Flock = guest!(uaccess::read(arg));
@@ -1639,6 +1649,32 @@ impl<P: Platform> Kernel<P> {
         size as i64
     }
 
+    /// The requests Linux answers for any file before its own ioctls
+    /// (`do_vfs_ioctl`): close-on-exec and the `O_NONBLOCK` and `O_ASYNC`
+    /// status flags, as `fcntl` sets them, on a descriptor fwe stands in
+    /// for as on any other.
+    fn generic_ioctl(&mut self, fd: i32, req: u64, arg: u64) -> Option<i64> {
+        let flag = match req {
+            ioctl::FIOCLEX => {
+                return Some(self.sys_fcntl(fd as u64, fcntl::F_SETFD, fcntl::FD_CLOEXEC).min(0));
+            }
+            ioctl::FIONCLEX => return Some(self.sys_fcntl(fd as u64, fcntl::F_SETFD, 0).min(0)),
+            ioctl::FIONBIO => fcntl::O_NONBLOCK,
+            ioctl::FIOASYNC => fcntl::O_ASYNC,
+            _ => return None,
+        };
+        let on: i32 = match uaccess::read(arg) {
+            Ok(v) => v,
+            Err(e) => return Some(err(e)),
+        };
+        let fl = self.sys_fcntl(fd as u64, fcntl::F_GETFL, 0);
+        if fl < 0 {
+            return Some(fl);
+        }
+        let fl = if on != 0 { fl as u64 | flag } else { fl as u64 & !flag };
+        Some(self.sys_fcntl(fd as u64, fcntl::F_SETFL, fl).min(0))
+    }
+
     fn sys_ioctl(&mut self, fd: u64, req: u64, arg: u64) -> i64 {
         let fd = fd as i32;
         // The request is 32 bits (an `unsigned int`); a C library passing
@@ -1646,6 +1682,9 @@ impl<P: Platform> Kernel<P> {
         let req = req as u32 as u64;
         if let Err(e) = crate::landlock::may_ioctl(fd, req) {
             return err(e);
+        }
+        if let Some(r) = self.generic_ioctl(fd, req, arg) {
+            return r;
         }
         if let Some(r) = self.loop_ioctl(fd, req, arg) {
             return r;
@@ -1769,20 +1808,6 @@ impl<P: Platform> Kernel<P> {
                     0
                 }
                 ioctl::FIONREAD => ret(libc::ioctl(fd, libc::FIONREAD, arg as *mut libc::c_int)),
-                ioctl::FIONBIO => ret(libc::ioctl(fd, libc::FIONBIO, arg as *mut libc::c_int)),
-                ioctl::FIOCLEX => ret(libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC)),
-                ioctl::FIONCLEX => ret(libc::fcntl(fd, libc::F_SETFD, 0)),
-                // `O_ASYNC` on or off, as `fcntl` sets it.
-                ioctl::FIOASYNC => {
-                    let on: i32 = guest!(uaccess::read(arg));
-                    let fl = self.sys_fcntl(fd as u64, fcntl::F_GETFL, 0);
-                    if fl < 0 {
-                        return fl;
-                    }
-                    let fl = fl as u64 & !fcntl::O_ASYNC;
-                    let fl = if on != 0 { fl | fcntl::O_ASYNC } else { fl };
-                    self.sys_fcntl(fd as u64, fcntl::F_SETFL, fl).min(0)
-                }
                 _ => {
                     if libc::fcntl(fd, libc::F_GETFD) < 0 {
                         last_error()
@@ -1837,13 +1862,15 @@ impl<P: Platform> Kernel<P> {
                 0
             }
             PR_GET_NAME => {
-                // A thread not yet named has the program's file name.
+                // A thread not named since the program started has the
+                // process's name (what `execve` named it).
                 let name = thread::name().unwrap_or_else(|| {
-                    let exe = self.fs().exe();
-                    let base = exe.rsplit(|&b| b == b'/').next().unwrap_or(exe);
+                    let comm = crate::procreg::read(crate::host::pid())
+                        .map(|r| r.comm)
+                        .unwrap_or_default();
                     let mut name = [0u8; TASK_COMM_LEN];
-                    let n = base.len().min(TASK_COMM_LEN - 1);
-                    name[..n].copy_from_slice(&base[..n]);
+                    let n = comm.len().min(TASK_COMM_LEN - 1);
+                    name[..n].copy_from_slice(&comm[..n]);
                     name
                 });
                 guest!(uaccess::write(arg2, name));
@@ -2231,7 +2258,8 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// A call the seccomp filters refused with `action` (not `Allow`): its
-    /// errno, a `SIGSYS`, or the end of the thread or process.
+    /// errno, a `SIGSYS`, or the end of the thread or process; the caller
+    /// delivers what is pending ([`crate::klock::KernelLock::deliver_pending`]).
     pub fn seccomp_refuse(
         &mut self,
         regs: &mut crate::Regs,
@@ -2241,48 +2269,28 @@ impl<P: Platform> Kernel<P> {
     ) {
         use crate::seccomp::Action;
         match action {
-            Action::Allow => self.enter_syscall(regs),
-            Action::Errno(e) => self.finish_syscall(regs, nr, args, err(e)),
+            Action::Allow => self.run_syscall(regs),
+            Action::Errno(e) => self.complete_syscall(regs, nr, args, err(e)),
             Action::Trap(data) => {
-                crate::signal::raise_sigsys(regs.pc, nr, data);
-                // The call is not made; a handler can set what it returns.
-                let x0 = regs.x[0] as i64;
-                self.finish_syscall(regs, nr, args, x0);
+                crate::signal::raise_sigsys(crate::SvcSite(regs.pc), nr, data);
+                // The call is not made: `x0` keeps its first argument, as
+                // Linux's does, for a handler to set what it returns, and
+                // it is not restarted whatever that holds.
+                self.tracer.not_made(nr, args, "seccomp's SIGSYS");
+                regs.pc = regs.pc.wrapping_add(4);
             }
             // The backends end a thread of several before taking the
             // kernel lock; the last one takes the process with it.
             Action::KillThread | Action::KillProcess => self.terminate_by(signal::SIGSYS),
             Action::KillStrict => self.terminate_by(signal::SIGKILL),
             // No tracer took it: the call fails as Linux fails it then.
-            Action::Trace(_) => self.finish_syscall(regs, nr, args, err(errno::ENOSYS)),
+            Action::Trace(_) => self.complete_syscall(regs, nr, args, err(errno::ENOSYS)),
             // The tracer skipped it: what it left in `x0` is the result.
             Action::Skip => {
                 let x0 = regs.x[0] as i64;
-                self.finish_syscall(regs, nr, args, x0);
+                self.complete_syscall(regs, nr, args, x0);
             }
         }
-    }
-
-    /// `SECCOMP_RET_TRACE` with `data` for the call in `regs`: a tracer
-    /// that asked for it (`PTRACE_O_TRACESECCOMP`) stops the call with
-    /// `PTRACE_EVENT_SECCOMP` (its message `data`) and can change it; then
-    /// the filters run again on what it left, a call it set to -1 being
-    /// skipped, as Linux's `__seccomp_filter` has it. Without such a tracer,
-    /// [`crate::seccomp::Action::Trace`] stands (`ENOSYS`).
-    pub fn seccomp_trace(&mut self, regs: &mut crate::Regs, data: u16) -> crate::seccomp::Action {
-        use crate::seccomp::Action;
-        if !crate::ptrace::traced()
-            || crate::ptrace::options() & crate::ptrace::PTRACE_O_TRACESECCOMP == 0
-        {
-            return Action::Trace(data);
-        }
-        self.ptrace_event_stop(regs, crate::ptrace::PTRACE_EVENT_SECCOMP, u64::from(data));
-        let nr = regs.x[8];
-        if nr as i64 == -1 {
-            return Action::Skip;
-        }
-        let args = [regs.x[0], regs.x[1], regs.x[2], regs.x[3], regs.x[4], regs.x[5]];
-        crate::seccomp::recheck(nr, &args, regs.pc)
     }
 
     /// `reboot(magic, magic2, cmd)`, checked as Linux checks it: the
@@ -2353,9 +2361,10 @@ impl<P: Platform> Kernel<P> {
     pub(crate) fn ids_changed(&self, r: i64) -> i64 {
         if r >= 0 {
             let c = &self.creds;
-            crate::procreg::set_own_ids([
-                c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid,
-            ]);
+            crate::procreg::set_own_ids(
+                [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid],
+                c.groups(),
+            );
         }
         r
     }
@@ -2870,13 +2879,17 @@ pub(crate) unsafe fn pselect6(nfds: u64, sets: [u64; 3], timeout: u64) -> i64 {
 /// ([`crate::thread::wait_ready_ns`]), with what is ready as Linux reports
 /// it ([`linux_revents`]): how many descriptors are. A pipe given less than
 /// the host's capacity is not writable while full, which the host does not
-/// know: it is looked at each millisecond until it has room.
+/// know: it is looked at each millisecond until it has room. So is a TCP
+/// socket the host reports hung up where Linux has nothing to report (its
+/// peer's end of the stream come, and not asked to read): the host's
+/// `poll` would end at once each time.
 fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
     use std::time::{Duration, Instant};
     let deadline = (ns >= 0).then(|| Instant::now() + Duration::from_nanos(ns as u64));
+    let mut quiet = vec![false; set.len()];
     loop {
         let mut ask = set.to_vec();
-        let mut full = false;
+        let mut full = quiet.contains(&true);
         // An eventfd that can be written to is writable: its pipe's read
         // end, which the host watches, never is.
         let writable: Vec<bool> = set
@@ -2887,17 +2900,18 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         // host descriptor (`/dev/null`, a pipe's read end) says nothing of
         // it: ready to read and write, as Linux reports a file with no wait
         // of its own, and not asked the host.
-        let synthetic: Vec<bool> = set
+        let synthetic: Vec<bool> = set.iter().map(|p| crate::fs::stands_in(p.fd)).collect();
+        // TCP sockets asked for urgent data, which the host's `poll` does
+        // not report: watched while it waits.
+        let urgent: Vec<i32> = set
             .iter()
-            .map(|p| {
-                crate::procfile::is(p.fd)
-                    || crate::synthdir::is_synth(p.fd)
-                    || crate::anonfd::is(p.fd)
-                    || crate::mqueue::is_queue(p.fd)
-            })
+            .zip(&synthetic)
+            .filter(|&(p, &s)| !s && p.fd >= 0 && p.events & libc::POLLPRI != 0)
+            .map(|(p, _)| p.fd)
+            .filter(|&fd| crate::net::urgent_possible(fd))
             .collect();
-        for (p, &s) in ask.iter_mut().zip(&synthetic) {
-            if s {
+        for ((p, &s), &q) in ask.iter_mut().zip(&synthetic).zip(&quiet) {
+            if s || q {
                 p.fd = -1;
             }
         }
@@ -2905,6 +2919,7 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         let ready_now =
             set.iter().zip(&synthetic).any(|(p, &s)| s && p.events & (always | libc::POLLPRI) != 0);
         for p in &mut ask {
+            host_events(p);
             if p.events & libc::POLLOUT != 0 && crate::fdstate::pipe_full(p.fd) {
                 p.events &= !libc::POLLOUT;
                 full = true;
@@ -2925,11 +2940,22 @@ fn poll_linux(set: &mut [libc::pollfd], ns: i64) -> Result<i32, i32> {
         } else {
             left
         };
-        crate::thread::wait_ready_ns(&mut ask, wait)?;
-        for (((p, a), &w), &s) in set.iter_mut().zip(&ask).zip(&writable).zip(&synthetic) {
-            p.revents =
-                if s { p.events & always } else { a.revents | if w { libc::POLLOUT } else { 0 } };
+        let (_, fired) = crate::thread::wait_ready_urgent_ns(&mut ask, &urgent, wait)?;
+        for (i, p) in set.iter_mut().enumerate() {
+            let host = if quiet[i] { poll_now(p) } else { ask[i].revents };
+            p.revents = if synthetic[i] {
+                p.events & always
+            } else {
+                host | if writable[i] { libc::POLLOUT } else { 0 }
+            };
             linux_revents(p);
+            if !synthetic[i] && host & libc::POLLHUP != 0 && p.revents == 0 {
+                quiet[i] = true;
+                full = true;
+            }
+            if fired.contains(&p.fd) {
+                p.revents |= libc::POLLPRI;
+            }
             if crate::mountwatch::changed(p.fd) == Some(true) {
                 p.revents |= libc::POLLERR | (p.events & libc::POLLPRI);
             }
@@ -3391,10 +3417,48 @@ fn is_random_device(fd: i32) -> bool {
         .is_some_and(|n| n.major == 1 && (n.minor == 8 || n.minor == 9))
 }
 
-/// What the host reported ready on `p` as Linux reports it: a regular
-/// file is readable and writable but has no urgent data (`POLLPRI`, which
-/// the host gives it), and a pipe or FIFO whose writers have gone with
-/// nothing left to read has hung up (`POLLHUP`) but is not readable.
+/// What the host's `poll` reports ready on `p` now, asked as
+/// [`host_events`] asks it.
+fn poll_now(p: &libc::pollfd) -> libc::c_short {
+    let mut q = *p;
+    host_events(&mut q);
+    q.revents = 0;
+    // SAFETY: one valid entry; no wait.
+    unsafe { libc::poll(&mut q, 1, 0) };
+    q.revents
+}
+
+/// The events of `p` the host is asked for: no urgent data (`POLLPRI`,
+/// `POLLRDBAND`) of a file Linux reports none for (all but a device's),
+/// which macOS would report at once for a pipe holding data
+/// ([`linux_revents`]), so that a wait for it waits. A TCP socket's urgent
+/// data the host's `poll` does not report: [`poll_linux`] watches for it.
+fn host_events(p: &mut libc::pollfd) {
+    if p.events & (libc::POLLPRI | libc::POLLRDBAND) == 0 {
+        return;
+    }
+    // SAFETY: an all-zero `stat` is a valid out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: as above.
+    if unsafe { libc::fstat(p.fd, &mut st) } != 0 {
+        return;
+    }
+    if matches!(
+        st.st_mode & libc::S_IFMT,
+        libc::S_IFREG | libc::S_IFIFO | libc::S_IFDIR | libc::S_IFSOCK
+    ) {
+        p.events &= !(libc::POLLPRI | libc::POLLRDBAND);
+    }
+}
+
+/// What the host reported ready on `p` as Linux reports it. Only a TCP
+/// socket's urgent data is `POLLPRI` there (which the caller adds), and
+/// nothing of these files is `POLLRDBAND`: macOS gives both to a regular
+/// file, to a pipe holding data, and to a pipe or socket that has hung up
+/// (NSPR takes `POLLPRI` on its pipe for an error, and Firefox's socket
+/// thread then remakes the pipe for ever). A pipe or FIFO whose writers have gone with nothing left
+/// to read has hung up (`POLLHUP`) but is not readable; a TCP socket has
+/// hung up only once shut both ways ([`crate::net::hung_up`]).
 fn linux_revents(p: &mut libc::pollfd) {
     if p.revents == 0 || p.revents & libc::POLLNVAL != 0 {
         return;
@@ -3406,12 +3470,24 @@ fn linux_revents(p: &mut libc::pollfd) {
         return;
     }
     match st.st_mode & libc::S_IFMT {
-        libc::S_IFREG => p.revents &= !libc::POLLPRI,
-        libc::S_IFIFO if p.revents & libc::POLLHUP != 0 => {
+        libc::S_IFREG => p.revents &= !(libc::POLLPRI | libc::POLLRDBAND),
+        libc::S_IFIFO => {
+            p.revents &= !(libc::POLLPRI | libc::POLLRDBAND);
             let mut queued: libc::c_int = 0;
-            // SAFETY: a valid out-parameter for FIONREAD.
-            if unsafe { libc::ioctl(p.fd, libc::FIONREAD, &mut queued) } == 0 && queued == 0 {
+            if p.revents & libc::POLLHUP != 0
+                // SAFETY: a valid out-parameter for FIONREAD.
+                && unsafe { libc::ioctl(p.fd, libc::FIONREAD, &mut queued) } == 0
+                && queued == 0
+            {
                 p.revents &= !libc::POLLIN;
+            }
+        }
+        // A TCP socket's urgent data is the caller's to add, as the
+        // thread's wait saw it ([`crate::thread::wait_ready_urgent_ns`]).
+        libc::S_IFSOCK => {
+            p.revents &= !(libc::POLLPRI | libc::POLLRDBAND);
+            if p.revents & libc::POLLHUP != 0 && !crate::net::hung_up(p.fd) {
+                p.revents &= !libc::POLLHUP;
             }
         }
         _ => {}
@@ -4320,6 +4396,42 @@ mod tests {
     /// A fixed mapping below `vm.mmap_min_addr` is refused (`EPERM`) to a
     /// caller without `CAP_SYS_RAWIO`, as is a move there; a hint there is
     /// only a hint.
+    /// `mprotect` takes the protection bits Linux's arm64 takes: read,
+    /// write, execute and `PROT_SEM`, and those the CPU offers (none here:
+    /// `PROT_BTI` and `PROT_MTE` are `EINVAL`), `PROT_GROWSDOWN` only on a
+    /// grows-down mapping, `PROT_GROWSUP` never.
+    #[test]
+    fn mprotect_takes_the_protection_bits_linux_does() {
+        use fwe_abi::mman::*;
+        let _g = mapping_lock();
+        let mut k = kernel();
+        let anon = MAP_PRIVATE | MAP_ANONYMOUS;
+        let len = 0x4000;
+        let p = k.syscall(nr::MMAP, [0, len, PROT_READ | PROT_WRITE, anon, u64::MAX, 0]) as u64;
+        let protect =
+            |k: &mut Kernel<TestPlatform>, prot| k.syscall(nr::MPROTECT, [p, len, prot, 0, 0, 0]);
+        assert_eq!(protect(&mut k, PROT_READ | PROT_SEM), 0);
+        for prot in [
+            PROT_READ | PROT_EXEC | PROT_BTI,
+            PROT_READ | PROT_MTE,
+            PROT_READ | 0x40,
+            PROT_READ | PROT_GROWSUP,
+            PROT_READ | PROT_GROWSDOWN | PROT_GROWSUP,
+            PROT_READ | PROT_GROWSDOWN,
+        ] {
+            assert_eq!(protect(&mut k, prot), err(errno::EINVAL), "{prot:#x}");
+        }
+        assert_eq!(k.syscall(nr::MUNMAP, [p, len, 0, 0, 0, 0]), 0);
+        // A grows-down mapping of two pages: its top page asked for, the
+        // whole of it from its start given.
+        let rw = PROT_READ | PROT_WRITE;
+        let g = k.syscall(nr::MMAP, [0, 2 * len, rw, anon | MAP_GROWSDOWN, u64::MAX, 0]) as u64;
+        assert_eq!(k.syscall(nr::MPROTECT, [g + len, len, PROT_READ | PROT_GROWSDOWN, 0, 0, 0]), 0);
+        let areas = crate::maps::record().areas_in(g, g + 2 * len);
+        assert!(areas.iter().all(|a| a.value.prot == PROT_READ), "{areas:?}");
+        assert_eq!(k.syscall(nr::MUNMAP, [g, 2 * len, 0, 0, 0, 0]), 0);
+    }
+
     #[test]
     fn fixed_mappings_below_mmap_min_addr_need_rawio() {
         use fwe_abi::mman::{MAP_ANONYMOUS, MAP_FIXED, MAP_FIXED_NOREPLACE, MAP_PRIVATE};
@@ -4343,6 +4455,10 @@ mod tests {
     /// saved IDs becoming the effective ones, and a bad record is refused.
     #[test]
     fn exec_state_carries_credentials() {
+        // Restoring loads the process's tables of a re-executed fwe.
+        if !crate::alone::in_own_process(module_path!(), "exec_state_carries_credentials") {
+            return;
+        }
         let mut k = kernel();
         // Groups first: once the user IDs drop root, they cannot change.
         assert_eq!(k.creds.setgroups(vec![5, 6]), 0);
@@ -4365,6 +4481,13 @@ mod tests {
     /// credentials agree, and the exec is a secure one.
     #[test]
     fn exec_state_carries_what_the_program_grants() {
+        // Restoring loads the process's tables of a re-executed fwe.
+        if !crate::alone::in_own_process(
+            module_path!(),
+            "exec_state_carries_what_the_program_grants",
+        ) {
+            return;
+        }
         let mut k = kernel();
         assert_eq!(k.creds.setresuid(1000, 1000, 1000), 0);
         crate::EXEC_PRIVS.with(|p| p.set(crate::ExecPrivs { uid: Some(0), ..Default::default() }));

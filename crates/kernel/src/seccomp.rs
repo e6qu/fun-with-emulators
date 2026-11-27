@@ -6,7 +6,7 @@
 //! Every filter installed runs on every call, and the action with the
 //! highest precedence is taken: kill the process, kill the thread, raise
 //! `SIGSYS`, fail with an errno, hand it to a tracer that asked for it
-//! (`SECCOMP_RET_TRACE`, [`crate::Kernel::seccomp_trace`]; `ENOSYS`
+//! (`SECCOMP_RET_TRACE`, [`crate::klock::KernelLock::seccomp_trace`]; `ENOSYS`
 //! without one), or allow. `SECCOMP_RET_USER_NOTIF` fails with `ENOSYS`:
 //! there is no listener. The backends ask [`check`] before they route a
 //! call anywhere, so no call escapes it. The actions Linux logs are
@@ -78,7 +78,7 @@ pub enum Action {
     KillStrict,
     /// `SECCOMP_RET_TRACE` with this data: a tracer that asked for it
     /// (`PTRACE_O_TRACESECCOMP`) stops the call first
-    /// ([`crate::Kernel::seccomp_trace`]); without one it fails with
+    /// ([`crate::klock::KernelLock::seccomp_trace`]); without one it fails with
     /// `ENOSYS`.
     Trace(u16),
     /// The tracer skipped the call (its number set to -1): it returns what
@@ -273,16 +273,16 @@ pub fn filter_count() -> u32 {
     STATE.read().unwrap_or_else(|e| e.into_inner()).filters.len() as u32
 }
 
-/// The action for call `nr` with `args` at `pc`.
-pub fn check(nr: u64, args: &[u64; 6], pc: u64) -> Action {
-    decide(nr, args, pc, false)
+/// The action for call `nr` with `args`, made at `site`.
+pub fn check(nr: u64, args: &[u64; 6], site: crate::SvcSite) -> Action {
+    decide(nr, args, site.reported(), false)
 }
 
 /// The action for call `nr` with `args` at `pc` once a tracer has seen it
 /// (`SECCOMP_RET_TRACE`): the filters run again on what it left, and
 /// tracing again allows it, as Linux's recheck after the tracer has it.
-pub fn recheck(nr: u64, args: &[u64; 6], pc: u64) -> Action {
-    decide(nr, args, pc, true)
+pub fn recheck(nr: u64, args: &[u64; 6], site: crate::SvcSite) -> Action {
+    decide(nr, args, site.reported(), true)
 }
 
 /// Whether answer `ret`, from a filter installed with

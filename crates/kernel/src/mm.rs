@@ -1422,6 +1422,19 @@ fn final_prot(prot: u64) -> libc::c_int {
 /// processes (see [`crate::maps`]).
 impl<P: Platform> Kernel<P> {
     pub(crate) fn sys_brk(&mut self, addr: u64) -> i64 {
+        // Within `RLIMIT_DATA`, the program's data with the break
+        // (`check_data_rlimit`), and grown as a mapping of data would be.
+        let limits = crate::rlimits::memory();
+        if !limits.none() && addr >= self.brk.start {
+            let l = self.layout();
+            let used = (addr - l.start_brk).saturating_add(l.end_data - l.start_data);
+            let grows = self.page_up(addr).saturating_sub(self.page_up(self.brk.current));
+            if limits.data != fwe_abi::resource::RLIM_INFINITY && used > limits.data
+                || !self.may_expand(grows, true, None)
+            {
+                return self.brk.current as i64;
+            }
+        }
         let r = self.brk_call(addr);
         let b = self.brk;
         crate::maps::record().set_heap(b.start, self.page_up(b.current), b.limit);
@@ -1429,6 +1442,53 @@ impl<P: Platform> Kernel<P> {
             crate::maps::publish();
         }
         r
+    }
+
+    /// Whether `len` more bytes of mappings, `data` if they are data
+    /// ([`crate::maps::Area::data`]), fit the memory limits with
+    /// `[start, end)` (`replaced`) unmapped first, as Linux's
+    /// `may_expand_vm` (`ENOMEM` past them).
+    fn may_expand(&self, len: u64, data: bool, replaced: Option<(u64, u64)>) -> bool {
+        let limits = crate::rlimits::memory();
+        if limits.none() {
+            return true;
+        }
+        let record = crate::maps::record();
+        let (all, data_now) = record.sizes(None);
+        let (gone, _) = replaced.map_or((0, 0), |r| record.sizes(Some(r)));
+        fits(limits, self.page_size, all, data_now, len.saturating_sub(gone), data)
+    }
+
+    /// Whether making `[addr, addr + len)` writable fits `RLIMIT_DATA`: what
+    /// of it becomes data (private, not the stack, not writable yet), as
+    /// Linux's `mprotect_fixup` checks.
+    fn may_become_data(&self, addr: u64, len: u64) -> bool {
+        let limits = crate::rlimits::memory();
+        if limits.data == fwe_abi::resource::RLIM_INFINITY {
+            return true;
+        }
+        let record = crate::maps::record();
+        let (all, data_now) = record.sizes(None);
+        let end = addr.saturating_add(self.page_up(len));
+        let more: u64 = record
+            .areas_in(addr, end)
+            .iter()
+            .filter(|p| {
+                let a = &p.value;
+                !a.data()
+                    && crate::maps::Area { prot: a.prot | mman::PROT_WRITE, ..a.clone() }.data()
+            })
+            .map(|p| p.end - p.start)
+            .sum();
+        more == 0
+            || fits(
+                crate::rlimits::Memory { space: fwe_abi::resource::RLIM_INFINITY, ..limits },
+                self.page_size,
+                all,
+                data_now,
+                more,
+                true,
+            )
     }
 
     /// Whether the caller can map at fixed address `addr`: at or above
@@ -1524,6 +1584,15 @@ impl<P: Platform> Kernel<P> {
             if crate::maps::record().locked_bytes().saturating_add(self.page_up(len)) > soft {
                 return err(errno::EAGAIN);
             }
+        }
+        // Within `RLIMIT_AS` and, for data, `RLIMIT_DATA`.
+        let data = prot & mman::PROT_WRITE != 0
+            && flags & mman::MAP_TYPE == mman::MAP_PRIVATE
+            && flags & mman::MAP_GROWSDOWN == 0;
+        let fixed = flags & mman::MAP_FIXED != 0;
+        let replaced = fixed.then(|| (addr, addr.saturating_add(self.page_up(len))));
+        if !self.may_expand(self.page_up(len), data, replaced) {
+            return err(errno::ENOMEM);
         }
         // Nothing of a mount that runs nothing is mapped to run, then or
         // later.
@@ -1765,6 +1834,11 @@ impl<P: Platform> Kernel<P> {
                 return err(errno::EAGAIN);
             }
         }
+        let replaced =
+            (flags & mman::MAP_FIXED != 0).then(|| (addr, addr.saturating_add(self.page_up(len))));
+        if !self.may_expand(self.page_up(len), false, replaced) {
+            return err(errno::ENOMEM);
+        }
         let r = self.mmap_call(addr, len, prot, flags | mman::MAP_SHARED, fd as u64, 0, false);
         if r < 0 {
             return r;
@@ -1941,6 +2015,37 @@ impl<P: Platform> Kernel<P> {
     }
 
     pub(crate) fn sys_mprotect(&mut self, addr: u64, len: u64, prot: u64) -> i64 {
+        // As Linux checks them: `PROT_GROWSDOWN` takes the range down to
+        // the start of the grows-down mapping it is in, `PROT_GROWSUP`
+        // finds no grows-up mapping on arm64, and the other bits are those
+        // the CPU offers.
+        let grows = prot & (mman::PROT_GROWSDOWN | mman::PROT_GROWSUP);
+        let prot = prot & !grows;
+        let supported = mman::PROT_READ
+            | mman::PROT_WRITE
+            | mman::PROT_EXEC
+            | mman::PROT_SEM
+            | self.platform.cpu_prot();
+        if grows == mman::PROT_GROWSDOWN | mman::PROT_GROWSUP
+            || grows == mman::PROT_GROWSUP
+            || prot & !supported != 0
+        {
+            return err(errno::EINVAL);
+        }
+        let (addr, len) = if grows == mman::PROT_GROWSDOWN {
+            let end = addr.saturating_add(self.page_up(len));
+            let start = lock_ranges()
+                .grows_down
+                .range(..=addr)
+                .next_back()
+                .and_then(|(&s, &e)| (e > addr).then_some(s));
+            match start {
+                Some(s) => (s, end - s),
+                None => return err(errno::EINVAL),
+            }
+        } else {
+            (addr, len)
+        };
         if self.sealed(addr, len) {
             return err(errno::EPERM);
         }
@@ -1949,6 +2054,9 @@ impl<P: Platform> Kernel<P> {
                 && crate::maps::record().any_nowrite(addr, self.page_up(len))
         {
             return err(errno::EACCES);
+        }
+        if prot & mman::PROT_WRITE != 0 && !self.may_become_data(addr, len) {
+            return err(errno::ENOMEM);
         }
         let r = self.mprotect_call(addr, len, prot);
         if r == 0 {
@@ -1997,7 +2105,23 @@ impl<P: Platform> Kernel<P> {
         {
             return err(errno::EPERM);
         }
-        let kept = if flags & mman::MREMAP_DONTUNMAP != 0 {
+        // What it grows by (and with `MREMAP_DONTUNMAP`, the old range
+        // kept), within the memory limits, as the mapping it extends.
+        let dont_unmap = flags & mman::MREMAP_DONTUNMAP != 0;
+        let more = self.page_up(new_len).saturating_sub(self.page_up(old_len))
+            + if dont_unmap { self.page_up(old_len) } else { 0 };
+        if more > 0 {
+            let data = crate::maps::record()
+                .areas_in(old, old + 1)
+                .first()
+                .is_some_and(|p| p.value.data());
+            let replaced = (flags & mman::MREMAP_FIXED != 0)
+                .then(|| (new_addr, new_addr.saturating_add(self.page_up(new_len))));
+            if !self.may_expand(more, data, replaced) {
+                return err(errno::ENOMEM);
+            }
+        }
+        let kept = if dont_unmap {
             crate::maps::record().areas_in(old, old + self.page_up(old_len))
         } else {
             Vec::new()
@@ -2024,6 +2148,10 @@ impl<P: Platform> Kernel<P> {
         }
         if r >= 0 {
             crate::maps::publish();
+            // What was there moved (or the old range was emptied).
+            if r as u64 != old {
+                self.platform.code_gone(crate::uaccess::g2h(old), self.page_up(old_len));
+            }
             // Code a JIT moved: translated anew from where it is now.
             if self.platform.translates_jit() {
                 let moved =
@@ -2248,6 +2376,28 @@ fn wire(start: u64, len: u64, on: bool) -> bool {
 /// size's log2; 0 for the default) names a huge page size arm64 with 4K
 /// pages has: 64K, 2M (the default), 32M or 1G (Linux's
 /// `hstate_sizelog`).
+/// Whether a process with `all` bytes mapped, `data` of them data, can map
+/// `more`, data if `is_data`, within `limits`, counted in pages of
+/// `page` bytes, as Linux's `may_expand_vm`: a soft `RLIMIT_DATA` of 0
+/// lets data up to the hard limit through, as Linux lets Valgrind's.
+fn fits(
+    limits: crate::rlimits::Memory,
+    page: u64,
+    all: u64,
+    data: u64,
+    more: u64,
+    is_data: bool,
+) -> bool {
+    let pages = |b: u64| b / page;
+    if pages(all.saturating_add(more)) > pages(limits.space) {
+        return false;
+    }
+    let data_after = pages(data.saturating_add(more));
+    !is_data
+        || data_after <= pages(limits.data)
+        || limits.data == 0 && data_after <= pages(limits.data_hard)
+}
+
 pub fn huge_page_size_known(log: u64) -> bool {
     matches!(log & 0x3f, 0 | 16 | 21 | 25 | 30)
 }
@@ -2469,6 +2619,7 @@ impl<P: Platform> Kernel<P> {
             // sets its own).
             self.platform.unmap_guest(addr, self.page_up(len));
             let _ = self.platform.jit_changed(haddr, self.page_up(len));
+            self.platform.code_gone(haddr, self.page_up(len));
         }
         let mut retried = false;
         let guest = 'map: loop {
@@ -2649,6 +2800,7 @@ impl<P: Platform> Kernel<P> {
     /// ([`Platform::release_host`]). Returns 0 or a negated Linux errno.
     fn unmap_host(&mut self, addr: u64, len: u64) -> i64 {
         let _ = self.platform.jit_changed(addr, self.page_up(len));
+        self.platform.code_gone(addr, self.page_up(len));
         crate::lazycode::unmapped(addr, self.page_up(len));
         if self.platform.release_host(addr, self.page_up(len)) {
             return 0;
@@ -2743,11 +2895,19 @@ impl<P: Platform> Kernel<P> {
             }
         }
         // Code a JIT makes executable runs by translation where the backend
-        // translates it: never executable on the host, nothing written.
+        // translates it: never executable on the host, nothing written. Not
+        // code executable already and unwritten since, made executable
+        // again (glibc's dynamic linker adds `PROT_BTI` to every object
+        // built for it so): it runs as it did, as prepared.
+        let unchanged = prot & (mman::PROT_EXEC | mman::PROT_WRITE) == mman::PROT_EXEC
+            && crate::maps::record().all_code(addr, self.page_up(len));
         let translated = self.platform.translates_jit();
-        if translated {
-            let _ = self.platform.jit_changed(a as u64, self.page_up(len));
-        }
+        let translated = if translated {
+            let held = self.platform.jit_changed(a as u64, self.page_up(len));
+            held || !unchanged
+        } else {
+            false
+        };
         // (Readable: fwe reads the code to translate it.)
         let host = if translated && prot & mman::PROT_EXEC != 0 {
             (final_prot(prot) & !libc::PROT_EXEC) | libc::PROT_READ
@@ -2804,6 +2964,12 @@ impl<P: Platform> Kernel<P> {
         let gap = GAP_PAGES * page;
         let below = crate::maps::record().areas_in(new_start.saturating_sub(gap), new_start);
         if !below.is_empty() || any_mapped(new_start, start - new_start) {
+            return false;
+        }
+        // Within `RLIMIT_STACK` and `RLIMIT_AS`, as Linux's
+        // `acct_stack_growth`.
+        let (stack, _) = crate::rlimits::get(fwe_abi::resource::RLIMIT_STACK);
+        if end - new_start > stack || !self.may_expand(start - new_start, false, None) {
             return false;
         }
         let area = crate::maps::record().areas_in(start, start + page);
@@ -3573,4 +3739,31 @@ fn region_file(addr: u64) -> Option<Vec<u8>> {
 #[cfg(not(target_os = "macos"))]
 fn region_file(_addr: u64) -> Option<Vec<u8>> {
     None
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::fits;
+    use crate::rlimits::Memory;
+
+    const INF: u64 = fwe_abi::resource::RLIM_INFINITY;
+
+    /// `RLIMIT_AS` bounds every mapping, `RLIMIT_DATA` data alone, both in
+    /// whole pages; a soft data limit of 0 lets data up to the hard one.
+    #[test]
+    fn mappings_fit_the_memory_limits_as_linux_counts_them() {
+        let page = 0x4000;
+        let space = Memory { space: 10 * page, data: INF, data_hard: INF };
+        assert!(fits(space, page, 8 * page, 0, 2 * page, false));
+        assert!(!fits(space, page, 8 * page, 0, 3 * page, false));
+        // A limit not of whole pages counts the pages within it.
+        assert!(!fits(Memory { space: 10 * page + 1, ..space }, page, 10 * page, 0, page, false));
+        let data = Memory { space: INF, data: 4 * page, data_hard: 8 * page };
+        assert!(fits(data, page, 100 * page, 2 * page, 2 * page, true));
+        assert!(!fits(data, page, 100 * page, 2 * page, 3 * page, true));
+        assert!(fits(data, page, 100 * page, 2 * page, 30 * page, false));
+        let valgrind = Memory { data: 0, ..data };
+        assert!(fits(valgrind, page, 0, 0, 8 * page, true));
+        assert!(!fits(valgrind, page, 0, 0, 9 * page, true));
+    }
 }

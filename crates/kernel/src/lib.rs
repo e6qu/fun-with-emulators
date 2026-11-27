@@ -19,6 +19,8 @@
 
 pub mod acct;
 pub mod aio;
+#[cfg(test)]
+mod alone;
 pub mod anonfd;
 pub mod atime;
 pub mod bpf;
@@ -44,6 +46,7 @@ pub mod filestore;
 mod forklock;
 pub mod fs;
 mod fsops;
+pub mod fsshare;
 pub mod futex;
 mod handles;
 pub mod host;
@@ -101,6 +104,7 @@ pub mod pty;
 pub mod reaper;
 pub mod reclocks;
 pub mod rlimits;
+pub mod routes;
 mod sched;
 #[cfg(not(target_os = "linux"))]
 pub mod scm;
@@ -117,6 +121,7 @@ pub mod snapshot;
 #[cfg(target_os = "macos")]
 pub mod socketowners;
 pub mod sockopt;
+mod sockstate;
 pub mod specialfd;
 pub mod specialwrite;
 pub mod splice;
@@ -124,8 +129,10 @@ pub mod storenodes;
 mod storeops;
 pub mod synthdir;
 mod syscalls;
+pub mod syscpu;
 pub mod sysctl;
 pub mod sysvipc;
+mod tcpmcast;
 pub mod term;
 pub mod textbusy;
 pub mod thread;
@@ -149,6 +156,21 @@ pub use trace::Tracer;
 
 use fwe_abi::{Sigaction, Stack, signal as absig};
 use std::os::fd::AsRawFd;
+
+/// Where a guest's system call was made: the address of its `svc`, where
+/// [`Regs::pc`] points while fwe handles the call. Linux reports the
+/// address after it (the exception's return address) to seccomp filters,
+/// in a `SIGSYS`'s `si_call_addr` and in the handler's context alike, so
+/// that is the one address this gives.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SvcSite(pub u64);
+
+impl SvcSite {
+    /// The address Linux reports for the call: the one after the `svc`.
+    pub fn reported(self) -> u64 {
+        self.0.wrapping_add(4)
+    }
+}
 
 /// The guest's register file, as the backend exposes it to the kernel for one
 /// trap. `x[30]` is the link register; `pstate` is the condition/execution
@@ -248,6 +270,17 @@ pub trait Platform {
     fn jit_changed(&mut self, _addr: u64, _len: u64) -> bool {
         false
     }
+
+    /// The protection bits beyond read, write, execute and `PROT_SEM` that
+    /// the CPU the guest is given offers (arm64 Linux's
+    /// `arch_validate_prot`): `PROT_BTI` where `AT_HWCAP2` reports BTI.
+    fn cpu_prot(&self) -> u64 {
+        0
+    }
+
+    /// `[addr, addr + len)` (host addresses) is unmapped, or mapped anew:
+    /// what the backend knows of code it prepared there goes with it.
+    fn code_gone(&mut self, _addr: u64, _len: u64) {}
 
     /// `[addr, addr + len)` (host addresses) was just mapped or given
     /// other protections, and the record of mappings says so: a mapping
@@ -429,6 +462,7 @@ impl<P: Platform> Kernel<P> {
         e.bool(self.tracer.failures_only);
         e.bytes(trace::file().unwrap_or_default());
         fdmarks::save(e);
+        sockstate::save(e);
         netlink::save(e, false);
         mountapi::save(e);
         inotify::save(e);
@@ -448,6 +482,7 @@ impl<P: Platform> Kernel<P> {
             }
             None => e.bool(false),
         }
+        fsshare::save_for_fork(e);
         let c = &self.creds;
         for v in [c.uid, c.euid, c.suid, c.fsuid, c.gid, c.egid, c.sgid, c.fsgid] {
             e.u32(v);
@@ -509,6 +544,7 @@ impl<P: Platform> Kernel<P> {
         trace::traces(tracer);
         let trace_file = d.bytes();
         fdmarks::load(d);
+        sockstate::load(d);
         netlink::load(d);
         mountapi::load(d);
         inotify::load(d);
@@ -522,6 +558,7 @@ impl<P: Platform> Kernel<P> {
         coredump::set_dumpable(d.u8());
         rlimits::load(d);
         let fs = if d.bool() { Some(Fs::restore(d)) } else { None };
+        fsshare::load_for_fork(d);
         let mut k = Kernel::new(platform, page_size, brk, fs, tracer);
         let c = &mut k.creds;
         for v in [
@@ -562,7 +599,7 @@ impl<P: Platform> Kernel<P> {
             // (above the guest's descriptors, now placed).
             let _ = trace::to_file(&trace_file);
         }
-        specialfd::restore(d);
+        specialfd::restore(d, snapshot::Restoring::NewProcess);
         signalfd::restore(d);
         synthdir::restore(d);
         procfile::restore(d);
@@ -602,7 +639,7 @@ impl<P: Platform> Kernel<P> {
 
     /// Run system call `nr` with `args` and return its raw result, without
     /// tracing it or touching registers: for a backend that records the
-    /// result itself with [`Kernel::finish_syscall`].
+    /// result itself with [`Kernel::complete_syscall`].
     pub fn run_call(&mut self, nr: u64, args: [u64; 6]) -> i64 {
         let result = self.dispatch(nr, args);
         self.note_creds();
@@ -646,6 +683,8 @@ impl<P: Platform> Kernel<P> {
         thread::set_altstack(Stack { ss_flags: absig::SS_DISABLE, ..Stack::default() });
         thread::set_clear_child_tid(0);
         thread::set_robust_list(0, 0);
+        // Named as the program's file is, from now on.
+        thread::set_name_of(thread::tid(), None);
         acct::exec();
         aio::forget_all();
         // A set-ID program's owner and group, then the saved IDs the
@@ -955,6 +994,10 @@ impl<P: Platform> Kernel<P> {
     /// will happen, it also does what closing the message queues'
     /// close-on-exec descriptors does ([`mqueue::exec_closing`]).
     pub fn exec_state(&self) -> Vec<u8> {
+        // What it sent with its messages, for receivers yet to read them:
+        // the bundles it holds close with the exec.
+        #[cfg(not(target_os = "linux"))]
+        scm::settle_pending();
         let mut e = snapshot::Enc::new();
         e.u64(EXEC_STATE_MAGIC);
         // First, for the new process to size the program's stack by before
@@ -987,6 +1030,7 @@ impl<P: Platform> Kernel<P> {
         // Which mount each open file came through (a record whose
         // descriptor does not survive is never trusted, see `fdmarks`).
         fdmarks::save(&mut e);
+        sockstate::save(&mut e);
         // The netlink sockets' host ends, which survive the host exec.
         netlink::save(&mut e, true);
         mountapi::save(&mut e);
@@ -996,8 +1040,13 @@ impl<P: Platform> Kernel<P> {
         nsfd::save(&mut e);
         mqueue::save(&mut e);
         filestore::desc::save(&mut e);
-        // Process descriptors, which the host exec closes (kqueues).
+        // Process descriptors, eventfds, timerfds, signalfds and epoll
+        // sets, which the host exec closes (kqueues) or fwe alone knows;
+        // the others before the sets that might watch them.
         pidfd::save(&mut e);
+        specialfd::save_exec(&mut e);
+        signalfd::save_exec(&mut e);
+        epoll::save_exec(&mut e);
         // The parent-death signal, whose watch the exec ends.
         pdeath::save(&mut e);
         // The message queues' descriptors the exec closes: their
@@ -1024,6 +1073,9 @@ impl<P: Platform> Kernel<P> {
         landlock::save(&mut e);
         // Its foster children, still its own to follow.
         e.bool(reaper::fostering());
+        // The root, working directory and umask it shares with other
+        // processes (`CLONE_FS`), shared still.
+        fsshare::save(&mut e);
         e.into_bytes()
     }
 
@@ -1041,6 +1093,7 @@ impl<P: Platform> Kernel<P> {
         let umask = d.u32();
         rlimits::load(&mut d);
         fdmarks::load(&mut d);
+        sockstate::load(&mut d);
         netlink::load(&mut d);
         mountapi::load(&mut d);
         inotify::load(&mut d);
@@ -1049,6 +1102,9 @@ impl<P: Platform> Kernel<P> {
         mqueue::load(&mut d);
         filestore::desc::load(&mut d);
         pidfd::restore(&mut d, true);
+        specialfd::restore(&mut d, snapshot::Restoring::NewProcess);
+        signalfd::restore(&mut d);
+        epoll::restore(&mut d);
         pdeath::restore(&mut d);
         seccomp::load_state(&mut d);
         let nnp = d.bool();
@@ -1058,6 +1114,7 @@ impl<P: Platform> Kernel<P> {
         let ptracer = d.i32();
         landlock::load(&mut d);
         let fostering = d.bool();
+        fsshare::load(&mut d);
         d.finish()?;
         reaper::set_fostering(fostering);
         ptrace::restore(tracer, syscalls);
@@ -1121,10 +1178,10 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Run the system call named in `regs` (number in `x8`, arguments in
-    /// `x0`–`x5`), store its result and advance past the trap, then deliver a
-    /// pending signal if one is ready. `rt_sigreturn` restores `regs` from the
-    /// signal frame instead.
-    pub fn enter_syscall(&mut self, regs: &mut Regs) {
+    /// `x0`–`x5`), store its result and advance past the trap; the caller
+    /// delivers what is pending ([`klock::KernelLock::deliver_pending`]).
+    /// `rt_sigreturn` restores `regs` from the signal frame instead.
+    pub fn run_syscall(&mut self, regs: &mut Regs) {
         if regs.x[8] == fwe_abi::nr::RT_SIGRETURN {
             if !self.sys_rt_sigreturn(regs) {
                 // A frame the guest cannot read back: Linux kills it.
@@ -1139,25 +1196,27 @@ impl<P: Platform> Kernel<P> {
         let nr = regs.x[8];
         let result = self.dispatch(nr, args);
         self.note_creds();
-        self.finish_syscall(regs, nr, &args, result);
+        self.complete_syscall(regs, nr, &args, result);
     }
 
     /// Record the result of a system call for `--strace`, then store it into
-    /// `regs` and advance past the trap, and deliver a pending signal. Used
-    /// directly by the backend for the system calls it runs outside the
-    /// kernel lock (the blocking ones and `clone`).
+    /// `regs` and advance past the trap; the caller delivers what is pending
+    /// ([`klock::KernelLock::deliver_pending`]). Used directly by the
+    /// backend for the system calls it runs outside the kernel lock (the
+    /// blocking ones and `clone`).
     ///
     /// A call the host interrupted (`EINTR`) is handled as Linux does: if no
     /// guest handler is about to run, the signal that interrupted it was one
     /// the guest does not see (blocked for a `signalfd`, or ignored), so the
     /// call runs again; if the handler has `SA_RESTART` and the call is one
-    /// Linux restarts, it runs again after the handler returns; otherwise the
-    /// guest gets `EINTR` once the handler returns.
+    /// Linux restarts, or the call is one Linux restarts after any handler
+    /// ([`signal::restarts_always`]), it runs again after the handler
+    /// returns; otherwise the guest gets `EINTR` once the handler returns.
     #[cfg_attr(
         target_os = "macos",
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
-    pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
+    pub fn complete_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
         self.tracer.syscall(nr, args, result);
         // (`restart_syscall`'s own `EINTR` is its answer, not a host's.)
         if result == fwe_abi::err(fwe_abi::errno::EINTR) && nr != fwe_abi::nr::RESTART_SYSCALL {
@@ -1166,17 +1225,32 @@ impl<P: Platform> Kernel<P> {
                 None => true,
                 Some(action) => {
                     action.flags & absig::SA_RESTART != 0 && signal::restartable(nr, args)
+                        || signal::restarts_always(nr, args)
                 }
             };
             if rerun {
                 // Leave pc on the trap and x0 holding the first argument, so
                 // the call is made again (after any handler returns).
-                self.deliver_pending(regs);
                 return;
             }
         }
         regs.x[0] = result as u64;
         regs.pc = regs.pc.wrapping_add(4);
+    }
+
+    /// [`Kernel::run_syscall`], then what is pending delivered holding the
+    /// kernel: the unit tests', which have no lock.
+    #[cfg(test)]
+    pub fn enter_syscall(&mut self, regs: &mut Regs) {
+        self.run_syscall(regs);
+        self.deliver_pending(regs);
+    }
+
+    /// [`Kernel::complete_syscall`], then what is pending delivered holding
+    /// the kernel: the unit tests', which have no lock.
+    #[cfg(test)]
+    pub fn finish_syscall(&mut self, regs: &mut Regs, nr: u64, args: &[u64; 6], result: i64) {
+        self.complete_syscall(regs, nr, args, result);
         self.deliver_pending(regs);
     }
 
@@ -1565,7 +1639,7 @@ pub fn kqueue_state() -> Vec<u8> {
 /// recorded.
 pub fn restore_kqueues(state: &[u8]) {
     let mut d = snapshot::Dec::new(state);
-    specialfd::restore(&mut d);
+    specialfd::restore(&mut d, snapshot::Restoring::SameMemory);
     epoll::restore(&mut d);
     pidfd::restore(&mut d, false);
 }
@@ -1584,7 +1658,7 @@ pub fn wake_futex(addr: u64, count: u32) {
 /// `splice`, `tee`, `vmsplice`, `copy_file_range`): a pipe, socket or
 /// terminal blocks until the other side acts, and the other side can be a
 /// guest thread that needs the lock. Returns `None` for any other call,
-/// which the backend runs under the lock through [`Kernel::enter_syscall`].
+/// which the backend runs under the lock through [`Kernel::run_syscall`].
 ///
 /// # Safety
 /// Pointer arguments MUST reference valid guest memory for the call.
@@ -1599,6 +1673,12 @@ pub unsafe fn blocking_syscall(nr: u64, a: [u64; 6]) -> Option<i64> {
         return None;
     }
     let _call = fdmarks::Call::begin();
+    // A root or working directory another process sharing them changed.
+    if fsshare::active()
+        && let Some(v) = fsshare::take_published()
+    {
+        fs::republish_shared(&v);
+    }
     // What other processes can look at, current before this one waits.
     maps::flush_before(nr);
     let noted = atime::before(nr, &a);
@@ -1640,6 +1720,19 @@ pub(crate) fn linux_result(nr: u64, a: &[u64; 6], r: i64) -> i64 {
     inotify::after_io(nr, a, r);
     if r > 0 && matches!(nr, fwe_abi::nr::WRITE | fwe_abi::nr::WRITEV) {
         exclusive::wrote(a[0] as i32);
+    }
+    // What a pipe's reader took (a splice or vmsplice out of one too).
+    if r > 0
+        && matches!(
+            nr,
+            fwe_abi::nr::READ
+                | fwe_abi::nr::READV
+                | fwe_abi::nr::PREADV2
+                | fwe_abi::nr::SPLICE
+                | fwe_abi::nr::VMSPLICE
+        )
+    {
+        epoll::read_from(a[0] as i32, r as u64);
     }
     let r = fdmarks::linux_result(nr, a, r);
     let r = net::linux_read_error(nr, a[0] as i32, r);
@@ -1968,7 +2061,8 @@ fn vectored_at(
         Ok(v) => v,
         Err(e) => return err(e),
     };
-    if flags & !(rwf::HIPRI | rwf::DSYNC | rwf::SYNC | rwf::NOWAIT | rwf::APPEND) != 0
+    if flags & !(rwf::HIPRI | rwf::DSYNC | rwf::SYNC | rwf::NOWAIT | rwf::APPEND | rwf::NOAPPEND)
+        != 0
         || (flags & rwf::APPEND != 0 && !write)
     {
         return err(errno::EOPNOTSUPP);
@@ -1991,12 +2085,26 @@ fn vectored_at(
             return err(errno::EAGAIN);
         }
     }
-    let appends = write && status & libc::O_APPEND != 0 && kind == libc::S_IFREG;
-    let n = iov.len() as i32;
     // Linux appends to a file opened to append whatever the offset, as
-    // its `pwrite` does.
+    // its `pwrite` does, unless the call says `RWF_NOAPPEND` (`RWF_APPEND`
+    // wins over it).
+    let opened_to_append = status & libc::O_APPEND != 0;
+    let appends = write && opened_to_append && kind == libc::S_IFREG && flags & rwf::NOAPPEND == 0;
+    let n = iov.len() as i32;
     let r = if flags & rwf::APPEND != 0 || appends {
         append_vectored(fd, &iov, offset)
+    } else if write && opened_to_append && offset == -1 {
+        // At the file's position, which the host's `O_APPEND` would pass
+        // over: written there, and the position moved past it.
+        // SAFETY: plain host calls; the iovecs are checked host buffers.
+        unsafe {
+            let at = libc::lseek(fd, 0, libc::SEEK_CUR);
+            let r = if at < 0 { -1 } else { libc::pwritev(fd, iov.as_ptr(), n, at) };
+            if r > 0 {
+                libc::lseek(fd, at + r as libc::off_t, libc::SEEK_SET);
+            }
+            r
+        }
     } else if offset == -1 {
         // SAFETY: the iovecs are checked host buffers.
         unsafe {
@@ -2300,6 +2408,14 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
                     Err(e) => fwe_abi::err(e),
                 });
             }
+            // A Unix socket whose peer asked for the sender's credentials,
+            // which the host does not attach ([`net::writes_creds`]).
+            if net::writes_creds(fd) {
+                return Some(match uaccess::host_buffer(buf, len, false) {
+                    Ok(v) => net::write_with_creds(fd, &[v]),
+                    Err(e) => fwe_abi::err(e),
+                });
+            }
             if seqpacket::is(fd) {
                 return Some(match uaccess::host_buffer(buf, len, false) {
                     Ok(v) => seqpacket::write(fd, &[v]),
@@ -2362,6 +2478,7 @@ pub(crate) unsafe fn blocking_call(nr: u64, a: [u64; 6]) -> Option<i64> {
             Err(e) => fwe_abi::err(e),
         },
         n::WRITEV => match uaccess::host_iovecs(a[1], a[2], false) {
+            Ok(iov) if net::writes_creds(a[0] as i32) => net::write_with_creds(a[0] as i32, &iov),
             Ok(iov) if seqpacket::is(a[0] as i32) => seqpacket::write(a[0] as i32, &iov),
             Ok(iov) if iov.is_empty() => no_buffers(a[0] as i32, true),
             Ok(iov) => {

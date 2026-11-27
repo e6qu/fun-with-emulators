@@ -1,15 +1,16 @@
 # arm64 assembly
 
-The arm64 (AArch64) instruction set as far as fwe's work needs it:
-registers, how instructions are encoded, exception levels, the
-procedure call standard, branches, loads, stores and atomics, the
+This document is background, not fwe: the arm64 (AArch64) instruction
+set as far as fwe's work needs it. It covers registers, how instructions
+are encoded, exception levels, the procedure call standard and how
+Linux's and Apple's differ, branches, loads, stores and atomics, the
 memory model and its barriers, system registers, and pointer
-authentication and branch targets. It is background, not fwe, as
-[linking.md](linking.md) is: how code reaches addresses and which
-registers each platform reserves are there; what fwe does with each
-instruction is in [linux-on-macos.md](linux-on-macos.md#which-instructions-get-translated-and-how)
-and, for code made at run time, in [jit.md](jit.md). The encodings
-below are what `clang` assembles and `llvm-objdump -d` prints.
+authentication and branch targets. How code reaches addresses, and
+thread-local storage, are in [linking.md](linking.md); what fwe does with
+each instruction is in
+[linux-on-macos.md](linux-on-macos.md#which-instructions-get-translated-and-how)
+and, for code made at run time, in [jit.md](jit.md). The encodings below
+are what `clang` assembles and `llvm-objdump -d` prints.
 
 ## Registers
 
@@ -91,9 +92,8 @@ which is why Linux and macOS differ on a few of them.
 
 Under Linux and macOS alike, programs run at EL0 and the kernel at EL1.
 A Hypervisor.framework VM has an EL1 and EL0 of its own under macOS's
-kernel; fwe's runs the guest program at EL0 and only a page of fwe's
-code at EL1
-([linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used)).
+kernel; how fwe's VM uses them is in
+[linux-on-macos.md](linux-on-macos.md#how-the-vm-is-actually-used).
 
 ## The procedure call standard
 
@@ -106,7 +106,7 @@ is what compiled functions agree on:
 | `x8` | the address of a structure result (and, on Linux, a system call's number) |
 | `x9`–`x15` | temporaries: the caller saves them if it needs them |
 | `x16`, `x17` (`ip0`, `ip1`) | intra-procedure-call scratch: a linker's veneer or PLT stub can change them between a call and its target |
-| `x18` | the platform register ([linking.md](linking.md#registers-the-platform-reserves)) |
+| `x18` | the platform register ([below](#x18-the-platform-register)) |
 | `x19`–`x28` | kept by the callee |
 | `x29`, `x30` | frame pointer and link register, saved by a function that calls others |
 | `sp` | 16-byte aligned at every call; Linux has no red zone below it |
@@ -132,9 +132,9 @@ keeps other temporaries live across the call.
 
 Linux follows AAPCS64 as Arm publishes it. Apple's platforms follow it
 with changes of their own (Apple's *Writing ARM64 code for Apple
-platforms*), and the C types differ too. Code built for one is not
-callable from the other without care, which is one reason fwe never
-lets Linux code call macOS libraries directly:
+platforms*), and the C types differ too, so code built for one is not
+callable from the other without care: a call between them would pass
+variadic arguments, small integers and `long double` differently.
 
 | | Linux (AAPCS64) | macOS (Apple arm64) |
 |---|---|---|
@@ -148,31 +148,33 @@ lets Linux code call macOS libraries directly:
 | `char` | unsigned | signed |
 | `long double` | 128-bit IEEE quadruple precision, in software | the same as `double` |
 | `wchar_t` | 32-bit, unsigned | 32-bit, signed |
-| Symbol names | as written (`main`) | with a leading underscore (`_main`) |
 | Thread pointer | `TPIDR_EL0`, the program's | `TPIDRRO_EL0`, the kernel's; `TPIDR_EL0` not kept |
-| Thread-local storage | at offsets from the thread pointer (or through TLS descriptors) | through a descriptor, by a call (`tlv_get_addr`) |
-| Pointer authentication | return addresses signed where built for it (`-mbranch-protection`) | throughout Apple's own `arm64e` binaries; third-party code is plain `arm64` |
+| Pointer authentication | return addresses signed where built for it (`-mbranch-protection`) | throughout Apple's own `arm64e` binaries (return addresses, function pointers, GOT slots); third-party code is plain `arm64` |
 | System calls | `svc #0`, number in `x8`, error as `-errno` in `x0` | `svc #0x80`, number in `x16`, error as the carry flag and `errno` in `x0` |
 | A signal handler's frame | Linux's `ucontext_t`, with `sigcontext` and its records (FP and SIMD, ESR) | macOS's `ucontext_t`, pointing to a separate `mcontext` |
 
-Where these meet fwe:
+Symbol names and thread-local storage are compared in linking.md
+([File formats](linking.md#file-formats-elf-and-mach-o),
+[Thread-local storage](linking.md#thread-local-storage)). What fwe
+does with these differences is in linux-on-macos.md:
+[`x18` and the thread pointer](linux-on-macos.md#registers-and-the-thread-pointer),
+[stubs that keep registers in TSD slots, not below `sp`](linux-on-macos.md#x18-a-stub-per-use)
+(Linux's lack of a red zone lets only a signal frame write there),
+[system calls](linux-on-macos.md#system-call-entry) and
+[signal frames](linux-on-macos.md#dispositions-masks-and-frames). A
+Linux program under fwe calls only Linux code (its own libraries,
+inside its root), never a macOS library.
 
-- **`x18` and the thread pointer** are why guest code is rewritten
-  natively ([linux-on-macos.md](linux-on-macos.md#registers-and-the-thread-pointer)).
-- **No red zone** on Linux is what lets fwe's stubs save registers just
-  below a Linux program's `sp`: the program keeps nothing there. A
-  signal arriving in a stub would write its frame there too, so it is
-  delivered as if at the stub's site, the registers it saved taken back
-  ([linux-on-macos.md](linux-on-macos.md#x18-a-stub-per-use)).
-- **System calls and signal frames** are fwe's to convert
-  ([linux-on-macos.md](linux-on-macos.md#system-call-entry),
-  [Dispositions, masks and frames](linux-on-macos.md#dispositions-masks-and-frames)).
-- **The argument rules and types** keep a Linux program and a macOS
-  library apart: a call between them would pass variadic arguments,
-  small integers and `long double` differently. A Linux program only
-  ever calls Linux code: its own libraries, inside its root.
-- **Linking and thread-local storage** are compared in
-  [linking.md](linking.md#thread-local-storage).
+### x18, the platform register
+
+The procedure call standard leaves `x18` to the platform:
+
+- **Linux** treats `x18` as an ordinary temporary register. Most
+  toolchains avoid it anyway, but hand-written code and some compilers'
+  output use it, and Windows code (under Wine) keeps its thread block
+  there.
+- **macOS** reserves `x18`: the kernel can change it at any time, so
+  macOS code never uses it.
 
 ## Branches and reach
 

@@ -150,7 +150,10 @@ static const struct fwe_vk_entry *find(const char *name) {
 }
 
 FWE_EXPORT fwe_vk_fn vk_icdGetInstanceProcAddr(void *instance, const char *name);
-FWE_EXPORT fwe_vk_fn vkGetDeviceProcAddr(void *device, const char *name);
+/* The driver's vkGetDeviceProcAddr, found only by name: exported, a
+ * program's own (the loader's, when a program links it) would stand in
+ * its place. */
+static fwe_vk_fn get_device_proc_addr(void *device, const char *name);
 
 FWE_EXPORT int32_t vk_icdNegotiateLoaderICDInterfaceVersion(uint32_t *version) {
     /* 5: physical devices are the driver's own handles, and the loader
@@ -183,15 +186,15 @@ FWE_EXPORT fwe_vk_fn vk_icdGetInstanceProcAddr(void *instance, const char *name)
         return (fwe_vk_fn)vk_icdNegotiateLoaderICDInterfaceVersion;
     if (!compare(name, "vk_icdGetPhysicalDeviceProcAddr"))
         return (fwe_vk_fn)vk_icdGetPhysicalDeviceProcAddr;
-    if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)vkGetDeviceProcAddr;
+    if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)get_device_proc_addr;
     const struct fwe_vk_entry *e = find(name);
     if (!e) return instance ? fwe_wsi_instance_proc(name) : 0;
     if (!instance || e->level == FWE_VK_GLOBAL) return e->level == FWE_VK_GLOBAL ? given(e, 0) : 0;
     return given(e, instance);
 }
 
-FWE_EXPORT fwe_vk_fn vkGetDeviceProcAddr(void *device, const char *name) {
-    if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)vkGetDeviceProcAddr;
+static fwe_vk_fn get_device_proc_addr(void *device, const char *name) {
+    if (!compare(name, "vkGetDeviceProcAddr")) return (fwe_vk_fn)get_device_proc_addr;
     const struct fwe_vk_entry *e = find(name);
     if (!e || e->level != FWE_VK_DEVICE) return 0;
     return given(e, device);

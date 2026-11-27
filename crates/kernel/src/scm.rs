@@ -26,6 +26,18 @@
 //! manifest's magic number, takes what it describes, and closes it, so the
 //! guest never sees it. The manifest also carries credentials the sender
 //! gave with `SCM_CREDENTIALS`.
+//!
+//! macOS collects sockets in flight that it finds no process can reach,
+//! and empties them (their data and the descriptors queued in them): it
+//! looks for references only in sockets that are in flight themselves, so
+//! a socket whose sender closed it, passed to a socket that is not in
+//! flight, is emptied by any collection that runs before the receiver
+//! takes it (one runs whenever a Unix socket goes away). Linux collects
+//! only cycles no process can reach. So a message that passes sockets
+//! gets a bundle that holds them too (*keeps*), and the sender holds the
+//! bundle until its receiver has read it ([`PENDING`]): reachable through
+//! it, the sockets are left alone. The receiver closes the keeps as it
+//! takes the message, so no reference outlives it.
 
 use crate::snapshot::{Dec, Enc};
 use fwe_abi::errno;
@@ -39,7 +51,7 @@ const UCRED: usize = 12;
 /// fwe's or a program's is given).
 const BUNDLE_MARK: libc::c_int = 196_613;
 /// The manifest's first word.
-const MAGIC: u64 = 0x6677_655f_7363_6d31;
+const MAGIC: u64 = 0x6677_655f_7363_6d32;
 /// Descriptors per datagram of companions in the bundle.
 const CHUNK: usize = 200;
 
@@ -180,6 +192,103 @@ impl Drop for Prepared {
 /// its receiver has read it (or the sender ends).
 pub(crate) static PENDING: std::sync::Mutex<Vec<i32>> = std::sync::Mutex::new(Vec::new());
 
+/// The manifests of bundles whose senders ended, or changed program,
+/// before their receivers read them ([`settle_pending`]): each by its
+/// bundle's host identity, with when it was kept (a count), for the
+/// receiver to take ([`take_settled`]). The host collects a bundle held
+/// only in flight, emptying it, once its sender no longer holds it.
+#[derive(Clone, Default)]
+pub struct Settled {
+    by_id: std::collections::BTreeMap<u64, (u64, Vec<u8>)>,
+    count: u64,
+}
+
+/// How many manifests [`Settled`] keeps: the oldest goes for a new one
+/// past these (a message never read, its bundle gone with it).
+const SETTLED_MOST: usize = 256;
+
+impl crate::shared::Data for Settled {
+    fn encode(&self, e: &mut Enc) {
+        e.u64(self.count);
+        e.u64(self.by_id.len() as u64);
+        for (&id, (at, data)) in &self.by_id {
+            e.u64(id);
+            e.u64(*at);
+            e.bytes(data);
+        }
+    }
+    fn decode(d: &mut Dec) -> Self {
+        let count = d.u64();
+        let n = d.count(24);
+        let by_id = (0..n).map(|_| (d.u64(), (d.u64(), d.bytes()))).collect();
+        Settled { by_id, count }
+    }
+}
+
+fn settled() -> Option<&'static crate::shared::Record<Settled>> {
+    static R: std::sync::OnceLock<Option<crate::shared::Record<Settled>>> =
+        std::sync::OnceLock::new();
+    R.get_or_init(|| crate::shared::Record::named("bundles", 0, Settled::default).ok()).as_ref()
+}
+
+/// This process ends, or changes program: the manifests of the bundles it
+/// sent that their receivers have not read are kept for them
+/// ([`Settled`]), taken out of the bundles (first kept, then taken, so a
+/// receiver reading at once finds one or the other).
+pub fn settle_pending() {
+    let p = PENDING.lock().unwrap_or_else(|e| e.into_inner());
+    for &b in p.iter() {
+        let Some((data, _)) = take_datagram(b, true) else { continue };
+        if !data.starts_with(&MAGIC.to_le_bytes()) {
+            continue;
+        }
+        let (Some(r), Some(id)) = (settled(), crate::net::socket_id(b)) else { continue };
+        let _ = r.update(|s| {
+            s.count += 1;
+            let at = s.count;
+            s.by_id.insert(id, (at, data));
+            while s.by_id.len() > SETTLED_MOST {
+                let oldest = s.by_id.iter().min_by_key(|(_, (at, _))| *at).map(|(&id, _)| id);
+                oldest.map(|id| s.by_id.remove(&id));
+            }
+            Ok(())
+        });
+        if let Some((_, fds)) = recv_datagram(b) {
+            close_all(fds);
+        }
+    }
+}
+
+/// The manifest kept of bundle `b` ([`settle_pending`]), taken.
+fn take_settled(b: i32) -> Option<Vec<u8>> {
+    let r = settled()?;
+    if r.get().by_id.is_empty() {
+        return None;
+    }
+    let id = crate::net::socket_id(b)?;
+    r.update_maybe(|s| {
+        let data = s.by_id.remove(&id).map(|(_, d)| d);
+        let changed = data.is_some();
+        Ok((data, changed))
+    })
+    .ok()
+    .flatten()
+}
+
+/// Bundle `b`'s manifest was read from it: none kept of it stays.
+fn forget_settled(b: i32) {
+    let Some(r) = settled() else { return };
+    if r.get().by_id.is_empty() {
+        return;
+    }
+    if let Some(id) = crate::net::socket_id(b) {
+        let _ = r.update_maybe(|s| {
+            let changed = s.by_id.remove(&id).is_some();
+            Ok(((), changed))
+        });
+    }
+}
+
 /// Close the pending bundles their receivers have emptied.
 fn sweep(p: &mut Vec<i32>) {
     p.retain(|&b| {
@@ -229,8 +338,33 @@ pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Pre
         .filter(|x| x.kind == kind::STORE)
         .map(|x| x.state.clone())
         .collect();
+    // The sockets sent as themselves, kept in the bundle as well, out of
+    // the host's collection (a process of the host's reads no bundle).
+    let keeps: Vec<i32> = if host_peer {
+        Vec::new()
+    } else {
+        host.iter()
+            .zip(&exports)
+            .filter(|(_, x)| !x.as_ref().is_some_and(|x| x.placeholder))
+            .map(|(&fd, _)| fd)
+            .filter(|&fd| is_socket(fd))
+            .collect()
+    };
+    // What fwe keeps of the sockets sent, which they take along.
+    let states: Vec<(usize, Vec<u8>)> = if host_peer {
+        Vec::new()
+    } else {
+        fds.iter()
+            .enumerate()
+            .filter_map(|(i, &fd)| Some((i, crate::sockstate::export(fd)?)))
+            .collect()
+    };
     let mut p = Prepared { buf: Vec::new(), bundle: None, objects, stored };
-    if creds.is_some() || exports.iter().any(Option::is_some) {
+    if creds.is_some()
+        || exports.iter().any(Option::is_some)
+        || !keeps.is_empty()
+        || !states.is_empty()
+    {
         let ends = match make_bundle() {
             Ok(ends) => ends,
             Err(e) => {
@@ -239,7 +373,7 @@ pub fn prepare(fds: &[i32], creds: Option<Creds>, host_peer: bool) -> Result<Pre
             }
         };
         p.bundle = Some(ends);
-        if let Err(e) = fill_bundle(ends[0], &exports, creds) {
+        if let Err(e) = fill_bundle(ends[0], &exports, creds, &keeps, &states) {
             // Nothing went: the bundle and what it held go.
             p.unsent();
             return Err(e);
@@ -321,8 +455,14 @@ fn import(kind: u8, fd: i32, state: &[u8], companions: Vec<i32>) -> bool {
 pub(crate) fn replace(slot: i32, made: i32) -> bool {
     // SAFETY: plain host calls on descriptors this process holds.
     unsafe {
+        // `dup2` clears close-on-exec; the slot keeps the flag it was
+        // received with (`MSG_CMSG_CLOEXEC`).
+        let flags = libc::fcntl(slot, libc::F_GETFD);
         let r = libc::dup2(made, slot);
         libc::close(made);
+        if r == slot && flags > 0 {
+            libc::fcntl(slot, libc::F_SETFD, flags);
+        }
         r == slot
     }
 }
@@ -364,9 +504,23 @@ fn make_bundle() -> Result<[i32; 2], i32> {
     Ok(ends)
 }
 
-/// Write the manifest of `exports` and `creds` to bundle end `w`, then the
-/// descriptors behind them.
-fn fill_bundle(w: i32, exports: &[Option<Export>], creds: Option<Creds>) -> Result<(), i32> {
+/// Whether host descriptor `fd` is a socket.
+fn is_socket(fd: i32) -> bool {
+    // SAFETY: zeroed bytes are a valid `stat`, filled by the call.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFSOCK }
+}
+
+/// Write the manifest of `exports`, `creds` and `keeps` to bundle end `w`,
+/// then the descriptors behind the exports, then the keeps.
+fn fill_bundle(
+    w: i32,
+    exports: &[Option<Export>],
+    creds: Option<Creds>,
+    keeps: &[i32],
+    states: &[(usize, Vec<u8>)],
+) -> Result<(), i32> {
     let mut e = Enc::new();
     e.u64(MAGIC);
     e.bool(creds.is_some());
@@ -385,9 +539,15 @@ fn fill_bundle(w: i32, exports: &[Option<Export>], creds: Option<Creds>) -> Resu
         e.bytes(&x.state);
         companions.extend_from_slice(&x.companions);
     }
+    e.u32(keeps.len() as u32);
+    e.u64(states.len() as u64);
+    for (i, s) in states {
+        e.u32(*i as u32);
+        e.bytes(s);
+    }
     let manifest = e.into_bytes();
     send_datagram(w, &manifest, &[])?;
-    for chunk in companions.chunks(CHUNK) {
+    for chunk in companions.chunks(CHUNK).chain(keeps.chunks(CHUNK)) {
         send_datagram(w, &[0], chunk)?;
     }
     Ok(())
@@ -410,7 +570,13 @@ fn send_datagram(s: i32, data: &[u8], fds: &[i32]) -> Result<(), i32> {
 
 /// Receive one datagram from bundle `b` (never waiting): its data and the
 /// descriptors with it.
-fn recv_datagram(b: i32, peek: bool) -> Option<(Vec<u8>, Vec<i32>)> {
+fn recv_datagram(b: i32) -> Option<(Vec<u8>, Vec<i32>)> {
+    take_datagram(b, false)
+}
+
+/// [`recv_datagram`], or a look at the datagram that leaves it there
+/// (`peek`, which gives no descriptors).
+fn take_datagram(b: i32, peek: bool) -> Option<(Vec<u8>, Vec<i32>)> {
     let mut size: libc::c_int = 0;
     let mut l = 4 as libc::socklen_t;
     // SAFETY: valid out-parameters.
@@ -468,18 +634,31 @@ struct Entry {
     companions: Vec<i32>,
 }
 
-/// A bundle's contents: the sender's credentials, if it gave any, and
-/// its entries.
+/// A bundle's contents: the sender's credentials, if it gave any, its
+/// entries, and the states of sockets sent ([`crate::sockstate`]), by
+/// index.
 struct Manifest {
     creds: Option<Creds>,
     entries: Vec<Entry>,
+    states: Vec<(usize, Vec<u8>)>,
 }
 
 /// Read bundle `b`'s manifest and the descriptors behind its entries.
-fn read_bundle(b: i32, peek: bool) -> Option<Manifest> {
-    let (data, _) = recv_datagram(b, peek)?;
+fn read_bundle(b: i32) -> Option<Manifest> {
+    // The manifest, first; or, its sender having taken it out as it ended
+    // ([`settle_pending`]), what it kept of it, the first datagram then
+    // holding descriptors.
+    let first = recv_datagram(b);
+    let (data, mut fds) = match first {
+        Some((data, _)) if data.starts_with(&MAGIC.to_le_bytes()) => {
+            forget_settled(b);
+            (data, Vec::new())
+        }
+        other => (take_settled(b)?, other.map(|(_, fds)| fds).unwrap_or_default()),
+    };
     let mut d = Dec::new(&data);
     if d.u64() != MAGIC {
+        close_all(fds);
         return None;
     }
     let has = d.bool();
@@ -490,21 +669,26 @@ fn read_bundle(b: i32, peek: bool) -> Option<Manifest> {
         let (index, kind, want) = (d.u32() as usize, d.u8(), d.u32() as usize);
         entries.push(Entry { index, kind, state: d.bytes(), companions: Vec::with_capacity(want) });
     }
+    let keeps = d.u32() as usize;
+    let n = d.count(12);
+    let states = (0..n).map(|_| (d.u32() as usize, d.bytes())).collect();
     if !d.whole() {
+        close_all(fds);
         return None;
     }
-    let mut fds = Vec::new();
     let total: usize = entries.iter().map(|e| e.companions.capacity()).sum();
-    while fds.len() < total {
-        let Some((_, got)) = recv_datagram(b, peek) else { break };
+    while fds.len() < total + keeps {
+        let Some((_, got)) = recv_datagram(b) else { break };
         fds.extend(got);
     }
+    // The keeps did their part: the message is the receiver's.
+    close_all(fds.split_off(total.min(fds.len())));
     let mut fds = fds.into_iter();
     for e in &mut entries {
         let want = e.companions.capacity();
         e.companions.extend(fds.by_ref().take(want));
     }
-    Some(Manifest { creds: has.then_some(creds), entries })
+    Some(Manifest { creds: has.then_some(creds), entries, states })
 }
 
 fn close_all(fds: impl IntoIterator<Item = i32>) {
@@ -526,9 +710,14 @@ pub struct Incoming {
 
 /// Take the host control data `ctl` of a received message, keeping at most
 /// `room` of its descriptors (the rest are closed): the descriptors and
-/// any credentials the sender gave. A bundle is taken and closed;
-/// `peek` reads it without taking it from the queue (`MSG_PEEK`).
+/// any credentials the sender gave. A bundle is taken and closed. A peek
+/// (`peek`, `MSG_PEEK`) takes nothing: macOS gives no descriptors on one
+/// (its control data has only zeroes where they would be), so the
+/// message's descriptors and bundle wait for the receive that takes it.
 pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
+    if peek {
+        return Incoming { fds: Vec::new(), creds: None, dropped: false };
+    }
     // Received without the kernel lock: where a plug put them, in the
     // guest's range once it is gone.
     let mut fds: Vec<i32> = host_fds(ctl).into_iter().map(crate::fdtable::into_range).collect();
@@ -536,10 +725,16 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
     if let Some(&b) = fds.last()
         && is_bundle(b)
     {
-        manifest = read_bundle(b, peek);
-        if manifest.is_some() {
-            fds.pop();
-            close_all([b]);
+        // Fwe's, never the guest's, whatever it held.
+        manifest = read_bundle(b);
+        fds.pop();
+        close_all([b]);
+        if manifest.is_none() && crate::trace::file().is_some() {
+            crate::trace::note_to_file(&format!(
+                "a received message's bundle held no manifest: its {} descriptors are \
+                 taken as host objects",
+                fds.len()
+            ));
         }
     }
     let Some(m) = manifest else {
@@ -560,6 +755,12 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         match fds.get(e.index) {
             Some(&fd) if e.index < kept => {
                 taken[e.index] = import(e.kind, fd, &e.state, e.companions);
+                if !taken[e.index] && crate::trace::file().is_some() {
+                    crate::trace::note_to_file(&format!(
+                        "received descriptor {} (kind {}) was not taken as what it stands for",
+                        e.index, e.kind
+                    ));
+                }
             }
             // Not delivered, or not there: what came for it goes.
             _ => close_all(e.companions),
@@ -571,6 +772,12 @@ pub fn receive(ctl: &[u8], room: usize, peek: bool) -> Incoming {
         // A socket of a namespace can be a SOCK_SEQPACKET or ping one too.
         if !taken[i] || crate::netns::of(fd).is_some() {
             crate::net::adopt(fd);
+        }
+    }
+    for (i, s) in &m.states {
+        if let Some(&fd) = fds.get(*i) {
+            crate::sockstate::import(fd, s);
+            crate::net::received(fd);
         }
     }
     Incoming { fds, creds: m.creds, dropped }
@@ -675,25 +882,53 @@ pub fn own_creds() -> Creds {
     Creds { host_pid: crate::host::pid().get(), uid: id.uids[0], gid: id.gids[0] }
 }
 
-/// The host addresses (socket paths) of datagram sockets that asked for
-/// credentials (`SO_PASSCRED`), which every fwe process sees: a datagram
-/// sent to one carries the sender's in a bundle, since the host attaches
-/// none (a connected socket's peer is the host's to name).
+/// The Unix sockets that asked for credentials (`SO_PASSCRED`), which
+/// every fwe process sees, since the host attaches none: the host
+/// addresses (socket paths) of datagram sockets, a datagram sent to one
+/// carrying the sender's in a bundle, and the host identities of sockets
+/// (`net::socket_ids`), to which a process not the maker of its end of the
+/// connection sends its own (Linux gives each message's sender; the
+/// receiver takes the end's maker otherwise). Each with the processes that
+/// hold it (a host pid and start time): it asks until the last of them
+/// closes it or ends.
 #[derive(Clone, Default)]
 pub struct Passcred {
-    paths: std::collections::BTreeSet<Vec<u8>>,
+    paths: std::collections::BTreeMap<Vec<u8>, Vec<(i32, u64)>>,
+    socks: std::collections::BTreeMap<u64, Vec<(i32, u64)>>,
+}
+
+fn encode_holders(e: &mut Enc, h: &[(i32, u64)]) {
+    e.u64(h.len() as u64);
+    for &(pid, start) in h {
+        e.i32(pid);
+        e.u64(start);
+    }
+}
+
+fn decode_holders(d: &mut Dec) -> Vec<(i32, u64)> {
+    let n = d.count(12);
+    (0..n).map(|_| (d.i32(), d.u64())).collect()
 }
 
 impl crate::shared::Data for Passcred {
     fn encode(&self, e: &mut Enc) {
         e.u64(self.paths.len() as u64);
-        for p in &self.paths {
+        for (p, h) in &self.paths {
             e.bytes(p);
+            encode_holders(e, h);
+        }
+        e.u64(self.socks.len() as u64);
+        for (&s, h) in &self.socks {
+            e.u64(s);
+            encode_holders(e, h);
         }
     }
     fn decode(d: &mut Dec) -> Self {
-        let n = d.count(8);
-        Passcred { paths: (0..n).map(|_| d.bytes()).collect() }
+        let n = d.count(12);
+        let paths = (0..n).map(|_| (d.bytes(), decode_holders(d))).collect();
+        let n = d.count(16);
+        let socks = (0..n).map(|_| (d.u64(), decode_holders(d))).collect();
+        Passcred { paths, socks }
     }
 }
 
@@ -703,36 +938,148 @@ fn passcred() -> Option<&'static crate::shared::Record<Passcred>> {
     R.get_or_init(|| crate::shared::Record::named("passcred", 0, Passcred::default).ok()).as_ref()
 }
 
-/// The datagram socket at host path `path` asks for credentials (`on`),
-/// or no longer does.
-pub fn wants_creds(path: &[u8], on: bool) {
-    let Some(r) = passcred() else { return };
-    if r.get().paths.contains(path) == on {
-        return;
+/// A socket that asks for credentials, named by its path or identity.
+#[derive(Clone, Copy)]
+pub enum Asker<'a> {
+    Path(&'a [u8]),
+    Sock(u64),
+}
+
+/// This process as a holder.
+fn me() -> (i32, u64) {
+    (crate::host::pid().get(), crate::procreg::own_start().unwrap_or(0))
+}
+
+/// The holders of `a` in `p`, made if `make`.
+fn holders<'p>(p: &'p mut Passcred, a: Asker, make: bool) -> Option<&'p mut Vec<(i32, u64)>> {
+    match a {
+        Asker::Path(path) if make => Some(p.paths.entry(path.to_vec()).or_default()),
+        Asker::Path(path) => p.paths.get_mut(path),
+        Asker::Sock(id) if make => Some(p.socks.entry(id).or_default()),
+        Asker::Sock(id) => p.socks.get_mut(&id),
     }
-    let _ = r.update(|p| {
-        if on {
-            p.paths.insert(path.to_vec());
-        } else {
-            p.paths.remove(path);
-        }
-        Ok(())
+}
+
+fn remove(p: &mut Passcred, a: Asker) {
+    match a {
+        Asker::Path(path) => p.paths.remove(path),
+        Asker::Sock(id) => p.socks.remove(&id),
+    };
+}
+
+/// The socket `a` asks for credentials (`on`, this process holding it),
+/// or no longer does (for every process).
+pub fn wants_creds(a: Asker, on: bool) {
+    let Some(r) = passcred() else { return };
+    let me = me();
+    let _ = r.update_maybe(|p| {
+        let changed = match holders(p, a, on) {
+            Some(h) if on && !h.contains(&me) => {
+                h.push(me);
+                true
+            }
+            Some(_) if !on => {
+                remove(p, a);
+                true
+            }
+            _ => false,
+        };
+        Ok(((), changed))
     });
 }
 
-/// Whether any datagram socket asks for credentials.
-pub fn any_wanted() -> bool {
-    passcred().is_some_and(|r| !r.get().paths.is_empty())
+/// This process holds socket `a`, which asks for credentials, too (a fork
+/// child, or one it was passed to).
+pub fn holds(a: Asker) {
+    wants_creds(a, true);
 }
 
-/// Whether the datagram socket at host path `path` asks for credentials.
-pub fn creds_wanted(path: &[u8]) -> bool {
-    passcred().is_some_and(|r| r.get().paths.contains(path))
+/// This process no longer holds socket `a` (its last descriptor here is
+/// closed): with its last holder, it no longer asks.
+pub fn released(a: Asker) {
+    let Some(r) = passcred() else { return };
+    let me = me();
+    let _ = r.update_maybe(|p| {
+        let Some(h) = holders(p, a, false) else { return Ok(((), false)) };
+        let before = h.len();
+        h.retain(|&x| x != me);
+        let changed = h.len() != before;
+        if h.is_empty() {
+            remove(p, a);
+        }
+        Ok(((), changed))
+    });
+}
+
+/// Whether socket `a` asks for credentials: some process that holds it is
+/// alive.
+pub fn creds_wanted(a: Asker) -> bool {
+    let Some(r) = passcred() else { return false };
+    let p = r.get();
+    let h = match a {
+        Asker::Path(path) => p.paths.get(path),
+        Asker::Sock(id) => p.socks.get(&id),
+    };
+    h.is_some_and(|h| h.iter().any(|&x| crate::procreg::alive_kept(x)))
+}
+
+/// The record's generation, which changes with what asks.
+pub fn generation() -> u64 {
+    passcred().map_or(0, |r| r.generation())
+}
+
+/// Whether any socket asks for credentials: an answer kept until the
+/// record changes, so that a write that need not look further costs two
+/// atomic loads.
+pub fn any_wanted() -> bool {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    // The generation the answer is of, +1 (0: none yet), shifted left by
+    // one, with the answer in the low bit: one word, so that the two go
+    // together.
+    static KEPT: AtomicU64 = AtomicU64::new(0);
+    let Some(r) = passcred() else { return false };
+    let now = (r.generation() + 1) << 1;
+    let kept = KEPT.load(Ordering::Relaxed);
+    if kept & !1 == now {
+        return kept & 1 != 0;
+    }
+    let p = r.get();
+    let any = !p.paths.is_empty() || !p.socks.is_empty();
+    KEPT.store(now | any as u64, Ordering::Relaxed);
+    any
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::shared::Data;
+
+    #[test]
+    fn what_asks_for_credentials_survives_its_encoding() {
+        let mut p = Passcred::default();
+        p.paths.insert(b"/tmp/s".to_vec(), vec![(7, 70)]);
+        p.socks.insert(0xfeed, vec![(7, 70), (8, 80)]);
+        let mut e = Enc::new();
+        p.encode(&mut e);
+        let b = e.into_bytes();
+        let mut d = Dec::new(&b);
+        let q = Passcred::decode(&mut d);
+        assert!(d.whole());
+        assert_eq!((q.paths, q.socks), (p.paths, p.socks));
+    }
+
+    #[test]
+    fn kept_manifests_survive_their_encoding() {
+        let mut s = Settled { count: 3, ..Settled::default() };
+        s.by_id.insert(0xbeef, (3, vec![1, 2, 3]));
+        let mut e = Enc::new();
+        s.encode(&mut e);
+        let b = e.into_bytes();
+        let mut d = Dec::new(&b);
+        let t = Settled::decode(&mut d);
+        assert!(d.whole());
+        assert_eq!((t.count, t.by_id), (s.count, s.by_id));
+    }
 
     fn cmsg(level: i32, ty: i32, data: &[u8]) -> Vec<u8> {
         let len = CMSG_HDR + data.len();

@@ -33,6 +33,8 @@
 //!   a queue's family ([`generated::PARENT`], [`generated::QUEUE_FAMILY`]).
 //! - **Null descriptors** where the driver has none are stand-ins of fwe's
 //!   ([`null`]).
+//! - **Host image copy** is offered for an image only where the driver's
+//!   memory requirements back it ([`hostcopy`]).
 //! - **Waits** with a timeout end at the deadline the stub computed, and
 //!   are made in slices of [`SLICE_NS`]: a signal for the waiting thread
 //!   ends the call with `EINTR`, and the stub makes it again.
@@ -43,6 +45,7 @@ pub mod driver;
 pub mod files;
 #[rustfmt::skip]
 pub mod generated;
+pub mod hostcopy;
 pub mod null;
 pub mod objects;
 
@@ -59,6 +62,33 @@ pub enum Level {
     Device,
 }
 
+/// A Vulkan structure fwe makes for the driver, as its bytes: aligned as
+/// the driver reads it (its pointers and 64-bit handles at multiples of 8),
+/// which a plain byte array is not.
+#[repr(C, align(8))]
+#[derive(Clone, Copy)]
+pub(crate) struct Structure<const N: usize>(pub [u8; N]);
+
+impl<const N: usize> Structure<N> {
+    pub(crate) const fn zeroed() -> Self {
+        Structure([0; N])
+    }
+}
+
+impl<const N: usize> std::ops::Deref for Structure<N> {
+    type Target = [u8; N];
+
+    fn deref(&self) -> &[u8; N] {
+        &self.0
+    }
+}
+
+impl<const N: usize> std::ops::DerefMut for Structure<N> {
+    fn deref_mut(&mut self) -> &mut [u8; N] {
+        &mut self.0
+    }
+}
+
 /// How long one slice of a wait is: the longest a signal waits for a thread
 /// waiting on the GPU.
 pub const SLICE_NS: u64 = 5_000_000;
@@ -71,6 +101,7 @@ pub mod result {
     pub const ERROR_INITIALIZATION_FAILED: i32 = -3;
     pub const ERROR_LAYER_NOT_PRESENT: i32 = -6;
     pub const ERROR_EXTENSION_NOT_PRESENT: i32 = -7;
+    pub const ERROR_FORMAT_NOT_SUPPORTED: i32 = -11;
     pub const ERROR_INCOMPATIBLE_DRIVER: i32 = -9;
     pub const ERROR_UNKNOWN: i32 = -13;
 }
@@ -130,9 +161,37 @@ fn plain(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Result<
 /// ([`crate::mm::host_writes`]), each structure of the `pNext` chains the
 /// driver fills too.
 fn outputs_writable(index: usize, w: &[u64; MOST_ARGS]) {
-    if !crate::mm::host_writes_watched() {
-        return;
+    if crate::mm::host_writes_watched() {
+        each_output(index, w, crate::mm::host_writes);
     }
+}
+
+/// What command `index` wrote to the guest's memory, in hex by range, for
+/// a trace of every command ([`device`]).
+pub(crate) fn written(index: usize, w: &[u64; MOST_ARGS]) -> String {
+    /// The most of one range shown.
+    const SHOWN: u64 = 512;
+    let mut out = String::new();
+    each_output(index, w, |addr, len| {
+        let Ok(bytes) = crate::uaccess::read_bytes(addr, len.min(SHOWN) as usize) else {
+            out.push_str(&format!(" {addr:#x}: unreadable;"));
+            return;
+        };
+        out.push_str(&format!(" {addr:#x}:"));
+        for b in bytes {
+            out.push_str(&format!("{b:02x}"));
+        }
+        if len > SHOWN {
+            out.push_str(&format!("..(+{})", len - SHOWN));
+        }
+        out.push(';');
+    });
+    out
+}
+
+/// Each guest range command `index` writes, as `(address, length)`, the
+/// structures of the `pNext` chains the driver fills included.
+fn each_output(index: usize, w: &[u64; MOST_ARGS], mut range: impl FnMut(u64, u64)) {
     let read_count = |addr: u64, width: u64| match width {
         8 => crate::uaccess::read::<u64>(addr).unwrap_or(0),
         _ => u64::from(crate::uaccess::read::<u32>(addr).unwrap_or(0)),
@@ -145,18 +204,18 @@ fn outputs_writable(index: usize, w: &[u64; MOST_ARGS]) {
             return;
         }
         let count = count.min(1 << 20);
-        crate::mm::host_writes(addr, count.saturating_mul(size));
+        range(addr, count.saturating_mul(size));
         if chained {
             for i in 0..count {
-                chain_writable(addr + i * size);
+                each_chained(addr + i * size, &mut range);
             }
         }
     });
 }
 
-/// Make the structures of the `pNext` chain of guest structure `addr`
-/// writable by the host.
-fn chain_writable(addr: u64) {
+/// Each structure of the `pNext` chain of guest structure `addr`, as
+/// `(address, size)`.
+fn each_chained(addr: u64, range: &mut impl FnMut(u64, u64)) {
     let mut at = crate::uaccess::read::<u64>(addr + 8).unwrap_or(0);
     for _ in 0..256 {
         if at == 0 {
@@ -164,7 +223,7 @@ fn chain_writable(addr: u64) {
         }
         let Ok(stype) = crate::uaccess::read::<u32>(at) else { return };
         if let Some(size) = generated::struct_size(stype) {
-            crate::mm::host_writes(at, size);
+            range(at, size);
         }
         at = crate::uaccess::read::<u64>(at + 8).unwrap_or(0);
     }
@@ -221,12 +280,15 @@ fn special(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Resul
         }
         cmd::vkCreateInstance => objects::create_instance(driver, w),
         cmd::vkCreateDevice => objects::create_device(driver, w),
-        cmd::vkDestroyInstance => plain(driver, index, w),
+        cmd::vkDestroyInstance => {
+            hostcopy::stop(w[0]);
+            plain(driver, index, w)
+        }
         cmd::vkDestroyDevice => {
             null::stop(driver, w[0]);
             plain(driver, index, w)
         }
-        cmd::vkGetPhysicalDeviceFeatures2 => {
+        cmd::vkGetPhysicalDeviceFeatures2 | cmd::vkGetPhysicalDeviceFeatures2KHR => {
             let r = plain(driver, index, w)?;
             null::features(driver, w[0], w[1]);
             Ok(r)
@@ -241,6 +303,9 @@ fn special(driver: &driver::Driver, index: usize, w: &[u64; MOST_ARGS]) -> Resul
         | cmd::vkCmdBindVertexBuffers2
         | cmd::vkCreateDescriptorUpdateTemplate
         | cmd::vkDestroyDescriptorUpdateTemplate => null::call(driver, index, w),
+        cmd::vkGetPhysicalDeviceImageFormatProperties
+        | cmd::vkGetPhysicalDeviceImageFormatProperties2
+        | cmd::vkGetPhysicalDeviceImageFormatProperties2KHR => hostcopy::query(driver, index, w),
         cmd::vkWaitForFences
         | cmd::vkWaitSemaphores
         | cmd::vkWaitSemaphoresKHR

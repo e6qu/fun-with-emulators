@@ -1,0 +1,51 @@
+<!doctype html>
+<html>
+  <!-- The benchmarks' video frames: 300 frames of 640x360 drawn on a
+       canvas are encoded as VP8 by WebCodecs, in software; then each is
+       decoded, in software, and drawn on a canvas. It logs the decoding
+       and drawing's time per frame: "fwe-bench frame <ms>". -->
+  <head><meta charset="utf-8"><title>fwe-frames</title></head>
+  <body style="margin:0;background:#ff00ff">
+    <canvas id="out" width="640" height="360"></canvas>
+    <script>
+      const W = 640, H = 360, N = 300;
+      const src = new OffscreenCanvas(W, H), g = src.getContext("2d");
+      const out = document.getElementById("out").getContext("2d");
+      const chunks = [];
+      const config = { codec: "vp8", width: W, height: H, bitrate: 2_000_000,
+                       framerate: 30, hardwareAcceleration: "prefer-software" };
+      const enc = new VideoEncoder({ output: (c) => chunks.push(c), error: (e) => console.log("fwe-bench error " + e) });
+      enc.configure(config);
+      for (let i = 0; i < N; i++) {
+        g.fillStyle = "#00ff00";
+        g.fillRect(0, 0, W, H);
+        g.fillStyle = "#0000ff";
+        g.fillRect((i * 7) % W, 0, 60, H);
+        g.fillStyle = "#000";
+        g.font = "48px sans-serif";
+        g.fillText(String(i), 20, 60);
+        const f = new VideoFrame(src, { timestamp: i * 33333 });
+        enc.encode(f, { keyFrame: i % 60 === 0 });
+        f.close();
+      }
+      enc.flush().then(() => {
+        let drawn = 0, began = 0;
+        const dec = new VideoDecoder({
+          output: (f) => {
+            out.drawImage(f, 0, 0);
+            f.close();
+            if (++drawn === N) {
+              console.log("fwe-bench frame " + ((performance.now() - began) / N).toFixed(3));
+            }
+          },
+          error: (e) => console.log("fwe-bench error " + e),
+        });
+        dec.configure({ codec: "vp8", codedWidth: W, codedHeight: H,
+                        hardwareAcceleration: "prefer-software" });
+        began = performance.now();
+        for (const c of chunks) dec.decode(c);
+        dec.flush();
+      });
+    </script>
+  </body>
+</html>

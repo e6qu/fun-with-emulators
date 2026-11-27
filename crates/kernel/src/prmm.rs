@@ -186,7 +186,7 @@ fn shown(saved: &[u8]) -> Vec<u8> {
 
 impl<P: Platform> Kernel<P> {
     /// The layout now: as changed, or as the program was loaded.
-    fn layout(&self) -> Layout {
+    pub(crate) fn layout(&self) -> Layout {
         if let Some(l) = *LAYOUT.lock().unwrap_or_else(|e| e.into_inner()) {
             return l;
         }

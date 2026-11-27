@@ -1,11 +1,14 @@
 //! The system-call gate: guest code calls fwe directly for a system call.
 //!
 //! A rewritten `svc #0` branches to a stub of its own
-//! ([`crate::rewrite`]), which saves `x30` and `x0` below the guest's `sp`
-//! and calls [`fwe_gate`]. (Where the guest's `sp` takes no store, as at
-//! musl's thread exit, which unmaps its own stack before `exit`, that store
-//! faults, and the fault handler runs the call as the trap does.) The gate saves the guest's registers into this thread's
-//! [`Block`], switches to the thread's gate stack and calls the Rust half
+//! ([`crate::rewrite`]), which keeps `x30` and `x0` in this thread's
+//! scratch slots ([`crate::scratch_slots`]) and calls [`fwe_gate`]. Neither
+//! touches memory below the guest's `sp`, which is the guest's (Go keeps a
+//! new thread's start there across its first system call): the gate finds
+//! this thread's [`Block`] through `x18` (a group the fault handler starts
+//! again where the host zeroed `x18` meanwhile: [`restart`]). The gate
+//! saves the guest's registers into the block, switches to the thread's
+//! gate stack and calls the Rust half
 //! (`trap::fwe_gate_call`), which runs the call. When the call changed
 //! nothing but `x0` and no signal is to be delivered, the gate restores the
 //! registers and returns to the stub, which goes on past the site: no host
@@ -83,6 +86,14 @@ const _: () = assert!(std::mem::size_of::<Block>() <= 4096);
 #[unsafe(no_mangle)]
 static FWE_GATE_SLOT: AtomicU64 = AtomicU64::new(0);
 
+/// Byte offsets of the scratch slots a system call's stub keeps the
+/// program's `x30` and `x0` in ([`crate::rewrite::Slots::scratch`]), for the
+/// gate.
+#[unsafe(no_mangle)]
+static FWE_SCRATCH_X30: AtomicU64 = AtomicU64::new(0);
+#[unsafe(no_mangle)]
+static FWE_SCRATCH_X0: AtomicU64 = AtomicU64::new(0);
+
 /// Byte offsets of the slots holding the program's `x16` and `x17` while
 /// translations use the registers ([`crate::parked_slots`]), for the exit
 /// gate.
@@ -102,6 +113,9 @@ fn key() -> libc::pthread_key_t {
         let (s16, s17) = crate::parked_slots();
         FWE_PARK16.store(u64::from(s16), SeqCst);
         FWE_PARK17.store(u64::from(s17), SeqCst);
+        let [s30, s0, _] = crate::scratch_slots();
+        FWE_SCRATCH_X30.store(u64::from(s30), SeqCst);
+        FWE_SCRATCH_X0.store(u64::from(s0), SeqCst);
         key
     })
 }
@@ -195,6 +209,16 @@ pub fn rewind(pc: u64) -> Option<u64> {
     (exit..fwe_gate_end as *const () as u64).contains(&pc).then_some(exit)
 }
 
+/// A fault at `pc` in a gate's first words, its access through `x18`
+/// (zeroed by the host since the gate read the TSD base into it): where
+/// the gate starts again. Its first words only find the block, so running
+/// them again does the same. Async-signal-safe.
+pub fn restart(pc: u64) -> Option<u64> {
+    let gate = fwe_gate as *const () as u64;
+    let exit = fwe_exit_gate as *const () as u64;
+    [gate, exit].into_iter().find(|&start| (start..start + 4 * 5).contains(&pc))
+}
+
 /// The address of the exit gate, which translations' ways out branch to.
 pub fn exit_address() -> u64 {
     key();
@@ -219,18 +243,16 @@ pub fn address() -> u64 {
     fwe_gate as *const () as u64
 }
 
-/// The system-call site whose stub returns to `ret` (the stub's branch
-/// back, one word on, goes past the site).
+/// The system-call site whose stub returns to `ret`
+/// ([`crate::rewrite::syscall_site_of`]).
 pub fn site_of(ret: u64) -> u64 {
     // SAFETY: `ret` is in a stub fwe wrote, which is mapped.
-    let b = unsafe { ((ret + 4) as *const u32).read() };
-    let offset = (((b & 0x03ff_ffff) << 6) as i32 >> 4) as i64;
-    (ret as i64 + 4 + offset) as u64 - 4
+    crate::rewrite::syscall_site_of(|a| unsafe { (a as *const u32).read() }, ret)
 }
 
 unsafe extern "C" {
     /// The gate (see the module documentation); its stub calls it with the
-    /// guest's `x30` and `x0` saved at `[sp]` and `[sp, #8]`.
+    /// guest's `x30` and `x0` in their scratch slots.
     fn fwe_gate();
     /// The gate's way out: from here it looks for a signal, restores the
     /// guest's registers from the block and returns to the stub.
@@ -260,14 +282,14 @@ core::arch::global_asm!(
     ".p2align 4",
     ".globl _fwe_gate",
     "_fwe_gate:",
-    // The stub saved x30 and x0 at [sp] and [sp, #8], 32 bytes below the
-    // guest's sp; x1 goes beside them, a second scratch register.
-    "str x1, [sp, #16]",
-    "mrs x0, tpidrro_el0",
-    "and x0, x0, #0xfffffffffffffff8",
-    "adrp x1, _FWE_GATE_SLOT@PAGE",
-    "ldr x1, [x1, _FWE_GATE_SLOT@PAGEOFF]",
-    "ldr x0, [x0, x1]",
+    // The stub kept x30 and x0 in their scratch slots: the block into x0,
+    // through x18 ([`restart`]).
+    "adrp x0, _FWE_GATE_SLOT@PAGE",
+    "ldr x0, [x0, _FWE_GATE_SLOT@PAGEOFF]",
+    "mrs x18, tpidrro_el0",
+    "and x18, x18, #0xfffffffffffffff8",
+    "ldr x0, [x18, x0]",
+    "str x1, [x0, #8]",
     "stp x2, x3, [x0, #16]",
     "stp x4, x5, [x0, #32]",
     "stp x6, x7, [x0, #48]",
@@ -282,13 +304,18 @@ core::arch::global_asm!(
     "stp x24, x25, [x0, #192]",
     "stp x26, x27, [x0, #208]",
     "stp x28, x29, [x0, #224]",
-    "ldr x2, [sp, #8]",
-    "ldr x3, [sp, #16]",
-    "stp x2, x3, [x0, #0]",
-    // The guest's x30, saved by the stub, and its sp above them.
-    "ldr x2, [sp]",
-    "str x2, [x0, #240]",
-    "add x2, sp, #32",
+    // The guest's x0 and x30, from their scratch slots, and its sp.
+    "mrs x1, tpidrro_el0",
+    "and x1, x1, #0xfffffffffffffff8",
+    "adrp x2, _FWE_SCRATCH_X0@PAGE",
+    "ldr x2, [x2, _FWE_SCRATCH_X0@PAGEOFF]",
+    "ldr x3, [x1, x2]",
+    "str x3, [x0, #0]",
+    "adrp x2, _FWE_SCRATCH_X30@PAGE",
+    "ldr x2, [x2, _FWE_SCRATCH_X30@PAGEOFF]",
+    "ldr x3, [x1, x2]",
+    "str x3, [x0, #240]",
+    "mov x2, sp",
     "str x2, [x0, #248]",
     "mrs x2, nzcv",
     "str x2, [x0, #264]",
@@ -365,9 +392,9 @@ core::arch::global_asm!(
     "3:",
     "ldr x3, [x0, #264]",
     "msr nzcv, x3",
-    // Back on the guest's stack, its x30 still saved there for the stub.
+    // Back on the guest's stack; the stub takes its x30 back from its slot.
     "ldr x3, [x0, #248]",
-    "sub sp, x3, #32",
+    "mov sp, x3",
     "ldr x30, [x0, #800]",
     "ldp x2, x3, [x0, #16]",
     "ldp x4, x5, [x0, #32]",
@@ -400,16 +427,15 @@ core::arch::global_asm!(
     ".globl _fwe_exit_gate",
     "_fwe_exit_gate:",
     // x16: the way out's address; the program's x16 and x17 in their
-    // slots. x0 and x1 go below sp, two scratch registers, through x17
-    // (free here): the program can keep sp off 16-byte alignment, where
-    // an access through sp faults.
-    "sub x17, sp, #16",
-    "stp x0, x1, [x17]",
-    "mrs x0, tpidrro_el0",
-    "and x0, x0, #0xfffffffffffffff8",
-    "adrp x1, _FWE_GATE_SLOT@PAGE",
-    "ldr x1, [x1, _FWE_GATE_SLOT@PAGEOFF]",
-    "ldr x0, [x0, x1]",
+    // slots. The block into x17 (free here), through x18 ([`restart`]),
+    // and x0 and x1 into it.
+    "adrp x17, _FWE_GATE_SLOT@PAGE",
+    "ldr x17, [x17, _FWE_GATE_SLOT@PAGEOFF]",
+    "mrs x18, tpidrro_el0",
+    "and x18, x18, #0xfffffffffffffff8",
+    "ldr x17, [x18, x17]",
+    "stp x0, x1, [x17, #0]",
+    "mov x0, x17",
     "stp x2, x3, [x0, #16]",
     "stp x4, x5, [x0, #32]",
     "stp x6, x7, [x0, #48]",
@@ -424,8 +450,6 @@ core::arch::global_asm!(
     "stp x26, x27, [x0, #208]",
     "stp x28, x29, [x0, #224]",
     "str x30, [x0, #240]",
-    "ldp x2, x3, [x17]",
-    "stp x2, x3, [x0, #0]",
     "mrs x2, tpidrro_el0",
     "and x2, x2, #0xfffffffffffffff8",
     "adrp x3, _FWE_PARK16@PAGE",

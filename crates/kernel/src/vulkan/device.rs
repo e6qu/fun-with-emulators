@@ -145,17 +145,25 @@ pub const LOCKED: [usize; 3] =
 
 /// The device's ioctl on `fd` with record `arg`, if `fd` is the device:
 /// Linux's answer. Under the kernel lock: a command of [`LOCKED`] runs with
-/// the guest's range plugged.
+/// the guest's range plugged, as does a query that makes fwe's device for
+/// host image copy ([`super::hostcopy::needs_lock`]).
 pub fn ioctl(fd: i32, req: u64, arg: u64) -> Option<i64> {
     if req != generated::IOCTL_CALL {
         return None;
     }
     let key = key_of(fd)?;
     let command = crate::uaccess::read::<u32>(arg).ok()? as usize;
-    if !LOCKED.contains(&command) {
+    let helper = super::hostcopy::needs_lock(command, arg);
+    if !LOCKED.contains(&command) && !helper {
         return Some(run(key, arg));
     }
-    Some(crate::fdtable::plugged(|| run(key, arg)).unwrap_or_else(|e| -(e as i64)))
+    let locked = || {
+        if helper {
+            super::hostcopy::prepare(arg);
+        }
+        run(key, arg)
+    };
+    Some(crate::fdtable::plugged(locked).unwrap_or_else(|e| -(e as i64)))
 }
 
 /// Before an `execve` that starts a fresh fwe, from a process with the
@@ -209,14 +217,14 @@ fn all_fds() -> Vec<i32> {
 
 /// The device's ioctl without the kernel lock ([`crate::blocking_syscall`]):
 /// its answer, or `None` for any other call and the commands that need the
-/// lock ([`LOCKED`]).
+/// lock ([`LOCKED`], [`super::hostcopy::needs_lock`]).
 pub fn io(nr: u64, a: &[u64; 6]) -> Option<i64> {
     if nr != fwe_abi::nr::IOCTL || a[1] as u32 as u64 != generated::IOCTL_CALL {
         return None;
     }
     let key = key_of(a[0] as i32)?;
     let command = crate::uaccess::read::<u32>(a[2]).ok()? as usize;
-    if LOCKED.contains(&command) {
+    if LOCKED.contains(&command) || super::hostcopy::needs_lock(command, a[2]) {
         return None;
     }
     Some(run(key, a[2]))
@@ -247,11 +255,19 @@ fn run(key: u32, arg: u64) -> i64 {
     let began = crate::timing::call_began();
     let r = super::call(command, &w);
     counted(command as usize, began);
-    // In a trace to a file: every command and its result where every call
-    // is traced; a command that failed, and how, otherwise.
+    // In a trace to a file: every command, its result and what it wrote
+    // where every call is traced; a command that failed, and how, otherwise.
     if crate::trace::calls_traced() {
         let name = generated::NAMES.get(command as usize).copied().unwrap_or("fwe's query");
-        crate::trace::note_to_file(&format!("vulkan: {name}{:x?} = {r:#x?}", &w[..count]));
+        let got = match r {
+            Ok(v) => format!("{v:#x}"),
+            Err(e) => format!("errno {e}"),
+        };
+        let wrote = match r {
+            Ok(_) => super::written(command as usize, &w),
+            Err(_) => String::new(),
+        };
+        crate::trace::note_to_file(&format!("vulkan: {name}{:x?} = {got}{wrote}", &w[..count]));
     } else if crate::trace::file().is_some() {
         let index = command as usize;
         let failed = match r {

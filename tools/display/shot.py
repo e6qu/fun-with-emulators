@@ -4,7 +4,8 @@
 
 Grabs the root window of `display` (a 24- or 32-bit TrueColor screen, as
 Xvfb's is) through libX11 (`libX11`, the host's), or the rectangle of it
-given, and writes it to `out.png`. Prints its size and how many of its
+given, as much of it as is on the screen (a window can reach past it),
+and writes it to `out.png`. Prints its size and how many of its
 pixels are not its most common colour (what was drawn on the
 background); then `colour <rrggbb> <n>` for each colour of the whole
 image, most common first (the first 32), and `digest <hex>`, a hash of
@@ -42,10 +43,14 @@ def grab(lib, display, rect=None):
     d = x.XOpenDisplay(display.encode())
     if not d:
         sys.exit(f"cannot open display {display}")
-    left, top = 0, 0
-    w, h = x.XDisplayWidth(d, 0), x.XDisplayHeight(d, 0)
+    sw, sh = x.XDisplayWidth(d, 0), x.XDisplayHeight(d, 0)
+    left, top, w, h = 0, 0, sw, sh
     if rect:
-        left, top, w, h = rect
+        x0, y0, rw, rh = rect
+        left, top = max(0, x0), max(0, y0)
+        w, h = min(sw, x0 + rw) - left, min(sh, y0 + rh) - top
+        if w <= 0 or h <= 0:
+            sys.exit(f"{rw}x{rh} at {x0},{y0} is off the {sw}x{sh} screen")
     img = x.XGetImage(d, x.XDefaultRootWindow(d), left, top, w, h, 0xFFFFFFFF, 2).contents
     if img.bits_per_pixel != 32:
         sys.exit(f"{img.bits_per_pixel} bits a pixel: only 32 are read")

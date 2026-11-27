@@ -95,9 +95,35 @@ pub(crate) fn hold<R>(f: impl FnOnce() -> R) -> R {
 
 /// Write the registry into a fork snapshot.
 pub(crate) fn save(e: &mut crate::snapshot::Enc) {
+    write(e, false);
+}
+
+/// Write into an exec state what of the registry an `execve` that
+/// re-executes fwe keeps, for [`restore`] in the new program: the
+/// signalfds without close-on-exec, their pipes' write ends (fwe's own,
+/// made to survive the host's `execve`), and the signals taken for them,
+/// which stay pending across `execve` as on Linux.
+pub(crate) fn save_exec(e: &mut crate::snapshot::Enc) {
+    write(e, true);
+}
+
+/// [`save`], or [`save_exec`] (`exec`).
+fn write(e: &mut crate::snapshot::Enc, exec: bool) {
     let mut g = REG.lock();
     let reg = g.get_or_insert_with(Reg::default);
-    crate::snapshot::fd_map(e, &reg.fds, |e, s| {
+    let fds: std::collections::HashMap<i32, &SignalFd> = reg
+        .fds
+        .iter()
+        .filter(|&(&fd, _)| !exec || !crate::snapshot::cloexec(fd))
+        .map(|(&fd, s)| (fd, s))
+        .collect();
+    if exec {
+        for s in fds.values() {
+            // SAFETY: plain host call on fwe's own descriptor.
+            unsafe { libc::fcntl(s.wfd, libc::F_SETFD, 0) };
+        }
+    }
+    crate::snapshot::fd_map(e, &fds, |e, s| {
         e.i32(s.rfd);
         e.i32(s.wfd);
         e.u64(s.mask);
@@ -106,7 +132,8 @@ pub(crate) fn save(e: &mut crate::snapshot::Enc) {
     crate::snapshot::queue(e, &reg.queue);
 }
 
-/// Rebuild the registry in a fork child (its pipes are inherited).
+/// Rebuild the registry in a fork child, or in the program an exec
+/// started (its pipes are inherited).
 pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
     let fds = crate::snapshot::read_fd_map(d, |d| SignalFd {
         rfd: d.i32(),
@@ -114,6 +141,11 @@ pub(crate) fn restore(d: &mut crate::snapshot::Dec) {
         mask: d.u64(),
         ready: d.bool(),
     });
+    for s in fds.values() {
+        // SAFETY: plain host call on fwe's own descriptor, out of a
+        // program's reach across its `execve`.
+        unsafe { libc::fcntl(s.wfd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
     let queue = crate::snapshot::read_queue(d);
     with(|m| *m = Reg { fds, queue });
 }

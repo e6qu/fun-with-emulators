@@ -104,11 +104,13 @@ impl<T: Send + Sync + 'static> ForkLock for ForkRwLock<T> {
 /// The locks, as [`hold`] takes them.
 fn locks() -> Vec<&'static dyn ForkLock> {
     use crate::*;
-    let mut v: Vec<&'static dyn ForkLock> = Vec::with_capacity(58);
+    let mut v: Vec<&'static dyn ForkLock> = Vec::with_capacity(59);
     // The host's kqueue behind `epoll` (macOS).
     #[cfg(not(target_os = "linux"))]
     v.extend([
-        &epoll::INTEREST as &'static dyn ForkLock,
+        &epoll::SETS as &'static dyn ForkLock,
+        &epoll::INTEREST,
+        &epoll::ALIASES,
         &epoll::BPF_WATCHED,
         &epoll::EDGES,
         &epoll::ALWAYS,
@@ -138,8 +140,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &creds::IDENTITY,
         &netns::SUNK,
         &net::CORKED,
-        &net::KEPT_VALUES,
-        &net::MEMBERSHIPS,
+        &sockstate::TABLE,
         &net::NAMES,
         &net::SOCKETS,
         &netlink::SOCKS,
@@ -149,6 +150,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &crate::filestore::desc::DESCS,
         &crate::filestore::desc::HELD,
         &crate::filestore::desc::PLACES,
+        &crate::filestore::desc::SYNCING,
         &atime::NOATIME_FDS,
         &modes::SETID_FILES,
         &modes::CAPS_FILES,
@@ -177,6 +179,7 @@ fn locks() -> Vec<&'static dyn ForkLock> {
         &crate::vulkan::device::FILES,
         &crate::vulkan::null::DEVICES,
         &crate::vulkan::null::TEMPLATES,
+        &crate::vulkan::hostcopy::HELPERS,
     ]);
     v
 }

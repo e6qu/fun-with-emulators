@@ -310,7 +310,7 @@ pub(crate) fn stop_stands() -> bool {
 /// Stop fwe process `target` with stop signal `sig` (`SIGSTOP` above all,
 /// which the host cannot catch): sent through its mailbox, so that it
 /// stops itself where it holds nothing every process shares
-/// ([`Kernel::deliver_pending`]), as Linux stops a task only on its way
+/// ([`Kernel::deliver_step`]), as Linux stops a task only on its way
 /// back to user mode; the host's would stop it wherever it was, a lock of
 /// fwe's held. This process posts it to itself.
 pub(crate) fn stop_process(target: HostPid, sig: u64) -> i64 {
@@ -359,7 +359,7 @@ pub fn host_continued(sender: i32) -> bool {
 }
 
 /// This process's job-control stop of signal `sig`, its default action
-/// ([`Kernel::deliver_pending`]), taken where it holds nothing every
+/// ([`Kernel::deliver_step`]), taken where it holds nothing every
 /// process shares. fwe stops it here ([`crate::procreg::stops_in_fwe`]):
 /// every other thread waits for the kernel lock this one holds, this one
 /// sleeps until it is continued or killed, and its parent learns of it
@@ -577,6 +577,15 @@ pub fn restartable(nr: u64, args: &[u64; 6]) -> bool {
     }
 }
 
+/// Whether Linux restarts system call `nr` after any handler, with
+/// `SA_RESTART` or not (its `ERESTARTNOINTR`): a priority-inheritance
+/// futex's lock, whose absolute timeout stands.
+pub fn restarts_always(nr: u64, args: &[u64; 6]) -> bool {
+    use fwe_abi::futex as f;
+    nr == fwe_abi::nr::FUTEX
+        && matches!(args[1] & f::FUTEX_CMD_MASK, f::FUTEX_LOCK_PI | f::FUTEX_LOCK_PI2)
+}
+
 /// Move pending signals that the calling thread blocks and a `signalfd`
 /// watches onto that `signalfd`, as Linux queues them there.
 pub fn drain_to_signalfd() {
@@ -617,8 +626,9 @@ fn guest_pid(host: i32) -> i32 {
 const SYS_SECCOMP: i32 = 1;
 
 /// The `SIGSYS` a seccomp filter's `SECCOMP_RET_TRAP` raises for call `nr`
-/// at `pc`, with the filter's `data`.
-pub(crate) fn raise_sigsys(pc: u64, nr: u64, data: u16) {
+/// made at `site`, with the filter's `data`.
+pub(crate) fn raise_sigsys(site: crate::SvcSite, nr: u64, data: u16) {
+    let pc = site.reported();
     let info = SigInfo {
         code: SYS_SECCOMP,
         pid: pc as u32 as i32,
@@ -690,7 +700,7 @@ impl<P: Platform> Kernel<P> {
         let watched = crate::signalfd::watched() & bit(sig) != 0
             || WAITERS[(sig - 1) as usize].load(std::sync::atomic::Ordering::SeqCst) > 0;
         // A default action that ends or stops the process is fwe's to take
-        // too ([`Kernel::deliver_pending`]), not the host's: the host never
+        // too ([`Kernel::deliver_step`]), not the host's: the host never
         // blocks a caught signal for the guest (see [`caught`]), so a
         // default action left to the host could strike a thread whose guest
         // mask blocks the signal, which Linux keeps pending instead.
@@ -761,51 +771,77 @@ impl<P: Platform> Kernel<P> {
         None
     }
 
+    /// Act on the ready pending signals before returning to the guest,
+    /// serving the stops they make holding the kernel: the unit tests',
+    /// which have no lock. The backends deliver through
+    /// [`crate::klock::KernelLock::deliver_pending`], which serves each
+    /// stop without it.
+    #[cfg(test)]
+    pub fn deliver_pending(&mut self, regs: &mut Regs) {
+        let mut carried = None;
+        while let Some(met) = self.deliver_step(regs, carried.take()) {
+            let r = self.stop_held(regs, met.stop);
+            carried = met.after(r);
+        }
+    }
+
     /// Act on the ready pending signals before returning to the guest:
     /// ignored ones are dropped, default actions are taken, and the first
-    /// one with a handler enters it. Ends a finished `rt_sigsuspend` by
-    /// restoring the mask it replaced, if no handler did.
+    /// one with a handler enters it; `carried` first, a signal a tracer
+    /// already chose ([`Met::after`]). Ends a finished `rt_sigsuspend` by
+    /// restoring the mask it replaced, if no handler did. A traced
+    /// thread's stop is not served here: it is returned, for the caller to
+    /// serve without the kernel and then go on with what follows it.
     #[cfg_attr(
         target_os = "macos",
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
-    pub fn deliver_pending(&mut self, regs: &mut Regs) {
+    pub(crate) fn deliver_step(
+        &mut self,
+        regs: &mut Regs,
+        mut carried: Option<(u64, SigInfo)>,
+    ) -> Option<Met> {
         // Most often nothing is pending: the thread's state in one look.
-        if self.settle_shared() {
-            return;
+        if carried.is_none() && self.settle_shared() {
+            return None;
         }
         thread::wake_others_if_asked(host::WAKE_SIGNAL);
         drain_to_signalfd();
         loop {
-            let ready = thread::deliverable();
-            if ready == 0 {
-                break;
-            }
-            let sig = ready.trailing_zeros() as u64 + 1;
-            let Some(info) = thread::take_pending(sig) else { continue };
-            if sig == signal::SIGCHLD && crate::trace::file().is_some() {
-                crate::trace::note_to_file(&format!(
-                    "signal: SIGCHLD from {} delivered to {}",
-                    info.pid,
-                    thread::tid()
-                ));
-            }
-            // fwe's nudge of a seized thread: no signal for the guest.
-            if sig == signal::SIGSTOP && info.code == crate::ptrace::POKE_CODE {
-                self.ptrace_poked(regs);
-                continue;
-            }
-            // Traced: the tracer sees the signal first, and says which to
-            // deliver (none, this one, or another).
-            let (sig, info) = if sig != signal::SIGKILL
-                && (crate::ptrace::traced() || crate::ptrace::attached(sig))
-            {
-                match self.ptrace_signal_stop(regs, sig, info) {
-                    Some(s) => s,
-                    None => continue,
+            let (sig, info) = match carried.take() {
+                Some(c) => c,
+                None => {
+                    let ready = thread::deliverable();
+                    if ready == 0 {
+                        break;
+                    }
+                    let sig = ready.trailing_zeros() as u64 + 1;
+                    let Some(info) = thread::take_pending(sig) else { continue };
+                    if sig == signal::SIGCHLD && crate::trace::file().is_some() {
+                        crate::trace::note_to_file(&format!(
+                            "signal: SIGCHLD from {} delivered to {}",
+                            info.pid,
+                            thread::tid()
+                        ));
+                    }
+                    // fwe's nudge of a seized thread: no signal for the
+                    // guest.
+                    if sig == signal::SIGSTOP && info.code == crate::ptrace::POKE_CODE {
+                        if let Some(stop) = crate::ptrace::Stop::poked() {
+                            return Some(Met { stop, then: Then::Raise });
+                        }
+                        continue;
+                    }
+                    // Traced: the tracer sees the signal first, and says
+                    // which to deliver (none, this one, or another).
+                    if sig != signal::SIGKILL
+                        && (crate::ptrace::traced() || crate::ptrace::attached(sig))
+                    {
+                        let stop = crate::ptrace::Stop::signal(sig, info);
+                        return Some(Met { stop, then: Then::Deliver(sig) });
+                    }
+                    (sig, info)
                 }
-            } else {
-                (sig, info)
             };
             let action = self.sigactions[(sig - 1) as usize];
             match action.handler {
@@ -817,7 +853,8 @@ impl<P: Platform> Kernel<P> {
                     // A traced thread's group-stop is its tracer's to see
                     // and end.
                     signal::Default::Stop if crate::ptrace::traced() => {
-                        self.ptrace_group_stop(regs, sig, info);
+                        let stop = crate::ptrace::Stop::group(sig, info);
+                        return Some(Met { stop, then: Then::Raise });
                     }
                     // One sent before the process was last continued is
                     // gone.
@@ -838,6 +875,7 @@ impl<P: Platform> Kernel<P> {
         if let Some(mask) = thread::take_saved_mask() {
             thread::set_mask(mask);
         }
+        None
     }
 
     /// Terminate the process as killed by `sig`.
@@ -995,9 +1033,11 @@ impl<P: Platform> Kernel<P> {
     }
 
     /// Deliver synchronous fault signal `sig` (at `addr`, of syndrome `esr`
-    /// where the fault has one) to a guest handler, returning `true` if a
-    /// handler was entered. When `false`, the caller takes the default
-    /// action (terminate).
+    /// where the fault has one) to a guest handler, untraced (the unit
+    /// tests'; the backends go through
+    /// [`crate::klock::KernelLock::deliver_fault`], whose tracer sees it
+    /// first), returning `true` if a handler was entered.
+    #[cfg(test)]
     pub fn deliver_fault(
         &mut self,
         regs: &mut Regs,
@@ -1005,30 +1045,7 @@ impl<P: Platform> Kernel<P> {
         addr: u64,
         esr: Option<u64>,
     ) -> bool {
-        // A breakpoint of a step a tracer asked for: the step's stop.
-        if sig == signal::SIGTRAP && crate::ptrace::traced() && crate::ptrace::step_hit(regs.pc) {
-            const TRAP_TRACE: i32 = 2;
-            let info = SigInfo { code: TRAP_TRACE, ..SigInfo::default() };
-            if let Some((s, i)) = self.ptrace_signal_stop(regs, sig, info) {
-                thread::post_process(s, i);
-            }
-            return true;
-        }
-        let info = SigInfo { code: fault_code(sig, addr, esr), ..SigInfo::default() };
-        // Traced: the tracer sees the fault first (a breakpoint's SIGTRAP,
-        // say), and the guest goes on as it leaves the registers, or takes
-        // the signal it chooses.
-        if crate::ptrace::traced() {
-            match self.ptrace_signal_stop(regs, sig, info) {
-                None => return true,
-                Some((s, i)) if s != sig => {
-                    thread::post_process(s, i);
-                    return true;
-                }
-                Some(_) => {}
-            }
-        }
-        self.deliver_to_handler(regs, sig, info, addr, esr)
+        self.deliver_to_handler(regs, sig, fault_info(sig, addr, esr), addr, esr)
     }
 
     /// Restore `regs` from the signal frame at `regs.sp` (the `rt_sigreturn`
@@ -1461,7 +1478,7 @@ pub(crate) unsafe fn with_call_mask(set: u64, call: impl FnOnce() -> i64) -> i64
 
 /// `rt_sigsuspend(set, size)`: replace the mask and wait for a signal.
 /// Returns `EINTR` once one is pending; delivering it then restores the mask
-/// from before the call (see [`Kernel::deliver_pending`]). Runs without the
+/// from before the call (see [`Kernel::deliver_step`]). Runs without the
 /// kernel lock.
 ///
 /// # Safety
@@ -1564,6 +1581,43 @@ pub unsafe fn sigtimedwait(set: u64, info: u64, timeout: u64, size: u64) -> i64 
             return err(errno::EINTR);
         }
     }
+}
+
+/// A tracer's stop met delivering signals ([`Kernel::deliver_step`]), and
+/// what follows it.
+#[must_use = "a stop is served"]
+pub(crate) struct Met {
+    pub(crate) stop: crate::ptrace::Stop,
+    then: Then,
+}
+
+enum Then {
+    /// A signal-delivery stop for this signal: the tracer chooses what is
+    /// delivered.
+    Deliver(u64),
+    /// A group-stop or an interrupt: a signal the tracer resumed with is
+    /// raised.
+    Raise,
+}
+
+impl Met {
+    /// After the stop, which the tracer ended with `r`: the signal to
+    /// deliver next, before any other pending one.
+    pub(crate) fn after(self, r: crate::ptrace::Resume) -> Option<(u64, SigInfo)> {
+        match self.then {
+            Then::Deliver(sig) => crate::ptrace::chosen(sig, r),
+            Then::Raise => {
+                crate::ptrace::raise_resumed(r);
+                None
+            }
+        }
+    }
+}
+
+/// The `siginfo` of synchronous fault signal `sig` at `addr`, of syndrome
+/// `esr` where the fault has one.
+pub(crate) fn fault_info(sig: u64, addr: u64, esr: Option<u64>) -> SigInfo {
+    SigInfo { code: fault_code(sig, addr, esr), ..SigInfo::default() }
 }
 
 #[cfg(test)]

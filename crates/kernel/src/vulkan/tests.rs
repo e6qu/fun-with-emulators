@@ -438,3 +438,32 @@ fn moltenvk_is_told_no_heaps_after_the_programs_own_settings() {
     assert_eq!(name_of(&both[..32]), "MVK_CONFIG_LOG_LEVEL", "the program's first");
     assert_eq!(name_of(&both[32..]), "MVK_CONFIG_USE_MTLHEAP", "fwe's last, so it holds");
 }
+
+/// A trace shows what a command wrote: each output range in hex, the
+/// structures of a filled `pNext` chain too.
+#[test]
+fn a_trace_shows_what_a_command_wrote() {
+    let props: [u32; 3] = [0x11, 0x2233, 0];
+    let got = super::written(
+        cmd::vkGetPhysicalDeviceFormatProperties,
+        &words(&[0, 37, props.as_ptr() as u64]),
+    );
+    let at = props.as_ptr() as u64;
+    assert_eq!(got, format!(" {at:#x}:110000003322000000000000;"));
+    // VkFormatProperties2 (32 bytes) chained to VkFormatProperties3 (40).
+    let mut three = [0u64; 5];
+    three[0] = 1_000_360_000;
+    three[3] = 0x200;
+    let mut two = [0u64; 4];
+    two[0] = 1_000_059_002;
+    two[1] = three.as_ptr() as u64;
+    let got = super::written(
+        cmd::vkGetPhysicalDeviceFormatProperties2,
+        &words(&[0, 126, two.as_ptr() as u64]),
+    );
+    let (a2, a3) = (two.as_ptr() as u64, three.as_ptr() as u64);
+    let hex = |w: &[u64]| {
+        w.iter().flat_map(|v| v.to_ne_bytes()).map(|b| format!("{b:02x}")).collect::<String>()
+    };
+    assert_eq!(got, format!(" {a2:#x}:{}; {a3:#x}:{};", hex(&two), hex(&three)));
+}

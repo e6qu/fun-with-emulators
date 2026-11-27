@@ -1,10 +1,15 @@
 # Roadmap
 
-The path to [PLAN.md](PLAN.md)'s 1.0, laid out as pull requests in order
-([AGENTS.md](AGENTS.md#development-process)). A pull request is done when
-its **Done when** criteria pass as end-to-end tests and benchmarks in CI;
-a milestone, when its pull requests are merged. Current limitations are
-in [docs/architecture.md](docs/architecture.md#known-limitations).
+The status of each milestone, what is done, and the path to
+[PLAN.md](PLAN.md)'s 1.0 as pull requests in order
+([AGENTS.md](AGENTS.md#development-process)), with what is not planned. A
+pull request is done when its **Done when** criteria pass as end-to-end
+tests and benchmarks in CI; a milestone, when its pull requests are
+merged. What runs unmodified is in [README.md](README.md#status); what
+each Linux mechanism becomes under fwe, in
+[docs/linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces); the
+current limitations, in
+[docs/architecture.md](docs/architecture.md#known-limitations).
 
 ## Status
 
@@ -17,10 +22,8 @@ in [docs/architecture.md](docs/architecture.md#known-limitations).
 | M4 Compatibility | Done |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way: PRs 1 and 2 done |
-| M7 Graphical programs and sandboxes | Under way: PRs 1 and 2 done |
+| M7 Graphical programs and sandboxes | Under way: PRs 1, 2 and 3 done |
 | M8 Virtual networking | After 1.0 |
-
-What runs unmodified is in [README.md](README.md#status).
 
 ## Done
 
@@ -63,9 +66,13 @@ What runs unmodified is in [README.md](README.md#status).
   null descriptors where the Mac's driver lacks them; OpenGL through
   Zink; `vkcube` and `glxgears` drawn on it in CI; a Vulkan submission
   and `vkcube`'s frames within 1.5× of the same driver natively.
-
-What each Linux mechanism becomes under fwe is in
-[docs/linux-on-macos.md](docs/linux-on-macos.md#what-fwe-enforces).
+- **M7 PR 3 — Browsers and application frameworks:** Chromium and
+  Firefox, sandboxes on, showing a page and playing a video; Electron,
+  Visual Studio Code and Zed (by lavapipe) on Debian 13, the editors
+  saving what is typed into them; Tauri and Wails apps of fwe's own built
+  under fwe, drawing through WebKitGTK; Chromium's page load and video
+  frames benchmarked against Chrome for Testing on macOS, Electron's
+  start-up against its macOS build.
 
 ## Left to 1.0
 
@@ -149,22 +156,25 @@ reason.
 **Done when:** Wine's test program runs natively in CI and its benchmarks
 hold 1.5×.
 
+#### PR 8 — Large images natively
+
+- [ ] **Counted:** per process, the code run by translation because no
+  stub space reaches it, the code that translation follows into from
+  there, and the time taken bringing in translations kept by earlier
+  runs.
+- [ ] **No band beyond reach:** every site of an image whose code is
+  wider than a branch reaches across (Chromium's 224 MiB) gets a stub, or
+  the code beyond reach and what it calls costs as native code does.
+- [ ] **Kept translations brought in at the cost of a native page's first
+  run,** not one lookup per block.
+
+**Done when:** Chromium's page load holds 1.5× Chrome for Testing on
+macOS, its budget back from 3×.
+
 ### M7 — Graphical programs and sandboxes
 
 CI starts an X server and drives each program with synthetic input,
 checking what it draws by screenshot.
-
-#### PR 3 — Browsers and application frameworks
-
-- [ ] **Browsers:** Chrome or Chromium, and Firefox, sandboxes on,
-  browsing local pages and playing video.
-- [ ] **Frameworks:** an Electron app and Visual Studio Code; Zed; a Tauri
-  and a Wails app (WebKitGTK).
-- [ ] **Benchmarks:** a page load and video frames against the same
-  browser on macOS; an Electron app's start-up.
-
-**Done when:** these run in CI on the GPU, driven and checked by what
-they draw.
 
 #### PR 4 — Graphical Wine
 
@@ -182,12 +192,33 @@ they draw.
 **Done when:** CI runs the JDK workload through `runsc` on fwe, its
 benchmark beside `runsc` on Linux.
 
+#### PR 6 — Applications on the GPU through MoltenVK
+
+MoltenVK is the Vulkan driver every Apple Silicon Mac runs, so what
+programs need on the GPU is made to work on it.
+
+- [ ] **OpenGL 3 and OpenGL ES 3 on MoltenVK:** fwe's Vulkan driver
+  gives what Zink and ANGLE need for them and MoltenVK lacks: transform
+  feedback, and triangles whose flat values come from their last vertex.
+- [ ] **Browsers on the GPU:** Firefox's WebGL 1 and 2 by Zink, and
+  Chromium's GPU process by ANGLE on Vulkan, drawing pages on the Mac's
+  GPU.
+- [ ] **Zed on the GPU:** its shaders compile on MoltenVK, whose
+  translation to Metal passes a structure's array member where a
+  function takes `spvUnsafeArray` (Metal's compiler refuses it).
+
+**Done when:** both browsers' WebGL names the Mac's GPU and draws the
+test page in CI, antialiased, Chromium composites on the GPU, and Zed
+edits a file on the GPU.
+
 ## After 1.0
 
 ### M8 — Virtual networking
 
 Applications on networks of their own, as on a Linux host, the host's
-TCP/IP stack carrying the traffic.
+TCP/IP stack carrying the traffic. Packet-level features (iptables,
+packet sockets, TUN) would need a TCP/IP stack in fwe; they stay out
+unless one proves cheap enough.
 
 #### PR 1 — Addresses per network namespace
 
@@ -205,9 +236,6 @@ bridge at loopback speed within 1.5×.
   those calls; containers reach each other by name; published ports
   listen on the Mac; outgoing connections leave as the Mac's.
 
-Packet-level features (iptables, packet sockets, TUN) would need a TCP/IP
-stack in fwe; they stay out unless one proves cheap enough.
-
 **Done when:** Docker Compose with a bridge network and a Podman pod run,
 reaching each other by name, with a published port reachable from the Mac.
 
@@ -215,6 +243,7 @@ reaching each other by name, with a published port reachable from the Mac.
 
 Calls for these are refused (`ENOSYS`, `EINVAL` or `EPERM`) unless noted,
 so programs that probe for them fall back.
+
 - **io_uring.**
 - **Networking beyond loopback and the host's sockets** (veth, bridges,
   firewalling, packet sockets, SCTP, RDS, TUN, kernel TLS): a new network

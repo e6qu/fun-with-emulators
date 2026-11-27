@@ -1,0 +1,23 @@
+# A Tauri app of fwe's own: one window showing dist/index.html, which the
+# application tests look at. Built under fwe on an Alpine root, offline,
+# from the crates Cargo.lock pins.
+[package]
+name = "fwe-tauri"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.96"
+license = "MIT"
+publish = false
+
+[dependencies]
+tauri = { version = "2.12", features = ["custom-protocol"] }
+
+[build-dependencies]
+tauri-build = { version = "2.7", features = [] }
+
+[profile.release]
+debug = false
+strip = true
+
+[workspace]
+resolver = "3"
