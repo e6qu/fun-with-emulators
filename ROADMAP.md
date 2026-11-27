@@ -53,7 +53,8 @@ current limitations, in
 - **M6 PR 2 — Kernel state in memory:** the process store, shared
   records, a file store for tmpfs, `/dev/shm`, memfds and the cgroup tree
   in memory every fwe process maps, or in macOS's own objects, none of it
-  on disk; System V semaphores, messages and segments within 3× macOS.
+  on disk; System V semaphores and messages within 3× macOS, segments
+  3.5×.
 - **M7 PR 1 — A display:** X11 clients on an X server on the Mac
   (XQuartz, Xvfb), `MIT-SHM` where the server takes segments by
   descriptor; Weston and Xwayland in the guest; demo programs
@@ -101,7 +102,8 @@ Budgets, held in CI against native macOS on the same runner:
 | Benchmark | Budget |
 |---|---|
 | a system call (`getpid`, `fstat`, `stat`, `open`+`close`, `pread`, `mmap`+`munmap`; one thread and several) | 1.5× |
-| thread create and join; `fork` + exit + wait; `fork` + `exec` + wait; start-up | 3× |
+| thread create and join; `fork` + exit + wait; start-up | 3× |
+| `fork` + `exec` + wait (each `execve` in a fork child starts a fresh fwe) | 4× |
 | SQLite, git, a JDK at work, Node.js, LuaJIT, an X frame and round trip | 1.5× |
 | a C build (Lua), a Lua script, a Python script, xz | fwe's share of CPU samples 1.2× |
 | translated code (calls and returns, a switch, calls through a register, a loop) against the same code natively | 1.3× |
@@ -139,9 +141,12 @@ hold 0.5× macOS (unless the directory cache is not planned), and
 - [ ] **Fewer mappings to fork:** fwe's code cache, tables and descriptor
   room made on first use, in as few host regions as they can be.
 - [ ] **`rt_sigreturn` through the gate,** without a host signal.
+- [ ] **A fork child's `execve` started faster:** the fresh fwe it starts
+  takes what it needs from its parent without looking it up again, and the
+  forked address space it leaves is small to tear down.
 
-**Done when:** `fork` + exit + wait holds 2× macOS and a handled
-`SIGSEGV` 2×.
+**Done when:** `fork` + exit + wait holds 2× macOS, `fork` + `exec` + wait
+3×, and a handled `SIGSEGV` 2×.
 
 #### PR 6 — 4 KiB pages natively
 

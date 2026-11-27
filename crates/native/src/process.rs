@@ -120,7 +120,7 @@ fn exec_program(path: Vec<u8>, args: Vec<Vec<u8>>, env: Vec<Vec<u8>>) -> Result<
         let exe = fs.exec_fd(&path).map_or_else(|| path.clone(), |fd| fs.fd_target(fd));
         let named = fwe_kernel::fs::exec_name(&run_by, &exe);
         return Err(crate::reexec(
-            crate::Program { path: &path, named: &named, args: &args, env: &env },
+            crate::Program { path: &path, named: &named, args: &args, env: &env, file: &file },
             fs,
             strace,
             &state,
