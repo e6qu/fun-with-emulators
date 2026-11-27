@@ -553,6 +553,9 @@ pub(crate) struct Program<'a> {
     pub named: &'a [u8],
     pub args: &'a [Vec<u8>],
     pub env: &'a [Vec<u8>],
+    /// The program's file, as the caller read it (a big program's is read
+    /// once, not again here).
+    pub file: &'a [u8],
 }
 
 /// `execve` by re-executing fwe on the new program: the new process image is
@@ -578,15 +581,11 @@ pub(crate) fn reexec(
 ) -> i64 {
     use fwe_abi::{err, errno};
     use std::ffi::CString;
-    let Program { path, named, args, env } = program;
+    let Program { path, named, args, env, file } = program;
     // A `/proc` link names a program the new fwe would look for in itself.
     let target = fs.exec_target(path);
     let path = &target[..];
-    let file = match fs.read(path) {
-        Ok(f) => f,
-        Err(e) => return err(e),
-    };
-    if Elf::parse(&file).is_err() {
+    if Elf::parse(file).is_err() {
         return err(errno::ENOEXEC);
     }
     let Some(fwe) = FWE_EXE.get() else { return err(errno::ENOEXEC) };

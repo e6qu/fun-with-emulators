@@ -1278,6 +1278,10 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
         Err(e) => return err(e),
     };
     let fs = k.fs();
+    let file = match fs.read(&fs.exec_target(&path)) {
+        Ok(f) => f,
+        Err(e) => return err(e),
+    };
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
     let state = k.exec_state();
@@ -1293,7 +1297,7 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     let exe = fs.exec_fd(&path).map_or_else(|| path.clone(), |fd| fs.fd_target(fd));
     let named = fwe_kernel::fs::exec_name(&run_by, &exe);
     let r = crate::reexec(
-        crate::Program { path: &path, named: &named, args: &argv, env: &envp },
+        crate::Program { path: &path, named: &named, args: &argv, env: &envp, file: &file },
         fs,
         k.tracer,
         &state,
