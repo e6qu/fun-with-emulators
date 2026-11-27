@@ -3414,7 +3414,13 @@ fn user_guide_recipes() {
 
 /// The Mac's PulseAudio server for the sound tests: Homebrew's (`PULSEAUDIO`
 /// names it; the tests skip without it), with one null sink, its socket and
-/// cookie in a directory of its own; ended when dropped.
+/// cookie in a directory of its own; ended when dropped. The sink renders
+/// 50 ms ahead (`norewinds`): by default, with no stream asking for a
+/// latency, it renders two seconds ahead, and a stream that then asks for
+/// less can rewind it only by as much, so it is not played until the
+/// sink's clock has caught up, up to two seconds later (PulseAudio 17's
+/// `module-null-sink`; the Mac's own output, its CoreAudio sink, is
+/// other code).
 struct PulseServer {
     dir: PathBuf,
     bin: PathBuf,
@@ -3434,7 +3440,7 @@ impl PulseServer {
         let socket = dir.join("native");
         let child = Command::new(&bin)
             .args(["-n", "--daemonize=no", "--exit-idle-time=-1", "--use-pid-file=no"])
-            .args(["-L", "module-null-sink sink_name=nul"])
+            .args(["-L", "module-null-sink sink_name=nul norewinds=1"])
             .arg("-L")
             .arg(format!("module-native-protocol-unix socket={}", socket.display()))
             .env_clear()
@@ -3468,13 +3474,16 @@ impl PulseServer {
     }
 
     /// The frames of sound (not silence) its null sink's monitor records
-    /// while `play` runs, and a second after.
+    /// while `play` runs, and a second after: in fragments of 20 ms (the
+    /// server holds a recorder's sound until a fragment is full, two
+    /// seconds' by default, which would keep the end of what was played).
     fn recorded(&self, play: impl FnOnce()) -> u64 {
         let raw = self.dir.join("monitor.raw");
         let mut parec = Command::new(self.bin.with_file_name("parec"))
             .arg("-s")
             .arg(format!("unix:{}", self.dir.join("native").display()))
-            .args(["-d", "nul.monitor", "--format=s16le", "--rate=44100", "--channels=2", "--raw"])
+            .args(["-d", "nul.monitor", "--latency-msec=20", "--format=s16le", "--rate=44100"])
+            .args(["--channels=2", "--raw"])
             .env_clear()
             .env("HOME", &self.dir)
             .stdin(Stdio::null())
@@ -3506,10 +3515,13 @@ impl Drop for PulseServer {
     }
 }
 
-/// `secs` seconds of a 440 Hz tone, as a WAV file: 16-bit stereo at
-/// 44.1 kHz.
+/// `secs` seconds of a 440 Hz tone and half a second of silence, as a WAV
+/// file: 16-bit stereo at 44.1 kHz. (A player's server can drop what it
+/// holds of a stream as it ends: PipeWire's sink to a PulseAudio server
+/// flushes it once nothing plays.)
 fn tone_wav(secs: u32) -> Vec<u8> {
-    let frames = 44_100 * secs;
+    let sound = 44_100 * secs;
+    let frames = sound + 22_050;
     let mut w = b"RIFF".to_vec();
     w.extend((36 + frames * 4).to_le_bytes());
     w.extend(b"WAVEfmt ");
@@ -3524,7 +3536,8 @@ fn tone_wav(secs: u32) -> Vec<u8> {
     w.extend((frames * 4).to_le_bytes());
     for i in 0..frames {
         let t = f64::from(i) / 44_100.0;
-        let s = ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16;
+        let s =
+            if i < sound { ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16 } else { 0 };
         w.extend(s.to_le_bytes());
         w.extend(s.to_le_bytes());
     }
@@ -3534,8 +3547,10 @@ fn tone_wav(secs: u32) -> Vec<u8> {
 /// Linux's sound clients play on the Mac's PulseAudio server, which fwe's
 /// `PULSE_SERVER` names: the guest's own names it as Linux's system-wide
 /// server (`/run/pulse/native`), and a second of tone played by
-/// PulseAudio's `paplay` and by ALSA's `aplay` (through ALSA's PulseAudio
-/// plugin) reaches the server's null sink, whose monitor records it.
+/// PulseAudio's `paplay`, by ALSA's `aplay` (through ALSA's PulseAudio
+/// plugin) and by PipeWire's `pw-play` (through the guest's PipeWire and
+/// WirePlumber, to a sink PipeWire's PulseAudio tunnel makes) reaches the
+/// server's null sink, whose monitor records it.
 #[test]
 fn sound_clients_play_on_the_macs_pulseaudio_server() {
     if !fetched_program_tests("FWE_SOUND_TESTS") {
@@ -3547,6 +3562,18 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("sound")).arg(&root));
     let root = ScratchRoot(root);
     std::fs::write(root.0.join("tmp/tone.wav"), tone_wav(1)).unwrap();
+    // PipeWire's sink on the Mac's server, as a user's configuration adds it.
+    let conf = root.0.join("root/.config/pipewire/pipewire.conf.d");
+    std::fs::create_dir_all(&conf).unwrap();
+    std::fs::write(
+        conf.join("mac.conf"),
+        "context.modules = [\n\
+         \x20 { name = libpipewire-module-pulse-tunnel\n\
+         \x20   args = { tunnel.mode = sink, pulse.server.address = \"unix:/run/pulse/native\",\n\
+         \x20            node.name = mac } }\n\
+         ]\n",
+    )
+    .unwrap();
     let run = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
         cmd.arg("--root").arg(&root.0).arg(root.0.join(&args[0][1..])).args(&args[1..]);
@@ -3558,15 +3585,25 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     };
     let info = run(&["/usr/bin/pactl", "info"]);
     assert!(info.contains("Server String: unix:/run/pulse/native"), "{info}");
-    // A second of tone is 44100 frames; the server's start can miss some.
+    // A second of tone is 44100 frames, those at its zero crossings silent
+    // (900 of them): all are recorded.
+    // PipeWire and its session manager, for as long as pw-play plays.
+    let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
+        pipewire 2>/tmp/pipewire.err & p=$!
+        until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done
+        wireplumber 2>/tmp/wireplumber.err & w=$!
+        until pw-cli ls Node 2>/dev/null | grep -q 'node.name = \"mac\"'; do sleep 0.1; done
+        pw-play --target mac /tmp/tone.wav; r=$?
+        kill $w $p; wait; exit $r";
     for player in [
         &["/usr/bin/paplay", "/tmp/tone.wav"][..],
         &["/usr/bin/aplay", "-q", "-D", "pulse", "/tmp/tone.wav"],
+        &["/bin/sh", "-c", pipewire],
     ] {
         let frames = pulse.recorded(|| {
             run(player);
         });
-        assert!(frames > 30_000, "{player:?}: {frames} frames of the tone recorded");
+        assert!(frames > 43_000, "{player:?}: {frames} frames of the tone recorded");
     }
 }
 

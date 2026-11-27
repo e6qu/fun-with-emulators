@@ -1,21 +1,23 @@
 # Debian 13 (trixie) arm64 packages of the sound tests' root: PulseAudio's
 # clients (paplay, pactl), ALSA's programs (aplay) with ALSA's PulseAudio
-# plugin, and PipeWire's (pipewire, pw-play) with its modules (its tunnel
-# to a PulseAudio server among them).
+# plugin, and PipeWire's (pipewire, WirePlumber, pw-play) with its modules
+# (its tunnel to a PulseAudio server among them).
 # Each line is a pool path and the package's SHA-256 from the trixie index,
 # as tools/debian-manifest.py makes them from the seeds below: a whole
 # system (every Essential package) with the seeds and all they depend on.
 # suite: trixie
-# seeds: pulseaudio-utils alsa-utils libasound2-plugins pipewire-bin libpipewire-0.3-modules
+# seeds: pulseaudio-utils alsa-utils libasound2-plugins pipewire pipewire-bin libpipewire-0.3-modules wireplumber
 # snapshot: 20261126T000000Z
 pool/main/a/abseil/libabsl20240722_20240722.0-4_arm64.deb eb6648c73cd69c577a2bc18c8d66d44de897c0207a734ffdb55f91945404d0ac
 pool/main/a/acl/libacl1_2.3.2-2+b1_arm64.deb 10b2399169e42e6d8db55944116cb2ed61caab997cf700acb83de0b0668e5721
+pool/main/a/adduser/adduser_3.152_all.deb e50984d2e1ef6300e3fd51303839842189a077b10cb5cadff1923df10c61c493
 pool/main/a/alsa-lib/libasound2-data_1.2.14-1+deb13u1_all.deb 04688afdff3769c0f685541daed7b2f6f0cb946799ddf1d5847ddf11fe245559
 pool/main/a/alsa-lib/libasound2t64_1.2.14-1+deb13u1_arm64.deb 9c808d819ccddc37c793dd3186c2ecd858b2feb2474cebb883f70386e7890d39
 pool/main/a/alsa-lib/libatopology2t64_1.2.14-1+deb13u1_arm64.deb 8e9dd1458d0b990f6391c0612e38a26adba4fdc138a6a911be905acc9e499ccd
 pool/main/a/alsa-plugins/libasound2-plugins_1.2.12-2+b1_arm64.deb cd09117fd7cf92326a0ca17125f46395f16d1b3ad6c8122151d3302c602d3b23
 pool/main/a/alsa-utils/alsa-utils_1.2.14-1_arm64.deb 485fdd5ff4232fcc761ee4ca2f6e8be7572783e696a0d595ccffcba324db1026
 pool/main/a/aom/libaom3_3.12.1-1+deb13u1_arm64.deb 552e2bd21772a39713a0c63e814039f558b355d048f0d0bfc4009658253cc1e9
+pool/main/a/apparmor/libapparmor1_4.1.0-1_arm64.deb 6e5ec85de21bd5f489327e6d2c85c2825e82ff6f4581dc936704d022a1f164af
 pool/main/a/attr/libattr1_2.5.2-3_arm64.deb 25057d7bfba969a76cdf18ae88ce7ff6e664520726ddf02cdde97c03d5e9a43c
 pool/main/a/audit/libaudit-common_4.0.2-2+deb13u1_all.deb b9d32e5ff04fd747aacb7d6b3ebbbbf734ddefb2f1695f0b1b2a4b5e51b1052e
 pool/main/a/audit/libaudit1_4.0.2-2+deb13u1_arm64.deb 3472a1d77e36832ea0bb6509153c721ffc46a96aa0bc25073e7b95571df16196
@@ -35,6 +37,12 @@ pool/main/c/coreutils/coreutils_9.7-3_arm64.deb 99b2531e8d16e4f2d3f239ae3cb57913
 pool/main/d/dash/dash_0.5.12-12_arm64.deb ce4c8688a1a3ea510186ba95aba74d4c49863094e47e1effc0b602839e840c04
 pool/main/d/dav1d/libdav1d7_1.5.1-1_arm64.deb bcb430fa4c5f05bc3fa4dd9f18b7b0498ec9701c23e83bf57a29996216c3a245
 pool/main/d/db5.3/libdb5.3t64_5.3.28+dfsg2-9_arm64.deb bfef56508d69fd3f940668f6abd0a466a362cabf63c4cc1c787cc58d28f6e92f
+pool/main/d/dbus/dbus-bin_1.16.2-2_arm64.deb 4d8423744f34150c6f20959a868bed986fd0e39740a29c48f65c6da60fa2b328
+pool/main/d/dbus/dbus-daemon_1.16.2-2_arm64.deb 74650cdf706f6a782f9bb486237c210454a39ebf840e3260492e557013931739
+pool/main/d/dbus/dbus-session-bus-common_1.16.2-2_all.deb 98bd27836c7170839ed9c84b00daad9ed7155bd3d42e3f0ec3faf497aafa5f5f
+pool/main/d/dbus/dbus-system-bus-common_1.16.2-2_all.deb 262e9ec8aae4e38bfa341648f9498b29280a81458601e1c265a36a24771d120a
+pool/main/d/dbus/dbus-user-session_1.16.2-2_arm64.deb 765c63b00e0054a2ec1e599b14eda13e3a7902c652be3482dda037b8de15cc17
+pool/main/d/dbus/dbus_1.16.2-2_arm64.deb 984e4c740ecd258e862eae9d0aed11ff75f83eff60b95ab27cb6c9a7dd0028c1
 pool/main/d/dbus/libdbus-1-3_1.16.2-2_arm64.deb ca6bb5f2047ad58d274cb7d14216035a07d8e5aae6f6a0122c4f6293c9c39515
 pool/main/d/debconf/debconf_1.5.91_all.deb 1ddc7e6c5925f748eefb7ca811d98e049f18c158bb21fbc7e122262ce6011e49
 pool/main/d/debianutils/debianutils_5.23.2_arm64.deb 662d59d9cd0d46f0250ddcd997353be915fbc6be692d7c676c73dc33c90715e8
@@ -83,7 +91,9 @@ pool/main/l/lame/libmp3lame0_3.100-6+b3_arm64.deb ed3563722129ffa4def03b7af0b589
 pool/main/l/lcms2/liblcms2-2_2.16-2+deb13u2_arm64.deb 6636997fc488327a8d0951a038df6e5178a52b3f5e5cc2386d42655621f5672d
 pool/main/l/lerc/liblerc4_4.0.0+ds-5_arm64.deb db015dc1888371e490594f8aaaaa55356313478d744fa69e242e034e4c2a0019
 pool/main/l/lilv/liblilv-0-0_0.24.26-1_arm64.deb eb14f680a7c639a9dce34928a2a560468baa25f03a79cb76b6acc9b35226b54e
+pool/main/l/lua5.4/liblua5.4-0_5.4.7-1+b2_arm64.deb 56c90caee447f0c9bc9390f822cb1d8ffd37e44041c736e2d8d86040c23547d8
 pool/main/liba/libasyncns/libasyncns0_0.8-6+b5_arm64.deb 818bbcaa7ada536a1bdd5b1c26b77608606403f5c15557691e83d0b4433b89ef
+pool/main/libb/libbsd/libbsd0_0.12.2-2_arm64.deb 6827c1b3ad8dcbf3478803f9150359433e3376a3bde01c4503888a22eb3924e3
 pool/main/libc/libcap-ng/libcap-ng0_0.8.5-4+b1_arm64.deb eb6da83296e4710a8600c1426692ed9b9eadcab7ebd36dbabc2a562b5c1ab691
 pool/main/libc/libcap2/libcap2_2.75-10+deb13u1+b3_arm64.deb 863aa5b9cdf6f80010b48982d4639126b09a89eeef2c0c5c7be226297c811581
 pool/main/libc/libconfig/libconfig++11_1.7.3-2_arm64.deb d6b92f922a288aae212a9cd89951c7c154aba9965480a9ab9a5f5ff1ce576127
@@ -104,7 +114,11 @@ pool/main/libp/libpng1.6/libpng16-16t64_1.6.48-1+deb13u6_arm64.deb 57177299a638e
 pool/main/libr/libraw1394/libraw1394-11_2.1.2-2+b2_arm64.deb 23af99af78c3eaac033f14e62958f83a2748e8df1467c32840957431bacef911
 pool/main/libr/librsvg/librsvg2-2_2.60.0+dfsg-1+deb13u1_arm64.deb f0ce936ee724964f62d7c31a4f826a5f13e13b7d44cd44ccae2f241c1b08ad2b
 pool/main/libs/libsamplerate/libsamplerate0_0.2.2-4+b2_arm64.deb 5d9fad694b249d48d8457e1242ab60e04db6a30d7d56f80c6ae463ff122147ec
+pool/main/libs/libseccomp/libseccomp2_2.6.0-2_arm64.deb 013d0af0444177960d5899f4673e35d492f31edfc40cb8d5a82bb56147ab2e35
 pool/main/libs/libselinux/libselinux1_3.8.1-1_arm64.deb fc13da4c7783b8f4361d92ef1045931f298d1b0ac78ed1a85c2232615f49fc6f
+pool/main/libs/libsemanage/libsemanage-common_3.8.1-1_all.deb 65375d886749c236bd1da4d9990b7c2469d2fe66019a28e5614f6814376d3dcb
+pool/main/libs/libsemanage/libsemanage2_3.8.1-1_arm64.deb ed73a76d3c39ac5cbd0a447527bba3dc33d3ec3785af7583b70ab41f85fc0243
+pool/main/libs/libsepol/libsepol2_3.8.1-1_arm64.deb 0119cbb4d12a6b5093430a00714019bac87a446f34f21d834453742f1af35b8b
 pool/main/libs/libsigc++-2.0/libsigc++-2.0-0v5_2.12.1-3_arm64.deb 3107ff3df00f987ff53e0ec83ffe2c3df4351417203bb24387cde1c98f455b5c
 pool/main/libs/libsigsegv/libsigsegv2_2.14-1+b2_arm64.deb 4fd72af654e2a72c84093cc2a38c856fba9492ecd828721117867e99c2c9cd92
 pool/main/libs/libsndfile/libsndfile1_1.2.2-2+deb13u1_arm64.deb 6c94f17e1f02778f98b96bb9ae19ff30085662e96685898a018c26bfd4bfc3f2
@@ -166,6 +180,7 @@ pool/main/p/pipewire/libpipewire-0.3-0t64_1.4.2-1_arm64.deb f25ab475f09ab5ec952f
 pool/main/p/pipewire/libpipewire-0.3-modules_1.4.2-1_arm64.deb d9cbca11fa44fded83f941124cba92ecd1771eaa45f5c4815f4f398d62e523e8
 pool/main/p/pipewire/libspa-0.2-modules_1.4.2-1_arm64.deb b13c1955882ea689f9135bf45c020a364d3cba2d2ed69251827b5c6abd41d4b7
 pool/main/p/pipewire/pipewire-bin_1.4.2-1_arm64.deb e4516c5af7ee95390cc1b42feae844f69ed487e39b98962f13dc79b75175933e
+pool/main/p/pipewire/pipewire_1.4.2-1_arm64.deb 5a79fe7a8ebaec93ea2acaaf638e67bce55daca23ea0296056bc02d68bbad4d7
 pool/main/p/pixman/libpixman-1-0_0.44.0-3_arm64.deb b502cd8b1ece222f42b44c42c33a300d84152c20089660167b9422ad2ebb6132
 pool/main/p/pulseaudio/libpulse0_17.0+dfsg1-2+b1_arm64.deb 2de5610e3affe69cfb11110f890375261b47c9e0fc1a81eef7ecc4d6d2dc9a6d
 pool/main/p/pulseaudio/libpulsedsp_17.0+dfsg1-2+b1_arm64.deb 6539aeafbae115a0423b520641c09b5e8956e2219812fdad2081f23a0fa4c2ec
@@ -176,6 +191,8 @@ pool/main/r/roc-toolkit/libroc0.4_0.4.0+dfsg-5_arm64.deb 5433a9435ca3093c56ccff9
 pool/main/r/rust-rav1e/librav1e0.7_0.7.1-9+b2_arm64.deb 1b81b3c3494033bb32573442ce49f253dc76e262de8b28d4bfa3f433cd9783d4
 pool/main/s/sed/sed_4.9-2+deb13u1_arm64.deb c654fa045de8cc722855b8db59990b703cb7299c897c6e187bf949d42df82b62
 pool/main/s/serd/libserd-0-0_0.32.4-1_arm64.deb 01205ff5c346ae395ec3066034e151e8100e46f596afc65d9bba7a80cce129ae
+pool/main/s/shadow/login.defs_4.17.4-2_all.deb b4bbb8242cbf5588de7aafeb9d578a3dee1db2891f444ab454fd30bd80ccf2b4
+pool/main/s/shadow/passwd_4.17.4-2_arm64.deb a6863055a3d53bf805dd0048b836e4b7a3d14a899b832a50d577b047da4202d8
 pool/main/s/shared-mime-info/shared-mime-info_2.4-5+b2_arm64.deb a68086d0fdffc32fa05b1768f67b83d06344b026a855e29daa7ff02d64deec59
 pool/main/s/shine/libshine3_3.1.1-2+b2_arm64.deb d54a5f7154c0e826338bb18c34c69de9a036f3264adf59cef39bc30f07baa6d0
 pool/main/s/snappy/libsnappy1v5_1.2.2-1_arm64.deb b307da3076ad257cd8adec2faa5ad051fa9bd54edc1f473ecaf69b1456fdebd2
@@ -185,8 +202,12 @@ pool/main/s/speexdsp/libspeexdsp1_1.2.1-3_arm64.deb edb6b04791bccdb37bedb570255d
 pool/main/s/sqlite3/libsqlite3-0_3.46.1-7+deb13u2_arm64.deb 5b09efca71cb7a16d67f5453af3989ae1a84fe6b68c6dd3913de527cb0ca23aa
 pool/main/s/sratom/libsratom-0-0_0.6.18-1_arm64.deb 5ebc866e3632741477cc225a3a927ddacae432238494e73c50b07c00420d2406
 pool/main/s/svt-av1/libsvtav1enc2_2.3.0+dfsg-1_arm64.deb 9b7de4fcdaba3fdc0fe8eed956cd5ce270158c858493db901bfcb9bd4a432fb6
+pool/main/s/systemd/libpam-systemd_257.13-1~deb13u1_arm64.deb 05bc0f7e21e896299aae22ea45075185cea0fb25574218a0ad9235f93029b823
+pool/main/s/systemd/libsystemd-shared_257.13-1~deb13u1_arm64.deb b48df445566ff6c39395c9fc571524c9e03803bc2e434d7869fc21e723c64b4d
 pool/main/s/systemd/libsystemd0_257.13-1~deb13u1_arm64.deb d2f63c408549c29eaefb6f4c948393edce99f45ee8e43c991391bef63fb7d54b
 pool/main/s/systemd/libudev1_257.13-1~deb13u1_arm64.deb 459b1c9c17cc3c586e90d13d2a991715d498c6eed6c046cabf321021167bc380
+pool/main/s/systemd/systemd-sysv_257.13-1~deb13u1_arm64.deb af3c883fabc97850c7afe9489a9e1808b4db2d9cfdc4dc1639da9e1b0356c97b
+pool/main/s/systemd/systemd_257.13-1~deb13u1_arm64.deb dcc3ba37f0488ecd513820035b4efc300e198849f5b6437a9bac9c2f307149ab
 pool/main/s/sysvinit/sysvinit-utils_3.14-4_arm64.deb 1366e87a382a6b95a0a7c507b8f1be9b193f772f3428f9f7e0271a217915cfae
 pool/main/t/tar/tar_1.35+dfsg-3.1_arm64.deb c460a8294202ca3802b7c703b0bd70dd8bda1f2fc8785839595cf9d5e060d71b
 pool/main/t/tiff/libtiff6_4.7.0-3+deb13u3_arm64.deb 208e9fdc14ed88a30f31fdfb993d1e8ab19f9ab29f3cd8546ffb4ea3f74f5a3f
@@ -197,8 +218,11 @@ pool/main/u/util-linux/liblastlog2-2_2.41.5-0+deb13u1_arm64.deb 934e7f90814e014a
 pool/main/u/util-linux/libmount1_2.41.5-0+deb13u1_arm64.deb 14e2d555459f3c0b1442bb49dd2d266ea202a003198c86f65508a1dbfaa18732
 pool/main/u/util-linux/libsmartcols1_2.41.5-0+deb13u1_arm64.deb 1881ac0bc2a58a52ecbf6e7690b17552233b71e94129db79e2302656b0d22f24
 pool/main/u/util-linux/libuuid1_2.41.5-0+deb13u1_arm64.deb 448ad6b190184dbff24508ef2eda88bd737a5ffc0f9750eb779fcf9885292bea
+pool/main/u/util-linux/mount_2.41.5-0+deb13u1_arm64.deb 8b40a9eb9f72647c8732e9264c7328233f8ef8e9d962e516edeb210caa6789b6
 pool/main/u/util-linux/util-linux_2.41.5-0+deb13u1_arm64.deb d427f83a08d46107e8f7d39f1522a8a316e785e45f04ad657d2ecb7570210d84
 pool/main/w/webrtc-audio-processing/libwebrtc-audio-processing-1-3_1.3-3+b1_arm64.deb b3222b13cac750380a6f6800aace801fbc0587ab1fa23a4aa2ce307ed0391ae2
+pool/main/w/wireplumber/libwireplumber-0.5-0_0.5.8-2_arm64.deb 708fc6cc892f44ca723969908ab90b174ef1850e1b09713a8892e2f4e3b5cbdc
+pool/main/w/wireplumber/wireplumber_0.5.8-2_arm64.deb 7a53f5b2f7fdec9ad92f1b3e2e15a3b7e508ba7de015d68f294c2bafeeeab6d0
 pool/main/x/x264/libx264-164_0.164.3108+git31e19f9-2+b1_arm64.deb e062e2ed96d60fdc3ebba5714957e4bfc76e1c87ff6cfa7c022cea3052573f94
 pool/main/x/x265/libx265-215_4.1-2_arm64.deb c786ffe37393781b39fa99100aaa93891436dc0d8e0a4a5209cc1102679ebe22
 pool/main/x/xvidcore/libxvidcore4_1.3.7-1+b2_arm64.deb 82ec04ee5561e5f01e0c93c4a7feb68252cd14a2cddf6622c006a01ea6bb0471
