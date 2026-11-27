@@ -3412,6 +3412,164 @@ fn user_guide_recipes() {
     assert!(failed.is_empty(), "guide recipes that failed: {failed:?}");
 }
 
+/// The Mac's PulseAudio server for the sound tests: Homebrew's (`PULSEAUDIO`
+/// names it; the tests skip without it), with one null sink, its socket and
+/// cookie in a directory of its own; ended when dropped.
+struct PulseServer {
+    dir: PathBuf,
+    bin: PathBuf,
+    child: std::process::Child,
+}
+
+impl PulseServer {
+    fn start(test: &str) -> Option<PulseServer> {
+        let Some(bin) = std::env::var_os("PULSEAUDIO").map(PathBuf::from) else {
+            eprintln!("skipped: set PULSEAUDIO to Homebrew's pulseaudio to run the sound tests");
+            return None;
+        };
+        // Short, as a socket's path is at most 104 bytes on macOS.
+        let dir = std::env::temp_dir().join(format!("fwe-pa-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("native");
+        let child = Command::new(&bin)
+            .args(["-n", "--daemonize=no", "--exit-idle-time=-1", "--use-pid-file=no"])
+            .args(["-L", "module-null-sink sink_name=nul"])
+            .arg("-L")
+            .arg(format!("module-native-protocol-unix socket={}", socket.display()))
+            .env_clear()
+            .env("HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("server.err")).unwrap())
+            .spawn_alone()
+            .unwrap();
+        let mut server = PulseServer { dir, bin, child };
+        let began = Instant::now();
+        while !socket.exists() {
+            let said =
+                || std::fs::read_to_string(server.dir.join("server.err")).unwrap_or_default();
+            if let Some(status) = server.child.try_wait().unwrap() {
+                panic!("pulseaudio ended ({status}): {}", said());
+            }
+            assert!(began.elapsed() < Duration::from_secs(30), "no pulseaudio: {}", said());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        Some(server)
+    }
+
+    /// fwe's environment for its programs to reach this server, as a Mac's
+    /// `PULSE_SERVER` and `PULSE_COOKIE` name a server and its cookie.
+    fn env(&self) -> [(String, String); 2] {
+        [
+            ("PULSE_SERVER".into(), format!("unix:{}", self.dir.join("native").display())),
+            ("PULSE_COOKIE".into(), self.dir.join(".config/pulse/cookie").display().to_string()),
+        ]
+    }
+
+    /// The frames of sound (not silence) its null sink's monitor records
+    /// while `play` runs, and a second after.
+    fn recorded(&self, play: impl FnOnce()) -> u64 {
+        let raw = self.dir.join("monitor.raw");
+        let mut parec = Command::new(self.bin.with_file_name("parec"))
+            .arg("-s")
+            .arg(format!("unix:{}", self.dir.join("native").display()))
+            .args(["-d", "nul.monitor", "--format=s16le", "--rate=44100", "--channels=2", "--raw"])
+            .env_clear()
+            .env("HOME", &self.dir)
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&raw).unwrap())
+            .stderr(Stdio::null())
+            .spawn_alone()
+            .unwrap();
+        // Recording once silence arrives.
+        let began = Instant::now();
+        while std::fs::metadata(&raw).map_or(0, |m| m.len()) == 0 {
+            assert!(began.elapsed() < Duration::from_secs(30), "parec recorded nothing");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        play();
+        std::thread::sleep(Duration::from_secs(1));
+        // SAFETY: a signal to the child this test made.
+        unsafe { libc::kill(parec.id() as i32, libc::SIGINT) };
+        let _ = parec.wait();
+        let data = std::fs::read(&raw).unwrap();
+        data.as_chunks::<4>().0.iter().filter(|f| f.iter().any(|&b| b != 0)).count() as u64
+    }
+}
+
+impl Drop for PulseServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `secs` seconds of a 440 Hz tone, as a WAV file: 16-bit stereo at
+/// 44.1 kHz.
+fn tone_wav(secs: u32) -> Vec<u8> {
+    let frames = 44_100 * secs;
+    let mut w = b"RIFF".to_vec();
+    w.extend((36 + frames * 4).to_le_bytes());
+    w.extend(b"WAVEfmt ");
+    w.extend(16u32.to_le_bytes());
+    w.extend(1u16.to_le_bytes());
+    w.extend(2u16.to_le_bytes());
+    w.extend(44_100u32.to_le_bytes());
+    w.extend((44_100u32 * 4).to_le_bytes());
+    w.extend(4u16.to_le_bytes());
+    w.extend(16u16.to_le_bytes());
+    w.extend(b"data");
+    w.extend((frames * 4).to_le_bytes());
+    for i in 0..frames {
+        let t = f64::from(i) / 44_100.0;
+        let s = ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16;
+        w.extend(s.to_le_bytes());
+        w.extend(s.to_le_bytes());
+    }
+    w
+}
+
+/// Linux's sound clients play on the Mac's PulseAudio server, which fwe's
+/// `PULSE_SERVER` names: the guest's own names it as Linux's system-wide
+/// server (`/run/pulse/native`), and a second of tone played by
+/// PulseAudio's `paplay` and by ALSA's `aplay` (through ALSA's PulseAudio
+/// plugin) reaches the server's null sink, whose monitor records it.
+#[test]
+fn sound_clients_play_on_the_macs_pulseaudio_server() {
+    if !fetched_program_tests("FWE_SOUND_TESTS") {
+        return;
+    }
+    let Some(pulse) = PulseServer::start("clients") else { return };
+    let root = std::env::temp_dir().join(format!("fwe-sound-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("sound")).arg(&root));
+    let root = ScratchRoot(root);
+    std::fs::write(root.0.join("tmp/tone.wav"), tone_wav(1)).unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root.0).arg(root.0.join(&args[0][1..])).args(&args[1..]);
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
+        cmd.envs(pulse.env());
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        stdout(&out)
+    };
+    let info = run(&["/usr/bin/pactl", "info"]);
+    assert!(info.contains("Server String: unix:/run/pulse/native"), "{info}");
+    // A second of tone is 44100 frames; the server's start can miss some.
+    for player in [
+        &["/usr/bin/paplay", "/tmp/tone.wav"][..],
+        &["/usr/bin/aplay", "-q", "-D", "pulse", "/tmp/tone.wav"],
+    ] {
+        let frames = pulse.recorded(|| {
+            run(player);
+        });
+        assert!(frames > 30_000, "{player:?}: {frames} frames of the tone recorded");
+    }
+}
+
 /// The README's examples (`README.md`), run as written on the XQuartz
 /// display `FWE_README_DISPLAY` names (`:N`, a server running already):
 /// each block marked `<!-- example: NAME, window "SEARCH"[ WxH][, vm] -->`
