@@ -205,10 +205,85 @@ pub(crate) fn fresh(fd: i32) {
     t.map_new(fd, State::default());
 }
 
-/// Descriptor `fd` was closed: the state of its socket, if fwe kept any
-/// and `fd` was its last descriptor here.
-pub(crate) fn closed(fd: i32) -> Option<State> {
-    TABLE.if_used()?.unmap(fd)
+/// Descriptor `fd` was closed: its socket's number and state, if fwe kept
+/// any and `fd` was its last descriptor here.
+pub(crate) fn closed(fd: i32) -> Option<(u32, State)> {
+    let mut t = TABLE.if_used()?;
+    let n = *t.fds.get(&fd)?;
+    t.unmap(fd).map(|s| (n, s))
+}
+
+/// The number of socket `fd`, if fwe keeps anything of it: found without
+/// asking the host, and never a number another socket had.
+pub(crate) fn number(fd: i32) -> Option<u32> {
+    TABLE.if_used()?.fds.get(&fd).copied()
+}
+
+/// The number of socket `fd`, given one if it has none yet.
+fn numbered(fd: i32) -> u32 {
+    let mut t = TABLE.lock();
+    match t.fds.get(&fd) {
+        Some(&n) => n,
+        None => t.map_new(fd, State::default()),
+    }
+}
+
+/// Connections whose bytes fwe follows (an X client's, a sound client's
+/// first packet), by socket number ([`number`]): a send finds its
+/// connection without asking the host, the connection goes with its
+/// socket's last descriptor ([`Followed::gone`]), and a socket made later
+/// with a descriptor or inode a followed one had is never taken for it.
+/// While none is followed, a send costs one load to pass by.
+pub(crate) struct Followed<C> {
+    /// Whether `conns` has any.
+    any: std::sync::atomic::AtomicBool,
+    conns: std::sync::Mutex<Option<std::collections::HashMap<u32, C>>>,
+}
+
+impl<C> Followed<C> {
+    pub(crate) const fn new() -> Self {
+        Followed {
+            any: std::sync::atomic::AtomicBool::new(false),
+            conns: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Socket `fd` is followed from now on, as `conn`.
+    pub(crate) fn start(&self, fd: i32, conn: C) {
+        let n = numbered(fd);
+        let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        c.get_or_insert_with(Default::default).insert(n, conn);
+        self.any.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// `f` of the connection socket `fd` is, if it is one followed.
+    pub(crate) fn with<R>(&self, fd: i32, f: impl FnOnce(&mut C) -> R) -> Option<R> {
+        if !self.any.load(std::sync::atomic::Ordering::Relaxed) {
+            return None;
+        }
+        let n = number(fd)?;
+        let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        c.as_mut()?.get_mut(&n).map(f)
+    }
+
+    /// Socket `fd` is followed no more.
+    pub(crate) fn end(&self, fd: i32) {
+        if let Some(n) = number(fd) {
+            self.gone(n);
+        }
+    }
+
+    /// Socket `n`'s last descriptor here was closed.
+    pub(crate) fn gone(&self, n: u32) {
+        if !self.any.load(std::sync::atomic::Ordering::Relaxed) {
+            return;
+        }
+        let mut c = self.conns.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(conns) = c.as_mut() {
+            conns.remove(&n);
+            self.any.store(!conns.is_empty(), std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 /// `new` is a duplicate of `old`.
@@ -310,6 +385,58 @@ mod tests {
         assert_eq!(kept(&t, 7).map(|s| s.v4_view), Some(true));
         assert_eq!(t.unmap(7).map(|s| s.v4_view), Some(true));
         assert!(t.socks.is_empty() && t.fds.is_empty());
+    }
+
+    #[test]
+    fn a_followed_socket_is_found_by_its_descriptors_until_its_last_goes() {
+        if !crate::alone::in_own_process(
+            module_path!(),
+            "a_followed_socket_is_found_by_its_descriptors_until_its_last_goes",
+        ) {
+            return;
+        }
+        static F: Followed<u8> = Followed::new();
+        let pair = || {
+            let mut fds = [0; 2];
+            // SAFETY: a valid out-parameter for two descriptors.
+            let r =
+                unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()) };
+            assert_eq!(r, 0);
+            fds
+        };
+        // As `crate::net::closed` ends a socket's following.
+        let close = |fd: i32| {
+            if let Some((n, _)) = closed(fd) {
+                F.gone(n);
+            }
+            // SAFETY: a descriptor this test made.
+            unsafe { libc::close(fd) };
+        };
+        let [a, b] = pair();
+        assert_eq!(F.with(a, |c| *c), None);
+        F.start(a, 7);
+        F.start(b, 9);
+        // SAFETY: duplicates a descriptor this test made.
+        let d = unsafe { libc::dup(a) };
+        duplicated(a, d);
+        assert_eq!(
+            (F.with(a, |c| *c), F.with(d, |c| *c), F.with(b, |c| *c)),
+            (Some(7), Some(7), Some(9))
+        );
+        close(a);
+        assert_eq!(F.with(d, |c| *c), Some(7), "a descriptor of the socket is left");
+        close(d);
+        assert_eq!(F.with(d, |c| *c), None);
+        // A socket made on the closed one's descriptor number is another.
+        let [e, f] = pair();
+        fresh(e);
+        assert!(e == a || e == d || f == a || f == d, "a number is reused: {a} {d} {e} {f}");
+        assert_eq!((F.with(e, |c| *c), F.with(f, |c| *c)), (None, None));
+        assert!(F.any.load(std::sync::atomic::Ordering::Relaxed), "one is followed still");
+        close(b);
+        assert!(!F.any.load(std::sync::atomic::Ordering::Relaxed), "none is followed");
+        close(e);
+        close(f);
     }
 
     #[test]

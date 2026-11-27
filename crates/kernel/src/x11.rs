@@ -411,31 +411,21 @@ struct Conn {
     stream: Stream,
 }
 
-/// The X connections of this process, by socket (its inode).
-static CONNS: Mutex<Option<HashMap<u64, Conn>>> = Mutex::new(None);
-
-/// Whether this process has made an X connection: until it has, a write
-/// is not looked at.
-static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The X connections of this process.
+static CONNS: crate::sockstate::Followed<Conn> = crate::sockstate::Followed::new();
 
 /// MIT-SHM's request number at each server (by socket), if it takes
 /// descriptors (1.2); asked once.
 static SHM: Mutex<Option<HashMap<Vec<u8>, Option<u8>>>> = Mutex::new(None);
 
-fn inode(fd: i32) -> Option<u64> {
-    // SAFETY: an all-zero `stat` is a valid out-parameter.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `st` is a valid out-parameter.
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino)
-}
-
 /// Socket `fd` is now connected to the host display's socket `socket`.
 pub fn connected(fd: i32, socket: &[u8]) {
-    let Some(ino) = inode(fd) else { return };
-    ANY.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    c.get_or_insert_with(HashMap::new)
-        .insert(ino, Conn { socket: socket.to_vec(), stream: Stream::default() });
+    CONNS.start(fd, Conn { socket: socket.to_vec(), stream: Stream::default() });
+}
+
+/// Socket `n`'s last descriptor here was closed.
+pub fn gone(n: u32) {
+    CONNS.gone(n);
 }
 
 /// The `k`th byte of the host buffers `iov`.
@@ -464,15 +454,7 @@ pub fn write(
     iov: &[libc::iovec],
     mut send: impl FnMut(&[libc::iovec]) -> i64,
 ) -> Option<i64> {
-    if !ANY.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    let ino = inode(fd)?;
-    let (socket, stream) = {
-        let c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = c.as_ref()?.get(&ino)?;
-        (conn.socket.clone(), conn.stream.clone())
-    };
+    let (socket, stream) = CONNS.with(fd, |conn| (conn.socket.clone(), conn.stream.clone()))?;
     let total: u64 = iov.iter().map(|v| v.iov_len as u64).sum();
     let byte = |k| byte_of(iov, k);
     // The setup, whole in this write and with no authorization: sent with
@@ -486,13 +468,10 @@ pub fn write(
         if !send_all(fd, &authorized_setup(&head, &auth), None) {
             return Some(fwe_abi::err(crate::host::last_errno().linux()));
         }
-        {
-            let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-            if let Some(conn) = c.as_mut().and_then(|c| c.get_mut(&ino)) {
-                conn.stream.advance(12, byte);
-                conn.stream.auth = Some(auth);
-            }
-        }
+        CONNS.with(fd, |conn| {
+            conn.stream.advance(12, byte);
+            conn.stream.auth = Some(auth);
+        });
         if total == 12 {
             return Some(12);
         }
@@ -527,10 +506,7 @@ pub fn write(
     {
         sent += SHM_ATTACH_LEN;
     }
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = c.as_mut().and_then(|c| c.get_mut(&ino)) {
-        conn.stream.advance(sent, byte);
-    }
+    CONNS.with(fd, |conn| conn.stream.advance(sent, byte));
     Some(sent as i64)
 }
 
@@ -538,13 +514,8 @@ pub fn write(
 /// message with control data, sent as it was): followed if it is an X
 /// connection.
 pub fn sent(fd: i32, iov: &[libc::iovec], sent: i64) {
-    if sent <= 0 || !ANY.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let Some(ino) = inode(fd) else { return };
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = c.as_mut().and_then(|c| c.get_mut(&ino)) {
-        conn.stream.advance(sent as u64, |k| byte_of(iov, k));
+    if sent > 0 {
+        CONNS.with(fd, |conn| conn.stream.advance(sent as u64, |k| byte_of(iov, k)));
     }
 }
 

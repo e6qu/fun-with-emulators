@@ -19,9 +19,7 @@
 //!   its root's `/dev/shm`, and its memfds are none the Mac's server can
 //!   map. The sound then travels over the socket.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 
 /// The guest's `PULSE_SERVER`, where fwe's environment names one.
 pub const GUEST_SERVER: &[u8] = b"unix:/run/pulse/native";
@@ -162,19 +160,9 @@ struct Conn {
     cookie: Option<[u8; COOKIE_LEN]>,
 }
 
-/// The connections to the Mac's server whose first packet is being sent,
-/// by socket (its inode).
-static CONNS: Mutex<Option<HashMap<u64, Conn>>> = Mutex::new(None);
-
-/// Whether one is: until then a write is not looked at.
-static ANY: AtomicBool = AtomicBool::new(false);
-
-fn inode(fd: i32) -> Option<u64> {
-    // SAFETY: an all-zero `stat` is a valid out-parameter.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `st` is a valid out-parameter.
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino)
-}
+/// The connections to the Mac's server whose first packet is being sent:
+/// once it has gone, a connection is followed no more.
+static CONNS: crate::sockstate::Followed<Conn> = crate::sockstate::Followed::new();
 
 /// The Mac user's cookie, as its file holds it now.
 fn cookie() -> Option<[u8; COOKIE_LEN]> {
@@ -185,10 +173,12 @@ fn cookie() -> Option<[u8; COOKIE_LEN]> {
 
 /// Socket `fd` is now connected to the Mac's server.
 pub fn connected(fd: i32) {
-    let Some(ino) = inode(fd) else { return };
-    ANY.store(true, Ordering::Relaxed);
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    c.get_or_insert_with(HashMap::new).insert(ino, Conn { seen: Vec::new(), cookie: cookie() });
+    CONNS.start(fd, Conn { seen: Vec::new(), cookie: cookie() });
+}
+
+/// Socket `n`'s last descriptor here was closed.
+pub fn gone(n: u32) {
+    CONNS.gone(n);
 }
 
 /// The `k`th byte of the host buffers `iov`.
@@ -235,33 +225,30 @@ pub fn write(
     iov: &[libc::iovec],
     mut send: impl FnMut(&[libc::iovec]) -> i64,
 ) -> Option<i64> {
-    if !ANY.load(Ordering::Relaxed) {
-        return None;
-    }
-    let ino = inode(fd)?;
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    let conns = c.as_mut()?;
-    let conn = conns.get_mut(&ino)?;
-    let total: usize = iov.iter().map(|v| v.iov_len).sum();
-    let before = conn.seen.len();
-    // As far as the first packet goes (a short send, which the client
-    // sends the rest of after); what follows it as any write is.
-    let mut bytes: Vec<u8> = (0..total.min(Auth::LEN - before)).map(|k| byte_of(iov, k)).collect();
-    let mut seen = conn.seen.clone();
-    if !changed(&mut seen, conn.cookie.as_ref(), &mut bytes) {
-        conns.remove(&ino);
-        return None;
-    }
-    let part = [libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() }];
-    let r = send(&part);
-    if r > 0 {
-        // The bytes the host took: the rest are sent (and changed) again.
-        conn.seen = seen[..before + r as usize].to_vec();
-        if conn.seen.len() >= Auth::LEN {
-            conns.remove(&ino);
+    // What was sent, and whether the packet has more to go.
+    let (sent, more) = CONNS.with(fd, |conn| {
+        let total: usize = iov.iter().map(|v| v.iov_len).sum();
+        let before = conn.seen.len();
+        // As far as the first packet goes (a short send, which the client
+        // sends the rest of after); what follows it as any write is.
+        let mut bytes: Vec<u8> =
+            (0..total.min(Auth::LEN - before)).map(|k| byte_of(iov, k)).collect();
+        let mut seen = conn.seen.clone();
+        if !changed(&mut seen, conn.cookie.as_ref(), &mut bytes) {
+            return (None, false);
         }
+        let part = [libc::iovec { iov_base: bytes.as_mut_ptr().cast(), iov_len: bytes.len() }];
+        let r = send(&part);
+        if r > 0 {
+            // The bytes the host took: the rest are sent (and changed) again.
+            conn.seen = seen[..before + r as usize].to_vec();
+        }
+        (Some(r), conn.seen.len() < Auth::LEN)
+    })?;
+    if !more {
+        CONNS.end(fd);
     }
-    Some(r)
+    sent
 }
 
 #[cfg(test)]
