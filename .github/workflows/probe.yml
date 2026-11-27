@@ -1,0 +1,37 @@
+name: probe-media
+on:
+  push:
+    branches: [probe-media]
+jobs:
+  media:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools pulseaudio
+      - run: cargo test -p fwe --test guests --no-run
+      - name: Media tests alone, then sound beside three busy loops
+        env:
+          FWE_DISPLAY_TESTS: "1"
+          FWE_SOUND_TESTS: "1"
+        run: |
+          export XVFB="$(brew --prefix)/bin/Xvfb"
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
+          export FWE_VULKAN_DRIVER="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          t() { cargo test -q -p fwe --test guests -- --exact "$1" --nocapture 2>&1 | grep -E "frames of sound|test result|audio running|authorization" | cut -c1-400 | sed "s|^|$2: |"; }
+          for i in 1 2 3 4 5; do t sound_clients_play_on_the_macs_pulseaudio_server "alone $i"; done
+          for i in 1 2; do
+            yes > /dev/null & a=$!; yes > /dev/null & b=$!; yes > /dev/null & c=$!
+            t sound_clients_play_on_the_macs_pulseaudio_server "busy $i"
+            kill $a $b $c
+          done
+          for i in 1 2 3; do t alpine_display_chromium_plays_a_video_with_its_sound "chromium alone $i"; done
+          yes > /dev/null & a=$!; yes > /dev/null & b=$!; yes > /dev/null & c=$!
+          t alpine_display_chromium_plays_a_video_with_its_sound "chromium busy"
+          kill $a $b $c
