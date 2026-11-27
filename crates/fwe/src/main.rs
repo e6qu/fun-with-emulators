@@ -308,8 +308,12 @@ fn main() -> ExitCode {
     // The guest's environment is fwe's, but for the host display, which
     // the guest knows by its number ([`fwe_kernel::x11`]), and the Mac's
     // sound server, which it knows by the system server's socket
-    // ([`fwe_kernel::pulse`]).
+    // ([`fwe_kernel::pulse`]). The files of the Mac's cookies for them
+    // (`XAUTHORITY`, `PULSE_COOKIE`) are fwe's, which sends their cookies
+    // itself: their paths are the Mac's, which the guest's root does not
+    // have.
     let env: Vec<OsString> = std::env::vars_os()
+        .filter(|(k, _)| options.guest_path || (k != "XAUTHORITY" && k != "PULSE_COOKIE"))
         .map(|(k, v)| {
             use std::os::unix::ffi::{OsStrExt, OsStringExt};
             let v = if k == "DISPLAY" {
