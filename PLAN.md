@@ -46,7 +46,7 @@ signals, `/proc`, `/sys`, `/dev`, ioctls, namespaces, cgroups);
 distributions' userlands (Debian, Alpine); container engines and standard
 images; gVisor's `runsc`; Wine for ARM64 Windows programs, console and
 graphical; graphical Linux programs on an X server on the Mac, with OpenGL
-and Vulkan on its GPU.
+and Vulkan on its GPU, and their sound played by the Mac.
 
 Out of scope: kernel modules and private kernel interfaces, hardware
 drivers, and x86 binaries (Linux or Windows).
@@ -65,7 +65,7 @@ Reached when, as [ROADMAP.md](ROADMAP.md)'s pull requests define them:
 - Linux code runs at native speed and what fwe adds holds the benchmark
   budgets;
 - graphical Linux programs and Windows programs through Wine draw on the
-  Mac's screen, on its GPU;
+  Mac's screen, on its GPU, and play sound through the Mac's;
 - a JDK workload runs inside gVisor on fwe;
 - a signed release installs and runs all of this, documented.
 

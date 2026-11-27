@@ -306,6 +306,8 @@ that lacks it, and `--strace` names it.
   shaders; Zed draws by software through Mesa's lavapipe
   (`VK_DRIVER_FILES=/usr/share/vulkan/icd.d/lvp_icd.aarch64.json` and
   `ZED_ALLOW_EMULATED_GPU=1`).
+- **Sound**: programs find no PulseAudio server and no ALSA device
+  (`/dev/snd`), so they play nothing.
 - **The GPU in the VM, or after `fork`**: a program in the VM has no
   GPU, nor does a child forked from a process that used it (its Vulkan
   calls fail) until it runs a program with `execve`.

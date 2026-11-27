@@ -2290,3 +2290,5 @@ mark what holds in one backend only.
   `/proc/self/maps`, as fwe's own is not.
 - A fork child has no GPU until it calls `execve`, and the VM backend has
   none.
+- There is no sound: no ALSA device (`/dev/snd`) and no PulseAudio
+  server, so programs play nothing (PulseAudio's clients find no server).

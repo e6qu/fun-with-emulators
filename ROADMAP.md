@@ -171,6 +171,20 @@ hold 1.5×.
 **Done when:** Chromium's page load holds 1.5× Chrome for Testing on
 macOS, its budget back from 3×.
 
+#### PR 9 — Steady benchmarks
+
+- [ ] **Each row's spread measured:** rounds under fwe and natively
+  interleaved, more of them for rows whose rounds spread (the JDK's,
+  2.4-fold between rounds of one run), a figure's spread across runs
+  recorded beside it.
+- [ ] **Judged on what fwe costs:** a multithreaded workload's CPU time
+  beside its wall time, and the median beside the best round.
+- [ ] **Budgets for every row with a native counterpart:** PostgreSQL,
+  a handled `SIGSEGV` (M6 PR 5's), files' lives in `/tmp`.
+
+**Done when:** ten consecutive benchmark runs on main pass, each row's
+spread across them in the summary.
+
 ### M7 — Graphical programs and sandboxes
 
 CI starts an X server and drives each program with synthetic input,
@@ -178,11 +192,18 @@ checking what it draws by screenshot.
 
 #### PR 4 — Graphical Wine
 
-- [ ] Wine's Notepad, Minesweeper and `regedit`, and a Direct3D demo,
-  natively through Wine's X11 driver, Direct3D on the GPU through DXVK
-  and VKD3D-Proton.
+Natively, so after M6 PRs 6 and 7 (the VM has no GPU).
 
-**Done when:** they draw in CI, the demo on the GPU.
+- [ ] **Direct3D's way to the GPU chosen by a probe:** what DXVK and
+  VKD3D-Proton need of Vulkan against what MoltenVK has (geometry
+  shaders and transform feedback among them); fwe's driver gives what
+  they lack, or Direct3D goes through Wine's OpenGL on Zink once PR 6
+  gives OpenGL 3.
+- [ ] Wine's Notepad, Minesweeper and `regedit`, and a Direct3D demo,
+  natively through Wine's X11 driver, the demo on the GPU.
+
+**Done when:** they draw in CI, the demo on the GPU, and the probe's
+findings are in the docs.
 
 #### PR 5 — gVisor on fwe
 
@@ -203,6 +224,9 @@ programs need on the GPU is made to work on it.
 - [ ] **Browsers on the GPU:** Firefox's WebGL 1 and 2 by Zink, and
   Chromium's GPU process by ANGLE on Vulkan, drawing pages on the Mac's
   GPU.
+- [ ] **GPU memory between processes,** where Chromium's compositing
+  needs it (its GPU process and renderers): external memory and
+  semaphore descriptors, or what the probe shows Chromium uses instead.
 - [ ] **Zed on the GPU:** its shaders compile on MoltenVK, whose
   translation to Metal passes a structure's array member where a
   function takes `spvUnsafeArray` (Metal's compiler refuses it).
@@ -210,6 +234,37 @@ programs need on the GPU is made to work on it.
 **Done when:** both browsers' WebGL names the Mac's GPU and draws the
 test page in CI, antialiased, Chromium composites on the GPU, and Zed
 edits a file on the GPU.
+
+#### PR 7 — Sound
+
+Played by a PulseAudio server on the Mac (Homebrew's, on CoreAudio), as
+the X server draws the windows: guests' programs reach it through the
+socket fwe passes them, as they reach the display.
+
+- [ ] **PulseAudio's clients:** the server's socket in the guest's
+  runtime directory and `PULSE_SERVER`; what the protocol passes
+  (credentials, descriptors, shared memory and memfds) as the Mac's
+  server takes it.
+- [ ] **ALSA's programs** through ALSA's PulseAudio plugin; PipeWire's
+  through its PulseAudio layer.
+- [ ] **Benchmarks:** a stream's latency and underruns against the same
+  program's macOS build where there is one.
+
+**Done when:** Firefox and Chromium play the test video with its sound
+and an ALSA program plays a tone, checked in CI by what the Mac's
+server's monitor of its null sink records.
+
+### Across milestones — every test, every run
+
+#### PR 1 — No intermittent failures
+
+- [ ] **Each failure seen, reproduced and fixed at its cause,** with its
+  rate: the Vulkan loader test, Chromium's video, Wine's Notepad in the
+  VM, and those found running the suites again and again.
+- [ ] **The VM's calls traced** as a native run's are, so its failures
+  leave evidence.
+
+**Done when:** ten consecutive full CI runs pass with no job run again.
 
 ## After 1.0
 
@@ -270,6 +325,11 @@ so programs that probe for them fall back.
 - **Setting the initial UTS namespace's names:** they are the Mac's.
 - **CPU affinity:** accepted, pins nothing.
 - **x86 binaries,** Linux or Windows.
+- **Wayland surfaces in fwe's Vulkan driver:** Wayland programs draw
+  through a compositor in the guest (Weston on the X display).
+- **The GPU in the VM:** the VM runs only programs linked below 4 GiB.
+- **The GPU in a fork child before `execve`:** the Mac's driver cannot
+  be used after a `fork`; the child gets one once it runs a program.
 - **kselftests and gVisor's suite as gates:** LTP is the gate.
 - **Translator techniques measured and not adopted:** lookups without a
   load (4096 functions 19.5–20.3 ns against the table's 19.7), inline
