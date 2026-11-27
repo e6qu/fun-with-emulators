@@ -301,15 +301,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: brew install --cask xquartz
+      # XQuartz's server starts its app's (`org.xquartz.X11`), which
+      # LaunchServices does not know of until it is registered or first
+      # opened: a server started before then finds no app and ends.
+      - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Utilities/XQuartz.app
       - run: brew install xdotool unicorn molten-vk pulseaudio
       - name: The README's examples
         run: |
-          # Its first start on a runner takes up to a minute or more (macOS
-          # checks the app as it is first launched).
           /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
-          for i in $(seq 300); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
+          for i in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
           if [ ! -S /tmp/.X11-unix/X4 ]; then
-            echo "::error::no XQuartz server after 300 s"
+            echo "::error::no XQuartz server after 60 s"
             ps -axo pid,etime,command | grep -i -E "[x]quartz|[X]11" || true
             ls -la /tmp/.X11-unix || true
             cat xquartz.log
