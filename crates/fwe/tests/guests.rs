@@ -3422,9 +3422,67 @@ fn user_guide_recipes() {
 /// `module-null-sink`; the Mac's own output, its CoreAudio sink, is
 /// other code).
 struct PulseServer {
+    test: String,
+    /// When it started, as Unix time, which its log's times count from.
+    began: Duration,
     dir: PathBuf,
     bin: PathBuf,
     child: std::process::Child,
+}
+
+/// What a recording of [`PulseServer::recorded`] held: its frames, those of
+/// sound, and the silences between the first and the last of them (where,
+/// and how long, in frames), for a failure's report.
+struct Recording {
+    frames: usize,
+    sound: u64,
+    first: Option<usize>,
+    last: Option<usize>,
+    gaps: Vec<(usize, usize)>,
+}
+
+impl std::fmt::Display for Recording {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} frames of sound in {}, from frame {:?} to {:?}, silences (at, frames) between: {:?}",
+            self.sound, self.frames, self.first, self.last, self.gaps
+        )
+    }
+}
+
+impl Recording {
+    /// A recording of 16-bit stereo frames `data`; a silence counts as a
+    /// gap from 10 ms (441 frames).
+    fn of(data: &[u8]) -> Recording {
+        let frames = data.as_chunks::<4>().0;
+        let loud = |f: &[u8; 4]| f.iter().any(|&b| b != 0);
+        let first = frames.iter().position(loud);
+        let last = frames.iter().rposition(loud);
+        let mut gaps = Vec::new();
+        if let (Some(a), Some(b)) = (first, last) {
+            let mut quiet = None;
+            for (i, f) in frames[a..=b].iter().enumerate() {
+                match (loud(f), quiet) {
+                    (false, None) => quiet = Some(a + i),
+                    (true, Some(q)) => {
+                        if a + i - q >= 441 {
+                            gaps.push((q, a + i - q));
+                        }
+                        quiet = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Recording {
+            frames: frames.len(),
+            sound: frames.iter().filter(|f| loud(f)).count() as u64,
+            first,
+            last,
+            gaps,
+        }
+    }
 }
 
 impl PulseServer {
@@ -3439,6 +3497,8 @@ impl PulseServer {
         let socket = dir.join("native");
         let child = Command::new(&bin)
             .args(["-n", "--daemonize=no", "--exit-idle-time=-1", "--use-pid-file=no"])
+            // Its clients and streams, with times, for a failure's report.
+            .args(["--log-level=info", "--log-time=1"])
             .args(["-L", "module-null-sink sink_name=nul norewinds=1"])
             .arg("-L")
             .arg(format!("module-native-protocol-unix socket={}", socket.display()))
@@ -3449,7 +3509,8 @@ impl PulseServer {
             .stderr(std::fs::File::create(dir.join("server.err")).unwrap())
             .spawn_alone()
             .unwrap();
-        let mut server = PulseServer { dir, bin, child };
+        let began = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let mut server = PulseServer { test: test.to_string(), began, dir, bin, child };
         let began = Instant::now();
         while !socket.exists() {
             let said =
@@ -3476,7 +3537,7 @@ impl PulseServer {
     /// while `play` runs, and a second after: in fragments of 20 ms (the
     /// server holds a recorder's sound until a fragment is full, two
     /// seconds' by default, which would keep the end of what was played).
-    fn recorded(&self, play: impl FnOnce()) -> u64 {
+    fn recorded(&self, play: impl FnOnce()) -> Recording {
         let raw = self.dir.join("monitor.raw");
         let mut parec = Command::new(self.bin.with_file_name("parec"))
             .arg("-s")
@@ -3501,8 +3562,7 @@ impl PulseServer {
         // SAFETY: a signal to the child this test made.
         unsafe { libc::kill(parec.id() as i32, libc::SIGINT) };
         let _ = parec.wait();
-        let data = std::fs::read(&raw).unwrap();
-        data.as_chunks::<4>().0.iter().filter(|f| f.iter().any(|&b| b != 0)).count() as u64
+        Recording::of(&std::fs::read(&raw).unwrap())
     }
 }
 
@@ -3510,6 +3570,12 @@ impl Drop for PulseServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // Its log, beside the display tests' files, with when it started.
+        let log = std::fs::read_to_string(self.dir.join("server.err")).unwrap_or_default();
+        let _ = std::fs::write(
+            display_dir().join(format!("pulse-{}.err", self.test)),
+            format!("started at {:.3} (Unix time)\n{log}", self.began.as_secs_f64()),
+        );
         let _ = std::fs::remove_dir_all(&self.dir);
     }
 }
@@ -3599,10 +3665,17 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
         &["/usr/bin/aplay", "-q", "-D", "pulse", "/tmp/tone.wav"],
         &["/bin/sh", "-c", pipewire],
     ] {
-        let frames = pulse.recorded(|| {
+        let rec = pulse.recorded(|| {
             run(player);
         });
-        assert!(frames > 43_000, "{player:?}: {frames} frames of the tone recorded");
+        eprintln!("{player:?}: {rec}");
+        let said = |f: &str| std::fs::read_to_string(root.0.join(f)).unwrap_or_default();
+        assert!(
+            rec.sound > 43_000,
+            "{player:?}: {rec}, of the tone; PipeWire said: {}; WirePlumber said: {}",
+            said("tmp/pipewire.err"),
+            said("tmp/wireplumber.err")
+        );
     }
 }
 
@@ -3695,8 +3768,8 @@ fn readme_examples() {
                 // What it plays a while after: on the stand-in, a while
                 // longer.
                 let secs = if in_vm { 120 } else { 20 };
-                let frames = pulse.recorded(|| std::thread::sleep(Duration::from_secs(secs)));
-                assert!(frames > 4_410, "{name} played {frames} frames: {}", gui.report());
+                let rec = pulse.recorded(|| std::thread::sleep(Duration::from_secs(secs)));
+                assert!(rec.sound > 4_410, "{name} played {rec}: {}", gui.report());
             }
         }));
         if drew.is_err() {
@@ -11868,8 +11941,11 @@ fn alpine_display_chromium_plays_a_video_with_its_sound() {
     let pulse = PulseServer::start("chromium");
     let root = browsers_root("chromium-video");
     let x = XServer::in_root(&root);
+    // Its audio service's and devices' steps logged, with times, for a
+    // failure's report.
     let args = su_nobody(&format!(
-        "{CHROMIUM} --autoplay-policy=no-user-gesture-required file:///tmp/fwe-pages/video.html"
+        "{CHROMIUM} --autoplay-policy=no-user-gesture-required \
+         --vmodule=*/media/audio/*=1,*/services/audio/*=1 file:///tmp/fwe-pages/video.html"
     ));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let env = pulse.env();
@@ -11932,12 +12008,8 @@ fn plays_the_test_video(x: &XServer, name: &str, gui: &mut Gui, pulse: &PulseSer
         seen.len(),
         gui.report()
     );
-    let frames = pulse.recorded(|| std::thread::sleep(Duration::from_secs(3)));
-    assert!(
-        frames > 44_100,
-        "{name}'s video is silent: {frames} frames of sound: {}",
-        gui.report()
-    );
+    let rec = pulse.recorded(|| std::thread::sleep(Duration::from_secs(3)));
+    assert!(rec.sound > 44_100, "{name}'s video is silent: {rec}: {}", gui.report());
 }
 
 /// Electron, sandboxed: an app of its own showing a page.
