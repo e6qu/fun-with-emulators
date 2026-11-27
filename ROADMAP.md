@@ -53,7 +53,8 @@ current limitations, in
 - **M6 PR 2 — Kernel state in memory:** the process store, shared
   records, a file store for tmpfs, `/dev/shm`, memfds and the cgroup tree
   in memory every fwe process maps, or in macOS's own objects, none of it
-  on disk; System V semaphores, messages and segments within 3× macOS.
+  on disk; System V semaphores and messages within 3× macOS, segments
+  3.5×.
 - **M7 PR 1 — A display:** X11 clients on an X server on the Mac
   (XQuartz, Xvfb), `MIT-SHM` where the server takes segments by
   descriptor; Weston and Xwayland in the guest; demo programs

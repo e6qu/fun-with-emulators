@@ -1674,7 +1674,8 @@ fwe build never reads it, and what no live process holds is collected
 ([architecture.md](architecture.md)).
 
 What it costs (micro benchmarks of `tools/bench/run.py`, on CI's macOS 26
-and Linux arm64 runners; the System V calls' budget is 3x macOS's):
+and Linux arm64 runners; the System V calls' budget is 3x macOS's, a
+segment's 3.5x, as that ratio moves with the runner's speed):
 
 | Benchmark | fwe | macOS | Linux |
 |---|---|---|---|

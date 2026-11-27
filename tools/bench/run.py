@@ -351,8 +351,9 @@ BUDGETS = {
     # shares without a copy, freed when removed): the host's own cycle of
     # one ("POSIX shared memory object made and removed", natively) is
     # 1.2-1.5x macOS's System V segment, and fwe's four calls' work comes
-    # on top of it (docs/linux-on-macos.md).
-    "System V segment made and removed (ns)": 3.0,
+    # on top of it (docs/linux-on-macos.md). The ratio moves with the
+    # runner's speed, 2.5-3.1x on CI's runners.
+    "System V segment made and removed (ns)": 3.5,
     # A sound stream's latency on the Mac's PulseAudio server ([`sound`]),
     # as a program's system calls are.
     "sound stream latency (ms)": 1.5,
