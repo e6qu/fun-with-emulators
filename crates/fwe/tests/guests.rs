@@ -3628,9 +3628,12 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     let root = ScratchRoot(root);
     std::fs::write(root.0.join("tmp/tone.wav"), tone_wav(1)).unwrap();
     // PipeWire's sink on the Mac's server, as a user's configuration adds it.
-    // The tunnel's stream holds `pulse.latency` ms at the server (25 by
-    // default), and PipeWire with no device of its own hands it 2048 frames
-    // (43 ms) a cycle: the server, waking when it will, runs dry of less.
+    // The tunnel keeps half its `pulse.latency` (200 ms by default) at the
+    // server and as much in its own ring, and answers a request of the
+    // server's its ring cannot fill with silence; PipeWire with no device
+    // of its own fills the ring 2048 frames (43 ms) a cycle. A server that
+    // wakes unevenly (a CI runner's, whose native clients underrun as well)
+    // asks ahead of that: a second's latency keeps up.
     let conf = root.0.join("root/.config/pipewire/pipewire.conf.d");
     std::fs::create_dir_all(&conf).unwrap();
     std::fs::write(
@@ -3638,7 +3641,7 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
         "context.modules = [\n\
          \x20 { name = libpipewire-module-pulse-tunnel\n\
          \x20   args = { tunnel.mode = sink, pulse.server.address = \"unix:/run/pulse/native\",\n\
-         \x20            pulse.latency = 200, node.name = mac } }\n\
+         \x20            pulse.latency = 1000, node.name = mac } }\n\
          ]\n",
     )
     .unwrap();
