@@ -11995,7 +11995,7 @@ fn alpine_display_chromium_plays_a_video_with_its_sound() {
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let env = pulse.env();
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &env);
+    let mut gui = Gui::start_traced(&x, "chromium-video", &root, "/bin/su", &args, &env, true);
     plays_the_test_video(&x, "chromium-video", &mut gui, &pulse);
 }
 

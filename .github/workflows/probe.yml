@@ -1,0 +1,48 @@
+name: probe-chrome
+on:
+  push:
+    branches: [probe-chrome]
+jobs:
+  display:
+    strategy:
+      fail-fast: false
+      matrix:
+        copy: [1, 2, 3]
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - uses: actions/cache@v4
+        with:
+          path: target/built-apps
+          key: built-apps-${{ hashFiles('guests/apps/tauri/**', 'guests/apps/wails/**', 'guests/alpine/fetch/apps.txt') }}
+      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools pulseaudio
+      - name: The display and sound tests, Chromium's video traced whole
+        run: |
+          export XVFB="$(brew --prefix)/bin/Xvfb"
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
+          export FWE_VULKAN_DRIVER="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          cargo test -p fwe --test guests -- display_ sound_ --nocapture 2>&1 | grep -a -E "^test |test result|panicked" || true
+          grep -a -c "" target/tmp/display/chromium-video.trace || true
+          if grep -a -q "Terminating current process\|authorization timed out" target/tmp/display/chromium-video.err; then
+            echo "CHROMIUM FAILED HERE"
+            xz -T0 -6 target/tmp/display/chromium-video.trace
+          else
+            rm -f target/tmp/display/chromium-video.trace
+          fi
+        env:
+          FWE_DISPLAY_TESTS: "1"
+          FWE_SOUND_TESTS: "1"
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: display-${{ matrix.copy }}
+          path: |
+            target/tmp/display/chromium-video.*
+            target/tmp/display/pulse-chromium.err
