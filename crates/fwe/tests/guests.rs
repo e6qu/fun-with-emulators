@@ -3728,9 +3728,6 @@ fn readme_examples() {
         let size = parts.next().unwrap_or_default();
         let flags: Vec<&str> = parts.collect();
         assert!(flags.iter().all(|f| matches!(*f, "vm" | "sound")), "{marker}");
-        if name != "openttd" && name != "putty" {
-            continue;
-        }
         let (in_vm, sound) = (flags.contains(&"vm"), flags.contains(&"sound"));
         let size = (!size.is_empty()).then(|| {
             let (w, h) = size.split_once('x').unwrap();
@@ -3775,16 +3772,7 @@ fn readme_examples() {
             // take the longest.
             let secs = if in_vm { 3600 } else { 1200 };
             x.window_sized(&mut gui, &["--name", search], size, secs);
-            let began = Instant::now();
-            let mut k = 0;
-            let drawn = loop {
-                let now = x.drawn_found(&mut gui, &["--name", search], size, &format!("{shot}-{k:02}"), 10_000, 60);
-                eprintln!("PROBE {name} after {:?}: {now:?}", began.elapsed());
-                k += 1;
-                if now.drawn > 10_000 || k >= 40 {
-                    break now;
-                }
-            };
+            let drawn = x.drawn_found(&mut gui, &["--name", search], size, &shot, 10_000, 300);
             assert!(drawn.drawn > 10_000, "{name} drew {drawn:?}: {}", gui.report());
             if sound {
                 // What it plays a while after: on the stand-in, a while

@@ -5,31 +5,23 @@ on:
 jobs:
   openttd:
     runs-on: macos-26
-    timeout-minutes: 170
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
       - run: brew install --cask xquartz
       - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Utilities/XQuartz.app
-      - run: brew install xdotool unicorn molten-vk pulseaudio
-      - name: OpenTTD's example, watched
+      - run: brew install xdotool unicorn libx11
+      - run: cargo build --release -p fwe
+      - name: OpenTTD on the stand-in, both drivers
         run: |
           /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
           for i in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
-          mkdir -p screens
-          ( for k in $(seq 100); do screencapture -x screens/screen-$k.png 2>> screens/err.txt; DISPLAY=:4 /opt/X11/bin/xwininfo -root -tree > screens/tree-$k.txt 2>&1; sleep 60; done ) &
-          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
-          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
-          cargo test -p fwe --test guests -- --exact readme_examples --nocapture > screens/test.txt 2>&1 || true
-          grep -a -E "PROBE|panicked|test result|failed" screens/test.txt | cut -c1-400
-        env:
-          FWE_README_DISPLAY: ":4"
-          FWE_README_VM: "1"
+          tools/probe-openttd.sh
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: openttd
           path: |
-            target/tmp/display
-            screens
+            out
             xquartz.log
