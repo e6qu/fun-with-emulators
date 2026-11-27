@@ -1,7 +1,10 @@
 //! Phase timings of a start, an `execve` and a `fork`, for finding where
 //! their time goes: with `FWE_TIMING` set, each mark writes to standard
 //! error how long since the previous one and since the process began,
-//! and how many page faults the process took since the previous one. A
+//! how many page faults the process took since the previous one, and the
+//! host's monotonic clock (`@` microseconds), by which marks of different
+//! processes, and of one pid across a host `execve`, are placed against
+//! each other. A
 //! `backend:` mark names the backend each program starts in, native or the
 //! VM (the benchmarks count them).
 //! Off (the default), a mark costs one relaxed load.
@@ -48,9 +51,13 @@ fn write_mark(name: &str) {
     let mut line = [0u8; 4096];
     let mut at = std::io::Cursor::new(&mut line[..]);
     use std::io::Write;
+    let mut clock = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    // SAFETY: a valid out-parameter.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut clock) };
+    let at_us = clock.tv_sec as u64 * 1_000_000 + clock.tv_nsec as u64 / 1000;
     let _ = writeln!(
         at,
-        "[fwe {pid}] timing: {name} +{}us ({}us) +{since} faults",
+        "[fwe {pid}] timing: {name} +{}us ({}us) +{since} faults @{at_us}",
         now.saturating_sub(last) / 1000,
         now / 1000
     );

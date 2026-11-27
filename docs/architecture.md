@@ -222,10 +222,17 @@ Around the load:
   from its exec state before its kernel exists, in either backend.
 - **Checks before an `execve`:** an `execve` of a native program checks
   the new program first (an arm64 ELF that fits the address space, with a
-  dynamic linker that exists), whether it is loaded in place or by a
-  re-executed fwe, so a bad one fails with the caller intact. One of a
-  program for the VM checks only that it is an ELF file before the host
-  `execve`, so a later failure ends the process.
+  dynamic linker that exists and is position-independent), whether it is
+  loaded in place or by a re-executed fwe, so a bad one fails with the
+  caller intact. One of a program for the VM checks only that it is an ELF
+  file before the host `execve`, so a later failure ends the process. The
+  program is read through the descriptor its permission checks were made
+  on (`Kernel::exec_file`): whole when it is loaded in place, and only as
+  far as its checks need when a re-executed fwe loads it
+  (`ProgramFile::head`: the ELF header, the program headers and the
+  dynamic linker's path; the whole of a non-PIE program linked below
+  4 GiB, whose move depends on its relocations). The dynamic linker's
+  check reads its head too.
 - **Busy programs** (`crates/kernel/src/textbusy.rs`): a page every fwe
   process maps holds each process's program and a ring of files recently
   opened for writing. Opening a running program's file to write, or

@@ -119,8 +119,24 @@ pub const MOVE: u64 = 1 << 40;
 /// [`MOVE`] higher, or why it cannot be (see [`fwe_elf::moves`]).
 /// `None` for one the host can map where it is linked.
 pub fn moved(elf: &Elf<'_>, page_size: u64) -> Option<Result<Vec<(u64, Patch)>, String>> {
-    (!elf.is_pie() && LoadPlan::new(elf, page_size).start < host_min_address())
-        .then(|| fwe_elf::moves(elf, MOVE))
+    // (Its pages start below 4 GiB exactly when its lowest address does:
+    // 4 GiB is a multiple of every page size.)
+    debug_assert_eq!(
+        LoadPlan::new(elf, page_size).start < host_min_address(),
+        elf.bounds().0 < host_min_address()
+    );
+    linked_low(elf.is_pie(), elf.bounds().0).then(|| fwe_elf::moves(elf, MOVE))
+}
+
+/// Whether the image whose file starts with `head` is linked into the low
+/// 4 GiB without being position-independent: whether it runs here, and
+/// where, depends on its relocations ([`moved`]), so on the whole file.
+pub fn low(head: &fwe_elf::Head<'_>) -> bool {
+    linked_low(head.is_pie(), head.lowest())
+}
+
+fn linked_low(pie: bool, lowest: u64) -> bool {
+    !pie && lowest < host_min_address()
 }
 
 /// Map `elf` for host pages of `page_size` bytes. `prepare_exec` is called

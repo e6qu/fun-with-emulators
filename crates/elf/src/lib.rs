@@ -184,86 +184,175 @@ fn u64_at(d: &[u8], o: usize) -> u64 {
     u64::from_le_bytes(d[o..o + 8].try_into().unwrap())
 }
 
-impl<'a> Elf<'a> {
-    pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
-        if data.len() < EHDR_SIZE {
-            return Err(Error::TooShort);
+/// The ELF header's fields and the program headers of the image whose
+/// file starts with `data` and is `len` bytes long, its segments checked
+/// against `len`.
+type Headers = (u16, u64, u64, u16, u16, Vec<ProgramHeader>);
+
+fn headers(data: &[u8], len: u64) -> Result<Headers, Error> {
+    if data.len() < EHDR_SIZE {
+        return Err(Error::TooShort);
+    }
+    if &data[0..4] != b"\x7fELF" {
+        return Err(Error::BadMagic);
+    }
+    if data[4] != 2 {
+        return Err(Error::Not64Bit);
+    }
+    if data[5] != 1 {
+        return Err(Error::NotLittleEndian);
+    }
+    if data[6] != 1 {
+        return Err(Error::BadVersion);
+    }
+    let kind = u16_at(data, 16);
+    let machine = u16_at(data, 18);
+    if machine != EM_AARCH64 {
+        return Err(Error::WrongMachine(machine));
+    }
+    if kind != ET_EXEC && kind != ET_DYN {
+        return Err(Error::WrongType(kind));
+    }
+    let entry = u64_at(data, 24);
+    let phoff = u64_at(data, 32);
+    let phentsize = u16_at(data, 54);
+    let phnum = u16_at(data, 56);
+    if phentsize as usize != PHDR_SIZE {
+        return Err(Error::BadProgramHeaders);
+    }
+    let table_end = (phnum as u64)
+        .checked_mul(PHDR_SIZE as u64)
+        .and_then(|n| n.checked_add(phoff))
+        .ok_or(Error::BadProgramHeaders)?;
+    if table_end > data.len() as u64 {
+        return Err(Error::BadProgramHeaders);
+    }
+    let mut phdrs = Vec::with_capacity(phnum as usize);
+    for i in 0..phnum as usize {
+        let o = phoff as usize + i * PHDR_SIZE;
+        phdrs.push(ProgramHeader {
+            kind: u32_at(data, o),
+            flags: u32_at(data, o + 4),
+            offset: u64_at(data, o + 8),
+            vaddr: u64_at(data, o + 16),
+            filesz: u64_at(data, o + 32),
+            memsz: u64_at(data, o + 40),
+            align: u64_at(data, o + 48),
+        });
+    }
+    validate(&phdrs, len)?;
+    Ok((kind, entry, phoff, phentsize, phnum, phdrs))
+}
+
+/// Check segments against a file of `len` bytes.
+fn validate(phdrs: &[ProgramHeader], len: u64) -> Result<(), Error> {
+    let mut loads: Vec<&ProgramHeader> = phdrs.iter().filter(|ph| ph.kind == PT_LOAD).collect();
+    if loads.is_empty() {
+        return Err(Error::NoLoadSegments);
+    }
+    for (index, ph) in phdrs.iter().enumerate() {
+        let file_end = ph.offset.checked_add(ph.filesz);
+        let mem_end = ph.vaddr.checked_add(ph.memsz);
+        let bad = match (file_end, mem_end) {
+            (Some(fe), Some(_)) => fe > len && ph.kind != PT_GNU_STACK,
+            _ => true,
+        };
+        if bad || (ph.kind == PT_LOAD && ph.filesz > ph.memsz) {
+            return Err(Error::BadSegment { index });
         }
-        if &data[0..4] != b"\x7fELF" {
-            return Err(Error::BadMagic);
+    }
+    loads.sort_by_key(|ph| ph.vaddr);
+    for pair in loads.windows(2) {
+        if pair[0].vaddr + pair[0].memsz > pair[1].vaddr {
+            return Err(Error::OverlappingSegments);
         }
-        if data[4] != 2 {
-            return Err(Error::Not64Bit);
-        }
-        if data[5] != 1 {
-            return Err(Error::NotLittleEndian);
-        }
-        if data[6] != 1 {
-            return Err(Error::BadVersion);
-        }
-        let kind = u16_at(data, 16);
-        let machine = u16_at(data, 18);
-        if machine != EM_AARCH64 {
-            return Err(Error::WrongMachine(machine));
-        }
-        if kind != ET_EXEC && kind != ET_DYN {
-            return Err(Error::WrongType(kind));
-        }
-        let entry = u64_at(data, 24);
-        let phoff = u64_at(data, 32);
-        let phentsize = u16_at(data, 54);
-        let phnum = u16_at(data, 56);
-        if phentsize as usize != PHDR_SIZE {
-            return Err(Error::BadProgramHeaders);
-        }
-        let table_end = (phnum as u64)
-            .checked_mul(PHDR_SIZE as u64)
-            .and_then(|n| n.checked_add(phoff))
-            .ok_or(Error::BadProgramHeaders)?;
-        if table_end > data.len() as u64 {
-            return Err(Error::BadProgramHeaders);
-        }
-        let mut phdrs = Vec::with_capacity(phnum as usize);
-        for i in 0..phnum as usize {
-            let o = phoff as usize + i * PHDR_SIZE;
-            phdrs.push(ProgramHeader {
-                kind: u32_at(data, o),
-                flags: u32_at(data, o + 4),
-                offset: u64_at(data, o + 8),
-                vaddr: u64_at(data, o + 16),
-                filesz: u64_at(data, o + 32),
-                memsz: u64_at(data, o + 40),
-                align: u64_at(data, o + 48),
-            });
-        }
-        let elf = Elf { data, kind, entry, phoff, phentsize, phnum, phdrs };
-        elf.validate()?;
-        Ok(elf)
+    }
+    Ok(())
+}
+
+/// The longest dynamic linker path Linux runs (`PATH_MAX`, its NUL
+/// included); a longer `PT_INTERP`, or one shorter than two bytes, is
+/// `ENOEXEC`.
+const INTERP_MAX: u64 = 4096;
+
+/// The dynamic linker path of the image whose file starts with `data`
+/// (its `PT_INTERP`, within `data`), if it has one.
+fn interpreter_in<'a>(data: &'a [u8], phdrs: &[ProgramHeader]) -> Result<Option<&'a [u8]>, Error> {
+    let Some(ph) = phdrs.iter().find(|ph| ph.kind == PT_INTERP) else {
+        return Ok(None);
+    };
+    if !(2..=INTERP_MAX).contains(&ph.filesz) {
+        return Err(Error::BadInterpreter);
+    }
+    let bytes = data
+        .get(ph.offset as usize..(ph.offset + ph.filesz) as usize)
+        .ok_or(Error::BadInterpreter)?;
+    match bytes.split_last() {
+        Some((0, path)) if !path.is_empty() => Ok(Some(path)),
+        _ => Err(Error::BadInterpreter),
+    }
+}
+
+/// How many of an ELF file's first bytes [`Head::parse`] reads, given its
+/// first bytes `prefix`: the ELF header, the program headers, and the
+/// dynamic linker's path, each as far as what is read shows. Read again
+/// while it asks for more than was read, within the file's length.
+pub fn head_len(prefix: &[u8]) -> u64 {
+    if prefix.len() < EHDR_SIZE {
+        return EHDR_SIZE as u64;
+    }
+    let (phoff, phnum) = (u64_at(prefix, 32), u16_at(prefix, 56) as u64);
+    let table_end = phoff.saturating_add(phnum * PHDR_SIZE as u64);
+    let Some(table) = prefix.get(phoff as usize..table_end as usize) else { return table_end };
+    let interp_end = table
+        .as_chunks::<PHDR_SIZE>()
+        .0
+        .iter()
+        .filter(|&ph| u32_at(ph, 0) == PT_INTERP && u64_at(ph, 32) <= INTERP_MAX)
+        .map(|ph| u64_at(ph, 8).saturating_add(u64_at(ph, 32)))
+        .max();
+    interp_end.unwrap_or(0).max(table_end)
+}
+
+/// What the first bytes of an ELF file tell of the image ([`head_len`] of
+/// them): what a program is checked by before it runs, read without the
+/// rest of the file.
+#[derive(Debug, Clone)]
+pub struct Head<'a> {
+    kind: u16,
+    phdrs: Vec<ProgramHeader>,
+    interpreter: Option<&'a [u8]>,
+}
+
+impl<'a> Head<'a> {
+    /// Parse the first bytes `head` of a file `len` bytes long, its
+    /// segments checked against `len`, as [`Elf::parse`] checks them.
+    pub fn parse(head: &'a [u8], len: u64) -> Result<Self, Error> {
+        let (kind, _, _, _, _, phdrs) = headers(head, len)?;
+        let interpreter = interpreter_in(head, &phdrs)?;
+        Ok(Head { kind, phdrs, interpreter })
     }
 
-    fn validate(&self) -> Result<(), Error> {
-        let mut loads: Vec<&ProgramHeader> = self.loads().collect();
-        if loads.is_empty() {
-            return Err(Error::NoLoadSegments);
-        }
-        for (index, ph) in self.phdrs.iter().enumerate() {
-            let file_end = ph.offset.checked_add(ph.filesz);
-            let mem_end = ph.vaddr.checked_add(ph.memsz);
-            let bad = match (file_end, mem_end) {
-                (Some(fe), Some(_)) => fe > self.data.len() as u64 && ph.kind != PT_GNU_STACK,
-                _ => true,
-            };
-            if bad || (ph.kind == PT_LOAD && ph.filesz > ph.memsz) {
-                return Err(Error::BadSegment { index });
-            }
-        }
-        loads.sort_by_key(|ph| ph.vaddr);
-        for pair in loads.windows(2) {
-            if pair[0].vaddr + pair[0].memsz > pair[1].vaddr {
-                return Err(Error::OverlappingSegments);
-            }
-        }
-        Ok(())
+    /// See [`Elf::is_pie`].
+    pub fn is_pie(&self) -> bool {
+        self.kind == ET_DYN
+    }
+
+    /// See [`Elf::interpreter`].
+    pub fn interpreter(&self) -> Option<&'a [u8]> {
+        self.interpreter
+    }
+
+    /// The lowest virtual address of a loadable segment.
+    pub fn lowest(&self) -> u64 {
+        self.phdrs.iter().filter(|ph| ph.kind == PT_LOAD).map(|ph| ph.vaddr).min().unwrap_or(0)
+    }
+}
+
+impl<'a> Elf<'a> {
+    pub fn parse(data: &'a [u8]) -> Result<Self, Error> {
+        let (kind, entry, phoff, phentsize, phnum, phdrs) = headers(data, data.len() as u64)?;
+        Ok(Elf { data, kind, entry, phoff, phentsize, phnum, phdrs })
     }
 
     pub fn loads(&self) -> impl Iterator<Item = &ProgramHeader> {
@@ -318,14 +407,7 @@ impl<'a> Elf<'a> {
 
     /// The program interpreter (dynamic loader) path, if any.
     pub fn interpreter(&self) -> Result<Option<&'a [u8]>, Error> {
-        let Some(ph) = self.phdrs.iter().find(|ph| ph.kind == PT_INTERP) else {
-            return Ok(None);
-        };
-        let bytes = &self.data[ph.offset as usize..(ph.offset + ph.filesz) as usize];
-        match bytes.split_last() {
-            Some((0, path)) if !path.is_empty() => Ok(Some(path)),
-            _ => Err(Error::BadInterpreter),
-        }
+        interpreter_in(self.data, &self.phdrs)
     }
 
     /// Lowest and highest (exclusive) virtual addresses of loadable segments.
@@ -713,6 +795,76 @@ mod tests {
         assert!(elf.is_pie());
         assert_eq!(elf.interpreter().unwrap(), Some(&interp[..interp.len() - 1]));
         assert_eq!(elf.phdr_vaddr(), Some(EHDR_SIZE as u64));
+    }
+
+    /// An image whose dynamic linker's path lies past its program headers,
+    /// in a file of `size` bytes, with a segment at its end.
+    fn far_interpreter(size: usize, interp: &[u8], at: u64) -> Vec<u8> {
+        let mut d = image(
+            ET_DYN,
+            &[
+                load(PF_R | PF_X, 0, 0, size as u64, size as u64),
+                ProgramHeader {
+                    kind: PT_INTERP,
+                    flags: PF_R,
+                    offset: at,
+                    vaddr: at,
+                    filesz: interp.len() as u64,
+                    memsz: interp.len() as u64,
+                    align: 1,
+                },
+            ],
+            size,
+        );
+        d[at as usize..at as usize + interp.len()].copy_from_slice(interp);
+        d
+    }
+
+    /// The head [`head_len`] asks for, read as a caller reads it: from a
+    /// first `first` bytes, again while it asks for more, within the file.
+    fn read_head(file: &[u8], first: usize) -> &[u8] {
+        let mut n = first.min(file.len());
+        loop {
+            let want = (head_len(&file[..n]) as usize).min(file.len());
+            if want <= n {
+                return &file[..n];
+            }
+            n = want;
+        }
+    }
+
+    #[test]
+    fn a_head_tells_what_the_whole_file_does() {
+        let interp = b"/lib/ld-musl-aarch64.so.1\0";
+        let file = far_interpreter(0x10000, interp, 0x8000);
+        // Read 64 bytes first: the header, then the program headers, then
+        // the path, are each asked for in turn.
+        let head = read_head(&file, 64);
+        assert_eq!(head.len(), 0x8000 + interp.len());
+        let h = Head::parse(head, file.len() as u64).unwrap();
+        let elf = Elf::parse(&file).unwrap();
+        assert_eq!(h.is_pie(), elf.is_pie());
+        assert_eq!(Some(h.interpreter()), elf.interpreter().ok());
+        assert_eq!(h.lowest(), elf.bounds().0);
+        // Segments are checked against the file's length, not the head's.
+        assert_eq!(Head::parse(head, 0x8000).unwrap_err(), Error::BadSegment { index: 0 });
+        // A head short of the path does not parse.
+        assert_eq!(
+            Head::parse(&file[..0x200], file.len() as u64).unwrap_err(),
+            Error::BadInterpreter
+        );
+    }
+
+    #[test]
+    fn a_dynamic_linker_path_longer_than_path_max_is_malformed() {
+        let mut interp = vec![b'a'; INTERP_MAX as usize];
+        interp.push(0);
+        let file = far_interpreter(0x4000, &interp, 0x1000);
+        assert_eq!(Elf::parse(&file).unwrap().interpreter(), Err(Error::BadInterpreter));
+        // Its head is not read for it.
+        let head = read_head(&file, 64);
+        assert_eq!(head.len(), EHDR_SIZE + 2 * PHDR_SIZE);
+        assert_eq!(Head::parse(head, file.len() as u64).unwrap_err(), Error::BadInterpreter);
     }
 
     #[test]

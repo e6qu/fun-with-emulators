@@ -2152,19 +2152,28 @@ def phases(name, cmd):
     and the page faults between each of its marks and the one before it in
     the same process, by mark (numbers in a mark's name taken as one), as
     medians over the run: where a step that repeats (a fork, a wait) spends
-    its time, and how many pages it writes (each a copy after a fork)."""
+    its time, and how many pages it writes (each a copy after a fork).
+    A re-executed fwe's start counts from its host `execve` (the same
+    pid's mark before it, by the host's clock): "re-exec: host execve to
+    main" is the host's exec and what runs before fwe's `main`."""
     r = subprocess.run(cmd, env=dict(os.environ, FWE_TIMING="1"), capture_output=True,
                        text=True, errors="replace")
     steps, faults = collections.defaultdict(list), collections.defaultdict(list)
     first = None
+    # Each pid's last mark: its name and the host's clock.
+    last = {}
     for line in r.stderr.splitlines():
-        m = re.match(r"\[fwe (\d+)\] timing: (.*?) \+(\d+)us \(\d+us\) \+(\d+) faults$",
-                     line)
+        m = re.match(r"\[fwe (\d+)\] timing: (.*?) \+(\d+)us \(\d+us\) \+(\d+) faults"
+                     r" @(\d+)$", line)
         if m:
             pid, m = m.group(1), m.groups()[1:]
             first = first or pid
             # The first process's steps, and those of the processes after it.
             who = "" if pid == first else "(others) "
+            if m[0] == "main" and last.get(pid, ("",))[0] == "exec: host execve":
+                steps[who + "re-exec: host execve to main"].append(int(m[3]) - last[pid][1])
+                faults[who + "re-exec: host execve to main"].append(0)
+            last[pid] = (m[0], int(m[3]))
             step = who + re.sub(r"\d+", "N", m[0])[:60]
             steps[step].append(int(m[1]))
             faults[step].append(int(m[2]))

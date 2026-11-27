@@ -1278,10 +1278,16 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
         Err(e) => return err(e),
     };
     let fs = k.fs();
-    let file = match fs.read(&fs.exec_target(&path)) {
-        Ok(f) => f,
-        Err(e) => return err(e),
+    // An ELF program, checked by its first bytes: the fresh fwe reads it.
+    let program = match k.take_exec_file(&path) {
+        Some(file) => Ok(file),
+        None => fs.program_file(&fs.exec_target(&path)),
     };
+    match program.and_then(|p| p.head()) {
+        Ok((head, len)) if fwe_elf::Head::parse(&head, len).is_ok() => {}
+        Ok(_) => return err(fwe_abi::errno::ENOEXEC),
+        Err(e) => return err(e),
+    }
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
     let state = k.exec_state();
@@ -1297,7 +1303,7 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
     let exe = fs.exec_fd(&path).map_or_else(|| path.clone(), |fd| fs.fd_target(fd));
     let named = fwe_kernel::fs::exec_name(&run_by, &exe);
     let r = crate::reexec(
-        crate::Program { path: &path, named: &named, args: &argv, env: &envp, file: &file },
+        crate::Program { path: &path, named: &named, args: &argv, env: &envp },
         fs,
         k.tracer,
         &state,

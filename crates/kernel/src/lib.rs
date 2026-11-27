@@ -791,9 +791,9 @@ impl<P: Platform> Kernel<P> {
     /// bit set), and that no process has open for writing (`ETXTBSY`).
     /// What running it grants ([`ExecPrivs`]) is noted for the exec.
     /// The program file at `path`, which the caller can run
-    /// ([`Kernel::may_exec`]): its contents, read through the one
-    /// descriptor its checks were made on (`None` with no filesystem).
-    fn exec_file(&self, path: &[u8]) -> Result<Option<ExecFile>, i32> {
+    /// ([`Kernel::may_exec`]): open to be read through the one descriptor
+    /// its checks were made on (`None` with no filesystem).
+    fn exec_file(&self, path: &[u8]) -> Result<Option<fs::ProgramFile>, i32> {
         use fwe_abi::{errno, fcntl};
         use std::os::fd::FromRawFd;
         let Some(fs) = self.fs_opt() else {
@@ -803,7 +803,7 @@ impl<P: Platform> Kernel<P> {
         // fwe's own files (`/proc/self/exe`, `/dev/fd/N`): through them.
         if fs.synthetic(fcntl::AT_FDCWD as i32, path).is_some() {
             self.may_exec(path)?;
-            return fs.read_identified(path).map(Some);
+            return fs.program_file(path).map(Some);
         }
         EXEC_PRIVS.with(|p| p.set(ExecPrivs::default()));
         if landlock::active() {
@@ -821,7 +821,7 @@ impl<P: Platform> Kernel<P> {
                 || filestore::io::written(file),
                 || store_caps(file),
             )?;
-            return filestore::io::read_file(file, r.mount_flags).map(|d| Some((d, None)));
+            return Ok(Some(fs::ProgramFile::Store(file, r.mount_flags)));
         }
         let name = r.name_c()?;
         // Not waiting for a writer, in case it is a FIFO (refused below).
@@ -846,12 +846,15 @@ impl<P: Platform> Kernel<P> {
             || host_file_busy(&st),
             || file_caps(r.dir.as_raw_fd(), &name),
         )?;
-        let id = prepcache::FileId::of_fd(fd.as_raw_fd());
-        fs::read_all_fd(fd.as_raw_fd()).map(|d| Some((d, id)))
+        // Kept for the loader: out of the guest's descriptors.
+        let fd = fdtable::reserve(std::os::fd::IntoRawFd::into_raw_fd(fd))?;
+        // SAFETY: the descriptor just moved, this one's.
+        Ok(Some(fs::ProgramFile::Host(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })))
     }
 
-    /// The program the last [`Kernel::exec_target`] found at `path`, read.
-    pub fn take_exec_file(&self, path: &[u8]) -> Option<ExecFile> {
+    /// The program the last [`Kernel::exec_target`] found at `path`, open
+    /// through the descriptor its checks were made on.
+    pub fn take_exec_file(&self, path: &[u8]) -> Option<fs::ProgramFile> {
         EXEC_FILE.with(|f| f.borrow_mut().take()).filter(|(p, _)| p == path).map(|(_, d)| d)
     }
 
@@ -971,11 +974,11 @@ impl<P: Platform> Kernel<P> {
         let (mut path, mut args) = (path, args);
         EXEC_FILE.with(|f| f.borrow_mut().take());
         for _ in 0..5 {
-            let Some(data) = self.exec_file(&path)? else { return Ok((path, args)) };
-            let head = &data.0[..data.0.len().min(256)];
-            let Some((interp, arg)) = script_interpreter(head)? else {
+            let Some(file) = self.exec_file(&path)? else { return Ok((path, args)) };
+            let head = file.read_at(0, 256)?;
+            let Some((interp, arg)) = script_interpreter(&head)? else {
                 // Kept for the loader ([`Kernel::take_exec_file`]).
-                EXEC_FILE.with(|f| *f.borrow_mut() = Some((path.clone(), data)));
+                EXEC_FILE.with(|f| *f.borrow_mut() = Some((path.clone(), file)));
                 return Ok((path, args));
             };
             let mut new = vec![interp.clone()];
@@ -1400,7 +1403,7 @@ pub type ExecFile = (Vec<u8>, Option<prepcache::FileId>);
 thread_local! {
     /// The program file [`Kernel::exec_target`] read, by its path, for the
     /// loader to take.
-    static EXEC_FILE: std::cell::RefCell<Option<(Vec<u8>, ExecFile)>> =
+    static EXEC_FILE: std::cell::RefCell<Option<(Vec<u8>, fs::ProgramFile)>> =
         const { std::cell::RefCell::new(None) };
 }
 
