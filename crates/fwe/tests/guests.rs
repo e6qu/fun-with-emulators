@@ -3580,13 +3580,13 @@ impl Drop for PulseServer {
     }
 }
 
-/// `secs` seconds of a 440 Hz tone and half a second of silence, as a WAV
+/// `secs` seconds of a 440 Hz tone and `silence_ms` of silence, as a WAV
 /// file: 16-bit stereo at 44.1 kHz. (A player's server can drop what it
 /// holds of a stream as it ends: PipeWire's sink to a PulseAudio server
-/// flushes it once nothing plays.)
-fn tone_wav(secs: u32) -> Vec<u8> {
+/// corks its stream, what the server holds unplayed, once nothing plays.)
+fn tone_wav(secs: u32, silence_ms: u32) -> Vec<u8> {
     let sound = 44_100 * secs;
-    let frames = sound + 22_050;
+    let frames = sound + 441 * silence_ms / 10;
     let mut w = b"RIFF".to_vec();
     w.extend((36 + frames * 4).to_le_bytes());
     w.extend(b"WAVEfmt ");
@@ -3626,14 +3626,18 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     let _ = std::fs::remove_dir_all(&root);
     run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("sound")).arg(&root));
     let root = ScratchRoot(root);
-    std::fs::write(root.0.join("tmp/tone.wav"), tone_wav(1)).unwrap();
+    std::fs::write(root.0.join("tmp/tone.wav"), tone_wav(1, 500)).unwrap();
+    // For PipeWire, silence for longer than its tunnel holds.
+    std::fs::write(root.0.join("tmp/tone-long.wav"), tone_wav(1, 2000)).unwrap();
     // PipeWire's sink on the Mac's server, as a user's configuration adds it.
     // The tunnel keeps half its `pulse.latency` (200 ms by default) at the
     // server and as much in its own ring, and answers a request of the
     // server's its ring cannot fill with silence; PipeWire with no device
     // of its own fills the ring 2048 frames (43 ms) a cycle. A server that
     // wakes unevenly (a CI runner's, whose native clients underrun as well)
-    // asks ahead of that: a second's latency keeps up.
+    // asks ahead of that: a second's latency keeps up. (The tunnel holds
+    // as much once its player is done: the player's file plays silence for
+    // longer.)
     let conf = root.0.join("root/.config/pipewire/pipewire.conf.d");
     std::fs::create_dir_all(&conf).unwrap();
     std::fs::write(
@@ -3651,7 +3655,6 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
         cmd.envs(pulse.env());
         let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
-        eprintln!("PROBE {:?} said: {}", &args[..1], String::from_utf8_lossy(&out.stderr));
         assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
         stdout(&out)
     };
@@ -3659,16 +3662,13 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     assert!(info.contains("Server String: unix:/run/pulse/native"), "{info}");
     // A second of tone is 44100 frames, those at its zero crossings silent
     // (900 of them): all are recorded.
-    // PipeWire and its session manager, for as long as pw-play plays and
-    // the tunnel then holds (its latency, a second; twice that is waited).
+    // PipeWire and its session manager, for as long as pw-play plays.
     let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
-        PIPEWIRE_DEBUG='3,mod.pulse-tunnel:5' pipewire 2>/tmp/pipewire.err & p=$!
+        pipewire 2>/tmp/pipewire.err & p=$!
         until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done
         wireplumber 2>/tmp/wireplumber.err & w=$!
         until pw-cli ls Node 2>/dev/null | grep -q 'node.name = \"mac\"'; do sleep 0.1; done
-        pw-top -b -n 12 > /tmp/pwtop.txt 2>&1 & t=$!
-        PIPEWIRE_DEBUG=3 pw-play --target mac /tmp/tone.wav; r=$?; sleep 2
-        sleep 1; kill $t; cat /tmp/pwtop.txt >&2
+        pw-play --target mac /tmp/tone-long.wav; r=$?
         kill $w $p; wait; exit $r";
     for player in [
         &["/usr/bin/paplay", "/tmp/tone.wav"][..],
