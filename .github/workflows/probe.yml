@@ -13,7 +13,7 @@ jobs:
           mkdir -p out
           docker run --rm -v "$PWD:/work:ro" -v "$PWD/out:/out" debian:trixie sh -c '
             apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pulseaudio pulseaudio-utils alsa-utils libasound2-plugins pipewire pipewire-bin libpipewire-0.3-modules wireplumber python3 > /out/apt.txt 2>&1
-            useradd -m pa && python3 /work/tools/probe-pw-native.py'
+            useradd -m pa && chmod 777 /out && python3 /work/tools/probe-pw-native.py'
       - if: always()
         uses: actions/upload-artifact@v4
         with:
