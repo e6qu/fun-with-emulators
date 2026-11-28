@@ -151,9 +151,13 @@ fn call_line(nr: u64, args: &[u64; 6]) -> String {
         if i > 0 {
             line.push_str(", ");
         }
-        // A path or name, as the guest wrote it.
-        match crate::uaccess::read_cstr(*a, 256).ok().filter(|_| *a != 0 && strings & (1 << i) != 0)
-        {
+        // A path or name, as the guest wrote it: read only where the call
+        // takes one (another argument is a number, or a pointer to bytes
+        // that are no string).
+        let text = (*a != 0 && strings & (1 << i) != 0)
+            .then(|| crate::uaccess::read_cstr(*a, 256).ok())
+            .flatten();
+        match text {
             Some(text) => {
                 let _ = write!(line, "{:?}", String::from_utf8_lossy(&text));
             }
