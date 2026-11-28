@@ -8,34 +8,14 @@ jobs:
     timeout-minutes: 40
     steps:
       - uses: actions/checkout@v4
-      - name: OpenTTD under Wine natively, without and with a sound server
+      - name: PipeWire's tunnel natively, 20 runs
         run: |
           mkdir -p out
-          docker run --rm -v "$PWD:/work:ro" -v "$PWD/out:/out" alpine:3.24 sh /work/tools/probe-ottd-linux.sh
+          docker run --rm -v "$PWD:/work:ro" -v "$PWD/out:/out" debian:trixie sh -c '
+            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pulseaudio pulseaudio-utils alsa-utils libasound2-plugins pipewire pipewire-bin libpipewire-0.3-modules wireplumber python3 > /out/apt.txt 2>&1
+            useradd -m pa && python3 /work/tools/probe-pw-native.py'
       - if: always()
         uses: actions/upload-artifact@v4
         with:
           name: linux
           path: out
-  mac:
-    runs-on: macos-26
-    timeout-minutes: 90
-    steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
-      - run: brew install --cask xquartz
-      - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Utilities/XQuartz.app
-      - run: brew install unicorn pulseaudio
-      - run: cargo build --release -p fwe
-      - name: OpenTTD on the stand-in, without and with a sound server
-        run: |
-          /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
-          for i in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
-          tools/probe-ottd-mac.sh
-      - if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: mac
-          path: |
-            out
-            xquartz.log
