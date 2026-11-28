@@ -1102,6 +1102,12 @@ static ENTERED_RETURNS: AtomicU64 = AtomicU64::new(0);
 static ENTERED_CALLS: AtomicU64 = AtomicU64::new(0);
 static ENTERED_DIRECT: AtomicU64 = AtomicU64::new(0);
 static ENTERED_FOLLOWED: AtomicU64 = AtomicU64::new(0);
+/// Of [`ENTERED_DIRECT`]: those through a site linked already, its target
+/// translated and found in the table, the program's `x16` the target: its
+/// stub's lookup made the call as it was (`x16` the target, as it does for
+/// one not translated), the translation it found lost with `x18`, which the
+/// host zeroed meanwhile ([`STASH`]).
+static ENTERED_X18_LOST: AtomicU64 = AtomicU64::new(0);
 /// Sites of code not translated linked to translations.
 static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 /// For `FWE_TIMING`: entries by fetch by their target and `x30`, each
@@ -1221,7 +1227,7 @@ pub fn counts() -> Option<String> {
         format!(
             "JIT code: {t} blocks translated, {} exits through fwe ({} from call stubs, {} from `br x18`'s stubs; {} direct and {} \
              indirect to code not translated; to blocks made already: {} direct, {} of them left unlinked, \
-             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls through a register from code not translated, {} from code a direct call there led to, {} sites linked, {} whose return is followed), \
+             {} indirect, {} of them with their entry another's), {} entries by fetch ({} returns, {} calls through a register from code not translated, {} from code a direct call there led to, {} of them through a site linked already whose lookup lost `x18`, {} sites linked, {} whose return is followed), \
              {} cache lines flushed ({} blocks kept unchanged, {} dropped, {} taken back), the code cache emptied {} times; \
              {} ms translating, {} ms in ways out, {} waits for the lock ({} ms), held {} ms in ways out, {} in flushes, {} in entries, {} in the gate, {} else",
             EXITS.load(Ordering::Relaxed),
@@ -1237,6 +1243,7 @@ pub fn counts() -> Option<String> {
             ENTERED_RETURNS.load(Ordering::Relaxed),
             ENTERED_CALLS.load(Ordering::Relaxed),
             ENTERED_DIRECT.load(Ordering::Relaxed),
+            ENTERED_X18_LOST.load(Ordering::Relaxed),
             CALL_SITES_LINKED.load(Ordering::Relaxed),
             ENTERED_FOLLOWED.load(Ordering::Relaxed),
             LINES_FLUSHED.load(Ordering::Relaxed),
@@ -2009,6 +2016,13 @@ pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
             if matches!(site, CallSite::Call(_)) { &ENTERED_CALLS } else { &ENTERED_DIRECT };
         counter.fetch_add(1, Ordering::Relaxed);
         if let CallSite::Direct(to) = site {
+            let found = s.by_g.get(&to).map(|&i| looked_up(s.blocks[i].t));
+            if s.call_sites.get(&at) == Some(&true)
+                && x16_x17.0 == to
+                && found.is_some_and(|t| holding(TABLE, to).is_some_and(|e| read_entry(e).1 == t))
+            {
+                ENTERED_X18_LOST.fetch_add(1, Ordering::Relaxed);
+            }
             // Its target translated, for the lookup to find (again, if
             // its translation went since).
             translation(&mut s, to, false);

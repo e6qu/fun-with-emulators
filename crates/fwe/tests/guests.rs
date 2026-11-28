@@ -1188,7 +1188,10 @@ fn jit_calls_keep_x16_x17_through_signals() {
 /// code, from a function a loop calls (guests/c/jittail.c): each reaches
 /// the code, and only the first is a fault into fwe (the call that led to
 /// the branch is linked from then on, the branch translated and a lookup),
-/// not one for each of the 100000.
+/// not one for each of the 100000. Any other is a call whose stub's lookup
+/// lost `x18` to the host (which zeroes it as the thread enters the
+/// kernel, a preemption say), which fwe counts apart: the call then goes
+/// on natively, as the program wrote it.
 #[test]
 fn jit_code_branched_into_faults_once() {
     let prog = build_c("jittail", Libc::Musl, true, true);
@@ -1199,13 +1202,18 @@ fn jit_code_branched_into_faults_once() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stdout(&out), "sum: 5000050000\n", "{err}");
     assert_eq!(out.status.code(), Some(0));
-    // "..., N entries by fetch (...": N, for the one process.
-    let fetched: Vec<u64> = err
-        .lines()
-        .filter(|l| l.contains(" entries by fetch ("))
-        .filter_map(|l| l.split(" entries by fetch (").next()?.rsplit(' ').next()?.parse().ok())
-        .collect();
-    assert_eq!(fetched, [1], "{err}");
+    // "..., N entries by fetch (..., L of them through a site linked
+    // already whose lookup lost `x18`, ...": N less L, for the one process.
+    let count = |after: &str| -> Vec<u64> {
+        err.lines()
+            .filter(|l| l.contains(after))
+            .filter_map(|l| l.split(after).next()?.rsplit([' ', '(', ',']).next()?.parse().ok())
+            .collect()
+    };
+    let fetched = count(" entries by fetch (");
+    let lost = count(" of them through a site linked already whose lookup lost `x18`");
+    assert!(fetched.len() == 1 && lost.len() == 1, "{err}");
+    assert_eq!(fetched[0] - lost[0], 1, "{err}");
     let _ = std::fs::remove_dir_all(&root);
 }
 

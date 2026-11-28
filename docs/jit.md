@@ -114,8 +114,10 @@ anew.
   (single-copy atomic, as the table's writes are), so a match leads to
   the target's own translation. Through `x16` or `x17`, which the lookup
   takes for itself, the target is read again from its slot to compare,
-  the translation kept in `x18` meanwhile (lost to a kernel entry that
-  zeroes `x18`, it reads as a miss).
+  the translation kept in `x18` meanwhile. Lost to a kernel entry that
+  zeroes `x18`, it reads as a target not translated, and the branch goes
+  on as the program made it (from the near table, which holds
+  translations only, it reads as a miss).
   - A lookup looks first in a near table, one entry for each 64 bytes of
     the program's code, which keeps the entries of thousands of
     functions in the data cache, as the full table (an entry for each
@@ -196,7 +198,10 @@ anew.
     puts the call's target in `x16`, as a linker's veneer can, and looks
     that up, so the called code runs by translation and its branches
     into the JIT's code are lookups. Code read through such a site to be
-    translated has its own word back.
+    translated has its own word back. The host zeroing `x18` inside the
+    stub's lookup makes that one call as the program wrote it, natively,
+    and its branch into the JIT's code faults again (`FWE_TIMING` counts
+    these entries apart).
   - A way in that tells nothing of where it came from has its return
     address (`x30`) followed instead: the code that came in goes on by
     translation from there, and its next ways in are lookups.
