@@ -1,0 +1,20 @@
+name: probe-jit
+on:
+  push:
+    branches: [probe-jit]
+jobs:
+  jit:
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - name: A JIT tail call's entries, 60 times
+        run: |
+          cargo test -p fwe --test guests --no-run 2>&1 | tail -1
+          for i in $(seq 60); do
+            out=$(cargo test -p fwe --test guests -- --exact jit_code_branched_into_faults_once 2>&1)
+            echo "run $i: $(echo "$out" | grep -a -o 'test result: [a-zA-Z]*')"
+            echo "$out" | grep -a -o 'entries by fetch at a call site linked already: .*' | cut -c1-900
+            echo "$out" | grep -a -o '[0-9]* entries by fetch ([^)]*)' | head -1
+          done
