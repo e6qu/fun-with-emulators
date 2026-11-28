@@ -175,7 +175,12 @@ guest's mappings (`set_validator`) and translated (`g2h`, `host_arg`)
 - `FWE_TIMING=1` prints to standard error how long each phase of a start,
   an `execve`, a `fork` (in parent and child) and a `wait` took, and the
   page faults each took (in a fork's child every page touched is one; in
-  the parent every page written while the child lives).
+  the parent every page written while the child lives). As a process
+  exits it prints its system calls by number with their time, the host
+  signals it took, the traps among them by what they were for, and the
+  fault signals by what fwe made of each (an `x18` group run again, a
+  first run of code, a fetch of translated code, a page copied, a stack
+  grown, the guest's own, and others) with their total and longest time.
 - All are passed on across `execve` and `fork`. A failed code preparation
   is noted with its reason (no room for stubs, say), and the guest gets
   `ENOMEM`.
