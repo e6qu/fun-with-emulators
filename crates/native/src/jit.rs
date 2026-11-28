@@ -1108,6 +1108,10 @@ static CALL_SITES_LINKED: AtomicU64 = AtomicU64::new(0);
 /// with how many there were and the registers that held the target.
 static ENTRY_SPOTS: std::sync::Mutex<BTreeMap<(u64, u64), (u64, u32)>> =
     std::sync::Mutex::new(BTreeMap::new());
+/// For `FWE_TIMING`: entries by fetch from code a direct call led to whose
+/// call site was linked already (its stub's lookup made the call as it
+/// was): what the lookup found for the call's target, the first eight.
+static LINKED_AGAIN: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
 /// Time spent translating blocks, and in [`exit`] (with its lock), in
 /// nanoseconds.
 static TRANSLATE_NS: AtomicU64 = AtomicU64::new(0);
@@ -1291,10 +1295,20 @@ fn entry_spots() -> String {
             )
         })
         .collect();
-    if said.is_empty() {
+    let again = LINKED_AGAIN.lock().unwrap_or_else(|e| e.into_inner());
+    let again = if again.is_empty() {
         String::new()
     } else {
-        format!("; entries by fetch at {} places, most often: {}", spots.len(), said.join(", "))
+        format!("; entries by fetch at a call site linked already: {}", again.join(", "))
+    };
+    if said.is_empty() {
+        again
+    } else {
+        format!(
+            "; entries by fetch at {} places, most often: {}{again}",
+            spots.len(),
+            said.join(", ")
+        )
     }
 }
 
@@ -2009,6 +2023,24 @@ pub fn enter(pc: u64, lr: u64, held: u32, x16_x17: (u64, u64)) -> Option<u64> {
             if matches!(site, CallSite::Call(_)) { &ENTERED_CALLS } else { &ENTERED_DIRECT };
         counter.fetch_add(1, Ordering::Relaxed);
         if let CallSite::Direct(to) = site {
+            if fwe_kernel::timing::on() && s.call_sites.get(&at) == Some(&true) {
+                let e = entry(to);
+                let said = format!(
+                    "{to:#x} from {at:#x}: entries {:x?} {:x?}, translated {}, marked not {}",
+                    read_entry(e),
+                    read_entry(e ^ 16),
+                    s.by_g.get(&to).map_or("no".into(), |&i| format!(
+                        "at {:#x}{}",
+                        looked_up(s.blocks[i].t),
+                        if s.blocks[i].retired { ", retired" } else { "" }
+                    )),
+                    s.outside.contains(&to)
+                );
+                let mut l = LINKED_AGAIN.lock().unwrap_or_else(|e| e.into_inner());
+                if l.len() < 8 {
+                    l.push(said);
+                }
+            }
             // Its target translated, for the lookup to find (again, if
             // its translation went since).
             translation(&mut s, to, false);
