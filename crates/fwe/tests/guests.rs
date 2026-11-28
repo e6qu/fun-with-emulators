@@ -3682,12 +3682,6 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     .unwrap();
     let run = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-        if args[0] == "/bin/sh" {
-            let n = std::env::var("PROBE_RUN").unwrap_or_default();
-            let f = display_dir().join(format!("run{n}-strace.txt"));
-            let _ = std::fs::remove_file(&f);
-            let _ = f;
-        }
         cmd.arg("--root").arg(&root.0).arg(root.0.join(&args[0][1..])).args(&args[1..]);
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
         cmd.envs(pulse.env());
@@ -3704,27 +3698,23 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     // (900 of them): all are recorded.
     // PipeWire and its session manager, for as long as pw-play plays.
     let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
-        export PIPEWIRE_DEBUG='3,pw.node:4,spa.driver:5'
-        export PIPEWIRE_LOG_TIMESTAMP=realtime
+        export PIPEWIRE_DEBUG='2,pw.node:3' PIPEWIRE_LOG_TIMESTAMP=realtime
         pipewire 2>/tmp/pipewire.err & p=$!
         until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done
         wireplumber 2>/tmp/wireplumber.err & w=$!
         until pw-cli ls Node 2>/dev/null | grep -q 'node.name = \"mac\"'; do sleep 0.1; done
-        date +%s.%N > /tmp/pwplay.start
-        pw-play --target mac /tmp/tone-long.wav 2>/tmp/pwplay.err; r=$?
-        date +%s.%N > /tmp/pwplay.end
+        pw-play --target mac /tmp/tone-long.wav; r=$?
         kill $w $p; wait; exit $r";
-    for player in [&["/bin/sh", "-c", pipewire][..]] {
+    for player in [
+        &["/usr/bin/paplay", "/tmp/tone.wav"][..],
+        &["/usr/bin/aplay", "-q", "-D", "pulse", "/tmp/tone.wav"],
+        &["/bin/sh", "-c", pipewire],
+    ] {
         let rec = pulse.recorded(|| {
             run(player);
         });
-        eprintln!("PROBE {player:?}: {rec}");
+        eprintln!("{player:?}: {rec}");
         let said = |f: &str| std::fs::read_to_string(root.0.join(f)).unwrap_or_default();
-        let n = std::env::var("PROBE_RUN").unwrap_or_default();
-        for f in ["pipewire.err", "wireplumber.err", "pwplay.err", "pwplay.start", "pwplay.end"] {
-            let _ = std::fs::write(display_dir().join(format!("run{n}-{f}")), said(&format!("tmp/{f}")));
-        }
-        let _ = std::fs::write(display_dir().join(format!("run{n}-recording.txt")), format!("{rec}"));
         assert!(
             rec.sound > 43_000,
             "{player:?}: {rec}, of the tone; PipeWire said: {}; WirePlumber said: {}",

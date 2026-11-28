@@ -1,9 +1,14 @@
-name: probe-pipewire-fwe
+name: probe-display
 on:
   push:
     branches: [probe-media]
 jobs:
-  sound:
+  display:
+    strategy:
+      fail-fast: false
+      matrix:
+        k: [1, 2, 3, 4]
+    name: Display (macos-26)
     runs-on: macos-26
     timeout-minutes: 120
     steps:
@@ -13,26 +18,37 @@ jobs:
         with:
           path: target/fetched-packages
           key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
-      - run: brew install pulseaudio
-      - name: The PipeWire sound case, ten times, logged
+      # The apps of fwe's own the application tests build under fwe.
+      - uses: actions/cache@v4
+        with:
+          path: target/built-apps
+          key: built-apps-${{ hashFiles('guests/apps/tauri/**', 'guests/apps/wails/**', 'guests/alpine/fetch/apps.txt') }}
+      # Unicorn: the hypervisor stand-in, Wine's VM.
+      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools pulseaudio
+      # The Mac's Vulkan drivers, each one's devices, and whether each has
+      # what Zink needs (robustness2's nullDescriptor): a record of the
+      # runner, which fails nothing.
+      - name: The runner's Vulkan drivers
         run: |
-          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
-          mkdir -p target/tmp/display
-          python3 tools/probe-latency.py target/tmp/display/latency.txt & lat=$!
-          # The runner's 3 CPUs kept busy, as the Display job's other tests keep them.
-          python3 tools/probe-memhog.py 6 & load=$!
-          sleep 20; memory_pressure -Q || true; vm_stat | head -8
-          for i in $(seq 16); do
-            PROBE_RUN=$i cargo test -p fwe --test guests -- --exact sound_clients_play_on_the_macs_pulseaudio_server --nocapture 2>&1 | grep -a -E "PROBE|test result|panicked" | cut -c1-300
-            cp target/tmp/display/pulse-clients.err target/tmp/display/run$i-pulse-server.err 2>/dev/null || true
+          for icd in "$(brew --prefix)"/etc/vulkan/icd.d/*.json "$(brew --prefix)"/share/vulkan/icd.d/*.json; do
+            echo "== $icd"
+            VK_DRIVER_FILES="$icd" vulkaninfo 2>&1 \
+              | grep -E "deviceName|driverName|apiVersion|nullDescriptor|ERROR|Cannot" | sort -u || true
           done
-          memory_pressure -Q || true; vm_stat | head -12
-          kill "$lat"; for p in $load; do [ "$p" -gt 0 ] && kill "$p"; done
-          sysctl hw.ncpu hw.memsize
+      - name: The display and sound tests
+        run: |
+          export XVFB="$(brew --prefix)/bin/Xvfb"
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
+          export FWE_VULKAN_DRIVER="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          for i in 1 2; do cargo test -p fwe --test guests -- display_ sound_ --nocapture 2>&1 | grep -a -E "^test |test result|panicked|of the tone|xrun|timing: exit: [0-9]* system calls|^---- " | cut -c1-1500; done
         env:
+          FWE_DISPLAY_TESTS: "1"
           FWE_SOUND_TESTS: "1"
+      # What each program said, its calls and its screenshots.
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: sound
+          name: display-${{ matrix.k }}
           path: target/tmp/display
+
