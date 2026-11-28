@@ -5,16 +5,27 @@ on:
 jobs:
   jit:
     runs-on: macos-15
-    timeout-minutes: 90
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
-      - name: A JIT tail call's entries, 60 times
+      - name: The JIT tests, eight at once, 12 rounds
         run: |
           cargo test -p fwe --test guests --no-run 2>&1 | tail -1
-          for i in $(seq 60); do
-            out=$(cargo test -p fwe --test guests -- --exact jit_code_branched_into_faults_once 2>&1)
-            echo "run $i: $(echo "$out" | grep -a -o 'test result: [a-zA-Z]*')"
-            echo "$out" | grep -a -o 'entries by fetch at a call site linked already: .*' | cut -c1-900
-            echo "$out" | grep -a -o '[0-9]* entries by fetch ([^)]*)' | head -1
+          bin=$(ls -t target/debug/deps/guests-* | grep -v '\.d$' | head -1)
+          mkdir -p out
+          for r in $(seq 12); do
+            pids=""
+            for k in $(seq 8); do
+              "$bin" jit_ --skip hv_ > out/r$r-$k.txt 2>&1 < /dev/null & pids="$pids $!"
+            done
+            for p in $pids; do wait "$p"; done
+            echo "round $r: $(grep -l 'test result: FAILED' out/r$r-*.txt | wc -l) of 8 failed; $(grep -h -o '^    [a-z_0-9]*$' out/r$r-*.txt | sort | uniq -c | tr '\n' ' ')"
           done
+          grep -h -o 'entries by fetch at a call site linked already: .*' out/*.txt | cut -c1-900 | head -20
+          grep -h -o '[0-9]* entries by fetch ([^)]*)' out/*.txt | sort | uniq -c | head
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jit
+          path: out
