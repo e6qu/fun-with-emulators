@@ -437,6 +437,20 @@ unsafe fn copy_guest(addr: u64, buf: *mut u8, len: usize, to_guest: bool) -> Res
     Ok(())
 }
 
+/// How a backend runs fwe's atomic operations on guest memory where no
+/// guest code runs: for one whose guest's atomics are not atomic against
+/// the host's (an emulator, whose compare-and-swap is a load and then a
+/// store, which a host operation between them would be lost to).
+type Alone = fn(&mut dyn FnMut());
+
+static ALONE: std::sync::OnceLock<Alone> = std::sync::OnceLock::new();
+
+/// Have fwe's atomic operations on guest memory ([`cmpxchg_u32`]) run
+/// through `f`, which runs what it is given while no guest code runs.
+pub fn set_alone(f: Alone) {
+    let _ = ALONE.set(f);
+}
+
 /// Atomically set the guest's 32-bit word at `addr` to `new` if it holds
 /// `expected`: the value it held, or `EFAULT` (also for a word not
 /// aligned).
@@ -447,8 +461,16 @@ pub fn cmpxchg_u32(addr: u64, expected: u32, new: u32) -> Result<u32> {
     }
     check(valid(addr, 4, true))?;
     let host = run(addr).0;
-    // SAFETY: an aligned guest word, validated; a fault is recovered.
-    unsafe { imp::cas32(host as *mut u32, expected, new) }.ok_or(errno::EFAULT)
+    let mut held = None;
+    let mut cas = || {
+        // SAFETY: an aligned guest word, validated; a fault is recovered.
+        held = unsafe { imp::cas32(host as *mut u32, expected, new) };
+    };
+    match ALONE.get() {
+        Some(alone) => alone(&mut cas),
+        None => cas(),
+    }
+    held.ok_or(errno::EFAULT)
 }
 
 /// Copy `src` to host address `dst`, a guest buffer already translated

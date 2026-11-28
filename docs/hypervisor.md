@@ -261,8 +261,12 @@ another waits, and each Unicorn engine is driven only by its own thread:
 Unicorn's API, `uc_emu_stop` included, races with an engine running on
 another thread (its JIT write-protection bookkeeping is unsynchronised on
 Apple Silicon), and Unicorn runs hooks inside its own memory calls, so no
-lock a hook takes is held across them. Emulation is several times slower
-than the CPU, so stand-in guests get a longer test time limit.
+lock a hook takes is held across them. fwe's own atomic operations on
+guest memory (a futex's compare-and-swap) take a turn too: Unicorn's
+compare-and-swap is a load and then a store, and a host one between them
+would be lost (two threads would hold one lock). Emulation is several
+times slower than the CPU, so stand-in guests get a longer test time
+limit.
 
 The stand-in also checks the rules the backend MUST keep, printing a line
 with `fwe hv stand-in: VIOLATION:`, on which the tests fail:
