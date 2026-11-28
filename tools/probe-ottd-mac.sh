@@ -15,17 +15,16 @@ echo "mac wineboot: $(( $(date +%s) - t0 )) s"
 run() {  # $1 tag, then env for fwe
   tag=$1; shift
   env -i HOME=/root PATH=/usr/bin:/bin DISPLAY=:4 WINEDLLOVERRIDES="mscoree,mshtml=" "$@" \
-    "$FWE" --hv-standin --vm --root ~/alpine ~/alpine/bin/sh -c \
+    "$FWE" --hv-standin --vm --strace "--strace-file=$PWD/out/strace-$tag.txt" --root ~/alpine ~/alpine/bin/sh -c \
     'WINEDEBUG=+timestamp,+mmdevapi,+pulse,+alsa,+xaudio2 wine /root/openttd-15.3-windows-arm64/openttd.exe -d driver=9,misc=2' \
     > "out/$tag.txt" 2>&1 &
   p=$!
-  for m in $(seq 15); do sleep 60; screencapture -x "out/$tag-$m.png" 2>/dev/null
+  for m in $(seq 8); do sleep 60; screencapture -x "out/$tag-$m.png" 2>/dev/null
     echo "mac $tag minute $m: $(wc -l < out/$tag.txt) lines, last: $(tail -1 out/$tag.txt | cut -c1-150)"; done
   [ "$p" -gt 0 ] && kill "$p"; sleep 5
   for q in $(pgrep -f "wineserver|openttd.exe|alpine/bin/sh -c"); do [ "$q" -gt 0 ] && kill -9 "$q"; done
   sleep 5
 }
-run nosound
 PA=$(brew --prefix pulseaudio)/bin/pulseaudio
 D=$(mktemp -d /tmp/pa.XXXX)
 env -i HOME="$D" "$PA" -n --daemonize=no --exit-idle-time=-1 --use-pid-file=no --log-level=info --log-time=1 \
@@ -33,3 +32,6 @@ env -i HOME="$D" "$PA" -n --daemonize=no --exit-idle-time=-1 --use-pid-file=no -
   > out/pa-server.txt 2>&1 &
 for i in $(seq 30); do [ -S "$D/native" ] && break; sleep 1; done
 run pulse PULSE_SERVER="unix:$D/native" PULSE_COOKIE="$D/.config/pulse/cookie"
+
+grep -n "pulse_connect" out/pulse.txt | head -3
+gzip -9 out/strace-*.txt
