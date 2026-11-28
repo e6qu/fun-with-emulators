@@ -310,7 +310,10 @@ BUDGETS = {
     # Programs at work that are mostly system calls (a database on disk, a
     # repository), as a call is.
     "SQLite (s)": 1.5,
-    "git (s)": 1.5,
+    # git runs its commands by fork and exec, and a fork child's execve
+    # starts a fresh fwe: held at 2x (CI measures 1.5x) until that start is
+    # faster (ROADMAP.md M6 PR 5).
+    "git (s)": 2.0,
     # JIT runtimes at work (OpenJDK compiling, then running, a
     # multi-threaded application; Node.js and LuaJIT running a script),
     # against the same releases built for macOS.

@@ -104,7 +104,8 @@ Budgets, held in CI against native macOS on the same runner:
 | a system call (`getpid`, `fstat`, `stat`, `open`+`close`, `pread`, `mmap`+`munmap`; one thread and several) | 1.5× |
 | thread create and join; `fork` + exit + wait; start-up | 3× |
 | `fork` + `exec` + wait (each `execve` in a fork child starts a fresh fwe) | 4× |
-| SQLite, git, a JDK at work, Node.js, LuaJIT, an X frame and round trip | 1.5× |
+| git (its commands run by `fork` and `exec`) | 2× |
+| SQLite, a JDK at work, Node.js, LuaJIT, an X frame and round trip | 1.5× |
 | a C build (Lua), a Lua script, a Python script, xz | fwe's share of CPU samples 1.2× |
 | translated code (calls and returns, a switch, calls through a register, a loop) against the same code natively | 1.3× |
 | a function made at run time and run (no native counterpart) | 2 µs |
@@ -146,7 +147,7 @@ hold 0.5× macOS (unless the directory cache is not planned), and
   forked address space it leaves is small to tear down.
 
 **Done when:** `fork` + exit + wait holds 2× macOS, `fork` + `exec` + wait
-3×, and a handled `SIGSEGV` 2×.
+3×, git 1.5× (its budget back from 2×), and a handled `SIGSEGV` 2×.
 
 #### PR 6 — 4 KiB pages natively
 
