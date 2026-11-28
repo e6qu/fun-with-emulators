@@ -11,8 +11,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: The JIT tests, eight at once, 12 rounds
         run: |
-          cargo test -p fwe --test guests --no-run 2>&1 | tail -1
-          bin=$(ls -t target/debug/deps/guests-* | grep -v '\.d$' | head -1)
+          bin=$(cargo test -p fwe --test guests --no-run 2>&1 | sed -n 's/.*Executable .*(\(.*\)).*/\1/p' | tail -1)
+          echo "binary: $bin"; test -x "$bin"
           mkdir -p out
           for r in $(seq 12); do
             pids=""
