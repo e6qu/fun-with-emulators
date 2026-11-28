@@ -17,10 +17,14 @@ jobs:
       - name: The PipeWire sound case, ten times, logged
         run: |
           export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          mkdir -p target/tmp/display
+          python3 tools/probe-latency.py target/tmp/display/latency.txt & lat=$!
           for i in $(seq 16); do
             PROBE_RUN=$i cargo test -p fwe --test guests -- --exact sound_clients_play_on_the_macs_pulseaudio_server --nocapture 2>&1 | grep -a -E "PROBE|test result|panicked" | cut -c1-300
             cp target/tmp/display/pulse-clients.err target/tmp/display/run$i-pulse-server.err 2>/dev/null || true
           done
+          kill "$lat"
+          sysctl hw.ncpu hw.memsize
         env:
           FWE_SOUND_TESTS: "1"
       - if: always()

@@ -3686,7 +3686,7 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
             let n = std::env::var("PROBE_RUN").unwrap_or_default();
             let f = display_dir().join(format!("run{n}-strace.txt"));
             let _ = std::fs::remove_file(&f);
-            cmd.arg("--strace").arg(format!("--strace-file={}", f.display()));
+            let _ = f;
         }
         cmd.arg("--root").arg(&root.0).arg(root.0.join(&args[0][1..])).args(&args[1..]);
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
