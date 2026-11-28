@@ -47,6 +47,9 @@
 //! Only one vCPU emulates at a time (a fair lock, handed on at the next
 //! block whenever another vCPU waits): Unicorn instances are independent
 //! CPUs, and running one at a time keeps the guest's atomics atomic.
+//! fwe's own atomic operations on guest memory (a futex's compare-and-swap)
+//! take a turn too ([`alone`]): Unicorn's compare-and-swap is a load and
+//! then a store, and a host one between them would be lost.
 //!
 //! Each Unicorn engine is driven only by its own thread: mapping changes
 //! are logged and applied by each vCPU before it next emulates, and a stop
@@ -85,6 +88,16 @@ static ON: AtomicBool = AtomicBool::new(false);
 /// startup, before any VM exists.
 pub fn enable() {
     ON.store(true, SeqCst);
+    fwe_kernel::uaccess::set_alone(alone);
+}
+
+/// Run `f` while no vCPU emulates: fwe's own atomic operations on guest
+/// memory ([`fwe_kernel::uaccess::set_alone`]). Called with no turn held
+/// (a system call is served after its vCPU's run returned).
+fn alone(f: &mut dyn FnMut()) {
+    take_turn(MAPPER, &|| false);
+    f();
+    end_turn();
 }
 
 /// The stand-in is in use (`--hv-standin`).

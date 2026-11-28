@@ -1,21 +1,30 @@
-name: probe-openttd-sound
+name: probe-pipewire-fwe
 on:
   push:
     branches: [probe-media]
 jobs:
-  linux:
-    runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+  sound:
+    runs-on: macos-26
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
-      - name: PipeWire's tunnel natively, 20 runs
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: target/fetched-packages
+          key: fetched-files-${{ hashFiles('guests/*/fetch/*.txt') }}
+      - run: brew install pulseaudio
+      - name: The PipeWire sound case, ten times, logged
         run: |
-          mkdir -p out
-          docker run --rm -v "$PWD:/work:ro" -v "$PWD/out:/out" debian:trixie sh -c '
-            apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq pulseaudio pulseaudio-utils alsa-utils libasound2-plugins pipewire pipewire-bin libpipewire-0.3-modules wireplumber python3 > /out/apt.txt 2>&1
-            useradd -m pa && chmod 777 /out && python3 /work/tools/probe-pw-native.py'
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          for i in $(seq 10); do
+            PROBE_RUN=$i cargo test -p fwe --test guests -- --exact sound_clients_play_on_the_macs_pulseaudio_server --nocapture 2>&1 | grep -a -E "PROBE|test result|panicked" | cut -c1-300
+            cp target/tmp/display/pulse-clients.err target/tmp/display/run$i-pulse-server.err 2>/dev/null || true
+          done
+        env:
+          FWE_SOUND_TESTS: "1"
       - if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: linux
-          path: out
+          name: sound
+          path: target/tmp/display
