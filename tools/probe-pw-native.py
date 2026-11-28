@@ -38,8 +38,18 @@ for run in range(20):
     raw = f"/tmp/rec-{run}.raw"
     rec = subprocess.Popen(["parec", "-s", "unix:/home/pa/pa/native", "-d", "nul.monitor", "--latency-msec=20", "--format=s16le", "--rate=44100", "--channels=2", "--raw"],
         env=env, preexec_fn=as_pa, stdout=open(raw, "wb"), stderr=subprocess.DEVNULL)
-    while os.path.getsize(raw) == 0: time.sleep(0.05)
-    r = subprocess.run(["sh", "-c", script], env=env, preexec_fn=as_pa)
+    began = time.time()
+    while os.path.getsize(raw) == 0 and time.time() - began < 10: time.sleep(0.05)
+    if os.path.getsize(raw) == 0:
+        state = subprocess.run(["sh", "-c", "pactl -s unix:/home/pa/pa/native list sinks short; pactl -s unix:/home/pa/pa/native list sources short; pactl -s unix:/home/pa/pa/native list source-outputs short"],
+            env=env, preexec_fn=as_pa, capture_output=True, text=True, timeout=20)
+        print(f"native run {run}: parec recorded nothing in 10 s; {state.stdout} {state.stderr}", flush=True)
+    try:
+        r = subprocess.run(["sh", "-c", script], env=env, preexec_fn=as_pa, timeout=60)
+    except subprocess.TimeoutExpired:
+        print(f"native run {run}: PipeWire's play took over 60 s", flush=True)
+        subprocess.run(["pkill", "-u", "pa", "-x", "pipewire"]); subprocess.run(["pkill", "-u", "pa", "-x", "wireplumber"]); subprocess.run(["pkill", "-u", "pa", "-x", "pw-play"])
+        r = subprocess.CompletedProcess([], -1)
     time.sleep(1)
     rec.send_signal(2); rec.wait()
     d = open(raw, "rb").read()
