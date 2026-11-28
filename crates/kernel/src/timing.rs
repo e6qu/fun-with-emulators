@@ -142,6 +142,61 @@ pub fn trapped(what: Trap) {
     }
 }
 
+/// What a host fault signal (`SIGSEGV`, `SIGBUS`, `SIGILL`) was, counted
+/// by [`faulted`].
+#[derive(Clone, Copy)]
+pub enum Fault {
+    /// A signal another process sent, or one the host left pending.
+    Sent,
+    /// An access through `x18` the host zeroed: its group ran again.
+    X18,
+    /// The first run of a page of code whose preparation waited for it.
+    FirstRun,
+    /// A bad guest pointer in fwe's copy: `EFAULT`.
+    Copy,
+    /// An instruction fwe emulates (`mrs ctr_el0`).
+    Emulated,
+    /// A fetch from code that runs by translation.
+    Translated,
+    /// A first write to a private page of a file with no name: copied.
+    Copied,
+    /// Below a stack that grows down: grown.
+    Grown,
+    /// An access another thread allowed meanwhile: tried again.
+    Stale,
+    /// The guest's own fault, for its handler or its end.
+    Guest,
+}
+
+const FAULT_NAMES: [&str; 10] = [
+    "sent",
+    "x18 restarts",
+    "first runs of code",
+    "bad pointers copied",
+    "emulated",
+    "fetches of translated code",
+    "pages copied",
+    "stacks grown",
+    "stale",
+    "the guest's",
+];
+
+static FAULTS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static FAULT_NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+static FAULT_MAX_NS: [AtomicU64; 10] = [const { AtomicU64::new(0) }; 10];
+
+/// A host fault signal taken for `what`, its handling begun at `began`
+/// ([`call_began`]: if [`on`]).
+#[inline]
+pub fn faulted(what: Fault, began: Option<Instant>) {
+    if let Some(b) = began {
+        let ns = b.elapsed().as_nanos() as u64;
+        FAULTS[what as usize].fetch_add(1, Relaxed);
+        FAULT_NS[what as usize].fetch_add(ns, Relaxed);
+        FAULT_MAX_NS[what as usize].fetch_max(ns, Relaxed);
+    }
+}
+
 /// System V IPC waits: a waiter woken by a change of its namespace's
 /// objects, and a waiter woken that tried its operation again under the
 /// namespace's lock (one the change let go on). Counted always: a wake
@@ -164,7 +219,7 @@ pub fn ipc_wakes() -> (u64, u64) {
 }
 
 /// The calls that took longest (number, count, milliseconds), the signals
-/// taken (number, count), what the traps among them were for, the IPC
+/// taken (number, count), what the traps and faults among them were for, the IPC
 /// waiters woken, and the Vulkan commands run ([`crate::vulkan::device::counts`]),
 /// as text.
 pub fn calls_and_signals() -> String {
@@ -189,6 +244,15 @@ pub fn calls_and_signals() -> String {
         .filter(|t| t.1 > 0)
         .map(|(name, n)| format!("{name} {n}"))
         .collect();
+    let faults: Vec<String> = (0..FAULTS.len())
+        .map(|i| {
+            let (n, ns, max) =
+                (FAULTS[i].load(Relaxed), FAULT_NS[i].load(Relaxed), FAULT_MAX_NS[i].load(Relaxed));
+            (FAULT_NAMES[i], n, ns / 1_000_000, max / 1000)
+        })
+        .filter(|f| f.1 > 0)
+        .map(|(name, n, ms, max)| format!("{name} {n} ({ms} ms, the longest {max} us)"))
+        .collect();
     let (woken, retried) = ipc_wakes();
     let gpu: String = [crate::vulkan::device::counts(), crate::fdtable::plugs()]
         .into_iter()
@@ -196,10 +260,11 @@ pub fn calls_and_signals() -> String {
         .map(|c| format!("; {c}"))
         .collect();
     format!(
-        "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}; \
+        "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}; faults: {}; \
          IPC waiters woken {woken}, of them tried again under the lock {retried}{gpu}",
         calls.join(", "),
         signals.join(", "),
-        traps.join(", ")
+        traps.join(", "),
+        faults.join(", ")
     )
 }
