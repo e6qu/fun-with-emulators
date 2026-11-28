@@ -3674,6 +3674,12 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     .unwrap();
     let run = |args: &[&str]| {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        if args[0] == "/bin/sh" {
+            let n = std::env::var("PROBE_RUN").unwrap_or_default();
+            let f = display_dir().join(format!("run{n}-strace.txt"));
+            let _ = std::fs::remove_file(&f);
+            cmd.arg(format!("--strace-file={}", f.display()));
+        }
         cmd.arg("--root").arg(&root.0).arg(root.0.join(&args[0][1..])).args(&args[1..]);
         cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
         cmd.envs(pulse.env());
@@ -3687,7 +3693,7 @@ fn sound_clients_play_on_the_macs_pulseaudio_server() {
     // (900 of them): all are recorded.
     // PipeWire and its session manager, for as long as pw-play plays.
     let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
-        export PIPEWIRE_DEBUG='3,mod.pulse-tunnel:5,pw.stream:5,pw.node:4,pw.context:4,spa.driver:5,pw.link:4'
+        export PIPEWIRE_DEBUG='3,pw.node:4,spa.driver:5'
         export PIPEWIRE_LOG_TIMESTAMP=realtime
         pipewire 2>/tmp/pipewire.err & p=$!
         until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done

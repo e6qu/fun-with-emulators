@@ -107,7 +107,15 @@ impl Tracer {
         let mut out = String::with_capacity(line.len() + 16);
         let fd = match FILE.get() {
             Some((_, fd)) => {
-                let _ = write!(out, "[fwe {}] ", crate::host::pid());
+                let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+                let mut tid = 0u64;
+                // SAFETY: probe: out pointers to locals.
+                unsafe {
+                    libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts);
+                    libc::pthread_threadid_np(0, &mut tid);
+                }
+                let us = ts.tv_sec as u64 * 1_000_000 + ts.tv_nsec as u64 / 1000;
+                let _ = write!(out, "[fwe {} {tid} @{us}] ", crate::host::pid());
                 *fd
             }
             None => {
