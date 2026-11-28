@@ -65,13 +65,14 @@ fn root_unix_path(raw: &[u8], follow: bool) -> Result<Vec<u8>, i64> {
     if raw.is_empty() {
         return Ok(Vec::new()); // unnamed / autobind
     }
-    // The host display's socket, by either of its names ([`crate::x11`]).
+    // The host display's socket, by either of its names ([`crate::x11`]),
+    // and the Mac's sound server's ([`crate::pulse`]).
     let name = if raw[0] == 0 {
         &raw[1..]
     } else {
         &raw[..raw.iter().position(|&b| b == 0).unwrap_or(raw.len())]
     };
-    if let Some(host) = crate::x11::host_socket(name) {
+    if let Some(host) = crate::x11::host_socket(name).or_else(|| crate::pulse::host_socket(name)) {
         return Ok(host);
     }
     if raw[0] == 0 {
@@ -1317,6 +1318,9 @@ pub unsafe fn connect(fd: u64, addr: u64, addrlen: u64) -> i64 {
         if crate::x11::is_host_socket(&hb[2..end]) {
             crate::x11::connected(fd as i32, &hb[2..end]);
         }
+        if crate::pulse::is_host_socket(&hb[2..end]) {
+            crate::pulse::connected(fd as i32);
+        }
     }
     if r == 0 {
         crate::netns::used(fd as i32);
@@ -1838,8 +1842,12 @@ pub unsafe fn sendto(fd: u64, buf: u64, len: u64, flags: u64, addr: u64, addrlen
             // SAFETY: `hmsg` references the guest buffer and the local name.
             unsafe { send_corked(fd as i32, &mut hmsg, flags, hflags) }
         };
-        // An X connection's requests, followed ([`crate::x11`]).
-        r = if ctl_len == 0 && !named {
+        // The first packet to the Mac's sound server, changed
+        // ([`crate::pulse`]); an X connection's requests, followed
+        // ([`crate::x11`]).
+        r = if let Some(r) = crate::pulse::write(fd as i32, &iov, &mut send) {
+            r
+        } else if ctl_len == 0 && !named {
             crate::x11::write(fd as i32, &iov, &mut send).unwrap_or_else(|| send(&iov))
         } else {
             let r = send(&iov);
@@ -1919,12 +1927,17 @@ fn take_corked(fd: i32) -> Option<Held> {
 }
 
 /// Socket `fd` was closed: what it held back goes out, as Linux sends it;
-/// with its last descriptor, the groups it joined are left (its state in
-/// [`crate::sockstate`] goes).
+/// with its last descriptor, the groups it joined are left, and its state
+/// in [`crate::sockstate`] and fwe's following of its bytes
+/// ([`crate::x11`], [`crate::pulse`]) go.
 pub fn closed(fd: i32) {
     let last = crate::sockstate::closed(fd);
+    if let Some((n, _)) = last {
+        crate::x11::gone(n);
+        crate::pulse::gone(n);
+    }
     #[cfg(not(target_os = "linux"))]
-    if last.is_some_and(|s| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
+    if last.is_some_and(|(_, s)| s.kept.iter().any(|&(k, v)| k == SO_PASSCRED && v != 0)) {
         for a in askers(fd) {
             crate::scm::released(a.asker());
         }
@@ -3080,7 +3093,14 @@ fn peergroups(fd: i32, optval: u64, optlen: u64) -> i64 {
     if !is_unix(fd) || crate::netlink::is(fd) {
         return err(errno::ENODATA);
     }
-    let Ok((pid, _, _)) = host_peercred(fd) else { return err(errno::ENODATA) };
+    // The peer as it was when the connection was made, as for `SO_PEERCRED`.
+    let pid = match crate::sockstate::with(fd, |s| s.peer).flatten() {
+        Some(p) => p.pid,
+        None => match live_peer(fd) {
+            Ok(p) => p.pid,
+            Err(_) => return err(errno::ENODATA),
+        },
+    };
     let groups: Vec<u32> = match crate::ids::HostPid::new(pid).and_then(crate::procreg::groups) {
         Some(g) => g.into_iter().map(|g| crate::userns::to_ns(g, true)).collect(),
         None => host_peer_groups(fd).into_iter().map(crate::host::gid_to_linux).collect(),
@@ -3145,15 +3165,20 @@ use crate::sockstate::Peer;
 
 /// The process at the other end of Unix socket `fd` now: its host pid and
 /// effective user and group ids as the kernel holds them (fwe's for it,
-/// else its host ids as Linux ones).
+/// else its host ids as Linux ones), and whether it is a process of the
+/// host's. Right as a connection is made (the host's answer is the last
+/// process to use the peer's socket).
 fn live_peer(fd: i32) -> Result<Peer, i32> {
     let (pid, uid, gid) = host_peercred(fd)?;
     let rec = crate::ids::HostPid::new(pid).and_then(crate::procreg::read);
     Ok(match rec {
-        Some(r) => Peer { pid, uid: r.ids[1], gid: r.ids[5] },
-        None => {
-            Peer { pid, uid: crate::host::uid_to_linux(uid), gid: crate::host::gid_to_linux(gid) }
-        }
+        Some(r) => Peer { pid, host: false, uid: r.ids[1], gid: r.ids[5] },
+        None => Peer {
+            pid,
+            host: true,
+            uid: crate::host::uid_to_linux(uid),
+            gid: crate::host::gid_to_linux(gid),
+        },
     })
 }
 
@@ -3175,7 +3200,7 @@ fn made_here(fd: i32) {
 /// This process as a peer: its host pid and effective ids.
 fn own_peer() -> Peer {
     let id = crate::creds::identity();
-    Peer { pid: crate::host::pid().get(), uid: id.uids[1], gid: id.gids[1] }
+    Peer { pid: crate::host::pid().get(), host: false, uid: id.uids[1], gid: id.gids[1] }
 }
 
 /// Credentials as the caller sees them: the pid in its pid namespace, the
@@ -3452,9 +3477,13 @@ pub unsafe fn sendmsg(fd: u64, msg: u64, flags: u64) -> i64 {
                 // buffers.
                 unsafe { send_corked(fd as i32, &mut m, flags, msg_flags_to_host(flags)) }
             };
-            // An X connection's requests, followed ([`crate::x11`]): one
+            // The first packet to the Mac's sound server, changed
+            // ([`crate::pulse`]), with its control data (its credentials);
+            // an X connection's requests, followed ([`crate::x11`]): one
             // with control data or an address goes as it is.
-            r = if ctl_len == 0 && name_ptr.is_null() {
+            r = if let Some(r) = crate::pulse::write(fd as i32, &hiov, send) {
+                r
+            } else if ctl_len == 0 && name_ptr.is_null() {
                 crate::x11::write(fd as i32, &hiov, send).unwrap_or_else(|| send(&hiov))
             } else {
                 let r = send(&hiov);
@@ -3836,12 +3865,15 @@ fn send_control(
 
 /// Whether the peer of connected Unix socket `fd` is a process of the
 /// host's, not fwe's (an X server, say): it reads no bundle
-/// ([`crate::scm::prepare`]).
+/// ([`crate::scm::prepare`]). As it was when the connection was made
+/// ([`crate::sockstate::Peer`]); for a socket fwe did not see connected
+/// (one the first program was started with), as the host tells now.
 #[cfg(not(target_os = "linux"))]
 fn host_peer(fd: i32) -> bool {
-    host_peercred(fd).is_ok_and(|(pid, _, _)| {
-        crate::ids::HostPid::new(pid).is_some_and(|p| crate::procreg::read(p).is_none())
-    })
+    match crate::sockstate::with(fd, |s| s.peer).flatten() {
+        Some(p) => p.host,
+        None => live_peer(fd).is_ok_and(|p| p.host),
+    }
 }
 
 #[cfg(test)]
@@ -4488,6 +4520,61 @@ pub(crate) mod scm_tests {
         assert_eq!(r, Some(err(errno::EAGAIN)));
         assert_eq!(crate::specialfd::try_close(got[0]), Some(0));
         assert_eq!(crate::specialfd::try_close(fd), Some(0));
+    }
+
+    /// A socket pair's peer is this process's, as it was when the pair was
+    /// made, whatever process used the other end since: macOS names the
+    /// last one (a fork child, here, gone since), which is no process of
+    /// fwe's, and a message to a host process's socket carries no bundle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_peer_is_as_the_connection_found_it() {
+        // A fork child: the test runs alone in a process of its own.
+        if !crate::alone::in_own_process(module_path!(), "a_peer_is_as_the_connection_found_it") {
+            return;
+        }
+        let sv = pair(SOCK_STREAM);
+        // SAFETY: the child only sends a byte and ends.
+        let child = unsafe { libc::fork() };
+        if child == 0 {
+            // SAFETY: a one-byte send on an inherited socket, then the end.
+            unsafe {
+                libc::send(sv[1], b"x".as_ptr().cast(), 1, 0);
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        // SAFETY: waiting for the child just made.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        let (pid, _, _) = host_peercred(sv[0]).unwrap();
+        assert_eq!(pid, child, "macOS names the last process to use the peer");
+        assert!(!host_peer(sv[0]), "the peer is taken for a process of the host's");
+        close_all(&sv);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_eventfd_closed_once_sent_arrives_at_its_number() {
+        let _g = serial();
+        // SAFETY: no pointers.
+        let fd = unsafe { crate::specialfd::eventfd2(0, fwe_abi::eventfd::EFD_NONBLOCK) } as i32;
+        let sv = pair(SOCK_STREAM);
+        assert_eq!(send_control(sv[0], &rights(&[fd])), 1);
+        assert_eq!(crate::specialfd::try_close(fd), Some(0));
+        let (r, control, _) = recv_control(sv[1], 4096, 0);
+        assert_eq!(r, 1);
+        close_all(&sv);
+        let got = fds_in(&control);
+        assert_eq!(crate::specialfd::anon_name(got[0]), Some("[eventfd]"));
+        let seven = 7u64;
+        // SAFETY: 8 readable bytes.
+        let wrote = unsafe { crate::specialfd::try_write(got[0], &seven as *const u64 as u64, 8) };
+        assert_eq!(wrote, Some(8));
+        let mut v = 0u64;
+        // SAFETY: 8 writable bytes.
+        let read = unsafe { crate::specialfd::try_read(got[0], &mut v as *mut u64 as u64, 8) };
+        assert_eq!((read, v), (Some(8), 7));
+        assert_eq!(crate::specialfd::try_close(got[0]), Some(0));
     }
 
     #[cfg(target_os = "macos")]

@@ -20,6 +20,14 @@
 //!   for the next. An absolute time (`TFD_TIMER_ABSTIME`) is measured
 //!   against the timer's own clock when it is set.
 //!
+//! A duplicate (`dup`, `dup3`, `F_DUPFD`) is the same open file, as on
+//! Linux ([`duplicated`]): an eventfd's is a duplicate of the pipe's read
+//! end with its own hold on the write end and the counter (all an
+//! eventfd's state is in those host objects, its `O_NONBLOCK` the read
+//! end's); a timerfd's is a duplicate of the kqueue sharing the schedule,
+//! and a fork child or a program an `execve` started rebuilds one kqueue
+//! for them all.
+//!
 //! Reads can block, so the backend routes `read`/`write` on any fd through
 //! [`try_read`]/[`try_write`] from the lock-free `blocking_syscall` path: a
 //! consumer blocking under the kernel lock while the producer needs that same
@@ -252,6 +260,15 @@ pub unsafe fn timerfd_gettime(fd: u64, curr_value: u64) -> i64 {
     }
 }
 
+/// `new` is a duplicate of `old` (the host's): if `old` is an eventfd or a
+/// timerfd, `new` is the same one.
+pub fn duplicated(old: i32, new: i32) {
+    #[cfg(target_os = "linux")]
+    let _ = (old, new);
+    #[cfg(not(target_os = "linux"))]
+    imp::duplicated(old, new)
+}
+
 /// What `/proc/self/fd` shows for an emulated descriptor: `[eventfd]` or
 /// `[timerfd]`.
 pub fn anon_name(fd: i32) -> Option<&'static str> {
@@ -342,7 +359,22 @@ mod imp {
     use std::collections::HashMap;
     enum Special {
         Event(EventFd),
-        Timer(TimerFd),
+        /// A timerfd: its kqueue is the descriptor; the schedule is shared
+        /// by its duplicates.
+        Timer(Timer),
+    }
+
+    /// A timerfd's schedule, shared by the descriptors that are it (always
+    /// used under the registry's lock: its own is never contended).
+    type Timer = std::sync::Arc<std::sync::Mutex<TimerFd>>;
+
+    fn timer(t: TimerFd) -> Timer {
+        std::sync::Arc::new(std::sync::Mutex::new(t))
+    }
+
+    /// The schedule of timer `t`, to read or change.
+    fn sched(t: &Timer) -> std::sync::MutexGuard<'_, TimerFd> {
+        t.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     struct EventFd {
@@ -355,7 +387,6 @@ mod imp {
         mfd: i32,
         shared: usize,
         semaphore: bool,
-        nonblock: bool,
     }
 
     /// An eventfd's counter, in memory every process holding the eventfd
@@ -420,8 +451,6 @@ mod imp {
     }
 
     struct TimerFd {
-        /// The kqueue fd (the fd the guest holds).
-        kq: i32,
         /// The host clock the guest's clock reads
         /// ([`crate::host::clock_to_host`]).
         clock: libc::clockid_t,
@@ -454,10 +483,11 @@ mod imp {
             }
         }
 
-        /// Arm the host timer for the first expiry not yet read (at once if
-        /// it is due), or clear it once nothing is left to expire: 0 or a
-        /// negated errno.
-        fn arm(&self, now: i64) -> i64 {
+        /// Arm the host timer, in kqueue `kq` (a descriptor that is this
+        /// timer), for the first expiry not yet read (at once if it is
+        /// due), or clear it once nothing is left to expire: 0 or a negated
+        /// errno.
+        fn arm(&self, kq: i32, now: i64) -> i64 {
             let next = match self.first_at_ns {
                 // Set expiries are due at once.
                 _ if self.extra > 0 => Some(now),
@@ -476,9 +506,8 @@ mod imp {
                 None => timer_kevent(libc::EV_DELETE, 0),
             };
             // SAFETY: single-change kevent with no event list.
-            let r = unsafe {
-                libc::kevent(self.kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null())
-            };
+            let r =
+                unsafe { libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null()) };
             // Deleting a timer that is not armed is no failure.
             if r < 0 && next.is_some() { last_error() } else { 0 }
         }
@@ -498,12 +527,13 @@ mod imp {
         if ticks == 0 {
             return Some(err(errno::EINVAL));
         }
-        Some(with_reg(|m| match m.get_mut(&fd) {
+        Some(with_reg(|m| match m.get(&fd) {
             Some(Special::Timer(t)) => {
+                let mut t = sched(t);
                 let now = now_ns();
                 t.taken = t.taken.max(t.expired(now));
                 t.extra = ticks;
-                t.arm(now)
+                t.arm(fd, now)
             }
             _ => err(errno::EBADF),
         }))
@@ -537,21 +567,32 @@ mod imp {
                 }
             }
         }
-        {
-            crate::snapshot::fd_map(e, &m, |e, s| match s {
+        // Each timer's schedule once, with the first (lowest) of the
+        // descriptors that are it; the others name that one.
+        let mut first: HashMap<*const std::sync::Mutex<TimerFd>, i32> = HashMap::new();
+        let mut fds: Vec<i32> = m.keys().copied().collect();
+        fds.sort();
+        e.u64(fds.len() as u64);
+        for fd in fds {
+            e.i32(fd);
+            match m[&fd] {
                 Special::Event(ev) => {
                     e.u8(0);
-                    e.i32(ev.rfd);
                     e.i32(ev.wfd);
                     e.i32(ev.mfd);
                     e.u64(ev.shared as u64);
                     e.bool(ev.semaphore);
-                    e.bool(ev.nonblock);
                 }
                 Special::Timer(t) => {
                     e.u8(1);
-                    e.i32(t.kq);
-                    e.bool(crate::snapshot::cloexec(t.kq));
+                    e.bool(crate::snapshot::cloexec(fd));
+                    if let Some(&same) = first.get(&std::sync::Arc::as_ptr(t)) {
+                        e.i32(same);
+                        continue;
+                    }
+                    first.insert(std::sync::Arc::as_ptr(t), fd);
+                    e.i32(-1);
+                    let t = sched(t);
                     e.u64(t.clock as u64);
                     e.bool(t.nonblock);
                     for v in [t.interval.0, t.interval.1, t.value.0, t.value.1] {
@@ -563,21 +604,26 @@ mod imp {
                     e.u64(t.taken);
                     e.u64(t.extra);
                 }
-            })
+            }
         }
     }
 
     pub(super) fn restore(d: &mut crate::snapshot::Dec, restoring: crate::snapshot::Restoring) {
-        let mut cloexec = std::collections::HashMap::new();
-        let reg = crate::snapshot::read_fd_map(d, |d| {
+        let mut reg = HashMap::new();
+        // Each timer's descriptors, the first first, with their
+        // close-on-exec flags.
+        let mut timers: Vec<Vec<(i32, bool)>> = Vec::new();
+        let n = d.count(4);
+        for _ in 0..n {
+            let fd = d.i32();
             if d.u8() == 0 {
-                let (rfd, wfd, mfd, at) = (d.i32(), d.i32(), d.i32(), d.u64() as usize);
+                let (wfd, mfd, at) = (d.i32(), d.i32(), d.u64() as usize);
                 // A host fork's child has its parent's counter mapped at the
                 // same place; a new process maps its file.
                 let shared = match restoring {
                     crate::snapshot::Restoring::SameMemory => at,
                     crate::snapshot::Restoring::NewProcess => map_shared(mfd).unwrap_or_else(|e| {
-                        panic!("eventfd {rfd}: its counter cannot be mapped (errno {e})")
+                        panic!("eventfd {fd}: its counter cannot be mapped (errno {e})")
                     }),
                 };
                 // fwe's own, out of a program's reach across its `execve`.
@@ -585,43 +631,62 @@ mod imp {
                     // SAFETY: plain host call on fwe's own descriptor.
                     unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
                 }
-                Special::Event(EventFd {
-                    rfd,
-                    wfd,
-                    mfd,
-                    shared,
-                    semaphore: d.bool(),
-                    nonblock: d.bool(),
-                })
-            } else {
-                let kq = d.i32();
-                cloexec.insert(kq, d.bool());
-                Special::Timer(TimerFd {
-                    kq,
-                    clock: d.u64() as libc::clockid_t,
-                    nonblock: d.bool(),
-                    interval: (d.i64(), d.i64()),
-                    value: (d.i64(), d.i64()),
-                    first_at_ns: {
-                        let (on, at) = (d.bool(), d.i64());
-                        on.then_some(at)
-                    },
-                    period_ns: d.i64(),
-                    taken: d.u64(),
-                    extra: d.u64(),
-                })
-            }
-        });
-        let now = now_ns();
-        for s in reg.values() {
-            let Special::Timer(t) = s else { continue };
-            let ce = cloexec.get(&t.kq).copied().unwrap_or(false);
-            if !crate::snapshot::fresh_kqueue_at(t.kq, ce) {
+                let ev = EventFd { rfd: fd, wfd, mfd, shared, semaphore: d.bool() };
+                reg.insert(fd, Special::Event(ev));
                 continue;
             }
-            // The parent's schedule: the first expiry not read fires when
-            // due, at once if it is due already.
-            t.arm(now);
+            let cloexec = d.bool();
+            let same = d.i32();
+            if same >= 0 {
+                let Some(Special::Timer(t)) = reg.get(&same) else {
+                    panic!("timerfd {fd}: the same as {same}, which is no timerfd");
+                };
+                let t = t.clone();
+                if let Some(fds) = timers.iter_mut().find(|fds| fds[0].0 == same) {
+                    fds.push((fd, cloexec));
+                }
+                reg.insert(fd, Special::Timer(t));
+                continue;
+            }
+            let t = TimerFd {
+                clock: d.u64() as libc::clockid_t,
+                nonblock: d.bool(),
+                interval: (d.i64(), d.i64()),
+                value: (d.i64(), d.i64()),
+                first_at_ns: {
+                    let (on, at) = (d.bool(), d.i64());
+                    on.then_some(at)
+                },
+                period_ns: d.i64(),
+                taken: d.u64(),
+                extra: d.u64(),
+            };
+            timers.push(vec![(fd, cloexec)]);
+            reg.insert(fd, Special::Timer(timer(t)));
+        }
+        // The host passes no kqueue to a fork child or across an `execve`:
+        // each timer gets a new one, at its first descriptor and duplicated
+        // to the others, armed on the schedule: the first expiry not read
+        // fires when due, at once if it is due already.
+        let now = now_ns();
+        for fds in timers {
+            let (fd, cloexec) = fds[0];
+            if !crate::snapshot::fresh_kqueue_at(fd, cloexec) {
+                continue;
+            }
+            for &(other, ce) in &fds[1..] {
+                // SAFETY: plain host calls: the new kqueue, at a number the
+                // timer's descriptor had (a fork child's or a new
+                // program's, empty of the host's own).
+                unsafe {
+                    if libc::fcntl(other, libc::F_GETFD) < 0 && libc::dup2(fd, other) == other {
+                        libc::fcntl(other, libc::F_SETFD, if ce { libc::FD_CLOEXEC } else { 0 });
+                    }
+                }
+            }
+            if let Some(Special::Timer(t)) = reg.get(&fd) {
+                sched(t).arm(fd, now);
+            }
         }
         *REG.lock() = Some(reg);
     }
@@ -640,7 +705,6 @@ mod imp {
             Some(match m.get(&fd)? {
                 Special::Event(ev) => {
                     e.bool(ev.semaphore);
-                    e.bool(ev.nonblock);
                     Export {
                         kind: kind::EVENTFD,
                         state: e.into_bytes(),
@@ -649,6 +713,7 @@ mod imp {
                     }
                 }
                 Special::Timer(t) => {
+                    let t = sched(t);
                     e.u64(t.clock as u64);
                     e.bool(t.nonblock);
                     for v in [t.interval.0, t.interval.1, t.value.0, t.value.1] {
@@ -704,7 +769,7 @@ mod imp {
                 }
                 return false;
             };
-            let ev = EventFd { rfd: fd, wfd, mfd, shared, semaphore: d.bool(), nonblock: d.bool() };
+            let ev = EventFd { rfd: fd, wfd, mfd, shared, semaphore: d.bool() };
             with_reg(|m| m.insert(fd, Special::Event(ev)));
             return true;
         }
@@ -716,7 +781,6 @@ mod imp {
             return false;
         }
         let t = TimerFd {
-            kq: fd,
             clock: d.u64() as libc::clockid_t,
             nonblock: d.bool(),
             interval: (d.i64(), d.i64()),
@@ -729,8 +793,8 @@ mod imp {
             taken: d.u64(),
             extra: d.u64(),
         };
-        t.arm(now_ns());
-        with_reg(|m| m.insert(fd, Special::Timer(t)));
+        t.arm(fd, now_ns());
+        with_reg(|m| m.insert(fd, Special::Timer(timer(t))));
         true
     }
 
@@ -753,6 +817,35 @@ mod imp {
             _ => None,
         });
         shared.is_some_and(|sh| locked(sh, |c| *c < u64::MAX - 1))
+    }
+
+    pub(super) fn duplicated(old: i32, new: i32) {
+        with_reg(|m| {
+            let dup = match m.get(&old) {
+                Some(Special::Event(ev)) => {
+                    // Its own hold on the pipe's write end and the counter,
+                    // fwe's, as a received eventfd has.
+                    let Ok(wfd) = crate::fdtable::dup_reserved(ev.wfd) else { return };
+                    let Ok(mfd) = crate::fdtable::dup_reserved(ev.mfd) else {
+                        // SAFETY: the duplicate just made.
+                        unsafe { libc::close(wfd) };
+                        return;
+                    };
+                    let Ok(shared) = map_shared(mfd) else {
+                        // SAFETY: the duplicates just made.
+                        unsafe {
+                            libc::close(wfd);
+                            libc::close(mfd);
+                        }
+                        return;
+                    };
+                    Special::Event(EventFd { rfd: new, wfd, mfd, shared, semaphore: ev.semaphore })
+                }
+                Some(Special::Timer(t)) => Special::Timer(t.clone()),
+                None => return,
+            };
+            m.insert(new, dup);
+        })
     }
 
     pub(super) fn anon_name(fd: i32) -> Option<&'static str> {
@@ -829,14 +922,7 @@ mod imp {
                 return err(e);
             }
         };
-        let ev = EventFd {
-            rfd,
-            wfd,
-            mfd,
-            shared,
-            semaphore: flags & EFD_SEMAPHORE != 0,
-            nonblock: flags & EFD_NONBLOCK != 0,
-        };
+        let ev = EventFd { rfd, wfd, mfd, shared, semaphore: flags & EFD_SEMAPHORE != 0 };
         if initval > 0 {
             // SAFETY: fresh pipe write end.
             unsafe { poke(wfd) };
@@ -871,8 +957,7 @@ mod imp {
         with_reg(|m| {
             m.insert(
                 kq,
-                Special::Timer(TimerFd {
-                    kq,
+                Special::Timer(timer(TimerFd {
                     clock: crate::host::clock_to_host(clockid).unwrap_or(libc::CLOCK_MONOTONIC),
                     nonblock: flags & TFD_NONBLOCK != 0,
                     interval: (0, 0),
@@ -881,7 +966,7 @@ mod imp {
                     period_ns: 0,
                     taken: 0,
                     extra: 0,
-                }),
+                })),
             )
         });
         kq as i64
@@ -909,11 +994,12 @@ mod imp {
         let interval = iv_s.saturating_mul(1_000_000_000).saturating_add(iv_ns);
         let now = now_ns();
         let set = with_reg(|m| {
-            let Some(Special::Timer(t)) = m.get_mut(&fd) else {
+            let Some(Special::Timer(t)) = m.get(&fd) else {
                 return Err(errno::EINVAL);
             };
+            let mut t = sched(t);
             // The old setting as `timerfd_gettime` reads it.
-            let prev = (t.interval, time_left(t, now));
+            let prev = (t.interval, time_left(&t, now));
             t.interval = (iv_s, iv_ns);
             t.value = (val_s, val_ns);
             t.first_at_ns = if value == 0 {
@@ -934,7 +1020,7 @@ mod imp {
             };
             t.period_ns = interval;
             t.taken = 0;
-            match t.arm(now) {
+            match t.arm(fd, now) {
                 0 => Ok(prev),
                 e => Err(-e as i32),
             }
@@ -996,7 +1082,7 @@ mod imp {
     /// Whether `fd` is a timerfd that does not block, if it is one.
     pub fn timer_nonblock(fd: i32) -> Option<bool> {
         with_reg(|m| match m.get(&fd) {
-            Some(Special::Timer(t)) => Some(t.nonblock),
+            Some(Special::Timer(t)) => Some(sched(t).nonblock),
             _ => None,
         })
     }
@@ -1004,9 +1090,9 @@ mod imp {
     /// `F_SETFL`'s `O_NONBLOCK` on timerfd `fd` (which the host takes on no
     /// kqueue): whether it was one.
     pub fn set_timer_nonblock(fd: i32, on: bool) -> bool {
-        with_reg(|m| match m.get_mut(&fd) {
+        with_reg(|m| match m.get(&fd) {
             Some(Special::Timer(t)) => {
-                t.nonblock = on;
+                sched(t).nonblock = on;
                 true
             }
             _ => false,
@@ -1019,7 +1105,10 @@ mod imp {
             return err(e);
         }
         match with_reg(|m| match m.get(&fd) {
-            Some(Special::Timer(t)) => Some((t.interval, time_left(t, now_ns()))),
+            Some(Special::Timer(t)) => {
+                let t = sched(t);
+                Some((t.interval, time_left(&t, now_ns())))
+            }
             _ => None,
         }) {
             Some((iv, val)) => {
@@ -1040,7 +1129,7 @@ mod imp {
         }
         let kind = with_reg(|m| match m.get(&fd) {
             Some(Special::Event(e)) => Some(Kind::Event { rfd: e.rfd }),
-            Some(Special::Timer(t)) => Some(Kind::Timer { kq: t.kq, nonblock: t.nonblock }),
+            Some(Special::Timer(t)) => Some(Kind::Timer { kq: fd, nonblock: sched(t).nonblock }),
             None => None,
         })?;
 
@@ -1113,13 +1202,14 @@ mod imp {
                     // The expiries due since the last read, and the host
                     // timer armed for the next.
                     let now = now_ns();
-                    let due = with_reg(|m| match m.get_mut(&fd) {
+                    let due = with_reg(|m| match m.get(&fd) {
                         Some(Special::Timer(t)) => {
+                            let mut t = sched(t);
                             let total = t.expired(now);
                             let due = total.saturating_sub(t.taken).saturating_add(t.extra);
                             t.taken = t.taken.max(total);
                             t.extra = 0;
-                            t.arm(now);
+                            t.arm(kq, now);
                             due
                         }
                         _ => 0,
@@ -1241,8 +1331,9 @@ mod imp {
                     // shares it keeps its own).
                     libc::munmap(e.shared as *mut libc::c_void, std::mem::size_of::<Shared>());
                 }
-                Special::Timer(t) => {
-                    libc::close(t.kq);
+                // The descriptor; its schedule goes with the last that is it.
+                Special::Timer(_) => {
+                    libc::close(fd);
                 }
             }
         }
@@ -1353,6 +1444,101 @@ mod tests {
         assert_eq!(v, 8, "the count carried over");
         assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
         assert_eq!(close_fd(fd), 0);
+    }
+
+    /// A host duplicate of `fd`, as the guest's `dup` makes it.
+    fn dup(fd: i32) -> i32 {
+        // SAFETY: plain host call.
+        let new = unsafe { libc::dup(fd) };
+        assert!(new >= 0);
+        duplicated(fd, new);
+        new
+    }
+
+    /// A duplicate of an eventfd is the same eventfd: what is written to
+    /// one is read from the other, after the first is closed too.
+    #[test]
+    fn a_duplicated_eventfd_is_the_same_one() {
+        // SAFETY: no pointers.
+        let fd = unsafe { eventfd2(0, EFD_NONBLOCK) } as i32;
+        let other = dup(fd);
+        assert_eq!(write_u64(other, 3), 8);
+        assert_eq!(write_u64(fd, 4), 8);
+        let mut v = 0u64;
+        assert_eq!(read_into(other, &mut v), 8);
+        assert_eq!(v, 7);
+        assert_eq!(close_fd(fd), 0);
+        assert_eq!(write_u64(other, 5), 8);
+        assert_eq!(read_into(other, &mut v), 8);
+        assert_eq!(v, 5);
+        assert_eq!(read_u64(other), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        assert_eq!(close_fd(other), 0);
+    }
+
+    /// A duplicate of a timerfd shares its schedule: an expiry read from
+    /// one is not read again from the other, and setting one sets both,
+    /// after the first is closed too.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn a_duplicated_timerfd_shares_its_schedule() {
+        // SAFETY: no pointers.
+        let fd = unsafe { timerfd_create(1, 0o4000) } as i32;
+        let other = dup(fd);
+        let soon: [i64; 4] = [0, 0, 0, 1_000_000];
+        let set = |fd: i32| {
+            // SAFETY: a valid itimerspec; no old value.
+            unsafe { timerfd_settime(fd as u64, 0, soon.as_ptr() as u64, 0) }
+        };
+        assert_eq!(set(fd), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let mut v = 0u64;
+        assert_eq!(read_into(other, &mut v), 8);
+        assert_eq!(v, 1);
+        assert_eq!(read_u64(fd), fwe_abi::err(fwe_abi::errno::EAGAIN));
+        assert_eq!(close_fd(fd), 0);
+        assert_eq!(set(other), 0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        assert_eq!(read_into(other, &mut v), 8);
+        assert_eq!(v, 1);
+        assert_eq!(close_fd(other), 0);
+    }
+
+    /// Duplicates of a timerfd restored in a new process share one new
+    /// kqueue: setting the timer through one makes the other readable.
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn duplicated_timerfds_restored_share_a_kqueue() {
+        // Restoring replaces the process's registry.
+        if !crate::alone::in_own_process(
+            module_path!(),
+            "duplicated_timerfds_restored_share_a_kqueue",
+        ) {
+            return;
+        }
+        // SAFETY: no pointers.
+        let fd = unsafe { timerfd_create(1, 0o4000) } as i32;
+        let other = dup(fd);
+        let mut e = crate::snapshot::Enc::new();
+        save(&mut e);
+        let state = e.into_bytes();
+        // A new process has neither kqueue.
+        // SAFETY: the descriptors just made.
+        unsafe {
+            libc::close(fd);
+            libc::close(other);
+        }
+        restore(&mut crate::snapshot::Dec::new(&state), crate::snapshot::Restoring::NewProcess);
+        let soon: [i64; 4] = [0, 0, 0, 1_000_000];
+        // SAFETY: a valid itimerspec; no old value.
+        assert_eq!(unsafe { timerfd_settime(fd as u64, 0, soon.as_ptr() as u64, 0) }, 0);
+        let mut p = libc::pollfd { fd: other, events: libc::POLLIN, revents: 0 };
+        // SAFETY: one valid pollfd.
+        assert_eq!(unsafe { libc::poll(&mut p, 1, 1000) }, 1, "the duplicate is readable");
+        let mut v = 0u64;
+        assert_eq!(read_into(other, &mut v), 8);
+        assert_eq!(v, 1);
+        assert_eq!(close_fd(fd), 0);
+        assert_eq!(close_fd(other), 0);
     }
 
     /// A write that would take the count past its maximum waits for a

@@ -64,7 +64,7 @@ impl Platform for HvPlatform {
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
         mem::finish_lazy();
         teardown();
-        record::Line::new().s("exit ").dec(code as u32 as u64).emit();
+        record::exit(code);
         // SAFETY: terminating the process, its VM gone.
         unsafe { libc::_exit(code) }
     }
@@ -337,7 +337,7 @@ fn exit_thread(code: i32) -> ! {
         fwe_kernel::procreg::exiting((code & 0xff) << 8);
         mem::finish_lazy();
         teardown();
-        record::Line::new().s("exit ").dec(code as u32 as u64).emit();
+        record::exit(code);
         // SAFETY: terminating the process, its VM gone.
         unsafe { libc::_exit(code) }
     }
@@ -1278,6 +1278,16 @@ fn exec_program(path: Vec<u8>, argv: u64, envp: u64) -> i64 {
         Err(e) => return err(e),
     };
     let fs = k.fs();
+    // An ELF program, checked by its first bytes: the fresh fwe reads it.
+    let program = match k.take_exec_file(&path) {
+        Some(file) => Ok(file),
+        None => fs.program_file(&fs.exec_target(&path)),
+    };
+    match program.and_then(|p| p.head()) {
+        Ok((head, len)) if fwe_elf::Head::parse(&head, len).is_ok() => {}
+        Ok(_) => return err(fwe_abi::errno::ENOEXEC),
+        Err(e) => return err(e),
+    }
     // The VM goes before the host exec; once the program is known to be
     // runnable, there is no way back.
     let state = k.exec_state();

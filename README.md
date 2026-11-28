@@ -2,7 +2,7 @@
 
 `fwe` runs unmodified Linux arm64 programs on macOS on Apple Silicon:
 command-line programs and toolchains, language runtimes, containers
-(Docker, Podman), graphical programs, Windows programs through Linux's
+(Docker, Podman), graphical programs and their sound, Windows programs through Linux's
 Wine and, by 1.0, gVisor's sandbox. It implements the Linux kernel's
 user-space ABI instead of running a Linux kernel, as Wine does for
 Windows. It is written in Rust. This page says what runs and how to
@@ -55,11 +55,15 @@ What runs unmodified, its output checked in CI:
   Docker Engine runs and builds images (BuildKit) and brings up Docker
   Compose projects.
 - **Windows:** Wine runs ARM64 Windows console programs in the VM
-  (`fwe --vm`, on the stand-in), and Notepad on an X display.
+  (`fwe --vm`, on the stand-in), and Notepad, PuTTY and OpenTTD, with
+  its sounds, on an X display.
 - **Graphical, natively:** X11 clients, GTK, Qt, Tk and software OpenGL
   on an X server on the Mac; Weston with Wayland clients and Xwayland;
   Vulkan (`vkcube`) and OpenGL (`glxgears`, through Zink) on the Mac's
-  GPU, through fwe's own Vulkan driver.
+  GPU, through fwe's own Vulkan driver; Extreme Tux Racer and Xonotic.
+- **Sound, natively:** PulseAudio's, ALSA's and PipeWire's programs play
+  through PulseAudio on the Mac; games play their music, browsers their
+  videos' sound.
 - **Browsers and applications, natively:** Chromium and Firefox with
   their sandboxes, showing pages and playing video; Electron, Visual
   Studio Code and Zed editing files; Tauri and Wails apps, built under fwe,
@@ -82,6 +86,121 @@ fwe --strace ./hello                       # with its system calls traced
 
 The [user guide](docs/user-guide.md) covers installing, userlands,
 programs, containers and what does not work.
+
+## Examples
+
+Programs with windows draw on XQuartz (`brew install --cask xquartz`,
+then log out and back in, so programs get its `DISPLAY`). Their sound
+plays through PulseAudio on the Mac (`brew install pulseaudio`, then
+`brew services start pulseaudio`), which fwe hands them as it hands them
+XQuartz's display. Each example runs a userland's programs with a Linux
+environment (`env -i`), as the
+[user guide](docs/user-guide.md#a-linux-userland) explains. CI runs every
+example as written here, on XQuartz, and checks that its window draws
+and, for a game, that it plays sound.
+
+### Extreme Tux Racer
+
+A Debian game drawn with OpenGL. Mesa finds none of XQuartz's GLX
+configurations usable, so the game draws in Xephyr, the userland's own
+X server, which shows its screen in an XQuartz window. Mesa renders on
+the CPU: through Zink, on the Mac's GPU, one of the game's shaders does
+not yet build on MoltenVK ([M7 PR 6](ROADMAP.md)). Its music plays
+through OpenAL's PulseAudio client (`libpulse0`, which OpenAL only
+recommends).
+
+<!-- example: tuxracer, window "Extreme Tux Racer", sound -->
+```sh
+[ -d ~/debian ] || fwe --pull debian:trixie ~/debian
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/debian ~/debian/bin/sh -c \
+  'apt-get update -qq && apt-get install -qq -y --no-install-recommends extremetuxracer xserver-xephyr libgl1-mesa-dri libpulse0'
+env -i HOME=/root PATH=/usr/games:/usr/bin:/bin DISPLAY="$DISPLAY" "$(command -v fwe)" --root ~/debian ~/debian/bin/sh -c \
+  'Xephyr :1 -screen 1024x768 -title "Extreme Tux Racer" & until [ -S /tmp/.X11-unix/X1 ]; do sleep 0.1; done
+   DISPLAY=:1 LIBGL_ALWAYS_SOFTWARE=1 etr; kill $!'
+```
+
+### Xonotic
+
+An arena shooter from Alpine (its data is 1.2 GB), drawn with OpenGL in
+Xephyr on the CPU as Tux Racer is, its music played through SDL's
+PulseAudio client:
+
+<!-- example: xonotic, window "Xonotic", sound -->
+```sh
+[ -d ~/alpine ] || fwe --pull alpine:3.24 ~/alpine
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/alpine ~/alpine/bin/sh -c \
+  'apk add -q xonotic-sdl xonotic-data xorg-server-xephyr mesa-dri-gallium libpulse'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" "$(command -v fwe)" --root ~/alpine ~/alpine/bin/sh -c \
+  'Xephyr :1 -screen 1024x768 -title Xonotic & until [ -S /tmp/.X11-unix/X1 ]; do sleep 0.1; done
+   DISPLAY=:1 LIBGL_ALWAYS_SOFTWARE=1 xonotic-sdl; kill $!'
+```
+
+### vkcube, on the GPU
+
+Vulkan programs draw on the Mac's GPU through fwe's own Vulkan driver,
+on MoltenVK (`brew install molten-vk`), and show their frames on XQuartz
+directly:
+
+<!-- example: vkcube, window "^$" 500x500 -->
+```sh
+[ -d ~/debian ] || fwe --pull debian:trixie ~/debian
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/debian ~/debian/bin/sh -c \
+  'apt-get update -qq && apt-get install -qq -y --no-install-recommends vulkan-tools'
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" VK_DRIVER_FILES=/etc/vulkan/icd.d/fwe_icd.aarch64.json \
+  "$(command -v fwe)" --root ~/debian ~/debian/usr/bin/vkcube --wsi xcb
+```
+
+### PuTTY, a Windows program
+
+PuTTY's build for Windows on Arm, run by Alpine's Wine. Wine needs 4 KiB
+pages, so it runs in fwe's VM (`--vm`), which needs `fwe` signed with
+the hypervisor entitlement (Homebrew's is) on a Mac that offers the
+hypervisor ([user guide](docs/user-guide.md#programs-linked-below-4-gib)).
+The VM has been tested only on CI's software stand-in for
+Hypervisor.framework. Once Wine runs natively
+([M6 PR 7](ROADMAP.md)), the example runs without `--vm`.
+
+<!-- example: putty, window "PuTTY Configuration", vm -->
+```sh
+[ -d ~/alpine ] || fwe --pull alpine:3.24 ~/alpine
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/alpine ~/alpine/bin/sh -c \
+  'apk add -q wine font-dejavu libxcursor libxi libxinerama libxrandr libxcomposite'
+curl -fsSL -o ~/alpine/root/putty.exe https://the.earth.li/~sgtatham/putty/0.83/wa64/putty.exe
+echo "19a81aee36bcfcc5f9bb3401529458bbe8ea88a8478291ce2300058f4cb64a00  $HOME/alpine/root/putty.exe" | shasum -a 256 -c
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" WINEDLLOVERRIDES="mscoree,mshtml=" \
+  "$(command -v fwe)" --vm --root ~/alpine ~/alpine/bin/sh -c 'wine /root/putty.exe'
+```
+
+### OpenTTD, a Windows game with sound
+
+OpenTTD's build for Windows on Arm, with its free graphics and sounds
+(OpenGFX and OpenSFX, which it reads from its `baseset` directory), run
+by Alpine's Wine in fwe's VM as PuTTY is. Wine plays the game's sounds
+through its PulseAudio driver. Its music (OpenMSX) needs a MIDI device,
+which Wine has none of here.
+
+<!-- example: openttd, window "OpenTTD", vm, sound -->
+```sh
+[ -d ~/alpine ] || fwe --pull alpine:3.24 ~/alpine
+env -i HOME=/root PATH=/usr/sbin:/usr/bin:/sbin:/bin "$(command -v fwe)" --root ~/alpine ~/alpine/bin/sh -c \
+  'apk add -q wine font-dejavu libpulse libxcursor libxi libxinerama libxrandr libxcomposite'
+(
+  cd ~/alpine/root
+  curl -fsSLO https://cdn.openttd.org/openttd-releases/15.3/openttd-15.3-windows-arm64.zip
+  curl -fsSLO https://cdn.openttd.org/opengfx-releases/8.0/opengfx-8.0-all.zip
+  curl -fsSLO https://cdn.openttd.org/opensfx-releases/1.0.3/opensfx-1.0.3-all.zip
+  shasum -a 256 -c <<'SUMS'
+8b4eb443e425ed3046ca94336008fef78ce7c535fd607ae2ec79630e6d6dba96  openttd-15.3-windows-arm64.zip
+43a0c1dabf39cb865394f3a6cc36d4da5c10ecfaaf55652043104806810903be  opengfx-8.0-all.zip
+e0a218b7dd9438e701503b0f84c25a97c1c11b7c2f025323fb19d6db16ef3759  opensfx-1.0.3-all.zip
+SUMS
+  unzip -oq openttd-15.3-windows-arm64.zip
+  unzip -oq -d openttd-15.3-windows-arm64/baseset opengfx-8.0-all.zip
+  unzip -oq -d openttd-15.3-windows-arm64/baseset opensfx-1.0.3-all.zip
+)
+env -i HOME=/root PATH=/usr/bin:/bin DISPLAY="$DISPLAY" WINEDLLOVERRIDES="mscoree,mshtml=" \
+  "$(command -v fwe)" --vm --root ~/alpine ~/alpine/bin/sh -c 'wine /root/openttd-15.3-windows-arm64/openttd.exe'
+```
 
 ## Testing
 

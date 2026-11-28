@@ -1188,7 +1188,10 @@ fn jit_calls_keep_x16_x17_through_signals() {
 /// code, from a function a loop calls (guests/c/jittail.c): each reaches
 /// the code, and only the first is a fault into fwe (the call that led to
 /// the branch is linked from then on, the branch translated and a lookup),
-/// not one for each of the 100000.
+/// not one for each of the 100000. Any other is a call whose stub's lookup
+/// lost `x18` to the host (which zeroes it as the thread enters the
+/// kernel, a preemption say), which fwe counts apart: the call then goes
+/// on natively, as the program wrote it.
 #[test]
 fn jit_code_branched_into_faults_once() {
     let prog = build_c("jittail", Libc::Musl, true, true);
@@ -1199,13 +1202,18 @@ fn jit_code_branched_into_faults_once() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert_eq!(stdout(&out), "sum: 5000050000\n", "{err}");
     assert_eq!(out.status.code(), Some(0));
-    // "..., N entries by fetch (...": N, for the one process.
-    let fetched: Vec<u64> = err
-        .lines()
-        .filter(|l| l.contains(" entries by fetch ("))
-        .filter_map(|l| l.split(" entries by fetch (").next()?.rsplit(' ').next()?.parse().ok())
-        .collect();
-    assert_eq!(fetched, [1], "{err}");
+    // "..., N entries by fetch (..., L of them through a site linked
+    // already whose lookup lost `x18`, ...": N less L, for the one process.
+    let count = |after: &str| -> Vec<u64> {
+        err.lines()
+            .filter(|l| l.contains(after))
+            .filter_map(|l| l.split(after).next()?.rsplit([' ', '(', ',']).next()?.parse().ok())
+            .collect()
+    };
+    let fetched = count(" entries by fetch (");
+    let lost = count(" of them through a site linked already whose lookup lost `x18`");
+    assert!(fetched.len() == 1 && lost.len() == 1, "{err}");
+    assert_eq!(fetched[0] - lost[0], 1, "{err}");
     let _ = std::fs::remove_dir_all(&root);
 }
 
@@ -2239,21 +2247,44 @@ fn memory_below_sp_is_the_programs() {
     );
 }
 
+/// What guests/c/pifutex.c prints, as on Linux.
+const PIFUTEX: &str = "lock: 0, the owner's: 1\nagain: -35\na waiter marks it: 1\nunlock: 0\n\
+                       the waiter's lock: 0, handed to it: 1, then free: 1\n\
+                       with junk where unused: try: 0, unlock: 0, free: 1\n\
+                       another's unlock: -1, try: -11, timed lock: -110\n\
+                       an owner that never ran: -3\ninterrupted: handler ran 1, then locked: 0\n\
+                       setprotocol: 0\ncounted: 8000\n\
+                       its owner ended: 130, made consistent: 0, unlocked: 0\n";
+
 /// Priority-inheritance futexes (guests/c/pifutex.c) as Linux runs them:
-/// a lock handed to its waiter, its errors, a lock a signal interrupts
-/// going on after the handler, and both C libraries' `PTHREAD_PRIO_INHERIT`
-/// mutexes, robust too (musl's tries `FUTEX_LOCK_PI` as one is made, which
-/// PulseAudio asserts on).
+/// a lock handed to its waiter, its errors, the arguments an operation
+/// does not use ignored, a lock a signal interrupts going on after the
+/// handler, and both C libraries' `PTHREAD_PRIO_INHERIT` mutexes, robust
+/// too (musl's tries `FUTEX_LOCK_PI` as one is made, which PulseAudio
+/// asserts on).
 #[test]
 fn priority_inheritance_locks_are_linuxs() {
-    let want = "lock: 0, the owner's: 1\nagain: -35\na waiter marks it: 1\nunlock: 0\n\
-                the waiter's lock: 0, handed to it: 1, then free: 1\n\
-                another's unlock: -1, try: -11, timed lock: -110\n\
-                an owner that never ran: -3\ninterrupted: handler ran 1, then locked: 0\n\
-                setprotocol: 0\ncounted: 8000\n\
-                its owner ended: 130, made consistent: 0, unlocked: 0\n";
     for libc in [Libc::Glibc, Libc::Musl] {
-        c_guest_prints_on(libc, "pifutex", &[], want);
+        c_guest_prints_on(libc, "pifutex", &[], PIFUTEX);
+    }
+}
+
+/// Priority-inheritance futexes in the VM (see
+/// [`priority_inheritance_locks_are_linuxs`]): only the pointers an
+/// operation reads are taken for guest pointers (musl's unlock of a
+/// `PTHREAD_PRIO_INHERIT` mutex leaves junk in the second word's
+/// argument, and Wine's PulseAudio driver's lock is one).
+#[test]
+fn hv_priority_inheritance_locks_are_linuxs() {
+    for libc in [Libc::Glibc, Libc::Musl] {
+        let prog = build_c_dynamic("pifutex", libc, true);
+        let root = libc_rootfs(libc, &format!("vm-pifutex-{}", name_suffix(libc)));
+        let Some(mut cmd) = hv_command() else { return };
+        cmd.arg("--vm").arg("--strace").arg("--root").arg(&root).arg(&prog);
+        let out = run_hv(cmd, "pifutex --vm");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stdout(&out), PIFUTEX, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0));
     }
 }
 
@@ -3410,6 +3441,392 @@ fn user_guide_recipes() {
     let _ = std::fs::remove_dir_all(&home);
     assert_eq!(ran, ["debian", "alpine", "podman"]);
     assert!(failed.is_empty(), "guide recipes that failed: {failed:?}");
+}
+
+/// The Mac's PulseAudio server for the sound tests: Homebrew's (`PULSEAUDIO`
+/// names it), with one null sink, its socket and
+/// cookie in a directory of its own; ended when dropped. The sink renders
+/// 50 ms ahead (`norewinds`): by default, with no stream asking for a
+/// latency, it renders two seconds ahead, and a stream that then asks for
+/// less can rewind it only by as much, so it is not played until the
+/// sink's clock has caught up, up to two seconds later (PulseAudio 17's
+/// `module-null-sink`; the Mac's own output, its CoreAudio sink, is
+/// other code).
+struct PulseServer {
+    test: String,
+    /// When it started, as Unix time, which its log's times count from.
+    began: Duration,
+    dir: PathBuf,
+    bin: PathBuf,
+    child: std::process::Child,
+}
+
+/// What a recording of [`PulseServer::recorded`] held: its frames, those of
+/// sound, and the silences between the first and the last of them (where,
+/// and how long, in frames), for a failure's report.
+struct Recording {
+    frames: usize,
+    sound: u64,
+    first: Option<usize>,
+    last: Option<usize>,
+    gaps: Vec<(usize, usize)>,
+}
+
+impl std::fmt::Display for Recording {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{} frames of sound in {}, from frame {:?} to {:?}, silences (at, frames) between: {:?}",
+            self.sound, self.frames, self.first, self.last, self.gaps
+        )
+    }
+}
+
+impl Recording {
+    /// A recording of 16-bit stereo frames `data`; a silence counts as a
+    /// gap from 10 ms (441 frames).
+    fn of(data: &[u8]) -> Recording {
+        let frames = data.as_chunks::<4>().0;
+        let loud = |f: &[u8; 4]| f.iter().any(|&b| b != 0);
+        let first = frames.iter().position(loud);
+        let last = frames.iter().rposition(loud);
+        let mut gaps = Vec::new();
+        if let (Some(a), Some(b)) = (first, last) {
+            let mut quiet = None;
+            for (i, f) in frames[a..=b].iter().enumerate() {
+                match (loud(f), quiet) {
+                    (false, None) => quiet = Some(a + i),
+                    (true, Some(q)) => {
+                        if a + i - q >= 441 {
+                            gaps.push((q, a + i - q));
+                        }
+                        quiet = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Recording {
+            frames: frames.len(),
+            sound: frames.iter().filter(|f| loud(f)).count() as u64,
+            first,
+            last,
+            gaps,
+        }
+    }
+}
+
+impl PulseServer {
+    fn start(test: &str) -> PulseServer {
+        let bin = std::env::var_os("PULSEAUDIO").map(PathBuf::from).unwrap_or_else(|| {
+            panic!("the sound tests need PULSEAUDIO: the path of Homebrew's pulseaudio")
+        });
+        // Short, as a socket's path is at most 104 bytes on macOS.
+        let dir = std::env::temp_dir().join(format!("fwe-pa-{test}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let socket = dir.join("native");
+        let child = Command::new(&bin)
+            .args(["-n", "--daemonize=no", "--exit-idle-time=-1", "--use-pid-file=no"])
+            // Its clients and streams, with times, for a failure's report.
+            .args(["--log-level=info", "--log-time=1"])
+            .args(["-L", "module-null-sink sink_name=nul norewinds=1"])
+            .arg("-L")
+            .arg(format!("module-native-protocol-unix socket={}", socket.display()))
+            .env_clear()
+            .env("HOME", &dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(dir.join("server.err")).unwrap())
+            .spawn_alone()
+            .unwrap();
+        let began = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+        let mut server = PulseServer { test: test.to_string(), began, dir, bin, child };
+        let began = Instant::now();
+        while !socket.exists() {
+            let said =
+                || std::fs::read_to_string(server.dir.join("server.err")).unwrap_or_default();
+            if let Some(status) = server.child.try_wait().unwrap() {
+                panic!("pulseaudio ended ({status}): {}", said());
+            }
+            assert!(began.elapsed() < Duration::from_secs(30), "no pulseaudio: {}", said());
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        server
+    }
+
+    /// fwe's environment for its programs to reach this server, as a Mac's
+    /// `PULSE_SERVER` and `PULSE_COOKIE` name a server and its cookie.
+    fn env(&self) -> [(String, String); 2] {
+        [
+            ("PULSE_SERVER".into(), format!("unix:{}", self.dir.join("native").display())),
+            ("PULSE_COOKIE".into(), self.dir.join(".config/pulse/cookie").display().to_string()),
+        ]
+    }
+
+    /// The frames of sound (not silence) its null sink's monitor records
+    /// while `play` runs, and a second after: in fragments of 20 ms (the
+    /// server holds a recorder's sound until a fragment is full, two
+    /// seconds' by default, which would keep the end of what was played).
+    fn recorded(&self, play: impl FnOnce()) -> Recording {
+        let raw = self.dir.join("monitor.raw");
+        let mut parec = Command::new(self.bin.with_file_name("parec"))
+            .arg("-s")
+            .arg(format!("unix:{}", self.dir.join("native").display()))
+            .args(["-d", "nul.monitor", "--latency-msec=20", "--format=s16le", "--rate=44100"])
+            .args(["--channels=2", "--raw"])
+            .env_clear()
+            .env("HOME", &self.dir)
+            .stdin(Stdio::null())
+            .stdout(std::fs::File::create(&raw).unwrap())
+            .stderr(Stdio::null())
+            .spawn_alone()
+            .unwrap();
+        // Recording once silence arrives.
+        let began = Instant::now();
+        while std::fs::metadata(&raw).map_or(0, |m| m.len()) == 0 {
+            assert!(began.elapsed() < Duration::from_secs(30), "parec recorded nothing");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        play();
+        std::thread::sleep(Duration::from_secs(1));
+        // SAFETY: a signal to the child this test made.
+        unsafe { libc::kill(parec.id() as i32, libc::SIGINT) };
+        let _ = parec.wait();
+        Recording::of(&std::fs::read(&raw).unwrap())
+    }
+}
+
+impl Drop for PulseServer {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Its log, beside the display tests' files, with when it started.
+        let log = std::fs::read_to_string(self.dir.join("server.err")).unwrap_or_default();
+        let _ = std::fs::write(
+            display_dir().join(format!("pulse-{}.err", self.test)),
+            format!("started at {:.3} (Unix time)\n{log}", self.began.as_secs_f64()),
+        );
+        let _ = std::fs::remove_dir_all(&self.dir);
+    }
+}
+
+/// `secs` seconds of a 440 Hz tone and `silence_ms` of silence, as a WAV
+/// file: 16-bit stereo at 44.1 kHz. (A player's server can drop what it
+/// holds of a stream as it ends: PipeWire's sink to a PulseAudio server
+/// corks its stream, what the server holds unplayed, once nothing plays.)
+fn tone_wav(secs: u32, silence_ms: u32) -> Vec<u8> {
+    let sound = 44_100 * secs;
+    let frames = sound + 441 * silence_ms / 10;
+    let mut w = b"RIFF".to_vec();
+    w.extend((36 + frames * 4).to_le_bytes());
+    w.extend(b"WAVEfmt ");
+    w.extend(16u32.to_le_bytes());
+    w.extend(1u16.to_le_bytes());
+    w.extend(2u16.to_le_bytes());
+    w.extend(44_100u32.to_le_bytes());
+    w.extend((44_100u32 * 4).to_le_bytes());
+    w.extend(4u16.to_le_bytes());
+    w.extend(16u16.to_le_bytes());
+    w.extend(b"data");
+    w.extend((frames * 4).to_le_bytes());
+    for i in 0..frames {
+        let t = f64::from(i) / 44_100.0;
+        let s =
+            if i < sound { ((t * 440.0 * std::f64::consts::TAU).sin() * 8000.0) as i16 } else { 0 };
+        w.extend(s.to_le_bytes());
+        w.extend(s.to_le_bytes());
+    }
+    w
+}
+
+/// Linux's sound clients play on the Mac's PulseAudio server, which fwe's
+/// `PULSE_SERVER` names: the guest's own names it as Linux's system-wide
+/// server (`/run/pulse/native`), and a second of tone played by
+/// PulseAudio's `paplay`, by ALSA's `aplay` (through ALSA's PulseAudio
+/// plugin) and by PipeWire's `pw-play` (through the guest's PipeWire and
+/// WirePlumber, to a sink PipeWire's PulseAudio tunnel makes) reaches the
+/// server's null sink, whose monitor records it.
+#[test]
+fn sound_clients_play_on_the_macs_pulseaudio_server() {
+    if !fetched_program_tests("FWE_SOUND_TESTS") {
+        return;
+    }
+    let pulse = PulseServer::start("clients");
+    let root = std::env::temp_dir().join(format!("fwe-sound-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    run_checked(Command::new("cp").arg("-cpR").arg(fetched_system("sound")).arg(&root));
+    let root = ScratchRoot(root);
+    std::fs::write(root.0.join("tmp/tone.wav"), tone_wav(1, 500)).unwrap();
+    // For PipeWire, silence for longer than its tunnel holds.
+    std::fs::write(root.0.join("tmp/tone-long.wav"), tone_wav(1, 2000)).unwrap();
+    // PipeWire's sink on the Mac's server, as a user's configuration adds it.
+    // The tunnel keeps half its `pulse.latency` (200 ms by default) at the
+    // server and as much in its own ring, and answers a request of the
+    // server's its ring cannot fill with silence; PipeWire with no device
+    // of its own fills the ring 2048 frames (43 ms) a cycle. A server that
+    // wakes unevenly (a CI runner's, whose native clients underrun as well)
+    // asks ahead of that: a second's latency keeps up. (The tunnel holds
+    // as much once its player is done: the player's file plays silence for
+    // longer.)
+    let conf = root.0.join("root/.config/pipewire/pipewire.conf.d");
+    std::fs::create_dir_all(&conf).unwrap();
+    std::fs::write(
+        conf.join("mac.conf"),
+        "context.modules = [\n\
+         \x20 { name = libpipewire-module-pulse-tunnel\n\
+         \x20   args = { tunnel.mode = sink, pulse.server.address = \"unix:/run/pulse/native\",\n\
+         \x20            pulse.latency = 1000, node.name = mac } }\n\
+         ]\n",
+    )
+    .unwrap();
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root.0).arg(root.0.join(&args[0][1..])).args(&args[1..]);
+        cmd.env_clear().env("HOME", "/root").env("PATH", "/usr/bin:/bin");
+        cmd.envs(pulse.env());
+        let out = run_bounded_for(cmd, &[], Duration::from_secs(120));
+        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        stdout(&out)
+    };
+    let info = run(&["/usr/bin/pactl", "info"]);
+    assert!(info.contains("Server String: unix:/run/pulse/native"), "{info}");
+    // A second of tone is 44100 frames, those at its zero crossings silent
+    // (900 of them): all are recorded.
+    // PipeWire and its session manager, for as long as pw-play plays.
+    let pipewire = "export XDG_RUNTIME_DIR=/tmp/xdg; mkdir -p -m 700 $XDG_RUNTIME_DIR
+        pipewire 2>/tmp/pipewire.err & p=$!
+        until [ -S $XDG_RUNTIME_DIR/pipewire-0 ]; do sleep 0.1; done
+        wireplumber 2>/tmp/wireplumber.err & w=$!
+        until pw-cli ls Node 2>/dev/null | grep -q 'node.name = \"mac\"'; do sleep 0.1; done
+        pw-play --target mac /tmp/tone-long.wav; r=$?
+        kill $w $p; wait; exit $r";
+    for player in [
+        &["/usr/bin/paplay", "/tmp/tone.wav"][..],
+        &["/usr/bin/aplay", "-q", "-D", "pulse", "/tmp/tone.wav"],
+        &["/bin/sh", "-c", pipewire],
+    ] {
+        let rec = pulse.recorded(|| {
+            run(player);
+        });
+        eprintln!("{player:?}: {rec}");
+        let said = |f: &str| std::fs::read_to_string(root.0.join(f)).unwrap_or_default();
+        assert!(
+            rec.sound > 43_000,
+            "{player:?}: {rec}, of the tone; PipeWire said: {}; WirePlumber said: {}",
+            said("tmp/pipewire.err"),
+            said("tmp/wireplumber.err")
+        );
+    }
+}
+
+/// The README's examples (`README.md`), run as written on the XQuartz
+/// display `FWE_README_DISPLAY` names (`:N`, a server running already):
+/// each block marked `<!-- example: NAME, window "SEARCH"[ WxH][, vm][,
+/// sound] -->` runs in `bash`, in order, sharing a home directory, with
+/// `fwe` on the `PATH`, until a window xdotool finds by `--name SEARCH`
+/// (of that size, if given) has drawn; then its processes are ended. A
+/// block marked `vm` runs only where `FWE_README_VM` is set (CI), its
+/// `fwe` on the hypervisor stand-in: VM programs are not run on a
+/// development Mac. Their sound goes to a PulseAudio server of the test's
+/// (`PULSEAUDIO`), which the `fwe` on the `PATH` names (`PULSE_SERVER`,
+/// as a Mac's environment can, the README's `env -i` keeping fwe's
+/// environment from the guest); a block marked `sound` has to have played
+/// some once its window has drawn.
+#[test]
+fn readme_examples() {
+    let Some(display) = std::env::var("FWE_README_DISPLAY").ok() else {
+        eprintln!("skipped: set FWE_README_DISPLAY to an XQuartz display to run them");
+        return;
+    };
+    let x = XServer::running(&display);
+    let pulse = PulseServer::start("readme");
+    let readme = std::fs::read_to_string(repo().join("README.md")).unwrap();
+    let home = std::env::temp_dir().join(format!("fwe-readme-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let vm = std::env::var_os("FWE_README_VM").is_some();
+    let mut ran = Vec::new();
+    // Every example runs, so one run of CI shows each that fails.
+    let mut failed = Vec::new();
+    let mut at = 0;
+    while let Some(i) = readme[at..].find("<!-- example: ") {
+        let i = i + at + "<!-- example: ".len();
+        let marker = &readme[i..i + readme[i..].find(" -->").unwrap()];
+        let (name, rest) = marker.split_once(", window \"").expect("NAME, window \"SEARCH\"");
+        let (search, rest) = rest.split_once('"').unwrap();
+        let mut parts = rest.split(',').map(str::trim);
+        let size = parts.next().unwrap_or_default();
+        let flags: Vec<&str> = parts.collect();
+        assert!(flags.iter().all(|f| matches!(*f, "vm" | "sound")), "{marker}");
+        let (in_vm, sound) = (flags.contains(&"vm"), flags.contains(&"sound"));
+        let size = (!size.is_empty()).then(|| {
+            let (w, h) = size.split_once('x').unwrap();
+            (w.parse().unwrap(), h.parse().unwrap())
+        });
+        let start = i + readme[i..].find("```sh\n").unwrap() + "```sh\n".len();
+        let end = start + readme[start..].find("\n```").unwrap();
+        let script = &readme[start..end];
+        at = end;
+        if in_vm && !vm {
+            eprintln!("skipped: README example {name} runs in the VM (FWE_README_VM)");
+            continue;
+        }
+        // `fwe` on the PATH, naming the test's sound server: the
+        // stand-in's for the VM.
+        let bin = home.join(format!(".fwe-{name}"));
+        std::fs::create_dir_all(&bin).unwrap();
+        let fwe = bin.join("fwe");
+        let line = if in_vm {
+            match hv_mode().expect("FWE_README_VM: the VM examples need a hypervisor") {
+                HvMode::Real(signed) => format!("exec '{}' \"$@\"", signed.display()),
+                HvMode::Standin => {
+                    format!("exec '{}' --hv-standin \"$@\"", env!("CARGO_BIN_EXE_fwe"))
+                }
+            }
+        } else {
+            format!("exec '{}' \"$@\"", env!("CARGO_BIN_EXE_fwe"))
+        };
+        let names: String =
+            pulse.env().iter().map(|(k, v)| format!("export {k}='{v}'\n")).collect();
+        std::fs::write(&fwe, format!("#!/bin/sh\n{names}{line}\n")).unwrap();
+        std::fs::set_permissions(&fwe, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        let mut cmd = Command::new("bash");
+        cmd.args(["-euo", "pipefail", "-c", script]);
+        cmd.env_clear().env("HOME", &home).env("DISPLAY", x.display());
+        cmd.env("PATH", format!("{}:/usr/bin:/bin:/usr/sbin:/sbin", bin.display()));
+        let shot = format!("readme-{name}");
+        let drew = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut gui = Gui::run(&shot, cmd);
+            // Its downloads and installs first: Wine's on the stand-in
+            // take the longest.
+            let secs = if in_vm { 3600 } else { 1200 };
+            x.window_sized(&mut gui, &["--name", search], size, secs);
+            let drawn = x.drawn_found(&mut gui, &["--name", search], size, &shot, 10_000, 300);
+            assert!(drawn.drawn > 10_000, "{name} drew {drawn:?}: {}", gui.report());
+            if sound {
+                // What it plays a while after: on the stand-in, a while
+                // longer.
+                let secs = if in_vm { 120 } else { 20 };
+                let rec = pulse.recorded(|| std::thread::sleep(Duration::from_secs(secs)));
+                assert!(rec.sound > 4_410, "{name} played {rec}: {}", gui.report());
+            }
+        }));
+        if drew.is_err() {
+            failed.push(name.to_string());
+        }
+        ran.push(name.to_string());
+    }
+    run_checked(Command::new("chmod").arg("-R").arg("u+rwX").arg(&home));
+    let _ = std::fs::remove_dir_all(&home);
+    let want: &[&str] = if vm {
+        &["tuxracer", "xonotic", "vkcube", "putty", "openttd"]
+    } else {
+        &["tuxracer", "xonotic", "vkcube"]
+    };
+    assert_eq!(ran, want);
+    assert!(failed.is_empty(), "README examples that failed: {failed:?}");
 }
 
 /// Run `args` (a program of the root, then its arguments) in a copy of the
@@ -6065,6 +6482,12 @@ fn exec_replaces_the_address_space() {
     assert_eq!(signals("vfork-exec"), "hello from the spawned child\nexited 0\n");
     // Threads that vfork at once: none waits for another's child.
     assert_eq!(signals("vfork-concurrent"), "each vfork returned once its child exec'd: true\n");
+    // A vfork child that forks and exits: the grandchild holds nothing
+    // the vfork waits on.
+    assert_eq!(
+        signals("vfork-fork-exit"),
+        "vfork child exited: exited 0\nthe vfork returned at its child's exit: true\n"
+    );
     assert_eq!(signals("exec-self"), "hello from the spawned child\n");
 }
 
@@ -10083,19 +10506,29 @@ fn hv_fault_frames_hold_the_syndrome() {
     assert_eq!(stdout(&out), FAULT_ESR, "{}", String::from_utf8_lossy(&out.stderr));
 }
 
-/// A headless X server for the display tests: Homebrew's Xvfb (`XVFB`
-/// names it; the tests skip without it, as on a development machine),
-/// listening on its Unix socket only, at a display number of its own; or
-/// a root's own Xvfb run by fwe ([`Xvfb::in_root`]).
-struct Xvfb {
+/// An X server for the display tests, at a display number of its own
+/// ([`Run`] says whose it is).
+struct XServer {
     number: u32,
-    child: std::process::Child,
-    /// Run by fwe in a root: the host's tools reach it over TCP.
-    in_root: bool,
+    run: Run,
 }
 
-impl Xvfb {
-    fn start() -> Option<Xvfb> {
+/// Who runs an X server, and how the host's tools reach it.
+enum Run {
+    /// Homebrew's Xvfb, headless, started by the tests (`XVFB` names it;
+    /// the tests skip without it, as on a development machine), listening
+    /// on its Unix socket only ([`XServer::start`]).
+    Host(std::process::Child),
+    /// A root's own Xvfb run by fwe, in a process group of its own: the
+    /// host's tools reach it over TCP ([`XServer::in_root`]).
+    InRoot(std::process::Child),
+    /// A server running already, which the tests leave running: XQuartz,
+    /// on its Unix socket ([`XServer::running`]).
+    Running,
+}
+
+impl XServer {
+    fn start() -> Option<XServer> {
         let Some(xvfb) = std::env::var_os("XVFB") else {
             eprintln!("skipped: set XVFB to an Xvfb to run the display tests");
             return None;
@@ -10137,11 +10570,11 @@ impl Xvfb {
             .stderr(std::fs::File::create(&err).unwrap())
             .spawn()
             .unwrap();
-        let mut x = Xvfb { number, child, in_root: false };
+        let mut x = XServer { number, run: Run::Host(child) };
         let began = Instant::now();
         while !socket.exists() {
             let said = || std::fs::read_to_string(&err).unwrap_or_default();
-            if let Some(status) = x.child.try_wait().unwrap() {
+            if let Some(status) = x.ended() {
                 panic!("Xvfb :{number} ended ({status}): {}", said());
             }
             assert!(
@@ -10157,8 +10590,8 @@ impl Xvfb {
     /// The root's own Xvfb (Alpine's, which has GLX, as Homebrew's has
     /// not), run by fwe in `root`, in a process group of its own: the
     /// root's programs reach it as `:N` (its socket in the root's
-    /// `/tmp/.X11-unix`), the host's tools over TCP ([`Xvfb::display`]).
-    fn in_root(root: &ScratchRoot) -> Xvfb {
+    /// `/tmp/.X11-unix`), the host's tools over TCP ([`XServer::display`]).
+    fn in_root(root: &ScratchRoot) -> XServer {
         use std::os::unix::process::CommandExt;
         static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let number = 170 + NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10188,7 +10621,7 @@ impl Xvfb {
             .process_group(0)
             .spawn_alone()
             .unwrap();
-        let x = Xvfb { number, child, in_root: true };
+        let x = XServer { number, run: Run::InRoot(child) };
         let began = Instant::now();
         while std::net::TcpStream::connect(("127.0.0.1", 6000 + number as u16)).is_err() {
             let err = std::fs::read_to_string(dir.join(format!("{name}.err"))).unwrap_or_default();
@@ -10201,28 +10634,54 @@ impl Xvfb {
         x
     }
 
+    /// The server running already at `display` (`:N`), left running.
+    fn running(display: &str) -> XServer {
+        let number = display
+            .strip_prefix(':')
+            .and_then(|n| n.split('.').next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("{display}: not a local display (:N)"));
+        assert!(
+            Path::new(&format!("/tmp/.X11-unix/X{number}")).exists(),
+            "no X server at {display}"
+        );
+        XServer { number, run: Run::Running }
+    }
+
+    /// How the server the tests started ended, if it has.
+    fn ended(&mut self) -> Option<std::process::ExitStatus> {
+        match &mut self.run {
+            Run::Host(child) | Run::InRoot(child) => child.try_wait().unwrap(),
+            Run::Running => None,
+        }
+    }
+
     /// The display as the host's tools (and fwe's `DISPLAY`) name it.
     fn display(&self) -> String {
-        if self.in_root {
-            format!("127.0.0.1:{}", self.number)
-        } else {
-            format!(":{}", self.number)
+        match self.run {
+            Run::InRoot(_) => format!("127.0.0.1:{}", self.number),
+            Run::Host(_) | Run::Running => format!(":{}", self.number),
         }
     }
 }
 
-impl Drop for Xvfb {
+impl Drop for XServer {
     fn drop(&mut self) {
-        if self.in_root {
-            let pgid = self.child.id() as i32;
-            assert!(pgid > 1);
-            // SAFETY: signals to the process group this test made (its
-            // leader is the child), never pid 0, 1 or -1.
-            unsafe { libc::kill(-pgid, libc::SIGKILL) };
-        } else {
-            let _ = self.child.kill();
+        match &mut self.run {
+            Run::InRoot(child) => {
+                let pgid = child.id() as i32;
+                assert!(pgid > 1);
+                // SAFETY: signals to the process group this test made (its
+                // leader is the child), never pid 0, 1 or -1.
+                unsafe { libc::kill(-pgid, libc::SIGKILL) };
+                let _ = child.wait();
+            }
+            Run::Host(child) => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            Run::Running => {}
         }
-        let _ = self.child.wait();
     }
 }
 
@@ -10236,7 +10695,7 @@ impl Drop for Xvfb {
 #[test]
 fn display_x11_client_draws_through_shared_memory() {
     let prog = build_c("x11shm", Libc::Musl, true, true);
-    let Some(x) = Xvfb::start() else { return };
+    let Some(x) = XServer::start() else { return };
     let root = libc_rootfs(Libc::Musl, "x11shm");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root").arg(&root).arg(&prog).env("DISPLAY", x.display());
@@ -10257,7 +10716,7 @@ fn display_x11_client_draws_through_shared_memory() {
 #[test]
 fn display_x11_client_draws_from_a_fork_child_in_the_vm() {
     let prog = build_c("x11shm", Libc::Musl, true, true);
-    let Some(x) = Xvfb::start() else { return };
+    let Some(x) = XServer::start() else { return };
     let root = libc_rootfs(Libc::Musl, "vm-x11shm");
     let Some(mut cmd) = hv_command() else { return };
     cmd.arg("--vm").arg("--root").arg(&root).arg(&prog).arg("fork").env("DISPLAY", x.display());
@@ -10276,11 +10735,11 @@ fn display_x11_client_draws_from_a_fork_child_in_the_vm() {
 /// X server: only where `FWE_DISPLAY_TESTS` is set (CI's `display` job,
 /// with Homebrew's Xvfb, xdotool and libX11: `XVFB`, `LIBX11`), never on a
 /// development machine.
-fn display_tests() -> Option<Xvfb> {
+fn display_tests() -> Option<XServer> {
     if !fetched_program_tests("FWE_DISPLAY_TESTS") {
         return None;
     }
-    Some(Xvfb::start().expect("XVFB: the display tests need Xvfb"))
+    Some(XServer::start().expect("XVFB: the display tests need Xvfb"))
 }
 
 /// A root of its own for display test `test`, cloned from `cached` (a
@@ -10381,7 +10840,7 @@ fn display_dir() -> PathBuf {
 
 impl Gui {
     fn start(
-        x: &Xvfb,
+        x: &XServer,
         name: &str,
         root: &ScratchRoot,
         program: &str,
@@ -10394,7 +10853,7 @@ impl Gui {
     /// As [`Gui::start`], every system call traced if `calls`, else those
     /// that fail (with fwe's notes, for a failure's report).
     fn start_traced(
-        x: &Xvfb,
+        x: &XServer,
         name: &str,
         root: &ScratchRoot,
         program: &str,
@@ -10500,7 +10959,7 @@ struct Window {
     h: i32,
 }
 
-/// What a window shows ([`Xvfb::shot`], from `tools/display/shot.py`).
+/// What a window shows ([`XServer::shot`], from `tools/display/shot.py`).
 #[derive(Debug)]
 struct Shot {
     /// How many pixels it has: the window's on the screen.
@@ -10519,7 +10978,7 @@ impl Shot {
     }
 }
 
-impl Xvfb {
+impl XServer {
     /// Homebrew's xdotool on this server.
     fn xdotool(&self, args: &[&str]) -> Output {
         Command::new("xdotool").args(args).env("DISPLAY", self.display()).output_alone().unwrap()
@@ -10531,7 +10990,7 @@ impl Xvfb {
         self.window_sized(gui, search, None, secs)
     }
 
-    /// [`Xvfb::window`], of size `size` (width, height) if given.
+    /// [`XServer::window`], of size `size` (width, height) if given.
     fn window_sized(
         &self,
         gui: &mut Gui,
@@ -10594,17 +11053,31 @@ impl Xvfb {
 
     /// What window `w` shows now, its screenshot saved as `<name>.png`.
     fn shot(&self, w: &Window, name: &str) -> Shot {
+        self.shot_of(w, name).unwrap_or_else(|| panic!("window {} is gone", w.id))
+    }
+
+    /// What window `w` shows now, its screenshot saved as `<name>.png`;
+    /// `None` if it is no more (`shot.py`'s status 2).
+    fn shot_of(&self, w: &Window, name: &str) -> Option<Shot> {
         let lib = std::env::var("LIBX11").expect("LIBX11: Homebrew's libX11");
         let png = display_dir().join(format!("{name}.png"));
-        let (x, y, ww, hh) = (w.x.to_string(), w.y.to_string(), w.w.to_string(), w.h.to_string());
+        // Its place on the root window; on XQuartz, whose root shows none
+        // of its windows, the window itself.
+        let place = match self.run {
+            Run::Host(_) | Run::InRoot(_) => [w.x, w.y, w.w, w.h].map(|v| v.to_string()).to_vec(),
+            Run::Running => vec!["window".to_string(), w.id.clone()],
+        };
         let out = Command::new("python3")
             .arg(repo().join("tools/display/shot.py"))
             .arg(lib)
             .arg(self.display())
             .arg(&png)
-            .args([&x, &y, &ww, &hh])
+            .args(&place)
             .output_alone()
             .unwrap();
+        if out.status.code() == Some(2) {
+            return None;
+        }
         assert!(out.status.success(), "shot.py: {}", String::from_utf8_lossy(&out.stderr));
         let text = stdout(&out);
         let drawn = text
@@ -10630,7 +11103,33 @@ impl Xvfb {
             .and_then(|p| p.split(' ').next())
             .and_then(|n| n.parse().ok())
             .unwrap();
-        Shot { pixels, drawn, colours, digest }
+        Some(Shot { pixels, drawn, colours, digest })
+    }
+
+    /// Wait up to `secs` for the window `search` finds ([`Self::window_sized`],
+    /// of `size` if given) to have drawn more than `least` pixels: what it
+    /// shows then. The window is found again for each shot, as a program can
+    /// make a new one in its place (OpenTTD's Windows build does as it sizes
+    /// its window).
+    fn drawn_found(
+        &self,
+        gui: &mut Gui,
+        search: &[&str],
+        size: Option<(i32, i32)>,
+        name: &str,
+        least: u64,
+        secs: u64,
+    ) -> Shot {
+        let began = Instant::now();
+        loop {
+            let w = self.window_sized(gui, search, size, secs);
+            let late = began.elapsed() > Duration::from_secs(secs);
+            match self.shot_of(&w, name) {
+                Some(now) if now.drawn > least || late => return now,
+                None if late => panic!("window {} is gone: {}", w.id, gui.report()),
+                _ => std::thread::sleep(Duration::from_millis(500)),
+            }
+        }
     }
 
     /// Wait up to `secs` for window `w` to have drawn more than `least`
@@ -10791,7 +11290,7 @@ fn alpine_display_glxgears_turns_by_software() {
         return;
     }
     let root = x11_root("glxgears");
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let env = [("LIBGL_ALWAYS_SOFTWARE", "1"), ("GALLIUM_DRIVER", "llvmpipe")];
     let command = format!("DISPLAY=:{} exec /usr/bin/glxgears -geometry 300x300+0+0", x.number);
     let mut gui = Gui::start(&x, "glxgears", &root, "/bin/sh", &["-c", &command], &env);
@@ -10821,7 +11320,7 @@ fn alpine_display_glxgears_turns_by_software() {
 /// `secs`): its standard output. Its calls are traced, and the Vulkan
 /// loader says what it finds (`VK_LOADER_DEBUG`), for a failure's report.
 fn display_output(
-    x: &Xvfb,
+    x: &XServer,
     name: &str,
     root: &ScratchRoot,
     args: &[&str],
@@ -10854,7 +11353,7 @@ const FWE_VULKAN: [(&str, &str); 1] =
 
 /// The Vulkan device a program finds is the Mac's GPU, through fwe's
 /// driver: `vulkaninfo` names it.
-fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
+fn assert_vulkan_on_the_gpu(x: &XServer, root: &ScratchRoot, test: &str) {
     let name = format!("{test}-vulkaninfo");
     let info =
         display_output(x, &name, root, &["/usr/bin/vulkaninfo", "--summary"], &FWE_VULKAN, 120);
@@ -10866,10 +11365,10 @@ fn assert_vulkan_on_the_gpu(x: &Xvfb, root: &ScratchRoot, test: &str) {
     display_output(x, &format!("{name}-full"), root, &["/usr/bin/vulkaninfo"], &FWE_VULKAN, 120);
 }
 
-/// A program a threaded process's fork child starts in place (as Chromium
-/// starts its GPU process) finds the Mac's GPU through fwe's driver: the
-/// Mac's driver, whose Objective-C classes initialize as it starts, runs
-/// in a fork child of a process that had threads (guests/c/threadfork.c).
+/// A program a threaded process's fork child execs (as Chromium starts its
+/// GPU process) finds the Mac's GPU through fwe's driver
+/// (guests/c/threadfork.c): the Mac's driver, whose Objective-C classes
+/// initialize as it starts, runs in the fresh process the `execve` makes.
 #[test]
 fn alpine_display_a_threaded_programs_fork_child_execs_onto_the_gpu() {
     let Some(x) = display_tests() else { return };
@@ -10882,6 +11381,25 @@ fn alpine_display_a_threaded_programs_fork_child_execs_onto_the_gpu() {
         info.lines().find(|l| l.trim_start().starts_with("deviceName")).unwrap_or_default();
     assert!(device.contains("Apple"), "the device is not the GPU:\n{info}");
     assert!(info.ends_with("child: exit 0\n"), "{info}");
+}
+
+/// A program a shell starts (its fork child's `execve`) compiles a shader
+/// Metal has never compiled (guests/c/vkcompile.c, its entry point named
+/// anew each run): Metal's shader compiler works only in a process exec'd
+/// since its fork, as the fresh process that `execve` makes is.
+#[test]
+fn alpine_display_a_shells_child_compiles_a_new_shader_on_the_gpu() {
+    let Some(x) = display_tests() else { return };
+    let root = x11_root("vkcompile");
+    let prog = build_c_dynamic("vkcompile", Libc::Musl, true);
+    std::fs::copy(&prog, root.0.join("usr/bin/vkcompile")).unwrap();
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let digits = format!("{:010}", nanos.as_nanos() % 10_000_000_000);
+    // Not the shell's last command, so the shell forks to run it.
+    let command = format!("/usr/bin/vkcompile {digits}; echo \"exit $?\"");
+    let args = ["/bin/sh", "-c", &command];
+    let out = display_output(&x, "vkcompile", &root, &args, &FWE_VULKAN, 120);
+    assert!(out.ends_with("compute pipeline: 0\nexit 0\n"), "{out}");
 }
 
 /// vkcube draws its cube with Vulkan on the Mac's GPU (fwe's driver, its
@@ -10947,7 +11465,7 @@ fn alpine_display_vulkaninfo_finds_the_macs_driver_through_fwes() {
 
     // On an X display: the loader asks fwe's driver for a surface of its
     // own of an X window, which the device presents to.
-    let x = Xvfb::start().expect("XVFB: the display tests need Xvfb");
+    let x = XServer::start().expect("XVFB: the display tests need Xvfb");
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
     cmd.arg("--root")
         .arg(root)
@@ -10996,10 +11514,11 @@ fn alpine_display_vulkan_through_a_loader_in_the_global_scope() {
     assert_eq!(out.status.code(), Some(0));
 }
 
-/// A fork child of a process using the GPU device: its copy of the
-/// parent's open and an open of its own fail (the Mac's driver in its
-/// memory is the parent's), an `execve` makes it a process with a device
-/// of its own, and the parent's open goes on working.
+/// A fork child has no GPU device until it is exec'd (macOS's libraries,
+/// Metal's shader compiler among them, work only in a process exec'd since
+/// its fork): its copy of its parent's open and an open of its own fail,
+/// whether or not the parent used the device; an `execve` makes it a
+/// process with a device of its own, and the parent's open goes on working.
 #[test]
 fn gpu_device_across_fork_and_exec() {
     let Some(driver) = mock_vulkan_driver() else { return };
@@ -11008,20 +11527,33 @@ fn gpu_device_across_fork_and_exec() {
     // Inside the root, where `/proc/self/exe` leads back to it.
     let inside = root.join("gpufork");
     std::fs::copy(&prog, &inside).unwrap();
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
-    cmd.arg("--root").arg(&root).arg(&inside).env("FWE_VULKAN_DRIVER", &driver);
-    let out = run_bounded(cmd);
+    let run = |args: &[&str]| {
+        let mut cmd = Command::new(env!("CARGO_BIN_EXE_fwe"));
+        cmd.arg("--root").arg(&root).arg(&inside).args(args).env("FWE_VULKAN_DRIVER", &driver);
+        run_bounded(cmd)
+    };
+    let used = run(&[]);
+    let fresh = run(&["fresh"]);
     let _ = std::fs::remove_dir_all(&root);
     assert_eq!(
-        stdout(&out),
+        stdout(&used),
         "parent: the driver works\n\
          child: inherited open ENODEV, own open ENODEV\n\
          exec'd child: its own open works\n\
          parent: child exit 0, its open works\n",
         "{}",
-        String::from_utf8_lossy(&out.stderr)
+        String::from_utf8_lossy(&used.stderr)
     );
-    assert_eq!(out.status.code(), Some(0));
+    assert_eq!(used.status.code(), Some(0));
+    assert_eq!(
+        stdout(&fresh),
+        "child: own open ENODEV\n\
+         exec'd child: its own open works\n\
+         parent: child exit 0\n",
+        "{}",
+        String::from_utf8_lossy(&fresh.stderr)
+    );
+    assert_eq!(fresh.status.code(), Some(0));
 }
 
 /// The tests' Mac Vulkan driver (`tests/fake_vulkan_driver.c`), which does
@@ -11104,7 +11636,7 @@ fn alpine_display_glxgears_draws_on_the_gpu() {
         return;
     }
     let root = x11_root("glxgears-gpu");
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let mut env = FWE_VULKAN.to_vec();
     env.extend([
         ("MESA_LOADER_DRIVER_OVERRIDE", "zink"),
@@ -11230,7 +11762,7 @@ fn toolkits_root(test: &str) -> ScratchRoot {
 /// A program of a toolkit's that draws a 200×100 block of #3366cc and,
 /// when `q` is pressed, writes `/tmp/keyed` and ends: its window drawn,
 /// then the key taken.
-fn toolkit_draws_and_takes_a_key(x: &Xvfb, name: &str, root: &ScratchRoot, gui: Gui) {
+fn toolkit_draws_and_takes_a_key(x: &XServer, name: &str, root: &ScratchRoot, gui: Gui) {
     let mut gui = gui;
     let w = x.window(&mut gui, &["--name", "fwe-toolkit"], 180);
     std::thread::sleep(Duration::from_secs(1));
@@ -11300,7 +11832,7 @@ fn alpine_display_qt_draws_and_takes_a_key() {
 /// A GTK demo program (`gtk3-demo`, `gtk4-demo`): its window drawn, typing
 /// into it searching its list of demos (what it shows changes), and
 /// Ctrl+Q ending it.
-fn gtk_demo(x: &Xvfb, name: &str, env: &[(&str, &str)]) {
+fn gtk_demo(x: &XServer, name: &str, env: &[(&str, &str)]) {
     let root = toolkits_root(name);
     let mut gui = Gui::start(x, name, &root, &format!("/usr/bin/{name}"), &[], env);
     let w = x.window(&mut gui, &["--class", name], 180);
@@ -11404,7 +11936,7 @@ fn as_nobody<'a>(program: &'a str, args: &[&'a str]) -> Vec<&'a str> {
 /// What a window showing the test page (magenta, with "fwe" in green, as
 /// `guests/apps/electron/index.html` has it) shows, checked: mostly the
 /// page's magenta, and the green of its text.
-fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
+fn shows_the_test_page(x: &XServer, w: &Window, name: &str, gui: &mut Gui) {
     let began = Instant::now();
     loop {
         let shot = x.shot(w, name);
@@ -11424,8 +11956,9 @@ fn shows_the_test_page(x: &Xvfb, w: &Window, name: &str, gui: &mut Gui) {
 
 /// A root for browser test `test`: Alpine's browsers
 /// (`guests/alpine/fetch/browsers.txt`), with the pages of
-/// `guests/apps/pages` in `/tmp/fwe-pages` and `nobody`'s home in
-/// `/tmp/nobody`.
+/// `guests/apps/pages` in `/tmp/fwe-pages`, `nobody`'s home in
+/// `/tmp/nobody`, and Firefox letting a page play sound unasked (its
+/// `media.autoplay` preferences, as Chromium's `--autoplay-policy` does).
 fn browsers_root(test: &str) -> ScratchRoot {
     use std::os::unix::fs::PermissionsExt;
     let root = display_root(&alpine_root("browsers"), test);
@@ -11438,6 +11971,15 @@ fn browsers_root(test: &str) -> ScratchRoot {
     let home = root.0.join("tmp/nobody");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let prefs = root.0.join("usr/lib/firefox/defaults/pref");
+    std::fs::create_dir_all(&prefs).unwrap();
+    std::fs::write(
+        prefs.join("fwe-autoplay.js"),
+        "pref(\"media.autoplay.default\", 0);\n\
+         pref(\"media.autoplay.blocking_policy\", 0);\n\
+         pref(\"media.autoplay.block-webaudio\", false);\n",
+    )
+    .unwrap();
     root
 }
 
@@ -11460,7 +12002,7 @@ fn alpine_display_chromium_draws_a_page_sandboxed() {
     let root = browsers_root("chromium-page");
     // The root's Xvfb, which has GLX: Chromium's GPU process falls back to
     // drawing in software through it.
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
     let args = su_nobody(&format!("{CHROMIUM} file:///tmp/fwe-pages/page.html"));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let mut gui = Gui::start(&x, "chromium-page", &root, "/bin/su", &args, &[]);
@@ -11468,18 +12010,24 @@ fn alpine_display_chromium_draws_a_page_sandboxed() {
     shows_the_test_page(&x, &w, "chromium-page", &mut gui);
 }
 
-/// Chromium plays a video ([`plays_the_test_video`]).
+/// Chromium plays a video with its sound ([`plays_the_test_video`]).
 #[test]
-fn alpine_display_chromium_plays_a_video() {
+fn alpine_display_chromium_plays_a_video_with_its_sound() {
     let Some(_x) = display_tests() else { return };
+    let pulse = PulseServer::start("chromium");
     let root = browsers_root("chromium-video");
-    let x = Xvfb::in_root(&root);
+    let x = XServer::in_root(&root);
+    // Its audio service's and devices' steps logged, with times, for a
+    // failure's report.
     let args = su_nobody(&format!(
-        "{CHROMIUM} --autoplay-policy=no-user-gesture-required file:///tmp/fwe-pages/video.html"
+        "{CHROMIUM} --autoplay-policy=no-user-gesture-required \
+         --vmodule=*/media/audio/*=1,*/services/audio/*=1 file:///tmp/fwe-pages/video.html"
     ));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &[]);
-    plays_the_test_video(&x, "chromium-video", &mut gui);
+    let env = pulse.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut gui = Gui::start(&x, "chromium-video", &root, "/bin/su", &args, &env);
+    plays_the_test_video(&x, "chromium-video", &mut gui, &pulse);
 }
 
 /// Firefox's command for a test's run: an instance of its own, its
@@ -11498,22 +12046,26 @@ fn alpine_display_firefox_draws_a_page_sandboxed() {
     shows_the_test_page(&x, &w, "firefox-page", &mut gui);
 }
 
-/// Firefox plays a video ([`plays_the_test_video`]).
+/// Firefox plays a video with its sound ([`plays_the_test_video`]).
 #[test]
-fn alpine_display_firefox_plays_a_video() {
+fn alpine_display_firefox_plays_a_video_with_its_sound() {
     let Some(x) = display_tests() else { return };
+    let pulse = PulseServer::start("firefox");
     let root = browsers_root("firefox-video");
     let args = su_nobody(&format!("{FIREFOX} file:///tmp/fwe-pages/video.html"));
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let mut gui = Gui::start(&x, "firefox-video", &root, "/bin/su", &args, &[]);
-    plays_the_test_video(&x, "firefox-video", &mut gui);
+    let env = pulse.env();
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let mut gui = Gui::start(&x, "firefox-video", &root, "/bin/su", &args, &env);
+    plays_the_test_video(&x, "firefox-video", &mut gui, &pulse);
 }
 
 /// A browser showing `guests/apps/pages/video.html` plays its video: the
-/// page says it plays (its title), and what the window shows changes from
-/// one look to the next (the bar crossing the video), the page's own
-/// magenta covering less than all of it.
-fn plays_the_test_video(x: &Xvfb, name: &str, gui: &mut Gui) {
+/// page says it plays (its title), what the window shows changes from one
+/// look to the next (the bar crossing the video), the page's own magenta
+/// covering less than all of it, and the Mac's sound server `pulse` plays
+/// its tone (a second of sound in three).
+fn plays_the_test_video(x: &XServer, name: &str, gui: &mut Gui, pulse: &PulseServer) {
     let w = x.window(gui, &["--name", "^fwe-video: playing"], 180);
     let mut seen = std::collections::BTreeSet::new();
     for n in 0..8 {
@@ -11532,6 +12084,8 @@ fn plays_the_test_video(x: &Xvfb, name: &str, gui: &mut Gui) {
         seen.len(),
         gui.report()
     );
+    let rec = pulse.recorded(|| std::thread::sleep(Duration::from_secs(3)));
+    assert!(rec.sound > 44_100, "{name}'s video is silent: {rec}: {}", gui.report());
 }
 
 /// Electron, sandboxed: an app of its own showing a page.
@@ -11561,7 +12115,7 @@ fn editable_file(dir: &Path) -> PathBuf {
 
 /// An editor showing `file` in window `w` (once it has drawn it) edits it:
 /// what is typed at its start, then saved (`ctrl+s`), is in the file.
-fn saves_what_is_typed(x: &Xvfb, w: &Window, gui: &mut Gui, file: &Path, name: &str) {
+fn saves_what_is_typed(x: &XServer, w: &Window, gui: &mut Gui, file: &Path, name: &str) {
     let before = x.drawn(w, &format!("{name}-before"), 50_000, 120);
     assert!(before.drawn > 50_000, "{name} drew {before:?}: {}", gui.report());
     x.settled(w, &format!("{name}-before"), 60);

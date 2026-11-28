@@ -9,28 +9,6 @@
 #[cfg(target_os = "macos")]
 mod alloc;
 
-/// The mark that Objective-C classes' `+initialize` is safe in a fork child
-/// of one of fwe's processes that had threads (objc4 reads it from the
-/// executable: `hasForkOkSection`). The runtime otherwise refuses any such
-/// `+initialize`, in case the fork came while one ran: it would refuse the
-/// Mac's Vulkan driver in a program a threaded process's child starts in
-/// place (Chromium's GPU process). No fork comes while one runs: fwe runs
-/// Objective-C code only through the Mac's Vulkan driver, a child forked
-/// while the driver was in its parent never calls into it, and its
-/// `execve` starts a fresh process (`vulkan::device::driver_in_memory`).
-#[cfg(target_os = "macos")]
-#[used]
-#[unsafe(link_section = "__DATA,__objc_fork_ok")]
-static OBJC_FORK_OK: [u32; 1] = [1];
-
-/// The Objective-C image information clang writes for each image with
-/// Objective-C in it (version 0; flags: class properties in categories),
-/// without which the runtime looks at no section of the executable,
-/// [`OBJC_FORK_OK`] among them.
-#[cfg(target_os = "macos")]
-#[used]
-#[unsafe(link_section = "__DATA,__objc_imageinfo,regular,no_dead_strip")]
-static OBJC_IMAGE_INFO: [u32; 2] = [0, 64];
 mod json;
 mod pull;
 mod tarlist;
@@ -141,8 +119,13 @@ fn main() -> ExitCode {
     }
     let mut args = args.into_iter().peekable();
     let mut options = fwe_native::Options::default();
-    // The host display, given by the fwe that re-executes this one.
+    // The host display and the host user's Xauthority file, given by the
+    // fwe that re-executes this one.
     let mut host_display: Option<OsString> = None;
+    let mut host_authority: Option<OsString> = None;
+    // The Mac's sound server and its user's cookie, likewise.
+    let mut host_pulse: Option<OsString> = None;
+    let mut host_pulse_cookie: Option<OsString> = None;
     while let Some(arg) = args.peek() {
         match arg.as_bytes() {
             b"--strace" => options.strace.enabled = true,
@@ -169,8 +152,17 @@ fn main() -> ExitCode {
             }
             // Used when fwe re-executes itself for a guest execve.
             b"--guest-path" => options.guest_path = true,
-            b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd" | b"--exe-store"
-            | b"--user-dir" | b"--host-display" => {
+            b"--cwd"
+            | b"--argv0"
+            | b"--comm"
+            | b"--exec-state"
+            | b"--exe-fd"
+            | b"--exe-store"
+            | b"--user-dir"
+            | b"--host-display"
+            | b"--host-xauthority"
+            | b"--host-pulse"
+            | b"--host-pulse-cookie" => {
                 let flag = args.next().unwrap();
                 let Some(value) = args.next() else {
                     eprintln!("fwe: {} needs a value\n{USAGE}", flag.to_string_lossy());
@@ -178,6 +170,12 @@ fn main() -> ExitCode {
                 };
                 if flag == "--host-display" {
                     host_display = Some(value);
+                } else if flag == "--host-xauthority" {
+                    host_authority = Some(value);
+                } else if flag == "--host-pulse" {
+                    host_pulse = Some(value);
+                } else if flag == "--host-pulse-cookie" {
+                    host_pulse_cookie = Some(value);
                 } else if flag == "--user-dir" {
                     fwe_native::adopt_user_dir(value.as_bytes());
                 } else if flag == "--comm" {
@@ -285,17 +283,43 @@ fn main() -> ExitCode {
         return ExitCode::from(2);
     };
     let path = PathBuf::from(program);
-    // The host display: fwe's `DISPLAY`, or for an fwe re-executed on a
-    // guest's program (whose environment is the guest's) the one given.
-    let host = if options.guest_path { host_display } else { std::env::var_os("DISPLAY") };
-    fwe_kernel::x11::set_host(host.as_ref().map(|v| v.as_bytes()));
+    // The host display and its authorizations' file: fwe's `DISPLAY` and
+    // `XAUTHORITY`; the Mac's sound server and its cookie's file: fwe's
+    // `PULSE_SERVER` (a Unix socket's) and `PULSE_COOKIE`. For an fwe
+    // re-executed on a guest's program (whose environment is the
+    // guest's), those given.
+    let bytes = |v: Option<OsString>| v.map(|v| v.as_bytes().to_vec());
+    let named_pulse = if options.guest_path {
+        bytes(host_pulse)
+    } else {
+        std::env::var_os("PULSE_SERVER").and_then(|s| fwe_kernel::pulse::named_server(s.as_bytes()))
+    };
+    let (host, authority, pulse_cookie) = if options.guest_path {
+        (host_display, bytes(host_authority), bytes(host_pulse_cookie))
+    } else {
+        (
+            std::env::var_os("DISPLAY"),
+            bytes(std::env::var_os("XAUTHORITY")),
+            bytes(std::env::var_os("PULSE_COOKIE")),
+        )
+    };
+    fwe_kernel::x11::set_host(host.as_ref().map(|v| v.as_bytes()), authority.as_deref());
+    fwe_kernel::pulse::set_host(named_pulse.as_deref(), pulse_cookie.as_deref());
     // The guest's environment is fwe's, but for the host display, which
-    // the guest knows by its number ([`fwe_kernel::x11`]).
+    // the guest knows by its number ([`fwe_kernel::x11`]), and the Mac's
+    // sound server, which it knows by the system server's socket
+    // ([`fwe_kernel::pulse`]). The files of the Mac's cookies for them
+    // (`XAUTHORITY`, `PULSE_COOKIE`) are fwe's, which sends their cookies
+    // itself: their paths are the Mac's, which the guest's root does not
+    // have.
     let env: Vec<OsString> = std::env::vars_os()
+        .filter(|(k, _)| options.guest_path || (k != "XAUTHORITY" && k != "PULSE_COOKIE"))
         .map(|(k, v)| {
             use std::os::unix::ffi::{OsStrExt, OsStringExt};
             let v = if k == "DISPLAY" {
                 OsString::from_vec(fwe_kernel::x11::guest_display(v.as_bytes()))
+            } else if k == "PULSE_SERVER" && !options.guest_path && named_pulse.is_some() {
+                OsString::from_vec(fwe_kernel::pulse::GUEST_SERVER.to_vec())
             } else {
                 v
             };
@@ -321,8 +345,19 @@ fn late_leading_option(args: &[OsString]) -> Option<String> {
             b"--vm" | b"--hv-standin" | b"--hv-record" => {
                 return Some(a.to_string_lossy().into_owned());
             }
-            b"--root" | b"--cwd" | b"--argv0" | b"--comm" | b"--exec-state" | b"--exe-fd"
-            | b"--exe-store" | b"--probe" | b"--host-display" => i += 2,
+            b"--root"
+            | b"--cwd"
+            | b"--argv0"
+            | b"--comm"
+            | b"--exec-state"
+            | b"--exe-fd"
+            | b"--exe-store"
+            | b"--probe"
+            | b"--host-display"
+            | b"--host-xauthority"
+            | b"--host-pulse"
+            | b"--host-pulse-cookie"
+            | b"--user-dir" => i += 2,
             b"--" => return None,
             o if o.starts_with(b"-") => i += 1,
             _ => return None,

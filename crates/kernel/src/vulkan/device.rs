@@ -14,11 +14,12 @@
 //!   ([`LOCKED`]) run under the kernel lock with the guest's range plugged
 //!   ([`crate::fdtable::plugged`]), and an `execve` closes them
 //!   ([`before_exec`]).
-//! - **A fork child** never calls the driver: the driver's threads, and
-//!   the dispatch queues and Metal objects it holds, are its parent's
-//!   (macOS's own libraries do not work in a fork child). Its copies of its
-//!   parent's opens fail with `ENODEV`, and its own opens are refused while
-//!   the driver is in its memory; an `execve` makes it a fresh process.
+//! - **A fork child** never calls the driver: macOS's libraries work in a
+//!   process only once it has been exec'd (in a fork child, Metal's shader
+//!   compiler is out of reach, and the driver's threads, dispatch queues and
+//!   Metal objects are its parent's). Its copies of its parent's opens fail
+//!   with `ENODEV`, as do its own; its `execve` starts a fresh process
+//!   (`fwe_native`'s `execve`), whose opens work.
 
 use crate::fdmarks::{self, Mark};
 use fwe_abi::errno;
@@ -41,8 +42,8 @@ pub fn is_node(n: crate::devnodes::Node) -> bool {
 /// The backend runs guest code in a VM, whose memory is not the process's.
 static ABSENT: AtomicBool = AtomicBool::new(false);
 
-/// This process is a fork child of one that had loaded the Mac's driver.
-static FORKED_WITH_DRIVER: AtomicBool = AtomicBool::new(false);
+/// This process is a host fork child, not exec'd since: it has no device.
+static FORK_CHILD: AtomicBool = AtomicBool::new(false);
 
 /// Whether the device is there: a Mac Vulkan driver is installed, and guest
 /// code runs in fwe's process.
@@ -97,32 +98,29 @@ pub fn fd_closed(fd: i32) {
     }
 }
 
-/// The device can be opened: it is there, and the driver is not a fork
-/// parent's.
+/// The device can be opened: it is there, and this process is not a fork
+/// child.
 pub fn check_open() -> Result<(), i32> {
-    if !present() || FORKED_WITH_DRIVER.load(Relaxed) {
+    if !present() || FORK_CHILD.load(Relaxed) {
         return Err(errno::ENODEV);
     }
     Ok(())
 }
 
-/// In a fork child: the opens it has are its parent's, and the driver in
-/// its memory, if any, is its parent's too.
+/// In a fork child: the opens it has are its parent's, and it has no
+/// device of its own until it is exec'd.
 pub fn forked_child() {
     for f in files().values_mut() {
         f.parents = true;
     }
-    if super::driver::loaded() {
-        FORKED_WITH_DRIVER.store(true, Relaxed);
-    }
+    FORK_CHILD.store(true, Relaxed);
 }
 
-/// Whether the Mac's driver is in this process's memory (loaded here, or in
-/// the parent this process is a fork child of): an `execve` then starts a
-/// fresh process, as the driver's threads and the host's objects it holds
-/// cannot be carried into the new program's.
+/// Whether the Mac's driver is loaded in this process: an `execve` then
+/// starts a fresh process, as the driver's threads and the host's objects
+/// it holds cannot be carried into the new program's.
 pub fn driver_in_memory() -> bool {
-    super::driver::loaded() || FORKED_WITH_DRIVER.load(Relaxed)
+    super::driver::loaded()
 }
 
 /// The open of the device `fd` is, if it is one.

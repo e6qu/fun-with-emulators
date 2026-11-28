@@ -19,12 +19,13 @@
 //! starts.
 //!
 //! A line is `fwe-hv <wall-clock seconds>.<µs> pid <pid> tid <tid> <what>`;
-//! a call is `> name args` before and `< name = rc` after. Everything here
+//! a call is `> name args` before and `< name = rc` after. A process's
+//! record ends with its `exit` line ([`exit`]): the heartbeat stops first. Everything here
 //! is async-signal-safe: teardown and the framework calls it makes can run
 //! in a signal handler.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU64, Ordering::SeqCst};
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering::SeqCst};
 
 /// Where the record goes: descriptors, and whether each is a file.
 struct Sinks {
@@ -35,6 +36,13 @@ struct Sinks {
 static SINKS: OnceLock<Sinks> = OnceLock::new();
 /// `hv_vcpu_run` calls so far, for the heartbeat.
 static RUNS: AtomicU64 = AtomicU64::new(0);
+
+/// The heartbeat's state: between its lines, writing one, or stopped for
+/// good at the process's end ([`exit`]).
+static HEART: AtomicU8 = AtomicU8::new(0);
+const BETWEEN: u8 = 0;
+const BEATING: u8 = 1;
+const STOPPED: u8 = 2;
 
 /// Start recording to `spec` (`file:PATH` and/or `udp:HOST:PORT`, comma
 /// separated). Called at startup.
@@ -105,9 +113,13 @@ pub fn start(spec: &str) -> Result<(), String> {
         std::thread::Builder::new().name("fwe-hv-record".into()).spawn(|| {
             loop {
                 fwe_kernel::procstore::Busy::new().sleep(std::time::Duration::from_millis(500));
+                if HEART.compare_exchange(BETWEEN, BEATING, SeqCst, SeqCst).is_err() {
+                    return;
+                }
                 let mut l = Line::new();
                 l.s("heartbeat runs ").dec(RUNS.load(SeqCst));
                 l.emit();
+                HEART.store(BETWEEN, SeqCst);
             }
         })
     })
@@ -252,6 +264,19 @@ impl Line {
             }
         }
     }
+}
+
+/// Record the process's end with status `code`: its record's last line. The
+/// heartbeat stops first (a line of it being written is waited for).
+pub fn exit(code: i32) {
+    if !active() {
+        return;
+    }
+    while let Err(BEATING) = HEART.compare_exchange(BETWEEN, STOPPED, SeqCst, SeqCst) {
+        // SAFETY: yields the processor; async-signal-safe.
+        unsafe { libc::sched_yield() };
+    }
+    Line::new().s("exit ").dec(code as u32 as u64).emit();
 }
 
 /// Record an event of the process (`what` and a detail).

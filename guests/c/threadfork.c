@@ -1,7 +1,7 @@
-/* A program with a second thread forks, and its child runs the program
- * its arguments name, which a single-threaded process starts in place:
- * Chromium starts its GPU process so, and that program then finds the
- * Mac's GPU through fwe's driver. The parent prints how the child ended. */
+/* A program with a second thread forks, and its child execs the program
+ * its arguments name: Chromium starts its GPU process so, and that program
+ * then finds the Mac's GPU through fwe's driver. The parent prints how the
+ * child ended. */
 typedef unsigned long pthread_t;
 int pthread_create(pthread_t *t, const void *attr, void *(*f)(void *), void *arg);
 int fork(void);

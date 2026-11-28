@@ -22,7 +22,7 @@ current limitations, in
 | M4 Compatibility | Done |
 | M5 Release | Done but for the first release (the owner's) |
 | M6 Native speed and coverage | Under way: PRs 1 and 2 done |
-| M7 Graphical programs and sandboxes | Under way: PRs 1, 2 and 3 done |
+| M7 Graphical programs and sandboxes | Under way: PRs 1, 2, 3 and 7 done |
 | M8 Virtual networking | After 1.0 |
 
 ## Done
@@ -53,7 +53,8 @@ current limitations, in
 - **M6 PR 2 — Kernel state in memory:** the process store, shared
   records, a file store for tmpfs, `/dev/shm`, memfds and the cgroup tree
   in memory every fwe process maps, or in macOS's own objects, none of it
-  on disk; System V semaphores, messages and segments within 3× macOS.
+  on disk; System V semaphores and messages within 3× macOS, segments
+  3.5×.
 - **M7 PR 1 — A display:** X11 clients on an X server on the Mac
   (XQuartz, Xvfb), `MIT-SHM` where the server takes segments by
   descriptor; Weston and Xwayland in the guest; demo programs
@@ -73,6 +74,15 @@ current limitations, in
   under fwe, drawing through WebKitGTK; Chromium's page load and video
   frames benchmarked against Chrome for Testing on macOS, Electron's
   start-up against its macOS build.
+- **M7 PR 7 — Sound:** PulseAudio's, ALSA's (through ALSA's PulseAudio
+  plugin) and PipeWire's (through its PulseAudio tunnel) programs play
+  on a PulseAudio server on the Mac, which a guest reaches at the system
+  server's socket, its first packet sent with the Mac user's cookie and
+  no shared memory; Chromium and Firefox play the test video's sound,
+  Extreme Tux Racer and Xonotic their music, OpenTTD for Windows its
+  sounds in the VM, checked in CI by what the server's null sink
+  records; a stream's latency and underruns benchmarked against the same
+  PulseAudio release's client on macOS.
 
 ## Left to 1.0
 
@@ -92,8 +102,10 @@ Budgets, held in CI against native macOS on the same runner:
 | Benchmark | Budget |
 |---|---|
 | a system call (`getpid`, `fstat`, `stat`, `open`+`close`, `pread`, `mmap`+`munmap`; one thread and several) | 1.5× |
-| thread create and join; `fork` + exit + wait; `fork` + `exec` + wait; start-up | 3× |
-| SQLite, git, a JDK at work, Node.js, LuaJIT, an X frame and round trip | 1.5× |
+| thread create and join; `fork` + exit + wait; start-up | 3× |
+| `fork` + `exec` + wait (each `execve` in a fork child starts a fresh fwe) | 4× |
+| git (its commands run by `fork` and `exec`) | 2× |
+| SQLite, a JDK at work, Node.js, LuaJIT, an X frame and round trip | 1.5× |
 | a C build (Lua), a Lua script, a Python script, xz | fwe's share of CPU samples 1.2× |
 | translated code (calls and returns, a switch, calls through a register, a loop) against the same code natively | 1.3× |
 | a function made at run time and run (no native counterpart) | 2 µs |
@@ -130,9 +142,12 @@ hold 0.5× macOS (unless the directory cache is not planned), and
 - [ ] **Fewer mappings to fork:** fwe's code cache, tables and descriptor
   room made on first use, in as few host regions as they can be.
 - [ ] **`rt_sigreturn` through the gate,** without a host signal.
+- [ ] **A fork child's `execve` started faster:** the fresh fwe it starts
+  takes what it needs from its parent without looking it up again, and the
+  forked address space it leaves is small to tear down.
 
-**Done when:** `fork` + exit + wait holds 2× macOS and a handled
-`SIGSEGV` 2×.
+**Done when:** `fork` + exit + wait holds 2× macOS, `fork` + `exec` + wait
+3×, git 1.5× (its budget back from 2×), and a handled `SIGSEGV` 2×.
 
 #### PR 6 — 4 KiB pages natively
 
@@ -167,9 +182,26 @@ hold 1.5×.
   the code beyond reach and what it calls costs as native code does.
 - [ ] **Kept translations brought in at the cost of a native page's first
   run,** not one lookup per block.
+- [ ] **A video frame's cost found:** where fwe's 1.4-1.8 ms per decoded
+  and drawn frame goes against macOS's 0.56-1.27 ms (translated code,
+  the media thread's hand-offs to the main thread), counted, and cut.
 
-**Done when:** Chromium's page load holds 1.5× Chrome for Testing on
-macOS, its budget back from 3×.
+**Done when:** Chromium's page load and video frame each hold 1.5× Chrome
+for Testing on macOS, their budgets back from 3×.
+
+#### PR 9 — Steady benchmarks
+
+- [ ] **Each row's spread measured:** rounds under fwe and natively
+  interleaved, more of them for rows whose rounds spread (the JDK's,
+  2.4-fold between rounds of one run), a figure's spread across runs
+  recorded beside it.
+- [ ] **Judged on what fwe costs:** a multithreaded workload's CPU time
+  beside its wall time, and the median beside the best round.
+- [ ] **Budgets for every row with a native counterpart:** PostgreSQL,
+  a handled `SIGSEGV` (M6 PR 5's), files' lives in `/tmp`.
+
+**Done when:** ten consecutive benchmark runs on main pass, each row's
+spread across them in the summary.
 
 ### M7 — Graphical programs and sandboxes
 
@@ -178,11 +210,18 @@ checking what it draws by screenshot.
 
 #### PR 4 — Graphical Wine
 
-- [ ] Wine's Notepad, Minesweeper and `regedit`, and a Direct3D demo,
-  natively through Wine's X11 driver, Direct3D on the GPU through DXVK
-  and VKD3D-Proton.
+Natively, so after M6 PRs 6 and 7 (the VM has no GPU).
 
-**Done when:** they draw in CI, the demo on the GPU.
+- [ ] **Direct3D's way to the GPU chosen by a probe:** what DXVK and
+  VKD3D-Proton need of Vulkan against what MoltenVK has (geometry
+  shaders and transform feedback among them); fwe's driver gives what
+  they lack, or Direct3D goes through Wine's OpenGL on Zink once PR 6
+  gives OpenGL 3.
+- [ ] Wine's Notepad, Minesweeper and `regedit`, and a Direct3D demo,
+  natively through Wine's X11 driver, the demo on the GPU.
+
+**Done when:** they draw in CI, the demo on the GPU, and the probe's
+findings are in the docs.
 
 #### PR 5 — gVisor on fwe
 
@@ -203,13 +242,32 @@ programs need on the GPU is made to work on it.
 - [ ] **Browsers on the GPU:** Firefox's WebGL 1 and 2 by Zink, and
   Chromium's GPU process by ANGLE on Vulkan, drawing pages on the Mac's
   GPU.
+- [ ] **GPU memory between processes,** where Chromium's compositing
+  needs it (its GPU process and renderers): external memory and
+  semaphore descriptors, or what the probe shows Chromium uses instead.
 - [ ] **Zed on the GPU:** its shaders compile on MoltenVK, whose
   translation to Metal passes a structure's array member where a
   function takes `spvUnsafeArray` (Metal's compiler refuses it).
+- [ ] **Games' OpenGL on the GPU:** Extreme Tux Racer and Xonotic
+  through Zink, one of Tux Racer's shaders not building on MoltenVK
+  now, so the README's examples draw on the GPU rather than in Xephyr
+  on the CPU.
 
 **Done when:** both browsers' WebGL names the Mac's GPU and draws the
-test page in CI, antialiased, Chromium composites on the GPU, and Zed
-edits a file on the GPU.
+test page in CI, antialiased, Chromium composites on the GPU, Zed edits
+a file on the GPU, and the README's games draw on it.
+
+### Across milestones — every test, every run
+
+#### PR 1 — No intermittent failures
+
+- [ ] **Each failure seen, reproduced and fixed at its cause,** with its
+  rate: the Vulkan loader test, Chromium's video, Wine's Notepad in the
+  VM, and those found running the suites again and again.
+- [ ] **The VM's calls traced** as a native run's are, so its failures
+  leave evidence.
+
+**Done when:** ten consecutive full CI runs pass with no job run again.
 
 ## After 1.0
 
@@ -270,6 +328,11 @@ so programs that probe for them fall back.
 - **Setting the initial UTS namespace's names:** they are the Mac's.
 - **CPU affinity:** accepted, pins nothing.
 - **x86 binaries,** Linux or Windows.
+- **Wayland surfaces in fwe's Vulkan driver:** Wayland programs draw
+  through a compositor in the guest (Weston on the X display).
+- **The GPU in the VM:** the VM runs only programs linked below 4 GiB.
+- **The GPU in a fork child before `execve`:** the Mac's driver cannot
+  be used after a `fork`; the child gets one once it runs a program.
 - **kselftests and gVisor's suite as gates:** LTP is the gate.
 - **Translator techniques measured and not adopted:** lookups without a
   load (4096 functions 19.5–20.3 ns against the table's 19.7), inline

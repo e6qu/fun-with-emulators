@@ -10,7 +10,15 @@
 //!
 //! Such a socket is an X connection ([`connected`]), whose requests fwe
 //! follows as the client writes them ([`Stream`]): the connection's setup
-//! (its authorization), then each request's header and length. MIT-SHM's
+//! (its authorization), then each request's header and length. A setup
+//! with no authorization is sent with the host user's for the display (the
+//! entry for this host and the display's number in the Xauthority file X's
+//! library would read: fwe's `XAUTHORITY`, else `.Xauthority` in the
+//! user's home, [`authority_file`]), as `ssh -X` authorizes a
+//! forwarded client: a guest runs as the host user, who has the display,
+//! and a server that checks cookies (XQuartz) takes it with no cookie in
+//! the guest's root. A setup with an authorization of its own is sent as it
+//! is. MIT-SHM's
 //! `ShmAttach` names a System V segment by id, which the host server would
 //! look up among the host's segments; fwe's segments are files of its own
 //! ([`crate::sysvipc`]). So a `ShmAttach` is sent as `ShmAttachFd` (MIT-SHM
@@ -69,24 +77,124 @@ pub fn guest_display(value: &[u8]) -> Vec<u8> {
     }
 }
 
-/// The host display: as `DISPLAY` names it, and the display.
-static HOST: OnceLock<Option<(Vec<u8>, Display)>> = OnceLock::new();
+/// The host display: as `DISPLAY` names it, the display, and the
+/// `XAUTHORITY` fwe was given, if any.
+struct Host {
+    value: Vec<u8>,
+    display: Display,
+    authority: Option<Vec<u8>>,
+}
+
+static HOST: OnceLock<Option<Host>> = OnceLock::new();
 
 /// The host display is the one `value` (fwe's `DISPLAY` as the first fwe
-/// was given it) names, if any; set as fwe starts, and passed on to the
-/// fwe a guest's `execve` starts ([`host_value`]), whose environment is
-/// the guest's.
-pub fn set_host(value: Option<&[u8]>) {
-    let _ = HOST.set(value.and_then(|v| parse(v).map(|d| (v.to_vec(), d))));
+/// was given it) names, if any, its authorizations in the file
+/// `authority` names (the first fwe's `XAUTHORITY`) or else the user's
+/// ([`authority_file`]); set as fwe starts, and passed on to the fwe a
+/// guest's `execve` starts ([`host_value`], [`host_authority`]), whose
+/// environment is the guest's.
+pub fn set_host(value: Option<&[u8]>, authority: Option<&[u8]>) {
+    let host = value.and_then(|v| {
+        parse(v).map(|display| Host {
+            value: v.to_vec(),
+            display,
+            authority: authority.filter(|a| !a.is_empty()).map(<[u8]>::to_vec),
+        })
+    });
+    let _ = HOST.set(host);
 }
 
 /// The host display's `DISPLAY`, to pass on.
 pub fn host_value() -> Option<&'static [u8]> {
-    HOST.get().and_then(Option::as_ref).map(|(v, _)| &v[..])
+    HOST.get().and_then(Option::as_ref).map(|h| &h.value[..])
+}
+
+/// The `XAUTHORITY` the first fwe was given, to pass on.
+pub fn host_authority() -> Option<&'static [u8]> {
+    HOST.get().and_then(Option::as_ref).and_then(|h| h.authority.as_deref())
 }
 
 fn host_display() -> Option<&'static Display> {
-    HOST.get().and_then(Option::as_ref).map(|(_, d)| d)
+    HOST.get().and_then(Option::as_ref).map(|h| &h.display)
+}
+
+/// The host user's Xauthority file, as X's library finds it: `XAUTHORITY`,
+/// or `.Xauthority` in the user's home, but for the home being the
+/// password database's: fwe's `HOME` is the guest's (`/root`, say), as a
+/// forwarded client's is not the X server's user's.
+fn authority_file() -> Option<Vec<u8>> {
+    if let Some(file) = host_authority() {
+        return Some(file.to_vec());
+    }
+    Some([crate::host::user_home()?, b"/.Xauthority"].concat())
+}
+
+/// The authorization name X's library offers servers it has a cookie for.
+const COOKIE: &[u8] = b"MIT-MAGIC-COOKIE-1";
+/// Xauthority's address families: a host's own (by its name), and any.
+const FAMILY_LOCAL: u16 = 256;
+const FAMILY_WILD: u16 = 65535;
+
+/// The `MIT-MAGIC-COOKIE-1` authorization of Xauthority file contents
+/// `file` for display `number` on host `hostname`: an entry of this host or
+/// of any, for that display, as X's library picks one (the first).
+fn cookie_in(file: &[u8], number: u32, hostname: &[u8]) -> Option<(Vec<u8>, Vec<u8>)> {
+    let mut at = 0;
+    let mut take = |n: usize| -> Option<&[u8]> {
+        let part = file.get(at..at + n)?;
+        at += n;
+        Some(part)
+    };
+    let number = number.to_string();
+    loop {
+        let family = u16::from_be_bytes(take(2)?.try_into().ok()?);
+        let mut field = || -> Option<Vec<u8>> {
+            let len = usize::from(u16::from_be_bytes(take(2)?.try_into().ok()?));
+            take(len).map(<[u8]>::to_vec)
+        };
+        let (address, display, name, data) = (field()?, field()?, field()?, field()?);
+        let here = family == FAMILY_WILD || (family == FAMILY_LOCAL && address == hostname);
+        if here && display == number.as_bytes() && name == COOKIE {
+            return Some((name, data));
+        }
+    }
+}
+
+/// This host's name, as X's library names a local display's host.
+fn hostname() -> Vec<u8> {
+    let mut name = [0u8; 256];
+    // SAFETY: a buffer of its length; the host NUL-terminates what fits.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
+        return Vec::new();
+    }
+    name.split(|&b| b == 0).next().unwrap_or_default().to_vec()
+}
+
+/// The host user's authorization for the host display, if the host's
+/// Xauthority file has one.
+fn host_cookie() -> Option<(Vec<u8>, Vec<u8>)> {
+    use std::os::unix::ffi::OsStrExt;
+    let file = std::fs::read(std::ffi::OsStr::from_bytes(&authority_file()?)).ok()?;
+    cookie_in(&file, host_display()?.number, &hostname())
+}
+
+/// A connection setup's fixed 12 bytes `head` (its authorization empty)
+/// with authorization `auth` after them, in the setup's byte order.
+fn authorized_setup(head: &[u8], (name, data): &(Vec<u8>, Vec<u8>)) -> Vec<u8> {
+    let big_endian = head[0] == b'B';
+    let u16_of = |n: usize| {
+        let n = n as u16;
+        if big_endian { n.to_be_bytes() } else { n.to_le_bytes() }
+    };
+    let mut setup = head[..6].to_vec();
+    setup.extend(u16_of(name.len()));
+    setup.extend(u16_of(data.len()));
+    setup.extend(&head[10..12]);
+    for part in [name, data] {
+        setup.extend(part);
+        setup.resize(pad4(setup.len()), 0);
+    }
+    setup
 }
 
 /// The host socket a guest Unix socket name stands for, if it names the
@@ -285,6 +393,11 @@ impl Stream {
         }
     }
 
+    /// Whether the client has sent nothing yet.
+    fn unstarted(&self) -> bool {
+        self.phase == Phase::SetupHead && self.head.is_empty()
+    }
+
     /// The client sent `len` more bytes.
     fn advance(&mut self, len: u64, byte: impl Fn(u64) -> u8) {
         self.walk(len, byte, |_| Flow::Pass);
@@ -298,31 +411,21 @@ struct Conn {
     stream: Stream,
 }
 
-/// The X connections of this process, by socket (its inode).
-static CONNS: Mutex<Option<HashMap<u64, Conn>>> = Mutex::new(None);
-
-/// Whether this process has made an X connection: until it has, a write
-/// is not looked at.
-static ANY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The X connections of this process.
+static CONNS: crate::sockstate::Followed<Conn> = crate::sockstate::Followed::new();
 
 /// MIT-SHM's request number at each server (by socket), if it takes
 /// descriptors (1.2); asked once.
 static SHM: Mutex<Option<HashMap<Vec<u8>, Option<u8>>>> = Mutex::new(None);
 
-fn inode(fd: i32) -> Option<u64> {
-    // SAFETY: an all-zero `stat` is a valid out-parameter.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    // SAFETY: `st` is a valid out-parameter.
-    (unsafe { libc::fstat(fd, &mut st) } == 0).then_some(st.st_ino)
-}
-
 /// Socket `fd` is now connected to the host display's socket `socket`.
 pub fn connected(fd: i32, socket: &[u8]) {
-    let Some(ino) = inode(fd) else { return };
-    ANY.store(true, std::sync::atomic::Ordering::Relaxed);
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    c.get_or_insert_with(HashMap::new)
-        .insert(ino, Conn { socket: socket.to_vec(), stream: Stream::default() });
+    CONNS.start(fd, Conn { socket: socket.to_vec(), stream: Stream::default() });
+}
+
+/// Socket `n`'s last descriptor here was closed.
+pub fn gone(n: u32) {
+    CONNS.gone(n);
 }
 
 /// The `k`th byte of the host buffers `iov`.
@@ -351,17 +454,34 @@ pub fn write(
     iov: &[libc::iovec],
     mut send: impl FnMut(&[libc::iovec]) -> i64,
 ) -> Option<i64> {
-    if !ANY.load(std::sync::atomic::Ordering::Relaxed) {
-        return None;
-    }
-    let ino = inode(fd)?;
-    let (socket, stream) = {
-        let c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-        let conn = c.as_ref()?.get(&ino)?;
-        (conn.socket.clone(), conn.stream.clone())
-    };
+    let (socket, stream) = CONNS.with(fd, |conn| (conn.socket.clone(), conn.stream.clone()))?;
     let total: u64 = iov.iter().map(|v| v.iov_len as u64).sum();
     let byte = |k| byte_of(iov, k);
+    // The setup, whole in this write and with no authorization: sent with
+    // the host user's, the rest after it as any write is.
+    if stream.unstarted()
+        && total >= 12
+        && (6..10).all(|k| byte(k) == 0)
+        && let Some(auth) = host_cookie()
+    {
+        let head = bytes_of(iov, 0, 12);
+        if !send_all(fd, &authorized_setup(&head, &auth), None) {
+            return Some(fwe_abi::err(crate::host::last_errno().linux()));
+        }
+        CONNS.with(fd, |conn| {
+            conn.stream.advance(12, byte);
+            conn.stream.auth = Some(auth);
+        });
+        if total == 12 {
+            return Some(12);
+        }
+        let rest = crate::iovecs_part(iov, 12, total - 12);
+        return Some(match write(fd, &rest, send) {
+            Some(r) if r < 0 => 12,
+            Some(r) => 12 + r,
+            None => 12,
+        });
+    }
     let major = stream.auth.as_ref().and_then(|auth| shm_major(&socket, auth));
     let found = major.map_or(Found::None, |m| stream.find_attach(total, byte, m));
     let (upto, attach) = match found {
@@ -386,10 +506,7 @@ pub fn write(
     {
         sent += SHM_ATTACH_LEN;
     }
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = c.as_mut().and_then(|c| c.get_mut(&ino)) {
-        conn.stream.advance(sent, byte);
-    }
+    CONNS.with(fd, |conn| conn.stream.advance(sent, byte));
     Some(sent as i64)
 }
 
@@ -397,13 +514,8 @@ pub fn write(
 /// message with control data, sent as it was): followed if it is an X
 /// connection.
 pub fn sent(fd: i32, iov: &[libc::iovec], sent: i64) {
-    if sent <= 0 || !ANY.load(std::sync::atomic::Ordering::Relaxed) {
-        return;
-    }
-    let Some(ino) = inode(fd) else { return };
-    let mut c = CONNS.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(conn) = c.as_mut().and_then(|c| c.get_mut(&ino)) {
-        conn.stream.advance(sent as u64, |k| byte_of(iov, k));
+    if sent > 0 {
+        CONNS.with(fd, |conn| conn.stream.advance(sent as u64, |k| byte_of(iov, k)));
     }
 }
 
@@ -427,12 +539,12 @@ fn attach_fd(fd: i32, major: u8, req: &[u8], big_endian: bool) -> bool {
     out.extend(if big_endian { seg.to_be_bytes() } else { seg.to_le_bytes() });
     out.extend([read_only, 0, 0, 0]);
     // (The server holds its own copy; this one is closed after.)
-    send_with_fd(fd, &out, file)
+    send_all(fd, &out, Some(file))
 }
 
-/// Send `data` on `fd` whole, descriptor `pass` with its first byte,
-/// waiting for room as a blocking socket would.
-fn send_with_fd(fd: i32, data: &[u8], pass: i32) -> bool {
+/// Send `data` on `fd` whole (descriptor `pass`, if any, with its first
+/// byte), waiting for room as a blocking socket would.
+fn send_all(fd: i32, data: &[u8], pass: Option<i32>) -> bool {
     let mut at = 0;
     while at < data.len() {
         let mut iov =
@@ -443,7 +555,9 @@ fn send_with_fd(fd: i32, data: &[u8], pass: i32) -> bool {
         let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
         msg.msg_iov = &mut iov;
         msg.msg_iovlen = 1;
-        if at == 0 {
+        if at == 0
+            && let Some(pass) = pass
+        {
             // SAFETY: CMSG_SPACE only computes a size.
             let space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<i32>() as u32) };
             msg.msg_control = control.as_mut_ptr().cast();
@@ -591,6 +705,57 @@ mod tests {
         assert_eq!(d(":x"), None);
         assert_eq!(guest_display(b"/private/tmp/com.apple.launchd.ab12/org.xquartz:0"), b":0");
         assert_eq!(guest_display(b":99.1"), b":99.1");
+    }
+
+    /// An Xauthority file's entry, as `xauth` writes it.
+    fn entry(family: u16, address: &[u8], number: &[u8], name: &[u8], data: &[u8]) -> Vec<u8> {
+        let mut e = family.to_be_bytes().to_vec();
+        for part in [address, number, name, data] {
+            e.extend((part.len() as u16).to_be_bytes());
+            e.extend(part);
+        }
+        e
+    }
+
+    #[test]
+    fn the_cookie_is_this_hosts_for_the_display() {
+        let file = [
+            entry(FAMILY_LOCAL, b"other.local", b"0", COOKIE, &[1; 16]),
+            entry(FAMILY_LOCAL, b"mac.local", b"1", COOKIE, &[2; 16]),
+            entry(FAMILY_LOCAL, b"mac.local", b"0", b"XDM-AUTHORIZATION-1", &[3; 16]),
+            entry(FAMILY_LOCAL, b"mac.local", b"0", COOKIE, &[4; 16]),
+            entry(FAMILY_WILD, b"", b"7", COOKIE, &[5; 16]),
+        ]
+        .concat();
+        let cookie = |n, host: &[u8]| cookie_in(&file, n, host).map(|(_, d)| d[0]);
+        assert_eq!(cookie(0, b"mac.local"), Some(4));
+        assert_eq!(cookie(1, b"mac.local"), Some(2));
+        assert_eq!(cookie(7, b"mac.local"), Some(5), "any host's");
+        assert_eq!(cookie(2, b"mac.local"), None);
+        assert_eq!(cookie(0, b"another"), None);
+        // A file cut short holds what came before the cut.
+        assert_eq!(cookie_in(&file[..file.len() - 3], 0, b"mac.local").map(|(_, d)| d[0]), Some(4));
+        assert_eq!(cookie_in(&[], 0, b"mac.local"), None);
+    }
+
+    #[test]
+    fn a_setup_without_authorization_takes_the_cookie() {
+        let auth = (COOKIE.to_vec(), vec![9; 16]);
+        let head = &setup(b"", b"")[..12];
+        let made = authorized_setup(head, &auth);
+        assert_eq!(made, setup(COOKIE, &[9; 16]));
+        let mut s = Stream::default();
+        walked(&mut s, &made);
+        assert_eq!(s.auth, Some(auth.clone()));
+        // A big-endian client's lengths in its order.
+        let mut big = vec![b'B', 0, 0, 11, 0, 0, 0, 0, 0, 0, 0, 0];
+        let made = authorized_setup(&big, &auth);
+        big[6..8].copy_from_slice(&18u16.to_be_bytes());
+        big[8..10].copy_from_slice(&16u16.to_be_bytes());
+        assert_eq!(&made[..12], &big[..]);
+        assert_eq!(made.len(), 12 + 20 + 16);
+        assert!(Stream::default().unstarted());
+        assert!(!s.unstarted());
     }
 
     #[test]

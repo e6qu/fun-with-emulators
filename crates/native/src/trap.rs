@@ -1261,6 +1261,7 @@ const ESR_EC_PC_ALIGNMENT: u32 = 0x22;
 const ESR_EC_SP_ALIGNMENT: u32 = 0x26;
 
 extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    let began = fwe_kernel::timing::call_began();
     fwe_kernel::timing::signal(sig);
     // A process that sends itself one of these signals has it emulated (see
     // `Kernel::sys_kill`), so here it is a fault, or a signal sent by
@@ -1270,6 +1271,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // signal for the guest, whatever this thread was running. (A genuine
     // fault that coincides with a note faults again, without one.)
     if let Some(note) = fwe_kernel::signote::take(sig) {
+        fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Sent, began);
         let lsig = host::signal_to_linux(sig);
         take_async(sig, || host::sent_info(lsig, note), ctx, guest_interrupted(ctx));
         return;
@@ -1286,6 +1288,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         // SAFETY: the kernel passes a valid ucontext for SA_SIGINFO handlers.
         let esr = unsafe { (*(*(ctx as *mut Ucontext)).uc_mcontext).es.esr };
         if !matches!((esr >> 26) & 0x3f, 0x20 | 0x21 | 0x22 | 0x24 | 0x25 | 0x26) {
+            fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Sent, began);
             // SAFETY: `info` is valid for SA_SIGINFO handlers.
             if unsafe { (*info).si_code } > 0 && unsafe { (*info).si_code } < 0x10000 {
                 return;
@@ -1308,6 +1311,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         let (ss, addr) =
             unsafe { (&mut (*(*(ctx as *mut Ucontext)).uc_mcontext).ss, (*info).si_addr() as u64) };
         if x18_restart(ss, addr) {
+            fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::X18, began);
             return;
         }
     }
@@ -1320,6 +1324,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         // SAFETY: `info` is valid for SA_SIGINFO handlers.
         let addr = unsafe { (*info).si_addr() } as u64;
         if fwe_kernel::lazycode::fault(ss.pc, addr) {
+            fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::FirstRun, began);
             return;
         }
     }
@@ -1330,6 +1335,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
             // A guest pointer the kernel was copying through was bad: the
             // copy reports EFAULT.
             ss.pc = resume;
+            fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Copy, began);
             return;
         }
         // Anywhere else in fwe's own code (the kernel lock might be held):
@@ -1360,6 +1366,7 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         regs.pc += 4;
         settle(&mut regs);
         regs_to(mc, &regs);
+        fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Emulated, began);
         // SAFETY: `ctx` is this handler's ucontext.
         unsafe { return_with_guest_mask(ctx) };
         return;
@@ -1377,17 +1384,20 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
         .fold(0, |m, r| m | 1 << r);
     if exec && let Some(t) = crate::jit::enter(addr, mc.ss.lr, held, (mc.ss.x[16], mc.ss.x[17])) {
         mc.ss.pc = t;
+        fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Translated, began);
         return;
     }
     // A page of a private mapping of a file with no name, first written:
     // it becomes a copy, and the write is tried again.
     let write = !exec && mc.es.esr & (1 << 6) != 0;
     if write && kernel().as_mut().is_some_and(|k| k.view_fault(addr)) {
+        fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Copied, began);
         return;
     }
     // Below a stack that grows down (`MAP_GROWSDOWN`): it grows, and the
     // access is retried.
     if sig == libc::SIGSEGV && !exec && kernel().as_mut().is_some_and(|k| k.stack_fault(addr)) {
+        fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Grown, began);
         return;
     }
     // An access the page allows now: another thread changed its protection
@@ -1396,8 +1406,10 @@ extern "C" fn on_fault(sig: libc::c_int, info: *mut libc::siginfo_t, ctx: *mut l
     // file's end) stands.
     let allowed = allowed_now(addr, mc.es.esr);
     if allowed && !fwe_kernel::mm::poisoned(addr) && stale_fault(addr) {
+        fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Stale, began);
         return;
     }
+    fwe_kernel::timing::faulted(fwe_kernel::timing::Fault::Guest, began);
 
     // Offer the fault to a guest handler; if one is installed, enter it.
     let mut regs = regs_from(mc);

@@ -239,6 +239,9 @@ jobs:
   # OpenGL's on the runner's GPU (Metal), through fwe's Vulkan driver on
   # MoltenVK: the runner's KosmicKrisp (Homebrew's Mesa, which xorg-server
   # brings) finds no device on its paravirtual GPU, so MoltenVK is named.
+  # Their sound, and that of Linux's sound clients (FWE_SOUND_TESTS), on
+  # the Mac's PulseAudio server (Homebrew's, `PULSEAUDIO`), recorded from
+  # its null sink.
   display:
     name: Display (macos-26)
     runs-on: macos-26
@@ -256,7 +259,7 @@ jobs:
           path: target/built-apps
           key: built-apps-${{ hashFiles('guests/apps/tauri/**', 'guests/apps/wails/**', 'guests/alpine/fetch/apps.txt') }}
       # Unicorn: the hypervisor stand-in, Wine's VM.
-      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools
+      - run: brew install xorg-server xdotool unicorn molten-vk vulkan-tools pulseaudio
       # The Mac's Vulkan drivers, each one's devices, and whether each has
       # what Zink needs (robustness2's nullDescriptor): a record of the
       # runner, which fails nothing.
@@ -267,20 +270,68 @@ jobs:
             VK_DRIVER_FILES="$icd" vulkaninfo 2>&1 \
               | grep -E "deviceName|driverName|apiVersion|nullDescriptor|ERROR|Cannot" | sort -u || true
           done
-      - name: The display tests
+      - name: The display and sound tests
         run: |
           export XVFB="$(brew --prefix)/bin/Xvfb"
           export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
           export FWE_VULKAN_DRIVER="$(brew --prefix)/etc/vulkan/icd.d/MoltenVK_icd.json"
-          cargo test -p fwe --test guests -- display_ --nocapture
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          cargo test -p fwe --test guests -- display_ sound_ --nocapture
         env:
           FWE_DISPLAY_TESTS: "1"
+          FWE_SOUND_TESTS: "1"
       # What each program said, its calls and its screenshots.
       - if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: display
           path: target/tmp/display
+
+  # The README's examples as written (README.md), on XQuartz's own server
+  # (`Xquartz`, as a Mac user's display is), their sound on Homebrew's
+  # PulseAudio (`PULSEAUDIO`), checked by xdotool and screenshots (libX11,
+  # `LIBX11`); its VM examples on the hypervisor stand-in (Unicorn). vkcube
+  # draws through fwe's Vulkan driver on MoltenVK, the Vulkan driver a user
+  # installs.
+  readme:
+    name: README examples (macos-26)
+    runs-on: macos-26
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: brew install --cask xquartz
+      # XQuartz's server starts its app's (`org.xquartz.X11`), which
+      # LaunchServices does not know of until it is registered or first
+      # opened: a server started before then finds no app and ends.
+      - run: /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f /Applications/Utilities/XQuartz.app
+      - run: brew install xdotool unicorn molten-vk pulseaudio
+      - name: The README's examples
+        run: |
+          /opt/X11/bin/Xquartz :4 -nolisten tcp > xquartz.log 2>&1 &
+          for i in $(seq 60); do [ -S /tmp/.X11-unix/X4 ] && break; sleep 1; done
+          if [ ! -S /tmp/.X11-unix/X4 ]; then
+            echo "::error::no XQuartz server after 60 s"
+            ps -axo pid,etime,command | grep -i -E "[x]quartz|[X]11" || true
+            ls -la /tmp/.X11-unix || true
+            cat xquartz.log
+            exit 1
+          fi
+          echo "XQuartz's socket after $i s"
+          export LIBX11="$(brew --prefix libx11)/lib/libX11.6.dylib"
+          export PULSEAUDIO="$(brew --prefix pulseaudio)/bin/pulseaudio"
+          cargo test -p fwe --test guests -- --exact readme_examples --nocapture
+        env:
+          FWE_README_DISPLAY: ":4"
+          FWE_README_VM: "1"
+      # What each example said and its screenshots, and the server's log.
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: readme
+          path: |
+            target/tmp/display
+            xquartz.log
 
   # Alpine's OpenJDK (fetched) compiling and running a multi-threaded
   # application natively: HotSpot's JIT, threads and garbage collector.
@@ -372,15 +423,16 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: target/bench-cache
-          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'guests/alpine/fetch/browsers.txt', 'guests/debian/fetch/apps.txt', 'guests/apps/fetch/upstream.txt', 'tools/bench/run.py') }}
+          key: bench-cache-${{ hashFiles('guests/alpine/fetch/clang.txt', 'guests/alpine/fetch/workloads.txt', 'guests/alpine/fetch/jdk.txt', 'guests/alpine/fetch/nodejs.txt', 'guests/alpine/fetch/luajit.txt', 'guests/alpine/fetch/display.txt', 'guests/alpine/fetch/browsers.txt', 'guests/debian/fetch/apps.txt', 'guests/debian/fetch/sound.txt', 'guests/apps/fetch/upstream.txt', 'tools/bench/run.py') }}
       - uses: actions/download-artifact@v4
         with:
           name: bench-linux
       - run: cargo build --release -p fwe
       - run: clang -O2 -Wno-deprecated-declarations -o bench-mac guests/c/bench.c
       # The native side's programs: the clang release Alpine's root has, and
-      # the workloads' programs (tools/bench/run.py, BREW), and an X server.
-      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers
+      # the workloads' programs (tools/bench/run.py, BREW), an X server, and
+      # a PulseAudio server and its client.
+      - run: brew install llvm@22 python@3.14 sqlite git xz openjdk@25 node@24 luajit postgresql@18 xorg-server molten-vk vulkan-tools vulkan-headers pulseaudio
       # The Vulkan benchmark for macOS, with Homebrew's headers.
       - run: clang -O2 -I"$(brew --prefix)/include" -o vkbench-mac tools/bench/vkbench.c
       - run: chmod +x bench vkbench && python3 tools/bench/run.py macos --fwe target/release/fwe --bench ./bench --native ./bench-mac --brew "$(brew --prefix)" --cache target/bench-cache --roots "$RUNNER_TEMP/bench-roots" --xvfb "$(brew --prefix)/bin/Xvfb" --vkbench ./vkbench --vkbench-native ./vkbench-mac --linux linux.json --out macos.json
@@ -391,6 +443,7 @@ jobs:
           path: |
             macos.json
             bench-*.sample
+            bench-*.sockets
             bench-*.vmmap
             bench-*.pcs
             bench-*.trace

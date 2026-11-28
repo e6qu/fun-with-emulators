@@ -49,6 +49,24 @@ impl std::fmt::Display for HostErrno {
 }
 
 /// The calling thread's host `errno`.
+/// The user's home on the Mac, the password database's (fwe's `HOME` can
+/// be the guest's): looked up once, as it is first needed (a request to
+/// the directory service, which takes milliseconds).
+pub fn user_home() -> Option<&'static [u8]> {
+    static HOME: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        // SAFETY: getpwuid takes no pointers; its result is read at once,
+        // under the once-lock, before another call can reuse it.
+        let pw = unsafe { libc::getpwuid(libc::getuid()) };
+        if pw.is_null() {
+            return None;
+        }
+        // SAFETY: a password entry's home, a C string while the entry lives.
+        Some(unsafe { std::ffi::CStr::from_ptr((*pw).pw_dir) }.to_bytes().to_vec())
+    })
+    .as_deref()
+}
+
 pub fn last_errno() -> HostErrno {
     HostErrno(std::io::Error::last_os_error().raw_os_error().unwrap_or(libc::EIO))
 }

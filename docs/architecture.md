@@ -175,7 +175,12 @@ guest's mappings (`set_validator`) and translated (`g2h`, `host_arg`)
 - `FWE_TIMING=1` prints to standard error how long each phase of a start,
   an `execve`, a `fork` (in parent and child) and a `wait` took, and the
   page faults each took (in a fork's child every page touched is one; in
-  the parent every page written while the child lives).
+  the parent every page written while the child lives). As a process
+  exits it prints its system calls by number with their time, the host
+  signals it took, the traps among them by what they were for, and the
+  fault signals by what fwe made of each (an `x18` group run again, a
+  first run of code, a fetch of translated code, a page copied, a stack
+  grown, the guest's own, and others) with their total and longest time.
 - All are passed on across `execve` and `fork`. A failed code preparation
   is noted with its reason (no room for stubs, say), and the guest gets
   `ENOMEM`.
@@ -220,11 +225,19 @@ Around the load:
   exec leaves them (`AuxIds`): the kernel computes them before an
   in-place `execve` loads the program, and a re-executed fwe reads them
   from its exec state before its kernel exists, in either backend.
-- **Checks before an `execve`:** an in-place `execve` checks the new
-  program first (an arm64 ELF that fits the address space, with a dynamic
-  linker that exists), so a bad one fails with the caller intact. A
-  re-exec checks only that it is an ELF file before the host `execve`, so
-  a later failure ends the process.
+- **Checks before an `execve`:** an `execve` of a native program checks
+  the new program first (an arm64 ELF that fits the address space, with a
+  dynamic linker that exists and is position-independent), whether it is
+  loaded in place or by a re-executed fwe, so a bad one fails with the
+  caller intact. One of a program for the VM checks only that it is an ELF
+  file before the host `execve`, so a later failure ends the process. The
+  program is read through the descriptor its permission checks were made
+  on (`Kernel::exec_file`): whole when it is loaded in place, and only as
+  far as its checks need when a re-executed fwe loads it
+  (`ProgramFile::head`: the ELF header, the program headers and the
+  dynamic linker's path; the whole of a non-PIE program linked below
+  4 GiB, whose move depends on its relocations). The dynamic linker's
+  check reads its head too.
 - **Busy programs** (`crates/kernel/src/textbusy.rs`): a page every fwe
   process maps holds each process's program and a ring of files recently
   opened for writing. Opening a running program's file to write, or
@@ -1362,9 +1375,13 @@ The Linux event descriptors are built on kqueues and pipes (mapping in
   again. The counter counts its writes too: an
   edge-triggered set sees the eventfd readable anew on each, as Linux
   wakes its waiters on each, though the pipe holds its one byte
-  throughout. Of the epoll and timerfd kqueues a fork child rebuilds, a
-  timer keeps its schedule, and one with an expiry due and unread is
-  readable in the child at once.
+  throughout. A duplicate (`dup`, `dup3`, `F_DUPFD`) is the same open
+  file: an eventfd's holds the pipe's write end and the counter as the
+  original does (all its state is in them), and a timerfd's shares the
+  schedule and the kqueue. Of the epoll and timerfd kqueues a fork child
+  rebuilds (one for a timerfd and its duplicates), a timer keeps its
+  schedule, and one with an expiry due and unread is readable in the
+  child at once.
 - **`EPOLLEXCLUSIVE`** (`crates/kernel/src/exclusive.rs`): a page every
   fwe process maps counts, for each pipe a set watches exclusively, its
   writes and the writes a waiter took. A set a write woke reports it only
@@ -1493,7 +1510,7 @@ Sockets and terminals are the host's; fwe translates their interfaces
   still hold it. fwe tells a slave's hang-up itself, by looking at the
   guest processes' descriptors.
 
-## Displays and the GPU
+## Displays, sound and the GPU
 
 How a Linux program's display and GPU map onto the Mac's is in
 [linux-on-macos.md](linux-on-macos.md#displays).
@@ -1503,7 +1520,11 @@ How a Linux program's display and GPU map onto the Mac's is in
 `crates/kernel/src/x11.rs`: a guest `connect` to the host's display
 (`net::root_unix_path`) reaches the server's socket. On such a connection
 fwe follows the client's bytes as it writes them: the setup (its
-authorization), then each request's header and length. A `ShmAttach`
+authorization), then each request's header and length. A write finds its
+connection by the socket's number in fwe's table of sockets
+(`sockstate::Followed`), with no question to the host, and the following
+ends with the socket's last descriptor; a process with no connection
+followed pays one load per write. A `ShmAttach`
 names a System V segment, which the server would look up among the
 host's; fwe's are files of its own, so it is sent as `ShmAttachFd` with
 the segment's file, which the server maps as the guest has it. Whether
@@ -1610,19 +1631,52 @@ command a program makes to the Mac's Vulkan driver in fwe's process.
   (`vulkan/objects.rs`, after the program's own settings), learnt from
   the driver's ID and the device's name on the first instance a process
   makes, which is made again so.
-- **`execve`** from a process with the driver in memory starts a fresh
+- **`execve`** from a process with the driver loaded starts a fresh
   fwe, with the driver's descriptors made close-on-exec
-  (`vulkan::device::before_exec`). A fork child never calls the driver
-  (macOS's libraries do not work in a fork child): its copies of its
-  parent's opens fail with `ENODEV`, and its own opens are refused while
-  the driver is in its memory; an `execve` gives it a device, in a fresh
-  fwe if its parent had the driver. A program started in place in the
-  child of a parent without the driver (Chromium's GPU process) loads it
-  there: fwe's executable carries the Objective-C runtime's mark that
-  classes' `+initialize` is safe in a fork child (`__DATA,__objc_fork_ok`,
-  in `crates/fwe/src/main.rs`), which the runtime otherwise refuses in the
-  child of any process that had threads. In the VM backend there is no
-  device.
+  (`vulkan::device::before_exec`). A fork child never calls the driver:
+  macOS's libraries work in a process only once it has been exec'd (in a
+  fork child, a pipeline Metal has not compiled before fails with
+  `XPC_ERROR_CONNECTION_INVALID`: its shader compiler is out of reach),
+  and the driver's threads and objects in its memory are its parent's.
+  Its copies of its parent's opens, and its own opens, fail with
+  `ENODEV`; its `execve` starts a fresh fwe, as every fork child's does
+  ([execve in linux-on-macos.md](linux-on-macos.md#execve)), whose
+  opens work. In the VM backend there is no device.
+
+### Sound
+
+`crates/kernel/src/pulse.rs`: the Mac's PulseAudio server is the guest's
+system-wide one. The server is the one fwe's `PULSE_SERVER` names (a
+Unix socket; fwe passes it, and `PULSE_COOKIE`, on to the fwe an
+`execve` starts, as the X display), else the socket Homebrew's server
+makes in the user's home (`.config/pulse/HOST-runtime/native`), found
+when a guest first names it. A guest `connect` to the system server's
+socket (`/run/pulse/native`, `/var/run/pulse/native`) reaches it
+(`net::root_unix_path`), and the connection is followed
+(`pulse::connected`, `sockstate::Followed`) until its first packet has
+gone. Its first packet, the client's `AUTH`, goes
+changed as it is written (`pulse::write`, before `x11::write` in
+`write`, `writev`, `sendto` and `sendmsg`): the Mac user's cookie (from
+`PULSE_COOKIE`, else `.config/pulse/cookie` in the home) in the guest's
+place, and the offer of shared memory and memfds taken out, so the sound
+goes over the socket. A packet written in pieces is changed as each
+piece passes, and a short send keeps what was sent. Later packets go as
+they are.
+
+ALSA's programs play through ALSA's PulseAudio plugin, PipeWire's
+through PipeWire's daemon in the guest and its PulseAudio tunnel to the
+system server's socket; PipeWire's graph wakes on eventfds and timerfds
+it duplicates, which share their counter and schedule
+([Event descriptors](#event-descriptors-and-inotify)).
+
+Limitations:
+
+- There is no ALSA device (`/dev/snd`): a program that opens one finds
+  none, and only ALSA's PulseAudio plugin plays.
+- The Mac's server takes no shared memory of the guest's, so every
+  client's sound is copied through the socket.
+- A server named by TCP (`PULSE_SERVER=tcp:…`) is reached as any host
+  connection, its cookie the guest's own.
 
 ## Containers
 

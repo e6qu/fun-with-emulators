@@ -227,8 +227,9 @@ rewritten as it is mapped executable.
 A program can `execve` one of the other kind: a shell in the VM runs a
 native `ls`, a native `make` runs a low-linked `gcc`. fwe then re-executes
 itself on the new program, and the fresh `fwe` decides again; only a
-native program execing a native one can be replaced in place
-([execve](#execve) has when, and what crosses).
+native program execing a native one, in a process that is not a fork
+child, can be replaced in place ([execve](#execve) has when, and what
+crosses).
 
 ## Which instructions get translated, and how
 
@@ -708,7 +709,7 @@ for a well-known property only.
 | VM, compilers | Debian's GCC 14 (`gcc`, `cc1`, `collect2`) (tested) | non-PIE, linked low; GNU `as` and `ld` are PIEs and run natively, so every compiler stage is an `execve` between the backends |
 | VM, Go toolchain | Debian's Go 1.24: `go`, `compile`, `link`, and the static executables it builds by default (tested) | linked low, non-PIE; `go` starts its tools with `vfork` |
 | VM, container engine | Debian's podman 5.4 with its conmon and crun (tested) | podman is non-PIE, linked low; conmon and crun are PIEs and run natively; the pause process's `catatonit` is static and non-PIE, in the VM too |
-| fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` that changes backend or starts in the VM re-executes fwe |
+| fork and exec heavy | bash scripts, `apt` running `dpkg`, the GCC driver, the `go` command (tested) | each child a host `fork` (native) or a new fwe process (VM); each `execve` in a fork child re-executes fwe |
 | system-call heavy | lighttpd serving files and CGI, git (tested) | many small reads, writes and `epoll` waits: each a call into fwe's gate natively, a VM exit in the VM |
 | uses `x18` as Linux allows | hand-written assembly that allocates it; Wine on arm64, which keeps the Windows thread block in `x18` (tested, in the VM) | natively each use goes through a stub (in code made executable at run time, its translation's expansion); in the VM `x18` is the guest's own |
 
@@ -1200,8 +1201,10 @@ are the child's own.
 
 **vfork** (`CLONE_VM | CLONE_VFORK`, used by `posix_spawn`, `vfork`, Go's
 `os/exec`): the same host fork with the guest's private memory inherited
-by sharing. The parent waits on a close-on-exec pipe only the child holds,
-so it resumes when the child execs or exits and sees what the child wrote.
+by sharing. The parent waits on a pipe only the child holds (its `execve`
+closes it, and a child it forks does not keep it), so it resumes when the
+child execs or exits, whatever the child started, and sees what the child
+wrote.
 fwe's own memory is not shared, so the child's `mmap` and `munmap` stay
 its own. Natively, `CLONE_VM` without `CLONE_VFORK` is the same fork
 without the wait; the VM backend refuses it (`ENOSYS`), since the same
@@ -1272,15 +1275,21 @@ A new thread starts with its creator's registers and signal mask, `x0` =
 Linux replaces the address space in place. fwe does so where it can
 ([Across execve](#across-execve) says when); otherwise it runs the host's
 `execve` on `fwe` itself, passing what has to survive on the command line,
-and the new fwe picks the backend:
+and the new fwe picks the backend. A host fork child always takes the
+host's `execve`: macOS's libraries work in a process only once it has
+been exec'd since its fork (in a fork child, Metal's shader compiler is
+out of reach), so a program a shell starts gets a process they work in.
+That costs about 2 ms more per `execve` than loading in place:
 
 ```mermaid
 flowchart TD
-    e["guest execve(path)"] --> how{"VM backend, program needs the VM, other live threads, or the Mac's Vulkan driver in memory?"}
-    how -- no --> chk{"new program valid? (arm64 ELF that fits, interpreter exists)"}
+    e["guest execve(path)"] --> vm{"program needs the VM, or VM backend?"}
+    vm -- no --> chk{"new program valid? (arm64 ELF that fits, interpreter exists)"}
     chk -- no --> fail["error returned, caller intact"]
-    chk -- yes --> inplace["native, in place: unmap tracked guest memory, close CLOEXEC fds, load new image, all registers zero"]
-    how -- yes --> elf{"an ELF file?"}
+    chk -- yes --> how{"a host fork child, other live threads, or the Mac's Vulkan driver loaded?"}
+    how -- no --> inplace["native, in place: unmap tracked guest memory, close CLOEXEC fds, load new image, all registers zero"]
+    how -- yes --> reexec
+    vm -- yes --> elf{"an ELF file?"}
     elf -- no --> fail
     elf -- yes --> reexec["host execve of fwe itself with --exec-state, --guest-path, --root, --cwd, --argv0 and the trace and VM options"]
     reexec --> pick["new fwe picks the backend the program needs"]
@@ -1619,11 +1628,27 @@ the one fwe's own `DISPLAY` names (`crates/kernel/src/x11.rs`):
 | Linux | macOS | fwe |
 |---|---|---|
 | `DISPLAY=:N`, the server's socket `/tmp/.X11-unix/XN` and the abstract name `@/tmp/.X11-unix/XN` libxcb tries first | the host server's socket: Xvfb's or Xorg's `/tmp/.X11-unix/XN`, XQuartz's launchd socket `/private/tmp/com.apple.launchd.…/org.xquartz:N` | either name, in any root and from every process of the run (a VM's fork children too), reaches the host server's socket; the guest's `DISPLAY` is `:N` (XQuartz's path shortened to it) |
+| the client's authorization: the cookie for the display in its user's Xauthority file (`XAUTHORITY`, else `~/.Xauthority`), which a server that checks cookies needs | XQuartz checks them, its cookies in the Mac user's Xauthority file; Xvfb, run without one, takes any client | a setup with no authorization goes with the Mac user's cookie for the display (fwe's `XAUTHORITY`, else `.Xauthority` in the user's home), as `ssh -X` authorizes a forwarded client; one with an authorization of its own goes as it is; the guest's environment has no `XAUTHORITY` of fwe's, a path of the Mac's |
 | another display, its socket in the guest's `/tmp/.X11-unix` (an Xwayland a compositor starts, an Xvfb the guest runs) | — | the guest's own, a Unix socket in its root like any other (a server's TCP port is the host's) |
 | MIT-SHM's `ShmAttach`: the server attaches the client's System V segment by id | its own segments, which are not fwe's | sent as `ShmAttachFd` (MIT-SHM 1.2) with the segment's file, so the server draws from the guest's pages uncopied; a server without 1.2 gets the `ShmAttach` as it was |
 | `DISPLAY=host:N` (TCP) | the host's network | a host connection, as any other |
 | Wayland: a compositor's socket in `XDG_RUNTIME_DIR` | none | the guest's own compositor (Weston), drawing as an X client |
 | GPU rendering: a Vulkan driver the loader finds by its manifest in `/usr/share/vulkan/icd.d` or `/etc/vulkan/icd.d`, which talks to the GPU's kernel driver through `/dev/dri` | Metal; Vulkan through MoltenVK or KosmicKrisp, in the process | fwe's Linux Vulkan driver in `/etc/vulkan/icd.d`, whose every command reaches the Mac's Vulkan driver in fwe's process through one ioctl on `/dev/fwe-gpu` (see [Devices](#devices)); OpenGL through Mesa's Zink on it; frames reach the X server as copies |
+
+#### Sound
+
+A Linux program plays sound through a sound server it reaches by a Unix
+socket (PulseAudio, or PipeWire's PulseAudio layer), or through ALSA's
+devices. macOS has neither, but runs PulseAudio (Homebrew's, playing on
+CoreAudio). fwe hands the guest the Mac's server as the system-wide one
+(`crates/kernel/src/pulse.rs`):
+
+| Linux | macOS | fwe |
+|---|---|---|
+| a client finds its server by `PULSE_SERVER`, its user's runtime directory, then the system server's socket `/run/pulse/native` | Homebrew's server's socket at `~/.config/pulse/HOST-runtime/native`, or where `PULSE_SERVER` names one | the system server's socket, `/run/pulse/native` or `/var/run/pulse/native`, in any root, reaches the Mac's server: the one fwe's `PULSE_SERVER` names (a Unix socket), else the default one; where fwe's names one, the guest's `PULSE_SERVER` is `unix:/run/pulse/native` |
+| the client's `AUTH`: its cookie, and shared memory and memfds offered for the sound | the server knows a client only by its cookie (it takes no socket credentials), and maps no segment of fwe's | the first packet goes with the Mac user's cookie (fwe's `PULSE_COOKIE`, else `.config/pulse/cookie` in the user's home) and no shared memory offered: the sound travels over the socket; the guest's environment has no `PULSE_COOKIE` of fwe's, a path of the Mac's |
+| ALSA's programs: a device in `/dev/snd`, or ALSA's PulseAudio plugin (`-D pulse`) | no ALSA | no `/dev/snd`: they play through the plugin |
+| PipeWire's programs: the PipeWire daemon, which plays on ALSA or forwards to a PulseAudio server (`libpipewire-module-pulse-tunnel`) | none | the daemon in the guest, with its PulseAudio tunnel to the system server's socket |
 
 ### Kernel-wide state
 
@@ -1649,7 +1674,8 @@ fwe build never reads it, and what no live process holds is collected
 ([architecture.md](architecture.md)).
 
 What it costs (micro benchmarks of `tools/bench/run.py`, on CI's macOS 26
-and Linux arm64 runners; the System V calls' budget is 3x macOS's):
+and Linux arm64 runners; the System V calls' budget is 3x macOS's, a
+segment's 3.5x, as that ratio moves with the runner's speed):
 
 | Benchmark | fwe | macOS | Linux |
 |---|---|---|---|
@@ -2520,7 +2546,7 @@ sees the message:
 | netlink socket | the same socket, answered through the same host end, for the namespace it was made in |
 | process descriptor | a kqueue of its own watching the same process (a `PIDFD_THREAD` one of another process's thread watches that process) |
 | `SOCK_SEQPACKET` socket | itself: its buffer size says what it is |
-| a file of fwe's store (a memfd, a tmpfs or `/dev/shm` file) | the same open file description of the same file, its offset and flags shared; a process of the host's (an X server) is handed the shared memory object of the file's data instead, which it maps, writable only if the description allows writing: the file's first extent, which holds all of a file sized before it held data; one grown past it is refused (`EOPNOTSUPP`) |
+| a file of fwe's store (a memfd, a tmpfs or `/dev/shm` file) | the same open file description of the same file, its offset and flags shared; a process of the host's (an X server: a peer that was no process of fwe's when the connection was made) is handed the shared memory object of the file's data instead, which it maps, writable only if the description allows writing: the file's first extent, which holds all of a file sized before it held data; one grown past it is refused (`EOPNOTSUPP`) |
 
 macOS collects sockets in flight that it finds no process can reach,
 emptying their data and the descriptors queued in them, and looks for
@@ -2597,7 +2623,9 @@ none went). `recvmmsg` honours `MSG_WAITFORONE`, checks its timeout after
 each message as Linux does, and stops after urgent data.
 
 **`getsockopt(SO_PEERCRED)`**: the peer process from the host's
-`LOCAL_PEERPID`, its pid in the caller's pid namespace and its effective
+`LOCAL_PEERPID` as the connection is made (later it names the last
+process to use the peer's socket, which can be a `fork` child gone
+since), its pid in the caller's pid namespace and its effective
 user and group ids as fwe keeps them for it (what it set inside fwe), in
 the caller's user namespace; a peer fwe did not start has its host ids
 as the guest sees them

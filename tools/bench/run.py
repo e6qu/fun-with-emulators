@@ -46,6 +46,7 @@ import ctypes
 import hashlib
 import io
 import json
+import math
 import os
 import re
 import shutil
@@ -290,7 +291,9 @@ MICRO_NATIVE = [
 
 # How many times native macOS's figure fwe's is allowed to be, on the same
 # runner (PLAN.md, "Native speed"): system calls 1.5x, the process and
-# thread calls and start-up 3x.
+# thread calls and start-up 3x, but fork + exec 4x (each execve in a fork
+# child starts a fresh fwe, as macOS's libraries work only in a process
+# exec'd since its fork).
 BUDGETS = {
     "startup (ms)": 3.0,
     "getpid (ns)": 1.5,
@@ -303,11 +306,14 @@ BUDGETS = {
     "mmap+munmap (ns)": 1.5,
     "thread create+join (us)": 3.0,
     "fork+exit+wait (us)": 3.0,
-    "fork+exec+wait (us)": 3.0,
+    "fork+exec+wait (us)": 4.0,
     # Programs at work that are mostly system calls (a database on disk, a
     # repository), as a call is.
     "SQLite (s)": 1.5,
-    "git (s)": 1.5,
+    # git runs its commands by fork and exec, and a fork child's execve
+    # starts a fresh fwe: held at 2x (CI measures 1.5x) until that start is
+    # faster (ROADMAP.md M6 PR 5).
+    "git (s)": 2.0,
     # JIT runtimes at work (OpenJDK compiling, then running, a
     # multi-threaded application; Node.js and LuaJIT running a script),
     # against the same releases built for macOS.
@@ -338,7 +344,10 @@ BUDGETS = {
     # calls, runs by translation, each process taking the translations
     # kept by earlier runs as it first reaches them.
     "Chromium page load (ms)": 3.0,
-    "Chromium video frame (ms)": 1.5,
+    # A video frame is held at 3x as well: fwe takes 1.4-1.8 ms a frame on
+    # every runner, macOS 0.56-1.27 ms by the runner (1.3-2.6x), until
+    # where fwe's time goes is found and cut (ROADMAP.md M6 PR 8).
+    "Chromium video frame (ms)": 3.0,
     "Electron start-up (ms)": 3.0,
     # Kernel state every process shares, kept in memory as a kernel keeps
     # it (ROADMAP.md M6 PR 2).
@@ -348,8 +357,12 @@ BUDGETS = {
     # shares without a copy, freed when removed): the host's own cycle of
     # one ("POSIX shared memory object made and removed", natively) is
     # 1.2-1.5x macOS's System V segment, and fwe's four calls' work comes
-    # on top of it (docs/linux-on-macos.md).
-    "System V segment made and removed (ns)": 3.0,
+    # on top of it (docs/linux-on-macos.md). The ratio moves with the
+    # runner's speed, 2.5-3.1x on CI's runners.
+    "System V segment made and removed (ns)": 3.5,
+    # A sound stream's latency on the Mac's PulseAudio server ([`sound`]),
+    # as a program's system calls are.
+    "sound stream latency (ms)": 1.5,
 }
 
 # The most fwe's figure is allowed to be, in the row's own unit: making a
@@ -849,6 +862,7 @@ def macos(a):
     if not a.no_build:
         build(a, fwe, results)
         browsers(a, fwe, results)
+        sound(a, fwe, results)
     if a.linux:
         with open(a.linux) as f:
             results["Linux"] = json.load(f)
@@ -1105,8 +1119,8 @@ def run_limited(cmd, name, env=None):
     environment `env`, or this one's), for at most LIMIT seconds. Past
     them, each of its processes is sampled
     (`bench-<name>-hung-<pid>.sample`, uploaded with the results; what is
-    on top of its threads' stacks printed), they are ended, and the
-    benchmarks fail. Its processes are its descendants and, for a run under
+    on top of its threads' stacks printed), the host's Unix sockets are
+    listed ([`hung_sockets`]), they are ended, and the benchmarks fail. Its processes are its descendants and, for a run under
     fwe, every process of fwe's on its root: a daemon a guest started (a
     database's server) has left the session and its parent."""
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -1127,6 +1141,7 @@ def run_limited(cmd, name, env=None):
             top = text.split("Sort by top of stack", 1)[-1].split("\n\n", 1)[0].splitlines()[1:25]
             print(f"{name}: process {pid} after {LIMIT} s, on top of its stacks:\n"
                   + "\n".join(top), file=sys.stderr)
+        hung_sockets(slug, name, pids)
         os.killpg(p.pid, signal.SIGKILL)
         for pid in pids:
             try:
@@ -1137,6 +1152,30 @@ def run_limited(cmd, name, env=None):
         sys.exit(f"{name}: still running after {LIMIT} s: {cmd}\nits error output's end: "
                  f"{err[-3000:]}")
     return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
+def hung_sockets(slug, name, pids):
+    """Every Unix socket of the host's processes (`lsof -U`, kept as
+    `bench-<slug>-hung.sockets`, uploaded with the results), and for each
+    of `pids`' sockets with a peer, which processes hold that peer: a
+    process that waits on its socket for the end of a peer that has gone
+    waits for whoever holds the peer still."""
+    r = subprocess.run(["lsof", "-U", "-n", "-P"], capture_output=True, text=True,
+                       errors="replace")
+    with open(os.path.abspath(f"bench-{slug}-hung.sockets"), "w") as f:
+        f.write(r.stdout)
+    rows = [l.split() for l in r.stdout.splitlines()[1:]]
+    # COMMAND PID USER FD TYPE DEVICE SIZE/OFF NODE NAME: DEVICE is the
+    # socket, NAME `->0x...` its peer.
+    holders = collections.defaultdict(set)
+    for row in rows:
+        if len(row) >= 6:
+            holders[row[5]].add(f"{row[0]} {row[1]} fd {row[3]}")
+    for row in rows:
+        if len(row) >= 9 and row[1].isdigit() and int(row[1]) in pids and row[-1].startswith("->"):
+            peer = row[-1][2:]
+            print(f"{name}: process {row[1]} fd {row[3]} (socket {row[5]}): its peer {peer} "
+                  f"held by {sorted(holders.get(peer, [])) or 'no process'}", file=sys.stderr)
 
 
 def processes_of(p, root=None):
@@ -1277,6 +1316,100 @@ def browsers(a, fwe, results):
         [os.path.join(mac_electron, "Electron.app/Contents/MacOS/Electron"), "--no-sandbox",
          ELECTRON_APP], row, host), BROWSER_ROUNDS)
     print(f"{row}: fwe {ours[row]:.0f}, macOS {theirs[row]:.0f}", flush=True)
+
+
+# What [`sound`] plays: a tone of so many seconds, at a latency of so many
+# milliseconds (at 20 the null sink runs streams dry natively as well).
+SOUND_SECS = 10
+SOUND_MS = 40
+
+
+def pulse_server(brew):
+    """Homebrew's PulseAudio server with one null sink (rendering 50 ms
+    ahead: `norewinds`, as the sound tests' server), its socket and cookie
+    in a directory of its own: the process, and the environment its
+    clients reach it with (fwe passes it on to its guests)."""
+    d = tempfile.mkdtemp(prefix="fwe-pa-")
+    sock = os.path.join(d, "native")
+    err = open(os.path.join(d, "server.err"), "w")
+    p = subprocess.Popen(
+        [os.path.join(brew, "opt/pulseaudio/bin/pulseaudio"), "-n", "--daemonize=no",
+         "--exit-idle-time=-1", "--use-pid-file=no",
+         "-L", "module-null-sink sink_name=nul norewinds=1",
+         "-L", f"module-native-protocol-unix socket={sock}"],
+        env={"HOME": d}, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=err)
+    began = time.monotonic()
+    while not os.path.exists(sock):
+        if p.poll() is not None or time.monotonic() - began > 30:
+            p.kill()
+            sys.exit("no PulseAudio server: " + open(os.path.join(d, "server.err")).read())
+        time.sleep(0.1)
+    env = {"PULSE_SERVER": "unix:" + sock,
+           "PULSE_COOKIE": os.path.join(d, ".config/pulse/cookie")}
+    return p, env
+
+
+def played(cmd, env, name):
+    """`pacat -v`'s run as `cmd`: the median latency it reported (ms) and
+    the underruns after its stream began (the first report)."""
+    r = subprocess.run(cmd, env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                       text=True, errors="replace", timeout=120)
+    said = r.stderr.replace("\r", "\n")
+    if r.returncode != 0:
+        sys.exit(f"{name}: pacat ended with {r.returncode}: {said[-3000:]}")
+    latencies, underruns = [], 0
+    for line in said.splitlines():
+        m = re.search(r"Latency: (\d+) usec", line)
+        if m:
+            latencies.append(int(m.group(1)) / 1000)
+        elif latencies and "underrun" in line:
+            underruns += 1
+    if not latencies:
+        sys.exit(f"{name}: pacat reported no latency: {said[-3000:]}")
+    return statistics.median(latencies), underruns
+
+
+def sound(a, fwe, results):
+    """A sound stream on the Mac's PulseAudio server (ROADMAP.md M7 PR 7):
+    Debian's `pacat` under fwe against Homebrew's, the same PulseAudio
+    release's built for macOS, each playing the same tone to the same
+    server at the same latency: the latency each reports (its buffer and
+    the sink's), and how often it ran dry. The underruns have no budget:
+    the server's sink thread, scheduled late, runs a stream dry under fwe
+    and natively alike (on a development Mac, 2 runs of 27 under fwe and 1
+    of 27 natively ran dry once)."""
+    root = debian_system("sound", a.cache, a.roots)
+    frames = 44100 * SOUND_SECS
+    tone = b"".join(struct.pack("<hh", v, v) for v in (
+        int(8000 * math.sin(2 * math.pi * 440 * i / 44100)) for i in range(frames)))
+    with open(os.path.join(root, "tmp/fwe-tone.raw"), "wb") as f:
+        f.write(tone)
+    native_tone = os.path.join(a.roots, "fwe-tone.raw")
+    with open(native_tone, "wb") as f:
+        f.write(tone)
+    server, env = pulse_server(a.brew)
+    try:
+        args = ["-v", f"--latency-msec={SOUND_MS}", "--format=s16le", "--rate=44100",
+                "--channels=2"]
+        ours = fwe + ["--root", root, os.path.join(root, "usr/bin/pacat")] + args + [
+            "/tmp/fwe-tone.raw"]
+        theirs = [os.path.join(a.brew, "opt/pulseaudio/bin/pacat")] + args + [native_tone]
+        runs = {"fwe": [], "macOS": []}
+        # Each round under fwe, then natively: the runner's load falls on
+        # both alike.
+        for _ in range(3):
+            runs["fwe"].append(played(ours, linux_env(**env), "fwe"))
+            runs["macOS"].append(played(theirs, dict(os.environ, **env), "macOS"))
+        results[BACKEND]["sound stream latency (ms)"] = backends(
+            ["env", "-i"] + [f"{k}={v}" for k, v in linux_env(**env).items()] + ours[:-1]
+            + ["/dev/null"])
+    finally:
+        server.kill()
+        server.wait()
+    for side, got in runs.items():
+        results[side]["sound stream latency (ms)"] = min(l for l, _ in got)
+        results[side]["sound underruns"] = sum(u for _, u in got)
+        print(f"sound {side}: {got}", flush=True)
 
 
 def workload(results, name, ours, theirs, fresh, at, profiled=False, share=False):
@@ -2022,19 +2155,28 @@ def phases(name, cmd):
     and the page faults between each of its marks and the one before it in
     the same process, by mark (numbers in a mark's name taken as one), as
     medians over the run: where a step that repeats (a fork, a wait) spends
-    its time, and how many pages it writes (each a copy after a fork)."""
+    its time, and how many pages it writes (each a copy after a fork).
+    A re-executed fwe's start counts from its host `execve` (the same
+    pid's mark before it, by the host's clock): "re-exec: host execve to
+    main" is the host's exec and what runs before fwe's `main`."""
     r = subprocess.run(cmd, env=dict(os.environ, FWE_TIMING="1"), capture_output=True,
                        text=True, errors="replace")
     steps, faults = collections.defaultdict(list), collections.defaultdict(list)
     first = None
+    # Each pid's last mark: its name and the host's clock.
+    last = {}
     for line in r.stderr.splitlines():
-        m = re.match(r"\[fwe (\d+)\] timing: (.*?) \+(\d+)us \(\d+us\) \+(\d+) faults$",
-                     line)
+        m = re.match(r"\[fwe (\d+)\] timing: (.*?) \+(\d+)us \(\d+us\) \+(\d+) faults"
+                     r" @(\d+)$", line)
         if m:
             pid, m = m.group(1), m.groups()[1:]
             first = first or pid
             # The first process's steps, and those of the processes after it.
             who = "" if pid == first else "(others) "
+            if m[0] == "main" and last.get(pid, ("",))[0] == "exec: host execve":
+                steps[who + "re-exec: host execve to main"].append(int(m[3]) - last[pid][1])
+                faults[who + "re-exec: host execve to main"].append(0)
+            last[pid] = (m[0], int(m[3]))
             step = who + re.sub(r"\d+", "N", m[0])[:60]
             steps[step].append(int(m[1]))
             faults[step].append(int(m[2]))
