@@ -133,6 +133,7 @@ impl<T> Lock<T> {
         unsafe(link_section = "__TEXT,__fwe_fork,regular,pure_instructions")
     )]
     pub fn lock(&self) -> Exclusive<'_, T> {
+        let began = crate::timing::call_began();
         // Readers and writers that wait come in first: a thread making one
         // exclusive call after another would otherwise take the mutex back
         // each time (the host's mutex gives it to whoever asks first), and
@@ -171,6 +172,7 @@ impl<T> Lock<T> {
                 }
             }
         }
+        crate::timing::lock_waited(true, began);
         Exclusive { lock: self, _writers: writers }
     }
 
@@ -197,11 +199,13 @@ impl<T> Lock<T> {
         // writers' mutex, when no writer is in. The next writer then waits
         // for this reader, so readers get their turns with writers that
         // follow one another.
+        let began = crate::timing::call_began();
         self.waiting.fetch_add(1, SeqCst);
         count.fetch_sub(1, Release);
         let _writers = self.writers.lock().unwrap_or_else(|e| e.into_inner());
         count.fetch_add(1, SeqCst);
         self.waiting.fetch_sub(1, Release);
+        crate::timing::lock_waited(false, began);
         Shared { lock: self, shard }
     }
 

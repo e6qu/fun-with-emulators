@@ -88,6 +88,7 @@ pub fn on() -> bool {
 /// process ends ([`calls_and_signals`]). Counted only with it on.
 static CALLS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static CALL_NS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
+static CALL_MAX_NS: [AtomicU64; 512] = [const { AtomicU64::new(0) }; 512];
 static SIGNALS: [AtomicU64; 32] = [const { AtomicU64::new(0) }; 32];
 
 /// The start of a system call's run, if [`on`].
@@ -101,8 +102,29 @@ pub fn call_began() -> Option<Instant> {
 pub fn call_done(nr: u64, began: Option<Instant>) {
     if let Some(b) = began {
         let i = (nr as usize).min(CALLS.len() - 1);
+        let ns = b.elapsed().as_nanos() as u64;
         CALLS[i].fetch_add(1, Relaxed);
-        CALL_NS[i].fetch_add(b.elapsed().as_nanos() as u64, Relaxed);
+        CALL_NS[i].fetch_add(ns, Relaxed);
+        CALL_MAX_NS[i].fetch_max(ns, Relaxed);
+    }
+}
+
+/// Waits for the kernel lock ([`crate::klock`]): for itself, and for its
+/// shared side where a writer was in: how many, their nanoseconds, the
+/// longest.
+static LOCK_WAITS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static LOCK_WAIT_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+static LOCK_WAIT_MAX_NS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// The kernel lock taken, for itself (`exclusive`) or its shared side, the
+/// wait begun at `began` ([`call_began`]).
+#[inline]
+pub fn lock_waited(exclusive: bool, began: Option<Instant>) {
+    if let Some(b) = began {
+        let (i, ns) = (usize::from(!exclusive), b.elapsed().as_nanos() as u64);
+        LOCK_WAITS[i].fetch_add(1, Relaxed);
+        LOCK_WAIT_NS[i].fetch_add(ns, Relaxed);
+        LOCK_WAIT_MAX_NS[i].fetch_max(ns, Relaxed);
     }
 }
 
@@ -223,16 +245,35 @@ pub fn ipc_wakes() -> (u64, u64) {
 /// waiters woken, and the Vulkan commands run ([`crate::vulkan::device::counts`]),
 /// as text.
 pub fn calls_and_signals() -> String {
-    let mut calls: Vec<(usize, u64, u64)> = (0..CALLS.len())
-        .map(|i| (i, CALLS[i].load(Relaxed), CALL_NS[i].load(Relaxed)))
+    let mut calls: Vec<(usize, u64, u64, u64)> = (0..CALLS.len())
+        .map(|i| {
+            (i, CALLS[i].load(Relaxed), CALL_NS[i].load(Relaxed), CALL_MAX_NS[i].load(Relaxed))
+        })
         .filter(|c| c.1 > 0)
         .collect();
     calls.sort_by_key(|c| std::cmp::Reverse(c.2));
     let total: u64 = calls.iter().map(|c| c.1).sum();
+    // The calls that took longest in all, and those that took longest once.
+    let mut longest = calls.clone();
+    longest.sort_by_key(|c| std::cmp::Reverse(c.3));
     let calls: Vec<String> = calls
         .iter()
         .take(12)
-        .map(|(i, n, ns)| format!("{i}: {n} ({} ms)", ns / 1_000_000))
+        .map(|(i, n, ns, _)| format!("{i}: {n} ({} ms)", ns / 1_000_000))
+        .collect();
+    let longest: Vec<String> =
+        longest.iter().take(6).map(|(i, _, _, max)| format!("{i}: {} us", max / 1000)).collect();
+    let lock: Vec<String> = ["for itself", "its shared side"]
+        .iter()
+        .enumerate()
+        .map(|(i, side)| {
+            format!(
+                "{side} {} ({} ms, the longest {} us)",
+                LOCK_WAITS[i].load(Relaxed),
+                LOCK_WAIT_NS[i].load(Relaxed) / 1_000_000,
+                LOCK_WAIT_MAX_NS[i].load(Relaxed) / 1000
+            )
+        })
         .collect();
     let signals: Vec<String> = (0..SIGNALS.len())
         .map(|i| (i, SIGNALS[i].load(Relaxed)))
@@ -260,9 +301,12 @@ pub fn calls_and_signals() -> String {
         .map(|c| format!("; {c}"))
         .collect();
     format!(
-        "{total} system calls, by number, the longest: {}; host signals by number: {}; traps: {}; faults: {}; \
+        "{total} system calls, by number, the longest: {}; the longest one call: {}; the kernel lock \
+         waited for: {}; host signals by number: {}; traps: {}; faults: {}; \
          IPC waiters woken {woken}, of them tried again under the lock {retried}{gpu}",
         calls.join(", "),
+        longest.join(", "),
+        lock.join(", "),
         signals.join(", "),
         traps.join(", "),
         faults.join(", ")

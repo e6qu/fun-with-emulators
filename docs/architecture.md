@@ -176,7 +176,8 @@ guest's mappings (`set_validator`) and translated (`g2h`, `host_arg`)
   an `execve`, a `fork` (in parent and child) and a `wait` took, and the
   page faults each took (in a fork's child every page touched is one; in
   the parent every page written while the child lives). As a process
-  exits it prints its system calls by number with their time, the host
+  exits it prints its system calls by number with their time and the
+  longest single call of each, the waits for the kernel lock, the host
   signals it took, the traps among them by what they were for, and the
   fault signals by what fwe made of each (an `x18` group run again, a
   first run of code, a fetch of translated code, a page copied, a stack
