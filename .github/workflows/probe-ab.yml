@@ -1,0 +1,25 @@
+name: probe-jdk-ab
+on:
+  push:
+    branches: [probe-ab]
+jobs:
+  ab:
+    runs-on: macos-26
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/cache@v4
+        with:
+          path: target/bench-cache
+          key: probe-ab-${{ hashFiles('guests/alpine/fetch/jdk.txt') }}
+      - run: brew install openjdk@25
+      - name: Both builds
+        run: |
+          git worktree add ../wt-main origin/main
+          git worktree add ../wt-branch 6f4efa9e
+          (cd ../wt-main && cargo build --release -p fwe 2>&1 | tail -1)
+          (cd ../wt-branch && cargo build --release -p fwe 2>&1 | tail -1)
+      - name: The JDK workload, A/B
+        run: python3 tools/probe-jdk-ab.py target/bench-cache "$RUNNER_TEMP/roots" "$(brew --prefix)" "$PWD/../wt-main/target/release/fwe" "$PWD/../wt-branch/target/release/fwe"
