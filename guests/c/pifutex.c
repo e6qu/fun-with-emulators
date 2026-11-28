@@ -1,7 +1,8 @@
 /* Priority-inheritance futexes, as Linux runs them: FUTEX_LOCK_PI takes a
  * word with no owner (its thread id the word), marks one another owns
  * with FUTEX_WAITERS and waits; FUTEX_UNLOCK_PI hands the lock to the
- * oldest waiter (its thread id, with FUTEX_WAITERS, the word); a lock
+ * oldest waiter (its thread id, with FUTEX_WAITERS, the word), whatever
+ * the arguments it does not use hold; a lock
  * interrupted by a signal goes on after the handler, SA_RESTART or not.
  * Then the C library's PTHREAD_PRIO_INHERIT mutexes (musl's
  * pthread_mutexattr_setprotocol tries FUTEX_LOCK_PI first, as PulseAudio
@@ -54,6 +55,14 @@ static volatile unsigned word;
 
 static long futex(volatile unsigned *w, int op, const struct timespec *ts) {
     long r = syscall(SYS_futex, w, op | FUTEX_PRIVATE, 0, ts, 0, 0);
+    return r < 0 ? -*__errno_location() : r;
+}
+
+/* As futex, with junk in the arguments the operation does not use (its
+ * value, timeout and second word), as musl's pthread_mutex_unlock leaves
+ * them for FUTEX_UNLOCK_PI: Linux reads none of them. */
+static long futex_junk(volatile unsigned *w, int op) {
+    long r = syscall(SYS_futex, w, op | FUTEX_PRIVATE, 7, (void *)0x80, (void *)0x80, 7);
     return r < 0 ? -*__errno_location() : r;
 }
 
@@ -135,6 +144,9 @@ int main(void) {
     printf("unlock: %ld\n", futex(&word, FUTEX_UNLOCK_PI, 0));
     pthread_join(t, 0);
     printf("the waiter's lock: %ld, handed to it: %d, then free: %d\n", waited, handed, word == 0);
+    long tried = futex_junk(&word, FUTEX_TRYLOCK_PI);
+    long unlocked = futex_junk(&word, FUTEX_UNLOCK_PI);
+    printf("with junk where unused: try: %ld, unlock: %ld, free: %d\n", tried, unlocked, word == 0);
 
     futex(&word, FUTEX_LOCK_PI, 0);
     pthread_create(&t, 0, other, 0);

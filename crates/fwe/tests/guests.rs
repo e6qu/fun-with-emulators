@@ -2239,21 +2239,44 @@ fn memory_below_sp_is_the_programs() {
     );
 }
 
+/// What guests/c/pifutex.c prints, as on Linux.
+const PIFUTEX: &str = "lock: 0, the owner's: 1\nagain: -35\na waiter marks it: 1\nunlock: 0\n\
+                       the waiter's lock: 0, handed to it: 1, then free: 1\n\
+                       with junk where unused: try: 0, unlock: 0, free: 1\n\
+                       another's unlock: -1, try: -11, timed lock: -110\n\
+                       an owner that never ran: -3\ninterrupted: handler ran 1, then locked: 0\n\
+                       setprotocol: 0\ncounted: 8000\n\
+                       its owner ended: 130, made consistent: 0, unlocked: 0\n";
+
 /// Priority-inheritance futexes (guests/c/pifutex.c) as Linux runs them:
-/// a lock handed to its waiter, its errors, a lock a signal interrupts
-/// going on after the handler, and both C libraries' `PTHREAD_PRIO_INHERIT`
-/// mutexes, robust too (musl's tries `FUTEX_LOCK_PI` as one is made, which
-/// PulseAudio asserts on).
+/// a lock handed to its waiter, its errors, the arguments an operation
+/// does not use ignored, a lock a signal interrupts going on after the
+/// handler, and both C libraries' `PTHREAD_PRIO_INHERIT` mutexes, robust
+/// too (musl's tries `FUTEX_LOCK_PI` as one is made, which PulseAudio
+/// asserts on).
 #[test]
 fn priority_inheritance_locks_are_linuxs() {
-    let want = "lock: 0, the owner's: 1\nagain: -35\na waiter marks it: 1\nunlock: 0\n\
-                the waiter's lock: 0, handed to it: 1, then free: 1\n\
-                another's unlock: -1, try: -11, timed lock: -110\n\
-                an owner that never ran: -3\ninterrupted: handler ran 1, then locked: 0\n\
-                setprotocol: 0\ncounted: 8000\n\
-                its owner ended: 130, made consistent: 0, unlocked: 0\n";
     for libc in [Libc::Glibc, Libc::Musl] {
-        c_guest_prints_on(libc, "pifutex", &[], want);
+        c_guest_prints_on(libc, "pifutex", &[], PIFUTEX);
+    }
+}
+
+/// Priority-inheritance futexes in the VM (see
+/// [`priority_inheritance_locks_are_linuxs`]): only the pointers an
+/// operation reads are taken for guest pointers (musl's unlock of a
+/// `PTHREAD_PRIO_INHERIT` mutex leaves junk in the second word's
+/// argument, and Wine's PulseAudio driver's lock is one).
+#[test]
+fn hv_priority_inheritance_locks_are_linuxs() {
+    for libc in [Libc::Glibc, Libc::Musl] {
+        let prog = build_c_dynamic("pifutex", libc, true);
+        let root = libc_rootfs(libc, &format!("vm-pifutex-{}", name_suffix(libc)));
+        let Some(mut cmd) = hv_command() else { return };
+        cmd.arg("--vm").arg("--strace").arg("--root").arg(&root).arg(&prog);
+        let out = run_hv(cmd, "pifutex --vm");
+        let _ = std::fs::remove_dir_all(&root);
+        assert_eq!(stdout(&out), PIFUTEX, "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.status.code(), Some(0));
     }
 }
 

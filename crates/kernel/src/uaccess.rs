@@ -716,16 +716,21 @@ pub fn pointer_args(nr: u64) -> u8 {
     }
 }
 
-/// [`pointer_args`] for a `futex` call with operation `op`: argument 3 is
-/// a timeout pointer for the waits, a count for the requeues and `WAKE_OP`;
-/// argument 4 a second word for those, unused by the wakes.
+/// [`pointer_args`] for a `futex` call with operation `op`, the pointers
+/// Linux reads for it, and no other (an argument an operation does not
+/// use can hold anything: musl's `FUTEX_UNLOCK_PI` leaves `x4` as it
+/// was): argument 3 is a timeout pointer for the waits and the
+/// priority-inheritance locks, a count for the requeues and `WAKE_OP`;
+/// argument 4 is a second word for those and for `FUTEX_WAIT_REQUEUE_PI`.
+/// An operation Linux does not know uses none (`ENOSYS`).
 pub fn futex_pointer_args(op: u64) -> u8 {
     use fwe_abi::futex::*;
     match op & FUTEX_CMD_MASK {
-        FUTEX_WAIT | FUTEX_WAIT_BITSET => 0b1001,
-        // A wake uses only the word: the other arguments can hold anything.
-        FUTEX_WAKE | FUTEX_WAKE_BITSET => 0b1,
-        _ => 0b1_0001,
+        FUTEX_WAIT | FUTEX_WAIT_BITSET | FUTEX_LOCK_PI | FUTEX_LOCK_PI2 => 0b1001,
+        FUTEX_WAKE | FUTEX_WAKE_BITSET | FUTEX_UNLOCK_PI | FUTEX_TRYLOCK_PI => 0b1,
+        FUTEX_REQUEUE | FUTEX_CMP_REQUEUE | FUTEX_WAKE_OP | FUTEX_CMP_REQUEUE_PI => 0b1_0001,
+        FUTEX_WAIT_REQUEUE_PI => 0b1_1001,
+        _ => 0,
     }
 }
 
@@ -764,6 +769,39 @@ macro_rules! guest {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `futex` call's pointers are those Linux reads for its operation:
+    /// the arguments an operation does not use are never taken for
+    /// pointers (musl's `FUTEX_UNLOCK_PI` leaves `x4` holding anything).
+    #[test]
+    fn a_futex_operation_s_pointers_are_those_it_reads() {
+        use fwe_abi::futex::*;
+        let cases = [
+            (FUTEX_WAIT, 0b1001),
+            (FUTEX_WAKE, 0b1),
+            (FUTEX_REQUEUE, 0b1_0001),
+            (FUTEX_CMP_REQUEUE, 0b1_0001),
+            (FUTEX_WAKE_OP, 0b1_0001),
+            (FUTEX_LOCK_PI, 0b1001),
+            (FUTEX_UNLOCK_PI, 0b1),
+            (FUTEX_TRYLOCK_PI, 0b1),
+            (FUTEX_WAIT_BITSET, 0b1001),
+            (FUTEX_WAKE_BITSET, 0b1),
+            (FUTEX_WAIT_REQUEUE_PI, 0b1_1001),
+            (FUTEX_CMP_REQUEUE_PI, 0b1_0001),
+            (FUTEX_LOCK_PI2, 0b1001),
+            (14, 0),
+        ];
+        for (op, mask) in cases {
+            for flags in [0, FUTEX_PRIVATE_FLAG, FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME] {
+                assert_eq!(
+                    futex_pointer_args(op | flags),
+                    mask,
+                    "operation {op}, flags {flags:#x}"
+                );
+            }
+        }
+    }
 
     /// Guest ranges in the low 4 GiB, which no test's real memory uses, so
     /// tests running alongside are not affected.
